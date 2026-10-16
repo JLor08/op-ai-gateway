@@ -31,8 +31,10 @@ import (
 // capability gate's job, keyed on inference.Request.RequiredCapabilities.
 const apiFlavorImages = "openai_images"
 
-// billingUnitFor returns usage.BillingUnitImage when apiFlavor identifies an
-// images request and usage.BillingUnitTokens (the zero value) otherwise. The
+// billingUnitFor returns the non-token unit an endpoint's rows are billed in --
+// usage.BillingUnitImage for an images request (apiFlavorImages) and
+// usage.BillingUnitAudioSecond for a speech request (apiFlavorSpeech) -- and
+// usage.BillingUnitTokens (the zero value) for every other flavor. The
 // name is deliberately NOT "imagesBillingUnit": proxyNative's three shared
 // recordUsage call sites (native_passthrough.go -- the "provider is not a
 // NativeProxyClient" branch, the pre-response ProxyNative-error branch, and
@@ -49,10 +51,14 @@ const apiFlavorImages = "openai_images"
 // images-only functions, so their own recordUsage calls set
 // usage.BillingUnitImage directly.
 func billingUnitFor(apiFlavor string) string {
-	if apiFlavor == apiFlavorImages {
+	switch apiFlavor {
+	case apiFlavorImages:
 		return usage.BillingUnitImage
+	case apiFlavorSpeech:
+		return usage.BillingUnitAudioSecond
+	default:
+		return usage.BillingUnitTokens
 	}
-	return usage.BillingUnitTokens
 }
 
 // imagesDataMarker is the JSON key an images response uses for one produced

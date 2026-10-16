@@ -8,12 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/usage"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -220,9 +223,12 @@ func validateSpeechRequest(raw []byte, model string) *inference.Error {
 // claim one that never happened (and make the energy reconciler price the row
 // against a server that never saw the request).
 //
-// No billing unit is set here: a refused request produced no audio, and the
-// speech billing measure is recorded where the relay finishes, not where a
-// request is refused.
+// The row carries usage.BillingUnitAudioSecond with a zero quantity, set here
+// unconditionally as recordImagesRoutingFailure does for images: the unit is the
+// ENDPOINT's identity, and the default "" would record a refused speech request
+// as token-metered with a zero measure, the lie the (unit, quantity) pair exists
+// to prevent. A refused request produced no audio, so the quantity stays 0; it
+// is only ever set where a relay finishes (setSpeechBillingQuantity).
 func (s *Server) recordSpeechRoutingFailure(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, start time.Time, err error) {
 	id := nextRequestID()
 	capturing := s.capturingEnabled(token)
@@ -238,7 +244,7 @@ func (s *Server) recordSpeechRoutingFailure(w http.ResponseWriter, r *http.Reque
 		slog.Debug("speech request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
 	}
 	body := writeCompletionErrorCaptured(w, err)
-	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, Endpoint: endpointSpeech}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
+	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: endpointSpeech}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
 }
 
 // resolveSpeechTarget is resolveImagesTarget's speech twin: it resolves the
@@ -298,4 +304,68 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 		pfReq:    req,
 		endpoint: endpointSpeech,
 	})
+}
+
+// speechDurationHeader is the response header audio.cpp reports a synthesized
+// clip's length in, in MILLISECONDS as a decimal string ("2000.000000"). It is
+// the only metering signal a speech response carries: the body is binary audio
+// with no usage object, which is why the speech row's measure is a duration
+// (usage.BillingUnitAudioSecond) and not a token count.
+const speechDurationHeader = "X-AudioCPP-Audio-Duration-Ms"
+
+// speechDurationSeconds parses a speechDurationHeader value into seconds, and
+// reports whether it was a usable duration: a finite number greater than zero.
+// An absent or empty value, a non-number (ParseFloat rejects "1500ms"), zero,
+// a negative and "NaN"/"Inf" (which ParseFloat does accept) all answer false --
+// none states how much audio was produced, and a NaN or infinite quantity would
+// poison every sum the usage views take.
+func speechDurationSeconds(header string) (float64, bool) {
+	ms, err := strconv.ParseFloat(strings.TrimSpace(header), 64)
+	if err != nil || math.IsNaN(ms) || math.IsInf(ms, 0) || ms <= 0 {
+		return 0, false
+	}
+	return ms / 1000, true
+}
+
+// setSpeechBillingQuantity records, on meta, how many seconds of audio a
+// finished speech relay produced -- and does nothing at all for a non-speech
+// flavor or a request that did not finish cleanly, leaving BillingQuantity at 0
+// so nothing is asserted about what was produced. It is setImagesBillingQuantity's
+// twin and shares its reasoning: the quantity comes from the RESPONSE (the
+// upstream's own statement of the clip it synthesized, never the request's
+// input or speed), and is only trusted once the FULL body reached the client
+// (status == "success"; a non-2xx upstream answer, an idle timeout, a client
+// disconnect or a copy error all leave it 0).
+//
+// upstream is the UPSTREAM response's headers. Unlike the images count, which
+// the copier accumulates from the body, the duration arrives on the response
+// header, and nativeExchange is built before any response exists, so the one
+// caller passes resp.Header alongside it rather than the exchange growing a
+// field that is empty for every other flavor and for the whole pre-response
+// phase.
+//
+// A successful relay with no usable duration is indistinguishable, in the
+// recorded row alone, from a genuinely empty clip, and the (unit, quantity) pair
+// has no "unknown" representation to fall back on. So, exactly as for a counted
+// zero image, the gap is logged once at Error with enough to find the request,
+// instead of silently recording a bare zero (or repairing the row, which would
+// destroy the evidence). The raw header value is logged because an unparseable
+// one is the very thing an operator needs to see; it is the upstream's own
+// string, never client input.
+//
+// Nothing else is set: the usage scanner is nil for speech (newUsageScanner), so
+// no token count or rate exists to leak onto the row and ValidateBillingXOR
+// holds. meta.ReqPath is read for the log line rather than taking the request a
+// second time: it is the same r.URL.Path the caller already put there.
+func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.Header, status string) {
+	if ex.req.APIFlavor != apiFlavorSpeech || status != "success" {
+		return
+	}
+	value := upstream.Get(speechDurationHeader)
+	seconds, ok := speechDurationSeconds(value)
+	if !ok {
+		slog.Error("speech relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "header", speechDurationHeader, "value", value)
+		return
+	}
+	meta.BillingQuantity = seconds
 }

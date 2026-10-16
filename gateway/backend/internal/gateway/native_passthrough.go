@@ -786,6 +786,11 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// the count comes off the RESPONSE and why a counted zero is logged rather
 	// than quietly recorded.
 	setImagesBillingQuantity(&meta, ex, imgCounter, status)
+	// The speech measure, likewise for a speech request that finished cleanly and
+	// for nothing else. Its quantity is the upstream's own duration header, so
+	// resp.Header is passed alongside the exchange -- see
+	// setSpeechBillingQuantity (speech_handler.go).
+	setSpeechBillingQuantity(&meta, ex, resp.Header, status)
 	// resp.Header is the UPSTREAM provider response headers (the native-passthrough
 	// path holds them directly), threaded in for the best-effort vendor rate-limit
 	// scrape -- a no-op for a non-vendor target.
