@@ -86,7 +86,8 @@ type BenchmarkResult struct {
 	Error string      `json:"error,omitempty"`
 	// Skipped names why an application- or server-scope run did not measure
 	// this mapping, from a closed set: "images_only"
-	// (benchmarkSkippedImagesOnly). A skipped result carries no metrics and
+	// (benchmarkSkippedImagesOnly) or "audio_only"
+	// (benchmarkSkippedAudioOnly). A skipped result carries no metrics and
 	// no error, and no history row is written for it.
 	Skipped string `json:"skipped,omitempty"`
 }

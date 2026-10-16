@@ -58,18 +58,19 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 //
 // Every mode sends each target a chat prompt, so before the reservation the
 // scope's views are partitioned (partitionBenchmarkViews): a view that serves
-// only images is skipped, and one whose runtime spec cannot be read is not
-// measured either, because the answer is unknown and is not guessed at. A
-// scope with no runnable view reserves nothing and answers 409
-// benchmark.images_only when every view serves only images, else 500
-// benchmark.request_failed; a mapping scope's single view therefore gets
-// exactly those answers. Otherwise the skipped and unreadable views are
-// recorded as the run's first results, before it measures anything, so Total
-// counts every view and Done reaches it.
+// only images or only speech is skipped, and one whose runtime spec cannot be
+// read is not measured either, because the answer is unknown and is not
+// guessed at. A scope with no runnable view reserves nothing and answers 409
+// benchmark.images_only when every view serves only images (or images and
+// speech), 409 benchmark.audio_only when every view serves only speech, else
+// 500 benchmark.request_failed (refuseNothingRunnable); a mapping scope's
+// single view therefore gets exactly those answers. Otherwise the skipped and
+// unreadable views are recorded as the run's first results, before it measures
+// anything, so Total counts every view and Done reaches it.
 //
 // The partition and TryStart are not atomic. A flavor edit in between is
-// benign either way: a view that became images-only is prompted and its
-// result records the failure, and one that stopped being images-only is
+// benign either way: a view that became images-only or audio-only is prompted
+// and its result records the failure, and one that stopped being either is
 // skipped for this run.
 //
 // A speed or both run is the one run that may stop the server's running agent
@@ -178,8 +179,8 @@ func (s *Server) startContextProbe(w http.ResponseWriter, r *http.Request, token
 //
 // Before the reservation it reads the mapping's runtime spec once (starterSpec) and asks
 // loadRefusal whether the Load can succeed: a refusal answers its 409 and reserves nothing. A
-// Load that passes is built from that same spec (loadTargetFor), so an images-only agent child
-// is loaded without generating.
+// Load that passes is built from that same spec (loadTargetFor), so an images-only or
+// audio-only agent child is loaded without generating.
 //
 // The check and TryStart are not atomic: a spec that becomes force_stopped in between is not
 // refused, and the agent's 503 for it keeps the Load retrying until loadUntilServable's bound,
@@ -335,6 +336,7 @@ var benchmarkErrRows = []errRow{
 	{err: portal.ErrBenchmarkScopeInvalid, status: http.StatusBadRequest, code: "benchmark.scope_invalid", msg: "unknown benchmark scope"},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: "benchmark.not_found", msg: "not found"},
 	{err: errBenchmarkImagesOnly, status: http.StatusConflict, code: codeBenchmarkImagesOnly, msg: msgBenchmarkImagesOnly},
+	{err: errBenchmarkAudioOnly, status: http.StatusConflict, code: codeBenchmarkAudioOnly, msg: msgBenchmarkAudioOnly},
 	{err: errBenchmarkAgentEnsureUnsupported, status: http.StatusConflict, code: codeBenchmarkAgentEnsureUnsupported, msg: msgBenchmarkAgentEnsureUnsupported},
 	{err: errBenchmarkSpecForceStopped, status: http.StatusConflict, code: codeBenchmarkSpecForceStopped, msg: msgBenchmarkSpecForceStopped},
 }
@@ -342,7 +344,7 @@ var benchmarkErrRows = []errRow{
 // writeBenchmarkError maps the AuthorizeBenchmarkScope sentinels and the
 // starters' refusals to HTTP status codes. The not-found sentinels
 // (mapping/application/server) all map to 404 (no existence leak); the two
-// benchmark-specific sentinels map to 400, and the three refusals
+// benchmark-specific sentinels map to 400, and the refusals
 // (benchmark_refusals.go) to 409.
 func writeBenchmarkError(w http.ResponseWriter, err error) {
 	writeMappedError(w, err, benchmarkErrRows, http.StatusInternalServerError, codeBenchmarkRequestFailed, msgBenchmarkRequestFailed)
