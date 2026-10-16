@@ -119,7 +119,6 @@ Inputs/conditions the spec implies that no single happy-path task exercises, mos
 **Files:**
 - Modify: `gateway/backend/internal/gateway/session_extract.go` (iota ~26–32; `extractClientSession` switch ~73–88; `sessionFromBody` switch ~101–141)
 - Modify: `gateway/backend/internal/gateway/native_passthrough.go` (`upstreamPath` ~178–213)
-- Modify: `gateway/backend/internal/gateway/server.go` (route registration ~1291–1294)
 - Test: `gateway/backend/internal/gateway/session_extract_test.go`; `native_passthrough_test.go` (extend the `upstreamPath` table)
 
 **Interfaces:**
@@ -127,7 +126,7 @@ Inputs/conditions the spec implies that no single happy-path task exercises, mos
 
 - [ ] **Step 1: Write failing tests** — extend the `upstreamPath` table: `apiFlavorSpeech` + `endpointSpeech` → `/v1/audio/speech`. Add `session_extract` cases asserting `endpointSpeech` yields empty `ClientSession`/`Source` (speech has no session signal) through both switches.
 - [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** — add `endpointSpeech` to the iota; add an **explicit, commented** `case endpointSpeech:` to **both** switches stating "no session signal" (house style, never the absent default); add the `apiFlavorSpeech` branch to `upstreamPath` → `/v1/audio/speech`; register `/v1/audio/speech` + `/openai/v1/audio/speech` → `s.handleOpenAISpeech` next to the images routes.
+- [ ] **Step 3: Implement** — add `endpointSpeech` to the iota; add an **explicit, commented** `case endpointSpeech:` to **both** switches stating "no session signal" (house style, never the absent default); add the `apiFlavorSpeech` branch to `upstreamPath` → `/v1/audio/speech`. (Route registration is done in Task 6, co-located with the handler it references — ruling 2026-10-16.)
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit** — `feat(gateway): wire the /v1/audio/speech endpoint path and session plumbing`
 
@@ -135,6 +134,7 @@ Inputs/conditions the spec implies that no single happy-path task exercises, mos
 
 **Files:**
 - Create: `gateway/backend/internal/gateway/speech_handler.go`
+- Modify: `gateway/backend/internal/gateway/server.go` (register `/v1/audio/speech` + `/openai/v1/audio/speech` → `s.handleOpenAISpeech`, next to the images routes ~1291–1294 — moved here from Task 5 so the route and its handler land in one compiling commit)
 - Test: `gateway/backend/internal/gateway/speech_handler_test.go`; `inference_handlers_test.go` (preflight shape); `gateway/backend/internal/routing/resolver_capability_gate_test.go` (extend for speech incl. the affinity branch)
 
 **Interfaces:**
@@ -143,7 +143,7 @@ Inputs/conditions the spec implies that no single happy-path task exercises, mos
 
 - [ ] **Step 1: Write failing tests** — `TestValidateSpeechRequest`: missing `model`/`input` → 400 with distinct codes; `response_format:"mp3"` and `response_format:"json"` and `response_format:"b64_json"` → `speech.response_format_unsupported`; `response_format:"wav"` and absent → OK; `stream:true`/`stream_format` → `speech.stream_unsupported`. `TestHandleOpenAISpeechRefusesSessionCookie` (bearer/internal only). Extend the capability-gate test: a request with `RequiredCapabilities:["speech"]` to a model without a `(speech,yes)` verdict → `ErrModelNotCapable` on the fresh, group, **affinity**, and server-override branches; an unknown (unprobed) verdict also refuses (no fail-open).
 - [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** `handleOpenAISpeech` mirroring `handleOpenAIImages` (requireMethod POST → auth → `liftInferenceDeadlines` → `readRawJSONUnlimited` → `sniffRoutingModel` → `validateSpeechRequest` → `inferencePreflight(inferenceShape{apiFlavor: apiFlavorSpeech, endpoint: endpointSpeech, model, requiredCapabilities: []string{routing.CapabilitySpeech}})` → `relaySpeech`), plus `validateSpeechRequest`, `resolveSpeechTarget`, `recordSpeechRoutingFailure`. The gate itself is reused (`filterCapable`); only the new verdict/flavor flow through it.
+- [ ] **Step 3: Implement** `handleOpenAISpeech` mirroring `handleOpenAIImages` (requireMethod POST → auth → `liftInferenceDeadlines` → `readRawJSONUnlimited` → `sniffRoutingModel` → `validateSpeechRequest` → `inferencePreflight(inferenceShape{apiFlavor: apiFlavorSpeech, endpoint: endpointSpeech, model, requiredCapabilities: []string{routing.CapabilitySpeech}})` → `relaySpeech`), plus `validateSpeechRequest`, `resolveSpeechTarget`, `recordSpeechRoutingFailure`, and **register the routes** in `server.go`. The gate itself is reused (`filterCapable`); only the new verdict/flavor flow through it.
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit** — `feat(gateway): add the /v1/audio/speech handler with capability gate`
 
