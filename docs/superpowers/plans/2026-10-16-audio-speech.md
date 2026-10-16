@@ -130,6 +130,28 @@ Inputs/conditions the spec implies that no single happy-path task exercises, mos
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit** — `feat(gateway): wire the /v1/audio/speech endpoint path and session plumbing`
 
+### Task 5b: Audio-only served-flavor gating
+
+(Added 2026-10-16 by ruling — Task 1 surfaced that `FlavorsAreAudioOnly` has no
+consumers; the images-only helper is wired into several sites that the audio flavor
+must mirror, else an `openai_audio`-only server counts as serving `openai` (chat) and
+chat-prompt background jobs would ping audio models.)
+
+**Files (mirror every site that consumes the images-only helper — confirm the current set by grep):**
+- Modify: `gateway/backend/internal/routing/` — `effectiveHasAPIFlavor` (the `openai` half) and any `targetServes*`/served-flavor matching that special-cases images.
+- Modify: `gateway/backend/internal/gateway/native_passthrough.go` — the `targetIsImagesOnly` analog used on the relay path.
+- Modify: the chat-prompt background jobs that skip images-only mappings: `benchmark_refusals`, `benchmark_scheduler`, and `portal/service_mapping_images_only` (grep for the images-only helper to find them all).
+- Test: extend the existing images-only tests with the audio-only cases, in their current locations.
+
+**Interfaces:**
+- Consumes: `routing.FlavorsAreAudioOnly`, `routing.APIFlavorOpenAIAudio` (Task 1).
+
+- [ ] **Step 1: Write failing tests** — for each site, the audio-only case mirroring the images-only case: an `[openai_audio]` mapping is NOT offered for `openai`/chat, IS offered for `openai_audio`, and is skipped by the chat-prompt background jobs. First grep for every current consumer of the images-only helper and enumerate them in the report, so no site is missed.
+- [ ] **Step 2: Run, verify fail.**
+- [ ] **Step 3: Implement** — mirror the images-only gating for audio at every enumerated site, consuming `FlavorsAreAudioOnly`. Prefer a minimal parallel of the existing pattern; only generalise an images-only helper to "non-chat-only" if the existing code shape makes that the natural, smaller change (do not undertake a broad refactor — AGENTS.md).
+- [ ] **Step 4: Run, verify pass** — the affected packages.
+- [ ] **Step 5: Commit** — `feat(routing): gate audio-only servers out of chat flavors and chat-prompt jobs`
+
 ### Task 6: Handler, validation, and the capability gate
 
 **Files:**
