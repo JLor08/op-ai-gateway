@@ -161,7 +161,7 @@ jobs:
     # an inference routes to it, and the state returns to the portal. A locator
     # that no longer matches the shipped DOM is exactly the class of defect only
     # this layer sees -- e2e:runtime was red for three commits once and no gate
-    # noticed (issue #24). This job runs `e2e:runtime` ONLY; the other 19
+    # noticed (issue #24). This job runs `e2e:runtime` ONLY; the other 20
     # Playwright suites stay local-only (development-and-quality.md §6).
     steps:
       - uses: actions/checkout@v4

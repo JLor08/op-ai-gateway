@@ -263,7 +263,10 @@ reports success on a broken corpus is worse than no checker.
   `e2e:runtime` (agent-managed model runtime end to end: the REAL server-agent
   binary starts REAL child processes from a stub model server module in
   `gateway/e2e/e2e-runtime/fixtures/stubserver`, which the suite builds but
-  never starts), `e2e:services`, `e2e:servers`, `e2e:smtp` (local
+  never starts), `e2e:services`, `e2e:servers`,
+  `e2e:speech` (covers `POST /v1/audio/speech` end to end: the real gateway
+  against an in-process stub audio.cpp, through the portal's audio_cpp form,
+  the capability probe, the relay and the Activity view), `e2e:smtp` (local
   mail catcher module in `gateway/e2e/e2e-smtp/mailcatcher`), `e2e:totp`,
   and `e2e:system-admin-mode`. These suites run the gateway in **memory
   mode** — fast, but see the conformance-suite caveat above for what memory
@@ -271,7 +274,7 @@ reports success on a broken corpus is worse than no checker.
   expected to require matching spec updates; plan the e2e rewrite as part of
   such a change.
 
-> **Only `e2e:runtime` runs in CI; the other 19 Playwright suites do not.**
+> **Only `e2e:runtime` runs in CI; the other 20 Playwright suites do not.**
 > `.github/workflows/ci.yml` has six jobs — `go`, `docs`, `sonar-scripts`,
 > `opencode-config-script`, `frontend`, and `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
 > least-exercised subsystem, and the one whose three-commit regression no gate
