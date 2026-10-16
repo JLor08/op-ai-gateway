@@ -372,6 +372,12 @@ const (
 	// their first-data budget from TimeoutMS the same way as server_agent's
 	// above.
 	defaultStableDiffusionTimeoutMS = 600000
+	// defaultAudioCppTimeoutMS is the TimeoutMS default for ProviderAudioCpp,
+	// for the same reason as the image value above: a speech synthesis is a
+	// non-streaming request, so TimeoutMS is a TOTAL request deadline, and a
+	// long input can take longer than the stock 30s to render. With that
+	// default it would fail as 502 provider.timeout.
+	defaultAudioCppTimeoutMS = 600000
 )
 
 // ApplicationDTO is the portal-facing representation of a routing.Application.
@@ -1517,6 +1523,8 @@ func normalizeApplicationType(raw string) (string, error) {
 		return routing.ProviderServerAgent, nil
 	case routing.ProviderStableDiffusionCpp:
 		return routing.ProviderStableDiffusionCpp, nil
+	case routing.ProviderAudioCpp:
+		return routing.ProviderAudioCpp, nil
 	default:
 		return "", ErrApplicationTypeInvalid
 	}
@@ -1853,15 +1861,18 @@ func validateApplicationTuning(priority, weight, timeoutMS, affinityTTLSeconds, 
 }
 
 // applicationTimeoutDefaultFor is the TimeoutMS default for an application
-// type. Two types override the stock value because for them it is a
-// correctness matter rather than tuning: an agent-managed cold model load and
-// an image generation both routinely exceed 30s (see each constant's doc).
+// type. Three types override the stock value because for them it is a
+// correctness matter rather than tuning: an agent-managed cold model load, an
+// image generation and a long speech synthesis all routinely exceed 30s (see
+// each constant's doc).
 func applicationTimeoutDefaultFor(appType string) int {
 	switch appType {
 	case routing.ProviderServerAgent:
 		return defaultServerAgentTimeoutMS
 	case routing.ProviderStableDiffusionCpp:
 		return defaultStableDiffusionTimeoutMS
+	case routing.ProviderAudioCpp:
+		return defaultAudioCppTimeoutMS
 	default:
 		return defaultApplicationTimeoutMS
 	}

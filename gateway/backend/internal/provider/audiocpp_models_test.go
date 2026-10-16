@@ -189,13 +189,14 @@ func TestMultiplexerDispatchesAudioCppModelsToOpenAICompatibleClient(t *testing.
 	defer srv.Close()
 	shared := NewOpenAICompatibleClient(srv.Client())
 	mux := NewMultiplexer(map[string]Client{
-		routing.ProviderVLLM:   shared,
-		routing.ProviderOllama: &recordingClient{},
+		routing.ProviderVLLM:     shared,
+		routing.ProviderAudioCpp: shared, // same instance, exactly as providerClients wires it
+		routing.ProviderOllama:   &recordingClient{},
 	}, nil)
 
-	got, err := mux.ProbeAudioCppModels(context.Background(), routing.Target{Provider: routing.ProviderVLLM, Endpoint: srv.URL}, "pocket_tts_english_bf16")
+	got, err := mux.ProbeAudioCppModels(context.Background(), routing.Target{Provider: routing.ProviderAudioCpp, Endpoint: srv.URL}, "pocket_tts_english_bf16")
 	if err != nil {
-		t.Fatalf("ProbeAudioCppModels(vllm) returned %v", err)
+		t.Fatalf("ProbeAudioCppModels(audio_cpp) returned %v", err)
 	}
 	if got.Speech != routing.CapabilityYes {
 		t.Fatalf("got %+v, want {Speech:yes}", got)

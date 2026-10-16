@@ -1322,9 +1322,11 @@ func TestListModelsDiscoversStableDiffusionCppFromSdModels(t *testing.T) {
 // TestListModelsKeepsV1ModelsForEveryOtherType is the regression guard for
 // every type that existed before stable_diffusion_cpp, plus the empty
 // provider: discovery is derived from the type, so each must still ask
-// /v1/models and read the OpenAI shape.
+// /v1/models and read the OpenAI shape. audio_cpp is in the list on purpose:
+// audio.cpp's /v1/models is the standard OpenAI shape, so it gets no
+// discovery branch of its own (unlike sd.cpp's placeholder-only listing).
 func TestListModelsKeepsV1ModelsForEveryOtherType(t *testing.T) {
-	for _, typ := range []string{routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, ""} {
+	for _, typ := range []string{routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderAudioCpp, ""} {
 		t.Run("type="+typ, func(t *testing.T) {
 			var mu sync.Mutex
 			var gotPath string

@@ -29,6 +29,15 @@ const (
 	// type that must NOT be borrowed for this, since it is bound to its own
 	// client which does not implement provider.NativeProxyClient.
 	ProviderStableDiffusionCpp = "stable_diffusion_cpp"
+	// ProviderAudioCpp is an OpenAI-compatible audio.cpp server
+	// (audiocpp_server) started and run by the operator, not launched by an
+	// agent: a static application, so it has no runtime spec. It shares the
+	// OpenAI-compatible provider client, which is also what reads the server's
+	// /v1/models listing for the speech capability verdict (the health loop
+	// probes every application of this type). The string equals
+	// RuntimeSpecTypeAudioCpp, but it is a different namespace: that one names
+	// the kind of an agent-managed runtime spec on a server_agent application.
+	ProviderAudioCpp = "audio_cpp"
 	// ProviderVendorOpenAI and ProviderVendorAnthropic are the provider kinds of
 	// a vendor-account target: inference served by a hosted vendor API
 	// (api.openai.com / api.anthropic.com) instead of an on-prem application.

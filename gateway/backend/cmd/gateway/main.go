@@ -1294,6 +1294,12 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// dialect too, and shares this client (not ollama's) so the images
 		// relay's native passthrough works -- see the constant's doc comment.
 		routing.ProviderStableDiffusionCpp: openAICompatible,
+		// ProviderAudioCpp: audiocpp_server speaks the OpenAI-compatible
+		// dialect too and shares this client. It is also what makes the health
+		// loop's speech probe reachable for the type: this client implements
+		// provider.AudioCppModelsProber, and the Multiplexer dispatches the
+		// probe by the application's type.
+		routing.ProviderAudioCpp: openAICompatible,
 		// ProviderVendorOpenAI: api.openai.com speaks the OpenAI-compatible
 		// dialect, so a vendor-account target reuses the same client.
 		routing.ProviderVendorOpenAI: openAICompatible,

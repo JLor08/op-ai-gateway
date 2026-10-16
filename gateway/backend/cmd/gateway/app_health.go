@@ -708,31 +708,29 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 }
 
 // probeAudioCppModels is the audio_cpp branch of the probe pass for ONE
-// server_agent application: for each active mapping whose runtime kind is
-// routing.RuntimeSpecTypeAudioCpp it reads audio.cpp's own /v1/models listing,
-// derives the speech verdict that listing states for the mapping's model, and
-// writes it (audioCppCapabilityRows through writeCapabilityRows, so the
-// precedence and change-detection guards hold exactly as for the other probe
-// sources).
+// application of type routing.ProviderAudioCpp, a static, operator-run audio.cpp
+// server: for each of its active mappings it reads audio.cpp's own /v1/models
+// listing, derives the speech verdict that listing states for the mapping's
+// model, and writes it (audioCppCapabilityRows through writeCapabilityRows, so
+// the precedence and change-detection guards hold exactly as for the other
+// probe sources).
 //
-// THE KIND GATE is the mapping's runtime spec: routing.EffectiveRuntimeSpecType
-// of the spec, its explicit type or the one detected from its binary. A mapping
-// with no spec, or a spec of another kind, is never asked about -- a speech
-// verdict for a chat model would be meaningless, and a written "no" for one
-// would be wrong. Specs can only exist on a server_agent application (the
-// portal refuses a write on any other type), which is why the caller offers
-// this branch that type alone: it spares every other application a store round
-// trip per cadence tick for specs it cannot have.
+// THE GATE is the application's type, applied by the caller exactly as for the
+// sdcpp pass: every mapping of such an application is an audio.cpp model, so
+// there is no per-mapping kind to ask about and no runtime spec to read -- a
+// static server has none. (An agent-managed audio.cpp, a server_agent mapping
+// whose runtime spec is of kind audio_cpp, is NOT probed here: the agent
+// router's /v1/models carries no task, so it could state no verdict.)
 //
 // The model id handed to the prober is the mapping's AppModelName, the name the
 // upstream is addressed by and so the id audio.cpp lists the model under. The
 // listing is per SERVER, but the verdict is per MODEL, so each mapping is its
-// own probe (one small GET per audio_cpp mapping per cadence tick).
+// own probe (one small GET per active mapping per cadence tick) -- unlike
+// sdcpp, whose single capability document is one probe per application.
 //
-// The target and the auth context are built as the context-probe branch builds
-// them for a server_agent application: the credential is per MAPPING
-// (routing.SpecUpstreamAuth off the mapping's own spec, whose default is the
-// application's token), sealed in the store and opened here, fail-open.
+// The target and the auth context are built as probeSdcppCapabilities builds
+// them: the application's own credential, sealed in the store and opened here,
+// fail-open, carried by every mapping's probe.
 //
 // A failed probe (unreachable, a non-2xx, a 401/403) states nothing, so it
 // writes nothing and the next cadence tick asks again; an unknown verdict ("",
@@ -741,22 +739,6 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // signal to hand back: the mappings are read from the store, not discovered by
 // the probe, so there is no mapping a verdict could be waiting for.
 func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.AudioCppModelsProber) {
-	specs, err := r.store.RuntimeSpecsByApplication(ctx, app.ID)
-	if err != nil {
-		// Without the specs no mapping's runtime kind is known, and guessing
-		// could write a "no" for a mapping that is not an audio.cpp one.
-		log.Printf("app health: runtime specs for app %s failed: %v (audio.cpp probe skipped)", app.ID, err)
-		return
-	}
-	specByMapping := map[string]routing.RuntimeSpec{}
-	for _, sp := range specs {
-		if routing.EffectiveRuntimeSpecType(sp) == routing.RuntimeSpecTypeAudioCpp {
-			specByMapping[sp.MappingID] = sp
-		}
-	}
-	if len(specByMapping) == 0 {
-		return // no audio_cpp mapping on this application: no mapping read, nothing to ask
-	}
 	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
 	if err != nil {
 		log.Printf("app health: mappings for app %s failed: %v", app.ID, err)
@@ -767,22 +749,21 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 		Endpoint: routing.ApplicationEndpoint(server, app),
 		Timeout:  r.probeTimeout,
 	}
+	// Attach the app's per-app upstream credential to the probe (fail-open).
+	token, _ := capture.OpenSecret(r.cipher, app.APIToken)
+	pctx := provider.WithUpstreamAuth(ctx, app.APITokenHeader, token)
 	for _, mp := range mappings {
-		spec, isAudioCpp := specByMapping[mp.ID]
-		if !isAudioCpp || mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
+		if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
 			continue
 		}
-		specToken, header := routing.SpecUpstreamAuth(spec, app)
-		token, _ := capture.OpenSecret(r.cipher, specToken)
-		mctx := provider.WithUpstreamAuth(ctx, header, token)
-		v, err := prober.ProbeAudioCppModels(mctx, target, mp.AppModelName)
+		v, err := prober.ProbeAudioCppModels(pctx, target, mp.AppModelName)
 		if err != nil {
 			if errors.Is(err, provider.ErrAuthRejected) {
 				// Like the context probe: a 401/403 here is a MISCONFIGURED
 				// token, not "cannot determine" -- the gateway holds the
 				// credential. It repeats each failing cycle by design; it is
 				// the operator signal and stops when the token is fixed.
-				log.Printf("app health: audio.cpp models probe for app %s model %q rejected by the upstream (401/403): check the runtime spec's API token", app.ID, mp.AppModelName)
+				log.Printf("app health: audio.cpp models probe for app %s model %q rejected by the upstream (401/403): check the application's API token", app.ID, mp.AppModelName)
 			} else {
 				slog.Debug("app health: audio.cpp models probe failed", "app_id", app.ID, "model", mp.AppModelName, "error", err)
 			}
@@ -1294,28 +1275,29 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 			}
 		}
 
-		// audio.cpp capability pass: for every active server_agent application,
-		// read the running audio.cpp server's own /v1/models listing for each
-		// of its audio_cpp mappings and write the speech verdict that listing
-		// states (probeAudioCppModels). A separate branch from the context
+		// audio.cpp capability pass: for every active audio_cpp application,
+		// read the server's own /v1/models listing for each of its active
+		// mappings and write the speech verdict that listing states for that
+		// model (probeAudioCppModels). A separate branch from the context
 		// probe for the same reason as the sdcpp one: audio_cpp has no
-		// context probe path (routing.DeriveProbePaths), and the listing is
-		// not a ModelInfo. It shares the application's cadence and wg+sem,
-		// under its own "audiocpp:"+id key, seen-marked for every such app so
-		// the cleanup keeps its last-probe time.
+		// context probe path, and the listing is not a ModelInfo. It shares
+		// that branch's cadence (the application's effective interval) and
+		// wg+sem, under its own "audiocpp:"+id key, seen-marked for every such
+		// app so the cleanup keeps its last-probe time.
 		//
-		// Offered to server_agent applications only: a mapping's runtime kind
-		// is its runtime spec's, specs exist only on that type, and an
-		// application of any other type has no spec to name a kind -- so asking
-		// it would cost a store read per tick for nothing. The spec read and
-		// the kind gate are the probe's own (probeAudioCppModels).
+		// Gated on the application's TYPE alone, like the sdcpp pass: the type
+		// is a static, operator-run audio.cpp server, which has no runtime
+		// spec, so the pass neither needs nor reads one. It reaches such a
+		// server only. An agent-managed audio.cpp is a server_agent mapping
+		// behind the agent's router, whose /v1/models carries no task, so this
+		// pass could state no verdict for it; that path is deferred.
 		//
 		// No unstamp-on-miss, unlike the sdcpp pass: it asks about mappings
 		// that already exist, so no verdict can arrive before its mapping.
 		if acProber, ok := r.prober.(provider.AudioCppModelsProber); ok {
 			for i := range active {
 				app := active[i]
-				if app.Type != routing.ProviderServerAgent {
+				if app.Type != routing.ProviderAudioCpp {
 					continue
 				}
 				key := "audiocpp:" + app.ID

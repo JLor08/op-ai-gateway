@@ -621,7 +621,7 @@ func TestCreateApplicationAllowsLlamaSwapTypeAndAcceptsAllValidTypes(t *testing.
 	server := createTestServer(t, svc, "S", "s.example.test")
 
 	port := 9000
-	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp} {
+	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp} {
 		port++
 		if _, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
 			Type: typ, Port: port, Scheme: "http",
@@ -3956,6 +3956,58 @@ func TestNormalizeApplicationTypeAcceptsStableDiffusionCpp(t *testing.T) {
 	}
 	if applicationTimeoutDefaultFor(routing.ProviderVLLM) != defaultApplicationTimeoutMS {
 		t.Fatal("vllm's timeout default must be unchanged")
+	}
+}
+
+// TestNormalizeApplicationTypeAcceptsAudioCpp pins that audio_cpp is a
+// creatable application type, and its timeout default: 30s is not a preference
+// for this type but a likely failure, since a long synthesis is a non-streaming
+// request whose TimeoutMS is a TOTAL deadline.
+func TestNormalizeApplicationTypeAcceptsAudioCpp(t *testing.T) {
+	got, err := normalizeApplicationType("audio_cpp")
+	if err != nil {
+		t.Fatalf("normalizeApplicationType(audio_cpp) error = %v", err)
+	}
+	if got != routing.ProviderAudioCpp {
+		t.Fatalf("type = %q, want %q", got, routing.ProviderAudioCpp)
+	}
+	if got := applicationTimeoutDefaultFor(routing.ProviderAudioCpp); got != 600000 {
+		t.Fatalf("audio_cpp timeout default = %d, want 600000", got)
+	}
+	if applicationTimeoutDefaultFor(routing.ProviderVLLM) != defaultApplicationTimeoutMS {
+		t.Fatal("vllm's timeout default must be unchanged")
+	}
+	if _, err := normalizeApplicationType("audio_cpp_typo"); !errors.Is(err, ErrApplicationTypeInvalid) {
+		t.Fatalf("normalizeApplicationType(audio_cpp_typo) error = %v, want ErrApplicationTypeInvalid", err)
+	}
+}
+
+// TestCreateApplicationAudioCppDefaultTimeout pins the default through the
+// create path: a zero TimeoutMS becomes the audio_cpp default, and an explicit
+// value is kept.
+func TestCreateApplicationAudioCppDefaultTimeout(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderAudioCpp, Port: 9000, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if dto.Type != routing.ProviderAudioCpp || dto.TimeoutMS != 600000 {
+		t.Fatalf("type/TimeoutMS = %q/%d, want audio_cpp/600000", dto.Type, dto.TimeoutMS)
+	}
+
+	explicit, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderAudioCpp, Port: 9001, Scheme: "http", TimeoutMS: 12345,
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication (explicit timeout): %v", err)
+	}
+	if explicit.TimeoutMS != 12345 {
+		t.Fatalf("TimeoutMS = %d, want 12345 (explicit value preserved)", explicit.TimeoutMS)
 	}
 }
 
