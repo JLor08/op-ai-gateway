@@ -28,9 +28,15 @@ import (
 // owner + CM at `full`), with VendorAccountAdminGroupCandidates listing the groups the
 // caller may name.
 //
+// The resource-group links of a shared account have two paths, both mirroring
+// resource_group_servers: the OWNER's self-service (VendorAccountResourceGroups,
+// AddVendorAccountToResourceGroup, RemoveVendorAccountFromResourceGroup, at the end of
+// this file) and the resource-group MANAGER's side (SetResourceGroupVendorAccounts and
+// ResourceGroupVendorAccountCandidates, in service_resource_groups.go).
+//
 // Every one of them is refused with ErrVendorAccountSharingDisabled while the master
-// sharing flag is off; that guard (requireVendorAccountSharingEnabled) is shared with
-// the resource-group methods that follow.
+// sharing flag is off; that guard (requireVendorAccountSharingEnabled) is shared by all
+// of them.
 
 // SetVendorAccountShareLevelRequest is the body of PUT
 // /api/portal/vendor-accounts/{id}/share-level. Level is the TARGET level (none,
@@ -470,6 +476,164 @@ func (s *Service) replaceVendorAccountAdminGroups(ctx context.Context, accountID
 		}
 	}
 	return nil
+}
+
+// VendorAccountResourceGroupDTO is the read shape of one resource group an account's
+// OWNER may self-service enter and leave the account into and from: id, name and
+// whether the account is currently in it. Nothing else about the group (its servers,
+// its other accounts, its provisioned targets) is exposed here (the vendor-account
+// counterpart of ServerResourceGroupDTO).
+type VendorAccountResourceGroupDTO struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Member bool   `json:"member"`
+}
+
+// vendorAccountRootMatches reports whether acc may be linked into rg: the account's
+// containment root must be the group's. It fails closed on an empty root, so an
+// account with no root (the raise never produces one; a store written directly could)
+// is never linked, and neither does an empty root "match" a group's empty one. Both
+// link paths ask it on ADD only; dropping a link needs no root check.
+func vendorAccountRootMatches(acc routing.VendorAccount, rg routing.ResourceGroup) bool {
+	return acc.SystemGroupID != "" && acc.SystemGroupID == rg.SystemGroupID
+}
+
+// authorizeVendorAccountOwnerLink is the gate of the owner's resource-group
+// self-service (spec 2026-10-15 sections 6, 7 and 9), the vendor-account counterpart of
+// authorizeServerOwner. It needs, in this order:
+//
+//  1. the sharing master flag (requireVendorAccountSharingEnabled: module flag, then
+//     vendor_account_sharing_enabled, both a 409), before any account is loaded, so
+//     the answer is global and reveals nothing;
+//  2. the OWNER, strictly: a co-manager at `full` reaches a resource group through the
+//     resource-group manager side, never through this path (like a server's
+//     co-manager), and system scope never bypasses an account write. A caller who can
+//     already SEE the account (a CM of a shared/full one) but does not own it is
+//     ErrVendorAccountForbidden (403); everyone else -- a stranger, system scope, a
+//     co-manager without the vendor flag, a principal with no user identity -- is
+//     ErrVendorAccountNotFound, identical to an unknown id (the operate gate decides
+//     who can see it);
+//  3. an account that is `shared` or `full` by its EFFECTIVE level
+//     (ErrVendorAccountNotShared otherwise): a private account is in no group. Asked
+//     only of the owner, so it confirms nothing to a stranger.
+//
+// The group side (membership of the owner in an admin group the group is linked to) is
+// the caller's second step, so a caller refused here learns nothing about any group.
+func (s *Service) authorizeVendorAccountOwnerLink(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, error) {
+	if err := s.requireVendorAccountSharingEnabled(ctx); err != nil {
+		return routing.VendorAccount{}, err
+	}
+	acc, err := s.loadVendorAccount(ctx, id)
+	if err != nil {
+		return routing.VendorAccount{}, err
+	}
+	if !isVendorAccountOwner(principal, acc) {
+		if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+			return routing.VendorAccount{}, err
+		}
+		return routing.VendorAccount{}, ErrVendorAccountForbidden
+	}
+	if !vendorAccountSharedLevel(s.effectiveVendorAccountShareLevel(ctx, acc)) {
+		return routing.VendorAccount{}, ErrVendorAccountNotShared
+	}
+	return acc, nil
+}
+
+// authorizeVendorAccountResourceGroupLink is the combined gate of joining or leaving
+// ONE group through the owner's self-service: the owner gate on the account
+// (authorizeVendorAccountOwnerLink), then the group must be reachable, i.e. exist and be
+// linked to an admin group the owner is a MEMBER of (resourceGroupForOwner, system scope
+// reaches every group; ErrResourceGroupNotFound otherwise, the 404 of an unknown id).
+// The account gate runs first, so a caller who cannot own the account learns nothing
+// about the group. Mirrors authorizeServiceRGSelfService.
+func (s *Service) authorizeVendorAccountResourceGroupLink(ctx context.Context, principal auth.Token, id, rgID string) (routing.VendorAccount, routing.ResourceGroup, error) {
+	acc, err := s.authorizeVendorAccountOwnerLink(ctx, principal, id)
+	if err != nil {
+		return routing.VendorAccount{}, routing.ResourceGroup{}, err
+	}
+	memberGroups, err := s.memberAdminGroupIDs(ctx, principal)
+	if err != nil {
+		return routing.VendorAccount{}, routing.ResourceGroup{}, err
+	}
+	rg, err := s.resourceGroupForOwner(ctx, principal, rgID, memberGroups)
+	if err != nil {
+		return routing.VendorAccount{}, routing.ResourceGroup{}, err
+	}
+	return acc, rg, nil
+}
+
+// VendorAccountResourceGroups lists the resource groups the OWNER of a shared account
+// may enter it into: the owner gate (authorizeVendorAccountOwnerLink), then every group
+// linked to an admin group the owner is a MEMBER of (system scope: every group) AND
+// whose root is the account's (so the panel never offers a group a join would refuse),
+// each with Member = the account is in it. A group the account is in but the owner cannot
+// reach is not listed. Sorted by name; never nil.
+func (s *Service) VendorAccountResourceGroups(ctx context.Context, principal auth.Token, id string) ([]VendorAccountResourceGroupDTO, error) {
+	acc, err := s.authorizeVendorAccountOwnerLink(ctx, principal, id)
+	if err != nil {
+		return nil, err
+	}
+	memberGroups, err := s.memberAdminGroupIDs(ctx, principal)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := s.reachableResourceGroups(ctx, principal, memberGroups)
+	if err != nil {
+		return nil, err
+	}
+	linked, err := s.routes.ResourceGroupsByVendorAccount(ctx, acc.ID)
+	if err != nil {
+		return nil, notFoundAsVendorAccountNotFound(err)
+	}
+	isMember := make(map[string]bool, len(linked))
+	for _, rg := range linked {
+		isMember[rg.ID] = true
+	}
+	out := make([]VendorAccountResourceGroupDTO, 0, len(groups))
+	for _, rg := range groups {
+		if vendorAccountRootMatches(acc, rg) {
+			out = append(out, VendorAccountResourceGroupDTO{ID: rg.ID, Name: rg.Name, Member: isMember[rg.ID]})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// AddVendorAccountToResourceGroup enters a shared account the caller OWNS into a
+// resource group linked to an admin group the caller is a MEMBER of, iff the account's
+// root is the group's: the vendor-account counterpart of AddServerToResourceGroup,
+// writing the one resource_group_vendor_accounts row through
+// SetResourceGroupVendorAccount (never a whole-set replace, so the group's other
+// accounts are untouched). Idempotent. ErrVendorAccountNotFound (404-no-leak) for an
+// account the caller cannot see, ErrVendorAccountForbidden for one they can see but do
+// not own, ErrVendorAccountNotShared (400) for a private one, ErrResourceGroupNotFound
+// (404-no-leak) for a group the owner cannot reach, and
+// ErrResourceGroupVendorAccountSystemGroupMismatch (400) for a group under another root.
+// This only LINKS the account: whether a member of the group can use it is the routing
+// grant's decision, which also needs the member's per-account opt-in and re-reads the live
+// share level.
+func (s *Service) AddVendorAccountToResourceGroup(ctx context.Context, principal auth.Token, id, rgID string) error {
+	acc, rg, err := s.authorizeVendorAccountResourceGroupLink(ctx, principal, id, rgID)
+	if err != nil {
+		return err
+	}
+	if !vendorAccountRootMatches(acc, rg) {
+		return ErrResourceGroupVendorAccountSystemGroupMismatch
+	}
+	return notFoundAsVendorAccountNotFound(s.routes.SetResourceGroupVendorAccount(ctx, rg.ID, acc.ID))
+}
+
+// RemoveVendorAccountFromResourceGroup removes a shared account the caller OWNS from a
+// resource group linked to an admin group the caller is a MEMBER of: the single-row
+// inverse of AddVendorAccountToResourceGroup (same gates, same errors) with NO root check,
+// like the server counterpart, so a link to another root can always be dropped.
+// Idempotent (an account that is not in the group is a no-op).
+func (s *Service) RemoveVendorAccountFromResourceGroup(ctx context.Context, principal auth.Token, id, rgID string) error {
+	acc, rg, err := s.authorizeVendorAccountResourceGroupLink(ctx, principal, id, rgID)
+	if err != nil {
+		return err
+	}
+	return notFoundAsVendorAccountNotFound(s.routes.RemoveResourceGroupVendorAccount(ctx, rg.ID, acc.ID))
 }
 
 // vendorAccountDTOByID re-reads the account (the write may have moved columns the

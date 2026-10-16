@@ -119,6 +119,18 @@ func (_d *APIWithTracing) AddUserToAdminGroup(ctx context.Context, t1 auth.Token
 	return _d.API.AddUserToAdminGroup(ctx, t1, s1, s2, s3)
 }
 
+func (_d *APIWithTracing) AddVendorAccountToResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AddVendorAccountToResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AddVendorAccountToResourceGroup(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) AdminOwnerCandidates(ctx context.Context, t1 auth.Token) (aa1 []AdminOwnerCandidateDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AdminOwnerCandidates")
 	defer span.End()
@@ -1660,6 +1672,18 @@ func (_d *APIWithTracing) RemoveServiceFromResourceGroup(ctx context.Context, t1
 	return _d.API.RemoveServiceFromResourceGroup(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) RemoveVendorAccountFromResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RemoveVendorAccountFromResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RemoveVendorAccountFromResourceGroup(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) RenameGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (u1 UserGroupDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RenameGroup")
 	defer span.End()
@@ -1766,6 +1790,18 @@ func (_d *APIWithTracing) ResourceGroupServerCandidates(ctx context.Context, t1 
 		}
 	}()
 	return _d.API.ResourceGroupServerCandidates(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) ResourceGroupVendorAccountCandidates(ctx context.Context, t1 auth.Token, s1 string) (ra1 []ResourceGroupVendorAccountRefDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ResourceGroupVendorAccountCandidates")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ResourceGroupVendorAccountCandidates(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) RespondInvitation(ctx context.Context, t1 auth.Token, s1 string, b1 bool) (err error) {
@@ -2118,6 +2154,18 @@ func (_d *APIWithTracing) SetResourceGroupServers(ctx context.Context, t1 auth.T
 		}
 	}()
 	return _d.API.SetResourceGroupServers(ctx, t1, s1, sa1)
+}
+
+func (_d *APIWithTracing) SetResourceGroupVendorAccounts(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (r1 ResourceGroupDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetResourceGroupVendorAccounts")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetResourceGroupVendorAccounts(ctx, t1, s1, sa1)
 }
 
 func (_d *APIWithTracing) SetServerAdminGroups(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (s2 ServerDTO, err error) {
@@ -2524,6 +2572,18 @@ func (_d *APIWithTracing) VendorAccountAdminGroupCandidates(ctx context.Context,
 		}
 	}()
 	return _d.API.VendorAccountAdminGroupCandidates(ctx, t1)
+}
+
+func (_d *APIWithTracing) VendorAccountResourceGroups(ctx context.Context, t1 auth.Token, s1 string) (va1 []VendorAccountResourceGroupDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountResourceGroups")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VendorAccountResourceGroups(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) VendorAccountRoutingMode(ctx context.Context) (s1 string) {

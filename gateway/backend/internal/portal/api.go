@@ -24,6 +24,7 @@ type API interface {
 	AddServerToResourceGroup(context.Context, auth.Token, string, string) error
 	AddServiceToResourceGroup(context.Context, auth.Token, string, string) error
 	AddUserToAdminGroup(context.Context, auth.Token, string, string, string) error
+	AddVendorAccountToResourceGroup(context.Context, auth.Token, string, string) error
 	AdminOwnerCandidates(context.Context, auth.Token) ([]AdminOwnerCandidateDTO, error)
 	AgentTokenStatus(context.Context, auth.Token, string) (AgentTokenDTO, error)
 	AgentCertificate(context.Context, string) (AgentCertificateDTO, error)
@@ -168,6 +169,7 @@ type API interface {
 	RemoveProjectMember(context.Context, auth.Token, string, string) error
 	RemoveServerFromResourceGroup(context.Context, auth.Token, string, string) error
 	RemoveServiceFromResourceGroup(context.Context, auth.Token, string, string) error
+	RemoveVendorAccountFromResourceGroup(context.Context, auth.Token, string, string) error
 	RenameGroup(context.Context, auth.Token, string, string) (UserGroupDTO, error)
 	RenewCertificateNow(context.Context, auth.Token, string) error
 	ResolveGatewayPeerDNS(context.Context) (string, error)
@@ -177,6 +179,7 @@ type API interface {
 	ResourceGroupProvisionCandidates(context.Context, auth.Token, string) (ResourceGroupProvisionCandidatesDTO, error)
 	ResourceGroupProvisionsView(context.Context, auth.Token, string) ([]ResourceGroupProvisionDTO, error)
 	ResourceGroupServerCandidates(context.Context, auth.Token, string) ([]ResourceGroupServerRefDTO, error)
+	ResourceGroupVendorAccountCandidates(context.Context, auth.Token, string) ([]ResourceGroupVendorAccountRefDTO, error)
 	RespondInvitation(context.Context, auth.Token, string, bool) error
 	RevokeAgentToken(context.Context, auth.Token, string) error
 	RotateCertificateCA(context.Context, auth.Token) error
@@ -207,6 +210,7 @@ type API interface {
 	SetResourceGroupAdminGroups(context.Context, auth.Token, string, []string) (ResourceGroupDTO, error)
 	SetResourceGroupProvisions(context.Context, auth.Token, string, []routing.ResourceGroupProvision) error
 	SetResourceGroupServers(context.Context, auth.Token, string, []string) (ResourceGroupDTO, error)
+	SetResourceGroupVendorAccounts(context.Context, auth.Token, string, []string) (ResourceGroupDTO, error)
 	SetServerAdminGroups(context.Context, auth.Token, string, []string) (ServerDTO, error)
 	SetServerCertificateOverride(context.Context, auth.Token, string, string) (ServerDTO, error)
 	SetServerEnergyConfig(context.Context, auth.Token, string, float64, float64, float64, float64, string) (ServerDTO, error)
@@ -245,6 +249,7 @@ type API interface {
 	UserPreferences(context.Context, string) (map[string]json.RawMessage, error)
 	UserTokens(context.Context, auth.Token, string) (TokenListResponse, error)
 	VendorAccountAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
+	VendorAccountResourceGroups(context.Context, auth.Token, string) ([]VendorAccountResourceGroupDTO, error)
 	VendorAccountRoutingMode(context.Context) string
 	VendorAccountSharingEnabled(context.Context) bool
 	VendorAccountsEnabled(context.Context) bool

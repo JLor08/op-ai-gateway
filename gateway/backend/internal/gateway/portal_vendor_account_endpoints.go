@@ -18,6 +18,17 @@ import (
 const (
 	msgVendorAccountNotFound = "vendor account not found"
 
+	// The codes and messages of the gate rows that both vendor-account mappers
+	// (portalVendorAccountErrRows, and portalResourceGroupErrRows for the
+	// resource-group manager side of a shared account) answer with, so the two cannot
+	// drift apart.
+	codeVendorAccountsModuleDisabled  = "vendor_accounts.module_disabled"
+	msgVendorAccountsModuleDisabled   = "vendor accounts are not enabled"
+	codeVendorAccountsSharingDisabled = "vendor_accounts.sharing_disabled"
+	msgVendorAccountsSharingDisabled  = "vendor account sharing is not enabled"
+	codeVendorAccountForbidden        = "vendor_account.forbidden"
+	codeVendorAccountNotShared        = "vendor_account.not_shared"
+
 	codeVendorAccountListFailed    = "vendor_account.list_failed"
 	codeVendorAccountCreateFailed  = "vendor_account.create_failed"
 	codeVendorAccountGetFailed     = "vendor_account.get_failed"
@@ -37,6 +48,11 @@ const (
 	// failure.
 	codeVendorAccountAdminGroupsFailed          = "vendor_account.admin_groups_failed"
 	codeVendorAccountAdminGroupCandidatesFailed = "vendor_account.admin_group_candidates_failed"
+
+	// codeVendorAccountResourceGroupsFailed is the uncategorized fallback of the owner's
+	// resource-group self-service (GET/PUT/DELETE .../resource-groups[/{rgId}]): a store
+	// failure.
+	codeVendorAccountResourceGroupsFailed = "vendor_account.resource_groups_failed"
 
 	// codeVendorAccountUsageRefreshFailed is the uncategorized fallback of the
 	// dedicated usage refresh (POST .../usage/refresh): a store failure.
@@ -117,7 +133,9 @@ func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Reque
 // model-discovery action "/api/portal/vendor-accounts/{id}/models/refresh" (POST),
 // the usage-pull action "/api/portal/vendor-accounts/{id}/usage/refresh" (POST) and
 // the share-level lifecycle "/api/portal/vendor-accounts/{id}/share-level" (PUT) and
-// the management-group assignment "/api/portal/vendor-accounts/{id}/admin-groups" (PUT).
+// the management-group assignment "/api/portal/vendor-accounts/{id}/admin-groups" (PUT) and
+// the owner's resource-group self-service "/api/portal/vendor-accounts/{id}/resource-groups"
+// (GET) and ".../resource-groups/{rgId}" (PUT / DELETE).
 // Any other deeper path is answered with the same 404 as an unknown id. The
 // "/api/portal/vendor-accounts/" subtree route in server.go already covers every one
 // of these sub-resources, so a new sub-route needs no registration of its own.
@@ -160,8 +178,8 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 
 // routeVendorAccountSubpath dispatches the sub-routes of
 // /api/portal/vendor-accounts/{id}/... (the /check, /models/refresh, /usage/refresh,
-// /share-level and /admin-groups actions and the /connect/... family) and reports whether it
-// handled the request. The item handler falls through to the {id}
+// /share-level, /admin-groups and /resource-groups[/{rgId}] actions and the /connect/...
+// family) and reports whether it handled the request. The item handler falls through to the {id}
 // GET/PATCH/DELETE surface when this returns false.
 func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "check" {
@@ -182,6 +200,10 @@ func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Reques
 	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "admin-groups" {
 		s.handlePortalVendorAccountAdminGroups(w, r, token, parts[0])
+		return true
+	}
+	if len(parts) >= 2 && parts[0] != "" && parts[1] == "resource-groups" {
+		s.handlePortalVendorAccountResourceGroups(w, r, token, parts)
 		return true
 	}
 	return s.routeVendorAccountConnectSubpath(w, r, token, parts)
@@ -336,6 +358,63 @@ func (s *Server) handleVendorAccountAdminGroupCandidates(w http.ResponseWriter, 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": data})
+}
+
+// handlePortalVendorAccountResourceGroups backs the OWNER's resource-group self-service of
+// a shared vendor account (#183, spec 2026-10-15 sections 7 and 9; the vendor-account
+// analogue of handlePortalServerResourceGroups):
+//
+//	GET    /api/portal/vendor-accounts/{id}/resource-groups        -> reachable groups + member flag
+//	PUT    /api/portal/vendor-accounts/{id}/resource-groups/{rgId} -> join (idempotent)
+//	DELETE /api/portal/vendor-accounts/{id}/resource-groups/{rgId} -> leave (idempotent)
+//
+// parts[0] = account id, parts[1] = "resource-groups", parts[2] = rgId (item paths); any
+// deeper path is the same 404 as an unknown id. The handler only decodes; the service
+// decides: the OWNER only (a CM who can see the account is a 403, everyone else the 404 of an
+// unknown id), at `shared` or `full` (400 vendor_account.not_shared otherwise), joining only
+// a group linked to an admin group the owner is a member of (404 resource_group.not_found
+// otherwise) and whose root is the account's (400
+// resource_group.vendor_account_system_group_mismatch, on a join). While the vendor-accounts
+// module or the sharing switch is off it is a 409, whoever asks and whatever the ids.
+func (s *Server) handlePortalVendorAccountResourceGroups(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) {
+	accountID := parts[0]
+	switch len(parts) {
+	case 2:
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		data, err := s.Portal.VendorAccountResourceGroups(r.Context(), token, accountID)
+		if err != nil {
+			writePortalVendorAccountError(w, err, codeVendorAccountResourceGroupsFailed)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": data})
+	case 3:
+		s.handlePortalVendorAccountResourceGroupItem(w, r, token, accountID, parts[2])
+	default:
+		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeVendorAccountNotFound, msgVendorAccountNotFound, ""))
+	}
+}
+
+// handlePortalVendorAccountResourceGroupItem backs PUT (join) and DELETE (leave) on
+// /api/portal/vendor-accounts/{id}/resource-groups/{rgId}; both answer {"ok": true}.
+func (s *Server) handlePortalVendorAccountResourceGroupItem(w http.ResponseWriter, r *http.Request, token auth.Token, accountID, rgID string) {
+	var err error
+	switch r.Method {
+	case http.MethodPut:
+		err = s.Portal.AddVendorAccountToResourceGroup(r.Context(), token, accountID, rgID)
+	case http.MethodDelete:
+		err = s.Portal.RemoveVendorAccountFromResourceGroup(r.Context(), token, accountID, rgID)
+	default:
+		w.Header().Set("Allow", http.MethodPut+", "+http.MethodDelete)
+		writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
+		return
+	}
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountResourceGroupsFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // handlePortalVendorAccountCheck (POST .../check) is the explicit "test
@@ -555,7 +634,7 @@ var portalVendorAccountErrRows = []errRow{
 	// The vendor_accounts_enabled master flag is off: a 409, like
 	// netbird.module_disabled. The portal hides the area in that state, so this
 	// is reached by a stale tab or a direct API client.
-	{err: portal.ErrVendorAccountsDisabled, status: http.StatusConflict, code: "vendor_accounts.module_disabled", msg: "vendor accounts are not enabled"},
+	{err: portal.ErrVendorAccountsDisabled, status: http.StatusConflict, code: codeVendorAccountsModuleDisabled, msg: msgVendorAccountsModuleDisabled},
 	// The vendor_subscriptions_enabled switch is off: creating or connecting a
 	// SUBSCRIPTION account is a 409 too (api_key accounts are never refused).
 	{err: portal.ErrVendorSubscriptionsDisabled, status: http.StatusConflict, code: "vendor_accounts.subscriptions_disabled", msg: "vendor subscription accounts are not enabled"},
@@ -563,7 +642,7 @@ var portalVendorAccountErrRows = []errRow{
 	// resource-group endpoint is a 409 (the account does not even get looked at). The
 	// subscription switch narrows it: raising a SUBSCRIPTION account while
 	// vendor_subscription_sharing_enabled is off is a 409 too.
-	{err: portal.ErrVendorAccountSharingDisabled, status: http.StatusConflict, code: "vendor_accounts.sharing_disabled", msg: "vendor account sharing is not enabled"},
+	{err: portal.ErrVendorAccountSharingDisabled, status: http.StatusConflict, code: codeVendorAccountsSharingDisabled, msg: msgVendorAccountsSharingDisabled},
 	{err: portal.ErrVendorSubscriptionSharingDisabled, status: http.StatusConflict, code: "vendor_accounts.subscription_sharing_disabled", msg: "sharing subscription accounts is not enabled"},
 	{err: portal.ErrVendorAccountNotFound, status: http.StatusNotFound, code: portal.CodeVendorAccountNotFound, msg: msgVendorAccountNotFound},
 	{err: portal.ErrVendorAccountNameRequired, status: http.StatusBadRequest, code: "vendor_account.name_required", msg: "vendor account name is required"},
@@ -575,7 +654,7 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountModelPrefixInvalid, status: http.StatusBadRequest, code: "vendor_account.model_prefix_invalid", msg: "model prefix must be at most 64 characters from A-Z a-z 0-9 - _ . ~ : / @ + and must not contain .."},
 	{err: portal.ErrVendorAccountBaseURLRequired, status: http.StatusBadRequest, code: "vendor_account.base_url_required", msg: "a base URL is required for a custom OpenAI-compatible account"},
 	{err: portal.ErrVendorAccountBaseURLInvalid, status: http.StatusBadRequest, code: "vendor_account.base_url_invalid", msg: "the base URL must be an https URL without credentials, query or fragment"},
-	{err: portal.ErrVendorAccountForbidden, status: http.StatusForbidden, code: "vendor_account.forbidden", msg: notAllowedMsg},
+	{err: portal.ErrVendorAccountForbidden, status: http.StatusForbidden, code: codeVendorAccountForbidden, msg: notAllowedMsg},
 	// base_url and auth_type are create-only: a PATCH that tries to change either is
 	// refused for every caller (a 400; the gate has already answered 404/403 for a
 	// caller who may not touch the credential).
@@ -593,7 +672,13 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountRootMismatch, status: http.StatusBadRequest, code: "vendor_account.root_mismatch", msg: "management groups must sit under the system group the account is already shared in"},
 	// Management groups (PUT .../admin-groups) can only be assigned to an account that
 	// is shared; a 400 too, answered only to a caller the gate has let through.
-	{err: portal.ErrVendorAccountNotShared, status: http.StatusBadRequest, code: "vendor_account.not_shared", msg: "management groups can only be assigned to a shared account; raise its share level first"},
+	{err: portal.ErrVendorAccountNotShared, status: http.StatusBadRequest, code: codeVendorAccountNotShared, msg: "management groups can only be assigned to a shared account; raise its share level first"},
+	// Resource-group self-service (GET/PUT/DELETE .../resource-groups[/{rgId}]): the
+	// reachable-group gate (also what a non-existent group id gets, 404-no-leak) and the
+	// containment check of a join, a 400 like the root mismatch of the management groups.
+	// Both are answered only after the account gate, so neither confirms an account.
+	{err: portal.ErrResourceGroupNotFound, status: http.StatusNotFound, code: portal.CodeResourceGroupNotFound, msg: msgResourceGroupNotFound},
+	{err: portal.ErrResourceGroupVendorAccountSystemGroupMismatch, status: http.StatusBadRequest, code: codeResourceGroupVendorAccountSystemGroupMismatch, msg: msgResourceGroupVendorAccountSystemGroupMismatch},
 	// Subscription connect. A vendor refusal of the pasted code is a 400, never a
 	// 401: the portal treats a 401 from this API as an expired session. The vendor
 	// being unreachable or answering with something unusable is a 502. The rows

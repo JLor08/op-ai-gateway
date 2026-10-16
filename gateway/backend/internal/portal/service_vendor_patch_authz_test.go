@@ -649,6 +649,20 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		// The candidates list touches no account: it is scoped to the caller's own reach.
 		"SetVendorAccountAdminGroups":       "admin-groups",
 		"VendorAccountAdminGroupCandidates": "candidates",
+		// The resource-group links (service_vendor_sharing.go and
+		// service_resource_groups.go), pinned by
+		// service_vendor_sharing_resource_groups_test.go. The OWNER's self-service
+		// (list, join, leave) is owner-only at `shared`/`full` with the owner a member of
+		// the group's admin group: its own gate, neither of the two write gates. The
+		// resource-group MANAGER side (set, candidates) is authorizeResourceGroup plus
+		// authorizeVendorAccountOperate plus the `full`-only restriction plus the root
+		// match. None of them opens a credential or sends anything upstream, so none is a
+		// credential operation.
+		"VendorAccountResourceGroups":          "rg-owner",
+		"AddVendorAccountToResourceGroup":      "rg-owner",
+		"RemoveVendorAccountFromResourceGroup": "rg-owner",
+		"SetResourceGroupVendorAccounts":       "rg-manager",
+		"ResourceGroupVendorAccountCandidates": "rg-manager",
 		// Operate gate (authorizeVendorAccountOperate).
 		"TestVendorAccountConnection": "operate",
 		"RefreshVendorAccountModels":  "operate",
