@@ -241,11 +241,13 @@ and persists it. The whole sequence runs under a
 **per-account lock** (`lockVendorAccount`) so concurrent dispatches for one
 account single-flight the refresh instead of each burning the refresh token. The
 explicit model refresh (§6.3) asks for a refresh through this same path and lock
-rather than refreshing by itself. The protection runs in one direction only: the
-PATCH writer (`UpdateVendorAccount`) still rewrites the whole row, `oauth_tokens`
-included, from a copy it loaded earlier and outside both locks, so a PATCH that
-races a refresh can write the superseded single-use refresh token back — a known,
-tracked limitation (§10). The
+rather than refreshing by itself. The portal PATCH does not clobber it either: an
+operate-only PATCH (`name`, `status`, `model_prefix`) writes only those columns and
+`updated_at` through `UpdateVendorAccountOperateFields`, never `oauth_tokens`. Only a
+PATCH that carries the api key (the credential gate) still rewrites the whole row from
+a copy it loaded earlier and outside both locks, so a subscription account's
+`api_key: ""` clear can write the superseded single-use refresh token back — a known,
+narrowed, tracked limitation (§10). The
 refresh is **vendor-aware**: an Anthropic token goes only to the Anthropic token
 endpoint and an OpenAI token only to the OpenAI one; the `resolveSubscriptionBearer`
 switch is fail-closed, serving no bearer for an unrecognized vendor.
@@ -2057,9 +2059,11 @@ reasons are recorded deliberately, not in denial of them
   not flip the account to `needs_reconnect` (only a refresh rejection does); a
   persist-failure after a refresh may keep a single-use refresh token, forcing a
   reconnect on the next request. Both are bounded by the token TTL and accepted.
-  A third is **not** accepted but tracked: a PATCH that races a refresh can write
-  a stale `oauth_tokens` back, and its fix is a column-subset PATCH writer in
-  every store driver (§3.4; [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+  A third is **not** accepted but tracked, and narrowed: an operate-only PATCH now
+  writes only its own columns (`UpdateVendorAccountOperateFields`), but a PATCH that
+  carries the api key still rewrites the whole row, so an `api_key: ""` clear sent to
+  a subscription account can write a stale `oauth_tokens` back; its fix is an api-key
+  column writer (§3.4; [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 - **The OpenAI-compatible presets are the providers' own endpoints, but still
   VERIFY-LIVE data (§4.4).** Each preset's root, path prefix, key-probe endpoint and model-list
   shape was confirmed live on 2026-10-10: x.ai at `https://api.x.ai/v1`;

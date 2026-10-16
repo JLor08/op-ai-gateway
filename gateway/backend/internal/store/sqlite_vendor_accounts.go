@@ -61,6 +61,34 @@ func (s *SQLiteStore) UpdateVendorAccount(ctx context.Context, a routing.VendorA
 	return requireAffected(result)
 }
 
+// UpdateVendorAccountOperateFields writes ONLY the operate columns the patch names
+// (name, status, model_prefix; a nil field is left out of the SET list) plus
+// updated_at, with one targeted UPDATE. It never lists api_key, oauth_tokens or
+// auth_type, so a portal PATCH that merely renames or disables an account cannot
+// write a stale credential back over a concurrent rotation (unlike the full-row
+// UpdateVendorAccount). The SET list is assembled from fixed column names only;
+// every value is a bound parameter. An unknown id is ErrNotFound.
+func (s *SQLiteStore) UpdateVendorAccountOperateFields(ctx context.Context, accountID string, patch routing.VendorAccountOperatePatch) error {
+	sets := make([]string, 0, 4)
+	args := make([]any, 0, 5)
+	if patch.Name != nil {
+		sets, args = append(sets, "name = ?"), append(args, *patch.Name)
+	}
+	if patch.Status != nil {
+		sets, args = append(sets, "status = ?"), append(args, *patch.Status)
+	}
+	if patch.ModelPrefix != nil {
+		sets, args = append(sets, "model_prefix = ?"), append(args, *patch.ModelPrefix)
+	}
+	sets, args = append(sets, "updated_at = ?"), append(args, patch.UpdatedAt)
+	args = append(args, accountID)
+	res, err := s.exec(ctx, `update vendor_accounts set `+strings.Join(sets, ", ")+` where id = ?`, args...)
+	if err != nil {
+		return fmt.Errorf("update vendor account operate fields: %w", err)
+	}
+	return requireAffected(res)
+}
+
 // SetVendorAccountOAuthTokens writes ONLY the oauth_tokens + updated_at columns
 // of an existing account. It is the narrow dispatch-time refresh writer: it
 // leaves auth_type, name, status and api_key untouched so a token refresh cannot

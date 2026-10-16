@@ -1684,6 +1684,18 @@ func (_d *RoutingStoreWithTracing) UpdateVendorAccount(ctx context.Context, acc 
 	return _d.Store.UpdateVendorAccount(ctx, acc)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateVendorAccountOperateFields(ctx context.Context, accountID string, patch _sourceRouting.VendorAccountOperatePatch) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateVendorAccountOperateFields")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateVendorAccountOperateFields(ctx, accountID, patch)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateVendorAccountShareLevel(ctx context.Context, id string, level string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateVendorAccountShareLevel")
 	defer span.End()

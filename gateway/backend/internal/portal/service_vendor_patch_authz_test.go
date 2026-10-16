@@ -611,13 +611,16 @@ func TestVendorAccountConnectReauthorizesAfterTheVendorRoundTrip(t *testing.T) {
 
 // TestEveryVendorAccountServiceMethodIsClassified keeps the credential-method list
 // EXHAUSTIVE rather than illustrative. Every exported Service method that has
-// "VendorAccount" in its name must be filed below under what it does to an
-// account; a method that is not filed fails the test, so a credential method added
-// later cannot slip past the gate unnoticed -- its author has to say what it is
-// and, if it is a credential operation, put it in credentialOps (and behind
-// authorizeVendorAccountCredential). The reverse holds as well: everything filed as
-// "credential" must be exercised by TestVendorAccountCredentialMethodsUseTheCredentialGate,
-// and every name below must still exist.
+// "Vendor" or "Credential" in its name -- not only "VendorAccount", so a future
+// RotateVendorCredential or ResetCredential is caught too -- must be filed below
+// under what it does to an account; a method that is not filed fails the test, so a
+// credential method added later cannot slip past the gate unnoticed: its author has
+// to say what it is and, if it is a credential operation, put it in credentialOps
+// (and behind authorizeVendorAccountCredential). The reverse holds as well:
+// everything filed as "credential" must be exercised by
+// TestVendorAccountCredentialMethodsUseTheCredentialGate, and every name below must
+// still exist. The match is on the NAME, so it is a net, not a proof: a credential
+// method named with neither word still needs a reviewer to spot it.
 func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 	class := map[string]string{
 		// Reads and the owner's own collection.
@@ -640,17 +643,21 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"CompleteVendorAccountConnect":    "credential",
 		"BeginVendorAccountDeviceConnect": "credential",
 		"PollVendorAccountDeviceConnect":  "credential",
-		// Switch readers: they touch no account.
-		"VendorAccountsEnabled":       "setting",
-		"VendorAccountSharingEnabled": "setting",
-		"VendorAccountRoutingMode":    "setting",
+		// Switch and setting readers: they touch no account.
+		"VendorAccountsEnabled":          "setting",
+		"VendorAccountSharingEnabled":    "setting",
+		"VendorAccountRoutingMode":       "setting",
+		"VendorSubscriptionsEnabled":     "setting",
+		"VendorOpenAICodexClientVersion": "setting",
+		// The injection point of the dispatch-time token refresher: wiring, no account.
+		"SetVendorTokenRefresher": "wiring",
 	}
 
 	typ := reflect.TypeFor[*Service]()
 	have := map[string]bool{}
 	for i := range typ.NumMethod() {
 		name := typ.Method(i).Name
-		if !strings.Contains(name, "VendorAccount") {
+		if !strings.Contains(name, "Vendor") && !strings.Contains(name, "Credential") {
 			continue
 		}
 		have[name] = true

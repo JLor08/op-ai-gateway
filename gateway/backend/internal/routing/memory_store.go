@@ -2894,6 +2894,31 @@ func (m *MemoryStore) UpdateVendorAccount(_ context.Context, a VendorAccount) er
 	return nil
 }
 
+// UpdateVendorAccountOperateFields writes ONLY the operate columns the patch
+// names (name, status, model_prefix) and updated_at of an existing account; every
+// other column, the credentials included, is left as the store holds it right now
+// (see the store interface). An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateVendorAccountOperateFields(_ context.Context, accountID string, patch VendorAccountOperatePatch) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[accountID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	if patch.Name != nil {
+		cur.Name = *patch.Name
+	}
+	if patch.Status != nil {
+		cur.Status = *patch.Status
+	}
+	if patch.ModelPrefix != nil {
+		cur.ModelPrefix = *patch.ModelPrefix
+	}
+	cur.UpdatedAt = patch.UpdatedAt
+	m.vendorAccounts[accountID] = copyVendorAccount(cur)
+	return nil
+}
+
 // SetVendorAccountOAuthTokens writes ONLY the oauth_tokens + updated_at of an
 // existing account (the narrow dispatch-time refresh writer; see the store
 // interface). An unknown id is ErrNotFound. UpdatedAt is advanced to the store

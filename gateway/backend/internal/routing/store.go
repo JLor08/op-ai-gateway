@@ -289,6 +289,19 @@ type VendorAccount struct {
 	UpdatedAt     time.Time
 }
 
+// VendorAccountOperatePatch is a change to the OPERATE columns of a vendor account
+// -- name, status and model_prefix, the only columns a co-manager of a `shared`
+// account may change -- as UpdateVendorAccountOperateFields applies it: a nil field
+// leaves its column alone, so the patch can never carry a credential column
+// (api_key, oauth_tokens) or auth_type by construction. UpdatedAt is written as
+// updated_at.
+type VendorAccountOperatePatch struct {
+	Name        *string
+	Status      *string
+	ModelPrefix *string
+	UpdatedAt   time.Time
+}
+
 // VendorAccountModel is one model a vendor account serves: the public id a
 // caller asks the gateway for (GatewayModel), the id sent to the vendor
 // (UpstreamModel), the wire dialect used to reach it (APIFlavor, one of
@@ -2371,6 +2384,11 @@ type RuntimeStore interface {
 // dependent rows -- including its vendor_account_admin_groups and
 // resource_group_vendor_accounts links.
 //
+// UpdateVendorAccount is a FULL-ROW write, credentials included, so it is for a
+// caller that is entitled to write them (a credential PATCH, a connect). A caller
+// that only changes name, status or model_prefix uses
+// UpdateVendorAccountOperateFields, which cannot carry a stale credential back.
+//
 // Sharing (migrations 91 and 92): share_level and system_group_id are fields of
 // VendorAccount (ShareLevel, SystemGroupID) and every reader returns them, but
 // they have their own narrow writers: Create starts every account at the column
@@ -2380,6 +2398,16 @@ type RuntimeStore interface {
 type VendorAccountStore interface {
 	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
 	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error
+	// UpdateVendorAccountOperateFields writes ONLY the operate columns the patch
+	// names (name, status, model_prefix; nil = untouched) plus updated_at, with one
+	// targeted UPDATE ... WHERE id. It exists alongside the full-row
+	// UpdateVendorAccount for the same reason the two token/status writers below do:
+	// a portal PATCH that only renames, disables or re-prefixes an account must not
+	// carry the credential columns of its stale copy back into the row, which would
+	// silently revert a concurrent api key rotation, refresh-token rotation or
+	// needs_reconnect flip. It never writes api_key, oauth_tokens, auth_type or the
+	// identity and sharing columns. An unknown id is ErrNotFound.
+	UpdateVendorAccountOperateFields(ctx context.Context, accountID string, patch VendorAccountOperatePatch) error
 	// SetVendorAccountOAuthTokens writes ONLY the oauth_tokens column (plus
 	// updated_at) of an existing account. It exists alongside the full-row
 	// UpdateVendorAccount so a dispatch-time token refresh persists the resealed

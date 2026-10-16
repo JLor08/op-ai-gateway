@@ -547,8 +547,13 @@ func patchTouchesOutsideOperate(body any) bool {
 // status change is turned away with nothing applied). The decision depends only on
 // which fields are present, never on their values: whether an api_key is "really"
 // different is not knowable without opening the sealed one.
-func (s *Service) authorizeVendorAccountPatch(ctx context.Context, principal auth.Token, acc routing.VendorAccount, req UpdateVendorAccountRequest) error {
-	if patchTouchesOutsideOperate(req) {
+//
+// credentialPatch is patchTouchesOutsideOperate(req), computed ONCE by the caller:
+// the same decision that picks the gate also picks the write
+// (saveVendorAccountPatch), so an operate-only PATCH can never be authorized as
+// one thing and written as another.
+func (s *Service) authorizeVendorAccountPatch(ctx context.Context, principal auth.Token, acc routing.VendorAccount, credentialPatch bool) error {
+	if credentialPatch {
 		return s.authorizeVendorAccountCredential(ctx, principal, acc)
 	}
 	return s.authorizeVendorAccountOperate(ctx, principal, acc)
@@ -828,10 +833,61 @@ func (s *Service) applyVendorAccountAPIKey(acc *routing.VendorAccount, raw *stri
 	return nil
 }
 
+// saveVendorAccountPatch persists a PATCH that has been authorized and applied to
+// acc (the copy loaded before, mutated in Go), and returns the account as it is
+// stored afterwards, for the response.
+//
+// The write follows the gate. A credentialPatch (the credential gate passed:
+// api_key or another non-operate field is present) writes the whole row, as it
+// always has: its actor may change the credential columns. An operate-only PATCH
+// writes ONLY the operate columns it was asked to change and updated_at
+// (UpdateVendorAccountOperateFields), because the load-modify-write is not atomic
+// and a full-row write would carry the credential columns of its stale copy back
+// into the row: a CM of a `shared` account sending a status change would revert
+// the owner's api key rotation, a dispatch-time refresh-token rotation or the
+// needs_reconnect flip, writing a credential column without ever passing the
+// credential gate. Name and model_prefix are written when the request carries
+// them (the request is the intent); status only when it differs from the loaded
+// one (a status that merely echoes the stored value, which applyVendorAccountStatus
+// treats as a no-op, must not be written back over a concurrent change).
+//
+// loaded is the record as it was read, applied the one after the apply* calls. A
+// field added to the operate allowlist must be added to the patch built here as
+// well; forgetting only means it is not persisted, never that a credential column
+// is written.
+func (s *Service) saveVendorAccountPatch(ctx context.Context, loaded, applied routing.VendorAccount, req UpdateVendorAccountRequest, credentialPatch bool) (routing.VendorAccount, error) {
+	if credentialPatch {
+		if err := s.routes.UpdateVendorAccount(ctx, applied); err != nil {
+			return routing.VendorAccount{}, notFoundAsVendorAccountNotFound(err)
+		}
+		return applied, nil
+	}
+	patch := routing.VendorAccountOperatePatch{UpdatedAt: applied.UpdatedAt}
+	if req.Name != nil {
+		patch.Name = &applied.Name
+	}
+	if applied.Status != loaded.Status {
+		patch.Status = &applied.Status
+	}
+	if req.ModelPrefix != nil {
+		patch.ModelPrefix = &applied.ModelPrefix
+	}
+	if err := s.routes.UpdateVendorAccountOperateFields(ctx, applied.ID, patch); err != nil {
+		return routing.VendorAccount{}, notFoundAsVendorAccountNotFound(err)
+	}
+	// The row is not the stale copy any more (a credential may have moved since the
+	// load), so describe what is actually stored.
+	current, err := s.routes.VendorAccountByID(ctx, applied.ID)
+	if err != nil {
+		return routing.VendorAccount{}, notFoundAsVendorAccountNotFound(err)
+	}
+	return current, nil
+}
+
 // UpdateVendorAccount renames an account, changes its status or model prefix,
 // and/or replaces or clears its api key. The store keeps id, owner, vendor and
 // created_at immutable, so this loads the row, mutates only the requested fields
-// and writes it back.
+// and writes them back.
 //
 // Authorization is field-level and deny-by-default (authorizeVendorAccountPatch):
 // name, status and model_prefix need the operate gate (the owner, or a CM of a
@@ -841,6 +897,11 @@ func (s *Service) applyVendorAccountAPIKey(acc *routing.VendorAccount, raw *stri
 // is a stranger to both. base_url and auth_type are create-only: a request that
 // tries to change either is ErrVendorAccountFieldImmutable. Authorization runs
 // first, so a stranger gets 404 even for an invalid body.
+//
+// The write follows the gate (saveVendorAccountPatch): an operate-only PATCH
+// writes only the operate columns it changes and never a credential column, so it
+// cannot revert a concurrent credential write.
+//
 // ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token, id string, req UpdateVendorAccountRequest) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
@@ -850,12 +911,14 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	if err := s.authorizeVendorAccountPatch(ctx, principal, acc, req); err != nil {
+	credentialPatch := patchTouchesOutsideOperate(req)
+	if err := s.authorizeVendorAccountPatch(ctx, principal, acc, credentialPatch); err != nil {
 		return VendorAccountDTO{}, err
 	}
 	if err := rejectVendorAccountImmutableChange(acc, req); err != nil {
 		return VendorAccountDTO{}, err
 	}
+	loaded := acc
 	if err := applyVendorAccountName(&acc, req.Name); err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -869,10 +932,8 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 		return VendorAccountDTO{}, err
 	}
 	acc.UpdatedAt = s.clock().UTC()
-	if err := s.routes.UpdateVendorAccount(ctx, acc); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return VendorAccountDTO{}, ErrVendorAccountNotFound
-		}
+	saved, err := s.saveVendorAccountPatch(ctx, loaded, acc, req, credentialPatch)
+	if err != nil {
 		return VendorAccountDTO{}, err
 	}
 	// A request that carries a prefix re-labels the account's model rows to it
@@ -881,11 +942,11 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	// re-label left behind; relabelVendorAccountModels writes only when a row
 	// actually differs.
 	if req.ModelPrefix != nil {
-		if err := s.relabelVendorAccountModels(ctx, acc.ID); err != nil {
+		if err := s.relabelVendorAccountModels(ctx, saved.ID); err != nil {
 			return VendorAccountDTO{}, err
 		}
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	return s.vendorAccountDTO(ctx, saved)
 }
 
 // DeleteVendorAccount removes an account the principal owns (owner-only, system
