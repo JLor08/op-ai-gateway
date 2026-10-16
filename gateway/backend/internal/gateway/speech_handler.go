@@ -14,7 +14,6 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
-	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
@@ -90,10 +89,9 @@ func speechInferenceShape(model string) inferenceShape {
 // inferencePreflight -> Resolve refuses a model without a yes verdict. No second
 // admitPrincipal call site is added here.
 //
-// Run-as: exactly handleOpenAIChat's block, copied (as handleOpenAIImages copies
-// it) rather than shared. token.ID == "" only for the loopback principal, so
-// this fires only for the run executor's own loopback calls; without it a
-// run-as speech call would bill and capture under the bare session instead of
+// Run-as: the shared runAsPrincipal helper. token.ID == "" only for the loopback
+// principal, so this fires only for the run executor's own loopback calls; without
+// it a run-as speech call would bill and capture under the bare session instead of
 // the token.
 func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
@@ -117,22 +115,9 @@ func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, err)
 		return
 	}
-	if token.ID == "" { // loopback principal (not a bearer token): honor optional run-as, exactly as handleOpenAIChat
-		if runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName)); runAsID != "" {
-			if s.Portal == nil {
-				// Fail closed rather than silently fall back to the bare session
-				// principal: the caller explicitly asked to run as a specific
-				// token, and with no Portal there is no way to authorize it.
-				writePortalTokenError(w, portal.ErrTokenForbidden)
-				return
-			}
-			runAs, rErr := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
-			if rErr != nil {
-				writePortalTokenError(w, rErr)
-				return
-			}
-			token = runAs
-		}
+	token, ok = s.runAsPrincipal(w, r, token)
+	if !ok {
+		return
 	}
 	pf, handled := s.inferencePreflight(w, r, token, raw, speechInferenceShape(model))
 	if handled {

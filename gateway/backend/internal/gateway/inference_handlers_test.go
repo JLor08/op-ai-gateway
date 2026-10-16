@@ -11,8 +11,34 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+// A bare &Server{} (no Portal) must refuse a chat run-as request rather than
+// panic or proceed as the bare loopback principal. This is the s.Portal == nil
+// fail-closed guard the images, images-edit and speech paths already have via
+// runAsPrincipal; the chat path previously inlined the run-as block WITHOUT it
+// and would nil-panic on s.Portal.AuthorizeRunAsToken.
+func TestChatRunAsWithoutPortalIsRefused(t *testing.T) {
+	s := &Server{internalAuthSecret: "s3cret", users: fakeUserLookup{
+		"usr_1": {ID: "usr_1", Role: "user"},
+	}}
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set(internalAuthHeaderName, "s3cret")
+	r.Header.Set(internalUserHeaderName, "usr_1")
+	r.Header.Set(runAsHeaderName, "tok_whatever")
+	w := httptest.NewRecorder()
+
+	s.handleOpenAIChat(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s, want 403", w.Code, w.Body.String())
+	}
+	requireErrorCode(t, w.Body.String(), "portal.token_forbidden")
+}
 
 // fakeOfferingPortal is a minimal portal.API stand-in (embeds a nil interface,
 // per the established internal/gateway test pattern — see
