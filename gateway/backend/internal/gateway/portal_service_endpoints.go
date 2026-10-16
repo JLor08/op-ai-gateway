@@ -318,6 +318,13 @@ var portalServiceErrRows = []errRow{
 	// on purpose: it is the same mistake, and it names the setting instead of
 	// letting a mistyped model read as a 500 "the gateway broke".
 	{err: portal.ErrTokenModelOverrideInvalid, status: http.StatusBadRequest, code: "portal.token_model_override_invalid", msg: "token model override is invalid"},
+	// A service token's vendor_access policy goes through the same validateVendorAccess
+	// as a user token's, against the SERVICE identity (a service owns no account, so
+	// an id not shared with it is unreachable). Both of its client errors map exactly
+	// as portalTokenErrRows maps them; without the rows they fell through to a 500
+	// service.token_create_failed.
+	{err: portal.ErrTokenVendorAccessInvalid, status: http.StatusBadRequest, code: "portal.token_vendor_access_invalid", msg: "token vendor access is invalid"},
+	{err: portal.ErrTokenVendorAccessConflict, status: http.StatusBadRequest, code: "portal.token_vendor_access_conflict", msg: "token vendor access names collide"},
 	{err: portal.ErrServiceNotFound, status: http.StatusNotFound, code: portal.CodeServiceNotFound, msg: msgServiceNotFound},
 	{err: portal.ErrTokenNotFound, status: http.StatusNotFound, code: "service.token_not_found", msg: "service token not found"},
 }

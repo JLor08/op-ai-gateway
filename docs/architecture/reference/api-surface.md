@@ -265,10 +265,9 @@ Two stable error codes, both `400`, apply to create and update:
 
 Both are the user-token routes' codes (`POST`/`PATCH /api/portal/tokens`). The
 service-token create (`POST /api/portal/services/{id}/tokens`) runs the same advisory
-check against the service as principal, but the service error mapper has no row for
-these two sentinels, so a rejected `vendor_access` there currently surfaces as the
-mapper's fallback `500 service.token_create_failed` rather than a `400`
-([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+check against the **service** as principal and answers with the same two `400` codes (a
+service owns no account, so an `account_id` not shared with it is unreachable); only the
+service-token **create** takes a `vendor_access` policy.
 
 Neither code is a read failure: an infrastructure error while reading the
 principal's own accounts is a `500`, not a `400`. A store error while computing the
