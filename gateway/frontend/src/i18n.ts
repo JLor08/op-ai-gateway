@@ -2099,14 +2099,29 @@ const de = {
   errorTokenProjectNotMember: 'Sie sind kein Mitglied dieses Projekts.',
   tokenVendorAccessLabel: 'Anbieter-Zugriff',
   tokenVendorAccessNote: 'Wähle, welche Anbieter dieser Token nutzen darf.',
-  tokenVendorAccessAll: 'Alle Anbieter (auch künftige)',
-  tokenVendorAccessAllHint: 'Nutzt alle verbundenen Konten unter ihrem eigenen Prefix.',
-  tokenVendorAccessAccountsLabel: 'Verfügbare Anbieter',
+  // "Alle" deckt nur die eigenen Konten des Token-Besitzers ab; ein geteiltes Konto
+  // (ADR-050) braucht immer seinen eigenen Eintrag, auch neben "Alle".
+  tokenVendorAccessAll: 'Alle eigenen Anbieter (auch künftige)',
+  tokenVendorAccessAllHint:
+    'Nutzt alle eigenen Konten unter ihrem eigenen Prefix. Mit dir geteilte Anbieter gehören nicht dazu: Sie werden unten einzeln gewählt.',
+  tokenVendorAccessAccountsLabel: 'Eigene Anbieter',
+  tokenVendorAccessSharedLabel: 'Mit mir geteilte Anbieter',
+  tokenVendorAccessSharedHint:
+    'Ein geteilter Anbieter wird nie automatisch freigeschaltet, auch nicht mit „Alle eigenen Anbieter“. Nutzbar ist er nur, wenn du ihn über eine Ressourcengruppe erreichst; sonst wird das Speichern abgelehnt.',
   tokenVendorAccessPrefixToggle: 'Prefix überschreiben',
   tokenVendorAccessPrefixLabel: 'Prefix',
   tokenVendorAccessPrefixEmptyHint: 'Leer = Modelle unter Originalnamen ohne Prefix.',
   tokenVendorAccessNone: 'Keine Anbieter verbunden.',
-  errorTokenVendorAccessInvalid: 'Anbieter-Zugriff ungültig.',
+  // Service-Token: ein Dienst besitzt keine Konten, der Anbieter-Zugriff gilt nur beim
+  // Erstellen (kein Bearbeiten), eine Rotation behält ihn.
+  serviceTokenVendorAccessNote:
+    'Ein Dienst besitzt keine eigenen Anbieter-Konten. Nutzbar sind nur Konten, die mit diesem Dienst geteilt sind (der Dienst gehört zu einer Ressourcengruppe, die das Konto enthält); jedes wird einzeln gewählt. Die Auswahl gilt nur beim Erstellen: Eine Rotation behält sie bei, zum Ändern muss ein neuer Token erstellt werden.',
+  serviceTokenVendorAccessAccountsLabel: 'Geteilte Anbieter',
+  serviceTokenVendorAccessNone: 'Es sind keine geteilten Anbieter verfügbar.',
+  serviceTokenRotateKeepsVendorAccess:
+    'Der Anbieter-Zugriff des Tokens bleibt bei der Rotation unverändert.',
+  errorTokenVendorAccessInvalid:
+    'Anbieter-Zugriff ungültig: Ein gewähltes Konto ist für diesen Token nicht erreichbar, oder ein Prefix ist ungültig.',
   errorTokenVendorAccessConflict:
     'Zwei Anbieter liefern denselben Modellnamen — vergib einen eigenen Prefix.',
   activityEmpty: 'Keine Anfragen',
@@ -2434,6 +2449,14 @@ const de = {
   serviceAdminGroupsSectionTitle: 'Verwaltungsgruppen',
   serviceAdminGroupsSave: 'Verwaltungsgruppen speichern',
   serviceAdminGroupsSaved: 'Verwaltungsgruppen gespeichert.',
+  // Service-side resource-group self-service (#183 Phase 0): the service-manager
+  // analogue of the serverResourceGroups* keys.
+  serviceResourceGroupsTitle: 'Ressourcengruppen',
+  serviceResourceGroupsColGroup: 'Ressourcengruppe',
+  serviceResourceGroupsColMember: 'Mitglied',
+  serviceResourceGroupsEmpty: 'Keine berechtigten Ressourcengruppen.',
+  serviceResourceGroupsJoinError: 'Dienst konnte nicht eingetragen werden.',
+  serviceResourceGroupsLeaveError: 'Dienst konnte nicht entfernt werden.',
   resourceGroups: 'Ressourcen',
   resourceGroupsIntro:
     'Ressourcengruppen bündeln Server unter einer Verwaltungsgruppen-Verknüpfung.',
@@ -2460,6 +2483,11 @@ const de = {
   resourceGroupServersLabel: 'Server dieser Ressourcengruppe',
   resourceGroupServersSave: 'Server speichern',
   resourceGroupServersSaved: 'Server gespeichert.',
+  // The provider-account ("Anbieter") panel of the resource-group detail (#183).
+  resourceGroupVendorAccountsSectionTitle: 'Anbieter-Konten',
+  resourceGroupVendorAccountsLabel: 'Anbieter-Konten dieser Ressourcengruppe',
+  resourceGroupVendorAccountsSave: 'Anbieter-Konten speichern',
+  resourceGroupVendorAccountsSaved: 'Anbieter-Konten gespeichert.',
   resourceGroupProvisionsSectionTitle: 'Bereitgestellt für',
   resourceGroupProvisionsColKind: 'Art',
   resourceGroupProvisionsColTarget: 'Ziel',
@@ -2513,6 +2541,63 @@ const de = {
   vendorAccountSettingsTitle: 'Einstellungen',
   vendorAccountActionDelete: 'Löschen',
   vendorAccountDeleteConfirm: 'Anbieter-Konto wirklich löschen?',
+  // Sharing a provider account with the co-managers of its management groups
+  // (#183): the share-level control, the management-group editor and the
+  // read-only view of a member that only borrows the account through a resource
+  // group. "Besitzer" is the account's owner, "Mitverwalter" a co-manager of a
+  // management group who holds the vendor-account permission there.
+  vendorAccountSharedBy: 'Geteilt von',
+  vendorAccountShareTitle: 'Freigabe',
+  vendorAccountShareIntro:
+    'Legt fest, wie weit dieses Anbieter-Konto mit den Mitverwaltern seiner Verwaltungsgruppen geteilt wird.',
+  vendorAccountShareLevelLabel: 'Freigabestufe',
+  vendorAccountShareLevelNone: 'Nicht geteilt',
+  vendorAccountShareLevelShared: 'Geteilt',
+  vendorAccountShareLevelFull: 'Vollständig geteilt',
+  vendorAccountShareLevelNoneNote: 'Nur der Besitzer kann dieses Konto verwalten und nutzen.',
+  vendorAccountShareLevelSharedNote:
+    'Mitverwalter der Verwaltungsgruppen können das Konto einsehen und betreiben. Zugangsdaten, Verwaltungsgruppen und Löschen bleiben beim Besitzer.',
+  vendorAccountShareLevelFullNote:
+    'Mitverwalter der Verwaltungsgruppen dürfen zusätzlich Zugangsdaten, Verwaltungsgruppen und Löschen verwalten und die Freigabe zurücknehmen.',
+  vendorAccountShareSubscriptionNote:
+    'Ein Abonnement-Konto lässt sich höchstens auf „Geteilt“ stellen. Verbindungstest sowie Modell- und Nutzungsaktualisierung bleiben beim Besitzer.',
+  vendorAccountShareTargetLabel: 'Neue Stufe',
+  vendorAccountShareRaiseAction: (level: string) => `Auf „${level}“ erhöhen`,
+  vendorAccountShareLowerAction: (level: string) => `Auf „${level}“ senken`,
+  vendorAccountShareStopAction: 'Freigabe beenden',
+  vendorAccountShareStopConfirm:
+    'Freigabe wirklich beenden? Die Verwaltungsgruppen und Ressourcengruppen-Zuordnungen des Kontos werden entfernt.',
+  vendorAccountShareKeepGroupsNote: 'Die bestehenden Verwaltungsgruppen bleiben erhalten.',
+  vendorAccountShareNoGroupsHint:
+    'Dem Konto ist keine Verwaltungsgruppe zugeordnet. Zuerst unten eine Verwaltungsgruppe zuordnen.',
+  vendorAccountShareReadOnlyNote: 'Die Freigabe dieses Kontos verwaltet der Besitzer.',
+  vendorAccountShareSaved: 'Freigabe gespeichert.',
+  // Shown in place of the sharing controls while sharing is switched off (the
+  // vendor_account_sharing_enabled system setting): every account behaves as
+  // personal, so nothing can be raised, lowered or reassigned.
+  vendorAccountSharingOffNotice:
+    'Das Teilen von Anbieter-Konten ist deaktiviert. Ein Systemadministrator kann es in den Systemeinstellungen aktivieren. Bis dahin gilt jedes Konto als persönlich; gespeicherte Freigaben bleiben erhalten und wirken wieder, sobald das Teilen aktiviert wird.',
+  vendorAccountSharingOffStoredLevel: (level: string) => `Gespeicherte Freigabestufe: ${level}`,
+  vendorAccountAdminGroupLabel: 'Verwaltungsgruppe(n)',
+  vendorAccountAdminGroupAuto: (name: string) => `Verwaltungsgruppe: ${name}`,
+  vendorAccountAdminGroupSystemGroupLabel: 'System-Gruppe',
+  vendorAccountAdminGroupSystemGroupAuto: (name: string) => `System-Gruppe: ${name}`,
+  vendorAccountNoAdminGroupHint:
+    'Du verwaltest keine Verwaltungsgruppe mit Anbieter-Konten-Verwaltung — bitte einen Eigentümer/Mitverwalter bitten, dich hinzuzufügen.',
+  vendorAccountAdminGroupsSectionTitle: 'Verwaltungsgruppen',
+  vendorAccountAdminGroupsSave: 'Verwaltungsgruppen speichern',
+  vendorAccountAdminGroupsSaved: 'Verwaltungsgruppen gespeichert.',
+  // The owner's resource-group link of a shared provider account (#183): the
+  // Anbieter-Konto analogue of the serverResourceGroups* keys.
+  vendorAccountResourceGroupsTitle: 'Ressourcengruppen',
+  vendorAccountResourceGroupsColGroup: 'Ressourcengruppe',
+  vendorAccountResourceGroupsColMember: 'Mitglied',
+  vendorAccountResourceGroupsEmpty: 'Keine berechtigten Ressourcengruppen.',
+  vendorAccountResourceGroupsJoinError: 'Anbieter-Konto konnte nicht eingetragen werden.',
+  vendorAccountResourceGroupsLeaveError: 'Anbieter-Konto konnte nicht entfernt werden.',
+  vendorAccountMemberTitle: 'Geteiltes Konto',
+  vendorAccountMemberNote:
+    'Dieses Konto wird über eine Ressourcengruppe bereitgestellt. Seine Modelle lassen sich nutzen, das Konto selbst aber nicht verwalten.',
   vendorAccountSubscriptionCreateNote:
     'Das Konto wird zunächst ohne Zugangsdaten angelegt. Auf der Detailseite lässt es sich anschließend mit dem Abonnement verbinden.',
   // Shown on every subscription account while the system admin has turned
@@ -2667,7 +2752,7 @@ const de = {
   errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
   errorVendorAccountAuthTypeInvalid: 'Ungültige Authentifizierungsart',
   errorVendorAccountStatusInvalid: 'Ungültiger Status des Anbieter-Kontos',
-  errorVendorAccountForbidden: 'Anbieter-Konten können nur mit einem Benutzerkonto angelegt werden',
+  errorVendorAccountForbidden: 'Keine Berechtigung für diese Aktion am Anbieter-Konto',
   errorVendorAccountApiKeyNotAllowed:
     'Ein API-Schlüssel kann nur bei einem Konto mit API-Schlüssel-Authentifizierung gesetzt werden',
   errorVendorAccountApiKeyInvalid:
@@ -2678,6 +2763,28 @@ const de = {
     'Anbieter-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen aktivieren.',
   errorVendorSubscriptionsDisabled:
     'Abonnement-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen zulassen. Konten mit API-Schlüssel sind nicht betroffen.',
+  // Sharing (#183): the two sharing switches, and the 400/409 refusals of the
+  // share-level and management-group endpoints. Each carries exactly one code.
+  errorVendorAccountsSharingDisabled:
+    'Das Teilen von Anbieter-Konten ist deaktiviert. Ein Systemadministrator kann es in den Systemeinstellungen aktivieren.',
+  errorVendorSubscriptionSharingDisabled:
+    'Das Teilen von Abonnement-Konten ist deaktiviert. Ein Systemadministrator kann es in den Systemeinstellungen zulassen. Konten mit API-Schlüssel sind nicht betroffen.',
+  errorVendorAccountShareLevelUnchanged:
+    'Die Freigabestufe des Kontos hat sich inzwischen geändert. Die Ansicht aktualisieren und erneut versuchen.',
+  errorVendorAccountSubscriptionShareCapped:
+    'Ein Abonnement-Konto lässt sich höchstens auf „Geteilt“ stellen, nie vollständig.',
+  errorVendorAccountAdminGroupRequired:
+    'Zum Teilen ist mindestens eine Verwaltungsgruppe erforderlich.',
+  errorVendorAccountAdminGroupInvalid:
+    'Eine der gewählten Verwaltungsgruppen ist ungültig oder darf nicht verwendet werden.',
+  errorVendorAccountAdminGroupParentMismatch:
+    'Die Verwaltungsgruppen müssen unter derselben System-Gruppe liegen.',
+  errorVendorAccountRootMismatch:
+    'Die Verwaltungsgruppen müssen unter der System-Gruppe liegen, in der das Konto bereits geteilt ist.',
+  errorVendorAccountNotShared:
+    'Das ist nur bei einem geteilten Konto möglich. Zuerst die Freigabestufe erhöhen.',
+  errorResourceGroupVendorAccountSystemGroupMismatch:
+    'Das Anbieter-Konto muss zur System-Gruppe der Ressourcengruppe gehören.',
   errorVendorAccountNotSubscription:
     'Nur ein Konto mit Abonnement-Authentifizierung kann mit einem Abonnement verbunden werden',
   errorVendorAccountConnectTokenRequired: 'Ein Access-Token ist erforderlich',
@@ -2719,6 +2826,12 @@ const de = {
   systemVendorSubscriptionsEnabledLabel: 'Abonnement-Konten zulassen',
   systemVendorSubscriptionsEnabledNote:
     'Abonnement-Konten (OAuth-Anmeldung mit einem ChatGPT- oder Claude-Abonnement) sind experimentell und verstoßen gegen die Nutzungsbedingungen der Anbieter für Privatkunden. Aus: Abonnement-Konten können weder angelegt noch verbunden oder genutzt werden; bereits angelegte Konten bleiben erhalten, sind aber nicht nutzbar. Konten mit API-Schlüssel sind nicht betroffen.',
+  systemVendorAccountSharingEnabledLabel: 'Teilen von Anbieter-Konten zulassen',
+  systemVendorAccountSharingEnabledNote:
+    'Aus (Standard): Jedes Anbieter-Konto gilt als persönlich. Gespeicherte Freigaben bleiben erhalten, wirken aber nicht, und die Freigabe-Funktionen (Freigabestufe, Verwaltungsgruppen, Ressourcengruppen) sind im Portal ausgeblendet. Ein: Administratoren können ihre eigenen Konten für Verwaltungsgruppen freigeben und über Ressourcengruppen anbieten. Wirkt nur, solange Anbieter aktiviert sind.',
+  systemVendorSubscriptionSharingEnabledLabel: 'Teilen von Abonnement-Konten zulassen',
+  systemVendorSubscriptionSharingEnabledNote:
+    'Abonnement-Konten sind experimentell und verstoßen gegen die Nutzungsbedingungen der Anbieter für Privatkunden; sie lassen sich höchstens auf „Geteilt“ stellen. Wirkt nur, solange das Teilen von Anbieter-Konten zugelassen ist (solange es aus ist, nicht änderbar). Aus: Abonnement-Konten können nicht geteilt werden. Konten mit API-Schlüssel sind nicht betroffen.',
   systemVendorAccountRoutingModeLabel: 'Vorrang bei der Anbieter-Auswahl',
   systemVendorAccountRoutingModeNote:
     'Legt fest, ob ein eigenes Anbieter-Konto Vorrang vor selbst gehosteten und gemeinsamen Servern hat. Wirkt nur, solange Anbieter aktiviert sind.',
@@ -2785,6 +2898,7 @@ const de = {
   groupsPermServers: 'Server-Verwaltung',
   groupsPermServices: 'Dienst-Verwaltung',
   groupsPermResources: 'Ressourcen-Verwaltung',
+  groupsPermVendorAccounts: 'Anbieter-Konten-Verwaltung',
   groupsActionRename: 'Umbenennen',
   groupsActionMembers: 'Mitglieder verwalten',
   groupsActionDelete: 'Löschen',
@@ -4856,14 +4970,29 @@ const en: PortalMessages = {
   errorTokenProjectNotMember: 'You are not a member of that project.',
   tokenVendorAccessLabel: 'Provider access',
   tokenVendorAccessNote: 'Choose which providers this token may use.',
-  tokenVendorAccessAll: 'All providers (incl. future)',
-  tokenVendorAccessAllHint: 'Uses every connected account under its own prefix.',
-  tokenVendorAccessAccountsLabel: 'Available providers',
+  // "All" covers only the token owner's own accounts; a shared account (ADR-050)
+  // always needs its own entry, also next to "All".
+  tokenVendorAccessAll: 'All own providers (incl. future)',
+  tokenVendorAccessAllHint:
+    'Uses every own account under its own prefix. Providers shared with you are not part of it: you pick them one by one below.',
+  tokenVendorAccessAccountsLabel: 'Own providers',
+  tokenVendorAccessSharedLabel: 'Providers shared with me',
+  tokenVendorAccessSharedHint:
+    'A shared provider is never enabled automatically, not even by "All own providers". It is usable only when you reach it through a resource group; otherwise saving is refused.',
   tokenVendorAccessPrefixToggle: 'Override prefix',
   tokenVendorAccessPrefixLabel: 'Prefix',
   tokenVendorAccessPrefixEmptyHint: 'Empty = models under their original names, no prefix.',
   tokenVendorAccessNone: 'No providers connected.',
-  errorTokenVendorAccessInvalid: 'Provider access is invalid.',
+  // Service token: a service owns no accounts, the provider access is set at create
+  // only (no edit), and a rotation keeps it.
+  serviceTokenVendorAccessNote:
+    'A service owns no provider accounts of its own. Only accounts shared with this service (the service belongs to a resource group that contains the account) can be used, each chosen individually. The selection applies at creation only: a rotation keeps it, and changing it means creating a new token.',
+  serviceTokenVendorAccessAccountsLabel: 'Shared providers',
+  serviceTokenVendorAccessNone: 'No shared providers are available.',
+  serviceTokenRotateKeepsVendorAccess:
+    'The provider access of this token stays unchanged by the rotation.',
+  errorTokenVendorAccessInvalid:
+    'Provider access is invalid: a selected account is not reachable for this token, or a prefix is invalid.',
   errorTokenVendorAccessConflict:
     'Two providers serve the same model name — give one a distinct prefix.',
   activityEmpty: 'No requests yet',
@@ -5189,6 +5318,14 @@ const en: PortalMessages = {
   serviceAdminGroupsSectionTitle: 'Admin groups',
   serviceAdminGroupsSave: 'Save admin groups',
   serviceAdminGroupsSaved: 'Admin groups saved.',
+  // Service-side resource-group self-service (#183 Phase 0): the service-manager
+  // analogue of the serverResourceGroups* keys.
+  serviceResourceGroupsTitle: 'Resource groups',
+  serviceResourceGroupsColGroup: 'Resource group',
+  serviceResourceGroupsColMember: 'Member',
+  serviceResourceGroupsEmpty: 'No eligible resource groups.',
+  serviceResourceGroupsJoinError: 'Could not add the service.',
+  serviceResourceGroupsLeaveError: 'Could not remove the service.',
   resourceGroups: 'Resources',
   resourceGroupsIntro: 'Resource groups bundle servers under an admin-group linkage.',
   resourceGroupListTitle: 'Resource group list',
@@ -5214,6 +5351,11 @@ const en: PortalMessages = {
   resourceGroupServersLabel: 'Servers in this resource group',
   resourceGroupServersSave: 'Save servers',
   resourceGroupServersSaved: 'Servers saved.',
+  // The provider-account ("Anbieter") panel of the resource-group detail (#183).
+  resourceGroupVendorAccountsSectionTitle: 'Provider accounts',
+  resourceGroupVendorAccountsLabel: 'Provider accounts in this resource group',
+  resourceGroupVendorAccountsSave: 'Save provider accounts',
+  resourceGroupVendorAccountsSaved: 'Provider accounts saved.',
   resourceGroupProvisionsSectionTitle: 'Provisioned for',
   resourceGroupProvisionsColKind: 'Kind',
   resourceGroupProvisionsColTarget: 'Target',
@@ -5267,6 +5409,63 @@ const en: PortalMessages = {
   vendorAccountSettingsTitle: 'Settings',
   vendorAccountActionDelete: 'Delete',
   vendorAccountDeleteConfirm: 'Delete this provider account?',
+  // Sharing a provider account with the co-managers of its management groups
+  // (#183): the share-level control, the management-group editor and the
+  // read-only view of a member that only borrows the account through a resource
+  // group. "Owner" is the account's owner, "co-manager" a co-manager of a
+  // management group who holds the vendor-account permission there.
+  vendorAccountSharedBy: 'Shared by',
+  vendorAccountShareTitle: 'Sharing',
+  vendorAccountShareIntro:
+    'Sets how far this provider account is shared with the co-managers of its management groups.',
+  vendorAccountShareLevelLabel: 'Sharing level',
+  vendorAccountShareLevelNone: 'Not shared',
+  vendorAccountShareLevelShared: 'Shared',
+  vendorAccountShareLevelFull: 'Fully shared',
+  vendorAccountShareLevelNoneNote: 'Only the owner can manage and use this account.',
+  vendorAccountShareLevelSharedNote:
+    'Co-managers of the management groups can view and operate the account. Credentials, management groups and deletion stay with the owner.',
+  vendorAccountShareLevelFullNote:
+    'Co-managers of the management groups may also manage credentials, management groups and deletion, and take the sharing back.',
+  vendorAccountShareSubscriptionNote:
+    'A subscription account can be shared at most as "Shared". The connection test and the model and usage refresh stay with the owner.',
+  vendorAccountShareTargetLabel: 'New level',
+  vendorAccountShareRaiseAction: (level: string) => `Raise to "${level}"`,
+  vendorAccountShareLowerAction: (level: string) => `Lower to "${level}"`,
+  vendorAccountShareStopAction: 'Stop sharing',
+  vendorAccountShareStopConfirm:
+    "Really stop sharing? The account's management groups and resource group links are removed.",
+  vendorAccountShareKeepGroupsNote: 'The existing management groups are kept.',
+  vendorAccountShareNoGroupsHint:
+    'The account has no management group. Assign a management group below first.',
+  vendorAccountShareReadOnlyNote: "This account's sharing is managed by its owner.",
+  vendorAccountShareSaved: 'Sharing saved.',
+  // Shown in place of the sharing controls while sharing is switched off (the
+  // vendor_account_sharing_enabled system setting): every account behaves as
+  // personal, so nothing can be raised, lowered or reassigned.
+  vendorAccountSharingOffNotice:
+    'Sharing provider accounts is disabled. A system administrator can enable it in the system settings. Until then every account behaves as personal; stored sharing is kept and applies again once sharing is enabled.',
+  vendorAccountSharingOffStoredLevel: (level: string) => `Stored sharing level: ${level}`,
+  vendorAccountAdminGroupLabel: 'Admin group(s)',
+  vendorAccountAdminGroupAuto: (name: string) => `Admin group: ${name}`,
+  vendorAccountAdminGroupSystemGroupLabel: 'System group',
+  vendorAccountAdminGroupSystemGroupAuto: (name: string) => `System group: ${name}`,
+  vendorAccountNoAdminGroupHint:
+    'You do not manage an admin group with provider-account management — ask an owner/co-manager to add you.',
+  vendorAccountAdminGroupsSectionTitle: 'Admin groups',
+  vendorAccountAdminGroupsSave: 'Save admin groups',
+  vendorAccountAdminGroupsSaved: 'Admin groups saved.',
+  // The owner's resource-group link of a shared provider account (#183): the
+  // provider-account analogue of the serverResourceGroups* keys.
+  vendorAccountResourceGroupsTitle: 'Resource groups',
+  vendorAccountResourceGroupsColGroup: 'Resource group',
+  vendorAccountResourceGroupsColMember: 'Member',
+  vendorAccountResourceGroupsEmpty: 'No eligible resource groups.',
+  vendorAccountResourceGroupsJoinError: 'Could not add the provider account.',
+  vendorAccountResourceGroupsLeaveError: 'Could not remove the provider account.',
+  vendorAccountMemberTitle: 'Shared account',
+  vendorAccountMemberNote:
+    'This account is provided through a resource group. Its models can be used, but the account itself cannot be managed.',
   vendorAccountSubscriptionCreateNote:
     'The account is created without credentials first. You can then connect it to your subscription from its detail page.',
   // Shown on every subscription account while the system admin has turned
@@ -5414,7 +5613,7 @@ const en: PortalMessages = {
   errorVendorAccountVendorInvalid: 'Invalid provider',
   errorVendorAccountAuthTypeInvalid: 'Invalid authentication type',
   errorVendorAccountStatusInvalid: 'Invalid provider account status',
-  errorVendorAccountForbidden: 'Provider accounts can only be created with a user account',
+  errorVendorAccountForbidden: 'You are not allowed to do this on the provider account',
   errorVendorAccountApiKeyNotAllowed:
     'An API key can only be set on an account with API-key authentication',
   errorVendorAccountApiKeyInvalid:
@@ -5425,6 +5624,27 @@ const en: PortalMessages = {
     'Provider accounts are disabled. A system administrator can enable them in the system settings.',
   errorVendorSubscriptionsDisabled:
     'Subscription accounts are disabled. A system administrator can allow them in the system settings. API-key accounts are not affected.',
+  // Sharing (#183): the two sharing switches, and the 400/409 refusals of the
+  // share-level and management-group endpoints. Each carries exactly one code.
+  errorVendorAccountsSharingDisabled:
+    'Sharing provider accounts is disabled. A system administrator can enable it in the system settings.',
+  errorVendorSubscriptionSharingDisabled:
+    'Sharing subscription accounts is disabled. A system administrator can allow it in the system settings. API-key accounts are not affected.',
+  errorVendorAccountShareLevelUnchanged:
+    "The account's sharing level has changed in the meantime. Refresh the view and try again.",
+  errorVendorAccountSubscriptionShareCapped:
+    'A subscription account can be shared at most as "Shared", never fully.',
+  errorVendorAccountAdminGroupRequired: 'At least one management group is required to share.',
+  errorVendorAccountAdminGroupInvalid:
+    'One of the selected management groups is invalid or may not be used.',
+  errorVendorAccountAdminGroupParentMismatch:
+    'The management groups must sit under the same system group.',
+  errorVendorAccountRootMismatch:
+    'The management groups must sit under the system group the account is already shared in.',
+  errorVendorAccountNotShared:
+    'This is only possible for a shared account. Raise the sharing level first.',
+  errorResourceGroupVendorAccountSystemGroupMismatch:
+    "The provider account must belong to the resource group's system group.",
   errorVendorAccountNotSubscription:
     'Only an account with subscription authentication can be connected to a subscription',
   errorVendorAccountConnectTokenRequired: 'An access token is required',
@@ -5466,6 +5686,12 @@ const en: PortalMessages = {
   systemVendorSubscriptionsEnabledLabel: 'Allow subscription accounts',
   systemVendorSubscriptionsEnabledNote:
     "Subscription accounts (OAuth sign-in with a ChatGPT or Claude subscription) are experimental and against the vendors' consumer terms. Off: subscription accounts can no longer be created, connected or used; existing ones are kept but cannot be used. API-key accounts are not affected.",
+  systemVendorAccountSharingEnabledLabel: 'Allow sharing of provider accounts',
+  systemVendorAccountSharingEnabledNote:
+    'Off (default): every provider account behaves as personal. Stored sharing is kept but has no effect, and the sharing controls (sharing level, management groups, resource groups) are hidden in the portal. On: administrators can share their own accounts with management groups and offer them through resource groups. Only takes effect while providers are enabled.',
+  systemVendorSubscriptionSharingEnabledLabel: 'Allow sharing of subscription accounts',
+  systemVendorSubscriptionSharingEnabledNote:
+    'Subscription accounts are experimental and against the vendors\' consumer terms; they can be shared at most as "Shared". Only takes effect while sharing of provider accounts is allowed (it cannot be changed while that is off). Off: subscription accounts cannot be shared. API-key accounts are not affected.',
   systemVendorAccountRoutingModeLabel: 'Provider routing precedence',
   systemVendorAccountRoutingModeNote:
     "Whether a user's own provider account takes precedence over self-hosted and shared servers. Only takes effect while providers are enabled.",
@@ -5530,6 +5756,7 @@ const en: PortalMessages = {
   groupsPermServers: 'Server management',
   groupsPermServices: 'Service management',
   groupsPermResources: 'Resource management',
+  groupsPermVendorAccounts: 'Provider account management',
   groupsActionRename: 'Rename',
   groupsActionMembers: 'Manage members',
   groupsActionDelete: 'Delete',

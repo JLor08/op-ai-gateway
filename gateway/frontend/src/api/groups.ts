@@ -59,6 +59,14 @@ export type UserGroup = {
   // can_manage/can_manage_users/can_manage_servers/can_manage_services.
   // Mirrors portal.UserGroupDTO.CanManageResources exactly.
   can_manage_resources: boolean;
+  // can_manage_vendor_accounts (shared vendor accounts, #183): may the caller
+  // manage the vendor-account shares of this admin-tier group -- owner | a
+  // co-manager whose stored CanManageVendorAccounts flag is set | a
+  // system_admin. Follows ONLY its own stored flag, independent of
+  // can_manage/can_manage_users/can_manage_servers/can_manage_services/
+  // can_manage_resources. Mirrors portal.UserGroupDTO.CanManageVendorAccounts
+  // exactly.
+  can_manage_vendor_accounts: boolean;
   member_count: number;
   manager_count: number;
   // Projects coupled to this group (spec 2026-08-09, coupled projects) — only
@@ -124,6 +132,11 @@ export type GroupMember = {
   // non-manager row (is_manager false). Mirrors
   // portal.UserGroupMemberDTO.CanManageResources exactly.
   can_manage_resources: boolean;
+  // can_manage_vendor_accounts (shared vendor accounts, #183): this row's
+  // stored co-manager vendor-account-sharing flag -- false for a non-manager
+  // row (is_manager false). Mirrors
+  // portal.UserGroupMemberDTO.CanManageVendorAccounts exactly.
+  can_manage_vendor_accounts: boolean;
 };
 
 // POST /api/portal/groups body.
@@ -162,6 +175,7 @@ type ManagerPerms = {
   canManageServers: boolean;
   canManageServices: boolean;
   canManageResources: boolean;
+  canManageVendorAccounts: boolean;
 };
 
 // Default for promoteManager's `perms` param -- see its comment below.
@@ -171,6 +185,7 @@ const DEFAULT_MANAGER_PERMS: ManagerPerms = {
   canManageServers: true,
   canManageServices: true,
   canManageResources: true,
+  canManageVendorAccounts: true,
 };
 
 export function groupsApi(fetcher: Fetcher) {
@@ -234,7 +249,8 @@ export function groupsApi(fetcher: Fetcher) {
     // Promotes userId to co-manager of the group, with the given initial
     // per-permission flags (spec 2026-08-10 + Phase B can_manage_servers +
     // Phase C can_manage_services + Resource Groups Phase 1
-    // can_manage_resources). Defaulting ALL FIVE to true reproduces the
+    // can_manage_resources + shared vendor accounts #183
+    // can_manage_vendor_accounts). Defaulting ALL SIX to true reproduces the
     // pre-feature "a co-manager can do everything" behavior byte-for-byte --
     // every pre-existing caller that doesn't pass a `perms` arg keeps
     // working unchanged.
@@ -248,6 +264,7 @@ export function groupsApi(fetcher: Fetcher) {
           can_manage_servers: perms.canManageServers,
           can_manage_services: perms.canManageServices,
           can_manage_resources: perms.canManageResources,
+          can_manage_vendor_accounts: perms.canManageVendorAccounts,
         },
       }),
     demoteManager: (id: string, userId: string) =>
@@ -259,7 +276,8 @@ export function groupsApi(fetcher: Fetcher) {
     // Narrows/widens an EXISTING co-manager's per-permission flags (owner/
     // system_admin only, spec 2026-08-10 + Phase B can_manage_servers +
     // Phase C can_manage_services + Resource Groups Phase 1
-    // can_manage_resources) -- never promotes; the userId must already hold
+    // can_manage_resources + shared vendor accounts #183
+    // can_manage_vendor_accounts) -- never promotes; the userId must already hold
     // a co-manager row on the group, else the backend rejects with
     // group.candidate_invalid (400).
     setManagerPermissions: (
@@ -271,6 +289,7 @@ export function groupsApi(fetcher: Fetcher) {
         canManageServers: boolean;
         canManageServices: boolean;
         canManageResources: boolean;
+        canManageVendorAccounts: boolean;
       },
     ) =>
       request<{ ok: boolean }>(
@@ -284,6 +303,7 @@ export function groupsApi(fetcher: Fetcher) {
             can_manage_servers: perms.canManageServers,
             can_manage_services: perms.canManageServices,
             can_manage_resources: perms.canManageResources,
+            can_manage_vendor_accounts: perms.canManageVendorAccounts,
           },
         },
       ),

@@ -20,9 +20,10 @@ import (
 )
 
 // Subscription connect: how a user attaches a consumer subscription (Anthropic
-// Claude Pro/Max, OpenAI ChatGPT/Codex) to their OWN vendor account. Two paths
-// end in the same place -- a sealed vendorauth.TokenSet in the account's
-// OAuthTokens, with the account active:
+// Claude Pro/Max, OpenAI ChatGPT/Codex) to a vendor account whose credential they
+// may manage: their own, or a shared one only at `full` (see
+// connectableVendorAccount). Two paths end in the same place -- a sealed
+// vendorauth.TokenSet in the account's OAuthTokens, with the account active:
 //
 //   - ConnectVendorAccountImport: the user pastes tokens they already hold (for
 //     example from a CLI's credential file).
@@ -124,27 +125,35 @@ func vendorConnectExpired(p pendingVendorConnect, now time.Time) bool {
 	return now.Sub(p.createdAt) > vendorConnectPendingTTL
 }
 
-// connectableVendorAccount is the gate every connect method runs: the master
-// flag first, then OWNER-ONLY authorization (a stranger and an unknown id are
-// both ErrVendorAccountNotFound, even for a body that is invalid anyway), then
-// the subscription-only check, then the vendor_subscriptions_enabled switch
-// (ErrVendorSubscriptionsDisabled while it is off). It returns the freshly loaded
-// account.
+// connectableVendorAccount is the gate every connect method runs (token import,
+// code-paste begin and complete, device begin and poll; a RE-connect of an already
+// connected account is the same call): the master flag first, then the CREDENTIAL
+// gate (authorizeVendorAccountCredential: the owner, or a CM of a `full` account;
+// a CM of a `shared` account is ErrVendorAccountForbidden, and a stranger, system
+// scope and an unknown id are all ErrVendorAccountNotFound, even for a body that is
+// invalid anyway), then the subscription-only check, then the
+// vendor_subscriptions_enabled switch (ErrVendorSubscriptionsDisabled while it is
+// off). It returns the freshly loaded account. It is the ONLY authorization of
+// the connect family, so a new connect method must come through it.
 func (s *Service) connectableVendorAccount(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return routing.VendorAccount{}, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
+		return routing.VendorAccount{}, err
+	}
+	if err := s.authorizeVendorAccountCredential(ctx, principal, acc); err != nil {
 		return routing.VendorAccount{}, err
 	}
 	if acc.AuthType != routing.VendorAuthSubscription {
 		return routing.VendorAccount{}, ErrVendorAccountNotSubscription
 	}
 	// vendor_subscriptions_enabled: while off, no connect flow (token import,
-	// code-paste, device) may run. Checked after the owner and subscription-only
-	// checks, so a stranger or an unknown id is still a not-found and an api_key
-	// account still "not a subscription account" (the switch masks neither).
+	// code-paste, device) may run. Checked after the credential-gate and
+	// subscription-only checks, so a stranger or an unknown id is still a not-found
+	// and an api_key account still "not a subscription account" (the switch masks
+	// neither).
 	if !s.VendorSubscriptionsEnabled(ctx) {
 		return routing.VendorAccount{}, ErrVendorSubscriptionsDisabled
 	}
@@ -177,7 +186,7 @@ func (s *Service) requireVendorTokensSealable() error {
 // active subscription account and writes it. The token set is sealed BEFORE the
 // store write, so a keyless disk store fails with ErrVendorAccountConnectKeyRequired
 // and persists nothing (never plaintext).
-func (s *Service) persistVendorTokens(ctx context.Context, acc routing.VendorAccount, ts vendorauth.TokenSet) (VendorAccountDTO, error) {
+func (s *Service) persistVendorTokens(ctx context.Context, principal auth.Token, acc routing.VendorAccount, ts vendorauth.TokenSet) (VendorAccountDTO, error) {
 	sealed, err := vendorauth.SealTokenSet(s.cipher, s.settingsVolatile, ts)
 	if err != nil {
 		return VendorAccountDTO{}, vendorSealError(err)
@@ -192,7 +201,7 @@ func (s *Service) persistVendorTokens(ctx context.Context, acc routing.VendorAcc
 		}
 		return VendorAccountDTO{}, err
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	return s.vendorAccountDTO(ctx, principal, acc)
 }
 
 // ConnectVendorAccountImportRequest carries the tokens of a token import. Both
@@ -225,7 +234,8 @@ type ConnectVendorAccountImportRequest struct {
 // dispatch needs the account id for the chatgpt-account-id header. Once the tokens
 // are stored a best-effort model discovery runs (discoverAfterConnect), so the
 // account serves the models the vendor reports instead of the static seed; it can
-// never fail the import. The write is OWNER-ONLY and the response is the
+// never fail the import. The write needs the credential gate (see
+// connectableVendorAccount) and the response is the
 // credential-free DTO (SubscriptionConnected=true, never a token, with the
 // discovered models when the discovery produced any). ErrVendorAccountsDisabled
 // while the master flag is off and ErrVendorSubscriptionsDisabled while
@@ -253,7 +263,7 @@ func (s *Service) ConnectVendorAccountImport(ctx context.Context, principal auth
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	dto, err := s.persistVendorTokens(ctx, acc, ts)
+	dto, err := s.persistVendorTokens(ctx, principal, acc, ts)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -289,9 +299,9 @@ func importedTokenSet(vendor, access string, req ConnectVendorAccountImportReque
 // and puts only the challenge and the state on the URL. A second begin for the
 // same account replaces the first. A store that cannot seal the eventual token
 // set (a keyless disk store) fails here, before the user signs in, with
-// ErrVendorAccountConnectKeyRequired. OWNER-ONLY; ErrVendorAccountsDisabled while
-// the master flag is off and ErrVendorSubscriptionsDisabled while
-// vendor_subscriptions_enabled is off.
+// ErrVendorAccountConnectKeyRequired. Credential gate (see
+// connectableVendorAccount); ErrVendorAccountsDisabled while the master flag is off
+// and ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
 func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.Token, accountID string) (string, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -345,7 +355,8 @@ func (s *Service) BeginVendorAccountConnect(ctx context.Context, principal auth.
 // (ErrVendorAccountConnectKeyRequired) never costs the user their one-time code.
 // Once the tokens are stored a best-effort model discovery runs (see
 // ConnectVendorAccountImport); it never fails the connect.
-// OWNER-ONLY; ErrVendorAccountsDisabled while the master flag is off and
+// Credential gate (see connectableVendorAccount), checked again after the exchange;
+// ErrVendorAccountsDisabled while the master flag is off and
 // ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
 func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal auth.Token, accountID, codeAndState string) (VendorAccountDTO, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, accountID)
@@ -379,7 +390,7 @@ func (s *Service) CompleteVendorAccountConnect(ctx context.Context, principal au
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	dto, err := s.persistVendorTokens(ctx, acc, ts)
+	dto, err := s.persistVendorTokens(ctx, principal, acc, ts)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}

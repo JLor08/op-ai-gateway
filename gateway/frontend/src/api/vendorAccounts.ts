@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import type { AdminGroupCandidate } from './groups';
 import { type Fetcher, request } from './transport';
 
 // Vendor accounts ("Anbieter"): a per-user external AI vendor account -- a
 // plain API key today, a consumer-subscription OAuth connection later. Every
-// authenticated user manages only their OWN accounts (the backend answers 404,
-// never 403, for somebody else's id). Field names mirror
+// authenticated user manages their OWN accounts; an owner may also share one
+// (share_level, see below), and then its co-managers read and operate it and
+// the members of a resource group it is linked to read a minimal view. For a
+// stranger the backend answers 404, never 403, for the id. Field names mirror
 // portal.VendorAccountDTO / CreateVendorAccountRequest /
 // UpdateVendorAccountRequest exactly, field-for-field
 // (internal/portal/service_vendor_accounts.go); the routes and response shapes
@@ -48,6 +51,11 @@ export type VendorAccountAuthType = 'api_key' | 'subscription';
 // needs_reconnect is system-managed (a failed subscription token refresh); a
 // user can only ever set active or disabled.
 export type VendorAccountStatus = 'active' | 'disabled' | 'needs_reconnect';
+// How far an account is shared (portal.VendorAccountDTO.ShareLevel): `none` is
+// personal (owner-only), `shared` lets the co-managers of its management groups
+// read and operate it, `full` also delegates its credential and sharing to them.
+// The backend reports the STORED level and an unrecognised stored value as `none`.
+export type VendorAccountShareLevel = 'none' | 'shared' | 'full';
 
 // One gateway model an account serves -- mirrors portal.VendorAccountModelDTO.
 // gateway_model is the id a client requests at the gateway: the account's
@@ -120,7 +128,37 @@ export type VendorAccount = {
   usage?: VendorAccountUsage;
   created_at: string;
   updated_at: string;
+  // Sharing (spec 2026-10-15 sections 6 and 10). The DTO is rendered FOR the
+  // viewer, and it is credential-free for every viewer: a co-manager (CM) of a
+  // shared account receives exactly these fields with is_owner false, never the
+  // owner's secret (only the api_key_set / subscription_connected booleans above).
+  //
+  // A MEMBER -- somebody who can only route to the account through a resource
+  // group -- reads a MINIMAL view of it: share_level "" (withheld, which is NOT
+  // `none`), admin_groups [], system_group_id / system_group_name "", base_url "",
+  // no usage, each model's upstream_model "" and both timestamps the zero time
+  // ("0001-01-01T00:00:00Z"). is_owner is false and shared_by names the owner.
+  // vendorAccountAccess (components/shared) is the one place that tells the views
+  // apart; nothing renders a withheld field.
+  share_level: VendorAccountShareLevel | '';
+  // The management groups (id + name; always an array, [] when the account is not
+  // shared) and their parent system group, the containment root ("" / "" when
+  // there is none; the name is a best-effort lookup).
+  admin_groups: { id: string; name: string }[];
+  system_group_id: string;
+  system_group_name: string;
+  // Whether the viewer owns the account; shared_by is the owner's display name
+  // for a viewer who does not ("" for the owner, or when the name is unknown).
+  is_owner: boolean;
+  shared_by: string;
 };
+
+// One resource group the OWNER of a shared account may enter it into (spec
+// 2026-10-15 section 9): id + name + whether the account is currently in it.
+// Mirrors portal.VendorAccountResourceGroupDTO. Drives the owner's "Resource
+// groups" join/leave section in the Anbieter detail; never exposes any other
+// server, account or target of the resource group.
+export type VendorAccountResourceGroup = { id: string; name: string; member: boolean };
 
 // POST /api/portal/vendor-accounts body. status defaults to active when
 // omitted/empty; api_key is only meaningful (and only accepted) for an api_key
@@ -255,16 +293,26 @@ export function vendorAccountsApi(fetcher: Fetcher) {
     // system switch (on by default) the same way, so every user's Anbieter page
     // can flag its subscription accounts without the system-scoped settings read.
     // Optional on the wire: a response without it means the switch is on.
+    //
+    // sharing_enabled mirrors the vendor_account_sharing_enabled master switch the
+    // same way (#183), so the Anbieter page and the resource-group manager can hide
+    // the controls that create or change sharing without the system-scoped settings
+    // read. Sharing is opt-in, so a response without it means the switch is OFF.
     vendorAccountsEnabled: () =>
-      request<{ module_enabled: boolean; subscriptions_enabled?: boolean }>(
-        fetcher,
-        '/api/portal/vendor-accounts/enabled',
-      ),
-    // The caller's OWN accounts, oldest first -- system scope does not widen
-    // the list (the page is a personal one and the DTO carries no owner).
+      request<{
+        module_enabled: boolean;
+        subscriptions_enabled?: boolean;
+        sharing_enabled?: boolean;
+      }>(fetcher, '/api/portal/vendor-accounts/enabled'),
+    // The accounts the caller OWNS, then the ones they manage as a co-manager of a
+    // shared account, then the ones they can only route to as a member (each arm
+    // oldest first; a member row is the minimal view -- see VendorAccount). System
+    // scope does not widen the list (the page is a personal one).
     vendorAccounts: () =>
       request<{ data: VendorAccount[] }>(fetcher, '/api/portal/vendor-accounts'),
-    // One account of the caller (404 for anybody else's id).
+    // One account the caller may read, in the view their tier earns -- the owner's,
+    // a co-manager's (key-free, is_owner false) or a member's minimal one (404 for a
+    // stranger's id).
     vendorAccount: (id: string) =>
       request<VendorAccount>(fetcher, `/api/portal/vendor-accounts/${encodeURIComponent(id)}`),
     createVendorAccount: (body: CreateVendorAccountRequest) =>
@@ -278,6 +326,83 @@ export function vendorAccountsApi(fetcher: Fetcher) {
       request<{ ok: boolean }>(fetcher, `/api/portal/vendor-accounts/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       }),
+    // Moves an account to `level` (PUT .../share-level; the share-level lifecycle of
+    // spec 2026-10-15 section 7). The backend compares it with the stored level and
+    // runs the one or the other: a RAISE (none -> shared -> full) is owner + a current
+    // admin role and always carries >= 1 management group in `adminGroupIds` (a
+    // subscription account only to `shared`); a LOWER (to `shared` from `full`, or to
+    // `none`) is the credential gate -- the owner always, a CM at `full` -- and ignores
+    // the groups, so the portal leaves them out. Lowering to `none` also removes the
+    // management groups, the resource-group links and the containment root. Answers
+    // the credential-free account as the caller now reads it. 409
+    // vendor_accounts.sharing_disabled while the sharing switch is off (it is by
+    // default); a stranger gets the 404 of an unknown id, a caller who can see the
+    // account but may not do this a 403.
+    setVendorAccountShareLevel: (
+      id: string,
+      level: VendorAccountShareLevel,
+      adminGroupIds?: string[],
+    ) =>
+      request<VendorAccount>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/share-level`,
+        {
+          method: 'PUT',
+          body: adminGroupIds === undefined ? { level } : { level, admin_group_ids: adminGroupIds },
+        },
+      ),
+    // Replaces the management groups of an account that is already shared (PUT
+    // .../admin-groups): the owner at `shared`, the owner or a CM at `full`. >= 1
+    // group, each one the caller may name, all under the account's immutable
+    // containment root (400 vendor_account.root_mismatch otherwise). Answers the
+    // credential-free account. Mirrors setServerAdminGroups.
+    setVendorAccountAdminGroups: (id: string, groupIds: string[]) =>
+      request<VendorAccount>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/admin-groups`,
+        {
+          method: 'PUT',
+          body: { admin_group_ids: groupIds },
+        },
+      ),
+    // The admin-tier groups the caller may name as management groups: system scope ->
+    // every admin-tier group; anyone else -> the groups they manage vendor accounts
+    // through (can_manage_vendor_accounts), so a plain user gets []. Each carries its
+    // parent system group, the account's future containment root. Drives the raise
+    // picker and the management-group editor; mirrors serverAdminGroupCandidates.
+    vendorAccountAdminGroupCandidates: () =>
+      request<{ data: AdminGroupCandidate[] }>(
+        fetcher,
+        '/api/portal/vendor-account-admin-group-candidates',
+      ).then((r) => r.data),
+    // Owner self-service resource-group link (spec 2026-10-15 section 9; the
+    // vendor-account analogue of the server-owner trio in api/servers.ts): the
+    // OWNER of a `shared` or `full` account lists the resource groups linked to an
+    // admin group they are a MEMBER of and whose root is the account's (each with a
+    // `member` flag) and joins/leaves their OWN account. Neither admin nor
+    // resource-management permission required. A caller who is not the owner gets
+    // the 403/404 of the account, a private account a 400
+    // vendor_account.not_shared; a join under another root is a 400
+    // resource_group.vendor_account_system_group_mismatch. Join and leave are
+    // idempotent and write only this account's own link row. All three are a 409
+    // while the vendor-accounts module or the sharing switch is off.
+    vendorAccountResourceGroups: (id: string) =>
+      request<{ data: VendorAccountResourceGroup[] }>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/resource-groups`,
+      ).then((r) => r.data),
+    joinVendorAccountResourceGroup: (id: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/resource-groups/${encodeURIComponent(rgId)}`,
+        { method: 'PUT' },
+      ),
+    leaveVendorAccountResourceGroup: (id: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/resource-groups/${encodeURIComponent(rgId)}`,
+        { method: 'DELETE' },
+      ),
     // The explicit "test connection": the backend opens the account's stored
     // credential and asks the vendor whether it is accepted, answering 200 with
     // the credential-free verdict whichever way it came out (a rejected credential

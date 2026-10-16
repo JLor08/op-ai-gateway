@@ -33,6 +33,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       can_manage_servers: false,
       can_manage_services: false,
       can_manage_resources: false,
+      can_manage_vendor_accounts: false,
       member_count: 0,
       manager_count: 0,
       ...overrides,
@@ -48,6 +49,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       role?: string;
       userId?: string;
       systemAdminMode?: boolean;
+      // The vendor_account_sharing_enabled master flag as the shell reads it; on
+      // unless a test turns it off, so the provider-accounts column is there.
+      sharingEnabled?: boolean;
       overrides?: Partial<PortalApi>;
     } = {},
   ) {
@@ -96,6 +100,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           role={opts.role ?? 'user'}
           userId={opts.userId ?? 'usr_1'}
           systemAdminMode={opts.systemAdminMode ?? false}
+          vendorAccountSharingEnabled={opts.sharingEnabled ?? true}
         />
       </ToastProvider>,
     );
@@ -342,6 +347,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       can_manage_servers: false,
       can_manage_services: false,
       can_manage_resources: false,
+      can_manage_vendor_accounts: false,
       ...overrides,
     };
   }
@@ -569,9 +575,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   });
 
   // Per-Admin-Group co-manager permissions (spec 2026-08-10 + Phase B + Phase
-  // C + Resource Groups Phase 1, spec 2026-08-11): the FIVE roster-table
-  // permission checkboxes (Benutzer-Verwaltung / Gruppen-Änderung /
-  // Server-Verwaltung / Dienst-Verwaltung / Ressourcen-Verwaltung).
+  // C + Resource Groups Phase 1, spec 2026-08-11 + shared vendor accounts,
+  // #183): the SIX roster-table permission checkboxes (Benutzer-Verwaltung /
+  // Gruppen-Änderung / Server-Verwaltung / Dienst-Verwaltung /
+  // Ressourcen-Verwaltung / Anbieter-Konten-Verwaltung).
   function permRoster(): GroupMember[] {
     return [
       makeMember({ user_id: 'usr_owner', display_name: 'Owner Person', is_owner: true }),
@@ -584,13 +591,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         can_manage_servers: true,
         can_manage_services: true,
         can_manage_resources: true,
+        can_manage_vendor_accounts: false,
       }),
       makeMember({ user_id: 'usr_plain', display_name: 'Plain Person' }),
     ];
   }
 
   describe(`GroupsView per-manager permission controls [${locale}]`, () => {
-    it("owner: sees the co-manager row's five permission checkboxes as editable, and toggling one PATCHes all five flags (carrying over the untouched four)", async () => {
+    it("owner: sees the co-manager row's six permission checkboxes as editable, and toggling one PATCHes all six flags (carrying over the untouched five)", async () => {
       const { fakeApi } = renderGroupsView({
         role: 'user',
         landscape: makeOwnedGroupLandscape(),
@@ -615,6 +623,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const resourcesBox = screen.getByRole('checkbox', {
         name: `${t.groupsPermResources} – Manager Person`,
       });
+      const vendorAccountsBox = screen.getByRole('checkbox', {
+        name: `${t.groupsPermVendorAccounts} – Manager Person`,
+      });
       expect(usersBox).toBeEnabled();
       expect(usersBox).toBeChecked();
       expect(groupBox).toBeEnabled();
@@ -625,10 +636,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(servicesBox).toBeChecked();
       expect(resourcesBox).toBeEnabled();
       expect(resourcesBox).toBeChecked();
+      expect(vendorAccountsBox).toBeEnabled();
+      expect(vendorAccountsBox).not.toBeChecked();
 
       // Toggling ONLY the group-changes checkbox must still send the CURRENT
       // (unchanged) can_manage_users/can_manage_servers/can_manage_services/
-      // can_manage_resources values -- the PATCH has no partial update.
+      // can_manage_resources/can_manage_vendor_accounts values -- the PATCH
+      // has no partial update.
       fireEvent.click(groupBox);
       await waitFor(() =>
         expect(fakeApi.setManagerPermissions).toHaveBeenCalledWith('ugrp_1', 'usr_manager', {
@@ -637,6 +651,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           canManageServers: true,
           canManageServices: true,
           canManageResources: true,
+          canManageVendorAccounts: false,
         }),
       );
 
@@ -648,10 +663,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
 
     // Toggling the THIRD (servers) checkbox specifically -- proves the Phase
-    // B column reaches setManagerPermissions with all five flags, carrying
-    // over the four untouched ones (users=true, group=false, services=true,
-    // resources=true).
-    it('owner: toggling the servers checkbox PATCHes all five flags, carrying over the untouched four', async () => {
+    // B column reaches setManagerPermissions with all six flags, carrying
+    // over the five untouched ones (users=true, group=false, services=true,
+    // resources=true, vendor_accounts=false).
+    it('owner: toggling the servers checkbox PATCHes all six flags, carrying over the untouched five', async () => {
       const { fakeApi } = renderGroupsView({
         role: 'user',
         landscape: makeOwnedGroupLandscape(),
@@ -673,15 +688,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           canManageServers: false,
           canManageServices: true,
           canManageResources: true,
+          canManageVendorAccounts: false,
         }),
       );
     });
 
     // Toggling the FOURTH (services) checkbox specifically -- proves the
-    // Phase C column reaches setManagerPermissions with all five flags,
-    // carrying over the four untouched ones (users=true, group=false,
-    // servers=true, resources=true).
-    it('owner: toggling the services checkbox PATCHes all five flags, carrying over the untouched four', async () => {
+    // Phase C column reaches setManagerPermissions with all six flags,
+    // carrying over the five untouched ones (users=true, group=false,
+    // servers=true, resources=true, vendor_accounts=false).
+    it('owner: toggling the services checkbox PATCHes all six flags, carrying over the untouched five', async () => {
       const { fakeApi } = renderGroupsView({
         role: 'user',
         landscape: makeOwnedGroupLandscape(),
@@ -703,15 +719,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           canManageServers: true,
           canManageServices: false,
           canManageResources: true,
+          canManageVendorAccounts: false,
         }),
       );
     });
 
     // Toggling the FIFTH (resources) checkbox specifically -- proves the new
     // Resource Groups Phase 1 column reaches setManagerPermissions with all
-    // five flags, carrying over the four untouched ones (users=true,
-    // group=false, servers=true, services=true).
-    it('owner: toggling the resources checkbox PATCHes all five flags, carrying over the untouched four', async () => {
+    // six flags, carrying over the five untouched ones (users=true,
+    // group=false, servers=true, services=true, vendor_accounts=false).
+    it('owner: toggling the resources checkbox PATCHes all six flags, carrying over the untouched five', async () => {
       const { fakeApi } = renderGroupsView({
         role: 'user',
         landscape: makeOwnedGroupLandscape(),
@@ -733,6 +750,161 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           canManageServers: true,
           canManageServices: true,
           canManageResources: false,
+          canManageVendorAccounts: false,
+        }),
+      );
+    });
+
+    // Toggling the SIXTH (vendor accounts) checkbox specifically -- proves the
+    // shared-vendor-accounts column (#183) renders as its own labelled column
+    // in the managers table and that its toggle reaches setManagerPermissions
+    // as canManageVendorAccounts=true, carrying over the five untouched ones
+    // (users=true, group=false, servers=true, services=true, resources=true).
+    it('owner: renders the vendor-accounts column and toggling it PATCHes all six flags, carrying over the untouched five', async () => {
+      const { fakeApi } = renderGroupsView({
+        role: 'user',
+        landscape: makeOwnedGroupLandscape(),
+        overrides: { groupMembers: vi.fn(async () => permRoster()) },
+      });
+
+      await openMembers();
+      await screen.findByText('Manager Person');
+
+      expect(
+        screen.getByRole('columnheader', { name: new RegExp(t.groupsPermVendorAccounts) }),
+      ).toBeInTheDocument();
+
+      const vendorAccountsBox = screen.getByRole('checkbox', {
+        name: `${t.groupsPermVendorAccounts} – Manager Person`,
+      });
+      expect(vendorAccountsBox).not.toBeChecked();
+      fireEvent.click(vendorAccountsBox);
+      await waitFor(() =>
+        expect(fakeApi.setManagerPermissions).toHaveBeenCalledWith('ugrp_1', 'usr_manager', {
+          canManageUsers: true,
+          canManageGroup: false,
+          canManageServers: true,
+          canManageServices: true,
+          canManageResources: true,
+          canManageVendorAccounts: true,
+        }),
+      );
+    });
+
+    // Carry-over of a TRUE vendor-accounts value. permRoster()'s manager has
+    // can_manage_vendor_accounts=false, so on its own it cannot tell a real
+    // carry-over from a hard-coded false. Here the co-manager HOLDS the flag
+    // and the admin toggles a DIFFERENT checkbox (servers): the PATCH must
+    // still send canManageVendorAccounts=true, or toggling any other facet
+    // would silently strip the co-manager's vendor-account permission. The
+    // other five values are deliberately mixed (not all true) so no flag can
+    // be defaulted without the assertion noticing.
+    it('owner: toggling another flag carries over a TRUE can_manage_vendor_accounts (the PATCH must not drop it)', async () => {
+      const { fakeApi } = renderGroupsView({
+        role: 'user',
+        landscape: makeOwnedGroupLandscape(),
+        overrides: {
+          groupMembers: vi.fn(async () => [
+            makeMember({ user_id: 'usr_owner', display_name: 'Owner Person', is_owner: true }),
+            makeMember({
+              user_id: 'usr_vendor_manager',
+              display_name: 'Vendor Manager',
+              is_manager: true,
+              can_manage_users: false,
+              can_manage_group: true,
+              can_manage_servers: false,
+              can_manage_services: true,
+              can_manage_resources: false,
+              can_manage_vendor_accounts: true,
+            }),
+          ]),
+        },
+      });
+
+      await openMembers();
+      await screen.findByText('Vendor Manager');
+
+      const vendorAccountsBox = screen.getByRole('checkbox', {
+        name: `${t.groupsPermVendorAccounts} – Vendor Manager`,
+      });
+      expect(vendorAccountsBox).toBeChecked();
+
+      const serversBox = screen.getByRole('checkbox', {
+        name: `${t.groupsPermServers} – Vendor Manager`,
+      });
+      expect(serversBox).not.toBeChecked();
+      fireEvent.click(serversBox);
+      await waitFor(() =>
+        expect(fakeApi.setManagerPermissions).toHaveBeenCalledWith('ugrp_1', 'usr_vendor_manager', {
+          canManageUsers: false,
+          canManageGroup: true,
+          canManageServers: true,
+          canManageServices: true,
+          canManageResources: false,
+          canManageVendorAccounts: true,
+        }),
+      );
+    });
+
+    // Spec 2026-10-15 section 13: while vendor-account sharing is off the Groups UI
+    // hides the provider-accounts permission column (it only matters once accounts can
+    // be shared). The other five columns stay, and the hidden column's STORED value is
+    // still carried over by every other toggle, so hiding never strips a permission.
+    it('owner: hides the vendor-accounts column while sharing is off, keeps the other five and carries the stored value over', async () => {
+      const { fakeApi } = renderGroupsView({
+        role: 'user',
+        landscape: makeOwnedGroupLandscape(),
+        sharingEnabled: false,
+        overrides: {
+          groupMembers: vi.fn(async () => [
+            makeMember({ user_id: 'usr_owner', display_name: 'Owner Person', is_owner: true }),
+            makeMember({
+              user_id: 'usr_vendor_manager',
+              display_name: 'Vendor Manager',
+              is_manager: true,
+              can_manage_users: false,
+              can_manage_group: true,
+              can_manage_servers: false,
+              can_manage_services: true,
+              can_manage_resources: false,
+              can_manage_vendor_accounts: true,
+            }),
+          ]),
+        },
+      });
+
+      await openMembers();
+      await screen.findByText('Vendor Manager');
+
+      expect(
+        screen.queryByRole('columnheader', { name: new RegExp(t.groupsPermVendorAccounts) }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('checkbox', { name: `${t.groupsPermVendorAccounts} – Vendor Manager` }),
+      ).not.toBeInTheDocument();
+      // The five others are still there, and toggling one still sends the stored TRUE.
+      for (const label of [
+        t.groupsPermUsers,
+        t.groupsPermGroup,
+        t.groupsPermServers,
+        t.groupsPermServices,
+        t.groupsPermResources,
+      ]) {
+        expect(
+          screen.getByRole('checkbox', { name: `${label} – Vendor Manager` }),
+        ).toBeInTheDocument();
+      }
+      fireEvent.click(
+        screen.getByRole('checkbox', { name: `${t.groupsPermServers} – Vendor Manager` }),
+      );
+      await waitFor(() =>
+        expect(fakeApi.setManagerPermissions).toHaveBeenCalledWith('ugrp_1', 'usr_vendor_manager', {
+          canManageUsers: false,
+          canManageGroup: true,
+          canManageServers: true,
+          canManageServices: true,
+          canManageResources: false,
+          canManageVendorAccounts: true,
         }),
       );
     });
@@ -779,6 +951,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const resourcesBox = screen.getByRole('checkbox', {
         name: `${t.groupsPermResources} – Manager Person`,
       });
+      const vendorAccountsBox = screen.getByRole('checkbox', {
+        name: `${t.groupsPermVendorAccounts} – Manager Person`,
+      });
       expect(usersBox).toBeDisabled();
       expect(usersBox).toBeChecked();
       expect(groupBox).toBeDisabled();
@@ -789,11 +964,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(servicesBox).toBeChecked();
       expect(resourcesBox).toBeDisabled();
       expect(resourcesBox).toBeChecked();
+      expect(vendorAccountsBox).toBeDisabled();
+      expect(vendorAccountsBox).not.toBeChecked();
 
       fireEvent.click(usersBox);
       fireEvent.click(serversBox);
       fireEvent.click(servicesBox);
       fireEvent.click(resourcesBox);
+      fireEvent.click(vendorAccountsBox);
       expect(fakeApi.setManagerPermissions).not.toHaveBeenCalled();
     });
 
@@ -837,6 +1015,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           canManageServers: true,
           canManageServices: true,
           canManageResources: true,
+          canManageVendorAccounts: false,
         }),
       );
     });

@@ -122,6 +122,9 @@ var migrations = []migration{
 	{version: 87, name: "chat_blobs", up: migration87Up},
 	{version: 88, name: "token_claude_model_aliases", up: migration88Up},
 	{version: 89, name: "token_claude_effort_compatibility", up: migration89Up},
+	{version: 90, name: "user_group_managers_can_manage_vendor_accounts", up: migration90Up},
+	{version: 91, name: "vendor_account_admin_groups", up: migration91Up},
+	{version: 92, name: "resource_group_vendor_accounts", up: migration92Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4039,4 +4042,121 @@ func migration88Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // the upgrade changes no behavior. addColumnIfMissing keeps it re-runnable.
 func migration89Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_effort_compatibility integer not null default 0")
+}
+
+// migration90Up adds user_group_managers.can_manage_vendor_accounts (shared
+// vendor accounts via resource groups, #183 Phase 2) — the SIXTH per-admin-group
+// co-manager flag, `integer not null default 1` — mirrors migration49Up and
+// migration53Up exactly (same table, same default-1 rationale: a co-manager row
+// that predates this migration, and a brand-new row inserted by
+// SetUserGroupManager [which does not name this column either], both pick up
+// the default of "full co-manager rights", so no existing co-manager is
+// narrowed on the day the flag lands, until a later Phase 1 task starts
+// consuming it). The default is deliberately 1 and not the 0 of the opt-in
+// token flags in migrations 88/89: like every sibling can_manage_* column this
+// is a co-manager permission, not a feature switch. Additive,
+// duplicate-tolerant, both dialects through addColumnIfMissing.
+func migration90Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "user_group_managers", "can_manage_vendor_accounts integer not null default 1")
+}
+
+// migration91Up adds the schema that makes a vendor account shareable (shared
+// vendor accounts via resource groups, #183 Phase 2). It mirrors the AI-server
+// sharing schema of migration50Up column for column — vendor_accounts takes
+// the place of ai_servers — and is schema only: no store accessor, DTO field or
+// sharing logic consumes any of it yet.
+//
+//   - vendor_accounts.share_level, `text not null default 'none'`: an account is
+//     private until someone explicitly shares it, so every row that predates
+//     this migration (and every row inserted by a writer that does not name the
+//     column) is 'none' purely from the DEFAULT — no data step, no behavior
+//     change on the day it lands.
+//   - vendor_accounts.system_group_id, `text not null` defaulting to the empty
+//     string: the immutable containment root, declared exactly like
+//     ai_servers.system_group_id (same type, same empty default). It stays empty
+//     until the account is shared and assigned a root; like its sibling it is a
+//     plain text column, not a foreign key.
+//   - vendor_account_admin_groups: the account's management groups, shaped like
+//     server_admin_groups. Both sides are REAL foreign keys declared ON DELETE
+//     CASCADE — deleting a vendor account drops its group links, and deleting a
+//     user group drops its account links — enforced by both SQL dialects;
+//     unique(vendor_account_id, group_id) makes a link idempotent, and the
+//     group_id index serves the reverse lookup (which accounts does this group
+//     manage), the one the unique pair's implicit index does not cover.
+//
+// created_at uses dl.timestampType() — migration50Up's choice, and the one that
+// keeps postgres on timestamptz rather than a narrower type. Additive and
+// replayable on both dialects: the columns go through addColumnIfMissing and
+// the table and index are create-if-not-exists, so a second run changes
+// nothing.
+func migration91Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, colDef := range []string{
+		"share_level text not null default 'none'",
+		"system_group_id text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "vendor_accounts", colDef); err != nil {
+			return err
+		}
+	}
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists vendor_account_admin_groups (
+			vendor_account_id text not null,
+			group_id text not null,
+			created_at ` + ts + ` not null,
+			unique(vendor_account_id, group_id),
+			foreign key(vendor_account_id) references vendor_accounts(id) on delete cascade,
+			foreign key(group_id) references user_groups(id) on delete cascade
+		)`,
+		`create index if not exists idx_vendor_account_admin_groups_group on vendor_account_admin_groups(group_id)`,
+	}
+	for _, s := range stmts {
+		if err := execTx(ctx, tx, dl, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration92Up creates resource_group_vendor_accounts, the link table that
+// records which vendor accounts are provisioned into a resource group (shared
+// vendor accounts via resource groups, #183 Phase 2). It is the vendor-account
+// twin of resource_group_servers from migration54Up — vendor_accounts takes the
+// place of ai_servers — and is schema only: no store accessor, DTO field or
+// routing eligibility check reads it yet.
+//
+// Both sides are REAL foreign keys declared ON DELETE CASCADE, enforced by both
+// SQL dialects: deleting a resource group drops its vendor-account links, and
+// deleting a vendor account drops its resource-group links, each side leaving
+// the other parent untouched. unique(resource_group_id, vendor_account_id) makes
+// a link idempotent, and the vendor_account_id index serves the reverse lookup
+// (which resource groups hold this account), the one the unique pair's implicit
+// index — led by resource_group_id — does not cover. The index is named by
+// migration54Up's rule, idx_<table>_<column without _id>.
+//
+// Like resource_group_servers, the table has no baseline predecessor: it is
+// created SOLELY by this migration, on every database, fresh or upgrading (a
+// fresh install runs v1..v91 first, so resource_groups and vendor_accounts
+// already exist). created_at uses dl.timestampType(), migration54Up's choice,
+// which keeps postgres on timestamptz. Create-if-not-exists on the table and
+// the index make a second run change nothing.
+func migration92Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists resource_group_vendor_accounts (
+			resource_group_id text not null,
+			vendor_account_id text not null,
+			created_at ` + ts + ` not null,
+			unique(resource_group_id, vendor_account_id),
+			foreign key(resource_group_id) references resource_groups(id) on delete cascade,
+			foreign key(vendor_account_id) references vendor_accounts(id) on delete cascade
+		)`,
+		`create index if not exists idx_resource_group_vendor_accounts_vendor_account on resource_group_vendor_accounts(vendor_account_id)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

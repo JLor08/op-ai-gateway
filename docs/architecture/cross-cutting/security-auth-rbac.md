@@ -648,19 +648,23 @@ any number of **managers**, and any number of plain **members**:
 - The **owner** (or a `system`-scope caller) is the only one who may promote/
   demote managers, transfer ownership, or change a manager's permission
   flags.
-- A **manager** (`user_group_managers` row) carries five independent boolean
+- A **manager** (`user_group_managers` row) carries six independent boolean
   permission flags — `can_manage_users`, `can_manage_group`,
-  `can_manage_servers`, `can_manage_services`, `can_manage_resources` — not a
-  bitmask, five separate columns, each defaulting to `true` for a new
+  `can_manage_servers`, `can_manage_services`, `can_manage_resources`,
+  `can_manage_vendor_accounts` — not a
+  bitmask, six separate columns, each defaulting to `true` for a new
   manager row.
 - A plain **member** has no management capability at all.
 
 An `admin`-tier group can then be **linked** to a specific resource — an AI
 server (`server_admin_groups`), a service account
-(`service_admin_groups`), or a resource group
-(`resource_group_admin_groups`) — and any owner/manager of that group with
+(`service_admin_groups`), a resource group
+(`resource_group_admin_groups`), or a shared vendor account
+(`vendor_account_admin_groups`) — and any owner/manager of that group with
 the matching `can_manage_*` flag gets owner-equivalent rights **on that one
-resource**, without needing the `admin` scope at all. This is deliberately
+resource**, without needing the `admin` scope at all. (A vendor account is the one
+exception to "owner-equivalent": what a co-manager may do depends on the account's share
+level, [§12](#12-delegated--resource-scoped-authorization).) This is deliberately
 narrower than a global admin bypass: see the comparison table in
 [§12](#12-delegated--resource-scoped-authorization).
 
@@ -689,19 +693,21 @@ flowchart TB
 
     subgraph Groups["Admin-groups (user_groups, tier=admin)"]
         OWN["owner"]
-        MGR["manager\n(5 boolean flags)"]
+        MGR["manager\n(6 boolean flags)"]
         MEM["member"]
     end
 
-    OWN -->|"all 5 flags implicitly"| MGR
+    OWN -->|"all 6 flags implicitly"| MGR
     MGR -->|"can_manage_servers"| SRV["server_admin_groups\n-> AI server(s)"]
     MGR -->|"can_manage_services"| SVC["service_admin_groups\n-> service account(s)"]
     MGR -->|"can_manage_resources"| RG["resource_group_admin_groups\n-> resource group(s)"]
+    MGR -->|"can_manage_vendor_accounts"| VA["vendor_account_admin_groups\n-> vendor account(s)"]
     MGR -->|"can_manage_users"| USRS["users assignable\ninto the group"]
 
     SRV -.->|"owner-equivalent,\nscoped to that resource"| ADS
     SVC -.->|"owner-equivalent,\nscoped to that resource"| ADS
     RG -.->|"owner-equivalent,\nscoped to that resource"| ADS
+    VA -.->|"by share level,\nscoped to that account"| ADS
 ```
 
 ## 12. Delegated & resource-scoped authorization
@@ -740,6 +746,7 @@ table is the load-bearing reference for "who can actually touch this":
 | AI server / application / model mapping | always authorized | `server_owners` | `server_admin_groups` + `can_manage_servers` | **not sufficient** |
 | Service account | always authorized | — (no owner list; see delegates) | `service_admin_groups` + `can_manage_services` (grant is Full, equivalent to a Full-Delegate) | **not sufficient** (Full-Delegate or the above required) |
 | Resource group | always authorized | — (no owner list at all) | `resource_group_admin_groups` + `can_manage_resources` | **not sufficient** |
+| Vendor account | **read only**, never a write | `owner_user_id` (exactly one owner) | `vendor_account_admin_groups` + `can_manage_vendor_accounts`, **by share level** (operate at `shared`; credential, assignment, delete and lowering at `full` only) | **not sufficient**, needed only to *raise* the level (and then as the owner) |
 | User group (any tier) | always authorized (bypasses group-scoping) | group's own `owner_user_id` | manager flags within the group itself | **not sufficient** for a `system`-tier group |
 | Project | — (no distinct check found) | `owner_user_id` (or the coupled group's *current* owner) | not narrowed by admin-groups | **sufficient** — any `admin`-scope caller may manage any project |
 
@@ -800,7 +807,72 @@ group. This is gated by the `resource_provisioning_enforce` system setting
 Notably, this check currently has **no role bypass** — even a `system`-scope
 principal is subject to the same allow/deny evaluation as anyone else; the
 code marks a bypass as a deliberate future extension point, not present
-behavior today.
+behavior today. A resource group can also offer shared **vendor accounts**
+(`resource_group_vendor_accounts`), but their eligibility is a separate, pure
+grant that `resource_provisioning_enforce` does not govern (see **Vendor
+accounts** below).
+
+**Vendor accounts** (`vendor_accounts`) are the one resource whose authorization is
+**by share level**, because the thing delegated is a credential: the owner's sealed
+key or OAuth token set is sent upstream by the gateway on the owner's behalf. Each
+account has exactly one owner and a `share_level` of `none` (personal, the default),
+`shared` or `full`; the owner, an admin, raises it and assigns it to management groups
+(`vendor_account_admin_groups`) and resource groups
+(`resource_group_vendor_accounts`), and a **co-manager (CM)**, an owner or co-manager
+holding `can_manage_vendor_accounts` of a management group, then acts at the level's
+reach ([External Vendor Accounts §8](external-vendor-accounts.md#8-authorization-by-share-level)
+has the full matrix):
+
+| Operation | `none` | `shared` | `full` |
+|---|---|---|---|
+| Read (key-free) | owner, system scope | owner, CM, member (minimal view), system scope | owner, CM, member (minimal view), system scope |
+| Operate: status, prefix, rename, test, model refresh, usage refresh | owner | owner, CM | owner, CM |
+| Credential, management-group and resource-group assignment, delete, lowering | owner | **owner only** | owner, CM |
+| Raise | owner who is an admin | owner who is an admin | nobody (already the top) |
+
+A **subscription** account is capped at `shared` and its token-opening operate calls
+(test, model refresh, usage refresh) stay owner-only even there, because they can rotate
+the owner's single-use refresh token. The properties that matter for the security model:
+
+- **System scope is read-only here and never bypasses a write**, the credential-bearing
+  calls included; it is a stranger for them, because they send the owner's credential
+  upstream. A plain `admin` scope is never sufficient on its own: it matters only to
+  *raise* a level, and then the caller must be the **owner** and an admin **right now**
+  (the token carries the admin scope **and** the user's current role is admin, so a
+  token minted before a demotion stops working at once). An owner who lost the admin
+  role can still lower the level.
+- **Two denials, deliberately.** A caller with no business knowing the account exists
+  (a stranger, system scope on a write, a co-manager without the flag) gets the
+  `404 vendor_account.not_found` of an unknown id; a CM, who can already see the
+  account, gets `403 vendor_account.forbidden` for an operation that is not theirs,
+  because "not found" would be a lie. This is the one resource where a 403 is a normal
+  by-level answer, in contrast to the servers above, where every object-level denial is a
+  404 (`server.forbidden` is only a create or a field the caller may not set).
+- **Field-level, deny-by-default PATCH**: `name`, `status`, `model_prefix` take the
+  operate gate and every other field takes the credential gate, so an overlooked field
+  can never fall through to the weaker gate.
+- **The effective level.** While `vendor_account_sharing_enabled` is off, every gate
+  reads every account as `none`: a CM is a stranger and only the owner can act. The
+  switch is a pause, not an un-share, and it fails closed.
+- **No credential ever reaches a delegate.** Every read DTO, the owner's, a CM's and a
+  member's, carries presence booleans only; the CM-reachable operate endpoints scrub
+  their results and errors of credential material; a **member**, a principal that can
+  only route to the account through a resource group, gets an allowlist-built minimal
+  view and cannot operate anything; and dispatch is owner-agnostic and opens the sealed
+  credential only at the dispatch edge.
+- **Routing eligibility is not the resource-group model above.** Shared vendor accounts
+  are offered through `resource_group_vendor_accounts` and
+  `resource_group_provisions`, but the grant is a **pure grant**: it does not read
+  `resource_provisioning_enforce`, has no open pool (an account in no group is usable
+  **only by its owner**), re-reads the live level on every resolve, **fails closed** on
+  the shared arm (the owner's own accounts are always kept), and an unwired seam falls
+  back to owner-only, never allow-all. It decides *reach* only: a token still *uses* a
+  shared account only when its policy **names** it (`all: true` and a portal session
+  cover only the principal's own accounts), for a user token and, create-only, a service
+  token, and a service reaches one only through a **direct** service provision
+  ([External Vendor Accounts §4.6](external-vendor-accounts.md#46-routing-to-a-shared-account-the-pure-grant),
+  [§11](external-vendor-accounts.md#11-per-token-vendor-access),
+  [ADR-060](../09-architecture-decisions.md#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in)).
 
 **Principal limits** (`principal_limits`; rate limit, request quota, token
 quota, cost budget — each an independent threshold/period pair) apply to

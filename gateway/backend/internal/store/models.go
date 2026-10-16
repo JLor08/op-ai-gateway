@@ -62,19 +62,23 @@ type UserGroupMembership struct {
 // managing the AI-servers linked to the group's admin tier (Phase B),
 // CanManageServices gates managing the services linked to the group's admin
 // tier (Phase C), CanManageResources gates managing the resources linked to
-// the group's admin tier (Resource Groups Phase 1). A row inserted by
-// SetUserGroupManager defaults all five to true via the column default
+// the group's admin tier (Resource Groups Phase 1), CanManageVendorAccounts
+// gates managing the vendor accounts shared with the group's admin tier
+// (shared vendor accounts via resource groups, #183). A row inserted by
+// SetUserGroupManager defaults all six to true via the column default
 // (migration v48 for the first two, v49 for CanManageServers, v51 for
-// CanManageServices, v53 for CanManageResources) — today's "a co-manager can
-// do everything" behavior, preserved byte-for-byte until a caller narrows
-// them via SetUserGroupManagerPermissions.
+// CanManageServices, v53 for CanManageResources, v90 for
+// CanManageVendorAccounts) — today's "a co-manager can do everything"
+// behavior, preserved byte-for-byte until a caller narrows them via
+// SetUserGroupManagerPermissions.
 type UserGroupManagerPerm struct {
-	UserID             string
-	CanManageUsers     bool
-	CanManageGroup     bool
-	CanManageServers   bool
-	CanManageServices  bool
-	CanManageResources bool
+	UserID                  string
+	CanManageUsers          bool
+	CanManageGroup          bool
+	CanManageServers        bool
+	CanManageServices       bool
+	CanManageResources      bool
+	CanManageVendorAccounts bool
 }
 
 // Project groups work across people; users + user-groups are assigned to it,

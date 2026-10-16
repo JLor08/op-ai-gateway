@@ -6750,7 +6750,9 @@ func testUserGroups(t *testing.T, s *SQLStore) {
 // co-manager permission flags added by migration v48 (UserGroupManagerPerm /
 // UserGroupManagerPerms / SetUserGroupManagerPermissions), extended by
 // migration v49 (CanManageServers), migration v51 (CanManageServices), and
-// migration v53 (CanManageResources), independent of testUserGroups above.
+// migration v53 (CanManageResources), and migration v90 (CanManageVendorAccounts,
+// shared vendor accounts via resource groups, #183), independent of
+// testUserGroups above.
 func TestConformanceUserGroupManagerPerms(t *testing.T) {
 	forEachDialect(t, testUserGroupManagerPerms)
 }
@@ -6780,15 +6782,16 @@ func testUserGroupManagerPerms(t *testing.T, s *SQLStore) {
 
 	// SetUserGroupManagerPermissions against a manager row that does not
 	// exist yet (group exists, but usr_gp2 is not a co-manager) -> ErrNotFound.
-	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: false, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != ErrNotFound {
+	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: false, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != ErrNotFound {
 		t.Fatalf("SetUserGroupManagerPermissions(no row) = %v, want ErrNotFound", err)
 	}
 
-	// SetUserGroupManager's insert picks up the column DEFAULT (1/1/1/1/1) —
+	// SetUserGroupManager's insert picks up the column DEFAULT (1/1/1/1/1/1) —
 	// a fresh co-manager row starts with FULL rights, matching today's
 	// pre-migration behavior byte-for-byte (extended to can_manage_servers by
-	// migration v49, to can_manage_services by migration v51, and to
-	// can_manage_resources by migration v53).
+	// migration v49, to can_manage_services by migration v51, to
+	// can_manage_resources by migration v53, and to can_manage_vendor_accounts
+	// by migration v90).
 	if err := s.SetUserGroupManager(ctx, "ugrp_gp_adm", "usr_gp2"); err != nil {
 		t.Fatalf("SetUserGroupManager: %v", err)
 	}
@@ -6796,37 +6799,37 @@ func testUserGroupManagerPerms(t *testing.T, s *SQLStore) {
 	if err != nil {
 		t.Fatalf("UserGroupManagerPerms: %v", err)
 	}
-	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources {
-		t.Fatalf("UserGroupManagerPerms(fresh insert) = %+v, want one row usr_gp2 true/true/true/true/true", perms)
+	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources || !perms[0].CanManageVendorAccounts {
+		t.Fatalf("UserGroupManagerPerms(fresh insert) = %+v, want one row usr_gp2 true/true/true/true/true/true", perms)
 	}
 
 	// Narrow the flags: CanManageUsers stays true, CanManageGroup flips
 	// false, CanManageServers stays true, CanManageServices stays true,
 	// CanManageResources stays true (untouched by this call).
-	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: false, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
+	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: false, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("SetUserGroupManagerPermissions: %v", err)
 	}
 	perms, err = s.UserGroupManagerPerms(ctx, "ugrp_gp_adm")
 	if err != nil {
 		t.Fatalf("UserGroupManagerPerms(after narrow): %v", err)
 	}
-	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources {
-		t.Fatalf("UserGroupManagerPerms(after narrow) = %+v, want usr_gp2 true/false/true/true/true", perms)
+	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources || !perms[0].CanManageVendorAccounts {
+		t.Fatalf("UserGroupManagerPerms(after narrow) = %+v, want usr_gp2 true/false/true/true/true/true", perms)
 	}
 
 	// Narrow CanManageServers INDEPENDENTLY of the other three: widen
 	// CanManageGroup back to true while flipping CanManageServers to false —
 	// proves each flag is settable without disturbing the others
 	// (admin-group permissions Phase B, spec 2026-08-10).
-	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: true, CanManageServers: false, CanManageServices: true, CanManageResources: true}); err != nil {
+	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: true, CanManageServers: false, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("SetUserGroupManagerPermissions(narrow servers only): %v", err)
 	}
 	perms, err = s.UserGroupManagerPerms(ctx, "ugrp_gp_adm")
 	if err != nil {
 		t.Fatalf("UserGroupManagerPerms(after independent servers-narrow): %v", err)
 	}
-	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources {
-		t.Fatalf("UserGroupManagerPerms(after independent servers-narrow) = %+v, want usr_gp2 true/true/false/true/true", perms)
+	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources || !perms[0].CanManageVendorAccounts {
+		t.Fatalf("UserGroupManagerPerms(after independent servers-narrow) = %+v, want usr_gp2 true/true/false/true/true/true", perms)
 	}
 
 	// Narrow CanManageServices INDEPENDENTLY of the other three: widen
@@ -6834,33 +6837,51 @@ func testUserGroupManagerPerms(t *testing.T, s *SQLStore) {
 	// false — proves the FOURTH flag is settable without disturbing the
 	// others, in either direction (admin-group permissions Phase C, spec
 	// 2026-08-10).
-	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: false, CanManageResources: true}); err != nil {
+	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: false, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("SetUserGroupManagerPermissions(narrow services only): %v", err)
 	}
 	perms, err = s.UserGroupManagerPerms(ctx, "ugrp_gp_adm")
 	if err != nil {
 		t.Fatalf("UserGroupManagerPerms(after independent services-narrow): %v", err)
 	}
-	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || perms[0].CanManageServices || !perms[0].CanManageResources {
-		t.Fatalf("UserGroupManagerPerms(after independent services-narrow) = %+v, want usr_gp2 true/true/true/false/true", perms)
+	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || perms[0].CanManageServices || !perms[0].CanManageResources || !perms[0].CanManageVendorAccounts {
+		t.Fatalf("UserGroupManagerPerms(after independent services-narrow) = %+v, want usr_gp2 true/true/true/false/true/true", perms)
 	}
 
 	// Narrow CanManageResources INDEPENDENTLY of the other four: widen
 	// CanManageServices back to true while flipping CanManageResources to
 	// false — proves the FIFTH flag is settable without disturbing the
 	// others, in either direction (Resource Groups Phase 1, spec 2026-08-11).
-	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: false}); err != nil {
+	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: false, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("SetUserGroupManagerPermissions(narrow resources only): %v", err)
 	}
 	perms, err = s.UserGroupManagerPerms(ctx, "ugrp_gp_adm")
 	if err != nil {
 		t.Fatalf("UserGroupManagerPerms(after independent resources-narrow): %v", err)
 	}
-	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || perms[0].CanManageResources {
-		t.Fatalf("UserGroupManagerPerms(after independent resources-narrow) = %+v, want usr_gp2 true/true/true/true/false", perms)
+	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || perms[0].CanManageResources || !perms[0].CanManageVendorAccounts {
+		t.Fatalf("UserGroupManagerPerms(after independent resources-narrow) = %+v, want usr_gp2 true/true/true/true/false/true", perms)
 	}
 
-	// A SECOND co-manager also starts at 1/1/1/1/1, and is unaffected by
+	// Narrow CanManageVendorAccounts INDEPENDENTLY of the other five, to the
+	// NON-default false: CanManageResources stays narrowed from the step above
+	// while the new flag flips true -> false, so a dropped write column (which
+	// would leave the column default 1 in place) or a scan that reads the wrong
+	// column fails here rather than hiding behind the default (shared vendor
+	// accounts via resource groups, #183). Every write above sent
+	// CanManageVendorAccounts=true and read it back true; this one sends false.
+	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_adm", UserGroupManagerPerm{UserID: "usr_gp2", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: false, CanManageVendorAccounts: false}); err != nil {
+		t.Fatalf("SetUserGroupManagerPermissions(narrow vendor accounts only): %v", err)
+	}
+	perms, err = s.UserGroupManagerPerms(ctx, "ugrp_gp_adm")
+	if err != nil {
+		t.Fatalf("UserGroupManagerPerms(after independent vendor-accounts-narrow): %v", err)
+	}
+	if len(perms) != 1 || perms[0].UserID != "usr_gp2" || !perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || perms[0].CanManageResources || perms[0].CanManageVendorAccounts {
+		t.Fatalf("UserGroupManagerPerms(after independent vendor-accounts-narrow) = %+v, want usr_gp2 true/true/true/true/false/false", perms)
+	}
+
+	// A SECOND co-manager also starts at 1/1/1/1/1/1, and is unaffected by
 	// usr_gp2's narrowed flags — each row's permissions are independent.
 	if err := s.SetUserGroupManager(ctx, "ugrp_gp_adm", "usr_gp1"); err != nil {
 		t.Fatalf("SetUserGroupManager(second): %v", err)
@@ -6876,11 +6897,11 @@ func testUserGroupManagerPerms(t *testing.T, s *SQLStore) {
 	for _, p := range perms {
 		byUser[p.UserID] = p
 	}
-	if p, ok := byUser["usr_gp1"]; !ok || !p.CanManageUsers || !p.CanManageGroup || !p.CanManageServers || !p.CanManageServices || !p.CanManageResources {
-		t.Fatalf("usr_gp1 perms = %+v, want true/true/true/true/true (fresh default)", p)
+	if p, ok := byUser["usr_gp1"]; !ok || !p.CanManageUsers || !p.CanManageGroup || !p.CanManageServers || !p.CanManageServices || !p.CanManageResources || !p.CanManageVendorAccounts {
+		t.Fatalf("usr_gp1 perms = %+v, want true/true/true/true/true/true (fresh default)", p)
 	}
-	if p, ok := byUser["usr_gp2"]; !ok || !p.CanManageUsers || !p.CanManageGroup || !p.CanManageServers || !p.CanManageServices || p.CanManageResources {
-		t.Fatalf("usr_gp2 perms = %+v, want true/true/true/true/false (narrowed earlier, unaffected by the new row)", p)
+	if p, ok := byUser["usr_gp2"]; !ok || !p.CanManageUsers || !p.CanManageGroup || !p.CanManageServers || !p.CanManageServices || p.CanManageResources || p.CanManageVendorAccounts {
+		t.Fatalf("usr_gp2 perms = %+v, want true/true/true/true/false/false (narrowed earlier, unaffected by the new row)", p)
 	}
 
 	// A re-set of an EXISTING manager (on-conflict-do-nothing) must not reset
@@ -6893,13 +6914,13 @@ func testUserGroupManagerPerms(t *testing.T, s *SQLStore) {
 		t.Fatalf("UserGroupManagerPerms(after re-set): %v", err)
 	}
 	for _, p := range perms {
-		if p.UserID == "usr_gp2" && p.CanManageResources {
+		if p.UserID == "usr_gp2" && (p.CanManageResources || p.CanManageVendorAccounts) {
 			t.Fatalf("re-set of an existing manager reset its narrowed flags: %+v", perms)
 		}
 	}
 
 	// SetUserGroupManagerPermissions against a nonexistent group -> ErrNotFound.
-	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_missing", UserGroupManagerPerm{UserID: "usr_gp1", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != ErrNotFound {
+	if err := s.SetUserGroupManagerPermissions(ctx, "ugrp_gp_missing", UserGroupManagerPerm{UserID: "usr_gp1", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != ErrNotFound {
 		t.Fatalf("SetUserGroupManagerPermissions(missing group) = %v, want ErrNotFound", err)
 	}
 

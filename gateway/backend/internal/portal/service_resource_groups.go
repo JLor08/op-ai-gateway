@@ -73,6 +73,13 @@ var (
 	ErrResourceGroupServerSystemGroupMismatch = errors.New("resource_group.server_system_group_mismatch")
 )
 
+// ErrResourceGroupVendorAccountSystemGroupMismatch is the vendor-account counterpart of
+// ErrResourceGroupServerSystemGroupMismatch (#183, spec 2026-10-15 sections 5 and 9): a
+// shared account whose containment root (system_group_id) is not the resource group's,
+// or is empty -- containment, not an existence or authorization question, hence a 400.
+// Returned by both link paths on ADD (the owner's self-service and the manager side).
+var ErrResourceGroupVendorAccountSystemGroupMismatch = errors.New("resource_group.vendor_account_system_group_mismatch")
+
 // authorizeResourceGroup loads the resource group and returns
 // ErrResourceGroupNotFound unless the principal is system-scoped or a
 // can_manage_resources owner/co-manager of one of the resource group's
@@ -130,6 +137,22 @@ type ResourceGroupDTO struct {
 	// server that has since vanished is skipped (best-effort name
 	// resolution), never failing the whole DTO.
 	Servers []ResourceGroupServerRefDTO `json:"servers"`
+	// VendorAccounts is the resource group's linked vendor accounts (id+name,
+	// credential-free), always non-nil. Every stored link is listed, the one a
+	// manager may not operate and one whose account is no longer shared included:
+	// what a group offers is its manager's call, and a manager can drop any link
+	// (SetResourceGroupVendorAccounts). An account that has since vanished is
+	// skipped (best-effort name resolution), never failing the whole DTO. Empty
+	// while the vendor-accounts module flag is off.
+	VendorAccounts []ResourceGroupVendorAccountRefDTO `json:"vendor_accounts"`
+}
+
+// ResourceGroupVendorAccountRefDTO is a minimal, credential-free vendor-account
+// reference used by ResourceGroupDTO.VendorAccounts and the manager-side candidates
+// (id + display name only; never the owner, the level or any credential flag).
+type ResourceGroupVendorAccountRefDTO struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // ResourceGroupServerRefDTO is a minimal, non-secret AI-server reference used
@@ -185,7 +208,8 @@ func (s *Service) ListResourceGroups(ctx context.Context, principal auth.Token) 
 // serverDTO/serviceDTO's own admin-group/system-group resolution exactly
 // (id+name via s.groups.UserGroupByID, best-effort/skip-on-error, nil-safe on
 // s.groups), plus a member-server resolution via s.routes.AIServerByID
-// (best-effort/skip-on-error; s.routes is never nil).
+// (best-effort/skip-on-error; s.routes is never nil) and the linked vendor
+// accounts (resourceGroupVendorAccountRefs).
 func (s *Service) resourceGroupDTO(ctx context.Context, rg routing.ResourceGroup) (ResourceGroupDTO, error) {
 	groupIDs, err := s.routes.ResourceGroupAdminGroups(ctx, rg.ID)
 	if err != nil {
@@ -209,9 +233,32 @@ func (s *Service) resourceGroupDTO(ctx context.Context, rg routing.ResourceGroup
 			systemGroup = GroupRefDTO{ID: g.ID, Name: g.Name}
 		}
 	}
-	serverIDs, err := s.routes.ResourceGroupServers(ctx, rg.ID)
+	servers, err := s.resourceGroupServerRefs(ctx, rg.ID)
 	if err != nil {
 		return ResourceGroupDTO{}, err
+	}
+	vendorAccounts, err := s.resourceGroupVendorAccountRefs(ctx, rg.ID)
+	if err != nil {
+		return ResourceGroupDTO{}, err
+	}
+	return ResourceGroupDTO{
+		ID:             rg.ID,
+		Name:           rg.Name,
+		Status:         rg.Status,
+		SystemGroup:    systemGroup,
+		AdminGroups:    adminGroups,
+		Servers:        servers,
+		VendorAccounts: vendorAccounts,
+	}, nil
+}
+
+// resourceGroupServerRefs resolves the member servers of rgID to id+name
+// references, in link order (best-effort/skip-on-error: a member server that
+// vanished is skipped rather than failing the whole DTO). Never nil.
+func (s *Service) resourceGroupServerRefs(ctx context.Context, rgID string) ([]ResourceGroupServerRefDTO, error) {
+	serverIDs, err := s.routes.ResourceGroupServers(ctx, rgID)
+	if err != nil {
+		return nil, err
 	}
 	servers := make([]ResourceGroupServerRefDTO, 0, len(serverIDs))
 	for _, sid := range serverIDs {
@@ -222,14 +269,38 @@ func (s *Service) resourceGroupDTO(ctx context.Context, rg routing.ResourceGroup
 		}
 		servers = append(servers, ResourceGroupServerRefDTO{ID: srv.ID, Name: srv.Name})
 	}
-	return ResourceGroupDTO{
-		ID:          rg.ID,
-		Name:        rg.Name,
-		Status:      rg.Status,
-		SystemGroup: systemGroup,
-		AdminGroups: adminGroups,
-		Servers:     servers,
-	}, nil
+	return servers, nil
+}
+
+// resourceGroupVendorAccountRefs resolves the vendor accounts linked into rgID to
+// id+name references, in link order. An account that vanished since the link is
+// skipped (the FK cascade normally removes the link with it) rather than failing the
+// whole DTO, like a vanished member server. Never nil.
+//
+// While the vendor-accounts module flag is off (its default) the answer is the empty
+// list and the store is not read: the whole area is switched off then (every
+// vendor-account method is a 409), so a group does not advertise accounts of it, and a
+// deployment that never enables the module pays no extra query per group.
+func (s *Service) resourceGroupVendorAccountRefs(ctx context.Context, rgID string) ([]ResourceGroupVendorAccountRefDTO, error) {
+	if !s.VendorAccountsEnabled(ctx) {
+		return []ResourceGroupVendorAccountRefDTO{}, nil
+	}
+	ids, err := s.routes.ResourceGroupVendorAccounts(ctx, rgID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ResourceGroupVendorAccountRefDTO, 0, len(ids))
+	for _, aid := range ids {
+		acc, err := s.routes.VendorAccountByID(ctx, aid)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ResourceGroupVendorAccountRefDTO{ID: acc.ID, Name: acc.Name})
+	}
+	return out, nil
 }
 
 // GetResourceGroup is the *Read* object-gate over a single resource group
@@ -691,4 +762,210 @@ func (s *Service) ResourceGroupServerCandidates(ctx context.Context, principal a
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// SetResourceGroupVendorAccounts replaces a resource group's vendor-account set (#183,
+// spec 2026-10-15 sections 6, 7 and 9) -- the vendor-account counterpart of
+// SetResourceGroupServers, with the same delta model (add desired-not-current, remove
+// current-not-desired) and the same all-or-nothing validation, but a stricter gate on
+// ADDING an account, because a link here lets the group's members spend someone else's
+// credential. In this order:
+//
+//  1. requireVendorAccountSharingEnabled (module flag, then the sharing master flag, both
+//     a 409), before the group is loaded, so the answer is global and reveals nothing;
+//  2. authorizeResourceGroup(id) gates the WHOLE call (ErrResourceGroupNotFound, the
+//     404-no-leak on the group itself: a stranger and an unknown id are
+//     indistinguishable), so a caller who does not manage the group learns nothing of
+//     any account;
+//  3. for every id in the DESIRED set that is not already linked, ALL of
+//     authorizeResourceGroupVendorAccountAdd: the caller OPERATES the account
+//     (authorizeVendorAccountOperate, so system scope gets no bypass) -- a stranger and
+//     an unknown id are the same ErrVendorAccountNotFound -- the account is `full`
+//     (ErrVendorAccountForbidden at `shared`, where only the owner's self-service links
+//     it; ErrVendorAccountNotShared at `none`), and its root is the group's
+//     (ErrResourceGroupVendorAccountSystemGroupMismatch). Any failure aborts the ENTIRE
+//     call before a single store write.
+//
+// REMOVAL needs none of step 3: dropping a current link only re-touches
+// resource_group_vendor_accounts, already gated by step 2, so whoever manages the group
+// can drop any account out of it, one they cannot operate or one that is no longer shared
+// included (what a group offers is its manager's call, like a member server). An account
+// already linked is not re-validated when the caller sends it again. An account may be
+// linked into MULTIPLE groups; this method only ever touches id's own link set.
+//
+// Returns the group, with its vendor accounts listed. This only links accounts: whether a
+// member can use one is the routing grant's decision (live share level, per-account
+// opt-in).
+func (s *Service) SetResourceGroupVendorAccounts(ctx context.Context, principal auth.Token, id string, accountIDs []string) (ResourceGroupDTO, error) {
+	if err := s.requireVendorAccountSharingEnabled(ctx); err != nil {
+		return ResourceGroupDTO{}, err
+	}
+	rg, err := s.authorizeResourceGroup(ctx, principal, id)
+	if err != nil {
+		return ResourceGroupDTO{}, err
+	}
+	current, err := s.routes.ResourceGroupVendorAccounts(ctx, id)
+	if err != nil {
+		return ResourceGroupDTO{}, err
+	}
+	add, remove := idSetDelta(current, trimmedUniqueIDs(accountIDs))
+	// Validate EVERY new addition BEFORE writing anything, so a rejected call never
+	// partially applies (the same all-or-nothing shape as SetResourceGroupServers).
+	for _, aid := range add {
+		if err := s.authorizeResourceGroupVendorAccountAdd(ctx, principal, rg, aid); err != nil {
+			return ResourceGroupDTO{}, err
+		}
+	}
+	if err := s.writeResourceGroupVendorAccountLinks(ctx, id, add, remove); err != nil {
+		return ResourceGroupDTO{}, err
+	}
+	return s.resourceGroupDTO(ctx, rg)
+}
+
+// authorizeResourceGroupVendorAccountAdd is the per-account gate of ADDING an account to
+// rg from the resource-group manager side (see SetResourceGroupVendorAccounts, step 3).
+// The order matters for what each answer reveals: an account the caller cannot operate is
+// ErrVendorAccountNotFound whatever its level (so nothing about a stranger's account
+// leaks), and only then is the level asked: `shared` is ErrVendorAccountForbidden (the
+// caller can see and operate the account, so "not found" would be a lie; the owner links
+// a `shared` account through their own self-service), anything below `full` is
+// ErrVendorAccountNotShared, and last comes the root.
+func (s *Service) authorizeResourceGroupVendorAccountAdd(ctx context.Context, principal auth.Token, rg routing.ResourceGroup, accountID string) error {
+	acc, err := s.loadVendorAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+		return err
+	}
+	level := s.effectiveVendorAccountShareLevel(ctx, acc)
+	if level == routing.VendorShareLevelShared {
+		return ErrVendorAccountForbidden
+	}
+	if level != routing.VendorShareLevelFull {
+		return ErrVendorAccountNotShared
+	}
+	if !vendorAccountRootMatches(acc, rg) {
+		return ErrResourceGroupVendorAccountSystemGroupMismatch
+	}
+	return nil
+}
+
+// writeResourceGroupVendorAccountLinks applies a validated delta to rgID: the missing
+// links are written first, then the surplus ones removed. A store failure stops at the
+// first error, leaving the earlier writes in place (each is a single idempotent row, so a
+// retry converges). An account that vanished between validation and write is
+// ErrVendorAccountNotFound.
+func (s *Service) writeResourceGroupVendorAccountLinks(ctx context.Context, rgID string, add, remove []string) error {
+	for _, aid := range add {
+		if err := s.routes.SetResourceGroupVendorAccount(ctx, rgID, aid); err != nil {
+			return notFoundAsVendorAccountNotFound(err)
+		}
+	}
+	for _, aid := range remove {
+		if err := s.routes.RemoveResourceGroupVendorAccount(ctx, rgID, aid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ResourceGroupVendorAccountCandidates lists the vendor accounts the caller may add to
+// resource group id (drives the membership-editor picker; mirrors
+// ResourceGroupServerCandidates): the group's own gate (authorizeResourceGroup) runs first
+// (404-no-leak), then the accounts the caller OPERATES -- their own and the shared ones of
+// a management group they are a CM of (operableVendorAccounts; system scope widens
+// nothing, it never bypasses an account write) -- FILTERED down to the `full` ones whose
+// root is the group's: exactly what SetResourceGroupVendorAccounts would accept, so the
+// picker never offers an account the write path would refuse. Accounts already in the
+// group are included (so the picker shows the selection). Sorted by name, then id; never
+// nil. Like every method behind the link endpoints it is a 409 while sharing is off.
+func (s *Service) ResourceGroupVendorAccountCandidates(ctx context.Context, principal auth.Token, id string) ([]ResourceGroupVendorAccountRefDTO, error) {
+	if err := s.requireVendorAccountSharingEnabled(ctx); err != nil {
+		return nil, err
+	}
+	rg, err := s.authorizeResourceGroup(ctx, principal, id)
+	if err != nil {
+		return nil, err
+	}
+	accounts, err := s.operableVendorAccounts(ctx, principal)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ResourceGroupVendorAccountRefDTO, 0, len(accounts))
+	for _, acc := range accounts {
+		if s.effectiveVendorAccountShareLevel(ctx, acc) == routing.VendorShareLevelFull && vendorAccountRootMatches(acc, rg) {
+			out = append(out, ResourceGroupVendorAccountRefDTO{ID: acc.ID, Name: acc.Name})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+// operableVendorAccounts returns the accounts principal passes
+// authorizeVendorAccountOperate for: their own (every level) plus the accounts they
+// manage as a CM (managedVendorAccounts: shared or full by the effective level, deduped
+// against their own). A principal with no user identity operates nothing. The two arms
+// are read the way the management listing reads them, so a candidate list built from them
+// never offers an account the operate gate would refuse.
+func (s *Service) operableVendorAccounts(ctx context.Context, principal auth.Token) ([]routing.VendorAccount, error) {
+	if principal.UserID == "" {
+		return nil, nil
+	}
+	own, err := s.routes.VendorAccountsByOwner(ctx, principal.UserID)
+	if err != nil {
+		return nil, err
+	}
+	managed, err := s.managedVendorAccounts(ctx, principal, own)
+	if err != nil {
+		return nil, err
+	}
+	return append(own, managed...), nil
+}
+
+// trimmedUniqueIDs trims each id and drops the blank ones and the repeats, keeping the
+// first occurrence's order. Never nil.
+func trimmedUniqueIDs(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, r := range raw {
+		id := strings.TrimSpace(r)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// idSetDelta returns what turns the current id set into the desired one: add = the
+// desired ids not in current (desired order), remove = the current ids not in desired
+// (current order).
+func idSetDelta(current, desired []string) (add, remove []string) {
+	currentSet := make(map[string]bool, len(current))
+	for _, id := range current {
+		currentSet[id] = true
+	}
+	desiredSet := make(map[string]bool, len(desired))
+	for _, id := range desired {
+		desiredSet[id] = true
+		if !currentSet[id] {
+			add = append(add, id)
+		}
+	}
+	for _, id := range current {
+		if !desiredSet[id] {
+			remove = append(remove, id)
+		}
+	}
+	return add, remove
 }

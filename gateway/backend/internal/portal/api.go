@@ -22,7 +22,9 @@ type API interface {
 	AddProjectGroups(context.Context, auth.Token, string, []string) error
 	AddProjectMembers(context.Context, auth.Token, string, []string) error
 	AddServerToResourceGroup(context.Context, auth.Token, string, string) error
+	AddServiceToResourceGroup(context.Context, auth.Token, string, string) error
 	AddUserToAdminGroup(context.Context, auth.Token, string, string, string) error
+	AddVendorAccountToResourceGroup(context.Context, auth.Token, string, string) error
 	AdminOwnerCandidates(context.Context, auth.Token) ([]AdminOwnerCandidateDTO, error)
 	AgentTokenStatus(context.Context, auth.Token, string) (AgentTokenDTO, error)
 	AgentCertificate(context.Context, string) (AgentCertificateDTO, error)
@@ -149,7 +151,7 @@ type API interface {
 	ProjectCandidates(context.Context, auth.Token, string) ([]UserRefDTO, []GroupRefDTO, error)
 	ProjectMembersView(context.Context, auth.Token, string) (ProjectMembersDTO, error)
 	ProjectTokens(context.Context, auth.Token, string) (ProjectTokensView, error)
-	PromoteManager(context.Context, auth.Token, string, string, bool, bool, bool, bool, bool) error
+	PromoteManager(context.Context, auth.Token, string, string, ManagerPermissions) error
 	PublicLanguage(context.Context) string
 	PublicTheme(context.Context) string
 	PublicThemeView(context.Context) ThemePublicView
@@ -166,6 +168,8 @@ type API interface {
 	RemoveProjectGroup(context.Context, auth.Token, string, string) error
 	RemoveProjectMember(context.Context, auth.Token, string, string) error
 	RemoveServerFromResourceGroup(context.Context, auth.Token, string, string) error
+	RemoveServiceFromResourceGroup(context.Context, auth.Token, string, string) error
+	RemoveVendorAccountFromResourceGroup(context.Context, auth.Token, string, string) error
 	RenameGroup(context.Context, auth.Token, string, string) (UserGroupDTO, error)
 	RenewCertificateNow(context.Context, auth.Token, string) error
 	ResolveGatewayPeerDNS(context.Context) (string, error)
@@ -175,6 +179,7 @@ type API interface {
 	ResourceGroupProvisionCandidates(context.Context, auth.Token, string) (ResourceGroupProvisionCandidatesDTO, error)
 	ResourceGroupProvisionsView(context.Context, auth.Token, string) ([]ResourceGroupProvisionDTO, error)
 	ResourceGroupServerCandidates(context.Context, auth.Token, string) ([]ResourceGroupServerRefDTO, error)
+	ResourceGroupVendorAccountCandidates(context.Context, auth.Token, string) ([]ResourceGroupVendorAccountRefDTO, error)
 	RespondInvitation(context.Context, auth.Token, string, bool) error
 	RevokeAgentToken(context.Context, auth.Token, string) error
 	RotateCertificateCA(context.Context, auth.Token) error
@@ -192,18 +197,20 @@ type API interface {
 	ServerPerfHistory(context.Context, auth.Token, string, time.Duration) ([]routing.TelemetrySample, error)
 	ServerRuntimeReportView(context.Context, auth.Token, string) (ServerRuntimeReportViewDTO, error)
 	ServiceAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
+	ServiceResourceGroups(context.Context, auth.Token, string) ([]ServiceResourceGroupDTO, error)
 	SetBenchmarkOverrideLease(context.Context, string, BenchmarkOverrideLease) error
 	SetBenchmarkRuntimeSpecAdminState(context.Context, string, string, string) (RuntimeSpecDTO, error)
 	SetBenchmarkRuntimeSpecsAdminState(context.Context, []string, string, string) (BenchmarkSpecsOutcome, error)
 	SetBenchmarkRuntimeSpecsPinned(context.Context, []string, bool, bool) (BenchmarkSpecsOutcome, error)
 	SetCaptureSecret(auth.Token, string, bool) error
 	SetCoResidency(context.Context, auth.Token, string, SetCoResidencyRequest) (CoResidencyDTO, error)
-	SetManagerPermissions(context.Context, auth.Token, string, string, bool, bool, bool, bool, bool) error
+	SetManagerPermissions(context.Context, auth.Token, string, string, ManagerPermissions) error
 	SetModelVisibility(context.Context, auth.Token, string, string) error
 	SetNetbirdNetwork(context.Context, auth.Token, NetbirdNetworkDTO) (NetbirdNetworkDTO, error)
 	SetResourceGroupAdminGroups(context.Context, auth.Token, string, []string) (ResourceGroupDTO, error)
 	SetResourceGroupProvisions(context.Context, auth.Token, string, []routing.ResourceGroupProvision) error
 	SetResourceGroupServers(context.Context, auth.Token, string, []string) (ResourceGroupDTO, error)
+	SetResourceGroupVendorAccounts(context.Context, auth.Token, string, []string) (ResourceGroupDTO, error)
 	SetServerAdminGroups(context.Context, auth.Token, string, []string) (ServerDTO, error)
 	SetServerCertificateOverride(context.Context, auth.Token, string, string) (ServerDTO, error)
 	SetServerEnergyConfig(context.Context, auth.Token, string, float64, float64, float64, float64, string) (ServerDTO, error)
@@ -213,6 +220,8 @@ type API interface {
 	SetServiceAdminGroups(context.Context, auth.Token, string, []string) (ServiceDTO, error)
 	SetUserLimits(context.Context, auth.Token, string, LimitConfigDTO) (UserLimitsDTO, error)
 	SetUserPreference(context.Context, string, string, json.RawMessage) error
+	SetVendorAccountAdminGroups(context.Context, auth.Token, string, []string) (VendorAccountDTO, error)
+	SetVendorAccountShareLevel(context.Context, auth.Token, string, SetVendorAccountShareLevelRequest) (VendorAccountDTO, error)
 	SyncApplicationModels(context.Context, auth.Token, string) (SyncResultDTO, error)
 	SyncApplicationModelsForApp(context.Context, routing.AIServer, routing.Application) (SyncResultDTO, error)
 	SystemAdminModeRequirePassword(context.Context) bool
@@ -239,8 +248,13 @@ type API interface {
 	UserLimits(context.Context, string) (UserLimitsDTO, error)
 	UserPreferences(context.Context, string) (map[string]json.RawMessage, error)
 	UserTokens(context.Context, auth.Token, string) (TokenListResponse, error)
+	VendorAccountAdminGroupCandidates(context.Context, auth.Token) ([]AdminGroupCandidateDTO, error)
+	VendorAccountResourceGroups(context.Context, auth.Token, string) ([]VendorAccountResourceGroupDTO, error)
 	VendorAccountRoutingMode(context.Context) string
+	VendorAccountSharingEnabled(context.Context) bool
 	VendorAccountsEnabled(context.Context) bool
+	VendorAccountsForRouting(context.Context, auth.Token) ([]routing.VendorAccount, error)
+	VendorSubscriptionSharingEnabled(context.Context) bool
 	VendorSubscriptionsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	VisionProbeMode(context.Context) string

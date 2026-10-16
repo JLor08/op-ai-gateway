@@ -645,3 +645,120 @@ func TestGroupManagerPermissionsEndToEnd(t *testing.T) {
 		t.Fatalf("wrong method on managers/{userId} = %d, want 405, body=%s", wrongMethodRec.Code, wrongMethodRec.Body.String())
 	}
 }
+
+// TestGroupManagerVendorAccountsEndToEnd drives can_manage_vendor_accounts
+// (shared vendor accounts via resource groups, issue #183) through the HTTP
+// layer. It closes the handler half of a real gap: portal.Service persisted
+// the flag only if the handlers passed it, and both handlers used to drop it,
+// so a promote / PATCH over the wire silently wrote false.
+//
+// Request bodies are RAW JSON literals (not groupManagerRequest values) so the
+// wire name `can_manage_vendor_accounts` is pinned independently of the Go
+// struct tag, and responses are decoded into untyped maps so the DTO key is
+// pinned the same way. Each step sets ONE facet differently from the rest, so a
+// handler that mapped a request field onto the wrong facet fails by name.
+func TestGroupManagerVendorAccountsEndToEnd(t *testing.T) {
+	srv, dir := newAuthTestServer(t)
+	seedLoginUser(t, dir, "usr_sysadmin", "sysadmin@example.test", "password-1", "system_admin")
+	seedLoginUser(t, dir, "usr_owner", "owner@example.test", "password-1", "admin")
+	seedLoginUser(t, dir, "usr_mgr", "mgr@example.test", "password-1", "admin")
+
+	sysadmin := loginSession(t, srv, "sysadmin@example.test", "password-1")
+	elevateSystemAdmin(t, srv, sysadmin, "password-1")
+	ownerSession := loginSession(t, srv, "owner@example.test", "password-1")
+	mgrSession := loginSession(t, srv, "mgr@example.test", "password-1")
+
+	var sysGroup portal.UserGroupDTO
+	doGroupReq(t, srv, sysadmin, http.MethodPost, "/api/portal/groups",
+		createGroupRequest{Tier: store.GroupTierSystem, Name: "VASys"}, http.StatusCreated, &sysGroup)
+	doGroupReq(t, srv, sysadmin, http.MethodPost, "/api/portal/groups/"+sysGroup.ID+"/members",
+		groupMembersRequest{UserIDs: []string{"usr_owner", "usr_mgr"}}, http.StatusOK, nil)
+
+	var adminGroup portal.UserGroupDTO
+	doGroupReq(t, srv, ownerSession, http.MethodPost, "/api/portal/groups",
+		createGroupRequest{Tier: store.GroupTierAdmin, Name: "VAAdmin"}, http.StatusCreated, &adminGroup)
+	doGroupReq(t, srv, ownerSession, http.MethodPost, "/api/portal/groups/"+adminGroup.ID+"/members",
+		groupMembersRequest{UserIDs: []string{"usr_mgr"}}, http.StatusOK, nil)
+
+	facets := []string{
+		"can_manage_users", "can_manage_group", "can_manage_servers",
+		"can_manage_services", "can_manage_resources", "can_manage_vendor_accounts",
+	}
+	// assertOnly checks the roster row (raw wire keys) AND the manager's own
+	// principal-relative group DTO: exactly the facets in want are true.
+	assertOnly := func(label string, want ...string) {
+		t.Helper()
+		wantSet := map[string]bool{}
+		for _, f := range want {
+			wantSet[f] = true
+		}
+
+		var roster struct {
+			Data []map[string]any `json:"data"`
+		}
+		doGroupReq(t, srv, ownerSession, http.MethodGet, "/api/portal/groups/"+adminGroup.ID+"/members", nil, http.StatusOK, &roster)
+		var row map[string]any
+		for _, r := range roster.Data {
+			if r["user_id"] == "usr_mgr" {
+				row = r
+			}
+		}
+		if row == nil || row["is_manager"] != true {
+			t.Fatalf("%s: usr_mgr roster row = %v, want a manager row", label, row)
+		}
+		for _, f := range facets {
+			if got, ok := row[f].(bool); !ok || got != wantSet[f] {
+				t.Fatalf("%s: roster %s = %v (present=%v), want %v; row=%v", label, f, row[f], ok, wantSet[f], row)
+			}
+		}
+
+		var landscape struct {
+			Admin []map[string]any `json:"admin"`
+		}
+		doGroupReq(t, srv, mgrSession, http.MethodGet, "/api/portal/groups", nil, http.StatusOK, &landscape)
+		var dto map[string]any
+		for _, g := range landscape.Admin {
+			if g["id"] == adminGroup.ID {
+				dto = g
+			}
+		}
+		if dto == nil || dto["my_role"] != "manager" {
+			t.Fatalf("%s: manager landscape admin group = %v, want my_role=manager", label, dto)
+		}
+		// UserGroupDTO names the structure facet can_manage (not
+		// can_manage_group); the other five share the roster's key names.
+		dtoKey := map[string]string{"can_manage_group": "can_manage"}
+		for _, f := range facets {
+			key := f
+			if k, ok := dtoKey[f]; ok {
+				key = k
+			}
+			if got, ok := dto[key].(bool); !ok || got != wantSet[f] {
+				t.Fatalf("%s: group dto %s = %v (present=%v), want %v; dto=%v", label, key, dto[key], ok, wantSet[f], dto)
+			}
+		}
+	}
+
+	// POST .../managers: vendor accounts ONLY.
+	doGroupReq(t, srv, ownerSession, http.MethodPost, "/api/portal/groups/"+adminGroup.ID+"/managers",
+		json.RawMessage(`{"user_id":"usr_mgr","can_manage_vendor_accounts":true}`), http.StatusOK, nil)
+	assertOnly("after POST (vendor accounts only)", "can_manage_vendor_accounts")
+
+	// PATCH .../managers/{userId}: servers ON, vendor accounts OFF -- the
+	// vendor flag must follow the body (false), not stick at its old value.
+	doGroupReq(t, srv, ownerSession, http.MethodPatch, "/api/portal/groups/"+adminGroup.ID+"/managers/usr_mgr",
+		json.RawMessage(`{"can_manage_servers":true,"can_manage_vendor_accounts":false}`), http.StatusOK, nil)
+	assertOnly("after PATCH (servers only)", "can_manage_servers")
+
+	// PATCH again: resources + vendor accounts ON, servers OFF.
+	doGroupReq(t, srv, ownerSession, http.MethodPatch, "/api/portal/groups/"+adminGroup.ID+"/managers/usr_mgr",
+		json.RawMessage(`{"can_manage_resources":true,"can_manage_vendor_accounts":true}`), http.StatusOK, nil)
+	assertOnly("after PATCH (resources + vendor accounts)", "can_manage_resources", "can_manage_vendor_accounts")
+
+	// A body that omits the field entirely decodes to false (an explicit
+	// write carries the caller's chosen value; there is no default-true on
+	// this write path).
+	doGroupReq(t, srv, ownerSession, http.MethodPatch, "/api/portal/groups/"+adminGroup.ID+"/managers/usr_mgr",
+		json.RawMessage(`{"can_manage_users":true,"can_manage_group":true}`), http.StatusOK, nil)
+	assertOnly("after PATCH omitting the vendor field", "can_manage_users", "can_manage_group")
+}

@@ -30,10 +30,19 @@ const vendorAccountParityRows = 3
 // So every reader must return the EXACT same routing.VendorAccount value for the
 // same row, and the ByID baseline must carry the value seeded into each field.
 // vendor_accounts has no integer-boolean column, so no bit-pattern table is
-// needed: every one of the twelve fields holds a distinct non-zero value per row
-// (the eight text credential/identity columns are each different from every
-// other, so a swapped pair is observable), and the two owners make
-// VendorAccountsByOwner's filter observable too.
+// needed: every one of the fourteen fields holds a distinct value per row (the
+// text credential/identity columns, share_level and system_group_id are each
+// different from every other, so a swapped pair is observable), and the two
+// owners make VendorAccountsByOwner's filter observable too.
+//
+// share_level takes all three legal values across the three rows (shared / full /
+// none) and system_group_id a different non-empty string per row. Both have
+// narrow writers instead of an insert column (CreateVendorAccount leaves them to
+// the column DEFAULTs), so they are seeded through
+// UpdateVendorAccountShareLevel / UpdateVendorAccountSystemGroup after the create,
+// the way the AI-server parity test seeds its system_group_id. The store keeps
+// both verbatim, so a root on the 'none' row is fine here: the point is that the
+// readers agree, not that the row is a state the service can produce.
 func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
@@ -51,6 +60,7 @@ func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 		statuses := []string{
 			routing.VendorAccountStatusActive, routing.VendorAccountStatusDisabled, routing.VendorAccountStatusNeedsReconnect,
 		}
+		shareLevels := []string{routing.VendorShareLevelShared, routing.VendorShareLevelFull, routing.VendorShareLevelNone}
 		// Rows 0 and 2 belong to owner A, row 1 to owner B.
 		rowOwner := []string{owners[0], owners[1], owners[0]}
 
@@ -63,13 +73,22 @@ func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 				APIKey: "enc:api-key-" + idx, OAuthTokens: "enc:oauth-tokens-" + idx,
 				ModelPrefix: "prefix-" + idx + "/",
 				BaseURL:     "https://base-" + idx + ".example.test",
-				CreatedAt:   now.Add(time.Duration(-10-i) * time.Minute),
-				UpdatedAt:   now.Add(time.Duration(-3-i) * time.Minute),
+				ShareLevel:  shareLevels[i], SystemGroupID: "ugrp_cols_sys_" + idx,
+				CreatedAt: now.Add(time.Duration(-10-i) * time.Minute),
+				UpdatedAt: now.Add(time.Duration(-3-i) * time.Minute),
 			})
 		}
 		for _, acc := range want {
 			if err := s.CreateVendorAccount(ctx, acc); err != nil {
 				t.Fatalf("create %s: %v", acc.ID, err)
+			}
+			// share_level and system_group_id are not part of the insert (a new
+			// account is private); their narrow writers seed the distinct values.
+			if err := s.UpdateVendorAccountShareLevel(ctx, acc.ID, acc.ShareLevel); err != nil {
+				t.Fatalf("set share level %s: %v", acc.ID, err)
+			}
+			if err := s.UpdateVendorAccountSystemGroup(ctx, acc.ID, acc.SystemGroupID); err != nil {
+				t.Fatalf("set system group %s: %v", acc.ID, err)
 			}
 		}
 
@@ -141,16 +160,21 @@ func findVendorAccountByID(accounts []routing.VendorAccount, id string) (routing
 // fixture to the LIVE migrated schema (the #84 guard): a column added to
 // vendor_accounts and wired into scanVendorAccount but not into the fixture
 // above would read back its zero from every reader and stay green. The table has
-// no integer-boolean column, so every column is seeded.
+// no integer-boolean column, so every column is seeded, share_level and
+// system_group_id (migration 91) included: both are fields of
+// routing.VendorAccount, selected by every reader, and carry a distinct value per
+// row in the fixture above. The guard only checks that each column is CLASSIFIED,
+// not that an ignored one is unread, so leaving either in ignored would silently
+// leave it unseeded.
 func TestVendorAccountsSchemaColumnsAllCovered(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		assertColumnCoverage(context.Background(), t, s, "vendor_accounts", columnCoverage{
 			bools: nil,
 			seeded: []string{
 				"api_key", "auth_type", "base_url", "created_at", "id", "model_prefix", "name", "oauth_tokens",
-				"owner_user_id", "status", "updated_at", "vendor",
+				"owner_user_id", "share_level", "status", "system_group_id", "updated_at", "vendor",
 			},
-			ignored: map[string]string{},
+			ignored: nil,
 		})
 	})
 }

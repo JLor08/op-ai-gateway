@@ -303,10 +303,14 @@ func vendorConnectionStatus(status vendorauth.CredentialStatus) string {
 // TestVendorAccountConnection is the explicit "test connection" action: it opens
 // the account's stored credential (an api key, or the access token of the sealed
 // token set), asks the vendor whether it is accepted and returns the verdict. It
-// changes nothing and refreshes nothing. STRICTLY OWNER-ONLY, system scope
-// included (it USES the stored credential, so it is authorized like a write, not
-// like a metadata read); an unknown id and a stranger's account are both
-// ErrVendorAccountNotFound. ErrVendorAccountsDisabled while the master flag is off.
+// changes nothing and refreshes nothing. Authorized by
+// authorizeVendorAccountOperate: the owner, or a CM while the account is
+// shared/full; system scope is NOT let through (it USES the stored credential, so
+// it is authorized like a write, not like a metadata read). An unknown id and a
+// stranger's account are both ErrVendorAccountNotFound. A SUBSCRIPTION account is
+// owner-only on top of that (requireOwnerForSubscriptionOperate): it opens the
+// OAuth token set, so a CM who can see the account gets ErrVendorAccountForbidden.
+// ErrVendorAccountsDisabled while the master flag is off.
 //
 // A missing credential (no api key set, subscription not connected) is
 // "unverifiable" with a detail saying so, and so is an access token that is
@@ -318,12 +322,19 @@ func (s *Service) TestVendorAccountConnection(ctx context.Context, principal aut
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorConnectionCheck{}, err
 	}
-	// write=true: strictly owner-only, system scope included. The test opens the
-	// sealed credential and sends it to the vendor from the gateway, so letting a
-	// non-owner trigger it would make the owner's personal credential a live/dead
-	// oracle for someone else (and a vendor-side call the owner never made).
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
+	// The test opens the sealed credential and sends it to the vendor from the
+	// gateway, so it is a write-class operation: system scope is not let through,
+	// and a non-owner may trigger it only as a CM of a shared/full account (the
+	// owner delegated its management). Whoever calls it, the detail is scrubbed of
+	// the credential below.
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
+		return VendorConnectionCheck{}, err
+	}
+	if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+		return VendorConnectionCheck{}, err
+	}
+	if err := requireOwnerForSubscriptionOperate(principal, acc); err != nil {
 		return VendorConnectionCheck{}, err
 	}
 	check, credential, err := s.checkVendorAccount(ctx, acc)

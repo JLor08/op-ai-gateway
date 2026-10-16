@@ -429,4 +429,108 @@ describe('vendorAccountsApi', () => {
       code: 'vendor_account.check_failed',
     });
   });
+
+  // Sharing (#183, spec 2026-10-15): the share-level lifecycle and the
+  // management-group editor's two calls.
+  it('PUTs .../share-level with the target level and the management groups of a raise', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ id: 'va/1', share_level: 'shared' }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.setVendorAccountShareLevel('va/1', 'shared', ['ag_1', 'ag_2']);
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/share-level');
+    expect(init.method).toBe('PUT');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(JSON.parse(init.body)).toEqual({ level: 'shared', admin_group_ids: ['ag_1', 'ag_2'] });
+    expect(resp).toMatchObject({ share_level: 'shared' });
+  });
+
+  it('PUTs .../share-level with the level alone for a lower (the groups are ignored there)', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ id: 'va_1', share_level: 'none' }));
+    const api = createPortalApi(fetcher);
+
+    await api.setVendorAccountShareLevel('va_1', 'none');
+
+    const [, init] = fetcher.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ level: 'none' });
+  });
+
+  it('PUTs .../admin-groups with the full replacement set and returns the account', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ id: 'va/1' }));
+    const api = createPortalApi(fetcher);
+
+    await api.setVendorAccountAdminGroups('va/1', ['ag_b']);
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/admin-groups');
+    expect(init.method).toBe('PUT');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(JSON.parse(init.body)).toEqual({ admin_group_ids: ['ag_b'] });
+  });
+
+  it('GETs the management-group candidates and unwraps the {data:[...]} envelope', async () => {
+    const candidate = {
+      id: 'ag_a',
+      name: 'Group A',
+      parent_group_id: 'sg_1',
+      parent_group_name: 'Ops',
+    };
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: [candidate] }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.vendorAccountAdminGroupCandidates();
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/vendor-account-admin-group-candidates', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(resp).toEqual([candidate]);
+  });
+
+  // Owner self-service resource-group link (#183, spec 2026-10-15 section 9): the
+  // vendor-account analogue of the server-owner trio in api/servers.ts.
+  it('GETs the resource groups an account can join from the {data:[...]} envelope, id URL-encoded', async () => {
+    const groups = [
+      { id: 'rg-1', name: 'Alpha', member: true },
+      { id: 'rg-2', name: 'Beta', member: false },
+    ];
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: groups }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.vendorAccountResourceGroups('va/1');
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/vendor-accounts/va%2F1/resource-groups', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(resp).toEqual(groups);
+  });
+
+  it('PUTs .../resource-groups/{rgId} to join, both ids URL-encoded, with the CSRF header', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.joinVendorAccountResourceGroup('va/1', 'rg/2');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/resource-groups/rg%2F2');
+    expect(init.method).toBe('PUT');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp.ok).toBe(true);
+  });
+
+  it('DELETEs .../resource-groups/{rgId} to leave, both ids URL-encoded, with the CSRF header', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.leaveVendorAccountResourceGroup('va/1', 'rg/2');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/resource-groups/rg%2F2');
+    expect(init.method).toBe('DELETE');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(resp.ok).toBe(true);
+  });
 });

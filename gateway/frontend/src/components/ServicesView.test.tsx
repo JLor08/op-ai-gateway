@@ -6,14 +6,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ServicesView } from './ServicesView';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
-import { EMPTY_LIMIT_CONFIG } from '../api';
+import { EMPTY_LIMIT_CONFIG, PortalApiError } from '../api';
 import type {
   AdminGroupCandidate,
   CreateServiceRequest,
   ModelOption,
   PortalService,
+  ServiceResourceGroup,
   ServiceTokenDTO,
   UpdateServiceRequest,
+  VendorAccount,
 } from '../api';
 import type { PortalApi } from './shared/types';
 
@@ -103,6 +105,32 @@ function makeServiceToken(overrides: Partial<ServiceTokenDTO> = {}): ServiceToke
   };
 }
 
+// A vendor account as api.vendorAccounts() renders it FOR the caller (an own
+// account by default; the shared-account tests override is_owner/share_level).
+function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
+  return {
+    id: 'acc_a',
+    vendor: 'openai',
+    auth_type: 'api_key',
+    name: 'Work OpenAI',
+    status: 'active',
+    model_prefix: 'work/',
+    base_url: '',
+    api_key_set: true,
+    subscription_connected: false,
+    models: [],
+    created_at: '2026-08-12T12:00:00Z',
+    updated_at: '2026-08-12T12:00:00Z',
+    share_level: 'none',
+    admin_groups: [],
+    system_group_id: '',
+    system_group_name: '',
+    is_owner: true,
+    shared_by: '',
+    ...overrides,
+  };
+}
+
 afterEach(cleanup);
 
 for (const locale of ['de', 'en'] as readonly Locale[]) {
@@ -118,6 +146,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // redirect's fallback-picker test, which needs a group entry (is_group)
       // alongside a plain model in the SAME list (Task 8).
       models?: ModelOption[];
+      // The vendor-accounts master flag (off by default, like the prop) and the
+      // account list api.vendorAccounts() resolves with (the CREATOR's view).
+      vendorAccountsEnabled?: boolean;
+      vendorAccounts?: VendorAccount[];
     } = {},
   ) {
     const services = opts.services ?? [makeService()];
@@ -150,6 +182,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // which care about admin-group linkage) keeps working unchanged.
       serviceAdminGroupCandidates: vi.fn(async () => defaultAdminGroupCandidates),
       setServiceAdminGroups: vi.fn(),
+      // Service-side resource-group self-service (#183 Phase 0): the detail
+      // view always mounts the section, so every test needs these. Default to
+      // "no reachable group" (the empty state) so tests that don't care about
+      // resource groups keep working unchanged.
+      serviceResourceGroups: vi.fn(async () => [] as ServiceResourceGroup[]),
+      joinServiceResourceGroup: vi.fn(async () => ({ ok: true })),
+      leaveServiceResourceGroup: vi.fn(async () => ({ ok: true })),
+      // The token create dialog's vendor-access picker (#183 sharing): only
+      // fetched while the master flag is on.
+      vendorAccounts: vi.fn(async () => ({ data: opts.vendorAccounts ?? [] })),
     };
     Object.assign(fakeApi, opts.overrides ?? {});
 
@@ -161,6 +203,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           models={opts.models ?? models}
           role={opts.role ?? 'admin'}
           userId={opts.userId ?? 'usr_admin'}
+          vendorAccountsEnabled={opts.vendorAccountsEnabled}
         />
       </ToastProvider>,
     );
@@ -296,6 +339,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         serviceTokens: vi.fn(async () => ({ data: [] })),
         setServiceAdminGroups: vi.fn(),
         updateService: vi.fn(),
+        // The detail view mounts the resource-group section (#183 Phase 0);
+        // the create-flow tests never open it, so inert stubs suffice.
+        serviceResourceGroups: vi.fn(async () => [] as ServiceResourceGroup[]),
+        joinServiceResourceGroup: vi.fn(async () => ({ ok: true })),
+        leaveServiceResourceGroup: vi.fn(async () => ({ ok: true })),
+        vendorAccounts: vi.fn(async () => ({ data: [] as VendorAccount[] })),
       };
       render(
         <ToastProvider>
@@ -647,6 +696,101 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(dialog.getByRole('button', { name: t.serviceActionDelete }));
 
       await waitFor(() => expect(fakeApi.deleteService).toHaveBeenCalledWith('svc_del'));
+    });
+  });
+
+  describe(`ServicesView detail — resource-group self-service (#183) [${locale}]`, () => {
+    const reachable: ServiceResourceGroup[] = [
+      { id: 'rg-1', name: 'Alpha', member: true },
+      { id: 'rg-2', name: 'Beta', member: false },
+    ];
+
+    it('mounts the section between the admin-groups editor and the token panel', async () => {
+      const svc = makeService({
+        id: 'svc_rg',
+        admin_groups: [{ id: 'ag_default', name: 'Default Admin Group' }],
+        system_group_id: 'sg_default',
+        system_group_name: 'Default System Group',
+      });
+      const { fakeApi } = renderServicesView({
+        services: [svc],
+        overrides: { serviceResourceGroups: vi.fn(async () => reachable) },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      const adminGroups = await screen.findByRole('region', {
+        name: t.serviceAdminGroupsSectionTitle,
+      });
+      const resourceGroups = await screen.findByRole('region', {
+        name: t.serviceResourceGroupsTitle,
+      });
+      const tokens = screen.getByRole('region', { name: t.serviceTokensTitle });
+
+      // DOM order: admin groups -> resource groups -> tokens.
+      expect(
+        adminGroups.compareDocumentPosition(resourceGroups) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        resourceGroups.compareDocumentPosition(tokens) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+
+      // Scoped to the opened service, listing each group with its member state.
+      await waitFor(() => expect(fakeApi.serviceResourceGroups).toHaveBeenCalledWith('svc_rg'));
+      expect(
+        (await within(resourceGroups).findByRole('switch', { name: 'Alpha' })) as HTMLInputElement,
+      ).toBeChecked();
+      expect(within(resourceGroups).getByRole('switch', { name: 'Beta' })).not.toBeChecked();
+    });
+
+    it('joins the opened service into a resource group from the detail view', async () => {
+      const svc = makeService({ id: 'svc_rg', name: 'Join Me' });
+      const { fakeApi } = renderServicesView({
+        services: [svc],
+        overrides: { serviceResourceGroups: vi.fn(async () => reachable) },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      const resourceGroups = await screen.findByRole('region', {
+        name: t.serviceResourceGroupsTitle,
+      });
+      fireEvent.click(await within(resourceGroups).findByRole('switch', { name: 'Beta' }));
+
+      await waitFor(() =>
+        expect(fakeApi.joinServiceResourceGroup).toHaveBeenCalledWith('svc_rg', 'rg-2'),
+      );
+      expect(fakeApi.leaveServiceResourceGroup).not.toHaveBeenCalled();
+    });
+
+    it('folds a refused load (a delegate the backend 404s) to the empty state and keeps the token panel', async () => {
+      const svc = makeService({
+        id: 'svc_rg_ro',
+        delegates: [
+          {
+            user_id: 'usr_token_delegate',
+            user_name: 'Token Delegate',
+            can_manage_settings: false,
+          },
+        ],
+      });
+      renderServicesView({
+        services: [svc],
+        role: 'user',
+        userId: 'usr_token_delegate',
+        overrides: {
+          serviceResourceGroups: vi.fn(async () => {
+            throw new Error('not found');
+          }),
+        },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      const resourceGroups = await screen.findByRole('region', {
+        name: t.serviceResourceGroupsTitle,
+      });
+      expect(
+        await within(resourceGroups).findByText(t.serviceResourceGroupsEmpty),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.serviceTokenCreate })).toBeInTheDocument();
     });
   });
 
@@ -1114,6 +1258,302 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: t.listColumns }));
       fireEvent.click(screen.getByRole('checkbox', { name: t.tokenLastUsedModel }));
       expect(screen.getByText('—')).toBeInTheDocument();
+    });
+  });
+
+  // #183 sharing, phase 5.3: a service token's per-account vendor opt-in. A service
+  // owns no account, so the only ones it can use are those SHARED with it (the
+  // service provisioned into a resource group that contains them), each named
+  // explicitly. It is create-only: a service token has no field-level update and a
+  // rotation preserves it server-side.
+  describe(`ServiceTokensSection vendor access at create (#183) [${locale}]`, () => {
+    const ownShared = makeVendorAccount({
+      id: 'acc_own_shared',
+      name: 'Own Shared',
+      share_level: 'shared',
+    });
+    const ownPrivate = makeVendorAccount({
+      id: 'acc_own_private',
+      name: 'Own Private',
+      share_level: 'none',
+    });
+    const memberAccount = makeVendorAccount({
+      id: 'acc_member',
+      name: 'Team Claude',
+      vendor: 'anthropic',
+      is_owner: false,
+      shared_by: 'Alice',
+      share_level: '',
+    });
+    const managedAccount = makeVendorAccount({
+      id: 'acc_managed',
+      name: 'Ops Gemini',
+      vendor: 'google',
+      is_owner: false,
+      shared_by: 'Bob',
+      share_level: 'full',
+    });
+    const memberLabel = `Team Claude (${t.vendorAccountSharedBy} Alice)`;
+    const managedLabel = `Ops Gemini (${t.vendorAccountSharedBy} Bob)`;
+
+    async function openCreateDialog(opts: Parameters<typeof renderServicesView>[0] = {}) {
+      const rendered = renderServicesView({
+        services: [makeService({ id: 'svc_va' })],
+        vendorAccountsEnabled: true,
+        ...opts,
+        overrides: {
+          createServiceToken: vi.fn(async () => ({ token: makeServiceToken(), secret: 's' })),
+          ...opts.overrides,
+        },
+      });
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      fireEvent.click(await screen.findByRole('button', { name: t.serviceTokenCreate }));
+      const createDialog = within(screen.getByRole('dialog'));
+      fireEvent.change(createDialog.getByLabelText(t.tokenNameLabel), {
+        target: { value: 'Batch Token' },
+      });
+      return { ...rendered, createDialog };
+    }
+
+    function createBody(fakeApi: { createServiceToken: unknown }): Record<string, unknown> {
+      const calls = (fakeApi.createServiceToken as { mock: { calls: unknown[][] } }).mock.calls;
+      return calls[calls.length - 1][1] as Record<string, unknown>;
+    }
+
+    it('hides the picker, never fetches accounts and sends no vendor_access while the flag is off', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog({
+        vendorAccountsEnabled: false,
+        vendorAccounts: [memberAccount],
+      });
+
+      expect(createDialog.queryByText(t.tokenVendorAccessLabel)).not.toBeInTheDocument();
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(createBody(fakeApi).vendor_access).toBeUndefined();
+    });
+
+    it('fetches the accounts only when the create dialog opens', async () => {
+      const { fakeApi } = renderServicesView({
+        services: [makeService({ id: 'svc_lazy' })],
+        vendorAccountsEnabled: true,
+        vendorAccounts: [memberAccount],
+      });
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByRole('button', { name: t.serviceTokenCreate });
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole('button', { name: t.serviceTokenCreate }));
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalledTimes(1));
+    });
+
+    it('offers the shared accounts, not an unshared own one, and has no all switch', async () => {
+      const { createDialog } = await openCreateDialog({
+        vendorAccounts: [ownShared, ownPrivate, memberAccount, managedAccount],
+      });
+
+      const group = await createDialog.findByRole('group', { name: t.tokenVendorAccessLabel });
+      expect(within(group).getByRole('checkbox', { name: 'Own Shared' })).not.toBeChecked();
+      expect(within(group).getByRole('checkbox', { name: memberLabel })).not.toBeChecked();
+      expect(within(group).getByRole('checkbox', { name: managedLabel })).not.toBeChecked();
+      // An unshared account grants a service nothing; "all" would cover nothing for
+      // a service (it owns no account), so there is no such switch either.
+      expect(
+        within(group).queryByRole('checkbox', { name: 'Own Private' }),
+      ).not.toBeInTheDocument();
+      expect(
+        createDialog.queryByRole('checkbox', { name: t.tokenVendorAccessAll }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('states that the opt-in is set at create only and what a rotation does with it', async () => {
+      const { createDialog } = await openCreateDialog({ vendorAccounts: [memberAccount] });
+
+      await createDialog.findByRole('checkbox', { name: memberLabel });
+      expect(createDialog.getByText(t.serviceTokenVendorAccessNote)).toBeInTheDocument();
+    });
+
+    it('creates a token opted into a shared account, with a prefix override', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog({
+        vendorAccounts: [memberAccount, managedAccount],
+      });
+      fireEvent.click(await createDialog.findByRole('checkbox', { name: memberLabel }));
+
+      const accountGroup = createDialog.getByRole('group', { name: memberLabel });
+      expect(within(accountGroup).queryByLabelText(t.tokenVendorAccessPrefixLabel)).toBeNull();
+      fireEvent.click(
+        within(accountGroup).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      fireEvent.change(within(accountGroup).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'svc/' },
+      });
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+        'svc_va',
+        expect.objectContaining({
+          vendor_access: {
+            all: false,
+            accounts: [
+              { account_id: 'acc_member', prefix_override: { enabled: true, value: 'svc/' } },
+            ],
+          },
+        }),
+      );
+    });
+
+    it('omits prefix_override for an account whose override is off and sends every picked account', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog({
+        vendorAccounts: [memberAccount, managedAccount],
+      });
+      fireEvent.click(await createDialog.findByRole('checkbox', { name: memberLabel }));
+      fireEvent.click(createDialog.getByRole('checkbox', { name: managedLabel }));
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(createBody(fakeApi).vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_member' }, { account_id: 'acc_managed' }],
+      });
+    });
+
+    it('sends no vendor_access when no account is picked (the strict default)', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog({ vendorAccounts: [memberAccount] });
+      await createDialog.findByRole('checkbox', { name: memberLabel });
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(createBody(fakeApi).vendor_access).toBeUndefined();
+    });
+
+    it('starts every create dialog with nothing picked', async () => {
+      const { createDialog } = await openCreateDialog({ vendorAccounts: [memberAccount] });
+      fireEvent.click(await createDialog.findByRole('checkbox', { name: memberLabel }));
+      expect(createDialog.getByRole('checkbox', { name: memberLabel })).toBeChecked();
+
+      fireEvent.click(createDialog.getByRole('button', { name: t.cancel }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      fireEvent.click(screen.getByRole('button', { name: t.serviceTokenCreate }));
+      const reopened = within(screen.getByRole('dialog'));
+      expect(await reopened.findByRole('checkbox', { name: memberLabel })).not.toBeChecked();
+    });
+
+    it('shows an empty state when no account is shared with anybody the caller can see', async () => {
+      const { createDialog } = await openCreateDialog({ vendorAccounts: [ownPrivate] });
+
+      expect(await createDialog.findByText(t.serviceTokenVendorAccessNone)).toBeInTheDocument();
+    });
+
+    it('blocks the create while an enabled override prefix is malformed', async () => {
+      const { createDialog } = await openCreateDialog({ vendorAccounts: [memberAccount] });
+      fireEvent.click(await createDialog.findByRole('checkbox', { name: memberLabel }));
+      const accountGroup = createDialog.getByRole('group', { name: memberLabel });
+      fireEvent.click(
+        within(accountGroup).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      fireEvent.change(within(accountGroup).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'bad prefix?' },
+      });
+
+      expect(createDialog.getByRole('button', { name: t.serviceTokenCreate })).toBeDisabled();
+      expect(
+        within(accountGroup).getByText(t.errorVendorAccountModelPrefixInvalid),
+      ).toBeInTheDocument();
+    });
+
+    it('creates without vendor access, and still opens the dialog, when the account list could not be loaded', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog({
+        overrides: {
+          vendorAccounts: vi.fn(async () => {
+            throw new Error('network down');
+          }),
+        },
+      });
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(createBody(fakeApi).vendor_access).toBeUndefined();
+    });
+
+    it('shows the specific toast when the backend refuses an unreachable account', async () => {
+      const code = 'portal.token_vendor_access_invalid';
+      const { createDialog } = await openCreateDialog({
+        vendorAccounts: [memberAccount],
+        overrides: {
+          createServiceToken: vi.fn(async () => {
+            throw new PortalApiError(400, code, 'raw');
+          }),
+        },
+      });
+      fireEvent.click(await createDialog.findByRole('checkbox', { name: memberLabel }));
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+
+      expect(
+        await screen.findByText(`${code}: ${t.errorTokenVendorAccessInvalid}`),
+      ).toBeInTheDocument();
+    });
+
+    it('offers no vendor-access field on a rotation: it rotates by id alone and the opt-in is kept', async () => {
+      const existingToken = makeServiceToken({
+        id: 'tok_rot',
+        service_id: 'svc_va',
+        name: 'Rotate Me',
+        vendor_access: { all: false, accounts: [{ account_id: 'acc_member' }] },
+      });
+      const { fakeApi } = renderServicesView({
+        services: [makeService({ id: 'svc_va' })],
+        vendorAccountsEnabled: true,
+        vendorAccounts: [memberAccount],
+        overrides: {
+          serviceTokens: vi.fn(async () => ({ data: [existingToken] })),
+          rotateServiceToken: vi.fn(async () => ({ token: existingToken, secret: 'rotated' })),
+        },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      // A service token has no edit action at all: only rotate and delete.
+      await screen.findByText('Rotate Me');
+      expect(screen.queryByRole('button', { name: t.tokenActionEdit })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionRotate }));
+
+      const confirmDialog = within(screen.getByRole('dialog'));
+      expect(
+        confirmDialog.getByText(t.serviceTokenRotateKeepsVendorAccess, { exact: false }),
+      ).toBeInTheDocument();
+      expect(confirmDialog.queryByRole('group')).not.toBeInTheDocument();
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+      fireEvent.click(confirmDialog.getByRole('button', { name: t.tokenRotateConfirm }));
+
+      await waitFor(() =>
+        expect(fakeApi.rotateServiceToken).toHaveBeenCalledWith('svc_va', 'tok_rot'),
+      );
+      expect(fakeApi.rotateServiceToken).toHaveBeenCalledTimes(1);
+      const [args] = (fakeApi.rotateServiceToken as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls;
+      expect(args).toHaveLength(2);
+    });
+
+    it('does not mention vendor access in the rotation prompt while the flag is off', async () => {
+      const existingToken = makeServiceToken({
+        id: 'tok_rot',
+        service_id: 'svc_va',
+        name: 'Rotate Me',
+      });
+      renderServicesView({
+        services: [makeService({ id: 'svc_va' })],
+        overrides: { serviceTokens: vi.fn(async () => ({ data: [existingToken] })) },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText('Rotate Me');
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionRotate }));
+
+      expect(
+        within(screen.getByRole('dialog')).queryByText(t.serviceTokenRotateKeepsVendorAccess, {
+          exact: false,
+        }),
+      ).not.toBeInTheDocument();
     });
   });
 }

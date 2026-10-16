@@ -62,6 +62,8 @@ function makeSystemSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemS
     vision_probe_mode: 'accept',
     vendor_accounts_enabled: false,
     vendor_subscriptions_enabled: true,
+    vendor_account_sharing_enabled: false,
+    vendor_subscription_sharing_enabled: false,
     anthropic_prompt_caching_enabled: false,
     vendor_account_routing_mode: 'vendor_first',
     vendor_openai_codex_client_version: '26.930.61225',

@@ -251,11 +251,18 @@ func TestCreateTokenVendorAccessStrictDefault(t *testing.T) {
 	}
 }
 
-// With all=true the account list is ignored by the resolver, so it is not
-// validated or collision-checked: the SAME pair that conflicts under all=false
-// (see TestCreateTokenVendorAccessValidation, "collision on empty prefixes") must
-// still save, and a foreign id riding along is stored inert. Sending the colliding
-// pair (not an empty list) is what makes this guard the all=true short-circuit.
+// With all=true the principal's OWN accounts are covered by the switch and the
+// account list is ignored for them, so entries naming them are not validated or
+// collision-checked: the SAME pair that conflicts under all=false (see
+// TestCreateTokenVendorAccessValidation, "collision on empty prefixes") must still
+// save. Sending the colliding pair (not an empty list) is what makes this guard the
+// all=true short-circuit.
+//
+// An entry naming an account the principal does NOT own is different: all:true never
+// covers a shared account, so such an entry is a live opt-in to one and is held to the
+// reach check like under all=false. A foreign id that is not shared with the owner is
+// therefore refused (it used to be stored inert; the reachable case is pinned in
+// TestVendorOptInAllTrueSaveTimeValidatesOnlyNonOwnEntries).
 func TestCreateTokenVendorAccessAllSkipsPerAccountChecks(t *testing.T) {
 	fx := newTokenVendorAccessFixture(t)
 	pair := []VendorAccessEntryDTO{
@@ -271,25 +278,25 @@ func TestCreateTokenVendorAccessAllSkipsPerAccountChecks(t *testing.T) {
 		t.Fatalf("all=false control: err = %v, want ErrTokenVendorAccessConflict", err)
 	}
 
-	for _, tc := range []struct {
-		name     string
-		accounts []VendorAccessEntryDTO
-	}{
-		{"colliding pair", pair},
-		{"foreign id", []VendorAccessEntryDTO{{AccountID: "acc_other"}}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			resp, err := fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{
-				Name: "all-" + tc.name, Scopes: []string{"gateway:use"},
-				VendorAccess: &VendorAccessDTO{All: true, Accounts: tc.accounts},
-			})
-			if err != nil {
-				t.Fatalf("CreateToken: %v", err)
-			}
-			if resp.Token.VendorAccess == nil || !resp.Token.VendorAccess.All {
-				t.Fatalf("DTO = %+v, want all=true", resp.Token.VendorAccess)
-			}
-		})
+	resp, err := fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{
+		Name: "all-colliding-pair", Scopes: []string{"gateway:use"},
+		VendorAccess: &VendorAccessDTO{All: true, Accounts: pair},
+	})
+	if err != nil {
+		t.Fatalf("CreateToken(all, colliding own pair): %v", err)
+	}
+	if resp.Token.VendorAccess == nil || !resp.Token.VendorAccess.All {
+		t.Fatalf("DTO = %+v, want all=true", resp.Token.VendorAccess)
+	}
+
+	// A foreign account (usr_2's acc_other, shared with nobody) is not covered by all
+	// and is not reachable: refused, not stored inert.
+	_, err = fx.svc.CreateToken(context.Background(), fx.owner, CreateTokenRequest{
+		Name: "all-foreign-id", Scopes: []string{"gateway:use"},
+		VendorAccess: &VendorAccessDTO{All: true, Accounts: []VendorAccessEntryDTO{{AccountID: "acc_other"}}},
+	})
+	if !errors.Is(err, ErrTokenVendorAccessInvalid) {
+		t.Fatalf("CreateToken(all, foreign id) = %v, want ErrTokenVendorAccessInvalid", err)
 	}
 }
 

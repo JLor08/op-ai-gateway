@@ -1289,7 +1289,12 @@ paths:
   /api/portal/services:
     description: >
       Service (service-account) collection. Per-service sub-paths (see
-      api-surface.md): tokens, admin-groups. A service token takes the same
+      api-surface.md): tokens, admin-groups, resource-groups (typed below). A
+      service token takes the vendor-account opt-in vendor_access (the
+      TokenVendorAccess schema) on create only, naming the shared vendor
+      accounts the service can reach (it must be provisioned directly into a
+      resource group that contains them); there is no field-level update and a
+      rotation preserves it. A service token takes the same
       claude_model_aliases flag as a user token, on create only
       (POST /api/portal/services/{id}/tokens; there is no field-level update),
       and reads it back on the token list. It takes claude_effort_compatibility
@@ -1335,7 +1340,11 @@ paths:
   /api/portal/resource-groups:
     description: >
       Resource-group collection. Per-resource-group sub-paths (see
-      api-surface.md): servers, admin-groups, provisions, candidates.
+      api-surface.md): servers, admin-groups, provisions, candidates, and the
+      vendor-account side (vendor-accounts, vendor-account-candidates; typed
+      below). A resource-group DTO carries vendor_accounts, the credential-free
+      [{id, name}] of the shared vendor accounts it offers (empty while the
+      vendor-accounts module flag is off).
     get:
       tags: [portal]
       summary: List resource groups
@@ -1371,6 +1380,129 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/services/{id}/resource-groups:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Resource groups a service manager may enter the service into
+      description: >
+        The service-side resource-group self-service (read): every resource group
+        linked to an admin group the caller is a member of (system scope: every
+        group), each with member = the service is provisioned into it (a
+        resource_group_provisions row of kind service). Provisioning a service
+        into a group is what lets its tokens reach the shared vendor accounts
+        the group offers. The caller must manage the service (system scope, or a
+        can_manage_services owner or co-manager of a linked admin group; a
+        delegate does not qualify); anything else is a 404 service.not_found.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The reachable resource groups, sorted by name
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ServiceResourceGroup' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/portal/services/{id}/resource-groups/{rgId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: rgId, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Provision the service into a resource group (idempotent)
+      description: >
+        Writes the single service provision row, never the group's whole-set
+        replace. The caller must manage the service and be a member of an admin
+        group the resource group is linked to; a miss on either is a
+        404-no-leak (service.not_found, resource_group.not_found).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [portal]
+      summary: Remove the service from a resource group (idempotent)
+      description: The single-row inverse of the PUT, with the same gates.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/portal/resource-groups/{id}/vendor-accounts:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Replace the shared vendor accounts a resource group offers (resource-group manager side)
+      description: >
+        Body {vendor_account_ids}. Replaces the group's vendor-account set (add
+        the desired-not-current, remove the current-not-desired; all-or-nothing
+        validation, nothing is written when any addition is refused) and answers
+        the group. The caller must manage the group (404 resource_group.not_found
+        for a stranger and an unknown id alike) and, for EACH account they add,
+        must operate it (404 vendor_account.not_found, system scope included),
+        the account must be full (403 vendor_account.forbidden at shared, where
+        only the owner's self-service links it; 400 vendor_account.not_shared
+        below that) and rooted where the group is (400
+        resource_group.vendor_account_system_group_mismatch). Removal needs only
+        the group: whoever manages it can drop any link. This only links:
+        whether a member can use an account is the routing grant's decision. 409
+        vendor_accounts.module_disabled / vendor_accounts.sharing_disabled while
+        the module or the sharing switch is off, whoever asks.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vendor_account_ids]
+              properties:
+                vendor_account_ids:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: The resource group, with its vendor_accounts (see api-surface.md for the resource-group DTO)
+          content:
+            application/json:
+              schema: { type: object }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/resource-groups/{id}/vendor-account-candidates:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Vendor accounts the caller may add to a resource group
+      description: >
+        Exactly what the PUT above would accept: the full accounts the caller
+        operates (their own and the ones they co-manage) under the group's root,
+        sorted by name then id; accounts already in the group are included so a
+        picker shows the selection. Gated by the group (404 resource_group.not_found)
+        and, like the PUT, a 409 while the module or sharing switch is off.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The candidate accounts (credential-free id and name only)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ResourceGroupVendorAccountRef' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/server-admin-group-candidates:
     get:
       tags: [portal]
@@ -1421,24 +1553,39 @@ paths:
   # ── 3. Portal: vendor accounts (Anbieter) ─────────────────────────────────
   /api/portal/vendor-accounts:
     description: >
-      Per-user external vendor accounts ("Anbieter"). Owner-only inside
-      portal.Service; secrets are write-only; the whole surface 409s with
-      vendor_account(s).module_disabled while vendor_accounts_enabled is off.
-      The narrower vendor_subscriptions_enabled switch (default on) additionally
-      409s creating a subscription account and every connect operation with
-      vendor_accounts.subscriptions_disabled while it is off.
+      External vendor accounts ("Anbieter"), each owned by one user. Authorization
+      is by share level inside portal.Service: an account is personal (share_level
+      none) until its owner, an admin, raises it to shared or full; then a
+      co-manager (CM, a holder of can_manage_vendor_accounts in a management group
+      the account is assigned to) may operate it at shared and manage it fully at
+      full, and a member (provisioned into a resource group that contains it) gets
+      a minimal key-free read and may use it once a token opts in. A stranger gets
+      the 404 of an unknown id; a CM who can see the account but may not do the
+      thing gets 403 vendor_account.forbidden. Secrets are write-only for every
+      viewer; the whole surface 409s with vendor_accounts.module_disabled while
+      vendor_accounts_enabled is off. The narrower vendor_subscriptions_enabled
+      switch (default on) additionally 409s creating a subscription account and
+      every connect operation with vendor_accounts.subscriptions_disabled while it
+      is off, and the sharing endpoints 409 with vendor_accounts.sharing_disabled
+      while vendor_account_sharing_enabled (default off) is off.
       See api-surface.md for the request/response shapes and error codes.
     get:
       tags: [portal]
-      summary: List the caller's own vendor accounts
+      summary: List the vendor accounts the caller can see (own, managed, routable as a member)
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200':
           description: >
-            The caller's own accounts, oldest first. Each row carries its
-            rate-limit usage snapshot when one has been stored (omitted
-            otherwise, and omitted for a row whose snapshot could not be read:
-            the list never fails over it).
+            The accounts the caller owns (oldest first), then, for a non-system
+            caller, the shared accounts they manage as a CM, then the shared
+            accounts they can only route to as a member (each arm oldest first,
+            an account listed once in the first arm that holds it; system scope
+            does not widen the list; with the sharing switch off it is the
+            caller's own accounts only). An own or managed row is the management
+            view and carries its rate-limit usage snapshot when one has been
+            stored (omitted otherwise, and omitted for a row whose snapshot could
+            not be read: the list never fails over it). A member-only row is the
+            minimal key-free view (see the VendorAccount schema).
           content:
             application/json:
               schema:
@@ -1468,28 +1615,44 @@ paths:
   /api/portal/vendor-accounts/enabled:
     get:
       tags: [portal]
-      summary: Whether the vendor-accounts module is enabled, and whether subscription accounts are allowed
+      summary: Whether the vendor-accounts module is enabled, whether subscription accounts are allowed, and whether sharing is on
       description: >
-        Two booleans and nothing else: module_enabled (the vendor_accounts_enabled
-        master flag) and subscriptions_enabled (the vendor_subscriptions_enabled
-        switch, default true). Answers for any portal user even while the module
-        is off.
+        Three booleans and nothing else: module_enabled (the vendor_accounts_enabled
+        master flag), subscriptions_enabled (the vendor_subscriptions_enabled
+        switch, default true) and sharing_enabled (the
+        vendor_account_sharing_enabled master switch as stored, default false).
+        vendor_subscription_sharing_enabled, the routing mode and every other
+        setting are never reported. Answers for any portal user even while the
+        module is off, so the portal can show or hide the nav item and the
+        sharing controls without the system-scoped settings read.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200':
+          description: The three switches
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountsEnabled' }
   /api/portal/vendor-accounts/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Vendor-account detail (includes the usage snapshot)
+      summary: Vendor-account detail (includes the usage snapshot for a management view)
+      description: >
+        Rendered in the view the caller's relation to the account earns: the
+        management view for the owner, a CM of a shared or full account and
+        system scope; the minimal key-free member view for a principal that can
+        only route to it through a resource group (reach, not the token opt-in,
+        is what admits it); anyone else gets the 404 of an unknown id.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200':
-          description: The credential-free account, with its rate-limit usage snapshot when one has been scraped
+          description: The credential-free account, with its rate-limit usage snapshot when one has been scraped (management view only)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
     patch:
       tags: [portal]
       summary: Update a vendor account (write-only api_key sentinel; a model_prefix re-labels the stored models)
@@ -1500,7 +1663,17 @@ paths:
         account's stored model rows to the prefix plus each vendor id without
         asking the vendor again. A prefix longer than 64 characters, containing
         "..", or containing anything but A-Z a-z 0-9 - _ . ~ : / @ + is a 400
-        vendor_account.model_prefix_invalid.
+        vendor_account.model_prefix_invalid. Authorization is per field, deny by
+        default: a body whose every present field is name, status or model_prefix
+        needs the operate gate (the owner, or a CM of a shared or full account);
+        a body that carries anything else (api_key above all, and base_url or
+        auth_type even when merely echoed) needs the credential gate (the owner,
+        or a CM of a full account; a CM of a shared account gets 403
+        vendor_account.forbidden and nothing is written), and a mixed body takes
+        the stricter. base_url and auth_type are create-only: changing either is a
+        400 vendor_account.field_immutable (a value equal to the stored one is not
+        a change). An operate-only PATCH writes only the columns it names, never
+        a credential column.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody:
         required: true
@@ -1514,12 +1687,25 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
     delete:
       tags: [portal]
-      summary: Delete a vendor account
+      summary: Delete a vendor account (credential gate)
+      description: >
+        The credential gate: the owner at every level, a CM of a full account; a
+        CM of a shared account gets 403 vendor_account.forbidden, anyone else the
+        404 of an unknown id (system scope included). The delete cascades the
+        account's models, usage, management-group links and resource-group links,
+        and so revokes every borrower. Answers ok true. A 409
+        vendor_accounts.module_disabled while the vendor_accounts_enabled master
+        flag is off, whoever asks.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
-        '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/connect/import:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1533,7 +1719,9 @@ paths:
         stored, an unreachable or inconclusive vendor still stores. Once the
         tokens are stored a best-effort model discovery (bounded to 5 seconds,
         never failing the connect) replaces the seeded models with the vendor's
-        real list; the answer carries them when it succeeded.
+        real list; the answer carries them when it succeeded. Every connect route
+        is the credential gate: the owner, or a CM of a full account (a CM of a
+        shared account gets 403 vendor_account.forbidden, anyone else 404).
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -1543,6 +1731,8 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/check:
     parameters:
@@ -1552,9 +1742,12 @@ paths:
       summary: Test the connection (model-independent credential check)
       description: >
         No request body. Asks the vendor whether the account's stored credential
-        is accepted and answers a VendorConnectionCheck. Strictly owner-only
-        (system scope included); a non-owner gets the same 404 as an unknown
-        id. Changes nothing and never returns a credential. A rejected
+        is accepted and answers a VendorConnectionCheck. An operate call: the
+        owner, or a CM of a shared or full account, never system scope alone (a
+        stranger gets the same 404 as an unknown id). On a subscription account
+        it is owner-only even at shared, because it opens the single-use OAuth
+        token set (403 vendor_account.forbidden for a CM). Changes nothing and
+        never returns a credential (the detail is scrubbed of it). A rejected
         credential is a 200 with status invalid, not an error; a stored
         credential that cannot be opened (lost encryption key, corrupt blob) is
         a 409 vendor_account.credential_unreadable.
@@ -1565,6 +1758,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VendorConnectionCheck' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: >
@@ -1591,9 +1785,12 @@ paths:
         credential-free account and a VendorModelsRefreshResult. Fail-soft: when
         nothing usable can be had the models are kept and the answer is still a
         200 with refresh.status unverifiable (the account then already reads
-        needs_reconnect when the vendor rejected the refresh token). Strictly
-        owner-only (system scope included); a non-owner gets the same 404 as an
-        unknown id. A stored credential that cannot be opened is a 409
+        needs_reconnect when the vendor rejected the refresh token). An operate
+        call gated like the connection test: the owner, or a CM of a shared or
+        full account, never system scope alone (404 for a stranger), and
+        owner-only even at shared for a subscription account, because the refresh
+        can rotate its single-use token (403 vendor_account.forbidden for a CM).
+        A stored credential that cannot be opened is a 409
         vendor_account.credential_unreadable; an uncategorized failure (a store
         error) is a 500 vendor_account.refresh_failed.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
@@ -1608,6 +1805,7 @@ paths:
                 properties:
                   account: { $ref: '#/components/schemas/VendorAccount' }
                   refresh: { $ref: '#/components/schemas/VendorModelsRefreshResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: >
@@ -1649,8 +1847,11 @@ paths:
         bypasses the TTL and always asks. An expired subscription token is
         renewed first through the gateway's own locked token refresh; an
         api-key account has nothing to renew. Fail-soft: a vendor that cannot be asked is a 200 with refresh.status
-        unverifiable and the stored snapshot kept. Strictly owner-only (system
-        scope included); a non-owner gets the same 404 as an unknown id. A
+        unverifiable and the stored snapshot kept. An operate call gated like
+        the connection test: the owner, or a CM of a shared or full account,
+        never system scope alone (404 for a stranger), and owner-only even at
+        shared for a subscription account (the pull renews the token first, the
+        lazy on-view pull included; 403 vendor_account.forbidden for a CM). A
         stored credential (a token set or an api key) that cannot be opened is
         a 409 vendor_account.credential_unreadable; an uncategorized failure (a store
         error) is a 500 vendor_account.usage_refresh_failed.
@@ -1678,6 +1879,7 @@ paths:
                       - { $ref: '#/components/schemas/VendorAccountUsage' }
                       - { type: 'null' }
                   refresh: { $ref: '#/components/schemas/VendorUsageRefreshResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '405': { description: 'Any method other than POST (Allow: POST).' }
         '409':
@@ -1746,6 +1948,178 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-accounts/{id}/share-level:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Move a vendor account to a share level (raise or lower)
+      description: >
+        Body {level, admin_group_ids?}; level is the TARGET (none, shared or
+        full). A level above the stored one is a raise, anything else a lower.
+        Raise: the owner, who must be an admin right now (the token carries the
+        admin scope and the user's current role is admin or system_admin),
+        carrying admin_group_ids with at least one management group (existing
+        admin-tier groups the caller may name, all under one parent system group,
+        which becomes the account's immutable containment root). A subscription
+        account may be raised to shared only (400
+        vendor_account.subscription_share_capped for full) and only while
+        vendor_subscription_sharing_enabled is on (409
+        vendor_accounts.subscription_sharing_disabled). Lower: the credential
+        gate, so the owner at every level (ownership alone) and a CM at full
+        only; lowering to none runs ClearVendorAccountSharing, one transaction
+        that sets the level to none first, then deletes the management-group and
+        resource-group links and clears the root (idempotent); full to shared
+        changes only the level. Refusals, in order: 409 for the module and
+        sharing switches (global, before any account is read), 400
+        vendor_account.share_level_invalid, then the account (404 for a
+        stranger, an unknown id and system scope; 403 vendor_account.forbidden
+        for a caller who can see the account but may not raise or lower it), 400
+        vendor_account.share_level_unchanged, the subscription cap and flag, and
+        the group validation (400 vendor_account.admin_group_required, .admin_group_invalid,
+        .admin_group_parent_mismatch, .root_mismatch).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountShareLevelRequest' }
+      responses:
+        '200':
+          description: The credential-free account at its new level
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-accounts/{id}/admin-groups:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Replace the management groups of a shared vendor account
+      description: >
+        Body {admin_group_ids}. The credential gate's shape: the owner at every
+        level, a CM at full only (403 vendor_account.forbidden for a CM of a
+        shared account, 404 for a stranger, system scope included). The account
+        must be shared or full (400 vendor_account.not_shared), the set must hold
+        at least one group (400 vendor_account.admin_group_required), each an
+        existing admin-tier group the caller may name (400
+        vendor_account.admin_group_invalid), all under one parent (400
+        vendor_account.admin_group_parent_mismatch) which must be the account's
+        retained root (400 vendor_account.root_mismatch, checked for every
+        principal). Additions are written first, so the account never has zero
+        groups mid-write. 409 while the module or sharing switch is off.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountAdminGroupsRequest' }
+      responses:
+        '200':
+          description: The credential-free account with its new management groups
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-account-admin-group-candidates:
+    get:
+      tags: [portal]
+      summary: Admin-tier groups the caller may name as management groups of a vendor account
+      description: >
+        System scope gets every admin-tier group; anyone else exactly the groups
+        they manage vendor accounts through (owner of the group, or a
+        co-manager holding can_manage_vendor_accounts), so a plain user gets an
+        empty list. Each candidate carries its parent system group, the account's
+        future containment root. 409 while the module or sharing switch is off.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The candidate groups, sorted by name
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminGroupCandidate' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-accounts/{id}/resource-groups:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Resource groups the owner may enter a shared vendor account into
+      description: >
+        The owner's resource-group self-service (read): every group linked to an
+        admin group the owner is a member of (system scope: every group) and
+        whose root is the account's, each with member = the account is in it.
+        Owner only (403 vendor_account.forbidden for a CM who can see the
+        account, 404 for everyone else, system scope included), on a shared or
+        full account (400 vendor_account.not_shared). 409 while the module or
+        sharing switch is off.
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The reachable resource groups, sorted by name
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/VendorAccountResourceGroup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-accounts/{id}/resource-groups/{rgId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: rgId, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Join a resource group (owner self-service, idempotent)
+      description: >
+        Writes the single resource_group_vendor_accounts row, never a whole-set
+        replace. Same account gate as the GET (owner only, shared or full); the
+        group must be reachable by the owner (404 resource_group.not_found, also
+        what a non-existent id gets) and under the account's root (400
+        resource_group.vendor_account_system_group_mismatch). A co-manager of a
+        full account links through the resource-group manager side instead. This
+        only links: whether a member can use the account is the routing grant's
+        decision (live share level, provisioning and the member token's
+        per-account opt-in).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+    delete:
+      tags: [portal]
+      summary: Leave a resource group (owner self-service, idempotent)
+      description: >
+        The single-row inverse of the PUT, with the same gates and no root check,
+        so a link to another root can always be dropped.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
 
   # ── 3. Portal: feature flags / read-only status ───────────────────────────
@@ -1847,6 +2221,15 @@ paths:
       account is a 409 vendor_accounts.subscriptions_disabled and existing
       subscription accounts stop routing and being listed. It only has an effect
       while the vendor_accounts_enabled master flag is on.
+      They also include the two sharing switches vendor_account_sharing_enabled
+      (the sharing master switch, default false) and
+      vendor_subscription_sharing_enabled (whether subscription accounts may be
+      shared, default false, subordinate to the first): both always present in the
+      GET (false when the store is absent or unreadable), writable on the PUT with
+      an omitted or null value keeping the stored one, and neither has a
+      validation error. While the master switch is off the share-level,
+      management-group and resource-group endpoints are a 409
+      vendor_accounts.sharing_disabled and every account behaves as personal.
     get:
       tags: [system]
       summary: System-wide settings (SMTP, NetBird, certificate gates, currency, …)
@@ -2389,18 +2772,33 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    OkTrue:
+      description: The operation was applied (or already held); the body is ok true.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok]
+            properties:
+              ok: { type: boolean }
     VendorAccountsUnavailable:
       description: >
         The vendor-accounts feature refuses the operation -- the Error envelope
         carries the stable code: vendor_accounts.module_disabled while the
-        vendor_accounts_enabled master flag is off, or
+        vendor_accounts_enabled master flag is off,
         vendor_accounts.subscriptions_disabled while the
         vendor_subscriptions_enabled switch is off and the operation creates or
-        connects a subscription account. The subscriptions code is checked
-        late (on a connect after the owner and subscription-only checks, on a
-        create after the request validation), so a non-owner still gets 404, an
-        api-key account is never refused with it, and a malformed request keeps
-        its 400.
+        connects a subscription account,
+        vendor_accounts.sharing_disabled while the
+        vendor_account_sharing_enabled switch (default off) is off and the
+        operation is a share-level, management-group or resource-group one (it is
+        answered before any account or group is read, so it reveals nothing), or
+        vendor_accounts.subscription_sharing_disabled when raising a subscription
+        account while vendor_subscription_sharing_enabled is off. The
+        subscriptions code is checked late (on a connect after the owner and
+        subscription-only checks, on a create after the request validation), so
+        a stranger still gets 404, an api-key account is never refused with it,
+        and a malformed request keeps its 400.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -2570,16 +2968,18 @@ components:
     TokenVendorAccess:
       type: object
       description: >
-        An API token's vendor-account ("Anbieter") access policy. Strict
+        An API token's vendor-account ("Anbieter") access policy, on a user
+        token (create and update) and, create-only, on a service token. Strict
         opt-in: a token with no policy (field absent on a response, absent or
         null on create) has no vendor access. all=true lets the token use
-        EVERY active account the owner has (future accounts included) under
-        each account's own model_prefix, and accounts is then ignored.
-        all=false limits it to the listed accounts; an empty list means no
-        vendor access. A response always carries accounts as an array. The
-        public model name a token sees for an account's model is the
-        effective prefix plus the vendor's own model id, in both the model
-        listing and routing.
+        EVERY active account its principal OWNS (future accounts included)
+        under each account's own model_prefix; it never covers an account
+        shared with the principal, which is used only when an accounts entry
+        names it (the per-account opt-in). all=false limits it to the listed
+        accounts; an empty list means no vendor access. A response always
+        carries accounts as an array. The public model name a token sees for an
+        account's model is the effective prefix plus the vendor's own model id,
+        in both the model listing and routing.
       properties:
         all: { type: boolean }
         accounts:
@@ -2591,7 +2991,13 @@ components:
       properties:
         account_id:
           type: string
-          description: Id of one of the token owner's own vendor accounts (va_...).
+          description: >
+            Id of a vendor account (va_...) the token's principal can reach: one it
+            owns, or one shared with it through a resource group it is
+            provisioned into (for a user token the owning user; for a service
+            token the service, provisioned directly into a containing group). The
+            save-time check is advisory; routing re-evaluates the grant on every
+            request.
         prefix_override:
           type: object
           description: >
@@ -2750,12 +3156,98 @@ components:
             width: { type: integer }
             height: { type: integer }
             cfg: { type: number, description: 'Classifier-free guidance scale (guidance.txt_cfg).' }
+    VendorAccountsEnabled:
+      type: object
+      description: >
+        GET /api/portal/vendor-accounts/enabled: three booleans and nothing
+        else. sharing_enabled is the vendor_account_sharing_enabled master switch
+        as stored (the module flag is checked first by the endpoints themselves,
+        and the consumer combines the two); vendor_subscription_sharing_enabled
+        is never reported.
+      required: [module_enabled, subscriptions_enabled, sharing_enabled]
+      properties:
+        module_enabled: { type: boolean, description: The vendor_accounts_enabled master flag. }
+        subscriptions_enabled: { type: boolean, description: The vendor_subscriptions_enabled switch (default true). }
+        sharing_enabled: { type: boolean, description: The vendor_account_sharing_enabled master switch (default false). }
+    VendorAccountShareLevelRequest:
+      type: object
+      description: portal.SetVendorAccountShareLevelRequest.
+      required: [level]
+      properties:
+        level:
+          type: string
+          enum: [none, shared, full]
+          description: The TARGET level. A level above the stored one is a raise, anything else a lower.
+        admin_group_ids:
+          type: array
+          items: { type: string }
+          description: >
+            The management groups. Required (at least one) when the request raises
+            the account; ignored when it lowers it.
+    VendorAccountAdminGroupsRequest:
+      type: object
+      description: The body of PUT /api/portal/vendor-accounts/{id}/admin-groups.
+      required: [admin_group_ids]
+      properties:
+        admin_group_ids:
+          type: array
+          items: { type: string }
+          description: The new management-group set (at least one), replacing the stored one.
+    AdminGroupCandidate:
+      type: object
+      description: portal.AdminGroupCandidateDTO, an admin-tier group the caller may name as a management group.
+      required: [id, name, parent_group_id, parent_group_name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        parent_group_id: { type: string, description: "The parent system group, the account's future containment root." }
+        parent_group_name: { type: string }
+    GroupRef:
+      type: object
+      description: portal.GroupRefDTO, a group by id and name.
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+    VendorAccountResourceGroup:
+      type: object
+      description: >
+        portal.VendorAccountResourceGroupDTO, one resource group the owner may
+        self-service enter or leave the account into or from. Nothing else about
+        the group is exposed.
+      required: [id, name, member]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        member: { type: boolean, description: The account is currently in this group. }
+    ServiceResourceGroup:
+      type: object
+      description: >
+        portal.ServiceResourceGroupDTO, one resource group a service manager may
+        self-service enter or leave the service into or from.
+      required: [id, name, member]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        member: { type: boolean, description: The service is currently provisioned into this group. }
+    ResourceGroupVendorAccountRef:
+      type: object
+      description: >
+        portal.ResourceGroupVendorAccountRefDTO, a minimal credential-free
+        vendor-account reference (id and display name only; never the owner, the
+        level or any credential flag).
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
     VendorAccountModel:
       type: object
       description: >
         One model a vendor account serves (portal.VendorAccountModelDTO, a row
         of vendor_account_models): the id a client requests, the id the vendor
-        is sent, the wire flavor and the vendor's display name.
+        is sent, the wire flavor and the vendor's display name. A member's view
+        of an account carries upstream_model as an empty string (the vendor's own
+        id is withheld; the member requests the gateway name).
       required: [gateway_model, upstream_model, api_flavor, display_name]
       properties:
         gateway_model:
@@ -2775,10 +3267,20 @@ components:
     VendorAccount:
       type: object
       description: >
-        The credential-free view of a vendor account (portal.VendorAccountDTO).
-        The sealed api key and OAuth token set are reduced to the api_key_set /
-        subscription_connected booleans; no response carries a secret.
-      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at]
+        The credential-free view of a vendor account (portal.VendorAccountDTO),
+        rendered for the viewer. The sealed api key and OAuth token set are
+        reduced to the api_key_set / subscription_connected booleans; no
+        response carries a secret, for any viewer. There are two views. The
+        management view (the owner, a CM of a shared or full account, system
+        scope) carries every field. The member view (a principal that can only
+        route to the account through a resource group it is provisioned into) is
+        a minimal allowlist: id, vendor, auth_type, name, status, model_prefix,
+        models (gateway_model, api_flavor and display_name only), the two
+        credential booleans, is_owner false and shared_by. Everything else is
+        withheld and reads as its zero value (usage is omitted): share_level,
+        admin_groups, system_group_id and system_group_name, base_url, usage, each
+        model's upstream_model and the two timestamps.
+      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by]
       properties:
         id: { type: string, description: 'va_-prefixed, random hex.' }
         vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, google_native, openai_compatible] }
@@ -2811,6 +3313,25 @@ components:
           $ref: '#/components/schemas/VendorAccountUsage'
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        share_level:
+          type: string
+          enum: ['', none, shared, full]
+          description: >
+            The stored share level (anything the service does not recognise reads
+            none; an empty string only in the member view, which withholds it).
+            With the sharing master switch off it keeps reporting what is stored.
+        admin_groups:
+          type: array
+          description: The management groups; always an array, empty for an account not stored as shared.
+          items: { $ref: '#/components/schemas/GroupRef' }
+        system_group_id: { type: string, description: 'The containment root, empty until the account is first raised.' }
+        system_group_name: { type: string, description: "The root's name, best effort." }
+        is_owner: { type: boolean, description: Whether the viewer owns the account. }
+        shared_by:
+          type: string
+          description: >
+            The owner's display name (never the e-mail address) for a viewer who
+            is not the owner; empty for the owner and when it cannot be resolved.
     VendorAccountUsage:
       type: object
       description: >

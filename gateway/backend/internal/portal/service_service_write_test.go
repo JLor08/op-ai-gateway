@@ -68,7 +68,7 @@ func TestCreateServiceCoManagerHappyPath(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_cms")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG", ParentGroupID: sg.ID})
 	e.mustAddMembers(owner, ag.ID, "usr_cms")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", false, false, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cms", ManagerPermissions{CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cms (can_manage_services): %v", err)
 	}
 
@@ -532,7 +532,7 @@ func TestServiceAdminGroupCandidatesScoped(t *testing.T) {
 
 	ownAG := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "OwnAG", ParentGroupID: sg.ID})
 	e.mustAddMembers(owner, ownAG.ID, "usr_cms", "usr_pm")
-	if err := e.svc.PromoteManager(e.ctx, owner, ownAG.ID, "usr_cms", false, false, false, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ownAG.ID, "usr_cms", ManagerPermissions{CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cms: %v", err)
 	}
 	// A THIRD admin group owner doesn't touch, owned by a different admin

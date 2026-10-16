@@ -59,6 +59,10 @@ function outcomePresentation(
  * settings save never overlap, because the answer of one would otherwise overwrite
  * the other's account. The parent keys this panel by the account's id, so
  * another account never inherits an outcome.
+ *
+ * `onRefresh` is absent for a viewer the backend would refuse the refresh (a member
+ * that only borrows the account, a co-manager of a shared SUBSCRIPTION account): the
+ * panel then only lists the models, with no button.
  */
 export function VendorAccountModels({
   t,
@@ -70,7 +74,7 @@ export function VendorAccountModels({
   t: Translation;
   account: VendorAccount;
   busy: boolean;
-  onRefresh: (id: VendorAccount['id']) => Promise<VendorModelsRefresh>;
+  onRefresh?: (id: VendorAccount['id']) => Promise<VendorModelsRefresh>;
   // When subscriptions are disabled the detail view hides the connect panel, so
   // the "reconnect via that panel" hint below would point at nothing. Defaults
   // to true so a caller that does not thread the flag keeps today's behavior.
@@ -91,6 +95,7 @@ export function VendorAccountModels({
   );
 
   async function refresh() {
+    if (!onRefresh) return;
     const request = ++requestRef.current;
     setRunning(true);
     // Never leave an earlier outcome up beside a refresh that is running.
@@ -115,21 +120,23 @@ export function VendorAccountModels({
       title={t.vendorModelsTitle}
       subtitle={t.vendorModelsIntro}
       actions={
-        <Button
-          type="button"
-          variant="outlined"
-          disabled={busy || running}
-          startIcon={
-            running ? (
-              <CircularProgress size={16} color="inherit" />
-            ) : (
-              <RefreshIcon fontSize="small" />
-            )
-          }
-          onClick={() => void refresh()}
-        >
-          {t.vendorModelsRefreshAction}
-        </Button>
+        onRefresh ? (
+          <Button
+            type="button"
+            variant="outlined"
+            disabled={busy || running}
+            startIcon={
+              running ? (
+                <CircularProgress size={16} color="inherit" />
+              ) : (
+                <RefreshIcon fontSize="small" />
+              )
+            }
+            onClick={() => void refresh()}
+          >
+            {t.vendorModelsRefreshAction}
+          </Button>
+        ) : undefined
       }
     >
       <Box sx={{ display: 'grid', gap: 2.25 }}>

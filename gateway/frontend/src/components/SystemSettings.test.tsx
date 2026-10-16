@@ -41,6 +41,8 @@ function makeSettings(overrides: Partial<SystemSettingsDTO> = {}): SystemSetting
     vision_probe_mode: 'accept',
     vendor_accounts_enabled: false,
     vendor_subscriptions_enabled: true,
+    vendor_account_sharing_enabled: false,
+    vendor_subscription_sharing_enabled: false,
     anthropic_prompt_caching_enabled: false,
     vendor_account_routing_mode: 'vendor_first',
     vendor_openai_codex_client_version: '26.930.61225',
@@ -496,6 +498,126 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           ).checked,
         ).toBe(false),
       );
+    });
+  });
+
+  describe(`SystemSettings vendor account sharing [${locale}]`, () => {
+    const masterToggle = () =>
+      screen.getByRole('checkbox', {
+        name: t.systemVendorAccountSharingEnabledLabel,
+      }) as HTMLInputElement;
+    const subscriptionToggle = () =>
+      screen.getByRole('checkbox', {
+        name: t.systemVendorSubscriptionSharingEnabledLabel,
+      }) as HTMLInputElement;
+
+    it('places both sharing toggles in the providers panel after the subscriptions toggle, OFF by default, with their notes', async () => {
+      renderSystemSettings(makeSettings());
+      const accounts = (await screen.findByLabelText(
+        t.systemVendorAccountsEnabledLabel,
+      )) as HTMLInputElement;
+      const subscriptions = screen.getByRole('checkbox', {
+        name: t.systemVendorSubscriptionsEnabledLabel,
+      }) as HTMLInputElement;
+      expect(masterToggle().checked).toBe(false);
+      expect(subscriptionToggle().checked).toBe(false);
+      expect(screen.getByText(t.systemVendorAccountSharingEnabledNote)).toBeInTheDocument();
+      expect(screen.getByText(t.systemVendorSubscriptionSharingEnabledNote)).toBeInTheDocument();
+      // Same panel, in this order: providers, subscriptions, sharing, subscription sharing.
+      const checkboxes = within(accounts.closest('section') ?? document.body).getAllByRole(
+        'checkbox',
+      );
+      const at = checkboxes.indexOf(subscriptions);
+      expect(checkboxes.indexOf(masterToggle())).toBe(at + 1);
+      expect(checkboxes.indexOf(subscriptionToggle())).toBe(at + 2);
+    });
+
+    it('renders both unchecked when the server does not send the fields (default off)', async () => {
+      renderSystemSettings(
+        makeSettings({
+          vendor_account_sharing_enabled: undefined,
+          vendor_subscription_sharing_enabled: undefined,
+        }),
+      );
+      await screen.findByLabelText(t.systemVendorAccountsEnabledLabel);
+      expect(masterToggle().checked).toBe(false);
+      expect(subscriptionToggle().checked).toBe(false);
+    });
+
+    it('reflects the stored values', async () => {
+      renderSystemSettings(
+        makeSettings({
+          vendor_account_sharing_enabled: true,
+          vendor_subscription_sharing_enabled: true,
+        }),
+      );
+      await screen.findByLabelText(t.systemVendorAccountsEnabledLabel);
+      expect(masterToggle().checked).toBe(true);
+      expect(subscriptionToggle().checked).toBe(true);
+    });
+
+    it('disables the subscription sharing toggle while the master is off and enables it once the master is switched on', async () => {
+      renderSystemSettings(makeSettings());
+      await screen.findByLabelText(t.systemVendorAccountsEnabledLabel);
+      // Meaningful only with the master on: shown, but not editable.
+      expect(subscriptionToggle()).toBeDisabled();
+      expect(masterToggle()).toBeEnabled();
+
+      fireEvent.click(masterToggle());
+      expect(subscriptionToggle()).toBeEnabled();
+
+      fireEvent.click(masterToggle());
+      expect(subscriptionToggle()).toBeDisabled();
+    });
+
+    it('keeps a stored subscription sharing value while the master is off (disabled, not cleared)', async () => {
+      const { updateSystemSettings } = renderSystemSettings(
+        makeSettings({
+          vendor_account_sharing_enabled: false,
+          vendor_subscription_sharing_enabled: true,
+        }),
+      );
+      await screen.findByLabelText(t.systemVendorAccountsEnabledLabel);
+      expect(subscriptionToggle().checked).toBe(true);
+      expect(subscriptionToggle()).toBeDisabled();
+
+      const save = screen.getByRole('button', { name: t.save });
+      await waitFor(() => expect(save).not.toBeDisabled());
+      fireEvent.click(save);
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_account_sharing_enabled: false,
+        vendor_subscription_sharing_enabled: true,
+      });
+    });
+
+    it('sends the stored values unchanged on a save that does not touch them', async () => {
+      const { updateSystemSettings } = renderSystemSettings(makeSettings());
+      const save = await screen.findByRole('button', { name: t.save });
+      await waitFor(() => expect(save).not.toBeDisabled());
+      fireEvent.click(save);
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_account_sharing_enabled: false,
+        vendor_subscription_sharing_enabled: false,
+      });
+    });
+
+    it('saves both toggled values, notifies the shell and keeps them shown after the reset', async () => {
+      const { updateSystemSettings, onSaved } = renderSystemSettings(makeSettings());
+      await screen.findByLabelText(t.systemVendorAccountsEnabledLabel);
+      fireEvent.click(masterToggle());
+      fireEvent.click(subscriptionToggle());
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(updateSystemSettings).toHaveBeenCalled());
+      expect(updateSystemSettings.mock.calls[0][0]).toMatchObject({
+        vendor_account_sharing_enabled: true,
+        vendor_subscription_sharing_enabled: true,
+      });
+      // onSaved is what makes the shell re-read the flag, so the share UI follows live.
+      await waitFor(() => expect(onSaved).toHaveBeenCalled());
+      await waitFor(() => expect(masterToggle().checked).toBe(true));
+      expect(subscriptionToggle().checked).toBe(true);
     });
   });
 

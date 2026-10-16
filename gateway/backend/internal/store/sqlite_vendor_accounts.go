@@ -9,18 +9,30 @@ import (
 	"errors"
 	"fmt"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"time"
 )
 
+// vendorAccountInsertColumns is the column list CreateVendorAccount writes. It
+// deliberately omits share_level and system_group_id (migration 91): a new account
+// is always private, so both take their column DEFAULTs ('none' and the empty
+// string) whatever the routing.VendorAccount carries -- a zero-value struct must
+// not write an empty string into share_level and bypass the DEFAULT. The two
+// columns are changed only by their narrow writers (UpdateVendorAccountShareLevel,
+// UpdateVendorAccountSystemGroup, ClearVendorAccountSharing).
+const vendorAccountInsertColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at`
+
 // vendorAccountColumns is the single column list every vendor_accounts reader
-// selects, in the order scanVendorAccount scans them.
-const vendorAccountColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at`
+// selects, in the order scanVendorAccount scans them: the insert columns, then
+// the two sharing columns the narrow writers own.
+const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id`
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
-// exactly as given -- the caller seals them first. A duplicate id is
-// ErrConflict.
+// exactly as given -- the caller seals them first. ShareLevel and SystemGroupID
+// are ignored: the account starts at the column DEFAULTs (private). A duplicate id
+// is ErrConflict.
 func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
-	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountColumns+`)
+	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountInsertColumns+`)
 		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.BaseURL, a.CreatedAt, a.UpdatedAt)
 	if err != nil {
@@ -47,6 +59,34 @@ func (s *SQLiteStore) UpdateVendorAccount(ctx context.Context, a routing.VendorA
 		return fmt.Errorf("update vendor account: %w", err)
 	}
 	return requireAffected(result)
+}
+
+// UpdateVendorAccountOperateFields writes ONLY the operate columns the patch names
+// (name, status, model_prefix; a nil field is left out of the SET list) plus
+// updated_at, with one targeted UPDATE. It never lists api_key, oauth_tokens or
+// auth_type, so a portal PATCH that merely renames or disables an account cannot
+// write a stale credential back over a concurrent rotation (unlike the full-row
+// UpdateVendorAccount). The SET list is assembled from fixed column names only;
+// every value is a bound parameter. An unknown id is ErrNotFound.
+func (s *SQLiteStore) UpdateVendorAccountOperateFields(ctx context.Context, accountID string, patch routing.VendorAccountOperatePatch) error {
+	sets := make([]string, 0, 4)
+	args := make([]any, 0, 5)
+	if patch.Name != nil {
+		sets, args = append(sets, "name = ?"), append(args, *patch.Name)
+	}
+	if patch.Status != nil {
+		sets, args = append(sets, "status = ?"), append(args, *patch.Status)
+	}
+	if patch.ModelPrefix != nil {
+		sets, args = append(sets, "model_prefix = ?"), append(args, *patch.ModelPrefix)
+	}
+	sets, args = append(sets, "updated_at = ?"), append(args, patch.UpdatedAt)
+	args = append(args, accountID)
+	res, err := s.exec(ctx, `update vendor_accounts set `+strings.Join(sets, ", ")+` where id = ?`, args...)
+	if err != nil {
+		return fmt.Errorf("update vendor account operate fields: %w", err)
+	}
+	return requireAffected(res)
 }
 
 // SetVendorAccountOAuthTokens writes ONLY the oauth_tokens + updated_at columns
@@ -109,14 +149,153 @@ func (s *SQLiteStore) VendorAccountsByOwner(ctx context.Context, userID string) 
 }
 
 // DeleteVendorAccount removes the account; its model-catalog and usage-snapshot
-// rows go with it through their ON DELETE CASCADE FKs. An unknown id is
-// ErrNotFound.
+// rows, its vendor_account_admin_groups links and its
+// resource_group_vendor_accounts links go with it through their ON DELETE
+// CASCADE FKs. An unknown id is ErrNotFound.
 func (s *SQLiteStore) DeleteVendorAccount(ctx context.Context, id string) error {
 	res, err := s.exec(ctx, `delete from vendor_accounts where id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete vendor account: %w", err)
 	}
 	return requireAffected(res)
+}
+
+// UpdateVendorAccountShareLevel writes only share_level (migration 91) with a
+// targeted UPDATE of that one column, so it cannot race a concurrent full-row
+// write; updated_at is left alone, like UpdateServerSystemGroup. The level is
+// stored verbatim -- the service validates it. An unknown id is ErrNotFound.
+func (s *SQLiteStore) UpdateVendorAccountShareLevel(ctx context.Context, id, level string) error {
+	result, err := s.exec(ctx, `update vendor_accounts set share_level = ? where id = ?`, level, id)
+	if err != nil {
+		return fmt.Errorf("update vendor account share level: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateVendorAccountSystemGroup writes only system_group_id -- the containment
+// root (migration 91) -- with a targeted UPDATE of that one column, mirroring
+// UpdateServerSystemGroup. An unknown id is ErrNotFound.
+func (s *SQLiteStore) UpdateVendorAccountSystemGroup(ctx context.Context, id, systemGroupID string) error {
+	result, err := s.exec(ctx, `update vendor_accounts set system_group_id = ? where id = ?`, systemGroupID, id)
+	if err != nil {
+		return fmt.Errorf("update vendor account system group: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// SetVendorAccountAdminGroup links accountID to groupID
+// (vendor_account_admin_groups), idempotent on the (vendor_account_id,
+// group_id) unique pair -- mirrors SetServerAdminGroup. A missing accountID or
+// groupID surfaces ErrNotFound (FK violation).
+func (s *SQLiteStore) SetVendorAccountAdminGroup(ctx context.Context, accountID, groupID string) error {
+	_, err := s.exec(ctx, `insert into vendor_account_admin_groups (vendor_account_id, group_id, created_at)
+		values (?, ?, ?) on conflict (vendor_account_id, group_id) do nothing`,
+		accountID, groupID, time.Now().UTC())
+	if err != nil {
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("set vendor account admin group: %w", err)
+	}
+	return nil
+}
+
+// RemoveVendorAccountAdminGroup unlinks accountID from groupID. A no-op
+// (non-error) when the link does not exist -- mirrors RemoveServerAdminGroup.
+func (s *SQLiteStore) RemoveVendorAccountAdminGroup(ctx context.Context, accountID, groupID string) error {
+	_, err := s.exec(ctx, `delete from vendor_account_admin_groups where vendor_account_id = ? and group_id = ?`, accountID, groupID)
+	if err != nil {
+		return fmt.Errorf("remove vendor account admin group: %w", err)
+	}
+	return nil
+}
+
+// VendorAccountAdminGroups lists every admin-group id linked to accountID,
+// ordered by created_at then group_id -- mirrors ServerAdminGroups. Always
+// non-nil, empty when none.
+func (s *SQLiteStore) VendorAccountAdminGroups(ctx context.Context, accountID string) ([]string, error) {
+	rows, err := s.query(ctx, `select group_id from vendor_account_admin_groups where vendor_account_id = ? order by created_at, group_id`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("list vendor account admin groups: %w", err)
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan vendor account admin group: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// VendorAccountsByAdminGroups returns every vendor account linked to ANY of
+// groupIDs, deduped by account id (an account linked to more than one of the
+// given groups is returned once), ordered by id -- mirrors ServersByAdminGroups.
+// An empty groupIDs returns an empty slice without issuing a query.
+//
+// The link table is consulted through an IN subquery rather than a join so the
+// select list is vendorAccountColumns itself, unprefixed: both tables carry a
+// created_at, which a join would make ambiguous, and a hand-copied aliased
+// column list is exactly the kind of reader that drifts from scanVendorAccount.
+func (s *SQLiteStore) VendorAccountsByAdminGroups(ctx context.Context, groupIDs []string) ([]routing.VendorAccount, error) {
+	if len(groupIDs) == 0 {
+		return make([]routing.VendorAccount, 0), nil
+	}
+	placeholders := make([]string, len(groupIDs))
+	args := make([]any, len(groupIDs))
+	for i, id := range groupIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.query(ctx, `select `+vendorAccountColumns+` from vendor_accounts
+		where id in (select vendor_account_id from vendor_account_admin_groups where group_id in (`+strings.Join(placeholders, ",")+`))
+		order by id`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("vendor accounts by admin groups: %w", err)
+	}
+	defer rows.Close()
+	return scanVendorAccounts(rows)
+}
+
+// ClearVendorAccountSharing returns accountID to a private account in ONE
+// transaction, in this order: share_level = 'none' first, then every
+// vendor_account_admin_groups link and every resource_group_vendor_accounts link
+// of the account is deleted, then system_group_id is cleared. Writing the level
+// first is the load-bearing part: the account is already owner-only before any
+// link row disappears, so even a torn write leaves it owner-only rather than
+// live-shared over half-deleted links. The first UPDATE also takes the
+// account's row lock, serializing a concurrent Clear or delete of the same
+// account. An unknown id is ErrNotFound; an already-private account is a
+// successful no-op.
+func (s *SQLiteStore) ClearVendorAccountSharing(ctx context.Context, accountID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("clear vendor account sharing tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, s.dl.rebind(`update vendor_accounts set share_level = ? where id = ?`), routing.VendorShareLevelNone, accountID)
+	if err != nil {
+		return fmt.Errorf("reset vendor account share level: %w", err)
+	}
+	if err := requireAffected(res); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from vendor_account_admin_groups where vendor_account_id = ?`), accountID); err != nil {
+		return fmt.Errorf("clear vendor account admin groups: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`delete from resource_group_vendor_accounts where vendor_account_id = ?`), accountID); err != nil {
+		return fmt.Errorf("clear vendor account resource group links: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, s.dl.rebind(`update vendor_accounts set system_group_id = '' where id = ?`), accountID); err != nil {
+		return fmt.Errorf("clear vendor account system group: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit clear vendor account sharing: %w", err)
+	}
+	return nil
 }
 
 // VendorAccountModels returns the models accountID serves, ordered by
@@ -272,7 +451,7 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
-	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt)
+	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccount{}, ErrNotFound
 	}

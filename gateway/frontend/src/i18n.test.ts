@@ -548,6 +548,42 @@ describe('token vendor access i18n keys', () => {
   });
 });
 
+describe('vendor-account resource-group link i18n keys', () => {
+  // The owner's self-service section of the Anbieter detail and the provider-account
+  // panel of the resource-group detail (#183, spec 2026-10-15 section 14).
+  const keys = [
+    'vendorAccountResourceGroupsTitle',
+    'vendorAccountResourceGroupsColGroup',
+    'vendorAccountResourceGroupsColMember',
+    'vendorAccountResourceGroupsEmpty',
+    'vendorAccountResourceGroupsJoinError',
+    'vendorAccountResourceGroupsLeaveError',
+    'resourceGroupVendorAccountsSectionTitle',
+    'resourceGroupVendorAccountsLabel',
+    'resourceGroupVendorAccountsSave',
+    'resourceGroupVendorAccountsSaved',
+    'errorResourceGroupVendorAccountSystemGroupMismatch',
+  ] as const;
+
+  it('defines every key in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k], `${k} (de)`).toBe('string');
+      expect(typeof messages.en[k], `${k} (en)`).toBe('string');
+      expect(messages.de[k].length, `${k} (de)`).toBeGreaterThan(0);
+      expect(messages.en[k].length, `${k} (en)`).toBeGreaterThan(0);
+    }
+  });
+
+  // The user-facing name is "Anbieter" / "provider account", never the internal
+  // word "vendor" (it is the code's name for the concept, not the portal's).
+  it('says Anbieter / provider account, never "vendor", to the user', () => {
+    for (const k of keys) {
+      expect(messages.de[k], `${k} (de)`).not.toMatch(/vendor/i);
+      expect(messages.en[k], `${k} (en)`).not.toMatch(/vendor/i);
+    }
+  });
+});
+
 describe('token rotate i18n keys', () => {
   it('defines the rotate keys in de and en', () => {
     const keys = [
@@ -1839,6 +1875,7 @@ describe('groups i18n keys', () => {
       'groupsPermServers',
       'groupsPermServices',
       'groupsPermResources',
+      'groupsPermVendorAccounts',
       'groupsActionRename',
       'groupsActionMembers',
       'groupsActionDelete',

@@ -80,6 +80,12 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     models: [],
     created_at: '2026-08-12T12:00:00Z',
     updated_at: '2026-08-12T12:00:00Z',
+    share_level: 'none',
+    admin_groups: [],
+    system_group_id: '',
+    system_group_name: '',
+    is_owner: true,
+    shared_by: '',
     ...overrides,
   };
 }
@@ -1492,6 +1498,355 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
       await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
       expect(lastUpdateBody(fakeApi)).not.toHaveProperty('vendor_access');
+    });
+  });
+
+  // #183 sharing, phase 5.3: the per-token provider opt-in also offers the accounts
+  // SHARED with the caller. The account list api.vendorAccounts() is own ∪ managed ∪
+  // member, rendered FOR the caller (a member row is the minimal view, a
+  // co-manager's the management view), and an all=true token covers only the
+  // caller's OWN accounts: a shared one needs its explicit per-account entry.
+  describe(`TokenList opt-in to shared vendor accounts (#183) [${locale}]`, () => {
+    const ownAccount = makeVendorAccount({
+      id: 'acc_own',
+      name: 'Work OpenAI',
+      model_prefix: 'work/',
+    });
+    // A member (routing-reachable) row: the minimal view, share_level withheld.
+    const memberAccount = makeVendorAccount({
+      id: 'acc_member',
+      name: 'Team Claude',
+      vendor: 'anthropic',
+      model_prefix: 'team/',
+      is_owner: false,
+      shared_by: 'Alice',
+      share_level: '',
+    });
+    // A co-managed row: the management view of somebody else's account.
+    const managedAccount = makeVendorAccount({
+      id: 'acc_managed',
+      name: 'Ops Gemini',
+      vendor: 'google',
+      is_owner: false,
+      shared_by: 'Bob',
+      share_level: 'shared',
+    });
+    const sharedLabel = (name: string, by: string) => `${name} (${t.vendorAccountSharedBy} ${by})`;
+    const memberLabel = sharedLabel('Team Claude', 'Alice');
+    const ownAndMember = [ownAccount, memberAccount];
+
+    function lastUpdateBody(fakeApi: { updateToken: unknown }): Record<string, unknown> {
+      const calls = (fakeApi.updateToken as { mock: { calls: unknown[][] } }).mock.calls;
+      return calls[calls.length - 1][1] as Record<string, unknown>;
+    }
+    function accountGroup(name: string) {
+      return screen.getByRole('group', { name });
+    }
+    async function createAndWait(fakeApi: { createToken: unknown }, tokenName: string) {
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: tokenName } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+    }
+
+    it('lists the own accounts and the accounts shared with the caller in separate groups', async () => {
+      renderTokenList({ vendorAccountsEnabled: true, vendorAccounts: ownAndMember });
+      openCreate();
+
+      const mine = await screen.findByRole('group', { name: t.tokenVendorAccessAccountsLabel });
+      expect(within(mine).getByRole('checkbox', { name: 'Work OpenAI' })).toBeInTheDocument();
+      expect(within(mine).queryByRole('checkbox', { name: memberLabel })).not.toBeInTheDocument();
+
+      const shared = screen.getByRole('group', { name: t.tokenVendorAccessSharedLabel });
+      expect(within(shared).getByRole('checkbox', { name: memberLabel })).not.toBeChecked();
+      expect(
+        within(shared).queryByRole('checkbox', { name: 'Work OpenAI' }),
+      ).not.toBeInTheDocument();
+      // The owner's name is what tells two same-named shared accounts apart; the
+      // hint says why a shared account is chosen one by one.
+      expect(screen.getByText(t.tokenVendorAccessSharedHint)).toBeInTheDocument();
+    });
+
+    it('shows no shared group when nothing is shared with the caller', async () => {
+      renderTokenList({ vendorAccountsEnabled: true, vendorAccounts: [ownAccount] });
+      openCreate();
+
+      await screen.findByRole('checkbox', { name: 'Work OpenAI' });
+      expect(
+        screen.queryByRole('group', { name: t.tokenVendorAccessSharedLabel }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('opts a token into a shared account, with a prefix override, per account', async () => {
+      const { fakeApi, created } = renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: ownAndMember,
+      });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: memberLabel }));
+
+      // The shared entry supports the same override controls an own one does.
+      const group = accountGroup(memberLabel);
+      expect(within(group).queryByLabelText(t.tokenVendorAccessPrefixLabel)).toBeNull();
+      fireEvent.click(
+        within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      fireEvent.change(within(group).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'borrowed/' },
+      });
+
+      await createAndWait(fakeApi, 'Shared');
+      expect(created[0].vendor_access).toEqual({
+        all: false,
+        accounts: [
+          { account_id: 'acc_member', prefix_override: { enabled: true, value: 'borrowed/' } },
+        ],
+      });
+    });
+
+    it('sends an own and a shared account side by side, the shared one without an override when it is off', async () => {
+      const { fakeApi, created } = renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: ownAndMember,
+      });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: memberLabel }));
+
+      await createAndWait(fakeApi, 'Both');
+      expect(created[0].vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_own' }, { account_id: 'acc_member' }],
+      });
+    });
+
+    it('offers a co-managed account: the account row cannot say whether the caller also reaches it', async () => {
+      // A co-manager who is ALSO provisioned into the account's resource group reads
+      // the management view (the widest tier), so the row looks the same as a
+      // co-manager who is not. The row is offered; the backend save check (an
+      // unreachable id is a 400) and routing are the gate.
+      renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: [ownAccount, managedAccount],
+      });
+      openCreate();
+
+      const shared = await screen.findByRole('group', { name: t.tokenVendorAccessSharedLabel });
+      expect(
+        within(shared).getByRole('checkbox', { name: sharedLabel('Ops Gemini', 'Bob') }),
+      ).toBeInTheDocument();
+    });
+
+    it('does not offer a foreign account that is not shared at all', async () => {
+      renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: [
+          ownAccount,
+          makeVendorAccount({
+            id: 'acc_none',
+            name: 'Hidden',
+            is_owner: false,
+            shared_by: 'Carol',
+            share_level: 'none',
+          }),
+        ],
+      });
+      openCreate();
+
+      await screen.findByRole('checkbox', { name: 'Work OpenAI' });
+      expect(screen.queryByRole('checkbox', { name: /Hidden/ })).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('group', { name: t.tokenVendorAccessSharedLabel }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows the empty state when the caller has neither own nor shared accounts to offer', async () => {
+      renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: [
+          makeVendorAccount({ id: 'acc_none', is_owner: false, share_level: 'none', name: 'Gone' }),
+        ],
+      });
+      openCreate();
+      expect(await screen.findByText(t.tokenVendorAccessNone)).toBeInTheDocument();
+    });
+
+    it('words the all switch as own accounts only and says a shared account is chosen one by one', async () => {
+      renderTokenList({ vendorAccountsEnabled: true, vendorAccounts: ownAndMember });
+      openCreate();
+      await screen.findByRole('checkbox', { name: 'Work OpenAI' });
+
+      const ownWord = locale === 'de' ? /\beigenen\b/i : /\bown\b/i;
+      const sharedWord = locale === 'de' ? /geteilt/i : /shared/i;
+      const allSwitch = screen.getByRole('checkbox', { name: ownWord });
+      expect(allSwitch).toHaveAccessibleName(t.tokenVendorAccessAll);
+      fireEvent.click(allSwitch);
+      expect(screen.getByText(t.tokenVendorAccessAllHint)).toHaveTextContent(sharedWord);
+    });
+
+    it('keeps the shared accounts selectable under all=true while the own ones are covered by the switch', async () => {
+      const { fakeApi, created } = renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: ownAndMember,
+      });
+      openCreate();
+      // A prior own opt-in is covered by all=true and must not be sent.
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: t.tokenVendorAccessAll }));
+
+      expect(screen.queryByRole('checkbox', { name: 'Work OpenAI' })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('checkbox', { name: memberLabel }));
+
+      await createAndWait(fakeApi, 'All plus shared');
+      expect(created[0].vendor_access).toEqual({
+        all: true,
+        accounts: [{ account_id: 'acc_member' }],
+      });
+    });
+
+    it('still sends { all: true } alone when no shared account is picked', async () => {
+      const { fakeApi, created } = renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: ownAndMember,
+      });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: t.tokenVendorAccessAll }));
+
+      await createAndWait(fakeApi, 'All');
+      expect(created[0].vendor_access).toEqual({ all: true });
+    });
+
+    it('hydrates an all=true token that also names a shared account and round-trips both', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: ownAndMember,
+        tokens: [
+          makeToken({
+            vendor_access: {
+              all: true,
+              accounts: [
+                { account_id: 'acc_member', prefix_override: { enabled: true, value: 'b/' } },
+              ],
+            },
+          }),
+        ],
+      });
+      openEdit();
+
+      expect(await screen.findByRole('checkbox', { name: t.tokenVendorAccessAll })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: memberLabel })).toBeChecked();
+      expect(screen.queryByRole('checkbox', { name: 'Work OpenAI' })).not.toBeInTheDocument();
+      const group = accountGroup(memberLabel);
+      expect(within(group).getByLabelText(t.tokenVendorAccessPrefixLabel)).toHaveValue('b/');
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: true,
+        accounts: [{ account_id: 'acc_member', prefix_override: { enabled: true, value: 'b/' } }],
+      });
+    });
+
+    it('drops a stored own entry under all=true (the switch wins) but keeps the shared one', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: ownAndMember,
+        tokens: [
+          makeToken({
+            vendor_access: {
+              all: true,
+              accounts: [{ account_id: 'acc_own' }, { account_id: 'acc_member' }],
+            },
+          }),
+        ],
+      });
+      openEdit();
+      expect(await screen.findByRole('checkbox', { name: memberLabel })).toBeChecked();
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: true,
+        accounts: [{ account_id: 'acc_member' }],
+      });
+    });
+
+    it('drops a stored shared opt-in whose account the caller no longer sees, so the save is not refused', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        vendorAccounts: [ownAccount],
+        tokens: [
+          makeToken({
+            vendor_access: {
+              all: false,
+              accounts: [{ account_id: 'acc_unshared_since' }, { account_id: 'acc_own' }],
+            },
+          }),
+        ],
+      });
+      openEdit();
+      expect(await screen.findByRole('checkbox', { name: 'Work OpenAI' })).toBeChecked();
+
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_own' }],
+      });
+    });
+
+    it('keeps a stored all=true policy and its shared entries when the account list could not be loaded', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [
+          makeToken({
+            vendor_access: { all: true, accounts: [{ account_id: 'acc_member' }] },
+          }),
+        ],
+      });
+      fakeApi.vendorAccounts.mockRejectedValue(new Error('network down'));
+      openEdit();
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalled());
+
+      // Nothing can be judged stale or own without a loaded list: do not prune.
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(lastUpdateBody(fakeApi).vendor_access).toEqual({
+        all: true,
+        accounts: [{ account_id: 'acc_member' }],
+      });
+    });
+
+    it('blocks the save while a shared account override prefix is malformed, even under all=true', async () => {
+      renderTokenList({ vendorAccountsEnabled: true, vendorAccounts: ownAndMember });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: t.tokenVendorAccessAll }));
+      fireEvent.click(screen.getByRole('checkbox', { name: memberLabel }));
+      const group = accountGroup(memberLabel);
+      fireEvent.click(
+        within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      fireEvent.change(within(group).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'bad prefix?' },
+      });
+
+      expect(screen.getByRole('button', { name: t.tokenCreate })).toBeDisabled();
+      expect(within(group).getByText(t.errorVendorAccountModelPrefixInvalid)).toBeInTheDocument();
+    });
+
+    it('does not let a malformed prefix on a hidden own entry block an all=true save', async () => {
+      renderTokenList({ vendorAccountsEnabled: true, vendorAccounts: ownAndMember });
+      openCreate();
+      fireEvent.click(await screen.findByRole('checkbox', { name: 'Work OpenAI' }));
+      const group = accountGroup('Work OpenAI');
+      fireEvent.click(
+        within(group).getByRole('checkbox', { name: t.tokenVendorAccessPrefixToggle }),
+      );
+      fireEvent.change(within(group).getByLabelText(t.tokenVendorAccessPrefixLabel), {
+        target: { value: 'bad prefix?' },
+      });
+      fireEvent.click(screen.getByRole('checkbox', { name: t.tokenVendorAccessAll }));
+
+      expect(screen.getByRole('button', { name: t.tokenCreate })).toBeEnabled();
     });
   });
 

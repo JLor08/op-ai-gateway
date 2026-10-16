@@ -582,7 +582,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -638,7 +638,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -807,7 +807,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -992,7 +992,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1207,7 +1207,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-89-migrations),
+[§4](reference/data-model.md#4-migration-history-92-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1433,7 +1433,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-89-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-92-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1558,7 +1558,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-89-migrations),
+[§4](reference/data-model.md#4-migration-history-92-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3400,6 +3400,15 @@ default-off.
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Configuration & Environment Variables](reference/config-env.md).
 
+**Amended by [ADR-060](#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in) (sharing).** Choice (a)'s deferral of
+sharing is over: an account stays owned by exactly one user and personal by default, but
+its owner, if an admin, can now raise it to a share level and offer it through resource
+groups, and the "owner-only" wording of the follow-ups above (the test-connection, the
+models refresh and the usage refresh) now reads "the owner, or a co-manager of a shared
+account, and the owner alone for a subscription account". The five choices of this ADR
+are otherwise unchanged: the subscription path stays experimental and ToS-restricted,
+and sharing one is capped and separately switched.
+
 ## ADR-050 — Vendor-account access is a per-token opt-in, enforced in listing and routing through one prefix helper
 **Context:** a vendor account ([ADR-049](#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted))
 is personal, but until now **every** API token its owner had ever issued could route
@@ -3480,9 +3489,26 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-89-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-92-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+**Amended by [ADR-060](#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in) (sharing).** The policy and the single helper
+stand, with three changes. The policy may now also name an account **shared** with the
+token's principal, and **`all: true` covers only the principal's own accounts**, never a
+shared one, so borrowing stays a named choice (this refines (a), (d) and (e): the
+interactive session is still `all: true`, and so sees its own accounts only; (d) is spelled out
+at the end). `routing.TokenVendorPrefix`
+takes the whole token, because the own-versus-shared line depends on its principal. And a
+**service token** is no longer inert: it carries the policy, create-only, and reaches a
+shared account only when it names it and the service is directly provisioned into a
+resource group that contains it (this supersedes (e)'s "stays inert"). On (d) and the
+Consequence's last sentence: `all: true` now coexists with
+explicit entries naming a shared account, and each such entry is validated and
+collision-checked at save like an `all: false` entry (an id the token's principal cannot
+reach is the "unknown" `400`), so only an entry naming an **own** account goes unchecked
+and rests on the backstop, and a policy now names accounts its principal can *reach*, not
+only ones the owner owns, though it still never widens that reach.
 
 ## ADR-051 — Anthropic translate prompt caching is flag-gated, decided at the gateway by a hybrid auto-switch, and placed by the provider
 **Context:** Anthropic caches a prompt prefix only where the request carries a
@@ -3687,7 +3713,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-89-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-92-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4684,7 +4710,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4810,5 +4836,150 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-89-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
+
+## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
+
+**Context:** a vendor account ([ADR-049](#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted))
+was strictly personal: owned by one user, reachable only by that user's session and
+by the tokens that user had opted in ([ADR-050](#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)).
+An operator then wanted the **organization's** key or subscription usable by other
+users and by services, managed by a team rather than one person, without handing
+anyone the secret. ADR-049 had named this its second phase ("a sharing link table plus
+a resolver filter extension") and kept the model additive on purpose. The obvious
+answer is to copy how AI servers are managed and provisioned, because the portal
+already has every piece of it (admin groups, a containment root, resource groups, the
+provisioning gate, a co-manager permission). That answer is right for management and
+**wrong, in a way no happy-path test would catch, for routing**: a server is a shared
+*resource* that defaults open to everyone, a vendor account is a *credential* that must
+default to its owner. Each decision below has a cheaper obvious alternative that leaks
+the key or hands a delegate the owner's token.
+
+**Decision — five choices, taken together.**
+- **(a) A tiered `share_level` enum, `none` / `shared` / `full`, not a boolean.**
+  `vendor_accounts.share_level` (migration 91, `text not null default 'none'`) puts an
+  account in the sharing model and sets how much a co-manager may do. `none` is the
+  untouched personal account and what every existing row is, by the column default
+  alone, with no data step and no behavior change on upgrade. `shared` lets a co-manager
+  **operate** the account (status, model prefix, rename, test, refresh); `full` is
+  **complete owner-equivalent delegation** (the credential, the group and
+  resource-group assignment, the delete and the lowering too), except raising the
+  level. Three named states express a reach that two flags cannot, and give the
+  subscription cap (d) something to be capped at. The stored level is read **live** by
+  every gate, listing and grant, so a lowering never waits on a cache; the two sharing
+  switches come from one 5 s cache that every portal settings write drops, so a pause from
+  the portal is just as immediate and only an out-of-band edit of a switch has a tail of up
+  to 5 s.
+- **(b) Management mirrors AI servers; routing eligibility is a PURE grant.** A shared
+  account is assigned to **management groups** (`vendor_account_admin_groups`), rooted
+  in one **containment root** (`system_group_id`, immutable while shared) and linked
+  into **resource groups** (`resource_group_vendor_accounts`) by two paths (the
+  owner's self-service, the resource-group manager's side), and managed by co-managers
+  holding a sixth permission, `can_manage_vendor_accounts` (migrations 90 to 92). But the
+  routing/usage grant is **not** the server rule: an account is available iff it is
+  **owned**, or it is **live `shared`/`full` and linked to a resource group the
+  principal is provisioned into**, **fail-closed**. `AllowedServerIDs` makes a server in
+  no provisioned group available to *everyone* in its default opt-in mode, where it also
+  fails open on a store error; copying that for a credential would leak it. The vendor
+  grant reads neither `resource_provisioning_enforce` nor an open-pool branch, so a
+  shared account in no group is usable **only by its owner**; the owner's own accounts
+  are always returned and only the shared arm fails closed; an unwired enumerator seam is
+  **owner-only, never allow-all** (the inverse of `ProvisioningGate`'s nil). There are **two
+  enumerators**: the narrow routing one (own, then live-shared-via-group), parity-bound
+  with the model listings so an advertised name is a routable one, and the wider
+  management union (own, managed, member) that only the Anbieter page reads and routing
+  never does.
+- **(c) Authorization by share level, with `full` = owner-equivalent.** Two write gates
+  plus a read gate; every decision that lets a non-owner through on the strength of the
+  level reads the *effective* level (`none` while the sharing master switch is off). The
+  write gates are **operate** (the owner, or a CM at `shared`/`full`) and **credential**
+  (the owner, or a CM at `full`; also the connect calls, the delete, the lowering and the
+  management-group assignment). **PATCH is field-level and deny-by-default**: `name`,
+  `status` and `model_prefix` take the operate gate and **every other field** the
+  credential gate, so an overlooked field can never fall through to the weaker one, and
+  an operate-only PATCH writes only the columns it names. **System scope stays read-only
+  and never bypasses a write.** Raising is the owner who is an admin *right now*;
+  lowering needs only ownership at `shared` (an owner who lost the role can still
+  un-share). A caller who **cannot see** the account gets the `404` of an unknown id; a
+  CM who **can** gets a `403`, because "not found" would be a lie to them, a deliberate
+  departure from the servers' posture, where every object-level denial is a `404`
+  (`server.forbidden` is only a create or a field the caller may not set). A **member** reads a minimal,
+  allowlist-built key-free view and operates nothing, and no response to any viewer
+  ever carries a credential.
+- **(d) A subscription is capped at `shared`, and its token-opening operate calls stay
+  owner-only.** The subscription path is ToS-restricted and "built for internal testing,
+  never a supported multi-tenant capability" (ADR-049 (b)), so sharing one is allowed
+  but fenced: it may be raised to `shared` **never `full`** (its OAuth credential stays
+  strictly owner-only), only while its own switch `vendor_subscription_sharing_enabled`
+  (default off, subordinate to the master switch) is on, and even at `shared` the
+  **connection test, the model refresh and the usage refresh** are owner-only for it,
+  because each opens the token set and the two refreshes can persist a rotated
+  **single-use** refresh token or trip an account-wide `needs_reconnect`. A CM keeps
+  status, prefix and rename. The rule tests the auth type, not the level, so it fails
+  closed. The cap and its switch are checked inside the raise itself, so a subscription
+  can never be raised ungated.
+- **(e) The per-token opt-in stays explicit and is per account for a shared one, on user
+  and service tokens alike.** Reach is necessary, never sufficient: a token must **name**
+  the account in its `vendor_provider_access` policy, with the optional prefix override of
+  ADR-050. `all: true` covers only the principal's **own** accounts (and so does a portal
+  session, which is always `all: true`), never a shared one, so borrowing another owner's
+  credential is always a deliberate, named choice; an `all: true` policy may still carry
+  an entry naming a non-own account, which is a live opt-in validated like any other.
+  The own-versus-shared line is one function (`TokenOwnsVendorAccount`). The save-time
+  check validates against the **token's own principal** (the owning user, or the service),
+  never the admin saving it, and is **advisory**: routing re-evaluates the grant on every
+  request and is the sole security gate. A **service token** gets the opt-in as new,
+  **create-only** plumbing (`vendor_access` on the create request and DTO, preserved by a
+  rotation, changed only by recreating the token) and reaches a shared account only when
+  the service is **directly provisioned** into a containing resource group, the way it
+  reaches servers; a service-side resource-group self-service makes that provisioning
+  visible and editable.
+
+**Consequence:** a deployment that never turns on `vendor_account_sharing_enabled`
+(default off, fail-closed) behaves as personal accounts always did: every account reads
+as `none`, nothing stored is touched, and the switch is a **pause, not an un-share**. With it on,
+the gates, listings and grant are all live reads, so a downgrade, a removed provision or
+a paused switch takes effect on the next request and a stale link never grants. The costs
+are named, not hidden ([Risks §11.1](11-risks-and-technical-debt.md#111-operational-risks),
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). The grant runs
+on every routed request that reaches the vendor branch, before the token's policy is
+consulted (its structural reads are uncached on purpose, so the grant stays live; the
+sharing switches it asks for come from one 5 s invalidatable cache that every settings
+write drops). `vendor_account_usage` stays **one
+snapshot per account**, mixing borrowers, who spend the owner's rate-limit windows and
+credits. The owner is single (`owner_user_id … on delete cascade`): removing the owning
+user's row would hard-delete a `full`, org-shared account and revoke every borrower, with no
+ownership transfer, a named follow-up. A `disabled` resource group still grants its linked
+accounts, as for servers. Management is not usage: a CM who is not provisioned into a
+containing group can operate an account but cannot route through it. A credential-gated
+PATCH still rewrites the whole row, so the lost-update debt on a concurrent token rotation
+remains, and its trigger is any credential-gated PATCH, an echoed `base_url` or `auth_type`
+included, not only an `api_key` clear.
+
+**Rejected:** copying the server open-pool rule or its fail-open direction for a credential
+(it would hand every user the owner's key); a boolean `shared` flag (it cannot express the
+operate-versus-owner-equivalent reach, nor cap a subscription); making every shared account
+owner-equivalent (a co-manager of a `shared` account could then replace the key or delete the
+account) or none of them (nothing to delegate); letting system scope write to a shared
+account (the writes send the owner's credential upstream); one enumerator for routing and
+management (the page must show an account a CM manages without being provisioned into it,
+and routing must stay narrow and parity-bound); letting `all: true` or a portal session
+auto-borrow a shared account (borrowing would not be a deliberate act); a nil seam that
+allows all (an unwired grant must fail closed); authorizing PATCH by a list of
+credential-sensitive fields (a list of what is sensitive is what an overlooked field falls
+out of); validating a token's opt-in against the admin saving it (a token does not inherit
+its creator's reach); an editable service-token opt-in (it would be the only mutable
+service-token setting); per-borrower usage snapshots and limits (deferred, the events
+already carry the data); an ownership-transfer operation (named follow-up); and sharing a
+subscription as `full` or without its own switch (the ToS-restricted path must stay
+opt-in and owner-credentialed).
+→ [External Vendor Accounts §1](cross-cutting/external-vendor-accounts.md#1-the-entity-and-its-ownership),
+[§4.6](cross-cutting/external-vendor-accounts.md#46-routing-to-a-shared-account-the-pure-grant),
+[§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
+[§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
+[Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
+[Data Model](reference/data-model.md#4-migration-history-92-migrations) (migrations 90 to 92),
+[API Surface](reference/api-surface.md#vendor-accounts-anbieter),
+[Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
+[§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

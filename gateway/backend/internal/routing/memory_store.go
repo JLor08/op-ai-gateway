@@ -71,6 +71,15 @@ type MemoryStore struct {
 	resourceGroups           map[string]ResourceGroup
 	resourceGroupAdminGroups map[string]map[string]time.Time
 	resourceGroupServers     map[string]map[string]time.Time
+	// resourceGroupVendorAccounts mirrors resource_group_vendor_accounts
+	// (shared vendor accounts via resource groups, migration v92):
+	// resourceGroupID -> vendorAccountID -> the time it was linked. Keyed in the
+	// SAME direction as resourceGroupServers (group -> member), not the
+	// account-first direction of vendorAccountAdminGroups -- so
+	// ResourceGroupsByVendorAccount and the DeleteVendorAccount cascade both scan
+	// every group, and DeleteResourceGroup is the single-key delete. Same
+	// first-seen-time-kept upsert semantics as the maps above.
+	resourceGroupVendorAccounts map[string]map[string]time.Time
 	// resourceGroupProvisions mirrors resource_group_provisions (Resource
 	// Groups Phase 2 provisioning, migration v55): resourceGroupID -> the set
 	// of (target_kind, target_id) pairs it is "provisioned for". Unlike
@@ -151,6 +160,12 @@ type MemoryStore struct {
 	// deep-copy them (see copyVendorAccountUsage). Deleting the account drops its
 	// entry (see DeleteVendorAccount), mirroring the SQL ON DELETE CASCADE FK.
 	vendorAccountUsage map[string]VendorAccountUsage
+	// vendorAccountAdminGroups mirrors vendor_account_admin_groups (migration
+	// v91): accountID -> groupID -> the time it was linked (a stable,
+	// insertion-ordered listing; a re-link keeps the first-seen time). Keyed
+	// account-first like serverAdminGroups, so DeleteVendorAccount cascades it
+	// with one single-key delete.
+	vendorAccountAdminGroups map[string]map[string]time.Time
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -189,6 +204,9 @@ func NewMemoryStore() *MemoryStore {
 		vendorAccounts:           map[string]VendorAccount{},
 		vendorAccountModels:      map[string][]VendorAccountModel{},
 		vendorAccountUsage:       map[string]VendorAccountUsage{},
+
+		resourceGroupVendorAccounts: map[string]map[string]time.Time{},
+		vendorAccountAdminGroups:    map[string]map[string]time.Time{},
 	}
 }
 
@@ -1880,6 +1898,10 @@ func (m *MemoryStore) DeleteResourceGroup(_ context.Context, id string) error {
 	delete(m.resourceGroupAdminGroups, id) // cascade (FK on delete cascade)
 	delete(m.resourceGroupServers, id)     // cascade (FK on delete cascade)
 	delete(m.resourceGroupProvisions, id)  // cascade (FK on delete cascade)
+	// resource_group_vendor_accounts is keyed rgID -> accountID, so dropping the
+	// group's own entry is the whole cascade (the account side is the reverse
+	// loop in DeleteVendorAccount).
+	delete(m.resourceGroupVendorAccounts, id) // cascade (FK on delete cascade)
 	return nil
 }
 
@@ -2052,6 +2074,72 @@ func (m *MemoryStore) ResourceGroupsByServer(_ context.Context, serverID string)
 			continue
 		}
 		if _, ok := servers[serverID]; ok {
+			ids = append(ids, rgID)
+		}
+	}
+	sort.Strings(ids)
+	out := make([]ResourceGroup, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, m.resourceGroups[id])
+	}
+	return out, nil
+}
+
+// SetResourceGroupVendorAccount mirrors the SQL upsert (on-conflict-do-nothing
+// on the (resource_group_id, vendor_account_id) pair): a re-link keeps the
+// first-seen time. An unknown rgID or accountID is ErrNotFound (mirrors the FK
+// violation the SQL store surfaces on either column).
+func (m *MemoryStore) SetResourceGroupVendorAccount(_ context.Context, rgID, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.resourceGroups[rgID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	if _, ok := m.vendorAccounts[accountID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	accounts, ok := m.resourceGroupVendorAccounts[rgID]
+	if !ok {
+		accounts = map[string]time.Time{}
+		m.resourceGroupVendorAccounts[rgID] = accounts
+	}
+	if _, had := accounts[accountID]; !had {
+		accounts[accountID] = time.Now().UTC()
+	}
+	return nil
+}
+
+// RemoveResourceGroupVendorAccount mirrors the SQL delete: a no-op (non-error)
+// when the link does not exist.
+func (m *MemoryStore) RemoveResourceGroupVendorAccount(_ context.Context, rgID, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if accounts, ok := m.resourceGroupVendorAccounts[rgID]; ok {
+		delete(accounts, accountID)
+	}
+	return nil
+}
+
+// ResourceGroupVendorAccounts mirrors the SQL `order by created_at,
+// vendor_account_id` listing. Always non-nil, empty when none.
+func (m *MemoryStore) ResourceGroupVendorAccounts(_ context.Context, rgID string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return sortedByFirstSeen(m.resourceGroupVendorAccounts[rgID]), nil
+}
+
+// ResourceGroupsByVendorAccount mirrors the SQL join: every resource group
+// accountID is linked into, deduped by resource-group id, sorted by id. The map
+// is keyed group-first, so this scans every group.
+func (m *MemoryStore) ResourceGroupsByVendorAccount(_ context.Context, accountID string) ([]ResourceGroup, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ids := make([]string, 0)
+	for rgID, accounts := range m.resourceGroupVendorAccounts {
+		if _, exists := m.resourceGroups[rgID]; !exists {
+			continue
+		}
+		if _, ok := accounts[accountID]; ok {
 			ids = append(ids, rgID)
 		}
 	}
@@ -2768,19 +2856,25 @@ func (m *MemoryStore) ServerRuntimeReportByServer(_ context.Context, serverID st
 // --- VendorAccountStore: per-user external AI vendor accounts (migration 82) ---
 
 // CreateVendorAccount stores a new account; a duplicate id is ErrConflict,
-// mirroring the vendor_accounts primary key.
+// mirroring the vendor_accounts primary key. Like the SQL driver (whose INSERT
+// omits both columns) it ignores ShareLevel and SystemGroupID: a new account
+// starts at the column DEFAULTs ('none' and the empty string), so a zero-value
+// struct never stores an empty share level.
 func (m *MemoryStore) CreateVendorAccount(_ context.Context, a VendorAccount) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.vendorAccounts[a.ID]; ok {
 		return storeerr.ErrConflict
 	}
+	a.ShareLevel = VendorShareLevelNone
+	a.SystemGroupID = ""
 	m.vendorAccounts[a.ID] = copyVendorAccount(a)
 	return nil
 }
 
 // UpdateVendorAccount replaces every mutable column of an existing account
-// (owner, vendor and created_at are immutable, as in the SQL driver). An
+// (owner, vendor and created_at are immutable, as in the SQL driver; so are
+// ShareLevel and SystemGroupID, which only their narrow writers change). An
 // unknown id is ErrNotFound.
 func (m *MemoryStore) UpdateVendorAccount(_ context.Context, a VendorAccount) error {
 	m.mu.Lock()
@@ -2797,6 +2891,31 @@ func (m *MemoryStore) UpdateVendorAccount(_ context.Context, a VendorAccount) er
 	cur.ModelPrefix = a.ModelPrefix
 	cur.UpdatedAt = a.UpdatedAt
 	m.vendorAccounts[a.ID] = copyVendorAccount(cur)
+	return nil
+}
+
+// UpdateVendorAccountOperateFields writes ONLY the operate columns the patch
+// names (name, status, model_prefix) and updated_at of an existing account; every
+// other column, the credentials included, is left as the store holds it right now
+// (see the store interface). An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateVendorAccountOperateFields(_ context.Context, accountID string, patch VendorAccountOperatePatch) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[accountID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	if patch.Name != nil {
+		cur.Name = *patch.Name
+	}
+	if patch.Status != nil {
+		cur.Status = *patch.Status
+	}
+	if patch.ModelPrefix != nil {
+		cur.ModelPrefix = *patch.ModelPrefix
+	}
+	cur.UpdatedAt = patch.UpdatedAt
+	m.vendorAccounts[accountID] = copyVendorAccount(cur)
 	return nil
 }
 
@@ -2874,9 +2993,11 @@ func (m *MemoryStore) vendorAccountsLocked(keep func(VendorAccount) bool) []Vend
 	return out
 }
 
-// DeleteVendorAccount removes the account and its child rows -- the model catalog
-// and the usage snapshot -- mirroring the SQL drivers' two ON DELETE CASCADE FKs.
-// An unknown id is ErrNotFound.
+// DeleteVendorAccount removes the account and its child rows -- the model
+// catalog, the usage snapshot, its admin-group links and its resource-group
+// links -- mirroring the SQL drivers' ON DELETE CASCADE FKs. Its share_level /
+// system_group_id live on the account record, so they go with it and a re-create
+// under the same id starts private. An unknown id is ErrNotFound.
 func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2886,6 +3007,136 @@ func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	delete(m.vendorAccounts, id)
 	delete(m.vendorAccountModels, id)
 	delete(m.vendorAccountUsage, id)
+	delete(m.vendorAccountAdminGroups, id) // vendor_account_admin_groups (keyed account-first: one delete)
+	m.dropVendorAccountFromResourceGroupsLocked(id)
+	return nil
+}
+
+// dropVendorAccountFromResourceGroupsLocked removes accountID from EVERY
+// resource group's vendor-account set. resourceGroupVendorAccounts is keyed
+// resourceGroupID -> accountID (the REVERSE direction from
+// vendorAccountAdminGroups' accountID -> groupID), so cascading an account
+// delete -- or ClearVendorAccountSharing -- needs a loop over all groups, the
+// same shape as the resourceGroupServers loop in DeleteAIServer; mirrors the
+// resource_group_vendor_accounts FK ON DELETE CASCADE on vendor_account_id.
+// Callers must hold m.mu for writing.
+func (m *MemoryStore) dropVendorAccountFromResourceGroupsLocked(accountID string) {
+	for _, accounts := range m.resourceGroupVendorAccounts {
+		delete(accounts, accountID)
+	}
+}
+
+// UpdateVendorAccountShareLevel writes ONLY the share level of an existing
+// account (verbatim; the service validates it). An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateVendorAccountShareLevel(_ context.Context, id, level string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[id]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	cur.ShareLevel = level
+	m.vendorAccounts[id] = copyVendorAccount(cur)
+	return nil
+}
+
+// UpdateVendorAccountSystemGroup writes ONLY the containment root of an
+// existing account. An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateVendorAccountSystemGroup(_ context.Context, id, systemGroupID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[id]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	cur.SystemGroupID = systemGroupID
+	m.vendorAccounts[id] = copyVendorAccount(cur)
+	return nil
+}
+
+// SetVendorAccountAdminGroup mirrors the SQL upsert (on-conflict-do-nothing on
+// the (vendor_account_id, group_id) pair): a re-link keeps the first-seen time.
+// An unknown accountID is ErrNotFound (mirrors the FK violation the SQL store
+// surfaces); groupID is an opaque string here -- MemoryStore holds no
+// user_groups data to validate it against, exactly as for SetServerAdminGroup.
+func (m *MemoryStore) SetVendorAccountAdminGroup(_ context.Context, accountID, groupID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.vendorAccounts[accountID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	groups, ok := m.vendorAccountAdminGroups[accountID]
+	if !ok {
+		groups = map[string]time.Time{}
+		m.vendorAccountAdminGroups[accountID] = groups
+	}
+	if _, had := groups[groupID]; !had {
+		groups[groupID] = time.Now().UTC()
+	}
+	return nil
+}
+
+// RemoveVendorAccountAdminGroup mirrors the SQL delete: a no-op (non-error)
+// when the link does not exist.
+func (m *MemoryStore) RemoveVendorAccountAdminGroup(_ context.Context, accountID, groupID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if groups, ok := m.vendorAccountAdminGroups[accountID]; ok {
+		delete(groups, groupID)
+	}
+	return nil
+}
+
+// VendorAccountAdminGroups mirrors the SQL `order by created_at, group_id`
+// listing. Always non-nil, empty when none.
+func (m *MemoryStore) VendorAccountAdminGroups(_ context.Context, accountID string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return sortedByFirstSeen(m.vendorAccountAdminGroups[accountID]), nil
+}
+
+// VendorAccountsByAdminGroups mirrors the SQL subquery: every account linked to
+// ANY of groupIDs, deduped by account id, sorted by id. An empty groupIDs
+// returns an empty slice without scanning the map (mirrors the SQL store's
+// no-query short-circuit).
+func (m *MemoryStore) VendorAccountsByAdminGroups(_ context.Context, groupIDs []string) ([]VendorAccount, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(groupIDs) == 0 {
+		return make([]VendorAccount, 0), nil
+	}
+	want := make(map[string]struct{}, len(groupIDs))
+	for _, id := range groupIDs {
+		want[id] = struct{}{}
+	}
+	return m.vendorAccountsLocked(func(a VendorAccount) bool {
+		for groupID := range m.vendorAccountAdminGroups[a.ID] {
+			if _, ok := want[groupID]; ok {
+				return true
+			}
+		}
+		return false
+	}), nil
+}
+
+// ClearVendorAccountSharing returns an account to private: share level 'none',
+// the containment root cleared and both link sets emptied. The SQL driver does
+// this in one transaction that writes the level FIRST so a torn write still
+// leaves the account owner-only; under m.mu the whole call is atomic to every
+// other store method, so no such window exists here. An unknown id is
+// ErrNotFound; an already-private account is a successful no-op.
+func (m *MemoryStore) ClearVendorAccountSharing(_ context.Context, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[accountID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	cur.ShareLevel = VendorShareLevelNone
+	cur.SystemGroupID = ""
+	m.vendorAccounts[accountID] = copyVendorAccount(cur)
+	delete(m.vendorAccountAdminGroups, accountID)
+	m.dropVendorAccountFromResourceGroupsLocked(accountID)
 	return nil
 }
 

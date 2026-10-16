@@ -1664,8 +1664,9 @@ func TestCreateRejectsMalformedOrNonHTTPSBaseURL(t *testing.T) {
 	}
 }
 
-// base_url is immutable: it is not on the update request, so an update can never
-// change it (the JSON field is simply not read).
+// base_url is immutable (create-only): an update that tries to change it is
+// refused with ErrVendorAccountFieldImmutable -- never silently ignored -- and
+// writes nothing, not even the rename it came with.
 func TestUpdateVendorAccountCannotChangeTheBaseURL(t *testing.T) {
 	svc, routeStore := newVendorAccountTestService(t, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC))
 	ctx := context.Background()
@@ -1675,14 +1676,11 @@ func TestUpdateVendorAccountCannotChangeTheBaseURL(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"name":"Renamed","base_url":"https://other.example.test"}`), &req); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	dto, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, req)
-	if err != nil {
-		t.Fatalf("Update: %v", err)
+	if _, err := svc.UpdateVendorAccount(ctx, ownerToken(), created.ID, req); !errors.Is(err, ErrVendorAccountFieldImmutable) {
+		t.Fatalf("Update: err = %v, want ErrVendorAccountFieldImmutable", err)
 	}
-	if dto.Name != "Renamed" || dto.BaseURL != "https://gw.example.test" {
-		t.Fatalf("dto = %#v, want renamed with the original base_url", dto)
-	}
-	if row, err := routeStore.VendorAccountByID(ctx, created.ID); err != nil || row.BaseURL != "https://gw.example.test" {
-		t.Fatalf("stored account = %#v, %v, want the original BaseURL", row, err)
+	row, err := routeStore.VendorAccountByID(ctx, created.ID)
+	if err != nil || row.BaseURL != "https://gw.example.test" || row.Name != created.Name {
+		t.Fatalf("stored account = %#v, %v, want the original BaseURL and name", row, err)
 	}
 }

@@ -182,13 +182,33 @@ func (s *Service) resourceManageGroupIDs(ctx context.Context, principal auth.Tok
 	return s.manageGroupIDs(ctx, principal, func(p store.UserGroupManagerPerm) bool { return p.CanManageResources })
 }
 
+// vendorAccountManageGroupIDs returns the set of ADMIN-tier group ids the
+// given principal may manage VENDOR ACCOUNTS through: every admin group where
+// the principal is either the OWNER or a co-manager whose stored
+// CanManageVendorAccounts flag is true (mirrors serverManageGroupIDs/
+// resourceManageGroupIDs exactly, keyed on CanManageVendorAccounts instead of
+// CanManageServers/CanManageResources -- shared vendor accounts via resource
+// groups, issue #183). A co-manager with CanManageGroup and/or CanManageUsers
+// and/or CanManageServers and/or CanManageServices and/or CanManageResources
+// but WITHOUT CanManageVendorAccounts contributes nothing; neither does a
+// plain member. Never called for a system-scope principal -- system bypasses
+// group-scoping entirely.
+//
+// Nil-safe on s.groups, mirroring serverManageGroupIDs/resourceManageGroupIDs:
+// a Service built without a Groups store degrades to "no group-based reach"
+// rather than panicking on every vendor-account read/list.
+func (s *Service) vendorAccountManageGroupIDs(ctx context.Context, principal auth.Token) (map[string]bool, error) {
+	return s.manageGroupIDs(ctx, principal, func(p store.UserGroupManagerPerm) bool { return p.CanManageVendorAccounts })
+}
+
 // manageGroupIDs is the shared enumeration behind serverManageGroupIDs,
-// serviceManageGroupIDs, and resourceManageGroupIDs: every ADMIN-tier group
-// where principal is either the OWNER or a co-manager for whom can(perm) is
-// true, keyed on that group's id. can selects the single Can* flag that
-// distinguishes the three callers (CanManageServers/CanManageServices/
-// CanManageResources) — see their doc comments for the shared policy this
-// implements. Nil-safe on s.groups: a Service built without a Groups store
+// serviceManageGroupIDs, resourceManageGroupIDs, and
+// vendorAccountManageGroupIDs: every ADMIN-tier group where principal is
+// either the OWNER or a co-manager for whom can(perm) is true, keyed on that
+// group's id. can selects the single Can* flag that distinguishes the four
+// callers (CanManageServers/CanManageServices/CanManageResources/
+// CanManageVendorAccounts) — see their doc comments for the shared policy
+// this implements. Nil-safe on s.groups: a Service built without a Groups store
 // degrades to "no group-based reach" (map is empty, err is nil) rather than
 // panicking, since callers here have a far wider blast radius than
 // ManageableUserIDs' narrow admin-user-management call sites. Deliberately
@@ -397,8 +417,15 @@ type UserGroupDTO struct {
 	// CanManage/CanManageUsers/CanManageServers/CanManageServices, same
 	// pattern.
 	CanManageResources bool `json:"can_manage_resources"`
-	MemberCount        int  `json:"member_count"`
-	ManagerCount       int  `json:"manager_count"`
+	// CanManageVendorAccounts is principal-relative: may the caller manage the
+	// vendor accounts linked to this group's admin tier (shared vendor
+	// accounts via resource groups, issue #183) -- owner, OR a co-manager
+	// whose CanManageVendorAccounts flag is set, OR a system_admin.
+	// Independent of CanManage/CanManageUsers/CanManageServers/
+	// CanManageServices/CanManageResources, same pattern.
+	CanManageVendorAccounts bool `json:"can_manage_vendor_accounts"`
+	MemberCount             int  `json:"member_count"`
+	ManagerCount            int  `json:"manager_count"`
 	// CoupledProjects lists the projects coupled to this group (spec 2026-08-09):
 	// non-empty only for user-tier groups. Drives the group-delete warning.
 	CoupledProjects []ProjectRefDTO `json:"coupled_projects"`
@@ -435,15 +462,17 @@ type UserGroupMemberDTO struct {
 	IsManager bool   `json:"is_manager"`
 	IsOwner   bool   `json:"is_owner"`
 	// CanManageUsers/CanManageGroup/CanManageServers/CanManageServices/
-	// CanManageResources are this row's stored co-manager per-permission
-	// flags (per-Admin-Group co-manager permissions, spec 2026-08-10 +
-	// Phase B 2026-08-10 + Phase C 2026-08-10 + Resource Groups Phase 1
-	// 2026-08-11) -- all false for a non-manager row (IsManager false).
-	CanManageUsers     bool `json:"can_manage_users"`
-	CanManageGroup     bool `json:"can_manage_group"`
-	CanManageServers   bool `json:"can_manage_servers"`
-	CanManageServices  bool `json:"can_manage_services"`
-	CanManageResources bool `json:"can_manage_resources"`
+	// CanManageResources/CanManageVendorAccounts are this row's stored
+	// co-manager per-permission flags (per-Admin-Group co-manager
+	// permissions, spec 2026-08-10 + Phase B 2026-08-10 + Phase C 2026-08-10 +
+	// Resource Groups Phase 1 2026-08-11 + shared vendor accounts, issue #183)
+	// -- all false for a non-manager row (IsManager false).
+	CanManageUsers          bool `json:"can_manage_users"`
+	CanManageGroup          bool `json:"can_manage_group"`
+	CanManageServers        bool `json:"can_manage_servers"`
+	CanManageServices       bool `json:"can_manage_services"`
+	CanManageResources      bool `json:"can_manage_resources"`
+	CanManageVendorAccounts bool `json:"can_manage_vendor_accounts"`
 }
 
 // isAdminRole reports whether role can own/manage/be-promoted-into an admin
@@ -850,6 +879,7 @@ func (s *Service) groupDTO(ctx context.Context, principal auth.Token, g store.Us
 		dto.CanManageServers = isSystem(principal)
 		dto.CanManageServices = isSystem(principal)
 		dto.CanManageResources = isSystem(principal)
+		dto.CanManageVendorAccounts = isSystem(principal)
 	case g.OwnerUserID != "" && g.OwnerUserID == principal.UserID:
 		dto.MyRole = "owner"
 		dto.CanManage = true
@@ -857,18 +887,20 @@ func (s *Service) groupDTO(ctx context.Context, principal auth.Token, g store.Us
 		dto.CanManageServers = true
 		dto.CanManageServices = true
 		dto.CanManageResources = true
+		dto.CanManageVendorAccounts = true
 	case isManager:
 		// A co-manager's facets are independent -- CanManage (structure),
-		// CanManageUsers, CanManageServers, CanManageServices, and
-		// CanManageResources each follow ONLY their own stored flag, per spec
-		// 2026-08-10 (a manager narrowed to one facet must not silently gain
-		// another here).
+		// CanManageUsers, CanManageServers, CanManageServices,
+		// CanManageResources, and CanManageVendorAccounts each follow ONLY
+		// their own stored flag, per spec 2026-08-10 (a manager narrowed to
+		// one facet must not silently gain another here).
 		dto.MyRole = "manager"
 		dto.CanManage = myPerm.CanManageGroup
 		dto.CanManageUsers = myPerm.CanManageUsers
 		dto.CanManageServers = myPerm.CanManageServers
 		dto.CanManageServices = myPerm.CanManageServices
 		dto.CanManageResources = myPerm.CanManageResources
+		dto.CanManageVendorAccounts = myPerm.CanManageVendorAccounts
 	case isSystem(principal):
 		if isMember {
 			dto.MyRole = "member"
@@ -878,6 +910,7 @@ func (s *Service) groupDTO(ctx context.Context, principal auth.Token, g store.Us
 		dto.CanManageServers = true
 		dto.CanManageServices = true
 		dto.CanManageResources = true
+		dto.CanManageVendorAccounts = true
 	case isMember:
 		dto.MyRole = "member"
 	}
@@ -1453,10 +1486,12 @@ func (s *Service) GroupMembers(ctx context.Context, principal auth.Token, groupI
 	}
 	// perms maps a co-manager's userID to their stored per-permission flags
 	// (per-Admin-Group co-manager permissions, spec 2026-08-10 + Phase B
-	// 2026-08-10 + Phase C 2026-08-10 + Resource Groups Phase 1 2026-08-11); a
-	// member absent from this map is not a manager at all, so their DTO row's
-	// IsManager/CanManageUsers/CanManageGroup/CanManageServers/CanManageServices/CanManageResources
-	// all read false (the zero value of the missing-key lookup below).
+	// 2026-08-10 + Phase C 2026-08-10 + Resource Groups Phase 1 2026-08-11 +
+	// shared vendor accounts, issue #183); a member absent from this map is
+	// not a manager at all, so their DTO row's IsManager/CanManageUsers/
+	// CanManageGroup/CanManageServers/CanManageServices/CanManageResources/
+	// CanManageVendorAccounts all read false (the zero value of the
+	// missing-key lookup below).
 	var perms map[string]store.UserGroupManagerPerm
 	if g.Tier != store.GroupTierSystem {
 		list, err := s.groups.UserGroupManagerPerms(ctx, groupID)
@@ -1479,17 +1514,18 @@ func (s *Service) GroupMembers(ctx context.Context, principal auth.Token, groupI
 		}
 		p, isManager := perms[m.UserID]
 		out = append(out, UserGroupMemberDTO{
-			UserID:             u.ID,
-			Email:              u.Email,
-			DisplayName:        u.DisplayName,
-			State:              m.State,
-			IsManager:          isManager,
-			IsOwner:            g.OwnerUserID != "" && g.OwnerUserID == m.UserID,
-			CanManageUsers:     p.CanManageUsers,
-			CanManageGroup:     p.CanManageGroup,
-			CanManageServers:   p.CanManageServers,
-			CanManageServices:  p.CanManageServices,
-			CanManageResources: p.CanManageResources,
+			UserID:                  u.ID,
+			Email:                   u.Email,
+			DisplayName:             u.DisplayName,
+			State:                   m.State,
+			IsManager:               isManager,
+			IsOwner:                 g.OwnerUserID != "" && g.OwnerUserID == m.UserID,
+			CanManageUsers:          p.CanManageUsers,
+			CanManageGroup:          p.CanManageGroup,
+			CanManageServers:        p.CanManageServers,
+			CanManageServices:       p.CanManageServices,
+			CanManageResources:      p.CanManageResources,
+			CanManageVendorAccounts: p.CanManageVendorAccounts,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1525,16 +1561,29 @@ func (s *Service) authorizeOwnerAction(ctx context.Context, principal auth.Token
 	return g, nil
 }
 
+// ManagerPermissions is the set of per-permission flags a co-manager of a
+// group holds (per-Admin-Group co-manager permissions, spec 2026-08-10 +
+// Phase B 2026-08-10 + Phase C 2026-08-10 + Resource Groups Phase 1
+// 2026-08-11 + shared vendor accounts, issue #183). All six true reproduces
+// the pre-feature "a co-manager can do everything" behavior byte-for-byte.
+// PromoteManager and SetManagerPermissions take it as one value so each flag
+// is set BY NAME -- there is no positional order to transpose.
+type ManagerPermissions struct {
+	CanManageUsers          bool
+	CanManageGroup          bool
+	CanManageServers        bool
+	CanManageServices       bool
+	CanManageResources      bool
+	CanManageVendorAccounts bool
+}
+
 // PromoteManager promotes userID to co-manager of groupID (owner/system_admin
 // only). Eligibility (spec §8): a user-tier promotee must already be a
 // MEMBER; an admin-tier promotee must be a MEMBER, hold role admin/
 // system_admin, AND be a member of the parent system group.
-// canUsers/canGroup/canServers/canServices/canResources set the new
-// co-manager's per-permission flags (per-Admin-Group co-manager permissions,
-// spec 2026-08-10 + Phase B 2026-08-10 + Phase C 2026-08-10 + Resource
-// Groups Phase 1 2026-08-11) -- all five true reproduces the pre-feature "a
-// co-manager can do everything" behavior byte-for-byte.
-func (s *Service) PromoteManager(ctx context.Context, principal auth.Token, groupID, userID string, canUsers, canGroup, canServers, canServices, canResources bool) error {
+// perms sets the new co-manager's per-permission flags (see
+// ManagerPermissions).
+func (s *Service) PromoteManager(ctx context.Context, principal auth.Token, groupID, userID string, perms ManagerPermissions) error {
 	g, err := s.authorizeOwnerAction(ctx, principal, groupID)
 	if err != nil {
 		return err
@@ -1563,27 +1612,30 @@ func (s *Service) PromoteManager(ctx context.Context, principal auth.Token, grou
 		return err
 	}
 	return s.groups.SetUserGroupManagerPermissions(ctx, groupID, store.UserGroupManagerPerm{
-		UserID: userID, CanManageUsers: canUsers, CanManageGroup: canGroup,
-		CanManageServers: canServers, CanManageServices: canServices, CanManageResources: canResources,
+		UserID: userID, CanManageUsers: perms.CanManageUsers, CanManageGroup: perms.CanManageGroup,
+		CanManageServers: perms.CanManageServers, CanManageServices: perms.CanManageServices, CanManageResources: perms.CanManageResources,
+		CanManageVendorAccounts: perms.CanManageVendorAccounts,
 	})
 }
 
 // SetManagerPermissions narrows or widens an EXISTING co-manager's
 // per-permission flags (owner/system_admin only, per-Admin-Group co-manager
 // permissions, spec 2026-08-10 + Phase B 2026-08-10 + Phase C 2026-08-10 +
-// Resource Groups Phase 1 2026-08-11) -- it never PROMOTES userID to manager
-// (PromoteManager alone does that); userID must already hold a co-manager
-// row on groupID, else ErrGroupCandidateInvalid (mirrors
-// TransferOwnership's "target must be a current manager" rule -- here
-// enforced by the store's zero-rows-affected ErrNotFound, since the UPDATE
-// only ever touches an EXISTING row).
-func (s *Service) SetManagerPermissions(ctx context.Context, principal auth.Token, groupID, userID string, canUsers, canGroup, canServers, canServices, canResources bool) error {
+// Resource Groups Phase 1 2026-08-11 + shared vendor accounts, issue #183) --
+// it never PROMOTES userID to manager (PromoteManager alone does that);
+// userID must already hold a co-manager row on groupID, else
+// ErrGroupCandidateInvalid (mirrors TransferOwnership's "target must be a
+// current manager" rule -- here enforced by the store's zero-rows-affected
+// ErrNotFound, since the UPDATE only ever touches an EXISTING row). perms is
+// the same ManagerPermissions PromoteManager takes.
+func (s *Service) SetManagerPermissions(ctx context.Context, principal auth.Token, groupID, userID string, perms ManagerPermissions) error {
 	if _, err := s.authorizeOwnerAction(ctx, principal, groupID); err != nil {
 		return err
 	}
 	if err := s.groups.SetUserGroupManagerPermissions(ctx, groupID, store.UserGroupManagerPerm{
-		UserID: userID, CanManageUsers: canUsers, CanManageGroup: canGroup,
-		CanManageServers: canServers, CanManageServices: canServices, CanManageResources: canResources,
+		UserID: userID, CanManageUsers: perms.CanManageUsers, CanManageGroup: perms.CanManageGroup,
+		CanManageServers: perms.CanManageServers, CanManageServices: perms.CanManageServices, CanManageResources: perms.CanManageResources,
+		CanManageVendorAccounts: perms.CanManageVendorAccounts,
 	}); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return ErrGroupCandidateInvalid

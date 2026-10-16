@@ -201,6 +201,27 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // subscription account is refused (same 409 row table; api_key accounts never
   // are). Mapped for the same stale-tab reason as the master flag.
   'vendor_accounts.subscriptions_disabled': 'errorVendorSubscriptionsDisabled',
+  // Sharing (#183): the share-level and management-group endpoints' 409s (the
+  // master sharing switch, and the narrower subscription-sharing one) and 400s,
+  // from the same errRow table. Mapped because the portal does not read the
+  // sharing switches: an admin who raises with sharing off meets the 409 here.
+  // vendor_account.share_level_invalid is left unmapped: the portal only ever
+  // sends none, shared or full.
+  'vendor_accounts.sharing_disabled': 'errorVendorAccountsSharingDisabled',
+  'vendor_accounts.subscription_sharing_disabled': 'errorVendorSubscriptionSharingDisabled',
+  'vendor_account.share_level_unchanged': 'errorVendorAccountShareLevelUnchanged',
+  'vendor_account.subscription_share_capped': 'errorVendorAccountSubscriptionShareCapped',
+  'vendor_account.admin_group_required': 'errorVendorAccountAdminGroupRequired',
+  'vendor_account.admin_group_invalid': 'errorVendorAccountAdminGroupInvalid',
+  'vendor_account.admin_group_parent_mismatch': 'errorVendorAccountAdminGroupParentMismatch',
+  'vendor_account.root_mismatch': 'errorVendorAccountRootMismatch',
+  'vendor_account.not_shared': 'errorVendorAccountNotShared',
+  // The resource-group link of a shared account, from both sides (the owner's
+  // self-service join and the group manager's add): the account's containment root
+  // is not the group's. Mapped although both pickers pre-filter by root, because a
+  // stale list or a root fixed in between still reaches it.
+  'resource_group.vendor_account_system_group_mismatch':
+    'errorResourceGroupVendorAccountSystemGroupMismatch',
   // System settings: a Codex client_version the OpenAI model discovery would
   // send that is not version-shaped (400). The portal checks the same shape
   // inline, so this is the backstop.

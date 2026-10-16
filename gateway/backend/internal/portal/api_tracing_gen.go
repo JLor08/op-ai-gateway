@@ -95,6 +95,18 @@ func (_d *APIWithTracing) AddServerToResourceGroup(ctx context.Context, t1 auth.
 	return _d.API.AddServerToResourceGroup(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) AddServiceToResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AddServiceToResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AddServiceToResourceGroup(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) AddUserToAdminGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string, s3 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AddUserToAdminGroup")
 	defer span.End()
@@ -105,6 +117,18 @@ func (_d *APIWithTracing) AddUserToAdminGroup(ctx context.Context, t1 auth.Token
 		}
 	}()
 	return _d.API.AddUserToAdminGroup(ctx, t1, s1, s2, s3)
+}
+
+func (_d *APIWithTracing) AddVendorAccountToResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AddVendorAccountToResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.AddVendorAccountToResourceGroup(ctx, t1, s1, s2)
 }
 
 func (_d *APIWithTracing) AdminOwnerCandidates(ctx context.Context, t1 auth.Token) (aa1 []AdminOwnerCandidateDTO, err error) {
@@ -1431,7 +1455,7 @@ func (_d *APIWithTracing) ProjectTokens(ctx context.Context, t1 auth.Token, s1 s
 	return _d.API.ProjectTokens(ctx, t1, s1)
 }
 
-func (_d *APIWithTracing) PromoteManager(ctx context.Context, t1 auth.Token, s1 string, s2 string, b1 bool, b2 bool, b3 bool, b4 bool, b5 bool) (err error) {
+func (_d *APIWithTracing) PromoteManager(ctx context.Context, t1 auth.Token, s1 string, s2 string, m1 ManagerPermissions) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PromoteManager")
 	defer span.End()
 	defer func() {
@@ -1440,7 +1464,7 @@ func (_d *APIWithTracing) PromoteManager(ctx context.Context, t1 auth.Token, s1 
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.PromoteManager(ctx, t1, s1, s2, b1, b2, b3, b4, b5)
+	return _d.API.PromoteManager(ctx, t1, s1, s2, m1)
 }
 
 func (_d *APIWithTracing) PublicCertificateBundlePEM(ctx context.Context, s1 string) (s2 string, err error) {
@@ -1636,6 +1660,30 @@ func (_d *APIWithTracing) RemoveServerFromResourceGroup(ctx context.Context, t1 
 	return _d.API.RemoveServerFromResourceGroup(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) RemoveServiceFromResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RemoveServiceFromResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RemoveServiceFromResourceGroup(ctx, t1, s1, s2)
+}
+
+func (_d *APIWithTracing) RemoveVendorAccountFromResourceGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RemoveVendorAccountFromResourceGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.RemoveVendorAccountFromResourceGroup(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) RenameGroup(ctx context.Context, t1 auth.Token, s1 string, s2 string) (u1 UserGroupDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RenameGroup")
 	defer span.End()
@@ -1742,6 +1790,18 @@ func (_d *APIWithTracing) ResourceGroupServerCandidates(ctx context.Context, t1 
 		}
 	}()
 	return _d.API.ResourceGroupServerCandidates(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) ResourceGroupVendorAccountCandidates(ctx context.Context, t1 auth.Token, s1 string) (ra1 []ResourceGroupVendorAccountRefDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ResourceGroupVendorAccountCandidates")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ResourceGroupVendorAccountCandidates(ctx, t1, s1)
 }
 
 func (_d *APIWithTracing) RespondInvitation(ctx context.Context, t1 auth.Token, s1 string, b1 bool) (err error) {
@@ -1948,6 +2008,18 @@ func (_d *APIWithTracing) ServiceAdminGroupCandidates(ctx context.Context, t1 au
 	return _d.API.ServiceAdminGroupCandidates(ctx, t1)
 }
 
+func (_d *APIWithTracing) ServiceResourceGroups(ctx context.Context, t1 auth.Token, s1 string) (sa1 []ServiceResourceGroupDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ServiceResourceGroups")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ServiceResourceGroups(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) SetBenchmarkOverrideLease(ctx context.Context, s1 string, b1 BenchmarkOverrideLease) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetBenchmarkOverrideLease")
 	defer span.End()
@@ -2012,7 +2084,7 @@ func (_d *APIWithTracing) SetCoResidency(ctx context.Context, t1 auth.Token, s1 
 	return _d.API.SetCoResidency(ctx, t1, s1, s2)
 }
 
-func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Token, s1 string, s2 string, b1 bool, b2 bool, b3 bool, b4 bool, b5 bool) (err error) {
+func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Token, s1 string, s2 string, m1 ManagerPermissions) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetManagerPermissions")
 	defer span.End()
 	defer func() {
@@ -2021,7 +2093,7 @@ func (_d *APIWithTracing) SetManagerPermissions(ctx context.Context, t1 auth.Tok
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.SetManagerPermissions(ctx, t1, s1, s2, b1, b2, b3, b4, b5)
+	return _d.API.SetManagerPermissions(ctx, t1, s1, s2, m1)
 }
 
 func (_d *APIWithTracing) SetModelVisibility(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
@@ -2082,6 +2154,18 @@ func (_d *APIWithTracing) SetResourceGroupServers(ctx context.Context, t1 auth.T
 		}
 	}()
 	return _d.API.SetResourceGroupServers(ctx, t1, s1, sa1)
+}
+
+func (_d *APIWithTracing) SetResourceGroupVendorAccounts(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (r1 ResourceGroupDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetResourceGroupVendorAccounts")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetResourceGroupVendorAccounts(ctx, t1, s1, sa1)
 }
 
 func (_d *APIWithTracing) SetServerAdminGroups(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (s2 ServerDTO, err error) {
@@ -2190,6 +2274,30 @@ func (_d *APIWithTracing) SetUserPreference(ctx context.Context, s1 string, s2 s
 		}
 	}()
 	return _d.API.SetUserPreference(ctx, s1, s2, r1)
+}
+
+func (_d *APIWithTracing) SetVendorAccountAdminGroups(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetVendorAccountAdminGroups")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetVendorAccountAdminGroups(ctx, t1, s1, sa1)
+}
+
+func (_d *APIWithTracing) SetVendorAccountShareLevel(ctx context.Context, t1 auth.Token, s1 string, s2 SetVendorAccountShareLevelRequest) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetVendorAccountShareLevel")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetVendorAccountShareLevel(ctx, t1, s1, s2)
 }
 
 func (_d *APIWithTracing) SyncApplicationModels(ctx context.Context, t1 auth.Token, s1 string) (s2 SyncResultDTO, err error) {
@@ -2454,16 +2562,64 @@ func (_d *APIWithTracing) UserTokens(ctx context.Context, t1 auth.Token, s1 stri
 	return _d.API.UserTokens(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) VendorAccountAdminGroupCandidates(ctx context.Context, t1 auth.Token) (aa1 []AdminGroupCandidateDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountAdminGroupCandidates")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VendorAccountAdminGroupCandidates(ctx, t1)
+}
+
+func (_d *APIWithTracing) VendorAccountResourceGroups(ctx context.Context, t1 auth.Token, s1 string) (va1 []VendorAccountResourceGroupDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountResourceGroups")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VendorAccountResourceGroups(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) VendorAccountRoutingMode(ctx context.Context) (s1 string) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountRoutingMode")
 	defer span.End()
 	return _d.API.VendorAccountRoutingMode(ctx)
 }
 
+func (_d *APIWithTracing) VendorAccountSharingEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountSharingEnabled")
+	defer span.End()
+	return _d.API.VendorAccountSharingEnabled(ctx)
+}
+
 func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountsEnabled")
 	defer span.End()
 	return _d.API.VendorAccountsEnabled(ctx)
+}
+
+func (_d *APIWithTracing) VendorAccountsForRouting(ctx context.Context, t1 auth.Token) (va1 []routing.VendorAccount, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountsForRouting")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VendorAccountsForRouting(ctx, t1)
+}
+
+func (_d *APIWithTracing) VendorSubscriptionSharingEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorSubscriptionSharingEnabled")
+	defer span.End()
+	return _d.API.VendorSubscriptionSharingEnabled(ctx)
 }
 
 func (_d *APIWithTracing) VendorSubscriptionsEnabled(ctx context.Context) (b1 bool) {

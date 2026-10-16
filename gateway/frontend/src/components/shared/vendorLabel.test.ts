@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { messages, type Locale } from '../../i18n';
-import { vendorLabel } from './vendorLabel';
+import { authTypeLabel, vendorLabel } from './vendorLabel';
 
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
@@ -29,6 +29,20 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     it('shows an unknown vendor as sent', () => {
       expect(vendorLabel(t, 'mystery')).toBe('mystery');
       expect(vendorLabel(t, '')).toBe('');
+    });
+  });
+
+  describe(`authTypeLabel [${locale}]`, () => {
+    it.each([
+      ['api_key', t.vendorAuthApiKey],
+      ['subscription', t.vendorAuthSubscription],
+    ])('labels %s with its localized name', (authType, label) => {
+      expect(authTypeLabel(t, authType)).toBe(label);
+      expect(label).not.toBe(authType);
+    });
+
+    it('shows an unknown authentication type as sent', () => {
+      expect(authTypeLabel(t, 'oauth2')).toBe('oauth2');
     });
   });
 }

@@ -241,10 +241,10 @@ func (s *SQLiteStore) UserGroupManagers(ctx context.Context, groupID string) ([]
 // UserGroupManagerPerms returns every co-manager row of groupID with its
 // per-permission flags (per-Admin-Group co-manager permissions, spec
 // 2026-08-10 + Phase B 2026-08-10 + Phase C 2026-08-10 + Resource Groups
-// Phase 1 2026-08-11). A group with no co-managers returns an empty
-// (non-nil) slice.
+// Phase 1 2026-08-11 + shared vendor accounts #183). A group with no
+// co-managers returns an empty (non-nil) slice.
 func (s *SQLiteStore) UserGroupManagerPerms(ctx context.Context, groupID string) ([]UserGroupManagerPerm, error) {
-	rows, err := s.query(ctx, `select user_id, can_manage_users, can_manage_group, can_manage_servers, can_manage_services, can_manage_resources
+	rows, err := s.query(ctx, `select user_id, can_manage_users, can_manage_group, can_manage_servers, can_manage_services, can_manage_resources, can_manage_vendor_accounts
 		from user_group_managers where group_id = ? order by created_at, user_id`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("list group manager perms: %w", err)
@@ -253,8 +253,8 @@ func (s *SQLiteStore) UserGroupManagerPerms(ctx context.Context, groupID string)
 	out := make([]UserGroupManagerPerm, 0)
 	for rows.Next() {
 		var p UserGroupManagerPerm
-		var canUsers, canGroup, canServers, canServices, canResources int64
-		if err := rows.Scan(&p.UserID, &canUsers, &canGroup, &canServers, &canServices, &canResources); err != nil {
+		var canUsers, canGroup, canServers, canServices, canResources, canVendorAccounts int64
+		if err := rows.Scan(&p.UserID, &canUsers, &canGroup, &canServers, &canServices, &canResources, &canVendorAccounts); err != nil {
 			return nil, err
 		}
 		p.CanManageUsers = canUsers != 0
@@ -262,6 +262,7 @@ func (s *SQLiteStore) UserGroupManagerPerms(ctx context.Context, groupID string)
 		p.CanManageServers = canServers != 0
 		p.CanManageServices = canServices != 0
 		p.CanManageResources = canResources != 0
+		p.CanManageVendorAccounts = canVendorAccounts != 0
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -270,14 +271,14 @@ func (s *SQLiteStore) UserGroupManagerPerms(ctx context.Context, groupID string)
 // SetUserGroupManagerPermissions updates an EXISTING co-manager row's
 // permission flags (per-Admin-Group co-manager permissions, spec 2026-08-10 +
 // Phase B 2026-08-10 + Phase C 2026-08-10 + Resource Groups Phase 1
-// 2026-08-11). It does not create a row — a group/user pair with no existing
-// manager row returns ErrNotFound (mirrors UpdateUserGroup's zero-rows-
-// affected check). perm.UserID identifies the row (groupID is passed
-// separately since a UserGroupManagerPerm is otherwise group-agnostic);
-// perm's five Can* flags are the new values.
+// 2026-08-11 + shared vendor accounts #183). It does not create a row — a
+// group/user pair with no existing manager row returns ErrNotFound (mirrors
+// UpdateUserGroup's zero-rows-affected check). perm.UserID identifies the row
+// (groupID is passed separately since a UserGroupManagerPerm is otherwise
+// group-agnostic); perm's six Can* flags are the new values.
 func (s *SQLiteStore) SetUserGroupManagerPermissions(ctx context.Context, groupID string, perm UserGroupManagerPerm) error {
-	res, err := s.exec(ctx, `update user_group_managers set can_manage_users = ?, can_manage_group = ?, can_manage_servers = ?, can_manage_services = ?, can_manage_resources = ?
-		where group_id = ? and user_id = ?`, perm.CanManageUsers, perm.CanManageGroup, perm.CanManageServers, perm.CanManageServices, perm.CanManageResources, groupID, perm.UserID)
+	res, err := s.exec(ctx, `update user_group_managers set can_manage_users = ?, can_manage_group = ?, can_manage_servers = ?, can_manage_services = ?, can_manage_resources = ?, can_manage_vendor_accounts = ?
+		where group_id = ? and user_id = ?`, perm.CanManageUsers, perm.CanManageGroup, perm.CanManageServers, perm.CanManageServices, perm.CanManageResources, perm.CanManageVendorAccounts, groupID, perm.UserID)
 	if err != nil {
 		return fmt.Errorf("set group manager permissions: %w", err)
 	}

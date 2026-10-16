@@ -11,12 +11,13 @@ import (
 
 // vendorSettingsCacheTTL bounds how long the resolver's vendor-account accessors
 // reuse a cached read of vendor_accounts_enabled / vendor_subscriptions_enabled /
+// vendor_account_sharing_enabled / vendor_subscription_sharing_enabled /
 // vendor_account_routing_mode.
-// All three live in system_settings, whose store read is an uncached full-table
+// All five live in system_settings, whose store read is an uncached full-table
 // SELECT, and the per-user vendor branch runs on EVERY inference resolve, so
 // reading them per request would add a database round-trip to the hot path.
 // handleSystemSettings invalidates the caches explicitly after a successful PUT
-// that carried any of the three keys, so an operator toggling them in the portal
+// that carried any of the five keys, so an operator toggling them in the portal
 // sees the effect immediately; the TTL only bounds how stale an OUT-OF-BAND
 // change (a direct database edit) can be. Matches edgeSchemeSwitchTTL for the
 // same reason.
@@ -47,6 +48,35 @@ func (s *Server) vendorSubscriptionsEnabledCached(ctx context.Context) bool {
 	return s.vendorSubscriptionsEnabledCache.Get(ctx, vendorSettingsCacheTTL, s.Portal.VendorSubscriptionsEnabled)
 }
 
+// vendorAccountSharingEnabledCached reports the vendor_account_sharing_enabled
+// switch (sharing a vendor account with a resource group) through the same
+// short-TTL, invalidatable cache shape (vendorAccountSharingEnabledCache). The
+// setting is default-OFF (opt-in), so it fails CLOSED, the opposite of
+// vendorSubscriptionsEnabledCached: a Server with no portal reports false, and
+// the portal accessor itself reports false for an unreadable store, so a transient
+// read failure never turns sharing on.
+func (s *Server) vendorAccountSharingEnabledCached(ctx context.Context) bool {
+	if s.Portal == nil {
+		return false
+	}
+	return s.vendorAccountSharingEnabledCache.Get(ctx, vendorSettingsCacheTTL, s.Portal.VendorAccountSharingEnabled)
+}
+
+// vendorSubscriptionSharingEnabledCached reports the
+// vendor_subscription_sharing_enabled switch (whether subscription-type vendor
+// accounts may be shared) through the same short-TTL, invalidatable cache shape
+// (vendorSubscriptionSharingEnabledCache). The setting is default-OFF (opt-in), so
+// it fails CLOSED like vendorAccountSharingEnabledCached: a Server with no portal
+// reports false, and the portal accessor itself reports false for an unreadable
+// store, so a transient read failure never turns subscription sharing on. It only
+// narrows the master sharing switch; this accessor does not consult it.
+func (s *Server) vendorSubscriptionSharingEnabledCached(ctx context.Context) bool {
+	if s.Portal == nil {
+		return false
+	}
+	return s.vendorSubscriptionSharingEnabledCache.Get(ctx, vendorSettingsCacheTTL, s.Portal.VendorSubscriptionSharingEnabled)
+}
+
 // vendorAccountRoutingModeCached reports the effective vendor_account_routing_mode
 // through the short-TTL, invalidatable cache (vendorRoutingModeCache). Nil-safe:
 // a Server with no portal reports the default (vendor_first).
@@ -59,13 +89,15 @@ func (s *Server) vendorAccountRoutingModeCached(ctx context.Context) string {
 
 // invalidateVendorSettingsCache drops the cached vendor-settings reads so the
 // next resolve re-reads them. Called by handleSystemSettings after a successful
-// PUT that carried the master flag, the subscriptions switch or the routing mode,
-// so an operator toggling any of them in the portal does not have to wait out
-// vendorSettingsCacheTTL. The
+// PUT that carried the master flag, the subscriptions switch, either sharing
+// switch or the routing mode, so an operator toggling any of them in the portal
+// does not have to wait out vendorSettingsCacheTTL. The
 // generation bump also cancels any store read already in flight (see
 // settingCache.Get), so a pre-change read cannot re-arm the cache behind this.
 func (s *Server) invalidateVendorSettingsCache() {
 	s.vendorEnabledCache.Invalidate()
 	s.vendorRoutingModeCache.Invalidate()
 	s.vendorSubscriptionsEnabledCache.Invalidate()
+	s.vendorAccountSharingEnabledCache.Invalidate()
+	s.vendorSubscriptionSharingEnabledCache.Invalidate()
 }

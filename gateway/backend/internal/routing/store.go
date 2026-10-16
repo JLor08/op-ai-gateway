@@ -234,6 +234,14 @@ const (
 	VendorAccountStatusActive         = "active"
 	VendorAccountStatusDisabled       = "disabled"
 	VendorAccountStatusNeedsReconnect = "needs_reconnect"
+
+	// The vendor_accounts.share_level values (migration 91): how far an account
+	// is shared beyond its owner. 'none' is the column DEFAULT, a private
+	// account. The store keeps the value verbatim, like auth_type and status;
+	// which transitions are allowed, and to whom, is the service layer's call.
+	VendorShareLevelNone   = "none"
+	VendorShareLevelShared = "shared"
+	VendorShareLevelFull   = "full"
 )
 
 // VendorAccount is a per-user external AI vendor account ("Anbieter"): either a
@@ -260,9 +268,38 @@ type VendorAccount struct {
 	// BaseURL is the upstream ROOT url of an OpenAI-compatible account (no /v1 or
 	// other path prefix — the client adds the preset's prefix). "" for the bespoke
 	// openai/anthropic accounts. Set at create and immutable thereafter.
-	BaseURL   string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	BaseURL string
+	// ShareLevel is how far the account is shared beyond its owner
+	// (VendorShareLevelNone | VendorShareLevelShared | VendorShareLevelFull,
+	// migration 91). It is read off the row by every reader and decides which of
+	// the two write gates a non-owner can pass (portal.authorizeVendorAccountOperate
+	// / authorizeVendorAccountCredential). Like the sibling AuthType and Status it is
+	// a plain string the store keeps verbatim; the service validates transitions.
+	// CreateVendorAccount ignores it: a new account is always 'none' (the column
+	// DEFAULT), and the level changes only through UpdateVendorAccountShareLevel
+	// and ClearVendorAccountSharing. UpdateVendorAccount never writes it either, so a
+	// full-row write of a stale struct cannot revert a concurrent raise or downgrade.
+	ShareLevel string
+	// SystemGroupID is the containment root (migration 91): the parent system group
+	// the account's management groups share while it is shared/full, "" while it is
+	// private. Same write rules as ShareLevel -- UpdateVendorAccountSystemGroup and
+	// ClearVendorAccountSharing only.
+	SystemGroupID string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// VendorAccountOperatePatch is a change to the OPERATE columns of a vendor account
+// -- name, status and model_prefix, the only columns a co-manager of a `shared`
+// account may change -- as UpdateVendorAccountOperateFields applies it: a nil field
+// leaves its column alone, so the patch can never carry a credential column
+// (api_key, oauth_tokens) or auth_type by construction. UpdatedAt is written as
+// updated_at.
+type VendorAccountOperatePatch struct {
+	Name        *string
+	Status      *string
+	ModelPrefix *string
+	UpdatedAt   time.Time
 }
 
 // VendorAccountModel is one model a vendor account serves: the public id a
@@ -1924,7 +1961,9 @@ type ServiceStore interface {
 // ResourceGroupStore is Resource Groups (Phase 1 management structure,
 // migration v54): CRUD, the admin-group MANAGEMENT linkage
 // (resource_group_admin_groups), the server MEMBERSHIP linkage
-// (resource_group_servers), and Phase 2 provisioning
+// (resource_group_servers), the vendor-account linkage
+// (resource_group_vendor_accounts, migration v92 — which shared vendor accounts
+// are provisioned into the group), and Phase 2 provisioning
 // (resource_group_provisions — which principals may USE the group's
 // servers, distinct from management/membership).
 type ResourceGroupStore interface {
@@ -1973,6 +2012,23 @@ type ResourceGroupStore interface {
 	// ResourceGroupsByServer returns every resource group serverID is a
 	// member of (deduped by resource-group id).
 	ResourceGroupsByServer(ctx context.Context, serverID string) ([]ResourceGroup, error)
+	// SetResourceGroupVendorAccount links rgID to accountID (a
+	// resource_group_vendor_accounts row: the vendor account is PROVISIONED INTO
+	// the resource group -- membership, not management; the vendor-account twin
+	// of SetResourceGroupServer). Idempotent (on-conflict-do-nothing on the
+	// (resource_group_id, vendor_account_id) unique pair); a missing rgID or
+	// accountID is ErrNotFound (FK violation).
+	SetResourceGroupVendorAccount(ctx context.Context, rgID, accountID string) error
+	// RemoveResourceGroupVendorAccount unlinks rgID from accountID. A no-op
+	// (non-error) when the link does not exist.
+	RemoveResourceGroupVendorAccount(ctx context.Context, rgID, accountID string) error
+	// ResourceGroupVendorAccounts lists every vendor-account id linked into
+	// rgID, ordered by created_at then vendor_account_id. Always non-nil, empty
+	// when none.
+	ResourceGroupVendorAccounts(ctx context.Context, rgID string) ([]string, error)
+	// ResourceGroupsByVendorAccount returns every resource group accountID is
+	// linked into (deduped by resource-group id, ordered by id).
+	ResourceGroupsByVendorAccount(ctx context.Context, accountID string) ([]ResourceGroup, error)
 
 	// Resource Group provisioning (Phase 2, migration v55,
 	// resource_group_provisions) — a resource group's "provisioned for" set:
@@ -2325,10 +2381,33 @@ type RuntimeStore interface {
 // vendor and created_at — and its base_url are immutable, so every driver
 // ignores a changed value there. An unknown id is ErrNotFound on Update and Delete, a duplicate id is
 // ErrConflict on Create. Deleting an account (or its owning user) cascades its
-// dependent rows.
+// dependent rows -- including its vendor_account_admin_groups and
+// resource_group_vendor_accounts links.
+//
+// UpdateVendorAccount is a FULL-ROW write, credentials included, so it is for a
+// caller that is entitled to write them (a credential PATCH, a connect). A caller
+// that only changes name, status or model_prefix uses
+// UpdateVendorAccountOperateFields, which cannot carry a stale credential back.
+//
+// Sharing (migrations 91 and 92): share_level and system_group_id are fields of
+// VendorAccount (ShareLevel, SystemGroupID) and every reader returns them, but
+// they have their own narrow writers: Create starts every account at the column
+// DEFAULTs ('none' and the empty string) whatever the struct carries, and Update
+// never writes them. Only UpdateVendorAccountShareLevel,
+// UpdateVendorAccountSystemGroup and ClearVendorAccountSharing change them.
 type VendorAccountStore interface {
 	CreateVendorAccount(ctx context.Context, acc VendorAccount) error
 	UpdateVendorAccount(ctx context.Context, acc VendorAccount) error
+	// UpdateVendorAccountOperateFields writes ONLY the operate columns the patch
+	// names (name, status, model_prefix; nil = untouched) plus updated_at, with one
+	// targeted UPDATE ... WHERE id. It exists alongside the full-row
+	// UpdateVendorAccount for the same reason the two token/status writers below do:
+	// a portal PATCH that only renames, disables or re-prefixes an account must not
+	// carry the credential columns of its stale copy back into the row, which would
+	// silently revert a concurrent api key rotation, refresh-token rotation or
+	// needs_reconnect flip. It never writes api_key, oauth_tokens, auth_type or the
+	// identity and sharing columns. An unknown id is ErrNotFound.
+	UpdateVendorAccountOperateFields(ctx context.Context, accountID string, patch VendorAccountOperatePatch) error
 	// SetVendorAccountOAuthTokens writes ONLY the oauth_tokens column (plus
 	// updated_at) of an existing account. It exists alongside the full-row
 	// UpdateVendorAccount so a dispatch-time token refresh persists the resealed
@@ -2345,6 +2424,44 @@ type VendorAccountStore interface {
 	VendorAccounts(ctx context.Context) ([]VendorAccount, error)
 	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
 	DeleteVendorAccount(ctx context.Context, id string) error
+
+	// UpdateVendorAccountShareLevel writes only share_level (migration 91) with a
+	// targeted UPDATE of that one column, so it cannot race a concurrent
+	// full-row write; updated_at is deliberately left alone, like
+	// UpdateServerSystemGroup. The level is stored verbatim -- validating it and
+	// deciding who may change it is the service's job. An unknown id is
+	// ErrNotFound.
+	UpdateVendorAccountShareLevel(ctx context.Context, id, level string) error
+	// UpdateVendorAccountSystemGroup writes only system_group_id -- the
+	// containment root (migration 91) -- with a targeted UPDATE of that one
+	// column, mirroring UpdateServerSystemGroup. An unknown id is ErrNotFound.
+	UpdateVendorAccountSystemGroup(ctx context.Context, id, systemGroupID string) error
+	// SetVendorAccountAdminGroup links accountID to groupID (a
+	// vendor_account_admin_groups row: groupID may MANAGE the account).
+	// Idempotent (on-conflict-do-nothing on the (vendor_account_id, group_id)
+	// unique pair, mirrors SetServerAdminGroup); a missing accountID or groupID
+	// is ErrNotFound (FK violation). The in-memory driver keeps groupID opaque --
+	// it holds no user groups to check it against.
+	SetVendorAccountAdminGroup(ctx context.Context, accountID, groupID string) error
+	// RemoveVendorAccountAdminGroup unlinks accountID from groupID. A no-op
+	// (non-error) when the link does not exist.
+	RemoveVendorAccountAdminGroup(ctx context.Context, accountID, groupID string) error
+	// VendorAccountAdminGroups lists every admin-group id linked to accountID,
+	// ordered by created_at then group_id. Always non-nil, empty when none.
+	VendorAccountAdminGroups(ctx context.Context, accountID string) ([]string, error)
+	// VendorAccountsByAdminGroups returns every vendor account linked to ANY of
+	// groupIDs (deduped by account id, ordered by id). An empty groupIDs returns
+	// an empty slice without issuing a query.
+	VendorAccountsByAdminGroups(ctx context.Context, groupIDs []string) ([]VendorAccount, error)
+	// ClearVendorAccountSharing returns accountID to a private account in ONE
+	// transaction: share_level is set to 'none' FIRST, then every
+	// vendor_account_admin_groups link and every resource_group_vendor_accounts
+	// link of the account is deleted, then system_group_id is cleared to ''. The
+	// order is load-bearing: the account is already owner-only before any link
+	// row disappears, so no concurrent routing read can see a live non-'none'
+	// level over half-deleted links. Idempotent on an already-private account;
+	// an unknown id is ErrNotFound.
+	ClearVendorAccountSharing(ctx context.Context, accountID string) error
 
 	// VendorAccountModels returns the models accountID serves, sorted by
 	// gateway_model. Always non-nil (empty when the account has none, or does

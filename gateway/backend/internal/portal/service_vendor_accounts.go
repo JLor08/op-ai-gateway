@@ -13,6 +13,8 @@ import (
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -75,9 +77,39 @@ type VendorAccountUsageDTO struct {
 }
 
 // VendorAccountDTO is the portal view of a routing.VendorAccount. It carries NO
-// credential material: the sealed api key and OAuth token set are reduced to
-// the APIKeySet / SubscriptionConnected booleans (write-only secrets), and the
-// owner is implicit (every caller sees only their own accounts).
+// credential material, for ANY viewer: the sealed api key and OAuth token set are
+// reduced to the APIKeySet / SubscriptionConnected booleans (write-only secrets).
+// That is what makes the co-manager's read key-free: a CM of a shared account gets
+// the very same DTO shape as the owner, with the management fields below filled for
+// it, and there is no secret field a CM could be handed by mistake. The field set is
+// pinned to an explicit credential-free allowlist by a test, so adding one is a
+// deliberate, reviewed act.
+//
+// The DTO is rendered FOR a viewer (vendorAccountDTO takes the principal), because an
+// account is no longer always the viewer's own (spec 2026-10-15 section 10):
+//
+//   - IsOwner is whether the viewer owns the account;
+//   - SharedBy is the owner's display name for a viewer who is NOT the owner ("" for
+//     the owner, and when the owner's name cannot be resolved).
+//
+// There are two views of it. The MANAGEMENT view (vendorAccountDTO) is what the owner, a
+// CM and system scope get: every field below. The MEMBER view (memberVendorAccountDTO)
+// is what a principal gets that can only ROUTE to the account through a resource group
+// it is provisioned into: the minimal set a borrower needs (ID, Vendor, AuthType, Name,
+// Status, ModelPrefix, the two credential booleans, Models by gateway name, dialect and
+// display name, IsOwner false and SharedBy) and none of the rest. ShareLevel, AdminGroups,
+// SystemGroupID, SystemGroupName, BaseURL, Usage, each model's UpstreamModel and the two
+// timestamps are withheld from a member and read "" / [] / the zero time on the wire (Usage,
+// which is omitted when nil, is simply absent).
+//
+// ShareLevel is the account's STORED level (none, shared or full; anything the service
+// does not recognise reads as none, as every gate treats it). With the master sharing
+// flag off every account behaves personal but nothing stored is touched, so the DTO
+// keeps reporting what is stored: the pause is a global switch, not a property of the
+// account. AdminGroups are the management groups (id and name; always non-nil, empty
+// for an account that is not shared: a link a torn raise left behind at `none` is not
+// reported, the level decides), SystemGroupID/SystemGroupName the containment root
+// (name best effort, "" when the group has since vanished).
 //
 // ModelPrefix is the account's optional model-id namespace ("" = none): every
 // model the account serves is listed and requested as ModelPrefix + the vendor's
@@ -88,10 +120,11 @@ type VendorAccountUsageDTO struct {
 // default root, or the one the user typed); "" for openai and anthropic, whose
 // hosts are fixed. It is immutable and always on the wire.
 //
-// Usage is the rate-limit snapshot. The two read endpoints fill it -- the detail
-// view's Usage & Limits panel (GetVendorAccount) and the list
+// Usage is the rate-limit snapshot. The two read endpoints fill it for a management
+// viewer -- the detail view's Usage & Limits panel (GetVendorAccount) and the list
 // (ListVendorAccounts, so the dashboard's provider usage section reads every
-// account's usage in one call); the write endpoints leave it nil. It is also nil
+// account's usage in one call); the write endpoints leave it nil, and so does the
+// member view (the owner's rate-limit and spend figures are not a borrower's). It is also nil
 // for an account the gateway has not yet seen a rate-limit header for, and the
 // list leaves it nil for a row whose snapshot read failed (fail-soft). A nil
 // Usage is omitted from the JSON. The list's per-row snapshot read is bounded and
@@ -110,6 +143,12 @@ type VendorAccountDTO struct {
 	Usage                 *VendorAccountUsageDTO  `json:"usage,omitempty"`
 	CreatedAt             time.Time               `json:"created_at"`
 	UpdatedAt             time.Time               `json:"updated_at"`
+	ShareLevel            string                  `json:"share_level"`
+	AdminGroups           []GroupRefDTO           `json:"admin_groups"`
+	SystemGroupID         string                  `json:"system_group_id"`
+	SystemGroupName       string                  `json:"system_group_name"`
+	IsOwner               bool                    `json:"is_owner"`
+	SharedBy              string                  `json:"shared_by"`
 }
 
 // VendorAccountListResponse is the {data:[...]} envelope of the list endpoint.
@@ -140,29 +179,49 @@ type CreateVendorAccountRequest struct {
 // "" clears it, any other value replaces it. ModelPrefix follows the same
 // pointer convention: nil keeps the stored prefix, "" clears it, any other value
 // replaces it. Vendor, auth type and base URL are immutable.
+//
+// AUTHORIZATION IS PER FIELD AND DENY-BY-DEFAULT (authorizeVendorAccountPatch):
+// Name, Status and ModelPrefix are the only fields that ride the operate gate;
+// everything else this struct carries -- APIKey, and any field added later --
+// rides the credential gate. The allowlist is isVendorAccountPatchOperateField and
+// nothing else, so a new field is credential-gated until someone deliberately
+// edits that list. Every field MUST be a pointer (nil = "absent"): a value-typed
+// field cannot be told apart from "not sent", so the gate treats it as always
+// touched.
+//
+// BaseURL and AuthType are CREATE-ONLY. They are on the request solely so a PATCH
+// that tries to change them is refused with ErrVendorAccountFieldImmutable instead
+// of being silently ignored: base_url is where the sealed credential is sent, and
+// re-aiming it is a credential operation nobody is granted through a PATCH. They
+// are not applied anywhere.
 type UpdateVendorAccountRequest struct {
 	Name        *string `json:"name"`
 	Status      *string `json:"status"`
 	APIKey      *string `json:"api_key"`
 	ModelPrefix *string `json:"model_prefix"`
+	BaseURL     *string `json:"base_url"`
+	AuthType    *string `json:"auth_type"`
 }
 
-// vendorAccountDTO maps a stored account to its credential-free view, reading
-// the model rows the account serves from the store. Models is always a non-nil
-// slice so it serializes as [] (never null).
-func (s *Service) vendorAccountDTO(ctx context.Context, acc routing.VendorAccount) (VendorAccountDTO, error) {
-	rows, err := s.routes.VendorAccountModels(ctx, acc.ID)
+// vendorAccountDTO maps a stored account to its credential-free view FOR principal,
+// reading the model rows the account serves and its management fields from the store.
+// Models and AdminGroups are always non-nil slices so they serialize as [] (never
+// null). The credential columns are reduced to their two booleans whoever the viewer
+// is (see VendorAccountDTO); principal decides only IsOwner and SharedBy, so a CM's
+// answer to any call that returns an account says is_owner false, not the owner's.
+func (s *Service) vendorAccountDTO(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (VendorAccountDTO, error) {
+	models, err := s.vendorAccountModelDTOs(ctx, acc.ID, false)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	models := make([]VendorAccountModelDTO, 0, len(rows))
-	for _, row := range rows {
-		models = append(models, VendorAccountModelDTO{
-			GatewayModel:  row.GatewayModel,
-			UpstreamModel: row.UpstreamModel,
-			APIFlavor:     row.APIFlavor,
-			DisplayName:   row.DisplayName,
-		})
+	adminGroups, err := s.vendorAccountAdminGroupRefs(ctx, acc)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	owner := isVendorAccountOwner(principal, acc)
+	sharedBy := ""
+	if !owner {
+		sharedBy = s.vendorAccountOwnerName(ctx, acc)
 	}
 	return VendorAccountDTO{
 		ID:                    acc.ID,
@@ -177,7 +236,168 @@ func (s *Service) vendorAccountDTO(ctx context.Context, acc routing.VendorAccoun
 		Models:                models,
 		CreatedAt:             acc.CreatedAt,
 		UpdatedAt:             acc.UpdatedAt,
+		ShareLevel:            storedVendorAccountShareLevel(acc),
+		AdminGroups:           adminGroups,
+		SystemGroupID:         acc.SystemGroupID,
+		SystemGroupName:       s.vendorAccountSystemGroupName(ctx, acc),
+		IsOwner:               owner,
+		SharedBy:              sharedBy,
 	}, nil
+}
+
+// vendorAccountModelDTOs reads the model rows the account serves as their portal view,
+// always a non-nil slice (it serializes as [], never null). The management view
+// (forMember false) is every field of the entry (vendorAccountModelDTO); a member's view
+// (forMember) is memberVendorAccountModelDTO, a separate literal built from nothing.
+func (s *Service) vendorAccountModelDTOs(ctx context.Context, accountID string, forMember bool) ([]VendorAccountModelDTO, error) {
+	rows, err := s.routes.VendorAccountModels(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]VendorAccountModelDTO, 0, len(rows))
+	for _, row := range rows {
+		if forMember {
+			models = append(models, memberVendorAccountModelDTO(row))
+		} else {
+			models = append(models, vendorAccountModelDTO(row))
+		}
+	}
+	return models, nil
+}
+
+// vendorAccountModelDTO is the management view of one model entry: every field.
+func vendorAccountModelDTO(row routing.VendorAccountModel) VendorAccountModelDTO {
+	return VendorAccountModelDTO{
+		GatewayModel:  row.GatewayModel,
+		UpstreamModel: row.UpstreamModel,
+		APIFlavor:     row.APIFlavor,
+		DisplayName:   row.DisplayName,
+	}
+}
+
+// memberVendorAccountModelDTO is the MEMBER's view of one model entry, built from nothing
+// like the account DTO it sits in (memberVendorAccountDTO): the gateway name, the dialect
+// and the display name, which is what a borrower needs to request the model. The vendor's
+// own model id (UpstreamModel) is withheld: the member requests the gateway name, and the
+// mapping behind it is the account's own business. It is NOT vendorAccountModelDTO minus a
+// field: a field added to VendorAccountModelDTO later reaches a member only when someone
+// adds it HERE on purpose (the member model allowlist tests pin the classification).
+func memberVendorAccountModelDTO(row routing.VendorAccountModel) VendorAccountModelDTO {
+	return VendorAccountModelDTO{
+		GatewayModel: row.GatewayModel,
+		APIFlavor:    row.APIFlavor,
+		DisplayName:  row.DisplayName,
+	}
+}
+
+// memberVendorAccountDTO maps a stored account to the MINIMAL view a MEMBER gets (spec
+// 2026-10-15 section 10): a principal that can route to the account through a resource
+// group but neither owns nor manages it. It is the single source of that view, used by
+// the single-account read (GetVendorAccount) and by the member-only rows of the list
+// (ListVendorAccounts), so the two cannot differ.
+//
+// The view is built FROM NOTHING, field by field, and never by blanking a management
+// DTO: a field added to VendorAccountDTO later is withheld from a member until someone
+// adds it here on purpose (the member allowlist test in the portal package pins the
+// set). It holds what a borrower needs to find, understand and request the account:
+//
+//   - ID, Vendor, AuthType, Name: which account it is;
+//   - Status: whether it works right now (a member of a disabled account sees that it
+//     cannot use it);
+//   - ModelPrefix and Models (gateway name, dialect and display name): what to request;
+//   - APIKeySet / SubscriptionConnected: the credential BOOLEANS and never the
+//     credential (the sealed key and token set are not copied, only their presence);
+//   - IsOwner (always false: an owner is never rendered here) and SharedBy (the
+//     owner's display name, best effort).
+//
+// Everything else is withheld, as zero values (AdminGroups as a non-nil empty slice so
+// it serializes as []): ShareLevel (how the owner delegated management), AdminGroups,
+// SystemGroupID and SystemGroupName (who manages it and where it is rooted), BaseURL
+// (where the owner's key is sent), Usage (the owner's rate-limit and spend snapshot),
+// each model's UpstreamModel, and the timestamps. When in doubt a field is left out.
+func (s *Service) memberVendorAccountDTO(ctx context.Context, acc routing.VendorAccount) (VendorAccountDTO, error) {
+	models, err := s.vendorAccountModelDTOs(ctx, acc.ID, true)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	return VendorAccountDTO{
+		ID:                    acc.ID,
+		Vendor:                acc.Vendor,
+		AuthType:              acc.AuthType,
+		Name:                  acc.Name,
+		Status:                acc.Status,
+		ModelPrefix:           acc.ModelPrefix,
+		APIKeySet:             acc.APIKey != "",
+		SubscriptionConnected: acc.OAuthTokens != "",
+		Models:                models,
+		AdminGroups:           []GroupRefDTO{},
+		IsOwner:               false,
+		SharedBy:              s.vendorAccountOwnerName(ctx, acc),
+	}, nil
+}
+
+// storedVendorAccountShareLevel is the share level the DTO reports: the stored one
+// when it is a level the service knows, `none` for anything else (a corrupt row),
+// exactly how every gate reads it (vendorShareLevelRank, vendorAccountSharedLevel).
+// It is the STORED level, not the effective one: see VendorAccountDTO.
+func storedVendorAccountShareLevel(acc routing.VendorAccount) string {
+	if vendorAccountSharedLevel(acc.ShareLevel) {
+		return acc.ShareLevel
+	}
+	return routing.VendorShareLevelNone
+}
+
+// vendorAccountAdminGroupRefs resolves the account's management groups to id and
+// name. An account that is not stored as shared or full has none by definition, so
+// it costs no query (the personal accounts of a list are the common case) and a link
+// a torn raise left at `none` is not reported. A group that vanished between the
+// link read and its lookup is skipped (best effort, like serverDTOWith). The result
+// is always non-nil.
+func (s *Service) vendorAccountAdminGroupRefs(ctx context.Context, acc routing.VendorAccount) ([]GroupRefDTO, error) {
+	refs := make([]GroupRefDTO, 0)
+	if !vendorAccountSharedLevel(acc.ShareLevel) || s.groups == nil {
+		return refs, nil
+	}
+	groupIDs, err := s.routes.VendorAccountAdminGroups(ctx, acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, gid := range groupIDs {
+		g, err := s.groups.UserGroupByID(ctx, gid)
+		if err != nil {
+			continue
+		}
+		refs = append(refs, GroupRefDTO{ID: g.ID, Name: g.Name})
+	}
+	return refs, nil
+}
+
+// vendorAccountSystemGroupName is the best-effort name of the account's containment
+// root: "" for an account without one, without a group store, or whose root has since
+// vanished.
+func (s *Service) vendorAccountSystemGroupName(ctx context.Context, acc routing.VendorAccount) string {
+	if acc.SystemGroupID == "" || s.groups == nil {
+		return ""
+	}
+	g, err := s.groups.UserGroupByID(ctx, acc.SystemGroupID)
+	if err != nil {
+		return ""
+	}
+	return g.Name
+}
+
+// vendorAccountOwnerName is the owner's DISPLAY NAME, best effort ("" when the user
+// store is absent or the owner has vanished). It is deliberately not the e-mail
+// address: shared_by reaches viewers, a member later, who have no business with it.
+func (s *Service) vendorAccountOwnerName(ctx context.Context, acc routing.VendorAccount) string {
+	if acc.OwnerUserID == "" || s.users == nil {
+		return ""
+	}
+	u, err := s.users.UserByID(ctx, acc.OwnerUserID)
+	if err != nil {
+		return ""
+	}
+	return u.DisplayName
 }
 
 // vendorAccountUsageDTO reads accountID's rate-limit snapshot and maps it to its
@@ -296,17 +516,10 @@ func (s *Service) sealVendorAPIKey(raw string) (string, error) {
 	return capture.SealSecret(s.cipher, s.settingsVolatile, strings.TrimSpace(raw))
 }
 
-// authorizeVendorAccount loads the account and returns ErrVendorAccountNotFound
-// unless the principal OWNS it. With write=false (a READ) system scope is also
-// let through, so an operator can inspect any account's credential-free
-// metadata; with write=true the check is strictly owner-only. A vendor account
-// is a personal credential, not shared infrastructure like a server, so the
-// authorizeServer system bypass deliberately does not extend to writes: a
-// system-scope non-owner may not rotate or clear another user's key, rename or
-// disable the account, or delete it. As with authorizeServer, an unknown id and
-// a stranger's account are indistinguishable (404-no-leak), and a plain admin
-// who is not the owner is a stranger too.
-func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Token, id string, write bool) (routing.VendorAccount, error) {
+// loadVendorAccount loads the account, mapping the store's not-found to
+// ErrVendorAccountNotFound. It decides nothing about WHO may see the account:
+// every caller follows it with one of the gates below.
+func (s *Service) loadVendorAccount(ctx context.Context, id string) (routing.VendorAccount, error) {
 	acc, err := s.routes.VendorAccountByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -314,21 +527,572 @@ func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Tok
 		}
 		return routing.VendorAccount{}, err
 	}
-	if principal.UserID != "" && acc.OwnerUserID == principal.UserID {
-		return acc, nil
-	}
-	if !write && isSystem(principal) {
-		return acc, nil
-	}
-	return routing.VendorAccount{}, ErrVendorAccountNotFound
+	return acc, nil
 }
 
-// ListVendorAccounts returns the calling principal's OWN accounts, oldest first,
-// each with its rate-limit usage snapshot when one exists (see VendorAccountDTO).
-// Like every vendor-account method it is refused with ErrVendorAccountsDisabled
-// (before anything else) while the vendor_accounts_enabled master flag is off.
-// System scope does not widen the list: the page is a personal one and the DTO
-// carries no owner, so a cross-user list would be unattributed.
+// vendorAccountViewer is the tier a principal reads an account at, which decides the
+// DTO it is rendered as (spec 2026-10-15 section 10): the owner, a CM and system scope
+// read the management view (vendorAccountDTO: every field, the owner's own marked
+// is_owner, still no secret), a member reads the MINIMAL view (memberVendorAccountDTO).
+// The zero value is the principal who may not read the account at all, so a caller that
+// ignores the gate's error is handed no view rather than the widest one (deny by default).
+type vendorAccountViewer int
+
+const (
+	// vendorViewerNone may not read the account (always returned with an error).
+	vendorViewerNone vendorAccountViewer = iota
+	// vendorViewerManagement is the owner, a CM of a shared or full account, or system
+	// scope: the widest view the principal qualifies for, the DTO's management fields
+	// filled.
+	vendorViewerManagement
+	// vendorViewerMember reaches the account ONLY through a resource group it is
+	// provisioned into: it can route to the account but does not own or manage it, and
+	// sees what a borrower needs and nothing of the management of the account.
+	vendorViewerMember
+)
+
+// authorizeVendorAccountRead loads the account and returns ErrVendorAccountNotFound
+// unless the principal may READ it (spec 2026-10-15 section 6, the "Read" row), with the
+// tier it reads it at:
+//
+//   - the owner, at every level (management view);
+//   - a CM of the account while it is `shared` or `full` by its EFFECTIVE level
+//     (effectiveVendorAccountShareLevel: the stored level while the master sharing
+//     flag is on, `none` while it is off, so a paused account has no CM read)
+//     (management view);
+//   - system scope, at every level, so an operator can inspect any account's metadata
+//     (management view);
+//   - a MEMBER, a principal that can route to the account through a resource group it
+//     is provisioned into (isMemberOfSharedVendorAccount): the shared arm of the routing
+//     grant, so the account is `shared` or `full` by its effective level and the
+//     principal is provisioned into a group that contains it (member view).
+//
+// The tiers are tried widest first, so a principal who is several of them is rendered
+// at the widest (a CM who is also provisioned into the account's group reads the
+// management view). Everyone else is a stranger, and an unknown id and a stranger's
+// account are indistinguishable (404-no-leak): a plain admin who is not the owner, a CM
+// or a member is a stranger too, and so is a co-manager without
+// can_manage_vendor_accounts.
+//
+// A member's read needs REACH, not the per-token opt-in: the opt-in gates USING an
+// account (the resolver and the model listing), and reading is how a member finds an
+// account to opt into. It is as live as the grant: the level, the resource-group link
+// and the provisioning are read on every call.
+//
+// A read is KEY-FREE for every viewer but the owner's own: the DTO a read answers with
+// carries only the credential booleans whoever asks (see VendorAccountDTO), so
+// widening this gate widens nobody's reach to the secret, and the member view is
+// narrower still. Writes are a different matter and use authorizeVendorAccountOperate
+// or authorizeVendorAccountCredential (the PATCH picks between them per field,
+// authorizeVendorAccountPatch; every credential method, the delete and the share-level
+// lower use the latter); neither system scope's read nor a member's extends to them.
+func (s *Service) authorizeVendorAccountRead(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, vendorAccountViewer, error) {
+	acc, err := s.loadVendorAccount(ctx, id)
+	if err != nil {
+		return routing.VendorAccount{}, vendorViewerNone, err
+	}
+	if isVendorAccountOwner(principal, acc) || isSystem(principal) {
+		return acc, vendorViewerManagement, nil
+	}
+	managed, err := s.isManagerOfSharedVendorAccount(ctx, principal, acc)
+	if err != nil {
+		return routing.VendorAccount{}, vendorViewerNone, err
+	}
+	if managed {
+		return acc, vendorViewerManagement, nil
+	}
+	member, err := s.isMemberOfSharedVendorAccount(ctx, principal, acc)
+	if err != nil {
+		return routing.VendorAccount{}, vendorViewerNone, err
+	}
+	if member {
+		return acc, vendorViewerMember, nil
+	}
+	return routing.VendorAccount{}, vendorViewerNone, ErrVendorAccountNotFound
+}
+
+// isMemberOfSharedVendorAccount reports whether principal can ROUTE to acc through a
+// resource group: the single-account form of the shared arm of the routing grant
+// (sharedVendorAccountsForRouting), so the member read and the list's member rows
+// cannot disagree. acc must pass the grant's live predicate (vendorAccountSharedRoutable:
+// `shared` or `full` by its effective level, and a subscription account needs
+// subscription sharing) AND be linked to a resource group the principal is provisioned
+// into (provisionedRGsForPrincipal). The predicate is asked first, so a link that
+// outlives its level (a torn downgrade, a paused master flag) grants nothing and costs
+// no group lookup, and an account in no group costs no provisioning lookup.
+//
+// The management page is a personal one (ListVendorAccounts lists nothing for a
+// principal without a user identity), so a principal without one is never a member
+// here, even a service provisioned into the group: a service USES a shared account
+// through its tokens, it does not browse the portal. A store error is returned, never
+// read as a grant.
+func (s *Service) isMemberOfSharedVendorAccount(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (bool, error) {
+	if principal.UserID == "" || !s.vendorAccountSharedRoutable(ctx, acc, s.vendorSubscriptionSharingEnabledCached(ctx)) {
+		return false, nil
+	}
+	linked, err := s.routes.ResourceGroupsByVendorAccount(ctx, acc.ID)
+	if err != nil {
+		return false, err
+	}
+	if len(linked) == 0 {
+		return false, nil
+	}
+	provisioned, err := s.provisionedRGsForPrincipal(ctx, principal)
+	if err != nil {
+		return false, err
+	}
+	for _, rg := range linked {
+		if provisioned[rg.ID] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// isManagerOfSharedVendorAccount reports whether principal is a CM of acc AND acc is
+// `shared` or `full` by its effective level: the one place the read side asks "is this
+// a management view of someone else's account". The level is asked first, so a CM link
+// that outlives its level (a torn downgrade, a stale link at `none`, a master flag
+// switched off) grants nothing and costs no group lookup.
+func (s *Service) isManagerOfSharedVendorAccount(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (bool, error) {
+	if !vendorAccountSharedLevel(s.effectiveVendorAccountShareLevel(ctx, acc)) {
+		return false, nil
+	}
+	return s.isVendorAccountManager(ctx, principal, acc)
+}
+
+// isVendorAccountOwner reports whether principal is the account's owning user. A
+// principal with no user identity (a service token, say) owns nothing.
+func isVendorAccountOwner(principal auth.Token, acc routing.VendorAccount) bool {
+	return principal.UserID != "" && acc.OwnerUserID == principal.UserID
+}
+
+// isVendorAccountManager reports whether principal is a CM of acc: a co-manager
+// (or the owner) of an admin group the account is assigned to, holding
+// can_manage_vendor_accounts there. It is the INTERSECTION of the account's
+// vendor_account_admin_groups with vendorAccountManageGroupIDs(principal), both
+// read live, so un-assigning the group or demoting the co-manager revokes the
+// reach on the very next call.
+//
+// It says nothing about whether the account is shared: that is the share level's
+// job, and the two gates below check it BEFORE they ask. A CM link that outlives
+// its level (a torn downgrade, a store written directly) must grant nothing.
+// Scope never enters into it: a system-scope token is a CM only if its own user is
+// one, exactly like any other token of that user.
+func (s *Service) isVendorAccountManager(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (bool, error) {
+	if principal.UserID == "" {
+		return false, nil
+	}
+	groupIDs, err := s.routes.VendorAccountAdminGroups(ctx, acc.ID)
+	if err != nil {
+		return false, err
+	}
+	if len(groupIDs) == 0 {
+		return false, nil
+	}
+	manageGroups, err := s.vendorAccountManageGroupIDs(ctx, principal)
+	if err != nil {
+		return false, err
+	}
+	for _, gid := range groupIDs {
+		if manageGroups[gid] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// vendorAccountSharedLevel reports whether level is one at which a non-owner can
+// reach the account at all (shared or full). Anything else, an unrecognised value
+// included, is private: fail closed.
+func vendorAccountSharedLevel(level string) bool {
+	return level == routing.VendorShareLevelShared || level == routing.VendorShareLevelFull
+}
+
+// effectiveVendorAccountShareLevel is the share level an account is treated as
+// having RIGHT NOW: VendorShareLevelNone while the vendor_account_sharing_enabled
+// master flag is off, the account's stored ShareLevel while it is on (spec
+// 2026-10-15 section 13: with the master off "share_level is ignored, every account
+// behaves personal"). The flag is read through the 5 s invalidatable cache the
+// routing hot path uses (vendorAccountSharingEnabledCached,
+// service_vendor_sharing_flags.go): this runs per account on every routed request, so
+// a settings SELECT per call is not affordable. It is fail-closed like the raw
+// accessor behind requireVendorAccountSharingEnabled: no settings store, or one that
+// cannot be read, reads as off. A flip through the settings PUT shows on the very next
+// call; only an out-of-band change waits out the TTL.
+//
+// Turning the master off is a global PAUSE, not an un-share: nothing stored (the
+// level, the root, the management-group and resource-group links) is touched, so
+// switching it back on honours the stored level again. Every decision that lets a
+// NON-OWNER through on the strength of the share level reads this, not
+// acc.ShareLevel: the two write gates below (and with them the delete and the
+// share-level lower), and the listings and the routing grant that follow
+// must do the same.
+func (s *Service) effectiveVendorAccountShareLevel(ctx context.Context, acc routing.VendorAccount) string {
+	if !s.vendorAccountSharingEnabledCached(ctx) {
+		return routing.VendorShareLevelNone
+	}
+	return acc.ShareLevel
+}
+
+// authorizeVendorAccountOperate is the gate of the OPERATE operations: status,
+// model prefix, rename, model refresh, connection test, usage refresh (spec
+// 2026-10-15 section 6). acc is the record as the store returned it; the share level
+// it is judged by is the EFFECTIVE one (effectiveVendorAccountShareLevel: the stored
+// level while sharing is enabled, `none` while the master flag is off). Allowed for:
+//
+//   - the owner, at every level;
+//   - a CM of the account, while it is `shared` or `full`.
+//
+// Everyone else, system scope included, gets ErrVendorAccountNotFound
+// (404-no-leak): an operate call opens the owner's sealed credential and sends it
+// upstream, and system scope never bypasses a write. At `none` the account has no
+// management group, so no CM can exist and owner-only falls out; the level check
+// comes first anyway so a leftover admin-group link at `none` grants nothing.
+//
+// This gate says nothing about the credential-bearing operations (see
+// authorizeVendorAccountCredential), nor about the subscription exception that
+// makes some operate calls owner-only at `shared` for a subscription account
+// (requireOwnerForSubscriptionOperate, which the three token-opening operations
+// run right AFTER this gate).
+func (s *Service) authorizeVendorAccountOperate(ctx context.Context, principal auth.Token, acc routing.VendorAccount) error {
+	if isVendorAccountOwner(principal, acc) {
+		return nil
+	}
+	if !vendorAccountSharedLevel(s.effectiveVendorAccountShareLevel(ctx, acc)) {
+		return ErrVendorAccountNotFound
+	}
+	manager, err := s.isVendorAccountManager(ctx, principal, acc)
+	if err != nil {
+		return err
+	}
+	if manager {
+		return nil
+	}
+	return ErrVendorAccountNotFound
+}
+
+// requireOwnerForSubscriptionOperate is the subscription exception of the operate
+// gate (spec 2026-10-15 sections 6 note (1) and 11). A SUBSCRIPTION account's
+// operate calls that open the stored OAuth token set -- the connection test, the
+// model refresh and the usage refresh -- are owner-only even at `shared` and `full`:
+// all three open the token set, and the two refreshes renew an expired access token
+// through the gateway's refresher, which persists the rotated single-use refresh
+// token (and can trip the account-wide needs_reconnect); a CM may not do that to the
+// owner's token (the connection test only opens the set and renews nothing, but the
+// spec lists it with the other two and the rule covers it). An api-key account is
+// not affected: it has no token to rotate, so the owner and a CM both pass, as the
+// operate gate decided.
+//
+// It is not a gate of its own and MUST run AFTER authorizeVendorAccountOperate has
+// passed: a caller who cannot see the account at all is turned away there with the
+// 404-no-leak, and only one who can (a CM of a shared account) is told
+// ErrVendorAccountForbidden here (403: the account is no secret to them, so "not
+// found" would be a lie). It tests the account's auth type, not its level, so it
+// fails closed: a subscription account is owner-only here whatever level a stored
+// row claims, although the raise cap keeps one from `full`.
+//
+// Every operate call that opens a subscription's token set calls this one function,
+// so a further token-rotating operation joins the rule by calling it too. The calls
+// that do not open the token set (status, model prefix, rename) do not: a CM keeps
+// them on a subscription account.
+func requireOwnerForSubscriptionOperate(principal auth.Token, acc routing.VendorAccount) error {
+	if acc.AuthType == routing.VendorAuthSubscription && !isVendorAccountOwner(principal, acc) {
+		return ErrVendorAccountForbidden
+	}
+	return nil
+}
+
+// authorizeVendorAccountCredential is the gate of every operation that
+// establishes, replaces or clears the account's credential or acts as its
+// strongest lever (connect, reconnect, device connect, import, api key set or
+// change, and the rows the spec ties to it: delete and downgrade). Allowed for:
+//
+//   - the owner, at every level;
+//   - a CM of the account, at `full` only (complete owner-equivalent delegation).
+//
+// The two denials differ on purpose:
+//
+//   - a CM at `shared` gets ErrVendorAccountForbidden (403): they can already see
+//     and operate the account, so "not found" would be a lie;
+//   - anyone who cannot see the account at all (a stranger, a co-manager without
+//     the vendor-account flag, system scope, a principal with no user identity, or a
+//     CM whose link outlived the shared level) gets ErrVendorAccountNotFound
+//     (404-no-leak), identical to an unknown id.
+//
+// Like the operate gate it works on the EFFECTIVE share level (the stored level while
+// sharing is enabled, `none` while the master flag is off; read once, so one call
+// cannot see two answers), and an unrecognised level is treated as private.
+func (s *Service) authorizeVendorAccountCredential(ctx context.Context, principal auth.Token, acc routing.VendorAccount) error {
+	if isVendorAccountOwner(principal, acc) {
+		return nil
+	}
+	level := s.effectiveVendorAccountShareLevel(ctx, acc)
+	if !vendorAccountSharedLevel(level) {
+		return ErrVendorAccountNotFound
+	}
+	manager, err := s.isVendorAccountManager(ctx, principal, acc)
+	if err != nil {
+		return err
+	}
+	if !manager {
+		return ErrVendorAccountNotFound
+	}
+	if level == routing.VendorShareLevelFull {
+		return nil
+	}
+	return ErrVendorAccountForbidden
+}
+
+// isVendorAccountPatchOperateField is the OPERATE ALLOWLIST of the account PATCH:
+// the names (Go field names of UpdateVendorAccountRequest) of the only fields a CM
+// of a `shared` account may change. It is the single place a PATCH field is granted
+// the weaker gate; there is deliberately no matching list of "credential fields",
+// because the credential gate is the default and a list of what is sensitive is
+// exactly what an overlooked field falls out of. Widening this list widens what a
+// co-manager can do to someone else's account, so a test restates it literally
+// (TestVendorAccountPatchOperateAllowlistIsExactlyNameStatusModelPrefix) and any
+// edit is a visible, reviewed one.
+func isVendorAccountPatchOperateField(field string) bool {
+	switch field {
+	case "Name", "Status", "ModelPrefix":
+		return true
+	}
+	return false
+}
+
+// patchTouchesOutsideOperate reports whether the PATCH body (a request struct, by
+// value or pointer) carries anything the operate allowlist does not name, i.e.
+// whether it needs the credential gate. It fails CLOSED at every step:
+//
+//   - it walks the struct's fields by reflection, so a field added to the request
+//     later is examined without anyone touching this function;
+//   - a field outside the allowlist counts as touched when it is present (a non-nil
+//     pointer, slice, map or interface), so an api_key sent as "" (clear) is touched;
+//   - a field of a value type cannot be "absent", so it always counts as touched:
+//     such a field makes every PATCH credential-gated, which fails loudly in the
+//     tests rather than quietly granting it the operate gate;
+//   - anything that is not a plain struct (including nil) is touched.
+//
+// Allowlisted fields are skipped here: whether and how they apply is the apply
+// functions' business, and they are operate-grade by definition.
+func patchTouchesOutsideOperate(body any) bool {
+	v := reflect.ValueOf(body)
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return true
+	}
+	typ := v.Type()
+	for i := range typ.NumField() {
+		if isVendorAccountPatchOperateField(typ.Field(i).Name) {
+			continue
+		}
+		switch field := v.Field(i); field.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface:
+			if !field.IsNil() {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// authorizeVendorAccountPatch authorizes an account PATCH FIELD BY FIELD, deny by
+// default (spec 2026-10-15 section 6): a request whose every present field is on
+// the operate allowlist (name, status, model_prefix) takes the operate gate; a
+// request that carries ANY other field -- api_key, base_url, auth_type, or one nobody
+// has classified yet -- takes the credential gate, and so does a request that mixes
+// both kinds (the stricter wins; a CM at `shared` who sneaks an api_key in next to a
+// status change is turned away with nothing applied). The decision depends only on
+// which fields are present, never on their values: whether an api_key is "really"
+// different is not knowable without opening the sealed one.
+//
+// credentialPatch is patchTouchesOutsideOperate(req), computed ONCE by the caller:
+// the same decision that picks the gate also picks the write
+// (saveVendorAccountPatch), so an operate-only PATCH can never be authorized as
+// one thing and written as another.
+func (s *Service) authorizeVendorAccountPatch(ctx context.Context, principal auth.Token, acc routing.VendorAccount, credentialPatch bool) error {
+	if credentialPatch {
+		return s.authorizeVendorAccountCredential(ctx, principal, acc)
+	}
+	return s.authorizeVendorAccountOperate(ctx, principal, acc)
+}
+
+// rejectVendorAccountImmutableChange enforces the create-only invariant of
+// base_url and auth_type: a PATCH may not change either, for any caller. It runs
+// AFTER the gate (so a stranger still gets the 404 and a CM at `shared` the 403,
+// never a 400 that confirms the account) and BEFORE anything is applied, so a
+// request that also carries a valid change writes nothing. A value equal to the
+// stored one is not an attempt to change it (a client that round-trips the account
+// it read is not refused).
+func rejectVendorAccountImmutableChange(acc routing.VendorAccount, req UpdateVendorAccountRequest) error {
+	if req.BaseURL != nil && strings.TrimSpace(*req.BaseURL) != acc.BaseURL {
+		return fmt.Errorf("%w: base_url", ErrVendorAccountFieldImmutable)
+	}
+	if req.AuthType != nil && strings.TrimSpace(*req.AuthType) != acc.AuthType {
+		return fmt.Errorf("%w: auth_type", ErrVendorAccountFieldImmutable)
+	}
+	return nil
+}
+
+// sortVendorAccountsOldestFirst orders accounts by creation time, then id.
+func sortVendorAccountsOldestFirst(accounts []routing.VendorAccount) {
+	sort.SliceStable(accounts, func(i, j int) bool {
+		if !accounts[i].CreatedAt.Equal(accounts[j].CreatedAt) {
+			return accounts[i].CreatedAt.Before(accounts[j].CreatedAt)
+		}
+		return accounts[i].ID < accounts[j].ID
+	})
+}
+
+// managedVendorAccounts returns the accounts principal MANAGES that are not already
+// among own: the accounts linked to an admin group the principal manages vendor
+// accounts through (vendorAccountManageGroupIDs: owner of the group, or co-manager
+// holding can_manage_vendor_accounts), oldest first. It is the management arm of
+// ListVendorAccounts, a different set from the routing enumerator (an account the
+// principal manages but is not provisioned into is listed here and never routed).
+//
+// The filter is the EFFECTIVE share level, the same one the gates read: an account
+// counts only while it is `shared` or `full` by effectiveVendorAccountShareLevel. That
+// one rule does two jobs. With the master sharing flag off every account behaves
+// personal, so the arm is EMPTY (and is not even computed: sharing is off in most
+// deployments, and the page is read often). And a `none` account that still carries
+// admin-group links (a raise that tore halfway leaves exactly that) is never listed as
+// shared, because the link alone grants nothing; the retry of the raise overwrites it.
+//
+// The accounts own already holds are skipped, so an account the principal owns AND
+// manages is listed once, as their own.
+func (s *Service) managedVendorAccounts(ctx context.Context, principal auth.Token, own []routing.VendorAccount) ([]routing.VendorAccount, error) {
+	if !s.vendorAccountSharingEnabledCached(ctx) {
+		return nil, nil
+	}
+	manageGroups, err := s.vendorAccountManageGroupIDs(ctx, principal)
+	if err != nil {
+		return nil, err
+	}
+	if len(manageGroups) == 0 {
+		return nil, nil
+	}
+	groupIDs := make([]string, 0, len(manageGroups))
+	for gid := range manageGroups {
+		groupIDs = append(groupIDs, gid)
+	}
+	sort.Strings(groupIDs)
+	linked, err := s.routes.VendorAccountsByAdminGroups(ctx, groupIDs)
+	if err != nil {
+		return nil, err
+	}
+	owned := make(map[string]bool, len(own))
+	for _, acc := range own {
+		owned[acc.ID] = true
+	}
+	managed := make([]routing.VendorAccount, 0, len(linked))
+	for _, acc := range linked {
+		if owned[acc.ID] || !vendorAccountSharedLevel(s.effectiveVendorAccountShareLevel(ctx, acc)) {
+			continue
+		}
+		managed = append(managed, acc)
+	}
+	sortVendorAccountsOldestFirst(managed)
+	return managed, nil
+}
+
+// memberVendorAccounts returns the accounts principal can ROUTE to through a resource
+// group that are not already in listed (the accounts the list holds as own or managed),
+// oldest first. It is the member arm of ListVendorAccounts: the shared arm of the
+// routing grant (sharedVendorAccountsForRouting), so a member sees exactly the shared
+// accounts the resolver would let it route to -- the account is `shared` or `full` by
+// its EFFECTIVE level (so with the master sharing flag off the arm is empty and is not
+// even computed), a subscription account needs subscription sharing, and the principal
+// is provisioned into a resource group the account is linked to.
+//
+// It is not the routing enumerator's answer and is not used for routing: the list is a
+// management page, not a gate, so it shows an account that is not ACTIVE (the member
+// sees that it cannot use it) where the model listing advertises only the active ones,
+// and, unlike the grant, a store error here FAILS the read (as the managed arm's does):
+// the safe direction for a page is to show less, and a list that silently dropped the
+// shared accounts would hide them from a member without saying so.
+func (s *Service) memberVendorAccounts(ctx context.Context, principal auth.Token, listed []routing.VendorAccount) ([]routing.VendorAccount, error) {
+	member, err := s.sharedVendorAccountsForRouting(ctx, principal, listed)
+	if err != nil {
+		return nil, err
+	}
+	sortVendorAccountsOldestFirst(member)
+	return member, nil
+}
+
+// listedVendorAccounts is the account set of the management list for principal given
+// the accounts they own (id-sorted by the store), in two parts because they are rendered
+// as two different views: managementView holds the accounts the principal OWNS (oldest
+// first) and then (for a non-system principal) the ones they MANAGE; memberOnly holds the
+// accounts they can ROUTE to as a member and neither own nor manage. Each arm is oldest
+// first and no account is in both or twice (an account is listed in the first arm that
+// holds it: own, then managed, then member), so a CM who is also provisioned into a
+// managed account's group keeps the management view of it. System scope does not widen
+// the list: the page is a personal one, and the union is the non-system one.
+func (s *Service) listedVendorAccounts(ctx context.Context, principal auth.Token, own []routing.VendorAccount) (managementView, memberOnly []routing.VendorAccount, err error) {
+	sortVendorAccountsOldestFirst(own)
+	if isSystem(principal) {
+		return own, nil, nil
+	}
+	managed, err := s.managedVendorAccounts(ctx, principal, own)
+	if err != nil {
+		return nil, nil, err
+	}
+	managementView = slices.Concat(own, managed)
+	memberOnly, err = s.memberVendorAccounts(ctx, principal, managementView)
+	if err != nil {
+		return nil, nil, err
+	}
+	return managementView, memberOnly, nil
+}
+
+// vendorAccountListUsage is the usage snapshot that decorates a management row of the
+// list. It only decorates: a failed read yields nil (the row renders without a usage
+// panel) rather than failing the whole Providers list. GetVendorAccount, the detail
+// read, surfaces the error.
+func (s *Service) vendorAccountListUsage(ctx context.Context, accountID string) *VendorAccountUsageDTO {
+	usage, err := s.vendorAccountUsageDTO(ctx, accountID)
+	if err != nil {
+		slog.Debug("vendor accounts list: usage snapshot unavailable, listing the account without it",
+			"account_id", accountID, "err", err)
+		return nil
+	}
+	return usage
+}
+
+// ListVendorAccounts returns the accounts the calling principal OWNS, oldest first,
+// then (for a non-system principal) the accounts they MANAGE and the accounts they can
+// ROUTE to as a member, each arm oldest first. Like every vendor-account method it is
+// refused with ErrVendorAccountsDisabled (before anything else) while the
+// vendor_accounts_enabled master flag is off.
+//
+// This is the management union of spec 2026-10-15 section 8: own ∪ managed ∪ member.
+// A CM sees an account they manage even without resource-group provisioning
+// (managedVendorAccounts: the accounts linked to an admin group the principal manages
+// vendor accounts through) and a member sees every account they can route
+// (memberVendorAccounts), both filtered on the EFFECTIVE share level, so with the
+// master sharing flag off the list is the principal's own accounts and nothing else.
+// An account is listed once, in the first arm that holds it. It is a wider set than the
+// one the model listing advertises and is never used for routing.
+//
+// The rows are rendered FOR the principal, in the view its relation to the account
+// earns, the same view GetVendorAccount gives (spec section 10):
+//
+//   - an own or managed row is the management view (vendorAccountDTO), with its
+//     rate-limit usage snapshot when one exists (see VendorAccountDTO). A managed row is
+//     is_owner false, shared_by the owner's name, and no credential material (the DTO
+//     carries only the booleans, whoever the viewer is);
+//   - a member-only row is the MINIMAL view (memberVendorAccountDTO): a member sees what
+//     it needs to use the account and none of the management fields, usage or secrets.
+//
+// System scope does not widen the list: the page is a personal one, a system principal
+// reads any account by id but lists only their own, and the management union is the
+// non-system one.
 func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) (VendorAccountListResponse, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountListResponse{}, err
@@ -337,48 +1101,63 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 	if principal.UserID == "" {
 		return VendorAccountListResponse{Data: out}, nil
 	}
-	accounts, err := s.routes.VendorAccountsByOwner(ctx, principal.UserID)
+	own, err := s.routes.VendorAccountsByOwner(ctx, principal.UserID)
 	if err != nil {
 		return VendorAccountListResponse{}, err
 	}
-	sort.SliceStable(accounts, func(i, j int) bool {
-		if !accounts[i].CreatedAt.Equal(accounts[j].CreatedAt) {
-			return accounts[i].CreatedAt.Before(accounts[j].CreatedAt)
-		}
-		return accounts[i].ID < accounts[j].ID
-	})
-	for _, acc := range accounts {
-		dto, err := s.vendorAccountDTO(ctx, acc)
+	managementView, memberOnly, err := s.listedVendorAccounts(ctx, principal, own)
+	if err != nil {
+		return VendorAccountListResponse{}, err
+	}
+	for _, acc := range managementView {
+		dto, err := s.vendorAccountDTO(ctx, principal, acc)
 		if err != nil {
 			return VendorAccountListResponse{}, err
 		}
-		// The snapshot only decorates the row: a failed read leaves Usage nil
-		// (the row renders without a usage panel) rather than failing the whole
-		// Providers list. GetVendorAccount, the detail read, surfaces the error.
-		if dto.Usage, err = s.vendorAccountUsageDTO(ctx, acc.ID); err != nil {
-			slog.Debug("vendor accounts list: usage snapshot unavailable, listing the account without it",
-				"account_id", acc.ID, "err", err)
-			dto.Usage = nil
+		dto.Usage = s.vendorAccountListUsage(ctx, acc.ID)
+		out = append(out, dto)
+	}
+	for _, acc := range memberOnly {
+		dto, err := s.memberVendorAccountDTO(ctx, acc)
+		if err != nil {
+			return VendorAccountListResponse{}, err
 		}
 		out = append(out, dto)
 	}
 	return VendorAccountListResponse{Data: out}, nil
 }
 
-// GetVendorAccount returns one account the principal owns (404-no-leak
-// otherwise); system scope may read any account. It carries the account's
-// rate-limit usage snapshot (Usage; nil until one has been scraped) and, unlike
-// the list, fails when that snapshot cannot be read. ErrVendorAccountsDisabled
-// while the master flag is off.
+// GetVendorAccount returns one account the principal may read, in the view its relation
+// to the account earns (see authorizeVendorAccountRead and VendorAccountDTO):
+//
+//   - their own, one they manage as a CM while it is shared or full (a KEY-FREE
+//     management read: is_owner false, shared_by the owner's name, the booleans and
+//     never the secret), or any account for system scope: the management view, which
+//     carries the account's rate-limit usage snapshot (Usage; nil until one has been
+//     scraped) and, unlike the list, fails when that snapshot cannot be read;
+//   - one they can route to through a resource group they are provisioned into (a
+//     MEMBER): the minimal key-free view (memberVendorAccountDTO), without the
+//     management fields and without usage, which is not even read.
+//
+// Anyone else gets ErrVendorAccountNotFound (404-no-leak).
+// ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, false)
+	acc, viewer, err := s.authorizeVendorAccountRead(ctx, principal, id)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	dto, err := s.vendorAccountDTO(ctx, acc)
+	if viewer == vendorViewerMember {
+		return s.memberVendorAccountDTO(ctx, acc)
+	}
+	if viewer != vendorViewerManagement {
+		// The gate never answers a nil error with a denied viewer; if it ever did,
+		// the answer is still no view at all, not the widest one.
+		return VendorAccountDTO{}, ErrVendorAccountNotFound
+	}
+	dto, err := s.vendorAccountDTO(ctx, principal, acc)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -496,7 +1275,7 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 		}
 		return VendorAccountDTO{}, err
 	}
-	dto, err := s.vendorAccountDTO(ctx, acc)
+	dto, err := s.vendorAccountDTO(ctx, principal, acc)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -580,20 +1359,92 @@ func (s *Service) applyVendorAccountAPIKey(acc *routing.VendorAccount, raw *stri
 	return nil
 }
 
+// saveVendorAccountPatch persists a PATCH that has been authorized and applied to
+// acc (the copy loaded before, mutated in Go), and returns the account as it is
+// stored afterwards, for the response.
+//
+// The write follows the gate. A credentialPatch (the credential gate passed:
+// api_key or another non-operate field is present) writes the whole row, as it
+// always has: its actor may change the credential columns. An operate-only PATCH
+// writes ONLY the operate columns it was asked to change and updated_at
+// (UpdateVendorAccountOperateFields), because the load-modify-write is not atomic
+// and a full-row write would carry the credential columns of its stale copy back
+// into the row: a CM of a `shared` account sending a status change would revert
+// the owner's api key rotation, a dispatch-time refresh-token rotation or the
+// needs_reconnect flip, writing a credential column without ever passing the
+// credential gate. Name and model_prefix are written when the request carries
+// them (the request is the intent); status only when it differs from the loaded
+// one (a status that merely echoes the stored value, which applyVendorAccountStatus
+// treats as a no-op, must not be written back over a concurrent change).
+//
+// loaded is the record as it was read, applied the one after the apply* calls. A
+// field added to the operate allowlist must be added to the patch built here as
+// well; forgetting only means it is not persisted, never that a credential column
+// is written.
+func (s *Service) saveVendorAccountPatch(ctx context.Context, loaded, applied routing.VendorAccount, req UpdateVendorAccountRequest, credentialPatch bool) (routing.VendorAccount, error) {
+	if credentialPatch {
+		if err := s.routes.UpdateVendorAccount(ctx, applied); err != nil {
+			return routing.VendorAccount{}, notFoundAsVendorAccountNotFound(err)
+		}
+		return applied, nil
+	}
+	patch := routing.VendorAccountOperatePatch{UpdatedAt: applied.UpdatedAt}
+	if req.Name != nil {
+		patch.Name = &applied.Name
+	}
+	if applied.Status != loaded.Status {
+		patch.Status = &applied.Status
+	}
+	if req.ModelPrefix != nil {
+		patch.ModelPrefix = &applied.ModelPrefix
+	}
+	if err := s.routes.UpdateVendorAccountOperateFields(ctx, applied.ID, patch); err != nil {
+		return routing.VendorAccount{}, notFoundAsVendorAccountNotFound(err)
+	}
+	// The row is not the stale copy any more (a credential may have moved since the
+	// load), so describe what is actually stored.
+	current, err := s.routes.VendorAccountByID(ctx, applied.ID)
+	if err != nil {
+		return routing.VendorAccount{}, notFoundAsVendorAccountNotFound(err)
+	}
+	return current, nil
+}
+
 // UpdateVendorAccount renames an account, changes its status or model prefix,
 // and/or replaces or clears its api key. The store keeps id, owner, vendor and
 // created_at immutable, so this loads the row, mutates only the requested fields
-// and writes it back. The write is OWNER-ONLY (system scope included), and
-// authorization runs first, so a stranger gets 404 even for an invalid body.
+// and writes them back.
+//
+// Authorization is field-level and deny-by-default (authorizeVendorAccountPatch):
+// name, status and model_prefix need the operate gate (the owner, or a CM of a
+// shared/full account); a request carrying anything else -- the api key above all
+// -- needs the credential gate (the owner, or a CM of a `full` account; a CM of a
+// `shared` one is ErrVendorAccountForbidden and nothing is written). System scope
+// is a stranger to both. base_url and auth_type are create-only: a request that
+// tries to change either is ErrVendorAccountFieldImmutable. Authorization runs
+// first, so a stranger gets 404 even for an invalid body.
+//
+// The write follows the gate (saveVendorAccountPatch): an operate-only PATCH
+// writes only the operate columns it changes and never a credential column, so it
+// cannot revert a concurrent credential write.
+//
 // ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token, id string, req UpdateVendorAccountRequest) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
+	credentialPatch := patchTouchesOutsideOperate(req)
+	if err := s.authorizeVendorAccountPatch(ctx, principal, acc, credentialPatch); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if err := rejectVendorAccountImmutableChange(acc, req); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	loaded := acc
 	if err := applyVendorAccountName(&acc, req.Name); err != nil {
 		return VendorAccountDTO{}, err
 	}
@@ -607,10 +1458,8 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 		return VendorAccountDTO{}, err
 	}
 	acc.UpdatedAt = s.clock().UTC()
-	if err := s.routes.UpdateVendorAccount(ctx, acc); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return VendorAccountDTO{}, ErrVendorAccountNotFound
-		}
+	saved, err := s.saveVendorAccountPatch(ctx, loaded, acc, req, credentialPatch)
+	if err != nil {
 		return VendorAccountDTO{}, err
 	}
 	// A request that carries a prefix re-labels the account's model rows to it
@@ -619,24 +1468,34 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	// re-label left behind; relabelVendorAccountModels writes only when a row
 	// actually differs.
 	if req.ModelPrefix != nil {
-		if err := s.relabelVendorAccountModels(ctx, acc.ID); err != nil {
+		if err := s.relabelVendorAccountModels(ctx, saved.ID); err != nil {
 			return VendorAccountDTO{}, err
 		}
 	}
-	return s.vendorAccountDTO(ctx, acc)
+	return s.vendorAccountDTO(ctx, principal, saved)
 }
 
-// DeleteVendorAccount removes an account the principal owns (owner-only, system
-// scope included); the store cascades its dependent rows (the model catalog).
-// The bool reports that a row was removed (always true on a nil error): there is
-// no best-effort side effect to flag, unlike DeleteServer.
-// ErrVendorAccountsDisabled while the master flag is off.
+// DeleteVendorAccount removes an account; the store cascades its dependent rows
+// (the model catalog, the management-group and resource-group links). It is the
+// CREDENTIAL gate's row (spec 2026-10-15 section 6): the owner at every level, a CM
+// of a `full` account (complete owner-equivalent delegation); a CM of a `shared`
+// account is ErrVendorAccountForbidden (they can see it, so "not found" would be a
+// lie) and everyone else -- system scope included -- ErrVendorAccountNotFound
+// (404-no-leak). The bool reports that a row was removed (always true on a nil
+// error): there is no best-effort side effect to flag, unlike DeleteServer.
+// ErrVendorAccountsDisabled while the module flag is off. Deleting is not a sharing
+// endpoint, so the sharing flag does not REFUSE it; but the credential gate reads the
+// effective share level, so while vendor_account_sharing_enabled is off a CM is a
+// stranger (404) and only the owner can delete.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return false, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
+		return false, err
+	}
+	if err := s.authorizeVendorAccountCredential(ctx, principal, acc); err != nil {
 		return false, err
 	}
 	if err := s.routes.DeleteVendorAccount(ctx, acc.ID); err != nil {

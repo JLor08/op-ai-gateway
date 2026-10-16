@@ -178,18 +178,28 @@ func hasActiveVendorUsagePull(acc routing.VendorAccount) bool {
 // sent to the provider's usage endpoint (composed from the preset and the account's
 // base URL).
 //
-// STRICTLY OWNER-ONLY, system scope included: it opens the owner's sealed credential
-// and sends it to the vendor from the gateway, so it is authorized like a write (an
-// unknown id and a stranger's account are both ErrVendorAccountNotFound).
-// ErrVendorAccountsDisabled while the master flag is off. The only errors besides
-// those are a stored credential that cannot be opened
-// (ErrVendorAccountCredentialUnreadable) and a store failure.
+// Authorized by authorizeVendorAccountOperate: the owner, or a CM while the account
+// is shared/full. System scope is NOT let through: it opens the owner's sealed
+// credential and sends it to the vendor from the gateway, so it is authorized like a
+// write (an unknown id and a stranger's account are both ErrVendorAccountNotFound).
+// A SUBSCRIPTION account is owner-only on top of that
+// (requireOwnerForSubscriptionOperate): the pull renews an expired token first, so a
+// CM who can see the account gets ErrVendorAccountForbidden, the lazy on-view pull
+// included, and nothing is renewed or written. ErrVendorAccountsDisabled while the
+// master flag is off. The only errors besides those are a stored credential that
+// cannot be opened (ErrVendorAccountCredentialUnreadable) and a store failure.
 func (s *Service) RefreshVendorAccountUsage(ctx context.Context, principal auth.Token, id string, maxAge time.Duration) (*VendorAccountUsageDTO, VendorUsageRefreshResult, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return nil, VendorUsageRefreshResult{}, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
+		return nil, VendorUsageRefreshResult{}, err
+	}
+	if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+		return nil, VendorUsageRefreshResult{}, err
+	}
+	if err := requireOwnerForSubscriptionOperate(principal, acc); err != nil {
 		return nil, VendorUsageRefreshResult{}, err
 	}
 	if !hasActiveVendorUsagePull(acc) {

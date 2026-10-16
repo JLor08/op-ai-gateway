@@ -944,6 +944,16 @@ type SystemSettingsDTO struct {
 	// account is refused with 409 vendor_accounts.subscriptions_disabled and the
 	// existing ones stop routing and stop being advertised (nothing is deleted).
 	VendorSubscriptionsEnabled bool `json:"vendor_subscriptions_enabled"`
+	// VendorAccountSharingEnabled is the vendor_account_sharing_enabled master
+	// switch for sharing a vendor account with a resource group; default false
+	// (opt-in, fail-closed). Sharing stays unavailable until a system admin
+	// enables it.
+	VendorAccountSharingEnabled bool `json:"vendor_account_sharing_enabled"`
+	// VendorSubscriptionSharingEnabled is the vendor_subscription_sharing_enabled
+	// switch for whether SUBSCRIPTION-type vendor accounts may be shared (the
+	// subscription path is ToS-restricted); default false (opt-in, fail-closed).
+	// Meaningful only while VendorAccountSharingEnabled is on.
+	VendorSubscriptionSharingEnabled bool `json:"vendor_subscription_sharing_enabled"`
 	// AnthropicPromptCachingEnabled is the anthropic_prompt_caching_enabled
 	// MASTER flag for prompt caching on the Anthropic translate path; default
 	// false (opt-in). While off no cache_control breakpoints are placed.
@@ -1125,6 +1135,10 @@ type UpdateSystemSettingsRequest struct {
 	VendorAccountRoutingMode *string `json:"vendor_account_routing_mode"`
 	// VendorSubscriptionsEnabled: nil = keep the stored value (a plain boolean).
 	VendorSubscriptionsEnabled *bool `json:"vendor_subscriptions_enabled"`
+	// VendorAccountSharingEnabled: nil = keep the stored value (a plain boolean).
+	VendorAccountSharingEnabled *bool `json:"vendor_account_sharing_enabled"`
+	// VendorSubscriptionSharingEnabled: nil = keep the stored value (a plain boolean).
+	VendorSubscriptionSharingEnabled *bool `json:"vendor_subscription_sharing_enabled"`
 	// AnthropicPromptCachingEnabled: nil = keep the stored value.
 	AnthropicPromptCachingEnabled *bool `json:"anthropic_prompt_caching_enabled"`
 	// VendorOpenAICodexClientVersion: nil = keep the stored value. Trimmed; blank
@@ -1651,8 +1665,9 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 
 		RouteAffinitySessionMode: s.RouteAffinitySessionMode(ctx),
 
-		// The vendor-accounts flag is off (zero value), the subscriptions switch is
-		// on, and the routing mode is the default when the store is absent/unreadable.
+		// The vendor-accounts flag and both sharing switches are off (zero value),
+		// the subscriptions switch is on, and the routing mode is the default when
+		// the store is absent/unreadable.
 		VendorSubscriptionsEnabled:     true,
 		VendorAccountRoutingMode:       DefaultVendorAccountRoutingMode,
 		VendorOpenAICodexClientVersion: DefaultVendorOpenAICodexClientVersion,
@@ -1665,6 +1680,8 @@ func (s *Service) SystemSettingsView(ctx context.Context) SystemSettingsDTO {
 		if values, err := s.settings.SystemSettings(ctx); err == nil {
 			dto.VendorAccountsEnabled = VendorAccountsEnabled(values)
 			dto.VendorSubscriptionsEnabled = VendorSubscriptionsEnabled(values)
+			dto.VendorAccountSharingEnabled = VendorAccountSharingEnabled(values)
+			dto.VendorSubscriptionSharingEnabled = VendorSubscriptionSharingEnabled(values)
 			dto.AnthropicPromptCachingEnabled = AnthropicPromptCachingEnabled(values)
 			dto.VendorAccountRoutingMode = VendorAccountRoutingMode(values)
 			dto.VendorOpenAICodexClientVersion = VendorOpenAICodexClientVersion(values)
@@ -1771,10 +1788,17 @@ type settingWrite struct{ key, value string }
 // A store without that capability (an error-injecting test fake) falls back to
 // per-key writes in the same order, preserving those fakes' key-specific error
 // behaviour. One clock reading stamps the whole batch, which is written together.
+//
+// Whatever the outcome, the cached read of the two sharing switches is dropped once
+// the write attempt is over (see service_vendor_sharing_flags.go): after it, so a read
+// that starts now cannot see the pre-write rows, and on a failure too, because the
+// per-key fallback may have applied some keys before one failed. A write that touches
+// neither switch merely costs the next decision one settings read.
 func (s *Service) persistSystemSettings(ctx context.Context, writes []settingWrite) error {
 	if len(writes) == 0 {
 		return nil
 	}
+	defer s.invalidateVendorSharingFlags()
 	now := s.clock()
 	if batch, ok := s.settings.(atomicSystemSettingsStore); ok {
 		values := make(map[string]string, len(writes))
@@ -1856,6 +1880,12 @@ func (s *Service) UpdateSystemSettings(ctx context.Context, principal auth.Token
 	}
 	if req.VendorSubscriptionsEnabled != nil {
 		writes = append(writes, settingWrite{vendorSubscriptionsEnabledKey, strconv.FormatBool(*req.VendorSubscriptionsEnabled)})
+	}
+	if req.VendorAccountSharingEnabled != nil {
+		writes = append(writes, settingWrite{vendorAccountSharingEnabledKey, strconv.FormatBool(*req.VendorAccountSharingEnabled)})
+	}
+	if req.VendorSubscriptionSharingEnabled != nil {
+		writes = append(writes, settingWrite{vendorSubscriptionSharingEnabledKey, strconv.FormatBool(*req.VendorSubscriptionSharingEnabled)})
 	}
 	if req.AnthropicPromptCachingEnabled != nil {
 		writes = append(writes, settingWrite{anthropicPromptCachingEnabledKey, strconv.FormatBool(*req.AnthropicPromptCachingEnabled)})

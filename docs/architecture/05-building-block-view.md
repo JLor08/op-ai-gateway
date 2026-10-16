@@ -71,12 +71,14 @@ flowchart TB
         tracing["tracing<br/>OTel decorators"]
         logbuffer["logbuffer<br/>ring buffer + SSE"]
         theme["theme<br/>external theme loader"]
+        ttlcache["ttlcache<br/>TTL memoizer, invalidatable"]
     end
 
     cmd --> gateway
     gateway --> compat & apierror & account & auth & totp & portal
     portal --> routing & usage & capture & netbird & certissue & theme
     gateway & portal --> vendorauth
+    gateway & portal --> ttlcache
     routing --> inference --> provider
     provider --> geminiwire
     account & portal & routing & usage --> store
@@ -96,8 +98,8 @@ flowchart TB
 | `account` | Auth + session + user management: login, session resolution, logout, set/change password, invite/list/update users, last-admin guard. |
 | `auth` | Token authentication primitives; bcrypt password hashing/policy. |
 | `totp` | TOTP 2FA enrollment and verification. |
-| `portal` | The service boundary behind the portal/system APIs: current-user data, tokens, dashboards, model lists, server/application/mapping management, groups/projects/services/resource-groups, system settings, and the per-user external **vendor accounts** ("Anbieter") CRUD + subscription connect + credential validation and the test-connection action, plus the dynamic model discovery (`RefreshVendorAccountModels`, `service_vendor_discovery.go`) with the account's model prefix and its owner-overlay listings ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)). For the preset vendors (the five OpenAI-compatible ones, x.ai, OpenRouter, Kilo, Google, Custom, and native Gemini) it validates and defaults the account's `base_url` and composes each probe and discovery URL from that root and the routing preset, handing `vendorauth` a plain URL ([§4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors), [§4.5](cross-cutting/external-vendor-accounts.md#45-native-google-gemini) for the native Gemini preset). It also owns the active usage pulls of the accounts the gateway can ask, an OpenAI subscription's and, through the preset's usage strategy, an OpenRouter or Kilo api key's ([§5.2](cross-cutting/external-vendor-accounts.md#52-active-pull-openai-subscription-openrouter-and-kilo-api-keys)). |
-| `routing` | Candidate scoring, the mapping-based resolver, AI-server/routing repository interfaces, domain types (`AiServer`, `Application`, `ModelMapping`, `VendorAccount`), affinity, capacity/admission. The resolver's vendor-account candidate source turns a caller's own account into an owner-scoped `Target`, for the accounts the caller's token has been opted in to (`TokenVendorPrefix`, [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access)). It also holds the pure-data **preset registry** of the preset vendors, the OpenAI-compatible ones and native Gemini (`vendor_presets.go`: default root, path prefix, validate strategy, model-id rewrite, usage strategy and the `Dialect` that picks the wire) and the `Target.OpenAIPathPrefix` it feeds ([ADR-052](09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)). |
+| `portal` | The service boundary behind the portal/system APIs: current-user data, tokens, dashboards, model lists, server/application/mapping management, groups/projects/services/resource-groups, system settings, and the external **vendor accounts** ("Anbieter") CRUD + subscription connect + credential validation and the test-connection action, plus the dynamic model discovery (`RefreshVendorAccountModels`, `service_vendor_discovery.go`) with the account's model prefix and its listings, and the **sharing** model: the share-level lifecycle, management groups and resource-group links (`service_vendor_sharing.go`), the routing grant that lets a principal reach an account shared with it (`VendorAccountsForRouting`, `service_vendor_sharing_grant.go`) and the by-level authorization gates (`service_vendor_accounts.go`) ([External Vendor Accounts](cross-cutting/external-vendor-accounts.md)). For the preset vendors (the five OpenAI-compatible ones, x.ai, OpenRouter, Kilo, Google, Custom, and native Gemini) it validates and defaults the account's `base_url` and composes each probe and discovery URL from that root and the routing preset, handing `vendorauth` a plain URL ([§4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors), [§4.5](cross-cutting/external-vendor-accounts.md#45-native-google-gemini) for the native Gemini preset). It also owns the active usage pulls of the accounts the gateway can ask, an OpenAI subscription's and, through the preset's usage strategy, an OpenRouter or Kilo api key's ([§5.2](cross-cutting/external-vendor-accounts.md#52-active-pull-openai-subscription-openrouter-and-kilo-api-keys)). |
+| `routing` | Candidate scoring, the mapping-based resolver, AI-server/routing repository interfaces, domain types (`AiServer`, `Application`, `ModelMapping`, `VendorAccount`), affinity, capacity/admission. The resolver's vendor-account candidate source turns an account the caller can reach (its own, or one shared with it through a resource group it is provisioned into, asked through the `VendorAccountEnumerator` seam whose nil is owner-only, never allow-all; [External Vendor Accounts §4.6](cross-cutting/external-vendor-accounts.md#46-routing-to-a-shared-account-the-pure-grant)) into a `Target`, for the accounts the caller's token has been opted in to (`TokenVendorPrefix`, [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access)). It also holds the pure-data **preset registry** of the preset vendors, the OpenAI-compatible ones and native Gemini (`vendor_presets.go`: default root, path prefix, validate strategy, model-id rewrite, usage strategy and the `Dialect` that picks the wire) and the `Target.OpenAIPathPrefix` it feeds ([ADR-052](09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)). |
 | `inference` | The internal provider-neutral inference model. |
 | `geminiwire` | A leaf package: the Google Gemini `generateContent` wire structs and the converters between them and the neutral `inference` model: `RenderRequest`, `ParseResponse` and `ParseStreamChunk` (outbound, built), with the inbound halves reserved for the future Gemini endpoint (#204). Includes the reversible tool-call-id codec that carries a function name and a `thoughtSignature` through the neutral `ToolCall.ID`. It imports **only** `inference` (pinned by the architecture tests) and returns a package-local result, because `provider` imports it, not the reverse ([ADR-054](09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)). |
 | `provider` | Provider client interface (incl. `ModelLister`), Ollama adapter, OpenAI-compatible adapter (vLLM/llama.cpp + the OpenAI api-key vendor path), the native **Anthropic Messages** client (translate for the `openai_*` flavors to any Anthropic account, plus a lossless native `/v1/messages` passthrough for `anthropic_messages` to an api-key **or** subscription account; the subscription's relay injects the Claude-Code system block, and both forward the client's `anthropic-beta`) and the **OpenAI Responses** translate client (the OpenAI subscription's), the native **Gemini** client (`GeminiClient`, `gemini.go`: `generateContent` / `streamGenerateContent` translated through `geminiwire`, `x-goog-api-key` auth, no redirect following, and a `ProxyNative` seam for the later passthrough; a `google_native` account's provider kind `vendor_gemini`, [ADR-054](09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)), mock provider. |
@@ -114,6 +116,7 @@ flowchart TB
 | `tracing` | OpenTelemetry method-tracing decorators (generated), wired via the OTel global. |
 | `logbuffer` | In-memory log ring buffer with live SSE streaming and level control. |
 | `theme` | Loads and validates external, data-only themes from the themes directory. |
+| `ttlcache` | A leaf package: the generic TTL memoizer (`Cache[T]`, with a generation-guarded `Invalidate` so a read already in flight cannot re-arm a just-invalidated value) behind every hot-path setting read. The gateway's `settingCache[T]` is an alias of it; `portal` uses it directly for the sharing switches the routing grant and the effective-level gates read ([External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)). It lives in its own package because `portal` may not import `gateway`. |
 
 **The sanctioned seam for a service → server callback.**
 `gateway.ServerDeps.SetRuntimeConfigChangedHook func(func(serverID string))`
@@ -171,8 +174,11 @@ servers, services, models, usage, system, netbird, chat, vendorAccounts), a
 `theme/` subsystem (MUI + CSS-variable bridge + `ThemeRoot`), and `i18n.ts`
 (de/en). It talks only to the gateway HTTP APIs. The `providers` view is gated on
 the `vendorAccountsEnabled` flag — threaded through `App.tsx` and `NavSidebar`
-from `GET /api/portal/vendor-accounts/enabled` — so the nav item and the routed
-content are both hidden while the vendor-accounts module is off
+from `GET /api/portal/vendor-accounts/enabled`, which reports **three** booleans
+(`module_enabled`, `subscriptions_enabled` and `sharing_enabled`; the third gates the
+sharing controls of the Anbieter page, the resource-group manager's vendor-accounts
+panel and the Groups page's `can_manage_vendor_accounts` column) — so the nav item and
+the routed content are both hidden while the vendor-accounts module is off
 ([External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)).
 Its create form offers the five OpenAI-compatible providers (x.ai, OpenRouter, Kilo,
 Gemini, Custom) and "Google Gemini (native)" (`google_native`) beside OpenAI and
@@ -181,7 +187,20 @@ authentication select is hidden for them, and a **base URL** field (the preset's
 default root as its placeholder, required for Custom) is shown at create and
 read-only in the detail view, since the root is immutable
 ([§4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors)).
-The same flag decides whether the Dashboard mounts its "Anbieter — Nutzung & Limits"
+The Anbieter view is tiered by what the viewer may do with each account
+(`vendorAccountAccess`: owner, co-manager or member, mirroring the backend's
+authorization by share level): an owner who is an admin gets the share area
+(`VendorAccountSharePanel`: the share level and the management groups) and the
+resource-group link (`VendorAccountResourceGroupsSection`), a co-manager the same view
+minus what the backend refuses, and a member a read-only, minimal view
+(`VendorAccountReadOnlyDetail`); a service's detail view gets the resource-group
+self-service that provisions it into the groups offering shared accounts
+(`ServiceResourceGroupsSection`), and the token editors widen the per-account opt-in to
+the accounts shared with the creator
+([External Vendor Accounts §8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
+[§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access)). The
+backend is the gate; the portal only keeps from inviting a request certain to be
+refused. The same flag decides whether the Dashboard mounts its "Anbieter — Nutzung & Limits"
 section (`DashboardVendorUsage`, which reads the stored usage snapshots from the
 vendor-accounts list and never calls a vendor,
 [§5.4](cross-cutting/external-vendor-accounts.md#54-reading-it-and-what-is-deferred)).

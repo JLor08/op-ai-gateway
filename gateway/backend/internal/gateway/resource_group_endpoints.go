@@ -17,6 +17,16 @@ const (
 	msgResourceGroupNotFound = "resource group not found"
 
 	codeResourceGroupUpdateFailed = "resource_group.update_failed"
+
+	// The system-group containment refusal of a vendor account link: both link paths
+	// answer it (portalVendorAccountErrRows for the owner's self-service,
+	// portalResourceGroupErrRows for the manager side).
+	codeResourceGroupVendorAccountSystemGroupMismatch = "resource_group.vendor_account_system_group_mismatch"
+	msgResourceGroupVendorAccountSystemGroupMismatch  = "vendor account must belong to the resource group's system group"
+
+	// codeResourceGroupVendorAccountCandidatesFailed is the uncategorized fallback of
+	// GET .../vendor-account-candidates: a store failure.
+	codeResourceGroupVendorAccountCandidatesFailed = "resource_group.vendor_account_candidates_failed"
 )
 
 // handlePortalResourceGroups is the resource-group collection endpoint
@@ -77,7 +87,9 @@ func (s *Server) handlePortalResourceGroups(w http.ResponseWriter, r *http.Reque
 // Groups Phase 2, Task 5, spec 2026-08-12-resource-groups-phase-2-provisioning)
 // plus its sibling "/{id}/provision-candidates" (GET-only, the
 // provisioning-editor's combined users/user_groups/admin_groups/services
-// picker).
+// picker), and "/{id}/vendor-accounts" (shared vendor-account membership editor,
+// PUT-only -- #183) plus its sibling "/{id}/vendor-account-candidates" (GET-only,
+// the membership-editor picker).
 func (s *Server) handlePortalResourceGroupItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
 	if !ok {
@@ -103,6 +115,10 @@ func (s *Server) handlePortalResourceGroupItem(w http.ResponseWriter, r *http.Re
 		s.handlePortalResourceGroupProvisions(w, r, token, id)
 	case len(parts) == 2 && parts[1] == "provision-candidates":
 		s.handlePortalResourceGroupProvisionCandidates(w, r, token, id)
+	case len(parts) == 2 && parts[1] == "vendor-accounts":
+		s.handlePortalResourceGroupVendorAccounts(w, r, token, id)
+	case len(parts) == 2 && parts[1] == "vendor-account-candidates":
+		s.handlePortalResourceGroupVendorAccountCandidates(w, r, token, id)
 	default:
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeResourceGroupNotFound, msgResourceGroupNotFound, ""))
 	}
@@ -227,6 +243,59 @@ func (s *Server) handlePortalResourceGroupServerCandidates(w http.ResponseWriter
 	writeJSON(w, http.StatusOK, map[string]any{"data": data})
 }
 
+// handlePortalResourceGroupVendorAccounts backs PUT
+// /api/portal/resource-groups/{id}/vendor-accounts: replaces the resource group's
+// shared vendor-account set (#183, spec 2026-10-15 section 9 -- mirrors
+// handlePortalResourceGroupServers, keyed on "vendor_account_ids"). The handler only
+// decodes; portal.Service.SetResourceGroupVendorAccounts decides: the caller must manage
+// the group (404 resource_group.not_found otherwise) AND operate each account they ADD (404
+// vendor_account.not_found, system scope included), the account must be `full` (403
+// vendor_account.forbidden at `shared`, where only the owner's self-service links it; 400
+// vendor_account.not_shared below that) and under the group's root (400
+// resource_group.vendor_account_system_group_mismatch); dropping a link needs only the
+// group. The response is the group, with its vendor_accounts. While the vendor-accounts
+// module or the sharing switch is off it is a 409, whoever asks and whatever the ids.
+func (s *Server) handlePortalResourceGroupVendorAccounts(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPut) {
+		return
+	}
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		VendorAccountIDs []string `json:"vendor_account_ids"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+		return
+	}
+	dto, err := s.Portal.SetResourceGroupVendorAccounts(r.Context(), token, id, body.VendorAccountIDs)
+	if err != nil {
+		writePortalResourceGroupError(w, err, codeResourceGroupUpdateFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// handlePortalResourceGroupVendorAccountCandidates backs GET
+// /api/portal/resource-groups/{id}/vendor-account-candidates: the vendor accounts the
+// caller may add to resource group id (drives the membership-editor picker; mirrors
+// handlePortalResourceGroupServerCandidates): the accounts the caller operates that are
+// `full` and under the group's root. Gated by the group (404-no-leak) and, like the PUT,
+// a 409 while the module or the sharing switch is off.
+func (s *Server) handlePortalResourceGroupVendorAccountCandidates(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	data, err := s.Portal.ResourceGroupVendorAccountCandidates(r.Context(), token, id)
+	if err != nil {
+		writePortalResourceGroupError(w, err, codeResourceGroupVendorAccountCandidatesFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": data})
+}
+
 // handlePortalResourceGroupProvisions backs GET/PUT
 // /api/portal/resource-groups/{id}/provisions (Resource Groups Phase 2,
 // Task 5, spec 2026-08-12-resource-groups-phase-2-provisioning): GET lists
@@ -336,6 +405,19 @@ var portalResourceGroupErrRows = []errRow{
 	{err: portal.ErrResourceGroupServerForbidden, status: http.StatusNotFound, code: "resource_group.server_forbidden", msg: "server not found"},
 	{err: portal.ErrResourceGroupServerSystemGroupMismatch, status: http.StatusBadRequest, code: "resource_group.server_system_group_mismatch", msg: "server must belong to the resource group's system group"},
 	{err: portal.ErrResourceGroupProvisionTargetInvalid, status: http.StatusBadRequest, code: "resource_group.provision_target_invalid", msg: "provisioning target is invalid or not visible to you"},
+	// The shared vendor-account link (PUT .../vendor-accounts and GET
+	// .../vendor-account-candidates). The two switches are a 409, answered before the group
+	// is looked at. The account sentinels are answered only after the group gate, and a
+	// stranger's account is the same 404 as an unknown id; 403 is a caller who can see and
+	// operate a `shared` account (only its owner links it, through the self-service); the
+	// other two are 400s about the request, never a 401 (the portal reads that as an
+	// expired session).
+	{err: portal.ErrVendorAccountsDisabled, status: http.StatusConflict, code: codeVendorAccountsModuleDisabled, msg: msgVendorAccountsModuleDisabled},
+	{err: portal.ErrVendorAccountSharingDisabled, status: http.StatusConflict, code: codeVendorAccountsSharingDisabled, msg: msgVendorAccountsSharingDisabled},
+	{err: portal.ErrVendorAccountNotFound, status: http.StatusNotFound, code: portal.CodeVendorAccountNotFound, msg: msgVendorAccountNotFound},
+	{err: portal.ErrVendorAccountForbidden, status: http.StatusForbidden, code: codeVendorAccountForbidden, msg: notAllowedMsg},
+	{err: portal.ErrVendorAccountNotShared, status: http.StatusBadRequest, code: codeVendorAccountNotShared, msg: "only a full vendor account can be added to a resource group; raise its share level first"},
+	{err: portal.ErrResourceGroupVendorAccountSystemGroupMismatch, status: http.StatusBadRequest, code: codeResourceGroupVendorAccountSystemGroupMismatch, msg: msgResourceGroupVendorAccountSystemGroupMismatch},
 	{err: portal.ErrResourceGroupNotFound, status: http.StatusNotFound, code: portal.CodeResourceGroupNotFound, msg: msgResourceGroupNotFound},
 }
 

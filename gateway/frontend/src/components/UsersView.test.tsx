@@ -338,6 +338,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       can_manage_servers: false,
       can_manage_services: false,
       can_manage_resources: false,
+      can_manage_vendor_accounts: false,
       member_count: 1,
       manager_count: 0,
       ...overrides,

@@ -301,7 +301,7 @@ func TestGroupStoreConformance(t *testing.T) {
 			t.Fatalf("members after remove = %+v, want only gc1", members)
 		}
 
-		// Managers + the five independent per-permission flags.
+		// Managers + the six independent per-permission flags.
 		if err := gs.SetUserGroupManager(ctx, adm.ID, "usr_gc2"); err != nil {
 			t.Fatalf("SetUserGroupManager: %v", err)
 		}
@@ -315,36 +315,46 @@ func TestGroupStoreConformance(t *testing.T) {
 		perms, err := gs.UserGroupManagerPerms(ctx, adm.ID)
 		if err != nil || len(perms) != 1 || perms[0].UserID != "usr_gc2" ||
 			!perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers ||
-			!perms[0].CanManageServices || !perms[0].CanManageResources {
+			!perms[0].CanManageServices || !perms[0].CanManageResources || !perms[0].CanManageVendorAccounts {
 			t.Fatalf("UserGroupManagerPerms(fresh insert) = %+v err=%v, want all-true default", perms, err)
 		}
-		// Narrow CanManageUsers only; the other four stay true.
-		if err := gs.SetUserGroupManagerPermissions(ctx, adm.ID, store.UserGroupManagerPerm{UserID: "usr_gc2", CanManageUsers: false, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
+		// Narrow CanManageUsers only; the other five stay true.
+		if err := gs.SetUserGroupManagerPermissions(ctx, adm.ID, store.UserGroupManagerPerm{UserID: "usr_gc2", CanManageUsers: false, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 			t.Fatalf("SetUserGroupManagerPermissions(narrow users): %v", err)
 		}
 		perms, err = gs.UserGroupManagerPerms(ctx, adm.ID)
-		if err != nil || len(perms) != 1 || perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources {
-			t.Fatalf("UserGroupManagerPerms(after narrow) = %+v err=%v, want false/true/true/true/true", perms, err)
+		if err != nil || len(perms) != 1 || perms[0].CanManageUsers || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices || !perms[0].CanManageResources || !perms[0].CanManageVendorAccounts {
+			t.Fatalf("UserGroupManagerPerms(after narrow) = %+v err=%v, want false/true/true/true/true/true", perms, err)
 		}
 		// Narrow CanManageResources INDEPENDENTLY of CanManageUsers.
-		if err := gs.SetUserGroupManagerPermissions(ctx, adm.ID, store.UserGroupManagerPerm{UserID: "usr_gc2", CanManageUsers: false, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: false}); err != nil {
+		if err := gs.SetUserGroupManagerPermissions(ctx, adm.ID, store.UserGroupManagerPerm{UserID: "usr_gc2", CanManageUsers: false, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: false, CanManageVendorAccounts: true}); err != nil {
 			t.Fatalf("SetUserGroupManagerPermissions(narrow resources too): %v", err)
 		}
 		perms, err = gs.UserGroupManagerPerms(ctx, adm.ID)
-		if err != nil || len(perms) != 1 || perms[0].CanManageUsers || perms[0].CanManageResources || !perms[0].CanManageGroup {
-			t.Fatalf("UserGroupManagerPerms(after independent narrow) = %+v err=%v, want false/true/true/true/false", perms, err)
+		if err != nil || len(perms) != 1 || perms[0].CanManageUsers || perms[0].CanManageResources || !perms[0].CanManageGroup || !perms[0].CanManageVendorAccounts {
+			t.Fatalf("UserGroupManagerPerms(after independent narrow) = %+v err=%v, want false/true/true/true/false/true", perms, err)
+		}
+		// Narrow CanManageVendorAccounts INDEPENDENTLY, to the NON-default
+		// false, so a driver that drops the write or reads the wrong column
+		// fails instead of hiding behind the default-true (#183).
+		if err := gs.SetUserGroupManagerPermissions(ctx, adm.ID, store.UserGroupManagerPerm{UserID: "usr_gc2", CanManageUsers: false, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: false, CanManageVendorAccounts: false}); err != nil {
+			t.Fatalf("SetUserGroupManagerPermissions(narrow vendor accounts too): %v", err)
+		}
+		perms, err = gs.UserGroupManagerPerms(ctx, adm.ID)
+		if err != nil || len(perms) != 1 || perms[0].CanManageUsers || perms[0].CanManageResources || perms[0].CanManageVendorAccounts || !perms[0].CanManageGroup || !perms[0].CanManageServers || !perms[0].CanManageServices {
+			t.Fatalf("UserGroupManagerPerms(after vendor-accounts narrow) = %+v err=%v, want false/true/true/true/false/false", perms, err)
 		}
 		// A re-set of an EXISTING manager must not reset its narrowed flags.
 		if err := gs.SetUserGroupManager(ctx, adm.ID, "usr_gc2"); err != nil {
 			t.Fatalf("SetUserGroupManager(re-set existing): %v", err)
 		}
 		perms, _ = gs.UserGroupManagerPerms(ctx, adm.ID)
-		if len(perms) != 1 || perms[0].CanManageUsers || perms[0].CanManageResources {
+		if len(perms) != 1 || perms[0].CanManageUsers || perms[0].CanManageResources || perms[0].CanManageVendorAccounts {
 			t.Fatalf("re-set of an existing manager reset its narrowed flags: %+v", perms)
 		}
 		// SetUserGroupManagerPermissions against a group that exists but has
 		// no such manager row -> ErrNotFound (a zero-rows-affected update).
-		if err := gs.SetUserGroupManagerPermissions(ctx, adm.ID, store.UserGroupManagerPerm{UserID: "usr_gc_no_row", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != store.ErrNotFound {
+		if err := gs.SetUserGroupManagerPermissions(ctx, adm.ID, store.UserGroupManagerPerm{UserID: "usr_gc_no_row", CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != store.ErrNotFound {
 			t.Fatalf("SetUserGroupManagerPermissions(no manager row) = %v, want ErrNotFound", err)
 		}
 		if err := gs.RemoveUserGroupManager(ctx, adm.ID, "usr_gc2"); err != nil {
@@ -481,13 +491,13 @@ func TestGroupStoreManageableUserIDsSemantics(t *testing.T) {
 		if err := gs.SetUserGroupManager(ctx, ag.ID, "usr_mu_cmu"); err != nil {
 			t.Fatalf("promote cmu: %v", err)
 		}
-		if err := gs.SetUserGroupManagerPermissions(ctx, ag.ID, store.UserGroupManagerPerm{UserID: "usr_mu_cmu", CanManageUsers: true, CanManageGroup: false, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
+		if err := gs.SetUserGroupManagerPermissions(ctx, ag.ID, store.UserGroupManagerPerm{UserID: "usr_mu_cmu", CanManageUsers: true, CanManageGroup: false, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 			t.Fatalf("set cmu perms: %v", err)
 		}
 		if err := gs.SetUserGroupManager(ctx, ag.ID, "usr_mu_cmg"); err != nil {
 			t.Fatalf("promote cmg: %v", err)
 		}
-		if err := gs.SetUserGroupManagerPermissions(ctx, ag.ID, store.UserGroupManagerPerm{UserID: "usr_mu_cmg", CanManageUsers: false, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true}); err != nil {
+		if err := gs.SetUserGroupManagerPermissions(ctx, ag.ID, store.UserGroupManagerPerm{UserID: "usr_mu_cmg", CanManageUsers: false, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 			t.Fatalf("set cmg perms: %v", err)
 		}
 

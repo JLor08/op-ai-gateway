@@ -4,7 +4,7 @@
 import { type Fetcher, request } from './transport';
 import type { AdminGroupCandidate } from './groups';
 import type { LimitConfig, LimitUsage } from './users';
-import type { ModelOverrideEntry } from './tokens';
+import type { ModelOverrideEntry, VendorAccessDTO } from './tokens';
 
 // Service Accounts (Phase 1): a Service is managed like an AI-Server (admins
 // create; admins + delegates manage) and owns any number of service-tokens
@@ -113,6 +113,12 @@ export type ServiceTokenDTO = {
   // Opt-in Claude Code effort compatibility, identical in meaning to
   // PortalToken's.
   claude_effort_compatibility?: boolean;
+  // The token's vendor-account access (see VendorAccessDTO); absent when it has
+  // none. A service owns no account, so it can only name accounts SHARED with it
+  // (the service provisioned into a resource group that contains them). Set at
+  // create only and preserved by a rotation: a service token has no field-level
+  // update.
+  vendor_access?: VendorAccessDTO;
 };
 
 export type CreateServiceTokenRequest = {
@@ -132,6 +138,12 @@ export type CreateServiceTokenRequest = {
   claude_model_aliases?: boolean;
   // Claude Code effort compatibility (see ServiceTokenDTO); omitted = off.
   claude_effort_compatibility?: boolean;
+  // Vendor-account access (see ServiceTokenDTO); omitted = the strict default, no
+  // vendor access. Each named account must be reachable for THIS SERVICE (not for
+  // the admin or delegate creating the token), else 400
+  // portal.token_vendor_access_invalid. CREATE-ONLY: changing it means creating a
+  // new token, a rotation keeps it.
+  vendor_access?: VendorAccessDTO;
 };
 
 // The one-time reveal response for both create and rotate.
@@ -139,6 +151,14 @@ export type CreateServiceTokenResponse = {
   token: ServiceTokenDTO;
   secret: string;
 };
+
+// One resource group a service MANAGER may enter their service into (#183
+// Phase 0, the service-side analogue of ServerResourceGroup): id + name +
+// whether the service is currently provisioned into it. Mirrors
+// portal.ServiceResourceGroupDTO. Drives the per-service "Resource groups"
+// join/leave section in ServicesView; never exposes any other target of the
+// resource group.
+export type ServiceResourceGroup = { id: string; name: string; member: boolean };
 
 export function servicesApi(fetcher: Fetcher) {
   return {
@@ -202,6 +222,28 @@ export function servicesApi(fetcher: Fetcher) {
       request<{ ok: boolean }>(
         fetcher,
         `/api/portal/services/${encodeURIComponent(serviceId)}/tokens/${encodeURIComponent(tokenId)}`,
+        { method: 'DELETE' },
+      ),
+    // Service-side resource-group self-service (#183 Phase 0, the analogue of
+    // the server-owner trio in api/servers.ts): a service MANAGER lists the
+    // resource groups they can reach (each with a `member` flag = the service
+    // is provisioned into it) and joins/leaves their service. Mirrors
+    // serverResourceGroups / joinResourceGroup / leaveResourceGroup exactly.
+    serviceResourceGroups: (serviceId: string) =>
+      request<{ data: ServiceResourceGroup[] }>(
+        fetcher,
+        `/api/portal/services/${encodeURIComponent(serviceId)}/resource-groups`,
+      ).then((r) => r.data),
+    joinServiceResourceGroup: (serviceId: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/services/${encodeURIComponent(serviceId)}/resource-groups/${encodeURIComponent(rgId)}`,
+        { method: 'PUT' },
+      ),
+    leaveServiceResourceGroup: (serviceId: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/services/${encodeURIComponent(serviceId)}/resource-groups/${encodeURIComponent(rgId)}`,
         { method: 'DELETE' },
       ),
   };

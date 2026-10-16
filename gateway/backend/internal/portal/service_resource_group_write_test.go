@@ -73,7 +73,7 @@ func TestCreateResourceGroupCoManagerHappyPath(t *testing.T) {
 	e.mustAddMembers(sysAdmin, sg.ID, "usr_owner", "usr_cmr")
 	ag := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG", ParentGroupID: sg.ID})
 	e.mustAddMembers(owner, ag.ID, "usr_cmr")
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmr", false, false, false, false, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_cmr", ManagerPermissions{CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cmr (can_manage_resources): %v", err)
 	}
 
@@ -469,7 +469,7 @@ func TestResourceGroupAdminGroupCandidatesScoped(t *testing.T) {
 
 	ownAG := e.mustCreateGroup(owner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "OwnAG", ParentGroupID: sg.ID})
 	e.mustAddMembers(owner, ownAG.ID, "usr_cmr", "usr_pm")
-	if err := e.svc.PromoteManager(e.ctx, owner, ownAG.ID, "usr_cmr", false, false, false, false, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ownAG.ID, "usr_cmr", ManagerPermissions{CanManageResources: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("promote usr_cmr: %v", err)
 	}
 	e.createUser("usr_other", "admin")

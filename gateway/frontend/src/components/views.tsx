@@ -76,6 +76,10 @@ export type ViewRenderCtx = ViewGateCtx & {
   // The vendor_subscriptions_enabled switch (on by default). Render-only: it
   // gates no nav item, the providers page uses it to flag subscription accounts.
   vendorSubscriptionsEnabled: boolean;
+  // Vendor-account sharing (#183): the vendor_account_sharing_enabled master flag
+  // together with the module flag, off by default. Render-only: it gates no nav
+  // item, the views that offer sharing hide those controls while it is off.
+  vendorAccountSharingEnabled: boolean;
   t: Translation;
   api: PortalApi;
   locale: Locale;
@@ -235,7 +239,13 @@ export const viewRegistry: Record<View, ViewEntry> = {
   // accounts at external AI vendors, so there is deliberately NO role gate --
   // only the vendor_accounts_enabled master flag (off by default) that hides
   // the nav item + view and that the backend enforces with 409
-  // vendor_accounts.module_disabled.
+  // vendor_accounts.module_disabled. `isAdmin` is threaded in for one reason:
+  // only an admin owner may raise an account's share level (#183). Who owns, co-
+  // manages or merely borrows an account is read off the account itself
+  // (is_owner and the share level the backend rendered for the viewer), so the
+  // portal needs no user id here. `sharingEnabled` is the sharing master flag:
+  // while it is off the view offers none of the controls that create or change
+  // sharing (the backend answers each 409).
   providers: {
     id: 'providers',
     labelKey: 'providers',
@@ -246,7 +256,9 @@ export const viewRegistry: Record<View, ViewEntry> = {
       <VendorAccountsView
         t={ctx.t}
         api={ctx.api}
+        isAdmin={ctx.isAdmin}
         subscriptionsEnabled={ctx.vendorSubscriptionsEnabled}
+        sharingEnabled={ctx.vendorAccountSharingEnabled}
       />
     ),
   },
@@ -256,7 +268,14 @@ export const viewRegistry: Record<View, ViewEntry> = {
     href: '/resource-groups',
     icon: Boxes,
     gate: (ctx) => ctx.isAdmin,
-    render: (ctx) => <ResourceGroupsView t={ctx.t} api={ctx.api} role={ctx.role} />,
+    render: (ctx) => (
+      <ResourceGroupsView
+        t={ctx.t}
+        api={ctx.api}
+        role={ctx.role}
+        vendorAccountSharingEnabled={ctx.vendorAccountSharingEnabled}
+      />
+    ),
   },
   services: {
     id: 'services',
@@ -271,6 +290,7 @@ export const viewRegistry: Record<View, ViewEntry> = {
         models={ctx.models}
         role={ctx.role}
         userId={ctx.userId}
+        vendorAccountsEnabled={ctx.vendorAccountsEnabled}
       />
     ),
   },
@@ -302,6 +322,7 @@ export const viewRegistry: Record<View, ViewEntry> = {
         role={ctx.role}
         userId={ctx.userId}
         systemAdminMode={ctx.systemAdminMode}
+        vendorAccountSharingEnabled={ctx.vendorAccountSharingEnabled}
       />
     ),
   },

@@ -34,6 +34,12 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     models: [],
     created_at: '2026-09-01T12:00:00Z',
     updated_at: '2026-09-01T12:00:00Z',
+    share_level: 'none',
+    admin_groups: [],
+    system_group_id: '',
+    system_group_name: '',
+    is_owner: true,
+    shared_by: '',
     ...overrides,
   };
 }
@@ -259,12 +265,35 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       refreshUsage: vi.fn<PortalApi['refreshUsage']>(
         opts.refreshUsage ?? (async () => makeUsageRefresh('fresh')),
       ),
+      // The sharing calls (#183): these suites run as a plain owner of personal
+      // accounts, who is never offered them (VendorAccountsView.sharing.test.tsx
+      // covers the share area), so the stubs only satisfy the view's api type.
+      setVendorAccountShareLevel: vi.fn<PortalApi['setVendorAccountShareLevel']>(async (id) =>
+        makeVendorAccount({ id }),
+      ),
+      setVendorAccountAdminGroups: vi.fn<PortalApi['setVendorAccountAdminGroups']>(async (id) =>
+        makeVendorAccount({ id }),
+      ),
+      vendorAccountAdminGroupCandidates: vi.fn<PortalApi['vendorAccountAdminGroupCandidates']>(
+        async () => [],
+      ),
+      // The owner's resource-group link: only a shared account's owner is offered
+      // it, so these suites never reach it either.
+      vendorAccountResourceGroups: vi.fn<PortalApi['vendorAccountResourceGroups']>(async () => []),
+      joinVendorAccountResourceGroup: vi.fn<PortalApi['joinVendorAccountResourceGroup']>(
+        async () => ({ ok: true }),
+      ),
+      leaveVendorAccountResourceGroup: vi.fn<PortalApi['leaveVendorAccountResourceGroup']>(
+        async () => ({ ok: true }),
+      ),
     };
     const view = render(
       <ToastProvider>
         <VendorAccountsView
           t={t}
           api={fakeApi}
+          isAdmin={false}
+          sharingEnabled
           {...(opts.subscriptionsEnabled === undefined
             ? {}
             : { subscriptionsEnabled: opts.subscriptionsEnabled })}
@@ -649,7 +678,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         rerender(
           <ToastProvider>
-            <VendorAccountsView t={t} api={fakeApi} subscriptionsEnabled={false} />
+            <VendorAccountsView
+              t={t}
+              api={fakeApi}
+              isAdmin={false}
+              sharingEnabled
+              subscriptionsEnabled={false}
+            />
           </ToastProvider>,
         );
 

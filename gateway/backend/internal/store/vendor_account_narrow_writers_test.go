@@ -99,3 +99,106 @@ func TestRoutingStoreVendorAccountNarrowWriters(t *testing.T) {
 		}
 	})
 }
+
+// TestRoutingStoreVendorAccountOperateFieldsWriter pins UpdateVendorAccountOperateFields
+// across every driver: it writes ONLY the operate columns the patch names (a nil
+// field is untouched, "" is a real value) plus updated_at, and never api_key,
+// oauth_tokens, auth_type, the identity columns or the sharing columns. The point of
+// the writer is the disjointness from the credential writers: a credential changed
+// after the caller loaded its copy (an api key rotation, a refresh-token rotation, a
+// needs_reconnect flip) survives an operate write. An unknown id is ErrNotFound.
+func TestRoutingStoreVendorAccountOperateFieldsWriter(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	seedSQL := func(t *testing.T, s *SQLStore) {
+		if err := s.CreateUser(context.Background(), newTestUser("u_of", "of@example.test", now)); err != nil {
+			t.Fatalf("seed user: %v", err)
+		}
+	}
+	str := func(v string) *string { return &v }
+	forEachRoutingStoreSeeded(t, seedSQL, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		acc := routing.VendorAccount{
+			ID: "va_of", OwnerUserID: "u_of", Vendor: routing.VendorAnthropic,
+			AuthType: routing.VendorAuthSubscription, Name: "Sub", Status: routing.VendorAccountStatusActive,
+			APIKey: "enc:key-0", OAuthTokens: "enc:tokens-0", ModelPrefix: "p-", CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.CreateVendorAccount(ctx, acc); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if err := s.UpdateVendorAccountShareLevel(ctx, "va_of", routing.VendorShareLevelShared); err != nil {
+			t.Fatalf("raise: %v", err)
+		}
+		at := now.Add(time.Hour)
+
+		if err := s.UpdateVendorAccountOperateFields(ctx, "va_ghost", routing.VendorAccountOperatePatch{Name: str("x"), UpdatedAt: at}); !errors.Is(err, storeerr.ErrNotFound) {
+			t.Fatalf("UpdateVendorAccountOperateFields(unknown) = %v, want ErrNotFound", err)
+		}
+
+		// The credential columns move AFTER the caller's (imaginary) load: this is what
+		// the operate write must not undo.
+		if err := s.SetVendorAccountOAuthTokens(ctx, "va_of", "enc:tokens-1"); err != nil {
+			t.Fatalf("rotate tokens: %v", err)
+		}
+		rotated, err := s.VendorAccountByID(ctx, "va_of")
+		if err != nil {
+			t.Fatalf("by id: %v", err)
+		}
+		rotated.APIKey = "enc:key-1"
+		if err := s.UpdateVendorAccount(ctx, rotated); err != nil {
+			t.Fatalf("rotate key: %v", err)
+		}
+
+		// requireHeld checks every column the writer must never touch.
+		requireHeld := func(label string, got routing.VendorAccount, wantUpdatedAt time.Time) {
+			t.Helper()
+			if got.APIKey != "enc:key-1" || got.OAuthTokens != "enc:tokens-1" || got.AuthType != routing.VendorAuthSubscription ||
+				got.OwnerUserID != "u_of" || got.Vendor != routing.VendorAnthropic || got.ShareLevel != routing.VendorShareLevelShared ||
+				got.BaseURL != "" || !got.CreatedAt.UTC().Equal(now) {
+				t.Fatalf("%s touched a column outside the operate set: %+v", label, got)
+			}
+			if !got.UpdatedAt.UTC().Equal(wantUpdatedAt) {
+				t.Fatalf("%s: updated_at = %v, want %v", label, got.UpdatedAt.UTC(), wantUpdatedAt)
+			}
+		}
+
+		// name only: status and model_prefix hold.
+		if err := s.UpdateVendorAccountOperateFields(ctx, "va_of", routing.VendorAccountOperatePatch{Name: str("Renamed"), UpdatedAt: at}); err != nil {
+			t.Fatalf("name only: %v", err)
+		}
+		got, err := s.VendorAccountByID(ctx, "va_of")
+		if err != nil {
+			t.Fatalf("by id: %v", err)
+		}
+		if got.Name != "Renamed" || got.Status != routing.VendorAccountStatusActive || got.ModelPrefix != "p-" {
+			t.Fatalf("name only: name/status/prefix = %q/%q/%q", got.Name, got.Status, got.ModelPrefix)
+		}
+		requireHeld("name only", got, at)
+
+		// all three, and "" is a real value (it clears the prefix).
+		if err := s.UpdateVendorAccountOperateFields(ctx, "va_of", routing.VendorAccountOperatePatch{
+			Name: str("Again"), Status: str(routing.VendorAccountStatusDisabled), ModelPrefix: str(""), UpdatedAt: at,
+		}); err != nil {
+			t.Fatalf("all three: %v", err)
+		}
+		if got, err = s.VendorAccountByID(ctx, "va_of"); err != nil {
+			t.Fatalf("by id: %v", err)
+		}
+		if got.Name != "Again" || got.Status != routing.VendorAccountStatusDisabled || got.ModelPrefix != "" {
+			t.Fatalf("all three: name/status/prefix = %q/%q/%q", got.Name, got.Status, got.ModelPrefix)
+		}
+		requireHeld("all three", got, at)
+
+		// nothing but updated_at.
+		later := at.Add(time.Minute)
+		if err := s.UpdateVendorAccountOperateFields(ctx, "va_of", routing.VendorAccountOperatePatch{UpdatedAt: later}); err != nil {
+			t.Fatalf("updated_at only: %v", err)
+		}
+		if got, err = s.VendorAccountByID(ctx, "va_of"); err != nil {
+			t.Fatalf("by id: %v", err)
+		}
+		if got.Name != "Again" || got.Status != routing.VendorAccountStatusDisabled || got.ModelPrefix != "" {
+			t.Fatalf("updated_at only changed an operate column: %+v", got)
+		}
+		requireHeld("updated_at only", got, later)
+	})
+}

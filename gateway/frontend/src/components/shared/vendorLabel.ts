@@ -28,3 +28,15 @@ export function vendorLabel(t: Translation, vendor: string): string {
       return vendor;
   }
 }
+
+/** The display name of a vendor-account authentication type; an unknown one is shown as sent. */
+export function authTypeLabel(t: Translation, authType: string): string {
+  switch (authType) {
+    case 'api_key':
+      return t.vendorAuthApiKey;
+    case 'subscription':
+      return t.vendorAuthSubscription;
+    default:
+      return authType;
+  }
+}

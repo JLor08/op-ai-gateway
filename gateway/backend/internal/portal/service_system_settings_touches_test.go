@@ -39,6 +39,8 @@ var nonReconcileFields = []string{
 	"RouteAffinitySessionMode",
 	"VendorAccountsEnabled",
 	"VendorSubscriptionsEnabled",
+	"VendorAccountSharingEnabled",
+	"VendorSubscriptionSharingEnabled",
 	"VendorAccountRoutingMode",
 	"VendorOpenAICodexClientVersion",
 	"AnthropicPromptCachingEnabled",

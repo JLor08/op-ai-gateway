@@ -20,6 +20,12 @@ export type ResourceGroupStatus = 'active' | 'disabled';
 // (id + display name only).
 export type ResourceGroupServerRef = { id: string; name: string };
 
+// A minimal, credential-free vendor-account ("Anbieter") reference used by
+// ResourceGroup.vendor_accounts + resourceGroupVendorAccountCandidates() --
+// mirrors portal.ResourceGroupVendorAccountRefDTO (id + display name only; never
+// the owner, the share level or any credential flag).
+export type ResourceGroupVendorAccountRef = { id: string; name: string };
+
 export type ResourceGroup = {
   id: string;
   name: string;
@@ -36,6 +42,12 @@ export type ResourceGroup = {
   // servers is the resource group's member AI-servers (id+name). Always a
   // non-nil slice ([] = no members yet).
   servers: ResourceGroupServerRef[];
+  // vendor_accounts is the resource group's linked shared vendor accounts
+  // (id+name, credential-free). Always a non-nil slice. EVERY stored link is
+  // listed -- one the manager may not operate and one whose account is no longer
+  // shared included -- because a manager can drop any link; empty while the
+  // vendor-accounts module flag is off.
+  vendor_accounts: ResourceGroupVendorAccountRef[];
 };
 
 // POST /api/portal/resource-groups body. AdminGroupIDs is mandatory for
@@ -57,7 +69,7 @@ export type CreateResourceGroupRequest = {
 // PATCH /api/portal/resource-groups/{id} body -- pointer-semantics on the
 // backend (nil/omitted = keep the current value). Admin-group linkage is
 // edited separately, via setResourceGroupAdminGroups; server membership via
-// setResourceGroupServers.
+// setResourceGroupServers; linked vendor accounts via setResourceGroupVendorAccounts.
 export type UpdateResourceGroupRequest = {
   name?: string;
   status?: string;
@@ -163,6 +175,36 @@ export function resourceGroupsApi(fetcher: Fetcher) {
         {
           method: 'PUT',
           body: { server_ids: serverIds },
+        },
+      ),
+    // Shared vendor accounts ("Anbieter", #183, spec 2026-10-15 section 9): the
+    // resource-group MANAGER side, mirroring the server pair above. The accounts
+    // the caller may ADD to resource group id -- those they operate that are
+    // `full` and under the group's root, exactly what the write path accepts (the
+    // group's current links the caller could not add themselves are not listed:
+    // read them from ResourceGroup.vendor_accounts). A 409 while the vendor-accounts
+    // module or the sharing switch is off.
+    resourceGroupVendorAccountCandidates: (id: string) =>
+      request<{ data: ResourceGroupVendorAccountRef[] }>(
+        fetcher,
+        `/api/portal/resource-groups/${encodeURIComponent(id)}/vendor-account-candidates`,
+      ).then((r) => r.data),
+    // Replaces a resource group's linked-account set (add desired-not-current,
+    // remove current-not-desired). ADDING an account needs the caller to operate it
+    // and it to be `full` and under the group's root (403 vendor_account.forbidden
+    // at `shared`, where only the owner's self-service links it; 400
+    // vendor_account.not_shared below that; 400
+    // resource_group.vendor_account_system_group_mismatch for another root); every
+    // new addition is validated before anything is written. DROPPING a link needs
+    // only authorizeResourceGroup, and an account already linked is not
+    // re-validated when sent again. Answers the group, with its vendor_accounts.
+    setResourceGroupVendorAccounts: (id: string, vendorAccountIds: string[]) =>
+      request<ResourceGroup>(
+        fetcher,
+        `/api/portal/resource-groups/${encodeURIComponent(id)}/vendor-accounts`,
+        {
+          method: 'PUT',
+          body: { vendor_account_ids: vendorAccountIds },
         },
       ),
     // Provisioning (Phase 2, spec 2026-08-12-resource-groups-phase-2-provisioning):

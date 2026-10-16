@@ -73,12 +73,12 @@ func TestResourceManageGroupIDs(t *testing.T) {
 	e.mustAddMembers(owner, ag.ID, "usr_mgr_with", "usr_mgr_without")
 
 	// usr_mgr_with: every OTHER flag true, resources true.
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr_with", true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr_with", allManagerPerms); err != nil {
 		t.Fatalf("PromoteManager(with): %v", err)
 	}
 	// usr_mgr_without: every OTHER flag true, resources FALSE -- proves the
 	// facet is independent (mirrors CanManageServers/CanManageServices).
-	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr_without", true, true, true, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag.ID, "usr_mgr_without", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageVendorAccounts: true}); err != nil {
 		t.Fatalf("PromoteManager(without): %v", err)
 	}
 
@@ -153,10 +153,10 @@ func newResourceGroupAuthzFixture(e *groupTestEnv) resourceGroupAuthzFixture {
 	e.mustAddMembers(owner, ag1.ID, "usr_mgr_with", "usr_mgr_without")
 	ag2 := e.mustCreateGroup(otherOwner, CreateGroupInput{Tier: store.GroupTierAdmin, Name: "AG2"})
 
-	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr_with", true, true, true, true, true); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr_with", allManagerPerms); err != nil {
 		e.t.Fatalf("PromoteManager(with): %v", err)
 	}
-	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr_without", true, true, true, true, false); err != nil {
+	if err := e.svc.PromoteManager(e.ctx, owner, ag1.ID, "usr_mgr_without", ManagerPermissions{CanManageUsers: true, CanManageGroup: true, CanManageServers: true, CanManageServices: true, CanManageVendorAccounts: true}); err != nil {
 		e.t.Fatalf("PromoteManager(without): %v", err)
 	}
 

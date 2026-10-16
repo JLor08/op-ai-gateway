@@ -86,7 +86,8 @@ type ManagePermFlag =
   | 'can_manage_group'
   | 'can_manage_servers'
   | 'can_manage_services'
-  | 'can_manage_resources';
+  | 'can_manage_resources'
+  | 'can_manage_vendor_accounts';
 
 type ManagePermPatch = Partial<{
   canManageUsers: boolean;
@@ -94,6 +95,7 @@ type ManagePermPatch = Partial<{
   canManageServers: boolean;
   canManageServices: boolean;
   canManageResources: boolean;
+  canManageVendorAccounts: boolean;
 }>;
 
 function managePermChecked(member: GroupMember, flag: ManagePermFlag): boolean {
@@ -108,6 +110,8 @@ function managePermChecked(member: GroupMember, flag: ManagePermFlag): boolean {
       return member.can_manage_services;
     case 'can_manage_resources':
       return member.can_manage_resources;
+    case 'can_manage_vendor_accounts':
+      return member.can_manage_vendor_accounts;
   }
 }
 
@@ -123,6 +127,8 @@ function managePermLabel(flag: ManagePermFlag, t: Translation): string {
       return t.groupsPermServices;
     case 'can_manage_resources':
       return t.groupsPermResources;
+    case 'can_manage_vendor_accounts':
+      return t.groupsPermVendorAccounts;
   }
 }
 
@@ -138,6 +144,8 @@ function managePermPatch(flag: ManagePermFlag, checked: boolean): ManagePermPatc
       return { canManageServices: checked };
     case 'can_manage_resources':
       return { canManageResources: checked };
+    case 'can_manage_vendor_accounts':
+      return { canManageVendorAccounts: checked };
   }
 }
 
@@ -165,6 +173,7 @@ export function GroupsView({
   role,
   userId,
   systemAdminMode = false,
+  vendorAccountSharingEnabled,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -196,6 +205,12 @@ export function GroupsView({
       role prop; CurrentUser.role is untyped string on the wire). */
   role: string;
   userId: string;
+  /** The vendor_account_sharing_enabled master flag (off by default; #183 spec
+      section 13). The "provider accounts" permission only matters while sharing is
+      on (it lets a co-manager manage shared vendor accounts), so its column is
+      hidden while it is off. A stored value is untouched: every permission patch
+      carries it over unchanged. */
+  vendorAccountSharingEnabled: boolean;
 }>) {
   const { showError } = useToast();
   const {
@@ -459,10 +474,11 @@ export function GroupsView({
 
   // Narrows/widens an EXISTING co-manager row's per-permission flags (spec
   // 2026-08-10 + Phase B can_manage_servers + Phase C can_manage_services +
-  // Resource Groups Phase 1 can_manage_resources). `patch` carries only the
-  // ONE flag the checkbox that fired toggled; the other four flags are
-  // carried over from the member's current roster value, since the PATCH
-  // body always sends ALL FIVE (the backend has no partial-flag update).
+  // Resource Groups Phase 1 can_manage_resources + shared vendor accounts
+  // #183 can_manage_vendor_accounts). `patch` carries only the ONE flag the
+  // checkbox that fired toggled; the other five flags are carried over from
+  // the member's current roster value, since the PATCH body always sends ALL
+  // SIX (the backend has no partial-flag update).
   async function setManagerPermission(
     group: UserGroup,
     member: GroupMember,
@@ -476,6 +492,7 @@ export function GroupsView({
         canManageServers: patch.canManageServers ?? member.can_manage_servers,
         canManageServices: patch.canManageServices ?? member.can_manage_services,
         canManageResources: patch.canManageResources ?? member.can_manage_resources,
+        canManageVendorAccounts: patch.canManageVendorAccounts ?? member.can_manage_vendor_accounts,
       });
       await afterGroupChanged(group.id);
     } catch (err) {
@@ -895,7 +912,7 @@ export function GroupsView({
       return t.groupsRoleMember;
     }
 
-    // Renders one of the five per-co-manager permission checkboxes. Only a
+    // Renders one of the six per-co-manager permission checkboxes. Only a
     // co-manager row (is_manager, never the owner -- the owner's implicit
     // full permission isn't a stored flag, and a plain member/invited row
     // has no permission relationship at all) shows a real checkbox; every
@@ -954,10 +971,11 @@ export function GroupsView({
         enumLabel: (v) => memberRoleLabelForKey(v),
         render: (m) => memberRoleLabelForKey(memberRoleKey(m)),
       },
-      // The five per-co-manager permission columns don't apply to a
+      // The six per-co-manager permission columns don't apply to a
       // system-tier group (no owner/manager concept there -- every row's
       // is_manager is always false), so they're omitted entirely rather
-      // than rendered as a column of dashes.
+      // than rendered as a column of dashes. The sixth (provider accounts) is
+      // also omitted while vendor-account sharing is switched off.
       ...(group.tier !== 'system'
         ? [
             {
@@ -995,6 +1013,18 @@ export function GroupsView({
               searchable: false,
               render: (m: GroupMember) => memberPermCell(m, 'can_manage_resources'),
             },
+            ...(vendorAccountSharingEnabled
+              ? [
+                  {
+                    id: 'perm-vendor-accounts',
+                    label: t.groupsPermVendorAccounts,
+                    value: (m: GroupMember) =>
+                      m.is_manager ? String(m.can_manage_vendor_accounts) : '',
+                    searchable: false,
+                    render: (m: GroupMember) => memberPermCell(m, 'can_manage_vendor_accounts'),
+                  },
+                ]
+              : []),
           ]
         : []),
     ];

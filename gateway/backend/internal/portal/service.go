@@ -21,6 +21,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/theme"
+	"op-ai-gateway/internal/ttlcache"
 	"op-ai-gateway/internal/usage"
 	"op-ai-gateway/internal/vendorauth"
 	"slices"
@@ -126,8 +127,12 @@ var (
 	// Vendor accounts ("Anbieter"): per-user external AI vendor accounts.
 	// ErrVendorAccountNotFound covers both "no such account" AND "principal does
 	// not own it" (no existence leak, mirrors ErrServerNotFound).
-	// ErrVendorAccountForbidden is the create gate for a principal that is not a
-	// real user (no UserID to own the account).
+	// ErrVendorAccountForbidden (403) has two uses. It is the create gate for a
+	// principal that is not a real user (no UserID to own the account). And it is
+	// authorizeVendorAccountCredential's answer to a CM of a `shared` account: they
+	// can see and operate the account, so a credential operation is forbidden, not
+	// "not found". It is NEVER returned to a principal who cannot see the account
+	// (that is ErrVendorAccountNotFound, so a stranger learns nothing).
 	// ErrVendorAccountAPIKeyNotAllowed rejects an api_key on a subscription
 	// account, whose only credential is the OAuth token set.
 	// ErrVendorAccountAPIKeyInvalid rejects a whitespace-only api_key on update:
@@ -154,6 +159,13 @@ var (
 	ErrVendorAccountBaseURLRequired = errors.New("vendor_account.base_url_required")
 	ErrVendorAccountBaseURLInvalid  = errors.New("vendor_account.base_url_invalid")
 
+	// ErrVendorAccountFieldImmutable rejects an update that tries to change a
+	// create-only field: base_url (the upstream root the sealed credential is sent
+	// to) or auth_type. Changing either would re-aim the stored credential, so the
+	// PATCH refuses any attempt to change them, for everyone, owner included (a value
+	// equal to the stored one is no attempt).
+	ErrVendorAccountFieldImmutable = errors.New("vendor_account.field_immutable")
+
 	// ErrVendorAccountsDisabled is the vendor-accounts MASTER flag guard
 	// (system setting vendor_accounts_enabled, off by default): every
 	// vendor-account service method returns it, before doing anything, while
@@ -164,6 +176,39 @@ var (
 	// SUBSCRIPTION vendor account while the vendor_subscriptions_enabled setting
 	// (on by default) is off. api_key accounts are never affected. Mapped to a 409.
 	ErrVendorSubscriptionsDisabled = errors.New("vendor_accounts.subscriptions_disabled")
+
+	// Sharing (spec 2026-10-15 sections 6, 7, 11 and 13).
+	// ErrVendorAccountSharingDisabled is the SHARING master guard (system setting
+	// vendor_account_sharing_enabled, off by default): the share-level methods, and the
+	// management-group and resource-group methods after them, return it before doing
+	// anything while the flag is off. Mapped to a 409, like ErrVendorAccountsDisabled.
+	// ErrVendorSubscriptionSharingDisabled refuses RAISING a subscription account while
+	// vendor_subscription_sharing_enabled (subordinate to the master) is off. A 409.
+	// ErrVendorAccountSubscriptionShareCapped: a subscription account is raised to
+	// `shared` at most, never `full` (its OAuth credential stays owner-only). A 400.
+	// ErrVendorAccountShareLevelInvalid: the requested level is not none, shared or
+	// full. ErrVendorAccountShareLevelUnchanged: the request does not move the level in
+	// the direction asked for (a raise to a level at or below the stored one, a lower to
+	// one at or above it). Both 400.
+	// ErrVendorAccountAdminGroupRequired / Invalid / ParentMismatch are the management-
+	// group set's three failures (the vendor-account counterparts of the
+	// ErrServerAdminGroup* trio): no group at all, a group that is not an existing
+	// admin-tier group the caller may name, groups under different parents. All 400.
+	// ErrVendorAccountRootMismatch: groups whose parent differs from the account's
+	// retained containment root (immutable while the account stays shared/full). A 400.
+	// ErrVendorAccountNotShared: the request needs a shared account (management groups
+	// can only be assigned to one that is `shared` or `full`) and the account is not
+	// one. Asked of the owner only, after the 404/403 gate. A 400.
+	ErrVendorAccountSharingDisabled          = errors.New("vendor_accounts.sharing_disabled")
+	ErrVendorSubscriptionSharingDisabled     = errors.New("vendor_accounts.subscription_sharing_disabled")
+	ErrVendorAccountSubscriptionShareCapped  = errors.New("vendor_account.subscription_share_capped")
+	ErrVendorAccountShareLevelInvalid        = errors.New("vendor_account.share_level_invalid")
+	ErrVendorAccountShareLevelUnchanged      = errors.New("vendor_account.share_level_unchanged")
+	ErrVendorAccountAdminGroupRequired       = errors.New("vendor_account.admin_group_required")
+	ErrVendorAccountAdminGroupInvalid        = errors.New("vendor_account.admin_group_invalid")
+	ErrVendorAccountAdminGroupParentMismatch = errors.New("vendor_account.admin_group_parent_mismatch")
+	ErrVendorAccountRootMismatch             = errors.New("vendor_account.root_mismatch")
+	ErrVendorAccountNotShared                = errors.New("vendor_account.not_shared")
 
 	// Subscription connect (the OAuth code-paste flow and the token import).
 	// ErrVendorAccountNotSubscription: connect operates on an auth_type
@@ -823,6 +868,10 @@ type Service struct {
 	// vendorDiscovery holds the model-discovery fetchers and their bounded http
 	// client (see vendorDiscoveryState).
 	vendorDiscovery vendorDiscoveryState
+	// vendorSharingFlags is the 5 s, invalidatable cache of the two sharing switches
+	// the routing hot path reads (see service_vendor_sharing_flags.go). Zero value
+	// ready; persistSystemSettings invalidates it.
+	vendorSharingFlags ttlcache.Cache[vendorSharingFlagSet]
 	// vendorModelWrites serializes the two writers of an account's model rows (a
 	// discovery's replace and a prefix re-label) per account, so they cannot undo
 	// each other (see accountLocks).
@@ -1129,15 +1178,20 @@ type TokenDTO struct {
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
-// grants every owner account under its own model_prefix (Accounts is then
-// ignored); otherwise Accounts lists the opted-in accounts. Mirrors the stored
+// grants every account the token's principal OWNS under its own model_prefix
+// (Accounts is then ignored for those); otherwise Accounts lists the opted-in
+// accounts. An account SHARED with the principal (owned by someone else) is never
+// covered by All: it is used only when Accounts names it, with an optional prefix
+// override (the per-account opt-in, ADR-050). Mirrors the stored
 // vendor_provider_access shape (see store.DecodeVendorAccess).
 type VendorAccessDTO struct {
 	All      bool                   `json:"all"`
 	Accounts []VendorAccessEntryDTO `json:"accounts"`
 }
 
-// VendorAccessEntryDTO opts one vendor account in, by its stable account id.
+// VendorAccessEntryDTO opts one vendor account in, by its stable account id: one
+// the principal owns, or one shared with it (the id must be reachable for the
+// token's principal when the policy is saved, and is re-checked on every request).
 // A nil PrefixOverride (or one with Enabled=false) uses the account's own
 // model_prefix.
 type VendorAccessEntryDTO struct {
@@ -1672,7 +1726,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 	if err != nil {
 		return CreateTokenResponse{}, err
 	}
-	if err := s.validateVendorAccess(ctx, owner, req.VendorAccess); err != nil {
+	if err := s.validateVendorAccess(ctx, userTokenPrincipal(owner), req.VendorAccess); err != nil {
 		return CreateTokenResponse{}, err
 	}
 	projectID, err := s.assignTokenProject(ctx, owner.UserID, req.ProjectID)
@@ -1803,7 +1857,7 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 		record.ModelOverrideMap = store.EncodeModelOverrideRules(overrideRules)
 	}
 	if req.VendorAccess != nil {
-		if err := s.validateVendorAccess(ctx, owner, req.VendorAccess); err != nil {
+		if err := s.validateVendorAccess(ctx, userTokenPrincipal(owner), req.VendorAccess); err != nil {
 			return TokenDTO{}, err
 		}
 		record.VendorProviderAccess = encodeVendorAccessDTO(req.VendorAccess)
@@ -2250,11 +2304,13 @@ func (s *Service) attachUsageCost(ctx context.Context, rows []usage.Row) {
 // and the name is a transient display field: never persisted, never selected
 // by a store.
 //
-// Visibility follows authorizeVendorAccount's read rule, because an account is a
-// personal credential, not shared infrastructure: the name is set only when the
-// principal owns the account or is a system admin. For anyone else (a plain
-// admin or a project member looking at someone else's row) it stays empty — the
-// row's AccountID is still on the wire, only the name is withheld.
+// Visibility follows authorizeVendorAccountRead's read rule, because an account is a
+// personal credential unless it has been shared: the name is set only when the
+// principal owns the account, manages it as a CM while it is shared or full, can
+// route to it as a member (provisioned into a resource group that contains it while
+// it is shared or full), or is a system admin. For anyone else (a plain admin or a
+// project member looking at someone else's row) it stays empty — the row's AccountID
+// is still on the wire, only the name is withheld.
 //
 // Everything else is fail-soft and leaves the name empty rather than failing
 // the list: a nil routing store, an account that no longer exists (usage_events.
@@ -2282,12 +2338,15 @@ func (s *Service) attachUsageAccountNames(ctx context.Context, principal auth.To
 }
 
 // visibleVendorAccountName returns the name of the vendor account id when the
-// principal may see it (owner, or system scope — authorizeVendorAccount's read
-// rule), else "". A missing account and a stranger's account are both
-// ErrVendorAccountNotFound and both yield ""; any other lookup error is logged
-// and also yields "" (the Activity list must never fail over a display name).
+// principal may see it (the owner, a CM of the account while it is shared or full by
+// its effective level, a member that can route to it through a resource group, or
+// system scope — authorizeVendorAccountRead's read rule), else "". The name is the
+// same at every tier: the member's view of an account carries it too. A missing
+// account and a stranger's account are both ErrVendorAccountNotFound and both yield
+// ""; any other lookup error is logged and also yields "" (the Activity list must
+// never fail over a display name).
 func (s *Service) visibleVendorAccountName(ctx context.Context, principal auth.Token, id string) string {
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, false)
+	acc, _, err := s.authorizeVendorAccountRead(ctx, principal, id)
 	if err != nil {
 		if !errors.Is(err, ErrVendorAccountNotFound) {
 			log.Printf("portal: usage account-name lookup failed for %q: %v", id, err)
@@ -2789,8 +2848,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 				}
 			}
-			// Owner overlay: fold in the principal's own vendor-account models
-			// (Milestone 3) so the chat picker and /api/v1/models show exactly what
+			// Vendor overlay: fold in the principal's vendor-account models (its own
+			// and the ones shared with it, Milestone 3 and #183) so the chat picker
+			// and /api/v1/models show exactly what
 			// resolveVendorAccount will dispatch for them. USAGE PATH ONLY --
 			// suppress==true is Models() (the picker / inference discovery); the
 			// admin management surface (ManageModels(), suppress==false) shows the
@@ -3069,10 +3129,10 @@ func (s *Service) dashboardRouteData(ctx context.Context, token auth.Token) (str
 			Status:   routing.ServerStatusActive,
 		})
 	}
-	// The principal's own vendor-account models (ChatGPT/OpenAI/Anthropic accounts)
-	// are part of what they can route to, so the table lists them next to the
-	// self-hosted routes -- the dashboard half of the owner overlay the model
-	// listings already carry (vendorDashboardRoutes).
+	// The principal's vendor-account models (ChatGPT/OpenAI/Anthropic accounts, its
+	// own and the ones shared with it) are part of what they can route to, so the
+	// table lists them next to the self-hosted routes -- the dashboard half of the
+	// vendor overlay the model listings already carry (vendorDashboardRoutes).
 	out = append(out, s.vendorDashboardRoutes(ctx, token)...)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Model == out[j].Model {
@@ -4274,8 +4334,9 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 // "does this name exist at all" (Existing), which no row above answers.)
 //
 // (Models(), ModelsForFlavor() and dashboardRouteData() additionally carry the
-// principal's OWN vendor-account models, the owner overlay of external vendor
-// accounts: ownVendorAccountModels is the one source they all read, and a
+// principal's vendor-account models (its own and the ones shared with it), the
+// vendor overlay of external vendor accounts: ownVendorAccountModels is the one
+// source they all read, enumerated by the routing grant, and a
 // vendor model is never subject to column (b), which is a gateway-wide setting
 // on self-hosted models.)
 //
@@ -4387,8 +4448,9 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 	if err != nil {
 		return sets, err
 	}
-	// Owner overlay: fold in the principal's own vendor-account models (Milestone
-	// 3) so the per-flavor listings (/v1/models, the Anthropic list, and the
+	// Vendor overlay: fold in the principal's vendor-account models (its own and
+	// the ones shared with it; Milestone 3 and #183) so the per-flavor listings
+	// (/v1/models, the Anthropic list, and the
 	// ModelsForFlavor reference they are pinned against) advertise exactly what
 	// resolveVendorAccount will dispatch for them. Applied here, on
 	// the public method ModelsForFlavor consumes, rather than inside
@@ -4943,26 +5005,59 @@ func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 	return d
 }
 
-// validateVendorAccess checks a token's requested vendor-access policy against
-// the owner's own accounts: every account_id must be one the owner owns (and
-// appear once), every ENABLED override prefix must pass
-// normalizeVendorAccountModelPrefix, and (all=false) the effective public names
-// -- effective prefix + upstream model id -- must not collide across the selected
-// accounts' current models. A nil policy, all=true (the resolver ignores the
-// account list and keeps first-wins + dedup) and an empty list need no checks.
+// userTokenPrincipal is the principal a USER token acts as: the owning user, and
+// nothing the creating caller's own auth.Token happens to carry (scopes, a kind). It
+// is who the routing grant is asked about when a user token's policy is validated.
+func userTokenPrincipal(owner auth.Token) auth.Token {
+	return auth.Token{UserID: owner.UserID}
+}
+
+// serviceTokenPrincipal is the principal a SERVICE token acts as: the service
+// identity itself. It owns no vendor account and is provisioned into resource groups
+// only as a service (ProvisionKindService), exactly as the resolver asks the grant
+// about the token at request time.
+func serviceTokenPrincipal(serviceID string) auth.Token {
+	return auth.Token{Kind: store.TokenKindService, ServiceID: serviceID}
+}
+
+// validateVendorAccess checks a token's requested vendor-access policy against the
+// accounts the token's PRINCIPAL can reach (VendorAccountsForRouting: its own accounts
+// plus the ones shared with it through a resource group it is provisioned into): every
+// account_id must be one of them (and appear once), every ENABLED override prefix
+// must pass normalizeVendorAccountModelPrefix, and the effective public names --
+// effective prefix + upstream model id -- must not collide across the checked
+// accounts' current models. principal is the TOKEN's own identity (userTokenPrincipal,
+// serviceTokenPrincipal), never the caller who happens to be saving it: an admin
+// editing a token does not lend it their own reach.
+//
+// A nil policy and an empty list need no checks. With all=true the principal's OWN
+// accounts are covered by the switch and the list is ignored for them (so an entry
+// naming one is neither validated nor collision-checked, as before sharing); an entry
+// naming any other account is a live opt-in to a SHARED account (all:true never
+// covers one), so it is held to the same checks as under all=false.
+//
+// The check is ADVISORY, not the security gate: it keeps unreachable ids out of a new
+// policy as an unknown own id always was, but the gate is the routing grant, which is
+// re-evaluated live on every request -- a policy that names an account that stops
+// being reachable (a downgrade, a pause, a removed provision) simply routes nothing.
 // A collision that only emerges later (a vendor ships a new model after save) is
-// caught by the routing backstop, so a per-account models-read failure is logged
-// and skipped rather than failing the save; a failure to read the owner's
-// accounts at all is an infrastructure error and is returned raw (a 500, not the
-// 400 reserved for ErrTokenVendorAccessInvalid / ErrTokenVendorAccessConflict).
-func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d *VendorAccessDTO) error {
-	if d == nil || d.All || len(d.Accounts) == 0 {
+// caught by the routing backstop, so a per-account models-read failure is logged and
+// skipped rather than failing the save; a failure to read the principal's own accounts
+// at all is an infrastructure error and is returned raw (a 500, not the 400 reserved
+// for ErrTokenVendorAccessInvalid / ErrTokenVendorAccessConflict). The shared arm of
+// the grant fails CLOSED (VendorAccountsForRouting), so a store error there reads as
+// "not reachable" -- the same answer routing gives in that window.
+func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token, d *VendorAccessDTO) error {
+	if d == nil || len(d.Accounts) == 0 {
 		return nil
 	}
 	if s.routes == nil {
+		if d.All {
+			return nil
+		}
 		return fmt.Errorf("%w: vendor accounts unavailable", ErrTokenVendorAccessInvalid)
 	}
-	byID, err := s.ownerVendorAccountsByID(ctx, owner.UserID)
+	byID, err := s.reachableVendorAccountsByID(ctx, principal)
 	if err != nil {
 		return err
 	}
@@ -4972,6 +5067,9 @@ func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d 
 		names: make(map[string]string),
 	}
 	for _, e := range d.Accounts {
+		if d.All && coveredByAll(principal, byID, e) {
+			continue
+		}
 		if err := s.checkVendorAccessEntry(ctx, &check, e); err != nil {
 			return err
 		}
@@ -4979,18 +5077,27 @@ func (s *Service) validateVendorAccess(ctx context.Context, owner auth.Token, d 
 	return nil
 }
 
+// coveredByAll reports whether policy entry e names one of principal's OWN accounts,
+// the only kind an all=true policy covers (and so ignores the entry for).
+func coveredByAll(principal auth.Token, byID map[string]routing.VendorAccount, e VendorAccessEntryDTO) bool {
+	acc, ok := byID[strings.TrimSpace(e.AccountID)]
+	return ok && routing.TokenOwnsVendorAccount(principal, acc)
+}
+
 // vendorAccessCheck is the working state of one validateVendorAccess run.
 type vendorAccessCheck struct {
-	byID  map[string]routing.VendorAccount // the owner's accounts by id
+	byID  map[string]routing.VendorAccount // the accounts the principal can reach, by id
 	seen  map[string]struct{}              // account ids already listed in the policy
 	names map[string]string                // effective public name -> id of the account that first produced it
 }
 
-// ownerVendorAccountsByID loads userID's vendor accounts keyed by id. A read
-// failure is an infrastructure error and is returned raw, so the endpoints answer
-// 500 rather than a 400 the client cannot act on.
-func (s *Service) ownerVendorAccountsByID(ctx context.Context, userID string) (map[string]routing.VendorAccount, error) {
-	accounts, err := s.routes.VendorAccountsByOwner(ctx, userID)
+// reachableVendorAccountsByID loads the accounts principal can reach keyed by id:
+// the routing grant, own accounts and the accounts shared with it, which is the very
+// set the resolver enumerates for it. A read failure of its own accounts is an
+// infrastructure error and is returned raw, so the endpoints answer 500 rather than
+// a 400 the client cannot act on.
+func (s *Service) reachableVendorAccountsByID(ctx context.Context, principal auth.Token) (map[string]routing.VendorAccount, error) {
+	accounts, err := s.VendorAccountsForRouting(ctx, principal)
 	if err != nil {
 		return nil, err
 	}
@@ -5002,9 +5109,11 @@ func (s *Service) ownerVendorAccountsByID(ctx context.Context, userID string) (m
 }
 
 // checkVendorAccessEntry validates one policy entry in order -- the account is
-// owned, is listed once, carries a valid override prefix, and its effective public
-// names do not collide with those already claimed by earlier entries -- so the
-// first failure is the one reported. An unreadable model list skips the collision
+// reachable by the principal (its own, or shared with it), is listed once, carries a
+// valid override prefix, and its effective public names do not collide with those
+// already claimed by earlier entries -- so the first failure is the one reported. An
+// id the principal cannot reach is "unknown", the same answer for a missing account
+// and a foreign one (no existence leak). An unreadable model list skips the collision
 // check for that account only (logged; the routing backstop still applies).
 func (s *Service) checkVendorAccessEntry(ctx context.Context, check *vendorAccessCheck, e VendorAccessEntryDTO) error {
 	id := strings.TrimSpace(e.AccountID)
