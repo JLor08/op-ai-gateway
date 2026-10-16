@@ -20,6 +20,7 @@ describe('applicationTypeDefaults', () => {
       contextProbePath: '/upstream/{model}/props',
       timeoutMs: 30000,
       healthCheckMode: 'health_path',
+      healthCheckPath: '/v1/health',
       apiFlavors: ['openai', 'anthropic'],
     });
   });
@@ -35,6 +36,7 @@ describe('applicationTypeDefaults', () => {
       contextProbePath: '',
       timeoutMs: 30000,
       healthCheckMode: 'health_path',
+      healthCheckPath: '/v1/health',
       apiFlavors: ['openai', 'anthropic'],
     });
   });
@@ -55,6 +57,7 @@ describe('applicationTypeDefaults', () => {
       contextProbePath: '',
       timeoutMs: 600000,
       healthCheckMode: 'health_path',
+      healthCheckPath: '/v1/health',
       apiFlavors: ['openai', 'anthropic'],
     });
   });
@@ -193,18 +196,23 @@ describe('stable_diffusion_cpp defaults', () => {
   });
 });
 
-// audio_cpp mirrors stable_diffusion_cpp's reasoning for two of the three
-// diverging fields, and differs on the third: audio.cpp answers GET /health
-// (probed), so the stock health_path mode works and is NOT overridden.
+// audio_cpp mirrors stable_diffusion_cpp's reasoning for the flavors and the
+// timeout, and differs on the health check: audio.cpp has a real health
+// endpoint, so the stock health_path MODE works and is not overridden -- but at
+// /health (200), not the stock /v1/health, which it answers with 404 (probed
+// against v0.9.1). Left at the stock path, a freshly created application would
+// go unreachable after one probe cycle.
 describe('audio_cpp defaults', () => {
-  it('defaults away from the two fields whose stock value breaks this type', () => {
+  it('defaults away from the fields whose stock value breaks this type', () => {
     const d = applicationTypeDefaults.audio_cpp;
     // Speech only: the stock text pair would make it a text candidate.
     expect(d.apiFlavors).toEqual(['openai_audio']);
     // A synthesis can run far past 30s; matches the backend's default.
     expect(d.timeoutMs).toBe(600000);
-    // Serves GET /health, so the stock mode stays.
+    // Has a real health endpoint, so the stock mode stays ...
     expect(d.healthCheckMode).toBe('health_path');
+    // ... but it answers /health, not /v1/health (404).
+    expect(d.healthCheckPath).toBe('/health');
     // No chat or messages endpoint to translate to.
     expect(d.responsesMode).toBe('disabled');
     expect(d.messagesMode).toBe('disabled');
@@ -220,7 +228,22 @@ describe('audio_cpp defaults', () => {
     const patch = migrateTypeFields('ollama', 'audio_cpp', current);
     expect(patch.apiFlavors).toEqual(['openai_audio']);
     expect(patch.timeoutMs).toBe(600000);
-    // health_path is shared with ollama, so there is nothing to move.
+    // health_path is shared with ollama, so the mode only restates itself; the
+    // path is what has to move.
+    expect(patch.healthCheckMode).toBe('health_path');
+    expect(patch.healthCheckPath).toBe('/health');
+  });
+
+  it('preserves a customized health path across a switch to audio_cpp', () => {
+    const current: TypeDefaults = { ...applicationTypeDefaults.ollama, healthCheckPath: '/ready' };
+    expect(migrateTypeFields('ollama', 'audio_cpp', current).healthCheckPath).toBeUndefined();
+  });
+
+  it('moves the health path from stable_diffusion_cpp to audio_cpp when untouched', () => {
+    const current = { ...applicationTypeDefaults.stable_diffusion_cpp };
+    const patch = migrateTypeFields('stable_diffusion_cpp', 'audio_cpp', current);
+    expect(patch.healthCheckPath).toBe('/health');
+    // The mode moves too: sd uses model_sync, audio.cpp the path check.
     expect(patch.healthCheckMode).toBe('health_path');
   });
 
@@ -242,5 +265,15 @@ describe('audio_cpp defaults', () => {
     const patch = migrateTypeFields('audio_cpp', 'vllm', current);
     expect(patch.apiFlavors).toEqual(['openai', 'anthropic']);
     expect(patch.timeoutMs).toBe(30000);
+    expect(patch.healthCheckPath).toBe('/v1/health');
+  });
+
+  // Every other type keeps the stock path, so the widening changes nothing for
+  // them.
+  it('keeps the stock /v1/health path for every other type', () => {
+    for (const [type, d] of Object.entries(applicationTypeDefaults)) {
+      if (type === 'audio_cpp') continue;
+      expect(d.healthCheckPath, type).toBe('/v1/health');
+    }
   });
 });

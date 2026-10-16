@@ -3453,10 +3453,18 @@ describe('audio.cpp strings name what the operator sees', () => {
       expect(t.applicationTypeAudioCppNote).toContain('openai_audio');
     });
 
-    // audio.cpp answers GET /health, so the note must not tell the operator
-    // the health check mode was moved, as the sd note does.
+    // audio.cpp has a real health endpoint, so the note must not tell the
+    // operator the health check MODE was moved, as the sd note does -- but it
+    // must say the health PATH default is /health rather than /v1/health, the
+    // one that would take the application unreachable.
     it(`does not claim a health check mode override in the application note (${locale})`, () => {
       expect(t.applicationTypeAudioCppNote).not.toContain(t.applicationHealthModeModelSync);
+    });
+
+    it(`names the health path default and the stock one it replaces in the application note (${locale})`, () => {
+      expect(t.applicationTypeAudioCppNote).toContain(t.applicationHealthModePath);
+      expect(t.applicationTypeAudioCppNote).toContain('/v1/health');
+      expect(t.applicationTypeAudioCppNote.replace('/v1/health', '')).toContain('/health');
     });
 
     it(`says which flavor boxes to tick, on the spec and on its parent, in the launch-spec note (${locale})`, () => {

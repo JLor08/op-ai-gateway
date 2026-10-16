@@ -494,13 +494,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   });
 
   // A request billed in a non-token unit (an image, a second of speech) has no
-  // token count at all: the live row's zero is "not applicable", not "nothing
-  // reported yet". The completed-row tables already dash such a count with a
-  // tooltip; this column follows the same per-row rule, off the row's own
-  // `billing_unit` (empty or absent = token-metered).
+  // token count at all. This column never printed a "0" for it -- formatMetric
+  // already renders a zero count as the shared em dash -- so what the
+  // billing_unit gate adds is the TOOLTIP, which tells "not applicable to this
+  // request" apart from "nothing reported yet"; the completed-row tables
+  // already draw the same distinction. The rule is per row, off the row's own
+  // `billing_unit` (empty or absent = token-metered). The non-token fixtures
+  // below carry a NONZERO count on purpose: a zero would dash with or without
+  // the gate and could not tell its removal.
   describe(`ActiveRequestsPanel non-token rows in the output-tokens column [${locale}]`, () => {
-    // Seeds every optional column visible (see the test above for why this is
-    // seeded rather than clicked) and addresses the cell by column index.
+    // Addresses the cell by column index (see the test above for why).
     function countCell(model: string): HTMLElement {
       const headers = screen.getAllByRole('columnheader').map((h) => h.textContent ?? '');
       const countIndex = headers.findIndex((h) => h.includes(t.activityColLiveOutputTokens));
@@ -510,6 +513,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     }
 
     function renderRows() {
+      // Every optional column visible (seeded rather than clicked, as above).
       window.localStorage.setItem('op.pref.table.op.activeRequests.hidden', JSON.stringify([]));
       render(
         <ActiveRequestsPanel
@@ -534,6 +538,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               req_path: '/v1/audio/speech',
               provider_path: '/v1/audio/speech',
               billing_unit: 'audio_second',
+              output_tokens: 5,
             }),
             makeActive({
               id: 'act_image',
@@ -542,6 +547,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               req_path: '/v1/images/generations',
               provider_path: '/v1/images/generations',
               billing_unit: 'image',
+              output_tokens: 5,
+            }),
+            makeActive({
+              id: 'act_speech_zero',
+              model: 'speech-zero-model',
+              api_flavor: 'openai_audio',
+              billing_unit: 'audio_second',
+              output_tokens: 0,
             }),
           ]}
           effectiveScope="own"
@@ -555,11 +568,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(countCell('older-gateway-model').textContent).toBe('7');
     });
 
-    it('dashes the count of a non-token row instead of printing a measured-looking zero', () => {
+    it('dashes the count of a non-token row whatever count it carries', () => {
       renderRows();
       expect(countCell('speech-model').textContent).toBe('—');
       expect(countCell('image-model').textContent).toBe('—');
-      expect(within(countCell('speech-model')).queryByText('0')).not.toBeInTheDocument();
+      expect(countCell('speech-zero-model').textContent).toBe('—');
+      expect(within(countCell('speech-model')).queryByText('5')).not.toBeInTheDocument();
     });
 
     it('explains the dash with the not-token-metered tooltip, for a non-token row only', async () => {
@@ -568,6 +582,35 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(await screen.findByText(t.activityNotTokenMetered)).toBeInTheDocument();
       // The token-metered cell has nothing to explain.
       expect(within(countCell('chat-model')).queryByText('—')).not.toBeInTheDocument();
+    });
+
+    // The never-reported dash of a token-metered row stays tooltip-free: it is
+    // the other state, and the two must not read the same. A MUI Tooltip with a
+    // string title labels its child, so the label is the deterministic probe.
+    it('gives a token-metered row with no reported count no not-token-metered tooltip', () => {
+      window.localStorage.setItem('op.pref.table.op.activeRequests.hidden', JSON.stringify([]));
+      render(
+        <ActiveRequestsPanel
+          t={t}
+          active={[
+            makeActive({ id: 'act_none', model: 'none-model', output_tokens: 0 }),
+            makeActive({
+              id: 'act_speech',
+              model: 'speech-model',
+              billing_unit: 'audio_second',
+              output_tokens: 0,
+            }),
+          ]}
+          effectiveScope="own"
+        />,
+      );
+      expect(countCell('none-model').textContent).toBe('—');
+      expect(
+        within(countCell('none-model')).queryByLabelText(t.activityNotTokenMetered),
+      ).toBeNull();
+      expect(
+        within(countCell('speech-model')).getByLabelText(t.activityNotTokenMetered),
+      ).toBeInTheDocument();
     });
   });
 }

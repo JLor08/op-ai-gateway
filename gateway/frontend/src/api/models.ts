@@ -14,7 +14,8 @@ import { type Fetcher, request, subscribeSSE } from './transport';
 // flavors, timeout) would break it and are overridden per-type.
 // 'audio_cpp': a speech-synthesis server (audio.cpp / audiocpp_server), the
 // same kind of form default: 'openai_audio' alone and a 10-minute timeout,
-// but the stock health path check, since it answers GET /health.
+// and a health path of /health (the stock /v1/health answers 404 there), under
+// the stock health_path mode, since it has a real GET /health.
 export type ApplicationType =
   | 'ollama'
   | 'vllm'

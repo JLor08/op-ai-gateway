@@ -9180,6 +9180,34 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, 
     expect(field).toHaveAttribute('placeholder', '/health');
   });
 
+  // The sd default moved the untouched path to /v1/models; audio.cpp answers
+  // /v1/models too but its health endpoint is /health, so leaving sd for it
+  // must move the path back, and an edited path must stay put.
+  it('moves an untouched health path from the sd default back to /health on a switch to audio_cpp', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const field = () => screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement;
+
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    expect(field().value).toBe('/v1/models');
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+    expect(field().value).toBe('/health');
+    expect(field()).toHaveAttribute('placeholder', '/health');
+  });
+
+  it('keeps an edited health path on a switch from the sd default to audio_cpp', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStableDiffusionCpp);
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecHealthPath), {
+      target: { value: '/ready' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeAudioCpp);
+    expect((screen.getByLabelText(t.runtimeSpecHealthPath) as HTMLInputElement).value).toBe(
+      '/ready',
+    );
+  });
+
   it('restores the replaced values, not the template, on a switch back to an explicit type', async () => {
     const { putSpecs } = await openCreateWithBinary();
     fireEvent.click(flavorBoxes().openai);

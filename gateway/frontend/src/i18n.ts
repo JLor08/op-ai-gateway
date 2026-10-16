@@ -479,11 +479,12 @@ const de = {
   // values themselves are silent. See applicationTypeDefaults.ts.
   applicationTypeStableDiffusionCppNote:
     'stable-diffusion.cpp bedient nur Bildanfragen. Der Server bietet keinen /v1/health-Endpunkt, deshalb ist der Health-Check-Modus standardmäßig „Modell-Abgleich“ statt „Health-Pfad prüfen“; das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Bilderzeugung deutlich länger dauert als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_images“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird.',
-  // audio_cpp's two diverging defaults (API flavors, timeout) explained where
-  // the operator can see them. Its health check mode is NOT one of them: the
-  // server answers /health. See applicationTypeDefaults.ts.
+  // audio_cpp's three diverging defaults (API flavors, timeout, health path)
+  // explained where the operator can see them. Its health check MODE is not one
+  // of them: it has a real health endpoint, at /health. See
+  // applicationTypeDefaults.ts.
   applicationTypeAudioCppNote:
-    'audio.cpp bedient nur Sprachsynthese-Anfragen. Das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Synthese deutlich länger dauern kann als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_audio“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird. Der Health-Check-Modus bleibt bei „Health-Pfad prüfen“, weil der Server /health beantwortet.',
+    'audio.cpp bedient nur Sprachsynthese-Anfragen. Das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Synthese deutlich länger dauern kann als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_audio“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird. Der Health-Check-Modus bleibt bei „Health-Pfad prüfen“, aber der Health-Pfad ist standardmäßig /health statt /v1/health, weil der Server /health beantwortet und /v1/health mit 404.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -1477,8 +1478,9 @@ const de = {
   errorBenchmarkNoModels: 'Keine Modelle zum Benchmarken.',
   errorBenchmarkRequestFailed:
     'Der Lauf konnte nicht gestartet werden: Beim Lesen der gespeicherten Konfiguration ist ein interner Fehler aufgetreten. Bitte erneut versuchen.',
-  // The starters' three refusals before the reservation. The model list shows
-  // the same three sentences as the tooltip of a disabled Load action.
+  // The starters' four refusals before the reservation (images-only, audio-only,
+  // agent ensure unsupported, spec force-stopped). The model list shows the same
+  // sentences as the tooltip of a disabled Load action.
   errorBenchmarkImagesOnly:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Bildmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.',
   errorBenchmarkAudioOnly:
@@ -3485,11 +3487,12 @@ const en: PortalMessages = {
   // values themselves are silent. See applicationTypeDefaults.ts.
   applicationTypeStableDiffusionCppNote:
     'stable-diffusion.cpp serves image requests only. The server exposes no /v1/health endpoint, so the health check mode defaults to "Model sync" instead of "Check health path"; the timeout defaults to 10 minutes instead of 30 seconds, because a generation takes far longer than a text reply; and the API flavor defaults to "openai_images" only, instead of openai/anthropic, so this server is never offered as a text candidate.',
-  // audio_cpp's two diverging defaults (API flavors, timeout) explained where
-  // the operator can see them. Its health check mode is NOT one of them: the
-  // server answers /health. See applicationTypeDefaults.ts.
+  // audio_cpp's three diverging defaults (API flavors, timeout, health path)
+  // explained where the operator can see them. Its health check MODE is not one
+  // of them: it has a real health endpoint, at /health. See
+  // applicationTypeDefaults.ts.
   applicationTypeAudioCppNote:
-    'audio.cpp serves speech synthesis requests only. The timeout defaults to 10 minutes instead of 30 seconds, because a synthesis can take far longer than a text reply; and the API flavor defaults to "openai_audio" only, instead of openai/anthropic, so this server is never offered as a text candidate. The health check mode stays at "Check health path", because the server answers /health.',
+    'audio.cpp serves speech synthesis requests only. The timeout defaults to 10 minutes instead of 30 seconds, because a synthesis can take far longer than a text reply; and the API flavor defaults to "openai_audio" only, instead of openai/anthropic, so this server is never offered as a text candidate. The health check mode stays at "Check health path", but the health path defaults to /health instead of /v1/health, because the server answers /health and returns 404 for /v1/health.',
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',

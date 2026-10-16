@@ -575,8 +575,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   // audio_cpp is the second type whose stock API flavors and timeout are
   // reproducible failures rather than preferences: the stock pair would offer
   // a speech-only server as a text candidate, and 30s is shorter than a long
-  // synthesis. Unlike stable_diffusion_cpp it answers GET /health, so the
-  // health check mode stays at the stock path check.
+  // synthesis. Unlike stable_diffusion_cpp it has a real health endpoint, so
+  // the health check MODE stays at the stock path check -- but at /health, not
+  // the stock /v1/health, which it answers with 404.
   describe(`ApplicationSection audio_cpp type [${locale}]`, () => {
     it('offers audio_cpp in the application-type dropdown', async () => {
       renderSection();
@@ -601,9 +602,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(
         screen.getByRole('combobox', { name: t.applicationLoadedModelsFormat }),
       ).toHaveTextContent(t.applicationLoadedFormatOpenai);
-      // The stock health path check is kept: audio.cpp serves GET /health.
+      // The stock health path MODE is kept, but its path moves to /health:
+      // audio.cpp answers GET /health with 200 and the stock /v1/health with
+      // 404, so the stock path would take the new application unreachable.
       expect(screen.getByRole('combobox', { name: t.applicationHealthMode })).toHaveTextContent(
         t.applicationHealthModePath,
+      );
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/health',
       );
       expect(screen.getByText(t.applicationTypeAudioCppNote)).toBeInTheDocument();
 
@@ -612,8 +618,39 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(created[0].type).toBe('audio_cpp');
       expect(created[0].api_flavors).toEqual(['openai_audio']);
       expect(created[0].health_check_mode).toBe('health_path');
+      expect(created[0].health_check_path).toBe('/health');
       expect(created[0].timeout_ms).toBe(600000);
       expect(created[0].loaded_models_format).toBe('openai');
+    });
+
+    it('keeps an edited health path across a switch to audio_cpp', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.applicationHealthPath), {
+        target: { value: '/ready' },
+      });
+      await selectType('audio_cpp');
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/ready',
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].health_check_path).toBe('/ready');
+    });
+
+    it('restores the stock health path when an untouched audio_cpp form switches away', async () => {
+      const { created } = renderSection();
+      openCreate();
+      await selectType('audio_cpp');
+      await selectType('vllm');
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/v1/health',
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].health_check_path).toBe('/v1/health');
     });
 
     it('announces the audio_cpp note as the type field description', async () => {

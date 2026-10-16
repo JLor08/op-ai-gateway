@@ -33,7 +33,11 @@ import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable'
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
 import { applicationStatusOptions, applicationStatusLabelByKey } from './shared/application';
-import { applicationTypeDefaults, migrateTypeFields } from './shared/applicationTypeDefaults';
+import {
+  applicationTypeDefaults,
+  migrateTypeFields,
+  stockApplicationHealthPath,
+} from './shared/applicationTypeDefaults';
 import { applicationLiveTimingsKind, applicationSendsLiveTimings } from './shared/liveTimings';
 import { MappingSection } from './MappingSection';
 import { RuntimeAdminSection } from './RuntimeAdminSection';
@@ -99,7 +103,6 @@ const applicationProxyStateChipStatus: Record<ApplicationProxyState, BadgeStatus
 
 const defaultApplicationAffinityTtlSeconds = 1800;
 const defaultApplicationAdmissionQueueTimeoutSeconds = 0;
-const defaultApplicationHealthPath = '/v1/health';
 const defaultApplicationHealthMode: ApplicationHealthMode = 'health_path';
 
 const applicationHealthModeOptions: ApplicationHealthMode[] = [
@@ -245,7 +248,7 @@ export function ApplicationSection({
     defaultApplicationAdmissionQueueTimeoutSeconds,
   );
   const [healthMode, setHealthMode] = useState<ApplicationHealthMode>(defaultApplicationHealthMode);
-  const [healthPath, setHealthPath] = useState(defaultApplicationHealthPath);
+  const [healthPath, setHealthPath] = useState(stockApplicationHealthPath);
   // "default" = follow the system-wide interval (stores 0); "custom" = fixed value.
   const [healthIntervalMode, setHealthIntervalMode] = useState<'default' | 'custom'>('default');
   const [healthIntervalSeconds, setHealthIntervalSeconds] = useState(
@@ -336,7 +339,7 @@ export function ApplicationSection({
     setAffinityTtl(defaultApplicationAffinityTtlSeconds);
     setAdmissionQueueTimeout(defaultApplicationAdmissionQueueTimeoutSeconds);
     setHealthMode(defaultApplicationHealthMode);
-    setHealthPath(defaultApplicationHealthPath);
+    setHealthPath(d.healthCheckPath);
     setHealthIntervalMode('default');
     setHealthIntervalSeconds(defaultCustomHealthIntervalSeconds);
     setResponsesMode(d.responsesMode);
@@ -368,6 +371,7 @@ export function ApplicationSection({
       contextProbePath,
       timeoutMs,
       healthCheckMode: healthMode,
+      healthCheckPath: healthPath,
       apiFlavors: flavors,
     });
     if (patch.port !== undefined) setPort(patch.port);
@@ -379,6 +383,7 @@ export function ApplicationSection({
     if (patch.contextProbePath !== undefined) setContextProbePath(patch.contextProbePath);
     if (patch.timeoutMs !== undefined) setTimeoutMs(patch.timeoutMs);
     if (patch.healthCheckMode !== undefined) setHealthMode(patch.healthCheckMode);
+    if (patch.healthCheckPath !== undefined) setHealthPath(patch.healthCheckPath);
     if (patch.apiFlavors !== undefined) setFlavors(patch.apiFlavors);
     setType(newType);
   }
@@ -749,8 +754,8 @@ export function ApplicationSection({
     // preferences -- see applicationTypeDefaults.ts. This is the only place
     // that tells the operator so; the values themselves are silent. Riding the
     // same slot is what gets it announced with the field (aria-describedby),
-    // as the launch-spec form's type note is. audio_cpp's two diverging
-    // defaults (API flavors, timeout) are explained the same way.
+    // as the launch-spec form's type note is. audio_cpp's three diverging
+    // defaults (API flavors, timeout, health path) are explained the same way.
     const typeDescriptions = [
       managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
       serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
