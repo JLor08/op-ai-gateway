@@ -487,11 +487,13 @@ func TestVendorAccountsForRoutingSharedArmFailsClosedOwnIsAlwaysReturned(t *test
 	})
 }
 
-// failingGrantStore fails exactly the store calls the grant makes, one switch each.
+// failingGrantStore fails exactly the store calls the grant and the member read make, one
+// switch each.
 type failingGrantStore struct {
 	routing.Store
 	provisionTargets bool
 	groupAccounts    bool
+	accountGroups    bool
 	accountByID      bool
 	owner            bool
 	vanished         map[string]bool
@@ -511,6 +513,13 @@ func (f *failingGrantStore) ResourceGroupVendorAccounts(ctx context.Context, rgI
 		return nil, errGrantStore
 	}
 	return f.Store.ResourceGroupVendorAccounts(ctx, rgID)
+}
+
+func (f *failingGrantStore) ResourceGroupsByVendorAccount(ctx context.Context, accountID string) ([]routing.ResourceGroup, error) {
+	if f.accountGroups {
+		return nil, errGrantStore
+	}
+	return f.Store.ResourceGroupsByVendorAccount(ctx, accountID)
 }
 
 func (f *failingGrantStore) VendorAccountByID(ctx context.Context, id string) (routing.VendorAccount, error) {

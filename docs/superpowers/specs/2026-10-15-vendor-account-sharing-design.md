@@ -309,6 +309,31 @@ raw secret. `visibleVendorAccountName` is extended so a member/CM sees the share
 name. The DTO field additions **and the CM-facing management read land in phase 2** (the authz +
 management work); only the **member** (RG-reachable) surfacing is phase 3.
 
+**The member view is minimal, built from an allowlist (deny by default).** A member gets what a
+borrower needs to find, understand and request the account: `id`, `vendor`, `auth_type`, `name`,
+`status` (it sees that it cannot use a disabled account), `model_prefix`, `models` (each by
+`gateway_model`, `api_flavor` and `display_name`), the two credential booleans, `is_owner:false` and
+`shared_by`. Everything else is withheld (zero value on the wire, `usage` omitted): `share_level`,
+`admin_groups`, `system_group_id`/`system_group_name` (who manages the account and where it is
+rooted), `base_url` (where the owner's key is sent), `usage` (the owner's rate-limit and spend
+figures), each model's `upstream_model` (the vendor's own id: the member requests the gateway
+name) and the timestamps. One builder (`memberVendorAccountDTO`) renders it for **both** the
+single read (`GetVendorAccount`) and the member-only rows of `ListVendorAccounts`, so the two
+cannot differ; the owner's and the CM's views are unchanged. The viewer tiers are tried widest
+first (owner / system, then CM, then member), so a CM who is also provisioned into the account's
+group reads the management view.
+
+**The member read needs REACH, not the opt-in.** The read gate admits a principal iff it can
+route to the account through the shared arm of the grant (`isMemberOfSharedVendorAccount`: the
+account is `shared`/`full` by its effective level, a subscription account needs subscription
+sharing, and the principal is provisioned into a resource group containing it): the same
+predicate the list's member rows use, so the read and the list agree. The per-token opt-in gates
+*using* an account (resolver, model listing), and reading is how a member finds an account to
+opt into. A principal without a user identity is never a member of the management page, even a
+service provisioned into the group. A stranger, a member of nothing, a paused or lowered account
+and an unlinked account are all the same 404-no-leak; a store error while deciding reach fails
+the read (never a grant).
+
 ## 11. Subscription sharing
 
 Gated by `vendor_subscription_sharing_enabled` (default **off**), meaningful only with

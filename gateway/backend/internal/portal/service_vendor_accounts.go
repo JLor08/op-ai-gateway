@@ -92,6 +92,16 @@ type VendorAccountUsageDTO struct {
 //   - SharedBy is the owner's display name for a viewer who is NOT the owner ("" for
 //     the owner, and when the owner's name cannot be resolved).
 //
+// There are two views of it. The MANAGEMENT view (vendorAccountDTO) is what the owner, a
+// CM and system scope get: every field below. The MEMBER view (memberVendorAccountDTO)
+// is what a principal gets that can only ROUTE to the account through a resource group
+// it is provisioned into: the minimal set a borrower needs (ID, Vendor, AuthType, Name,
+// Status, ModelPrefix, the two credential booleans, Models by gateway name, dialect and
+// display name, IsOwner false and SharedBy) and none of the rest. ShareLevel, AdminGroups,
+// SystemGroupID, SystemGroupName, BaseURL, Usage, each model's UpstreamModel and the two
+// timestamps are withheld from a member and read "" / [] / the zero time on the wire (Usage,
+// which is omitted when nil, is simply absent).
+//
 // ShareLevel is the account's STORED level (none, shared or full; anything the service
 // does not recognise reads as none, as every gate treats it). With the master sharing
 // flag off every account behaves personal but nothing stored is touched, so the DTO
@@ -110,10 +120,11 @@ type VendorAccountUsageDTO struct {
 // default root, or the one the user typed); "" for openai and anthropic, whose
 // hosts are fixed. It is immutable and always on the wire.
 //
-// Usage is the rate-limit snapshot. The two read endpoints fill it -- the detail
-// view's Usage & Limits panel (GetVendorAccount) and the list
+// Usage is the rate-limit snapshot. The two read endpoints fill it for a management
+// viewer -- the detail view's Usage & Limits panel (GetVendorAccount) and the list
 // (ListVendorAccounts, so the dashboard's provider usage section reads every
-// account's usage in one call); the write endpoints leave it nil. It is also nil
+// account's usage in one call); the write endpoints leave it nil, and so does the
+// member view (the owner's rate-limit and spend figures are not a borrower's). It is also nil
 // for an account the gateway has not yet seen a rate-limit header for, and the
 // list leaves it nil for a row whose snapshot read failed (fail-soft). A nil
 // Usage is omitted from the JSON. The list's per-row snapshot read is bounded and
@@ -199,18 +210,9 @@ type UpdateVendorAccountRequest struct {
 // is (see VendorAccountDTO); principal decides only IsOwner and SharedBy, so a CM's
 // answer to any call that returns an account says is_owner false, not the owner's.
 func (s *Service) vendorAccountDTO(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (VendorAccountDTO, error) {
-	rows, err := s.routes.VendorAccountModels(ctx, acc.ID)
+	models, err := s.vendorAccountModelDTOs(ctx, acc.ID, false)
 	if err != nil {
 		return VendorAccountDTO{}, err
-	}
-	models := make([]VendorAccountModelDTO, 0, len(rows))
-	for _, row := range rows {
-		models = append(models, VendorAccountModelDTO{
-			GatewayModel:  row.GatewayModel,
-			UpstreamModel: row.UpstreamModel,
-			APIFlavor:     row.APIFlavor,
-			DisplayName:   row.DisplayName,
-		})
 	}
 	adminGroups, err := s.vendorAccountAdminGroupRefs(ctx, acc)
 	if err != nil {
@@ -240,6 +242,77 @@ func (s *Service) vendorAccountDTO(ctx context.Context, principal auth.Token, ac
 		SystemGroupName:       s.vendorAccountSystemGroupName(ctx, acc),
 		IsOwner:               owner,
 		SharedBy:              sharedBy,
+	}, nil
+}
+
+// vendorAccountModelDTOs reads the model rows the account serves as their portal view,
+// always a non-nil slice (it serializes as [], never null). A member's view
+// (forMember) names each model by its gateway name, dialect and display name and
+// withholds the vendor's own model id (UpstreamModel): the borrower requests the
+// gateway name, and the mapping behind it is the account's own business.
+func (s *Service) vendorAccountModelDTOs(ctx context.Context, accountID string, forMember bool) ([]VendorAccountModelDTO, error) {
+	rows, err := s.routes.VendorAccountModels(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]VendorAccountModelDTO, 0, len(rows))
+	for _, row := range rows {
+		model := VendorAccountModelDTO{
+			GatewayModel: row.GatewayModel,
+			APIFlavor:    row.APIFlavor,
+			DisplayName:  row.DisplayName,
+		}
+		if !forMember {
+			model.UpstreamModel = row.UpstreamModel
+		}
+		models = append(models, model)
+	}
+	return models, nil
+}
+
+// memberVendorAccountDTO maps a stored account to the MINIMAL view a MEMBER gets (spec
+// 2026-10-15 section 10): a principal that can route to the account through a resource
+// group but neither owns nor manages it. It is the single source of that view, used by
+// the single-account read (GetVendorAccount) and by the member-only rows of the list
+// (ListVendorAccounts), so the two cannot differ.
+//
+// The view is built FROM NOTHING, field by field, and never by blanking a management
+// DTO: a field added to VendorAccountDTO later is withheld from a member until someone
+// adds it here on purpose (the member allowlist test in the portal package pins the
+// set). It holds what a borrower needs to find, understand and request the account:
+//
+//   - ID, Vendor, AuthType, Name: which account it is;
+//   - Status: whether it works right now (a member of a disabled account sees that it
+//     cannot use it);
+//   - ModelPrefix and Models (gateway name, dialect and display name): what to request;
+//   - APIKeySet / SubscriptionConnected: the credential BOOLEANS and never the
+//     credential (the sealed key and token set are not copied, only their presence);
+//   - IsOwner (always false: an owner is never rendered here) and SharedBy (the
+//     owner's display name, best effort).
+//
+// Everything else is withheld, as zero values (AdminGroups as a non-nil empty slice so
+// it serializes as []): ShareLevel (how the owner delegated management), AdminGroups,
+// SystemGroupID and SystemGroupName (who manages it and where it is rooted), BaseURL
+// (where the owner's key is sent), Usage (the owner's rate-limit and spend snapshot),
+// each model's UpstreamModel, and the timestamps. When in doubt a field is left out.
+func (s *Service) memberVendorAccountDTO(ctx context.Context, acc routing.VendorAccount) (VendorAccountDTO, error) {
+	models, err := s.vendorAccountModelDTOs(ctx, acc.ID, true)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	return VendorAccountDTO{
+		ID:                    acc.ID,
+		Vendor:                acc.Vendor,
+		AuthType:              acc.AuthType,
+		Name:                  acc.Name,
+		Status:                acc.Status,
+		ModelPrefix:           acc.ModelPrefix,
+		APIKeySet:             acc.APIKey != "",
+		SubscriptionConnected: acc.OAuthTokens != "",
+		Models:                models,
+		AdminGroups:           []GroupRefDTO{},
+		IsOwner:               false,
+		SharedBy:              s.vendorAccountOwnerName(ctx, acc),
 	}, nil
 }
 
@@ -437,43 +510,123 @@ func (s *Service) loadVendorAccount(ctx context.Context, id string) (routing.Ven
 	return acc, nil
 }
 
+// vendorAccountViewer is the tier a principal reads an account at, which decides the
+// DTO it is rendered as (spec 2026-10-15 section 10): the owner, a CM and system scope
+// read the management view (vendorAccountDTO: every field, the owner's own marked
+// is_owner, still no secret), a member reads the MINIMAL view (memberVendorAccountDTO).
+// The zero value is the principal who may not read the account at all, so a caller that
+// ignores the gate's error is handed no view rather than the widest one (deny by default).
+type vendorAccountViewer int
+
+const (
+	// vendorViewerNone may not read the account (always returned with an error).
+	vendorViewerNone vendorAccountViewer = iota
+	// vendorViewerManagement is the owner, a CM of a shared or full account, or system
+	// scope: the widest view the principal qualifies for, the DTO's management fields
+	// filled.
+	vendorViewerManagement
+	// vendorViewerMember reaches the account ONLY through a resource group it is
+	// provisioned into: it can route to the account but does not own or manage it, and
+	// sees what a borrower needs and nothing of the management of the account.
+	vendorViewerMember
+)
+
 // authorizeVendorAccountRead loads the account and returns ErrVendorAccountNotFound
-// unless the principal may READ it (spec 2026-10-15 section 6, the "Read" row):
+// unless the principal may READ it (spec 2026-10-15 section 6, the "Read" row), with the
+// tier it reads it at:
 //
-//   - the owner, at every level;
+//   - the owner, at every level (management view);
 //   - a CM of the account while it is `shared` or `full` by its EFFECTIVE level
 //     (effectiveVendorAccountShareLevel: the stored level while the master sharing
-//     flag is on, `none` while it is off, so a paused account has no CM read);
-//   - system scope, at every level, so an operator can inspect any account's metadata.
+//     flag is on, `none` while it is off, so a paused account has no CM read)
+//     (management view);
+//   - system scope, at every level, so an operator can inspect any account's metadata
+//     (management view);
+//   - a MEMBER, a principal that can route to the account through a resource group it
+//     is provisioned into (isMemberOfSharedVendorAccount): the shared arm of the routing
+//     grant, so the account is `shared` or `full` by its effective level and the
+//     principal is provisioned into a group that contains it (member view).
 //
-// Everyone else is a stranger, and an unknown id and a stranger's account are
-// indistinguishable (404-no-leak): a plain admin who is not the owner and not a CM is
-// a stranger too, and so is a co-manager without can_manage_vendor_accounts.
+// The tiers are tried widest first, so a principal who is several of them is rendered
+// at the widest (a CM who is also provisioned into the account's group reads the
+// management view). Everyone else is a stranger, and an unknown id and a stranger's
+// account are indistinguishable (404-no-leak): a plain admin who is not the owner, a CM
+// or a member is a stranger too, and so is a co-manager without
+// can_manage_vendor_accounts.
+//
+// A member's read needs REACH, not the per-token opt-in: the opt-in gates USING an
+// account (the resolver and the model listing), and reading is how a member finds an
+// account to opt into. It is as live as the grant: the level, the resource-group link
+// and the provisioning are read on every call.
 //
 // A read is KEY-FREE for every viewer but the owner's own: the DTO a read answers with
 // carries only the credential booleans whoever asks (see VendorAccountDTO), so
-// widening this gate widens nobody's reach to the secret. Writes are a different
-// matter and use authorizeVendorAccountOperate or authorizeVendorAccountCredential
-// (the PATCH picks between them per field, authorizeVendorAccountPatch; every
-// credential method, the delete and the share-level lower use the latter); system
-// scope's read does not extend to them. The member read (an account reached through a
-// resource group) is not here: it lands with the routing grant.
-func (s *Service) authorizeVendorAccountRead(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, error) {
+// widening this gate widens nobody's reach to the secret, and the member view is
+// narrower still. Writes are a different matter and use authorizeVendorAccountOperate
+// or authorizeVendorAccountCredential (the PATCH picks between them per field,
+// authorizeVendorAccountPatch; every credential method, the delete and the share-level
+// lower use the latter); neither system scope's read nor a member's extends to them.
+func (s *Service) authorizeVendorAccountRead(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, vendorAccountViewer, error) {
 	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
-		return routing.VendorAccount{}, err
+		return routing.VendorAccount{}, vendorViewerNone, err
 	}
 	if isVendorAccountOwner(principal, acc) || isSystem(principal) {
-		return acc, nil
+		return acc, vendorViewerManagement, nil
 	}
 	managed, err := s.isManagerOfSharedVendorAccount(ctx, principal, acc)
 	if err != nil {
-		return routing.VendorAccount{}, err
+		return routing.VendorAccount{}, vendorViewerNone, err
 	}
 	if managed {
-		return acc, nil
+		return acc, vendorViewerManagement, nil
 	}
-	return routing.VendorAccount{}, ErrVendorAccountNotFound
+	member, err := s.isMemberOfSharedVendorAccount(ctx, principal, acc)
+	if err != nil {
+		return routing.VendorAccount{}, vendorViewerNone, err
+	}
+	if member {
+		return acc, vendorViewerMember, nil
+	}
+	return routing.VendorAccount{}, vendorViewerNone, ErrVendorAccountNotFound
+}
+
+// isMemberOfSharedVendorAccount reports whether principal can ROUTE to acc through a
+// resource group: the single-account form of the shared arm of the routing grant
+// (sharedVendorAccountsForRouting), so the member read and the list's member rows
+// cannot disagree. acc must pass the grant's live predicate (vendorAccountSharedRoutable:
+// `shared` or `full` by its effective level, and a subscription account needs
+// subscription sharing) AND be linked to a resource group the principal is provisioned
+// into (provisionedRGsForPrincipal). The predicate is asked first, so a link that
+// outlives its level (a torn downgrade, a paused master flag) grants nothing and costs
+// no group lookup, and an account in no group costs no provisioning lookup.
+//
+// The management page is a personal one (ListVendorAccounts lists nothing for a
+// principal without a user identity), so a principal without one is never a member
+// here, even a service provisioned into the group: a service USES a shared account
+// through its tokens, it does not browse the portal. A store error is returned, never
+// read as a grant.
+func (s *Service) isMemberOfSharedVendorAccount(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (bool, error) {
+	if principal.UserID == "" || !s.vendorAccountSharedRoutable(ctx, acc, s.VendorSubscriptionSharingEnabled(ctx)) {
+		return false, nil
+	}
+	linked, err := s.routes.ResourceGroupsByVendorAccount(ctx, acc.ID)
+	if err != nil {
+		return false, err
+	}
+	if len(linked) == 0 {
+		return false, nil
+	}
+	provisioned, err := s.provisionedRGsForPrincipal(ctx, principal)
+	if err != nil {
+		return false, err
+	}
+	for _, rg := range linked {
+		if provisioned[rg.ID] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // isManagerOfSharedVendorAccount reports whether principal is a CM of acc AND acc is
@@ -816,32 +969,48 @@ func (s *Service) memberVendorAccounts(ctx context.Context, principal auth.Token
 }
 
 // listedVendorAccounts is the account set of the management list for principal given
-// the accounts they own (id-sorted by the store): own, oldest first, then (for a
-// non-system principal) the accounts they MANAGE and the accounts they can ROUTE to as
-// a member, each arm oldest first, no account twice (an account is listed in the first
-// arm that holds it: own, then managed, then member). System scope does not widen the
-// list: the page is a personal one, and the union is the non-system one.
-func (s *Service) listedVendorAccounts(ctx context.Context, principal auth.Token, own []routing.VendorAccount) ([]routing.VendorAccount, error) {
+// the accounts they own (id-sorted by the store), in two parts because they are rendered
+// as two different views: managementView holds the accounts the principal OWNS (oldest
+// first) and then (for a non-system principal) the ones they MANAGE; memberOnly holds the
+// accounts they can ROUTE to as a member and neither own nor manage. Each arm is oldest
+// first and no account is in both or twice (an account is listed in the first arm that
+// holds it: own, then managed, then member), so a CM who is also provisioned into a
+// managed account's group keeps the management view of it. System scope does not widen
+// the list: the page is a personal one, and the union is the non-system one.
+func (s *Service) listedVendorAccounts(ctx context.Context, principal auth.Token, own []routing.VendorAccount) (managementView, memberOnly []routing.VendorAccount, err error) {
 	sortVendorAccountsOldestFirst(own)
 	if isSystem(principal) {
-		return own, nil
+		return own, nil, nil
 	}
 	managed, err := s.managedVendorAccounts(ctx, principal, own)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	listed := slices.Concat(own, managed)
-	member, err := s.memberVendorAccounts(ctx, principal, listed)
+	managementView = slices.Concat(own, managed)
+	memberOnly, err = s.memberVendorAccounts(ctx, principal, managementView)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return slices.Concat(listed, member), nil
+	return managementView, memberOnly, nil
+}
+
+// vendorAccountListUsage is the usage snapshot that decorates a management row of the
+// list. It only decorates: a failed read yields nil (the row renders without a usage
+// panel) rather than failing the whole Providers list. GetVendorAccount, the detail
+// read, surfaces the error.
+func (s *Service) vendorAccountListUsage(ctx context.Context, accountID string) *VendorAccountUsageDTO {
+	usage, err := s.vendorAccountUsageDTO(ctx, accountID)
+	if err != nil {
+		slog.Debug("vendor accounts list: usage snapshot unavailable, listing the account without it",
+			"account_id", accountID, "err", err)
+		return nil
+	}
+	return usage
 }
 
 // ListVendorAccounts returns the accounts the calling principal OWNS, oldest first,
 // then (for a non-system principal) the accounts they MANAGE and the accounts they can
-// ROUTE to as a member, each arm oldest first, each with its rate-limit usage snapshot
-// when one exists (see VendorAccountDTO). Like every vendor-account method it is
+// ROUTE to as a member, each arm oldest first. Like every vendor-account method it is
 // refused with ErrVendorAccountsDisabled (before anything else) while the
 // vendor_accounts_enabled master flag is off.
 //
@@ -851,11 +1020,18 @@ func (s *Service) listedVendorAccounts(ctx context.Context, principal auth.Token
 // vendor accounts through) and a member sees every account they can route
 // (memberVendorAccounts), both filtered on the EFFECTIVE share level, so with the
 // master sharing flag off the list is the principal's own accounts and nothing else.
-// An account is listed once, in the first arm that holds it. A managed or member row
-// is rendered for the principal like a CM's read of it: is_owner false, shared_by the
-// owner's name, and no credential material (the DTO carries only the booleans, whoever
-// the viewer is). It is a wider set than the one the model listing advertises and is
-// never used for routing.
+// An account is listed once, in the first arm that holds it. It is a wider set than the
+// one the model listing advertises and is never used for routing.
+//
+// The rows are rendered FOR the principal, in the view its relation to the account
+// earns, the same view GetVendorAccount gives (spec section 10):
+//
+//   - an own or managed row is the management view (vendorAccountDTO), with its
+//     rate-limit usage snapshot when one exists (see VendorAccountDTO). A managed row is
+//     is_owner false, shared_by the owner's name, and no credential material (the DTO
+//     carries only the booleans, whoever the viewer is);
+//   - a member-only row is the MINIMAL view (memberVendorAccountDTO): a member sees what
+//     it needs to use the account and none of the management fields, usage or secrets.
 //
 // System scope does not widen the list: the page is a personal one, a system principal
 // reads any account by id but lists only their own, and the management union is the
@@ -872,42 +1048,57 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 	if err != nil {
 		return VendorAccountListResponse{}, err
 	}
-	accounts, err := s.listedVendorAccounts(ctx, principal, own)
+	managementView, memberOnly, err := s.listedVendorAccounts(ctx, principal, own)
 	if err != nil {
 		return VendorAccountListResponse{}, err
 	}
-	for _, acc := range accounts {
+	for _, acc := range managementView {
 		dto, err := s.vendorAccountDTO(ctx, principal, acc)
 		if err != nil {
 			return VendorAccountListResponse{}, err
 		}
-		// The snapshot only decorates the row: a failed read leaves Usage nil
-		// (the row renders without a usage panel) rather than failing the whole
-		// Providers list. GetVendorAccount, the detail read, surfaces the error.
-		if dto.Usage, err = s.vendorAccountUsageDTO(ctx, acc.ID); err != nil {
-			slog.Debug("vendor accounts list: usage snapshot unavailable, listing the account without it",
-				"account_id", acc.ID, "err", err)
-			dto.Usage = nil
+		dto.Usage = s.vendorAccountListUsage(ctx, acc.ID)
+		out = append(out, dto)
+	}
+	for _, acc := range memberOnly {
+		dto, err := s.memberVendorAccountDTO(ctx, acc)
+		if err != nil {
+			return VendorAccountListResponse{}, err
 		}
 		out = append(out, dto)
 	}
 	return VendorAccountListResponse{Data: out}, nil
 }
 
-// GetVendorAccount returns one account the principal may read: their own, one they
-// manage as a CM while it is shared or full (a KEY-FREE management read: is_owner
-// false, shared_by the owner's name, the booleans and never the secret), or any
-// account for system scope; anyone else gets ErrVendorAccountNotFound (404-no-leak),
-// see authorizeVendorAccountRead. It carries the account's rate-limit usage snapshot
-// (Usage; nil until one has been scraped) and, unlike the list, fails when that
-// snapshot cannot be read. ErrVendorAccountsDisabled while the master flag is off.
+// GetVendorAccount returns one account the principal may read, in the view its relation
+// to the account earns (see authorizeVendorAccountRead and VendorAccountDTO):
+//
+//   - their own, one they manage as a CM while it is shared or full (a KEY-FREE
+//     management read: is_owner false, shared_by the owner's name, the booleans and
+//     never the secret), or any account for system scope: the management view, which
+//     carries the account's rate-limit usage snapshot (Usage; nil until one has been
+//     scraped) and, unlike the list, fails when that snapshot cannot be read;
+//   - one they can route to through a resource group they are provisioned into (a
+//     MEMBER): the minimal key-free view (memberVendorAccountDTO), without the
+//     management fields and without usage, which is not even read.
+//
+// Anyone else gets ErrVendorAccountNotFound (404-no-leak).
+// ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) GetVendorAccount(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	acc, err := s.authorizeVendorAccountRead(ctx, principal, id)
+	acc, viewer, err := s.authorizeVendorAccountRead(ctx, principal, id)
 	if err != nil {
 		return VendorAccountDTO{}, err
+	}
+	if viewer == vendorViewerMember {
+		return s.memberVendorAccountDTO(ctx, acc)
+	}
+	if viewer != vendorViewerManagement {
+		// The gate never answers a nil error with a denied viewer; if it ever did,
+		// the answer is still no view at all, not the widest one.
+		return VendorAccountDTO{}, ErrVendorAccountNotFound
 	}
 	dto, err := s.vendorAccountDTO(ctx, principal, acc)
 	if err != nil {
