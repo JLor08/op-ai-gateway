@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-// Vendor accounts ("Anbieter") system settings. Five keys, all ordinary
+// Vendor accounts ("Anbieter") system settings. Six keys, all ordinary
 // system-settings rows read through the settings store at request time:
 //
 //   - vendor_accounts_enabled is the MASTER flag, a module-enable switch like
@@ -29,6 +29,11 @@ import (
 //     sharing is a new capability, so an unreadable or unset value never enables
 //     it and it stays off until a system admin switches it on. This file only
 //     persists and reads it.
+//   - vendor_subscription_sharing_enabled gates whether SUBSCRIPTION-type vendor
+//     accounts may be shared at all (the subscription path is ToS-restricted); it
+//     is meaningful only with vendor_account_sharing_enabled on. It is OFF by
+//     default (opt-in, fail-closed), like the master sharing switch. This file only
+//     persists and reads it.
 //   - vendor_account_routing_mode is the routing precedence between a caller's
 //     own vendor accounts and the self-hosted/shared routes. The resolver
 //     consults it; this file only persists, validates and exposes it.
@@ -38,6 +43,7 @@ const (
 	vendorAccountsEnabledKey             = "vendor_accounts_enabled"
 	vendorSubscriptionsEnabledKey        = "vendor_subscriptions_enabled"
 	vendorAccountSharingEnabledKey       = "vendor_account_sharing_enabled"
+	vendorSubscriptionSharingEnabledKey  = "vendor_subscription_sharing_enabled"
 	vendorAccountRoutingModeKey          = "vendor_account_routing_mode"
 	vendorOpenAICodexClientVersionKey    = "vendor_openai_codex_client_version"
 	maxVendorOpenAICodexClientVersionLen = 64
@@ -130,6 +136,24 @@ func VendorSubscriptionsEnabled(values map[string]string) bool {
 // enabled deliberately.
 func VendorAccountSharingEnabled(values map[string]string) bool {
 	raw, ok := values[vendorAccountSharingEnabledKey]
+	if !ok {
+		return false
+	}
+	v, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return v
+}
+
+// VendorSubscriptionSharingEnabled interprets the vendor_subscription_sharing_enabled
+// switch (whether subscription-type vendor accounts may be shared). Defaults to
+// FALSE (opt-in) when absent, blank, or unparseable, so only an explicit true
+// switches subscription sharing on. Like VendorAccountSharingEnabled, and the
+// opposite default of VendorSubscriptionsEnabled: the subscription path is
+// ToS-restricted, so sharing it must be enabled deliberately.
+func VendorSubscriptionSharingEnabled(values map[string]string) bool {
+	raw, ok := values[vendorSubscriptionSharingEnabledKey]
 	if !ok {
 		return false
 	}
@@ -238,6 +262,24 @@ func (s *Service) VendorAccountSharingEnabled(ctx context.Context) bool {
 		return false
 	}
 	return VendorAccountSharingEnabled(values)
+}
+
+// VendorSubscriptionSharingEnabled reports whether subscription-type vendor
+// accounts may be shared. Like the other switches it is read from the settings
+// store on every call (the gateway reads it through a short-TTL cache that a
+// settings PUT invalidates). It is opt-IN: a service with no settings store, or a
+// store that cannot be read, reports FALSE (fail closed), so a transient read
+// failure never enables subscription sharing that an admin has not switched on.
+// It only narrows the master sharing switch; this accessor does not consult it.
+func (s *Service) VendorSubscriptionSharingEnabled(ctx context.Context) bool {
+	if s.settings == nil {
+		return false
+	}
+	values, err := s.settings.SystemSettings(ctx)
+	if err != nil {
+		return false
+	}
+	return VendorSubscriptionSharingEnabled(values)
 }
 
 // VendorAccountRoutingMode is the effective vendor_account_routing_mode, the

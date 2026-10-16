@@ -2508,6 +2508,12 @@ func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
 	return _d.API.VendorAccountsEnabled(ctx)
 }
 
+func (_d *APIWithTracing) VendorSubscriptionSharingEnabled(ctx context.Context) (b1 bool) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorSubscriptionSharingEnabled")
+	defer span.End()
+	return _d.API.VendorSubscriptionSharingEnabled(ctx)
+}
+
 func (_d *APIWithTracing) VendorSubscriptionsEnabled(ctx context.Context) (b1 bool) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorSubscriptionsEnabled")
 	defer span.End()

@@ -245,6 +245,7 @@ type API interface {
 	VendorAccountRoutingMode(context.Context) string
 	VendorAccountSharingEnabled(context.Context) bool
 	VendorAccountsEnabled(context.Context) bool
+	VendorSubscriptionSharingEnabled(context.Context) bool
 	VendorSubscriptionsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	VisionProbeMode(context.Context) string

@@ -644,11 +644,12 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"BeginVendorAccountDeviceConnect": "credential",
 		"PollVendorAccountDeviceConnect":  "credential",
 		// Switch and setting readers: they touch no account.
-		"VendorAccountsEnabled":          "setting",
-		"VendorAccountSharingEnabled":    "setting",
-		"VendorAccountRoutingMode":       "setting",
-		"VendorSubscriptionsEnabled":     "setting",
-		"VendorOpenAICodexClientVersion": "setting",
+		"VendorAccountsEnabled":            "setting",
+		"VendorAccountSharingEnabled":      "setting",
+		"VendorSubscriptionSharingEnabled": "setting",
+		"VendorAccountRoutingMode":         "setting",
+		"VendorSubscriptionsEnabled":       "setting",
+		"VendorOpenAICodexClientVersion":   "setting",
 		// The injection point of the dispatch-time token refresher: wiring, no account.
 		"SetVendorTokenRefresher": "wiring",
 	}

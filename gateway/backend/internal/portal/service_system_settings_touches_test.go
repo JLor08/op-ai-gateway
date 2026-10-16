@@ -40,6 +40,7 @@ var nonReconcileFields = []string{
 	"VendorAccountsEnabled",
 	"VendorSubscriptionsEnabled",
 	"VendorAccountSharingEnabled",
+	"VendorSubscriptionSharingEnabled",
 	"VendorAccountRoutingMode",
 	"VendorOpenAICodexClientVersion",
 	"AnthropicPromptCachingEnabled",
