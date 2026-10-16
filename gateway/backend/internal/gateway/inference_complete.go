@@ -985,6 +985,12 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, errImageEditTooLarge) {
 		message = fmt.Sprintf("the image edit is too large for this model's server: its request limit is %d MiB, counted after the mask and model are prepared", agentRouterMaxBodyBytes>>20)
 	}
+	if errors.Is(err, errTranscriptionUnavailable) {
+		message = "transcription is not available on this model's server: its agent has not declared the " + multipartProxyFeature + " feature. The agent is older than 0.9.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported"
+	}
+	if errors.Is(err, errTranscriptionTooLarge) {
+		message = fmt.Sprintf("the transcription is too large for this model's server: its request limit is %d MiB, counted after the model name is prepared", agentRouterMaxBodyBytes>>20)
+	}
 	return apierror.Response(code, message, "")
 }
 
@@ -1031,6 +1037,16 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, errImageEditTooLarge) {
 		return http.StatusRequestEntityTooLarge
 	}
+	// A transcription's agent target cannot take one (errTranscriptionUnavailable):
+	// 404 for the reasons the image edit's twin gives, and a transcription whose
+	// prepared body is past the agent's own request limit (errTranscriptionTooLarge)
+	// is the same 413 the client's own oversized body gets.
+	if errors.Is(err, errTranscriptionUnavailable) {
+		return http.StatusNotFound
+	}
+	if errors.Is(err, errTranscriptionTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
 	if errors.Is(err, routing.ErrNoHealthyHost) {
 		return http.StatusServiceUnavailable
 	}
@@ -1046,6 +1062,10 @@ func completionErrorCode(err error) string {
 	case errors.Is(err, errImageEditUnavailable):
 		return codeImageEditUnavailable
 	case errors.Is(err, errImageEditTooLarge):
+		return codeRequestBodyTooLarge
+	case errors.Is(err, errTranscriptionUnavailable):
+		return codeTranscriptionUnavailable
+	case errors.Is(err, errTranscriptionTooLarge):
 		return codeRequestBodyTooLarge
 	case errors.Is(err, routing.ErrNoHealthyHost):
 		return routing.ErrNoHealthyHost.Error()

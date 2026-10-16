@@ -73,11 +73,13 @@ const RuntimeUpstreamPropsFeature = "runtime_upstream_props"
 
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
-// route an image EDIT (POST /v1/images/edits, which is multipart) to the child
+// route an image EDIT (POST /v1/images/edits, which is multipart) or an audio
+// TRANSCRIPTION (POST /v1/audio/transcriptions, also multipart) to the child
 // it keys on that model. It is on the agent's list only, not on
 // gatewayAgentFeatures, and the GATEWAY gates real behavior on it, fail-closed:
-// an edit is relayed to an agent target only on positive evidence the agent
-// declared it (imageEditTargetServed). Trying the route instead cannot work. A
+// an edit or a transcription is relayed to an agent target only on positive
+// evidence the agent declared it (imageEditTargetServed,
+// transcriptionTargetServed). Trying the route instead cannot work. A
 // router without the multipart branch json-unmarshals the body to find the
 // model, fails, and answers 404 runtime.model_not_managed -- the same status and
 // code it answers an unmanaged model with -- so a request relayed to it is known
