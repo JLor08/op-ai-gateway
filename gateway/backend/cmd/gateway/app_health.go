@@ -468,8 +468,9 @@ func (r *appHealthRunner) applyCapabilityWrite(ctx context.Context, mp routing.M
 // the rows a probe of this loop determined for one mapping, after asking
 // routing.WritableCapabilityRows which of them may be written. Every probe
 // source this loop reads goes through it -- the /props probe
-// (applyCapabilityWrite) and the stable-diffusion.cpp capability document
-// (sdcppCapabilityRows) -- so the guards below hold for each without being
+// (applyCapabilityWrite), the stable-diffusion.cpp capability document
+// (sdcppCapabilityRows) and the audio.cpp model listing
+// (audioCppCapabilityRows) -- so the guards below hold for each without being
 // restated per source.
 //
 // Structurally identical to writeBackRuntimeCapabilities in
@@ -588,6 +589,33 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 	}}
 }
 
+// audioCppCapabilityRows projects what one audio.cpp /v1/models listing says
+// about ONE model onto the store's row shape: a single routing.CapabilitySpeech
+// row attributed to routing.CapabilitySourceAudioCppModels and stamped at, when
+// the listing answered yes or no, and no row at all otherwise -- "unknown" is
+// the absence of a row, exactly as in sdcppCapabilityRows. Pure: no I/O.
+//
+// The empty verdict is the case this guards. provider.AudioCppVerdicts answers
+// "" for everything the listing does not say -- the model is not in it
+// (/v1/models names LOADED models only), the listing is empty or unreadable, or
+// the entry carries no task -- and none of those is a statement that the model
+// cannot speak. A written "no" can switch a model's speech route off, so an
+// unknown verdict must never become one.
+//
+// A "no" is a real verdict where it IS stated: the listing names the loaded
+// model's task, so a model present with a non-synthesis task (asr, music) is
+// authoritatively not a speech model, which is what entitles this source, like
+// sdcpp's, to establish its capability's no.
+func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing.CapabilityRow {
+	if v.Speech != routing.CapabilityYes && v.Speech != routing.CapabilityNo {
+		return nil
+	}
+	return []routing.CapabilityRow{{
+		Capability: routing.CapabilitySpeech, Verdict: v.Speech,
+		Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at,
+	}}
+}
+
 // probeSdcppCapabilities is the stable_diffusion_cpp branch of the probe pass
 // for ONE application: it reads the sd-server's own capability document and
 // writes the image verdict it derives onto the application's active mappings.
@@ -677,6 +705,91 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 			"app_id", app.ID, "model_stem", v.ModelStem, "image", v.Image)
 	}
 	return !matched
+}
+
+// probeAudioCppModels is the audio_cpp branch of the probe pass for ONE
+// server_agent application: for each active mapping whose runtime kind is
+// routing.RuntimeSpecTypeAudioCpp it reads audio.cpp's own /v1/models listing,
+// derives the speech verdict that listing states for the mapping's model, and
+// writes it (audioCppCapabilityRows through writeCapabilityRows, so the
+// precedence and change-detection guards hold exactly as for the other probe
+// sources).
+//
+// THE KIND GATE is the mapping's runtime spec: routing.EffectiveRuntimeSpecType
+// of the spec, its explicit type or the one detected from its binary. A mapping
+// with no spec, or a spec of another kind, is never asked about -- a speech
+// verdict for a chat model would be meaningless, and a written "no" for one
+// would be wrong. Specs can only exist on a server_agent application (the
+// portal refuses a write on any other type), which is why the caller offers
+// this branch that type alone: it spares every other application a store round
+// trip per cadence tick for specs it cannot have.
+//
+// The model id handed to the prober is the mapping's AppModelName, the name the
+// upstream is addressed by and so the id audio.cpp lists the model under. The
+// listing is per SERVER, but the verdict is per MODEL, so each mapping is its
+// own probe (one small GET per audio_cpp mapping per cadence tick).
+//
+// The target and the auth context are built as the context-probe branch builds
+// them for a server_agent application: the credential is per MAPPING
+// (routing.SpecUpstreamAuth off the mapping's own spec, whose default is the
+// application's token), sealed in the store and opened here, fail-open.
+//
+// A failed probe (unreachable, a non-2xx, a 401/403) states nothing, so it
+// writes nothing and the next cadence tick asks again; an unknown verdict ("",
+// including a model the listing does not name) writes nothing either -- see
+// audioCppCapabilityRows. Unlike probeSdcppCapabilities there is no unlanded
+// signal to hand back: the mappings are read from the store, not discovered by
+// the probe, so there is no mapping a verdict could be waiting for.
+func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.AudioCppModelsProber) {
+	specs, err := r.store.RuntimeSpecsByApplication(ctx, app.ID)
+	if err != nil {
+		// Without the specs no mapping's runtime kind is known, and guessing
+		// could write a "no" for a mapping that is not an audio.cpp one.
+		log.Printf("app health: runtime specs for app %s failed: %v (audio.cpp probe skipped)", app.ID, err)
+		return
+	}
+	specByMapping := map[string]routing.RuntimeSpec{}
+	for _, sp := range specs {
+		if routing.EffectiveRuntimeSpecType(sp) == routing.RuntimeSpecTypeAudioCpp {
+			specByMapping[sp.MappingID] = sp
+		}
+	}
+	if len(specByMapping) == 0 {
+		return // no audio_cpp mapping on this application: no mapping read, nothing to ask
+	}
+	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
+	if err != nil {
+		log.Printf("app health: mappings for app %s failed: %v", app.ID, err)
+		return
+	}
+	target := routing.Target{
+		Provider: app.Type,
+		Endpoint: routing.ApplicationEndpoint(server, app),
+		Timeout:  r.probeTimeout,
+	}
+	for _, mp := range mappings {
+		spec, isAudioCpp := specByMapping[mp.ID]
+		if !isAudioCpp || mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
+			continue
+		}
+		specToken, header := routing.SpecUpstreamAuth(spec, app)
+		token, _ := capture.OpenSecret(r.cipher, specToken)
+		mctx := provider.WithUpstreamAuth(ctx, header, token)
+		v, err := prober.ProbeAudioCppModels(mctx, target, mp.AppModelName)
+		if err != nil {
+			if errors.Is(err, provider.ErrAuthRejected) {
+				// Like the context probe: a 401/403 here is a MISCONFIGURED
+				// token, not "cannot determine" -- the gateway holds the
+				// credential. It repeats each failing cycle by design; it is
+				// the operator signal and stops when the token is fixed.
+				log.Printf("app health: audio.cpp models probe for app %s model %q rejected by the upstream (401/403): check the runtime spec's API token", app.ID, mp.AppModelName)
+			} else {
+				slog.Debug("app health: audio.cpp models probe failed", "app_id", app.ID, "model", mp.AppModelName, "error", err)
+			}
+			continue
+		}
+		r.writeCapabilityRows(ctx, mp, audioCppCapabilityRows(v, r.now()))
+	}
 }
 
 // cacheSdcppImageOptions reads the image options of one external
@@ -1178,6 +1291,50 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						unstampMu.Unlock()
 					}
 				}(app, key)
+			}
+		}
+
+		// audio.cpp capability pass: for every active server_agent application,
+		// read the running audio.cpp server's own /v1/models listing for each
+		// of its audio_cpp mappings and write the speech verdict that listing
+		// states (probeAudioCppModels). A separate branch from the context
+		// probe for the same reason as the sdcpp one: audio_cpp has no
+		// context probe path (routing.DeriveProbePaths), and the listing is
+		// not a ModelInfo. It shares the application's cadence and wg+sem,
+		// under its own "audiocpp:"+id key, seen-marked for every such app so
+		// the cleanup keeps its last-probe time.
+		//
+		// Offered to server_agent applications only: a mapping's runtime kind
+		// is its runtime spec's, specs exist only on that type, and an
+		// application of any other type has no spec to name a kind -- so asking
+		// it would cost a store read per tick for nothing. The spec read and
+		// the kind gate are the probe's own (probeAudioCppModels).
+		//
+		// No unstamp-on-miss, unlike the sdcpp pass: it asks about mappings
+		// that already exist, so no verdict can arrive before its mapping.
+		if acProber, ok := r.prober.(provider.AudioCppModelsProber); ok {
+			for i := range active {
+				app := active[i]
+				if app.Type != routing.ProviderServerAgent {
+					continue
+				}
+				key := "audiocpp:" + app.ID
+				state.seen[key] = true
+				eff := routing.EffectiveHealthCheckIntervalSeconds(app, cfg.systemSeconds, portal.MinHealthCheckIntervalSeconds, portal.MaxHealthCheckIntervalSeconds)
+				if eff < nextSeconds {
+					nextSeconds = eff
+				}
+				if last, ok := state.lastProbed[key]; ok && cfg.tNow.Sub(last) < time.Duration(eff)*time.Second {
+					continue
+				}
+				state.lastProbed[key] = cfg.tNow
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(app routing.Application) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					r.probeAudioCppModels(ctx, server, app, acProber)
+				}(app)
 			}
 		}
 	}

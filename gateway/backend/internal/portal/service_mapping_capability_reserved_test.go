@@ -68,6 +68,11 @@ func TestMappingCapabilityVerdictReservedPairsAreRefused(t *testing.T) {
 			want: ErrMappingCapabilityReserved,
 		},
 		{
+			name: "a manual no on speech -- would permanently veto the audio.cpp probe",
+			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilitySpeech: routing.CapabilityNo}},
+			want: ErrMappingCapabilityReserved,
+		},
+		{
 			// The name is trimmed BEFORE the reservation is consulted, or the
 			// refusal would be one space away from being bypassed.
 			name: "a padded reserved pair is still reserved",

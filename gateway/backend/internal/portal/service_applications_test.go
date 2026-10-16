@@ -3890,6 +3890,28 @@ func TestImageNoIsAReservedManualVerdict(t *testing.T) {
 	}
 }
 
+// (speech, no) is reserved for the same reason (image, no) is. A manual row is
+// rank 3 and outranks every automated source, and nothing re-derives it, so a
+// manual `no` would permanently veto the audio.cpp /v1/models probe
+// (audiocpp_models) -- the writer entitled to establish it, because a loaded
+// model's `task` is authoritative -- against a genuinely capable model. The
+// cost to the operator is nil: an ABSENT row already refuses a speech request.
+func TestSpeechNoIsAReservedManualVerdict(t *testing.T) {
+	if !reservedManualVerdict(routing.CapabilitySpeech, routing.CapabilityNo) {
+		t.Error("(speech, no) must be reserved")
+	}
+	// yes stays writable: it is the operator's override of the probe, and the
+	// enablement path where no probe verdict exists (an audio.cpp model that is
+	// not loaded, so the listing does not name it).
+	if reservedManualVerdict(routing.CapabilitySpeech, routing.CapabilityYes) {
+		t.Error("(speech, yes) must stay writable: it is the operator's override of the audiocpp_models probe and the enablement path for a model that is not loaded")
+	}
+	// The reset is never refused, for any pair.
+	if reservedManualVerdict(routing.CapabilitySpeech, "") {
+		t.Error("the reset must never be refused")
+	}
+}
+
 // TestNormalizeFlavorsAcceptsImagesAndKeepsEmptyDefault guards the change's
 // migration safety. The empty-list default must stay exactly
 // [openai, anthropic]: if it ever gained openai_images, every existing

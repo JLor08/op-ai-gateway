@@ -317,6 +317,17 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// sd-server child that has never run, so nothing has read its document
 	// yet, or one whose agent predates the source and so never reports it.
 	routing.CapabilityImage: {routing.CapabilityNo: true},
+	// routing.CapabilitySpeech + CapabilityNo is reserved for the same reason
+	// and on the same terms as (image, no): an absent row already refuses a
+	// speech request, so "cannot synthesise speech" costs the operator nothing to
+	// leave unsaid, while a manual no is rank 3 and would outrank forever the
+	// writer entitled to establish it -- the gateway health loop's read of
+	// audio.cpp's own /v1/models listing (routing.CapabilitySourceAudioCppModels),
+	// whose per-model task is authoritative for a loaded model, so its no is real.
+	// (speech, yes) stays writable: it is the operator's override of that probe
+	// and the enablement path for a model the listing does not name, which is
+	// every model that is not currently loaded.
+	routing.CapabilitySpeech: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 
