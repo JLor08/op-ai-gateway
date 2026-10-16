@@ -273,6 +273,58 @@ func TestPreflightRedirectsACapabilityCarryingRequestOnlyToACapableCandidate(t *
 	}
 }
 
+// TestSpeechInferenceShapeIsTheSpeechEndpointsIdentity pins the shape
+// handleOpenAISpeech hands the ONE preflight gate, through the function the
+// handler itself calls (speechInferenceShape): the exact coarse flavor (never a
+// fine variant: upstreamPath matches it by string equality), the speech
+// endpoint, and the speech capability. The capability list is load-bearing
+// twice -- it feeds the capability gate, and it is what keeps a speech request
+// off the vendor-account path, which names only the images flavor (see
+// TestVendorAccountSkippedForSpeech in internal/routing) -- so a handler that
+// forgot it would both skip the gate and become routable to a vendor model of
+// the same name.
+func TestSpeechInferenceShapeIsTheSpeechEndpointsIdentity(t *testing.T) {
+	shape := speechInferenceShape("tts-voice")
+	if shape.apiFlavor != "openai_audio" {
+		t.Fatalf("apiFlavor = %q, want exactly openai_audio", shape.apiFlavor)
+	}
+	if shape.endpoint != endpointSpeech {
+		t.Fatalf("endpoint = %d, want endpointSpeech (%d)", shape.endpoint, endpointSpeech)
+	}
+	if shape.model != "tts-voice" || shape.stream {
+		t.Fatalf("model/stream = %q/%v, want the routing model and a non-stream request", shape.model, shape.stream)
+	}
+	if !reflect.DeepEqual(shape.requiredCapabilities, []string{routing.CapabilitySpeech}) {
+		t.Fatalf("requiredCapabilities = %v, want [%s]", shape.requiredCapabilities, routing.CapabilitySpeech)
+	}
+}
+
+// TestPreflightRedirectsASpeechRequestOnlyToACapableCandidate is the images
+// redirect test's speech twin: the preflight asks the offering for the speech
+// flavor and capability, takes only a candidate carrying it, and the request it
+// produces carries the flavor and the capability list on to Resolve.
+func TestPreflightRedirectsASpeechRequestOnlyToACapableCandidate(t *testing.T) {
+	fp := &fakeOfferingPortal{off: offeringWithIncapable([]string{"voice-model"}, []string{"text-model"})}
+	s := &Server{Portal: fp}
+	token := auth.Token{UnknownModelRedirect: true, LastUsedModel: "text-model", UnknownModelFallback: "voice-model"}
+	pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil, speechInferenceShape("totally-unknown"))
+	if handled {
+		t.Fatal("preflight refused the request")
+	}
+	if pf.Req.Model != "voice-model" {
+		t.Fatalf("effective model = %q, want voice-model (text-model lacks the capability)", pf.Req.Model)
+	}
+	if fp.flavor != routing.APIFlavorOpenAIAudio {
+		t.Fatalf("offering asked for flavor %q, want %q", fp.flavor, routing.APIFlavorOpenAIAudio)
+	}
+	if len(fp.required) != 1 || fp.required[0] != routing.CapabilitySpeech {
+		t.Fatalf("offering asked for capabilities %v, want [%s]", fp.required, routing.CapabilitySpeech)
+	}
+	if pf.Req.APIFlavor != apiFlavorSpeech || !reflect.DeepEqual(pf.Req.RequiredCapabilities, []string{routing.CapabilitySpeech}) {
+		t.Fatalf("preflight request = flavor %q, capabilities %v, want %q and [%s]", pf.Req.APIFlavor, pf.Req.RequiredCapabilities, apiFlavorSpeech, routing.CapabilitySpeech)
+	}
+}
+
 // aliasTargetCall is one ClaudeAliasTarget call a fakeAliasPortal saw.
 type aliasTargetCall struct {
 	token     auth.Token

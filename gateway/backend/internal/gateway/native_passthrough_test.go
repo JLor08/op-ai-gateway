@@ -761,21 +761,6 @@ func TestUpstreamPathSpeechFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 	}
 }
 
-// TestApiFlavorSpeechIsTheRoutingAudioFlavor pins the local alias to the coarse
-// routing flavor it mirrors, so the two cannot drift apart: candidacy,
-// targetServesFlavor and the usage label all key on this exact string.
-func TestApiFlavorSpeechIsTheRoutingAudioFlavor(t *testing.T) {
-	// Both sides are untyped constants; routing them through variables keeps
-	// go vet from flagging the (intentional) constant comparison.
-	alias, routingFlavor := apiFlavorSpeech, routing.APIFlavorOpenAIAudio
-	if alias != "openai_audio" || alias != routingFlavor {
-		t.Fatalf("apiFlavorSpeech = %q, want %q (routing.APIFlavorOpenAIAudio = %q)", alias, "openai_audio", routingFlavor)
-	}
-	if got := routing.NormalizeAPIFlavor(alias); got != alias {
-		t.Fatalf("NormalizeAPIFlavor(%q) = %q, want it to fold to itself", alias, got)
-	}
-}
-
 // TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath pins the translate
 // path of the vendor-account provider kinds: a vendor_anthropic target is
 // served by the native Anthropic client at /v1/messages (not the chat-completions

@@ -31,16 +31,6 @@ import (
 // capability gate's job, keyed on inference.Request.RequiredCapabilities.
 const apiFlavorImages = "openai_images"
 
-// apiFlavorSpeech is the speech endpoint's (/v1/audio/speech) flavor string,
-// the same local alias for the coarse routing.APIFlavorOpenAIAudio that
-// apiFlavorImages is for routing.APIFlavorOpenAIImages: NormalizeAPIFlavor
-// folds it to itself, so it filters candidacy, labels usage rows and answers
-// upstreamPath. It sits beside apiFlavorImages because speech mirrors the images
-// endpoint (a single-purpose flavor with no EndpointMode and no translate path),
-// and what it cannot express -- whether a MODEL can synthesize speech -- is the
-// capability gate's job, keyed on routing.CapabilitySpeech.
-const apiFlavorSpeech = "openai_audio"
-
 // billingUnitFor returns usage.BillingUnitImage when apiFlavor identifies an
 // images request and usage.BillingUnitTokens (the zero value) otherwise. The
 // name is deliberately NOT "imagesBillingUnit": proxyNative's three shared
