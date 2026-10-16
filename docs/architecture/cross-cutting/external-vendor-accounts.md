@@ -47,24 +47,33 @@ Messages client, an OpenAI Responses translate client and a native Gemini
 for an OpenAI subscription and for an OpenRouter or Kilo api key, an active usage
 pull with its own refresh endpoint (§5),
 and a discovery of each account's real model catalog from the vendor, served under
-an optional per-account prefix (§6). Which of a user's accounts each API token may
-use is the token's own, strictly opt-in decision, with an optional per-token
-prefix override (§11).
+an optional per-account prefix (§6). An account is **personal** by default, and its
+owner, if an admin, may **share** it through the management-group and
+resource-group machinery AI servers use, at a tiered share level (§1.1), with a
+routing eligibility that is a **pure grant** and deliberately not the server rule
+(§4.6); who may do what to a shared account is authorization by level (§8). Which of
+the accounts a principal can reach each API token may use is the token's own,
+strictly opt-in decision, per account and always by name for a shared one, with an
+optional per-token prefix override (§11,
+[ADR-060](../09-architecture-decisions.md#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in)).
 
 ## 1. The entity and its ownership
 
-A `vendor_account` is **personal**: owned by the connecting user and usable only
-for that user's own requests: the owner's interactive portal session, and the
-owner's own API tokens **that have been opted in to it** (§11; a token reaches no
-account until the owner grants it). Sharing
-an account across users via resource groups is deliberately deferred to a later
-phase; the entity and ownership model are shaped so that becomes additive (a
-sharing link table plus a resolver filter extension), not a rewrite.
+A `vendor_account` is owned by exactly one user and is **personal** by default
+(`share_level = none`): usable only for that user's own requests, the owner's
+interactive portal session and the owner's own API tokens **that have been opted in
+to it** (§11; a token reaches no account until the owner grants it). The owner, if an
+admin, may **share** it (§1.1): it is then also usable by the principals, users and
+services, provisioned into a resource group that contains it, and manageable by the
+co-managers of the management groups it is assigned to, at the share level's reach.
+Sharing is the second phase of ADR-049, built as that ADR shaped it (a link table plus
+a resolver filter extension, not a rewrite), and sits behind its own default-off
+master switch (§7).
 
 | Field | Meaning |
 |---|---|
 | `id` | `va_`-prefixed, random hex. |
-| `owner_user_id` | FK → `users(id)` `on delete cascade`. The one principal the account serves. |
+| `owner_user_id` | FK → `users(id)` `on delete cascade`. The single owner, by design (§1.3): the one principal a personal account serves, and the only one who can raise it. |
 | `vendor` | `openai` \| `anthropic` (`routing.VendorOpenAI` / `VendorAnthropic`) \| `xai` \| `openrouter` \| `kilo` \| `google` \| `google_native` \| `openai_compatible` (`routing.VendorXAI` / `VendorOpenRouter` / `VendorKilo` / `VendorGoogle` / `VendorGoogleNative` / `VendorOpenAICompatible`; the last is the Custom endpoint). The six newer ids are the **preset** vendors (`routing.IsPresetVendor`): five are the OpenAI-compatible vendors (§4.4; `routing.IsOpenAICompatibleVendor`, a preset whose `Dialect` is empty), and `google_native` is the native Gemini one (§4.5; `routing.IsNativeGeminiVendor`, `Dialect == "gemini"`), distinct from the shim `google`. Immutable after creation. |
 | `auth_type` | `api_key` \| `subscription` (`routing.VendorAuthAPIKey` / `VendorAuthSubscription`). Immutable after creation. |
 | `name` | User-facing label. |
@@ -72,6 +81,8 @@ sharing link table plus a resolver filter extension), not a rewrite.
 | `api_key` | **Sealed** (`enc:`/`plain:`), populated only when `auth_type = api_key`. |
 | `oauth_tokens` | **Sealed** JSON token set, populated only when `auth_type = subscription`. |
 | `model_prefix` | Optional per-account namespace for the account's model ids (migration 83; `''` = none). The service trims it and accepts at most 64 bytes from `A-Z a-z 0-9 - _ . ~ : / @ +` (the URL-path-safe characters of a model id) with no `..`, anything else being `400 vendor_account.model_prefix_invalid`. It is **applied**, not merely stored: every model the account serves is advertised and requested as the prefix plus the vendor's own id, while the vendor is still sent the bare id (§6.5). The DTO reports it and the create/update requests accept it. |
+| `share_level` | `none` \| `shared` \| `full` (`routing.VendorShareLevelNone` / `VendorShareLevelShared` / `VendorShareLevelFull`; migration 91, `text not null default 'none'`, so every account that predates sharing is personal with no data step). Changed only by the share-level lifecycle (§1.3), never by the full-row update or the create, which both leave it at its column default. A level the service does not recognise reads as `none`, fail closed. See §1.1. |
+| `system_group_id` | The **containment root** of a shared account (migration 91; opaque, no foreign key like `ai_servers.system_group_id`; `''` until the account is first raised): the one system group its management groups and its linked resource groups must sit under (§1.2). |
 | `base_url` | The upstream **root** URL of a preset account, OpenAI-compatible or native Gemini (migration 86; `''` for the bespoke `openai` / `anthropic` accounts, whose hosts are fixed). Stored as a root **without** `/v1` or any other path prefix: the client appends the preset's prefix and the resource (`{prefix}/chat/completions`, `{prefix}/models`; §4.4), or, for native Gemini, its own `/v1beta/models/{model}:generateContent` (§4.5). Defaulted from the preset at create (required for `openai_compatible`), https only with no userinfo, query or fragment, and **immutable** after creation: it is absent from the update request. The DTO always carries it. |
 
 At most one of `api_key` / `oauth_tokens` is populated per row — a subscription
@@ -89,14 +100,107 @@ have no seed and are filled by discovery alone), and is **replaced
 by the vendor's real list** once discovery has run (§6). The three tables and the
 `usage_events.account_id` attribution column are migration 82; migration 84 later
 adds the spend-control columns to the usage snapshot (§5.2), and migration 86 the
-immutable `base_url` of a preset account (OpenAI-compatible or native Gemini); see
+immutable `base_url` of a preset account (OpenAI-compatible or native Gemini);
+migrations 90 to 92 add the share model (§1.1): the sixth co-manager flag, the
+`share_level` and `system_group_id` columns with the `vendor_account_admin_groups`
+table, and the `resource_group_vendor_accounts` link table; see
 [Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).
 
 The domain type is `routing.VendorAccount`, stored across all three drivers
 (memory / SQLite / PostgreSQL) through the usual `routing.Store` composition; the
 portal view is `portal.VendorAccountDTO`, which carries **no** credential material
 — the sealed key and token set are reduced to the `api_key_set` /
-`subscription_connected` booleans ([Secrets at rest](#9-secrets-at-rest)).
+`subscription_connected` booleans ([Secrets at rest](#9-secrets-at-rest)), whoever
+the viewer is. It is rendered **for the viewer** and gains the share fields
+(`share_level`, `admin_groups`, `system_group_id` / `system_group_name`, `is_owner`,
+`shared_by`); a **member** of a shared account gets a separate, minimal allowlist
+view (§8.2).
+
+### 1.1 Share levels
+
+`vendor_accounts.share_level` is an enum, not a boolean: three named states read
+better than two flags, and the level decides how much a co-manager (CM) may do
+(§8). It is `text`, like the table's other free-text enums (`auth_type`, `status`).
+
+| Level | Meaning |
+|---|---|
+| `none` | A **personal** account: the default, and what every account is until its owner raises it. Never in anyone else's pool. A management-group or resource-group link that somehow survives at `none` grants nothing, because every gate and listing reads the level live. |
+| `shared` | The account enters the server-like model: it is assigned to management groups and linked into resource groups. A CM may **operate** it (status, model prefix, rename, test connection, model refresh, usage refresh); the credential, the management-group and resource-group assignment, the delete and the lowering stay owner-only. A principal provisioned into a linked resource group may route to it once its token opts in (§4.6, §11). |
+| `full` | **Complete owner-equivalent delegation**: a CM may do everything the owner can, the credential, the group and resource-group assignment, the delete and the lowering, except **raise** the level. The owner's control is structural (they own the record and chose the level, and can always lower it) and not an operation reserved at `full`. A subscription account can never be `full` (§10). |
+
+The full authorization matrix is §8.1. With the sharing master switch off (§7) the
+**effective** level of every account is `none`: a pause, not an un-share.
+
+### 1.2 Management groups, the containment root and resource-group links
+
+Management and assignment **mirror AI servers**, with the vendor-account twin of each
+piece, and routing eligibility does **not** (§4.6):
+
+- **Management groups** (`vendor_account_admin_groups`, at least one while the account
+  is shared): the admin-tier groups whose owners and co-managers manage the account. A
+  CM is an owner or co-manager of one of them who holds the sixth co-manager
+  permission `can_manage_vendor_accounts` (migration 90, a one-line wrapper
+  `vendorAccountManageGroupIDs` over the predicate its five siblings use; default
+  `true`, so no existing co-manager is narrowed).
+- **The containment root** (`system_group_id`): like a server, a shared account's
+  management groups share one parent system group, which becomes its root. It is set at
+  the first raise from `none` and is **immutable while the account stays shared or
+  full**; only a downgrade to `none` clears it. An account and a resource group link
+  only when their roots match (`vendorAccountRootMatches` fails closed on an empty
+  root). The edge: an FK cascade may delete the last `vendor_account_admin_groups` row
+  while the account stays shared with a non-empty root. The account then has zero
+  management groups, remains owner-manageable and lowerable, and re-adding a
+  management group must match the retained root (or a downgrade to `none` resets it).
+- **Resource-group links** (`resource_group_vendor_accounts`): the groups whose
+  provisioned principals can route to the account. There are two paths that write the
+  same single row, mirroring `resource_group_servers`: the **owner's self-service**
+  (join and leave a group the owner is a member of an admin group of, at `shared` or
+  `full`, on `.../vendor-accounts/{id}/resource-groups`) and the **resource-group
+  manager's side** (a manager with `can_manage_resources` adds an account to the group
+  on `PUT /resource-groups/{id}/vendor-accounts`, additionally needing to operate the
+  account, the account to be `full`, and the roots to match; removal needs only the
+  group). A link makes an account **offerable**; it never makes it **usable** by
+  itself (§4.6).
+
+### 1.3 Raise, lower and the owner-delete consequence
+
+- **Raise** (`none` to `shared` to `full`): the **owner**, who must be an admin right
+  now (the token carries the admin scope **and** the user's current role is `admin` or
+  `system_admin`), on an owned account, carrying **at least one** management group
+  (which establishes the root). A subscription account may be raised to `shared` only
+  and only while `vendor_subscription_sharing_enabled` is on (§10). The writes are
+  ordered **root, then groups, then the level last**, so every failure leaves the
+  account private or unchanged and never half-shared: until the level moves, every gate
+  and listing reads the account as `none`, so a link or a root left behind by a failed
+  raise grants nothing and is overwritten by the retry.
+- **Lower**: the **credential gate's** shape: the owner at every level (ownership alone,
+  so an owner can un-share even after losing the admin role) and a CM at `full` only. It
+  never looks at the subscription flag: an account can always be un-shared. Lowering to
+  `none` is `ClearVendorAccountSharing`, **one transaction** that sets the level to
+  `none` **first**, then deletes every management-group link and every resource-group
+  link, then clears the root, so even a torn write leaves the account owner-only. It
+  always runs, even for an account that already reads `none`, so it is idempotent and
+  also scrubs a leftover link. `full` to `shared` changes only the level (the groups,
+  the root and the links stay). A downgrade takes effect on the next resolve, because
+  the grant re-reads the live level (§4.6).
+- **Memory-store cascades.** Deleting an account drops its management-group links by a
+  single-key delete and its resource-group links by a **reverse-direction loop over
+  every group** (the map is keyed group to account, like `resource_group_servers`); a
+  resource-group delete drops its own entry; the conformance suite asserts both on all
+  three drivers. As with `server_admin_groups`, a user-group delete cascades
+  `vendor_account_admin_groups` on the SQL drivers only and leaves a dangling entry in
+  memory mode, which is harmless because routing is keyed on the resource-group link and
+  the live level, never on management-group membership.
+- **The owner-delete consequence.** `vendor_accounts.owner_user_id` stays
+  `not null … on delete cascade`, a single owner, so deleting the owning user's row
+  hard-deletes every account they own, including a `full`, org-shared one, and revokes
+  every borrower, with **no ownership-transfer path** (servers use the many-to-many
+  `server_owners` to survive one owner's removal; a credential deliberately has exactly
+  one owner). The portal has no user-delete operation today (a user is disabled, not
+  deleted), so this is a property of the schema that a direct database delete or a
+  future feature would trigger, and the owner's own account delete does the same on
+  purpose. An ownership-transfer operation is a named follow-up
+  ([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 ## 2. The two auth types
 
@@ -126,7 +230,8 @@ is off a subscription account cannot be created or connected, and an existing on
 kept but neither routed nor listed, whereas an `api_key` account is never affected. An
 operator can therefore keep the documented API-key path and shut the experimental,
 ToS-restricted one off without turning the whole module off. (It is an
-operator-wide switch, not account sharing, which stays deferred, §1.)
+operator-wide switch and has nothing to do with account sharing, which has its own
+switches, §7.)
 
 ## 3. Connect flows (`internal/vendorauth`)
 
@@ -139,7 +244,9 @@ overridable `Endpoints` struct, so a live operator (or a unit test against an
 flow code. `vendorauth` may import `capture` (for sealing) and nothing from
 `provider`, `portal` or `routing`.
 
-Three connect methods exist. All are owner-only and gated in `portal.Service` by the
+Three connect methods exist. All run the **credential gate** (§8: the owner, or a CM
+of a `full` account; a subscription account is shared at most at `shared`, so in
+practice the owner) and are gated in `portal.Service` by the
 `vendor_accounts_enabled` master flag and, as the last check, the
 `vendor_subscriptions_enabled` switch (a refused connect is
 `409 vendor_accounts.subscriptions_disabled`, §7), and a successful
@@ -356,12 +463,16 @@ account's stored credential (an API key, or the access token of the sealed token
 set), runs the same probe and returns `VendorConnectionCheck`:
 `{status: "valid" | "invalid" | "unverifiable", detail, checked_at}`
 ([API Surface](../reference/api-surface.md#vendor-accounts-anbieter)). It has no
-request body and changes nothing — it does not even refresh a token. It is
-**strictly owner-only, system scope included**, because it sends the owner's
-sealed credential to the vendor from the gateway: letting anyone else trigger it
-would turn that credential into a live-or-dead oracle. A non-owner gets the same
-`404 vendor_account.not_found` as for an unknown id; a disabled module answers
-`409`. A missing credential (no API key set, subscription not connected) and an
+request body and changes nothing — it does not even refresh a token. It is an
+**operate** call (§8): the owner, or a CM of a `shared` or `full` account, and
+**never system scope alone**, because it sends the owner's sealed credential to the
+vendor from the gateway: letting an arbitrary caller trigger it would turn that
+credential into a live-or-dead oracle, and a CM is the one non-owner the owner has
+delegated that to. On a **subscription** account it is **owner-only even at
+`shared`**, because it opens the single-use OAuth token set (§8.1). A stranger gets the
+same `404 vendor_account.not_found` as for an unknown id, a CM of a subscription
+account `403 vendor_account.forbidden`; a disabled module answers `409`. The verdict's
+`detail` is scrubbed of the credential for every caller. A missing credential (no API key set, subscription not connected) and an
 expired-but-refreshable token report `unverifiable` with an explanatory `detail`;
 a stored credential that cannot be opened (a lost or never-configured cipher key,
 a corrupt blob, a blob sealed under another key) is an error,
@@ -393,14 +504,17 @@ either is a one-line change in `constants.go`.
 A connected account becomes a routable candidate **without touching the hot
 scoring path, the multiplexer, or the `Target` core** beyond a small, additive
 dispatch extension. The resolver (`internal/routing/resolver.go`) gains a
-vendor-account candidate source consulted for a resolve carrying a known **user**
-principal: it enumerates the principal's **own** active accounts, keeps only those the
-principal's **token** may use (§11), and builds a `Target` directly for the
-**first** such account that has a `vendor_account_models` row whose public name
-under the token's effective prefix equals the requested model. Owner-scope is
-intrinsic — only the principal's accounts are enumerated — so one user's account
-can never serve another user's request. Precedence against
-self-hosted/shared routes is configurable (§7).
+vendor-account candidate source consulted for a resolve carrying a known **principal**,
+a user or a service token with a service id: it enumerates the accounts the principal
+may route to, its **own** accounts first and then the accounts another user **shared**
+into a resource group the principal is provisioned into (the grant, §4.6), keeps only
+those the principal's **token** may use (§11), and builds a `Target` directly for the
+**first** such active account that has a `vendor_account_models` row whose public name
+under the token's effective prefix equals the requested model. Reach is intrinsic —
+only accounts the grant lets the principal reach are enumerated — so a personal account
+can never serve another principal's request, and a shared one only a principal
+provisioned into one of its groups whose token named it. Precedence against
+self-hosted routes is configurable (§7).
 
 The match is on the **model name only**: the requested name must equal the
 **effective prefix plus the row's `upstream_model`**. For an all-access token or an
@@ -426,8 +540,9 @@ matrix:
 | **Google (native) api-key** (`google_native`) | the `openai` **and** `anthropic` dialects, **translate only** | `Target.Provider = vendor_gemini`, `APIFlavors = [openai, anthropic]`, both endpoint modes left zero: whichever dialect the caller used is translated through the neutral model to Gemini's `POST {root}/v1beta/models/{model}:generateContent` (`:streamGenerateContent?alt=sse` when streaming), authenticated with `x-goog-api-key` (§4.5). **No exception**, as for the OpenAI-compatible accounts: there is no passthrough yet (the inbound Gemini endpoint is #204). |
 
 The vendor branch is **skipped entirely** — the request falls through to the
-self-hosted/shared path — when the module flag is off, the principal has no user
-id (a **service token**), a **server-override** is set, the request is
+self-hosted path — when the module flag is off, the principal has **no identity the
+grant can be asked about** (neither a user id nor, for a service token, a service id),
+a **server-override** is set, the request is
 **capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image), or the
 flavor is **images** (`openai_images`). That the resolver and the listing overlay
 agree on what each account serves is what makes the "served-flavors parity"
@@ -440,9 +555,10 @@ self-hosted mapping, or `routing.no_model_route`), and the listing overlay appli
 identical skip (§6.7), so the two move together and parity holds in both states. An
 `api_key` account is untouched.
 
-A user token the owner has **not** opted in does not skip the branch: it runs, but
-`TokenVendorPrefix` denies every account (§11.2), so it enumerates nothing and the
-request falls through to the self-hosted/shared path all the same.
+A token that has **not** been opted in does not skip the branch: it runs, enumerates
+the accounts the principal can reach, and `TokenVendorPrefix` denies every one of them
+(§11.2), so it matches nothing and the request falls through to the self-hosted path
+all the same.
 
 `Target` carries four vendor fields, all empty/false for an ordinary AI-server
 target:
@@ -614,8 +730,10 @@ upstream call's context through `upstreamAuthCtxWithHeaders`, fed by
   is billed, or that the account's plan does not include, is sent exactly as the
   client names it, and whether it is accepted is Anthropic's to decide, its answer
   being relayed as-is. This is the intended behavior of an open list, not a
-  defect. The exposure is bounded by the account being personal (§1): the clients
-  are its owner's own tokens and portal chat.
+  defect. The exposure is bounded by who can reach the account: while it is personal
+  (§1) the clients are its owner's own tokens and portal chat, and once it is shared
+  (§1.1) they also include every borrowing token that named it (§11), so a share is a
+  grant to spend the owner's account on any beta the vendor will accept.
 - **`anthropic-version` stays pinned.** The client's own `anthropic-version` is
   **not** forwarded; `ProxyNative` sends the gateway's `2023-06-01` (the
   subscription target repeats the same value in its `ExtraHeaders`). The version
@@ -936,7 +1054,7 @@ Bearer key: `xai` (x.ai, Grok), `openrouter`, `kilo` (the Kilo Gateway), `google
 (Gemini through Google's OpenAI-compatible shim) and `openai_compatible` (Custom:
 any OpenAI-compatible endpoint the user addresses). They are ordinary per-user
 vendor accounts, so ownership, the per-token opt-in (§11), the model prefix (§6.5),
-the master flag (§7) and the owner-scope RBAC (§8) apply unchanged, but they are
+the master flag (§7) and the authorization by share level (§8) apply unchanged, but they are
 **presets over the one OpenAI client** rather than clients of their own
 ([ADR-052](../09-architecture-decisions.md#adr-052--openai-compatible-vendors-are-presets-over-one-openai-client-a-stored-root-url-plus-a-registry-derived-path-prefix)).
 
@@ -1040,7 +1158,7 @@ The vendor id `google_native` reaches Gemini through Google's own `generateConte
 wire rather than the OpenAI shim of §4.4
 ([ADR-054](../09-architecture-decisions.md#adr-054--native-google-gemini-dialect-its-own-vendor-id-and-provider-kind-selected-by-the-preset-dialect-field-over-a-leaf-translation-package)).
 It is an ordinary per-user vendor account (ownership, the per-token opt-in §11, the
-model prefix §6.5, the master flag §7, owner-scope RBAC §8 all apply) and a preset
+model prefix §6.5, the master flag §7, authorization by share level §8 all apply) and a preset
 of the same registry, so it is api-key only and carries an immutable stored root
 (default `https://generativelanguage.googleapis.com`, https only, an optional owner
 override under the same trust model as §4.4). It differs from the shim `google`
@@ -1138,6 +1256,94 @@ Gemini endpoint where a Gemini-shaped client connects, is #204 and reuses
 `geminiwire` and the client's `ProxyNative`. Broad translate fidelity, meaning the
 features the neutral model cannot carry (structured output, safety settings, non-image
 media, fine thinking control), is #208.
+
+### 4.6 Routing to a shared account: the pure grant
+
+A shared account reaches other principals through **one grant**,
+`VendorAccountsForRouting(principal)`
+(`internal/portal/service_vendor_sharing_grant.go`), which the resolver, the model
+listings and the save-time check of a token's opt-in all use, and whose shared arm the
+member read and the list's member rows reuse (`isMemberOfSharedVendorAccount` is its
+single-account form), so what is advertised is what is routable. `internal/routing` cannot import `portal`, so the
+resolver reaches it through the `VendorAccountEnumerator` seam
+(`Resolver.SetVendorAccountEnumerator`), the way it reaches `ProvisioningGate`, with
+the **opposite** nil meaning (below).
+
+**Two enumerators, two purposes.**
+
+| Enumerator | Set | Used for |
+|---|---|---|
+| `VendorAccountsForRouting` (the routing enumerator) | the principal's **own** accounts (every level, id order) **then** the accounts that are live `shared` or `full` **and** linked to a resource group the principal is provisioned into (id order) | routing (`resolveVendorAccount`), the model listings and dashboard rows and the opt-in's save-time check: **parity-bound** (the member read applies the same shared-arm predicate to one account) |
+| the **management union** (`ListVendorAccounts`) | own ∪ the accounts the principal **manages** (`VendorAccountsByAdminGroups` of the groups it manages vendor accounts through, live `shared`/`full`) ∪ the accounts it can **route to as a member**, each listed once in the first arm that holds it | the Anbieter page only, **never routing**. A CM sees an account it manages without being provisioned into it, and a member every account it can route to, a non-active one included, so it sees why it cannot use it |
+
+**The grant is pure, not the server rule.** An account is available to a principal iff
+it is **owned**, or it is (a) `shared` or `full` by its *effective* level (the stored
+level while the sharing master switch is on, `none` while it is off), **read live from
+the row in the same call**, AND (b) linked to a resource group the principal is
+**provisioned into** (`provisionedRGsForPrincipal`: a user matches its user, user-group
+and admin-group provisions, only `member` state counting so an invitation never grants;
+a service matches only a **direct** `ProvisionKindService` provision, since a service is
+in no group). Link existence is necessary, never sufficient: a `none` account with a
+surviving link, a paused account and an account lowered a moment ago grant nothing. A
+subscription account additionally needs `vendor_subscription_sharing_enabled` (link
+creation does not look at that switch, so this is the one place it bites on an
+existing link). A `disabled` **resource group** still grants its linked accounts,
+exactly as it does for `AllowedServerIDs`: the grant reads links and provisions, not
+the group's status.
+
+> **This deliberately diverges from AI servers.** The server gate (`AllowedServerIDs`)
+> is opt-in by default: a server in no provisioned resource group is available to
+> **everyone** (`allowed[id] || !restricted[id]`), and in that default mode it **fails
+> open** on a store error (it leans deny only under `resource_provisioning_enforce`).
+> Copying that for a credential would hand every user the owner's key. The
+> vendor grant reads neither `resource_provisioning_enforce` nor an open-pool branch: a
+> shared account in no group, or in a group nobody is provisioned into, is usable **only
+> by its owner**.
+
+**One fail direction.** The owner's own accounts are **always** returned; only the
+**shared arm** fails closed. A store error while computing the shared candidates denies
+them and still returns the own accounts with no error (logged at Warn), so routing and
+the listing agree even in the error window, unlike `AllowedServerIDs` in its default mode; only a failure to
+read the principal's *own* accounts is reported, and the resolver then fails the request
+as it always has. With the sharing master switch off the shared arm is empty and is not
+even computed.
+
+**An unwired seam is owner-only.** A nil enumerator falls back to
+`VendorAccountsByOwner(token.UserID)`, the principal's own accounts only, **never
+allow-all** (contrast `ProvisioningGate`, whose nil is allow-all): an unwired grant must
+fail closed. The gateway installs the adapter only when a real `portal.API` exists, as a
+genuinely nil seam otherwise, never a non-nil adapter around a nil api.
+
+**Eligibility.** The vendor branch asks the grant only for a principal with an
+identity: `token.UserID != "" || (token.IsService() && token.ServiceID != "")`, which
+the resolver (`vendorPrincipalEligible`) and the listing (`vendorListingPrincipal`)
+keep identical. A principal with neither is denied before any enumerator is consulted,
+and so is a service token whose id is blank. A service owns no account and reaches a
+shared one only through the grant.
+
+**Precedence and parity.** The own block comes first, so the owner's own account wins a
+same-name or same-prefix collision; among shared accounts the first active one by id
+wins. The resolver chooses per **(name, dialect)**, not per name: an account that does
+not serve the requested dialect (an OpenAI subscription for the anthropic dialect) is
+skipped and the request falls through to the next account serving the name. So the
+listing advertises a name under the **union** of the dialects its eligible accounts
+serve it on, each backed by its precedence winner (§6.7): a name is advertised on
+exactly the dialects it is routable on.
+
+**Dispatch is unchanged and owner-agnostic.** It trusts `Target.VendorAccountID`; the
+sealed credential opens only at the dispatch edge, so a borrower never sees it, and the
+resolver is the single routing-time gate.
+
+**Reach is not use, and management is not usage.** The grant decides which accounts a
+principal can *reach*; a token still *uses* only the accounts its policy names (§11),
+and for a shared account always by name. A CM who is not provisioned into a containing
+group can read and operate the account but cannot route through it: to *use* it a CM
+must be provisioned and opted in, like anyone.
+
+**Cost.** The enumerator runs on every routed request that reaches the vendor branch,
+before the token's policy is consulted, and the sharing switches are read from the
+settings store uncached; see [Risks
+§11.1](../11-risks-and-technical-debt.md#111-operational-risks).
 
 ## 5. Usage & limits
 
@@ -1572,9 +1778,13 @@ connected.
 subscription's or an OpenRouter or Kilo api key's usage **without re-listing the
 models**, so the usage panel can keep
 its figures current on its own (`RefreshVendorAccountUsage`,
-`internal/portal/service_vendor_usage_refresh.go`). It is **owner-only, system scope
-included** (it opens the owner's sealed credential and sends it to the vendor, so it
-is authorized like a write, §8), and gated by the master flag.
+`internal/portal/service_vendor_usage_refresh.go`). It is an **operate** call (§8): the
+owner, or a CM of a `shared` or `full` account, never system scope alone (it opens the
+owner's sealed credential and sends it to the vendor, so it is authorized like a
+write), and **owner-only even at `shared` for a subscription account**, because the
+pull renews an expired token first, the lazy on-view pull included (a CM gets
+`403 vendor_account.forbidden` and nothing is renewed or written). It is gated by the
+master flag.
 
 | Call | `maxAge` | Behavior |
 |---|---|---|
@@ -1820,30 +2030,40 @@ resolver, so it needs no cache (§7).
 
 ### 6.7 Where an account's models show up
 
-Every listing reads **one** source, `ownVendorAccountModels`: the principal's
-own **active** vendor accounts and their rows that the principal's **token may
-use** (§11) — each named under the token's effective prefix — behind the master
-flag (and, for a `subscription` account, the `vendor_subscriptions_enabled` switch,
-§7), for a user principal only (a service token owns no account) and fail-open
-per account. (That fail-open is the listing's: for the **generated Claude alias
-derivation** an unreadable account, like a failed owner read, makes the vendor
+Every listing reads **one** source, `ownVendorAccountModels` (the name
+predates sharing; the set is no longer owner-only): the **active** vendor accounts the
+principal can **route to**, its own and then the ones shared with it
+(`VendorAccountsForRouting`, §4.6, the very enumerator the resolver routes by), and
+their rows that the principal's **token may use** (§11) — each named under the token's
+effective prefix — behind the master flag (and, for a `subscription` account, the
+`vendor_subscriptions_enabled` switch, §7), for a principal with an identity (a user,
+or a service token with a service id) and fail-open per account. (That fail-open is the listing's: for the **generated Claude alias
+derivation** an unreadable account, like a failed read of the principal's own accounts, makes the vendor
 set incomplete and yields no generated aliases at all, fail-closed, because its
 vendor-shadow exclusion needs the whole set; see
-[Routing and Model Selection §2.4](routing-and-model-selection.md#24-generated-claude-model-aliases).) The owner's interactive portal session may use all of them, so the
-table below describes what a session sees; an API token sees the subset, and the
-names, its policy grants. What
+[Routing and Model Selection §2.4](routing-and-model-selection.md#24-generated-claude-model-aliases).) The owner's interactive portal session (`all: true`) may use all of its **own**
+accounts, so the table below describes what a session sees of them (never a shared
+account, §11); an API token sees the subset, and the names, its policy grants. A
+shared account the grant lets the principal reach is advertised only to a token whose
+policy names it. A failure of the **shared** arm alone is not an incomplete set: it is
+the routable set, the one the resolver uses in that same window. What
 the listings advertise and what the dashboard shows therefore cannot drift, and a
 vendor model is never subject to the gateway-wide hidden/locked suppression,
 which applies to self-hosted models.
 
-| Surface | Vendor models of the caller's own accounts |
+| Surface | Vendor models of the accounts the caller can route to |
 |---|---|
 | `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models`, `/openai/api/v1/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). A vendor-only model has no `context_size`, so `/v1/models` lists it without `context_length` and `/api/v1/models` with `max_context_length: 0`. |
 | Portal chat picker and a regular user's **Models** page | Listed. |
 | **Dashboard "Live Model Routes"** (`GET /api/portal/dashboard`) | Listed, one row per model: the prefixed name, the vendor as provider, the account's name as host, status `active`. A vendor model has no server, so its row id is the account id plus the model; the portal keys rows by that id because two accounts may share a name and a model. |
 | **Admin Models management** (`ManageModels`, the admin view of the Models page) | **Not listed — deliberately.** It shows the system's real models, and a vendor model is one principal's own, not something an operator manages for the system. |
-| Another user's account, or a disabled / `needs_reconnect` account | Never. |
+| A **personal** account of another user, a shared account the caller is not provisioned into (or one that is paused, lowered or in no resource group), a shared account the caller's token does not name, or a disabled / `needs_reconnect` account | Never. |
 | A `subscription` account while `vendor_subscriptions_enabled` is off | Never on any row above (the account is kept, and listed again once the switch is back on); its `api_key` siblings are unaffected. The listing reads the same switch as the resolver's skip (§4), from one settings read together with the master flag, and the skip also drops the account's models from the generated-alias vendor-shadow set. |
+
+A name several accounts serve is advertised under the **union** of the dialects they
+serve it on (the resolver picks an account per name **and** dialect, §4.6), so a name
+whose first account is openai-only stays advertised, and routable, on the anthropic
+dialect through a later both-dialect account.
 
 The asymmetry is intended and worth stating, because it can read as a bug: an
 admin who connects an account sees its models on their own Dashboard, in the
@@ -1853,7 +2073,7 @@ the id clients request, and carries the refresh button.
 
 ## 7. Feature flag and routing mode
 
-Four system settings govern the feature (all read from the `system_settings`
+Six system settings govern the feature (all read from the `system_settings`
 store). The **resolver** reads the first three (the master flag, the subscriptions
 switch and the routing mode) each through its own cached accessor
 (`vendorEnabledCache`, `vendorSubscriptionsEnabledCache`, `vendorRoutingModeCache`),
@@ -1868,8 +2088,10 @@ reads them uncached, so a PUT is visible on its very next call:
 |---|---|---|---|
 | `vendor_accounts_enabled` | bool | **off** | The **master** flag. When off: the "Anbieter" nav item is hidden, the CRUD/connect/test-connection endpoints answer `409 vendor_accounts.module_disabled`, and the resolver's vendor branch and the model-listing overlay are no-ops. |
 | `vendor_subscriptions_enabled` | bool | **on** (opt-out) | Gates **only** `auth_type = subscription` accounts, strictly narrower than the master flag (it only matters while the module is on, and it never affects an `api_key` account). When off: creating a subscription account and every connect flow answer `409 vendor_accounts.subscriptions_disabled`; existing subscription accounts are **kept** but stop routing and are dropped from every listing (the resolver and the listing move in lock-step, §4, §6.7); the portal Anbieter page flags each one as currently unusable. Default on, and an absent, blank or unparseable value, or an unreadable settings store, reads as **on**. Detail below. |
-| `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between a caller's own vendor accounts and the self-hosted/shared routes. `vendor_first`: an owned account wins when it serves the requested model. `fallback_only`: an owned account is used only when no self-hosted/shared route exists. |
+| `vendor_account_routing_mode` | `vendor_first` \| `fallback_only` | `vendor_first` | Precedence between the vendor accounts a caller can route to (its own and the ones shared with it) and the self-hosted routes. `vendor_first`: a vendor account wins when it serves the requested model. `fallback_only`: a vendor account is used only when no self-hosted route exists. |
 | `vendor_openai_codex_client_version` | version string | `26.930.61225` | The Codex `client_version` the OpenAI **subscription** model discovery sends (§6.6). The ChatGPT backend **hides every model whose `minimal_client_version` exceeds it**, so a stale value silently hides new models: **raise it when OpenAI ships a newer Codex app** (System settings, no redeploy). Blank resets to the built-in default (`vendorauth.CodexModelsClientVersionDefault`); a malformed value is a `400 system.vendor_openai_codex_client_version_invalid`. Read only by `portal.Service` (never the resolver), so it has no cache. VERIFY-LIVE. |
+| `vendor_account_sharing_enabled` | bool | **off** | The **sharing master** switch (opt-in, **fails closed**: an absent, blank or unparseable value, or an unreadable settings store, reads as off). Off: `share_level` is **ignored** by routing, the listings and every gate, so every account behaves personal (its *effective* level is `none`); the share-level, management-group and resource-group endpoints answer `409 vendor_accounts.sharing_disabled`; the Groups UI hides the `can_manage_vendor_accounts` column and the Anbieter page the sharing controls. A **pause, not an un-share**: nothing stored (level, root, links) is touched, so switching it back on honours the stored level again. Meaningful only while `vendor_accounts_enabled` is on (the module flag answers first). |
+| `vendor_subscription_sharing_enabled` | bool | **off** | Whether **subscription** accounts may be shared at all (§10); subordinate to the master switch (the effective condition is the AND of both). Off: *raising* a subscription account answers `409 vendor_accounts.subscription_sharing_disabled`, and an already-shared subscription account stops granting (the grant's live predicate asks it, the one place it bites on an existing link). Lowering is never refused. Fails closed like the master switch. |
 
 **`vendor_subscriptions_enabled` in detail.** It is the one **opt-out** setting of the
 set, the narrowest, and it can only restrict further inside an enabled module. Only an
@@ -1923,12 +2145,33 @@ page is opened (§5.5). "Off" is therefore not "the gateway never contacts the
 vendor's subscription endpoints". An operator who needs that turns the master flag
 off (which blocks those actions too) or deletes the account.
 
-The frontend reads both switches through a portal-scoped
-`GET /api/portal/vendor-accounts/enabled` (`{module_enabled, subscriptions_enabled}`,
-readable by any user even while the module is off — it exists to let the shell show
-or hide the nav item, and the Anbieter page flag inert subscription accounts, without
-granting the system-scoped settings read; it returns only those two booleans),
-mirroring the NetBird/certificates `/enabled` endpoints. The exact-path route wins
+**The two sharing switches in detail.** Both follow the settings plumbing of the
+others (schemaless `system_settings`, a pointer field on the PUT where an omitted or
+`null` value keeps the stored one, an always-present boolean on the GET, invalidation
+on a PUT that carries either key) and both fail **closed**, the opposite of
+`vendor_subscriptions_enabled`: a transient read error never turns sharing on. They are
+read in three places, all through the `portal.Service` accessors
+(`VendorAccountSharingEnabled`, `VendorSubscriptionSharingEnabled`), which hit the
+settings store on **every call, uncached** (a full-table `SELECT`): the sharing guard of
+every share, management-group and resource-group method
+(`requireVendorAccountSharingEnabled`, module flag first, so a disabled module answers
+`vendor_accounts.module_disabled` and not the sharing code), the *effective* level every
+gate and listing reads (`effectiveVendorAccountShareLevel`), and the routing grant
+(§4.6). The gateway also defines 5 s invalidatable caches for the two switches
+(`vendorAccountSharingEnabledCached`, `vendorSubscriptionSharingEnabledCached`, dropped
+by `invalidateVendorSettingsCache` on a PUT that carries either key), but nothing on
+the routing or listing path consults them today, so an operator's toggle takes effect on
+the very next request and each enumeration pays the settings read
+([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+
+The frontend reads the switches through a portal-scoped
+`GET /api/portal/vendor-accounts/enabled` (`{module_enabled, subscriptions_enabled,
+sharing_enabled}`, readable by any user even while the module is off — it exists to let
+the shell show or hide the nav item, the Anbieter page flag inert subscription accounts,
+and the Anbieter page and the resource-group manager hide the sharing controls that
+would answer `409`, without granting the system-scoped settings read; it returns only
+those **three** booleans, so `vendor_subscription_sharing_enabled` is never exposed
+there), mirroring the NetBird/certificates `/enabled` endpoints. The exact-path route wins
 over the `{id}` subtree because account ids are always `va_`-prefixed.
 
 The same master flag gates the **model-listing owner overlay** and the dashboard
@@ -1943,30 +2186,170 @@ that carries the key, but through its **own** gateway-side cache
 (`anthropicPromptCachingEnabledCached`, 5 s), separate from the resolver's
 vendor-settings cache (see *Translate prompt caching* in §4.1).
 
-## 8. Owner-scope RBAC
+## 8. Authorization by share level
 
-The HTTP handlers gate on the standard web scope (`gateway:use`), then per-object
-authorization happens **in `portal.Service`**: a user may read/manage only
-accounts where `owner_user_id` equals the principal, mirroring `authorizeServer`.
-A non-owner gets the **same `404 vendor_account.not_found`** as for a
-non-existent account (the no-existence-leak rule). The `system` scope may **read**
-any account (`GetVendorAccount`), but `ListVendorAccounts` and every **write**
-(create/update/delete/connect) are owner-only — a deliberate read/write
-asymmetry. The **test-connection** action (§3.5), the **model refresh** (§6.3) and
-the **usage refresh** (§5.5) are not writes of the account's credential but are
-owner-only for the `system` scope too, because each sends the stored credential to
-the vendor: they are authorized like a write, not like a metadata read. Routing and
-the model listings (§6.7) enforce the same owner scope by enumerating only the
-principal's own accounts, so one user's account can never serve, or be listed to, another.
+The HTTP handlers gate on the standard web scope (`gateway:use`); per-object
+authorization happens **in `portal.Service`**, by the account's share level (§1.1).
+Three kinds of principal can touch an account:
+
+- the **owner**: `owner_user_id` equals the principal, at every level;
+- a **co-manager (CM)**: an owner or co-manager holding `can_manage_vendor_accounts` of
+  an admin group the account is assigned to (`vendor_account_admin_groups`), while the
+  account is `shared` or `full`. It is the **intersection** of the account's management
+  groups with `vendorAccountManageGroupIDs(principal)`, both read live, so
+  un-assigning the group or demoting the co-manager revokes the reach on the very next
+  call;
+- a **member**: a principal provisioned into a resource group that contains the account.
+  A member may *read* a minimal view (§8.2) and *use* the account once a token opts in
+  (§11); it never operates it.
+
+**System scope stays read-only and never bypasses a write.** It may read any account
+(`GetVendorAccount`, the management view), but it lists only its own, and on an account that is
+not its own, every write and every call that opens or acts on the sealed credential (the
+connection test, the model refresh, the usage refresh) treats it as a stranger: those calls send the owner's
+credential upstream, so they are authorized like a write, not like a metadata read.
+
+### 8.1 The matrix
+
+| Operation | `none` | `shared` | `full` |
+|---|---|---|---|
+| **Read** (key-free DTO) | owner, system scope | owner, CM, member (minimal view), system scope | owner, CM, member (minimal view), system scope |
+| **Use** via a resource group plus a token opt-in | owner | owner, member | owner, member (a CM too, once provisioned and opted in) |
+| **Operate**: status, model prefix, rename, connection test, model refresh, usage refresh | owner | owner, CM (¹) | owner, CM (¹) |
+| **Credential**: connect, reconnect, device connect, import, set or change the api key | owner | owner | owner, CM |
+| **Management-group assignment**; resource-group link | not available | owner | owner, CM |
+| **Delete** | owner | owner | owner, CM |
+| **Raise** (`none` to `shared` to `full`) | owner and admin | owner and admin | nobody (already the top) |
+| **Lower** | not available | owner | owner, CM |
+
+(¹) **Subscription operate-op caveat.** For a **subscription** account the operate
+calls that open the sealed OAuth token set, the **connection test, the model refresh
+and the usage refresh**, are **owner-only even at `shared`**: the two refreshes renew an
+expired access token through the gateway's refresher, which persists the rotated
+**single-use** refresh token (and can trip the account-wide `needs_reconnect`), and a CM
+may not do that to the owner's token (the test only opens the set and renews nothing,
+but it is listed with the other two and the rule covers it). A CM keeps status, model
+prefix and rename on a subscription account. The rule is
+`requireOwnerForSubscriptionOperate`, run **after** the operate gate by every call that
+opens a subscription's token set (a further token-rotating operation joins the rule by
+calling it too); it tests the account's **auth type, not its level**, so it fails
+closed whatever level a stored row claims. An api-key account has no token to rotate:
+the owner and a CM both pass.
+
+So **`full` is complete owner-equivalent delegation**: a CM may do everything the owner
+can, the credential, the group and resource-group assignment, the delete and the
+lowering, except **raise**, which happens at `none` or `shared`, where a CM has no
+management reach. The owner's control is structural: they own the record, chose the
+level and can always lower it.
+
+Notes on how the matrix is enforced:
+
+- **Two denials, on purpose.** An operation the caller may not perform is answered
+  `404 vendor_account.not_found` when the caller has no business knowing the account
+  exists (a stranger, system scope on a write, a co-manager without the flag, a principal
+  with no user identity, an account whose level was lowered or whose sharing is paused:
+  indistinguishable from an unknown id, the no-existence-leak rule), and
+  `403 vendor_account.forbidden` when the caller **can already see** the account, a CM of
+  a `shared` or `full` one, and the operation is simply not theirs (a credential call, the
+  delete or an assignment at `shared`, a raise, a token-opening call on a subscription):
+  "not found" would be a lie to them. This is a deliberate departure from the servers'
+  never-a-403 posture.
+- **The gates.** There is a read gate (`authorizeVendorAccountRead`, which returns the
+  viewer's tier, §8.2) and three write gates: **operate**
+  (`authorizeVendorAccountOperate`: the owner, or a CM at `shared`/`full`), **credential**
+  (`authorizeVendorAccountCredential`: the owner, or a CM at `full`; also the gate of
+  the connect calls, the delete, the lowering and the management-group assignment) and
+  **raise** (`authorizeVendorAccountRaise`: the owner who is a current admin). The two
+  resource-group link paths differ: the owner's self-service is owner-only at `shared`
+  and `full` (a CM links through the other path), and the resource-group manager's side
+  is the operate gate plus the `full`-only restriction plus matching roots, so an owner
+  who also manages the group still links a `shared` account through their own
+  self-service, not through the group.
+- **PATCH is field-level and deny by default.** `name`, `status` and `model_prefix`
+  take the operate gate; **every other field**, `api_key` and any credential- or
+  endpoint-sensitive one, takes the credential gate, and a body that mixes both takes the
+  stricter. The allowlist is one function (`isVendorAccountPatchOperateField`) and there
+  is deliberately no list of "credential fields", because a list of what is sensitive is
+  what an overlooked field falls out of; the body is walked by reflection, so a field
+  added to the request later is credential-gated until someone edits the allowlist, and
+  a test restates it literally. The decision depends only on which fields are *present*,
+  never on their values (an `api_key` is not knowable without opening the sealed one),
+  so a client that round-trips `base_url` or `auth_type` takes the credential gate even
+  though they are create-only: a change to either is `400 vendor_account.field_immutable`,
+  answered after the gate so it confirms nothing to a stranger. The credential-gated
+  methods are enumerated, not illustrative: import, begin and complete connect, device
+  begin and poll, `api_key` set, change and clear, delete, lowering and the
+  management-group assignment.
+- **An operate-only PATCH never writes a credential column.** It writes only the columns
+  it names plus `updated_at` (`UpdateVendorAccountOperateFields`, in every store
+  driver), because the load-modify-write is not atomic and a full-row write would carry
+  the credential columns of a stale copy back over the owner's concurrent key rotation,
+  a dispatch-time refresh-token rotation or the `needs_reconnect` flip, writing a
+  credential without passing the credential gate. A PATCH that takes the credential gate
+  still rewrites the whole row ([Risks
+  §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+- **Raise and the first groups are owner and admin; lowering needs only ownership.**
+  Every management-group set must keep **at least one** group while the account is
+  shared (an empty set is rejected). A lowering needs only ownership at `shared` (an
+  owner can un-share even after losing the admin role) or owner-or-CM at `full`.
+- **The effective level and the master pause.** Every decision that lets a **non-owner**
+  through on the strength of the share level reads the *effective* level, `none` while
+  `vendor_account_sharing_enabled` is off (§7): a CM then reads, operates and deletes
+  nothing, the management arm of the list is empty, and only the owner can act. The DTO
+  keeps reporting the **stored** level, because the pause is a global switch and not a
+  property of the account. A delete is not a sharing endpoint, so the sharing switch does
+  not *refuse* it, but the credential gate reads the effective level.
+- **Response hygiene.** Every CM-reachable operate endpoint (test, refresh) answers with
+  fixed English phrases and scrubs its result and error payloads of any api key, access
+  token or refresh token (`scrubCredential` on the test's `detail`), so a CM never sees
+  the raw secret even in an echoed upstream error. A regression test plants secrets on
+  every channel (the stored credential, a raw upstream error, vendor-listed model names,
+  an unreadable stored value) and drives each endpoint as a CM and as the owner.
+- **Management is not usage** (§4.6): a CM who is not provisioned into a containing
+  resource group can read and operate but cannot route through the account.
+
+### 8.2 What each viewer reads
+
+The account DTO is rendered **for the viewer**, widest tier first (so a CM who is also
+provisioned into the account's group reads the management view):
+
+- **Management view**: the owner, a CM of a `shared` or `full` account (by its effective
+  level) and system scope. Every field, the share fields filled, `is_owner` the viewer's
+  own and `shared_by` the owner's display name for a non-owner, **and still no secret**:
+  the DTO has no secret field to hand out by mistake, and a test pins its field set to an
+  explicit credential-free allowlist.
+- **Member view**: a principal that can only **route** to the account through a resource
+  group. Built **from an allowlist, deny by default** (`memberVendorAccountDTO`, from
+  nothing, never by blanking the management DTO): `id`, `vendor`, `auth_type`, `name`,
+  `status`, `model_prefix`, `models` (each only the gateway name, the dialect and the
+  display name), the two credential booleans, `is_owner: false` and `shared_by`.
+  **Withheld**: `share_level`, `admin_groups`, `system_group_id` and `system_group_name`
+  (who manages the account and where it is rooted), `base_url` (where the owner's key
+  is sent), `usage` (the owner's rate-limit and spend figures), each model's
+  `upstream_model` and the timestamps. One builder renders it for both the single read
+  and the member-only rows of the list, so the two cannot differ.
+- **Nothing**: everyone else, the same `404`.
+
+A member's read needs **reach**, not the opt-in (`isMemberOfSharedVendorAccount`): the
+account is `shared` or `full` by its effective level, a subscription account needs
+subscription sharing, and the principal is provisioned into a resource group containing
+it, the same predicate the list's member rows use. The opt-in gates *using* an account;
+reading is how a member finds an account to opt into. A principal without a user
+identity is never a member of the management page, even a service provisioned into the
+group; a store error while deciding reach fails the read, never grants it.
+
+### 8.3 Related rules
+
 The `vendor_subscriptions_enabled` switch (§7) is an operator-wide gate, not an
-owner-scope rule: it narrows what a subscription account may do (create, connect,
+authorization rule: it narrows what a subscription account may do (create, connect,
 serve, be listed) but never who may reach it, and it leaves an owner's view, rename and
-delete of an existing account, and the three vendor-contacting actions above, as they are.
-A token's vendor-access policy (§11) narrows that further, never widens it: it can
-name only accounts the token's owner owns, and a stale id matches nothing.
-The Activity list follows the same read rule for the account's **name**: a usage
-row carries its `account_id` for every viewer, but the transient `account_name` is
-resolved only for the owner or a `system` admin and stays empty for anyone else
+delete of an existing account, and the three vendor-contacting actions above, as they
+are. A token's vendor-access policy (§11) narrows reach further, never widens it: it can
+name only accounts the token's principal can reach, and a stale id matches nothing. The
+Activity list follows the account's read rule for the account's **name**: a usage row
+carries its `account_id` for every viewer, but the transient `account_name` is resolved
+only for a viewer who may read the account (the owner, a CM of a shared or full account,
+a member that can route to it, or a system admin) and stays empty for anyone else
 ([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event)).
 
 ## 9. Secrets at rest
@@ -1976,15 +2359,18 @@ mechanism ([ADR-007](../09-architecture-decisions.md#adr-007--secrets-at-rest-th
 
 - The `api_key` and `oauth_tokens` columns are **sealed** with
   `capture.SealSecret` **before** the store write, and opened with
-  `capture.OpenSecret` at the cipher-holding dispatch edge **and, for the owner's
-  explicit test-connection (§3.5) and model refresh (§6.3), inside
-  `portal.Service`** (`checkVendorAccount`, `RefreshVendorAccountModels`).
+  `capture.OpenSecret` at the cipher-holding dispatch edge **and, for the explicit
+  test-connection (§3.5), model refresh (§6.3) and usage refresh (§5.5) run by the owner
+  or, on an api-key account, a CM, inside `portal.Service`**
+  (`checkVendorAccount`, `RefreshVendorAccountModels`).
   On those paths the opened value goes only to the vendor's own validation,
   model-listing or (OpenAI subscription) usage URL: it is never returned, logged or echoed in a verdict's or a
   refresh's `detail`. Likewise a token import probes the plaintext access token
   the user just submitted, before it is sealed. A refresh re-seals in place.
 - The read-back DTO exposes **presence only** (`api_key_set`,
-  `subscription_connected`), never the value. PATCH uses the keep/clear/replace
+  `subscription_connected`), never the value, for **every** viewer: the owner, a CM and
+  a member alike. A borrower never sees or opens the credential: dispatch is
+  owner-agnostic and opens it only at the dispatch edge (§4.6). PATCH uses the keep/clear/replace
   `*string` sentinel (nil = keep, `""` = clear, value = replace + reseal), exactly
   as `applications.api_token` does.
 - The **subscription path requires `OP_AI_GATEWAY_CAPTURE_ENCRYPTION_KEY`**: the
@@ -2008,6 +2394,20 @@ reasons are recorded deliberately, not in denial of them
   Terms, and **Anthropic enforces it server-side** (the credential is authorized
   only for use with Claude Code; the forced `You are Claude Code` system block).
   The feature must degrade gracefully when a vendor blocks or changes behavior.
+- **Sharing a subscription is the most exposed thing the feature can do, so it is
+  capped and separately gated.** A subscription account may be raised to `shared`
+  **but never to `full`**: its OAuth credential stays strictly owner-only (connect,
+  reconnect, device connect and the token set never reach a CM). Raising one needs
+  `vendor_subscription_sharing_enabled` (default **off**, subordinate to the sharing
+  master switch, §7), and the same switch gates an existing shared subscription's
+  grant. Even at `shared`, the operate calls that open the token set (the connection
+  test, the model refresh, the usage refresh) are owner-only (§8.1), so no CM can
+  rotate the owner's single-use refresh token or trip an account-wide
+  `needs_reconnect`. Borrowers spend the **owner's** rate-limit windows and credits, and
+  the usage snapshot (§5) stays one per account, mixing borrowers. None of this makes
+  the subscription path a supported multi-tenant capability: it stays built for internal
+  testing with the operator's own account, and the whole of sharing is off by default
+  ([ADR-060](../09-architecture-decisions.md#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in)).
 - **Every subscription constant is reverse-engineered and VERIFY-LIVE.** Each
   endpoint (including the two subscription credential-validation probes, §3.5, the
   two subscription model-list endpoints, §6.1, and the ChatGPT usage endpoint,
@@ -2131,19 +2531,21 @@ reasons are recorded deliberately, not in denial of them
 
 ## 11. Per-token vendor access
 
-An account is personal to its owner (§1), but **which of the owner's API tokens may
-use it is the token's own decision**, made by the owner in the token editor. The
+An account is personal to its owner (§1) unless it is shared (§1.1), but in either case
+**which API tokens may use it is the token's own decision**, made in the token editor:
+by the owner for a user token, by whoever creates it for a service token. The
 default is strict opt-in: a token reaches **no** vendor account until it is
 granted one, so connecting an account never silently exposes it to every key the
-owner has issued, and a leaked or shared key cannot spend a subscription the
-owner never meant it to reach
+owner has issued, a leaked or shared key cannot spend a subscription the
+owner never meant it to reach, and **borrowing another owner's credential is always a
+deliberate, named choice**, because `all: true` never covers a shared account (§11.1)
 ([ADR-050](../09-architecture-decisions.md#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)).
 
 ### 11.1 The policy
 
 The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 (column, a JSON string on `api_tokens`, migration 85;
-[Data Model](../reference/data-model.md#4-migration-history-89-migrations)):
+[Data Model](../reference/data-model.md#4-migration-history-92-migrations)):
 
 ```json
 { "all": false,
@@ -2156,8 +2558,9 @@ The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 | Setting | Effect |
 |---|---|
 | **No policy** / `all: false` with an empty list | **No vendor access.** The default for every new token, and — because migration 85 adds the column with an empty default and backfills nothing — for every token that existed at upgrade. `""` is how it is stored. |
-| `all: true` | Every **active** account the owner has, **including accounts connected later**, each under its **own** `model_prefix`. The account list is ignored. |
-| `all: false` + a list | Only the listed accounts. Each entry may carry a **prefix override**. |
+| `all: true` | Every **active** account the token's principal **owns**, **including accounts connected later**, each under its **own** `model_prefix`. The account list is ignored **for the principal's own accounts**. It **never covers a shared account**: an account shared with the principal is used only when an entry names it. |
+| `all: false` + a list | Only the listed accounts, the principal's own or ones shared with it. Each entry may carry a **prefix override**. |
+| `all: true` + an entry naming a **non-own** account | The entry is a live **opt-in to that shared account** and is validated like an `all: false` entry (an id the principal cannot reach is refused as an unknown one, so it is no longer stored inert). An entry naming an own account is ignored, as before sharing: all wins. |
 | `prefix_override` `{enabled: true, value}` | The token sees that account's models under `value` **instead of** the account's `model_prefix`. |
 | `prefix_override` with **`enabled: true` and an empty `value`** | The account's models are served under their **original vendor names, with no prefix** (`gpt-5` rather than `chatgpt/gpt-5`). This is a real, supported setting, not an unset field. |
 | No `prefix_override`, or `enabled: false` | The account's own `model_prefix`. A stored override only counts while it is enabled, so an object with `enabled: false` is a switched-off override. |
@@ -2176,7 +2579,11 @@ simply matches nothing.
 The token editor (portal, **Provider access** / "Anbieter-Zugriff") exposes it as
 an "All providers (incl. future)" switch, a checkbox per connected account and,
 for each ticked account, an "Override prefix" toggle with a prefix field whose
-hint states that empty means no prefix. The whole section is hidden while the
+hint states that empty means no prefix. Accounts shared with the creator are offered
+too, each labelled with its owner's name; the list is the creator's own, managed and
+member accounts, so it can offer an account the token's principal cannot actually reach,
+which is why the save-time check and the grant, not the form, are the gates. The
+service-token create form offers the same list, on create only (§11.6). The whole section is hidden while the
 master flag is off, and the field is then left out of the request so an edit
 cannot disturb a stored policy ([API surface: token vendor
 access](../reference/api-surface.md#token-vendor-access)).
@@ -2185,14 +2592,22 @@ access](../reference/api-surface.md#token-vendor-access)).
 
 The effective public name of a vendor model, for a given token, is
 **`prefix + upstream_model`**. Both places that need it ask one function,
-`routing.TokenVendorPrefix(access, account) → (prefix, allowed)`:
+`routing.TokenVendorPrefix(token, account) → (prefix, allowed)`, which takes the whole
+token because the own-versus-shared line depends on the token's principal
+(`routing.TokenOwnsVendorAccount`: the account's owner is the token's user; a service
+owns nothing), the one place that line is drawn, for routing, the listing and the
+save-time check alike:
 
 | Policy | Result for an account |
 |---|---|
-| `all: true` | allowed, the account's own `model_prefix` |
-| listed, no (or disabled) override | allowed, the account's own `model_prefix` |
-| listed, override enabled | allowed, the override value (possibly `""`) |
-| not listed (and not `all`) | **denied** |
+| `all: true`, the account is **owned** by the token's principal | allowed, the account's own `model_prefix` |
+| `all: true`, a **shared** account the policy does not name | **denied** |
+| listed (own or shared), no (or disabled) override | allowed, the account's own `model_prefix` |
+| listed (own or shared), override enabled | allowed, the override value (possibly `""`) |
+| not listed (and not covered by `all`) | **denied** |
+
+For an **own** account `all` wins over a listed entry (its override is not applied),
+exactly as before sharing.
 
 - **Listing.** `ownVendorAccountModels` (§6.7) skips a denied account and
   re-labels each remaining account's rows to `prefix + upstream_model`, so
@@ -2208,7 +2623,9 @@ The effective public name of a vendor model, for a given token, is
   to the account's native prefix.
 
 Sharing the helper is the parity contract: an advertised name cannot be
-unroutable, and a routable name cannot be unadvertised. An override is purely a
+unroutable, and a routable name cannot be unadvertised. Reach and use are separate
+questions asked in order: the grant (§4.6) decides which accounts the principal can
+**reach**, this helper which of those the token **uses**. An override is purely a
 **naming layer per token** — the stored catalog is the account's, written once by
 discovery (§6) under its native prefix, and nothing is copied per token.
 
@@ -2226,20 +2643,25 @@ accounts are a concrete case: a shim `google` account and a native `google_nativ
 account discover the same model names, so without a prefix on one of them they
 collide (give one a distinct `model_prefix`, §6.5). Two layers handle it:
 
-- **Rejected at save** (`all: false` only). Creating or updating a token checks the
-  effective names across the selected accounts' **current** models and refuses a
+- **Rejected at save** (every entry with `all: false`; under `all: true` only the
+  entries naming a non-own account). Creating or updating a token checks the
+  effective names across the checked accounts' **current** models and refuses a
   duplicate with `400 portal.token_vendor_access_conflict`; the owner resolves it by
-  giving one account a distinct override. The same save also refuses an unknown,
-  foreign or repeated account id and a malformed enabled override value with
-  `400 portal.token_vendor_access_invalid`. A transient failure to read the owner's
-  accounts is a `500`, and a failure to read one account's models is logged and
-  skipped rather than failing the save (the backstop below still applies).
-  `all: true` has no save-time check, because it names no accounts.
+  giving one account a distinct override. The same save also refuses an account id the
+  token's principal **cannot reach** (unknown, or someone else's and not shared with it:
+  the same answer, so nothing leaks), a repeated one and a malformed enabled override
+  value with `400 portal.token_vendor_access_invalid`. A transient failure to read the
+  principal's own accounts is a `500`, and a failure to read one account's models is
+  logged and skipped rather than failing the save (the backstop below still applies). An
+  `all: true` policy that names no non-own account has no save-time check, because it
+  names nothing to check.
 - **A deterministic backstop at routing.** A collision that only emerges later —
   the vendor ships a model after the save, or an account's own prefix is changed —
-  cannot be caught at save. The resolver enumerates accounts in **stable account-id
-  order** and the **first** match wins, the same rule that already applies to
-  colliding native prefixes, while the model listings show a name once. Routing is therefore
+  cannot be caught at save. The resolver enumerates accounts in the grant's **stable
+  order** (the principal's own accounts first, then the shared ones, each in
+  account-id order) and the **first** match wins, so an own account beats a shared one
+  of the same name, the same rule that already applies to colliding native
+  prefixes, while the model listings show a name once. Routing is therefore
   never ambiguous; the cost is that a shadowed account's model is unreachable under
   that name until the owner separates the prefixes.
 
@@ -2249,13 +2671,14 @@ The opt-in binds **API tokens**, and only those:
 
 | Principal | Vendor access |
 |---|---|
-| **API token** (user-owned) | Its stored policy; strict default none. |
-| **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | **Always all** of the owner's active accounts under their native prefixes (`VendorAccess{All: true}`). It has no `api_tokens` row to opt in on, and the chat model picker, the Models page and the dashboard's live routes (§6.7) depend on seeing every account. |
+| **API token** (user-owned) | Its stored policy; strict default none. Its own accounts are covered by `all`, a shared account only by a named entry. |
+| **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | **Always all** of the owner's **own** active accounts under their native prefixes (`VendorAccess{All: true}`), and, because `all` never covers a shared account, **never a shared one**. It has no `api_tokens` row to opt in on, and the chat model picker, the Models page and the dashboard's live routes (§6.7) depend on seeing every account the user owns; an account shared with the user is reached through a token that names it. |
 | **A run-as token** (a chat run that acts through one of the user's tokens) | That token's own stored policy, like any API call with it. |
-| **Service token** (no user id) | **None, and inert**: it owns no vendor accounts (§4), so its policy is never consulted. A service-token create has no `vendor_access`. |
+| **Service token** (a service id, no user id) | Its stored policy, **create-only** (§11.6). A service owns no account, so `all: true` covers nothing for it; it reaches a shared account only when its policy **names** it **and** the service is **provisioned directly** into a resource group that contains it. A service token with no policy has no vendor access, as before. |
 
-So a user always sees and can chat with every account they connect, while a key
-they hand to a script reaches only what they ticked for it. The token list's
+So a user always sees and can chat with every account they own, while a key
+they hand to a script reaches only what they ticked for it, and no principal borrows an
+account without a named choice. The token list's
 synthetic "chat session" row carries no `vendor_access` for the same reason.
 
 ### 11.5 Upgrade behavior
@@ -2272,6 +2695,36 @@ key with access to accounts it was never meant for
 The feature is behind the default-off master flag (§7), so only a deployment that
 enabled vendor accounts is affected.
 
+### 11.6 Service tokens and the save-time check
+
+A service token carries the same opt-in as a user token, on **new plumbing**:
+
+- `vendor_access` is a field of `CreateServiceTokenRequest` and `ServiceTokenDTO`;
+  `CreateServiceToken` writes the token's `VendorProviderAccess` column and
+  `RotateServiceToken` **preserves** it (it writes only the secret columns). It is
+  **create-only**: a service token has no field-level update, so changing the opt-in
+  means creating a new token, matching every other service-token setting. The bearer
+  lookup builds the policy onto the request principal for a service token exactly as for
+  a user token.
+- A service reaches a shared account only through a **direct service provision**
+  (`ProvisionKindService`) into a containing resource group, the way a service reaches
+  servers, because a service is in no management or user group, so there is no group
+  path. The service-side resource-group self-service (`GET`/`PUT`/`DELETE
+  /api/portal/services/{id}/resource-groups[/{rgId}]`, writing the same
+  `resource_group_provisions` rows the group's provisions editor writes, for a caller who
+  manages the service **and** is a member of an admin group the group is linked to) is the
+  place a service manager sees and edits that provisioning.
+- The save-time check validates against the **token's own principal**: the owning user
+  for a user token (`userTokenPrincipal`), the service for a service token
+  (`serviceTokenPrincipal`), **never the admin or delegate saving it**, because a token
+  does not inherit its creator's reach.
+- The check is **advisory; routing is the sole security gate.** Naming an account the
+  principal cannot reach is harmless (routing re-evaluates the grant on every request and
+  denies it, and a stale id matches nothing), so the check only keeps unreachable ids out
+  of a new policy the way an unknown own id always was. The shared arm of the grant fails
+  **closed** on a store error, which reads as "not reachable", the same answer routing
+  gives in that window.
+
 ## Related chapters
 
 - [Routing & Model Selection](routing-and-model-selection.md) — the resolver and
@@ -2284,15 +2737,21 @@ enabled vendor accounts is affected.
   three tables and the `usage_events.account_id` column (migration 82), the
   prefix and display-name columns (migration 83), the usage snapshot's
   spend-control columns (migration 84), the per-token
-  `api_tokens.vendor_provider_access` column (migration 85) and the
+  `api_tokens.vendor_provider_access` column (migration 85), the
   preset accounts' (OpenAI-compatible and native Gemini) `vendor_accounts.base_url`
-  column (migration 86).
+  column (migration 86) and the share model (migrations 90 to 92: the
+  `can_manage_vendor_accounts` flag, `share_level` / `system_group_id`,
+  `vendor_account_admin_groups` and `resource_group_vendor_accounts`).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
-  `/api/portal/vendor-accounts*` routes (the model and usage refreshes included) and
+  `/api/portal/vendor-accounts*` routes (the model and usage refreshes and the
+  share-level, management-group and resource-group endpoints included) and
   their error codes; [token vendor access](../reference/api-surface.md#token-vendor-access)
   for the per-token `vendor_access` field and its two error codes.
+- [Security, Authentication & Authorization §12](security-auth-rbac.md#12-delegated--resource-scoped-authorization)
+  — the vendor-account row of the delegated-authorization table and the
+  `can_manage_vendor_accounts` co-manager permission.
 - [Configuration & Environment Variables](../reference/config-env.md) — the cipher
-  key and the four system settings.
+  key and the six system settings.
 - [ADR-049](../09-architecture-decisions.md#adr-049--vendor-accounts-are-a-first-class-entity-the-subscription-oauth-path-is-experimental-and-tos-restricted)
   — the first-class-entity and experimental-subscription decisions.
 - [ADR-050](../09-architecture-decisions.md#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)
@@ -2310,3 +2769,7 @@ enabled vendor accounts is affected.
   — the native Gemini dialect: its own vendor id and provider kind, the preset
   `Dialect` selector, the shared `geminiwire` translation package and the
   translate-only scope.
+- [ADR-060](../09-architecture-decisions.md#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in)
+  — shared vendor accounts: the tiered share level, management that mirrors servers
+  with a routing grant that does not, authorization by level, the subscription cap and
+  the per-account opt-in across user and service tokens.

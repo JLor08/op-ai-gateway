@@ -932,8 +932,8 @@ that listing gets an alias when every one of these holds:
 the listing fails open (no groups, no hidden or locked suppression) so it never
 blanks, but the derivation does not: it cannot tell a hidden model from a shown
 one, and an alias would reveal what the operator hid. A vendor account or
-model read error closes it too: an owner-read failure
-(`VendorAccountsByOwner`) or an unreadable account
+model read error closes it too: a failure to read the principal's own
+accounts (the one error `VendorAccountsForRouting` reports) or an unreadable account
 (`VendorAccountModels`) leaves the vendor set incomplete, and the
 vendor-shadow exclusion above needs the complete set, so no aliases are derived
 until the read recovers. The vendor *listing* overlay stays fail-open: it folds

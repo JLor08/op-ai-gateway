@@ -611,10 +611,12 @@ Activity renders it as never measured. Two things make it readable:
   next to the event's persisted `account_id`. It is not a column and no store
   selects it: `Portal.Service.Usage` fills it after the page is read
   (`attachUsageAccountNames`), resolving once per **distinct** account id, and
-  only for the account's **owner** or an elevated **system admin** — the same read
-  rule as the account itself ([External Vendor Accounts
-  §8](external-vendor-accounts.md#8-owner-scope-rbac)), because an account is a
-  personal credential rather than shared infrastructure. For every other viewer
+  only for a viewer who may **read** the account: its **owner**, a co-manager of it
+  while it is shared or full, a member that can route to it through a resource group, or
+  an elevated **system admin** — the same read rule as the account itself
+  (`visibleVendorAccountName`, [External Vendor Accounts
+  §8](external-vendor-accounts.md#8-authorization-by-share-level)), because an account is
+  a credential rather than shared infrastructure. For every other viewer
   (a plain admin or a project member looking at someone else's row) the name is
   withheld and the row still carries `account_id`. It is fail-soft by
   construction — a nil routing store, a hard-deleted account (`usage_events.account_id`
@@ -1419,7 +1421,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-89-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-92-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -1887,7 +1889,7 @@ llama.cpp's `/props`, Ollama's `/api/show` or stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-89-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-92-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open
