@@ -71,12 +71,14 @@ flowchart TB
         tracing["tracing<br/>OTel decorators"]
         logbuffer["logbuffer<br/>ring buffer + SSE"]
         theme["theme<br/>external theme loader"]
+        ttlcache["ttlcache<br/>TTL memoizer, invalidatable"]
     end
 
     cmd --> gateway
     gateway --> compat & apierror & account & auth & totp & portal
     portal --> routing & usage & capture & netbird & certissue & theme
     gateway & portal --> vendorauth
+    gateway & portal --> ttlcache
     routing --> inference --> provider
     provider --> geminiwire
     account & portal & routing & usage --> store
@@ -114,6 +116,7 @@ flowchart TB
 | `tracing` | OpenTelemetry method-tracing decorators (generated), wired via the OTel global. |
 | `logbuffer` | In-memory log ring buffer with live SSE streaming and level control. |
 | `theme` | Loads and validates external, data-only themes from the themes directory. |
+| `ttlcache` | A leaf package: the generic TTL memoizer (`Cache[T]`, with a generation-guarded `Invalidate` so a read already in flight cannot re-arm a just-invalidated value) behind every hot-path setting read. The gateway's `settingCache[T]` is an alias of it; `portal` uses it directly for the sharing switches the routing grant and the effective-level gates read ([External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)). It lives in its own package because `portal` may not import `gateway`. |
 
 **The sanctioned seam for a service → server callback.**
 `gateway.ServerDeps.SetRuntimeConfigChangedHook func(func(serverID string))`

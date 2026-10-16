@@ -253,6 +253,12 @@ func (s *Service) VendorSubscriptionsEnabled(ctx context.Context) bool {
 // PUT invalidates). The area is opt-IN: a service with no settings store, or a
 // store that cannot be read, reports FALSE (fail closed), so a transient read
 // failure never enables sharing that an admin has not switched on.
+//
+// This accessor is deliberately the RAW read: portal's own per-request and
+// per-account decisions (the routing enumerator, effectiveVendorAccountShareLevel)
+// read the same switch through vendorAccountSharingEnabledCached instead, and the
+// gateway defines its own cached wrapper around this one, so caching it here would
+// stack two TTL windows (see service_vendor_sharing_flags.go).
 func (s *Service) VendorAccountSharingEnabled(ctx context.Context) bool {
 	if s.settings == nil {
 		return false
@@ -271,6 +277,8 @@ func (s *Service) VendorAccountSharingEnabled(ctx context.Context) bool {
 // store that cannot be read, reports FALSE (fail closed), so a transient read
 // failure never enables subscription sharing that an admin has not switched on.
 // It only narrows the master sharing switch; this accessor does not consult it.
+// Like VendorAccountSharingEnabled it is the RAW read; the routing enumerator and the
+// member read use vendorSubscriptionSharingEnabledCached.
 func (s *Service) VendorSubscriptionSharingEnabled(ctx context.Context) bool {
 	if s.settings == nil {
 		return false

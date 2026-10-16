@@ -4933,7 +4933,9 @@ a paused switch takes effect on the next request and a stale link never grants. 
 are named, not hidden ([Risks §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). The grant runs
 on every routed request that reaches the vendor branch, before the token's policy is
-consulted, and the sharing switches are read uncached. `vendor_account_usage` stays **one
+consulted (its structural reads are uncached on purpose, so the grant stays live; the
+sharing switches it asks for come from one 5 s invalidatable cache that every settings
+write drops). `vendor_account_usage` stays **one
 snapshot per account**, mixing borrowers, who spend the owner's rate-limit windows and
 credits. The owner is single (`owner_user_id … on delete cascade`): removing the owning
 user's row would hard-delete a `full`, org-shared account and revoke every borrower, with no

@@ -21,6 +21,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/theme"
+	"op-ai-gateway/internal/ttlcache"
 	"op-ai-gateway/internal/usage"
 	"op-ai-gateway/internal/vendorauth"
 	"slices"
@@ -867,6 +868,10 @@ type Service struct {
 	// vendorDiscovery holds the model-discovery fetchers and their bounded http
 	// client (see vendorDiscoveryState).
 	vendorDiscovery vendorDiscoveryState
+	// vendorSharingFlags is the 5 s, invalidatable cache of the two sharing switches
+	// the routing hot path reads (see service_vendor_sharing_flags.go). Zero value
+	// ready; persistSystemSettings invalidates it.
+	vendorSharingFlags ttlcache.Cache[vendorSharingFlagSet]
 	// vendorModelWrites serializes the two writers of an account's model rows (a
 	// discovery's replace and a prefix re-label) per account, so they cannot undo
 	// each other (see accountLocks).

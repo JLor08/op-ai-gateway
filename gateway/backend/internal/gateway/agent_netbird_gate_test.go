@@ -261,9 +261,7 @@ func TestAgentSourceCheckErrorMissSelfHeals(t *testing.T) {
 
 	// The error miss must be pinned only for the short error TTL, never the full
 	// legitimate-empty TTL -- pre-fix it was cached for the full agentSourcePeerIPTTL.
-	s.sourcePeerIP.mu.Lock()
-	ttlLeft := time.Until(s.sourcePeerIP.exp)
-	s.sourcePeerIP.mu.Unlock()
+	ttlLeft := time.Until(s.sourcePeerIP.ExpiresAt())
 	if ttlLeft > agentSourcePeerIPErrTTL+50*time.Millisecond {
 		t.Fatalf("error miss cached for ~%v; want <= the short error TTL %v (not the full %v)", ttlLeft, agentSourcePeerIPErrTTL, agentSourcePeerIPTTL)
 	}
@@ -271,9 +269,7 @@ func TestAgentSourceCheckErrorMissSelfHeals(t *testing.T) {
 	// Once the short window lapses, the next request re-resolves (now OK) and
 	// refuses. Expire the short miss deterministically instead of sleeping.
 	fail = false
-	s.sourcePeerIP.mu.Lock()
-	s.sourcePeerIP.exp = time.Now().Add(-time.Millisecond)
-	s.sourcePeerIP.mu.Unlock()
+	s.sourcePeerIP.Invalidate()
 
 	rec2 := httptest.NewRecorder()
 	s.AgentHandler().ServeHTTP(rec2, agentRequestFrom(t, "10.0.0.9:8443"))

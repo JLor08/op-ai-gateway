@@ -627,7 +627,7 @@ func (s *Service) authorizeVendorAccountRead(ctx context.Context, principal auth
 // through its tokens, it does not browse the portal. A store error is returned, never
 // read as a grant.
 func (s *Service) isMemberOfSharedVendorAccount(ctx context.Context, principal auth.Token, acc routing.VendorAccount) (bool, error) {
-	if principal.UserID == "" || !s.vendorAccountSharedRoutable(ctx, acc, s.VendorSubscriptionSharingEnabled(ctx)) {
+	if principal.UserID == "" || !s.vendorAccountSharedRoutable(ctx, acc, s.vendorSubscriptionSharingEnabledCached(ctx)) {
 		return false, nil
 	}
 	linked, err := s.routes.ResourceGroupsByVendorAccount(ctx, acc.ID)
@@ -713,9 +713,13 @@ func vendorAccountSharedLevel(level string) bool {
 // having RIGHT NOW: VendorShareLevelNone while the vendor_account_sharing_enabled
 // master flag is off, the account's stored ShareLevel while it is on (spec
 // 2026-10-15 section 13: with the master off "share_level is ignored, every account
-// behaves personal"). The flag is read through the same fail-closed accessor as
-// requireVendorAccountSharingEnabled, so no settings store, or one that cannot be
-// read, reads as off.
+// behaves personal"). The flag is read through the 5 s invalidatable cache the
+// routing hot path uses (vendorAccountSharingEnabledCached,
+// service_vendor_sharing_flags.go): this runs per account on every routed request, so
+// a settings SELECT per call is not affordable. It is fail-closed like the raw
+// accessor behind requireVendorAccountSharingEnabled: no settings store, or one that
+// cannot be read, reads as off. A flip through the settings PUT shows on the very next
+// call; only an out-of-band change waits out the TTL.
 //
 // Turning the master off is a global PAUSE, not an un-share: nothing stored (the
 // level, the root, the management-group and resource-group links) is touched, so
@@ -725,7 +729,7 @@ func vendorAccountSharedLevel(level string) bool {
 // share-level lower), and the listings and the routing grant that follow
 // must do the same.
 func (s *Service) effectiveVendorAccountShareLevel(ctx context.Context, acc routing.VendorAccount) string {
-	if !s.VendorAccountSharingEnabled(ctx) {
+	if !s.vendorAccountSharingEnabledCached(ctx) {
 		return routing.VendorShareLevelNone
 	}
 	return acc.ShareLevel
@@ -963,7 +967,7 @@ func sortVendorAccountsOldestFirst(accounts []routing.VendorAccount) {
 // The accounts own already holds are skipped, so an account the principal owns AND
 // manages is listed once, as their own.
 func (s *Service) managedVendorAccounts(ctx context.Context, principal auth.Token, own []routing.VendorAccount) ([]routing.VendorAccount, error) {
-	if !s.VendorAccountSharingEnabled(ctx) {
+	if !s.vendorAccountSharingEnabledCached(ctx) {
 		return nil, nil
 	}
 	manageGroups, err := s.vendorAccountManageGroupIDs(ctx, principal)

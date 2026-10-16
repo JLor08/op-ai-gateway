@@ -1341,8 +1341,12 @@ group can read and operate the account but cannot route through it: to *use* it 
 must be provisioned and opted in, like anyone.
 
 **Cost.** The enumerator runs on every routed request that reaches the vendor branch,
-before the token's policy is consulted, and the sharing switches are read from the
-settings store uncached; see [Risks
+before the token's policy is consulted. The sharing switches it asks for are **not** a
+per-request settings read: `portal.Service` serves them from a 5 s invalidatable cache,
+one settings read per window for both (§7), so with sharing off the enumerator costs the
+principal's own-accounts read and nothing else. With sharing on the shared arm adds its
+structural reads (provisioned groups, links, one account read per candidate), uncached on
+purpose so the grant stays live; see [Risks
 §11.1](../11-risks-and-technical-debt.md#111-operational-risks).
 
 ## 5. Usage & limits
@@ -2082,7 +2086,9 @@ switch and the routing mode) each through its own cached accessor
 resolve; the accessors' short TTL (~5 s, `vendorSettingsCacheTTL`) only bounds an
 **out-of-band** change, such as a direct database edit. `portal.Service` (the CRUD
 and connect gates, the model-listing overlay and the discovery client version)
-reads them uncached, so a PUT is visible on its very next call:
+reads them uncached, so a PUT is visible on its very next call (the two sharing
+switches' per-request decision reads are the exception, cached and dropped on every
+settings write; see below):
 
 | Setting | Values | Default | Effect |
 |---|---|---|---|
@@ -2150,19 +2156,33 @@ others (schemaless `system_settings`, a pointer field on the PUT where an omitte
 `null` value keeps the stored one, an always-present boolean on the GET, invalidation
 on a PUT that carries either key) and both fail **closed**, the opposite of
 `vendor_subscriptions_enabled`: a transient read error never turns sharing on. They are
-read in three places, all through the `portal.Service` accessors
-(`VendorAccountSharingEnabled`, `VendorSubscriptionSharingEnabled`), which hit the
-settings store on **every call, uncached** (a full-table `SELECT`): the sharing guard of
-every share, management-group and resource-group method
-(`requireVendorAccountSharingEnabled`, module flag first, so a disabled module answers
-`vendor_accounts.module_disabled` and not the sharing code), the *effective* level every
-gate and listing reads (`effectiveVendorAccountShareLevel`), and the routing grant
-(§4.6). The gateway also defines 5 s invalidatable caches for the two switches
-(`vendorAccountSharingEnabledCached`, `vendorSubscriptionSharingEnabledCached`, dropped
-by `invalidateVendorSettingsCache` on a PUT that carries either key), but nothing on
-the routing or listing path consults them today, so an operator's toggle takes effect on
-the very next request and each enumeration pays the settings read
-([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+read in three places, through two kinds of read. The **guard** of every share,
+management-group and resource-group method (`requireVendorAccountSharingEnabled`, module
+flag first, so a disabled module answers `vendor_accounts.module_disabled` and not the
+sharing code) uses the `portal.Service` accessors (`VendorAccountSharingEnabled`,
+`VendorSubscriptionSharingEnabled`), which hit the settings store on every call,
+**uncached** (a full-table `SELECT`): it runs once per request on a rare write path, and
+an admin acting right after a flip is told the truth. The two **decisions** that run per
+request or per account, the *effective* level every gate and listing reads
+(`effectiveVendorAccountShareLevel`) and the routing grant (§4.6, which also reads the
+subscription switch), read the switches through **one 5 s invalidatable cache** in
+`portal.Service` (`vendorAccountSharingEnabledCached`,
+`vendorSubscriptionSharingEnabledCached`; one settings read per window serves both
+switches). It is the same mechanism as the gateway's other vendor-flag caches (the
+shared `ttlcache.Cache`, the generic behind `settingCache`), it is dropped after **every**
+settings write (`persistSystemSettings`, so a portal toggle in either direction is seen on
+the very next decision), and the TTL only bounds an **out-of-band** change such as a
+direct database edit. It fails **closed** exactly like the accessors: an unreadable or
+missing settings store reads as both switches off for that call, and a failed read is
+**not retained** (the next call reads again), so an outage is never pinned for a TTL
+window. The raw accessors stay uncached on purpose: the gateway defines its own cached
+wrappers around them (`vendorAccountSharingEnabledCached`,
+`vendorSubscriptionSharingEnabledCached` on `Server`, dropped by
+`invalidateVendorSettingsCache` on a PUT that carries either key, though no production
+path consults them today), and a cache inside the accessors would stack two TTL windows
+under that one. The grant's remaining per-request cost when sharing is on is its
+structural reads, not the switches ([Risks
+§11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 The frontend reads the switches through a portal-scoped
 `GET /api/portal/vendor-accounts/enabled` (`{module_enabled, subscriptions_enabled,

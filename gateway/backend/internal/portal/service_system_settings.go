@@ -1788,10 +1788,17 @@ type settingWrite struct{ key, value string }
 // A store without that capability (an error-injecting test fake) falls back to
 // per-key writes in the same order, preserving those fakes' key-specific error
 // behaviour. One clock reading stamps the whole batch, which is written together.
+//
+// Whatever the outcome, the cached read of the two sharing switches is dropped once
+// the write attempt is over (see service_vendor_sharing_flags.go): after it, so a read
+// that starts now cannot see the pre-write rows, and on a failure too, because the
+// per-key fallback may have applied some keys before one failed. A write that touches
+// neither switch merely costs the next decision one settings read.
 func (s *Service) persistSystemSettings(ctx context.Context, writes []settingWrite) error {
 	if len(writes) == 0 {
 		return nil
 	}
+	defer s.invalidateVendorSharingFlags()
 	now := s.clock()
 	if batch, ok := s.settings.(atomicSystemSettingsStore); ok {
 		values := make(map[string]string, len(writes))

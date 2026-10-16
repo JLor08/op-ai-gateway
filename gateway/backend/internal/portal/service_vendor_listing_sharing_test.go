@@ -743,7 +743,11 @@ func TestListVendorAccountsMemberArmStoreErrorFailsTheRead(t *testing.T) {
 		t.Fatalf("ListVendorAccounts = %v, nil; want the store error", listedIDs(list))
 	}
 	// A principal whose member arm is empty by flag never reaches the failing read.
+	// svc is a second Service over the fixture's settings store, so e.flags drops only
+	// e.svc's cached sharing switches; svc's are dropped by hand, as the settings PUT
+	// does for the one Service of a real process.
 	e.flags(false, false)
+	svc.invalidateVendorSharingFlags()
 	if _, err := svc.ListVendorAccounts(e.ctx, token(grantAdminMember)); err != nil {
 		t.Errorf("sharing off must not touch the shared arm: %v", err)
 	}

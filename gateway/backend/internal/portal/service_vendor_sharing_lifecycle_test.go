@@ -73,11 +73,17 @@ func newVendorLifecycleEnv(t *testing.T) *vendorLifecycleEnv {
 
 // setVendorSetting writes one boolean system setting into svc's settings store
 // (which setVendorAccountsEnabled has already created).
+// setVendorSetting writes a boolean setting straight through the store and then drops
+// the service's cached sharing flags, standing in for the settings PUT, which does both
+// (persistSystemSettings invalidates after its write). Without the second step a test
+// that flips a sharing switch after a decision has already been made would read the
+// cached pre-flip value for the rest of the TTL.
 func setVendorSetting(t *testing.T, svc *Service, key string, on bool) {
 	t.Helper()
 	if err := svc.settings.SetSystemSetting(context.Background(), key, strconv.FormatBool(on), time.Time{}); err != nil {
 		t.Fatalf("SetSystemSetting(%s): %v", key, err)
 	}
+	svc.invalidateVendorSharingFlags()
 }
 
 func setVendorSharingFlags(t *testing.T, svc *Service, sharing, subscriptionSharing bool) {

@@ -268,8 +268,15 @@ func TestVendorOptInSaveTimeReachIsComputedAgainstTheTokenOwner(t *testing.T) {
 	})
 
 	t.Run("pausing sharing makes a shared account unnameable", func(t *testing.T) {
-		e.flags(false, false)
-		defer e.flags(true, false)
+		// svc is a second Service over the fixture's settings store, so e.flags drops
+		// only e.svc's cached sharing switches: standing in for the settings PUT, which
+		// invalidates the one Service of a real process, svc's cache is dropped by hand.
+		flip := func(sharing bool) {
+			e.flags(sharing, false)
+			svc.invalidateVendorSharingFlags()
+		}
+		flip(false)
+		defer flip(true)
 		if _, err := svc.CreateToken(ctx, member, CreateTokenRequest{Name: "paused", Scopes: scopes, VendorAccess: named(grantShared)}); !errors.Is(err, ErrTokenVendorAccessInvalid) {
 			t.Fatalf("CreateToken(sharing paused) = %v, want ErrTokenVendorAccessInvalid", err)
 		}

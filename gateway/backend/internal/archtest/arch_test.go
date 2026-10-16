@@ -98,6 +98,7 @@ var allowedDeps = map[string][]string{
 		"internal/store",
 		"internal/totp",
 		"internal/tracing",
+		"internal/ttlcache",
 		"internal/usage",
 		"internal/vendorauth",
 	},
@@ -119,6 +120,7 @@ var allowedDeps = map[string][]string{
 		"internal/routing",
 		"internal/store",
 		"internal/theme",
+		"internal/ttlcache",
 		"internal/usage",
 		"internal/vendorauth",
 	},
@@ -146,7 +148,11 @@ var allowedDeps = map[string][]string{
 		"internal/logbuffer",
 		"internal/routing",
 	},
-	"internal/usage": {},
+	// ttlcache is the shared TTL memoizer (generation-guarded Invalidate) behind
+	// the hot-path setting reads of both gateway and portal. A leaf, so either
+	// can import it without a cycle.
+	"internal/ttlcache": {},
+	"internal/usage":    {},
 	// vendorauth is the vendor-subscription OAuth library (reverse-engineered,
 	// experimental). It reaches only into capture for the enc:/plain: secret
 	// scheme, so portal and gateway can import it later without a cycle.

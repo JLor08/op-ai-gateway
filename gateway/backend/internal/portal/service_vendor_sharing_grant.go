@@ -80,9 +80,12 @@ func (s *Service) ownVendorAccountsForRouting(ctx context.Context, principal aut
 // off in most deployments and this runs on every routed request. The flag is read
 // once for that shortcut and again, through effectiveVendorAccountShareLevel, per
 // account; a flip between the two can only ever DENY (the per-account read answers
-// `none`), never grant.
+// `none`), never grant. Both reads, and the subscription flag's, go through the 5 s
+// invalidatable cache of the sharing switches (vendorAccountSharingEnabledCached,
+// service_vendor_sharing_flags.go), so this hot path costs no settings SELECT of its
+// own, sharing on or off.
 func (s *Service) sharedVendorAccountsForRouting(ctx context.Context, principal auth.Token, own []routing.VendorAccount) ([]routing.VendorAccount, error) {
-	if !s.VendorAccountSharingEnabled(ctx) {
+	if !s.vendorAccountSharingEnabledCached(ctx) {
 		return nil, nil
 	}
 	rgIDs, err := s.provisionedRGsForPrincipal(ctx, principal)
@@ -93,7 +96,7 @@ func (s *Service) sharedVendorAccountsForRouting(ctx context.Context, principal 
 	if err != nil {
 		return nil, err
 	}
-	subscriptionSharing := s.VendorSubscriptionSharingEnabled(ctx)
+	subscriptionSharing := s.vendorSubscriptionSharingEnabledCached(ctx)
 	shared := make([]routing.VendorAccount, 0, len(candidateIDs))
 	for _, id := range candidateIDs {
 		acc, err := s.routes.VendorAccountByID(ctx, id)
