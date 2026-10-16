@@ -1,0 +1,561 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package gateway
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"op-ai-gateway/internal/inference"
+	"strings"
+	"testing"
+)
+
+// transcriptionTestAudio is deliberately NOT valid UTF-8 and carries CRLF, NUL and
+// a "--" run, like editTestPNG: the bytes a line-oriented or string-based reading
+// of the form would damage.
+var transcriptionTestAudio = []byte("RIFF\x00\x01\xfe\xff\r\n--not-a-boundary\r\n\x00WAVEfmt ")
+
+// validTranscriptionParts is a well-formed transcription request for model: the
+// model field and one audio file.
+func validTranscriptionParts(model string) []editPart {
+	return []editPart{
+		{name: "model", body: []byte(model)},
+		{name: "file", filename: "clip.wav", contentType: "audio/wav", body: transcriptionTestAudio},
+	}
+}
+
+// requireTranscriptionInvalid asserts err is the transcription endpoint's own
+// malformed-form refusal: a *inference.Error carrying invalidTranscriptionRequest.
+func requireTranscriptionInvalid(t *testing.T, err error) {
+	t.Helper()
+	var ie *inference.Error
+	if !errors.As(err, &ie) {
+		t.Fatalf("err = %v (%T), want an *inference.Error", err, err)
+	}
+	if ie.Code != "transcription.invalid" {
+		t.Fatalf("code = %q, want transcription.invalid (message %q)", ie.Code, ie.Message)
+	}
+}
+
+// The error codes are API surface: clients branch on them.
+func TestTranscriptionErrorCodes(t *testing.T) {
+	for _, tc := range []struct{ got, want string }{
+		{transcriptionModelRequired, "transcription.model_required"},
+		{transcriptionFileRequired, "transcription.file_required"},
+		{transcriptionResponseFormatUnsupported, "transcription.response_format_unsupported"},
+		{transcriptionStreamUnsupported, "transcription.stream_unsupported"},
+		{invalidTranscriptionRequest, "transcription.invalid"},
+		{invalidTranscription("m").Code, "transcription.invalid"},
+	} {
+		if tc.got != tc.want {
+			t.Fatalf("code = %q, want %q", tc.got, tc.want)
+		}
+	}
+}
+
+// parseTranscriptionForm reads what routing needs from anywhere in the form,
+// counts the audio parts under both spellings, keeps the model as sent
+// (untrimmed) for the rewrite decision while routing on the trimmed one, and
+// keeps the boundary of the client's own body.
+func TestParseTranscriptionForm(t *testing.T) {
+	t.Run("a well-formed body yields the model and one file", func(t *testing.T) {
+		body, ct := buildEditMultipart(t, validTranscriptionParts("asr-model"))
+
+		form, err := parseTranscriptionForm(ct, body)
+		if err != nil {
+			t.Fatalf("parseTranscriptionForm: %v", err)
+		}
+		if form.model != "asr-model" || form.routingModel() != "asr-model" {
+			t.Fatalf("model = %q / routing %q, want asr-model", form.model, form.routingModel())
+		}
+		if form.files != 1 {
+			t.Fatalf("files = %d, want 1", form.files)
+		}
+		if form.boundary != mustBoundary(t, ct) {
+			t.Fatalf("boundary = %q, want the request's own %q", form.boundary, mustBoundary(t, ct))
+		}
+	})
+	t.Run("fields in any order, every text field kept, both file spellings counted", func(t *testing.T) {
+		body, ct := buildEditMultipart(t, []editPart{
+			{name: "file[]", filename: "a.wav", body: transcriptionTestAudio},
+			{name: "temperature", body: []byte("0.2")},
+			{name: "model", body: []byte("  asr-model \n")},
+			{name: "language", body: []byte("de")},
+			{name: "file", filename: "b.wav", body: []byte("x")},
+			{name: "prompt", body: []byte("names: Müller")},
+			{name: "response_format", body: []byte("json")},
+			{name: "stream", body: []byte("false")},
+			{name: "stream_format", body: []byte("sse")},
+		})
+
+		form, err := parseTranscriptionForm(ct, body)
+		if err != nil {
+			t.Fatalf("parseTranscriptionForm: %v", err)
+		}
+		if form.model != "  asr-model \n" || form.routingModel() != "asr-model" {
+			t.Fatalf("model = %q / routing %q, want the untrimmed field and its trimmed routing value", form.model, form.routingModel())
+		}
+		if form.language != "de" || form.prompt != "names: Müller" || form.responseFormat != "json" || form.stream != "false" || form.streamFormat != "sse" {
+			t.Fatalf("form = %+v", form)
+		}
+		if form.files != 2 {
+			t.Fatalf("files = %d, want 2 (one under each spelling)", form.files)
+		}
+	})
+	t.Run("a file part before the model still finds the model", func(t *testing.T) {
+		body, ct := buildEditMultipart(t, []editPart{
+			{name: "file", filename: "clip.wav", contentType: "audio/wav", body: transcriptionTestAudio},
+			{name: "model", body: []byte("asr-model")},
+		})
+
+		form, err := parseTranscriptionForm(ct, body)
+		if err != nil || form.routingModel() != "asr-model" || form.files != 1 {
+			t.Fatalf("err = %v, form = %+v, want model asr-model and one file", err, form)
+		}
+	})
+	t.Run("an empty file part does not count", func(t *testing.T) {
+		for _, name := range []string{"file", "file[]"} {
+			body, ct := buildEditMultipart(t, []editPart{
+				{name: "model", body: []byte("asr-model")},
+				{name: name, filename: "empty.wav", contentType: "audio/wav", body: nil},
+			})
+
+			form, err := parseTranscriptionForm(ct, body)
+			if err != nil || form.files != 0 {
+				t.Fatalf("%s: err = %v, files = %d, want no error and 0 files", name, err, form.files)
+			}
+		}
+	})
+	t.Run("an empty file part beside a non-empty one counts the non-empty one", func(t *testing.T) {
+		body, ct := buildEditMultipart(t, []editPart{
+			{name: "model", body: []byte("asr-model")},
+			{name: "file", filename: "empty.wav", body: nil},
+			{name: "file[]", filename: "clip.wav", body: transcriptionTestAudio},
+		})
+
+		form, err := parseTranscriptionForm(ct, body)
+		if err != nil || form.files != 1 {
+			t.Fatalf("err = %v, files = %d, want 1", err, form.files)
+		}
+	})
+	t.Run("a model-less form parses (validation refuses it)", func(t *testing.T) {
+		body, ct := buildEditMultipart(t, []editPart{{name: "file", filename: "clip.wav", body: transcriptionTestAudio}})
+
+		form, err := parseTranscriptionForm(ct, body)
+		if err != nil || form.routingModel() != "" || form.files != 1 {
+			t.Fatalf("err = %v, form = %+v, want no error, no model and one file", err, form)
+		}
+	})
+	t.Run("a field past its bound is refused", func(t *testing.T) {
+		for _, name := range []string{"model", "language", "prompt", "response_format", "stream", "stream_format"} {
+			body, ct := buildEditMultipart(t, []editPart{{name: name, body: bytes.Repeat([]byte("a"), maxTranscriptionFieldBytes+1)}})
+
+			_, err := parseTranscriptionForm(ct, body)
+
+			requireTranscriptionInvalid(t, err)
+			if !strings.Contains(err.Error(), "too large") {
+				t.Fatalf("%s: err = %v, want a too-large refusal", name, err)
+			}
+		}
+	})
+	t.Run("a field at its bound is read", func(t *testing.T) {
+		body, ct := buildEditMultipart(t, []editPart{{name: "prompt", body: bytes.Repeat([]byte("a"), maxTranscriptionFieldBytes)}})
+
+		form, err := parseTranscriptionForm(ct, body)
+		if err != nil || len(form.prompt) != maxTranscriptionFieldBytes {
+			t.Fatalf("err = %v, prompt length = %d, want %d", err, len(form.prompt), maxTranscriptionFieldBytes)
+		}
+	})
+	t.Run("the audio part is not bound by the field bound", func(t *testing.T) {
+		body, ct := buildEditMultipart(t, []editPart{
+			{name: "model", body: []byte("asr-model")},
+			{name: "file", filename: "big.wav", body: bytes.Repeat([]byte{0xAB}, maxTranscriptionFieldBytes+1)},
+		})
+
+		form, err := parseTranscriptionForm(ct, body)
+		if err != nil || form.files != 1 {
+			t.Fatalf("err = %v, files = %d, want the large file counted and not refused", err, form.files)
+		}
+	})
+}
+
+// A body that is not a usable multipart form is refused with the endpoint's own
+// code. Two of the ways in are the ones mime/multipart would otherwise let
+// through silently: a part the handler only steps over, which the Reader swallows
+// a read error of, and a field repeated where one answer is required. The WHOLE
+// body is walked, and every part read to its end, so a malformed tail is caught
+// here -- before routing and admission -- rather than later in a rebuild.
+func TestParseTranscriptionFormRefusesAMalformedBody(t *testing.T) {
+	validBody, validCT := buildEditMultipart(t, validTranscriptionParts("asr-model"))
+	// A body whose LAST part is one the handler never reads (neither a field it
+	// owns nor the audio) and which is cut off inside that part.
+	extraBody, extraCT := buildEditMultipart(t, append(validTranscriptionParts("asr-model"),
+		editPart{name: "reference", filename: "ref.wav", contentType: "audio/wav", body: bytes.Repeat([]byte("r"), 200)}))
+	// A body whose LAST part is the audio, cut off inside it.
+	audioLastBody, audioLastCT := buildEditMultipart(t, []editPart{
+		{name: "model", body: []byte("asr-model")},
+		{name: "file", filename: "clip.wav", body: bytes.Repeat([]byte("a"), 200)},
+	})
+	// The model is found first, and then repeated after the audio part.
+	lateRepeatBody, lateRepeatCT := buildEditMultipart(t, append(validTranscriptionParts("asr-model"),
+		editPart{name: "model", body: []byte("another-model")}))
+
+	cases := []struct {
+		name string
+		body []byte
+		ct   string
+	}{
+		{"json body", []byte(`{"model":"asr-model"}`), "application/json"},
+		{"no content type", validBody, ""},
+		{"multipart without a boundary", validBody, "multipart/form-data"},
+		{"another multipart type", validBody, strings.Replace(validCT, "form-data", "mixed", 1)},
+		{"malformed content type parameter", validBody, "multipart/form-data; boundary"},
+		{"truncated before the closing boundary", validBody[:len(validBody)-16], validCT},
+		{"truncated inside the audio part", audioLastBody[:len(audioLastBody)-100], audioLastCT},
+		{"truncated inside a part the handler does not read", extraBody[:len(extraBody)-100], extraCT},
+		{"a model repeated after the audio part", lateRepeatBody, lateRepeatCT},
+	}
+	for _, field := range []string{"model", "language", "prompt", "response_format", "stream", "stream_format"} {
+		body, ct := buildEditMultipart(t, []editPart{
+			{name: field, body: []byte("1")},
+			{name: "file", filename: "clip.wav", body: transcriptionTestAudio},
+			{name: field, body: []byte("2")},
+		})
+		cases = append(cases, struct {
+			name string
+			body []byte
+			ct   string
+		}{"repeated " + field, body, ct})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseTranscriptionForm(tc.ct, tc.body)
+
+			requireTranscriptionInvalid(t, err)
+		})
+	}
+	// mime/multipart reports a body it finds no part in -- an empty one, one that
+	// never mentions the request's boundary -- as the end of the form (the EOF a
+	// finished form ends with, wrapped), and the agent router's peekMultipartModel
+	// takes it the same way. Both end up with no model, so the refusal is the
+	// validation's model_required, still 400 and still before routing.
+	t.Run("a body with no part to find is a form with no model", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			body []byte
+			ct   string
+		}{
+			"empty body":                           {nil, validCT},
+			"a boundary that does not match":       {validBody, "multipart/form-data; boundary=SOMETHINGELSE"},
+			"a body that ends in the first header": {[]byte("--" + mustBoundary(t, validCT) + "\r\nContent-Disposition: form-data; na"), validCT},
+		} {
+			form, err := parseTranscriptionForm(tc.ct, tc.body)
+			if err != nil {
+				requireTranscriptionInvalid(t, err)
+				continue
+			}
+			if form.routingModel() != "" || form.files != 0 {
+				t.Fatalf("%s: form = %+v, want no model and no file", name, form)
+			}
+			if verr := validateTranscriptionRequest(form); verr == nil || verr.Code != "transcription.model_required" {
+				t.Fatalf("%s: validation = %v, want transcription.model_required", name, verr)
+			}
+		}
+	})
+}
+
+// The model is the one field two readers must agree on: the gateway decides
+// routing and the operator's model allowlist on it, and the server agent's
+// runtime router (peekMultipartModel, server-agent/internal/runtime/router.go)
+// then starts a process on its own reading of the same bytes. The cases mirror the
+// router's differential tests (router_multipart_test.go): where a model-shaped
+// lookalike sits next to a real form-data model part, the gateway reads the real
+// one, never the lookalike; and every body the router refuses (no model part, a
+// repeat, a part it cannot get to) the gateway refuses or reads as having no model.
+func TestParseTranscriptionFormReadsTheModelLikeTheAgentRouter(t *testing.T) {
+	const ct = "multipart/form-data; boundary=BOUNDARY"
+	const tail = "--BOUNDARY\n" +
+		"Content-Disposition: form-data; name=\"prompt\"\n\nsome words\n" +
+		"--BOUNDARY\n" +
+		"Content-Disposition: form-data; name=\"file\"; filename=\"in.wav\"\n\nWAVDATA\n"
+	crlf := func(s string) []byte { return []byte(strings.ReplaceAll(s, "\n", "\r\n")) }
+
+	t.Run("the model the router would start", func(t *testing.T) {
+		cases := []struct{ name, body string }{
+			{"attachment-named model before the real one", "--BOUNDARY\n" +
+				"Content-Disposition: attachment; name=\"model\"\n\nghost-model\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				tail + "--BOUNDARY--\n"},
+			{"attachment-named model after the real one", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: attachment; name=\"model\"\n\nghost-model\n" +
+				tail + "--BOUNDARY--\n"},
+			{"fake model in the preamble", "preamble text\n" +
+				"--ignored\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nghost-model\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				tail + "--BOUNDARY--\n"},
+			{"fake model in the epilogue", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				tail + "--BOUNDARY--\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nghost-model\n" +
+				"--BOUNDARY--\n"},
+			{"model text inside the prompt part", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"prompt\"\n\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nghost-model\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"file\"; filename=\"in.wav\"\n\nWAVDATA\n" +
+				"--BOUNDARY--\n"},
+			{"model after the file part", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"file\"; filename=\"in.wav\"\n\nWAVDATA\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				"--BOUNDARY--\n"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				form, err := parseTranscriptionForm(ct, crlf(tc.body))
+				if err != nil || form.model != "asr-model" {
+					t.Fatalf("err = %v, model = %q, want asr-model", err, form.model)
+				}
+			})
+		}
+	})
+	t.Run("the bodies the router routes nowhere", func(t *testing.T) {
+		const rest = tail + "--BOUNDARY--\n"
+		cases := []struct {
+			name string
+			body string
+			// refused is true when the parse itself must fail; otherwise the form
+			// must come back with no model, which validation refuses. (A body the
+			// Reader finds no part in at all reads as an empty form, as in the router.)
+			refused bool
+		}{
+			{"no model part", rest, false},
+			{"empty model value", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\n\n" + rest, false},
+			{"model part with an attachment disposition", "--BOUNDARY\n" +
+				"Content-Disposition: attachment; name=\"model\"\n\nghost-model\n" + rest, false},
+			{"model-shaped text in the preamble", "--ignored\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nghost-model\n" +
+				"\n" + rest, false},
+			{"model-shaped text in the epilogue", tail + "--BOUNDARY--\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nghost-model\n" +
+				"--BOUNDARY--\n", false},
+			{"model named twice", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nother-model\n" + rest, true},
+			{"model part never terminated", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model", true},
+			{"body ends inside the first part's headers", "--BOUNDARY\nContent-Disposition: form-data; name=\"mod", false},
+			{"unparseable part headers after the model", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nasr-model\n" +
+				"--BOUNDARY\n" +
+				"this is not a header line\n\nx\n" +
+				"--BOUNDARY--\n", true},
+			{"model field over the size bound", "--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\n" +
+				strings.Repeat("m", maxTranscriptionFieldBytes+1) + "\n" + rest, true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				form, err := parseTranscriptionForm(ct, crlf(tc.body))
+				if tc.refused {
+					requireTranscriptionInvalid(t, err)
+					return
+				}
+				if err != nil || form.routingModel() != "" {
+					t.Fatalf("err = %v, model = %q, want a form with no model", err, form.model)
+				}
+				if verr := validateTranscriptionRequest(form); verr == nil || verr.Code != "transcription.model_required" {
+					t.Fatalf("validation = %v, want transcription.model_required", verr)
+				}
+			})
+		}
+	})
+}
+
+// validateTranscriptionRequest is the multipart shape's validation twin: a
+// model and at least one non-empty file are required, response_format may only be
+// "json" (or absent), and neither stream nor stream_format may be on.
+func TestValidateTranscriptionRequest(t *testing.T) {
+	valid := transcriptionForm{model: "asr-model", files: 1}
+	with := func(mut func(*transcriptionForm)) transcriptionForm {
+		f := valid
+		mut(&f)
+		return f
+	}
+	cases := []struct {
+		name     string
+		form     transcriptionForm
+		wantCode string // "" = accepted
+	}{
+		{"a model and one file", valid, ""},
+		{"several files", with(func(f *transcriptionForm) { f.files = 3 }), ""},
+		{"optional fields set", with(func(f *transcriptionForm) { f.language, f.prompt = "de", "words" }), ""},
+
+		{"no model", with(func(f *transcriptionForm) { f.model = "" }), "transcription.model_required"},
+		{"a blank model", with(func(f *transcriptionForm) { f.model = " \t\n" }), "transcription.model_required"},
+		{"no file", with(func(f *transcriptionForm) { f.files = 0 }), "transcription.file_required"},
+		{"the model is checked before the file", transcriptionForm{}, "transcription.model_required"},
+
+		{"response_format json", with(func(f *transcriptionForm) { f.responseFormat = "json" }), ""},
+		{"response_format json, padded", with(func(f *transcriptionForm) { f.responseFormat = " json\n" }), ""},
+		{"response_format empty", with(func(f *transcriptionForm) { f.responseFormat = "" }), ""},
+		{"response_format blank", with(func(f *transcriptionForm) { f.responseFormat = "  " }), ""},
+		{"response_format verbose_json", with(func(f *transcriptionForm) { f.responseFormat = "verbose_json" }), "transcription.response_format_unsupported"},
+		{"response_format text", with(func(f *transcriptionForm) { f.responseFormat = "text" }), "transcription.response_format_unsupported"},
+		{"response_format srt", with(func(f *transcriptionForm) { f.responseFormat = "srt" }), "transcription.response_format_unsupported"},
+		{"response_format vtt", with(func(f *transcriptionForm) { f.responseFormat = "vtt" }), "transcription.response_format_unsupported"},
+		{"response_format mp3", with(func(f *transcriptionForm) { f.responseFormat = "mp3" }), "transcription.response_format_unsupported"},
+		{"response_format b64_json", with(func(f *transcriptionForm) { f.responseFormat = "b64_json" }), "transcription.response_format_unsupported"},
+		{"response_format in another case", with(func(f *transcriptionForm) { f.responseFormat = "JSON" }), "transcription.response_format_unsupported"},
+
+		{"stream absent", with(func(f *transcriptionForm) { f.stream = "" }), ""},
+		{"stream false", with(func(f *transcriptionForm) { f.stream = "false" }), ""},
+		{"stream 0, padded", with(func(f *transcriptionForm) { f.stream = " 0 " }), ""},
+		{"stream true", with(func(f *transcriptionForm) { f.stream = "true" }), "transcription.stream_unsupported"},
+		{"stream TRUE", with(func(f *transcriptionForm) { f.stream = "TRUE" }), "transcription.stream_unsupported"},
+		{"stream 1", with(func(f *transcriptionForm) { f.stream = "1" }), "transcription.stream_unsupported"},
+		{"stream that is no boolean", with(func(f *transcriptionForm) { f.stream = "maybe" }), "transcription.stream_unsupported"},
+
+		{"stream_format absent", with(func(f *transcriptionForm) { f.streamFormat = "" }), ""},
+		{"stream_format blank", with(func(f *transcriptionForm) { f.streamFormat = " " }), ""},
+		{"stream_format sse", with(func(f *transcriptionForm) { f.streamFormat = "sse" }), "transcription.stream_unsupported"},
+		{"stream_format audio", with(func(f *transcriptionForm) { f.streamFormat = "audio" }), "transcription.stream_unsupported"},
+		{"stream_format with stream false", with(func(f *transcriptionForm) { f.stream, f.streamFormat = "false", "sse" }), "transcription.stream_unsupported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := validateTranscriptionRequest(tc.form)
+
+			if tc.wantCode == "" {
+				if got != nil {
+					t.Fatalf("validate = %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil || got.Code != tc.wantCode {
+				t.Fatalf("validate = %+v, want code %q", got, tc.wantCode)
+			}
+			if got.Message == "" {
+				t.Fatalf("refusal %q carries no message", tc.wantCode)
+			}
+		})
+	}
+}
+
+// The end of the pipeline the handler runs, parse then validate, on real bodies.
+func TestParseThenValidateTranscriptionRequest(t *testing.T) {
+	cases := []struct {
+		name     string
+		parts    []editPart
+		wantCode string
+	}{
+		{"valid", validTranscriptionParts("asr-model"), ""},
+		{"no model", replaceEditPart(validTranscriptionParts("asr-model"), "model", nil), "transcription.model_required"},
+		{"no file", replaceEditPart(validTranscriptionParts("asr-model"), "file", nil), "transcription.file_required"},
+		{"empty file", replaceEditPart(validTranscriptionParts("asr-model"), "file", &editPart{name: "file", filename: "e.wav"}), "transcription.file_required"},
+		{"verbose_json", append(validTranscriptionParts("asr-model"), editPart{name: "response_format", body: []byte("verbose_json")}), "transcription.response_format_unsupported"},
+		{"stream", append(validTranscriptionParts("asr-model"), editPart{name: "stream", body: []byte("true")}), "transcription.stream_unsupported"},
+		{"stream_format", append(validTranscriptionParts("asr-model"), editPart{name: "stream_format", body: []byte("sse")}), "transcription.stream_unsupported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, ct := buildEditMultipart(t, tc.parts)
+
+			form, err := parseTranscriptionForm(ct, body)
+			if err != nil {
+				t.Fatalf("parseTranscriptionForm: %v", err)
+			}
+			got := validateTranscriptionRequest(form)
+
+			switch {
+			case tc.wantCode == "" && got != nil:
+				t.Fatalf("validate = %+v, want nil", got)
+			case tc.wantCode != "" && (got == nil || got.Code != tc.wantCode):
+				t.Fatalf("validate = %+v, want code %q", got, tc.wantCode)
+			}
+		})
+	}
+}
+
+// The multipart read is bounded. A body past the cap is a 413 whether its length
+// was declared (refused without reading a byte) or only discovered while reading
+// (chunked, where the read stops at the cap); a body under it is returned whole;
+// a body that cannot be read is the endpoint's own malformed-form 400.
+func TestReadTranscriptionBody(t *testing.T) {
+	const limit = 1 << 10
+	big := bytes.Repeat([]byte{0xAB}, limit+1)
+
+	t.Run("a body under the cap is returned whole", func(t *testing.T) {
+		body := bytes.Repeat([]byte("a"), limit)
+		req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
+		rec := httptest.NewRecorder()
+
+		raw, ok := readTranscriptionBody(rec, req, limit)
+
+		if !ok || !bytes.Equal(raw, body) {
+			t.Fatalf("ok = %v, %d bytes, want the %d-byte body back", ok, len(raw), len(body))
+		}
+	})
+	for _, declared := range []bool{true, false} {
+		name := "chunked"
+		if declared {
+			name = "declared length"
+		}
+		t.Run("past the cap, "+name, func(t *testing.T) {
+			counted := &countingReader{r: bytes.NewReader(big)}
+			req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", io.NopCloser(counted))
+			if declared {
+				req.ContentLength = int64(len(big))
+			} else {
+				req.ContentLength = -1
+			}
+			rec := httptest.NewRecorder()
+
+			raw, ok := readTranscriptionBody(rec, req, limit)
+
+			if ok || raw != nil {
+				t.Fatalf("ok = %v, %d bytes, want the read refused", ok, len(raw))
+			}
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413", rec.Code)
+			}
+			requireErrorCode(t, rec.Body.String(), "request.body_too_large")
+			if declared && counted.n != 0 {
+				t.Fatalf("read %d bytes of a body whose declared length was already past the cap", counted.n)
+			}
+		})
+	}
+	t.Run("a body that cannot be read", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", io.NopCloser(failingReader{}))
+		rec := httptest.NewRecorder()
+
+		raw, ok := readTranscriptionBody(rec, req, limit)
+
+		if ok || raw != nil {
+			t.Fatalf("ok = %v, %d bytes, want the read refused", ok, len(raw))
+		}
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+		requireErrorCode(t, rec.Body.String(), "transcription.invalid")
+	})
+}
+
+// failingReader fails every read with an error that is not the size cap's.
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
