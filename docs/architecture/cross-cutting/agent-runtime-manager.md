@@ -760,8 +760,8 @@ have emitted).
 ### 3.4 Runtime-server kind and per-kind probe-path derivation
 
 A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` |
-`stable_diffusion_cpp` | `custom`; migration 75, `text not null default ''`) is
-what tells the gateway — and, through it, the agent — which conventions govern
+`stable_diffusion_cpp` | `audio_cpp` | `custom`; migration 75, `text not null default ''`)
+is what tells the gateway — and, through it, the agent — which conventions govern
 *this* child's metrics and context-window endpoints (design 2026-09-07), and,
 for `stable_diffusion_cpp`, its health path. `""` (every pre-feature row) is
 not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
@@ -769,7 +769,8 @@ not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
 launched binary's basename, first match wins — `vllm`, then
 `llama-server`/`llama_cpp`/`llama.cpp`, then
 `text-generation-launcher`/`tgi`, then `sd-server`/`stable-diffusion`, then
-`ollama` — and falls back to `custom` when nothing matches.
+`audiocpp_server`/`audio.cpp`, then `ollama` — and falls back to `custom` when nothing
+matches.
 `EffectiveRuntimeSpecType(spec)` resolves the type that actually governs a
 spec: the explicit `Type` when set, else the detected one.
 
@@ -784,6 +785,7 @@ winning **per field** over the type's own default:
 | `tgi` | `/metrics` (Prometheus; `tgi_batch_current_size`=active, `tgi_queue_size`=queue) | `/info` | `max_total_tokens` |
 | `ollama` | *(none)* — Ollama exposes no Prometheus-style `/metrics` endpoint at all | `/api/show` — **POST**, body `{"model": "<the spec's model>"}` (see below) | `model_info["<arch>.context_length"]`, matched by suffix (e.g. `llama.context_length`) |
 | `stable_diffusion_cpp` | *(none)* — measured: `sd-server` serves no metrics endpoint of any kind | *(none)* — no `/props`, no context-length field in its capability document, and an image model has no context window | — |
+| `audio_cpp` | *(none)* — a speech server's design relies on no Prometheus-style scrape | *(none)* — `/v1/models` entries carry `family`, `task`, `mode`, `loaded` and `path`, not a context length, and a speech model has no context window | — |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -793,6 +795,37 @@ best-effort scan is also what `custom` and any type this portal build does not
 yet recognize fall back to — never a hard failure, since a spec's real backend
 is exactly what an operator picking `custom` is telling the gateway it cannot
 assume.
+
+**`audio_cpp` is the second kind with no probe paths, and it is the agent-managed
+half of a feature whose other half is not here.** audio.cpp's `audiocpp_server`
+(`routing.RuntimeSpecTypeAudioCpp`) is the backend of `POST /v1/audio/speech`
+([API Compatibility & Inference
+§3.6](compatibility-and-inference.md#36-openai-audio-speech)). What this kind does is
+small and entirely gateway-side: a binary basename containing `audiocpp_server` or
+`audio.cpp` detects as it (an explicit `type` always wins), `DeriveProbePaths` answers
+`("", "")` (an operator override still wins per field), the spec accepts the
+`openai_audio` flavor (the launch-spec form ticks it alone, with both endpoint modes
+`disabled`, when an untouched spec's Type is switched to the kind), and `health_path`
+takes the stock `/health`, because audio.cpp serves
+`GET /health` (the one place it differs from `stable_diffusion_cpp`, whose server
+answers it with 404 and so takes `/v1/models`). The agent holds no branch of its own
+for the kind: it receives the gateway-resolved type string and the derived probe paths,
+and its capability probe treats the kind like `custom` (the default `/props` branch of
+[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time), one loopback read per
+process generation of a document an audio.cpp server is not known to serve), so it
+reports no capability verdict for such a child. **The agent-managed audio.cpp
+capability source is deferred.** The gateway's `speech` verdict is read from audio.cpp's
+`GET /v1/models` `task` field by the gateway's own health loop, and only for a **static**
+`audio_cpp` *application*; the agent router's `/v1/models` carries no `task`, so that
+read could state nothing for a child launched behind the router, and the health loop
+deliberately does not probe a `server_agent` application at all. Until an agent-side
+source exists (a feature flag and an ingest acceptance, as `capability_source_sdcpp` is
+for images), an agent-launched `audio_cpp` child serves speech only after an operator
+sets `speech: yes` on its mapping by hand, and its agent-side launch shape (arguments,
+ensure route, VRAM measurement) has no worked example here
+([Routing & Model Selection
+§2.3](routing-and-model-selection.md#23-the-capability-gate),
+[ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
 
 **`ollama` is the one row whose verb is not `GET`, and having it wrong made
 that probe unsatisfiable for as long as it existed (issue #54, fixed).**
@@ -3850,6 +3883,7 @@ Nothing found is recorded as 0, which the history shows as "—". Per spec type:
 | `tgi` | 404, so telemetry decides | `/info`, public even with a key | `max_total_tokens` | agents before 0.6.0 |
 | `ollama` | 404, so telemetry decides | `POST /api/show`; Ollama has no auth | `model_info.<arch>.context_length`: the model maximum, the column's documented meaning | agents before 0.6.0 |
 | `stable_diffusion_cpp` | not applicable | not applicable | none | always: an images-only mapping gets no speed row, and the standalone context probe is refused and disabled for it |
+| `audio_cpp` | not applicable | not applicable | none | always: an audio-only mapping gets no speed row, and the standalone context probe is refused (`benchmark.audio_only`) and disabled for it |
 | `custom` | yes, if the child serves a llama.cpp-shaped `/props` | only when the spec sets `context_probe_path`, and only for a child without a key | a best-effort scan for `n_ctx`, `max_model_len` or `context_length` | otherwise |
 | Auto (`""`) | follows the type `EffectiveRuntimeSpecType` resolves | | | |
 
@@ -4504,7 +4538,7 @@ picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
 
 **Every launch spec also carries its own API-Varianten block** — the identical
-`openai`/`anthropic`/`openai_images` flavor checkboxes and Codex/Claude-Code
+`openai`/`anthropic`/`openai_images`/`openai_audio` flavor checkboxes and Codex/Claude-Code
 endpoint-mode dropdowns the application form shows, extracted into one shared
 component,
 `ApiVariantControls` (`gateway/frontend/src/components/shared/ApiVariantControls.tsx`),
@@ -4575,13 +4609,13 @@ document holds zero values for the three fields there (`[]` and `""`), not
 choices: a form opened on them would refuse to save the `[]`, and the
 backend would store the `""` as `passthrough` rather than the modes the
 mapping routed on. Its `enabled: false` is a zero value too, so that Edit
-opens with Enabled ticked, as the create form does. `openai_images` is left
-out of the template **only when a text flavor survives the exclusion**: it is
-opt-in on the spec too, and a parent that declares it for its image children
-would otherwise hand it to every new text model's spec. Under a parent whose
-flavors are *exactly* `[openai_images]` the exclusion is skipped and
-`openai_images` is inherited as is, because dropping it there would leave
-every flavor unticked, a form the launch-spec form refuses to save. This is a
+opens with Enabled ticked, as the create form does. `openai_images` and
+`openai_audio` are left out of the template **only when a text flavor survives the
+exclusion**: both are opt-in on the spec too, and a parent that declares one for its
+image or speech children would otherwise hand it to every new text model's spec. Under
+a parent whose flavors are *exactly* `[openai_images]` (or `[openai_audio]`) the
+exclusion is skipped and the flavor is inherited as is, because dropping it there
+would leave every flavor unticked, a form the launch-spec form refuses to save. This is a
 **frontend, form-open-time** convenience, not a backend default: the
 backend's default for an absent or empty field, on every spec write, is
 unconditionally `passthrough` for both modes and both text flavors (`openai`,
@@ -4628,8 +4662,12 @@ values are still exactly that sd default restores the remembered values, or
 the parent template when nothing is remembered because the spec was loaded as
 sd. Switching to Auto moves nothing, for the health path's reason: an Auto spec
 with an `sd-server` binary is still sd. In every other case the values are the
-operator's and stay as they are. "Untouched" is judged against the template,
-not by the form's flavor-touched flag, which resets on every open. The hint
+operator's and stay as they are. Switching Type to `audio_cpp` does the same with
+`["openai_audio"]` and both modes `disabled`, the application form's default for that
+type (`specTypeFlavorDefaults`, one entry per defaulting kind), and a switch between
+the two defaulting kinds moves from one default to the other. "Untouched" is judged
+against the template, not by the form's flavor-touched flag, which resets on every
+open. The hint
 and switch rules live in `runtimeSpecTypeFlavors.ts`
 (`specFlavorsAfterTypeSwitch` for the switch). This is a form convenience: the
 backend stays type-agnostic about flavors, and its default for an absent or
@@ -4789,8 +4827,8 @@ absolute under **both** rules (a UNC share spelled with forward slashes,
 **`api_flavors_not_on_application`** — a spec of a `server_agent` application
 lists a flavor the application does not declare. Candidacy reads the
 application's flavors, so that flavor has no effect: a spec `["openai_images"]`
-under a parent without `openai_images` is served, and listed, under no API at
-all
+(or `["openai_audio"]`) under a parent without that flavor is served, and listed, under
+no API at all
 ([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)).
 It also fires for a harmless extra — a parent from which `anthropic` was
 removed on purpose — so its label says the flavor has no effect, not that the
@@ -4801,7 +4839,10 @@ application whose effective type (`EffectiveRuntimeSpecType`: the explicit
 `type`, else the one detected from `binary`) is `stable_diffusion_cpp` has
 flavors that are not images-only, an empty list included. The listings'
 `openai` rule would offer such a spec as a text model, and `sd-server` has no
-chat endpoint (measured: `POST /v1/chat/completions` answers 404).
+chat endpoint (measured: `POST /v1/chat/completions` answers 404). There is **no
+audio.cpp twin** of this warning or of the form's matching inline hint: a spec of kind
+`audio_cpp` that keeps a text flavor is not flagged, because the agent-managed audio
+path is deferred ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
 
 Both count disabled specs, like `binary_path_os_mismatch` and unlike the
 timeout warning, because dispatch reads a spec's flavors whether it is enabled
@@ -6232,6 +6273,23 @@ convention its neighbouring count columns already use.
 
 ### 11.9 Manual runs on an images-only mapping
 
+**Everything in this section holds, unchanged, for an audio-only mapping** (effective
+flavors listing `openai_audio` and neither text flavor,
+`mappingSpecIsAudioOnly`/`routing.FlavorsAreAudioOnly`, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)): a
+speech server answers no chat prompt either. Each refusal and skip below has a twin
+that is the same mechanism under a speech-worded name: 409 `benchmark.audio_only`
+for `benchmark.images_only`, `skipped: "audio_only"` for `skipped: "images_only"`,
+`load_refusal: "audio_only"` on the model-server row, and the portal's `audio_only`
+mapping marker beside `images_only`. A scope that holds both kinds answers
+`benchmark.images_only`, and a mapping listing both non-text flavors is both. An
+audio-only agent child loads through the router's ensure route like an images-only
+one, and is refused with the shared `benchmark.agent_ensure_unsupported` while its
+agent has not declared `runtime_ensure`; that code's message is still worded for
+images, a known imprecision recorded rather than fixed because the agent-managed audio
+path is itself deferred. The scheduler, the warmer, the context probe and the
+VRAM probe treat it the same way. The text below is written for images, the case
+with a worked upstream.
+
 An images-only mapping is one whose effective flavors — the spec's for an
 agent-launched child with a spec, the application's otherwise — list
 `openai_images` and neither text flavor: the rule of
@@ -6740,7 +6798,7 @@ consistent if configured together.
 
 | Bound | Where | Default | Covers |
 |---|---|---|---|
-| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent` and `stable_diffusion_cpp` (30000 elsewhere) | **Total** deadline of a non-streaming request, never reset by upstream activity. On the gateway's own benchmark streams it also sets the first-data budget (below). |
+| `Application.timeout_ms` | Gateway, per application | 600000 for `server_agent`, `stable_diffusion_cpp` and `audio_cpp` (30000 elsewhere) | **Total** deadline of a non-streaming request, never reset by upstream activity. On the gateway's own benchmark streams it also sets the first-data budget (below). |
 | `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT` | Gateway | 120 s (2 min on a benchmark stream when set to `0` or less) | Idle watchdog on streaming responses. On a benchmark stream the router's heartbeats also reset it until the first event, up to the first-data budget (below). |
 | `spec.admission_wait_timeout_seconds` | Agent, per spec | `0` = until the client disconnects | Queueing for a slot. |
 | `spec.startup_timeout_seconds` | Agent, per spec | 180 (floored at 30 when unset) | Process start until first green health probe. |

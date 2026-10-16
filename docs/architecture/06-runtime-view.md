@@ -35,13 +35,53 @@ sequenceDiagram
     GW->>U: record usage event (tokens, cost, energy, status)
 ```
 
-Notes: the five JSON inference endpoints read the request body with no size cap
-(large multimodal payloads); the sixth, the multipart image edit
+Notes: the six JSON inference endpoints read the request body with no size cap
+(large multimodal payloads); the seventh, the multipart image edit
 (`POST /v1/images/edits`), is the one capped body
-(`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB). All six lift the
+(`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB). All seven lift the
 server read/write deadlines; SSE streams are bounded by an idle watchdog and
 client disconnect, not a total cap. See
 [Compatibility & Inference](cross-cutting/compatibility-and-inference.md).
+
+### 6.1.1 Speech relay (`POST /v1/audio/speech`)
+
+Text-to-speech is the one inference scenario whose response is **binary and not
+JSON**, so it has its own runtime shape: no translate path, a capability gate
+before routing, a validation that refuses what the relay cannot serve, a sized
+and unbuffered audio body, and a usage row in seconds rather than tokens.
+
+```mermaid
+sequenceDiagram
+    participant C as AI client
+    participant GW as Gateway (edge)
+    participant R as routing (resolver)
+    participant AC as audio.cpp server
+    participant U as usage
+
+    C->>GW: POST /v1/audio/speech {model, input, voice} (Bearer token)
+    GW->>GW: authenticate (bearer or loopback, never a session)
+    GW->>GW: validate: model + input; response_format wav only; no stream
+    Note over GW: 400 speech.* here, before any admission, not recorded
+    GW->>R: resolve(model, openai_audio, required capability speech)
+    R-->>GW: candidate with speech: yes, or 404 no_model_route / model_not_capable
+    GW->>AC: POST /v1/audio/speech (model rewritten to the app's own name)
+    alt 2xx
+        AC-->>GW: audio/wav + Content-Length + X-AudioCPP-* headers
+        GW-->>C: audio/wav + Content-Length (streamed, never buffered)
+        GW->>U: audio_second = Audio-Duration-Ms / 1000, zero tokens
+    else non-2xx
+        AC-->>GW: error body (an OpenAI object, or a plain string)
+        GW-->>C: OpenAI-shaped error at the upstream's status
+        GW->>U: audio_second error row, quantity 0
+    end
+```
+
+The gate is `RequiredCapabilities = ["speech"]`, whose verdict the health loop wrote
+from the server's `/v1/models` `task`; the flavor is the application's own
+`openai_audio` declaration. A payload capture keeps the request JSON and a metadata
+summary of the audio, never the WAV bytes. See [Compatibility & Inference
+§3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech) and
+[ADR-061](09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only).
 
 ## 6.2 Portal login (session + CSRF) with optional TOTP
 

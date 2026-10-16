@@ -99,6 +99,9 @@ endpoints when this was decided and there are five since
 was admitted under this decision rather than amending it
 ([Compatibility & Inference
 §10](cross-cutting/compatibility-and-inference.md#10-request-bodies-and-size-limits)).
+`POST /v1/audio/speech` is a further uncapped JSON endpoint, admitted the
+same way ([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)):
+its body is a short JSON object, and the gateway buffers it whole like the others.
 
 **Amended by [ADR-057](#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
 (the one capped inference body).** `POST /v1/images/edits` is the sixth inference
@@ -1795,6 +1798,17 @@ no)` is the operator's opt-out and is already writable (the vocabulary is open),
 while `(image, no)` stays reserved by (b). The two lists still must not be kept in
 step. → [Routing & Model Selection
 §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate).
+
+**Generalised by [ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
+(the second endpoint, `POST /v1/audio/speech`).** The Decision's claim that the next
+endpoint "inherits this gate, and both of its affinity write guards, by naming their
+own capability" is now exercised: speech declares `RequiredCapabilities = ["speech"]`
+and nothing in the resolver changed. Two forecasts above did not come true as
+written. Speech did **not** share a coarse flavor with a text endpoint, as the
+affinity paragraph allowed for: it took a coarse flavor of its own, `openai_audio`,
+so the guards stay redundant for it exactly as for images. And a capability list is
+now known to do a second job, keeping a request off the vendor-account path, which
+excludes the images flavor by name and has no audio twin.
 
 → [API Compatibility & Inference
 §3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
@@ -4983,3 +4997,219 @@ opt-in and owner-credentialed).
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-061 — Speech is the second endpoint on the capability gate: a distinct `speech` capability, a coarse `openai_audio` flavor, the `audio_cpp` kind, and a binary relay that serves WAV only
+
+**Context:** `POST /v1/audio/speech` (issue #68) is the third multi-modal endpoint
+after the billing pair ([ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar))
+and images ([ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
+[ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)),
+and the first whose response is **not JSON at all**: it relays a binary `audio/wav`
+body. The images template carries over almost whole, a dedicated handler relaying
+through `proxyNative` behind a required-capability gate, so this entry records what
+speech decided *differently*, and why. The inputs are facts about the backend,
+audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have chosen:
+
+- Its capability signal is the per-model `task` field of its own `GET /v1/models`
+  (`tts` and `clone` synthesise speech, `asr` transcribes), and that listing names
+  **loaded** models only.
+- It answers `response_format` `wav` or absent with a binary `audio/wav` body, a
+  `Content-Length` and metering headers (`X-AudioCPP-Audio-Duration-Ms`,
+  `X-AudioCPP-Wall-Ms`, `X-AudioCPP-RTF`). It answers `mp3` and every other
+  unsupported value with **raw WAV, still labelled `audio/wav`**, and answers `json`
+  and `b64_json` with base64 WAV in a JSON body that carries **none** of the
+  metering headers.
+- Its errors are OpenAI-object-shaped (`{"error":{"message","type":"server_error"}}`)
+  but it answers **HTTP 500 for client errors** (a missing `input`, an unknown model),
+  has no authentication of its own, and refuses a streaming request to an offline
+  model with a 500.
+
+**Decision — ten choices, taken together.**
+
+- **(a) `speech` is a capability of its own, and the images gate carries it
+  unchanged.** `routing.CapabilitySpeech = "speech"` means the model **synthesises**
+  speech. It is not `CapabilityAudio`, which means the model **accepts** audio as input
+  (a llama.cpp `/props` modality with its own writer), exactly as `image` is not
+  `vision`; the two can co-occur and neither is ever mapped onto the other. It also
+  does **not** coincide with the billable unit (`audio_second`), unlike `image`: a
+  capability names what a model can do, the unit names what a served request is metered
+  in. The handler sets `RequiredCapabilities = ["speech"]` from its own identity,
+  and the existing `filterCapable` refuses a model without a `yes` verdict on every
+  resolve branch, **the affinity pin and the server override included**
+  ([Routing & Model Selection §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
+  ADR-042's three rules all carry over: an absent row is unknown and **refuses**, a
+  store error refuses, and `(speech, no)` is reserved in `reservedManualVerdicts` so a
+  rank-3 manual `no` can never veto the probe that is entitled to write it. Nothing in
+  the resolver changed for speech, which is the return on ADR-042's cost comparison:
+  the second endpoint paid for a constant and a verdict writer. One dependency is worth
+  naming because it is easy to lose: the capability list is also what keeps a speech
+  request **off the vendor-account path**. `vendorAccountRoutingEligible` excludes the
+  images flavor by name and has no `openai_audio` twin; it declines a request only
+  because it carries a capability list, and a vendor model is matched by name, never by
+  flavor. A handler that dropped the list would skip the gate **and** become routable
+  to a hosted vendor model of the same name, so a test pins the list.
+- **(b) `openai_audio` is a COARSE flavor, opt-in everywhere, under the same
+  migration-safety rule as `openai_images`.** `NormalizeAPIFlavor` tests the images and
+  audio prefixes before the generic `openai` one, so the flavor folds to itself and
+  candidacy admits only an application that lists it. An empty list on save still
+  becomes exactly `[openai, anthropic]`. Because the flavor is a flavor of its own, a
+  speech request's affinity key can never collide with a chat client's, and speech
+  needs no endpoint mode and no translate path; `upstreamPath` answers
+  `/v1/audio/speech` directly. **The audio-only rule is the images-only rule, applied
+  to the second non-text flavor.** `routing.FlavorsAreAudioOnly` (the list names
+  `openai_audio` and neither text flavor) keeps an audio-only server **out of the chat
+  flavors**: the `openai` row of the listing and candidacy rule refuses an images-only
+  **or** an audio-only list, so such a model is not listed by `/v1/models`, is not a
+  redirect target for a text request, is refused by the text translate dispatch (404
+  `routing.no_model_route`), and is never sent a chat prompt by the background jobs
+  that send a mapping one of their own: the model warmer, the scheduled and manual
+  benchmarks, the context probe, a Load and the VRAM probe. A benchmark refusal
+  carries its own code, `benchmark.audio_only` (409), and the portal's mapping DTO
+  carries `audio_only` beside `images_only`
+  ([Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model)).
+- **(c) audio.cpp is two things under one name, in two namespaces.** The **application
+  type** `audio_cpp` (`routing.ProviderAudioCpp`) is a **static**, operator-run
+  `audiocpp_server`: no runtime spec, dispatched to the shared OpenAI-compatible client
+  (the relay is a native passthrough, and that client also reads the listing for the
+  verdict). Its defaults follow the images type's logic: `timeout_ms` 600000 (a
+  synthesis is a non-streaming request governed by one total deadline; the one default
+  the backend applies too), the `["openai_audio"]` flavor, and both coding-agent
+  endpoint modes disabled (both set by the application form, as for images). Unlike
+  `stable_diffusion_cpp` it keeps the `health_path` mode, with the path `/health`,
+  because audio.cpp serves `GET /health` and answers `/v1/health` with 404. The
+  **runtime spec kind** `audio_cpp` (`routing.RuntimeSpecTypeAudioCpp`) is the
+  agent-managed counterpart: detected from an `audiocpp_server` or `audio.cpp` binary
+  basename, with the probe paths `("", "")` (no `/metrics`, and a speech model has no
+  context window to probe)
+  ([Agent-Managed Model Runtime §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+  **The verdict writer is gated on the application type, not on the spec kind.** The
+  first design gated on `server_agent` plus a spec of the kind, and that is a gate that
+  never opens in a real deployment: a static server has no spec, and the agent router's
+  `/v1/models` carries no `task`, so the only server it could reach was one that could
+  state no verdict.
+- **(d) The verdict is read from `GET /v1/models`, per mapping, by the gateway's own
+  health loop.** `probeAudioCppModels` finds the entry whose `id` equals the mapping's
+  application-side model name and derives: `task` `tts` or `clone` is `(speech, yes)`;
+  the model present with any other non-empty task is `(speech, no)`, authoritative
+  because the listing states each loaded model's task; the model absent, the task
+  absent or the body unreadable writes **nothing**, because none of those says the
+  model cannot speak and a `no` can switch a route off. It is a new probe-rank source,
+  `audiocpp_models`, ranking 1 with the other probes (never able to outrank a `manual`
+  or `vision_benchmark` row, always able to repair its own drift), and it writes the
+  `speech` row only. **A model that is not loaded reads as unknown and refuses**
+  until the health loop sees it loaded; for an operator-run server the mapped model is
+  loaded, and `speech: yes` set by hand covers the rest. **The agent-managed source is
+  deferred:** the agent router's `/v1/models` carries no `task`, so an agent-launched
+  `audio_cpp` child has no automatic verdict until an agent-side source exists (a
+  feature flag and an ingest acceptance, as `capability_source_sdcpp` is for images); an
+  operator's manual `speech: yes` serves it meanwhile.
+- **(e) The request surface is WAV-only, and streaming is refused rather than
+  half-served.** `response_format` must be `wav` or absent, and **every other value is
+  400 `speech.response_format_unsupported`**: `mp3`, `opus`, `flac`, `aac` and `pcm`
+  **and also `json` and `b64_json`**. There are two reasons, and the second is the
+  decisive one. Forwarding `mp3` would silently hand a strict client WAV labelled
+  `audio/wav`, which is worse than a refusal. And `json` and `b64_json` are not OpenAI
+  speech formats and carry **no metering header**, so a relayed one would bill zero
+  seconds on every success and log an Error each time. `stream: true` and any
+  `stream_format` (`sse` or `audio`) are 400 `speech.stream_unsupported`: the relay's
+  buffering and billing contract is one complete audio response. `stream: false`, an
+  absent `stream` and a null `stream_format` describe what the endpoint already does and
+  are accepted. The handler validates its own shape, a non-empty `model`
+  (`speech.model_required`) and a non-empty `input` (`speech.input_required`),
+  **before the relay**, because audio.cpp would answer those with a 500 that the gateway
+  would hand on as a server failure. Both deferrals have a stated way back: streaming
+  needs the `mode=streaming` model contract and its SSE events, and `json`/`b64_json`
+  need a RIFF-header duration decode for billing.
+- **(f) The relay forwards the upstream `Content-Length` and still does not buffer.**
+  `proxyNative` relays every native body chunked (it flushes per chunk and sets no
+  length). For audio that is a loss a client can see: the body is one sized file,
+  audio.cpp always declares its length, and a player shows a duration and a download its
+  progress from it. For the speech flavor **only**, the upstream's declared
+  `Content-Length` is set on the client response before the header is written, while the
+  copier still moves 32 KiB at a time with a flush per chunk, so net/http frames by the
+  declared length and the bytes keep streaming. An upstream that declared none stays
+  chunked, and chat, Responses, Messages and images keep relaying chunked as before. The
+  length is read off the upstream header (the provider response type carries no length
+  field), which is sound because Go's client drops that header for a chunked or
+  decompressed response, so a surviving value is the length the copier writes. The
+  usage scanner is nil for speech, as for images: a binary body has no chat usage to
+  find, and scanning it would retain audio per in-flight request to learn that.
+- **(g) Speech bills `audio_second` from the upstream's own duration header.** The unit
+  is endpoint identity, as for images, so every speech `recordUsage` site, a refused or
+  failed request included, carries `billing_unit = audio_second`. The quantity is a
+  **measurement** and comes from the response: `X-AudioCPP-Audio-Duration-Ms` divided by
+  1000, set only on a clean `success` (the full body reached the client). A success with
+  **no usable duration** (absent, non-numeric, zero, negative, or `NaN`/`Inf`, which a
+  float parse accepts and which would poison every sum) records `0` and is logged once at
+  `Error`, because the pair has no "unknown", so the gap is made loud instead of
+  repaired. Tokens and both rates stay zero, so `ValidateBillingXOR` holds, and the
+  row's `provider_path` is `/v1/audio/speech` (its `req_path` is the path the client
+  called, that or the `/openai/` alias), so Activity never labels it a chat completion
+  ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
+- **(h) Capture stores metadata for a binary response, never the bytes.** The capture
+  envelope stores a body as a string that `json.Marshal` rewrites to valid UTF-8 and the
+  capture cap clips mid-file, so a captured WAV would be a corrupted fragment. A response
+  whose own `Content-Type` is `audio/*` is therefore stored as a small JSON summary
+  (content type, the size the relay actually wrote, `redacted: true`, and the upstream's
+  `X-AudioCPP-*` headers). The gate is the **response** type, not the request flavor, so
+  an error response (`application/json`) is captured like any other body. The request
+  JSON, which carries the `input` text the opt-in capture exists for, is captured as
+  usual
+  ([Security §14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+- **(i) A non-2xx upstream response is normalised to the OpenAI error shape.** The relay
+  buffers the (bounded) error body and, in order: an OpenAI error object passes through
+  **byte for byte** (audio.cpp's own shape, so its attested `type` is not overwritten
+  with ours); a plain `{"error":"..."}` string is wrapped with the gateway's own
+  `type: upstream_error` and `code: speech.upstream_error`; anything else is relayed
+  unchanged. The upstream's status is relayed as it came, and a failed relay records an
+  `audio_second` error row with quantity zero. The normalisation is gated on the speech
+  flavor and a non-2xx status, so a 2xx WAV still streams and no other flavor's error
+  handling changed.
+- **(j) The admission surface is the images one, and `GET /v1/audio/voices` is
+  deliberately not proxied.** Auth is a bearer token **or** the internal loopback pair,
+  never the session cookie (a third user of that leg after generations and edits), with
+  the same run-as block copied in. The voices listing is an audio.cpp and llama-swap
+  convention, not an OpenAI endpoint, so clients learn voice names out of band.
+
+**Consequence:** speech has the images day-one cost, in a milder form. A deployment with
+no `openai_audio` application serves no speech: a route without the flavor answers 404
+`routing.no_model_route`, and a route with it and no `(speech, yes)` verdict answers 404
+`routing.model_not_capable`. For an `audio_cpp` application that verdict arrives with the
+first health tick that finds the mapped model loaded, and a model that is not loaded
+stays unknown until it is. Every speech request is one buffered call governed by one
+**total** deadline, the application's `timeout_ms`: the `audio_cpp` type defaults it to
+600000, an application of any other type that serves speech needs it raised by hand, and
+the idle watchdog does not apply. Speech takes **no affinity pin**, by the guard ADR-042
+wrote for exactly this: a capability-carrying request never creates one. The costs
+accepted are named, not hidden
+([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)): no
+streaming, no `mp3`/`opus`/`flac`/`json`, no automatic verdict for an agent-managed
+`audio_cpp` child, and a capture gate that trusts the upstream's `Content-Type`. The
+portal's Models listing carries no speech flag, so its "Available via" column cannot gate
+`openai_audio` behind a verdict the way it gates `openai_images` behind `image`; the
+request itself is still gated server-side.
+
+**Rejected:** **a new fine flavor or a per-capability column** (ADR-042's argument,
+unchanged and now twice avoided). **Mapping `speech` onto `audio`** (`audio` is an input
+modality with its own writer; advertising a synthesiser as a consumer, or the reverse,
+fails far from its cause). **Relaying `mp3` as the upstream answers it** (a client would
+be handed WAV labelled `audio/wav`). **Relaying `json`/`b64_json`** (no metering header,
+so every success bills zero seconds). **Relaying `stream`** (a shape the relay was not
+built, metered or tested for). **Buffering the clip to learn its length** (the clip is
+megabytes, and the declared length is the upstream's own). **Storing the WAV in the
+capture** (a corrupted, clipped fragment that bloats every capture). **Gating the verdict
+writer on `server_agent` plus a spec kind** (it never opens for a static server, and the
+agent router's listing states no `task`). **Normalising an already-OpenAI-shaped error**
+(it would overwrite the upstream's attested type with the gateway's). **Proxying the
+voices listing** (not an OpenAI endpoint).
+→ [API Compatibility & Inference §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
+[Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
+[§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[Telemetry, Usage Analytics & Observability
+§8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[Security §14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers),
+[Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

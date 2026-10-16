@@ -543,8 +543,13 @@ The vendor branch is **skipped entirely** — the request falls through to the
 self-hosted path — when the module flag is off, the principal has **no identity the
 grant can be asked about** (neither a user id nor, for a service token, a service id),
 a **server-override** is set, the request is
-**capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image), or the
-flavor is **images** (`openai_images`). That the resolver and the listing overlay
+**capability-gated** (`RequiredCapabilities` non-empty, e.g. vision/image/speech), or
+the flavor is **images** (`openai_images`). A speech request (`/v1/audio/speech`,
+flavor `openai_audio`) is kept off this path by the capability list alone: the
+check has no `openai_audio` twin of the images test, so the speech handler always
+sets `RequiredCapabilities = ["speech"]`
+([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+That the resolver and the listing overlay
 agree on what each account serves is what makes the "served-flavors parity"
 between dispatch and the model listing (§6.7) meaningful.
 
