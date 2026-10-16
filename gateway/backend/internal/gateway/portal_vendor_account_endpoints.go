@@ -59,17 +59,23 @@ const (
 	codeVendorAccountUsageRefreshFailed = "vendor_account.usage_refresh_failed"
 )
 
-// handlePortalVendorAccountsEnabled reports two booleans for any portal user
+// handlePortalVendorAccountsEnabled reports three booleans for any portal user
 // (gateway:use, GET-only): module_enabled, the vendor-accounts master flag (system
-// setting vendor_accounts_enabled), and subscriptions_enabled, the
+// setting vendor_accounts_enabled); subscriptions_enabled, the
 // vendor_subscriptions_enabled switch (default on) that gates only subscription
-// accounts. It returns ONLY those two -- no routing mode or other setting -- so
-// any user's shell can show or hide the "Anbieter" nav item, and the Anbieter page
-// can explain why subscription accounts are inert, without being granted the
-// system-scoped settings read. It answers while the module is off (that is its
-// purpose), and the exact-path route registered for it wins over the
-// "/api/portal/vendor-accounts/{id}" subtree (account ids are "va_"-prefixed, so
-// none can be called "enabled").
+// accounts; and sharing_enabled, the vendor_account_sharing_enabled master switch
+// (default off, #183) behind the share-level, management-group and resource-group
+// endpoints, so the portal can hide the controls that would answer 409 without the
+// system-scoped settings read a plain owner, an un-elevated admin or a group manager
+// lacks. sharing_enabled is the switch as stored: the module flag is checked first
+// by the endpoints themselves, and the consumer combines the two. It returns ONLY
+// those three -- no routing mode or other setting (in particular not
+// vendor_subscription_sharing_enabled) -- so any user's shell can show or hide the
+// "Anbieter" nav item, and the Anbieter page can explain why subscription accounts
+// are inert, without being granted the system-scoped settings read. It answers
+// while the module is off (that is its purpose), and the exact-path route
+// registered for it wins over the "/api/portal/vendor-accounts/{id}" subtree
+// (account ids are "va_"-prefixed, so none can be called "enabled").
 func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireWebScope(w, r, scopeGatewayUse); !ok {
 		return
@@ -80,6 +86,7 @@ func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *htt
 	writeJSON(w, http.StatusOK, map[string]any{
 		"module_enabled":        s.Portal.VendorAccountsEnabled(r.Context()),
 		"subscriptions_enabled": s.Portal.VendorSubscriptionsEnabled(r.Context()),
+		"sharing_enabled":       s.Portal.VendorAccountSharingEnabled(r.Context()),
 	})
 }
 
