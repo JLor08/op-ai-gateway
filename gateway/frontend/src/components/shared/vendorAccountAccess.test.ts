@@ -20,20 +20,28 @@ const managed = (
 describe('vendorAccountAccess', () => {
   describe('the owner', () => {
     it.each([
-      // level, auth type, admin, raise targets, lower targets, may edit the groups
-      ['none', 'api_key', true, ['shared', 'full'], [], false],
-      ['none', 'api_key', false, [], [], false],
-      ['shared', 'api_key', true, ['full'], ['none'], true],
-      ['shared', 'api_key', false, [], ['none'], true],
-      ['full', 'api_key', true, [], ['shared', 'none'], true],
-      ['full', 'api_key', false, [], ['shared', 'none'], true],
+      // level, auth type, admin, subscription sharing on, raise targets, lower targets,
+      // may edit the groups
+      ['none', 'api_key', true, true, ['shared', 'full'], [], false],
+      ['none', 'api_key', false, true, [], [], false],
+      ['shared', 'api_key', true, true, ['full'], ['none'], true],
+      ['shared', 'api_key', false, true, [], ['none'], true],
+      ['full', 'api_key', true, true, [], ['shared', 'none'], true],
+      ['full', 'api_key', false, true, [], ['shared', 'none'], true],
       // A subscription account is raised to `shared` only, never `full` (spec 11).
-      ['none', 'subscription', true, ['shared'], [], false],
-      ['shared', 'subscription', true, [], ['none'], true],
+      ['none', 'subscription', true, true, ['shared'], [], false],
+      ['shared', 'subscription', true, true, [], ['none'], true],
+      // ...and only while vendor_subscription_sharing_enabled is on (#236): the backend
+      // answers the raise 409 otherwise, so it is not offered. An api-key account
+      // ignores the switch, and so does lowering (never refused by it).
+      ['none', 'subscription', true, false, [], [], false],
+      ['none', 'api_key', true, false, ['shared', 'full'], [], false],
+      ['shared', 'subscription', true, false, [], ['none'], true],
+      ['shared', 'api_key', true, false, ['full'], ['none'], true],
     ] as const)(
-      'at %s on %s (admin %s) may raise to %j, lower to %j, edit the groups: %s',
-      (level, authType, admin, raise, lower, editGroups) => {
-        const access = vendorAccountAccess(own(level, authType), admin);
+      'at %s on %s (admin %s, subscription sharing %s) may raise to %j, lower to %j, edit the groups: %s',
+      (level, authType, admin, subscriptionSharing, raise, lower, editGroups) => {
+        const access = vendorAccountAccess(own(level, authType), admin, subscriptionSharing);
         expect(access.tier).toBe('owner');
         expect(access.raiseTargets).toEqual(raise);
         expect(access.lowerTargets).toEqual(lower);
@@ -58,6 +66,21 @@ describe('vendorAccountAccess', () => {
       expect(vendorAccountAccess(own('none', 'api_key'), false).showSharePanel).toBe(false);
       expect(vendorAccountAccess(own('shared', 'api_key'), false).showSharePanel).toBe(true);
       expect(vendorAccountAccess(own('full', 'api_key'), true).showSharePanel).toBe(true);
+    });
+
+    it('shows no share area for an admin on a personal subscription account while subscription sharing is off, and keeps it once the account is shared', () => {
+      // Nothing to raise to (#236), so nothing to show: the notice that explains it is
+      // the system settings' business, not this area's.
+      expect(vendorAccountAccess(own('none', 'subscription'), true, false).showSharePanel).toBe(
+        false,
+      );
+      expect(vendorAccountAccess(own('none', 'subscription'), true, true).showSharePanel).toBe(
+        true,
+      );
+      // An already-shared one keeps its level and the lowering action.
+      expect(vendorAccountAccess(own('shared', 'subscription'), true, false).showSharePanel).toBe(
+        true,
+      );
     });
   });
 

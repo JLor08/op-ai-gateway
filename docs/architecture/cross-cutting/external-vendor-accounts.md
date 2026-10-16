@@ -2184,12 +2184,19 @@ sharing is on is its structural reads, not the switches ([Risks
 
 The frontend reads the switches through a portal-scoped
 `GET /api/portal/vendor-accounts/enabled` (`{module_enabled, subscriptions_enabled,
-sharing_enabled}`, readable by any user even while the module is off — it exists to let
-the shell show or hide the nav item, the Anbieter page flag inert subscription accounts,
-and the Anbieter page and the resource-group manager hide the sharing controls that
-would answer `409`, without granting the system-scoped settings read; it returns only
-those **three** booleans, so `vendor_subscription_sharing_enabled` is never exposed
-there), mirroring the NetBird/certificates `/enabled` endpoints. The exact-path route wins
+sharing_enabled, subscription_sharing_enabled}`, readable by any user even while the
+module is off — it exists to let the shell show or hide the nav item, the Anbieter page
+flag inert subscription accounts, and the Anbieter page and the resource-group manager
+hide the sharing controls that would answer `409`, without granting the system-scoped
+settings read; it returns only those **four** booleans, the two sharing ones as stored
+and read fresh from the raw accessors). `subscription_sharing_enabled` is
+`vendor_subscription_sharing_enabled`: the Anbieter page does not offer the raise to
+`shared` of a **subscription** account while it is off (the backend would answer
+`409 vendor_accounts.subscription_sharing_disabled`), exactly as it hides every raise
+while `sharing_enabled` is off, and an api-key account, lowering and an already-shared
+account are not affected. It is mirrored on the same footing as `sharing_enabled`:
+absent from a response means off. The probe is the NetBird/certificates `/enabled`
+pattern again, mirroring the NetBird/certificates `/enabled` endpoints. The exact-path route wins
 over the `{id}` subtree because account ids are always `va_`-prefixed.
 
 The same master flag gates the **model-listing owner overlay** and the dashboard

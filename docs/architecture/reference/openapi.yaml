@@ -1615,20 +1615,22 @@ paths:
   /api/portal/vendor-accounts/enabled:
     get:
       tags: [portal]
-      summary: Whether the vendor-accounts module is enabled, whether subscription accounts are allowed, and whether sharing is on
+      summary: Whether the vendor-accounts module is enabled, whether subscription accounts are allowed, and whether sharing (and subscription sharing) is on
       description: >
-        Three booleans and nothing else: module_enabled (the vendor_accounts_enabled
+        Four booleans and nothing else: module_enabled (the vendor_accounts_enabled
         master flag), subscriptions_enabled (the vendor_subscriptions_enabled
-        switch, default true) and sharing_enabled (the
-        vendor_account_sharing_enabled master switch as stored, default false).
-        vendor_subscription_sharing_enabled, the routing mode and every other
+        switch, default true), sharing_enabled (the
+        vendor_account_sharing_enabled master switch as stored, default false) and
+        subscription_sharing_enabled (the vendor_subscription_sharing_enabled
+        switch as stored, default false). The routing mode and every other
         setting are never reported. Answers for any portal user even while the
         module is off, so the portal can show or hide the nav item and the
-        sharing controls without the system-scoped settings read.
+        sharing controls (including the raise of a subscription account to
+        shared) without the system-scoped settings read.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200':
-          description: The three switches
+          description: The four switches
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccountsEnabled' }
@@ -3159,16 +3161,18 @@ components:
     VendorAccountsEnabled:
       type: object
       description: >
-        GET /api/portal/vendor-accounts/enabled: three booleans and nothing
+        GET /api/portal/vendor-accounts/enabled: four booleans and nothing
         else. sharing_enabled is the vendor_account_sharing_enabled master switch
         as stored (the module flag is checked first by the endpoints themselves,
-        and the consumer combines the two); vendor_subscription_sharing_enabled
-        is never reported.
-      required: [module_enabled, subscriptions_enabled, sharing_enabled]
+        and the consumer combines the two); subscription_sharing_enabled is the
+        subordinate vendor_subscription_sharing_enabled switch as stored, which
+        only narrows sharing_enabled.
+      required: [module_enabled, subscriptions_enabled, sharing_enabled, subscription_sharing_enabled]
       properties:
         module_enabled: { type: boolean, description: The vendor_accounts_enabled master flag. }
         subscriptions_enabled: { type: boolean, description: The vendor_subscriptions_enabled switch (default true). }
         sharing_enabled: { type: boolean, description: The vendor_account_sharing_enabled master switch (default false). }
+        subscription_sharing_enabled: { type: boolean, description: The vendor_subscription_sharing_enabled switch (default false), whether a subscription account may be raised to shared. }
     VendorAccountShareLevelRequest:
       type: object
       description: portal.SetVendorAccountShareLevelRequest.

@@ -161,6 +161,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // The vendor_account_sharing_enabled master flag as the shell reads it; the
       // sharing area is the only thing it gates. On unless a test turns it off.
       sharingEnabled?: boolean;
+      // The vendor_subscription_sharing_enabled switch as the shell reads it (#236):
+      // whether a SUBSCRIPTION account may be raised to Shared. On unless a test turns
+      // it off.
+      subscriptionSharingEnabled?: boolean;
       candidates?: AdminGroupCandidate[];
       resourceGroups?: VendorAccountResourceGroup[];
       setVendorAccountShareLevel?: PortalApi['setVendorAccountShareLevel'];
@@ -268,6 +272,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           api={fakeApi}
           isAdmin={opts.isAdmin ?? false}
           sharingEnabled={opts.sharingEnabled ?? true}
+          subscriptionSharingEnabled={opts.subscriptionSharingEnabled ?? true}
         />
       </ToastProvider>,
     );
@@ -348,6 +353,30 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           'ag_a',
         ]),
       );
+    });
+
+    // #236: the backend refuses to raise a subscription account while
+    // vendor_subscription_sharing_enabled is off (409), so the owner-admin is not
+    // invited to try. An api-key account is raised as before.
+    it('offers no raise for a personal subscription account while subscription sharing is off', async () => {
+      renderView({
+        isAdmin: true,
+        subscriptionSharingEnabled: false,
+        accounts: [makeVendorAccount(OPENAI_SUBSCRIPTION)],
+      });
+      await openDetail();
+      await screen.findByText(t.vendorAccountSettingsTitle);
+
+      expect(shareRegion()).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: raiseTo('Shared') })).not.toBeInTheDocument();
+    });
+
+    it('still offers the raise of an api-key account while subscription sharing is off', async () => {
+      renderView({ isAdmin: true, subscriptionSharingEnabled: false });
+      await openDetail();
+
+      const panel = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      expect(panel.getByRole('button', { name: raiseTo('Shared') })).toBeInTheDocument();
     });
 
     it('requires at least one management group: disabled until one of several is chosen', async () => {
@@ -812,6 +841,23 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // Nothing the backend would answer 409 is asked for.
       expect(fakeApi.vendorAccountAdminGroupCandidates).not.toHaveBeenCalled();
       expect(fakeApi.setVendorAccountShareLevel).not.toHaveBeenCalled();
+    });
+
+    // The subscription-sharing switch only narrows the master (#236), so while the
+    // master is off it is moot: a subscription account keeps the same notice an
+    // api-key one gets, whatever the subordinate switch says (both are off by default).
+    it('still shows an admin owner of a personal subscription account the notice while both sharing switches are off', async () => {
+      renderView({
+        isAdmin: true,
+        sharingEnabled: false,
+        subscriptionSharingEnabled: false,
+        accounts: [makeVendorAccount(OPENAI_SUBSCRIPTION)],
+      });
+      await openDetail();
+      await screen.findByText(t.vendorAccountSettingsTitle);
+
+      const panel = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      expect(panel.getByRole('status')).toHaveTextContent(t.vendorAccountSharingOffNotice);
     });
 
     it('shows a plain owner of a personal account nothing about sharing at all (no area, no notice)', async () => {
