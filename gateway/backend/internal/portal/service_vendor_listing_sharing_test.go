@@ -6,6 +6,7 @@ package portal
 import (
 	"encoding/json"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 	"reflect"
 	"slices"
@@ -77,12 +78,22 @@ func (e *vendorGrantEnv) liveResolver(svc *Service) *routing.Resolver {
 	return r
 }
 
-// routableNames is the fixture model names the resolver routes for principal, sorted.
-func (e *vendorGrantEnv) routableNames(r *routing.Resolver, principal auth.Token) []string {
+// inboundDialects pairs each coarse dialect the listings are keyed by with the fine
+// request flavor a client of that dialect sends, so the parity pin can ask the
+// resolver the question per (name, dialect): that is the granularity it routes at.
+var inboundDialects = []struct{ coarse, request string }{
+	{routing.APIFlavorOpenAI, "openai_chat"},
+	{routing.APIFlavorAnthropic, "anthropic_messages"},
+}
+
+// routableNames is the fixture model names the resolver routes for principal on the
+// request flavor, sorted.
+func (e *vendorGrantEnv) routableNames(r *routing.Resolver, principal auth.Token, request string, accountIDs []string) []string {
 	e.t.Helper()
 	var out []string
-	for _, name := range fixtureModelNames(allFixtureAccounts...) {
-		if got, err := e.resolvesTo(r, principal, name); err == nil && got != "" {
+	for _, name := range fixtureModelNames(accountIDs...) {
+		target, err := r.Resolve(e.ctx, principal, inference.Request{Model: name, APIFlavor: request})
+		if err == nil && target.VendorAccountID != "" {
 			out = append(out, name)
 		}
 	}
@@ -90,14 +101,31 @@ func (e *vendorGrantEnv) routableNames(r *routing.Resolver, principal auth.Token
 	return out
 }
 
-// requireAdvertisedEqualsRoutable is the parity pin: for every fixture model name, the
-// listing advertises it exactly when the resolver routes it.
+// requireAdvertisedEqualsRoutable is the parity pin: for every fixture model name AND
+// each inbound dialect, the listing advertises the name on that dialect exactly when the
+// resolver routes a request of that dialect for it (so neither a name nor a dialect is
+// ever advertised that is not routable, or routable and not advertised).
 func (e *vendorGrantEnv) requireAdvertisedEqualsRoutable(label string, svc *Service, principal auth.Token) {
 	e.t.Helper()
-	advertised := e.advertised(svc, principal, routing.APIFlavorOpenAI)
-	routable := e.routableNames(e.liveResolver(svc), principal)
-	if !slices.Equal(advertised, routable) {
-		e.t.Errorf("%s: advertised %v != routable %v", label, advertised, routable)
+	e.requireDialectParity(label, svc, principal, allFixtureAccounts)
+}
+
+// requireDialectParity is requireAdvertisedEqualsRoutable over the model names of
+// accountIDs (a test that seeds further accounts names them here).
+func (e *vendorGrantEnv) requireDialectParity(label string, svc *Service, principal auth.Token, accountIDs []string) {
+	e.t.Helper()
+	resolver := e.liveResolver(svc)
+	for _, d := range inboundDialects {
+		var advertised []string
+		for _, name := range svc.ModelsForFlavor(e.ctx, principal, d.coarse) {
+			if slices.Contains(fixtureModelNames(accountIDs...), name) {
+				advertised = append(advertised, name)
+			}
+		}
+		sort.Strings(advertised)
+		if routable := e.routableNames(resolver, principal, d.request, accountIDs); !slices.Equal(advertised, routable) {
+			e.t.Errorf("%s (%s): advertised %v != routable %v", label, d.coarse, advertised, routable)
+		}
 	}
 }
 
@@ -269,8 +297,8 @@ func TestVendorDashboardRoutesCarryTheSharedAccountsModels(t *testing.T) {
 }
 
 // openAISubscriptionAccount seeds an ACTIVE OpenAI SUBSCRIPTION account (the openai
-// dialect only: the ChatGPT backend speaks Responses only) serving grantDupModel, at
-// level, linked into rgIDs.
+// dialect only: the ChatGPT backend speaks Responses only) serving grantDupModel and
+// grantModel(id), at level, linked into rgIDs.
 func (e *vendorGrantEnv) openAISubscriptionAccount(id, owner, level string, rgIDs ...string) {
 	e.t.Helper()
 	acc := routing.VendorAccount{
@@ -281,6 +309,7 @@ func (e *vendorGrantEnv) openAISubscriptionAccount(id, owner, level string, rgID
 		e.t.Fatalf("CreateVendorAccount(%s): %v", id, err)
 	}
 	if err := e.routes.SetVendorAccountModels(e.ctx, id, []routing.VendorAccountModel{
+		{AccountID: id, GatewayModel: grantModel(id), UpstreamModel: grantModel(id), APIFlavor: routing.APIFlavorOpenAI},
 		{AccountID: id, GatewayModel: grantDupModel, UpstreamModel: grantDupModel, APIFlavor: routing.APIFlavorOpenAI},
 	}); err != nil {
 		e.t.Fatalf("SetVendorAccountModels(%s): %v", id, err)
@@ -308,60 +337,138 @@ func (e *vendorGrantEnv) flavorsOf(principal auth.Token, name string) []string {
 	return out
 }
 
-// TestVendorListingFlavorSetIsThePrecedenceWinners (spec section 8, Precedence & parity):
-// the flavors advertised for a name are the flavors of the account that WINS the name,
-// own block first and then the first active shared account by id, never a union across
-// the accounts that serve it. Here the winner is an OpenAI SUBSCRIPTION account, which
-// serves the openai dialect only, and a lower-precedence api_key account serves the same
-// name on both dialects: the name is advertised on the openai dialect alone.
-func TestVendorListingFlavorSetIsThePrecedenceWinners(t *testing.T) {
+// resolvesOn is the id of the vendor account the resolver routes a request of the fine
+// flavor to for principal, or "" when it routes none.
+func (e *vendorGrantEnv) resolvesOn(r *routing.Resolver, principal auth.Token, model, request string) string {
+	e.t.Helper()
+	target, err := r.Resolve(e.ctx, principal, inference.Request{Model: model, APIFlavor: request})
+	if err != nil {
+		return ""
+	}
+	return target.VendorAccountID
+}
+
+// TestVendorListingFlavorSetIsPerDialectRoutable (spec section 8, Precedence & parity):
+// the resolver chooses an account per (name, dialect), in precedence order (own block
+// first, then the shared accounts by id): an OpenAI SUBSCRIPTION account (the openai
+// dialect only) is skipped for the anthropic dialect and the request falls through to the
+// next account that serves the name. So the dialects advertised for a name are the union
+// of the dialects its eligible accounts serve, each dialect backed by the first account
+// that serves it, never the first account's dialects alone: a name whose first account is
+// openai-only is still advertised, and routable, on the anthropic dialect through a later
+// both-dialect account. The union never over-advertises: a dialect no account serves (a
+// name only an openai-only account has) is not advertised.
+func TestVendorListingFlavorSetIsPerDialectRoutable(t *testing.T) {
 	both := []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI}
 	openAIOnly := []string{routing.APIFlavorOpenAI}
+	const (
+		openAIRequest    = "openai_chat"
+		anthropicRequest = "anthropic_messages"
+	)
 
-	t.Run("an own account wins over the shared accounts", func(t *testing.T) {
+	t.Run("an own openai-only account first, a later own both-dialect account (the own-only regression)", func(t *testing.T) {
 		e := newVendorListingEnv(t)
-		const user = "usr_g_flavor"
+		const (
+			user    = "usr_g_flavor_own"
+			subID   = "vacc_g_aa_ownsub"
+			keyID   = "vacc_g_bb_ownkey"
+			subOnly = "m-" + subID
+		)
+		e.createUser(user, "user")
+		e.openAISubscriptionAccount(subID, user, routing.VendorShareLevelNone)
+		e.account(keyID, user, routing.VendorAuthAPIKey, routing.VendorShareLevelNone)
+		principal := userPrincipal(user)
+		r := e.liveResolver(e.svc)
+
+		if got := e.routable(e.svc, principal); !slices.Equal(got, []string{subID, keyID}) {
+			t.Fatalf("routable accounts = %v, want the two own accounts, the openai-only one first", got)
+		}
+		// The first account serves the name on the openai dialect, the later one on both:
+		// the resolver serves each dialect from the first account that serves it.
+		if got := e.resolvesOn(r, principal, grantDupModel, openAIRequest); got != subID {
+			t.Fatalf("an openai request for %s routes to %q, want the first account %q", grantDupModel, got, subID)
+		}
+		if got := e.resolvesOn(r, principal, grantDupModel, anthropicRequest); got != keyID {
+			t.Fatalf("an anthropic request for %s routes to %q, want the later both-dialect account %q", grantDupModel, got, keyID)
+		}
+		// ... so the name is advertised on both dialects.
+		if got := e.flavorsOf(principal, grantDupModel); !slices.Equal(got, both) {
+			t.Errorf("%s flavors = %v, want %v (anthropic is routable through the later account)", grantDupModel, got, both)
+		}
+		if got := e.svc.ModelsForFlavor(e.ctx, principal, routing.APIFlavorAnthropic); !slices.Contains(got, grantDupModel) {
+			t.Errorf("/anthropic/v1/models does not list %s, which the resolver routes: %v", grantDupModel, got)
+		}
+		// A name only the openai-only account serves is NOT advertised on the anthropic
+		// dialect: the union adds only dialects some account really serves.
+		if got := e.flavorsOf(principal, subOnly); !slices.Equal(got, openAIOnly) {
+			t.Errorf("%s flavors = %v, want %v (no account serves it on the anthropic dialect)", subOnly, got, openAIOnly)
+		}
+		if got := e.resolvesOn(r, principal, subOnly, anthropicRequest); got != "" {
+			t.Errorf("an anthropic request for %s routes to %q, want none", subOnly, got)
+		}
+		e.requireDialectParity("own openai-only first, own both-dialect later", e.svc, principal, []string{subID, keyID})
+	})
+
+	t.Run("an own openai-only account first, shared both-dialect accounts later", func(t *testing.T) {
+		e := newVendorListingEnv(t)
+		const (
+			user  = "usr_g_flavor"
+			subID = "vacc_g_zz_ownsub"
+		)
 		e.createUser(user, "user")
 		e.mustProvisionResourceGroup(e.rgGranted.ID, routing.ProvisionKindUser, user)
-		e.openAISubscriptionAccount("vacc_g_zz_ownsub", user, routing.VendorShareLevelNone)
+		e.openAISubscriptionAccount(subID, user, routing.VendorShareLevelNone)
 		principal := userPrincipal(user)
+		r := e.liveResolver(e.svc)
 
-		// grantShared, grantFull and grantDup serve grantDupModel on BOTH dialects, and
-		// are routable for this principal, but the own account wins the name.
-		if got := e.routable(e.svc, principal); !slices.Equal(got, append([]string{"vacc_g_zz_ownsub"}, grantedShared...)) {
+		// grantShared, grantFull and grantDup serve grantDupModel on BOTH dialects and are
+		// routable for this principal, after the own account.
+		if got := e.routable(e.svc, principal); !slices.Equal(got, append([]string{subID}, grantedShared...)) {
 			t.Fatalf("routable accounts = %v, want own first then the shared ones", got)
 		}
-		if got := e.flavorsOf(principal, grantDupModel); !slices.Equal(got, openAIOnly) {
-			t.Errorf("%s flavors = %v, want the owner's %v, not the union %v", grantDupModel, got, openAIOnly, both)
+		if got := e.resolvesOn(r, principal, grantDupModel, openAIRequest); got != subID {
+			t.Errorf("an openai request routes to %q, want the own account %q (own block first)", got, subID)
 		}
-		// A name only the shared accounts serve is theirs, on both dialects.
+		if got := e.resolvesOn(r, principal, grantDupModel, anthropicRequest); got != grantShared {
+			t.Errorf("an anthropic request routes to %q, want the first shared account %q", got, grantShared)
+		}
+		if got := e.flavorsOf(principal, grantDupModel); !slices.Equal(got, both) {
+			t.Errorf("%s flavors = %v, want %v", grantDupModel, got, both)
+		}
 		if got := e.flavorsOf(principal, grantModel(grantShared)); !slices.Equal(got, both) {
 			t.Errorf("%s flavors = %v, want %v", grantModel(grantShared), got, both)
 		}
-		// The per-flavor listings agree: the anthropic listing does not carry the name.
-		if got := e.svc.ModelsForFlavor(e.ctx, principal, routing.APIFlavorAnthropic); slices.Contains(got, grantDupModel) {
-			t.Errorf("/anthropic/v1/models lists %s, which its winner does not serve on that dialect: %v", grantDupModel, got)
+		if got := e.svc.ModelsForFlavor(e.ctx, principal, routing.APIFlavorAnthropic); !slices.Contains(got, grantDupModel) {
+			t.Errorf("/anthropic/v1/models does not list %s: %v", grantDupModel, got)
 		}
-		if got := e.svc.ModelsForFlavor(e.ctx, principal, routing.APIFlavorOpenAI); !slices.Contains(got, grantDupModel) {
-			t.Errorf("/v1/models does not list %s: %v", grantDupModel, got)
-		}
+		e.requireDialectParity("own openai-only first, shared later", e.svc, principal, append([]string{subID}, allFixtureAccounts...))
 	})
 
-	t.Run("among shared accounts the first active by id wins", func(t *testing.T) {
+	t.Run("among shared accounts the first active by id serves each dialect", func(t *testing.T) {
 		e := newVendorListingEnv(t)
 		e.flags(true, true) // a shared subscription account is routable only with this
-		e.openAISubscriptionAccount("vacc_g_00_subshared", grantOwner, routing.VendorShareLevelShared, e.rgGranted.ID)
+		const subID = "vacc_g_00_subshared"
+		e.openAISubscriptionAccount(subID, grantOwner, routing.VendorShareLevelShared, e.rgGranted.ID)
 		member := userPrincipal(grantAdminMember)
+		r := e.liveResolver(e.svc)
+		accounts := append([]string{subID}, allFixtureAccounts...)
 
-		if got := e.routable(e.svc, member); got[0] != "vacc_g_00_subshared" {
+		if got := e.routable(e.svc, member); got[0] != subID {
 			t.Fatalf("routable accounts = %v, want the subscription account first by id", got)
 		}
-		if got := e.flavorsOf(member, grantDupModel); !slices.Equal(got, openAIOnly) {
-			t.Errorf("%s flavors = %v, want the first shared account's %v, not the union %v", grantDupModel, got, openAIOnly, both)
+		if got := e.resolvesOn(r, member, grantDupModel, openAIRequest); got != subID {
+			t.Errorf("an openai request routes to %q, want the first shared account %q", got, subID)
 		}
+		if got := e.resolvesOn(r, member, grantDupModel, anthropicRequest); got != grantShared {
+			t.Errorf("an anthropic request routes to %q, want the next shared account %q", got, grantShared)
+		}
+		if got := e.flavorsOf(member, grantDupModel); !slices.Equal(got, both) {
+			t.Errorf("%s flavors = %v, want %v", grantDupModel, got, both)
+		}
+		e.requireDialectParity("first shared openai-only", e.svc, member, accounts)
 
-		// An inactive winner does not win: the next account's flavors apply.
-		acc, err := e.routes.VendorAccountByID(e.ctx, "vacc_g_00_subshared")
+		// An inactive first account serves nothing: the next account serves both dialects.
+		acc, err := e.routes.VendorAccountByID(e.ctx, subID)
 		if err != nil {
 			t.Fatalf("VendorAccountByID: %v", err)
 		}
@@ -369,19 +476,35 @@ func TestVendorListingFlavorSetIsThePrecedenceWinners(t *testing.T) {
 		if err := e.routes.UpdateVendorAccount(e.ctx, acc); err != nil {
 			t.Fatalf("UpdateVendorAccount: %v", err)
 		}
-		if got := e.flavorsOf(member, grantDupModel); !slices.Equal(got, both) {
-			t.Errorf("%s flavors with the first account disabled = %v, want the next account's %v", grantDupModel, got, both)
+		if got := e.resolvesOn(r, member, grantDupModel, openAIRequest); got != grantShared {
+			t.Errorf("an openai request routes to %q with the first account disabled, want %q", got, grantShared)
 		}
+		if got := e.flavorsOf(member, grantDupModel); !slices.Equal(got, both) {
+			t.Errorf("%s flavors with the first account disabled = %v, want %v", grantDupModel, got, both)
+		}
+		if got := e.flavorsOf(member, "m-"+subID); len(got) != 0 {
+			t.Errorf("a disabled account's own model is advertised: %v", got)
+		}
+		e.requireDialectParity("first shared disabled", e.svc, member, accounts)
 	})
 
-	t.Run("an own both-dialect account keeps both against a shared openai-only one", func(t *testing.T) {
+	t.Run("an own both-dialect account first keeps both against a shared openai-only one", func(t *testing.T) {
 		e := newVendorListingEnv(t)
 		e.flags(true, true)
-		e.openAISubscriptionAccount("vacc_g_00_subshared", grantOwner, routing.VendorShareLevelShared, e.rgGranted.ID)
+		const subID = "vacc_g_00_subshared"
+		e.openAISubscriptionAccount(subID, grantOwner, routing.VendorShareLevelShared, e.rgGranted.ID)
 		// grantDirect owns grantOwnAccount (api_key, both dialects) and is provisioned.
-		if got := e.flavorsOf(userPrincipal(grantDirect), grantDupModel); !slices.Equal(got, both) {
-			t.Errorf("%s flavors = %v, want the owner's %v", grantDupModel, got, both)
+		direct := userPrincipal(grantDirect)
+		r := e.liveResolver(e.svc)
+		if got := e.flavorsOf(direct, grantDupModel); !slices.Equal(got, both) {
+			t.Errorf("%s flavors = %v, want %v", grantDupModel, got, both)
 		}
+		for _, request := range []string{openAIRequest, anthropicRequest} {
+			if got := e.resolvesOn(r, direct, grantDupModel, request); got != grantOwnAccount {
+				t.Errorf("a %s request routes to %q, want the own account %q", request, got, grantOwnAccount)
+			}
+		}
+		e.requireDialectParity("own both-dialect first", e.svc, direct, append([]string{subID}, allFixtureAccounts...))
 	})
 }
 

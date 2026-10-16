@@ -246,9 +246,18 @@ requires `token.UserID != ""`. Phase 2 introduces **two** enumerators and the gr
   `VendorAccountsByOwner(token.UserID)` (own accounts only), **never allow-all** (contrast
   `ProvisioningGate`, whose nil = allow-all).
 - **Precedence & parity:** the own-block-first ordering makes the owner's own account win a
-  same-name/prefix collision; among shared accounts the first active by id wins. The listing's
-  per-name flavor set resolves to the **precedence winner's** flavors (not a union across own
-  and shared), so an advertised name is routable with exactly the flavors advertised.
+  same-name/prefix collision; among shared accounts the first active by id wins. The resolver
+  chooses per **(name, dialect)**, not per name: an account that does not serve the requested
+  dialect (an OpenAI subscription for the anthropic dialect) is skipped and the request falls
+  through to the next account serving the name. So the per-(name, dialect) winner is the first
+  account, in that order, that serves the name **on that dialect**, and the listing's per-name
+  flavor set is the **union** of the flavors served by the eligible accounts for that name:
+  each dialect in it is backed by its winner, so an advertised name is routable on exactly the
+  dialects advertised, and no dialect that is routable is dropped. (An earlier draft of this
+  bullet said the set resolves to the first account's flavors, "not a union across own and
+  shared". Review found that a misstatement: it assumed one account per name regardless of
+  dialect, which under-advertises a name whose first account is openai-only and regresses an
+  owner-only principal with two same-name accounts.)
 - **Dispatch unchanged:** owner-agnostic, trusts `Target.VendorAccountID`; the sealed
   credential opens only at the dispatch edge, so a borrower never sees it. The resolver is the
   single routing-time gate.

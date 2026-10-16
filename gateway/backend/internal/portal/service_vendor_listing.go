@@ -96,7 +96,7 @@ func vendorListingPrincipal(token auth.Token) bool {
 // resolver would serve for this token (active, the subscriptions switch, token
 // access) together with their models under the token-effective prefix. accounts is in
 // the enumerator's order and the result keeps it: it is the precedence the resolver
-// applies, and vendorModelFlavorSets resolves a name collision by it. loaded is false
+// applies, which decides which account serves a name on a dialect. loaded is false
 // when an account's models could not be read; the accounts that could be are still
 // returned.
 func (s *Service) advertisedVendorAccountModels(ctx context.Context, token auth.Token, accounts []routing.VendorAccount, subscriptionsOn bool) (out []vendorAccountModels, loaded bool) {
@@ -153,16 +153,20 @@ type vendorAccountModels struct {
 //     {openai} here. Listing them under anthropic would put them in
 //     /anthropic/v1/models where an anthropic call then 404s, breaking parity.
 //
-// A name several accounts serve resolves to the flavors of the account that WINS it
-// (spec 2026-10-15 section 8, Precedence & parity), NOT to a union across them: the
-// accounts arrive in the resolver's order (the principal's own accounts first, then
-// the shared ones by id) and the first account that serves a name owns it, so an
-// advertised name is never wider than the account the resolver picks for it. Only
-// active, reachable, token-allowed accounts get here, so an inactive account does not
-// win. (Where an account wins a name but does not serve the requested dialect, the
-// resolver falls through to the next account for that dialect; the listing does not
-// follow it there, which only ever leaves a routable dialect unadvertised, never the
-// reverse.)
+// A name several accounts serve is advertised under the UNION of the dialects they
+// serve it on, because the resolver chooses an account per (name, dialect), not per
+// name (spec 2026-10-15 section 8, Precedence & parity). The accounts arrive in the
+// resolver's order (the principal's own accounts first, then the shared ones by id) and
+// the precedence winner decides WHICH account serves each dialect: the first account,
+// in that order, that serves the name on it. An account that does not serve the
+// requested dialect (an OpenAI subscription for the anthropic one) is skipped and the
+// request falls through to the next account, so a name whose first account is
+// openai-only is still routable on the anthropic dialect through a later both-dialect
+// account, and is advertised on it. A dialect is in a name's set exactly when some
+// eligible account serves the name on it, which is exactly when the resolver can
+// route it: the union never advertises a dialect that is not routable, and never drops
+// one that is. Only active, reachable, token-allowed accounts get here, so an inactive
+// account contributes nothing.
 //
 // Gating, reach, principal scope and the fail-open behaviour are
 // ownVendorAccountModels's.
@@ -179,19 +183,17 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) (
 		return nil, loaded
 	}
 	out := make(map[string]map[string]struct{})
-	winner := make(map[string]string) // advertised name → id of the account that wins it
 	for _, am := range owned {
 		flavors := vendorAccountServedFlavors(am.Account)
 		for _, m := range am.Models {
-			if won, claimed := winner[m.GatewayModel]; claimed && won != am.Account.ID {
-				continue // an earlier account already wins this name
+			set := out[m.GatewayModel]
+			if set == nil {
+				set = make(map[string]struct{}, len(flavors))
+				out[m.GatewayModel] = set
 			}
-			winner[m.GatewayModel] = am.Account.ID
-			set := make(map[string]struct{}, len(flavors))
 			for _, f := range flavors {
 				set[f] = struct{}{}
 			}
-			out[m.GatewayModel] = set
 		}
 	}
 	return out, loaded

@@ -186,7 +186,7 @@ The phase that lets a borrower use a shared account.
 
 ### Task 3.3 — Listing parity (ownVendorAccountModels) + management listing
 
-**Files:** `internal/portal/service_vendor_listing.go` (`ownVendorAccountModels` reads `VendorAccountsForRouting`, same fail direction as routing); `ListVendorAccounts` non-system = own ∪ managed ∪ member (the full management union, spec §8/§9); the per-name flavor set resolves to the precedence winner (not a union across own+shared); tests.
+**Files:** `internal/portal/service_vendor_listing.go` (`ownVendorAccountModels` reads `VendorAccountsForRouting`, same fail direction as routing); `ListVendorAccounts` non-system = own ∪ managed ∪ member (the full management union, spec §8/§9); the per-name flavor set is the per-(name, dialect) union of the eligible accounts' served flavors (the resolver picks per name AND dialect; corrected in review, spec §8); tests.
 
 - [ ] Failing tests: advertised == routable for a shared account across on/off; the management list includes a member-only account (key-free) and a CM-managed-not-provisioned account; flavor set = winner's. Implement. Green. Commit.
 
