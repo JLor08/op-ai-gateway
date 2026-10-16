@@ -158,6 +158,13 @@ var (
 	ErrVendorAccountBaseURLRequired = errors.New("vendor_account.base_url_required")
 	ErrVendorAccountBaseURLInvalid  = errors.New("vendor_account.base_url_invalid")
 
+	// ErrVendorAccountFieldImmutable rejects an update that tries to change a
+	// create-only field: base_url (the upstream root the sealed credential is sent
+	// to) or auth_type. Changing either would re-aim the stored credential, so the
+	// PATCH refuses any attempt to change them, for everyone, owner included (a value
+	// equal to the stored one is no attempt).
+	ErrVendorAccountFieldImmutable = errors.New("vendor_account.field_immutable")
+
 	// ErrVendorAccountsDisabled is the vendor-accounts MASTER flag guard
 	// (system setting vendor_accounts_enabled, off by default): every
 	// vendor-account service method returns it, before doing anything, while

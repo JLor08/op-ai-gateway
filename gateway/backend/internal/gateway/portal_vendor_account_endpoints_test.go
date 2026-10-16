@@ -493,6 +493,8 @@ func TestVendorAccountEndpointsErrorMapping(t *testing.T) {
 		{"patch bad status", http.MethodPatch, itemPath, `{"status":"needs_reconnect"}`, http.StatusBadRequest, "vendor_account.status_invalid"},
 		{"patch whitespace-only key", http.MethodPatch, itemPath, `{"api_key":"   "}`, http.StatusBadRequest, "vendor_account.api_key_invalid"},
 		{"patch bad model prefix", http.MethodPatch, itemPath, `{"model_prefix":"w\u00f6rk"}`, http.StatusBadRequest, "vendor_account.model_prefix_invalid"},
+		{"patch base url is immutable", http.MethodPatch, itemPath, `{"base_url":"https://x.test"}`, http.StatusBadRequest, "vendor_account.field_immutable"},
+		{"patch auth type is immutable", http.MethodPatch, itemPath, `{"auth_type":"subscription"}`, http.StatusBadRequest, "vendor_account.field_immutable"},
 		{"collection rejects PUT", http.MethodPut, "/api/portal/vendor-accounts", `{}`, http.StatusMethodNotAllowed, codeRequestMethodNotAllowed},
 		{"item rejects POST", http.MethodPost, itemPath, `{}`, http.StatusMethodNotAllowed, codeRequestMethodNotAllowed},
 		{"nested path is not an item", http.MethodGet, itemPath + "/connect", "", http.StatusNotFound, portal.CodeVendorAccountNotFound},
@@ -555,7 +557,7 @@ func TestVendorAccountEndpointsStrangerWithInvalidPatchGets404(t *testing.T) {
 	created := vaCreate(t, srv, vaOwnerSecret, "Owner's")
 	path := "/api/portal/vendor-accounts/" + created.ID
 
-	for _, body := range []string{`{"name":""}`, `{"status":"paused"}`, `{"status":"needs_reconnect"}`, `{"api_key":"   "}`} {
+	for _, body := range []string{`{"name":""}`, `{"status":"paused"}`, `{"status":"needs_reconnect"}`, `{"api_key":"   "}`, `{"base_url":"https://x.test"}`, `{"auth_type":"subscription"}`} {
 		rec := vaDo(t, srv, http.MethodPatch, path, vaOtherSecret, body)
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("stranger PATCH %s status = %d, want 404, body = %s", body, rec.Code, rec.Body.String())

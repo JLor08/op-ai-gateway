@@ -138,9 +138,16 @@ func newVendorAuthzEnv(t *testing.T) *vendorAuthzEnv {
 // lifecycle will produce; a `none` account has neither.
 func (e *vendorAuthzEnv) newAccountAt(level string) routing.VendorAccount {
 	e.t.Helper()
-	dto, err := e.svc.CreateVendorAccount(e.ctx, token(vendorAuthzOwnerID), CreateVendorAccountRequest{
+	return e.newAccountOf(level, CreateVendorAccountRequest{
 		Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey, Name: "authz-" + level,
 	})
+}
+
+// newAccountOf is newAccountAt for any account shape: req is created through the
+// service as usr_va_owner and then put at level.
+func (e *vendorAuthzEnv) newAccountOf(level string, req CreateVendorAccountRequest) routing.VendorAccount {
+	e.t.Helper()
+	dto, err := e.svc.CreateVendorAccount(e.ctx, token(vendorAuthzOwnerID), req)
 	if err != nil {
 		e.t.Fatalf("CreateVendorAccount(%s): %v", level, err)
 	}

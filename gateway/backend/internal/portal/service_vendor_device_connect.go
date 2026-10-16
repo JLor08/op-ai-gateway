@@ -113,10 +113,11 @@ func vendorDeviceConnectExpired(p pendingVendorDeviceConnect, now time.Time) boo
 }
 
 // deviceConnectableVendorAccount is connectableVendorAccount (master flag +
-// owner-only + subscription-only) plus the device flow's OpenAI-only gate: a
+// credential gate + subscription-only) plus the device flow's OpenAI-only gate: a
 // subscription account of any other vendor is ErrVendorAccountDeviceUnsupported.
-// The checks run flag -> owner -> subscription -> vendor, so a disabled module is
-// a 409, a stranger a 404, and a wrong auth type or vendor a 400.
+// The checks run flag -> credential gate -> subscription -> vendor, so a disabled
+// module is a 409, a stranger a 404, a CM of a `shared` account a 403, and a wrong
+// auth type or vendor a 400.
 func (s *Service) deviceConnectableVendorAccount(ctx context.Context, principal auth.Token, id string) (routing.VendorAccount, error) {
 	acc, err := s.connectableVendorAccount(ctx, principal, id)
 	if err != nil {
@@ -162,9 +163,10 @@ func (s *Service) terminalDeviceError(accountID, deviceAuthID string, err error)
 // ErrVendorAccountConnectKeyRequired, before the vendor round trip and before the
 // user approves anything. A fresh begin replaces any previous pending entry for
 // the account. A vendor refusal is ErrVendorAccountConnectRejected, any other
-// vendor failure ErrVendorAccountConnectUpstream. OWNER-ONLY; OpenAI-only;
-// ErrVendorAccountsDisabled while the master flag is off and
-// ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
+// vendor failure ErrVendorAccountConnectUpstream. Credential gate (owner, or a CM
+// of a `full` account); OpenAI-only; ErrVendorAccountsDisabled while the master flag
+// is off and ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is
+// off.
 func (s *Service) BeginVendorAccountDeviceConnect(ctx context.Context, principal auth.Token, accountID string) (userCode, verificationURL string, err error) {
 	acc, err := s.deviceConnectableVendorAccount(ctx, principal, accountID)
 	if err != nil {
@@ -201,8 +203,10 @@ func (s *Service) BeginVendorAccountDeviceConnect(ctx context.Context, principal
 // ErrVendorAccountDeviceConnectState. The poll that connects the account also runs
 // a best-effort model discovery (see ConnectVendorAccountImport) before it
 // answers; it never fails the connect. The response never carries a token.
-// OWNER-ONLY; OpenAI-only; ErrVendorAccountsDisabled while the master flag is off
-// and ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is off.
+// Credential gate (owner, or a CM of a `full` account), checked again after the
+// vendor round trips; OpenAI-only; ErrVendorAccountsDisabled while the master flag
+// is off and ErrVendorSubscriptionsDisabled while vendor_subscriptions_enabled is
+// off.
 func (s *Service) PollVendorAccountDeviceConnect(ctx context.Context, principal auth.Token, accountID string) (connected bool, err error) {
 	acc, err := s.deviceConnectableVendorAccount(ctx, principal, accountID)
 	if err != nil {

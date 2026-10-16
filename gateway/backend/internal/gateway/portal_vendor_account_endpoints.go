@@ -193,7 +193,11 @@ func (s *Server) routeVendorAccountConnectSubpath(w http.ResponseWriter, r *http
 }
 
 // handlePortalVendorAccountPatch applies a PATCH to the {id} vendor account: it
-// decodes the update body and writes the result (or the mapped error).
+// decodes the update body and writes the result (or the mapped error). Who may
+// send which field is decided in portal.Service, per field and deny by default:
+// name, status and model_prefix need the operate gate, every other field (the
+// api_key above all) the credential gate, and base_url / auth_type are refused as
+// create-only. The handler only decodes; it must never decide authorization.
 func (s *Server) handlePortalVendorAccountPatch(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	raw, ok := readRawJSON(w, r)
 	if !ok {
@@ -216,8 +220,9 @@ func (s *Server) handlePortalVendorAccountPatch(w http.ResponseWriter, r *http.R
 // connection" action: the gateway asks the vendor whether the account's stored
 // credential is accepted and returns the verdict {status, detail, checked_at}
 // (status is valid, invalid or unverifiable). The request has no body, the call
-// changes nothing, and no credential is ever returned. Owner-only and gated by
-// the vendor_accounts_enabled master flag (both in portal.Service): any other
+// changes nothing, and no credential is ever returned. Gated by the
+// vendor_accounts_enabled master flag and the operate gate (both in
+// portal.Service): the owner, or a CM of a shared/full account; any other
 // principal gets the same 404 as an unknown id.
 func (s *Server) handlePortalVendorAccountCheck(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	if !requireMethod(w, r, http.MethodPost) {
@@ -246,10 +251,11 @@ type vendorAccountModelsRefreshResponse struct {
 // account's models with it (under the account's prefix). It is fail-soft: a vendor
 // that cannot be asked leaves the models as they were and is still a 200, with
 // refresh.status "unverifiable" and the reason in refresh.detail. The request has no
-// body and no credential is ever returned. Owner-only and gated by the
-// vendor_accounts_enabled master flag (both in portal.Service): any other principal
-// gets the same 404 as an unknown id; a stored credential that cannot be opened is a
-// 409 vendor_account.credential_unreadable.
+// body and no credential is ever returned. Gated by the vendor_accounts_enabled
+// master flag and the operate gate (both in portal.Service): the owner, or a CM of
+// a shared/full account; any other principal gets the same 404 as an unknown id; a
+// stored credential that cannot be opened is a 409
+// vendor_account.credential_unreadable.
 func (s *Server) handlePortalVendorAccountModelsRefresh(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -295,9 +301,10 @@ func vendorUsageForce(r *http.Request) bool {
 // no active pull (anything but an OpenAI subscription or an OpenRouter/Kilo
 // api-key account) is a 200 "unsupported" and opens no credential. The request has
 // no body and no credential is ever returned.
-// Owner-only and gated by the vendor_accounts_enabled master flag (both in
-// portal.Service): any other principal gets the same 404 as an unknown id; a stored
-// credential that cannot be opened is a 409 vendor_account.credential_unreadable.
+// Gated by the vendor_accounts_enabled master flag and the operate gate (both in
+// portal.Service): the owner, or a CM of a shared/full account; any other principal
+// gets the same 404 as an unknown id; a stored credential that cannot be opened is a
+// 409 vendor_account.credential_unreadable.
 func (s *Server) handlePortalVendorAccountUsageRefresh(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -322,8 +329,10 @@ type vendorAccountConnectCompleteRequest struct {
 }
 
 // handlePortalVendorAccountConnectImport (POST .../connect/import) connects a
-// subscription account from tokens the user already holds. Owner-only and gated
-// by the vendor_accounts_enabled master flag (both in portal.Service).
+// subscription account from tokens the user already holds. Gated by the
+// vendor_accounts_enabled master flag and the credential gate (both in
+// portal.Service): the owner, or a CM of a `full` account (a CM of a `shared` one
+// is a 403). The begin/complete and device sub-resources are gated the same way.
 func (s *Server) handlePortalVendorAccountConnectImport(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -439,6 +448,10 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountBaseURLRequired, status: http.StatusBadRequest, code: "vendor_account.base_url_required", msg: "a base URL is required for a custom OpenAI-compatible account"},
 	{err: portal.ErrVendorAccountBaseURLInvalid, status: http.StatusBadRequest, code: "vendor_account.base_url_invalid", msg: "the base URL must be an https URL without credentials, query or fragment"},
 	{err: portal.ErrVendorAccountForbidden, status: http.StatusForbidden, code: "vendor_account.forbidden", msg: notAllowedMsg},
+	// base_url and auth_type are create-only: a PATCH that tries to change either is
+	// refused for every caller (a 400; the gate has already answered 404/403 for a
+	// caller who may not touch the credential).
+	{err: portal.ErrVendorAccountFieldImmutable, status: http.StatusBadRequest, code: "vendor_account.field_immutable", msg: "base_url and auth_type are fixed when the account is created and cannot be changed"},
 	// Subscription connect. A vendor refusal of the pasted code is a 400, never a
 	// 401: the portal treats a 401 from this API as an expired session. The vendor
 	// being unreachable or answering with something unusable is a 502. The rows

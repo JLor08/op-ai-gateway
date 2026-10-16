@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -140,11 +141,28 @@ type CreateVendorAccountRequest struct {
 // "" clears it, any other value replaces it. ModelPrefix follows the same
 // pointer convention: nil keeps the stored prefix, "" clears it, any other value
 // replaces it. Vendor, auth type and base URL are immutable.
+//
+// AUTHORIZATION IS PER FIELD AND DENY-BY-DEFAULT (authorizeVendorAccountPatch):
+// Name, Status and ModelPrefix are the only fields that ride the operate gate;
+// everything else this struct carries -- APIKey, and any field added later --
+// rides the credential gate. The allowlist is isVendorAccountPatchOperateField and
+// nothing else, so a new field is credential-gated until someone deliberately
+// edits that list. Every field MUST be a pointer (nil = "absent"): a value-typed
+// field cannot be told apart from "not sent", so the gate treats it as always
+// touched.
+//
+// BaseURL and AuthType are CREATE-ONLY. They are on the request solely so a PATCH
+// that tries to change them is refused with ErrVendorAccountFieldImmutable instead
+// of being silently ignored: base_url is where the sealed credential is sent, and
+// re-aiming it is a credential operation nobody is granted through a PATCH. They
+// are not applied anywhere.
 type UpdateVendorAccountRequest struct {
 	Name        *string `json:"name"`
 	Status      *string `json:"status"`
 	APIKey      *string `json:"api_key"`
 	ModelPrefix *string `json:"model_prefix"`
+	BaseURL     *string `json:"base_url"`
+	AuthType    *string `json:"auth_type"`
 }
 
 // vendorAccountDTO maps a stored account to its credential-free view, reading
@@ -321,14 +339,13 @@ func (s *Service) loadVendorAccount(ctx context.Context, id string) (routing.Ven
 // a stranger's account are indistinguishable (404-no-leak), and a plain admin
 // who is not the owner is a stranger too.
 //
-// This is the pre-sharing owner-only gate, and it stays the gate of every call
-// site that has not been moved onto a share-level gate yet: the reads
+// This is the pre-sharing owner-only gate. It still guards the reads
 // (GetVendorAccount and the name lookup widen to CMs in the management read) and
-// the writes that belong to later steps of the sharing work (the PATCH, the
-// credential methods, delete). Owner-only is the safe side of both new gates, so
-// a site left here is merely stricter than the spec, never looser. New code that
-// writes to an account uses authorizeVendorAccountOperate or
-// authorizeVendorAccountCredential instead.
+// DeleteVendorAccount, which belongs to a later step of the sharing work; owner-only
+// is the safe side of both new gates, so a site left here is merely stricter than
+// the spec, never looser. Writes use authorizeVendorAccountOperate or
+// authorizeVendorAccountCredential: the PATCH picks between them per field
+// (authorizeVendorAccountPatch) and every credential method uses the latter.
 func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Token, id string, write bool) (routing.VendorAccount, error) {
 	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
@@ -462,6 +479,96 @@ func (s *Service) authorizeVendorAccountCredential(ctx context.Context, principa
 		return nil
 	}
 	return ErrVendorAccountForbidden
+}
+
+// isVendorAccountPatchOperateField is the OPERATE ALLOWLIST of the account PATCH:
+// the names (Go field names of UpdateVendorAccountRequest) of the only fields a CM
+// of a `shared` account may change. It is the single place a PATCH field is granted
+// the weaker gate; there is deliberately no matching list of "credential fields",
+// because the credential gate is the default and a list of what is sensitive is
+// exactly what an overlooked field falls out of. Widening this list widens what a
+// co-manager can do to someone else's account, so a test restates it literally
+// (TestVendorAccountPatchOperateAllowlistIsExactlyNameStatusModelPrefix) and any
+// edit is a visible, reviewed one.
+func isVendorAccountPatchOperateField(field string) bool {
+	switch field {
+	case "Name", "Status", "ModelPrefix":
+		return true
+	}
+	return false
+}
+
+// patchTouchesOutsideOperate reports whether the PATCH body (a request struct, by
+// value or pointer) carries anything the operate allowlist does not name, i.e.
+// whether it needs the credential gate. It fails CLOSED at every step:
+//
+//   - it walks the struct's fields by reflection, so a field added to the request
+//     later is examined without anyone touching this function;
+//   - a field outside the allowlist counts as touched when it is present (a non-nil
+//     pointer, slice, map or interface), so an api_key sent as "" (clear) is touched;
+//   - a field of a value type cannot be "absent", so it always counts as touched:
+//     such a field makes every PATCH credential-gated, which fails loudly in the
+//     tests rather than quietly granting it the operate gate;
+//   - anything that is not a plain struct (including nil) is touched.
+//
+// Allowlisted fields are skipped here: whether and how they apply is the apply
+// functions' business, and they are operate-grade by definition.
+func patchTouchesOutsideOperate(body any) bool {
+	v := reflect.ValueOf(body)
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return true
+	}
+	typ := v.Type()
+	for i := range typ.NumField() {
+		if isVendorAccountPatchOperateField(typ.Field(i).Name) {
+			continue
+		}
+		switch field := v.Field(i); field.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface:
+			if !field.IsNil() {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// authorizeVendorAccountPatch authorizes an account PATCH FIELD BY FIELD, deny by
+// default (spec 2026-10-15 section 6): a request whose every present field is on
+// the operate allowlist (name, status, model_prefix) takes the operate gate; a
+// request that carries ANY other field -- api_key, base_url, auth_type, or one nobody
+// has classified yet -- takes the credential gate, and so does a request that mixes
+// both kinds (the stricter wins; a CM at `shared` who sneaks an api_key in next to a
+// status change is turned away with nothing applied). The decision depends only on
+// which fields are present, never on their values: whether an api_key is "really"
+// different is not knowable without opening the sealed one.
+func (s *Service) authorizeVendorAccountPatch(ctx context.Context, principal auth.Token, acc routing.VendorAccount, req UpdateVendorAccountRequest) error {
+	if patchTouchesOutsideOperate(req) {
+		return s.authorizeVendorAccountCredential(ctx, principal, acc)
+	}
+	return s.authorizeVendorAccountOperate(ctx, principal, acc)
+}
+
+// rejectVendorAccountImmutableChange enforces the create-only invariant of
+// base_url and auth_type: a PATCH may not change either, for any caller. It runs
+// AFTER the gate (so a stranger still gets the 404 and a CM at `shared` the 403,
+// never a 400 that confirms the account) and BEFORE anything is applied, so a
+// request that also carries a valid change writes nothing. A value equal to the
+// stored one is not an attempt to change it (a client that round-trips the account
+// it read is not refused).
+func rejectVendorAccountImmutableChange(acc routing.VendorAccount, req UpdateVendorAccountRequest) error {
+	if req.BaseURL != nil && strings.TrimSpace(*req.BaseURL) != acc.BaseURL {
+		return fmt.Errorf("%w: base_url", ErrVendorAccountFieldImmutable)
+	}
+	if req.AuthType != nil && strings.TrimSpace(*req.AuthType) != acc.AuthType {
+		return fmt.Errorf("%w: auth_type", ErrVendorAccountFieldImmutable)
+	}
+	return nil
 }
 
 // ListVendorAccounts returns the calling principal's OWN accounts, oldest first,
@@ -724,15 +831,29 @@ func (s *Service) applyVendorAccountAPIKey(acc *routing.VendorAccount, raw *stri
 // UpdateVendorAccount renames an account, changes its status or model prefix,
 // and/or replaces or clears its api key. The store keeps id, owner, vendor and
 // created_at immutable, so this loads the row, mutates only the requested fields
-// and writes it back. The write is OWNER-ONLY (system scope included), and
-// authorization runs first, so a stranger gets 404 even for an invalid body.
+// and writes it back.
+//
+// Authorization is field-level and deny-by-default (authorizeVendorAccountPatch):
+// name, status and model_prefix need the operate gate (the owner, or a CM of a
+// shared/full account); a request carrying anything else -- the api key above all
+// -- needs the credential gate (the owner, or a CM of a `full` account; a CM of a
+// `shared` one is ErrVendorAccountForbidden and nothing is written). System scope
+// is a stranger to both. base_url and auth_type are create-only: a request that
+// tries to change either is ErrVendorAccountFieldImmutable. Authorization runs
+// first, so a stranger gets 404 even for an invalid body.
 // ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token, id string, req UpdateVendorAccountRequest) (VendorAccountDTO, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if err := s.authorizeVendorAccountPatch(ctx, principal, acc, req); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if err := rejectVendorAccountImmutableChange(acc, req); err != nil {
 		return VendorAccountDTO{}, err
 	}
 	if err := applyVendorAccountName(&acc, req.Name); err != nil {
