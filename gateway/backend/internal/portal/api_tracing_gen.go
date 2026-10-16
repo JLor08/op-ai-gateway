@@ -2604,6 +2604,18 @@ func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
 	return _d.API.VendorAccountsEnabled(ctx)
 }
 
+func (_d *APIWithTracing) VendorAccountsForRouting(ctx context.Context, t1 auth.Token) (va1 []routing.VendorAccount, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountsForRouting")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VendorAccountsForRouting(ctx, t1)
+}
+
 func (_d *APIWithTracing) VendorSubscriptionSharingEnabled(ctx context.Context) (b1 bool) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorSubscriptionSharingEnabled")
 	defer span.End()

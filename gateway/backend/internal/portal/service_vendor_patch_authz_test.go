@@ -663,6 +663,13 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"RemoveVendorAccountFromResourceGroup": "rg-owner",
 		"SetResourceGroupVendorAccounts":       "rg-manager",
 		"ResourceGroupVendorAccountCandidates": "rg-manager",
+		// The routing grant (service_vendor_sharing_grant.go), pinned by
+		// service_vendor_sharing_grant_test.go: the enumerator the resolver asks which
+		// accounts a PRINCIPAL may route to (own, then live-shared in a provisioned
+		// resource group). It authorizes no call on an account, opens no credential and
+		// sends nothing upstream (the sealed key is only carried to the dispatch edge,
+		// inside the resolved Target), so it is neither of the write gates.
+		"VendorAccountsForRouting": "routing-grant",
 		// Operate gate (authorizeVendorAccountOperate).
 		"TestVendorAccountConnection": "operate",
 		"RefreshVendorAccountModels":  "operate",

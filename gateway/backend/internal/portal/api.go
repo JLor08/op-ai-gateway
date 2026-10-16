@@ -253,6 +253,7 @@ type API interface {
 	VendorAccountRoutingMode(context.Context) string
 	VendorAccountSharingEnabled(context.Context) bool
 	VendorAccountsEnabled(context.Context) bool
+	VendorAccountsForRouting(context.Context, auth.Token) ([]routing.VendorAccount, error)
 	VendorSubscriptionSharingEnabled(context.Context) bool
 	VendorSubscriptionsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)

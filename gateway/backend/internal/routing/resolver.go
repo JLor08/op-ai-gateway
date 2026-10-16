@@ -257,6 +257,21 @@ type ProvisioningGate interface {
 	AllowedServerIDs(ctx context.Context, principal auth.Token, serverIDs []string) (map[string]bool, error)
 }
 
+// VendorAccountEnumerator lists the vendor accounts a principal may route to: the
+// principal's OWN accounts first (id order), then the accounts another user shared
+// into a resource group the principal is provisioned into, live-share-level-checked
+// (id order). It is the routing-time GRANT for shared vendor accounts (#183, spec
+// 2026-10-15 section 8), exposed to routing as a seam because routing cannot import
+// internal/portal. Satisfied by portal.Service.VendorAccountsForRouting.
+//
+// The nil semantics are the OPPOSITE of ProvisioningGate's, and load-bearing: a nil
+// (unwired) enumerator falls back to OWNER-ONLY -- the principal's own accounts, the
+// behaviour before sharing existed -- never allow-all. An unwired grant must fail
+// closed.
+type VendorAccountEnumerator interface {
+	VendorAccountsForRouting(ctx context.Context, principal auth.Token) ([]VendorAccount, error)
+}
+
 // GroupPolicy is a group's selection policy: how members are ordered, which are
 // eligible, and how failover behaves. Passed as one value so the seam stays
 // readable and extensible.
@@ -401,8 +416,10 @@ type resolverStore interface {
 	// line.
 	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
 	// VendorAccountsByOwner and VendorAccountModels are the per-user vendor-account
-	// surface resolveVendorAccount reads: the owner's accounts (sorted by id) and,
-	// for one account, the gateway models it serves (sorted by GatewayModel). Both
+	// surface resolveVendorAccount reads: the owner's accounts (sorted by id) -- the
+	// OWNER-ONLY fallback routableVendorAccounts uses when no VendorAccountEnumerator
+	// is wired -- and, for one account, the gateway models it serves (sorted by
+	// GatewayModel). Both
 	// are already on routing.Store and both drivers (*MemoryStore, *store.SQLStore)
 	// implement them, so widening this narrow interface stays compile-safe and
 	// needs no tracing-decorator regeneration (the decorator wraps routing.Store,
@@ -423,6 +440,7 @@ type Resolver struct {
 	reservation       *sessionReservation
 	admission         AdmissionController
 	provisioning      ProvisioningGate
+	vendorEnumerator  VendorAccountEnumerator
 	groups            GroupResolver
 	warmer            ModelWarmer
 	legacyAffinity    atomic.Bool // true => affinity keys on the explicit header (legacy); false (default) => ClientSessionID
@@ -509,6 +527,12 @@ func (r *Resolver) SetAdmissionController(c AdmissionController) { r.admission =
 // no-op invariant) — the concrete gate (a later task) enforces resource-group
 // membership + the configured enforcement mode.
 func (r *Resolver) SetProvisioningGate(g ProvisioningGate) { r.provisioning = g }
+
+// SetVendorAccountEnumerator installs the shared-vendor-account grant (see
+// VendorAccountEnumerator). Leaving it unset (nil) restricts every principal to its
+// OWN accounts -- owner-only, NEVER allow-all: the inverse of SetProvisioningGate's
+// nil, because here an unwired seam must deny the shared arm, not open it.
+func (r *Resolver) SetVendorAccountEnumerator(e VendorAccountEnumerator) { r.vendorEnumerator = e }
 
 // SetGroupResolver installs the model-group config source. Leaving it unset (nil)
 // means no groups exist, so Resolve is byte-identical to the single-model path
@@ -832,9 +856,12 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	}
 }
 
-// resolveVendorAccount resolves the request against the PRINCIPAL's own vendor
-// accounts (Milestone 3). It returns (Target, true, nil) on a match, (Target{},
-// false, nil) for no match, and a non-nil error only on a store failure.
+// resolveVendorAccount resolves the request against the vendor accounts the
+// PRINCIPAL may route to (Milestone 3, extended by shared vendor accounts, #183):
+// its OWN accounts first, then the accounts another user shared into a resource
+// group the principal is provisioned into (see VendorAccountEnumerator, the
+// single routing-time grant). It returns (Target, true, nil) on a match,
+// (Target{}, false, nil) for no match, and a non-nil error only on a store failure.
 //
 // It matches only when EVERY precondition holds, each a deliberate guard:
 //   - r.vendorOn(): the vendor_accounts_enabled master flag is on. Off → the
@@ -842,9 +869,11 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 //   - r.subscriptionsAllowed() (per account): the vendor_subscriptions_enabled
 //     switch (default on) is on, or the account is an api_key one. Off → every
 //     subscription account is skipped, exactly like a needs_reconnect one.
-//   - token.UserID != "": the principal is a USER. A SERVICE token (UserID=="")
-//     owns no vendor accounts and must never borrow a user's — service dispatch
-//     is a later milestone.
+//   - the principal has an identity (vendorPrincipalEligible): a USER token, or a
+//     SERVICE token carrying a service id. A service reaches a shared account only
+//     when the grant says so (a direct service provision into the resource group);
+//     it owns none of its own. A principal with neither identity is never asked
+//     about, whatever the grant would answer.
 //   - req.ServerOverrideID == "": a server-override request is a distinct routing
 //     path (handled before this is ever called) and must never land on a vendor.
 //     Re-checked here so the guarantee holds at this method's own boundary.
@@ -862,16 +891,19 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 // (translate) so the native-passthrough layer translates either inbound dialect
 // to the vendor's native wire format -- except an OpenAI account reached over the
 // fine openai_responses flavor, whose ResponsesMode is passthrough (see
-// vendorAccountTarget). Accounts are iterated in the store's
-// deterministic id order (VendorAccountsByOwner sorts by id) and the FIRST active
-// account with a model row whose token-effective public name (prefix +
-// UpstreamModel, see vendorAccountModelMatch) equals the request model wins; a
-// token only sees the accounts its VendorAccess policy allows.
+// vendorAccountTarget). Accounts are iterated in the order the enumerator
+// returns them -- the principal's OWN accounts first (id order), then the shared
+// ones (id order) -- and the FIRST active account with a model row whose
+// token-effective public name (prefix + UpstreamModel, see vendorAccountModelMatch)
+// equals the request model wins, so an own account wins a name collision with a
+// shared one; a token only sees the accounts its VendorAccess policy allows.
+// Dispatch trusts the Target's VendorAccountID and is owner-agnostic: the sealed
+// credential opens only at the dispatch edge, so a borrower never sees it.
 func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string) (Target, bool, error) {
 	if !r.vendorAccountRoutingEligible(token, req, apiFlavor) {
 		return Target{}, false, nil
 	}
-	accounts, err := r.store.VendorAccountsByOwner(ctx, token.UserID)
+	accounts, err := r.routableVendorAccounts(ctx, token)
 	if err != nil {
 		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
 	}
@@ -955,10 +987,37 @@ func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, pre
 // account models) is left to the standard path.
 func (r *Resolver) vendorAccountRoutingEligible(token auth.Token, req inference.Request, apiFlavor string) bool {
 	return r.vendorOn() &&
-		token.UserID != "" &&
+		vendorPrincipalEligible(token) &&
 		req.ServerOverrideID == "" &&
 		len(req.RequiredCapabilities) == 0 &&
 		apiFlavor != APIFlavorOpenAIImages
+}
+
+// vendorPrincipalEligible reports whether the token carries an identity the vendor
+// grant can be asked about: a USER (UserID set) or a SERVICE token with a service
+// id. It is deliberately NOT "UserID may be empty": a token with neither identity
+// (or a service token whose id is blank) owns nothing, is provisioned nowhere, and
+// must be denied before any enumerator -- which would have to answer for an empty
+// principal -- is consulted.
+func vendorPrincipalEligible(token auth.Token) bool {
+	return token.UserID != "" || (token.IsService() && token.ServiceID != "")
+}
+
+// routableVendorAccounts lists the accounts the token's principal may route to,
+// own accounts first. With an enumerator wired that is the grant
+// (VendorAccountEnumerator). With NONE wired it is OWNER-ONLY: the principal's own
+// accounts, exactly the behaviour before sharing existed -- never allow-all, the
+// inverse of the nil ProvisioningGate, because an unwired grant must fail closed.
+// A principal with no user identity (a service) owns nothing, so the fallback
+// returns no accounts rather than enumerating by an empty owner id.
+func (r *Resolver) routableVendorAccounts(ctx context.Context, token auth.Token) ([]VendorAccount, error) {
+	if r.vendorEnumerator != nil {
+		return r.vendorEnumerator.VendorAccountsForRouting(ctx, token)
+	}
+	if token.UserID == "" {
+		return nil, nil
+	}
+	return r.store.VendorAccountsByOwner(ctx, token.UserID)
 }
 
 // vendorAccountModelTarget builds the dispatch target for a matched account+model

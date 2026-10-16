@@ -715,6 +715,19 @@ func (g portalProvisioningGate) AllowedServerIDs(ctx context.Context, p auth.Tok
 	return g.api.AllowedServerIDs(ctx, p, ids)
 }
 
+// portalVendorAccountEnumerator adapts portal.API's VendorAccountsForRouting onto the
+// routing.VendorAccountEnumerator seam (shared vendor accounts, #183, spec
+// 2026-10-15 section 8) so the resolver can ask which vendor accounts a principal
+// may route to -- its own, then the live-shared ones in a resource group it is
+// provisioned into -- without importing internal/portal into internal/routing.
+// Unlike portalProvisioningGate, an UNWIRED seam must fail closed to owner-only;
+// see the wiring in New.
+type portalVendorAccountEnumerator struct{ api portal.API }
+
+func (e portalVendorAccountEnumerator) VendorAccountsForRouting(ctx context.Context, p auth.Token) ([]routing.VendorAccount, error) {
+	return e.api.VendorAccountsForRouting(ctx, p)
+}
+
 func New(deps ServerDeps) *Server {
 	providerClient := deps.Provider
 	if providerClient == nil {
@@ -894,6 +907,11 @@ func New(deps ServerDeps) *Server {
 		// not a non-nil gate around a nil api.
 		if deps.Portal != nil {
 			resolver.SetProvisioningGate(portalProvisioningGate{api: deps.Portal})
+			// The shared-vendor-account grant, wired under the same rule (a
+			// genuinely nil seam, never a non-nil adapter around a nil api) but with
+			// the OPPOSITE meaning of nil: without a portal the resolver falls back
+			// to OWNER-ONLY vendor accounts, never allow-all.
+			resolver.SetVendorAccountEnumerator(portalVendorAccountEnumerator{api: deps.Portal})
 		}
 		// SetModelWarmer is deferred until after s is built (the warmer needs the fully-
 		// assembled Server for its provider/routes/upstream-auth); see below.
