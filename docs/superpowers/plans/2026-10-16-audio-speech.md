@@ -295,6 +295,7 @@ tests cover the timeout default; the whole-branch review confirms it.)
 - Modify: `gateway/frontend/src/components/ActiveRequestsPanel.tsx` (output-tokens column ~237–244)
 - Modify: `gateway/frontend/src/i18n.ts` (add `applicationFlavorOpenaiAudio` DE+EN next to `applicationFlavorOpenaiImages`; `billingUnitHelpAudioSecond` already exists)
 - Modify: the flavor-checkbox component and `RuntimeAdminSection.tsx` (audio-only default for `audio_cpp`); the runtime-kind lists `gateway/frontend/src/api/runtime.ts` and `runtimeSpecTypeFlavors.ts` must include `audio_cpp` (added per Task 2 ruling)
+- Modify (application TYPE, added per Task 2b ruling): the application-type list/option so an operator can create an `audio_cpp` application — `gateway/frontend/src/api/models.ts` (the app-type union), `ApplicationSection.tsx` (the type option), `applicationTypeDefaults.ts` (defaults for `audio_cpp`, including defaulting its flavor to `openai_audio`, mirroring how `stable_diffusion_cpp` defaults to images-only)
 - Test: `gateway/frontend/src/components/*.test.tsx` (ActiveRequestsPanel; flavor UI)
 
 **Interfaces:**
