@@ -390,14 +390,21 @@ func hasCapabilityFold(capability string) bool {
 // the portal's flags are one rule. capsByMapping is the batch capability read,
 // keyed by mapping id, and idx covers views. The map is fresh each call, so the
 // caller may add its group names to it.
+//
+// Every capability hasCapabilityFold admits has its own case here. The default is
+// FAIL-CLOSED -- an empty map, so nothing is offered -- rather than the image fold:
+// a capability added to hasCapabilityFold but not to this switch must offer
+// nothing, not silently inherit another capability's answer.
 func capabilityFlagsByName(capability string, views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	switch capability {
+	case routing.CapabilityImage:
+		return imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
 	case routing.CapabilityImageEdit:
 		return imageEditFlagsByName(views, capsByMapping, idx)
 	case routing.CapabilitySpeech:
 		return speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
 	default:
-		return imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
+		return map[string]bool{}
 	}
 }
 

@@ -62,9 +62,9 @@ export interface TypeDefaults {
   contextProbePath: string;
   timeoutMs: number;
   // The exception to "health mode/path/interval stays out" -- see the doc
-  // comment above. Only the MODE is a type property; health_check_path and
-  // health_check_interval_seconds remain operator preferences and are not
-  // part of this contract.
+  // comment above. The MODE and the PATH (healthCheckPath, below) are type
+  // properties; health_check_interval_seconds remains an operator preference
+  // and is not part of this contract.
   healthCheckMode: ApplicationHealthMode;
   // The exception to "health path stays out" -- see the doc comment above. Used
   // when healthCheckMode is 'health_path'; every type but audio_cpp keeps the

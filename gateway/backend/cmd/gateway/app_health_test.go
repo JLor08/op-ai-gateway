@@ -3790,10 +3790,11 @@ func (f *audioCppFakeProber) audioCppAsked() []string {
 	return append([]string(nil), f.acModels...)
 }
 
-// audioCppApp is a static, operator-run audio.cpp application as the portal
-// creates one: the type's /v1/models health path, NO ContextProbePath (so the
-// speech probe cannot ride the context branch) and NO runtime spec -- the
-// deployment this type exists for, which no agent manages.
+// audioCppApp is a static, operator-run audio.cpp application: NO
+// ContextProbePath (so the speech probe cannot ride the context branch) and NO
+// runtime spec -- the deployment this type exists for, which no agent manages.
+// The health path is a fixture value, not the portal form's default (/health):
+// these tests fake the prober, so nothing here reads it.
 func audioCppApp(id, serverID string, port int) routing.Application {
 	app := activeApp(id, serverID, port)
 	app.Type = routing.ProviderAudioCpp

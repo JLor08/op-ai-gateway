@@ -209,6 +209,15 @@ func isAudioContentType(contentType string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "audio/")
 }
 
+// isBinarySpeechResponse reports whether the capture is of a speech request the
+// upstream answered 2xx. That response is one audio file by the endpoint's
+// contract, so its body must never reach json.Marshal even when its Content-Type
+// is missing or wrong. It is narrow on purpose: a speech request answered with an
+// error, and every other flavor, are decided by the Content-Type alone.
+func isBinarySpeechResponse(in *captureInput) bool {
+	return in.APIFlavor == apiFlavorSpeech && in.HTTPStatus >= 200 && in.HTTPStatus < 300
+}
+
 // captureResponseBody returns what the envelope stores as the response body, and
 // whether that was cut short. For an audio response it is the summary of
 // captureBinaryBody; for everything else it is the body itself clipped to
@@ -219,14 +228,16 @@ func isAudioContentType(contentType string) bool {
 // what a capture held would be a corrupted fragment of a clip, and its megabyte
 // would bloat every capture for nothing the viewer can show.
 //
-// The gate is the response's OWN Content-Type, the one the client was sent, not the
-// request's flavor: a speech request whose upstream answered an error
-// (application/json) is stored like any other JSON body, and the same holds for
-// anything else that is not audio. Nothing is cut off by the skip, so truncated is
-// false.
+// The gate is the response's OWN Content-Type, the one the client was sent: a
+// speech request whose upstream answered an error (application/json) is stored like
+// any other JSON body, and the same holds for anything else that is not audio.
+// There is one backstop behind it, isBinarySpeechResponse: a speech request that was
+// answered 2xx got audio whatever its Content-Type says (proxyNative defaults a
+// missing one to application/json), so it is skipped too. Nothing is cut off by the
+// skip, so truncated is false.
 func captureResponseBody(in *captureInput, maxBytes int) (string, bool) {
 	contentType := in.RespHeaders.Get("Content-Type")
-	if !isAudioContentType(contentType) {
+	if !isAudioContentType(contentType) && !isBinarySpeechResponse(in) {
 		body, truncated := capBody(in.RespBody, maxBytes)
 		return string(body), truncated
 	}

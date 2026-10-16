@@ -121,7 +121,10 @@ type audioCppModelsDoc struct {
 //     not a statement, and a "no" can switch the model's speech route off)
 //   - no entry for modelID, an empty data list, or an unreadable body -> ""
 //
-// The id match is exact. The first entry that carries the id answers.
+// The id match is exact. The task match ignores case and surrounding
+// whitespace: a "TTS" the server might one day emit must not fall to the "no"
+// default, which is a bidirectional verdict that switches a speech route off.
+// The first entry that carries the id answers.
 func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 	if modelID == "" {
 		return AudioCppVerdicts{}
@@ -134,7 +137,7 @@ func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 		if entry.ID != modelID {
 			continue
 		}
-		switch strings.TrimSpace(entry.Task) {
+		switch strings.ToLower(strings.TrimSpace(entry.Task)) {
 		case "":
 			return AudioCppVerdicts{}
 		case audioCppTaskTTS, audioCppTaskClone:

@@ -156,21 +156,101 @@ func TestBuildCaptureEnvelopeStoresEveryNonAudioResponseBody(t *testing.T) {
 	}
 }
 
-// The gate is the response, not the request's flavor: a speech request whose
-// upstream answered application/json is stored, and an audio response is skipped
-// whatever flavor asked for it.
+// The response's own media type is the primary gate, not the request's flavor: a
+// speech request whose upstream answered an error (application/json, non-2xx) is
+// stored, and an audio response is skipped whatever flavor asked for it.
 func TestBuildCaptureEnvelopeGateIsTheResponseContentTypeNotTheFlavor(t *testing.T) {
 	const errBody = `{"error":{"message":"boom","type":"server_error"}}`
 	speechErr := audioCaptureInput("application/json", []byte(errBody))
 	speechErr.APIFlavor = apiFlavorSpeech
+	speechErr.HTTPStatus = http.StatusBadGateway
 	if env := buildCaptureEnvelope(speechErr, 4096); env.RespBody != errBody {
-		t.Errorf("speech flavor with a JSON response: RespBody = %q, want the error body stored", env.RespBody)
+		t.Errorf("speech flavor with a JSON error response: RespBody = %q, want the error body stored", env.RespBody)
 	}
 
 	otherAudio := audioCaptureInput("audio/wav", speechTestWAV())
 	otherAudio.APIFlavor = "openai"
 	if env := buildCaptureEnvelope(otherAudio, 4096); !decodeCapturedBinaryBodyIsSummary(env.RespBody) {
 		t.Errorf("non-speech flavor with an audio response: RespBody = %q, want the binary summary", env.RespBody)
+	}
+}
+
+// Defense in depth behind the Content-Type gate: a speech request that was
+// answered 2xx got an audio body, whatever its Content-Type says. proxyNative
+// defaults a missing Content-Type to application/json, so without this fallback an
+// upstream that forgot (or mislabelled) the header would send raw WAV bytes
+// through json.Marshal and into the capture, corrupted and clipped mid-file. The
+// metadata summary is stored instead.
+func TestBuildCaptureEnvelopeSkipsA2xxSpeechBodyWhateverItsContentType(t *testing.T) {
+	wav := speechTestWAV()
+	for _, tc := range []struct {
+		name        string
+		contentType string // "" = the response names none
+		status      int
+	}{
+		{"no content type, 200", "", http.StatusOK},
+		{"json content type, 200", "application/json", http.StatusOK},
+		{"octet-stream, 200", "application/octet-stream", http.StatusOK},
+		{"no content type, 206", "", http.StatusPartialContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := audioCaptureInput(tc.contentType, wav)
+			if tc.contentType == "" {
+				in.RespHeaders = nil
+			}
+			in.APIFlavor = apiFlavorSpeech
+			in.HTTPStatus = tc.status
+			in.RespBytes = int64(len(wav))
+
+			env := buildCaptureEnvelope(in, 4096)
+
+			if !utf8.ValidString(env.RespBody) || strings.ContainsRune(env.RespBody, utf8.RuneError) {
+				t.Fatalf("the captured response body carries corrupted bytes (U+FFFD) or is not UTF-8: %q", env.RespBody)
+			}
+			for _, leaked := range []string{string(wav), "RIFF", "WAVE", "\x00"} {
+				if strings.Contains(env.RespBody, leaked) {
+					t.Fatalf("WAV content %q leaked into the captured response body: %q", leaked, env.RespBody)
+				}
+			}
+			doc := decodeCapturedBinaryBody(t, env.RespBody)
+			if doc.ContentType != tc.contentType || doc.Size != int64(len(wav)) || !doc.Redacted {
+				t.Fatalf("summary = %+v, want content type %q, size %d, redacted", doc, tc.contentType, len(wav))
+			}
+			if env.Truncated {
+				t.Fatal("Truncated = true: the summary is complete, a redacted body is not 'cut off'")
+			}
+		})
+	}
+}
+
+// The fallback is exactly "speech AND 2xx". A speech request answered with an
+// error, and every other flavor with a 2xx and no content type, keep storing the
+// body, so the new rule widens nothing beyond the one binary response it exists for.
+func TestBuildCaptureEnvelopeSpeechFallbackIsNarrow(t *testing.T) {
+	const body = `{"error":{"message":"boom","type":"server_error"}}`
+	for _, tc := range []struct {
+		name   string
+		flavor string
+		status int
+	}{
+		{"speech with a 400", apiFlavorSpeech, http.StatusBadRequest},
+		{"speech with a 502", apiFlavorSpeech, http.StatusBadGateway},
+		{"speech with a 199", apiFlavorSpeech, 199},
+		{"speech with a 300", apiFlavorSpeech, http.StatusMultipleChoices},
+		{"speech with no status recorded", apiFlavorSpeech, 0},
+		{"another flavor with a 200", "openai", http.StatusOK},
+		{"no flavor with a 200", "", http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := audioCaptureInput("", []byte(body))
+			in.RespHeaders = nil
+			in.APIFlavor = tc.flavor
+			in.HTTPStatus = tc.status
+
+			if env := buildCaptureEnvelope(in, 4096); env.RespBody != body {
+				t.Fatalf("RespBody = %q, want the body stored unchanged", env.RespBody)
+			}
+		})
 	}
 }
 
