@@ -590,30 +590,41 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 }
 
 // audioCppCapabilityRows projects what one audio.cpp /v1/models listing says
-// about ONE model onto the store's row shape: a single routing.CapabilitySpeech
-// row attributed to routing.CapabilitySourceAudioCppModels and stamped at, when
-// the listing answered yes or no, and no row at all otherwise -- "unknown" is
-// the absence of a row, exactly as in sdcppCapabilityRows. Pure: no I/O.
+// about ONE model onto the store's row shape: up to two rows, a
+// routing.CapabilitySpeech row and a routing.CapabilityTranscription row, each
+// attributed to routing.CapabilitySourceAudioCppModels and stamped at, and each
+// written only when the listing answered yes or no for THAT capability. No
+// answer is the absence of a row -- "unknown" is exactly as in
+// sdcppCapabilityRows -- so one unanswered axis never suppresses the other.
+// Pure: no I/O.
 //
 // The empty verdict is the case this guards. provider.AudioCppVerdicts answers
 // "" for everything the listing does not say -- the model is not in it
 // (/v1/models names LOADED models only), the listing is empty or unreadable, or
 // the entry carries no task -- and none of those is a statement that the model
-// cannot speak. A written "no" can switch a model's speech route off, so an
-// unknown verdict must never become one.
+// cannot speak or cannot transcribe. A written "no" can switch a model's route
+// off, so an unknown verdict must never become one.
 //
 // A "no" is a real verdict where it IS stated: the listing names the loaded
-// model's task, so a model present with a non-synthesis task (asr, music) is
-// authoritatively not a speech model, which is what entitles this source, like
-// sdcpp's, to establish its capability's no.
+// model's task, so a model present with a task that does not serve the
+// capability (an asr model for speech, a tts model for transcription, a music
+// model for both) is authoritatively not that kind of model, which is what
+// entitles this source, like sdcpp's, to establish its capability's no.
 func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing.CapabilityRow {
-	if v.Speech != routing.CapabilityYes && v.Speech != routing.CapabilityNo {
-		return nil
+	var rows []routing.CapabilityRow
+	for _, axis := range []struct{ capability, verdict string }{
+		{routing.CapabilitySpeech, v.Speech},
+		{routing.CapabilityTranscription, v.Transcription},
+	} {
+		if axis.verdict != routing.CapabilityYes && axis.verdict != routing.CapabilityNo {
+			continue
+		}
+		rows = append(rows, routing.CapabilityRow{
+			Capability: axis.capability, Verdict: axis.verdict,
+			Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at,
+		})
 	}
-	return []routing.CapabilityRow{{
-		Capability: routing.CapabilitySpeech, Verdict: v.Speech,
-		Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at,
-	}}
+	return rows
 }
 
 // probeSdcppCapabilities is the stable_diffusion_cpp branch of the probe pass
@@ -710,10 +721,10 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // probeAudioCppModels is the audio_cpp branch of the probe pass for ONE
 // application of type routing.ProviderAudioCpp, a static, operator-run audio.cpp
 // server: for each of its active mappings it reads audio.cpp's own /v1/models
-// listing, derives the speech verdict that listing states for the mapping's
-// model, and writes it (audioCppCapabilityRows through writeCapabilityRows, so
-// the precedence and change-detection guards hold exactly as for the other
-// probe sources).
+// listing, derives the speech and transcription verdicts that listing states
+// for the mapping's model, and writes them (audioCppCapabilityRows through
+// writeCapabilityRows, so the precedence and change-detection guards hold
+// exactly as for the other probe sources).
 //
 // THE GATE is the application's type, applied by the caller exactly as for the
 // sdcpp pass: every mapping of such an application is an audio.cpp model, so

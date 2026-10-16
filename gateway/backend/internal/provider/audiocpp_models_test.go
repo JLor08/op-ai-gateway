@@ -21,47 +21,58 @@ const audioCppLiveListing = `{"object":"list","data":[
 ]}`
 
 // TestParseAudioCppModels pins the mapping rule: the loaded entry's own task is
-// authoritative. A synthesis task (tts, clone) is a speech "yes", any other
-// task is a speech "no", and a model the listing does not name -- or a listing
-// this code cannot read -- is no verdict.
+// authoritative, for BOTH capability axes at once. A synthesis task (tts, clone)
+// is a speech "yes" and a transcription "no"; asr is a transcription "yes" and
+// a speech "no"; any other task is a "no" on both; and a model the listing does
+// not name -- or a listing this code cannot read -- is no verdict on either.
 func TestParseAudioCppModels(t *testing.T) {
+	const (
+		yes = routing.CapabilityYes
+		no  = routing.CapabilityNo
+	)
 	cases := []struct {
-		name    string
-		body    string
-		modelID string
-		want    string // "yes" | "no" | ""
+		name          string
+		body          string
+		modelID       string
+		wantSpeech    string // "yes" | "no" | ""
+		wantTranscrip string // "yes" | "no" | ""
 	}{
-		{"real v0.9.1 entry, task tts", audioCppLiveListing, "pocket_tts_english_bf16", "yes"},
-		{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", "yes"},
-		{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", "yes"},
-		{"task asr is a no", `{"data":[{"id":"m","task":"asr"}]}`, "m", "no"},
-		{"a music task is a no", `{"data":[{"id":"m","task":"music"}]}`, "m", "no"},
-		{"model absent from the listing", `{"data":[{"id":"other","task":"tts"}]}`, "m", ""},
-		{"empty data", `{"object":"list","data":[]}`, "m", ""},
-		{"data absent", `{"object":"list"}`, "m", ""},
-		{"data null", `{"data":null}`, "m", ""},
-		{"the entry is picked out by id among several", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"},{"id":"c","task":"asr"}]}`, "b", "yes"},
-		{"the sibling's task does not leak", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"}]}`, "a", "no"},
-		{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","task":"tts"}]}`, "pocket_tts", ""},
-		{"id match is case-sensitive", `{"data":[{"id":"M","task":"tts"}]}`, "m", ""},
-		{"a task padded with whitespace still maps", `{"data":[{"id":"m","task":" tts "}]}`, "m", "yes"},
-		{"task match ignores case", `{"data":[{"id":"m","task":"TTS"}]}`, "m", "yes"},
-		{"task match ignores case and padding for clone", `{"data":[{"id":"m","task":" Clone "}]}`, "m", "yes"},
-		{"a differently-cased non-synthesis task is still a no", `{"data":[{"id":"m","task":"ASR"}]}`, "m", "no"},
-		{"a named entry without a task says nothing", `{"data":[{"id":"m"}]}`, "m", ""},
-		{"a named entry with an empty task says nothing", `{"data":[{"id":"m","task":""}]}`, "m", ""},
-		{"an empty model id never matches", `{"data":[{"id":"","task":"tts"}]}`, "", ""},
-		{"unknown and extra fields are ignored", `{"object":"list","x":1,"data":[{"id":"m","task":"tts","loaded":false,"extra":{"k":[1,2]}}]}`, "m", "yes"},
-		{"data of the wrong type", `{"data":"m"}`, "m", ""},
-		{"a task of the wrong type", `{"data":[{"id":"m","task":1}]}`, "m", ""},
-		{"not JSON", `<html>502</html>`, "m", ""},
-		{"empty body", ``, "m", ""},
+		{"real v0.9.1 entry, task tts", audioCppLiveListing, "pocket_tts_english_bf16", yes, no},
+		{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", yes, no},
+		{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", yes, no},
+		{"task asr transcribes and does not speak", `{"data":[{"id":"m","task":"asr"}]}`, "m", no, yes},
+		{"an asr model the server lists as not loaded is still a yes", `{"data":[{"id":"m","task":"asr","loaded":false}]}`, "m", no, yes},
+		{"a music task is a no on both axes", `{"data":[{"id":"m","task":"music"}]}`, "m", no, no},
+		{"an unknown task is a no on both axes", `{"data":[{"id":"m","task":"some-future-task"}]}`, "m", no, no},
+		{"model absent from the listing", `{"data":[{"id":"other","task":"tts"}]}`, "m", "", ""},
+		{"empty data", `{"object":"list","data":[]}`, "m", "", ""},
+		{"data absent", `{"object":"list"}`, "m", "", ""},
+		{"data null", `{"data":null}`, "m", "", ""},
+		{"the entry is picked out by id among several", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"},{"id":"c","task":"asr"}]}`, "b", yes, no},
+		{"the sibling's task does not leak", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"}]}`, "a", no, yes},
+		{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","task":"tts"}]}`, "pocket_tts", "", ""},
+		{"id match is case-sensitive", `{"data":[{"id":"M","task":"tts"}]}`, "m", "", ""},
+		{"a task padded with whitespace still maps", `{"data":[{"id":"m","task":" tts "}]}`, "m", yes, no},
+		{"task match ignores case", `{"data":[{"id":"m","task":"TTS"}]}`, "m", yes, no},
+		{"task match ignores case and padding for clone", `{"data":[{"id":"m","task":" Clone "}]}`, "m", yes, no},
+		{"a differently-cased asr task is still a transcription yes", `{"data":[{"id":"m","task":"ASR"}]}`, "m", no, yes},
+		{"an asr task padded with whitespace still maps", `{"data":[{"id":"m","task":" asr "}]}`, "m", no, yes},
+		{"a named entry without a task says nothing", `{"data":[{"id":"m"}]}`, "m", "", ""},
+		{"a named entry with an empty task says nothing", `{"data":[{"id":"m","task":""}]}`, "m", "", ""},
+		{"a named entry with a blank task says nothing", `{"data":[{"id":"m","task":"  "}]}`, "m", "", ""},
+		{"an empty model id never matches", `{"data":[{"id":"","task":"tts"}]}`, "", "", ""},
+		{"unknown and extra fields are ignored", `{"object":"list","x":1,"data":[{"id":"m","task":"tts","loaded":false,"extra":{"k":[1,2]}}]}`, "m", yes, no},
+		{"data of the wrong type", `{"data":"m"}`, "m", "", ""},
+		{"a task of the wrong type", `{"data":[{"id":"m","task":1}]}`, "m", "", ""},
+		{"not JSON", `<html>502</html>`, "m", "", ""},
+		{"empty body", ``, "m", "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := parseAudioCppModels([]byte(tc.body), tc.modelID)
-			if got.Speech != tc.want {
-				t.Fatalf("Speech = %q, want %q", got.Speech, tc.want)
+			want := AudioCppVerdicts{Speech: tc.wantSpeech, Transcription: tc.wantTranscrip}
+			if got != want {
+				t.Fatalf("parseAudioCppModels = %+v, want %+v", got, want)
 			}
 		})
 	}
@@ -84,15 +95,15 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		if got.Speech != routing.CapabilityYes {
-			t.Fatalf("got %+v, want {Speech:yes}", got)
+		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}); got != want {
+			t.Fatalf("got %+v, want %+v", got, want)
 		}
 		if method != http.MethodGet || path != "/v1/models" {
 			t.Fatalf("request = %s %s, want GET /v1/models", method, path)
 		}
 	})
 
-	t.Run("a loaded asr model yields no", func(t *testing.T) {
+	t.Run("an asr model yields a transcription yes and a speech no", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`{"data":[{"id":"whisper_small","task":"asr","loaded":true}]}`))
 		}))
@@ -101,8 +112,8 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		if got.Speech != routing.CapabilityNo {
-			t.Fatalf("got %+v, want {Speech:no}", got)
+		if want := (AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes}); got != want {
+			t.Fatalf("got %+v, want %+v", got, want)
 		}
 	})
 
@@ -115,8 +126,8 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v, want nil -- the server answered, it just does not name the model", err)
 		}
-		if got.Speech != "" {
-			t.Fatalf("Speech = %q, want empty -- a missing entry says nothing about the model", got.Speech)
+		if got != (AudioCppVerdicts{}) {
+			t.Fatalf("got %+v, want no verdict on either axis -- a missing entry says nothing about the model", got)
 		}
 	})
 
@@ -155,8 +166,8 @@ func TestProbeAudioCppModels(t *testing.T) {
 		}))
 		defer srv.Close()
 		got, _ := probe(t, srv, context.Background(), "m")
-		if got.Speech != "" {
-			t.Fatalf("Speech = %q, want empty -- an unreadable body must not read as a verdict", got.Speech)
+		if got != (AudioCppVerdicts{}) {
+			t.Fatalf("got %+v, want no verdict on either axis -- an unreadable body must not read as a verdict", got)
 		}
 	})
 
@@ -200,8 +211,8 @@ func TestMultiplexerDispatchesAudioCppModelsToOpenAICompatibleClient(t *testing.
 	if err != nil {
 		t.Fatalf("ProbeAudioCppModels(audio_cpp) returned %v", err)
 	}
-	if got.Speech != routing.CapabilityYes {
-		t.Fatalf("got %+v, want {Speech:yes}", got)
+	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
 	}
 	if len(paths) != 1 || paths[0] != "/v1/models" {
 		t.Fatalf("upstream paths = %v, want exactly [/v1/models]", paths)

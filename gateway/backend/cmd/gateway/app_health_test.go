@@ -3706,34 +3706,68 @@ func TestNetbirdOnlyExcludesOffMeshFromRouting(t *testing.T) {
 	}
 }
 
-// TestAudioCppCapabilityRows pins the audio.cpp projector: ONE speech row,
-// attributed to routing.CapabilitySourceAudioCppModels and stamped at the
-// given instant, for a yes or a no -- and NO row for anything else.
+// TestAudioCppCapabilityRows pins the audio.cpp projector: one row PER AXIS the
+// listing answered -- a speech row and a transcription row, each attributed to
+// routing.CapabilitySourceAudioCppModels and stamped at the given instant, for a
+// yes or a no -- and NO row for anything else.
 //
 // "" is the case that matters. parseAudioCppModels answers "" for everything
 // the /v1/models listing does not say (the model is not loaded, the listing is
 // empty or unreadable, the entry carries no task), and a "no" here can switch a
-// model's speech route off, so "unknown" must be the ABSENCE of a row and never
-// a written no.
+// model's route off, so "unknown" must be the ABSENCE of a row and never a
+// written no -- on each axis independently.
 func TestAudioCppCapabilityRows(t *testing.T) {
 	at := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	row := func(capability, verdict string) routing.CapabilityRow {
+		return routing.CapabilityRow{Capability: capability, Verdict: verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}
+	}
 	for _, tc := range []struct {
 		name string
 		v    provider.AudioCppVerdicts
 		want []routing.CapabilityRow
 	}{
 		{
-			name: "yes",
-			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes},
-			want: []routing.CapabilityRow{{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}},
+			name: "a tts model: speech yes beside transcription no",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+			},
 		},
 		{
-			name: "no is a real verdict (a loaded model's task is authoritative)",
-			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo},
-			want: []routing.CapabilityRow{{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}},
+			name: "an asr model: speech no beside transcription yes (a loaded model's task is authoritative)",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityNo),
+				row(routing.CapabilityTranscription, routing.CapabilityYes),
+			},
 		},
-		{name: "unknown builds no row", v: provider.AudioCppVerdicts{Speech: ""}, want: nil},
-		{name: "anything that is not yes or no builds no row", v: provider.AudioCppVerdicts{Speech: "maybe"}, want: nil},
+		{
+			name: "a model that is neither: no on both axes",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityNo},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityNo),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+			},
+		},
+		{
+			name: "speech yes alone builds only the speech row",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes},
+			want: []routing.CapabilityRow{row(routing.CapabilitySpeech, routing.CapabilityYes)},
+		},
+		{
+			name: "transcription yes alone builds only the transcription row",
+			v:    provider.AudioCppVerdicts{Transcription: routing.CapabilityYes},
+			want: []routing.CapabilityRow{row(routing.CapabilityTranscription, routing.CapabilityYes)},
+		},
+		{name: "unknown on both axes builds no row", v: provider.AudioCppVerdicts{}, want: nil},
+		{name: "a speech verdict that is not yes or no builds no speech row", v: provider.AudioCppVerdicts{Speech: "maybe"}, want: nil},
+		{name: "a transcription verdict that is not yes or no builds no transcription row", v: provider.AudioCppVerdicts{Transcription: "maybe"}, want: nil},
+		{
+			name: "one axis unknown does not suppress the other",
+			v:    provider.AudioCppVerdicts{Speech: "", Transcription: routing.CapabilityNo},
+			want: []routing.CapabilityRow{row(routing.CapabilityTranscription, routing.CapabilityNo)},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := audioCppCapabilityRows(tc.v, at)
@@ -3825,23 +3859,24 @@ func audioCppMapping(id, appModel string) routing.ModelMapping {
 	return routing.ModelMapping{ID: id, ApplicationID: "a1", GatewayModelName: "g-" + id, AppModelName: appModel, Status: routing.ServerStatusActive}
 }
 
-// TestRunAppHealthOnceAudioCppWritesSpeechVerdict is the branch's whole job:
-// the gateway reads a static audio.cpp server's own /v1/models listing for each
-// of the application's mappings and writes the speech verdict it derives, at
-// the probe rank under source audiocpp_models. The application has NO runtime
-// spec -- an operator-run server has none -- so this also proves the probe
-// needs none.
+// TestRunAppHealthOnceAudioCppWritesSpeechAndTranscriptionVerdicts is the
+// branch's whole job: the gateway reads a static audio.cpp server's own
+// /v1/models listing for each of the application's mappings and writes the
+// speech AND transcription verdicts it derives, at the probe rank under source
+// audiocpp_models. The application has NO runtime spec -- an operator-run
+// server has none -- so this also proves the probe needs none.
 //
-// Both directions are asserted (a loaded asr model is a real "no"). The model
+// Both directions are asserted on both axes (a loaded asr model is a real speech
+// "no" and a transcription "yes"; a tts or clone model the reverse). The model
 // id handed to the probe is the MAPPING's upstream name (AppModelName), which
 // is what audio.cpp's listing is keyed on: the verdict is per MODEL, so every
 // mapping is its own probe.
-func TestRunAppHealthOnceAudioCppWritesSpeechVerdict(t *testing.T) {
+func TestRunAppHealthOnceAudioCppWritesSpeechAndTranscriptionVerdicts(t *testing.T) {
 	runner, st, prober := audioCppProbeRunner(t,
 		map[string]provider.AudioCppVerdicts{
-			"pocket_tts_english_bf16": {Speech: routing.CapabilityYes},
-			"whisper_small":           {Speech: routing.CapabilityNo},
-			"clone_model":             {Speech: routing.CapabilityYes},
+			"pocket_tts_english_bf16": {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo},
+			"whisper_small":           {Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes},
+			"clone_model":             {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo},
 		},
 		audioCppMapping("m1", "pocket_tts_english_bf16"), audioCppMapping("m2", "whisper_small"),
 		audioCppMapping("m3", "clone_model"))
@@ -3851,6 +3886,9 @@ func TestRunAppHealthOnceAudioCppWritesSpeechVerdict(t *testing.T) {
 	st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
 	st.assertCapability(t, "m2", routing.CapabilitySpeech, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
 	st.assertCapability(t, "m3", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	st.assertCapability(t, "m1", routing.CapabilityTranscription, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+	st.assertCapability(t, "m2", routing.CapabilityTranscription, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	st.assertCapability(t, "m3", routing.CapabilityTranscription, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
 
 	asked := prober.audioCppAsked()
 	sort.Strings(asked)
@@ -4113,7 +4151,7 @@ func TestRunAppHealthOnceAudioCppAuthRejectedLogsAndNeverWrites(t *testing.T) {
 	}
 }
 
-// TestAudioCppModelsPassE2EWritesSpeechVerdict drives the audio.cpp branch
+// TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts drives the audio.cpp branch
 // through the REAL production chain -- providerClients' Multiplexer, its
 // OpenAI-compatible client, a MemoryStore -- against an httptest server serving
 // a /v1/models listing in the shape measured against audiocpp_server v0.9.1.
@@ -4124,7 +4162,7 @@ func TestRunAppHealthOnceAudioCppAuthRejectedLogsAndNeverWrites(t *testing.T) {
 // does, would leave every audio mapping without a verdict and every fake test
 // green. The application is a static audio_cpp one with no runtime spec, the
 // deployment the type exists for.
-func TestAudioCppModelsPassE2EWritesSpeechVerdict(t *testing.T) {
+func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T) {
 	shrinkRetryGap(t)
 	var paths []string
 	var mu sync.Mutex
@@ -4186,13 +4224,19 @@ func TestAudioCppModelsPassE2EWritesSpeechVerdict(t *testing.T) {
 		settings: staticSettings(nil), probeTimeout: time.Second, now: func() time.Time { return now },
 	}).runOnce(ctx, &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
 
-	speech := func(mappingID string) (routing.CapabilityRow, bool) {
+	capabilityRow := func(mappingID, capability string) (routing.CapabilityRow, bool) {
 		rows, err := store.MappingCapabilities(ctx, mappingID)
 		if err != nil {
 			t.Fatalf("mapping capabilities %s: %v", mappingID, err)
 		}
-		row, ok := routing.CapabilityRowsByName(rows)[routing.CapabilitySpeech]
+		row, ok := routing.CapabilityRowsByName(rows)[capability]
 		return row, ok
+	}
+	speech := func(mappingID string) (routing.CapabilityRow, bool) {
+		return capabilityRow(mappingID, routing.CapabilitySpeech)
+	}
+	transcription := func(mappingID string) (routing.CapabilityRow, bool) {
+		return capabilityRow(mappingID, routing.CapabilityTranscription)
 	}
 	if row, ok := speech("m1"); !ok || row.Verdict != routing.CapabilityYes || row.Source != routing.CapabilitySourceAudioCppModels || !row.CheckedAt.Equal(now) {
 		t.Fatalf("m1 speech row = %+v (present=%v), want yes/audiocpp_models at %v", row, ok, now)
@@ -4202,6 +4246,15 @@ func TestAudioCppModelsPassE2EWritesSpeechVerdict(t *testing.T) {
 	}
 	if row, ok := speech("m3"); ok {
 		t.Fatalf("m3 speech row = %+v, want none -- a model absent from the listing is unknown, never a no", row)
+	}
+	if row, ok := transcription("m1"); !ok || row.Verdict != routing.CapabilityNo || row.Source != routing.CapabilitySourceAudioCppModels {
+		t.Fatalf("m1 transcription row = %+v (present=%v), want no/audiocpp_models", row, ok)
+	}
+	if row, ok := transcription("m2"); !ok || row.Verdict != routing.CapabilityYes || row.Source != routing.CapabilitySourceAudioCppModels || !row.CheckedAt.Equal(now) {
+		t.Fatalf("m2 transcription row = %+v (present=%v), want yes/audiocpp_models at %v", row, ok, now)
+	}
+	if row, ok := transcription("m3"); ok {
+		t.Fatalf("m3 transcription row = %+v, want none -- a model absent from the listing is unknown, never a no", row)
 	}
 	mu.Lock()
 	defer mu.Unlock()
