@@ -42,7 +42,11 @@ import (
 //     it must stay the sentinel's fixed text.
 //
 // Every endpoint is driven twice: as a CM of a shared account (the new reach) and
-// as the owner.
+// as the owner. A SUBSCRIPTION account is the exception to the CM's reach (spec
+// section 6 note (1), requireOwnerForSubscriptionOperate): these calls open its
+// token set, so a CM is refused with ErrVendorAccountForbidden before anything is
+// opened or sent. The CM run of a subscription case therefore asserts that refusal
+// (and that it echoes no secret either); the owner run keeps the full hygiene check.
 const (
 	hygieneAPIKey  = "sk-PLANTED-SECRET-abc123"
 	hygieneAccess  = "tok-PLANTED-ACCESS-def456"
@@ -340,12 +344,19 @@ func TestCMReachableRefreshEndpointsNeverEchoCredentialMaterial(t *testing.T) {
 				setUsageClock(e.svc, discoveryTestNow)
 				id, after := tc.seed(t, e)
 				e.shareAtShared(id)
+				// Read off the account itself, so a case cannot be missed by a flag:
+				// a CM never reaches a subscription's token set, so the planted secret
+				// never reaches the vendor seam either (no `after` check).
+				wantErr := tc.wantErr
+				if p.name == "cm" && e.reload(id).AuthType == routing.VendorAuthSubscription {
+					wantErr, after = ErrVendorAccountForbidden, nil
+				}
 
 				answers, data, err := tc.call(e, p.tok, id)
 
-				if tc.wantErr != nil {
-					if !errors.Is(err, tc.wantErr) {
-						t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				if wantErr != nil {
+					if !errors.Is(err, wantErr) {
+						t.Fatalf("err = %v, want %v", err, wantErr)
 					}
 				} else if err != nil {
 					t.Fatalf("err = %v, want success", err)

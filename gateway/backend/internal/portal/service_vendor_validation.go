@@ -307,7 +307,9 @@ func vendorConnectionStatus(status vendorauth.CredentialStatus) string {
 // authorizeVendorAccountOperate: the owner, or a CM while the account is
 // shared/full; system scope is NOT let through (it USES the stored credential, so
 // it is authorized like a write, not like a metadata read). An unknown id and a
-// stranger's account are both ErrVendorAccountNotFound.
+// stranger's account are both ErrVendorAccountNotFound. A SUBSCRIPTION account is
+// owner-only on top of that (requireOwnerForSubscriptionOperate): it opens the
+// OAuth token set, so a CM who can see the account gets ErrVendorAccountForbidden.
 // ErrVendorAccountsDisabled while the master flag is off.
 //
 // A missing credential (no api key set, subscription not connected) is
@@ -330,6 +332,9 @@ func (s *Service) TestVendorAccountConnection(ctx context.Context, principal aut
 		return VendorConnectionCheck{}, err
 	}
 	if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+		return VendorConnectionCheck{}, err
+	}
+	if err := requireOwnerForSubscriptionOperate(principal, acc); err != nil {
 		return VendorConnectionCheck{}, err
 	}
 	check, credential, err := s.checkVendorAccount(ctx, acc)

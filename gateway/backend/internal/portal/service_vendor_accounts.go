@@ -748,7 +748,9 @@ func (s *Service) effectiveVendorAccountShareLevel(ctx context.Context, acc rout
 //
 // This gate says nothing about the credential-bearing operations (see
 // authorizeVendorAccountCredential), nor about the subscription exception that
-// makes some operate calls owner-only at `shared` for a subscription account.
+// makes some operate calls owner-only at `shared` for a subscription account
+// (requireOwnerForSubscriptionOperate, which the three token-opening operations
+// run right AFTER this gate).
 func (s *Service) authorizeVendorAccountOperate(ctx context.Context, principal auth.Token, acc routing.VendorAccount) error {
 	if isVendorAccountOwner(principal, acc) {
 		return nil
@@ -764,6 +766,37 @@ func (s *Service) authorizeVendorAccountOperate(ctx context.Context, principal a
 		return nil
 	}
 	return ErrVendorAccountNotFound
+}
+
+// requireOwnerForSubscriptionOperate is the subscription exception of the operate
+// gate (spec 2026-10-15 sections 6 note (1) and 11). A SUBSCRIPTION account's
+// operate calls that open the stored OAuth token set -- the connection test, the
+// model refresh and the usage refresh -- are owner-only even at `shared` and `full`:
+// all three open the token set, and the two refreshes renew an expired access token
+// through the gateway's refresher, which persists the rotated single-use refresh
+// token (and can trip the account-wide needs_reconnect); a CM may not do that to the
+// owner's token (the connection test only opens the set and renews nothing, but the
+// spec lists it with the other two and the rule covers it). An api-key account is
+// not affected: it has no token to rotate, so the owner and a CM both pass, as the
+// operate gate decided.
+//
+// It is not a gate of its own and MUST run AFTER authorizeVendorAccountOperate has
+// passed: a caller who cannot see the account at all is turned away there with the
+// 404-no-leak, and only one who can (a CM of a shared account) is told
+// ErrVendorAccountForbidden here (403: the account is no secret to them, so "not
+// found" would be a lie). It tests the account's auth type, not its level, so it
+// fails closed: a subscription account is owner-only here whatever level a stored
+// row claims, although the raise cap keeps one from `full`.
+//
+// Every operate call that opens a subscription's token set calls this one function,
+// so a further token-rotating operation joins the rule by calling it too. The calls
+// that do not open the token set (status, model prefix, rename) do not: a CM keeps
+// them on a subscription account.
+func requireOwnerForSubscriptionOperate(principal auth.Token, acc routing.VendorAccount) error {
+	if acc.AuthType == routing.VendorAuthSubscription && !isVendorAccountOwner(principal, acc) {
+		return ErrVendorAccountForbidden
+	}
+	return nil
 }
 
 // authorizeVendorAccountCredential is the gate of every operation that

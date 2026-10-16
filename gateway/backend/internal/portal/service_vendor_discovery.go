@@ -280,7 +280,11 @@ func newVendorDiscoveryState(discoverers VendorModelDiscoverers, refresher Vendo
 // account is shared/full. System scope is NOT let through: it opens the owner's
 // sealed credential and sends it to the vendor from the gateway, so it is
 // authorized like a write (an unknown id and a stranger's account are both
-// ErrVendorAccountNotFound). ErrVendorAccountsDisabled while the master flag is off.
+// ErrVendorAccountNotFound). A SUBSCRIPTION account is owner-only on top of that
+// (requireOwnerForSubscriptionOperate): the refresh can renew an expired token and
+// persist the rotated single-use refresh token, so a CM who can see the account gets
+// ErrVendorAccountForbidden and nothing is renewed or written.
+// ErrVendorAccountsDisabled while the master flag is off.
 func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth.Token, id string) (VendorAccountDTO, RefreshResult, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
@@ -290,6 +294,9 @@ func (s *Service) RefreshVendorAccountModels(ctx context.Context, principal auth
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
 	if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+		return VendorAccountDTO{}, RefreshResult{}, err
+	}
+	if err := requireOwnerForSubscriptionOperate(principal, acc); err != nil {
 		return VendorAccountDTO{}, RefreshResult{}, err
 	}
 	found, tokens, note, err := s.discoverVendorModels(ctx, acc)

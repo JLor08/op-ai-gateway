@@ -424,7 +424,8 @@ func (s *Server) handlePortalVendorAccountResourceGroupItem(w http.ResponseWrite
 // changes nothing, and no credential is ever returned. Gated by the
 // vendor_accounts_enabled master flag and the operate gate (both in
 // portal.Service): the owner, or a CM of a shared/full account; any other
-// principal gets the same 404 as an unknown id.
+// principal gets the same 404 as an unknown id. A subscription account is
+// owner-only: a CM who can see it gets a 403.
 func (s *Server) handlePortalVendorAccountCheck(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -456,7 +457,8 @@ type vendorAccountModelsRefreshResponse struct {
 // master flag and the operate gate (both in portal.Service): the owner, or a CM of
 // a shared/full account; any other principal gets the same 404 as an unknown id; a
 // stored credential that cannot be opened is a 409
-// vendor_account.credential_unreadable.
+// vendor_account.credential_unreadable. A subscription account is owner-only (the
+// refresh can rotate its single-use token): a CM who can see it gets a 403.
 func (s *Server) handlePortalVendorAccountModelsRefresh(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -505,7 +507,9 @@ func vendorUsageForce(r *http.Request) bool {
 // Gated by the vendor_accounts_enabled master flag and the operate gate (both in
 // portal.Service): the owner, or a CM of a shared/full account; any other principal
 // gets the same 404 as an unknown id; a stored credential that cannot be opened is a
-// 409 vendor_account.credential_unreadable.
+// 409 vendor_account.credential_unreadable. A subscription account is owner-only
+// (the pull renews its token first), the lazy on-view pull included: a CM who can
+// see it gets a 403.
 func (s *Server) handlePortalVendorAccountUsageRefresh(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
