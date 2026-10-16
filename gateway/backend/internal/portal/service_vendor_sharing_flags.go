@@ -28,15 +28,11 @@ import (
 //     enumerator, effectiveVendorAccountShareLevel (and through it the write gates, the
 //     read gates and the listings), and the member read's subscription check.
 //   - RAW (Service.VendorAccountSharingEnabled / VendorSubscriptionSharingEnabled):
-//     the public accessors, deliberately left uncached. The gateway defines its own
-//     cached wrappers around them (vendorAccountSharingEnabledCached /
-//     vendorSubscriptionSharingEnabledCached in vendor_account_settings.go, dropped on
-//     the settings PUT; no production path consults them today) and the vendor-accounts
-//     probe reads them fresh, so a cache inside them would stack two TTL windows under
-//     the gateway's, and a flip could take up to twice as long to show. The require*
-//     guards of the write endpoints (requireVendorAccountSharingEnabled and its
-//     subscription twin) read them raw as well: they run once per request on a rare
-//     write path, and an admin acting right after a flip should be told the truth.
+//     the public accessors, deliberately left uncached. The vendor-accounts probe reads
+//     them fresh, and the require* guards of the write endpoints
+//     (requireVendorAccountSharingEnabled and its subscription twin) read them raw as
+//     well: they run once per request on a rare write path, and an admin acting right
+//     after a flip should be told the truth.
 //
 // The cache is invalidated after every settings write (persistSystemSettings), so a flip
 // through the portal takes effect on the very next decision; the TTL only bounds how
