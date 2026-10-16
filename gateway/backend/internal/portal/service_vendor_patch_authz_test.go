@@ -641,6 +641,14 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"RaiseVendorAccountShareLevel": "raise",
 		"LowerVendorAccountShareLevel": "lower",
 		"SetVendorAccountShareLevel":   "share-level",
+		// Management-group assignment (service_vendor_sharing.go) is the spec's
+		// "owner-only at `shared`, owner + CM at `full`" row: the credential gate's
+		// shape, but not a credential write (it opens no credential and sends nothing
+		// upstream), so it is pinned by its own matrix
+		// (TestSetVendorAccountAdminGroupsAuthorizationMatrix) rather than credentialOps.
+		// The candidates list touches no account: it is scoped to the caller's own reach.
+		"SetVendorAccountAdminGroups":       "admin-groups",
+		"VendorAccountAdminGroupCandidates": "candidates",
 		// Operate gate (authorizeVendorAccountOperate).
 		"TestVendorAccountConnection": "operate",
 		"RefreshVendorAccountModels":  "operate",

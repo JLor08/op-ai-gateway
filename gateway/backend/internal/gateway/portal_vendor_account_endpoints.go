@@ -31,6 +31,13 @@ const (
 	// share-level endpoint (PUT .../share-level): a store failure.
 	codeVendorAccountShareLevelFailed = "vendor_account.share_level_failed"
 
+	// codeVendorAccountAdminGroupsFailed is the uncategorized fallback of the
+	// management-group assignment (PUT .../admin-groups) and
+	// codeVendorAccountAdminGroupCandidatesFailed that of its candidate list: a store
+	// failure.
+	codeVendorAccountAdminGroupsFailed          = "vendor_account.admin_groups_failed"
+	codeVendorAccountAdminGroupCandidatesFailed = "vendor_account.admin_group_candidates_failed"
+
 	// codeVendorAccountUsageRefreshFailed is the uncategorized fallback of the
 	// dedicated usage refresh (POST .../usage/refresh): a store failure.
 	codeVendorAccountUsageRefreshFailed = "vendor_account.usage_refresh_failed"
@@ -108,7 +115,8 @@ func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Reque
 // test-connection action "/api/portal/vendor-accounts/{id}/check" (POST), the
 // model-discovery action "/api/portal/vendor-accounts/{id}/models/refresh" (POST),
 // the usage-pull action "/api/portal/vendor-accounts/{id}/usage/refresh" (POST) and
-// the share-level lifecycle "/api/portal/vendor-accounts/{id}/share-level" (PUT).
+// the share-level lifecycle "/api/portal/vendor-accounts/{id}/share-level" (PUT) and
+// the management-group assignment "/api/portal/vendor-accounts/{id}/admin-groups" (PUT).
 // Any other deeper path is answered with the same 404 as an unknown id. The
 // "/api/portal/vendor-accounts/" subtree route in server.go already covers every one
 // of these sub-resources, so a new sub-route needs no registration of its own.
@@ -150,8 +158,8 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 }
 
 // routeVendorAccountSubpath dispatches the sub-routes of
-// /api/portal/vendor-accounts/{id}/... (the /check, /models/refresh, /usage/refresh
-// and /share-level actions and the /connect/... family) and reports whether it
+// /api/portal/vendor-accounts/{id}/... (the /check, /models/refresh, /usage/refresh,
+// /share-level and /admin-groups actions and the /connect/... family) and reports whether it
 // handled the request. The item handler falls through to the {id}
 // GET/PATCH/DELETE surface when this returns false.
 func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
@@ -169,6 +177,10 @@ func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Reques
 	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "share-level" {
 		s.handlePortalVendorAccountShareLevel(w, r, token, parts[0])
+		return true
+	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "admin-groups" {
+		s.handlePortalVendorAccountAdminGroups(w, r, token, parts[0])
 		return true
 	}
 	return s.routeVendorAccountConnectSubpath(w, r, token, parts)
@@ -261,6 +273,68 @@ func (s *Server) handlePortalVendorAccountShareLevel(w http.ResponseWriter, r *h
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
+}
+
+// handlePortalVendorAccountAdminGroups (PUT .../admin-groups) replaces the management
+// groups of a shared vendor account with the set in the body ({"admin_group_ids":
+// [...]}), the vendor-account counterpart of PUT /api/portal/servers/{id}/admin-groups.
+// The handler only decodes; the service decides who may (the credential gate's shape,
+// the spec's "Management-group assignment" row: the owner always, a CM at `full` only),
+// that the account is shared, that the set has >= 1 group the caller may name, and that
+// the groups sit under the account's immutable containment root. The response is the
+// credential-free account. While the vendor_account_sharing_enabled switch is off
+// (default) it is a 409 vendor_accounts.sharing_disabled, whoever asks and whatever the
+// id (the vendor_accounts_enabled module flag answers first); a stranger and an unknown
+// id are the same 404, a CM of a `shared` account (who can see it) a 403, an account
+// that is not shared a 400 vendor_account.not_shared, an empty set a 400
+// vendor_account.admin_group_required, a group the caller may not name a 400
+// vendor_account.admin_group_invalid, and a set under another root a 400
+// vendor_account.root_mismatch.
+func (s *Server) handlePortalVendorAccountAdminGroups(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPut) {
+		return
+	}
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		AdminGroupIDs []string `json:"admin_group_ids"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+		return
+	}
+	dto, err := s.Portal.SetVendorAccountAdminGroups(r.Context(), token, id, body.AdminGroupIDs)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountAdminGroupsFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// handleVendorAccountAdminGroupCandidates backs GET
+// /api/portal/vendor-account-admin-group-candidates: the admin-tier groups the caller
+// may name as management groups of a vendor account (system scope -> every admin-tier
+// group; anyone else -> the groups they manage vendor accounts through, so a plain user
+// gets []), each with its parent system group. Drives the share dialog and the
+// management-group editor; the mirror of handleServerAdminGroupCandidates. Like every
+// vendor-account sharing endpoint it is a 409 while the module or the sharing flag is
+// off.
+func (s *Server) handleVendorAccountAdminGroupCandidates(w http.ResponseWriter, r *http.Request) {
+	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
+	if !ok {
+		return
+	}
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	data, err := s.Portal.VendorAccountAdminGroupCandidates(r.Context(), token)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountAdminGroupCandidatesFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": data})
 }
 
 // handlePortalVendorAccountCheck (POST .../check) is the explicit "test
@@ -516,6 +590,9 @@ var portalVendorAccountErrRows = []errRow{
 	{err: portal.ErrVendorAccountAdminGroupInvalid, status: http.StatusBadRequest, code: "vendor_account.admin_group_invalid", msg: "management group is invalid"},
 	{err: portal.ErrVendorAccountAdminGroupParentMismatch, status: http.StatusBadRequest, code: "vendor_account.admin_group_parent_mismatch", msg: "management groups must share one parent system group"},
 	{err: portal.ErrVendorAccountRootMismatch, status: http.StatusBadRequest, code: "vendor_account.root_mismatch", msg: "management groups must sit under the system group the account is already shared in"},
+	// Management groups (PUT .../admin-groups) can only be assigned to an account that
+	// is shared; a 400 too, answered only to a caller the gate has let through.
+	{err: portal.ErrVendorAccountNotShared, status: http.StatusBadRequest, code: "vendor_account.not_shared", msg: "management groups can only be assigned to a shared account; raise its share level first"},
 	// Subscription connect. A vendor refusal of the pasted code is a 400, never a
 	// 401: the portal treats a 401 from this API as an expired session. The vendor
 	// being unreachable or answering with something unusable is a 502. The rows

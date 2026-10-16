@@ -9,6 +9,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"sort"
 	"strings"
 )
 
@@ -22,9 +23,14 @@ import (
 //   - SetVendorAccountShareLevel is the endpoint's single entry: it compares the
 //     requested level with the stored one and runs the one or the other.
 //
+// The management groups of an account that is already shared are re-assigned by
+// SetVendorAccountAdminGroups (the credential gate's shape: owner-only at `shared`,
+// owner + CM at `full`), with VendorAccountAdminGroupCandidates listing the groups the
+// caller may name.
+//
 // Every one of them is refused with ErrVendorAccountSharingDisabled while the master
 // sharing flag is off; that guard (requireVendorAccountSharingEnabled) is shared with
-// the management-group and resource-group methods that follow.
+// the resource-group methods that follow.
 
 // SetVendorAccountShareLevelRequest is the body of PUT
 // /api/portal/vendor-accounts/{id}/share-level. Level is the TARGET level (none,
@@ -269,6 +275,137 @@ func (s *Service) checkVendorAccountSubscriptionRaise(ctx context.Context, acc r
 	return s.requireVendorSubscriptionSharingEnabled(ctx)
 }
 
+// SetVendorAccountAdminGroups replaces the management groups of an account that is
+// already shared (spec sections 5, 6 and 9): the vendor-account counterpart of
+// SetServerAdminGroups. It needs, in this order:
+//
+//  1. vendor_account_sharing_enabled (ErrVendorAccountSharingDisabled, a 409), before
+//     any account is loaded, so the answer is global and reveals nothing;
+//  2. the CREDENTIAL gate (authorizeVendorAccountCredential), which is the spec's
+//     "Management-group assignment" row exactly: the owner at every level, a CM at
+//     `full` only. A CM of a `shared` account is ErrVendorAccountForbidden (they can
+//     see the account), everyone else -- a stranger, system scope, a co-manager
+//     without the vendor-account flag, a principal with no user identity -- is
+//     ErrVendorAccountNotFound, identical to an unknown id. The operate gate plus a
+//     `full` restriction would give the same outcomes; the credential gate already
+//     is that, and a second spelling of it would be a second place to get it wrong;
+//  3. an account that is `shared` or `full` (ErrVendorAccountNotShared otherwise): a
+//     `none` account has no management groups to assign. Asked only of a caller the
+//     gate has let through, so it confirms nothing to a stranger;
+//  4. >= 1 management group (validateVendorAccountAdminGroupIDs): each an existing
+//     admin-tier group, for a non-system caller one they manage vendor accounts
+//     through (vendorAccountManageGroupIDs), all under one parent;
+//  5. the containment root IMMUTABLE: that parent must be the account's retained
+//     system_group_id, or the call is ErrVendorAccountRootMismatch. This is checked
+//     here for EVERY principal, system scope included, not through the validation's
+//     system-only hint, so nobody can relocate a shared account's root by swapping
+//     its groups for ones under another system group. The root survives the last
+//     management group vanishing (spec section 5), so re-adding one must match it too.
+//     Only an account with NO root (never produced by the raise; a store written
+//     directly could) takes the new one, as an ungrouped server does.
+//
+// The new set REPLACES the stored one (replaceVendorAccountAdminGroups: additions
+// first, so the account never has zero groups mid-write). Returns the account's
+// credential-free view.
+func (s *Service) SetVendorAccountAdminGroups(ctx context.Context, principal auth.Token, id string, groupIDs []string) (VendorAccountDTO, error) {
+	if err := s.requireVendorAccountSharingEnabled(ctx); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	acc, err := s.loadVendorAccount(ctx, id)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if err := s.authorizeVendorAccountCredential(ctx, principal, acc); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	// The sharing flag was checked above, so the stored level is the effective one.
+	// An unrecognised level is not shared: fail closed.
+	if !vendorAccountSharedLevel(acc.ShareLevel) {
+		return VendorAccountDTO{}, ErrVendorAccountNotShared
+	}
+	ids, rootID, err := s.validateVendorAccountAdminGroupIDs(ctx, principal, groupIDs)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if rootID == "" {
+		// An admin group always has a parent system group; a root-less account would
+		// escape the containment checks every later step relies on.
+		return VendorAccountDTO{}, ErrVendorAccountAdminGroupInvalid
+	}
+	if acc.SystemGroupID != "" && rootID != acc.SystemGroupID {
+		return VendorAccountDTO{}, ErrVendorAccountRootMismatch
+	}
+	if acc.SystemGroupID == "" {
+		if err := s.routes.UpdateVendorAccountSystemGroup(ctx, acc.ID, rootID); err != nil {
+			return VendorAccountDTO{}, notFoundAsVendorAccountNotFound(err)
+		}
+	}
+	if err := s.replaceVendorAccountAdminGroups(ctx, acc.ID, ids); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	return s.vendorAccountDTOByID(ctx, acc.ID)
+}
+
+// VendorAccountAdminGroupCandidates lists the admin-tier groups the caller may name as
+// management groups of a vendor account (drives the share dialog's and the
+// management-group editor's picker; mirrors ServerAdminGroupCandidates, over
+// vendorAccountManageGroupIDs). A system-scope principal gets EVERY admin-tier group
+// (it may name any of them, per validateVendorAccountAdminGroupIDs); anyone else gets
+// exactly the groups they manage vendor accounts through (owner of the group, or a
+// co-manager holding can_manage_vendor_accounts), so a co-manager without the flag, a
+// stranger and a principal with no user identity get an empty list. Each candidate
+// carries its parent system group, the account's future containment root: the list is
+// not narrowed to one root because it is not about one account (the assignment itself
+// enforces an existing account's root). Sorted by name; never nil.
+//
+// Like every method behind the management endpoints it is refused with
+// ErrVendorAccountSharingDisabled while the sharing flag is off. A Service with no group
+// store has no candidates.
+func (s *Service) VendorAccountAdminGroupCandidates(ctx context.Context, principal auth.Token) ([]AdminGroupCandidateDTO, error) {
+	if err := s.requireVendorAccountSharingEnabled(ctx); err != nil {
+		return nil, err
+	}
+	out := make([]AdminGroupCandidateDTO, 0)
+	if s.groups == nil {
+		return out, nil
+	}
+	var groups []store.UserGroup
+	if isSystem(principal) {
+		all, err := s.groups.ListUserGroupsByTier(ctx, store.GroupTierAdmin)
+		if err != nil {
+			return nil, err
+		}
+		groups = all
+	} else {
+		manageGroups, err := s.vendorAccountManageGroupIDs(ctx, principal)
+		if err != nil {
+			return nil, err
+		}
+		for gid := range manageGroups {
+			g, err := s.groups.UserGroupByID(ctx, gid)
+			if err != nil {
+				// The group vanished between the enumeration and this lookup; skip
+				// it rather than fail the whole list.
+				continue
+			}
+			groups = append(groups, g)
+		}
+	}
+	for _, g := range groups {
+		parentName := ""
+		if g.ParentGroupID != "" {
+			if parent, err := s.groups.UserGroupByID(ctx, g.ParentGroupID); err == nil {
+				parentName = parent.Name
+			}
+		}
+		out = append(out, AdminGroupCandidateDTO{
+			ID: g.ID, Name: g.Name, ParentGroupID: g.ParentGroupID, ParentGroupName: parentName,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
 // validateVendorAccountAdminGroupIDs validates the management-group set of a vendor
 // account: the vendor-account counterpart of validateAdminGroupIDs (server) and
 // validateServiceAdminGroupIDs, over the same validateAdminGroupScope. >= 1 id after
@@ -298,7 +435,7 @@ func (s *Service) validateVendorAccountAdminGroupIDs(ctx context.Context, princi
 // duplicates) the account's whole management-group set: the missing links are added
 // FIRST and the surplus ones removed after, so the account has at least one group at
 // every step (mirrors SetServerAdminGroups). It is the one write path of the
-// management-group set; the later assignment endpoint reuses it.
+// management-group set: the raise and SetVendorAccountAdminGroups both use it.
 func (s *Service) replaceVendorAccountAdminGroups(ctx context.Context, accountID string, want []string) error {
 	current, err := s.routes.VendorAccountAdminGroups(ctx, accountID)
 	if err != nil {

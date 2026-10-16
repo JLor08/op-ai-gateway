@@ -40,6 +40,10 @@ func TestVendorAccountEndpointsAre409WhileTheMasterFlagIsOff(t *testing.T) {
 		// The module flag answers before the sharing flag does.
 		{"share level", http.MethodPut, "/api/portal/vendor-accounts/va_anything/share-level", vaOwnerSecret, `{"level":"none"}`},
 		{"share level as system", http.MethodPut, "/api/portal/vendor-accounts/va_anything/share-level", vaSystemSecret, `{"level":"shared","admin_group_ids":["ugrp_x"]}`},
+		{"admin groups", http.MethodPut, "/api/portal/vendor-accounts/va_anything/admin-groups", vaOwnerSecret, `{"admin_group_ids":["ugrp_x"]}`},
+		{"admin groups as system", http.MethodPut, "/api/portal/vendor-accounts/va_anything/admin-groups", vaSystemSecret, `{"admin_group_ids":["ugrp_x"]}`},
+		{"admin group candidates", http.MethodGet, "/api/portal/vendor-account-admin-group-candidates", vaOwnerSecret, ""},
+		{"admin group candidates as system", http.MethodGet, "/api/portal/vendor-account-admin-group-candidates", vaSystemSecret, ""},
 		{"connect device begin", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/device/begin", vaOwnerSecret, ""},
 		{"connect device poll", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/device/poll", vaOwnerSecret, ""},
 		{"connect begin as another user", http.MethodPost, "/api/portal/vendor-accounts/va_anything/connect/begin", vaOtherSecret, ""},

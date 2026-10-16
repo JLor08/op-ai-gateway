@@ -2228,6 +2228,18 @@ func (_d *APIWithTracing) SetUserPreference(ctx context.Context, s1 string, s2 s
 	return _d.API.SetUserPreference(ctx, s1, s2, r1)
 }
 
+func (_d *APIWithTracing) SetVendorAccountAdminGroups(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetVendorAccountAdminGroups")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetVendorAccountAdminGroups(ctx, t1, s1, sa1)
+}
+
 func (_d *APIWithTracing) SetVendorAccountShareLevel(ctx context.Context, t1 auth.Token, s1 string, s2 SetVendorAccountShareLevelRequest) (v1 VendorAccountDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetVendorAccountShareLevel")
 	defer span.End()
@@ -2500,6 +2512,18 @@ func (_d *APIWithTracing) UserTokens(ctx context.Context, t1 auth.Token, s1 stri
 		}
 	}()
 	return _d.API.UserTokens(ctx, t1, s1)
+}
+
+func (_d *APIWithTracing) VendorAccountAdminGroupCandidates(ctx context.Context, t1 auth.Token) (aa1 []AdminGroupCandidateDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountAdminGroupCandidates")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VendorAccountAdminGroupCandidates(ctx, t1)
 }
 
 func (_d *APIWithTracing) VendorAccountRoutingMode(ctx context.Context) (s1 string) {

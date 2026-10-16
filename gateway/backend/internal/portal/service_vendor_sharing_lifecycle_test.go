@@ -43,6 +43,7 @@ type vendorLifecycleEnv struct {
 	agX         UserGroupDTO
 	rootID      string // the parent system group of AG and AG-B
 	otherRootID string // the parent system group of AG-X
+	accountSeq  int    // numbers the accounts sharedAccountAt creates
 }
 
 func newVendorLifecycleEnv(t *testing.T) *vendorLifecycleEnv {
