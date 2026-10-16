@@ -246,10 +246,9 @@ func (s *Service) vendorAccountDTO(ctx context.Context, principal auth.Token, ac
 }
 
 // vendorAccountModelDTOs reads the model rows the account serves as their portal view,
-// always a non-nil slice (it serializes as [], never null). A member's view
-// (forMember) names each model by its gateway name, dialect and display name and
-// withholds the vendor's own model id (UpstreamModel): the borrower requests the
-// gateway name, and the mapping behind it is the account's own business.
+// always a non-nil slice (it serializes as [], never null). The management view
+// (forMember false) is every field of the entry (vendorAccountModelDTO); a member's view
+// (forMember) is memberVendorAccountModelDTO, a separate literal built from nothing.
 func (s *Service) vendorAccountModelDTOs(ctx context.Context, accountID string, forMember bool) ([]VendorAccountModelDTO, error) {
 	rows, err := s.routes.VendorAccountModels(ctx, accountID)
 	if err != nil {
@@ -257,17 +256,38 @@ func (s *Service) vendorAccountModelDTOs(ctx context.Context, accountID string, 
 	}
 	models := make([]VendorAccountModelDTO, 0, len(rows))
 	for _, row := range rows {
-		model := VendorAccountModelDTO{
-			GatewayModel: row.GatewayModel,
-			APIFlavor:    row.APIFlavor,
-			DisplayName:  row.DisplayName,
+		if forMember {
+			models = append(models, memberVendorAccountModelDTO(row))
+		} else {
+			models = append(models, vendorAccountModelDTO(row))
 		}
-		if !forMember {
-			model.UpstreamModel = row.UpstreamModel
-		}
-		models = append(models, model)
 	}
 	return models, nil
+}
+
+// vendorAccountModelDTO is the management view of one model entry: every field.
+func vendorAccountModelDTO(row routing.VendorAccountModel) VendorAccountModelDTO {
+	return VendorAccountModelDTO{
+		GatewayModel:  row.GatewayModel,
+		UpstreamModel: row.UpstreamModel,
+		APIFlavor:     row.APIFlavor,
+		DisplayName:   row.DisplayName,
+	}
+}
+
+// memberVendorAccountModelDTO is the MEMBER's view of one model entry, built from nothing
+// like the account DTO it sits in (memberVendorAccountDTO): the gateway name, the dialect
+// and the display name, which is what a borrower needs to request the model. The vendor's
+// own model id (UpstreamModel) is withheld: the member requests the gateway name, and the
+// mapping behind it is the account's own business. It is NOT vendorAccountModelDTO minus a
+// field: a field added to VendorAccountModelDTO later reaches a member only when someone
+// adds it HERE on purpose (the member model allowlist tests pin the classification).
+func memberVendorAccountModelDTO(row routing.VendorAccountModel) VendorAccountModelDTO {
+	return VendorAccountModelDTO{
+		GatewayModel: row.GatewayModel,
+		APIFlavor:    row.APIFlavor,
+		DisplayName:  row.DisplayName,
+	}
 }
 
 // memberVendorAccountDTO maps a stored account to the MINIMAL view a MEMBER gets (spec

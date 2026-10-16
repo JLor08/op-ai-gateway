@@ -660,3 +660,118 @@ func TestVendorAccountMemberReadMatchesTheListedMemberSet(t *testing.T) {
 	e.setLevel(grantShared, routing.VendorShareLevelNone)
 	check("a shared account lowered")
 }
+
+// vendorMemberModelDTOFields and vendorMemberModelDTOWithheld classify EVERY wire field of
+// VendorAccountModelDTO, the model entry nested in the account DTO, for a member: either it
+// is a borrower field (the first map) or it is withheld (the second). The account DTO has
+// its own allowlist (vendorMemberDTOFields); this is the same discipline one level down, so
+// a field added to the model entry defaults to NOT reaching members and the structural test
+// below fails until someone classifies it.
+var vendorMemberModelDTOFields = map[string]string{
+	"gateway_model": "the name the member requests the account's model under",
+	"api_flavor":    "the dialect the member calls it on",
+	"display_name":  "the vendor's human-readable name for the model",
+}
+
+var vendorMemberModelDTOWithheld = map[string]string{
+	"upstream_model": "the vendor's own model id: the member requests the gateway name, the mapping behind it is the account's own business",
+}
+
+// jsonFieldNames returns the wire name of every field of v's struct type.
+func jsonFieldNames(typ reflect.Type) []string {
+	names := make([]string, 0, typ.NumField())
+	for i := range typ.NumField() {
+		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		names = append(names, name)
+	}
+	return names
+}
+
+// TestVendorMemberModelDTOFieldsAreAllClassified is the structural half of the model
+// entry's allowlist: every field of VendorAccountModelDTO is classified as a member field
+// or a withheld one (never both, never neither), and the classification names no field the
+// struct does not have. Adding a field to the model entry fails here until it is decided
+// whether a member may see it.
+func TestVendorMemberModelDTOFieldsAreAllClassified(t *testing.T) {
+	have := map[string]bool{}
+	for _, name := range jsonFieldNames(reflect.TypeFor[VendorAccountModelDTO]()) {
+		have[name] = true
+		_, visible := vendorMemberModelDTOFields[name]
+		_, withheld := vendorMemberModelDTOWithheld[name]
+		if visible == withheld {
+			t.Errorf("VendorAccountModelDTO field %q must be classified as exactly one of member-visible and withheld (member-visible %v, withheld %v)", name, visible, withheld)
+		}
+	}
+	for _, classified := range []map[string]string{vendorMemberModelDTOFields, vendorMemberModelDTOWithheld} {
+		for name := range classified {
+			if !have[name] {
+				t.Errorf("the model classification names %q, which VendorAccountModelDTO does not have", name)
+			}
+		}
+	}
+}
+
+// TestVendorMemberModelDTOHoldsOnlyClassifiedBorrowerFields is the behavioral half: a model
+// row with EVERY stored field filled in is read as a member and as the owner. The owner's
+// entry is the full one (all four fields, unchanged); the member's holds every borrower field
+// and, field by field through reflection, nothing outside vendorMemberModelDTOFields, with
+// every withheld field empty.
+func TestVendorMemberModelDTOHoldsOnlyClassifiedBorrowerFields(t *testing.T) {
+	e := newVendorMemberEnv(t)
+	acc := e.accounts[routing.VendorShareLevelShared]
+	e.link(acc.ID)
+	// In the store's order (by gateway name), which the read keeps.
+	rows := []routing.VendorAccountModel{
+		{AccountID: acc.ID, GatewayModel: "team/claude-x", UpstreamModel: "claude-x", APIFlavor: routing.APIFlavorAnthropic, DisplayName: "Claude X"},
+		{AccountID: acc.ID, GatewayModel: "team/gpt-x", UpstreamModel: "gpt-x", APIFlavor: routing.APIFlavorOpenAI, DisplayName: "GPT X"},
+	}
+	if err := e.routes.SetVendorAccountModels(e.ctx, acc.ID, rows); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
+
+	owner, err := e.svc.GetVendorAccount(e.ctx, token(vendorAuthzOwnerID), acc.ID)
+	if err != nil {
+		t.Fatalf("owner read: %v", err)
+	}
+	member, err := e.svc.GetVendorAccount(e.ctx, e.member, acc.ID)
+	if err != nil {
+		t.Fatalf("member read: %v", err)
+	}
+	if len(owner.Models) != len(rows) || len(member.Models) != len(rows) {
+		t.Fatalf("owner/member see %d/%d models, the account serves %d", len(owner.Models), len(member.Models), len(rows))
+	}
+	for i, row := range rows {
+		// The owner's entry is untouched by the member narrowing.
+		want := VendorAccountModelDTO{GatewayModel: row.GatewayModel, UpstreamModel: row.UpstreamModel, APIFlavor: row.APIFlavor, DisplayName: row.DisplayName}
+		if owner.Models[i] != want {
+			t.Errorf("owner model %d = %+v, want the full entry %+v", i, owner.Models[i], want)
+		}
+		if zero := zeroModelDTOFields(owner.Models[i]); len(zero) != 0 {
+			t.Errorf("owner model %d has empty fields %v: the fixture does not fill every field, so the member assertions would be vacuous", i, zero)
+		}
+
+		got := reflect.ValueOf(member.Models[i])
+		for fieldIndex, name := range jsonFieldNames(got.Type()) {
+			field := got.Field(fieldIndex)
+			_, visible := vendorMemberModelDTOFields[name]
+			switch {
+			case visible && field.IsZero():
+				t.Errorf("member model %d: borrower field %q is empty", i, name)
+			case !visible && !field.IsZero():
+				t.Errorf("member model %d: field %q = %v is outside the member model allowlist", i, name, field.Interface())
+			}
+		}
+	}
+}
+
+// zeroModelDTOFields returns the wire names of the empty fields of a model entry.
+func zeroModelDTOFields(m VendorAccountModelDTO) []string {
+	var zero []string
+	v := reflect.ValueOf(m)
+	for i, name := range jsonFieldNames(v.Type()) {
+		if v.Field(i).IsZero() {
+			zero = append(zero, name)
+		}
+	}
+	return zero
+}
