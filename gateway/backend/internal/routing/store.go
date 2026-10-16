@@ -1415,6 +1415,19 @@ const (
 	// unit (usage.BillingUnitAudioSecond is "audio_second"): a capability names
 	// what a model can do, the unit names what a served request is metered in.
 	CapabilitySpeech = "speech"
+
+	// CapabilityTranscription means the model TRANSCRIBES audio to text: it may
+	// be the target of POST /v1/audio/transcriptions. It is orthogonal to both
+	// neighbours above -- CapabilityAudio (the model ACCEPTS audio as chat input)
+	// and CapabilitySpeech (the model SYNTHESISES speech) -- and any of the three
+	// can co-occur on one model. Never map one onto another: advertising a
+	// transcriber as a synthesiser, or as a chat model that reads audio, fails
+	// far from its cause.
+	//
+	// Like CapabilitySpeech the string does NOT coincide with the billable unit
+	// (usage.BillingUnitAudioSecond is "audio_second"): the capability names what
+	// a model can do, the unit names what a served request is metered in.
+	CapabilityTranscription = "transcription"
 )
 
 // Capability verdicts.

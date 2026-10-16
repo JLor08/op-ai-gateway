@@ -3912,6 +3912,26 @@ func TestSpeechNoIsAReservedManualVerdict(t *testing.T) {
 	}
 }
 
+// (transcription, no) is reserved for the same reason (speech, no) is. A manual
+// row is rank 3 and outranks every automated source, and nothing re-derives it,
+// so a manual `no` would permanently veto a transcription probe -- the writer
+// entitled to establish it -- against a genuinely capable model. The cost to the
+// operator is nil: an ABSENT row already refuses a transcription request.
+func TestTranscriptionNoIsAReservedManualVerdict(t *testing.T) {
+	if !reservedManualVerdict(routing.CapabilityTranscription, routing.CapabilityNo) {
+		t.Error("(transcription, no) must be reserved")
+	}
+	// yes stays writable: it is the operator's override of the probe and the
+	// enablement path where no probe verdict exists.
+	if reservedManualVerdict(routing.CapabilityTranscription, routing.CapabilityYes) {
+		t.Error("(transcription, yes) must stay writable: it is the operator's override of the probe and the enablement path for a model no probe has named")
+	}
+	// The reset is never refused, for any pair.
+	if reservedManualVerdict(routing.CapabilityTranscription, "") {
+		t.Error("the reset must never be refused")
+	}
+}
+
 // TestNormalizeFlavorsAcceptsImagesAndKeepsEmptyDefault guards the change's
 // migration safety. The empty-list default must stay exactly
 // [openai, anthropic]: if it ever gained openai_images, every existing

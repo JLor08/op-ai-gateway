@@ -842,3 +842,55 @@ func TestVendorAccountSkippedForSpeech(t *testing.T) {
 		t.Fatalf("Resolve(speech) = %v, want ErrNoModelRoute (the vendor branch declines a capability-carrying request)", err)
 	}
 }
+
+// --- The transcription capability through the same gate ---------------------
+//
+// CapabilityTranscription means the model TRANSCRIBES audio to text (it may be
+// the target of POST /v1/audio/transcriptions). It is a plain literal name:
+// capabilityRowsSatisfy needs no derivation for it, exactly as for speech, so a
+// (transcription, yes) row satisfies the requirement and anything else refuses.
+// The name must also stay distinct from CapabilityAudio (a model that ACCEPTS
+// audio as input) and CapabilitySpeech (a model that SYNTHESISES it): advertising
+// one as another fails far from its cause.
+func TestCapabilityRowsSatisfyTranscriptionIsALiteralYes(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	row := func(capability, verdict string) CapabilityRow {
+		return CapabilityRow{Capability: capability, Verdict: verdict, Source: CapabilitySourceManual, CheckedAt: now}
+	}
+	required := []string{CapabilityTranscription}
+
+	if CapabilityTranscription != "transcription" {
+		t.Fatalf("CapabilityTranscription = %q, want %q", CapabilityTranscription, "transcription")
+	}
+	for _, other := range []string{CapabilityAudio, CapabilitySpeech} {
+		if CapabilityTranscription == other {
+			t.Fatalf("CapabilityTranscription collides with %q -- the three audio names are orthogonal", other)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		rows []CapabilityRow
+		want bool
+	}{
+		{"a yes row satisfies", []CapabilityRow{row(CapabilityTranscription, CapabilityYes)}, true},
+		{"an explicit no refuses", []CapabilityRow{row(CapabilityTranscription, CapabilityNo)}, false},
+		{"an absent row refuses (unknown never fails open)", nil, false},
+		{"speech:yes is not a grant", []CapabilityRow{row(CapabilitySpeech, CapabilityYes)}, false},
+		{"audio:yes is not a grant", []CapabilityRow{row(CapabilityAudio, CapabilityYes)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := capabilityRowsSatisfy(tc.rows, required); got != tc.want {
+				t.Fatalf("capabilityRowsSatisfy(%+v, %v) = %v, want %v", tc.rows, required, got, tc.want)
+			}
+		})
+	}
+	// And the other direction: a transcription yes must not leak into the
+	// neighbouring audio names.
+	rows := []CapabilityRow{row(CapabilityTranscription, CapabilityYes)}
+	for _, other := range []string{CapabilityAudio, CapabilitySpeech} {
+		if capabilityRowsSatisfy(rows, []string{other}) {
+			t.Fatalf("transcription:yes satisfied a %q requirement", other)
+		}
+	}
+}

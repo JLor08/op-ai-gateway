@@ -328,6 +328,17 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// and the enablement path for a model the listing does not name, which is
 	// every model that is not currently loaded.
 	routing.CapabilitySpeech: {routing.CapabilityNo: true},
+	// routing.CapabilityTranscription + CapabilityNo is reserved for the same
+	// reason and on the same terms as (speech, no): an absent row already refuses
+	// a transcription request, so "cannot transcribe audio" costs the operator
+	// nothing to leave unsaid, while a manual no is rank 3 and would outrank
+	// forever the writer entitled to establish it -- the gateway health loop's
+	// read of audio.cpp's own /v1/models listing, whose per-model task ("asr" for
+	// transcription) is authoritative, so its no is real. (transcription, yes)
+	// stays writable: it is the operator's override of that probe and the
+	// enablement path for a model the listing does not name or does not give a
+	// task, such as one behind an agent router, whose listing carries none.
+	routing.CapabilityTranscription: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 
