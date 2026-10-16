@@ -272,6 +272,11 @@ export function VendorAccountUsage({
  * their usage from the requests they serve. The panel is keyed by the account id,
  * so another account never inherits the previous one's snapshot, outcome or
  * on-view refresh.
+ *
+ * `canRefresh` is false for a viewer the backend would refuse the usage refresh (a
+ * co-manager of a shared SUBSCRIPTION account: the pull opens the owner's single-use
+ * token): the panel then still shows the stored snapshot, but there is neither the
+ * refresh button nor the on-view pull.
  */
 export function VendorAccountUsageSection({
   t,
@@ -279,12 +284,14 @@ export function VendorAccountUsageSection({
   account,
   refreshKey,
   onRefresh,
+  canRefresh = true,
 }: Readonly<{
   t: Translation;
   api: Pick<PortalApi, 'vendorAccount' | 'refreshUsage'>;
   account: VendorAccount;
   refreshKey: number;
   onRefresh: (id: VendorAccount['id']) => Promise<VendorUsageRefresh>;
+  canRefresh?: boolean;
 }>) {
   const usageCapable = account.auth_type === 'api_key' || account.subscription_connected;
   if (!usageCapable) return null;
@@ -295,7 +302,7 @@ export function VendorAccountUsageSection({
       api={api}
       accountId={account.id}
       refreshKey={refreshKey}
-      onRefresh={hasActiveUsagePull(account) ? onRefresh : undefined}
+      onRefresh={canRefresh && hasActiveUsagePull(account) ? onRefresh : undefined}
     />
   );
 }

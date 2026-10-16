@@ -2916,6 +2916,33 @@ describe('App', () => {
     ).not.toBeInTheDocument();
   });
 
+  // #183: the shell threads the signed-in user's admin-ness into the providers view,
+  // which offers the raise of an account's share level (the "Sharing" area of a
+  // personal account) to an admin owner only. Everyone else sees no such area.
+  it.each([
+    ['admin', true],
+    ['system_admin', true],
+    ['user', false],
+  ])('offers the share area of an own account to a %s: %s', async (role, offered) => {
+    vendorAccountsEnabledMock = true;
+    vendorAccountsListMock = vendorAccountRows;
+    currentRole = role;
+    systemAdminModeMock = role === 'system_admin';
+    renderApp();
+    await screen.findByText('Dev User');
+    await gotoNav(messages.de.providers);
+    const row = (await screen.findByText('Plain Key')).closest('tr')!;
+    fireEvent.click(within(row).getByRole('button', { name: messages.de.modelDetailsAction }));
+    await screen.findByText(messages.de.vendorAccountSettingsTitle);
+
+    const share = screen.queryByRole('region', { name: messages.de.vendorAccountShareTitle });
+    if (offered) {
+      expect(share).toBeInTheDocument();
+    } else {
+      expect(share).not.toBeInTheDocument();
+    }
+  });
+
   it('keeps the providers nav item hidden when the flag probe fails (fail closed)', async () => {
     vendorAccountsEnabledMock = true;
     const baseFetch = fetch as unknown as (

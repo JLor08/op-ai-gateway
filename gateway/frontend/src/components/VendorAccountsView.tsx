@@ -20,7 +20,7 @@ import { ConfirmDialog } from './shared/ConfirmDialog';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
 import type { RowAction } from './shared/RowActionsMenu';
 import { useToast } from './shared/ToastProvider';
-import { vendorLabel } from './shared/vendorLabel';
+import { authTypeLabel, vendorLabel } from './shared/vendorLabel';
 import { vendorStatusBadge, vendorStatusLabel } from './shared/vendorStatus';
 import { isValidBaseUrl, isValidModelPrefix, normalizeModelPrefix } from './shared/vendorInputs';
 import {
@@ -28,7 +28,10 @@ import {
   isConfigurableRootVendor,
   CONFIGURABLE_ROOT_VENDORS,
 } from './shared/vendorPresets';
+import { vendorAccountAccess } from './shared/vendorAccountAccess';
 import { VendorAccountModels } from './VendorAccountModels';
+import { VendorAccountReadOnlyDetail } from './VendorAccountReadOnlyDetail';
+import { VendorAccountSharePanel } from './VendorAccountSharePanel';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
@@ -44,17 +47,6 @@ type Mode = 'list' | 'create' | { kind: 'detail'; account: VendorAccount };
 const VENDORS: VendorAccount['vendor'][] = ['openai', 'anthropic', ...CONFIGURABLE_ROOT_VENDORS];
 const AUTH_TYPES: VendorAccount['auth_type'][] = ['api_key', 'subscription'];
 
-function authTypeLabel(t: Translation, authType: string): string {
-  switch (authType) {
-    case 'api_key':
-      return t.vendorAuthApiKey;
-    case 'subscription':
-      return t.vendorAuthSubscription;
-    default:
-      return authType;
-  }
-}
-
 // Whether the account holds a credential, whichever auth type it uses.
 function hasCredential(account: VendorAccount): boolean {
   return account.api_key_set || account.subscription_connected;
@@ -64,8 +56,17 @@ function hasCredential(account: VendorAccount): boolean {
  * Vendor accounts ("Anbieter"): the signed-in user's OWN accounts at external
  * AI vendors, kept as a CRUD list -> create form -> detail (rename / status /
  * key rotation / delete). Every authenticated user manages their own accounts,
- * so there is no role gate (the backend answers 404 for anybody else's id and
- * the list only ever carries the caller's accounts).
+ * so there is no role gate (the backend answers 404 for a stranger's id).
+ *
+ * An owner who is an admin may SHARE an account (#183, spec 2026-10-15): the
+ * list then also carries the accounts the user co-manages and the ones they can
+ * only borrow through a resource group, and the detail view is tiered by what
+ * vendorAccountAccess says the viewer may do. The owner sees everything; a
+ * co-manager (CM) sees the same view without what the backend refuses them (the
+ * credential, the api key and the delete at `shared`; the credential-opening
+ * test, refresh and usage pull on a SUBSCRIPTION account); a member sees a
+ * read-only, minimal view (VendorAccountReadOnlyDetail). The "Sharing" area
+ * (VendorAccountSharePanel) holds the share level and the management groups.
  *
  * The API key is a WRITE-ONLY secret, following ApplicationSection's api-token
  * pattern: the DTO only says `api_key_set`, never the value, so the detail
@@ -108,9 +109,13 @@ function hasCredential(account: VendorAccount): boolean {
 export function VendorAccountsView({
   t,
   api,
+  isAdmin,
   subscriptionsEnabled = true,
 }: Readonly<{
   t: Translation;
+  // Whether the signed-in user is an admin or system_admin right now: only an admin
+  // owner is offered the raise of an account's share level.
+  isAdmin: boolean;
   // The vendor_subscriptions_enabled system switch (on by default). While it is
   // off every subscription account is shown inactive with a notice: the backend
   // no longer routes it, nor lets it be created or connected, but it stays listed.
@@ -133,6 +138,9 @@ export function VendorAccountsView({
     | 'testConnection'
     | 'refreshModels'
     | 'refreshUsage'
+    | 'setVendorAccountShareLevel'
+    | 'setVendorAccountAdminGroups'
+    | 'vendorAccountAdminGroupCandidates'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -363,6 +371,29 @@ export function VendorAccountsView({
     if (current.account.id !== updated.id) return;
     if (current.account.status !== updated.status) setStatus(updated.status);
     setMode({ kind: 'detail', account: updated });
+  }
+
+  // A sharing change was answered (a raise, a lower or a new set of management
+  // groups): the account as the viewer now reads it replaces the one in the list and
+  // the view. A co-manager who stopped sharing no longer reaches the account at all
+  // (the next read would be a 404): it leaves the list and the view goes with it. A
+  // co-manager's typed api key is dropped too, since the credential may have left
+  // their reach (a save would otherwise send it and be refused).
+  function accountShareChanged(updated: VendorAccount) {
+    if (!updated.is_owner && updated.share_level === 'none') {
+      setAccountsData((current) => (current ?? []).filter((a) => a.id !== updated.id));
+      const current = modeRef.current;
+      if (
+        typeof current !== 'string' &&
+        current.kind === 'detail' &&
+        current.account.id === updated.id
+      ) {
+        backToList();
+      }
+      return;
+    }
+    if (!updated.is_owner) resetKeyInput();
+    accountRefreshed(updated);
   }
 
   // The explicit "refresh models": ask the gateway to re-discover the models from
@@ -625,10 +656,31 @@ export function VendorAccountsView({
   // Detail sub-view: rename / status / key rotation + delete, plus the
   // credential-check and usage panels and the connect panel of a subscription
   // account. Vendor and auth type are immutable server-side, so they are shown
-  // read-only.
+  // read-only. Every part is gated by what the viewer's tier may do with the
+  // account (see vendorAccountAccess): the backend refuses the rest, so it is not
+  // offered.
   if (typeof mode !== 'string' && mode.kind === 'detail') {
     const account = accounts.find((a) => a.id === mode.account.id) ?? mode.account;
+    const access = vendorAccountAccess(account, isAdmin);
     const keyStored = account.api_key_set && !keyCleared;
+    // A viewer who may not even operate the account (a member) reads it only.
+    if (!access.canOperate) {
+      return (
+        <>
+          <Breadcrumbs
+            ariaLabel={t.breadcrumb}
+            backLabel={t.back}
+            items={[{ label: t.providers, onClick: backToList }, { label: account.name }]}
+          />
+          {subscriptionBlocked(account) && (
+            <Alert severity="warning" role="status" sx={{ mb: 2.25 }}>
+              {t.vendorAccountSubscriptionsDisabledNotice}
+            </Alert>
+          )}
+          <VendorAccountReadOnlyDetail t={t} account={account} status={effectiveStatus(account)} />
+        </>
+      );
+    }
     return (
       <>
         <Breadcrumbs
@@ -645,15 +697,18 @@ export function VendorAccountsView({
           titleId="vendor-account-settings-heading"
           title={t.vendorAccountSettingsTitle}
           actions={
-            <Button
-              type="button"
-              variant="outlined"
-              color="error"
-              startIcon={<DeleteIcon fontSize="small" />}
-              onClick={() => setConfirmingDeleteId(account.id)}
-            >
-              {t.vendorAccountActionDelete}
-            </Button>
+            // Delete is the credential gate: the owner, or a co-manager at `full`.
+            access.canManageCredential ? (
+              <Button
+                type="button"
+                variant="outlined"
+                color="error"
+                startIcon={<DeleteIcon fontSize="small" />}
+                onClick={() => setConfirmingDeleteId(account.id)}
+              >
+                {t.vendorAccountActionDelete}
+              </Button>
+            ) : undefined
           }
         >
           <Box
@@ -678,6 +733,16 @@ export function VendorAccountsView({
               onChange={() => undefined}
               readOnly
             />
+            {/* A co-manager's account is somebody else's: say whose. */}
+            {!account.is_owner && account.shared_by !== '' && (
+              <Field
+                id="vendor-account-detail-shared-by"
+                label={t.vendorAccountSharedBy}
+                value={account.shared_by}
+                onChange={() => undefined}
+                readOnly
+              />
+            )}
             {/* Immutable: fixed when the account was created, never part of a save. */}
             {isConfigurableRootVendor(account.vendor) && (
               <Field
@@ -725,7 +790,10 @@ export function VendorAccountsView({
                   : t.errorVendorAccountModelPrefixInvalid
               }
             />
-            {account.auth_type === 'api_key' && (
+            {/* The api key is the credential gate: the owner, or a co-manager at
+                `full`. A co-manager at `shared` never sees it, so a save never
+                carries an api_key the backend would refuse. */}
+            {account.auth_type === 'api_key' && access.canManageCredential && (
               <Box>
                 <Field
                   id="vendor-account-detail-api-key"
@@ -764,16 +832,35 @@ export function VendorAccountsView({
           </Box>
         </Panel>
 
+        {/* Sharing: the share level and the management groups, for the viewer who
+            has anything to do or see there. Keyed by id, so another account never
+            inherits a half-filled raise form. */}
+        {access.showSharePanel && (
+          <Box sx={{ mt: 3 }}>
+            <VendorAccountSharePanel
+              key={account.id}
+              t={t}
+              api={api}
+              account={account}
+              access={access}
+              busy={busy}
+              onChanged={accountShareChanged}
+            />
+          </Box>
+        )}
+
         {/* The account's current models, and the explicit refresh from the
-            vendor. Keyed by id only: a refresh answer must not drop its own
-            outcome, but another account never inherits one. */}
+            vendor (not offered to a viewer whose refresh the backend would
+            refuse: a co-manager of a subscription account). Keyed by id only: a
+            refresh answer must not drop its own outcome, but another account
+            never inherits one. */}
         <Box sx={{ mt: 3 }}>
           <VendorAccountModels
             key={account.id}
             t={t}
             account={account}
             busy={busy}
-            onRefresh={refreshAccountModels}
+            onRefresh={access.canRunUpstreamOps ? refreshAccountModels : undefined}
             subscriptionsEnabled={subscriptionsEnabled}
           />
         </Box>
@@ -781,39 +868,47 @@ export function VendorAccountsView({
         {/* The credential check works for every account: one without a stored
             credential simply answers "unverifiable". Keyed by id and updated_at,
             so saving or reconnecting the account drops a verdict that described
-            the previous credential. */}
-        <Box sx={{ mt: 3 }}>
-          <VendorConnectionTest
-            key={`${account.id}:${account.updated_at}`}
-            t={t}
-            api={api}
-            accountId={account.id}
-          />
-        </Box>
+            the previous credential. It opens the stored credential, so a
+            co-manager of a subscription account (owner-only there) has none. */}
+        {access.canRunUpstreamOps && (
+          <Box sx={{ mt: 3 }}>
+            <VendorConnectionTest
+              key={`${account.id}:${account.updated_at}`}
+              t={t}
+              api={api}
+              accountId={account.id}
+            />
+          </Box>
+        )}
 
         {/* The usage frame for every usage-capable account; the refresh button and
             the one on-view refresh only for an account the gateway can actively ask
-            (see VendorAccountUsageSection). */}
+            AND a viewer who may ask it (see VendorAccountUsageSection). */}
         <VendorAccountUsageSection
           t={t}
           api={api}
           account={account}
           refreshKey={usageRefreshes}
           onRefresh={refreshAccountUsage}
+          canRefresh={access.canRunUpstreamOps}
         />
 
         {/* No connect panel while the subscriptions switch is off: every connect
-            flow would be refused with a 409, and the notice above says why. */}
-        {account.auth_type === 'subscription' && !subscriptionBlocked(account) && (
-          <Box sx={{ mt: 3 }}>
-            <VendorSubscriptionConnect
-              t={t}
-              account={account}
-              api={api}
-              onConnected={accountConnected}
-            />
-          </Box>
-        )}
+            flow would be refused with a 409, and the notice above says why. The
+            connect flows are the credential gate, so only the owner is offered
+            them (a subscription account is never shared fully). */}
+        {account.auth_type === 'subscription' &&
+          access.canManageCredential &&
+          !subscriptionBlocked(account) && (
+            <Box sx={{ mt: 3 }}>
+              <VendorSubscriptionConnect
+                t={t}
+                account={account}
+                api={api}
+                onConnected={accountConnected}
+              />
+            </Box>
+          )}
 
         <ConfirmDialog
           open={confirmingDeleteId !== ''}

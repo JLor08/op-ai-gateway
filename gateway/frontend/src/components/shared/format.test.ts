@@ -154,6 +154,38 @@ describe('formatPortalError', () => {
     }
     expect(messages.de[key]).not.toBe(messages.en[key]);
   });
+
+  // Sharing a vendor account (#183): the share-level and management-group
+  // endpoints' refusals, each rendered as its localized label in both locales
+  // (not the server's English text), including the two 409 sharing switches an
+  // admin meets because the portal does not read them.
+  it.each([
+    [409, 'vendor_accounts.sharing_disabled', 'errorVendorAccountsSharingDisabled'],
+    [
+      409,
+      'vendor_accounts.subscription_sharing_disabled',
+      'errorVendorSubscriptionSharingDisabled',
+    ],
+    [400, 'vendor_account.share_level_unchanged', 'errorVendorAccountShareLevelUnchanged'],
+    [400, 'vendor_account.subscription_share_capped', 'errorVendorAccountSubscriptionShareCapped'],
+    [400, 'vendor_account.admin_group_required', 'errorVendorAccountAdminGroupRequired'],
+    [400, 'vendor_account.admin_group_invalid', 'errorVendorAccountAdminGroupInvalid'],
+    [
+      400,
+      'vendor_account.admin_group_parent_mismatch',
+      'errorVendorAccountAdminGroupParentMismatch',
+    ],
+    [400, 'vendor_account.root_mismatch', 'errorVendorAccountRootMismatch'],
+    [400, 'vendor_account.not_shared', 'errorVendorAccountNotShared'],
+  ] as const)('labels %i %s with %s, in both locales', (status, code, key) => {
+    const err = new PortalApiError(status, code, 'raw server text');
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale][key];
+      expect(label.length).toBeGreaterThan(0);
+      expect(formatPortalError(err, messages[locale])).toBe(`${code}: ${label}`);
+    }
+    expect(messages.de[key]).not.toBe(messages.en[key]);
+  });
 });
 
 describe('errorLabelByCode (whole-map invariants)', () => {
@@ -586,7 +618,12 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * malformed model prefix, `base_url_required` / `base_url_invalid` the 400s of
    * create for a configurable-root account's missing (Custom) or malformed base URL, `refresh_failed` the models refresh's 500 fallback and
    * `usage_refresh_failed` the usage refresh's, both mapped for the same reason as
-   * `check_failed`. The five CRUD 500
+   * `check_failed`. The last seven are the sharing ones (#183;
+   * `internal/portal/service_vendor_sharing.go`): `share_level_unchanged`,
+   * `subscription_share_capped`, `admin_group_required`, `admin_group_invalid`,
+   * `admin_group_parent_mismatch`, `root_mismatch` and `not_shared`.
+   * `share_level_invalid` is unmapped on purpose: the portal only sends none, shared
+   * or full. The five CRUD 500
    * `vendor_account.*_failed` fallbacks (list/create/get/update/delete) are left
    * unmapped on purpose: they carry the server's own message.
    */
@@ -618,6 +655,13 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'vendor_account.base_url_invalid',
     'vendor_account.refresh_failed',
     'vendor_account.usage_refresh_failed',
+    'vendor_account.share_level_unchanged',
+    'vendor_account.subscription_share_capped',
+    'vendor_account.admin_group_required',
+    'vendor_account.admin_group_invalid',
+    'vendor_account.admin_group_parent_mismatch',
+    'vendor_account.root_mismatch',
+    'vendor_account.not_shared',
   ] as const;
 
   it('carries every vendor-account refusal code, by its exact wire string', () => {
@@ -651,6 +695,18 @@ describe('errorLabelByCode (whole-map invariants)', () => {
   it('maps the vendor subscriptions-disabled refusal by its exact wire string', () => {
     expect(errorLabelByCode['vendor_accounts.subscriptions_disabled']).toBe(
       'errorVendorSubscriptionsDisabled',
+    );
+  });
+
+  // The two sharing switches' 409s (`vendor_accounts.` plural, so outside the
+  // both-directions check above): the master sharing switch and the narrower
+  // subscription-sharing one (portalVendorAccountErrRows).
+  it('maps the vendor sharing-disabled refusals by their exact wire strings', () => {
+    expect(errorLabelByCode['vendor_accounts.sharing_disabled']).toBe(
+      'errorVendorAccountsSharingDisabled',
+    );
+    expect(errorLabelByCode['vendor_accounts.subscription_sharing_disabled']).toBe(
+      'errorVendorSubscriptionSharingDisabled',
     );
   });
 

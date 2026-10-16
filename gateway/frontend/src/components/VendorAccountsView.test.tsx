@@ -265,12 +265,25 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       refreshUsage: vi.fn<PortalApi['refreshUsage']>(
         opts.refreshUsage ?? (async () => makeUsageRefresh('fresh')),
       ),
+      // The sharing calls (#183): these suites run as a plain owner of personal
+      // accounts, who is never offered them (VendorAccountsView.sharing.test.tsx
+      // covers the share area), so the stubs only satisfy the view's api type.
+      setVendorAccountShareLevel: vi.fn<PortalApi['setVendorAccountShareLevel']>(async (id) =>
+        makeVendorAccount({ id }),
+      ),
+      setVendorAccountAdminGroups: vi.fn<PortalApi['setVendorAccountAdminGroups']>(async (id) =>
+        makeVendorAccount({ id }),
+      ),
+      vendorAccountAdminGroupCandidates: vi.fn<PortalApi['vendorAccountAdminGroupCandidates']>(
+        async () => [],
+      ),
     };
     const view = render(
       <ToastProvider>
         <VendorAccountsView
           t={t}
           api={fakeApi}
+          isAdmin={false}
           {...(opts.subscriptionsEnabled === undefined
             ? {}
             : { subscriptionsEnabled: opts.subscriptionsEnabled })}
@@ -655,7 +668,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         rerender(
           <ToastProvider>
-            <VendorAccountsView t={t} api={fakeApi} subscriptionsEnabled={false} />
+            <VendorAccountsView t={t} api={fakeApi} isAdmin={false} subscriptionsEnabled={false} />
           </ToastProvider>,
         );
 

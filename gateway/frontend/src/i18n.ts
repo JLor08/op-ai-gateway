@@ -2521,6 +2521,49 @@ const de = {
   vendorAccountSettingsTitle: 'Einstellungen',
   vendorAccountActionDelete: 'Löschen',
   vendorAccountDeleteConfirm: 'Anbieter-Konto wirklich löschen?',
+  // Sharing a provider account with the co-managers of its management groups
+  // (#183): the share-level control, the management-group editor and the
+  // read-only view of a member that only borrows the account through a resource
+  // group. "Besitzer" is the account's owner, "Mitverwalter" a co-manager of a
+  // management group who holds the vendor-account permission there.
+  vendorAccountSharedBy: 'Geteilt von',
+  vendorAccountShareTitle: 'Freigabe',
+  vendorAccountShareIntro:
+    'Legt fest, wie weit dieses Anbieter-Konto mit den Mitverwaltern seiner Verwaltungsgruppen geteilt wird.',
+  vendorAccountShareLevelLabel: 'Freigabestufe',
+  vendorAccountShareLevelNone: 'Nicht geteilt',
+  vendorAccountShareLevelShared: 'Geteilt',
+  vendorAccountShareLevelFull: 'Vollständig geteilt',
+  vendorAccountShareLevelNoneNote: 'Nur der Besitzer kann dieses Konto verwalten und nutzen.',
+  vendorAccountShareLevelSharedNote:
+    'Mitverwalter der Verwaltungsgruppen können das Konto einsehen und betreiben. Zugangsdaten, Verwaltungsgruppen und Löschen bleiben beim Besitzer.',
+  vendorAccountShareLevelFullNote:
+    'Mitverwalter der Verwaltungsgruppen dürfen zusätzlich Zugangsdaten, Verwaltungsgruppen und Löschen verwalten und die Freigabe zurücknehmen.',
+  vendorAccountShareSubscriptionNote:
+    'Ein Abonnement-Konto lässt sich höchstens auf „Geteilt“ stellen. Verbindungstest sowie Modell- und Nutzungsaktualisierung bleiben beim Besitzer.',
+  vendorAccountShareTargetLabel: 'Neue Stufe',
+  vendorAccountShareRaiseAction: (level: string) => `Auf „${level}“ erhöhen`,
+  vendorAccountShareLowerAction: (level: string) => `Auf „${level}“ senken`,
+  vendorAccountShareStopAction: 'Freigabe beenden',
+  vendorAccountShareStopConfirm:
+    'Freigabe wirklich beenden? Die Verwaltungsgruppen und Ressourcengruppen-Zuordnungen des Kontos werden entfernt.',
+  vendorAccountShareKeepGroupsNote: 'Die bestehenden Verwaltungsgruppen bleiben erhalten.',
+  vendorAccountShareNoGroupsHint:
+    'Dem Konto ist keine Verwaltungsgruppe zugeordnet. Zuerst unten eine Verwaltungsgruppe zuordnen.',
+  vendorAccountShareReadOnlyNote: 'Die Freigabe dieses Kontos verwaltet der Besitzer.',
+  vendorAccountShareSaved: 'Freigabe gespeichert.',
+  vendorAccountAdminGroupLabel: 'Verwaltungsgruppe(n)',
+  vendorAccountAdminGroupAuto: (name: string) => `Verwaltungsgruppe: ${name}`,
+  vendorAccountAdminGroupSystemGroupLabel: 'System-Gruppe',
+  vendorAccountAdminGroupSystemGroupAuto: (name: string) => `System-Gruppe: ${name}`,
+  vendorAccountNoAdminGroupHint:
+    'Du verwaltest keine Verwaltungsgruppe mit Anbieter-Konten-Verwaltung — bitte einen Eigentümer/Mitverwalter bitten, dich hinzuzufügen.',
+  vendorAccountAdminGroupsSectionTitle: 'Verwaltungsgruppen',
+  vendorAccountAdminGroupsSave: 'Verwaltungsgruppen speichern',
+  vendorAccountAdminGroupsSaved: 'Verwaltungsgruppen gespeichert.',
+  vendorAccountMemberTitle: 'Geteiltes Konto',
+  vendorAccountMemberNote:
+    'Dieses Konto wird über eine Ressourcengruppe bereitgestellt. Seine Modelle lassen sich nutzen, das Konto selbst aber nicht verwalten.',
   vendorAccountSubscriptionCreateNote:
     'Das Konto wird zunächst ohne Zugangsdaten angelegt. Auf der Detailseite lässt es sich anschließend mit dem Abonnement verbinden.',
   // Shown on every subscription account while the system admin has turned
@@ -2675,7 +2718,7 @@ const de = {
   errorVendorAccountVendorInvalid: 'Ungültiger Anbieter',
   errorVendorAccountAuthTypeInvalid: 'Ungültige Authentifizierungsart',
   errorVendorAccountStatusInvalid: 'Ungültiger Status des Anbieter-Kontos',
-  errorVendorAccountForbidden: 'Anbieter-Konten können nur mit einem Benutzerkonto angelegt werden',
+  errorVendorAccountForbidden: 'Keine Berechtigung für diese Aktion am Anbieter-Konto',
   errorVendorAccountApiKeyNotAllowed:
     'Ein API-Schlüssel kann nur bei einem Konto mit API-Schlüssel-Authentifizierung gesetzt werden',
   errorVendorAccountApiKeyInvalid:
@@ -2686,6 +2729,26 @@ const de = {
     'Anbieter-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen aktivieren.',
   errorVendorSubscriptionsDisabled:
     'Abonnement-Konten sind deaktiviert. Ein Systemadministrator kann sie in den Systemeinstellungen zulassen. Konten mit API-Schlüssel sind nicht betroffen.',
+  // Sharing (#183): the two sharing switches, and the 400/409 refusals of the
+  // share-level and management-group endpoints. Each carries exactly one code.
+  errorVendorAccountsSharingDisabled:
+    'Das Teilen von Anbieter-Konten ist deaktiviert. Ein Systemadministrator kann es in den Systemeinstellungen aktivieren.',
+  errorVendorSubscriptionSharingDisabled:
+    'Das Teilen von Abonnement-Konten ist deaktiviert. Ein Systemadministrator kann es in den Systemeinstellungen zulassen. Konten mit API-Schlüssel sind nicht betroffen.',
+  errorVendorAccountShareLevelUnchanged:
+    'Die Freigabestufe des Kontos hat sich inzwischen geändert. Die Ansicht aktualisieren und erneut versuchen.',
+  errorVendorAccountSubscriptionShareCapped:
+    'Ein Abonnement-Konto lässt sich höchstens auf „Geteilt“ stellen, nie vollständig.',
+  errorVendorAccountAdminGroupRequired:
+    'Zum Teilen ist mindestens eine Verwaltungsgruppe erforderlich.',
+  errorVendorAccountAdminGroupInvalid:
+    'Eine der gewählten Verwaltungsgruppen ist ungültig oder darf nicht verwendet werden.',
+  errorVendorAccountAdminGroupParentMismatch:
+    'Die Verwaltungsgruppen müssen unter derselben System-Gruppe liegen.',
+  errorVendorAccountRootMismatch:
+    'Die Verwaltungsgruppen müssen unter der System-Gruppe liegen, in der das Konto bereits geteilt ist.',
+  errorVendorAccountNotShared:
+    'Das ist nur bei einem geteilten Konto möglich. Zuerst die Freigabestufe erhöhen.',
   errorVendorAccountNotSubscription:
     'Nur ein Konto mit Abonnement-Authentifizierung kann mit einem Abonnement verbunden werden',
   errorVendorAccountConnectTokenRequired: 'Ein Access-Token ist erforderlich',
@@ -5284,6 +5347,49 @@ const en: PortalMessages = {
   vendorAccountSettingsTitle: 'Settings',
   vendorAccountActionDelete: 'Delete',
   vendorAccountDeleteConfirm: 'Delete this provider account?',
+  // Sharing a provider account with the co-managers of its management groups
+  // (#183): the share-level control, the management-group editor and the
+  // read-only view of a member that only borrows the account through a resource
+  // group. "Owner" is the account's owner, "co-manager" a co-manager of a
+  // management group who holds the vendor-account permission there.
+  vendorAccountSharedBy: 'Shared by',
+  vendorAccountShareTitle: 'Sharing',
+  vendorAccountShareIntro:
+    'Sets how far this provider account is shared with the co-managers of its management groups.',
+  vendorAccountShareLevelLabel: 'Sharing level',
+  vendorAccountShareLevelNone: 'Not shared',
+  vendorAccountShareLevelShared: 'Shared',
+  vendorAccountShareLevelFull: 'Fully shared',
+  vendorAccountShareLevelNoneNote: 'Only the owner can manage and use this account.',
+  vendorAccountShareLevelSharedNote:
+    'Co-managers of the management groups can view and operate the account. Credentials, management groups and deletion stay with the owner.',
+  vendorAccountShareLevelFullNote:
+    'Co-managers of the management groups may also manage credentials, management groups and deletion, and take the sharing back.',
+  vendorAccountShareSubscriptionNote:
+    'A subscription account can be shared at most as "Shared". The connection test and the model and usage refresh stay with the owner.',
+  vendorAccountShareTargetLabel: 'New level',
+  vendorAccountShareRaiseAction: (level: string) => `Raise to "${level}"`,
+  vendorAccountShareLowerAction: (level: string) => `Lower to "${level}"`,
+  vendorAccountShareStopAction: 'Stop sharing',
+  vendorAccountShareStopConfirm:
+    "Really stop sharing? The account's management groups and resource group links are removed.",
+  vendorAccountShareKeepGroupsNote: 'The existing management groups are kept.',
+  vendorAccountShareNoGroupsHint:
+    'The account has no management group. Assign a management group below first.',
+  vendorAccountShareReadOnlyNote: "This account's sharing is managed by its owner.",
+  vendorAccountShareSaved: 'Sharing saved.',
+  vendorAccountAdminGroupLabel: 'Admin group(s)',
+  vendorAccountAdminGroupAuto: (name: string) => `Admin group: ${name}`,
+  vendorAccountAdminGroupSystemGroupLabel: 'System group',
+  vendorAccountAdminGroupSystemGroupAuto: (name: string) => `System group: ${name}`,
+  vendorAccountNoAdminGroupHint:
+    'You do not manage an admin group with provider-account management — ask an owner/co-manager to add you.',
+  vendorAccountAdminGroupsSectionTitle: 'Admin groups',
+  vendorAccountAdminGroupsSave: 'Save admin groups',
+  vendorAccountAdminGroupsSaved: 'Admin groups saved.',
+  vendorAccountMemberTitle: 'Shared account',
+  vendorAccountMemberNote:
+    'This account is provided through a resource group. Its models can be used, but the account itself cannot be managed.',
   vendorAccountSubscriptionCreateNote:
     'The account is created without credentials first. You can then connect it to your subscription from its detail page.',
   // Shown on every subscription account while the system admin has turned
@@ -5431,7 +5537,7 @@ const en: PortalMessages = {
   errorVendorAccountVendorInvalid: 'Invalid provider',
   errorVendorAccountAuthTypeInvalid: 'Invalid authentication type',
   errorVendorAccountStatusInvalid: 'Invalid provider account status',
-  errorVendorAccountForbidden: 'Provider accounts can only be created with a user account',
+  errorVendorAccountForbidden: 'You are not allowed to do this on the provider account',
   errorVendorAccountApiKeyNotAllowed:
     'An API key can only be set on an account with API-key authentication',
   errorVendorAccountApiKeyInvalid:
@@ -5442,6 +5548,25 @@ const en: PortalMessages = {
     'Provider accounts are disabled. A system administrator can enable them in the system settings.',
   errorVendorSubscriptionsDisabled:
     'Subscription accounts are disabled. A system administrator can allow them in the system settings. API-key accounts are not affected.',
+  // Sharing (#183): the two sharing switches, and the 400/409 refusals of the
+  // share-level and management-group endpoints. Each carries exactly one code.
+  errorVendorAccountsSharingDisabled:
+    'Sharing provider accounts is disabled. A system administrator can enable it in the system settings.',
+  errorVendorSubscriptionSharingDisabled:
+    'Sharing subscription accounts is disabled. A system administrator can allow it in the system settings. API-key accounts are not affected.',
+  errorVendorAccountShareLevelUnchanged:
+    "The account's sharing level has changed in the meantime. Refresh the view and try again.",
+  errorVendorAccountSubscriptionShareCapped:
+    'A subscription account can be shared at most as "Shared", never fully.',
+  errorVendorAccountAdminGroupRequired: 'At least one management group is required to share.',
+  errorVendorAccountAdminGroupInvalid:
+    'One of the selected management groups is invalid or may not be used.',
+  errorVendorAccountAdminGroupParentMismatch:
+    'The management groups must sit under the same system group.',
+  errorVendorAccountRootMismatch:
+    'The management groups must sit under the system group the account is already shared in.',
+  errorVendorAccountNotShared:
+    'This is only possible for a shared account. Raise the sharing level first.',
   errorVendorAccountNotSubscription:
     'Only an account with subscription authentication can be connected to a subscription',
   errorVendorAccountConnectTokenRequired: 'An access token is required',
