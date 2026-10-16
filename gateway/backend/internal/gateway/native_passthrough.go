@@ -66,7 +66,8 @@ func endpointDisabledError(apiFlavor string) (string, int) {
 // is not the same as "falls through and is treated as translate" -- there is
 // no translate path for images at all, see images_handler.go -- so images
 // never reaches this function; its own upstream path is decided directly in
-// upstreamPath, before the mode lookup this function answers.
+// upstreamPath, before the mode lookup this function answers. Speech
+// (apiFlavorSpeech) is absent for the identical reason.
 func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
 	case inference.APIFlavorOpenAIResponses:
@@ -188,6 +189,11 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 			return "/v1/images/edits"
 		}
 		return "/v1/images/generations"
+	}
+	// speech is answered here for the same reason: no EndpointMode to look up,
+	// no translate fallback, and none of the provider fallbacks below applies.
+	if apiFlavor == apiFlavorSpeech {
+		return "/v1/audio/speech"
 	}
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p

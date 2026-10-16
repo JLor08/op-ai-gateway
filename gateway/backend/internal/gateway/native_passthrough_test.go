@@ -725,6 +725,57 @@ func TestUpstreamPathImagesEditEndpointReturnsTheEditsPath(t *testing.T) {
 	}
 }
 
+// TestUpstreamPathSpeechFlavorBypassesModeAndProviderFallbacks proves
+// upstreamPath's apiFlavorSpeech branch fires BEFORE both the endpointModeFor
+// lookup (which has no case for speech and would answer ("", "")) and the
+// provider fallbacks below it, exactly as the images branch does. The providers
+// are deliberately ones whose OWN fallbacks would otherwise answer here
+// (ProviderOllama -> "/api/chat", ProviderVendorAnthropic -> "/v1/messages",
+// ProviderAudioCpp -> the chat-completions default), so this only passes if the
+// speech branch itself ran. An empty Provider still yields "" (the
+// unresolved-target guard sits above the branch), and a non-speech flavor
+// carrying endpointSpeech keeps its provider-derived path: the branch keys on
+// the flavor, never the endpoint.
+func TestUpstreamPathSpeechFlavorBypassesModeAndProviderFallbacks(t *testing.T) {
+	cases := []struct {
+		name      string
+		provider  string
+		apiFlavor string
+		endpoint  sessionEndpoint
+		want      string
+	}{
+		{"ollama target", routing.ProviderOllama, apiFlavorSpeech, endpointSpeech, "/v1/audio/speech"},
+		{"audio.cpp target", routing.ProviderAudioCpp, apiFlavorSpeech, endpointSpeech, "/v1/audio/speech"},
+		{"vendor anthropic target", routing.ProviderVendorAnthropic, apiFlavorSpeech, endpointSpeech, "/v1/audio/speech"},
+		{"unresolved target keeps the empty answer", "", apiFlavorSpeech, endpointSpeech, ""},
+		{"speech endpoint does not hijack a non-speech flavor", routing.ProviderOllama, "openai_chat_completions", endpointSpeech, "/api/chat"},
+		{"speech flavor does not disturb images", routing.ProviderOllama, apiFlavorImages, endpointImages, "/v1/images/generations"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := routing.Target{Provider: tc.provider}
+			if got := upstreamPath(target, tc.apiFlavor, tc.endpoint); got != tc.want {
+				t.Fatalf("upstreamPath(%q, %q, endpoint %d) = %q, want %q", tc.provider, tc.apiFlavor, tc.endpoint, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestApiFlavorSpeechIsTheRoutingAudioFlavor pins the local alias to the coarse
+// routing flavor it mirrors, so the two cannot drift apart: candidacy,
+// targetServesFlavor and the usage label all key on this exact string.
+func TestApiFlavorSpeechIsTheRoutingAudioFlavor(t *testing.T) {
+	// Both sides are untyped constants; routing them through variables keeps
+	// go vet from flagging the (intentional) constant comparison.
+	alias, routingFlavor := apiFlavorSpeech, routing.APIFlavorOpenAIAudio
+	if alias != "openai_audio" || alias != routingFlavor {
+		t.Fatalf("apiFlavorSpeech = %q, want %q (routing.APIFlavorOpenAIAudio = %q)", alias, "openai_audio", routingFlavor)
+	}
+	if got := routing.NormalizeAPIFlavor(alias); got != alias {
+		t.Fatalf("NormalizeAPIFlavor(%q) = %q, want it to fold to itself", alias, got)
+	}
+}
+
 // TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath pins the translate
 // path of the vendor-account provider kinds: a vendor_anthropic target is
 // served by the native Anthropic client at /v1/messages (not the chat-completions
