@@ -121,7 +121,7 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	// threaded into the streamSession below, so both the registry's copy and this
 	// goroutine's writes share one live counter.
 	progress := &requestProgress{}
-	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: true, StartedAt: start, Progress: progress})
+	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, BillingUnit: billingUnitFor(req.APIFlavor), ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: true, StartedAt: start, Progress: progress})
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")

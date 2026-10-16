@@ -621,7 +621,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		progress = &requestProgress{}
 	}
 
-	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
+	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
 	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings, "reasoning_effort_injected", injectedReasoningEffort)
