@@ -269,7 +269,8 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 	_, preSuppress := flavorSetsFromViews(visible, idx, &overlay, token)
 	callable := callableNamesForFlavor(preSuppress, flavor, overlay.visByLower)
 	existing := existingNamesForFlavor(views, idx, overlay, flavor)
-	// Fold in the token's own vendor-account models under the token-effective
+	// Fold in the token's vendor-account models (its principal's own and the shared
+	// ones it can route to) under the token-effective
 	// prefix (vendorModelFlavorSets → routing.TokenVendorPrefix, the same source
 	// /v1/models and the resolver use, so a listed name equals a routable name).
 	// A model the resolver will dispatch for this token is reachable, so the

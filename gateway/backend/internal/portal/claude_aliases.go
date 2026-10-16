@@ -283,12 +283,12 @@ func listingLabel(id string) string { return id }
 //
 // vendorLoaded is that read's second result: whether vendor is the COMPLETE set.
 // It is true for a nil vendor that merely means "no vendor access", and false
-// when a vendor ACCOUNT or MODEL read failed (VendorAccountsByOwner, or an
+// when a vendor ACCOUNT or MODEL read failed (VendorAccountsForRouting, or an
 // account's VendorAccountModels: vendor is then nil or partial). The
 // vendor-shadow exclusion (here, and in claudeAliasEligible) and the reserved
 // names need the whole set, so such a read error fails the derivation CLOSED,
-// exactly like !overlayLoaded: a local name the owner's own vendor account also
-// serves must not be offered, or resolved, as an alias while the set is unknown
+// exactly like !overlayLoaded: a local name a vendor account the principal can
+// route to also serves must not be offered, or resolved, as an alias while the set is unknown
 // (the resolver would send it to the vendor first). The vendor LISTING overlay
 // stays fail-open: it uses the nil or partial set as it is, so the real listing
 // still renders. The vendor_accounts_enabled master-flag read is not part of

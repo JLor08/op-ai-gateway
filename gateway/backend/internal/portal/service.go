@@ -2837,8 +2837,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 				}
 			}
-			// Owner overlay: fold in the principal's own vendor-account models
-			// (Milestone 3) so the chat picker and /api/v1/models show exactly what
+			// Vendor overlay: fold in the principal's vendor-account models (its own
+			// and the ones shared with it, Milestone 3 and #183) so the chat picker
+			// and /api/v1/models show exactly what
 			// resolveVendorAccount will dispatch for them. USAGE PATH ONLY --
 			// suppress==true is Models() (the picker / inference discovery); the
 			// admin management surface (ManageModels(), suppress==false) shows the
@@ -3117,10 +3118,10 @@ func (s *Service) dashboardRouteData(ctx context.Context, token auth.Token) (str
 			Status:   routing.ServerStatusActive,
 		})
 	}
-	// The principal's own vendor-account models (ChatGPT/OpenAI/Anthropic accounts)
-	// are part of what they can route to, so the table lists them next to the
-	// self-hosted routes -- the dashboard half of the owner overlay the model
-	// listings already carry (vendorDashboardRoutes).
+	// The principal's vendor-account models (ChatGPT/OpenAI/Anthropic accounts, its
+	// own and the ones shared with it) are part of what they can route to, so the
+	// table lists them next to the self-hosted routes -- the dashboard half of the
+	// vendor overlay the model listings already carry (vendorDashboardRoutes).
 	out = append(out, s.vendorDashboardRoutes(ctx, token)...)
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Model == out[j].Model {
@@ -4322,8 +4323,9 @@ func (s *Service) activeMappingViews(ctx context.Context) ([]mappingView, error)
 // "does this name exist at all" (Existing), which no row above answers.)
 //
 // (Models(), ModelsForFlavor() and dashboardRouteData() additionally carry the
-// principal's OWN vendor-account models, the owner overlay of external vendor
-// accounts: ownVendorAccountModels is the one source they all read, and a
+// principal's vendor-account models (its own and the ones shared with it), the
+// vendor overlay of external vendor accounts: ownVendorAccountModels is the one
+// source they all read, enumerated by the routing grant, and a
 // vendor model is never subject to column (b), which is a gateway-wide setting
 // on self-hosted models.)
 //
@@ -4435,8 +4437,9 @@ func (s *Service) modelFlavorSets(ctx context.Context, token auth.Token) (map[st
 	if err != nil {
 		return sets, err
 	}
-	// Owner overlay: fold in the principal's own vendor-account models (Milestone
-	// 3) so the per-flavor listings (/v1/models, the Anthropic list, and the
+	// Vendor overlay: fold in the principal's vendor-account models (its own and
+	// the ones shared with it; Milestone 3 and #183) so the per-flavor listings
+	// (/v1/models, the Anthropic list, and the
 	// ModelsForFlavor reference they are pinned against) advertise exactly what
 	// resolveVendorAccount will dispatch for them. Applied here, on
 	// the public method ModelsForFlavor consumes, rather than inside

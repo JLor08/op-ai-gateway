@@ -446,7 +446,11 @@ func (c *countingSettingsStore) SystemSettings(ctx context.Context) (map[string]
 // ONE settings read (two uncached full-table reads per listing would double the
 // cost of every model listing), and keeps its gating semantics: master flag off ->
 // nothing (after one read), unreadable or missing store -> fails closed like the
-// master flag.
+// master flag. The routing enumerator it lists from (VendorAccountsForRouting, the
+// resolver's own) reads the sharing switch for itself, as it does on every routed
+// request: that is the one further read of a listing while sharing is off (the
+// shared arm is then not computed at all), so the gating read count is the total
+// minus it.
 func TestOwnVendorAccountModelsReadsTheSettingsOnce(t *testing.T) {
 	f := newSubscriptionGateListingFixture(t)
 	ctx := context.Background()
@@ -456,22 +460,25 @@ func TestOwnVendorAccountModelsReadsTheSettingsOnce(t *testing.T) {
 	}
 	f.svc.settings = counting
 
+	// The one read the enumerator makes for the master sharing switch (sharing is
+	// off here, so it reads nothing else); the rest is the listing's own gating.
+	const enumeratorReads = 1
 	owned, loaded := f.svc.ownVendorAccountModels(ctx, f.owner)
 	if !loaded || len(owned) != 3 {
 		t.Fatalf("ownVendorAccountModels = %d accounts, loaded=%v, want 3 accounts, loaded", len(owned), loaded)
 	}
-	if counting.reads != 1 {
-		t.Fatalf("settings reads = %d, want 1 (flag and switch from the same read)", counting.reads)
+	if gatingReads := counting.reads - enumeratorReads; gatingReads != 1 {
+		t.Fatalf("settings reads = %d, want 1 for the gating plus the enumerator's %d (flag and switch from the same read)", counting.reads, enumeratorReads)
 	}
 
-	// Subscriptions off: still one read, subscription accounts dropped.
+	// Subscriptions off: still one gating read, subscription accounts dropped.
 	if err := counting.SetSystemSetting(ctx, vendorSubscriptionsEnabledKey, "false", time.Time{}); err != nil {
 		t.Fatalf("SetSystemSetting: %v", err)
 	}
 	counting.reads = 0
 	owned, _ = f.svc.ownVendorAccountModels(ctx, f.owner)
-	if len(owned) != 1 || counting.reads != 1 {
-		t.Fatalf("subscriptions off: %d accounts / %d reads, want 1 account (api_key) / 1 read", len(owned), counting.reads)
+	if len(owned) != 1 || counting.reads-enumeratorReads != 1 {
+		t.Fatalf("subscriptions off: %d accounts / %d reads, want 1 account (api_key) / 1 gating read plus the enumerator's %d", len(owned), counting.reads, enumeratorReads)
 	}
 
 	// Master flag off: nothing, after one read.

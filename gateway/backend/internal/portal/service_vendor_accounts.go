@@ -14,6 +14,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -790,21 +791,71 @@ func (s *Service) managedVendorAccounts(ctx context.Context, principal auth.Toke
 	return managed, nil
 }
 
-// ListVendorAccounts returns the accounts the calling principal OWNS, oldest first,
-// then (for a non-system principal) the accounts they MANAGE, oldest first, each with
-// its rate-limit usage snapshot when one exists (see VendorAccountDTO). Like every
-// vendor-account method it is refused with ErrVendorAccountsDisabled (before anything
-// else) while the vendor_accounts_enabled master flag is off.
+// memberVendorAccounts returns the accounts principal can ROUTE to through a resource
+// group that are not already in listed (the accounts the list holds as own or managed),
+// oldest first. It is the member arm of ListVendorAccounts: the shared arm of the
+// routing grant (sharedVendorAccountsForRouting), so a member sees exactly the shared
+// accounts the resolver would let it route to -- the account is `shared` or `full` by
+// its EFFECTIVE level (so with the master sharing flag off the arm is empty and is not
+// even computed), a subscription account needs subscription sharing, and the principal
+// is provisioned into a resource group the account is linked to.
 //
-// The managed arm is the management union of spec 2026-10-15 section 8, restricted to
-// what exists in this phase: the accounts linked to an admin group the principal
-// manages vendor accounts through, filtered on the EFFECTIVE share level
-// (managedVendorAccounts), so with the master sharing flag off the list is the
-// principal's own accounts and nothing else. An account the principal owns and manages
-// is listed once, as their own. A managed row is rendered for the principal like a CM's
-// read of it: is_owner false, shared_by the owner's name, and no credential material
-// (the DTO carries only the booleans). The accounts a member reaches through a resource
-// group join the union with the routing grant; they are not part of it yet.
+// It is not the routing enumerator's answer and is not used for routing: the list is a
+// management page, not a gate, so it shows an account that is not ACTIVE (the member
+// sees that it cannot use it) where the model listing advertises only the active ones,
+// and, unlike the grant, a store error here FAILS the read (as the managed arm's does):
+// the safe direction for a page is to show less, and a list that silently dropped the
+// shared accounts would hide them from a member without saying so.
+func (s *Service) memberVendorAccounts(ctx context.Context, principal auth.Token, listed []routing.VendorAccount) ([]routing.VendorAccount, error) {
+	member, err := s.sharedVendorAccountsForRouting(ctx, principal, listed)
+	if err != nil {
+		return nil, err
+	}
+	sortVendorAccountsOldestFirst(member)
+	return member, nil
+}
+
+// listedVendorAccounts is the account set of the management list for principal given
+// the accounts they own (id-sorted by the store): own, oldest first, then (for a
+// non-system principal) the accounts they MANAGE and the accounts they can ROUTE to as
+// a member, each arm oldest first, no account twice (an account is listed in the first
+// arm that holds it: own, then managed, then member). System scope does not widen the
+// list: the page is a personal one, and the union is the non-system one.
+func (s *Service) listedVendorAccounts(ctx context.Context, principal auth.Token, own []routing.VendorAccount) ([]routing.VendorAccount, error) {
+	sortVendorAccountsOldestFirst(own)
+	if isSystem(principal) {
+		return own, nil
+	}
+	managed, err := s.managedVendorAccounts(ctx, principal, own)
+	if err != nil {
+		return nil, err
+	}
+	listed := slices.Concat(own, managed)
+	member, err := s.memberVendorAccounts(ctx, principal, listed)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Concat(listed, member), nil
+}
+
+// ListVendorAccounts returns the accounts the calling principal OWNS, oldest first,
+// then (for a non-system principal) the accounts they MANAGE and the accounts they can
+// ROUTE to as a member, each arm oldest first, each with its rate-limit usage snapshot
+// when one exists (see VendorAccountDTO). Like every vendor-account method it is
+// refused with ErrVendorAccountsDisabled (before anything else) while the
+// vendor_accounts_enabled master flag is off.
+//
+// This is the management union of spec 2026-10-15 section 8: own ∪ managed ∪ member.
+// A CM sees an account they manage even without resource-group provisioning
+// (managedVendorAccounts: the accounts linked to an admin group the principal manages
+// vendor accounts through) and a member sees every account they can route
+// (memberVendorAccounts), both filtered on the EFFECTIVE share level, so with the
+// master sharing flag off the list is the principal's own accounts and nothing else.
+// An account is listed once, in the first arm that holds it. A managed or member row
+// is rendered for the principal like a CM's read of it: is_owner false, shared_by the
+// owner's name, and no credential material (the DTO carries only the booleans, whoever
+// the viewer is). It is a wider set than the one the model listing advertises and is
+// never used for routing.
 //
 // System scope does not widen the list: the page is a personal one, a system principal
 // reads any account by id but lists only their own, and the management union is the
@@ -817,17 +868,13 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 	if principal.UserID == "" {
 		return VendorAccountListResponse{Data: out}, nil
 	}
-	accounts, err := s.routes.VendorAccountsByOwner(ctx, principal.UserID)
+	own, err := s.routes.VendorAccountsByOwner(ctx, principal.UserID)
 	if err != nil {
 		return VendorAccountListResponse{}, err
 	}
-	sortVendorAccountsOldestFirst(accounts)
-	if !isSystem(principal) {
-		managed, err := s.managedVendorAccounts(ctx, principal, accounts)
-		if err != nil {
-			return VendorAccountListResponse{}, err
-		}
-		accounts = append(accounts, managed...)
+	accounts, err := s.listedVendorAccounts(ctx, principal, own)
+	if err != nil {
+		return VendorAccountListResponse{}, err
 	}
 	for _, acc := range accounts {
 		dto, err := s.vendorAccountDTO(ctx, principal, acc)
