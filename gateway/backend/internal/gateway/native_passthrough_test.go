@@ -17,10 +17,55 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+// The Content-Length forward is SPEECH-ONLY. An images upstream answers with a
+// sized JSON body, and the relay must keep answering the client chunked, exactly
+// as it did before the speech relay learned to forward the length: images and
+// chat are unchanged.
+func TestNativeRelayDoesNotForwardTheUpstreamContentLengthForImages(t *testing.T) {
+	payload := `{"created":1,"output_format":"png","data":[{"b64_json":"QUJD"}]}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write([]byte(payload))
+	}))
+	t.Cleanup(up.Close)
+	srv := newImageCapableTestServer(t, up.URL)
+	front := httptest.NewServer(srv)
+	t.Cleanup(front.Close)
+
+	req, err := http.NewRequest(http.MethodPost, front.URL+"/v1/images/generations", strings.NewReader(`{"model":"sd-turbo","prompt":"a cat"}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/images/generations: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.ContentLength != -1 || resp.Header.Get("Content-Length") != "" {
+		t.Fatalf("ContentLength = %d (header %q), want the images relay to stay chunked", resp.ContentLength, resp.Header.Get("Content-Length"))
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the body: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("body = %s, want %s", got, payload)
+	}
+}
 
 // fakeFlushWriter is a minimal http.ResponseWriter + http.Flusher double for
 // unit-testing nativeCopier without a real httptest.ResponseRecorder — it lets

@@ -19,6 +19,7 @@ import (
 	"op-ai-gateway/internal/usage"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -640,5 +641,146 @@ func TestSpeechServesAServerAgentChildWhoseSpecIncludesSpeech(t *testing.T) {
 	}
 	if prov.proxyCalls != 1 || prov.gotPath != "/v1/audio/speech" {
 		t.Fatalf("ProxyNative calls = %d on %q, want 1 on /v1/audio/speech", prov.proxyCalls, prov.gotPath)
+	}
+}
+
+// postSpeechOverTheWire sends a speech request to a REAL listener fronting srv
+// and returns the client-side response. A ResponseRecorder cannot tell a sized
+// body from a chunked one -- it records the headers the handler set and none of
+// the framing net/http picks on the wire -- so the Content-Length assertions
+// below need a genuine round trip. resp.ContentLength is -1 and
+// resp.TransferEncoding is ["chunked"] for a chunked body, and the declared
+// length for a sized one.
+func postSpeechOverTheWire(t *testing.T, srv *Server, body string) (*http.Response, error) {
+	t.Helper()
+	front := httptest.NewServer(srv)
+	t.Cleanup(front.Close)
+	req, err := http.NewRequest(http.MethodPost, front.URL+"/v1/audio/speech", strings.NewReader(body))
+	if err != nil {
+		return nil, err // returned, not t.Fatalf: the streaming test calls this from a goroutine
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	return http.DefaultClient.Do(req)
+}
+
+// A speech upstream that declares its length hands the client a SIZED audio/wav
+// body: the relay forwards Content-Length, the body is the upstream's bytes
+// verbatim, and the wire framing is Content-Length rather than chunked.
+//
+// The upstream writes the first half, flushes, and then BLOCKS until the client
+// has read that half. That is the streaming assertion: a relay that buffered the
+// whole body before answering would never send response headers while the
+// upstream is parked (and the test would time out), whereas a relay that
+// forwards the declared length but still streams delivers the first half while
+// the upstream is parked.
+func TestSpeechRelayForwardsTheUpstreamContentLengthAndStillStreams(t *testing.T) {
+	wav := speechTestWAV()
+	half := len(wav) / 2
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseUpstream)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Header().Set("Content-Length", strconv.Itoa(len(wav)))
+		_, _ = w.Write(wav[:half])
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = w.Write(wav[half:])
+	}))
+	t.Cleanup(up.Close)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := postSpeechOverTheWire(t, srv, `{"model":"tts-voice","input":"Hello there."}`)
+		done <- result{resp, err}
+	}()
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(10 * time.Second):
+		releaseUpstream()
+		t.Fatal("no response headers while the upstream was parked mid-body: the relay buffers the body instead of streaming it")
+	}
+	if res.err != nil {
+		t.Fatalf("POST /v1/audio/speech: %v", res.err)
+	}
+	defer res.resp.Body.Close()
+
+	if res.resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.resp.StatusCode)
+	}
+	if got := res.resp.Header.Get("Content-Type"); got != "audio/wav" {
+		t.Fatalf("Content-Type = %q, want audio/wav", got)
+	}
+	if res.resp.ContentLength != int64(len(wav)) {
+		t.Fatalf("ContentLength = %d, want %d: the upstream's declared length must reach the client", res.resp.ContentLength, len(wav))
+	}
+	if len(res.resp.TransferEncoding) != 0 {
+		t.Fatalf("TransferEncoding = %v, want none -- a sized body is not chunked", res.resp.TransferEncoding)
+	}
+
+	first := make([]byte, half)
+	if _, err := io.ReadFull(res.resp.Body, first); err != nil {
+		t.Fatalf("reading the first half while the upstream is parked: %v", err)
+	}
+	if !bytes.Equal(first, wav[:half]) {
+		t.Fatalf("first half = %x, want %x", first, wav[:half])
+	}
+	releaseUpstream()
+	rest, err := io.ReadAll(res.resp.Body)
+	if err != nil {
+		t.Fatalf("reading the rest: %v", err)
+	}
+	if got := append(first, rest...); !bytes.Equal(got, wav) {
+		t.Fatalf("body = %x, want the upstream WAV %x byte for byte", got, wav)
+	}
+}
+
+// A genuinely streamed speech upstream -- no Content-Length, chunked on its own
+// wire -- stays chunked toward the client. There is no length to forward, and
+// inventing one would be wrong.
+func TestSpeechRelayLeavesAnUnsizedUpstreamChunked(t *testing.T) {
+	wav := speechTestWAV()
+	half := len(wav) / 2
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write(wav[:half])
+		w.(http.Flusher).Flush() // flushing before the handler returns forces chunked framing upstream
+		_, _ = w.Write(wav[half:])
+	}))
+	t.Cleanup(up.Close)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	resp, err := postSpeechOverTheWire(t, srv, `{"model":"tts-voice","input":"Hello there."}`)
+	if err != nil {
+		t.Fatalf("POST /v1/audio/speech: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.ContentLength != -1 || resp.Header.Get("Content-Length") != "" {
+		t.Fatalf("ContentLength = %d (header %q), want an unsized, chunked body", resp.ContentLength, resp.Header.Get("Content-Length"))
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the body: %v", err)
+	}
+	if !bytes.Equal(got, wav) {
+		t.Fatalf("body = %x, want the upstream WAV %x byte for byte", got, wav)
 	}
 }

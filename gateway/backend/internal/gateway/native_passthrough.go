@@ -19,6 +19,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -724,6 +725,24 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 	}
+	// A speech response is one binary audio file the client wants sized (a player
+	// can show the duration and a download its progress), so the upstream's own
+	// Content-Length is forwarded when it has one. The copier below relays the
+	// body byte for byte, so the declared length is the length written; net/http
+	// then frames the response by it, while the per-chunk Flush keeps streaming
+	// the bytes. An upstream that declared none (a genuinely streamed body) is
+	// left chunked.
+	//
+	// Speech only: every other flavor keeps relaying chunked, exactly as before.
+	// provider.ProxyResponse carries no ContentLength field, so the declared
+	// length is read off the header; Go's client drops that header both for a
+	// chunked response and for one it decompressed itself, so a value that
+	// survives is the length of the bytes the copier will write.
+	if rel.pfReq.APIFlavor == apiFlavorSpeech {
+		if n, ok := declaredContentLength(resp.Header); ok {
+			w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
@@ -741,10 +760,10 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// (TTFT, and whatever count/rate the upstream itself reports) into `progress`
 	// when there is one — display only: nothing on this path writes a routing
 	// input, which stays where it was, on the end-of-request recordUsage below.
-	// An images response gets NO usage scanner at all (newUsageScanner answers
-	// nil): there is nothing in it that scan could extract, and the buffered
-	// branch of feed would retain megabytes of base64 to find that out — see
-	// newUsageScanner's own doc comment.
+	// An images or speech response gets NO usage scanner at all (newUsageScanner
+	// answers nil): there is nothing in either that scan could extract, and the
+	// buffered branch of feed would retain megabytes of base64 or audio to find
+	// that out — see newUsageScanner's own doc comment.
 	// imgCounter counts KEY occurrences of the `"b64_json"` marker as bytes
 	// stream through the copier — which is what it takes to be a count of
 	// data[]'s produced images, not the same thing as parsing data[] — for
@@ -771,6 +790,22 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// path holds them directly), threaded in for the best-effort vendor rate-limit
 	// scrape -- a no-op for a non-vendor target.
 	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor), resp.Header)
+}
+
+// declaredContentLength reports the body length an upstream response declared in
+// its Content-Length header, and whether it declared a usable one: absent,
+// non-numeric and negative values all answer false, so the caller leaves the
+// relay chunked rather than forwarding something net/http would then reject.
+func declaredContentLength(h http.Header) (int64, bool) {
+	v := strings.TrimSpace(h.Get("Content-Length"))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // nativeRelay is everything, beyond the HTTP pair, that describes ONE native
