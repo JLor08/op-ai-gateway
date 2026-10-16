@@ -189,7 +189,8 @@ func (s *Server) mappingIsImagesOnly(ctx context.Context, app routing.Applicatio
 // store. A mapping with no spec yet, or a spec-store error, also returns zero
 // (best-effort -- a warm is a load-ahead that must never fail because a spec
 // lookup hiccupped; the warmer has already skipped a candidate whose spec
-// could not be classified, through mappingIsImagesOnly). A zero spec makes
+// could not be classified, in textCandidates, through its own fail-closed
+// mappingRuntimeSpec read). A zero spec makes
 // SpecUpstreamAuth fall back to the app token: today's pre-Runtime-Spec-
 // API-Token behaviour, unchanged for every non-server_agent or no-spec case.
 // The manual runs and the scheduler read fail-closed instead

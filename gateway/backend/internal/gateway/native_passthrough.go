@@ -109,7 +109,7 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 // Its two callers are tryProxyNative (the coding-agent endpoints) and
 // resolveImagesTarget (the generations and the edits relays). The text
 // translate dispatch does not call it: it applies only the narrower
-// targetIsImagesOnly below.
+// targetIsImagesOnly and targetIsAudioOnly below.
 func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 	coarse := routing.NormalizeAPIFlavor(apiFlavor)
 	for _, f := range target.APIFlavors {
@@ -123,28 +123,39 @@ func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 // targetIsImagesOnly reports whether target's effective APIFlavors (as for
 // targetServesFlavor) are images-only -- see routing.FlavorsAreImagesOnly.
 //
-// It is the one spec-flavor check the text translate dispatch makes (see
-// resolveTranslateTarget), and it is deliberately NARROWER than the general
-// effective-served rule targetServesFlavor answers (§6 / ADR-033): an
-// agent-managed child whose spec keeps a text flavor -- one narrowed to
-// [anthropic] included -- or is stored as [] serves /v1/chat/completions, and
-// only a child that can do nothing but generate images is refused (an empty
-// list is never images-only). The model listings apply the same test: the
+// With its speech twin targetIsAudioOnly it is the one spec-flavor check the
+// text translate dispatch makes (see resolveTranslateTarget), and the pair is
+// deliberately NARROWER than the general effective-served rule
+// targetServesFlavor answers (§6 / ADR-033): an agent-managed child whose spec
+// keeps a text flavor -- one narrowed to [anthropic] included -- or is stored
+// as [] serves /v1/chat/completions, and only a child that can do nothing but
+// generate images, or nothing but speech, is refused (an empty list is never
+// images-only or audio-only). The model listings apply the same pair: the
 // openai row of routing.MappingServesAPIFlavor is candidacy's chat-completions
-// predicate plus FlavorsAreImagesOnly on the mapping's routing.EffectiveFields,
-// whose flavors this target carries, so a mapping is listed for chat exactly
-// when candidacy admits it for chat completions and this dispatch then accepts
-// it. Holding this path to the general rule would refuse chat completions to
-// children those listings offer for chat.
+// predicate plus FlavorsAreImagesOnly and FlavorsAreAudioOnly on the mapping's
+// routing.EffectiveFields, whose flavors this target carries, so a mapping is
+// listed for chat exactly when candidacy admits it for chat completions and
+// this dispatch then accepts it. Holding this path to the general rule would
+// refuse chat completions to children those listings offer for chat.
 //
 // For an ordinary application this never fires: its flavors are its
 // candidacy, so an application listing only openai_images is never a
 // candidate for a text request in the first place (applicationServesEndpoint).
 // Nor for a server_agent mapping without a spec, which resolves to the
 // application's flavors candidacy just admitted. Only a runtime spec can
-// narrow a text candidate down to images.
+// narrow a text candidate down to images (or speech).
 func targetIsImagesOnly(target routing.Target) bool {
 	return routing.FlavorsAreImagesOnly(target.APIFlavors)
+}
+
+// targetIsAudioOnly is targetIsImagesOnly's speech twin: whether target's
+// effective APIFlavors (as for targetServesFlavor) are audio-only -- see
+// routing.FlavorsAreAudioOnly. The text translate dispatch refuses such a
+// target exactly as it refuses an images-only one (resolveTranslateTarget), and
+// the model listings agree (routing.MappingServesAPIFlavor's openai row), for
+// the reasons targetIsImagesOnly gives.
+func targetIsAudioOnly(target routing.Target) bool {
+	return routing.FlavorsAreAudioOnly(target.APIFlavors)
 }
 
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
@@ -326,8 +337,8 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 	// translate dispatch. What does reach that dispatch unjudged (a body whose
 	// model the routing probe could not read, a request whose resolve failed
 	// above, and every translate-path re-resolve) is checked there only by
-	// targetIsImagesOnly (resolveTranslateTarget), with neither this flavor
-	// check nor the mode read. A no-op for an ordinary app, whose flavor-less
+	// targetIsImagesOnly and targetIsAudioOnly (resolveTranslateTarget), with
+	// neither this flavor check nor the mode read. A no-op for an ordinary app, whose flavor-less
 	// state already excluded it at candidacy.
 	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
 		mode = routing.EndpointModeDisabled

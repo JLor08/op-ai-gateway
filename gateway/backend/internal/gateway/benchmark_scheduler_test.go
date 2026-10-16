@@ -354,6 +354,97 @@ func TestTriggerScheduledBenchmarkSkipsImagesOnlyMappings(t *testing.T) {
 	}
 }
 
+// schedAudioFixture is schedFlavorFixture's speech twin: a server with
+//
+//   - app-audio, an audio.cpp application whose flavors are [openai_audio]
+//     alone, with one mapping (audio-ext);
+//   - app-agent, a server_agent application declaring a text flavor and
+//     openai_audio, with four children: agent-text (spec [openai]),
+//     agent-audio (spec [openai_audio]), agent-nospec (no spec: the
+//     application's flavors stand) and agent-legacy (a spec stored as []).
+//
+// Both applications have BenchmarkScheduleEnabled set. It returns the server
+// and both applications.
+func schedAudioFixture(t *testing.T, mem *routing.MemoryStore) (routing.AIServer, routing.Application, routing.Application) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	server := routing.AIServer{ID: "srv1", Name: "Host", Domain: "host.example.test", Provider: routing.ProviderMock, Endpoint: "mock://srv1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}
+	if err := mem.CreateAIServer(ctx, server); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	audioApp := routing.Application{ID: "app-audio", ServerID: "srv1", Type: routing.ProviderAudioCpp, Port: 8200, Scheme: "http", TimeoutMS: 600000, APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive, BenchmarkScheduleEnabled: true, CreatedAt: now, UpdatedAt: now}
+	agentApp := routing.Application{ID: "app-agent", ServerID: "srv1", Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http", TimeoutMS: 600000, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive, BenchmarkScheduleEnabled: true, CreatedAt: now, UpdatedAt: now}
+	for _, app := range []routing.Application{audioApp, agentApp} {
+		if err := mem.CreateApplication(ctx, app); err != nil {
+			t.Fatalf("CreateApplication %s: %v", app.ID, err)
+		}
+	}
+	mapping := func(appID, name string) {
+		t.Helper()
+		if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: "map-" + name, ApplicationID: appID, GatewayModelName: name, AppModelName: name, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", name, err)
+		}
+	}
+	spec := func(name string, flavors []string) {
+		t.Helper()
+		if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-" + name, MappingID: "map-" + name, Binary: "/opt/bin/server", Args: "[]", Env: "{}", APIFlavors: flavors, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", name, err)
+		}
+	}
+	mapping("app-audio", "audio-ext")
+	for _, name := range []string{"agent-text", "agent-audio", "agent-nospec", "agent-legacy"} {
+		mapping("app-agent", name)
+	}
+	spec("agent-text", []string{routing.APIFlavorOpenAI})
+	spec("agent-audio", []string{routing.APIFlavorOpenAIAudio})
+	spec("agent-legacy", []string{})
+	return server, audioApp, agentApp
+}
+
+// A scheduled benchmark sends a chat prompt, which a mapping that serves only
+// speech cannot answer: left unskipped, an audio-only mapping with
+// BenchmarkScheduleEnabled would get an unattended failing prompt every
+// interval. Such a mapping is skipped, judged by its EFFECTIVE flavors with
+// the resolver's precedence, and every text-capable mapping beside it is still
+// benchmarked. An audio.cpp application has nothing to benchmark at all, so no
+// run is reserved for it.
+func TestTriggerScheduledBenchmarkSkipsAudioOnlyMappings(t *testing.T) {
+	ctx := context.Background()
+	mem := routing.NewMemoryStore()
+	server, audioApp, agentApp := schedAudioFixture(t, mem)
+	prov := newColdLister(nil)
+	srv := &Server{Provider: prov, Routes: mem, Benchmarks: NewBenchmarkRegistry(), Active: newActiveRegistry(nil)}
+
+	if got := srv.TriggerScheduledBenchmark(ctx, server, audioApp); !got {
+		t.Fatalf("audio-only application: TriggerScheduledBenchmark = false, want true (nothing to do)")
+	}
+	if srv.Benchmarks.ServerBusy(server.ID) {
+		t.Fatalf("audio-only application: ServerBusy = true, want false (no run reserved)")
+	}
+	if got := prov.streamedModels(); len(got) != 0 {
+		t.Fatalf("audio-only application: streamed %v, want no chat prompt at all", got)
+	}
+
+	if got := srv.TriggerScheduledBenchmark(ctx, server, agentApp); !got {
+		t.Fatalf("agent application: TriggerScheduledBenchmark = false, want true (a run should be launched)")
+	}
+	waitFor(t, func() bool { return !srv.Benchmarks.Status(server.ID).Running })
+	var benchmarked []string
+	for _, res := range srv.Benchmarks.Status(server.ID).Results {
+		benchmarked = append(benchmarked, res.GatewayModelName)
+	}
+	sort.Strings(benchmarked)
+	if want := []string{"agent-legacy", "agent-nospec", "agent-text"}; !reflect.DeepEqual(benchmarked, want) {
+		t.Fatalf("benchmarked mappings = %v, want %v (agent-audio serves speech only)", benchmarked, want)
+	}
+	for _, model := range prov.streamedModels() {
+		if model == "agent-audio" {
+			t.Fatalf("streamed a chat prompt to agent-audio, an audio-only child: %v", prov.streamedModels())
+		}
+	}
+}
+
 // specReadFailingStore fails every runtime-spec read by mapping.
 type specReadFailingStore struct {
 	*routing.MemoryStore

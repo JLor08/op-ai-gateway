@@ -49,8 +49,8 @@ const (
 	// message names the blocking spec.
 	codeBenchmarkVRAMIsolationBlocked = "benchmark.vram_isolation_blocked"
 
-	// codeBenchmarkVRAMAgentEnsureUnsupported: the target is images-only, so
-	// it has no chat endpoint to be loaded by generating on, and the agent
+	// codeBenchmarkVRAMAgentEnsureUnsupported: the target is images-only or
+	// audio-only, so it has no chat endpoint to be loaded by generating on, and the agent
 	// does not declare runtime_ensure, the only other way to start it. It is
 	// the Load's own code for the same missing feature
 	// (errBenchmarkAgentEnsureUnsupported), not a benchmark.vram_* one, so
@@ -111,8 +111,8 @@ const (
 	// (vramInconclusiveAlreadyResident). This warning says so: an unanswered
 	// question is not a no.
 	vramWarningResidencyUnknown = "residency_unknown"
-	// vramWarningFirstGenerationNotMeasured: the target is images-only, so the
-	// run started it through the agent router's ensure route and it never
+	// vramWarningFirstGenerationNotMeasured: the target is images-only or
+	// audio-only, so the run started it through the agent router's ensure route and it never
 	// generated (vramRunPlanned.ensure). Memory a backend allocates only on
 	// its first generation is therefore not in the number, which can be too
 	// low. A warning, not an inconclusive reason: the number is still offered
@@ -207,8 +207,8 @@ type vramRunPlanned struct {
 	// (vramInconclusiveIsolationUnacknowledged) rather than silently switching
 	// the evidence standard halfway through a proof.
 	acknowledged bool
-	// ensure is whether the target is images-only, so that the run loads it
-	// through the agent router's ensure route instead of by generating
+	// ensure is whether the target is images-only or audio-only, so that the
+	// run loads it through the agent router's ensure route instead of by generating
 	// (benchmarkTarget.loadWithoutGenerating). Decided here from the target's
 	// own spec, and the run re-checks the agent's runtime_ensure before it
 	// drains.
@@ -435,14 +435,14 @@ func vramEnumerateFleet(specs []routing.RuntimeSpec, targetMappingID string) (sp
 }
 
 // vramEnsurePlan decides how the run starts the target: false for a text
-// target, which loads by generating as always, and true for an images-only one
-// (mappingSpecIsImagesOnly on targetSpec), which has no chat endpoint to
-// generate on and is started through the agent router's ensure route instead.
-// That route needs an agent that declares runtime_ensure; without it the
-// target cannot be started at all, which is refused before anything is
-// written.
+// target, which loads by generating as always, and true for an images-only or
+// audio-only one (mappingSpecIsImagesOnly, mappingSpecIsAudioOnly on
+// targetSpec), which has no chat endpoint to generate on and is started
+// through the agent router's ensure route instead. That route needs an agent
+// that declares runtime_ensure; without it the target cannot be started at
+// all, which is refused before anything is written.
 func (s *Server) vramEnsurePlan(serverID string, app routing.Application, targetSpec routing.RuntimeSpec) (bool, error) {
-	if !mappingSpecIsImagesOnly(app, targetSpec, true) {
+	if !mappingSpecIsImagesOnly(app, targetSpec, true) && !mappingSpecIsAudioOnly(app, targetSpec, true) {
 		return false, nil
 	}
 	if !s.AgentFeatures.Has(serverID, runtimeEnsureFeature) {
@@ -451,7 +451,7 @@ func (s *Server) vramEnsurePlan(serverID string, app routing.Application, target
 	return true, nil
 }
 
-// vramEnsureUnsupported is the refusal of an images-only target on an agent
+// vramEnsureUnsupported is the refusal of an images-only or audio-only target on an agent
 // that does not declare runtime_ensure: at the trigger (vramEnsurePlan), and
 // again by the run before it drains.
 func vramEnsureUnsupported() *vramRefusal {

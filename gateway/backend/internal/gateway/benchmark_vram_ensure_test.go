@@ -102,6 +102,54 @@ func TestVRAMRunPlanRefusesAnImagesOnlyTargetWithoutRuntimeEnsure(t *testing.T) 
 	}
 }
 
+// TestVRAMRunPlanTakesAnAudioOnlyTargetThroughTheEnsureRoute: an audio.cpp
+// style child that serves only speech has no chat endpoint either, so its
+// plan is an ensure plan too, with the first-generation caveat; without
+// runtime_ensure the plan refuses it before anything is written, with the
+// Load's wire code, instead of draining the fleet and chat-loading a child
+// that cannot answer. Only the plan is exercised: the run's drain writes
+// launch specs through the portal's spec writer, which rejects openai_audio
+// (runtime_spec.flavor_invalid) until the portal's known flavors list it, and
+// the run itself is the images-only path, which TestVRAMRunEnsuresAnImagesOnlyTarget
+// covers.
+func TestVRAMRunPlanTakesAnAudioOnlyTargetThroughTheEnsureRoute(t *testing.T) {
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	t.Run("with runtime_ensure", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{targetAPIFlavors: audio})
+		f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager", runtimeEnsureFeature})
+		f.seedLatestSample()
+
+		plan, err := f.srv.vramRunPlan(context.Background(), f.target)
+		if err != nil {
+			t.Fatalf("vramRunPlan: %v", err)
+		}
+		if !plan.ensure {
+			t.Fatal("plan.ensure = false, want an ensure plan for an audio-only target")
+		}
+		if !containsString(plan.warnings, vramWarningFirstGenerationNotMeasured) {
+			t.Fatalf("warnings = %v, want %q", plan.warnings, vramWarningFirstGenerationNotMeasured)
+		}
+	})
+	t.Run("without runtime_ensure", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{targetAPIFlavors: audio})
+		f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager"})
+		f.seedLatestSample()
+
+		_, err := f.srv.vramRunPlan(context.Background(), f.target)
+		if got := vramRefusalCode(t, err); got != "benchmark.agent_ensure_unsupported" {
+			t.Fatalf("refusal code = %q, want benchmark.agent_ensure_unsupported", got)
+		}
+		for specID, state := range f.allAdminStates(t) {
+			if state != "" {
+				t.Fatalf("spec %q was written (admin_state %q) by a refused run", specID, state)
+			}
+		}
+		if got := f.notifies(); len(got) != 0 {
+			t.Fatalf("a refused run notified the agent: %#v", got)
+		}
+	})
+}
+
 // TestVRAMTextProbeNeedsNoRuntimeEnsure: a text target on an agent without
 // runtime_ensure is planned, run and loaded by generating exactly as before --
 // neither the plan nor the run's re-check asks for the feature.

@@ -179,6 +179,8 @@ func TestModelServersLoadRefusalAgreesWithTheLoadStarter(t *testing.T) {
 	text := []string{routing.APIFlavorOpenAI}
 	images := []string{routing.APIFlavorOpenAIImages}
 	both := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	textAndAudio := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}
 	type specCase struct {
 		flavors    []string
 		adminState string
@@ -201,6 +203,12 @@ func TestModelServersLoadRefusalAgreesWithTheLoadStarter(t *testing.T) {
 		{name: "agent text spec", appType: routing.ProviderServerAgent, appFlavors: both, spec: &specCase{flavors: text}, want: ""},
 		{name: "non-agent text row", appType: routing.ProviderVLLM, appFlavors: text, want: ""},
 		{name: "non-agent text row with a force-stopped spec row", appType: routing.ProviderVLLM, appFlavors: text, spec: &specCase{flavors: images, adminState: "force_stopped"}, want: ""},
+		{name: "non-agent audio-only row without a spec", appType: routing.ProviderAudioCpp, appFlavors: audio, want: "audio_only"},
+		{name: "non-agent audio-only row, runtime_ensure declared", appType: routing.ProviderAudioCpp, appFlavors: audio, ensure: true, want: "audio_only"},
+		{name: "agent audio-only spec, agent without runtime_ensure", appType: routing.ProviderServerAgent, appFlavors: textAndAudio, spec: &specCase{flavors: audio}, want: "agent_ensure_unsupported"},
+		{name: "agent audio-only spec, agent with runtime_ensure", appType: routing.ProviderServerAgent, appFlavors: textAndAudio, spec: &specCase{flavors: audio}, ensure: true, want: ""},
+		{name: "force-stopped agent audio-only spec with runtime_ensure", appType: routing.ProviderServerAgent, appFlavors: textAndAudio, spec: &specCase{flavors: audio, adminState: "force_stopped"}, ensure: true, want: "spec_force_stopped"},
+		{name: "agent text-and-audio spec", appType: routing.ProviderServerAgent, appFlavors: textAndAudio, spec: &specCase{flavors: textAndAudio}, want: ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

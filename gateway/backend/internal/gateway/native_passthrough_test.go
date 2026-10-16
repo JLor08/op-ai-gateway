@@ -1423,6 +1423,173 @@ func TestTranslateDispatchRefusesImagesOnlyChildForCodingAgentRequests(t *testin
 	}
 }
 
+// serverAgentTextAudioFlavors is the APPLICATION flavor list of the audio-only
+// fixtures below: both text flavors and openai_audio, so candidacy admits text
+// requests and only the mapping's runtime spec decides what is served.
+var serverAgentTextAudioFlavors = []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIAudio}
+
+// TestTargetIsAudioOnly pins the dispatch predicate: only a target whose
+// effective flavors name openai_audio and neither text flavor is audio-only.
+func TestTargetIsAudioOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flavors []string
+		want    bool
+	}{
+		{"audio only", []string{routing.APIFlavorOpenAIAudio}, true},
+		{"text and audio", []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, false},
+		{"anthropic and audio", []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAIAudio}, false},
+		{"images only", []string{routing.APIFlavorOpenAIImages}, false},
+		{"empty", []string{}, false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := targetIsAudioOnly(routing.Target{APIFlavors: tc.flavors}); got != tc.want {
+				t.Fatalf("targetIsAudioOnly(%q) = %v, want %v", tc.flavors, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestChatCompletionsRefusesAudioOnlyServerAgentChild is the speech twin of
+// TestChatCompletionsRefusesImagesOnlyServerAgentChild: candidacy gates a
+// server_agent application on its own flavors, which here include openai, so
+// only the resolved spec says the child can do nothing but speak. The text
+// translate dispatch must refuse it exactly as candidacy refuses a model with
+// no route -- same code, same status, a usage row recorded the same way, and
+// before any byte of a stream is written -- and must never send it the request.
+func TestChatCompletionsRefusesAudioOnlyServerAgentChild(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		stream bool
+	}{
+		{"buffered", `{"model":"gw-model","messages":[{"role":"user","content":"hi"}]}`, false},
+		{"stream", `{"model":"gw-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingTranslateProvider{}
+			srv := newServerAgentSpecTestServer(t, prov, serverAgentTextAudioFlavors, []string{routing.APIFlavorOpenAIAudio}, routing.EndpointModeTranslate)
+
+			rec := postBearer(t, srv, "dev-secret", "/v1/chat/completions", tc.body)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "routing.no_model_route")
+			if ct := rec.Header().Get("Content-Type"); ct != jsonContentType {
+				t.Fatalf("Content-Type = %q, want %q -- the refusal must come before the stream starts", ct, jsonContentType)
+			}
+			if strings.Contains(rec.Body.String(), "data:") {
+				t.Fatalf("body = %q, want no SSE frame", rec.Body.String())
+			}
+			if n := prov.calls(); n != 0 {
+				t.Fatalf("provider calls = %d (complete %d, stream %d, proxy %d), want 0 -- an audio-only child must never be sent a text request",
+					n, prov.completeCalls, prov.streamCalls, prov.proxyCalls)
+			}
+			events := srv.Usage.All()
+			if len(events) != 1 {
+				t.Fatalf("usage events = %d, want exactly 1; events = %+v", len(events), events)
+			}
+			got := events[0]
+			if got.Status != "error" || got.ErrorCode != "routing.no_model_route" || got.HTTPStatus != http.StatusNotFound ||
+				got.ContentType != jsonContentType || got.ReqPath != "/v1/chat/completions" || got.Stream != tc.stream {
+				t.Fatalf("usage row = %+v, want an error row for routing.no_model_route, 404, %s, /v1/chat/completions, stream=%v",
+					got, jsonContentType, tc.stream)
+			}
+			if got.Host != "" || got.RouteID != "" || got.Provider != "" || got.ProviderPath != "" || got.ServerName != "" {
+				t.Fatalf("usage row = %+v, want no Host/RouteID/Provider/ProviderPath/ServerName -- no upstream was ever called", got)
+			}
+
+			// The SAME row the path records for a genuine routing failure.
+			unknown := postBearer(t, srv, "dev-secret", "/v1/chat/completions", strings.Replace(tc.body, "gw-model", "no-such-model", 1))
+			if unknown.Code != http.StatusNotFound {
+				t.Fatalf("unknown model: status = %d, want 404; body = %s", unknown.Code, unknown.Body.String())
+			}
+			events = srv.Usage.All()
+			if len(events) != 2 {
+				t.Fatalf("usage events = %d, want 2 after the unknown-model request", len(events))
+			}
+			if refused, noRoute := routingFailureShape(events[0]), routingFailureShape(events[1]); refused != noRoute {
+				t.Fatalf("refusal row differs from the path's own no-route row:\n refused  = %+v\n no route = %+v", refused, noRoute)
+			}
+		})
+	}
+}
+
+// TestChatCompletionsServesServerAgentChildUnlessAudioOnly pins what the
+// audio-only refusal must NOT touch: a child whose spec lists openai beside
+// openai_audio, one narrowed to anthropic, and a legacy spec stored as []
+// still serve /v1/chat/completions.
+func TestChatCompletionsServesServerAgentChildUnlessAudioOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []string
+	}{
+		{"openai and openai_audio", []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}},
+		{"anthropic and openai_audio: the general rule is not enforced here", []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAIAudio}},
+		{"empty legacy spec", []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingTranslateProvider{}
+			srv := newServerAgentSpecTestServer(t, prov, serverAgentTextAudioFlavors, tc.spec, routing.EndpointModeTranslate)
+
+			rec := postBearer(t, srv, "dev-secret", "/v1/chat/completions", `{"model":"gw-model","messages":[{"role":"user","content":"hi"}]}`)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+			}
+			if prov.completeCalls != 1 || prov.streamCalls != 0 || prov.proxyCalls != 0 {
+				t.Fatalf("calls: complete %d, stream %d, proxy %d; want complete 1 only", prov.completeCalls, prov.streamCalls, prov.proxyCalls)
+			}
+		})
+	}
+}
+
+// TestTranslateDispatchRefusesAudioOnlyChildForCodingAgentRequests: the
+// audio-only check sits at the translate dispatch every text request shares,
+// as the images-only one does. A /v1/responses or /v1/messages request reaches
+// that dispatch unjudged by tryProxyNative whenever the routing probe reads no
+// model (a blank model, which the token's override routes to gw-model), and is
+// then refused like the chat request is.
+func TestTranslateDispatchRefusesAudioOnlyChildForCodingAgentRequests(t *testing.T) {
+	const (
+		responsesBody = `{"model":" ","input":"hi"}`
+		messagesBody  = `{"model":" ","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	)
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{"responses buffered", "/v1/responses", responsesBody},
+		{"messages stream", "/v1/messages", messagesBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &countingTranslateProvider{}
+			srv := newServerAgentSpecTestServer(t, prov, serverAgentTextAudioFlavors, []string{routing.APIFlavorOpenAIAudio}, routing.EndpointModeTranslate)
+
+			rec := postBearer(t, srv, "override-secret", tc.path, tc.body)
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "routing.no_model_route")
+			if ct := rec.Header().Get("Content-Type"); ct != jsonContentType {
+				t.Fatalf("Content-Type = %q, want %q", ct, jsonContentType)
+			}
+			if n := prov.calls(); n != 0 {
+				t.Fatalf("provider calls = %d, want 0", n)
+			}
+			events := srv.Usage.All()
+			if len(events) != 1 || events[0].ErrorCode != "routing.no_model_route" || events[0].Host != "" || events[0].RouteID != "" {
+				t.Fatalf("usage events = %+v, want one routing.no_model_route row with no target attribution", events)
+			}
+		})
+	}
+}
+
 // TestResponsesEndpointModeTable pins all three modes on the ordinary app for the
 // Responses endpoint in one place.
 func TestResponsesEndpointModeTable(t *testing.T) {

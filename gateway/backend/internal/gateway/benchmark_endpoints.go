@@ -129,10 +129,12 @@ func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token au
 //
 // The warm-load is a chat prompt, so before the reservation the probe reads the mapping's
 // runtime spec once (starterSpec) and refuses a mapping that serves only images with 409
-// benchmark.images_only. The probe's target is built from that same spec.
+// benchmark.images_only, and one that serves only speech with 409 benchmark.audio_only (images
+// first, for a list naming both non-text flavors, as loadRefusal does). The probe's target is
+// built from that same spec.
 //
-// The check and TryStart are not atomic: a mapping that becomes images-only in between is
-// warm-loaded anyway, and the failed warm-load is the probe's result.
+// The check and TryStart are not atomic: a mapping that becomes images-only or audio-only in
+// between is warm-loaded anyway, and the failed warm-load is the probe's result.
 func (s *Server) startContextProbe(w http.ResponseWriter, r *http.Request, token auth.Token, mappingID string) {
 	server, views, err := s.Portal.AuthorizeBenchmarkScope(r.Context(), token, "mapping", mappingID)
 	if err != nil {
@@ -149,6 +151,10 @@ func (s *Server) startContextProbe(w http.ResponseWriter, r *http.Request, token
 	}
 	if mappingSpecIsImagesOnly(v.App, spec, hasSpec) {
 		writeBenchmarkError(w, errBenchmarkImagesOnly)
+		return
+	}
+	if mappingSpecIsAudioOnly(v.App, spec, hasSpec) {
+		writeBenchmarkError(w, errBenchmarkAudioOnly)
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())

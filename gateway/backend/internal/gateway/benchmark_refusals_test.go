@@ -691,6 +691,36 @@ func TestStartContextProbeRefusesAnImagesOnlyMapping(t *testing.T) {
 	}
 }
 
+// The context probe warm-loads the model with a chat prompt, so it refuses a
+// mapping that serves only speech as it does an images-only one: 409
+// benchmark.audio_only, for an agent child (its spec read once) and for a
+// non-agent application's mapping, with nothing reserved and no prompt sent.
+func TestStartContextProbeRefusesAnAudioOnlyMapping(t *testing.T) {
+	for _, tc := range []struct {
+		mapping   string
+		specReads int
+	}{
+		{"ra_audio", 1},
+		{"ra_ext", 0},
+	} {
+		t.Run(tc.mapping, func(t *testing.T) {
+			f := newRefusalFixture(t)
+			f.addAudioOnlyMappings(t)
+			f.srv.AgentFeatures.Set(baOwnedServer, []string{runtimeEnsureFeature})
+			if status, code, _ := f.post(t, "/api/portal/mappings/"+tc.mapping+"/probe-context"); status != http.StatusConflict || code != codeBenchmarkAudioOnly {
+				t.Fatalf("status = %d code = %q, want 409 %s", status, code, codeBenchmarkAudioOnly)
+			}
+			f.assertNothingReserved(t)
+			if n := f.specs.readCount(tc.mapping); n != tc.specReads {
+				t.Fatalf("spec reads for %s = %d, want %d", tc.mapping, n, tc.specReads)
+			}
+			if got := f.prov.streamedModels(); len(got) != 0 {
+				t.Fatalf("streamed %v, want no chat prompt", got)
+			}
+		})
+	}
+}
+
 func TestStartBenchmarkMappingScopeRefusesAnImagesOnlyMapping(t *testing.T) {
 	for _, mode := range []string{"speed", "capacity", "both", "vision"} {
 		for _, tc := range []struct {
