@@ -937,6 +937,11 @@ func (s *Server) relayTranscriptionResponse(w http.ResponseWriter, r *http.Reque
 	capIn := buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), body, resp.StatusCode, ex.req.APIFlavor)
 	if capIn != nil {
 		capIn.RespBytes = int64(written)
+		// The endpoint is what tells this JSON transcript from speech's binary WAV: both
+		// carry the openai_audio flavor, and a 2xx speech capture is stored as a redacted
+		// summary (isBinarySpeechResponse). The error captures of this file need no stamp:
+		// the carve-out matters only for a 2xx, and theirs are all non-2xx.
+		capIn.Endpoint = ex.endpoint
 	}
 	// resp.Header is the UPSTREAM response's headers, threaded in for the best-effort
 	// vendor rate-limit scrape every native relay passes it for (a no-op here: a

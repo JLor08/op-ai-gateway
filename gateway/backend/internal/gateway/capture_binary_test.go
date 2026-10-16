@@ -187,11 +187,14 @@ func TestBuildCaptureEnvelopeSkipsA2xxSpeechBodyWhateverItsContentType(t *testin
 		name        string
 		contentType string // "" = the response names none
 		status      int
+		endpoint    sessionEndpoint
 	}{
-		{"no content type, 200", "", http.StatusOK},
-		{"json content type, 200", "application/json", http.StatusOK},
-		{"octet-stream, 200", "application/octet-stream", http.StatusOK},
-		{"no content type, 206", "", http.StatusPartialContent},
+		{"no content type, 200", "", http.StatusOK, endpointChat},
+		{"json content type, 200", "application/json", http.StatusOK, endpointChat},
+		{"octet-stream, 200", "application/octet-stream", http.StatusOK, endpointChat},
+		{"no content type, 206", "", http.StatusPartialContent, endpointChat},
+		{"no content type, 200, the speech endpoint stamped", "", http.StatusOK, endpointSpeech},
+		{"json content type, 200, the speech endpoint stamped", "application/json", http.StatusOK, endpointSpeech},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in := audioCaptureInput(tc.contentType, wav)
@@ -199,6 +202,7 @@ func TestBuildCaptureEnvelopeSkipsA2xxSpeechBodyWhateverItsContentType(t *testin
 				in.RespHeaders = nil
 			}
 			in.APIFlavor = apiFlavorSpeech
+			in.Endpoint = tc.endpoint
 			in.HTTPStatus = tc.status
 			in.RespBytes = int64(len(wav))
 
@@ -226,25 +230,31 @@ func TestBuildCaptureEnvelopeSkipsA2xxSpeechBodyWhateverItsContentType(t *testin
 // The fallback is exactly "speech AND 2xx". A speech request answered with an
 // error, and every other flavor with a 2xx and no content type, keep storing the
 // body, so the new rule widens nothing beyond the one binary response it exists for.
+// A transcription shares speech's flavor, but its 2xx answer is a JSON document --
+// the transcript -- so the endpoint keeps it out of the fallback.
 func TestBuildCaptureEnvelopeSpeechFallbackIsNarrow(t *testing.T) {
 	const body = `{"error":{"message":"boom","type":"server_error"}}`
 	for _, tc := range []struct {
-		name   string
-		flavor string
-		status int
+		name     string
+		flavor   string
+		endpoint sessionEndpoint
+		status   int
 	}{
-		{"speech with a 400", apiFlavorSpeech, http.StatusBadRequest},
-		{"speech with a 502", apiFlavorSpeech, http.StatusBadGateway},
-		{"speech with a 199", apiFlavorSpeech, 199},
-		{"speech with a 300", apiFlavorSpeech, http.StatusMultipleChoices},
-		{"speech with no status recorded", apiFlavorSpeech, 0},
-		{"another flavor with a 200", "openai", http.StatusOK},
-		{"no flavor with a 200", "", http.StatusOK},
+		{"speech with a 400", apiFlavorSpeech, endpointSpeech, http.StatusBadRequest},
+		{"speech with a 502", apiFlavorSpeech, endpointSpeech, http.StatusBadGateway},
+		{"speech with a 199", apiFlavorSpeech, endpointSpeech, 199},
+		{"speech with a 300", apiFlavorSpeech, endpointSpeech, http.StatusMultipleChoices},
+		{"speech with no status recorded", apiFlavorSpeech, endpointSpeech, 0},
+		{"transcription with a 200", apiFlavorSpeech, endpointTranscription, http.StatusOK},
+		{"transcription with a 206", apiFlavorSpeech, endpointTranscription, http.StatusPartialContent},
+		{"another flavor with a 200", "openai", endpointChat, http.StatusOK},
+		{"no flavor with a 200", "", endpointChat, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in := audioCaptureInput("", []byte(body))
 			in.RespHeaders = nil
 			in.APIFlavor = tc.flavor
+			in.Endpoint = tc.endpoint
 			in.HTTPStatus = tc.status
 
 			if env := buildCaptureEnvelope(in, 4096); env.RespBody != body {
