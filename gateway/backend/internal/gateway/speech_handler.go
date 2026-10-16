@@ -344,8 +344,15 @@ func speechDurationSeconds(header string) (float64, bool) {
 // no token count or rate exists to leak onto the row and ValidateBillingXOR
 // holds. meta.ReqPath is read for the log line rather than taking the request a
 // second time: it is the same r.URL.Path the caller already put there.
+//
+// A transcription shares the openai_audio flavor (apiFlavorSpeech) but not the
+// header: audio.cpp reports its duration in the response BODY, so the exchange of a
+// transcription (ex.endpoint == endpointTranscription) is left alone here --
+// setTranscriptionBillingQuantity is its setter. Without that endpoint test a
+// flavor-only guard would log an Error for every successful transcription (no
+// duration header, by design) and still leave its quantity at 0.
 func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.Header, status string) {
-	if ex.req.APIFlavor != apiFlavorSpeech || status != "success" {
+	if ex.req.APIFlavor != apiFlavorSpeech || ex.endpoint == endpointTranscription || status != "success" {
 		return
 	}
 	value := upstream.Get(speechDurationHeader)
@@ -400,8 +407,15 @@ const (
 // other flavor's errors on the copier, byte for byte, and the status test is the
 // 2xx window proxyNative's own success path uses, so a 2xx audio/wav still
 // streams.
-func needsSpeechErrorRelay(apiFlavor string, statusCode int) bool {
-	return apiFlavor == apiFlavorSpeech && (statusCode < 200 || statusCode >= 300)
+//
+// The endpoint test carves the transcription out of the flavor: it shares
+// openai_audio with speech, and its non-2xx answers belong to its own relay
+// (needsTranscriptionErrorRelay), whose normalised code is transcription.upstream_error
+// and not speech.upstream_error. The test is negative (everything but a
+// transcription) so a speech relay built without an endpoint -- the zero value is
+// endpointChat -- is still a speech relay.
+func needsSpeechErrorRelay(apiFlavor string, endpoint sessionEndpoint, statusCode int) bool {
+	return apiFlavor == apiFlavorSpeech && endpoint != endpointTranscription && (statusCode < 200 || statusCode >= 300)
 }
 
 // normalizeSpeechUpstreamError turns a speech upstream's non-2xx body into the

@@ -5,13 +5,16 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
@@ -649,9 +652,10 @@ func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, m
 // client sends does not guarantee (rebuilding can grow a body): one that does not is
 // refused here, recorded, instead of being sent.
 //
-// proxyNative relays the upstream's answer as it stands. What it does NOT yet do for
-// this endpoint is meter the duration out of the response body or normalise an
-// upstream error.
+// proxyNative then finishes the exchange through this file's response side, keyed on
+// the endpoint (the openai_audio flavor is speech's too): a non-2xx answer is
+// normalised (relayTranscriptionUpstreamError) and a 2xx one is buffered, metered from
+// the timing block of its body and written verbatim (relayTranscriptionResponse).
 func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, form transcriptionForm, raw []byte) {
 	start := time.Now()
 	target, ok := s.resolveTranscriptionTarget(w, r, &token, req, raw, start)
@@ -674,7 +678,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 	rel := nativeRelay{
 		token:       token,
 		target:      target,
-		path:        upstreamPath(target, apiFlavorSpeech, endpointTranscription),
+		path:        upstreamPath(target, req.APIFlavor, endpointTranscription),
 		raw:         raw,
 		pfReq:       req,
 		endpoint:    endpointTranscription,
@@ -709,4 +713,248 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		return
 	}
 	s.proxyNative(w, r, rel)
+}
+
+// transcriptionDurationSeconds reads the billable quantity out of a transcription
+// response body: the input audio's duration, timing.audio_duration_ms, in seconds. It
+// reports whether the body stated a usable one -- a finite number greater than zero.
+// An absent timing block or duration, a null, a non-number (a numeric STRING
+// included: the document says "number", and guessing at "2000" would bill on the
+// strength of a shape the upstream does not produce), zero, a negative, a value past
+// float range and a body that is no JSON object all answer false -- none states how
+// much audio was transcribed, and a NaN or infinite quantity would poison every sum
+// the usage views take. (encoding/json refuses the bare NaN and Infinity spellings,
+// so the explicit check is the second line of defence, not the first.)
+//
+// It is speechDurationSeconds' twin for a body instead of a header. audio.cpp writes
+// the timing block AFTER the text, so the whole body has to be in hand
+// (relayTranscriptionResponse buffers it); only the one numeric field is decoded, the
+// transcript itself is skipped, not copied.
+func transcriptionDurationSeconds(body []byte) (float64, bool) {
+	var doc struct {
+		Timing struct {
+			AudioDurationMs *float64 `json:"audio_duration_ms"`
+		} `json:"timing"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil || doc.Timing.AudioDurationMs == nil {
+		return 0, false
+	}
+	ms := *doc.Timing.AudioDurationMs
+	if math.IsNaN(ms) || math.IsInf(ms, 0) || ms <= 0 {
+		return 0, false
+	}
+	return ms / 1000, true
+}
+
+// setTranscriptionBillingQuantity records, on meta, how many seconds of audio a
+// finished transcription relay transcribed -- and does nothing at all for any other
+// endpoint or a relay that did not finish cleanly, leaving BillingQuantity at 0 so
+// nothing is asserted about what was transcribed. It is setSpeechBillingQuantity's
+// twin and shares its reasoning: the quantity is the RESPONSE's own statement (never
+// the request's), and is only trusted once the full body reached the client
+// (status == "success"; a non-2xx answer, an unreadable or over-limit body and a
+// client that went away mid-write all leave it 0).
+//
+// It is keyed on ex.endpoint, not the flavor: the openai_audio flavor is speech's
+// too, and speech's quantity comes from a header this endpoint does not have.
+//
+// body is the upstream's FULL response body, the very bytes the client was sent. A
+// successful relay with no usable duration is indistinguishable, in the recorded row
+// alone, from a genuinely empty recording, and the (unit, quantity) pair has no
+// "unknown" representation to fall back on. So the gap is logged once at Error with
+// enough to find the request, instead of silently recording a bare zero (ADR-041).
+// Only the body's size is logged: the body is the transcript, which is the user's
+// content and has no business in a log line.
+func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []byte, status string) {
+	if ex.endpoint != endpointTranscription || status != "success" {
+		return
+	}
+	seconds, ok := transcriptionDurationSeconds(body)
+	if !ok {
+		slog.Error("transcription relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "field", "timing.audio_duration_ms", "body_bytes", len(body))
+		return
+	}
+	meta.BillingQuantity = seconds
+}
+
+// transcriptionUpstreamErrorType and transcriptionUpstreamErrorCode are the GATEWAY's
+// own classification for a transcription upstream error whose shape is not already an
+// OpenAI error object (see normalizeTranscriptionUpstreamError), and for a 2xx answer
+// the relay could not deliver whole (over the buffer bound, or broken off mid-body).
+// They are fixed regardless of the upstream's HTTP status, for the reason the speech
+// pair documents. The code is API surface.
+const (
+	transcriptionUpstreamErrorType = "upstream_error"
+	transcriptionUpstreamErrorCode = "transcription.upstream_error"
+)
+
+// needsTranscriptionErrorRelay reports whether a native-passthrough response must go
+// through relayTranscriptionUpstreamError instead of the buffered success path: a
+// transcription whose upstream answered a non-2xx status. It is needsSpeechErrorRelay's
+// twin and is keyed on the endpoint, not the flavor string the two share; the status
+// test is the 2xx window proxyNative's own success path uses.
+func needsTranscriptionErrorRelay(endpoint sessionEndpoint, statusCode int) bool {
+	return endpoint == endpointTranscription && (statusCode < 200 || statusCode >= 300)
+}
+
+// normalizeTranscriptionUpstreamError turns a transcription upstream's non-2xx body
+// into the bytes the client is sent, and reports whether it recognised the shape. It
+// is normalizeSpeechUpstreamError's twin: an OpenAI error object
+// ({"error":{"message":...}}) passes through untouched, byte for byte -- audio.cpp
+// answers this way, with HTTP 500 and its own attested type "server_error" even for a
+// client error, and re-normalising would restate that as a gateway-authored value --
+// and a plain string ({"error":"..."}) is wrapped into an object whose message is that
+// string verbatim and whose type and code are the gateway's own
+// (transcriptionUpstreamErrorType, transcriptionUpstreamErrorCode). status is the
+// upstream's HTTP status; it is not consulted, because the classification is
+// deliberately independent of it.
+//
+// ok is false for anything else -- HTML from an intermediary, an empty body, JSON of
+// another shape -- and the caller then relays the upstream bytes unchanged instead of
+// guessing. The upstream's status is relayed as it came.
+func normalizeTranscriptionUpstreamError(body []byte, status int) ([]byte, bool) {
+	var already apierror.Body
+	if err := json.Unmarshal(body, &already); err == nil && already.Error.Message != "" {
+		return body, true
+	}
+	var plain struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &plain); err == nil && plain.Error != "" {
+		// Marshal cannot fail on this type (three strings), so there is no failure
+		// to report.
+		wrapped, _ := json.Marshal(apierror.Body{Error: apierror.ErrorBody{
+			Message: plain.Error,
+			Type:    transcriptionUpstreamErrorType,
+			Code:    transcriptionUpstreamErrorCode,
+		}})
+		return wrapped, true
+	}
+	return nil, false
+}
+
+// relayTranscriptionUpstreamError handles a non-2xx response from the transcription
+// upstream (audio.cpp): it buffers the (bounded) body, normalises it via
+// normalizeTranscriptionUpstreamError, and relays either the normalised body or -- when
+// the shape is not recognised -- the original bytes unchanged, under the upstream's own
+// status either way. It is relaySpeechUpstreamError's twin and is called from
+// proxyNative behind needsTranscriptionErrorRelay.
+//
+// The whole body is read before anything is written, as speech's is: normalising needs
+// all of it, and a transcription never streams, so an error is one small payload. The
+// read is bounded by s.captureMaxBytes, the cap an ERROR body has no reason to exceed
+// (the success path's bound is the transcription cap instead: a transcript is not an
+// error body, and is never clipped).
+//
+// A failed relay produced no transcript: the row is an audio_second row with quantity
+// 0, as recordTranscriptionRoutingFailure leaves it for a refused request.
+func (s *Server) relayTranscriptionUpstreamError(w http.ResponseWriter, r *http.Request, ex nativeExchange, resp *provider.ProxyResponse) {
+	upstreamBody, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(s.captureMaxBytes)))
+	errorCode := fmt.Sprintf("upstream.%d", resp.StatusCode)
+	if readErr != nil {
+		// A read failure this late (the status line arrived, the body broke) is the
+		// class nativeTerminalStatus names provider.stream_copy_error on the streaming
+		// path; named the same way here for one consistent code.
+		errorCode = "provider.stream_copy_error"
+		slog.Error("inference native passthrough copy error", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "err", readErr)
+	} else {
+		slog.Warn("inference native passthrough upstream error", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "status", resp.StatusCode)
+	}
+
+	written, sentContentType := upstreamBody, resp.Header.Get("Content-Type")
+	if body, ok := normalizeTranscriptionUpstreamError(upstreamBody, resp.StatusCode); ok {
+		written, sentContentType = body, jsonContentType
+	} else if sentContentType == "" {
+		// Neither recognised shape: the upstream's bytes go out unchanged, under its own
+		// Content-Type, or JSON when it named none (the relay's default).
+		sentContentType = jsonContentType
+	}
+	w.Header().Set("Content-Type", sentContentType)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(written)
+
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor), nil)
+}
+
+// relayTranscriptionResponse finishes a transcription whose upstream answered 2xx. It
+// is the one relay in proxyNative that BUFFERS a success instead of streaming it, and
+// that is forced, not chosen: the billable duration is the timing block of the JSON
+// body, written AFTER the transcript, so it cannot be known before the body has been
+// read to its end -- and the gateway must not have sent a byte by then, or a body that
+// turns out unreadable or too large could not be turned into an error.
+//
+// So the sequence is read, decide, write:
+//
+//  1. The body is read up to s.transcriptionBodyLimit() (the transcription cap, a
+//     generous bound: a transcript of a 32 MiB upload is a few MB of text), through
+//     io.LimitReader(limit+1) so that exceeding it is DETECTED instead of silently
+//     cut. It is not captureMaxBytes: that bound is for error bodies, and clipping a
+//     transcript there would hand the client a truncated success.
+//  2. A body past the bound, or one that cannot be read in full, is an upstream error:
+//     nothing of it is written (failTranscriptionRelay), nothing is billed.
+//  3. Otherwise the buffered bytes go to the client VERBATIM -- the upstream's status
+//     and Content-Type, the timing block kept (the gateway proxies, it does not
+//     translate) -- and the quantity is read off the same bytes once they were
+//     written (setTranscriptionBillingQuantity), so a client that went away mid-write
+//     bills 0.
+//
+// The memory exposure under concurrency is therefore bounded by this cap per in-flight
+// request, which is the price of metering a trailing field.
+//
+// ex carries this request's identity (see nativeExchange); the function both writes
+// the client's response and records its usage row, as relayTranscriptionUpstreamError
+// does. There is no idle watchdog and no usage scanner here: a transcription never
+// streams (validateTranscriptionRequest refuses it), so proxyNative arms neither, and
+// the row's token columns stay 0.
+func (s *Server) relayTranscriptionResponse(w http.ResponseWriter, r *http.Request, ex nativeExchange, resp *provider.ProxyResponse) {
+	limit := s.transcriptionBodyLimit()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	switch {
+	case readErr != nil:
+		// Same classification (client gone, copy error) the streaming path gives a body
+		// that breaks off; the nil idle flag is its watchdog, which a non-stream never arms.
+		_, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, ex.req, ex.serverName, false, readErr, ex.start)
+		s.failTranscriptionRelay(w, r, ex, errorCode, "the transcription upstream's response could not be read in full")
+		return
+	case int64(len(body)) > limit:
+		slog.Error("transcription upstream response exceeds the buffer bound; refused instead of truncated", "id", ex.id, "path", r.URL.Path, "model", ex.req.Model, "server", ex.serverName, "limit_bytes", limit)
+		s.failTranscriptionRelay(w, r, ex, transcriptionUpstreamErrorCode, "the transcription upstream's response is larger than the gateway buffers")
+		return
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = jsonContentType
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(resp.StatusCode)
+	written, writeErr := w.Write(body)
+
+	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, ex.req, ex.serverName, false, writeErr, ex.start)
+	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}
+	setTranscriptionBillingQuantity(&meta, ex, body, status)
+	capIn := buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), body, resp.StatusCode, ex.req.APIFlavor)
+	if capIn != nil {
+		capIn.RespBytes = int64(written)
+	}
+	// resp.Header is the UPSTREAM response's headers, threaded in for the best-effort
+	// vendor rate-limit scrape every native relay passes it for (a no-op here: a
+	// capability-carrying request never resolves to a vendor account).
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, status, meta, ex.id, capIn, resp.Header)
+}
+
+// failTranscriptionRelay answers a transcription whose 2xx upstream response could not
+// be delivered whole -- over the buffer bound, or broken off mid-body -- with the
+// gateway's own 502 transcription.upstream_error (an OpenAI error object of type
+// upstream_error), and records it as a failed relay: errorCode on the row, an
+// audio_second unit and quantity 0. Nothing of the upstream's body is written: a
+// transcript that cannot be delivered whole is not delivered in part.
+func (s *Server) failTranscriptionRelay(w http.ResponseWriter, r *http.Request, ex nativeExchange, errorCode, message string) {
+	payload := writeJSONCaptured(w, http.StatusBadGateway, apierror.Body{Error: apierror.ErrorBody{
+		Code:    transcriptionUpstreamErrorCode,
+		Message: message,
+		Type:    transcriptionUpstreamErrorType,
+	}})
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadGateway, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), payload, http.StatusBadGateway, ex.req.APIFlavor), nil)
 }

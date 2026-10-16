@@ -682,8 +682,27 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// one -- see normalizeSpeechUpstreamError. An audio.cpp error is always a single
 	// small buffered body, so reading it whole changes nothing the client can see
 	// beyond the normalisation.
-	if needsSpeechErrorRelay(rel.pfReq.APIFlavor, resp.StatusCode) {
+	if needsSpeechErrorRelay(rel.pfReq.APIFlavor, rel.endpoint, resp.StatusCode) {
 		s.relaySpeechUpstreamError(w, r, ex, resp)
+		return
+	}
+
+	// The TRANSCRIPTION upstream (audio.cpp) shares the openai_audio flavor with speech,
+	// so both of its response-side paths are keyed on the endpoint, never the flavor
+	// (needsSpeechErrorRelay above is carved the other way for the same reason). A non-2xx is
+	// normalised like speech's -- a transcription-specific code, see
+	// normalizeTranscriptionUpstreamError. A 2xx is the one response in this relay that
+	// cannot stream: the billable duration is the TRAILING timing block of a JSON body,
+	// so the whole body is read, bounded, before a byte is written, and then written
+	// verbatim -- see relayTranscriptionResponse. Both return, so no transcription ever
+	// reaches the speech-shaped streaming copier below (and its speech-only
+	// Content-Length forwarding and metering-header capture).
+	if needsTranscriptionErrorRelay(rel.endpoint, resp.StatusCode) {
+		s.relayTranscriptionUpstreamError(w, r, ex, resp)
+		return
+	}
+	if rel.endpoint == endpointTranscription {
+		s.relayTranscriptionResponse(w, r, ex, resp)
 		return
 	}
 
@@ -756,7 +775,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// the bytes. An upstream that declared none (a genuinely streamed body) is
 	// left chunked.
 	//
-	// Speech only: every other flavor keeps relaying chunked, exactly as before.
+	// Speech only: every other flavor keeps relaying chunked, exactly as before. (A
+	// transcription shares the openai_audio flavor this test reads, but never gets
+	// here: its 2xx is buffered and written by relayTranscriptionResponse above.)
 	// provider.ProxyResponse carries no ContentLength field, so the declared
 	// length is read off the header; Go's client drops that header both for a
 	// chunked response and for one it decompressed itself, so a value that

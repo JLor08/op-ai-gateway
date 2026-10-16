@@ -6,12 +6,14 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/inference"
@@ -1076,9 +1078,9 @@ func TestTranscriptionRelayDropsAnEmptyFilePart(t *testing.T) {
 }
 
 // An upstream's own refusal is relayed under its own status (the error
-// normalisation of an unrecognised shape is a separate step), and the usage row
-// still records the transcriptions path -- the non-2xx branch records through a
-// different site than the success one.
+// normalisation itself is pinned by the Normalize* and ...OverHTTP tests below),
+// and the usage row still records the transcriptions path -- the non-2xx branch
+// records through a different site than the success one.
 func TestTranscriptionUpstreamErrorRecordsTheTranscriptionsPath(t *testing.T) {
 	up, calls := newTranscriptionUpstream(t, http.StatusInternalServerError, `{"error":{"message":"boom","type":"server_error"}}`)
 	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
@@ -2044,4 +2046,369 @@ func TestTranscriptionSentinelsMapToTheirStatusCodeAndMessage(t *testing.T) {
 	if got := completionErrorResponse(errImageEditUnavailable).Error.Message; strings.Contains(got, "transcription") {
 		t.Fatalf("the image edit's unavailable message = %q reads as the transcription's", got)
 	}
+}
+
+// --- The response side: error normalisation and the buffered success --------
+
+// The gate that diverts a transcription's non-2xx answer from the streaming copier
+// to the error relay. It is keyed on the ENDPOINT, never the flavor string (which
+// speech shares), and is exactly the 2xx window proxyNative's own success path uses.
+func TestNeedsTranscriptionErrorRelay(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint sessionEndpoint
+		status   int
+		want     bool
+	}{
+		{"transcription 200", endpointTranscription, 200, false},
+		{"transcription 204", endpointTranscription, 204, false},
+		{"transcription 299", endpointTranscription, 299, false},
+		{"transcription 199 is outside the 2xx window", endpointTranscription, 199, true},
+		{"transcription 300 is outside the 2xx window", endpointTranscription, 300, true},
+		{"transcription 400", endpointTranscription, 400, true},
+		{"transcription 500, audio.cpp's answer to a client error", endpointTranscription, 500, true},
+		{"transcription 502", endpointTranscription, 502, true},
+		{"speech 500 has its own relay", endpointSpeech, 500, false},
+		{"images 500 has its own relay", endpointImages, 500, false},
+		{"chat 500", endpointChat, 500, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := needsTranscriptionErrorRelay(tc.endpoint, tc.status); got != tc.want {
+				t.Fatalf("needsTranscriptionErrorRelay(%v, %d) = %v, want %v", tc.endpoint, tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+// The gateway's own classification of a normalised transcription error is API
+// surface (clients branch on the code), so it is pinned by value.
+func TestTranscriptionUpstreamErrorClassificationIsStable(t *testing.T) {
+	if transcriptionUpstreamErrorType != "upstream_error" {
+		t.Errorf("transcriptionUpstreamErrorType = %q, want upstream_error", transcriptionUpstreamErrorType)
+	}
+	if transcriptionUpstreamErrorCode != "transcription.upstream_error" {
+		t.Errorf("transcriptionUpstreamErrorCode = %q, want transcription.upstream_error", transcriptionUpstreamErrorCode)
+	}
+}
+
+// An OpenAI error object passes through byte for byte: audio.cpp attests its own
+// type ("server_error"), and re-normalising would restate it as the gateway's.
+func TestNormalizeTranscriptionUpstreamErrorPassesAnOpenAIObjectThrough(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"message":"unknown model id: x","type":"server_error"}}`,
+		"{ \"error\" : { \"message\" : \"no file\", \"type\" : \"server_error\", \"param\" : null, \"extra\" : [1,2] } }\n",
+		`{"error":{"message":"m","type":"invalid_request_error","code":"model_not_found"}}`,
+	} {
+		got, ok := normalizeTranscriptionUpstreamError([]byte(body), 500)
+		if !ok || string(got) != body {
+			t.Errorf("normalizeTranscriptionUpstreamError(%q) = (%q, %v), want the same bytes and true", body, got, ok)
+		}
+	}
+}
+
+// A plain {"error":"..."} string is wrapped: the message verbatim, the gateway's own
+// type and code (the upstream attested neither), whatever the upstream's status.
+func TestNormalizeTranscriptionUpstreamErrorWrapsAPlainString(t *testing.T) {
+	for _, status := range []int{400, 404, 500, 503} {
+		got, ok := normalizeTranscriptionUpstreamError([]byte(`{"error":"model not loaded"}`), status)
+		if !ok {
+			t.Fatalf("status %d: a plain string error was not recognised", status)
+		}
+		var body apierror.Body
+		if err := json.Unmarshal(got, &body); err != nil {
+			t.Fatalf("status %d: wrapped body is not JSON: %v (%s)", status, err, got)
+		}
+		want := apierror.ErrorBody{Message: "model not loaded", Type: "upstream_error", Code: "transcription.upstream_error"}
+		if body.Error != want {
+			t.Fatalf("status %d: error = %+v, want %+v", status, body.Error, want)
+		}
+	}
+}
+
+// Anything else is not recognised, and the caller relays the upstream's bytes
+// unchanged instead of guessing at a shape.
+func TestNormalizeTranscriptionUpstreamErrorLeavesAnUnrecognisedBodyAlone(t *testing.T) {
+	for _, body := range []string{
+		"", "<html>502 Bad Gateway</html>", "not json",
+		`{"error":""}`, `{"error":{}}`, `{"error":{"type":"server_error"}}`, `{"error":5}`, `{"error":null}`,
+		`{"detail":"x"}`, `["error"]`, `{"text":"hello"}`,
+	} {
+		if got, ok := normalizeTranscriptionUpstreamError([]byte(body), 500); ok || got != nil {
+			t.Errorf("normalizeTranscriptionUpstreamError(%q) = (%q, %v), want (nil, false)", body, got, ok)
+		}
+	}
+}
+
+// The reachability proof for the unit tests above: a REAL non-2xx response from an
+// audio.cpp-shaped upstream goes through the actual mux. The OpenAI object reaches the
+// client byte for byte (its type is not overwritten), under the upstream's own status,
+// and the row is an error row billed in audio_second with no quantity.
+func TestTranscriptionRelayPassesAnAudioCppErrorThroughOverHTTP(t *testing.T) {
+	const upstreamBody = `{"error": {"message":"no audio file in the request","type":"server_error"}}`
+	up := newSpeechErrorUpstream(t, http.StatusInternalServerError, "application/json", upstreamBody)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (the upstream's own status); body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("body = %q, want the upstream's object byte for byte (its type must not be overwritten)", rec.Body.String())
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.HTTPStatus != http.StatusInternalServerError || got.ErrorCode != "upstream.500" {
+		t.Fatalf("row = %q/%d/%q, want error/500/upstream.500", got.Status, got.HTTPStatus, got.ErrorCode)
+	}
+	if got.ReqPath != "/v1/audio/transcriptions" || got.ProviderPath != "/v1/audio/transcriptions" || got.BillingQuantity != 0 {
+		t.Fatalf("row path/provider path/quantity = %q/%q/%v, want the transcriptions path and 0", got.ReqPath, got.ProviderPath, got.BillingQuantity)
+	}
+	requireSpeechNonTokenRow(t, got)
+}
+
+// A plain-string upstream error reaches the client wrapped, as the gateway's own
+// transcription.upstream_error, under the upstream's status.
+func TestTranscriptionRelayWrapsAPlainStringErrorOverHTTP(t *testing.T) {
+	up := newSpeechErrorUpstream(t, http.StatusBadRequest, "application/json", `{"error":"model not loaded"}`)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (the upstream's own status); body = %s", rec.Code, rec.Body.String())
+	}
+	var body apierror.Body
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("client body is not an OpenAI error object: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error.Message != "model not loaded" || body.Error.Type != "upstream_error" || body.Error.Code != "transcription.upstream_error" {
+		t.Fatalf("error = %+v, want the upstream string with the gateway's type and code", body.Error)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.ErrorCode != "upstream.400" || got.HTTPStatus != http.StatusBadRequest || got.ContentType != "application/json" {
+		t.Fatalf("row = %q/%d/%q, want upstream.400/400/application/json", got.ErrorCode, got.HTTPStatus, got.ContentType)
+	}
+	requireSpeechNonTokenRow(t, got)
+}
+
+// A body the normaliser does not recognise is relayed exactly as the upstream sent
+// it -- bytes, status and Content-Type.
+func TestTranscriptionRelayRelaysAnUnrecognisedErrorBodyUnchanged(t *testing.T) {
+	const upstreamBody = "<html>502 Bad Gateway</html>"
+	up := newSpeechErrorUpstream(t, http.StatusBadGateway, "text/html; charset=utf-8", upstreamBody)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want the upstream's own", got)
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("body = %q, want the upstream's bytes", rec.Body.String())
+	}
+	if got := lastUsageEvent(t, srv); got.ErrorCode != "upstream.502" || got.ContentType != "text/html; charset=utf-8" {
+		t.Fatalf("row = %q/%q, want upstream.502 and the upstream's content type", got.ErrorCode, got.ContentType)
+	}
+}
+
+// transcriptionDocOfSize is an audio.cpp-shaped document of exactly size bytes: a
+// recognisable transcript (so a leaked fragment is detectable) padded to the size,
+// with the timing block trailing.
+func transcriptionDocOfSize(t *testing.T, size int) string {
+	t.Helper()
+	const prefix, suffix = `{"text":"SECRET-TRANSCRIPT-`, `","timing":{"audio_duration_ms":2000}}`
+	pad := size - len(prefix) - len(suffix)
+	if pad < 0 {
+		t.Fatalf("size %d is below the %d-byte frame", size, len(prefix)+len(suffix))
+	}
+	doc := prefix + strings.Repeat("a", pad) + suffix
+	if len(doc) != size {
+		t.Fatalf("built %d bytes, want %d", len(doc), size)
+	}
+	return doc
+}
+
+// The timing block TRAILS the transcript, so the whole answer is buffered to reach
+// it -- bounded by the transcription cap, and NEVER truncated. A document exactly at
+// the bound is served whole and billed; one byte over is an upstream error
+// (transcription.upstream_error under 502), billed 0, and not a single byte of the
+// over-long transcript reaches the client. The over-limit case is run twice: with a
+// declared Content-Length and chunked, so the bound is enforced by reading, not by a
+// header an upstream may omit.
+func TestTranscriptionResponseBufferIsBoundedAndNeverTruncates(t *testing.T) {
+	const limit = 4096
+	t.Run("a document exactly at the bound is served whole and billed", func(t *testing.T) {
+		doc := transcriptionDocOfSize(t, limit)
+		up, _ := newTranscriptionUpstream(t, http.StatusOK, doc)
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+		srv.maxAudioTranscriptionBodyBytes = limit
+
+		rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+		if rec.Code != http.StatusOK || rec.Body.String() != doc {
+			t.Fatalf("status = %d, body length %d, want 200 and the %d-byte document verbatim", rec.Code, rec.Body.Len(), limit)
+		}
+		got := lastUsageEvent(t, srv)
+		if got.Status != "success" || got.BillingQuantity != 2 {
+			t.Fatalf("row = %q/%v, want success and 2 seconds", got.Status, got.BillingQuantity)
+		}
+	})
+	for _, chunked := range []bool{false, true} {
+		name := "declared length"
+		if chunked {
+			name = "chunked"
+		}
+		t.Run("one byte over the bound is an upstream error, "+name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			doc := transcriptionDocOfSize(t, limit+1)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				if chunked {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(doc[:100]))
+					w.(http.Flusher).Flush()
+					_, _ = w.Write([]byte(doc[100:]))
+					return
+				}
+				_, _ = w.Write([]byte(doc))
+			}))
+			t.Cleanup(up.Close)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+			srv.maxAudioTranscriptionBodyBytes = limit
+
+			rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "transcription.upstream_error")
+			var body apierror.Body
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error.Type != "upstream_error" {
+				t.Fatalf("client body = %s (%v), want an OpenAI error object of type upstream_error", rec.Body.String(), err)
+			}
+			if strings.Contains(rec.Body.String(), "SECRET-TRANSCRIPT") || rec.Body.Len() > 1024 {
+				t.Fatalf("the client received %d bytes including part of the over-long transcript: %.200q", rec.Body.Len(), rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", got)
+			}
+			got := lastUsageEvent(t, srv)
+			if got.Status != "error" || got.ErrorCode != "transcription.upstream_error" || got.HTTPStatus != http.StatusBadGateway {
+				t.Fatalf("row = %q/%q/%d, want error/transcription.upstream_error/502", got.Status, got.ErrorCode, got.HTTPStatus)
+			}
+			if got.BillingQuantity != 0 || got.ProviderPath != "/v1/audio/transcriptions" {
+				t.Fatalf("row quantity/provider path = %v/%q, want 0 (an over-limit answer is not billed) and the transcriptions path", got.BillingQuantity, got.ProviderPath)
+			}
+			requireSpeechNonTokenRow(t, got)
+			errs := errorLogs(buf)
+			if len(errs) != 1 || !strings.Contains(errs[0].Msg, "exceeds") {
+				t.Fatalf("Error logs = %+v, want exactly one saying the response exceeds the buffer bound", errs)
+			}
+		})
+	}
+}
+
+// An upstream whose answer breaks off mid-body (the status line arrived, the body did
+// not complete) is an upstream error too: nothing partial is written, nothing is
+// billed, and the row carries the copy-error code the streaming path gives the same
+// failure.
+func TestTranscriptionResponseThatBreaksOffIsAnUpstreamErrorNotAPartialSuccess(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"text":"SECRET-TRANSCRIPT-partial`))
+		w.(http.Flusher).Flush() // the status line and the first bytes are out; the rest never comes
+		panic(http.ErrAbortHandler)
+	}))
+	t.Cleanup(up.Close)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "transcription.upstream_error")
+	if strings.Contains(rec.Body.String(), "SECRET-TRANSCRIPT") {
+		t.Fatalf("the client received part of a transcript that never completed: %q", rec.Body.String())
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.ErrorCode != "provider.stream_copy_error" || got.BillingQuantity != 0 {
+		t.Fatalf("row = %q/%q/%v, want error/provider.stream_copy_error/0", got.Status, got.ErrorCode, got.BillingQuantity)
+	}
+	requireSpeechNonTokenRow(t, got)
+}
+
+// Speech and transcription share the openai_audio flavor string, so every
+// response-side behavior that differs between them is keyed on the endpoint. One
+// server, one audio.cpp stand-in that answers by path: each endpoint must still get
+// ITS OWN metering (the speech duration header vs the transcription body's timing
+// block) and ITS OWN error normalisation (speech.upstream_error vs
+// transcription.upstream_error), with nothing logged at Error.
+func TestSpeechAndTranscriptionResponseHooksDoNotCollide(t *testing.T) {
+	newStub := func(t *testing.T, fail bool) *httptest.Server {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			switch {
+			case fail:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":"boom"}`))
+			case r.URL.Path == "/v1/audio/speech":
+				w.Header().Set("Content-Type", "audio/wav")
+				w.Header().Set(speechDurationHeader, "1500.0")
+				_, _ = w.Write(speechTestWAV())
+			default:
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(transcriptionDoc("3000")))
+			}
+		}))
+		t.Cleanup(up.Close)
+		return up
+	}
+	t.Run("each endpoint bills from its own source", func(t *testing.T) {
+		buf, restore := withCapturedSlog(t)
+		t.Cleanup(restore)
+		srv, _ := newTranscriptionCapableTestServer(t, newStub(t, false).URL)
+
+		if rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there."}`); rec.Code != http.StatusOK {
+			t.Fatalf("speech status = %d", rec.Code)
+		}
+		if got := lastUsageEvent(t, srv); got.ReqPath != "/v1/audio/speech" || got.BillingQuantity != 1.5 {
+			t.Fatalf("speech row = %q/%v, want /v1/audio/speech and 1.5 from the header", got.ReqPath, got.BillingQuantity)
+		}
+		if rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel)); rec.Code != http.StatusOK {
+			t.Fatalf("transcription status = %d", rec.Code)
+		}
+		if got := lastUsageEvent(t, srv); got.ReqPath != "/v1/audio/transcriptions" || got.BillingQuantity != 3 {
+			t.Fatalf("transcription row = %q/%v, want /v1/audio/transcriptions and 3 from the body", got.ReqPath, got.BillingQuantity)
+		}
+		if errs := errorLogs(buf); len(errs) != 0 {
+			t.Fatalf("Error logs = %+v, want none", errs)
+		}
+	})
+	t.Run("each endpoint normalises its own errors", func(t *testing.T) {
+		srv, _ := newTranscriptionCapableTestServer(t, newStub(t, true).URL)
+
+		speech := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there."}`)
+		requireErrorCode(t, speech.Body.String(), "speech.upstream_error")
+		transcription := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+		requireErrorCode(t, transcription.Body.String(), "transcription.upstream_error")
+		for name, rec := range map[string]*httptest.ResponseRecorder{"speech": speech, "transcription": transcription} {
+			if rec.Code != http.StatusInternalServerError {
+				t.Errorf("%s status = %d, want the upstream's 500", name, rec.Code)
+			}
+		}
+	})
 }

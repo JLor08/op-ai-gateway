@@ -792,30 +792,34 @@ func TestSpeechRelayLeavesAnUnsizedUpstreamChunked(t *testing.T) {
 // stay on the copier byte for byte.
 func TestNeedsSpeechErrorRelay(t *testing.T) {
 	cases := []struct {
-		name   string
-		flavor string
-		status int
-		want   bool
+		name     string
+		flavor   string
+		endpoint sessionEndpoint
+		status   int
+		want     bool
 	}{
-		{"speech 200", apiFlavorSpeech, 200, false},
-		{"speech 204", apiFlavorSpeech, 204, false},
-		{"speech 299", apiFlavorSpeech, 299, false},
-		{"speech 199 is outside the 2xx window", apiFlavorSpeech, 199, true},
-		{"speech 300 is outside the 2xx window", apiFlavorSpeech, 300, true},
-		{"speech 400", apiFlavorSpeech, 400, true},
-		{"speech 404", apiFlavorSpeech, 404, true},
-		{"speech 500, audio.cpp's answer to a client error too", apiFlavorSpeech, 500, true},
-		{"speech 502", apiFlavorSpeech, 502, true},
-		{"images 500 has its own relay", apiFlavorImages, 500, false},
-		{"openai chat 500", "openai", 500, false},
-		{"openai_responses 500", "openai_responses", 500, false},
-		{"anthropic_messages 500", "anthropic_messages", 500, false},
-		{"empty flavor 500", "", 500, false},
+		{"speech 200", apiFlavorSpeech, endpointSpeech, 200, false},
+		{"speech 204", apiFlavorSpeech, endpointSpeech, 204, false},
+		{"speech 299", apiFlavorSpeech, endpointSpeech, 299, false},
+		{"speech 199 is outside the 2xx window", apiFlavorSpeech, endpointSpeech, 199, true},
+		{"speech 300 is outside the 2xx window", apiFlavorSpeech, endpointSpeech, 300, true},
+		{"speech 400", apiFlavorSpeech, endpointSpeech, 400, true},
+		{"speech 404", apiFlavorSpeech, endpointSpeech, 404, true},
+		{"speech 500, audio.cpp's answer to a client error too", apiFlavorSpeech, endpointSpeech, 500, true},
+		{"speech 502", apiFlavorSpeech, endpointSpeech, 502, true},
+		{"the openai_audio flavor with the zero-value endpoint is still speech", apiFlavorSpeech, endpointChat, 500, true},
+		{"transcription shares the flavor but has its own relay", apiFlavorSpeech, endpointTranscription, 500, false},
+		{"transcription 400", apiFlavorSpeech, endpointTranscription, 400, false},
+		{"images 500 has its own relay", apiFlavorImages, endpointImages, 500, false},
+		{"openai chat 500", "openai", endpointChat, 500, false},
+		{"openai_responses 500", "openai_responses", endpointResponses, 500, false},
+		{"anthropic_messages 500", "anthropic_messages", endpointMessages, 500, false},
+		{"empty flavor 500", "", endpointChat, 500, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := needsSpeechErrorRelay(tc.flavor, tc.status); got != tc.want {
-				t.Fatalf("needsSpeechErrorRelay(%q, %d) = %v, want %v", tc.flavor, tc.status, got, tc.want)
+			if got := needsSpeechErrorRelay(tc.flavor, tc.endpoint, tc.status); got != tc.want {
+				t.Fatalf("needsSpeechErrorRelay(%q, %v, %d) = %v, want %v", tc.flavor, tc.endpoint, tc.status, got, tc.want)
 			}
 		})
 	}

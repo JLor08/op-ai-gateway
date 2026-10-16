@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"math"
@@ -401,6 +402,328 @@ func TestSpeechRowsThatNeverFinishedARelayStillCarryTheUnit(t *testing.T) {
 		got := lastUsageEvent(t, srv)
 		if got.Status != "error" {
 			t.Fatalf("Status = %q, want error", got.Status)
+		}
+		requireSpeechNonTokenRow(t, got)
+	})
+}
+
+// --- Transcription: the quantity comes from the RESPONSE BODY ---------------
+
+// transcriptionDoc is the document audio.cpp answers a transcription with, its
+// timing block trailing the text as the real server writes it.
+func transcriptionDoc(durationMs string) string {
+	return `{"text":"hello there","timing":{"wall_ms":1200,"audio_duration_ms":` + durationMs + `,"rtf":0.2}}`
+}
+
+// The timing block's audio_duration_ms (milliseconds) is the billable quantity of a
+// transcription. The body reaches the client byte for byte, timing block included
+// (the gateway proxies, it does not translate), and the row carries nothing but the
+// audio_second pair: zero in every token column, the transcriptions path on both
+// path columns, and not one record at Error -- in particular not the speech relay's
+// "no usable audio duration" line, which a transcription (no duration HEADER at all)
+// used to trip on every request.
+func TestTranscriptionUsageBillsAudioSecondsFromTheResponseBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want float64
+	}{
+		{"audio.cpp's own shape", transcriptionDoc("5961.94"), 5.96194},
+		{"a whole number of seconds", transcriptionDoc("2000"), 2},
+		{"a sub-second fraction", transcriptionDoc("250.5"), 0.2505},
+		{"a long recording", transcriptionDoc("93456.789"), 93.456789},
+		{"exponent notation", transcriptionDoc("1.5e3"), 1.5},
+		{"timing ahead of the text", `{"timing":{"audio_duration_ms":1500},"text":"hello there"}`, 1.5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			up, _ := newTranscriptionUpstream(t, http.StatusOK, tc.body)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %q", rec.Code, rec.Body.Bytes())
+			}
+			if rec.Body.String() != tc.body {
+				t.Fatalf("client body = %q, want the upstream's document byte for byte (timing block included)", rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want the upstream's application/json", got)
+			}
+			got := lastUsageEvent(t, srv)
+			if got.Status != "success" || got.ErrorCode != "" {
+				t.Fatalf("row = %q/%q, want success with no error code", got.Status, got.ErrorCode)
+			}
+			if math.Abs(got.BillingQuantity-tc.want) > 1e-9 {
+				t.Errorf("BillingQuantity = %v, want %v (audio_duration_ms is milliseconds)", got.BillingQuantity, tc.want)
+			}
+			if got.ProviderPath != "/v1/audio/transcriptions" || got.ReqPath != "/v1/audio/transcriptions" {
+				t.Errorf("ProviderPath/ReqPath = %q/%q, want /v1/audio/transcriptions for both", got.ProviderPath, got.ReqPath)
+			}
+			requireSpeechNonTokenRow(t, got)
+			if errs := errorLogs(buf); len(errs) != 0 {
+				t.Errorf("a well-formed transcription relay logged at Error: %+v", errs)
+			}
+		})
+	}
+}
+
+// A successful relay whose body states no usable duration cannot say how much audio
+// it transcribed. The pair has no "unknown", so the row records 0 and the gap is
+// logged ONCE at Error (ADR-041: made loud, not repaired) -- and the client still
+// gets its transcript. Absent, null, non-numeric (a numeric STRING included),
+// zero, negative, out-of-range and structurally broken bodies are all unusable.
+func TestTranscriptionUsageWithoutAUsableDurationRecordsZeroAndLogsOnce(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"there is no timing block", `{"text":"hello there"}`},
+		{"the timing block has no duration", `{"text":"hello there","timing":{"wall_ms":1200}}`},
+		{"the duration is null", `{"text":"hello there","timing":{"audio_duration_ms":null}}`},
+		{"the duration is zero", transcriptionDoc("0")},
+		{"the duration is a six-decimal zero", transcriptionDoc("0.000000")},
+		{"the duration is negative", transcriptionDoc("-5")},
+		{"the duration is a numeric string", `{"text":"hello there","timing":{"audio_duration_ms":"2000"}}`},
+		{"the duration is not a number", `{"text":"hello there","timing":{"audio_duration_ms":"abc"}}`},
+		{"the duration is a bare NaN, which is no JSON", transcriptionDoc("NaN")},
+		{"the duration is out of float range", transcriptionDoc("1e999")},
+		{"the timing block is no object", `{"text":"hello there","timing":"fast"}`},
+		{"the body is plain text", "hello there"},
+		{"the body is empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			up, _ := newTranscriptionUpstream(t, http.StatusOK, tc.body)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+			if rec.Code != http.StatusOK || rec.Body.String() != tc.body {
+				t.Fatalf("status/body = %d/%q, want 200 and the upstream's bytes (the transcript still reaches the client)", rec.Code, rec.Body.String())
+			}
+			got := lastUsageEvent(t, srv)
+			if got.Status != "success" {
+				t.Fatalf("Status = %q, want success", got.Status)
+			}
+			if got.BillingQuantity != 0 {
+				t.Errorf("BillingQuantity = %v, want 0 (no usable duration)", got.BillingQuantity)
+			}
+			requireSpeechNonTokenRow(t, got)
+			errs := errorLogs(buf)
+			if len(errs) != 1 || !strings.Contains(errs[0].Msg, "transcription relay succeeded but the upstream reported no usable audio duration") {
+				t.Fatalf("Error logs = %+v, want exactly one saying the transcription relay reported no usable audio duration", errs)
+			}
+			if errs[0].Attrs["path"] != "/v1/audio/transcriptions" {
+				t.Errorf("path attr = %v, want /v1/audio/transcriptions", errs[0].Attrs["path"])
+			}
+		})
+	}
+}
+
+// The quantity is only trusted once the whole body reached the client: a client
+// whose connection breaks mid-write bills 0 (as speech does), and the row is an
+// ordinary copy-error failure, not a success.
+func TestTranscriptionUsageOfABrokenWriteBillsZeroSeconds(t *testing.T) {
+	up, _ := newTranscriptionUpstream(t, http.StatusOK, transcriptionDoc("2000"))
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+	body, ct := buildEditMultipart(t, validTranscriptionParts(transcriptionGatewayModel))
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", ct)
+	req.Header.Set("Authorization", "Bearer dev-secret")
+
+	srv.ServeHTTP(brokenWriteRecorder{httptest.NewRecorder()}, req)
+
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.ErrorCode != "provider.stream_copy_error" {
+		t.Fatalf("row = %q/%q, want error/provider.stream_copy_error", got.Status, got.ErrorCode)
+	}
+	if got.BillingQuantity != 0 {
+		t.Errorf("BillingQuantity = %v, want 0: the transcript did not reach the client", got.BillingQuantity)
+	}
+	requireSpeechNonTokenRow(t, got)
+}
+
+// brokenWriteRecorder is a response writer whose body writes fail, the way a client
+// that went away mid-response does.
+type brokenWriteRecorder struct{ *httptest.ResponseRecorder }
+
+func (brokenWriteRecorder) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// transcriptionDurationSeconds is the parser every billed second goes through, so
+// its edge cases are pinned directly: a finite number of milliseconds greater than
+// zero is a duration, and everything else is not.
+func TestTranscriptionDurationSeconds(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		want   float64
+		wantOK bool
+	}{
+		{"audio.cpp's shape", transcriptionDoc("5961.94"), 5.96194, true},
+		{"an integer", transcriptionDoc("2000"), 2, true},
+		{"timing before text", `{"timing":{"audio_duration_ms":500},"text":"x"}`, 0.5, true},
+		{"unrelated fields of other types are ignored", `{"text":5,"language":["de"],"timing":{"audio_duration_ms":500}}`, 0.5, true},
+		{"no timing", `{"text":"x"}`, 0, false},
+		{"empty timing", `{"text":"x","timing":{}}`, 0, false},
+		{"null timing", `{"text":"x","timing":null}`, 0, false},
+		{"null duration", `{"timing":{"audio_duration_ms":null}}`, 0, false},
+		{"zero", transcriptionDoc("0"), 0, false},
+		{"negative", transcriptionDoc("-0.5"), 0, false},
+		{"a numeric string", `{"timing":{"audio_duration_ms":"2000"}}`, 0, false},
+		{"a boolean", `{"timing":{"audio_duration_ms":true}}`, 0, false},
+		{"a bare NaN", transcriptionDoc("NaN"), 0, false},
+		{"a bare Infinity", transcriptionDoc("Infinity"), 0, false},
+		{"out of float range", transcriptionDoc("1e999"), 0, false},
+		{"timing is a string", `{"timing":"fast"}`, 0, false},
+		{"the body is an array", `[{"timing":{"audio_duration_ms":500}}]`, 0, false},
+		{"the body is not JSON", "hello", 0, false},
+		{"the body is empty", "", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := transcriptionDurationSeconds([]byte(tc.body))
+			if ok != tc.wantOK || (ok && math.Abs(got-tc.want) > 1e-9) || (!ok && got != 0) {
+				t.Fatalf("transcriptionDurationSeconds(%q) = (%v, %v), want (%v, %v)", tc.body, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+// setTranscriptionBillingQuantity records the quantity on a clean success of a
+// transcription and nothing else: not a speech exchange, not a relay that did not
+// finish, not a success without a usable duration (that one logs).
+func TestSetTranscriptionBillingQuantity(t *testing.T) {
+	exchange := func(endpoint sessionEndpoint) nativeExchange {
+		return nativeExchange{req: inference.Request{APIFlavor: apiFlavorSpeech, Model: "asr-model"}, endpoint: endpoint, id: "req-1", serverName: "srv"}
+	}
+	body := []byte(transcriptionDoc("3000"))
+	t.Run("a clean transcription success sets the quantity", func(t *testing.T) {
+		buf, restore := withCapturedSlog(t)
+		t.Cleanup(restore)
+		meta := usageMeta{ReqPath: "/v1/audio/transcriptions"}
+		setTranscriptionBillingQuantity(&meta, exchange(endpointTranscription), body, "success")
+		if meta.BillingQuantity != 3 {
+			t.Fatalf("BillingQuantity = %v, want 3", meta.BillingQuantity)
+		}
+		if errs := errorLogs(buf); len(errs) != 0 {
+			t.Fatalf("Error logs = %+v, want none", errs)
+		}
+	})
+	for _, tc := range []struct {
+		name     string
+		endpoint sessionEndpoint
+		status   string
+	}{
+		{"a speech exchange is not a transcription", endpointSpeech, "success"},
+		{"a failed relay bills nothing", endpointTranscription, "error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			meta := usageMeta{ReqPath: "/v1/audio/transcriptions"}
+			setTranscriptionBillingQuantity(&meta, exchange(tc.endpoint), body, tc.status)
+			if meta.BillingQuantity != 0 {
+				t.Fatalf("BillingQuantity = %v, want 0", meta.BillingQuantity)
+			}
+			if errs := errorLogs(buf); len(errs) != 0 {
+				t.Fatalf("Error logs = %+v, want none", errs)
+			}
+		})
+	}
+}
+
+// The speech header setter keys on the ENDPOINT as well as the flavor: a
+// transcription shares the openai_audio flavor and carries no duration header, so a
+// flavor-only guard would log an Error for every successful transcription and leave
+// the quantity at 0. A speech exchange (the endpoint is the placeholder zero value
+// in older call sites too) still bills from its header.
+func TestSetSpeechBillingQuantityIgnoresATranscriptionExchange(t *testing.T) {
+	header := http.Header{}
+	header.Set(speechDurationHeader, "2000.0")
+	exchange := func(endpoint sessionEndpoint) nativeExchange {
+		return nativeExchange{req: inference.Request{APIFlavor: apiFlavorSpeech, Model: "m"}, endpoint: endpoint}
+	}
+	t.Run("a transcription exchange is left alone and silent", func(t *testing.T) {
+		buf, restore := withCapturedSlog(t)
+		t.Cleanup(restore)
+		meta := usageMeta{ReqPath: "/v1/audio/transcriptions"}
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscription), http.Header{}, "success")
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscription), header, "success")
+		if meta.BillingQuantity != 0 {
+			t.Fatalf("BillingQuantity = %v, want 0", meta.BillingQuantity)
+		}
+		if errs := errorLogs(buf); len(errs) != 0 {
+			t.Fatalf("Error logs = %+v, want none: no duration HEADER is expected on a transcription", errs)
+		}
+	})
+	for _, endpoint := range []sessionEndpoint{endpointSpeech, endpointChat} {
+		meta := usageMeta{ReqPath: "/v1/audio/speech"}
+		setSpeechBillingQuantity(&meta, exchange(endpoint), header, "success")
+		if meta.BillingQuantity != 2 {
+			t.Fatalf("endpoint %v: BillingQuantity = %v, want 2 from the header", endpoint, meta.BillingQuantity)
+		}
+	}
+}
+
+// Every transcription row that never reached a finished relay still names its unit
+// and an audio_second pair with quantity 0 -- "audio_second, 0" is the truthful
+// statement where the default "" would claim a token-metered request. The first
+// two go through recordTranscriptionRoutingFailure; the last two are proxyNative's
+// shared recordUsage sites, which read the unit through billingUnitFor.
+func TestTranscriptionRowsThatNeverFinishedARelayStillCarryTheUnit(t *testing.T) {
+	t.Run("a model without a transcription verdict", func(t *testing.T) {
+		up, _ := newTranscriptionUpstream(t, http.StatusOK, transcriptionOKBody)
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+		postTranscriptionParts(t, srv, validTranscriptionParts("asr-denied"))
+
+		got := lastUsageEvent(t, srv)
+		if got.ErrorCode != "routing.model_not_capable" {
+			t.Fatalf("ErrorCode = %q, want routing.model_not_capable", got.ErrorCode)
+		}
+		requireSpeechNonTokenRow(t, got)
+	})
+	t.Run("an agent that has not declared multipart_proxy", func(t *testing.T) {
+		srv := newServerAgentTranscriptionTestServer(t, &recordingProxyProvider{respBody: transcriptionOKBody}, "agent-asr", "agent-asr", []string{routing.APIFlavorOpenAIAudio})
+
+		postTranscriptionParts(t, srv, validTranscriptionParts("agent-asr"))
+
+		got := lastUsageEvent(t, srv)
+		if got.ErrorCode != "transcription.unavailable" {
+			t.Fatalf("ErrorCode = %q, want transcription.unavailable", got.ErrorCode)
+		}
+		requireSpeechNonTokenRow(t, got)
+	})
+	t.Run("a provider that cannot proxy", func(t *testing.T) {
+		srv := newServerAgentTranscriptionTestServer(t, nonProxyCapableProvider{}, "agent-asr", "agent-asr", []string{routing.APIFlavorOpenAIAudio})
+		declareTranscriptionMultipartProxy(srv)
+
+		postTranscriptionParts(t, srv, validTranscriptionParts("agent-asr"))
+
+		got := lastUsageEvent(t, srv)
+		if got.ErrorCode != "provider.unavailable" {
+			t.Fatalf("ErrorCode = %q, want provider.unavailable", got.ErrorCode)
+		}
+		requireSpeechNonTokenRow(t, got)
+	})
+	t.Run("an upstream call that fails before any response", func(t *testing.T) {
+		srv := newServerAgentTranscriptionTestServer(t, erroringProxyProvider{err: errors.New("dial tcp: connection refused")}, "agent-asr", "agent-asr", []string{routing.APIFlavorOpenAIAudio})
+		declareTranscriptionMultipartProxy(srv)
+
+		postTranscriptionParts(t, srv, validTranscriptionParts("agent-asr"))
+
+		got := lastUsageEvent(t, srv)
+		if got.Status != "error" {
+			t.Fatalf("Status = %q, want error", got.Status)
+		}
+		if got.ReqPath != "/v1/audio/transcriptions" {
+			t.Errorf("ReqPath = %q, want /v1/audio/transcriptions", got.ReqPath)
 		}
 		requireSpeechNonTokenRow(t, got)
 	})
