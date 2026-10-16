@@ -214,3 +214,34 @@ func TestScoreModelServersRanksAnImagesOnlyModel(t *testing.T) {
 		t.Fatalf("scores = %+v, want exactly one score for map_mixed (deduplicated across flavors)", mixed)
 	}
 }
+
+// An audio-only model -- served by an application declaring openai_audio
+// alone, the audio.cpp speech shape -- gets a live rank like any other. Without
+// the audio flavor in the loop, ActiveMappingsForModel yields no candidate for
+// it, exactly the failure the images-only test above pins for openai_images.
+func TestScoreModelServersRanksAnAudioOnlyModel(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	if err := store.CreateAIServer(ctx, AIServer{ID: "srv_tts", Name: "tts", Domain: "tts.test", Status: ServerStatusActive, HealthStatus: HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateAIServer: %v", err)
+	}
+	if err := store.CreateApplication(ctx, Application{ID: "app_tts", ServerID: "srv_tts", Type: ProviderMock, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAIAudio}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if err := store.CreateMapping(ctx, ModelMapping{ID: "map_tts", ApplicationID: "app_tts", GatewayModelName: "tts-model", AppModelName: "tts", Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+	if err := store.UpsertTelemetry(ctx, ServerTelemetry{ServerID: "srv_tts", ReportedAt: now, LatencyMS: 100, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	resolver := NewResolver(store, func() time.Time { return now }, nil)
+
+	scores, err := resolver.ScoreModelServers(ctx, "tts-model", now)
+	if err != nil {
+		t.Fatalf("ScoreModelServers: %v", err)
+	}
+	if len(scores) != 1 || scores[0].MappingID != "map_tts" || !scores[0].Available {
+		t.Fatalf("scores = %+v, want one available score for map_tts", scores)
+	}
+}

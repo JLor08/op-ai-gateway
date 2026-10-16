@@ -19,6 +19,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -66,7 +67,8 @@ func endpointDisabledError(apiFlavor string) (string, int) {
 // is not the same as "falls through and is treated as translate" -- there is
 // no translate path for images at all, see images_handler.go -- so images
 // never reaches this function; its own upstream path is decided directly in
-// upstreamPath, before the mode lookup this function answers.
+// upstreamPath, before the mode lookup this function answers. Speech
+// (apiFlavorSpeech) is absent for the identical reason.
 func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
 	case inference.APIFlavorOpenAIResponses:
@@ -108,7 +110,7 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 // Its two callers are tryProxyNative (the coding-agent endpoints) and
 // resolveImagesTarget (the generations and the edits relays). The text
 // translate dispatch does not call it: it applies only the narrower
-// targetIsImagesOnly below.
+// targetIsImagesOnly and targetIsAudioOnly below.
 func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 	coarse := routing.NormalizeAPIFlavor(apiFlavor)
 	for _, f := range target.APIFlavors {
@@ -122,28 +124,39 @@ func targetServesFlavor(target routing.Target, apiFlavor string) bool {
 // targetIsImagesOnly reports whether target's effective APIFlavors (as for
 // targetServesFlavor) are images-only -- see routing.FlavorsAreImagesOnly.
 //
-// It is the one spec-flavor check the text translate dispatch makes (see
-// resolveTranslateTarget), and it is deliberately NARROWER than the general
-// effective-served rule targetServesFlavor answers (§6 / ADR-033): an
-// agent-managed child whose spec keeps a text flavor -- one narrowed to
-// [anthropic] included -- or is stored as [] serves /v1/chat/completions, and
-// only a child that can do nothing but generate images is refused (an empty
-// list is never images-only). The model listings apply the same test: the
+// With its speech twin targetIsAudioOnly it is the one spec-flavor check the
+// text translate dispatch makes (see resolveTranslateTarget), and the pair is
+// deliberately NARROWER than the general effective-served rule
+// targetServesFlavor answers (§6 / ADR-033): an agent-managed child whose spec
+// keeps a text flavor -- one narrowed to [anthropic] included -- or is stored
+// as [] serves /v1/chat/completions, and only a child that can do nothing but
+// generate images, or nothing but speech, is refused (an empty list is never
+// images-only or audio-only). The model listings apply the same pair: the
 // openai row of routing.MappingServesAPIFlavor is candidacy's chat-completions
-// predicate plus FlavorsAreImagesOnly on the mapping's routing.EffectiveFields,
-// whose flavors this target carries, so a mapping is listed for chat exactly
-// when candidacy admits it for chat completions and this dispatch then accepts
-// it. Holding this path to the general rule would refuse chat completions to
-// children those listings offer for chat.
+// predicate plus FlavorsAreImagesOnly and FlavorsAreAudioOnly on the mapping's
+// routing.EffectiveFields, whose flavors this target carries, so a mapping is
+// listed for chat exactly when candidacy admits it for chat completions and
+// this dispatch then accepts it. Holding this path to the general rule would
+// refuse chat completions to children those listings offer for chat.
 //
 // For an ordinary application this never fires: its flavors are its
 // candidacy, so an application listing only openai_images is never a
 // candidate for a text request in the first place (applicationServesEndpoint).
 // Nor for a server_agent mapping without a spec, which resolves to the
 // application's flavors candidacy just admitted. Only a runtime spec can
-// narrow a text candidate down to images.
+// narrow a text candidate down to images (or speech).
 func targetIsImagesOnly(target routing.Target) bool {
 	return routing.FlavorsAreImagesOnly(target.APIFlavors)
+}
+
+// targetIsAudioOnly is targetIsImagesOnly's speech twin: whether target's
+// effective APIFlavors (as for targetServesFlavor) are audio-only -- see
+// routing.FlavorsAreAudioOnly. The text translate dispatch refuses such a
+// target exactly as it refuses an images-only one (resolveTranslateTarget), and
+// the model listings agree (routing.MappingServesAPIFlavor's openai row), for
+// the reasons targetIsImagesOnly gives.
+func targetIsAudioOnly(target routing.Target) bool {
+	return routing.FlavorsAreAudioOnly(target.APIFlavors)
 }
 
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
@@ -188,6 +201,11 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 			return "/v1/images/edits"
 		}
 		return "/v1/images/generations"
+	}
+	// speech is answered here for the same reason: no EndpointMode to look up,
+	// no translate fallback, and none of the provider fallbacks below applies.
+	if apiFlavor == apiFlavorSpeech {
+		return "/v1/audio/speech"
 	}
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p
@@ -320,8 +338,8 @@ func (s *Server) tryProxyNative(w http.ResponseWriter, r *http.Request, token *a
 	// translate dispatch. What does reach that dispatch unjudged (a body whose
 	// model the routing probe could not read, a request whose resolve failed
 	// above, and every translate-path re-resolve) is checked there only by
-	// targetIsImagesOnly (resolveTranslateTarget), with neither this flavor
-	// check nor the mode read. A no-op for an ordinary app, whose flavor-less
+	// targetIsImagesOnly and targetIsAudioOnly (resolveTranslateTarget), with
+	// neither this flavor check nor the mode read. A no-op for an ordinary app, whose flavor-less
 	// state already excluded it at candidacy.
 	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
 		mode = routing.EndpointModeDisabled
@@ -603,7 +621,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		progress = &requestProgress{}
 	}
 
-	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
+	s.Active.Add(ActiveRequest{ID: id, UserID: rel.token.UserID, TokenID: rel.token.ID, TokenName: rel.token.Name, ServiceID: rel.token.ServiceID, ServiceName: rel.token.ServiceName, ServerName: serverName, ServerID: rel.target.ServerID, Model: rel.pfReq.Model, RequestedModel: rel.pfReq.RequestedModel, APIFlavor: rel.pfReq.APIFlavor, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), ReqPath: r.URL.Path, ProviderPath: rel.path, ProviderModel: effectiveProviderModel(rel.target, rel.pfReq.Model), SessionID: si.ClientSession, SessionSource: si.Source, AgentID: si.AgentID, Stream: rel.pfReq.Stream, StartedAt: start, Progress: progress})
 	defer s.Active.Remove(id)
 
 	slog.Debug("inference request (native passthrough)", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "stream", rel.pfReq.Stream, "server", serverName, "upstream_path", rel.path, "token_id", rel.token.ID, "user_id", rel.token.UserID, "timings_per_token_injected", injectedLiveTimings, "reasoning_effort_injected", injectedReasoningEffort)
@@ -643,6 +661,18 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// code path reads it.
 	if needsImagesErrorRelay(rel.pfReq.APIFlavor, resp.StatusCode) {
 		s.relayImagesUpstreamError(w, r, ex, resp)
+		return
+	}
+
+	// The same for a non-2xx from the SPEECH upstream (audio.cpp), gated just as
+	// narrowly: a 2xx audio/wav still streams through the copier below. audio.cpp
+	// already answers with an OpenAI-shaped object, which the relay passes through
+	// untouched; the gateway's own type/code are added only to a shape that is not
+	// one -- see normalizeSpeechUpstreamError. An audio.cpp error is always a single
+	// small buffered body, so reading it whole changes nothing the client can see
+	// beyond the normalisation.
+	if needsSpeechErrorRelay(rel.pfReq.APIFlavor, resp.StatusCode) {
+		s.relaySpeechUpstreamError(w, r, ex, resp)
 		return
 	}
 
@@ -707,6 +737,24 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 	}
+	// A speech response is one binary audio file the client wants sized (a player
+	// can show the duration and a download its progress), so the upstream's own
+	// Content-Length is forwarded when it has one. The copier below relays the
+	// body byte for byte, so the declared length is the length written; net/http
+	// then frames the response by it, while the per-chunk Flush keeps streaming
+	// the bytes. An upstream that declared none (a genuinely streamed body) is
+	// left chunked.
+	//
+	// Speech only: every other flavor keeps relaying chunked, exactly as before.
+	// provider.ProxyResponse carries no ContentLength field, so the declared
+	// length is read off the header; Go's client drops that header both for a
+	// chunked response and for one it decompressed itself, so a value that
+	// survives is the length of the bytes the copier will write.
+	if rel.pfReq.APIFlavor == apiFlavorSpeech {
+		if n, ok := declaredContentLength(resp.Header); ok {
+			w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
@@ -724,10 +772,10 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// (TTFT, and whatever count/rate the upstream itself reports) into `progress`
 	// when there is one — display only: nothing on this path writes a routing
 	// input, which stays where it was, on the end-of-request recordUsage below.
-	// An images response gets NO usage scanner at all (newUsageScanner answers
-	// nil): there is nothing in it that scan could extract, and the buffered
-	// branch of feed would retain megabytes of base64 to find that out — see
-	// newUsageScanner's own doc comment.
+	// An images or speech response gets NO usage scanner at all (newUsageScanner
+	// answers nil): there is nothing in either that scan could extract, and the
+	// buffered branch of feed would retain megabytes of base64 or audio to find
+	// that out — see newUsageScanner's own doc comment.
 	// imgCounter counts KEY occurrences of the `"b64_json"` marker as bytes
 	// stream through the copier — which is what it takes to be a count of
 	// data[]'s produced images, not the same thing as parsing data[] — for
@@ -750,10 +798,43 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// the count comes off the RESPONSE and why a counted zero is logged rather
 	// than quietly recorded.
 	setImagesBillingQuantity(&meta, ex, imgCounter, status)
+	// The speech measure, likewise for a speech request that finished cleanly and
+	// for nothing else. Its quantity is the upstream's own duration header, so
+	// resp.Header is passed alongside the exchange -- see
+	// setSpeechBillingQuantity (speech_handler.go).
+	setSpeechBillingQuantity(&meta, ex, resp.Header, status)
+	// The capture is told how many bytes were actually relayed, and (speech only)
+	// which metering headers the upstream sent: an audio body is not stored (see
+	// captureResponseBody), so these are all of it a capture keeps, and neither can
+	// be read off what it does hold -- respBuf is clipped at the capture cap, and
+	// the client's own response headers carry none of the upstream's metering.
+	capIn := buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor)
+	if capIn != nil {
+		capIn.RespBytes = copier.written
+		if rel.pfReq.APIFlavor == apiFlavorSpeech {
+			capIn.RespMetering = speechMeteringHeaders(resp.Header)
+		}
+	}
 	// resp.Header is the UPSTREAM provider response headers (the native-passthrough
 	// path holds them directly), threaded in for the best-effort vendor rate-limit
 	// scrape -- a no-op for a non-vendor target.
-	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor), resp.Header)
+	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, capIn, resp.Header)
+}
+
+// declaredContentLength reports the body length an upstream response declared in
+// its Content-Length header, and whether it declared a usable one: absent,
+// non-numeric and negative values all answer false, so the caller leaves the
+// relay chunked rather than forwarding something net/http would then reject.
+func declaredContentLength(h http.Header) (int64, bool) {
+	v := strings.TrimSpace(h.Get("Content-Length"))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // nativeRelay is everything, beyond the HTTP pair, that describes ONE native
@@ -817,9 +898,9 @@ type nativeRelay struct {
 // needs.
 //
 // It exists so a helper that finishes a request on its own —
-// relayImagesUpstreamError, which writes the client's response AND records its
-// usage row — can take that identity as one value instead of eight positional
-// parameters.
+// relayImagesUpstreamError and its speech twin relaySpeechUpstreamError, which
+// write the client's response AND record its usage row — can take that identity
+// as one value instead of eight positional parameters.
 type nativeExchange struct {
 	token      auth.Token
 	req        inference.Request
@@ -851,6 +932,10 @@ type nativeCopier struct {
 	capBytes   int
 	scanner    *usageScanner
 	imgCounter *imagesDataCounter
+	// written counts every body byte the client's writer took, past the capture
+	// cap too (respBuf stops growing there), so a capture that does not store the
+	// body can still say how large it was.
+	written int64
 }
 
 // run streams the upstream body to the client chunk by chunk and returns the
@@ -891,7 +976,9 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 		c.watchdog.Reset(c.idle)
 		_ = c.rc.SetWriteDeadline(time.Now().Add(c.idle))
 	}
-	if _, err := c.w.Write(chunk); err != nil {
+	n, err := c.w.Write(chunk)
+	c.written += int64(n)
+	if err != nil {
 		return err
 	}
 	if c.flusher != nil {

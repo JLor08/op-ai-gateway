@@ -31,6 +31,69 @@ func TestFlavorsAreImagesOnly(t *testing.T) {
 	}
 }
 
+// TestFlavorsAreAudioOnly pins the speech twin of the predicate: audio-only
+// means openai_audio listed and neither text flavor; an empty list is not.
+func TestFlavorsAreAudioOnly(t *testing.T) {
+	cases := []struct {
+		flavors []string
+		want    bool
+	}{
+		{nil, false},
+		{[]string{}, false},
+		{[]string{APIFlavorOpenAIAudio}, true},
+		{[]string{APIFlavorOpenAIAudio, "custom"}, true},
+		{[]string{APIFlavorOpenAI}, false},
+		{[]string{APIFlavorAnthropic}, false},
+		{[]string{APIFlavorOpenAIImages}, false},
+		{[]string{APIFlavorOpenAI, APIFlavorOpenAIAudio}, false},
+		{[]string{APIFlavorOpenAIAudio, APIFlavorAnthropic}, false},
+	}
+	for _, tc := range cases {
+		if got := FlavorsAreAudioOnly(tc.flavors); got != tc.want {
+			t.Errorf("FlavorsAreAudioOnly(%q) = %v, want %v", tc.flavors, got, tc.want)
+		}
+	}
+}
+
+// TestEffectiveHasAPIFlavor pins the effective half of both mapping rules on
+// its own. For openai the answer is "not images-only and not audio-only", so a
+// server that can only generate images or speech does not serve chat, while an
+// empty list, a text flavor, or a text flavor beside a non-text one does. For
+// every other flavor it is plain membership.
+func TestEffectiveHasAPIFlavor(t *testing.T) {
+	cases := []struct {
+		name    string
+		flavors []string
+		flavor  string
+		want    bool
+	}{
+		{"audio-only does not serve openai", []string{APIFlavorOpenAIAudio}, APIFlavorOpenAI, false},
+		{"audio-only serves openai_audio", []string{APIFlavorOpenAIAudio}, APIFlavorOpenAIAudio, true},
+		{"audio-only does not serve anthropic", []string{APIFlavorOpenAIAudio}, APIFlavorAnthropic, false},
+		{"audio-only plus a custom flavor does not serve openai", []string{APIFlavorOpenAIAudio, "custom"}, APIFlavorOpenAI, false},
+		{"openai serves openai", []string{APIFlavorOpenAI}, APIFlavorOpenAI, true},
+		{"openai does not serve openai_audio", []string{APIFlavorOpenAI}, APIFlavorOpenAIAudio, false},
+		{"openai and openai_audio serve openai", []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}, APIFlavorOpenAI, true},
+		{"openai and openai_audio serve openai_audio", []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}, APIFlavorOpenAIAudio, true},
+		{"anthropic and openai_audio serve openai", []string{APIFlavorAnthropic, APIFlavorOpenAIAudio}, APIFlavorOpenAI, true},
+		{"images and audio together do not serve openai", []string{APIFlavorOpenAIImages, APIFlavorOpenAIAudio}, APIFlavorOpenAI, false},
+		{"images-only does not serve openai", []string{APIFlavorOpenAIImages}, APIFlavorOpenAI, false},
+		{"images-only serves openai_images", []string{APIFlavorOpenAIImages}, APIFlavorOpenAIImages, true},
+		{"images-only does not serve openai_audio", []string{APIFlavorOpenAIImages}, APIFlavorOpenAIAudio, false},
+		{"an empty list keeps openai", []string{}, APIFlavorOpenAI, true},
+		{"a nil list keeps openai", nil, APIFlavorOpenAI, true},
+		{"an empty list does not serve openai_audio", []string{}, APIFlavorOpenAIAudio, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eff := EffectiveSpecFields{APIFlavors: tc.flavors}
+			if got := effectiveHasAPIFlavor(eff, tc.flavor); got != tc.want {
+				t.Fatalf("effectiveHasAPIFlavor(%q, %q) = %v, want %v", tc.flavors, tc.flavor, got, tc.want)
+			}
+		})
+	}
+}
+
 // effectiveFieldsApp and effectiveFieldsSpec differ in all four fields, so a
 // result that takes any one field from the wrong row fails its case.
 func effectiveFieldsApp(appType string) Application {
@@ -129,8 +192,9 @@ func TestEffectiveFields(t *testing.T) {
 	}
 }
 
-// knownFlavorsForRules is the coarse flavor set both mapping rules answer for.
-var knownFlavorsForRules = []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages}
+// knownFlavorsForRules is the coarse flavor set both mapping rules answer for:
+// the two text flavors, openai_images and openai_audio.
+var knownFlavorsForRules = []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages, APIFlavorOpenAIAudio}
 
 // flavorsWhere lists, in knownFlavorsForRules order, the coarse flavors rule
 // accepts for the mapping.
@@ -274,6 +338,40 @@ var flavorRuleCases = []flavorRuleCase{
 		wantHas: []string{APIFlavorOpenAIImages}, wantServed: []string{APIFlavorOpenAIImages},
 	},
 	{
+		name:    "spec-less agent mapping on an audio-only application",
+		appType: ProviderServerAgent, appFlavors: []string{APIFlavorOpenAIAudio}, appMessages: EndpointModeTranslate,
+		wantHas: []string{APIFlavorOpenAIAudio}, wantServed: []string{APIFlavorOpenAIAudio},
+	},
+	{
+		name:    "ordinary audio-only application",
+		appType: ProviderLlamaCPP, appFlavors: []string{APIFlavorOpenAIAudio}, appMessages: EndpointModeTranslate,
+		wantHas: []string{APIFlavorOpenAIAudio}, wantServed: []string{APIFlavorOpenAIAudio},
+	},
+	{
+		name:    "audio-only spec on an application without openai_audio",
+		appType: ProviderServerAgent, appFlavors: []string{APIFlavorOpenAI}, appMessages: EndpointModeTranslate,
+		hasSpec: true, specFlavors: []string{APIFlavorOpenAIAudio}, specMessages: EndpointModeTranslate,
+		wantHas: []string{}, wantServed: []string{},
+	},
+	{
+		name:    "audio child: audio-only spec on a text-and-audio application",
+		appType: ProviderServerAgent, appFlavors: []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}, appMessages: EndpointModeTranslate,
+		hasSpec: true, specFlavors: []string{APIFlavorOpenAIAudio}, specMessages: EndpointModeDisabled,
+		wantHas: []string{APIFlavorOpenAIAudio}, wantServed: []string{APIFlavorOpenAIAudio},
+	},
+	{
+		name:    "text-and-audio child of a text-and-audio application keeps openai",
+		appType: ProviderServerAgent, appFlavors: []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}, appMessages: EndpointModeTranslate,
+		hasSpec: true, specFlavors: []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}, specMessages: EndpointModeTranslate,
+		wantHas: []string{APIFlavorOpenAI, APIFlavorOpenAIAudio}, wantServed: []string{APIFlavorOpenAI, APIFlavorOpenAIAudio},
+	},
+	{
+		name:    "child serving only images and audio is offered no chat",
+		appType: ProviderServerAgent, appFlavors: []string{APIFlavorOpenAI, APIFlavorOpenAIImages, APIFlavorOpenAIAudio}, appMessages: EndpointModeTranslate,
+		hasSpec: true, specFlavors: []string{APIFlavorOpenAIImages, APIFlavorOpenAIAudio}, specMessages: EndpointModeTranslate,
+		wantHas: []string{APIFlavorOpenAIImages, APIFlavorOpenAIAudio}, wantServed: []string{APIFlavorOpenAIImages, APIFlavorOpenAIAudio},
+	},
+	{
 		name:    "ordinary application without flavors",
 		appType: ProviderLlamaCPP, appFlavors: []string{}, appMessages: EndpointModeTranslate,
 		wantHas: []string{}, wantServed: []string{},
@@ -299,11 +397,11 @@ func TestMappingFlavorRules(t *testing.T) {
 }
 
 // TestMappingFlavorRulesRejectOtherFlavors pins that both rules answer only
-// the three coarse flavors: a custom flavor and the empty string, which the
+// the known coarse flavors: a custom flavor and the empty string, which the
 // application and the spec both list, a fine flavor, and a differently cased
 // one are all false.
 func TestMappingFlavorRulesRejectOtherFlavors(t *testing.T) {
-	all := []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages, "custom", ""}
+	all := []string{APIFlavorOpenAI, APIFlavorAnthropic, APIFlavorOpenAIImages, APIFlavorOpenAIAudio, "custom", ""}
 	for _, appType := range []string{ProviderServerAgent, ProviderLlamaCPP} {
 		app := Application{Type: appType, APIFlavors: all, MessagesMode: EndpointModePassthrough}
 		eff := EffectiveFields(app, RuntimeSpec{APIFlavors: all, MessagesMode: EndpointModePassthrough}, true)
@@ -318,7 +416,7 @@ func TestMappingFlavorRulesRejectOtherFlavors(t *testing.T) {
 	}
 }
 
-// flavorSubsets is every subset of the three coarse flavors, in
+// flavorSubsets is every subset of the known coarse flavors, in
 // knownFlavorsForRules order, the empty one included.
 func flavorSubsets() [][]string {
 	subsets := make([][]string, 0, 1<<len(knownFlavorsForRules))

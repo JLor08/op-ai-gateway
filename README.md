@@ -35,6 +35,10 @@ Operators manage servers, models, users, and policies in a bilingual
 - OpenAI-compatible **Chat Completions** and **Responses** APIs and an
   **Anthropic-compatible Messages** API — streaming, tool calling, and image
   input included; unified model discovery (`/v1/models`, per-flavor variants).
+- **Image generation and editing** (`/v1/images/generations`,
+  `/v1/images/edits`) and **text-to-speech** (`/v1/audio/speech`, WAV audio) are
+  relayed to natively OpenAI-shaped backends (stable-diffusion.cpp, audio.cpp);
+  a model serves them only once it is marked as capable of the task.
 - One gateway model name can map to different backend model names per server;
   requests are translated between flavors when client and backend differ.
 - Works as the backend for coding agents: Codex (Responses API) and
@@ -189,7 +193,7 @@ Create an API token in the portal (**API Tokens**), then:
 
 | Client | Base URL / endpoint |
 |---|---|
-| OpenAI SDKs & tools | `http://<gateway>/openai/v1` (Chat Completions, Responses, Models) |
+| OpenAI SDKs & tools | `http://<gateway>/openai/v1` (Chat Completions, Responses, Images, Speech, Models) |
 | Anthropic SDKs | `http://<gateway>/anthropic/v1` (Messages, Models) |
 | Codex | Responses API at `/v1/responses` |
 | Claude Code | Messages API at `/v1/messages` |
@@ -204,7 +208,7 @@ curl -s http://localhost:8080/openai/v1/chat/completions \
 
 Browsers authenticate with a session cookie + `X-OP-CSRF` header instead
 (`/v1/chat/completions` additionally accepts that session auth;
-`/v1/images/generations` and `/v1/images/edits` additionally accept the
+`/v1/images/generations`, `/v1/images/edits` and `/v1/audio/speech` additionally accept the
 gateway's own internal loopback pair — never a browser session; every other
 inference endpoint is bearer-only). The portal's chat playground runs each turn as a server-side
 run — surviving page reloads and disconnects — and streams it to the browser

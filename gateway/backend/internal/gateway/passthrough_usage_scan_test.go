@@ -1431,6 +1431,31 @@ func TestUsageScannerRateSubstitutionNeverZeroesTheAccumulatorsFigure(t *testing
 	}
 }
 
+// A speech response gets NO usage scanner either. Its body is a binary audio/wav
+// file: the chat-SSE/JSON usage scan can extract nothing from it, and feeding it
+// through the scanner would run the line-splitting and the buffered-branch
+// retention (up to 2×capBytes of audio per in-flight request) only to find that
+// out. The nil scanner is the same nil-safe no-op the images test below pins.
+func TestNewUsageScannerSkipsSpeech(t *testing.T) {
+	if s := newUsageScanner(apiFlavorSpeech, defaultCaptureMaxBytes, nil, false); s != nil {
+		t.Fatalf("newUsageScanner(%q) = %+v, want nil -- a binary audio body has no chat usage to scan", apiFlavorSpeech, s)
+	}
+	// Skipping speech must not disturb the flavors that do scan.
+	for _, flavor := range []string{"openai", "openai_responses", "anthropic_messages"} {
+		if newUsageScanner(flavor, defaultCaptureMaxBytes, nil, false) == nil {
+			t.Fatalf("newUsageScanner(%q) = nil, want a scanner", flavor)
+		}
+	}
+	// The copier hands the nil scanner to feed/finish/usage: all must be no-ops.
+	var s *usageScanner
+	at := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	s.feed([]byte("RIFF\x2c\x00\x00\x00WAVE\x00\xff\xfe"), at)
+	s.finish(at)
+	if got := s.usage(); got != (inference.Usage{}) {
+		t.Fatalf("nil scanner usage() = %+v, want the zero Usage", got)
+	}
+}
+
 // An images response gets NO usage scanner. Two independent reasons, and the
 // test pins the decision rather than either symptom: mergePassthroughUsage
 // (native_passthrough.go) switches on openai_responses/anthropic_messages with

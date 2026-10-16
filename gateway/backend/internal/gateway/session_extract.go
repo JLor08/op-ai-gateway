@@ -29,6 +29,7 @@ const (
 	endpointMessages                          // /v1/messages (Claude Code / Anthropic)
 	endpointImages                            // /v1/images/generations (OpenAI images)
 	endpointImagesEdit                        // /v1/images/edits (OpenAI image edit, multipart)
+	endpointSpeech                            // /v1/audio/speech (OpenAI text-to-speech)
 )
 
 // sessionInfo is the extractor result. ExplicitHeader is the raw
@@ -85,6 +86,9 @@ func extractClientSession(h http.Header, raw []byte, endpoint sessionEndpoint) s
 		// /v1/images/generations and /v1/images/edits have no per-endpoint
 		// header signal; see the fuller comment on sessionFromBody's identical
 		// case below.
+	case endpointSpeech:
+		// /v1/audio/speech has no per-endpoint header signal either; see the
+		// fuller comment on sessionFromBody's speech case below.
 	}
 
 	// 3. Per-endpoint body fallback (only reached when headers were empty).
@@ -138,6 +142,14 @@ func sessionFromBody(raw []byte, endpoint sessionEndpoint) (id, source string) {
 		// function's JSON decoding could not read a field out of anyway. Stated
 		// as a case rather than left to the switch's absent default, so a reader
 		// can tell "considered, and there is none" from "nobody thought about it".
+	case endpointSpeech:
+		// /v1/audio/speech carries no session signal: OpenAI's speech request
+		// (model, input, voice, response_format, speed, ...) has no
+		// prompt_cache_key, no user and no metadata field, and a speech request
+		// is a one-shot synthesis with no conversation to pin an affinity to.
+		// Stated as a case rather than left to the switch's absent default, so a
+		// reader can tell "considered, and there is none" from "nobody thought
+		// about it".
 	}
 	return "", ""
 }

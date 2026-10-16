@@ -12,17 +12,20 @@ different trust boundary:
 |---|---|---|---|
 | Portal session | The browser SPA | `op_ai_gateway_session` cookie + `X-OP-CSRF` header on unsafe methods | `internal/gateway/auth.go` (`authenticateWeb`) |
 | Bearer API token | External OpenAI/Anthropic-compatible clients, Codex, Claude Code, service integrations | `Authorization: Bearer <secret>` | `internal/auth.TokenStore`, `internal/gateway/server.go` (`authenticate`) |
-| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations` and `/v1/images/edits` only) |
+| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations`, `/v1/images/edits` and `/v1/audio/speech` only) |
 | Agent token | The `op-ai-server-agent` reporting/proxy process on each AI server | `Authorization: Bearer <agent-secret>` against a separate token universe | `internal/gateway/agent_auth.go` |
 
 `/v1/chat/completions` (and its `/openai/v1/` alias) is the one inference
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
-token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`
-and `/v1/images/edits` (and their `/openai/v1/` aliases) accept **either** the
-internal trusted-loopback pair **or** a bearer token, but never a portal session
-cookie: they are reachable by the gateway's own background executor over
+token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`,
+`/v1/images/edits` and `/v1/audio/speech` (and their `/openai/v1/` aliases) accept
+**either** the internal trusted-loopback pair **or** a bearer token, but never a portal
+session cookie: they are reachable by the gateway's own background executor over
 loopback, never by a logged-in browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
-`internal/gateway/auth_internal_or_bearer.go`). Every remaining inference
+`internal/gateway/auth_internal_or_bearer.go`; speech is the third user of that leg,
+and no portal flow calls it today, so the loopback half is there for parity with the
+image endpoints rather than for a current caller,
+[ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)). Every remaining inference
 endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
 `/v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models` and
 `/openai/api/v1/models` model-listing endpoints) is **bearer-only**: no session cookie and no loopback pair is
@@ -252,7 +255,9 @@ gained image turns, on `/v1/images/generations`, `/v1/images/edits` and their
 and `handleOpenAIImagesEdit` (`images_edit_handler.go`) carry the identical
 block, guarded the identical way, so an image turn started under a
 run-as token bills, captures and routes under that token rather than under the
-bare session. The flowchart in [§7](#7-request-authentication-decision-flow)
+bare session. `handleOpenAISpeech` (`speech_handler.go`) carries a copy of the same
+block too, so a speech call made over the loopback pair with a run-as header would
+bill and capture under the token rather than under the bare session. The flowchart in [§7](#7-request-authentication-decision-flow)
 shows both edges into `AuthorizeRunAsToken`; do not read this section as
 naming chat completions exclusively.
 
@@ -345,7 +350,7 @@ flowchart TD
     P -- no/invalid bearer --> X2
     P -- pass --> L
 
-    D -- "/v1/images/generations, /v1/images/edits\n(/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
+    D -- "/v1/images/generations, /v1/images/edits,\n/v1/audio/speech\n(/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
     R -- yes --> S["Loopback principal\n(session-shaped, never elevated)"]
     R -- no --> T{"Authorization: Bearer present?"}
     T -- yes --> U["Bearer principal\n(TokenStore.LookupBearer)"]
@@ -359,8 +364,8 @@ flowchart TD
     Q -- pass --> L
 ```
 
-Note that `/v1/images/generations` and `/v1/images/edits` resolve their
-principal through `authenticateInternalOrBearer` (`auth_internal_or_bearer.go`)
+Note that `/v1/images/generations`, `/v1/images/edits` and `/v1/audio/speech` resolve
+their principal through `authenticateInternalOrBearer` (`auth_internal_or_bearer.go`)
 rather than through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
 duplicated: both entry points call the same `loopbackPrincipal`
 (`internal/gateway/auth.go`), so the constant-time secret comparison and its
@@ -1116,6 +1121,30 @@ far, never stored raw. Header redaction is unchanged, and the captured
 request is still the **client's** form, not the rebuilt one the upstream was
 sent (a mask conversion or a model-name rewrite changes the latter).
 
+A binary **response** body is treated the same way, on the response side. A speech
+relay's `audio/wav` clip would be stored as a string that `json.Marshal` rewrites to
+valid UTF-8 (every invalid byte becomes U+FFFD) and the cap clips mid-file, and
+megabytes of it would bloat every capture for nothing the viewer could show. So when
+the **response's own `Content-Type`** is `audio/*` (any case, with or without
+parameters), `captureResponseBody` stores a small JSON summary in place of the body:
+its `content_type`, its `size` (the number of bytes the relay actually wrote, counted by
+the copier, not the length of the bounded tee buffer, which stops at the cap and would
+record any longer clip as the cap), `"redacted": true` (so a reader does not take the
+summary for the body), and the upstream's `X-AudioCPP-*` metering headers. Those
+headers are the upstream's: the relay does not forward them to the client, so the
+client headers the capture holds carry none of them, and they reach the summary
+through their own field at the relay's terminal step. `truncated` is not set, since
+nothing was cut off. The gate is the response's type, **not the request flavor**: a
+speech request whose upstream answered an error (`application/json`) is stored like
+any other JSON body, and so is every other response. The request side is untouched:
+the speech request JSON, which carries the `input` text the opt-in exists to capture,
+is stored as usual. One residual is accepted and recorded: the gate trusts the
+upstream's `Content-Type`, and `proxyNative` relays a missing one as
+`application/json`, so a 2xx speech upstream that sent audio with no type would reach
+the string path; audio.cpp always labels its WAV
+([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+[Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
 The resulting envelope is gzip-compressed, then — following the scheme in
 [§13](#13-secrets-at-rest) — sealed with the capture cipher when one is
 configured (`KeyVersion` 1), or stored as plain gzip bytes when running the
@@ -1145,8 +1174,9 @@ occurrence) caps the stored-image bytes one run's upstream request carries
 document cap and the 5 MiB request cap are unchanged.
 
 **Inference bodies are intentionally uncapped.** `/v1/chat/completions`,
-`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens` and
-`/v1/images/generations` read their body with no `MaxBytesReader` limit at all,
+`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`,
+`/v1/images/generations` and `/v1/audio/speech` read their body with no
+`MaxBytesReader` limit at all,
 matching the reality that a chat/completions request can legitimately carry
 large base64-encoded image data. The body is still fully buffered into memory — "uncapped" means no
 *size* ceiling, not streamed processing. The one exception is

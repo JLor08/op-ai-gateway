@@ -16,6 +16,12 @@ import (
 // its provider call is running. It carries only lightweight metadata (no
 // payloads) so the "running connections" view can show what is currently in
 // flight without touching request/response bodies.
+//
+// BillingUnit rides on the live record so the running-connections view can tell
+// a non-token request (an image or speech request) from a token request that has
+// simply not produced tokens yet -- both report 0 output tokens. Every
+// registration site sets it from billingUnitFor(apiFlavor), the same chokepoint
+// the completed usage row uses, never by flavor.
 type ActiveRequest struct {
 	ID        string
 	UserID    string
@@ -37,6 +43,7 @@ type ActiveRequest struct {
 	// persisted row show the same pair of names.
 	RequestedModel string
 	APIFlavor      string
+	BillingUnit    string // billingUnitFor(APIFlavor): "image", "audio_second", or "" (token-metered)
 	ReqPath        string
 	// ProviderPath is the upstream endpoint path this request is calling (the
 	// built-in translation's chat-completions path, or the native passthrough path);
@@ -189,6 +196,7 @@ type activeRequestDTO struct {
 	Model          string `json:"model"`
 	RequestedModel string `json:"requested_model"`
 	APIFlavor      string `json:"api_flavor"`
+	BillingUnit    string `json:"billing_unit"` // "image", "audio_second" or "" (token-metered); never omitted
 	ReqPath        string `json:"req_path"`
 	ProviderPath   string `json:"provider_path"`
 	ProviderModel  string `json:"provider_model"`
@@ -304,6 +312,7 @@ func (s *Server) handlePortalUsageActive(w http.ResponseWriter, r *http.Request)
 			Model:                 row.Model,
 			RequestedModel:        row.RequestedModel,
 			APIFlavor:             row.APIFlavor,
+			BillingUnit:           row.BillingUnit,
 			ReqPath:               row.ReqPath,
 			ProviderPath:          row.ProviderPath,
 			ProviderModel:         row.ProviderModel,

@@ -287,6 +287,7 @@ func TestBenchmarkRefusalErrorsArePinned(t *testing.T) {
 		msg  string
 	}{
 		{errBenchmarkImagesOnly, "benchmark.images_only", "this model, or every model in the run's scope, serves only images, so no chat prompt is sent"},
+		{errBenchmarkAudioOnly, "benchmark.audio_only", "this model, or every model in the run's scope, serves only speech, so no chat prompt is sent"},
 		{errBenchmarkAgentEnsureUnsupported, "benchmark.agent_ensure_unsupported", "this model serves only images, and starting it without a chat prompt needs the agent feature runtime_ensure (agent 0.8.0 or newer), or the agent has not reported since the gateway restarted"},
 		{errBenchmarkSpecForceStopped, "benchmark.spec_force_stopped", "this model's runtime spec is force-stopped; clear the admin override before loading it"},
 	} {
@@ -315,6 +316,9 @@ func TestBenchmarkRefusalErrorsArePinned(t *testing.T) {
 	if benchmarkSkippedImagesOnly != "images_only" {
 		t.Fatalf("benchmarkSkippedImagesOnly = %q, want images_only (the portal switches on it)", benchmarkSkippedImagesOnly)
 	}
+	if benchmarkSkippedAudioOnly != "audio_only" {
+		t.Fatalf("benchmarkSkippedAudioOnly = %q, want audio_only (the portal switches on it)", benchmarkSkippedAudioOnly)
+	}
 }
 
 // Each Load refusal reason is the suffix of the code its sentinel answers,
@@ -328,7 +332,7 @@ func TestLoadRefusalReasonsNameTheirCodes(t *testing.T) {
 		}
 	}
 	slices.Sort(reasons)
-	if want := []string{"agent_ensure_unsupported", "images_only", "spec_force_stopped"}; !reflect.DeepEqual(reasons, want) {
+	if want := []string{"agent_ensure_unsupported", "audio_only", "images_only", "spec_force_stopped"}; !reflect.DeepEqual(reasons, want) {
 		t.Fatalf("load refusal reasons = %v, want %v", reasons, want)
 	}
 }
@@ -340,6 +344,11 @@ func TestLoadRefusal(t *testing.T) {
 	agentImagesApp := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: images}
 	sdApp := routing.Application{Type: routing.ProviderStableDiffusionCpp, APIFlavors: images}
 	sdMixedApp := routing.Application{Type: routing.ProviderStableDiffusionCpp, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}}
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	agentAudioApp := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: audio}
+	audioApp := routing.Application{Type: routing.ProviderAudioCpp, APIFlavors: audio}
+	audioMixedApp := routing.Application{Type: routing.ProviderAudioCpp, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}}
+	nonTextApp := routing.Application{Type: routing.ProviderAudioCpp, APIFlavors: []string{routing.APIFlavorOpenAIImages, routing.APIFlavorOpenAIAudio}}
 	spec := func(flavors []string, adminState string) routing.RuntimeSpec {
 		return routing.RuntimeSpec{APIFlavors: flavors, AdminState: adminState}
 	}
@@ -366,6 +375,18 @@ func TestLoadRefusal(t *testing.T) {
 		{"stable_diffusion_cpp images-only application, runtime_ensure declared", sdApp, routing.RuntimeSpec{}, false, true, loadRefusalImagesOnly},
 		{"stable_diffusion_cpp application that also serves openai", sdMixedApp, routing.RuntimeSpec{}, false, false, ""},
 		{"a spec never applies to a non-agent application", sdMixedApp, spec(images, "force_stopped"), true, false, ""},
+		{"agent audio-only child, runtime_ensure declared", agentApp, spec(audio, ""), true, true, ""},
+		{"agent audio-only child, runtime_ensure not declared", agentApp, spec(audio, ""), true, false, loadRefusalAgentEnsureUnsupported},
+		{"agent audio-only force-stopped child without runtime_ensure: the audio-only reason first", agentApp, spec(audio, "force_stopped"), true, false, loadRefusalAgentEnsureUnsupported},
+		{"agent audio-only force-stopped child with runtime_ensure", agentApp, spec(audio, "force_stopped"), true, true, loadRefusalSpecForceStopped},
+		{"agent mapping without a spec, audio-only application, no runtime_ensure", agentAudioApp, routing.RuntimeSpec{}, false, false, loadRefusalAgentEnsureUnsupported},
+		{"agent mapping without a spec, audio-only application, runtime_ensure", agentAudioApp, routing.RuntimeSpec{}, false, true, ""},
+		{"agent spec stored as [] under an audio-only application", agentAudioApp, spec([]string{}, ""), true, false, ""},
+		{"audio_cpp audio-only application", audioApp, routing.RuntimeSpec{}, false, false, loadRefusalAudioOnly},
+		{"audio_cpp audio-only application, runtime_ensure declared", audioApp, routing.RuntimeSpec{}, false, true, loadRefusalAudioOnly},
+		{"audio_cpp application that also serves openai", audioMixedApp, routing.RuntimeSpec{}, false, false, ""},
+		{"a spec never applies to a non-agent audio application", audioMixedApp, spec(audio, "force_stopped"), true, false, ""},
+		{"an application naming both non-text flavors takes the images-only reason", nonTextApp, routing.RuntimeSpec{}, false, false, loadRefusalImagesOnly},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := loadRefusal(tc.app, tc.spec, tc.hasSpec, tc.ensure); got != tc.want {
@@ -425,6 +446,96 @@ func TestLoadTargetForMarksAnImagesOnlyChild(t *testing.T) {
 	txt := routing.RuntimeSpec{ID: "rs_text", APIFlavors: []string{routing.APIFlavorOpenAI}}
 	if tgt := srv.loadTargetFor(ctx, view, txt, true); tgt.loadWithoutGenerating {
 		t.Fatal("text child: loadWithoutGenerating = true, want false (it loads by generating)")
+	}
+}
+
+// A Load that passed loadRefusal loads an audio-only agent child without
+// generating too: the Load's one-token chat completion is what it cannot
+// answer, as for an images-only one. It reads no spec.
+func TestLoadTargetForMarksAnAudioOnlyChild(t *testing.T) {
+	ctx := context.Background()
+	srv := &Server{Routes: noSpecReadStore{Store: routing.NewMemoryStore(), t: t}}
+	app := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}}
+	view := portal.BenchmarkTargetView{App: app, Mapping: routing.ModelMapping{ID: "m1"}}
+	audio := routing.RuntimeSpec{ID: "rs_audio", APIFlavors: []string{routing.APIFlavorOpenAIAudio}}
+	tgt := srv.loadTargetFor(ctx, view, audio, true)
+	if !tgt.loadWithoutGenerating || tgt.spec.ID != "rs_audio" {
+		t.Fatalf("audio-only child: loadWithoutGenerating = %v, spec = %q; want true, rs_audio", tgt.loadWithoutGenerating, tgt.spec.ID)
+	}
+	mixed := routing.RuntimeSpec{ID: "rs_mixed", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}}
+	if tgt := srv.loadTargetFor(ctx, view, mixed, true); tgt.loadWithoutGenerating {
+		t.Fatal("text-and-audio child: loadWithoutGenerating = true, want false (it loads by generating)")
+	}
+}
+
+// mappingSpecIsAudioOnly is the speech twin of mappingSpecIsImagesOnly: the
+// effective flavors decide, a server_agent mapping's spec is the authority
+// whenever it has one, and a spec never applies to any other application.
+func TestMappingSpecIsAudioOnly(t *testing.T) {
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	agent := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}}
+	agentAudio := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: audio}
+	audioApp := routing.Application{Type: routing.ProviderAudioCpp, APIFlavors: audio}
+	textApp := routing.Application{Type: routing.ProviderLlamaCPP, APIFlavors: []string{routing.APIFlavorOpenAI}}
+	for _, tc := range []struct {
+		name    string
+		app     routing.Application
+		spec    routing.RuntimeSpec
+		hasSpec bool
+		want    bool
+	}{
+		{"agent child whose spec lists only openai_audio", agent, routing.RuntimeSpec{APIFlavors: audio}, true, true},
+		{"agent child whose spec also lists openai", agent, routing.RuntimeSpec{APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}}, true, false},
+		{"agent child whose spec lists only openai_images", agent, routing.RuntimeSpec{APIFlavors: []string{routing.APIFlavorOpenAIImages}}, true, false},
+		{"agent mapping without a spec on an audio-only application", agentAudio, routing.RuntimeSpec{}, false, true},
+		{"agent spec stored as [] overrides an audio-only application", agentAudio, routing.RuntimeSpec{APIFlavors: []string{}}, true, false},
+		{"audio_cpp audio-only application", audioApp, routing.RuntimeSpec{}, false, true},
+		{"a spec never applies to a non-agent application", textApp, routing.RuntimeSpec{APIFlavors: audio}, true, false},
+		{"text application", textApp, routing.RuntimeSpec{}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mappingSpecIsAudioOnly(tc.app, tc.spec, tc.hasSpec); got != tc.want {
+				t.Fatalf("mappingSpecIsAudioOnly = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A partition with nothing runnable answers for why: audio_only when every
+// skipped view serves only speech, images_only for any skipped images-only
+// view or for a partition that skipped nothing, and request_failed when a
+// spec read failed, because then either answer would be a guess.
+func TestRefuseNothingRunnableNamesTheSkippedKind(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		part   benchmarkViewPartition
+		status int
+		code   string
+	}{
+		{"every view audio-only", benchmarkViewPartition{audioOnly: 2}, http.StatusConflict, codeBenchmarkAudioOnly},
+		{"every view images-only", benchmarkViewPartition{imagesOnly: 2}, http.StatusConflict, codeBenchmarkImagesOnly},
+		{"images-only and audio-only views", benchmarkViewPartition{imagesOnly: 1, audioOnly: 1}, http.StatusConflict, codeBenchmarkImagesOnly},
+		{"no view skipped", benchmarkViewPartition{}, http.StatusConflict, codeBenchmarkImagesOnly},
+		{"an unreadable view beside an audio-only one", benchmarkViewPartition{audioOnly: 1, unreadable: 1}, http.StatusInternalServerError, codeBenchmarkRequestFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if !tc.part.refuseNothingRunnable(rec) {
+				t.Fatal("refuseNothingRunnable = false, want true for a partition with no runnable view")
+			}
+			var body apierror.Body
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if rec.Code != tc.status || body.Error.Code != tc.code {
+				t.Fatalf("answer = %d %q, want %d %q", rec.Code, body.Error.Code, tc.status, tc.code)
+			}
+		})
+	}
+	runnable := benchmarkViewPartition{runnable: []benchmarkTarget{{}}, audioOnly: 1}
+	rec := httptest.NewRecorder()
+	if runnable.refuseNothingRunnable(rec) || rec.Body.Len() != 0 {
+		t.Fatalf("a partition with a runnable view was refused: %d %s", rec.Code, rec.Body.Bytes())
 	}
 }
 
@@ -580,6 +691,36 @@ func TestStartContextProbeRefusesAnImagesOnlyMapping(t *testing.T) {
 	}
 }
 
+// The context probe warm-loads the model with a chat prompt, so it refuses a
+// mapping that serves only speech as it does an images-only one: 409
+// benchmark.audio_only, for an agent child (its spec read once) and for a
+// non-agent application's mapping, with nothing reserved and no prompt sent.
+func TestStartContextProbeRefusesAnAudioOnlyMapping(t *testing.T) {
+	for _, tc := range []struct {
+		mapping   string
+		specReads int
+	}{
+		{"ra_audio", 1},
+		{"ra_ext", 0},
+	} {
+		t.Run(tc.mapping, func(t *testing.T) {
+			f := newRefusalFixture(t)
+			f.addAudioOnlyMappings(t)
+			f.srv.AgentFeatures.Set(baOwnedServer, []string{runtimeEnsureFeature})
+			if status, code, _ := f.post(t, "/api/portal/mappings/"+tc.mapping+"/probe-context"); status != http.StatusConflict || code != codeBenchmarkAudioOnly {
+				t.Fatalf("status = %d code = %q, want 409 %s", status, code, codeBenchmarkAudioOnly)
+			}
+			f.assertNothingReserved(t)
+			if n := f.specs.readCount(tc.mapping); n != tc.specReads {
+				t.Fatalf("spec reads for %s = %d, want %d", tc.mapping, n, tc.specReads)
+			}
+			if got := f.prov.streamedModels(); len(got) != 0 {
+				t.Fatalf("streamed %v, want no chat prompt", got)
+			}
+		})
+	}
+}
+
 func TestStartBenchmarkMappingScopeRefusesAnImagesOnlyMapping(t *testing.T) {
 	for _, mode := range []string{"speed", "capacity", "both", "vision"} {
 		for _, tc := range []struct {
@@ -671,6 +812,150 @@ func TestStartBenchmarkApplicationScopeWithNothingRunnable(t *testing.T) {
 		f.assertNothingReserved(t)
 		if got := f.prov.streamedModels(); len(got) != 0 {
 			t.Fatalf("streamed %v, want no chat prompt", got)
+		}
+	})
+}
+
+// addAudioOnlyMappings extends the fixture with speech-only mappings, apart
+// from newRefusalFixture's own so no existing case's counts move:
+//   - on rf_agent (a server may hold one server_agent application), the
+//     mapping ra_audio with the spec [openai_audio];
+//   - an audio_cpp application ra_audioapp ([openai_audio]) with two
+//     mappings, ra_ext and ra_ext2, and no spec.
+func (f *refusalFixture) addAudioOnlyMappings(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	must := func(what string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	routes := f.srv.Routes
+	must("CreateApplication(ra_audioapp)", routes.CreateApplication(ctx, routing.Application{ID: "ra_audioapp", ServerID: baOwnedServer, Type: routing.ProviderAudioCpp, Port: 8200, Scheme: "http", TimeoutMS: 600000, APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	for _, m := range []struct{ app, id string }{{"rf_agent", "ra_audio"}, {"ra_audioapp", "ra_ext"}, {"ra_audioapp", "ra_ext2"}} {
+		must("CreateMapping("+m.id+")", routes.CreateMapping(ctx, routing.ModelMapping{ID: m.id, ApplicationID: m.app, GatewayModelName: "gw-" + m.id, AppModelName: "up-" + m.id, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	}
+	must("UpsertRuntimeSpec(ra_audio)", routes.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "rs_ra_audio", MappingID: "ra_audio", Enabled: true, Binary: "/opt/bin/server", Args: "[]", Env: "{}", HealthPath: "/health", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, CreatedAt: now, UpdatedAt: now}))
+}
+
+// An application-scope run skips a child that serves only speech with the
+// reason audio_only, beside the images-only and the unreadable view it already
+// records, and measures the rest: no history row and no chat prompt for the
+// skipped child, which still counts in Total and Done.
+func TestStartBenchmarkApplicationScopeSkipsAnAudioOnlyChild(t *testing.T) {
+	f := newRefusalFixture(t)
+	f.addAudioOnlyMappings(t)
+	status, code, body := f.post(t, "/api/portal/applications/rf_agent/benchmark?mode=speed")
+	if status != http.StatusAccepted {
+		t.Fatalf("status = %d code = %q, want 202", status, code)
+	}
+	if !strings.Contains(string(body), `"skipped":"audio_only"`) {
+		t.Fatalf("202 body = %s, want a result carrying \"skipped\":\"audio_only\"", body)
+	}
+	st := f.waitFinished(t)
+	if st.Total != 4 || st.Done != 4 || len(st.Results) != 4 {
+		t.Fatalf("final status: total %d done %d results %d; want 4/4/4", st.Total, st.Done, len(st.Results))
+	}
+	wantRecorded := []BenchmarkResult{ // in view order, which is by mapping id
+		{MappingID: "ra_audio", GatewayModelName: "gw-ra_audio", Skipped: benchmarkSkippedAudioOnly},
+		{MappingID: "rf_sd", GatewayModelName: "gw-rf_sd", Skipped: benchmarkSkippedImagesOnly},
+		{MappingID: "rf_unread", GatewayModelName: "gw-rf_unread", Error: "runtime spec unreadable; not benchmarked (no chat prompt sent): spec read down"},
+	}
+	if !reflect.DeepEqual(st.Results[:3], wantRecorded) {
+		t.Fatalf("first results = %+v, want the recorded ones %+v", st.Results[:3], wantRecorded)
+	}
+	if got := st.Results[3]; got.MappingID != "rf_text" || got.Error != "" || got.Skipped != "" {
+		t.Fatalf("measured result = %+v, want rf_text measured without error", got)
+	}
+	if got := f.prov.streamedModels(); slices.Contains(got, "up-ra_audio") || !slices.Contains(got, "up-rf_text") {
+		t.Fatalf("streamed %v, want up-rf_text and no chat prompt to up-ra_audio", got)
+	}
+	f.assertHistoryRows(t, map[string]int{"ra_audio": 0, "rf_text": 1})
+	f.assertOneSpecReadEach(t, "ra_audio")
+}
+
+// A scope whose every view serves only speech has nothing to measure: 409
+// benchmark.audio_only, nothing reserved, no chat prompt. A mapping scope's
+// single view gets exactly that answer, for an agent child (its spec read once)
+// and for a non-agent application's mapping (no spec to read).
+func TestStartBenchmarkRefusesAnAudioOnlyScope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		path      string
+		specReads map[string]int
+	}{
+		{"application scope of non-agent mappings", "/api/portal/applications/ra_audioapp/benchmark?mode=speed", map[string]int{"ra_ext": 0, "ra_ext2": 0}},
+		{"mapping scope, non-agent mapping", "/api/portal/mappings/ra_ext/benchmark?mode=speed", map[string]int{"ra_ext": 0}},
+		{"mapping scope, agent child", "/api/portal/mappings/ra_audio/benchmark?mode=speed", map[string]int{"ra_audio": 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRefusalFixture(t)
+			f.addAudioOnlyMappings(t)
+			if status, code, _ := f.post(t, tc.path); status != http.StatusConflict || code != codeBenchmarkAudioOnly {
+				t.Fatalf("status = %d code = %q, want 409 %s", status, code, codeBenchmarkAudioOnly)
+			}
+			f.assertNothingReserved(t)
+			for mappingID, want := range tc.specReads {
+				if n := f.specs.readCount(mappingID); n != want {
+					t.Fatalf("spec reads for %s = %d, want %d", mappingID, n, want)
+				}
+			}
+			if got := f.prov.streamedModels(); len(got) != 0 {
+				t.Fatalf("streamed %v, want no chat prompt", got)
+			}
+		})
+	}
+}
+
+// A Load of a speech-only mapping is refused or started like an images-only
+// one: a non-agent application's mapping cannot be started without a request,
+// so 409 benchmark.audio_only; an agent child needs the agent's ensure route,
+// so 409 agent_ensure_unsupported without runtime_ensure, and with it the child
+// is started through that route and no chat prompt is sent.
+func TestStartLoadModelAudioOnly(t *testing.T) {
+	t.Run("audio-only application that is not agent-managed", func(t *testing.T) {
+		f := newRefusalFixture(t)
+		f.addAudioOnlyMappings(t)
+		f.srv.AgentFeatures.Set(baOwnedServer, []string{runtimeEnsureFeature})
+		if status, code, _ := f.post(t, "/api/portal/mappings/ra_ext/load"); status != http.StatusConflict || code != codeBenchmarkAudioOnly {
+			t.Fatalf("status = %d code = %q, want 409 %s", status, code, codeBenchmarkAudioOnly)
+		}
+		f.assertNothingReserved(t)
+		if got := f.prov.streamedModels(); len(got) != 0 {
+			t.Fatalf("streamed %v, want no chat prompt", got)
+		}
+	})
+	t.Run("audio-only agent child without runtime_ensure", func(t *testing.T) {
+		f := newRefusalFixture(t)
+		f.addAudioOnlyMappings(t)
+		if status, code, _ := f.post(t, "/api/portal/mappings/ra_audio/load"); status != http.StatusConflict || code != codeBenchmarkAgentEnsureUnsupported {
+			t.Fatalf("status = %d code = %q, want 409 %s", status, code, codeBenchmarkAgentEnsureUnsupported)
+		}
+		f.assertNothingReserved(t)
+		if got := f.prov.streamedModels(); len(got) != 0 {
+			t.Fatalf("streamed %v, want no chat prompt", got)
+		}
+	})
+	t.Run("audio-only agent child with runtime_ensure starts without generating", func(t *testing.T) {
+		f := newRefusalFixture(t)
+		f.addAudioOnlyMappings(t)
+		ensurer := &ensuringColdLister{coldLister: f.prov}
+		f.srv.Provider = ensurer
+		f.srv.AgentFeatures.Set(baOwnedServer, []string{runtimeEnsureFeature})
+		if status, code, _ := f.post(t, "/api/portal/mappings/ra_audio/load"); status != http.StatusAccepted {
+			t.Fatalf("status = %d code = %q, want 202", status, code)
+		}
+		st := f.waitFinished(t)
+		if len(st.Results) != 1 || !st.Results[0].Loaded {
+			t.Fatalf("results = %+v, want one Loaded result", st.Results)
+		}
+		if got := ensurer.ensuredModels(); !slices.Equal(got, []string{"up-ra_audio"}) {
+			t.Fatalf("ensured %v, want [up-ra_audio] (the Load starts the child through the ensure route)", got)
+		}
+		if got := f.prov.streamedModels(); slices.Contains(got, "up-ra_audio") {
+			t.Fatalf("streamed %v, want no chat prompt for the audio-only child", got)
 		}
 	})
 }

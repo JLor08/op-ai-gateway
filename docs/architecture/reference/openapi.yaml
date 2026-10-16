@@ -229,6 +229,58 @@ paths:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/audio/speech:
+    post:
+      tags: [inference]
+      summary: OpenAI-compatible text-to-speech (binary audio/wav relay, no translate path)
+      description: >
+        Same auth as /v1/images/generations: scope `gateway:use` or
+        `llm:invoke`, a bearer token OR the internal trusted-loopback header
+        pair (unreachable by any external client, which is why only bearerAuth
+        is modelled below), never a portal session cookie. Always relayed to a
+        natively OpenAI-shaped speech upstream (audio.cpp's `audiocpp_server`);
+        there is no translate fallback. Required: a non-empty `model` (400
+        `speech.model_required`) and a non-empty `input` (400
+        `speech.input_required`).
+        Admission takes an application that declares the `openai_audio` API
+        flavor (otherwise 404 `routing.no_model_route`) and a mapping whose
+        `speech` capability verdict is `yes` (otherwise 404
+        `routing.model_not_capable`); an agent-launched model's runtime spec
+        must declare the flavor too (otherwise 404
+        `routing.no_model_route`). The only accepted `response_format` is
+        `wav` or absent: every other value, `mp3`, `opus`, `flac`, `aac`, `pcm`,
+        `json` and `b64_json` included, is refused with 400
+        `speech.response_format_unsupported`. Streaming is not served (a
+        `stream: true`, or any `stream_format`, is refused with 400
+        `speech.stream_unsupported`). The 200 response is the synthesized clip as
+        one binary `audio/wav` body, relayed without buffering and with the
+        upstream's own `Content-Length`. A non-2xx upstream answer keeps the
+        upstream's status and is normalised to the OpenAI error shape: an OpenAI
+        error object passes through unchanged, a plain-string `error` is
+        wrapped with `type: upstream_error` and `code: speech.upstream_error`,
+        and any other body is relayed as it came. Metered in seconds of audio
+        (`billing_unit: audio_second`, read from the upstream's
+        `X-AudioCPP-Audio-Duration-Ms` header), not in tokens. The gateway does
+        not proxy `GET /v1/audio/voices`. Beyond those it answers the same
+        statuses as every other inference path (429/402 from the principal
+        limiter, 503 from the capacity queue or no healthy host), which this
+        path-level spec does not enumerate. Alias: /openai/v1/audio/speech.
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/SpeechRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/AudioWav' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /openai/v1/audio/speech:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/audio/speech
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/SpeechRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/AudioWav' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /v1/messages/count_tokens:
     post:
       tags: [inference]
@@ -2759,6 +2811,50 @@ components:
               output_compression:
                 type: integer
                 description: Compression of a jpeg output.
+    SpeechRequest:
+      required: true
+      description: >
+        The JSON body of POST /v1/audio/speech. Only the fields named here are
+        examined by the gateway; any other (`instructions`, `speed`, ...) reaches
+        the upstream unexamined.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [model, input]
+            properties:
+              model:
+                type: string
+                description: >
+                  The gateway model name. Routing input; the gateway rewrites
+                  the field to the mapping's own model name for the upstream.
+              input:
+                type: string
+                minLength: 1
+                description: The text to synthesize. Must be non-empty.
+              voice:
+                type: string
+                description: >
+                  The voice name, passed to the upstream as sent. The gateway
+                  does not proxy audio.cpp's `GET /v1/audio/voices`, so voice
+                  names are learned out of band.
+              response_format:
+                type: string
+                enum: [wav]
+                description: >
+                  Only `wav` (or absent, or `null`) is supported; every other
+                  value is 400 `speech.response_format_unsupported`.
+              stream:
+                type: boolean
+                enum: [false]
+                description: >
+                  Streaming is not served. `false` or absent is accepted;
+                  `true` is 400 `speech.stream_unsupported`.
+              stream_format:
+                type: string
+                description: >
+                  Not supported. Any value other than an absent field or `null`
+                  is 400 `speech.stream_unsupported`.
   responses:
     OpaqueJSON:
       description: >
@@ -2767,6 +2863,16 @@ components:
       content:
         application/json:
           schema: { type: object }
+    AudioWav:
+      description: >
+        The synthesized clip as one binary `audio/wav` body, streamed through
+        without being buffered. The upstream's `Content-Length` is forwarded
+        when it declared one. The upstream's metering headers
+        (`X-AudioCPP-*`) are not forwarded; the gateway reads
+        `X-AudioCPP-Audio-Duration-Ms` for the usage row.
+      content:
+        audio/wav:
+          schema: { type: string, format: binary }
     BadRequest:
       description: >
         Invalid request payload — the Error envelope carries the stable

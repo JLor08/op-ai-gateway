@@ -23,6 +23,7 @@ const (
 	RuntimeSpecTypeTGI                RuntimeSpecType = "tgi"
 	RuntimeSpecTypeOllama             RuntimeSpecType = "ollama"
 	RuntimeSpecTypeStableDiffusionCpp RuntimeSpecType = "stable_diffusion_cpp"
+	RuntimeSpecTypeAudioCpp           RuntimeSpecType = "audio_cpp"
 	RuntimeSpecTypeCustom             RuntimeSpecType = "custom"
 )
 
@@ -33,9 +34,9 @@ const defaultPrometheusMetricsPath = "/metrics"
 // DetectRuntimeSpecType infers the runtime server kind from the launched
 // binary's basename when no explicit RuntimeSpec.Type is set. It matches on
 // case-insensitive substrings -- vllm, llama-server/llama_cpp/llama.cpp,
-// text-generation-launcher/tgi, sd-server/stable-diffusion, ollama -- in the
-// order below (first match wins), and falls back to RuntimeSpecTypeCustom
-// when nothing matches.
+// text-generation-launcher/tgi, sd-server/stable-diffusion,
+// audiocpp_server/audio.cpp, ollama -- in the order below (first match wins),
+// and falls back to RuntimeSpecTypeCustom when nothing matches.
 func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 	name := strings.ToLower(filepath.Base(binary))
 
@@ -48,6 +49,8 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 		return RuntimeSpecTypeTGI
 	case strings.Contains(name, "sd-server"), strings.Contains(name, "stable-diffusion"):
 		return RuntimeSpecTypeStableDiffusionCpp
+	case strings.Contains(name, "audiocpp_server"), strings.Contains(name, "audio.cpp"):
+		return RuntimeSpecTypeAudioCpp
 	case strings.Contains(name, "ollama"):
 		return RuntimeSpecTypeOllama
 	default:
@@ -99,6 +102,13 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 		// /sdcpp/v1/capabilities carries no context-length field either, and
 		// an image model has no context window to probe, so there is nothing
 		// honest to default either path to.
+		defaultMetrics, defaultContext = "", ""
+	case RuntimeSpecTypeAudioCpp:
+		// A speech model has no context window to probe: audiocpp_server's
+		// /v1/models entries carry family/task/mode/loaded/path (probed against
+		// v0.9.1), not a context length, and nothing in the audio.cpp design
+		// relies on a Prometheus-style /metrics scrape, so there is nothing
+		// honest to default either path to. An explicit override still wins.
 		defaultMetrics, defaultContext = "", ""
 	case RuntimeSpecTypeCustom:
 		defaultMetrics, defaultContext = "", ""

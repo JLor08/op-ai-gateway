@@ -76,10 +76,11 @@ type BenchType = 'speed' | 'capacity' | 'both' | 'vision' | 'vram';
 
 /**
  * The four run kinds that are a `?mode=` value. Each sends the mapping a chat
- * prompt, so none of them can run on an images-only mapping (the gateway
- * refuses it with `benchmark.images_only` on the model scope and skips it on
- * the others, where it refuses the run the same way only when every mapping
- * in the scope serves images only). They are also the kinds whose finished
+ * prompt, so none of them can run on an images-only or audio-only mapping (the
+ * gateway refuses it with `benchmark.images_only` / `benchmark.audio_only` on
+ * the model scope and skips it on the others, where it refuses the run the
+ * same way only when every mapping in the scope serves images only, or speech
+ * only). They are also the kinds whose finished
  * results nothing renders once the live panel closes: the VRAM kind has its
  * own outcome view, and a load or a context probe is not started from this
  * form.
@@ -92,19 +93,26 @@ const promptModes: ReadonlySet<string> = new Set<BenchType>([
 ]);
 
 /**
- * Whether the mapping the model scope is set to serves images only. Only the
- * model scope asks: the application and server scopes skip such a mapping and
- * run the rest, and the gateway answers `benchmark.images_only` for one whose
- * every mapping serves images only, so there is no rest to run.
+ * Why the mapping the model scope is set to cannot take a chat prompt, if it
+ * cannot: it serves images only (`images_only`) or speech only (`audio_only`),
+ * or null when neither marker is set. A mapping carrying both is reported as
+ * images-only: the form shows one hint, and that sentence names a flavor that
+ * holds. Only the model scope asks: the application and server scopes skip
+ * such a mapping and run the rest, and the gateway answers
+ * `benchmark.images_only` / `benchmark.audio_only` for one whose every mapping
+ * serves only that, so there is no rest to run.
  */
-function selectedMappingIsImagesOnly(
+function selectedMappingChatRefusal(
   scopeKind: ScopeKind,
   mappings: readonly PortalModelMapping[],
   mappingId: string,
-): boolean {
-  if (scopeKind !== 'mapping') return false;
+): 'images_only' | 'audio_only' | null {
+  if (scopeKind !== 'mapping') return null;
   const id = mappingId || mappings[0]?.id;
-  return mappings.find((m) => m.id === id)?.images_only === true;
+  const mapping = mappings.find((m) => m.id === id);
+  if (mapping?.images_only === true) return 'images_only';
+  if (mapping?.audio_only === true) return 'audio_only';
+  return null;
 }
 
 // An unknown number renders as a dash, never as 0: `0` means UNKNOWN
@@ -298,6 +306,7 @@ function VramOutcome({ t, result }: Readonly<{ t: Translation; result: Benchmark
  * measured, never as 0 ms. */
 function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.skipped === 'images_only') return t.benchmarkResultSkippedImagesOnly;
+  if (r.skipped === 'audio_only') return t.benchmarkResultSkippedAudioOnly;
   if (r.error) return r.error;
   if (r.vision_capable !== undefined) {
     return `${t.benchmarkVision}: ${r.vision_capable ? '✓' : '✗'}`;
@@ -869,12 +878,13 @@ export function BenchmarkSection({
       : [];
   const unmeasuredResults = finishedUnmeasuredResults(liveStatus);
 
-  // An images-only mapping on the model scope: the four chat-prompt types are
-  // disabled, and so is Start while one of them is selected. The type is not
-  // switched to VRAM on the operator's behalf, because that run drains the
-  // whole server.
-  const imagesOnly = selectedMappingIsImagesOnly(scopeKind, mappings, mappingId);
-  const typeRefused = imagesOnly && promptModes.has(benchType);
+  // An images-only or audio-only mapping on the model scope: the four
+  // chat-prompt types are disabled, and so is Start while one of them is
+  // selected. The type is not switched to VRAM on the operator's behalf,
+  // because that run drains the whole server.
+  const chatRefusal = selectedMappingChatRefusal(scopeKind, mappings, mappingId);
+  const chatRefused = chatRefusal !== null;
+  const typeRefused = chatRefused && promptModes.has(benchType);
 
   const lastCompleted = useMemo(() => {
     if (!history || history.length === 0) return null;
@@ -948,16 +958,16 @@ export function BenchmarkSection({
             value={benchType}
             onChange={(e) => setBenchType(e.target.value as BenchType)}
           >
-            <option value="speed" disabled={imagesOnly}>
+            <option value="speed" disabled={chatRefused}>
               {t.benchmarkTypeSpeed}
             </option>
-            <option value="capacity" disabled={imagesOnly}>
+            <option value="capacity" disabled={chatRefused}>
               {t.benchmarkTypeCapacity}
             </option>
-            <option value="both" disabled={imagesOnly}>
+            <option value="both" disabled={chatRefused}>
               {t.benchmarkTypeBoth}
             </option>
-            <option value="vision" disabled={imagesOnly}>
+            <option value="vision" disabled={chatRefused}>
               {t.benchmarkTypeVision}
             </option>
             {/* Offered only where it can run. The hint below is UNCONDITIONAL
@@ -969,9 +979,9 @@ export function BenchmarkSection({
           <Typography variant="caption" color="text.secondary" sx={{ mt: -1.5 }}>
             {t.benchmarkTypeVramHint}
           </Typography>
-          {imagesOnly && (
-            <Typography id="benchmark-images-only-hint" variant="caption" color="text.secondary">
-              {t.benchmarkImagesOnlyHint}
+          {chatRefused && (
+            <Typography id="benchmark-chat-refusal-hint" variant="caption" color="text.secondary">
+              {chatRefusal === 'images_only' ? t.benchmarkImagesOnlyHint : t.benchmarkAudioOnlyHint}
             </Typography>
           )}
           <Box>
@@ -979,7 +989,7 @@ export function BenchmarkSection({
               variant="contained"
               onClick={() => void start()}
               disabled={starting || typeRefused}
-              aria-describedby={typeRefused ? 'benchmark-images-only-hint' : undefined}
+              aria-describedby={typeRefused ? 'benchmark-chat-refusal-hint' : undefined}
             >
               {t.benchmarkStart}
             </Button>

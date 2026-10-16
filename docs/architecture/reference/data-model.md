@@ -45,7 +45,7 @@ not route-based).
 | `server_owners` | `(server_id, user_id)` join — which users own/administer a given server. |
 | `applications` | One upstream API surface on a server: port/scheme/API flavors, priority/weight for scoring, `responses_mode`/`messages_mode` (migration 72: the three-state Codex/Claude-Code endpoint-mode pair — `disabled`/`translate`/`passthrough` — that superseded the inert `native_responses`/`native_messages` booleans), health-check config, loaded-models/context/capacity probe paths, sealed per-application upstream token, benchmark-schedule config, assigned TLS proxy port, `proxy_excluded` (migration 70: the operator's opt-out from the gateway-guided TLS proxy), and `responses_live_timings_enabled` (migration 80: the operator's per-application opt-in to asking a capable upstream for mid-stream timings on a passthrough `/v1/responses` stream — orthogonal to `responses_mode`, default off; when it is on, a streaming `passthrough` `/v1/responses` request to a `llama_cpp` upstream has `timings_per_token` added to the body the gateway forwards, which is what puts a live tokens/sec and a live token count on the running-connections row (the count on a column that ships hidden, revealed from that panel's column menu). Five conditions gate the injection, plus a sixth ANDed at the call site (this process has not already seen the upstream refuse the key), and **nothing retries without it**). At most **one** row per server may have `type = 'server_agent'` (migration 68). |
 | `model_mappings` | One gateway-model ↔ app-model binding on an application: performance metrics (tokens/s, load time, context size, energy/token), concurrency-capacity metrics, and their `metrics_locked`/`metrics_source`/`metrics_updated_at` provenance. Carries **no capability column at all** since migration 79 dropped the eleven it used to have — every per-model capability verdict is a `model_mapping_capabilities` row instead ([ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)). |
-| `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`ollama_api_show`/`llama_cpp_timings`/`sdcpp_capabilities`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
+| `model_mapping_capabilities` | One row per `(mapping_id, capability)` (migration 78, PK on the pair, FK `on delete cascade`): the `verdict` (`yes` or `no`, nothing else), its `source` (`manual`/`vision_benchmark`/`llama_cpp_props`/`ollama_api_show`/`llama_cpp_timings`/`sdcpp_capabilities`/`audiocpp_models`/`legacy`), and `checked_at`. **The absence of a row is UNKNOWN**, which is what a bool column could not say. The capability vocabulary is deliberately **open** — an upstream name this codebase has never heard of is stored and shown verbatim — and `source` carries a per-capability precedence rank, so an operator's verdict is never overwritten by a probe. Capabilities, not metrics: no writer here consults `metrics_locked` or touches the metrics provenance columns. |
 | `model_mapping_benchmarks` | Historical benchmark runs for a mapping (one row per run): measured throughput/latency/context/vision-capable/error, optionally a capacity curve (`capacity_curve`) or a VRAM-benchmark result (`vram_json`, migration 71). Each kind-specific payload gets its **own** opaque column, read for that `kind` only. |
 | `model_settings` | Per-gateway-model-name metadata — currently just visibility (`shown`/`hidden`/`locked`). |
 
@@ -225,7 +225,7 @@ erDiagram
         string mapping_id FK "PK part, on delete cascade"
         string capability "PK part, open vocabulary"
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | sdcpp_capabilities | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | sdcpp_capabilities | audiocpp_models | legacy"
         datetime checked_at
     }
     AGENT_TOKENS {
@@ -543,7 +543,7 @@ catch-all `model_override`, which has its own column).
 
 | # | Migration | Purpose |
 |---|---|---|
-| 75 | `runtime_spec_type_probe` | Three additive columns on `agent_runtime_specs`, all `text not null default ''` (design 2026-09-07). `type` — the explicit runtime-server kind (`""`\|`vllm`\|`llama_cpp`\|`tgi`\|`ollama`\|`custom`, and later `stable_diffusion_cpp`, which needed no schema change); `''` is not "unset", it is **auto-detect from `binary_path`'s basename** (`routing.DetectRuntimeSpecType`), which is exactly what every pre-feature row already resolves to — the `''` default preserves today's behaviour for the whole existing fleet with no backfill needed. `metrics_path`/`context_probe_path` — the operator's own raw overrides for the two probe endpoints `type` would otherwise default (`routing.DeriveProbePaths`); `''` means "use the resolved type's own default", which may itself be empty (e.g. `ollama` has no metrics endpoint, `custom` has neither). See [Agent-Managed Model Runtime §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation) and [ADR-036](../09-architecture-decisions.md#adr-036--runtime-probing-reuses-the-per-runtime-channel-type-drives-derivation-only-context-is-durable). |
+| 75 | `runtime_spec_type_probe` | Three additive columns on `agent_runtime_specs`, all `text not null default ''` (design 2026-09-07). `type` — the explicit runtime-server kind (`""`\|`vllm`\|`llama_cpp`\|`tgi`\|`ollama`\|`custom`, and later `stable_diffusion_cpp` and `audio_cpp`, which needed no schema change); `''` is not "unset", it is **auto-detect from `binary_path`'s basename** (`routing.DetectRuntimeSpecType`), which is exactly what every pre-feature row already resolves to — the `''` default preserves today's behaviour for the whole existing fleet with no backfill needed. `metrics_path`/`context_probe_path` — the operator's own raw overrides for the two probe endpoints `type` would otherwise default (`routing.DeriveProbePaths`); `''` means "use the resolved type's own default", which may itself be empty (e.g. `ollama` has no metrics endpoint, `custom` has neither). See [Agent-Managed Model Runtime §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation) and [ADR-036](../09-architecture-decisions.md#adr-036--runtime-probing-reuses-the-per-runtime-channel-type-drives-derivation-only-context-is-durable). |
 
 ### Live-progress capability detection
 
@@ -707,7 +707,9 @@ plausible-looking validation rule would break the normal case:
   is validated only for emptiness; the vocabulary is otherwise open on purpose
   (`vision`,
   `video`, `audio`, `tools`, `mtp`, `live_progress`,
-  `speculation_observed` and `image_edit` are the names the code itself reasons
+  `speculation_observed`, `image` and `speech` (the verdict `POST /v1/audio/speech`
+  is gated on, distinct from `audio`, which means a model *accepts* audio) and
+  `image_edit` are the names the code itself reasons
   about — `image_edit` is **derived** from `image` at the gate and its only
   stored row is an operator's `no` opt-out, [ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
   — while an
@@ -795,8 +797,12 @@ plausible-looking validation rule would break the normal case:
   passes write `llama_cpp_props` too, and, for an **external** `stable_diffusion_cpp`
   application, `sdcpp_capabilities` directly — the only source that answers
   `image` in both directions, whichever of its two producers wrote it — plus
-  one probe-ranked source no agent may report: `llama_cpp_timings` (read off
-  a completion it relayed). The probing agent REPORTS which of its three
+  two probe-ranked sources no agent may report: `llama_cpp_timings` (read off
+  a completion it relayed) and `audiocpp_models` (the gateway's own `GET` of an
+  `audio_cpp` application's `/v1/models`, the only source of the `speech` row and one
+  that answers it in both directions; a vocabulary addition only, with no schema
+  change, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+  The probing agent REPORTS which of its three
   produced a verdict set rather than the gateway inferring it, and the
   ingest boundary accepts exactly those three from an agent — a sample
   claiming `manual` or `vision_benchmark` writes nothing at all, since an

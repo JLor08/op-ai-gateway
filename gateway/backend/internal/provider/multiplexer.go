@@ -345,6 +345,41 @@ func (m *Multiplexer) dispatchProbeSdcppCapabilities(ctx context.Context, target
 	return SdcppVerdicts{}, ErrUnavailable
 }
 
+var _ AudioCppModelsProber = (*Multiplexer)(nil)
+
+// ProbeAudioCppModels routes the audio.cpp /v1/models speech probe to the
+// provider's client (like ProbeSdcppCapabilities), falling back to the fallback
+// client. A provider whose client does not implement AudioCppModelsProber
+// yields (AudioCppVerdicts{}, ErrUnavailable), for the same reason as the
+// sdcpp probe: an error is what tells the caller there is no verdict to write,
+// and a zero value with a nil error would read as a successful probe that found
+// nothing.
+func (m *Multiplexer) ProbeAudioCppModels(ctx context.Context, target routing.Target, modelID string) (AudioCppVerdicts, error) {
+	ctx, span := tracing.Start(ctx, "provider.ProbeAudioCppModels")
+	defer span.End()
+	res, err := m.dispatchProbeAudioCppModels(ctx, target, modelID)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return res, err
+}
+
+func (m *Multiplexer) dispatchProbeAudioCppModels(ctx context.Context, target routing.Target, modelID string) (AudioCppVerdicts, error) {
+	if m == nil {
+		return AudioCppVerdicts{}, ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if p, ok := client.(AudioCppModelsProber); ok {
+			return p.ProbeAudioCppModels(ctx, target, modelID)
+		}
+	}
+	if p, ok := m.fallback.(AudioCppModelsProber); ok {
+		return p.ProbeAudioCppModels(ctx, target, modelID)
+	}
+	return AudioCppVerdicts{}, ErrUnavailable
+}
+
 var _ SdcppImageOptionsProber = (*Multiplexer)(nil)
 
 // ProbeSdcppImageOptions routes the stable-diffusion.cpp image-options probe to

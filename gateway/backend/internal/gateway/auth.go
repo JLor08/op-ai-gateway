@@ -34,8 +34,9 @@ const (
 	// trusted-loopback path — loopbackPrincipal below, which BOTH entry points
 	// the executor can reach go through: authenticateWeb (/v1/chat/completions,
 	// the text kind) and authenticateInternalOrBearer
-	// (/v1/images/generations, the image kind). An external client can never
-	// inject them because nginx blanks both at the public edge (deploy/nginx/*.conf,
+	// (/v1/images/generations, /v1/images/edits and /v1/audio/speech, the image
+	// and speech kinds). An external client can never inject them because nginx
+	// blanks both at the public edge (deploy/nginx/*.conf,
 	// deploy/k8s/nginx-configmap.yaml), mirroring internalAuthHeaderName/
 	// internalUserHeaderName. See applyServerOverride (server.go) for the actual
 	// security boundary (AuthorizeServerManage re-authorization), which does not

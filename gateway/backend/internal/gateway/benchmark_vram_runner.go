@@ -67,8 +67,8 @@ var errVRAMIsolationTimedOut = errors.New("vram benchmark: isolation timed out")
 //  5. clear the TARGET's override only, and load it through the shared load
 //     core -- which loads BY GENERATING, so a backend that allocates on first
 //     use has necessarily already done so before the post-load window opens.
-//     There is deliberately no second generation step. An images-only target
-//     (an ensure plan) is the exception: the core starts it through the agent
+//     There is deliberately no second generation step. An images-only or
+//     audio-only target (an ensure plan) is the exception: the core starts it through the agent
 //     router's ensure route, and the report says the first generation is not
 //     in the number (vramWarningFirstGenerationNotMeasured);
 //  6. a target that reports RESIDENT after a confirmed drain is contamination,

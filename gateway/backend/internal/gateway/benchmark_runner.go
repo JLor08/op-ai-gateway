@@ -83,7 +83,8 @@ type benchmarkTarget struct {
 	// loadWithoutGenerating marks a target whose model the load core
 	// (ensureResidentForRun) starts through the agent's ensure route instead
 	// of loading it by generating: a server_agent child that serves only
-	// images, on a server whose agent declared runtime_ensure (loadRefusal).
+	// images or only speech, on a server whose agent declared runtime_ensure
+	// (loadRefusal).
 	// The Load starter sets it (loadTargetFor); the VRAM run copies it from
 	// its plan (vramRunPlanned.ensure) onto the target it loads.
 	loadWithoutGenerating bool
@@ -162,8 +163,11 @@ func (s *Server) streamOnceWithin(ctx context.Context, streamer provider.Streami
 
 // mappingIsImagesOnly reads a mapping's runtime spec (mappingRuntimeSpec)
 // and reports whether its EFFECTIVE flavors are images-only
-// (mappingSpecIsImagesOnly). The model warmer asks it before it sends a
-// candidate a chat prompt, because such a mapping cannot answer one.
+// (mappingSpecIsImagesOnly). The swap workaround's sibling pick
+// (benchmarkSiblingModel) asks it before it sends a mapping a chat prompt,
+// because such a mapping cannot answer one. The model warmer does not use it:
+// it reads the spec itself, so it can ask both the images-only and the
+// audio-only test (mappingSpecIsAudioOnly) of one read.
 //
 // Unlike benchmarkSpecFor it keeps "no spec" apart from a failed read: the
 // first means the application's flavors, the second means the answer is
@@ -185,7 +189,8 @@ func (s *Server) mappingIsImagesOnly(ctx context.Context, app routing.Applicatio
 // store. A mapping with no spec yet, or a spec-store error, also returns zero
 // (best-effort -- a warm is a load-ahead that must never fail because a spec
 // lookup hiccupped; the warmer has already skipped a candidate whose spec
-// could not be classified, through mappingIsImagesOnly). A zero spec makes
+// could not be classified, in textCandidates, through its own fail-closed
+// mappingRuntimeSpec read). A zero spec makes
 // SpecUpstreamAuth fall back to the app token: today's pre-Runtime-Spec-
 // API-Token behaviour, unchanged for every non-server_agent or no-spec case.
 // The manual runs and the scheduler read fail-closed instead

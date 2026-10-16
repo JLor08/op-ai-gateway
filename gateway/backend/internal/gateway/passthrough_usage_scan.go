@@ -183,8 +183,13 @@ type usageScanner struct {
 // usage() are all nil-receiver no-ops, and nativeCopier documents its scanner
 // field as nil-safe for exactly this. The images path's own usage row is the
 // (unit, quantity) pair, not tokens.
+//
+// apiFlavorSpeech gets none for the same two reasons: the same merge has no case
+// for it, so a scan of the response can produce nothing, and the body is a
+// binary audio/wav file that feed would split on '\n' and retain (the buffered
+// branch keeps up to 2×capBytes of it) only to find that out.
 func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress, vendorTarget bool) *usageScanner {
-	if apiFlavor == apiFlavorImages {
+	if apiFlavor == apiFlavorImages || apiFlavor == apiFlavorSpeech {
 		return nil
 	}
 	return &usageScanner{apiFlavor: apiFlavor, vendorTarget: vendorTarget, capBytes: capBytes, progress: progress}

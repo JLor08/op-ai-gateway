@@ -208,6 +208,66 @@ func TestModelWarmerSkipsAnImagesOnlyAgentChild(t *testing.T) {
 	}
 }
 
+// TestModelWarmerSkipsAnAudioOnlyAgentChild is the speech twin of the images
+// case: the warm call is a chat prompt, which a child that serves only speech
+// cannot answer. Candidacy judges a server_agent application by its own
+// flavors, so an agent-launched audio child whose spec lists only openai_audio
+// still arrives as a candidate under a parent that also declares openai. The
+// warmer skips it by its effective flavors, warms a text sibling of the same
+// name instead when there is one, and keeps a child whose spec lists openai
+// beside openai_audio.
+func TestModelWarmerSkipsAnAudioOnlyAgentChild(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	mem := routing.NewMemoryStore()
+	for i, srvID := range []string{"srv-audio", "srv-text"} {
+		if err := mem.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".example.test", Provider: routing.ProviderMock, Endpoint: "mock://" + srvID, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateAIServer: %v", err)
+		}
+		appID := "app-" + srvID
+		if err := mem.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderServerAgent, Port: 8081 + i, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, TimeoutMS: 30000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateApplication: %v", err)
+		}
+	}
+	child := func(id, appID, gateway, upstream string, flavors []string) {
+		t.Helper()
+		if err := mem.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: appID, GatewayModelName: gateway, AppModelName: upstream, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateMapping %s: %v", id, err)
+		}
+		if err := mem.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-" + id, MappingID: id, Binary: "/opt/bin/server", Args: "[]", Env: "{}", APIFlavors: flavors, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertRuntimeSpec %s: %v", id, err)
+		}
+	}
+	// "voice" exists only as an audio-only child. "shared" exists as an
+	// audio-only child (sorted first, map-a) and a text child (map-b).
+	// "both" is one child whose spec lists openai and openai_audio.
+	child("map-voice", "app-srv-audio", "voice", "up-voice", []string{routing.APIFlavorOpenAIAudio})
+	child("map-a-shared", "app-srv-audio", "shared", "up-shared-audio", []string{routing.APIFlavorOpenAIAudio})
+	child("map-b-shared", "app-srv-text", "shared", "up-shared-text", []string{routing.APIFlavorOpenAI})
+	child("map-both", "app-srv-text", "both", "up-both", []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio})
+
+	fake := newColdLister(nil)
+	w := newModelWarmer(&Server{Provider: fake, Routes: mem})
+
+	w.Warm(ctx, "voice")
+	waitWarmIdle(t, w, "voice")
+	if got := fake.streamedModels(); len(got) != 0 {
+		t.Fatalf("streamed = %v, want no chat prompt to an audio-only child", got)
+	}
+
+	w.Warm(ctx, "shared")
+	waitWarmIdle(t, w, "shared")
+	if got := fake.streamedModels(); len(got) != 1 || got[0] != "up-shared-text" {
+		t.Fatalf("streamed = %v, want exactly [up-shared-text] (the text sibling)", got)
+	}
+
+	w.Warm(ctx, "both")
+	waitWarmIdle(t, w, "both")
+	if got := fake.streamedModels(); len(got) != 2 || got[1] != "up-both" {
+		t.Fatalf("streamed = %v, want [up-shared-text up-both] (a child that also serves openai is warmed)", got)
+	}
+}
+
 // warmerTwoServerStore seeds two mock servers, srv-a and srv-b, each with one
 // openai application. The gateway model "twin" has a mapping on each server:
 // map-a -> "up-a" on srv-a, which ActiveMappingsForModel returns first, and

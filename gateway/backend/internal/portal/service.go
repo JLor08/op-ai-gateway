@@ -2023,12 +2023,12 @@ func (s *Service) tokenNameTaken(ctx context.Context, userID, name, excludeID st
 //     (group-only) names, which a direct request cannot route to, plus the
 //     merely-hidden ones, which it can.
 //
-// Every known flavor counts, openai_images included: a name valid for only one
-// of them is still a valid setting, and every consumer re-checks the flavor per
-// request. A name that no flavor serves (routing.MappingServesAPIFlavor) is in
-// no Callable set and therefore not a valid setting, although Models() still
-// lists it. Groups share the model namespace and are therefore included by the
-// same lookup.
+// Every known flavor counts, openai_images and openai_audio included: a name
+// valid for only one of them is still a valid setting, and every consumer
+// re-checks the flavor per request. A name that no flavor serves
+// (routing.MappingServesAPIFlavor) is in no Callable set and therefore not a
+// valid setting, although Models() still lists it. Groups share the model
+// namespace and are therefore included by the same lookup.
 //
 // The set is built ONCE per create/update and passed to each validator, rather
 // than rebuilt per entry: it costs one mapping traversal, one group-overlay
@@ -2967,7 +2967,30 @@ func imageEditFlagsByName(views []mappingView, capsByMapping map[string][]routin
 	})
 }
 
-// foldMappingFlags is the per-name AND shared by the image folds: for each
+// speechFlagsByName is THE speech fold, the speech twin of imageFlagsByName:
+// per gateway model name among views, whether the speech endpoint would serve
+// it. It backs the unknown-model redirect's ModelOffering.Capable for a request
+// that requires routing.CapabilitySpeech (capableNames). No listing field reads
+// it yet, but it is a fold of its own rather than an inlined rule so that one
+// does not grow a second copy of it. idx supplies each mapping's runtime spec
+// (runtimeSpecIndex) and must cover every view.
+//
+// This is the gate behind "openai_audio is offered only behind a speech
+// verdict": a name carries the speech capability only when EVERY one of its
+// mappings has a (speech, yes) verdict (speechRows, keyed by mapping id) AND
+// would pass both flavor stages of a speech request (viewServesAudio). It is
+// fail-closed exactly as imageFlagsByName is: a "no" row and a MISSING row
+// (never probed) both AND in as false, and a name starts true on its first
+// mapping and is only ever ANDed down, never up. Speech is independent of
+// every other capability: an image=yes or vision=yes verdict never makes a
+// model a speech candidate.
+func speechFlagsByName(views []mappingView, speechRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return speechRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesAudio(view, idx)
+	})
+}
+
+// foldMappingFlags is the per-name AND shared by the capability folds: for each
 // gateway model name among views, true only when ok holds for EVERY one of its
 // mappings. A name starts true on its first mapping and is only ever ANDed
 // down, never up, so the fold is fail-closed and a name with no mapping is
@@ -3016,10 +3039,31 @@ func groupCapabilityFlags(entries []groupOverlayEntry, flags map[string]bool) ma
 // its spec may exclude openai_images, and an image flag that is wrong sends an
 // image request to a model that refuses it.
 func viewServesImages(view mappingView, idx runtimeSpecIndex) bool {
+	return viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorOpenAIImages)
+}
+
+// viewServesAudio is viewServesImages' speech twin: whether a speech request
+// resolved to this mapping would pass both flavor stages. That is the
+// openai_audio flavor half (routing.MappingHasAPIFlavor): CANDIDACY admits only
+// an application that declares openai_audio, and the speech relay then holds the
+// mapping's effective flavors to it too -- the spec's for a server_agent mapping
+// with a spec row, the application's otherwise. The same fail-closed answer for
+// an application whose spec read failed: its spec may exclude openai_audio, and
+// a speech flag that is wrong sends a speech request to a model that refuses it.
+func viewServesAudio(view mappingView, idx runtimeSpecIndex) bool {
+	return viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorOpenAIAudio)
+}
+
+// viewHasAPIFlavorFailClosed is the flavor half shared by viewServesImages and
+// viewServesAudio: the mapping passes routing.MappingHasAPIFlavor for flavor
+// under its effective flavors, and an application whose spec read failed
+// (idx.failed) passes nothing, since the unreadable spec may be the very thing
+// that excludes the flavor.
+func viewHasAPIFlavorFailClosed(view mappingView, idx runtimeSpecIndex, flavor string) bool {
 	if _, failed := idx.failed[view.app.ID]; failed {
 		return false
 	}
-	return routing.MappingHasAPIFlavor(view.app, idx.effective(view), routing.APIFlavorOpenAIImages)
+	return routing.MappingHasAPIFlavor(view.app, idx.effective(view), flavor)
 }
 
 // runtimeSpecIndex is the runtime-spec state every portal flavor fold reads
@@ -4394,22 +4438,23 @@ func (s *Service) filterVisibleMappingViews(ctx context.Context, token auth.Toke
 }
 
 // knownAPIFlavors is the sorted set of coarse API flavors a model listing can
-// carry, the images flavor included: perNameFlavors asks its rule about each
-// of them, so a flavor missing here is a flavor no listing reports -- an
-// images-only model would reach the chat with no flavors at all. A model
-// carries the ones dispatch serves it under (routing.MappingServesAPIFlavor),
-// and each per-flavor listing (/anthropic/v1/models and /v1/models, narrowed
-// from the Models() rows, and the ids-only ModelsForFlavor they are pinned
-// against) asks for its OWN flavor, so an images-only model never appears in a
-// text listing.
+// carry, the images and audio flavors included: perNameFlavors asks its rule
+// about each of them, so a flavor missing here is a flavor no listing reports --
+// an images-only or audio-only model would reach the chat with no flavors at
+// all. A model carries the ones dispatch serves it under
+// (routing.MappingServesAPIFlavor), and each per-flavor listing
+// (/anthropic/v1/models and /v1/models, narrowed from the Models() rows, and
+// the ids-only ModelsForFlavor they are pinned against) asks for its OWN
+// flavor, so an images-only or audio-only model never appears in a text
+// listing.
 //
 // The seed fallback does not read this set; see seedAPIFlavors.
-var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIImages}
+var knownAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages}
 
 // seedAPIFlavors is the sorted set of flavors the seed models (the
 // unconfigured-routing-store fallback) expose. The seeds are TEXT models, and
-// openai_images is opt-in everywhere, so this is deliberately not
-// knownAPIFlavors: a seed that claimed images would be offered for image
+// openai_images and openai_audio are opt-in everywhere, so this is deliberately
+// not knownAPIFlavors: a seed that claimed images or speech would be offered for
 // requests it cannot serve.
 var seedAPIFlavors = []string{routing.APIFlavorAnthropic, routing.APIFlavorOpenAI}
 

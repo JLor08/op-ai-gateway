@@ -89,12 +89,13 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // store read failed before the run started.
   'benchmark.request_failed': 'errorBenchmarkRequestFailed',
   // The starters' refusals before the reservation (benchmarkErrRows): a run
-  // that would send an images-only mapping a chat prompt; an images-only agent
-  // mapping whose agent does not report runtime_ensure (the Load, and the VRAM
-  // probe under the same code); a Load of a force_stopped launch spec. The
-  // model list's `load_refusal` reuses these labels as the disabled Load
-  // action's tooltip.
+  // that would send an images-only (or, as benchmark.audio_only, an audio-only)
+  // mapping a chat prompt; an images-only or audio-only agent mapping whose
+  // agent does not report runtime_ensure (the Load, and the VRAM probe under
+  // the same code); a Load of a force_stopped launch spec. The model list's
+  // `load_refusal` reuses these labels as the disabled Load action's tooltip.
   'benchmark.images_only': 'errorBenchmarkImagesOnly',
+  'benchmark.audio_only': 'errorBenchmarkAudioOnly',
   'benchmark.agent_ensure_unsupported': 'errorBenchmarkAgentEnsureUnsupported',
   'benchmark.spec_force_stopped': 'errorBenchmarkSpecForceStopped',
   // The VRAM benchmark's precondition refusals (409 at the trigger), read

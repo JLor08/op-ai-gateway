@@ -21,6 +21,7 @@
     "e2e:runtime": "playwright test -c playwright.runtime.config.ts",
     "e2e:services": "playwright test -c playwright.services.config.ts",
     "e2e:servers": "playwright test -c playwright.servers.config.ts",
+    "e2e:speech": "playwright test -c playwright.speech.config.ts",
     "e2e:smtp": "playwright test -c playwright.smtp.config.ts",
     "e2e:totp": "playwright test -c playwright.totp.config.ts",
     "e2e:system-admin-mode": "playwright test -c playwright.system-admin-mode.config.ts"

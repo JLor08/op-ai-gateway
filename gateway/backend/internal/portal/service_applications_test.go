@@ -621,7 +621,7 @@ func TestCreateApplicationAllowsLlamaSwapTypeAndAcceptsAllValidTypes(t *testing.
 	server := createTestServer(t, svc, "S", "s.example.test")
 
 	port := 9000
-	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp} {
+	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp} {
 		port++
 		if _, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
 			Type: typ, Port: port, Scheme: "http",
@@ -3890,6 +3890,28 @@ func TestImageNoIsAReservedManualVerdict(t *testing.T) {
 	}
 }
 
+// (speech, no) is reserved for the same reason (image, no) is. A manual row is
+// rank 3 and outranks every automated source, and nothing re-derives it, so a
+// manual `no` would permanently veto the audio.cpp /v1/models probe
+// (audiocpp_models) -- the writer entitled to establish it, because a loaded
+// model's `task` is authoritative -- against a genuinely capable model. The
+// cost to the operator is nil: an ABSENT row already refuses a speech request.
+func TestSpeechNoIsAReservedManualVerdict(t *testing.T) {
+	if !reservedManualVerdict(routing.CapabilitySpeech, routing.CapabilityNo) {
+		t.Error("(speech, no) must be reserved")
+	}
+	// yes stays writable: it is the operator's override of the probe, and the
+	// enablement path where no probe verdict exists (an audio.cpp model that is
+	// not loaded, so the listing does not name it).
+	if reservedManualVerdict(routing.CapabilitySpeech, routing.CapabilityYes) {
+		t.Error("(speech, yes) must stay writable: it is the operator's override of the audiocpp_models probe and the enablement path for a model that is not loaded")
+	}
+	// The reset is never refused, for any pair.
+	if reservedManualVerdict(routing.CapabilitySpeech, "") {
+		t.Error("the reset must never be refused")
+	}
+}
+
 // TestNormalizeFlavorsAcceptsImagesAndKeepsEmptyDefault guards the change's
 // migration safety. The empty-list default must stay exactly
 // [openai, anthropic]: if it ever gained openai_images, every existing
@@ -3934,6 +3956,141 @@ func TestNormalizeApplicationTypeAcceptsStableDiffusionCpp(t *testing.T) {
 	}
 	if applicationTimeoutDefaultFor(routing.ProviderVLLM) != defaultApplicationTimeoutMS {
 		t.Fatal("vllm's timeout default must be unchanged")
+	}
+}
+
+// TestNormalizeApplicationTypeAcceptsAudioCpp pins that audio_cpp is a
+// creatable application type, and its timeout default: 30s is not a preference
+// for this type but a likely failure, since a long synthesis is a non-streaming
+// request whose TimeoutMS is a TOTAL deadline.
+func TestNormalizeApplicationTypeAcceptsAudioCpp(t *testing.T) {
+	got, err := normalizeApplicationType("audio_cpp")
+	if err != nil {
+		t.Fatalf("normalizeApplicationType(audio_cpp) error = %v", err)
+	}
+	if got != routing.ProviderAudioCpp {
+		t.Fatalf("type = %q, want %q", got, routing.ProviderAudioCpp)
+	}
+	if got := applicationTimeoutDefaultFor(routing.ProviderAudioCpp); got != 600000 {
+		t.Fatalf("audio_cpp timeout default = %d, want 600000", got)
+	}
+	if applicationTimeoutDefaultFor(routing.ProviderVLLM) != defaultApplicationTimeoutMS {
+		t.Fatal("vllm's timeout default must be unchanged")
+	}
+	if _, err := normalizeApplicationType("audio_cpp_typo"); !errors.Is(err, ErrApplicationTypeInvalid) {
+		t.Fatalf("normalizeApplicationType(audio_cpp_typo) error = %v, want ErrApplicationTypeInvalid", err)
+	}
+}
+
+// TestCreateApplicationAudioCppDefaultTimeout pins the default through the
+// create path: a zero TimeoutMS becomes the audio_cpp default, and an explicit
+// value is kept.
+func TestCreateApplicationAudioCppDefaultTimeout(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderAudioCpp, Port: 9000, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	if dto.Type != routing.ProviderAudioCpp || dto.TimeoutMS != 600000 {
+		t.Fatalf("type/TimeoutMS = %q/%d, want audio_cpp/600000", dto.Type, dto.TimeoutMS)
+	}
+
+	explicit, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderAudioCpp, Port: 9001, Scheme: "http", TimeoutMS: 12345,
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication (explicit timeout): %v", err)
+	}
+	if explicit.TimeoutMS != 12345 {
+		t.Fatalf("TimeoutMS = %d, want 12345 (explicit value preserved)", explicit.TimeoutMS)
+	}
+}
+
+// TestNormalizeFlavorsAcceptsAudio pins openai_audio as a flavor an operator
+// can save, on both write paths that share normalizeFlavors: an application's
+// (ErrApplicationFlavorInvalid) and a runtime spec's (ErrRuntimeSpecFlavorInvalid),
+// each keeping its own error code for a name that is not a flavor. The empty
+// default must stay exactly [openai, anthropic] (see
+// TestNormalizeFlavorsAcceptsImagesAndKeepsEmptyDefault): audio is opt-in, or
+// every existing text-only application would become a speech candidate.
+func TestNormalizeFlavorsAcceptsAudio(t *testing.T) {
+	got, err := normalizeApplicationFlavors([]string{routing.APIFlavorOpenAIAudio})
+	if err != nil {
+		t.Fatalf("normalizeApplicationFlavors([openai_audio]) error = %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{routing.APIFlavorOpenAIAudio}) {
+		t.Fatalf("audio-only = %v, want [%s]", got, routing.APIFlavorOpenAIAudio)
+	}
+
+	got, err = normalizeApplicationFlavors([]string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIAudio})
+	if err != nil {
+		t.Fatalf("normalizeApplicationFlavors([openai, openai_audio, openai_audio]) error = %v", err)
+	}
+	if want := []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("mixed = %v, want %v (deduplicated, order kept)", got, want)
+	}
+
+	got, err = normalizeRuntimeSpecFlavors([]string{routing.APIFlavorOpenAIAudio})
+	if err != nil {
+		t.Fatalf("normalizeRuntimeSpecFlavors([openai_audio]) error = %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{routing.APIFlavorOpenAIAudio}) {
+		t.Fatalf("spec audio-only = %v, want [%s]", got, routing.APIFlavorOpenAIAudio)
+	}
+
+	if _, err := normalizeApplicationFlavors([]string{"openai_speech"}); !errors.Is(err, ErrApplicationFlavorInvalid) {
+		t.Fatalf("unknown application flavor error = %v, want ErrApplicationFlavorInvalid", err)
+	}
+	if _, err := normalizeRuntimeSpecFlavors([]string{"openai_speech"}); !errors.Is(err, ErrRuntimeSpecFlavorInvalid) {
+		t.Fatalf("unknown spec flavor error = %v, want ErrRuntimeSpecFlavorInvalid", err)
+	}
+	if got, _ := normalizeApplicationFlavors(nil); !reflect.DeepEqual(got, []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}) {
+		t.Fatalf("empty default = %v, want exactly [openai anthropic]: audio is opt-in", got)
+	}
+}
+
+// TestApplicationSavesTheAudioFlavor is the end to end half of the pin above:
+// an audio_cpp application is created with [openai_audio], and another one
+// created without flavors takes the flavor on an update, neither refused as
+// ErrApplicationFlavorInvalid. The backend never defaults an application's
+// flavor from its type (the portal form does), so what is stored is exactly
+// what the operator sent.
+func TestApplicationSavesTheAudioFlavor(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	created, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderAudioCpp, Port: 9000, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAIAudio},
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication with openai_audio: %v", err)
+	}
+	if !reflect.DeepEqual(created.APIFlavors, []string{routing.APIFlavorOpenAIAudio}) {
+		t.Fatalf("created api_flavors = %v, want [%s]", created.APIFlavors, routing.APIFlavorOpenAIAudio)
+	}
+
+	plain, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderAudioCpp, Port: 9001, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication without flavors: %v", err)
+	}
+	if want := []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic}; !reflect.DeepEqual(plain.APIFlavors, want) {
+		t.Fatalf("api_flavors without an explicit list = %v, want the stock %v: the backend does not default by type", plain.APIFlavors, want)
+	}
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	updated, err := svc.UpdateApplication(context.Background(), ownerToken(), plain.ID, UpdateApplicationRequest{APIFlavors: &audio})
+	if err != nil {
+		t.Fatalf("UpdateApplication with openai_audio: %v", err)
+	}
+	if !reflect.DeepEqual(updated.APIFlavors, audio) {
+		t.Fatalf("updated api_flavors = %v, want %v", updated.APIFlavors, audio)
 	}
 }
 

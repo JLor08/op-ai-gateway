@@ -776,6 +776,40 @@ back off the relay. An edit refused before anything was relayed —
 (`413 request.body_too_large`) — is one error row billed as `image` with no host,
 route or provider path, because no upstream was called.
 
+**`/v1/audio/speech` is the second producer: `audio_second`, with a duration read off a
+response header.** The unit is endpoint identity again, so every speech
+`recordUsage` site carries `billing_unit: "audio_second"`, success and failure alike
+(a routing refusal, a failed or timed-out relay and an upstream-error relay record
+it with quantity `0`), derived from the caller's own `APIFlavor` on the shared
+`proxyNative` sites and set outright on the speech-only ones. The row's token counts
+and both rates stay zero (`ValidateBillingXOR`), because the usage scanner is nil
+for speech and so no count or rate can reach the row, and its `provider_path` is
+`/v1/audio/speech`. What differs from images is **where the quantity is read**: not
+from a counter over the body (a binary WAV has nothing to count), but from the
+upstream's own `X-AudioCPP-Audio-Duration-Ms` response header, divided by 1000
+(`setSpeechBillingQuantity`, `internal/gateway/speech_handler.go`; the header is the
+upstream's, passed in beside the exchange because the exchange is built before any
+response exists). It is the same kind of value as the image count, a **measurement**
+taken from the response, and it follows the same rule: set only when the full body
+reached the client (`status == "success"`), `0` on every other outcome. A duration
+is *usable* when it parses as a finite number greater than zero; an absent, empty,
+non-numeric (`"1500ms"`), zero, negative or `NaN`/`Inf` value is not (`ParseFloat`
+accepts the last two, and either would poison every sum the usage views take). **A
+2xx speech response with no usable duration is logged at `Error`** with the request
+id, the model, the server and the raw header value, and the row records `0`, for the
+reason the images count does: `(audio_second, 0)` on a successful relay is
+indistinguishable from a genuinely empty clip, so the gap is made loud instead of
+repaired. This is also why `response_format` is restricted to `wav` ([API
+Compatibility & Inference §3.6](compatibility-and-inference.md#36-openai-audio-speech)):
+the header is present only on audio.cpp's `audio/wav` answer, and `json` and
+`b64_json` carry none, so a relayed one would trip this log on every success. The
+other metering headers (`X-AudioCPP-Wall-Ms`, `X-AudioCPP-RTF`) are not billed and
+are not forwarded to the client; they reach only the payload capture's summary
+([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+A later transcription endpoint (#69) that shares the `openai_audio` flavor will have
+to tell itself apart from speech here, or read its own header
+([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
 the response, because a zero `provider.Response` on a failed request would
@@ -917,13 +951,14 @@ tooltips for all **four** aggregate surfaces — the grouped table's own row
 cells, the four Activity stat tiles, the Dashboard 24h tile, and the
 ProjectsView rollups (rows and total) — so a change to the rule or to its
 wording lands on all four at once. The per-row two-state rule is instead
-applied at each row-rendering site, and there are **two** of them, both with
-their own inline `Tooltip`: `ActivityTable.tsx`'s `tokenCountCell` (the
-Activity list's token cells) and the inline conditional in `ActivityGroups.tsx`
-that renders a folded group's **expanded member table**. Both carry the tooltip
-today; neither is reached by editing `TokenAggregateValue`. A maintainer
-changing row-level behaviour has to change both, and `isTokenMetered` is the
-only thing they share.
+applied at each row-rendering site, and there are **three** of them, each with
+its own inline `Tooltip`: `ActivityTable.tsx`'s `tokenCountCell` (the
+Activity list's token cells), the inline conditional in `ActivityGroups.tsx`
+that renders a folded group's **expanded member table**, and the live
+output-tokens cell of `ActiveRequestsPanel.tsx` (§8.4.3), which reads the in-flight
+row's own `billing_unit`. All three carry the tooltip today; none is reached by
+editing `TokenAggregateValue`. A maintainer changing row-level behaviour has to
+change all three, and `isTokenMetered` is the only thing they share.
 
 This is the converse of §8.4.3's live-counter rule that a measured zero must
 read as `0` — here a not-applicable zero must never be indistinguishable from
@@ -934,11 +969,11 @@ wire value**, with an explanatory tooltip keyed on the full enum value in both
 UI languages; a value this build does not recognise gets the chip and **no**
 tooltip, because silence is honest where a guessed label would not be. The
 `billing_unit` and `billing_quantity` columns ship **hidden**, revealed from the
-Activity column menu: no endpoint in this repository writes a unit yet (#71,
-#68 and #69 own the endpoints that will), so on current traffic every row is
-token-metered and both cells read as an em dash. The disclosure count and both
-rules are therefore in place *before* the first producer, which is
-the point — they are what makes the first non-token row readable on arrival
+Activity column menu: only the image and speech endpoints write a unit (#71, #68;
+the transcription endpoint #69 will be the next), so on traffic without them every
+row is token-metered and both cells read as an em dash. The disclosure count and both
+rules were in place *before* the first producer, which is
+the point — they are what makes a non-token row readable on arrival
 instead of silently wrong.
 
 ### 8.4.3 Running connections (active requests)
@@ -968,6 +1003,26 @@ only by reordering, or by a reset performed before this column existed — is
 the one that puts a later column at the END of the row. Column settings are
 per user profile, so two operators on one gateway can legitimately see
 different panels, and the menu's reset restores both defaults.
+
+**The live row carries its billing unit, so a non-token request is not shown a
+token count.** `ActiveRequest.BillingUnit` (JSON `billing_unit`, always sent, `""`
+for a token-metered request) is set at **every** registration site from the same
+`billingUnitFor(apiFlavor)` chokepoint the completed row uses: the non-streaming
+chat path, the streaming chat path (`beginStream`) and the native-passthrough path,
+the last being the shared site for images generations, image edits and speech. It is
+the in-flight twin of the completed row's field, and it is populated for **every**
+flavor, chat included (`""`), rather than only the non-token ones, so the portal
+never has to guess a missing field. The Active Requests panel applies the per-row
+two-state rule to its (opt-in) `Generated (live)` column from it: a row whose unit is
+not `""` shows an em dash with the "not token-metered" tooltip, a token-metered row
+beside it still shows its count, and a non-token row's zero is **not applicable**
+rather than "nothing reported yet" (an image or speech request is buffered and has no
+usage scanner, so its other live fields are the "not measured" values too). Before the
+field existed the column printed the
+same dash for an image or speech request, but with no explanation, so the delta is
+the tooltip; a gateway older than the field reads as token-metered
+([HTTP API Surface](../reference/api-surface.md#live-per-request-progress-apiportalusageactive),
+[ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
 
 **Live tokens/sec and TTFT.** Two more values ride the same `ActiveRequest`: a
 per-request output-tokens/sec figure and a time-to-first-token (TTFT), both
@@ -1143,7 +1198,7 @@ by shape, so tests pin both:
      `server_agent` there and is the wrong field to read;
   3. the request is the **Responses** flavor — the *fine* flavor, taken as a
      parameter, because `Target.APIFlavor` is the coarse one (`openai`,
-     `anthropic` or `openai_images`) and cannot tell `/v1/responses` from
+     `anthropic`, `openai_images` or `openai_audio`) and cannot tell `/v1/responses` from
      `/v1/chat/completions`;
   4. the request is **streaming** — a buffered body has no partial frames to
      time, and gets no live counter either;
@@ -1884,8 +1939,8 @@ Ollama child without it.
 
 **Persistence is one row per capability, with a provenance rank where the
 columns had a lock.** Every verdict a capability probe yields — off
-llama.cpp's `/props`, Ollama's `/api/show` or stable-diffusion.cpp's
-`/sdcpp/v1/capabilities` — is a
+llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
+`/sdcpp/v1/capabilities` or audio.cpp's `/v1/models` — is a
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
@@ -1898,11 +1953,11 @@ more. A verdict of `""` produces **no row at
 all**, and the absence of a row is what UNKNOWN means — which is why a partial
 answer (an older llama.cpp reporting `modalities` but no
 `chat_template_caps`) cannot clear a `tools` verdict a previous probe
-established: there is no empty verdict for it to write. There are **three
+established: there is no empty verdict for it to write. There are **four
 probe write paths**, each stamping the row's `source` with the probe that
 produced the document plus the observation time as `checked_at`, and naming
 them individually is the point — a rule about capability provenance has to be
-placed on all three, or on the ones that carry the risk, and that is a decision
+placed on all four, or on the ones that carry the risk, and that is a decision
 nobody can make from a count:
 
 - **The gateway's own `/props` pass** (`cmd/gateway/app_health.go`). The
@@ -1925,6 +1980,23 @@ nobody can make from a count:
   `writeCapabilityRows`, so every guard below applies unchanged. Attribution
   and the rest of its rules are in [Routing & Model Selection
   §2.3](routing-and-model-selection.md#23-the-capability-gate).
+- **The gateway's own audio.cpp pass** (`probeAudioCppModels`, same file), for each
+  active application of type `audio_cpp` (a static, operator-run server): one
+  `GET /v1/models` **per active mapping** (the verdict is per model, so unlike the
+  sd-server pass it is not one probe per application), projected by
+  `audioCppCapabilityRows` into at most one `speech` row with
+  `source = audiocpp_models`. The listing's per-model `task` decides: `tts`/`clone`
+  is `yes`, any other non-empty task is a real `no`, and a model the listing does not
+  name (it lists **loaded** models only), an entry with no task, an unreachable server
+  or an unreadable body writes **no row**, because none of those states that the
+  model cannot speak. It is written through the same `writeCapabilityRows`, so every
+  guard below applies unchanged. It is **gateway-only**: the agent ingest does not
+  accept `audiocpp_models`, so an agent-launched `audio_cpp` child has no automatic
+  `speech` verdict until an agent-side source exists, and the pass does not probe a
+  `server_agent` application at all, because the agent router's `/v1/models` carries
+  no `task` ([Routing & Model Selection
+  §2.3](routing-and-model-selection.md#23-the-capability-gate),
+  [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
 - **The agent's telemetry ingest**
   (`internal/gateway/agent_ingest.go`, `writeBackRuntimeCapabilities` →
   `runtimeSampleCapabilityRows`). It stamps whichever of
@@ -1942,7 +2014,7 @@ nobody can make from a count:
   §2.3](routing-and-model-selection.md#23-the-capability-gate)).
 
 The `/props` pass and the ingest both translate a live-progress verdict
-through the one `routing.LiveProgressCapabilityVerdict`, and all three ask the
+through the one `routing.LiveProgressCapabilityVerdict`, and all four ask the
 one `routing.WritableCapabilityRows` — which is how they cannot drift apart on
 the rules they share (`agent_ingest.go` names its sibling explicitly, and so
 does `probedCapabilityRows`).
@@ -1969,7 +2041,9 @@ so a manual row survives even a restart, and a `"no"` states something its
 vocabulary cannot mean. `image_edit` is on the probe list above and **not** on this
 one: `image_edit: "no"` is the operator's own opt-out
 ([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
-while `(image, no)`, by contrast, is reserved here. **`mtp` is on neither list**, because it is the one
+while `(image, no)`, by contrast, is reserved here, and `(speech, no)` with it, for
+the same reason: the audio.cpp pass is the writer entitled to establish it, and a
+rank-3 manual `no` would outrank that probe forever. **`mtp` is on neither list**, because it is the one
 internal name that HAS an operator control, whose rank-3 permanence is exactly
 how that control is meant to work.
 

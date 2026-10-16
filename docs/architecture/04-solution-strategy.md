@@ -55,8 +55,8 @@ negotiated by feature flag, so an agent without it behaves exactly as before.
 
 Browsers authenticate with a **session cookie + CSRF header**; programs use
 **bearer API tokens**. `/v1/chat/completions` additionally accepts the
-session; `/v1/images/generations` and `/v1/images/edits` additionally accept
-the internal trusted-loopback pair instead (the gateway's own background executor, never
+session; `/v1/images/generations`, `/v1/images/edits` and `/v1/audio/speech` additionally
+accept the internal trusted-loopback pair instead (the gateway's own background executor, never
 a browser); every other inference endpoint is bearer-only. Authorization is
 layered:
 roles `user < admin < system_admin`, plus delegated **admin groups**, **step-up**

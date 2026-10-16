@@ -1151,6 +1151,154 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(start).toBeDisabled());
     });
 
+    // The speech twin of the images-only rules above: a mapping whose
+    // effective flavors name openai_audio and no text flavor is refused every
+    // chat-prompt run (benchmark.audio_only) and skipped by the wider scopes.
+    const audioOnlyMapping: Overrides = {
+      apps: [makeApp({ id: 'app_1' })],
+      mappings: [makeMapping({ id: 'map_tts', gateway_model_name: 'tts-model', audio_only: true })],
+    };
+
+    it('renders an audio-only skip as its own skip, never as "0 tok/s, 0 ms"', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: true,
+          total: 2,
+          done: 1,
+          results: [result({ gateway_model_name: 'tts-model', skipped: 'audio_only' })],
+        }),
+      );
+      expect(
+        await screen.findByText(`tts-model: ${t.benchmarkResultSkippedAudioOnly}`),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.benchmarkResultSkippedImagesOnly)).not.toBeInTheDocument();
+    });
+
+    it('names an audio-only skip in the not-measured notice of a finished run', async () => {
+      renderSection(
+        { kind: 'server' },
+        delivering({
+          running: false,
+          mode: 'speed',
+          total: 2,
+          done: 2,
+          results: [
+            result({
+              mapping_id: 'map_ok',
+              gateway_model_name: 'text-model',
+              gen_tokens_per_second: 42,
+            }),
+            result({
+              mapping_id: 'map_tts',
+              gateway_model_name: 'tts-model',
+              skipped: 'audio_only',
+            }),
+          ],
+        }),
+      );
+      const notice = await screen.findByLabelText(t.benchmarkNotMeasured);
+      expect(
+        within(notice).getByText(`tts-model: ${t.benchmarkResultSkippedAudioOnly}`),
+      ).toBeInTheDocument();
+      expect(within(notice).queryByText(/text-model/)).not.toBeInTheDocument();
+    });
+
+    it('disables the chat-prompt run types for an audio-only mapping and says why', async () => {
+      const probeMappingVram = vi.fn(async () => idle) as unknown as PortalApi['probeMappingVram'];
+      renderSection(
+        { kind: 'mapping', id: 'map_tts', name: 'tts-model' },
+        { ...audioOnlyMapping, probeMappingVram },
+      );
+      const start = await screen.findByRole('button', { name: t.benchmarkStart });
+      await waitFor(() => expect(start).toBeDisabled());
+      expect(start).toHaveAccessibleDescription(t.benchmarkAudioOnlyHint);
+      expect(screen.getByText(t.benchmarkAudioOnlyHint)).toBeInTheDocument();
+      expect(screen.queryByText(t.benchmarkImagesOnlyHint)).not.toBeInTheDocument();
+
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.benchmarkType }));
+      for (const label of [
+        t.benchmarkTypeSpeed,
+        t.benchmarkTypeCapacity,
+        t.benchmarkTypeBoth,
+        t.benchmarkTypeVision,
+      ]) {
+        expect(await screen.findByRole('option', { name: label })).toHaveAttribute(
+          'aria-disabled',
+          'true',
+        );
+      }
+      // The VRAM measurement loads the model without a chat prompt, so it stays.
+      const vram = screen.getByRole('option', { name: t.benchmarkTypeVram });
+      expect(vram).not.toHaveAttribute('aria-disabled', 'true');
+      fireEvent.click(vram);
+
+      await waitFor(() => expect(start).toBeEnabled());
+      expect(start).not.toHaveAccessibleDescription();
+      fireEvent.click(start);
+      await waitFor(() => expect(probeMappingVram).toHaveBeenCalledWith('map_tts'));
+    });
+
+    it('leaves the application scope startable although its first mapping is audio-only', async () => {
+      const benchmarkApplication = vi.fn(
+        async () => idle,
+      ) as unknown as PortalApi['benchmarkApplication'];
+      renderSection(
+        { kind: 'application', id: 'app_1', name: 'app' },
+        { ...audioOnlyMapping, benchmarkApplication },
+      );
+      await screen.findByRole('combobox', { name: t.benchmarkHistory });
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeEnabled();
+      expect(screen.queryByText(t.benchmarkAudioOnlyHint)).not.toBeInTheDocument();
+      fireEvent.click(start);
+      await waitFor(() => expect(benchmarkApplication).toHaveBeenCalledWith('app_1', 'speed'));
+    });
+
+    it('refuses Start when a chat-prompt type stays selected as the picker moves to an audio-only mapping', async () => {
+      renderSection(
+        { kind: 'mapping', id: 'map_txt', name: 'txt', applicationId: 'app_1' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [
+            makeMapping({ id: 'map_txt', gateway_model_name: 'txt' }),
+            makeMapping({ id: 'map_tts', gateway_model_name: 'tts-model', audio_only: true }),
+          ],
+        },
+      );
+      await screen.findByRole('combobox', { name: t.benchmarkHistory });
+      await pickOption(t.benchmarkType, t.benchmarkTypeCapacity);
+      const start = screen.getByRole('button', { name: t.benchmarkStart });
+      expect(start).toBeEnabled();
+      await pickOption(t.benchmarkScopeMapping, 'tts-model');
+      await waitFor(() => expect(start).toBeDisabled());
+      expect(start).toHaveAccessibleDescription(t.benchmarkAudioOnlyHint);
+    });
+
+    // A list naming both flavors (and no text flavor) is both markers: the
+    // images-only sentence is the one shown, so the form never prints two.
+    it('shows only the images-only hint for a mapping that is both', async () => {
+      renderSection(
+        { kind: 'mapping', id: 'map_both', name: 'both-model' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [
+            makeMapping({
+              id: 'map_both',
+              gateway_model_name: 'both-model',
+              images_only: true,
+              audio_only: true,
+            }),
+          ],
+        },
+      );
+      const start = await screen.findByRole('button', { name: t.benchmarkStart });
+      await waitFor(() => expect(start).toBeDisabled());
+      expect(start).toHaveAccessibleDescription(t.benchmarkImagesOnlyHint);
+      expect(screen.queryByText(t.benchmarkAudioOnlyHint)).not.toBeInTheDocument();
+    });
+
     it('keeps every run type for a text mapping, with no hint', async () => {
       renderSection(
         { kind: 'mapping', id: 'map_1', name: 'gw-model' },

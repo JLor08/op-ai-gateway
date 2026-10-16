@@ -117,6 +117,28 @@ func TestExtractClientSession(t *testing.T) {
 			raw:    `{"model":"m","prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
 			wantID: "", wantSource: "",
 		},
+		{
+			// Speech (/v1/audio/speech) is the same story as images (see the cases
+			// above): no per-endpoint header and no body field is read; both are
+			// explicit, empty cases (endpointSpeech in extractClientSession's header
+			// switch and in sessionFromBody). Every OTHER endpoint's signal is
+			// present at once -- both per-endpoint headers feed the header switch,
+			// and the body (reached because the headers yielded nothing) feeds
+			// sessionFromBody -- so wantID/wantSource stay empty only if
+			// endpointSpeech reads none of them through either switch.
+			name: "speech: every other endpoint's signal present -> still empty", endpoint: endpointSpeech,
+			h:      hdr("session_id", "would-be-codex", "x-claude-code-session-id", "would-be-claude-code"),
+			raw:    `{"model":"m","input":"hello","prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
+			wantID: "", wantSource: "",
+		},
+		{
+			// The agent id is read only on endpointMessages; a speech request that
+			// carries the header must not pick it up.
+			name: "speech: claude-code agent id is not read", endpoint: endpointSpeech,
+			h:      hdr("x-claude-code-agent-id", "agent_9"),
+			raw:    `{"model":"m","input":"hello"}`,
+			wantID: "", wantSource: "", wantAgent: "",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -34,6 +34,16 @@ type captureInput struct {
 	APIFlavor   string
 	OwnerUserID string
 	Secret      bool
+	// RespBytes is how many body bytes the relay actually sent the client, and
+	// RespMetering the upstream's metering headers. Both are set only by
+	// proxyNative's streaming terminal step, and both are read only when the
+	// response body is not stored (captureResponseBody): RespBody is a BOUNDED copy
+	// of what was relayed, so its length is the size of the clip only while the clip
+	// fits the cap, and the client's own response headers carry none of the
+	// upstream's metering. RespBytes == 0 means "not counted", and the size then
+	// falls back to len(RespBody).
+	RespBytes    int64
+	RespMetering http.Header
 	// Translated* hold the TRANSLATED upstream exchange (the request the gateway
 	// actually sent to the Chat-Completions upstream + the raw upstream response),
 	// populated only on the translate path when capturing. Empty on native
@@ -179,6 +189,72 @@ func capBody(b []byte, maxBytes int) ([]byte, bool) {
 	return b, false
 }
 
+// captureBinaryBody is the JSON document stored as the response body of a binary
+// (audio) response whose bytes the capture does not keep: what the response was,
+// how large, and the upstream's metering headers, which are the only thing in it
+// the capture viewer can say anything about. The viewer pretty-prints it like any
+// JSON body.
+type captureBinaryBody struct {
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
+	// Redacted says the content is deliberately absent, as it does on a multipart
+	// part (captureMultipartPart): a reader must not take the summary for a body.
+	Redacted        bool                `json:"redacted"`
+	MeteringHeaders map[string][]string `json:"metering_headers,omitempty"`
+}
+
+// isAudioContentType reports whether a Content-Type header value names an audio
+// media type (audio/*), in any case and with or without parameters.
+func isAudioContentType(contentType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "audio/")
+}
+
+// isBinarySpeechResponse reports whether the capture is of a speech request the
+// upstream answered 2xx. That response is one audio file by the endpoint's
+// contract, so its body must never reach json.Marshal even when its Content-Type
+// is missing or wrong. It is narrow on purpose: a speech request answered with an
+// error, and every other flavor, are decided by the Content-Type alone.
+func isBinarySpeechResponse(in *captureInput) bool {
+	return in.APIFlavor == apiFlavorSpeech && in.HTTPStatus >= 200 && in.HTTPStatus < 300
+}
+
+// captureResponseBody returns what the envelope stores as the response body, and
+// whether that was cut short. For an audio response it is the summary of
+// captureBinaryBody; for everything else it is the body itself clipped to
+// maxBytes, exactly as before.
+//
+// An audio body is binary: it is stored as a string that json.Marshal then rewrites
+// to valid UTF-8 (every invalid byte becomes U+FFFD) and the cap clips mid-file, so
+// what a capture held would be a corrupted fragment of a clip, and its megabyte
+// would bloat every capture for nothing the viewer can show.
+//
+// The gate is the response's OWN Content-Type, the one the client was sent: a
+// speech request whose upstream answered an error (application/json) is stored like
+// any other JSON body, and the same holds for anything else that is not audio.
+// There is one backstop behind it, isBinarySpeechResponse: a speech request that was
+// answered 2xx got audio whatever its Content-Type says (proxyNative defaults a
+// missing one to application/json), so it is skipped too. Nothing is cut off by the
+// skip, so truncated is false.
+func captureResponseBody(in *captureInput, maxBytes int) (string, bool) {
+	contentType := in.RespHeaders.Get("Content-Type")
+	if !isAudioContentType(contentType) && !isBinarySpeechResponse(in) {
+		body, truncated := capBody(in.RespBody, maxBytes)
+		return string(body), truncated
+	}
+	size := in.RespBytes
+	if size == 0 {
+		size = int64(len(in.RespBody))
+	}
+	doc := captureBinaryBody{ContentType: strings.TrimSpace(contentType), Size: size, Redacted: true}
+	if len(in.RespMetering) > 0 {
+		doc.MeteringHeaders = cloneHeader(in.RespMetering)
+	}
+	// Marshal cannot fail on this type (strings, an int64, a bool and a map of
+	// string slices), so there is no failure to report.
+	summary, _ := json.Marshal(doc)
+	return string(summary), false
+}
+
 // buildCaptureEnvelope redacts request headers and clips both bodies to maxBytes.
 // When the translate path collected the upstream exchange, its request headers are
 // redacted (an upstream API key never leaks), its response headers stored verbatim,
@@ -189,14 +265,17 @@ func capBody(b []byte, maxBytes int) ([]byte, bool) {
 // UTF-8 (every invalid byte becomes U+FFFD) and clips mid-file, and the image and
 // mask parts have no business in a payload capture anyway. captureRequestBody
 // stores its text fields and each part's metadata and redacts the rest.
+//
+// An audio RESPONSE body (a speech relay's WAV) is skipped for the same reasons,
+// on the response side: captureResponseBody stores a metadata summary in its place.
 func buildCaptureEnvelope(in *captureInput, maxBytes int) captureEnvelope {
 	reqBody, reqTrunc := captureRequestBody(in, maxBytes)
-	respBody, respTrunc := capBody(in.RespBody, maxBytes)
+	respBody, respTrunc := captureResponseBody(in, maxBytes)
 	env := captureEnvelope{
 		ReqHeaders:  redactCaptureHeaders(in.ReqHeaders),
 		ReqBody:     reqBody,
 		RespHeaders: cloneHeader(in.RespHeaders),
-		RespBody:    string(respBody),
+		RespBody:    respBody,
 		Truncated:   reqTrunc || respTrunc,
 	}
 	if len(in.TranslatedReqBody) > 0 || len(in.TranslatedReqHeaders) > 0 || len(in.TranslatedRespBody) > 0 || len(in.TranslatedRespHeaders) > 0 {

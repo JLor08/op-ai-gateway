@@ -530,3 +530,315 @@ func TestServerOverrideServesCapableMapping(t *testing.T) {
 		t.Fatalf("target = {%q,%q}, want {srv_over, map_over}", target.ServerID, target.RouteID)
 	}
 }
+
+// --- The speech endpoint through the same gate ------------------------------
+//
+// /v1/audio/speech adds no gate of its own: it declares
+// RequiredCapabilities = [CapabilitySpeech] and meets the one filterCapable /
+// resolveAffinity / resolveServerOverride gate every capability-carrying
+// request meets. The tests below pin that the SPEECH capability flows through
+// each of the four Resolve branches the image gate is pinned on: a model
+// without a (speech, yes) verdict is refused, whether the verdict is absent (an
+// unprobed model, which must never fail open), an explicit "no" (an audio
+// model whose task is not speech) or another capability's "yes".
+
+// speechReq is a speech request: the endpoint's identity, expressed as the
+// required-capability list handleOpenAISpeech sets.
+func speechReq(model string) inference.Request {
+	return inference.Request{
+		Model:                model,
+		APIFlavor:            "openai_audio",
+		RequiredCapabilities: []string{CapabilitySpeech},
+	}
+}
+
+// speechRow is a speech verdict row as the audio.cpp prober writes it.
+func speechRow(verdict string, now time.Time) CapabilityRow {
+	return CapabilityRow{Capability: CapabilitySpeech, Verdict: verdict, Source: CapabilitySourceAudioCppModels, CheckedAt: now}
+}
+
+// declareSpeechFlavor turns the named applications of a seeded store into
+// audio.cpp applications declaring openai_audio: speech candidacy admits only
+// an application declaring that flavor, and the shared seeds declare the text
+// and images ones.
+func declareSpeechFlavor(t *testing.T, mem *MemoryStore, appIDs ...string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, id := range appIDs {
+		app, err := mem.ApplicationByID(ctx, id)
+		if err != nil {
+			t.Fatalf("ApplicationByID %s: %v", id, err)
+		}
+		app.Type = ProviderAudioCpp
+		app.APIFlavors = []string{APIFlavorOpenAIAudio}
+		if err := mem.UpdateApplication(ctx, app); err != nil {
+			t.Fatalf("UpdateApplication %s: %v", id, err)
+		}
+	}
+}
+
+// seededSpeechStore is seededGroupStore with both members declaring openai_audio.
+func seededSpeechStore(t *testing.T, now time.Time) *MemoryStore {
+	t.Helper()
+	mem := seededGroupStore(t, now)
+	declareSpeechFlavor(t, mem, "app_a", "app_b")
+	return mem
+}
+
+// speechUnservedVerdicts are the rows a mapping can carry without being
+// speech-capable. The nil case matters most: an unprobed model (audio.cpp lists
+// loaded models only) has no row, and the gate refuses on unknown (ADR-042).
+func speechUnservedVerdicts(now time.Time) map[string][]CapabilityRow {
+	return map[string][]CapabilityRow{
+		"unknown (no row)":     nil,
+		"explicit no":          {speechRow(CapabilityNo, now)},
+		"another capability's": {{Capability: CapabilityImage, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: now}},
+	}
+}
+
+// seedSpeechRows writes rows on a mapping, a nil set meaning "leave it with no
+// row at all".
+func seedSpeechRows(t *testing.T, mem *MemoryStore, mappingID string, rows []CapabilityRow) {
+	t.Helper()
+	if rows == nil {
+		return
+	}
+	if err := mem.UpsertMappingCapabilities(context.Background(), mappingID, rows); err != nil {
+		t.Fatalf("seed %s: %v", mappingID, err)
+	}
+}
+
+// The fresh-candidate branch: an unknown, an explicit no and a foreign yes are
+// all refused with the capability sentinel (not "no such model"), and the same
+// store with a (speech, yes) row serves the model -- the contrast that proves
+// the refusal is the gate and not the fixture.
+func TestSpeechGateFreshPathRefusesWithoutAYesVerdict(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	for name, rows := range speechUnservedVerdicts(now) {
+		t.Run(name, func(t *testing.T) {
+			mem := seededSpeechStore(t, now)
+			seedSpeechRows(t, mem, "map_a", rows)
+			r := NewResolver(mem, func() time.Time { return now }, nil)
+
+			_, err := r.Resolve(ctx, auth.Token{}, speechReq("coder-a"))
+			if !errors.Is(err, ErrModelNotCapable) {
+				t.Fatalf("err = %v, want ErrModelNotCapable", err)
+			}
+			if errors.Is(err, ErrNoModelRoute) {
+				t.Fatalf("err = %v also matches ErrNoModelRoute -- the two facts must stay distinguishable", err)
+			}
+		})
+	}
+
+	mem := seededSpeechStore(t, now)
+	seedSpeechRows(t, mem, "map_a", []CapabilityRow{speechRow(CapabilityYes, now)})
+	r := NewResolver(mem, func() time.Time { return now }, nil)
+	target, err := r.Resolve(ctx, auth.Token{}, speechReq("coder-a"))
+	if err != nil {
+		t.Fatalf("Resolve: %v, want the speech-capable mapping served", err)
+	}
+	if target.ServerID != "srv_a" || target.RouteID != "map_a" {
+		t.Fatalf("target = {%q,%q}, want {srv_a, map_a}", target.ServerID, target.RouteID)
+	}
+}
+
+// The group branch stays a per-member SOFT filter for speech as for images: the
+// first-priority member has no (speech, yes) verdict, the second does, and the
+// walk must reach it instead of failing the whole group on the first refusal.
+func TestSpeechGroupGateSkipsIncapableFirstMemberForCapableSecond(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	for name, rows := range speechUnservedVerdicts(now) {
+		t.Run(name, func(t *testing.T) {
+			mem := seededSpeechStore(t, now)
+			seedSpeechRows(t, mem, "map_a", rows)
+			seedSpeechRows(t, mem, "map_b", []CapabilityRow{speechRow(CapabilityYes, now)})
+			r := NewResolver(mem, func() time.Time { return now }, nil)
+			r.SetGroupResolver(twoMemberGroup("sticky"))
+
+			target, err := r.Resolve(ctx, auth.Token{}, speechReq("coder-group"))
+			if err != nil {
+				t.Fatalf("Resolve: %v, want the speech-capable second member served", err)
+			}
+			if target.ServerID != "srv_b" || target.Model != "coder-b" {
+				t.Fatalf("target = {%q,%q}, want {srv_b, coder-b}", target.ServerID, target.Model)
+			}
+		})
+	}
+}
+
+// The affinity branch: a pin on an application whose mapping has no (speech,
+// yes) verdict must not be reused, whatever kind of non-yes it is, and the
+// refusal is non-destructive (the pin survives). The pin sits under the speech
+// request's OWN key (coarse flavor openai_audio), the only key Resolve looks
+// up for it -- a pin under another flavor would never be found and the test
+// would pass without the gate running.
+func TestSpeechAffinityRefusesAPinnedMappingWithoutAYesVerdict(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	for name, rows := range speechUnservedVerdicts(now) {
+		t.Run(name, func(t *testing.T) {
+			mem := seededSpeechStore(t, now)
+			seedSpeechRows(t, mem, "map_a", rows)
+			seedSpeechRows(t, mem, "map_b", []CapabilityRow{speechRow(CapabilityYes, now)})
+			key := AffinityKey{APITokenID: "tok_1", Model: "coder-a", APIFlavor: APIFlavorOpenAIAudio, SessionID: "sess_1"}
+			seedPinnedAffinity(t, mem, key, "app_a", "srv_a", now)
+			r := NewResolver(&affinityGateStore{resolverStore: mem}, func() time.Time { return now }, nil)
+
+			req := speechReq("coder-a")
+			req.ClientSessionID = "sess_1"
+			target, err := r.Resolve(ctx, auth.Token{ID: "tok_1"}, req)
+
+			// coder-a is the only mapping for that gateway name, so the resolve
+			// refuses outright; what must NOT happen is serving the pinned app.
+			if err == nil && target.ServerID == "srv_a" {
+				t.Fatal("served the pinned but speech-incapable application")
+			}
+			if !errors.Is(err, ErrModelNotCapable) {
+				t.Fatalf("err = %v, want ErrModelNotCapable", err)
+			}
+			if _, ok, affErr := mem.Affinity(ctx, key); affErr != nil || !ok {
+				t.Fatalf("the affinity row was deleted by a speech request (ok=%v, err=%v)", ok, affErr)
+			}
+		})
+	}
+}
+
+// A capability read error on the affinity path refuses for speech too. The
+// mapping's own stored verdict is "yes", so a fail-open bug that trusts an
+// errored read would serve the pin; resolveAffinity is called directly for the
+// reason TestAffinityRefusesOnCapabilityReadError gives.
+func TestSpeechAffinityRefusesOnCapabilityReadError(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	mem := seededSpeechStore(t, now)
+	seedSpeechRows(t, mem, "map_a", []CapabilityRow{speechRow(CapabilityYes, now)})
+	key := AffinityKey{APITokenID: "tok_1", Model: "coder-a", APIFlavor: APIFlavorOpenAIAudio, SessionID: "sess_1"}
+	seedPinnedAffinity(t, mem, key, "app_a", "srv_a", now)
+	r := NewResolver(&affinityGateStore{resolverStore: mem, failKeyed: true}, func() time.Time { return now }, nil)
+
+	req := speechReq("coder-a")
+	target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
+	if err != nil {
+		t.Fatalf("resolveAffinity returned an error, want a non-destructive refusal: %v", err)
+	}
+	if ok {
+		t.Fatalf("a failed capability read served the pin anyway (failed open): target=%+v", target)
+	}
+	if _, rowOK, affErr := mem.Affinity(ctx, key); affErr != nil || !rowOK {
+		t.Fatalf("the affinity row was deleted on a read error (ok=%v, err=%v)", rowOK, affErr)
+	}
+}
+
+// The contrast for the affinity refusals: a pin on a speech-capable mapping IS
+// reused, so the gate refuses the incapable pin and not every pin.
+func TestSpeechAffinityServesAPinnedCapableMapping(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	mem := seededSpeechStore(t, now)
+	seedSpeechRows(t, mem, "map_a", []CapabilityRow{speechRow(CapabilityYes, now)})
+	key := AffinityKey{APITokenID: "tok_1", Model: "coder-a", APIFlavor: APIFlavorOpenAIAudio, SessionID: "sess_1"}
+	seedPinnedAffinity(t, mem, key, "app_a", "srv_a", now)
+	r := NewResolver(&affinityGateStore{resolverStore: mem}, func() time.Time { return now }, nil)
+
+	req := speechReq("coder-a")
+	target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
+	if err != nil || !ok {
+		t.Fatalf("resolveAffinity = (%+v, %v, %v), want the pinned speech-capable mapping served", target, ok, err)
+	}
+	if target.ServerID != "srv_a" {
+		t.Fatalf("ServerID = %q, want srv_a", target.ServerID)
+	}
+}
+
+// A speech resolve writes no pin, on the main or the group path. The key's
+// coarse flavor is its own (openai_audio), so it cannot collide with a text
+// client's; the capability guard (keyed on the list, not the flavor) keeps it
+// pin-free all the same.
+func TestSpeechResolveWritesNoAffinityPin(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	mem := seededSpeechStore(t, now)
+	for _, id := range []string{"map_a", "map_b"} {
+		seedSpeechRows(t, mem, id, []CapabilityRow{speechRow(CapabilityYes, now)})
+	}
+	store := &affinityGateStore{resolverStore: mem}
+	r := NewResolver(store, func() time.Time { return now }, nil)
+	r.SetGroupResolver(twoMemberGroup("sticky"))
+
+	for _, model := range []string{"coder-a", "coder-group"} {
+		req := speechReq(model)
+		req.ClientSessionID = "sess_1"
+		if _, err := r.Resolve(ctx, auth.Token{ID: "tok_1"}, req); err != nil {
+			t.Fatalf("Resolve(%s): %v", model, err)
+		}
+	}
+	if store.upserts != 0 {
+		t.Fatalf("affinity writes = %d, want 0: a capability-carrying resolve must not pin", store.upserts)
+	}
+}
+
+// The server-override branch short-circuits everything else in Resolve, so its
+// own filterCapable call is the only speech check an override request meets: an
+// override naming a server that offers the model through a mapping without a
+// (speech, yes) verdict is refused, and the same override with one is served.
+func TestSpeechServerOverrideGate(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	for name, rows := range speechUnservedVerdicts(now) {
+		t.Run("refuses "+name, func(t *testing.T) {
+			mem := maintenanceOverrideStore(t, now, ServerStatusActive, HealthHealthy)
+			declareSpeechFlavor(t, mem, "app_over")
+			seedSpeechRows(t, mem, "map_over", rows)
+			r := NewResolver(mem, func() time.Time { return now }, nil)
+
+			req := speechReq("qwen-coder")
+			req.ServerOverrideID = "srv_over"
+			_, err := r.Resolve(ctx, auth.Token{}, req)
+			if !errors.Is(err, ErrServerOverrideModelUnavailable) {
+				t.Fatalf("err = %v, want ErrServerOverrideModelUnavailable for an override whose mapping has no (speech, yes) verdict", err)
+			}
+		})
+	}
+
+	mem := maintenanceOverrideStore(t, now, ServerStatusActive, HealthHealthy)
+	declareSpeechFlavor(t, mem, "app_over")
+	seedSpeechRows(t, mem, "map_over", []CapabilityRow{speechRow(CapabilityYes, now)})
+	r := NewResolver(mem, func() time.Time { return now }, nil)
+	req := speechReq("qwen-coder")
+	req.ServerOverrideID = "srv_over"
+	target, err := r.Resolve(ctx, auth.Token{}, req)
+	if err != nil {
+		t.Fatalf("Resolve: %v, want the speech-capable override target served", err)
+	}
+	if target.ServerID != "srv_over" || target.RouteID != "map_over" {
+		t.Fatalf("target = {%q,%q}, want {srv_over, map_over}", target.ServerID, target.RouteID)
+	}
+}
+
+// The vendor-account branch declines a speech request. Nothing in
+// vendorAccountRoutingEligible names the openai_audio flavor (the images flavor
+// is excluded by name); a speech request avoids the branch because it carries
+// RequiredCapabilities = [speech], which the predicate does exclude. That makes
+// the handler's capability list load-bearing twice: it feeds the gate AND keeps
+// the request off a vendor account, whose model match reads the model NAME and
+// never the flavor, so a vendor model sharing a speech request's model name
+// would otherwise be served by a vendor with no speech endpoint here. The
+// handler's side of this pin is TestSpeechInferenceShapeIsTheSpeechEndpointsIdentity
+// in internal/gateway.
+func TestVendorAccountSkippedForSpeech(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	seedVendorAccount(t, store, now, "acc_openai", vendorOwner, VendorOpenAI, vendorKey, "", "gpt-4o", APIFlavorOpenAI)
+	resolver := vendorResolver(store, now, true, vendorRoutingModeVendorFirst)
+
+	req := speechReq("gpt-4o")
+	if resolver.vendorAccountRoutingEligible(ownerToken(), req, NormalizeAPIFlavor(req.APIFlavor)) {
+		t.Fatal("a speech request is eligible for the vendor-account path, want it declined")
+	}
+	if _, err := resolver.Resolve(ctx, ownerToken(), req); !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("Resolve(speech) = %v, want ErrNoModelRoute (the vendor branch declines a capability-carrying request)", err)
+	}
+}

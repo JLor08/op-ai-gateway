@@ -529,6 +529,54 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(button).toHaveAccessibleDescription(t.mappingProbeContextImagesOnly);
     });
 
+    // The speech twin: the gateway refuses the same chat-prompt probe for a
+    // mapping whose effective flavors name openai_audio and no text flavor
+    // (benchmark.audio_only), and the button says so the same way.
+    it('disables the probe for an audio-only mapping and names the reason beside it', () => {
+      renderForm({ contextProbePath: '/props', row: makeMapping({ audio_only: true }) });
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(t.mappingProbeContextAudioOnly);
+      expect(screen.queryByText(t.mappingProbeContextImagesOnly)).not.toBeInTheDocument();
+    });
+
+    it('still disables a derived probe for an audio-only mapping', async () => {
+      renderForm({
+        contextProbePath: '',
+        contextProbeDerived: true,
+        row: makeMapping({ audio_only: true }),
+      });
+      await act(async () => {});
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(t.mappingProbeContextAudioOnly);
+    });
+
+    it('offers the probe for a mapping that is not audio-only, with no audio-only hint', async () => {
+      renderForm({
+        contextProbePath: '/props',
+        row: makeMapping({ images_only: false, audio_only: false }),
+      });
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      await waitFor(() => expect(button).toBeEnabled());
+      expect(button).not.toHaveAccessibleDescription();
+      expect(screen.queryByText(t.mappingProbeContextAudioOnly)).not.toBeInTheDocument();
+    });
+
+    // A list naming both openai_images and openai_audio (and no text flavor)
+    // is both: one hint is shown, the images-only one, whose sentence names a
+    // flavor that holds.
+    it('shows a single hint for a mapping that is both images-only and audio-only', () => {
+      renderForm({
+        contextProbePath: '/props',
+        row: makeMapping({ images_only: true, audio_only: true }),
+      });
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(t.mappingProbeContextImagesOnly);
+      expect(screen.queryByText(t.mappingProbeContextAudioOnly)).not.toBeInTheDocument();
+    });
+
     // The create form has no mapping to probe yet.
     it('offers no probe on the create form', () => {
       renderForm({ contextProbePath: '/props', row: null });

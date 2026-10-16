@@ -116,11 +116,13 @@ describe('formatPortalError', () => {
     );
   });
 
-  // The starters' three refusals before they reserve the server, each with its
-  // OWN label: they send the operator to three different places (a model that
-  // only generates images, an agent update, an admin override).
+  // The starters' four refusals before they reserve the server, each with its
+  // OWN label: they send the operator to different places (a model that only
+  // generates images, one that only generates speech, an agent update, an admin
+  // override).
   it.each([
     ['benchmark.images_only', 'errorBenchmarkImagesOnly'],
+    ['benchmark.audio_only', 'errorBenchmarkAudioOnly'],
     ['benchmark.agent_ensure_unsupported', 'errorBenchmarkAgentEnsureUnsupported'],
     ['benchmark.spec_force_stopped', 'errorBenchmarkSpecForceStopped'],
   ] as const)('labels the %s refusal with %s, in both locales', (code, key) => {
@@ -296,11 +298,12 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * as the `portal.ErrBenchmarkNoModels` sentinel's row in `benchmarkErrRows`
    * there, and as `writeBenchmarkError`'s 500 fallback code
    * (`benchmark.request_failed`), which a starter answers when a store read
-   * fails before the run starts. The last three are the starters' refusals
-   * before the reservation: `errBenchmarkImagesOnly`,
-   * `errBenchmarkAgentEnsureUnsupported` and `errBenchmarkSpecForceStopped`,
-   * rows in the same `benchmarkErrRows`. The VRAM probe answers the second of
-   * them too, under this same code rather than a `benchmark.vram_*` one.
+   * fails before the run starts. The last four are the starters' refusals
+   * before the reservation: `errBenchmarkImagesOnly`, its speech twin
+   * `errBenchmarkAudioOnly`, `errBenchmarkAgentEnsureUnsupported` and
+   * `errBenchmarkSpecForceStopped`, rows in the same `benchmarkErrRows`. The
+   * VRAM probe answers the third of them too, under this same code rather than
+   * a `benchmark.vram_*` one.
    *
    * The starters also answer three other codes that this list leaves out on
    * purpose, because no portal action can trigger them:
@@ -317,6 +320,7 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'benchmark.no_models',
     'benchmark.request_failed',
     'benchmark.images_only',
+    'benchmark.audio_only',
     'benchmark.agent_ensure_unsupported',
     'benchmark.spec_force_stopped',
   ] as const;

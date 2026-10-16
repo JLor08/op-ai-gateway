@@ -479,6 +479,12 @@ const de = {
   // values themselves are silent. See applicationTypeDefaults.ts.
   applicationTypeStableDiffusionCppNote:
     'stable-diffusion.cpp bedient nur Bildanfragen. Der Server bietet keinen /v1/health-Endpunkt, deshalb ist der Health-Check-Modus standardmäßig „Modell-Abgleich“ statt „Health-Pfad prüfen“; das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Bilderzeugung deutlich länger dauert als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_images“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird.',
+  // audio_cpp's three diverging defaults (API flavors, timeout, health path)
+  // explained where the operator can see them. Its health check MODE is not one
+  // of them: it has a real health endpoint, at /health. See
+  // applicationTypeDefaults.ts.
+  applicationTypeAudioCppNote:
+    'audio.cpp bedient nur Sprachsynthese-Anfragen. Das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Synthese deutlich länger dauern kann als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_audio“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird. Der Health-Check-Modus bleibt bei „Health-Pfad prüfen“, aber der Health-Pfad ist standardmäßig /health statt /v1/health, weil der Server /health beantwortet und /v1/health mit 404.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -486,6 +492,9 @@ const de = {
   // anthropic nennt sie neben dem API-Wert auch den Zweck, weil der Wert allein
   // nicht verrät, dass er die Bilderzeugung (/v1/images/generations) freischaltet.
   applicationFlavorOpenaiImages: 'openai_images (Bilderzeugung)',
+  // The fourth flavor checkbox's label, for the same reason as the third's: it
+  // enables speech synthesis (/v1/audio/speech).
+  applicationFlavorOpenaiAudio: 'openai_audio (Sprachsynthese)',
   // Steht unter den Varianten-Kontrollkästchen, wenn keines angehakt ist.
   // Eine leere Liste speichert das Backend als openai + anthropic -- das
   // Formular würde also etwas anderes speichern, als es zeigt.
@@ -669,6 +678,8 @@ const de = {
   // loads the model with a chat prompt, which the gateway refuses for it.
   mappingProbeContextImagesOnly:
     'Nicht verfügbar: Dieses Modell erzeugt nur Bilder (seine API-Varianten nennen openai_images, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein Bildmodell nicht beantwortet.',
+  mappingProbeContextAudioOnly:
+    'Nicht verfügbar: Dieses Modell erzeugt nur Sprache (seine API-Varianten nennen openai_audio, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein Sprachsynthese-Modell nicht beantwortet.',
   runtimeAdmin: 'Agent-gesteuerte Runtime',
   runtimeSpecs: 'Runtime-Spezifikationen',
   runtimeSpecEdit: 'Runtime-Spezifikation bearbeiten',
@@ -684,6 +695,7 @@ const de = {
   runtimeSpecTypeTgi: 'TGI',
   runtimeSpecTypeOllama: 'Ollama',
   runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
+  runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Benutzerdefiniert',
   runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
   runtimeSpecMetricsPathHelp: 'Leer = Standardpfad des erkannten/gewählten Typs verwenden.',
@@ -935,6 +947,8 @@ const de = {
     '--listen-port\n${PORT}\n--diffusion-model\n/srv/models/flux1-dev.safetensors\n--vae\n/srv/models/ae.safetensors\n--clip_l\n/srv/models/clip_l.safetensors\n--t5xxl\n/srv/models/t5xxl_fp16.safetensors',
   runtimeSpecTypeStableDiffusionCppNote:
     'sd-server lauscht auf --listen-port (Standard 1234), nicht auf --port. Gewichte sind wörtliche Dateipfade – ${MODEL} ist ein Modellname, kein Pfad. Der Health-Pfad ist standardmäßig /v1/models, weil der Server /health mit 404 beantwortet. Unter „API-Varianten“ hier nur „openai_images (Bilderzeugung)“ ankreuzen und openai sowie anthropic abwählen; an der übergeordneten server_agent-Anwendung muss „openai_images (Bilderzeugung)“ ebenfalls angekreuzt sein.',
+  runtimeSpecTypeAudioCppNote:
+    'audiocpp_server liefert nur Sprachsynthese. Unter „API-Varianten“ hier nur „openai_audio (Sprachsynthese)“ ankreuzen und openai sowie anthropic abwählen; an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -1201,7 +1215,10 @@ const de = {
   // and a finished run names what it did not measure.
   benchmarkImagesOnlyHint:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Bildmodell nicht beantwortet, und sind deshalb gesperrt.',
+  benchmarkAudioOnlyHint:
+    'Dieses Modell erzeugt nur Sprache: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Sprachsynthese-Modell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
+  benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Sprache, kein Chat-Prompt gesendet',
   benchmarkResultLoadTimeNotMeasured: 'Ladezeit nicht gemessen',
   benchmarkNotMeasured: 'Nicht gemessen',
   // Die VRAM-Messung: ein eigener Lauf mit eigenem Endpunkt, der jedes
@@ -1461,12 +1478,15 @@ const de = {
   errorBenchmarkNoModels: 'Keine Modelle zum Benchmarken.',
   errorBenchmarkRequestFailed:
     'Der Lauf konnte nicht gestartet werden: Beim Lesen der gespeicherten Konfiguration ist ein interner Fehler aufgetreten. Bitte erneut versuchen.',
-  // The starters' three refusals before the reservation. The model list shows
-  // the same three sentences as the tooltip of a disabled Load action.
+  // The starters' four refusals before the reservation (images-only, audio-only,
+  // agent ensure unsupported, spec force-stopped). The model list shows the same
+  // sentences as the tooltip of a disabled Load action.
   errorBenchmarkImagesOnly:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Bildmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.',
+  errorBenchmarkAudioOnly:
+    'Dieses Modell erzeugt nur Sprache: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Sprachsynthese-Modell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Sprache erzeugt.',
   errorBenchmarkAgentEnsureUnsupported:
-    'Dieses Modell erzeugt nur Bilder und lässt sich deshalb nur laden, indem der Agent es ohne Chat-Prompt startet. Das kann erst ein Agent mit der Fähigkeit runtime_ensure (Agent 0.8.0 oder neuer). Der Agent dieses Servers meldet sie nicht: Er ist älter, oder er hat sich seit dem Neustart des Gateways noch nicht gemeldet. Aktualisieren Sie den Agenten, oder versuchen Sie es erneut, sobald er sich gemeldet hat.',
+    'Dieses Modell erzeugt nur Bilder oder nur Sprache und lässt sich deshalb nur laden, indem der Agent es ohne Chat-Prompt startet. Das kann erst ein Agent mit der Fähigkeit runtime_ensure (Agent 0.8.0 oder neuer). Der Agent dieses Servers meldet sie nicht: Er ist älter, oder er hat sich seit dem Neustart des Gateways noch nicht gemeldet. Aktualisieren Sie den Agenten, oder versuchen Sie es erneut, sobald er sich gemeldet hat.',
   errorBenchmarkSpecForceStopped:
     'Die Startkonfiguration dieses Modells hat die Admin-Übersteuerung „Stopp erzwingen“ (force_stopped), und Laden hebt keine Übersteuerung auf. Heben Sie sie zuerst auf („Übersteuerung aufheben“ im Reiter „Live-Status“ der Anwendung) und laden Sie das Modell dann erneut.',
   // The VRAM benchmark's own refusals (benchmark.vram_*). Each names a
@@ -3467,6 +3487,12 @@ const en: PortalMessages = {
   // values themselves are silent. See applicationTypeDefaults.ts.
   applicationTypeStableDiffusionCppNote:
     'stable-diffusion.cpp serves image requests only. The server exposes no /v1/health endpoint, so the health check mode defaults to "Model sync" instead of "Check health path"; the timeout defaults to 10 minutes instead of 30 seconds, because a generation takes far longer than a text reply; and the API flavor defaults to "openai_images" only, instead of openai/anthropic, so this server is never offered as a text candidate.',
+  // audio_cpp's three diverging defaults (API flavors, timeout, health path)
+  // explained where the operator can see them. Its health check MODE is not one
+  // of them: it has a real health endpoint, at /health. See
+  // applicationTypeDefaults.ts.
+  applicationTypeAudioCppNote:
+    'audio.cpp serves speech synthesis requests only. The timeout defaults to 10 minutes instead of 30 seconds, because a synthesis can take far longer than a text reply; and the API flavor defaults to "openai_audio" only, instead of openai/anthropic, so this server is never offered as a text candidate. The health check mode stays at "Check health path", but the health path defaults to /health instead of /v1/health, because the server answers /health and returns 404 for /v1/health.',
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',
@@ -3474,6 +3500,9 @@ const en: PortalMessages = {
   // the purpose next to the API value, because the value alone does not say
   // that it enables image generation (/v1/images/generations).
   applicationFlavorOpenaiImages: 'openai_images (image generation)',
+  // The fourth flavor checkbox's label, for the same reason as the third's: it
+  // enables speech synthesis (/v1/audio/speech).
+  applicationFlavorOpenaiAudio: 'openai_audio (speech synthesis)',
   // Shown under the flavor checkboxes when none is ticked. The backend stores
   // an empty list as openai + anthropic, so the form would save something
   // other than what it shows.
@@ -3645,6 +3674,8 @@ const en: PortalMessages = {
     'Determining the context size is taking longer than expected; run it again once the server is free.',
   mappingProbeContextImagesOnly:
     'Not available: this model only generates images (its API flavors name openai_images but neither openai nor anthropic). The context size is determined with a chat prompt, which an image model does not answer.',
+  mappingProbeContextAudioOnly:
+    'Not available: this model only generates speech (its API flavors name openai_audio but neither openai nor anthropic). The context size is determined with a chat prompt, which a speech synthesis model does not answer.',
   runtimeAdmin: 'Agent-managed runtime',
   runtimeSpecs: 'Runtime specs',
   runtimeSpecEdit: 'Edit runtime spec',
@@ -3660,6 +3691,7 @@ const en: PortalMessages = {
   runtimeSpecTypeTgi: 'TGI',
   runtimeSpecTypeOllama: 'Ollama',
   runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
+  runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Custom',
   runtimeSpecMetricsPath: 'Metrics path (override)',
   runtimeSpecMetricsPathHelp: "Empty = use the detected/selected type's default path.",
@@ -3889,6 +3921,8 @@ const en: PortalMessages = {
     '--listen-port\n${PORT}\n--diffusion-model\n/srv/models/flux1-dev.safetensors\n--vae\n/srv/models/ae.safetensors\n--clip_l\n/srv/models/clip_l.safetensors\n--t5xxl\n/srv/models/t5xxl_fp16.safetensors',
   runtimeSpecTypeStableDiffusionCppNote:
     'sd-server listens on --listen-port (default 1234), not --port. Weights are literal file paths — ${MODEL} is a model name, not a path. Its health path defaults to /v1/models, because the server answers /health with 404. Under "API flavors", tick only "openai_images (image generation)" here, with openai and anthropic unticked; the parent server_agent application needs "openai_images (image generation)" ticked too.',
+  runtimeSpecTypeAudioCppNote:
+    'audiocpp_server serves speech synthesis only. Under "API flavors", tick only "openai_audio (speech synthesis)" here, with openai and anthropic unticked; the parent server_agent application needs "openai_audio (speech synthesis)" ticked too.',
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:
@@ -4144,7 +4178,10 @@ const en: PortalMessages = {
   benchmarkLastCompleted: 'Last completed',
   benchmarkImagesOnlyHint:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an image model does not answer, so they are disabled.',
+  benchmarkAudioOnlyHint:
+    'This model only generates speech: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which a speech synthesis model does not answer, so they are disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
+  benchmarkResultSkippedAudioOnly: 'skipped — generates speech only, no chat prompt sent',
   benchmarkResultLoadTimeNotMeasured: 'load time not measured',
   benchmarkNotMeasured: 'Not measured',
   // See the German block for the two rules these texts carry: 0 always means
@@ -4370,8 +4407,10 @@ const en: PortalMessages = {
     'The run could not be started: an internal error occurred while reading the stored configuration. Please try again.',
   errorBenchmarkImagesOnly:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an image model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates images.',
+  errorBenchmarkAudioOnly:
+    'This model only generates speech: its API flavors name openai_audio but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which a speech synthesis model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates speech.',
   errorBenchmarkAgentEnsureUnsupported:
-    "This model only generates images, so it can only be loaded by the agent starting it without a chat prompt. Only an agent with the runtime_ensure capability can do that (agent 0.8.0 or newer). This server's agent does not report it: it is older, or the agent has not reported since the gateway restarted. Update the agent, or try again once it has reported.",
+    "This model only generates images, or only speech, so it can only be loaded by the agent starting it without a chat prompt. Only an agent with the runtime_ensure capability can do that (agent 0.8.0 or newer). This server's agent does not report it: it is older, or the agent has not reported since the gateway restarted. Update the agent, or try again once it has reported.",
   errorBenchmarkSpecForceStopped:
     'This model\'s launch spec has the admin override "Force stop" (force_stopped), and a Load never lifts an override. Clear it first ("Clear override" on the application\'s "Live status" tab), then load the model again.',
   // The VRAM benchmark's own refusals (benchmark.vram_*). Each names a

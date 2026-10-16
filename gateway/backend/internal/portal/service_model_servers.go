@@ -47,7 +47,7 @@ type ModelServerDTO struct {
 	ContextProbe string `json:"context_probe"`
 
 	// LoadRefusal is why a Load of this mapping would be refused right now:
-	// "images_only", "agent_ensure_unsupported" or "spec_force_stopped", the
+	// "images_only", "audio_only", "agent_ensure_unsupported" or "spec_force_stopped", the
 	// codes the Load starter answers 409 with minus their "benchmark." prefix,
 	// or "" when nothing refuses it. Like State, Service.ModelServers leaves it
 	// "" and the gateway layer injects it, from the same check the starter

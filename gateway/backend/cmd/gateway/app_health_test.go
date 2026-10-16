@@ -3705,3 +3705,512 @@ func TestNetbirdOnlyExcludesOffMeshFromRouting(t *testing.T) {
 		t.Fatalf("Resolve(onlyoffmesh) err = %v, want ErrNoHealthyHost (off-mesh only)", err)
 	}
 }
+
+// TestAudioCppCapabilityRows pins the audio.cpp projector: ONE speech row,
+// attributed to routing.CapabilitySourceAudioCppModels and stamped at the
+// given instant, for a yes or a no -- and NO row for anything else.
+//
+// "" is the case that matters. parseAudioCppModels answers "" for everything
+// the /v1/models listing does not say (the model is not loaded, the listing is
+// empty or unreadable, the entry carries no task), and a "no" here can switch a
+// model's speech route off, so "unknown" must be the ABSENCE of a row and never
+// a written no.
+func TestAudioCppCapabilityRows(t *testing.T) {
+	at := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		v    provider.AudioCppVerdicts
+		want []routing.CapabilityRow
+	}{
+		{
+			name: "yes",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes},
+			want: []routing.CapabilityRow{{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}},
+		},
+		{
+			name: "no is a real verdict (a loaded model's task is authoritative)",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo},
+			want: []routing.CapabilityRow{{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}},
+		},
+		{name: "unknown builds no row", v: provider.AudioCppVerdicts{Speech: ""}, want: nil},
+		{name: "anything that is not yes or no builds no row", v: provider.AudioCppVerdicts{Speech: "maybe"}, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := audioCppCapabilityRows(tc.v, at)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("audioCppCapabilityRows(%+v) = %+v, want %+v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+// audioCppFakeProber is the file's fakeProber plus provider.AudioCppModelsProber
+// -- the smallest addition that lets the audio.cpp branch of the probe pass be
+// observed, built exactly like sdcppFakeProber (see there for why it embeds).
+type audioCppFakeProber struct {
+	*fakeProber
+	acMu sync.Mutex
+	// acVerdicts / acErr answer ProbeAudioCppModels per MODEL ID. A model with
+	// an error STILL returns its verdict beside it, so a branch that ignored
+	// the error would write it -- which is what makes "an error writes
+	// nothing" observable rather than true by construction.
+	acVerdicts map[string]provider.AudioCppVerdicts
+	acErr      map[string]error
+	// acTargets / acModels / acAuth record every call, in order: the target,
+	// the model id the branch asked about, and the credential it carried.
+	acTargets []routing.Target
+	acModels  []string
+	acAuth    []provider.UpstreamAuth
+}
+
+var _ provider.AudioCppModelsProber = (*audioCppFakeProber)(nil)
+
+func newAudioCppFakeProber() *audioCppFakeProber {
+	return &audioCppFakeProber{
+		fakeProber: newFakeProber(),
+		acVerdicts: map[string]provider.AudioCppVerdicts{},
+		acErr:      map[string]error{},
+	}
+}
+
+func (f *audioCppFakeProber) ProbeAudioCppModels(ctx context.Context, target routing.Target, modelID string) (provider.AudioCppVerdicts, error) {
+	f.acMu.Lock()
+	defer f.acMu.Unlock()
+	f.acTargets = append(f.acTargets, target)
+	f.acModels = append(f.acModels, modelID)
+	a, _ := provider.UpstreamAuthFrom(ctx)
+	f.acAuth = append(f.acAuth, a)
+	return f.acVerdicts[modelID], f.acErr[modelID]
+}
+
+// audioCppAsked returns a copy of every model id ProbeAudioCppModels was asked about.
+func (f *audioCppFakeProber) audioCppAsked() []string {
+	f.acMu.Lock()
+	defer f.acMu.Unlock()
+	return append([]string(nil), f.acModels...)
+}
+
+// audioCppApp is a static, operator-run audio.cpp application: NO
+// ContextProbePath (so the speech probe cannot ride the context branch) and NO
+// runtime spec -- the deployment this type exists for, which no agent manages.
+// The health path is a fixture value, not the portal form's default (/health):
+// these tests fake the prober, so nothing here reads it.
+func audioCppApp(id, serverID string, port int) routing.Application {
+	app := activeApp(id, serverID, port)
+	app.Type = routing.ProviderAudioCpp
+	app.HealthCheckPath = "/v1/models"
+	return app
+}
+
+// audioCppProbeRunner builds a runner over one audio_cpp application ("a1" on
+// http://s1.local:8001) with the given mappings and NO runtime spec, whose
+// /v1/models listing answers verdicts per model id.
+func audioCppProbeRunner(t *testing.T, verdicts map[string]provider.AudioCppVerdicts, mappings ...routing.ModelMapping) (*appHealthRunner, *fakeHealthStore, *audioCppFakeProber) {
+	t.Helper()
+	shrinkRetryGap(t)
+	st := newHealthTestStore(audioCppApp("a1", "s1", 8001))
+	st.mappings = map[string][]routing.ModelMapping{"a1": mappings}
+	prober := newAudioCppFakeProber()
+	for model, v := range verdicts {
+		prober.acVerdicts[model] = v
+	}
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+	return runner, st, prober
+}
+
+func audioCppMapping(id, appModel string) routing.ModelMapping {
+	return routing.ModelMapping{ID: id, ApplicationID: "a1", GatewayModelName: "g-" + id, AppModelName: appModel, Status: routing.ServerStatusActive}
+}
+
+// TestRunAppHealthOnceAudioCppWritesSpeechVerdict is the branch's whole job:
+// the gateway reads a static audio.cpp server's own /v1/models listing for each
+// of the application's mappings and writes the speech verdict it derives, at
+// the probe rank under source audiocpp_models. The application has NO runtime
+// spec -- an operator-run server has none -- so this also proves the probe
+// needs none.
+//
+// Both directions are asserted (a loaded asr model is a real "no"). The model
+// id handed to the probe is the MAPPING's upstream name (AppModelName), which
+// is what audio.cpp's listing is keyed on: the verdict is per MODEL, so every
+// mapping is its own probe.
+func TestRunAppHealthOnceAudioCppWritesSpeechVerdict(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{
+			"pocket_tts_english_bf16": {Speech: routing.CapabilityYes},
+			"whisper_small":           {Speech: routing.CapabilityNo},
+			"clone_model":             {Speech: routing.CapabilityYes},
+		},
+		audioCppMapping("m1", "pocket_tts_english_bf16"), audioCppMapping("m2", "whisper_small"),
+		audioCppMapping("m3", "clone_model"))
+
+	runCapabilityCycle(runner)
+
+	st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	st.assertCapability(t, "m2", routing.CapabilitySpeech, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+	st.assertCapability(t, "m3", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+
+	asked := prober.audioCppAsked()
+	sort.Strings(asked)
+	if want := []string{"clone_model", "pocket_tts_english_bf16", "whisper_small"}; !reflect.DeepEqual(asked, want) {
+		t.Fatalf("audio.cpp probe asked about %v, want exactly %v (each mapping's AppModelName, nothing else)", asked, want)
+	}
+	prober.acMu.Lock()
+	defer prober.acMu.Unlock()
+	for _, target := range prober.acTargets {
+		if target.Provider != routing.ProviderAudioCpp || target.Endpoint != "http://s1.local:8001" || target.Timeout != time.Second {
+			t.Fatalf("audio.cpp probe target = %+v, want {Provider:audio_cpp Endpoint:http://s1.local:8001 Timeout:1s}", target)
+		}
+	}
+}
+
+// TestRunAppHealthOnceAudioCppNeverReadsRuntimeSpecs pins that the gate is the
+// application's TYPE alone: a static audio.cpp server has no runtime spec, so
+// the branch must not depend on reading one. A spec read that fails -- which
+// the old server_agent gate treated as "probe nothing" -- changes nothing here.
+func TestRunAppHealthOnceAudioCppNeverReadsRuntimeSpecs(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": {Speech: routing.CapabilityYes}},
+		audioCppMapping("m1", "pocket_tts"))
+	st.specsErr = true
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.audioCppAsked(), []string{"pocket_tts"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("audio.cpp probe asked about %v, want %v -- it must not depend on a runtime spec", got, want)
+	}
+	st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+}
+
+// TestRunAppHealthOnceAudioCppUnknownVerdictWritesNothing: an empty verdict --
+// the model is not in the listing, which names LOADED models only -- is no
+// answer, not a "no". Nothing may be written and the verdict already on file
+// must survive, or one tick with the model unloaded would switch its speech
+// route off.
+func TestRunAppHealthOnceAudioCppUnknownVerdictWritesNothing(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": {Speech: ""}},
+		audioCppMapping("m1", "pocket_tts"))
+	st.seedCapability("m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+
+	runCapabilityCycle(runner)
+
+	if n := len(prober.audioCppAsked()); n != 1 {
+		t.Fatalf("audio.cpp probe asked %d times, want 1 (the probe must have run for this to mean anything)", n)
+	}
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times for an unknown verdict, want 0", n)
+	}
+	st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+}
+
+// TestRunAppHealthOnceAudioCppProbeErrorWritesNothing: a failed probe states
+// no verdict. The fake hands a "no" back beside the error and the stored row is
+// a same-rank "yes" that "no" would be allowed to overwrite, so only the error
+// guard stands between them.
+func TestRunAppHealthOnceAudioCppProbeErrorWritesNothing(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": {Speech: routing.CapabilityNo}},
+		audioCppMapping("m1", "pocket_tts"))
+	prober.acErr["pocket_tts"] = fmt.Errorf("%w: status 503", provider.ErrUnavailable)
+	st.seedCapability("m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+
+	runCapabilityCycle(runner)
+
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times after a failed probe, want 0", n)
+	}
+	st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+}
+
+// TestRunAppHealthOnceAudioCppPrecedence pins the two halves of the shared
+// write rule for this source: an operator's (manual) verdict is never talked
+// over by the probe, however often it re-reads the listing; and the probe's OWN
+// earlier row is replaced when the loaded model's task changes, in either
+// direction -- the source is bidirectional.
+func TestRunAppHealthOnceAudioCppPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		seedVerdict, seedSource     string
+		probe, wantVerdict, wantSrc string
+	}{
+		{"manual yes survives a probe no", routing.CapabilityYes, routing.CapabilitySourceManual, routing.CapabilityNo, routing.CapabilityYes, routing.CapabilitySourceManual},
+		{"manual no survives a probe yes", routing.CapabilityNo, routing.CapabilitySourceManual, routing.CapabilityYes, routing.CapabilityNo, routing.CapabilitySourceManual},
+		{"a probed yes is replaced by a probed no", routing.CapabilityYes, routing.CapabilitySourceAudioCppModels, routing.CapabilityNo, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels},
+		{"a probed no is replaced by a probed yes", routing.CapabilityNo, routing.CapabilitySourceAudioCppModels, routing.CapabilityYes, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, _ := audioCppProbeRunner(t,
+				map[string]provider.AudioCppVerdicts{"pocket_tts": {Speech: tc.probe}},
+				audioCppMapping("m1", "pocket_tts"))
+			st.seedCapability("m1", routing.CapabilitySpeech, tc.seedVerdict, tc.seedSource)
+
+			runCapabilityCycle(runner)
+
+			st.assertCapability(t, "m1", routing.CapabilitySpeech, tc.wantVerdict, tc.wantSrc)
+		})
+	}
+}
+
+// TestRunAppHealthOnceAudioCppSkipsDisabledAndNamelessMappings: only an active
+// mapping with an upstream model name has anything to ask the listing about.
+func TestRunAppHealthOnceAudioCppSkipsDisabledAndNamelessMappings(t *testing.T) {
+	disabled := audioCppMapping("m2", "whisper_small")
+	disabled.Status = routing.ServerStatusDisabled
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{
+			"pocket_tts":    {Speech: routing.CapabilityYes},
+			"whisper_small": {Speech: routing.CapabilityYes},
+		},
+		audioCppMapping("m1", "pocket_tts"), disabled, audioCppMapping("m3", ""))
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.audioCppAsked(), []string{"pocket_tts"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("audio.cpp probe asked about %v, want %v", got, want)
+	}
+	st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	for _, id := range []string{"m2", "m3"} {
+		if _, ok := st.capabilityOf(id, routing.CapabilitySpeech); ok {
+			t.Fatalf("%s has a speech row, want none", id)
+		}
+	}
+}
+
+// TestRunAppHealthOnceAudioCppNeverAsksAnotherType pins the gate: the listing
+// is asked of audio_cpp applications only, and every other type is never
+// asked -- including a server_agent application whose mapping carries an
+// audio_cpp runtime spec, the shape the previous gate keyed on. That path stays
+// deferred (the agent router's /v1/models carries no task, so it could yield no
+// verdict), and a stale spec must not get an agent-managed mapping probed here.
+// The audio application in the same store is the positive control: a branch
+// that asked nobody would fail here too.
+func TestRunAppHealthOnceAudioCppNeverAsksAnotherType(t *testing.T) {
+	shrinkRetryGap(t)
+	apps := []routing.Application{audioCppApp("audio", "s1", 8000)}
+	mappings := map[string][]routing.ModelMapping{
+		"audio": {{ID: "ma", ApplicationID: "audio", GatewayModelName: "g-ma", AppModelName: "pocket_tts", Status: routing.ServerStatusActive}},
+	}
+	prober := newAudioCppFakeProber()
+	prober.acVerdicts["pocket_tts"] = provider.AudioCppVerdicts{Speech: routing.CapabilityYes}
+	var specs []routing.RuntimeSpec
+	for i, typ := range []string{
+		routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap,
+		routing.ProviderLiteLLM, routing.ProviderOllama, routing.ProviderServerAgent,
+		routing.ProviderStableDiffusionCpp, routing.ProviderMock,
+	} {
+		app := activeApp("other-"+typ, "s1", 8100+i)
+		app.Type = typ
+		apps = append(apps, app)
+		id, model := "mo-"+typ, "other-model-"+typ
+		mappings[app.ID] = []routing.ModelMapping{{ID: id, ApplicationID: app.ID, GatewayModelName: "g-" + id, AppModelName: model, Status: routing.ServerStatusActive}}
+		// An audio_cpp spec on every one of them: the old kind gate alone would
+		// accept it, so only the type gate keeps these from being probed.
+		specs = append(specs, routing.RuntimeSpec{ID: "sp-" + id, MappingID: id, Type: string(routing.RuntimeSpecTypeAudioCpp)})
+		prober.acVerdicts[model] = provider.AudioCppVerdicts{Speech: routing.CapabilityYes}
+	}
+	st := newHealthTestStore(apps...)
+	st.mappings = mappings
+	st.runtimeSpecs = specs
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.audioCppAsked(), []string{"pocket_tts"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("audio.cpp probe asked about %v, want exactly %v", got, want)
+	}
+	prober.acMu.Lock()
+	defer prober.acMu.Unlock()
+	if len(prober.acTargets) != 1 || prober.acTargets[0].Provider != routing.ProviderAudioCpp || prober.acTargets[0].Endpoint != "http://s1.local:8000" {
+		t.Fatalf("audio.cpp probe targets = %+v, want exactly the one audio_cpp application", prober.acTargets)
+	}
+}
+
+// TestRunAppHealthOnceAudioCppFollowsTheAppCadence pins the branch's own
+// schedule key ("audiocpp:"+app.ID): with the clock standing still a second
+// cycle does not ask again, and once the application's interval has elapsed it
+// does. A branch sharing another pass's key would never be due at all (that
+// pass stamps it first in the same cycle), and one with no schedule would ask
+// on every cycle.
+func TestRunAppHealthOnceAudioCppFollowsTheAppCadence(t *testing.T) {
+	runner, _, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": {Speech: routing.CapabilityYes}},
+		audioCppMapping("m1", "pocket_tts"))
+	current := time.Unix(10_000, 0).UTC()
+	runner.now = func() time.Time { return current }
+	state := &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)}
+
+	runner.runOnce(context.Background(), state)
+	runner.runOnce(context.Background(), state)
+	if n := len(prober.audioCppAsked()); n != 1 {
+		t.Fatalf("audio.cpp probe asked %d times over two cycles at one instant, want 1 -- it must follow the application's cadence", n)
+	}
+	if _, ok := state.lastProbed["audiocpp:a1"]; !ok {
+		t.Fatalf("lastProbed = %v, want an audiocpp:a1 entry", state.lastProbed)
+	}
+
+	current = current.Add(time.Duration(portal.MaxHealthCheckIntervalSeconds) * time.Second)
+	runner.runOnce(context.Background(), state)
+	if n := len(prober.audioCppAsked()); n != 2 {
+		t.Fatalf("audio.cpp probe asked %d times after the interval elapsed, want 2", n)
+	}
+}
+
+// TestRunAppHealthOnceAudioCppCarriesTheAppCredential: the branch builds its
+// auth context as the sdcpp branch does -- off the APPLICATION's own sealed
+// token, since a static server has no runtime spec to hold a per-mapping one --
+// so an audio.cpp server started with an API key is asked with it, for every
+// mapping.
+func TestRunAppHealthOnceAudioCppCarriesTheAppCredential(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t, nil,
+		audioCppMapping("m1", "model-a"), audioCppMapping("m2", "model-b"))
+	app := st.apps["s1"][0]
+	app.APIToken = "plain:app-tok"
+	app.APITokenHeader = "X-App-Key"
+	st.apps["s1"][0] = app
+
+	runCapabilityCycle(runner)
+
+	prober.acMu.Lock()
+	defer prober.acMu.Unlock()
+	if len(prober.acAuth) != 2 {
+		t.Fatalf("audio.cpp probe asked %d times, want 2 (one per mapping)", len(prober.acAuth))
+	}
+	for i, a := range prober.acAuth {
+		// UpstreamAuth carries an ExtraHeaders map and is not comparable with ==.
+		if a.Header != "X-App-Key" || a.Token != "app-tok" {
+			t.Errorf("credential for %s = {Header:%q Token:%q}, want {Header:X-App-Key Token:app-tok}", prober.acModels[i], a.Header, a.Token)
+		}
+	}
+}
+
+// TestRunAppHealthOnceAudioCppAuthRejectedLogsAndNeverWrites is the
+// misconfigured-token signal (issue #58) on this branch: a 401/403 means the
+// gateway's own credential for the application is wrong, not that the model's
+// capability is unknown, so it is logged where an operator sees it, distinct
+// from the debug-level noise of an unreachable server, and writes nothing.
+func TestRunAppHealthOnceAudioCppAuthRejectedLogsAndNeverWrites(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": {Speech: routing.CapabilityNo}},
+		audioCppMapping("m1", "pocket_tts"))
+	prober.acErr["pocket_tts"] = fmt.Errorf("wrapped: %w", provider.ErrAuthRejected)
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	runCapabilityCycle(runner)
+
+	if n := st.capabilityWriteCount(); n != 0 {
+		t.Fatalf("UpsertMappingCapabilities called %d times on a rejected probe, want 0", n)
+	}
+	if !strings.Contains(buf.String(), "check the application's API token") {
+		t.Fatalf("log output = %q, want the misconfigured-token signal", buf.String())
+	}
+}
+
+// TestAudioCppModelsPassE2EWritesSpeechVerdict drives the audio.cpp branch
+// through the REAL production chain -- providerClients' Multiplexer, its
+// OpenAI-compatible client, a MemoryStore -- against an httptest server serving
+// a /v1/models listing in the shape measured against audiocpp_server v0.9.1.
+// The fake-prober tests above cannot see the one failure that matters most
+// here: the branch type-asserts r.prober to provider.AudioCppModelsProber and
+// SKIPS silently when that fails, so a Multiplexer that stopped implementing
+// it, or a providerClients that stopped routing audio_cpp to a client that
+// does, would leave every audio mapping without a verdict and every fake test
+// green. The application is a static audio_cpp one with no runtime spec, the
+// deployment the type exists for.
+func TestAudioCppModelsPassE2EWritesSpeechVerdict(t *testing.T) {
+	shrinkRetryGap(t)
+	var paths []string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[` +
+			`{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/m/pocket"},` +
+			`{"id":"whisper_small","object":"model","owned_by":"engine","family":"whisper","task":"asr","mode":"offline","loaded":true,"path":"/m/whisper"}]}`))
+	}))
+	defer upstream.Close()
+	u, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream url: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse upstream port: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	store := routing.NewMemoryStore()
+	if err := store.CreateAIServer(ctx, routing.AIServer{
+		ID: "s1", Name: "S1", Domain: u.Hostname(), Provider: routing.ProviderAudioCpp,
+		Endpoint: upstream.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	// always_reachable: the audio branch is independent of the health-check
+	// mode, so the only request the upstream sees is the model listing.
+	if err := store.CreateApplication(ctx, routing.Application{
+		ID: "a1", ServerID: "s1", Type: routing.ProviderAudioCpp, Port: port, Scheme: "http",
+		APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1,
+		TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+	for _, m := range []routing.ModelMapping{
+		{ID: "m1", ApplicationID: "a1", GatewayModelName: "tts", AppModelName: "pocket_tts_english_bf16", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now},
+		{ID: "m2", ApplicationID: "a1", GatewayModelName: "asr", AppModelName: "whisper_small", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now},
+		{ID: "m3", ApplicationID: "a1", GatewayModelName: "idle", AppModelName: "not_loaded", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := store.CreateMapping(ctx, m); err != nil {
+			t.Fatalf("create mapping %s: %v", m.ID, err)
+		}
+	}
+
+	(&appHealthRunner{
+		store: store, prober: providerClients(0, false, nil), registry: gateway.NewAppHealthRegistry(nil),
+		settings: staticSettings(nil), probeTimeout: time.Second, now: func() time.Time { return now },
+	}).runOnce(ctx, &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+
+	speech := func(mappingID string) (routing.CapabilityRow, bool) {
+		rows, err := store.MappingCapabilities(ctx, mappingID)
+		if err != nil {
+			t.Fatalf("mapping capabilities %s: %v", mappingID, err)
+		}
+		row, ok := routing.CapabilityRowsByName(rows)[routing.CapabilitySpeech]
+		return row, ok
+	}
+	if row, ok := speech("m1"); !ok || row.Verdict != routing.CapabilityYes || row.Source != routing.CapabilitySourceAudioCppModels || !row.CheckedAt.Equal(now) {
+		t.Fatalf("m1 speech row = %+v (present=%v), want yes/audiocpp_models at %v", row, ok, now)
+	}
+	if row, ok := speech("m2"); !ok || row.Verdict != routing.CapabilityNo || row.Source != routing.CapabilitySourceAudioCppModels {
+		t.Fatalf("m2 speech row = %+v (present=%v), want no/audiocpp_models", row, ok)
+	}
+	if row, ok := speech("m3"); ok {
+		t.Fatalf("m3 speech row = %+v, want none -- a model absent from the listing is unknown, never a no", row)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, p := range paths {
+		if p != "/v1/models" {
+			t.Fatalf("upstream paths = %v, want only /v1/models", paths)
+		}
+	}
+	if len(paths) == 0 {
+		t.Fatal("the upstream was never asked for /v1/models")
+	}
+}

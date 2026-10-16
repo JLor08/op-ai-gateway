@@ -67,16 +67,20 @@ import (
 // Capable is Callable narrowed to the names that carry EVERY capability the
 // request requires, and it answers only the redirect's CANDIDATE question. A
 // request that requires a capability (today /v1/images/generations, which
-// requires "image", and /v1/images/edits, which requires the derived
-// "image_edit") is refused by the capability gate for a model without it,
+// requires "image", /v1/images/edits, which requires the derived
+// "image_edit", and /v1/audio/speech, which requires "speech") is refused by
+// the capability gate for a model without it,
 // so a LastUsedModel or fallback outside Capable would turn a legible "unknown
 // model" into a 404 model_not_capable about a model the client never named.
 // The flavor cannot answer this: Callable for openai_images holds every name
-// the images relay would admit, verdict or not. Capable is judged by the
+// the images relay would admit, verdict or not, and Callable for openai_audio
+// every name the speech relay would admit. Capable is judged by the
 // listing's own image folds (imageFlagsByName, imageEditFlagsByName,
 // groupCapabilityFlags), the rules behind ModelDTO.Image and ModelDTO.ImageEdit,
 // so a name is a candidate exactly when the portal lists it as generating
-// images (or as editable, for an edit). With no required capability Capable is
+// images (or as editable, for an edit); for speech it is judged by
+// speechFlagsByName, so the openai_audio flavor is offered ONLY behind a
+// (speech, yes) verdict. With no required capability Capable is
 // Callable itself. A required capability that has no fold makes Capable empty:
 // nothing is known to carry it, so nothing is a candidate. The requested-name
 // question never asks Capable: a callable name without the capability is the
@@ -313,13 +317,17 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 // idx is the caller's runtime-spec index and must cover views; capableNames
 // makes no spec read of its own.
 //
-// "image" and "image_edit" are the capabilities a request requires today and
-// the only ones with a fold here; any other makes the result empty
+// "image", "image_edit" and "speech" are the capabilities a request requires
+// today and the only ones with a fold here; any other makes the result empty
 // (fail-closed), alone or beside one that has a fold. "image_edit" is DERIVED
 // (routing.ImpliedImageEdit), which is why it is handled here at all: with no
 // fold for it, an edit request for an unknown model found Capable empty and
 // the preflight redirect, which needs a capable candidate, was dead for edits
-// -- a bare 404 instead of the redirect. A request requiring more than one
+// -- a bare 404 instead of the redirect. "speech" (/v1/audio/speech) is folded
+// by speechFlagsByName, the one place the openai_audio flavor meets the
+// (speech, yes) verdict: it is what offers the flavor ONLY behind that verdict,
+// so a model that was never probed, or probed "no", stays callable for the
+// flavor and is never a redirect candidate. A request requiring more than one
 // folded capability gets the intersection. An error is a failed capability
 // read, which the caller turns into the all-or-nothing empty offering.
 func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, required []string) (map[string]struct{}, error) {
@@ -327,7 +335,7 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 		return callable, nil
 	}
 	for _, capability := range required {
-		if capability != routing.CapabilityImage && capability != routing.CapabilityImageEdit {
+		if !hasCapabilityFold(capability) {
 			return map[string]struct{}{}, nil
 		}
 	}
@@ -344,12 +352,7 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 	entries, _ := buildGroupOverlay(overlay, perNameFlavors(views, idx, routing.MappingServesAPIFlavor))
 	folds := make([]map[string]bool, len(required))
 	for i, capability := range required {
-		var flags map[string]bool
-		if capability == routing.CapabilityImageEdit {
-			flags = imageEditFlagsByName(views, capsByMapping, idx)
-		} else {
-			flags = imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
-		}
+		flags := capabilityFlagsByName(capability, views, capsByMapping, idx)
 		for name, flag := range groupCapabilityFlags(entries, flags) {
 			flags[name] = flag
 		}
@@ -371,6 +374,40 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 	return out, nil
 }
 
+// hasCapabilityFold reports whether capability is one capableNames can fold:
+// the closed set of capabilities a request requires today, image, image_edit
+// and speech. Keep it in step with capabilityFlagsByName.
+func hasCapabilityFold(capability string) bool {
+	switch capability {
+	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech:
+		return true
+	}
+	return false
+}
+
+// capabilityFlagsByName is the per-model-name fold for one capability that
+// hasCapabilityFold admitted: the listing's own fold for it, so Capable and
+// the portal's flags are one rule. capsByMapping is the batch capability read,
+// keyed by mapping id, and idx covers views. The map is fresh each call, so the
+// caller may add its group names to it.
+//
+// Every capability hasCapabilityFold admits has its own case here. The default is
+// FAIL-CLOSED -- an empty map, so nothing is offered -- rather than the image fold:
+// a capability added to hasCapabilityFold but not to this switch must offer
+// nothing, not silently inherit another capability's answer.
+func capabilityFlagsByName(capability string, views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	switch capability {
+	case routing.CapabilityImage:
+		return imageFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityImage), idx)
+	case routing.CapabilityImageEdit:
+		return imageEditFlagsByName(views, capsByMapping, idx)
+	case routing.CapabilitySpeech:
+		return speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
+	default:
+		return map[string]bool{}
+	}
+}
+
 // emptyModelOffering is the ALL-OR-NOTHING store-error result: every set empty,
 // never a half-built answer. See ModelOfferingFor for why the failure direction
 // is the opposite of the listing's fail-open.
@@ -382,9 +419,9 @@ func emptyModelOffering() ModelOffering {
 // where the sets agree with the listing by construction: it mirrors
 // ModelsForFlavor's seed models so the answers match what /v1/models actually
 // served. The seeds expose the text flavors (seedAPIFlavors), so on those each
-// is both callable and existing; any other flavor, openai_images included,
-// offers nothing at all. The seeds carry no capability, so with a required
-// capability none of them is Capable.
+// is both callable and existing; any other flavor, openai_images and
+// openai_audio included, offers nothing at all. The seeds carry no capability,
+// so with a required capability none of them is Capable.
 func seedModelOffering(flavor string, required []string) ModelOffering {
 	out := emptyModelOffering()
 	if !isSeedAPIFlavor(flavor) {

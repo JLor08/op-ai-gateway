@@ -317,6 +317,17 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// sd-server child that has never run, so nothing has read its document
 	// yet, or one whose agent predates the source and so never reports it.
 	routing.CapabilityImage: {routing.CapabilityNo: true},
+	// routing.CapabilitySpeech + CapabilityNo is reserved for the same reason
+	// and on the same terms as (image, no): an absent row already refuses a
+	// speech request, so "cannot synthesise speech" costs the operator nothing to
+	// leave unsaid, while a manual no is rank 3 and would outrank forever the
+	// writer entitled to establish it -- the gateway health loop's read of
+	// audio.cpp's own /v1/models listing (routing.CapabilitySourceAudioCppModels),
+	// whose per-model task is authoritative for a loaded model, so its no is real.
+	// (speech, yes) stays writable: it is the operator's override of that probe
+	// and the enablement path for a model the listing does not name, which is
+	// every model that is not currently loaded.
+	routing.CapabilitySpeech: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 
@@ -361,6 +372,12 @@ const (
 	// their first-data budget from TimeoutMS the same way as server_agent's
 	// above.
 	defaultStableDiffusionTimeoutMS = 600000
+	// defaultAudioCppTimeoutMS is the TimeoutMS default for ProviderAudioCpp,
+	// for the same reason as the image value above: a speech synthesis is a
+	// non-streaming request, so TimeoutMS is a TOTAL request deadline, and a
+	// long input can take longer than the stock 30s to render. With that
+	// default it would fail as 502 provider.timeout.
+	defaultAudioCppTimeoutMS = 600000
 )
 
 // ApplicationDTO is the portal-facing representation of a routing.Application.
@@ -1506,6 +1523,8 @@ func normalizeApplicationType(raw string) (string, error) {
 		return routing.ProviderServerAgent, nil
 	case routing.ProviderStableDiffusionCpp:
 		return routing.ProviderStableDiffusionCpp, nil
+	case routing.ProviderAudioCpp:
+		return routing.ProviderAudioCpp, nil
 	default:
 		return "", ErrApplicationTypeInvalid
 	}
@@ -1774,8 +1793,9 @@ func (s *Service) classifyApplicationWriteConflict(ctx context.Context, app rout
 }
 
 // normalizeFlavors validates + dedups api-flavor entries (defaults empty ->
-// both), returning errInvalid on any unrecognized value so each caller keeps
-// its own honest error code: normalizeApplicationFlavors below reports
+// both text flavors; openai_images and openai_audio are opt-in and never part
+// of the default), returning errInvalid on any unrecognized value so each
+// caller keeps its own honest error code: normalizeApplicationFlavors below reports
 // ErrApplicationFlavorInvalid, and the runtime-spec path (service_runtime.go)
 // reports its own ErrRuntimeSpecFlavorInvalid rather than borrowing this
 // package's application-scoped code.
@@ -1788,7 +1808,7 @@ func normalizeFlavors(raw []string, errInvalid error) ([]string, error) {
 	for _, candidate := range raw {
 		flavor := strings.TrimSpace(candidate)
 		switch flavor {
-		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages:
+		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages, routing.APIFlavorOpenAIAudio:
 		default:
 			return nil, errInvalid
 		}
@@ -1842,15 +1862,18 @@ func validateApplicationTuning(priority, weight, timeoutMS, affinityTTLSeconds, 
 }
 
 // applicationTimeoutDefaultFor is the TimeoutMS default for an application
-// type. Two types override the stock value because for them it is a
-// correctness matter rather than tuning: an agent-managed cold model load and
-// an image generation both routinely exceed 30s (see each constant's doc).
+// type. Three types override the stock value because for them it is a
+// correctness matter rather than tuning: an agent-managed cold model load, an
+// image generation and a long speech synthesis all routinely exceed 30s (see
+// each constant's doc).
 func applicationTimeoutDefaultFor(appType string) int {
 	switch appType {
 	case routing.ProviderServerAgent:
 		return defaultServerAgentTimeoutMS
 	case routing.ProviderStableDiffusionCpp:
 		return defaultStableDiffusionTimeoutMS
+	case routing.ProviderAudioCpp:
+		return defaultAudioCppTimeoutMS
 	default:
 		return defaultApplicationTimeoutMS
 	}
@@ -1928,6 +1951,14 @@ type ModelMappingDTO struct {
 	// it up front. It is advisory: a failed spec read reports false, and the
 	// gateway's own check still refuses.
 	ImagesOnly bool `json:"images_only"`
+	// AudioOnly is ImagesOnly's speech twin: the mapping's effective flavors
+	// (the same routing.EffectiveFields) are audio-only
+	// (routing.FlavorsAreAudioOnly), so the gateway refuses to send it a chat
+	// prompt and the portal can disable the same chat-prompt jobs up front. A
+	// list naming both non-text flavors is both. Advisory in the same way, and
+	// always present: false is sent, not omitted. Both markers come out of one
+	// spec read (mappingFlavorMarkers).
+	AudioOnly bool `json:"audio_only"`
 }
 
 type MappingListResponse struct {
@@ -2107,10 +2138,10 @@ func (s *Service) ListMappings(ctx context.Context, principal auth.Token, appID 
 	if err != nil {
 		return MappingListResponse{}, err
 	}
-	imagesOnly := s.mappingsImagesOnly(ctx, app, mappings)
+	markers := s.mappingsFlavorMarkers(ctx, app, mappings)
 	out := make([]ModelMappingDTO, 0, len(mappings))
 	for _, mapping := range mappings {
-		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID]), imagesOnly[mapping.ID]))
+		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID]), markers[mapping.ID]))
 	}
 	return MappingListResponse{Data: out}, nil
 }
@@ -2296,7 +2327,7 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	// notifyRuntimeChangedForMapping -- the gate is the owning application's
 	// type, not which field this request set.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping, capsByName, s.mappingImagesOnly(ctx, app, mapping.ID)), nil
+	return mappingDTO(mapping, capsByName, s.mappingFlavorMarkersFor(ctx, app, mapping.ID)), nil
 }
 
 // UpdateMapping partially updates a mapping, re-validating any changed fields.
@@ -2536,7 +2567,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// the agent's router for up to a minute while the old one still routes. See
 	// notifyRuntimeChangedForMapping.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping, capsByName, s.mappingImagesOnly(ctx, app, mapping.ID)), nil
+	return mappingDTO(mapping, capsByName, s.mappingFlavorMarkersFor(ctx, app, mapping.ID)), nil
 }
 
 // DeleteMapping removes the mapping.
@@ -3044,8 +3075,8 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // mappingDTO projects a mapping onto the wire shape the portal's mapping form
 // binds to. caps is that mapping's stored capability rows keyed by capability
 // name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
-// "nothing determined"). imagesOnly is the mapping's ImagesOnly marker, from
-// mappingsImagesOnly or mappingImagesOnly.
+// "nothing determined"). markers is the mapping's ImagesOnly and AudioOnly
+// pair, from mappingsFlavorMarkers or mappingFlavorMarkersFor.
 //
 // Capabilities is what MappingForm.tsx SEEDS its two capability selects
 // from: one entry per determined row, and the ABSENCE of an entry is the
@@ -3067,7 +3098,7 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // the truth; UpdateMapping's compare-before-write is the other half of the
 // same guarantee, and the way back out is an empty verdict in
 // UpdateMappingRequest.CapabilityVerdicts.
-func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow, imagesOnly bool) ModelMappingDTO {
+func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow, markers mappingFlavorMarkers) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
 		ApplicationID:                mapping.ApplicationID,
@@ -3089,7 +3120,8 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		MetricsSource:                mapping.MetricsSource,
 		MetricsUpdatedAt:             mapping.MetricsUpdatedAt,
 		CreatedAt:                    mapping.CreatedAt,
-		ImagesOnly:                   imagesOnly,
+		ImagesOnly:                   markers.ImagesOnly,
+		AudioOnly:                    markers.AudioOnly,
 	}
 }
 

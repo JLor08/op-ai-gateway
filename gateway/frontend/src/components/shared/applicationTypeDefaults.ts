@@ -10,9 +10,9 @@ import type {
 
 // The type-specific fields that a type selection prefills. Most of the
 // Application form is deliberately left OUT of this contract -- status,
-// health path/interval, tuning other than timeoutMs, token, benchmarks, path
+// health interval, tuning other than timeoutMs, token, benchmarks, path
 // suffix -- because those are operator preferences, not properties of the
-// type, and a type switch must never clobber a preference. Three fields are
+// type, and a type switch must never clobber a preference. Four fields are
 // the documented exceptions, all on the same argument: for at least one type
 // the form's ordinary stock value is not a preference but a reproducible
 // failure, so leaving it out would silently ship a type nobody could use
@@ -31,14 +31,27 @@ import type {
 //     the coarse 'openai_images' flavor -- which is opt-in everywhere else in
 //     this system precisely so a type must name it explicitly rather than
 //     inherit it by accident.
+//   - healthCheckPath: audio_cpp's server answers GET /health (200) and GET
+//     /v1/health with 404, so the stock '/v1/health' path under the stock
+//     'health_path' mode takes the application unreachable after one failed
+//     probe cycle, the same silent failure as above. Only the PATH diverges
+//     for it; the mode stays.
 //
-// All three ride the same migrateTypeFields preservation contract as every
+// All four ride the same migrateTypeFields preservation contract as every
 // other field here instead of a bespoke special case: a field still holding
 // the OLD type's default migrates to the NEW type's default, and a value the
 // operator already changed is left alone. Every pre-existing type keeps its
-// current effective values for healthCheckMode ('health_path') and
-// apiFlavors (['openai', 'anthropic']), so this widening changes nothing for
-// them.
+// current effective values for healthCheckMode ('health_path'),
+// healthCheckPath ('/v1/health') and apiFlavors (['openai', 'anthropic']), so
+// this widening changes nothing for them.
+//
+// audio_cpp is the second type to diverge, on three of the four: its stock
+// apiFlavors pair would offer a speech-only server as a text candidate (it
+// serves speech only, via the coarse 'openai_audio' flavor, which is opt-in
+// everywhere else for the same reason as 'openai_images'), its timeout is a
+// long synthesis's, not 30s, and its health path is /health. It keeps the
+// stock healthCheckMode: audio.cpp has a real health endpoint, unlike
+// sd-server, so 'health_path' works for it once the path is right.
 export interface TypeDefaults {
   port: number;
   scheme: ApplicationScheme;
@@ -49,13 +62,21 @@ export interface TypeDefaults {
   contextProbePath: string;
   timeoutMs: number;
   // The exception to "health mode/path/interval stays out" -- see the doc
-  // comment above. Only the MODE is a type property; health_check_path and
-  // health_check_interval_seconds remain operator preferences and are not
-  // part of this contract.
+  // comment above. The MODE and the PATH (healthCheckPath, below) are type
+  // properties; health_check_interval_seconds remains an operator preference
+  // and is not part of this contract.
   healthCheckMode: ApplicationHealthMode;
+  // The exception to "health path stays out" -- see the doc comment above. Used
+  // when healthCheckMode is 'health_path'; every type but audio_cpp keeps the
+  // stock value.
+  healthCheckPath: string;
   // The exception to "flavors stay out" -- see the doc comment above.
   apiFlavors: string[];
 }
+
+// The stock health path the application form starts from, and every type but
+// audio_cpp keeps.
+export const stockApplicationHealthPath = '/v1/health';
 
 // Per-type sensible defaults (researched 2026-08-02; see the design spec).
 export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
@@ -69,6 +90,7 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     contextProbePath: '',
     timeoutMs: 30000,
     healthCheckMode: 'health_path',
+    healthCheckPath: stockApplicationHealthPath,
     apiFlavors: ['openai', 'anthropic'],
   },
   vllm: {
@@ -81,6 +103,7 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     contextProbePath: '',
     timeoutMs: 30000,
     healthCheckMode: 'health_path',
+    healthCheckPath: stockApplicationHealthPath,
     apiFlavors: ['openai', 'anthropic'],
   },
   llama_cpp: {
@@ -93,6 +116,7 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     contextProbePath: '/props',
     timeoutMs: 30000,
     healthCheckMode: 'health_path',
+    healthCheckPath: stockApplicationHealthPath,
     apiFlavors: ['openai', 'anthropic'],
   },
   llama_swap: {
@@ -105,6 +129,7 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     contextProbePath: '/upstream/{model}/props',
     timeoutMs: 30000,
     healthCheckMode: 'health_path',
+    healthCheckPath: stockApplicationHealthPath,
     apiFlavors: ['openai', 'anthropic'],
   },
   litellm: {
@@ -117,6 +142,7 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     contextProbePath: '',
     timeoutMs: 30000,
     healthCheckMode: 'health_path',
+    healthCheckPath: stockApplicationHealthPath,
     apiFlavors: ['openai', 'anthropic'],
   },
   // Agent-managed model processes (agent-runtime-manager feature): the
@@ -136,6 +162,7 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     contextProbePath: '',
     timeoutMs: 600000,
     healthCheckMode: 'health_path',
+    healthCheckPath: stockApplicationHealthPath,
     apiFlavors: ['openai', 'anthropic'],
   },
   // Measured against a real stable-diffusion.cpp server (FLUX.1-dev): a
@@ -160,7 +187,34 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     contextProbePath: '',
     timeoutMs: 600000,
     healthCheckMode: 'model_sync',
+    healthCheckPath: stockApplicationHealthPath,
     apiFlavors: ['openai_images'],
+  },
+  // audio.cpp (audiocpp_server), probed live: GET /health answers
+  // {"status":"ok",...} while GET /v1/health is a 404, so the stock health_path
+  // mode stays but its PATH is /health (the stock /v1/health would take a
+  // freshly created application unreachable after one probe cycle); GET /v1/models
+  // lists the LOADED models in the standard OpenAI shape, which is exactly what
+  // the loaded-models indicator reads (format 'openai'); there is no /props and
+  // no chat endpoint, so the context probe is empty and both coding-agent
+  // endpoint modes are 'disabled' (the openai and anthropic flavors are off by
+  // default, and a gated dropdown shows Deaktiviert anyway). timeout_ms matches
+  // the backend's default for this type (portal service_applications.go,
+  // defaultAudioCppTimeoutMS): a long synthesis routinely outlasts 30s. Port
+  // 8080 is a conventional placeholder, not a property of the binary -- the
+  // operator sets the port the server was started on.
+  audio_cpp: {
+    port: 8080,
+    scheme: 'http',
+    responsesMode: 'disabled',
+    messagesMode: 'disabled',
+    loadedModelsPath: '/v1/models',
+    loadedModelsFormat: 'openai',
+    contextProbePath: '',
+    timeoutMs: 600000,
+    healthCheckMode: 'health_path',
+    healthCheckPath: '/health',
+    apiFlavors: ['openai_audio'],
   },
 };
 

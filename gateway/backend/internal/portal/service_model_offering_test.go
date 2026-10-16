@@ -760,3 +760,39 @@ func TestOfferingReadsEachStoreTraversalOnce(t *testing.T) {
 		t.Fatalf("GroupMembersByGroup called %d times, want 1 per group (one overlay load)", counted.groupMembers)
 	}
 }
+
+// TestCapabilityFlagsByNameFailsClosedForAnUnnamedCapability pins the fold's
+// default: a capability that hasCapabilityFold admitted but capabilityFlagsByName
+// has no case for must offer NOTHING, not fall through to the image fold. The view
+// below is fully image- and speech-capable, so a fall-through to imageFlagsByName
+// would flag it true and a future capability would silently be offered wherever
+// image is. The map is non-nil because capableNames adds its group names to it.
+// The three named capabilities keep their own fold.
+func TestCapabilityFlagsByNameFailsClosedForAnUnnamedCapability(t *testing.T) {
+	view := mappingView{
+		app:     routing.Application{ID: "app_f", APIFlavors: []string{routing.APIFlavorOpenAIImages, routing.APIFlavorOpenAIAudio}},
+		mapping: routing.ModelMapping{ID: "map_f", GatewayModelName: "m"},
+	}
+	caps := map[string][]routing.CapabilityRow{"map_f": {
+		{Capability: routing.CapabilityImage, Verdict: routing.CapabilityYes},
+		{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes},
+	}}
+	views := []mappingView{view}
+	idx := runtimeSpecIndex{}
+
+	for _, capability := range []string{routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech} {
+		if flags := capabilityFlagsByName(capability, views, caps, idx); !flags["m"] {
+			t.Errorf("capabilityFlagsByName(%q) = %v, want m flagged: the named folds are unchanged", capability, flags)
+		}
+	}
+	for _, capability := range []string{"teleportation", routing.CapabilityVision, ""} {
+		flags := capabilityFlagsByName(capability, views, caps, idx)
+		if flags == nil {
+			t.Errorf("capabilityFlagsByName(%q) = nil, want an empty non-nil map the caller can add group names to", capability)
+			continue
+		}
+		if len(flags) != 0 {
+			t.Errorf("capabilityFlagsByName(%q) = %v, want empty (fail-closed): an unnamed capability is carried by nothing", capability, flags)
+		}
+	}
+}

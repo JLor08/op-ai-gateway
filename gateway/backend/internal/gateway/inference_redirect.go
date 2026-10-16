@@ -23,9 +23,10 @@ import (
 // flavor when one of its mappings passes the flavor half of the served rule
 // (routing.MappingHasAPIFlavor): its application declares the flavor, and an
 // agent-launched child's runtime spec does not rule it out. For openai, that
-// means the spec is not images-only. For anthropic and openai_images, it means
-// the spec lists the flavor. A group exists when one of its offerable members
-// does. So an images-only child does not exist for a text request, a child
+// means the spec is neither images-only nor audio-only. For anthropic,
+// openai_images and openai_audio, it means the spec lists the flavor. A group
+// exists when one of its offerable members does. So an images-only or
+// audio-only child does not exist for a text request, a child
 // whose spec lacks anthropic does not exist for /v1/messages, and a child
 // whose spec is [anthropic] still exists for a text request. A model that
 // exists but this token may not use is a refusal, and so is a model that
@@ -48,9 +49,10 @@ import (
 // answer to either question — including for a "locked" (group-only) name, which
 // Callable excludes precisely because a direct request for it cannot route.
 // Callable holds only names that pass the served rule
-// (routing.MappingServesAPIFlavor), so it also excludes an images-only child
-// for a text request and a messages-disabled model for /v1/messages: dispatch
-// refuses a request for either before any upstream call.
+// (routing.MappingServesAPIFlavor), so it also excludes an images-only or
+// audio-only child for a text request and a messages-disabled model for
+// /v1/messages: dispatch refuses a request for any of them before any upstream
+// call.
 // Both questions go through callableFor, which is Callable narrowed by the one
 // admission gate the portal cannot see: the service-account model allowlist.
 //
@@ -63,8 +65,8 @@ import (
 // runtime-spec read is narrower: it degrades only that application, whose
 // models then count with their application's flavors and messages mode. That
 // keeps Existing from shrinking and rerouting their requests during a store
-// blip; the price is that the candidate half can take an images-only child for
-// a text request until the read recovers. None of that application's models is
+// blip; the price is that the candidate half can take an images-only or
+// audio-only child for a text request until the read recovers. None of that application's models is
 // Capable for an images request.
 func redirectUnknownModel(token auth.Token, requested string, off portal.ModelOffering) string {
 	if !token.UnknownModelRedirect {

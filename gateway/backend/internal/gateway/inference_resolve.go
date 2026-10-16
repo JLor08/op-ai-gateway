@@ -74,11 +74,12 @@ func (s *Server) resolveTarget(ctx context.Context, token *auth.Token, req infer
 // request goes through, and every /v1/responses or /v1/messages request that
 // tryProxyNative handed back or never saw (a body whose model the routing
 // probe could not read) -- plus the one spec-flavor refusal that dispatch
-// makes: a resolved target that serves images only (targetIsImagesOnly) is
-// refused with routing.ErrNoModelRoute. Every request reaching it is a text
-// request (images has no translate path), so the refusal needs no flavor test
-// of its own. It is deliberately not the general effective-served rule; see
-// targetIsImagesOnly for why.
+// makes: a resolved target that serves images only (targetIsImagesOnly) or
+// speech only (targetIsAudioOnly) is refused with routing.ErrNoModelRoute.
+// Every request reaching it is a text request (images and speech have no
+// translate path), so the refusal needs no flavor test of its own. It is
+// deliberately not the general effective-served rule; see targetIsImagesOnly
+// for why.
 //
 // Returning the sentinel, rather than answering here, is what makes the
 // refusal indistinguishable from candidacy's own no-route answer when this
@@ -97,8 +98,8 @@ func (s *Server) resolveTranslateTarget(r *http.Request, token *auth.Token, req 
 	if err != nil {
 		return target, err
 	}
-	if targetIsImagesOnly(target) {
-		slog.Debug("inference request rejected: resolved target serves images only",
+	if targetIsImagesOnly(target) || targetIsAudioOnly(target) {
+		slog.Debug("inference request rejected: resolved target serves images or speech only",
 			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
 		return routing.Target{}, routing.ErrNoModelRoute

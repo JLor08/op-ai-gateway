@@ -87,9 +87,9 @@ func TestLiveProgressUpstreamsCoverEveryRoutingCapableKind(t *testing.T) {
 			kind, routing.ProviderVLLM)
 	}
 
-	// Every value in BOTH kind vocabularies, including the four that spell
+	// Every value in BOTH kind vocabularies, including the five that spell
 	// themselves the same in each ("vllm", "llama_cpp", "ollama",
-	// "stable_diffusion_cpp"), plus the empty spec type that means
+	// "stable_diffusion_cpp", "audio_cpp"), plus the empty spec type that means
 	// "auto-detect from the binary" and is a legitimate stored value. Listed
 	// rather than derived: neither vocabulary exposes an enumeration
 	// (portal.normalizeApplicationType and portal.validRuntimeSpecType are
@@ -97,10 +97,11 @@ func TestLiveProgressUpstreamsCoverEveryRoutingCapableKind(t *testing.T) {
 	kinds := []string{
 		routing.ProviderMock, routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP,
 		routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent,
-		routing.ProviderStableDiffusionCpp,
+		routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp,
 		string(routing.RuntimeSpecTypeVLLM), string(routing.RuntimeSpecTypeLlamaCpp),
 		string(routing.RuntimeSpecTypeTGI), string(routing.RuntimeSpecTypeOllama),
-		string(routing.RuntimeSpecTypeStableDiffusionCpp), string(routing.RuntimeSpecTypeCustom), "",
+		string(routing.RuntimeSpecTypeStableDiffusionCpp), string(routing.RuntimeSpecTypeAudioCpp),
+		string(routing.RuntimeSpecTypeCustom), "",
 	}
 	listed := make(map[string]struct{}, len(kinds))
 	for _, kind := range kinds {
@@ -114,7 +115,7 @@ func TestLiveProgressUpstreamsCoverEveryRoutingCapableKind(t *testing.T) {
 	// Not a drift claim, and deliberately phrased so it cannot be mistaken for
 	// one: the two sets can stand in the right relation and still hold a kind
 	// this enumeration has never heard of, and then the loop above is checking
-	// fifteen strings that no longer describe the vocabularies. Checked on the
+	// seventeen strings that no longer describe the vocabularies. Checked on the
 	// gate's keys only -- a size comparison would also fire whenever the
 	// CAPABLE side changed, duplicating the errors above with a message that
 	// points at the wrong file.

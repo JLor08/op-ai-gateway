@@ -572,6 +572,124 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // audio_cpp is the second type whose stock API flavors and timeout are
+  // reproducible failures rather than preferences: the stock pair would offer
+  // a speech-only server as a text candidate, and 30s is shorter than a long
+  // synthesis. Unlike stable_diffusion_cpp it has a real health endpoint, so
+  // the health check MODE stays at the stock path check -- but at /health, not
+  // the stock /v1/health, which it answers with 404.
+  describe(`ApplicationSection audio_cpp type [${locale}]`, () => {
+    it('offers audio_cpp in the application-type dropdown', async () => {
+      renderSection();
+      openCreate();
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
+      expect(await screen.findByRole('option', { name: 'audio_cpp' })).toBeInTheDocument();
+    });
+
+    it('prefills audio_cpp defaults (flavors, timeout, loaded models) when the type changes', async () => {
+      const { created } = renderSection();
+      openCreate();
+      await selectType('audio_cpp');
+      expect(screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiAudio })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'anthropic' })).not.toBeChecked();
+      expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe(
+        '600000',
+      );
+      expect((screen.getByLabelText(t.applicationLoadedModelsPath) as HTMLInputElement).value).toBe(
+        '/v1/models',
+      );
+      expect(
+        screen.getByRole('combobox', { name: t.applicationLoadedModelsFormat }),
+      ).toHaveTextContent(t.applicationLoadedFormatOpenai);
+      // The stock health path MODE is kept, but its path moves to /health:
+      // audio.cpp answers GET /health with 200 and the stock /v1/health with
+      // 404, so the stock path would take the new application unreachable.
+      expect(screen.getByRole('combobox', { name: t.applicationHealthMode })).toHaveTextContent(
+        t.applicationHealthModePath,
+      );
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/health',
+      );
+      expect(screen.getByText(t.applicationTypeAudioCppNote)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].type).toBe('audio_cpp');
+      expect(created[0].api_flavors).toEqual(['openai_audio']);
+      expect(created[0].health_check_mode).toBe('health_path');
+      expect(created[0].health_check_path).toBe('/health');
+      expect(created[0].timeout_ms).toBe(600000);
+      expect(created[0].loaded_models_format).toBe('openai');
+    });
+
+    it('keeps an edited health path across a switch to audio_cpp', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.applicationHealthPath), {
+        target: { value: '/ready' },
+      });
+      await selectType('audio_cpp');
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/ready',
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].health_check_path).toBe('/ready');
+    });
+
+    it('restores the stock health path when an untouched audio_cpp form switches away', async () => {
+      const { created } = renderSection();
+      openCreate();
+      await selectType('audio_cpp');
+      await selectType('vllm');
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/v1/health',
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].health_check_path).toBe('/v1/health');
+    });
+
+    it('announces the audio_cpp note as the type field description', async () => {
+      renderSection();
+      openCreate();
+      const combo = () => screen.getByRole('combobox', { name: t.applicationType });
+      expect(combo()).not.toHaveAccessibleDescription();
+
+      await selectType('audio_cpp');
+      expect(combo()).toHaveAccessibleDescription(t.applicationTypeAudioCppNote);
+
+      await selectType('vllm');
+      expect(combo()).not.toHaveAccessibleDescription();
+      expect(screen.queryByText(t.applicationTypeAudioCppNote)).not.toBeInTheDocument();
+    });
+
+    it('preserves a customized flavor selection across a switch to audio_cpp', async () => {
+      renderSection();
+      openCreate();
+      fireEvent.click(screen.getByRole('checkbox', { name: 'openai' }));
+      await selectType('audio_cpp');
+      expect(
+        screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiAudio }),
+      ).not.toBeChecked();
+    });
+
+    it('moves an untouched audio_cpp form back to the stock text pair on a switch away', async () => {
+      renderSection();
+      openCreate();
+      await selectType('audio_cpp');
+      await selectType('vllm');
+      expect(screen.getByRole('checkbox', { name: 'openai' })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'anthropic' })).toBeChecked();
+      expect(
+        screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiAudio }),
+      ).not.toBeChecked();
+    });
+  });
+
   describe(`ApplicationSection server_agent type [${locale}]`, () => {
     it('offers server_agent in the application-type dropdown', async () => {
       renderSection();
@@ -1139,6 +1257,52 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // openai_audio is the fourth flavor checkbox, opt-in like openai_images:
+  // never ticked by default, so an operator can add it to any application --
+  // a server_agent one included, whose agent-launched speech child needs it
+  // for candidacy.
+  describe(`ApplicationSection openai_audio flavor checkbox [${locale}]`, () => {
+    const audioBox = () => screen.getByRole('checkbox', { name: t.applicationFlavorOpenaiAudio });
+
+    it('leaves openai_audio unticked on a fresh create and sends it once ticked', async () => {
+      const { created } = renderSection();
+      openCreate();
+      expect(audioBox()).not.toBeChecked();
+
+      fireEvent.click(audioBox());
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].api_flavors).toEqual(['openai', 'anthropic', 'openai_audio']);
+    });
+
+    it('shows a stored openai_audio as ticked, and unticking it removes it', async () => {
+      const { updated } = renderSection({
+        apps: [makeApp({ id: 'app_1', api_flavors: ['openai', 'openai_audio'] })],
+      });
+      await screen.findByText('https://s1.example.test:8000');
+      fireEvent.click(screen.getByRole('button', { name: t.applicationEdit }));
+      expect(audioBox()).toBeChecked();
+
+      fireEvent.click(audioBox());
+      fireEvent.click(screen.getByRole('button', { name: t.applicationSave }));
+      await waitFor(() => expect(updated).toHaveLength(1));
+      expect(updated[0].body.api_flavors).toEqual(['openai']);
+    });
+
+    it('accepts openai_audio as the only ticked flavor, as the empty-list refusal does for images', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.click(screen.getByRole('checkbox', { name: 'openai' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'anthropic' }));
+      fireEvent.click(audioBox());
+      expect(screen.queryByText(t.applicationFlavorsRequired)).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].api_flavors).toEqual(['openai_audio']);
+    });
+  });
+
   // An empty flavor list is not an honest save: the backend stores [] as
   // [openai, anthropic], so a form showing nothing ticked would save a text
   // candidate -- on a stable_diffusion_cpp application, the exact trap its
@@ -1657,6 +1821,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       litellm: true,
       server_agent: true,
       stable_diffusion_cpp: true,
+      audio_cpp: true,
     };
     const allTypes = Object.keys(typeKeys) as ApplicationType[];
     const refusedTypes = allTypes.filter((type) => type !== 'server_agent');

@@ -39,6 +39,39 @@ describe('runtimeSpecTemplate', () => {
     ).toEqual(['openai_images']);
   });
 
+  // openai_audio is opt-in on the spec exactly as openai_images is: a
+  // server_agent parent declares it for its speech children, and copying it
+  // would make every new text model's spec admit speech requests too.
+  it('leaves openai_audio out when a text flavor survives', () => {
+    expect(
+      runtimeSpecTemplate({
+        api_flavors: ['openai', 'anthropic', 'openai_images', 'openai_audio'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      }).apiFlavors,
+    ).toEqual(['openai', 'anthropic']);
+  });
+
+  it('keeps openai_audio when the parent has no text flavor', () => {
+    expect(
+      runtimeSpecTemplate({
+        api_flavors: ['openai_audio'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      }).apiFlavors,
+    ).toEqual(['openai_audio']);
+  });
+
+  it('keeps both specific flavors when the parent names no text flavor at all', () => {
+    expect(
+      runtimeSpecTemplate({
+        api_flavors: ['openai_images', 'openai_audio'],
+        responses_mode: 'passthrough',
+        messages_mode: 'passthrough',
+      }).apiFlavors,
+    ).toEqual(['openai_images', 'openai_audio']);
+  });
+
   it('returns a copy, never the parent array', () => {
     const parent = {
       api_flavors: ['openai_images'],

@@ -12,6 +12,10 @@ import { type Fetcher, request, subscribeSSE } from './transport';
 // type: the backend stores whatever flavors the operator ticks. See
 // applicationTypeDefaults.ts for why its stock defaults (health mode, API
 // flavors, timeout) would break it and are overridden per-type.
+// 'audio_cpp': a speech-synthesis server (audio.cpp / audiocpp_server), the
+// same kind of form default: 'openai_audio' alone and a 10-minute timeout,
+// and a health path of /health (the stock /v1/health answers 404 there), under
+// the stock health_path mode, since it has a real GET /health.
 export type ApplicationType =
   | 'ollama'
   | 'vllm'
@@ -19,7 +23,8 @@ export type ApplicationType =
   | 'llama_swap'
   | 'litellm'
   | 'server_agent'
-  | 'stable_diffusion_cpp';
+  | 'stable_diffusion_cpp'
+  | 'audio_cpp';
 export type ApplicationScheme = 'http' | 'https';
 export type ApplicationStatus = 'active' | 'disabled';
 
@@ -218,6 +223,12 @@ export type PortalModelMapping = {
   // itself fails closed. Always present on the real wire DTO; optional here so
   // existing fixtures compile unchanged.
   images_only?: boolean;
+  // images_only's speech twin: true when the mapping's effective API flavors
+  // name openai_audio and neither openai nor anthropic, so the same chat-prompt
+  // runs are refused for it (`benchmark.audio_only`). A list naming both
+  // openai_images and openai_audio is both. Same advisory contract and the
+  // same optionality as images_only.
+  audio_only?: boolean;
 };
 
 export type PortalMappingListResponse = { data: PortalModelMapping[] };
@@ -600,11 +611,15 @@ export type ModelServerRow = {
 // The closed set of ModelServerRow.load_refusal values:
 //   images_only              -- an images-only model the server agent does not
 //                               launch; a Load would send it a chat prompt.
-//   agent_ensure_unsupported -- an images-only agent model whose agent does not
-//                               report the runtime_ensure feature.
+//   audio_only               -- images_only's speech twin: an audio-only model
+//                               the server agent does not launch.
+//   agent_ensure_unsupported -- an images-only or audio-only agent model whose
+//                               agent does not report the runtime_ensure
+//                               feature.
 //   spec_force_stopped       -- the launch spec's admin override is
 //                               force_stopped, which a Load never lifts.
-export type LoadRefusal = 'images_only' | 'agent_ensure_unsupported' | 'spec_force_stopped';
+export type LoadRefusal =
+  'images_only' | 'audio_only' | 'agent_ensure_unsupported' | 'spec_force_stopped';
 
 // One capability verdict on a ModelServerRow, mirroring the backend's
 // ModelServerCapabilityDTO field-for-field: which capability, its verdict

@@ -1476,11 +1476,14 @@ func filterServesEndpoint(cands []MappingCandidate, fineFlavor string) []Mapping
 func NormalizeAPIFlavor(apiFlavor string) string {
 	normalized := strings.ToLower(strings.TrimSpace(apiFlavor))
 	switch {
-	// BEFORE the generic "openai" prefix, deliberately: every fine images
-	// flavor also starts with "openai", so testing the generic prefix first
-	// would fold images into text and defeat the separation entirely.
+	// BEFORE the generic "openai" prefix, deliberately: every fine images and
+	// audio flavor also starts with "openai", so testing the generic prefix
+	// first would fold images and speech into text and defeat the separation
+	// entirely.
 	case strings.HasPrefix(normalized, APIFlavorOpenAIImages):
 		return APIFlavorOpenAIImages
+	case strings.HasPrefix(normalized, APIFlavorOpenAIAudio):
+		return APIFlavorOpenAIAudio
 	case strings.HasPrefix(normalized, "openai"):
 		return APIFlavorOpenAI
 	case strings.HasPrefix(normalized, "anthropic"):

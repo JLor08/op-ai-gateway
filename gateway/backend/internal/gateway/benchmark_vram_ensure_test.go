@@ -102,6 +102,52 @@ func TestVRAMRunPlanRefusesAnImagesOnlyTargetWithoutRuntimeEnsure(t *testing.T) 
 	}
 }
 
+// TestVRAMRunPlanTakesAnAudioOnlyTargetThroughTheEnsureRoute: an audio.cpp
+// style child that serves only speech has no chat endpoint either, so its
+// plan is an ensure plan too, with the first-generation caveat; without
+// runtime_ensure the plan refuses it before anything is written, with the
+// Load's wire code, instead of draining the fleet and chat-loading a child
+// that cannot answer. Only the plan is exercised here; the run itself, whose
+// drain writes launch specs through the portal's spec writer (which accepts
+// openai_audio), is TestVRAMRunEnsuresAnAudioOnlyTarget.
+func TestVRAMRunPlanTakesAnAudioOnlyTargetThroughTheEnsureRoute(t *testing.T) {
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	t.Run("with runtime_ensure", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{targetAPIFlavors: audio})
+		f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager", runtimeEnsureFeature})
+		f.seedLatestSample()
+
+		plan, err := f.srv.vramRunPlan(context.Background(), f.target)
+		if err != nil {
+			t.Fatalf("vramRunPlan: %v", err)
+		}
+		if !plan.ensure {
+			t.Fatal("plan.ensure = false, want an ensure plan for an audio-only target")
+		}
+		if !containsString(plan.warnings, vramWarningFirstGenerationNotMeasured) {
+			t.Fatalf("warnings = %v, want %q", plan.warnings, vramWarningFirstGenerationNotMeasured)
+		}
+	})
+	t.Run("without runtime_ensure", func(t *testing.T) {
+		f := newVRAMFixture(t, vramFixtureOpts{targetAPIFlavors: audio})
+		f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager"})
+		f.seedLatestSample()
+
+		_, err := f.srv.vramRunPlan(context.Background(), f.target)
+		if got := vramRefusalCode(t, err); got != "benchmark.agent_ensure_unsupported" {
+			t.Fatalf("refusal code = %q, want benchmark.agent_ensure_unsupported", got)
+		}
+		for specID, state := range f.allAdminStates(t) {
+			if state != "" {
+				t.Fatalf("spec %q was written (admin_state %q) by a refused run", specID, state)
+			}
+		}
+		if got := f.notifies(); len(got) != 0 {
+			t.Fatalf("a refused run notified the agent: %#v", got)
+		}
+	})
+}
+
 // TestVRAMTextProbeNeedsNoRuntimeEnsure: a text target on an agent without
 // runtime_ensure is planned, run and loaded by generating exactly as before --
 // neither the plan nor the run's re-check asks for the feature.
@@ -132,6 +178,41 @@ func TestVRAMTextProbeNeedsNoRuntimeEnsure(t *testing.T) {
 // number with the first-generation caveat.
 func TestVRAMRunEnsuresAnImagesOnlyTarget(t *testing.T) {
 	f := newImagesOnlyVRAMFixture(t, "runtime_manager", runtimeEnsureFeature)
+	f.seedLatestSample()
+	f.drive(t)
+	f.provider.onEnsure = func() { f.used0.Store(21500 * oneMiB) }
+
+	status := f.run(t)
+	res := status.Results[0]
+	if res.Error != "" || res.VRAM == nil {
+		t.Fatalf("result = %+v, want a report", res)
+	}
+	report := res.VRAM
+	if report.Inconclusive != "" || len(report.GPUs) != 1 || report.GPUs[0].DeltaMB != 21000 {
+		t.Fatalf("report = %+v, want a definitive 21000 MB delta", report)
+	}
+	if !containsString(report.Warnings, vramWarningFirstGenerationNotMeasured) {
+		t.Fatalf("warnings = %v, want %q", report.Warnings, vramWarningFirstGenerationNotMeasured)
+	}
+	if f.provider.streamCount() != 0 || f.provider.ensureCount() != 1 {
+		t.Fatalf("streams = %d, ensures = %d; want one ensure and no generation", f.provider.streamCount(), f.provider.ensureCount())
+	}
+	for _, specID := range []string{f.targetSpec, f.siblingSpec} {
+		if state := f.adminState(t, specID); state != "" {
+			t.Fatalf("%s admin_state after the run = %q, want empty", specID, state)
+		}
+	}
+}
+
+// TestVRAMRunEnsuresAnAudioOnlyTarget is TestVRAMRunEnsuresAnImagesOnlyTarget
+// for an audio.cpp style child: the run drains the fleet through the portal's
+// spec writer, which has to accept the target's openai_audio spec flavors (it
+// rejected them, runtime_spec.flavor_invalid, until the portal's known flavors
+// listed openai_audio), loads the child through the ensure route, never by
+// generating, measures it, and restores every spec.
+func TestVRAMRunEnsuresAnAudioOnlyTarget(t *testing.T) {
+	f := newVRAMFixture(t, vramFixtureOpts{targetAPIFlavors: []string{routing.APIFlavorOpenAIAudio}})
+	f.srv.AgentFeatures.Set("srv1", []string{"runtime_manager", runtimeEnsureFeature})
 	f.seedLatestSample()
 	f.drive(t)
 	f.provider.onEnsure = func() { f.used0.Store(21500 * oneMiB) }
