@@ -1564,6 +1564,28 @@ func TestNormalizeAPIFlavorSeparatesImagesFromText(t *testing.T) {
 	}
 }
 
+// TestNormalizeAPIFlavorFoldsOpenAIAudio pins the same ORDER-SENSITIVE rule
+// for the speech flavor: "openai_audio" also starts with "openai", so it must
+// fold to its own coarse flavor BEFORE the generic "openai" prefix, or every
+// text-serving application would become a speech candidate. Every fine value
+// that already folded to text, images or anthropic keeps folding there.
+func TestNormalizeAPIFlavorFoldsOpenAIAudio(t *testing.T) {
+	for _, tc := range []struct{ fine, wantCoarse string }{
+		{"openai_audio", APIFlavorOpenAIAudio},
+		{"openai_audio_speech", APIFlavorOpenAIAudio},
+		{"  OpenAI_Audio  ", APIFlavorOpenAIAudio},
+		{"openai_images", APIFlavorOpenAIImages},
+		{"openai_chat_completions", APIFlavorOpenAI},
+		{"openai_responses", APIFlavorOpenAI},
+		{"openai", APIFlavorOpenAI},
+		{"anthropic_messages", APIFlavorAnthropic},
+	} {
+		if got := NormalizeAPIFlavor(tc.fine); got != tc.wantCoarse {
+			t.Errorf("NormalizeAPIFlavor(%q) = %q, want %q", tc.fine, got, tc.wantCoarse)
+		}
+	}
+}
+
 // flavorExclusionStore seeds two applications that differ only in their
 // flavors, each with one mapping carrying an image=yes verdict, so that
 // candidacy's flavor check is the only thing that can tell them apart: an

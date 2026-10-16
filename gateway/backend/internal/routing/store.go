@@ -87,6 +87,15 @@ const (
 	// existing text-only application a candidate for image requests it cannot
 	// serve.
 	APIFlavorOpenAIImages = "openai_images"
+	// APIFlavorOpenAIAudio is the speech twin of APIFlavorOpenAIImages: a COARSE
+	// flavor of its own, for the same reason and with the same opt-in rule.
+	// It is what lets an application serve POST /v1/audio/speech and not text
+	// (or the reverse), and normalizeFlavors' empty-list default stays
+	// [openai, anthropic] exactly, so no existing text-only application becomes
+	// a candidate for a speech request it cannot serve. It is unrelated to
+	// CapabilityAudio, which means the model ACCEPTS audio input: this flavor
+	// names the endpoint that PRODUCES audio.
+	APIFlavorOpenAIAudio = "openai_audio"
 
 	// PrincipalTypeService / PrincipalTypeUser are the two supported
 	// principal_limits owner kinds (Phase 2 of the service-accounts work):
@@ -1385,6 +1394,18 @@ const (
 	// it is on the agent ingest's reserved list for that reason -- and "no row"
 	// means "derive from image", not "unknown" (ImpliedImageEdit).
 	CapabilityImageEdit = "image_edit"
+
+	// CapabilitySpeech means the model SYNTHESISES speech: it may be the target
+	// of POST /v1/audio/speech. It is orthogonal to CapabilityAudio above, which
+	// means the model ACCEPTS audio as input, exactly as CapabilityImage is
+	// orthogonal to CapabilityVision, and the two can co-occur. Never map one
+	// onto the other: advertising a synthesiser as a consumer (or the reverse)
+	// fails far from its cause.
+	//
+	// Unlike CapabilityImage the string does NOT coincide with the billable
+	// unit (usage.BillingUnitAudioSecond is "audio_second"): a capability names
+	// what a model can do, the unit names what a served request is metered in.
+	CapabilitySpeech = "speech"
 )
 
 // Capability verdicts.
@@ -1476,6 +1497,20 @@ const (
 // rank-3 manual "no" cannot outrank it forever. A document with NO
 // supported_modes list at all is still no verdict: an absent list is not an
 // exhaustive one.
+//
+// CapabilitySourceAudioCppModels names the fifth probe-rank source: audio.cpp's
+// own model listing, GET /v1/models, from whose per-model task field the
+// CapabilitySpeech verdict is derived. It is named for the document it read,
+// like the sources above, and ranks 1 through capabilitySourceRank's DEFAULT
+// branch for the same reason: never able to overwrite manual (3) or
+// vision_benchmark (2), always able to repair its own drift (1 vs 1).
+//
+// It is the sdcpp_capabilities source's twin in the one respect that matters:
+// it is entitled to establish (speech, no) as well as (speech, yes). The
+// listing states each model's task, so a model it names with a task that is not
+// a synthesis task is a real CapabilityNo, not an absence -- while a model the
+// listing does not name at all is still no verdict, because a missing entry
+// says nothing about that model. It writes the speech row only.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"
@@ -1483,6 +1518,7 @@ const (
 	CapabilitySourceOllamaAPIShow     = "ollama_api_show"
 	CapabilitySourceLlamaCppTimings   = "llama_cpp_timings"
 	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
+	CapabilitySourceAudioCppModels    = "audiocpp_models"
 	CapabilitySourceLegacy            = "legacy"
 )
 
@@ -1501,7 +1537,8 @@ const (
 //	   CapabilitySourceOllamaAPIShow,     document (llama.cpp's /props,
 //	   CapabilitySourceLegacy,            Ollama's /api/show,
 //	   CapabilitySourceLlamaCppTimings,   stable-diffusion.cpp's
-//	   CapabilitySourceSdcppCapabilities  /sdcpp/v1/capabilities) every
+//	   CapabilitySourceSdcppCapabilities, /sdcpp/v1/capabilities,
+//	   CapabilitySourceAudioCppModels     audio.cpp's /v1/models) every
 //	   or any unrecognised source         time, reads the timings llama.cpp
 //	                                      put on a completion it just
 //	                                      served, or replays a migrated
@@ -1512,9 +1549,10 @@ const (
 //	                                      rather than silently handing an
 //	                                      unknown writer manual's immunity,
 //	                                      which is also why none of
-//	                                      ollama_api_show, llama_cpp_timings
-//	                                      and sdcpp_capabilities needs a
-//	                                      case of its own below.
+//	                                      ollama_api_show, llama_cpp_timings,
+//	                                      sdcpp_capabilities and
+//	                                      audiocpp_models needs a case of
+//	                                      its own below.
 //	0  no stored row at all               "unknown" -- see
 //	                                      CapabilityRowsByName.
 //

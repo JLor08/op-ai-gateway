@@ -70,6 +70,25 @@ func FlavorsAreImagesOnly(flavors []string) bool {
 	return images
 }
 
+// FlavorsAreAudioOnly is FlavorsAreImagesOnly's speech twin: it reports whether
+// a flavor list names openai_audio and neither text flavor (openai, anthropic).
+// Naming openai_audio is also what makes the list non-empty, so an empty list
+// is never audio-only. It is the test that keeps an audio-only server from
+// being offered a chat prompt, as FlavorsAreImagesOnly keeps an images-only one
+// from being.
+func FlavorsAreAudioOnly(flavors []string) bool {
+	audio := false
+	for _, f := range flavors {
+		switch f {
+		case APIFlavorOpenAI, APIFlavorAnthropic:
+			return false
+		case APIFlavorOpenAIAudio:
+			audio = true
+		}
+	}
+	return audio
+}
+
 // MappingHasAPIFlavor is the FLAVOR HALF of the rule the model listings apply
 // to one mapping: whether a request of the coarse flavor gets past both flavor
 // checks on its way to the mapping, before any endpoint mode is read. app is
@@ -79,13 +98,13 @@ func FlavorsAreImagesOnly(flavors []string) bool {
 //     candidacy admits on), and eff's flavors are not images-only, the one
 //     spec-flavor refusal of the text translate dispatch. So a spec narrowed
 //     to [anthropic], or stored as [], keeps openai: chat completions serve it.
-//   - anthropic, openai_images: the application declares it, and eff's flavors
-//     list it, the check /v1/messages and the images relay make after resolve
-//     (the gateway's targetServesFlavor).
+//   - anthropic, openai_images, openai_audio: the application declares it, and
+//     eff's flavors list it, the check /v1/messages and the images relay make
+//     after resolve (the gateway's targetServesFlavor).
 //
 // Any other value, a fine flavor included, is false. For an ordinary
 // application eff's flavors are the application's own, so the rule is exactly
-// applicationHasAPIFlavor for the three coarse flavors.
+// applicationHasAPIFlavor for the four coarse flavors.
 func MappingHasAPIFlavor(app Application, eff EffectiveSpecFields, flavor string) bool {
 	if _, known := listedEndpoint(flavor); !known {
 		return false
@@ -103,7 +122,7 @@ func MappingHasAPIFlavor(app Application, eff EffectiveSpecFields, flavor string
 // completes the rule.
 //
 // For an ordinary application whose messages endpoint is not disabled the rule
-// is exactly the application's flavors among the three coarse flavors.
+// is exactly the application's flavors among the four coarse flavors.
 func MappingServesAPIFlavor(app Application, eff EffectiveSpecFields, flavor string) bool {
 	endpoint, known := listedEndpoint(flavor)
 	if !known || !applicationServesEndpoint(app, endpoint) || !effectiveHasAPIFlavor(eff, flavor) {
@@ -115,8 +134,8 @@ func MappingServesAPIFlavor(app Application, eff EffectiveSpecFields, flavor str
 // listedEndpoint is the fine flavor a listed coarse flavor stands for, the one
 // MappingServesAPIFlavor asks applicationServesEndpoint about: chat
 // completions for openai (never openai_responses, whose mode no listing
-// reflects), the Messages endpoint for anthropic, and openai_images itself.
-// known is false for any other value.
+// reflects), the Messages endpoint for anthropic, and openai_images and
+// openai_audio themselves. known is false for any other value.
 func listedEndpoint(flavor string) (endpoint string, known bool) {
 	switch flavor {
 	case APIFlavorOpenAI:
@@ -125,6 +144,8 @@ func listedEndpoint(flavor string) (endpoint string, known bool) {
 		return "anthropic_messages", true
 	case APIFlavorOpenAIImages:
 		return APIFlavorOpenAIImages, true
+	case APIFlavorOpenAIAudio:
+		return APIFlavorOpenAIAudio, true
 	default:
 		return "", false
 	}
