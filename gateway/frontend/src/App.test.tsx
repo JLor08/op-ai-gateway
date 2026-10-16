@@ -276,8 +276,16 @@ let vendorAccountsEnabledMock = false;
 // reports it (`subscriptions_enabled`). undefined = the field is absent from the
 // answer, which the shell must read as ON (the default).
 let vendorSubscriptionsEnabledMock: boolean | undefined = undefined;
+// The vendor_account_sharing_enabled master flag as the same portal-scoped endpoint
+// reports it (`sharing_enabled`). undefined = the field is absent from the answer,
+// which the shell must read as OFF (sharing is opt-in), so every sharing control
+// stays hidden. A saved vendor_account_sharing_enabled in the System-settings PUT
+// flips it, like the module flag.
+let vendorSharingEnabledMock: boolean | undefined = undefined;
 // The caller's own accounts as GET /api/portal/vendor-accounts lists them.
 let vendorAccountsListMock: Array<Record<string, unknown>> = [];
+// The resource groups as GET /api/portal/resource-groups lists them.
+let resourceGroupsListMock: Array<Record<string, unknown>> = [];
 // Drives CurrentUser.system_admin_mode on the mocked /api/auth/session +
 // /api/portal/me responses. A system_admin session starts NOT elevated
 // (matches the backend default), so only tests that specifically need the
@@ -316,7 +324,9 @@ beforeEach(() => {
   netbirdRawCheckboxMock = null;
   vendorAccountsEnabledMock = false;
   vendorSubscriptionsEnabledMock = undefined;
+  vendorSharingEnabledMock = undefined;
   vendorAccountsListMock = [];
+  resourceGroupsListMock = [];
   systemAdminModeMock = false;
   window.sessionStorage.clear();
   // The reworked Chat persists its transcript + settings to localStorage. jsdom
@@ -587,10 +597,16 @@ beforeEach(() => {
           ...(vendorSubscriptionsEnabledMock === undefined
             ? {}
             : { subscriptions_enabled: vendorSubscriptionsEnabledMock }),
+          ...(vendorSharingEnabledMock === undefined
+            ? {}
+            : { sharing_enabled: vendorSharingEnabledMock }),
         });
       }
       if (path === '/api/portal/vendor-accounts' && (!init?.method || init.method === 'GET')) {
         return jsonResponse({ data: vendorAccountsListMock });
+      }
+      if (path === '/api/portal/resource-groups' && (!init?.method || init.method === 'GET')) {
+        return jsonResponse({ data: resourceGroupsListMock });
       }
       if (path === '/v1/chat/completions' && init?.method === 'POST') {
         const body = JSON.parse(String(init?.body)) as { model: string };
@@ -1149,13 +1165,17 @@ beforeEach(() => {
           health_check_interval_seconds?: number;
           netbird_enabled?: boolean;
           vendor_accounts_enabled?: boolean;
+          vendor_account_sharing_enabled?: boolean;
         };
         // Reflect a saved NetBird enable toggle so the App's onSaved re-fetch of
         // /api/portal/netbird/enabled returns the new module_enabled (live nav update).
         if (body.netbird_enabled !== undefined) netbirdRawCheckboxMock = body.netbird_enabled;
-        // Same for the vendor-accounts master flag.
+        // Same for the vendor-accounts master flag and the sharing master flag.
         if (body.vendor_accounts_enabled !== undefined) {
           vendorAccountsEnabledMock = body.vendor_accounts_enabled;
+        }
+        if (body.vendor_account_sharing_enabled !== undefined) {
+          vendorSharingEnabledMock = body.vendor_account_sharing_enabled;
         }
         return jsonResponse({
           theme: body.theme ?? 'default',
@@ -2925,6 +2945,7 @@ describe('App', () => {
     ['user', false],
   ])('offers the share area of an own account to a %s: %s', async (role, offered) => {
     vendorAccountsEnabledMock = true;
+    vendorSharingEnabledMock = true;
     vendorAccountsListMock = vendorAccountRows;
     currentRole = role;
     systemAdminModeMock = role === 'system_admin';
@@ -2941,6 +2962,107 @@ describe('App', () => {
     } else {
       expect(share).not.toBeInTheDocument();
     }
+  });
+
+  // #183: the shell reads the vendor_account_sharing_enabled master flag from the same
+  // portal-scoped probe (`sharing_enabled`) and threads it into the providers view and
+  // the resource-groups view. Off, or absent from the answer (an older backend, a failed
+  // probe), every control that creates or changes sharing stays hidden -- the backend
+  // answers each of them 409 -- while the owner's own account management is untouched.
+  it.each([
+    ['reported off', false],
+    ['absent from the answer (default off)', undefined],
+  ])(
+    'replaces the share controls of an admin owner by the notice while sharing is %s',
+    async (_l, flag) => {
+      vendorAccountsEnabledMock = true;
+      vendorSharingEnabledMock = flag;
+      vendorAccountsListMock = vendorAccountRows;
+      currentRole = 'admin';
+      renderApp();
+      await screen.findByText('Dev User');
+      await gotoNav(messages.de.providers);
+      const row = (await screen.findByText('Plain Key')).closest('tr')!;
+      fireEvent.click(within(row).getByRole('button', { name: messages.de.modelDetailsAction }));
+      await screen.findByText(messages.de.vendorAccountSettingsTitle);
+
+      const share = await screen.findByRole('region', {
+        name: messages.de.vendorAccountShareTitle,
+      });
+      expect(within(share).getByRole('status')).toHaveTextContent(
+        messages.de.vendorAccountSharingOffNotice,
+      );
+      expect(within(share).queryByLabelText(messages.de.vendorAccountShareLevelLabel)).toBeNull();
+      // The owner's own account management is still there.
+      expect(screen.getByLabelText(messages.de.vendorAccountApiKeyLabel)).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ['on', true, true, true],
+    ['off', true, false, false],
+    ['absent from the answer (default off)', true, undefined, false],
+    // The backend checks the module first, so sharing "on" under a disabled module is
+    // not on at all.
+    ['on but the vendor-accounts module is off', false, true, false],
+  ])(
+    'shows the provider-accounts panel of a resource group only while sharing is %s',
+    async (_l, moduleOn, flag, shown) => {
+      vendorAccountsEnabledMock = moduleOn;
+      vendorSharingEnabledMock = flag;
+      resourceGroupsListMock = [
+        {
+          id: 'rgrp_1',
+          name: 'GPU Pool',
+          status: 'active',
+          system_group: { id: 'sg_default', name: 'Default System Group' },
+          admin_groups: [{ id: 'ag_default', name: 'Default Admin Group' }],
+          servers: [],
+          vendor_accounts: [],
+        },
+      ];
+      currentRole = 'admin';
+      renderApp();
+      await screen.findByText('Dev User');
+      await gotoNav(messages.de.resourceGroups);
+      fireEvent.click(await screen.findByRole('button', { name: messages.de.modelDetailsAction }));
+      await screen.findByText(messages.de.resourceGroupServersSectionTitle);
+
+      const region = () =>
+        screen.queryByRole('region', { name: messages.de.resourceGroupVendorAccountsSectionTitle });
+      if (shown) {
+        expect(
+          await screen.findByLabelText(messages.de.resourceGroupVendorAccountsLabel),
+        ).toBeTruthy();
+        expect(region()).toBeInTheDocument();
+      } else {
+        expect(region()).not.toBeInTheDocument();
+      }
+    },
+  );
+
+  it('reveals the share controls live after enabling sharing in System settings and saving', async () => {
+    vendorAccountsListMock = vendorAccountRows;
+    currentRole = 'system_admin';
+    systemAdminModeMock = true;
+    renderApp();
+    await screen.findByText('Dev User');
+
+    await gotoNav(messages.de.system);
+    // The System form sends its whole state, so the module flag it shows (off in this
+    // mock's settings) is part of the save: turn it on together with sharing.
+    fireEvent.click(await screen.findByLabelText(messages.de.systemVendorAccountsEnabledLabel));
+    fireEvent.click(screen.getByLabelText(messages.de.systemVendorAccountSharingEnabledLabel));
+    fireEvent.click(screen.getByRole('button', { name: messages.de.save }));
+    await screen.findByText(messages.de.systemSaved);
+
+    // onSaved re-reads the probe: no reload needed for the providers page to follow.
+    await gotoNav(messages.de.providers);
+    const row = (await screen.findByText('Plain Key')).closest('tr')!;
+    fireEvent.click(within(row).getByRole('button', { name: messages.de.modelDetailsAction }));
+    const share = await screen.findByRole('region', { name: messages.de.vendorAccountShareTitle });
+    expect(within(share).getByLabelText(messages.de.vendorAccountShareLevelLabel)).toBeTruthy();
+    expect(within(share).queryByRole('status')).toBeNull();
   });
 
   it('keeps the providers nav item hidden when the flag probe fails (fail closed)', async () => {
@@ -3061,6 +3183,8 @@ describe('App', () => {
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
       vendor_subscriptions_enabled: true,
+      vendor_account_sharing_enabled: false,
+      vendor_subscription_sharing_enabled: false,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
@@ -3154,6 +3278,8 @@ describe('App', () => {
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
       vendor_subscriptions_enabled: true,
+      vendor_account_sharing_enabled: false,
+      vendor_subscription_sharing_enabled: false,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
@@ -3209,6 +3335,8 @@ describe('App', () => {
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
       vendor_subscriptions_enabled: true,
+      vendor_account_sharing_enabled: false,
+      vendor_subscription_sharing_enabled: false,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,
@@ -3285,6 +3413,8 @@ describe('App', () => {
       vision_probe_mode: 'accept',
       vendor_accounts_enabled: false,
       vendor_subscriptions_enabled: true,
+      vendor_account_sharing_enabled: false,
+      vendor_subscription_sharing_enabled: false,
       anthropic_prompt_caching_enabled: false,
       vendor_account_routing_mode: 'vendor_first',
       energy_default_price_per_kwh: 0,

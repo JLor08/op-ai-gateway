@@ -88,6 +88,18 @@ export type SystemSettings = {
   // from being used; they stay listed and nothing is deleted. api_key accounts
   // are never affected.
   vendor_subscriptions_enabled: boolean;
+  // Vendor-account SHARING master switch, off by default (opt-in; #183). While off
+  // every account behaves as personal: the stored share levels and links are kept
+  // but ignored by routing and the listings, and the share, management-group and
+  // resource-group endpoints answer 409 vendor_accounts.sharing_disabled (so the
+  // portal hides the controls behind them). Only meaningful while
+  // vendor_accounts_enabled is on.
+  vendor_account_sharing_enabled: boolean;
+  // Whether SUBSCRIPTION-type accounts may be shared (off by default, opt-in; the
+  // subscription path is ToS-restricted). Subordinate to vendor_account_sharing_enabled:
+  // it takes effect only while that one is on. A subscription account is shared at
+  // most as "shared", never "full", whatever this says.
+  vendor_subscription_sharing_enabled: boolean;
   // Anthropic prompt caching flag, off by default (opt-in, experimental). While on,
   // the gateway's Anthropic translate path places cache_control breakpoints so
   // repeated context is billed at cache rates.
@@ -509,6 +521,10 @@ export function systemApi(fetcher: Fetcher) {
       // is rejected with 400 system.vendor_account_routing_mode_invalid).
       vendor_accounts_enabled?: boolean;
       vendor_subscriptions_enabled?: boolean;
+      // The two sharing switches (#183); the subscription one is meaningful only
+      // while the master one is on.
+      vendor_account_sharing_enabled?: boolean;
+      vendor_subscription_sharing_enabled?: boolean;
       anthropic_prompt_caching_enabled?: boolean;
       vendor_account_routing_mode?: VendorAccountRoutingMode;
       // Omitted keeps the stored value, "" resets to the built-in default.

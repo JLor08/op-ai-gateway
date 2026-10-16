@@ -80,6 +80,12 @@ export function SystemSettings({
   const [pendingVendorSubscriptionsEnabled, setPendingVendorSubscriptionsEnabled] = useState<
     boolean | null
   >(null);
+  // Vendor-account SHARING switches (#183), both off by default. Null = untouched.
+  const [pendingVendorAccountSharingEnabled, setPendingVendorAccountSharingEnabled] = useState<
+    boolean | null
+  >(null);
+  const [pendingVendorSubscriptionSharingEnabled, setPendingVendorSubscriptionSharingEnabled] =
+    useState<boolean | null>(null);
   const [pendingVendorRoutingMode, setPendingVendorRoutingMode] =
     useState<VendorAccountRoutingMode | null>(null);
   // Anthropic prompt caching flag (experimental, off by default). Null = untouched.
@@ -166,6 +172,15 @@ export function SystemSettings({
   // does not send the field implies).
   const vendorSubscriptionsEnabled =
     pendingVendorSubscriptionsEnabled ?? settings?.vendor_subscriptions_enabled ?? true;
+  // Sharing is opt-IN, like the vendor-accounts flag: off unless the admin turns
+  // it on (the backend default, and what an older server that does not send the
+  // fields implies). The subscription one is subordinate to the master.
+  const vendorAccountSharingEnabled =
+    pendingVendorAccountSharingEnabled ?? settings?.vendor_account_sharing_enabled ?? false;
+  const vendorSubscriptionSharingEnabled =
+    pendingVendorSubscriptionSharingEnabled ??
+    settings?.vendor_subscription_sharing_enabled ??
+    false;
   const vendorRoutingMode: VendorAccountRoutingMode =
     pendingVendorRoutingMode ?? settings?.vendor_account_routing_mode ?? 'vendor_first';
   // Opt-in like the vendor-accounts flag: off unless the admin turns it on.
@@ -263,6 +278,8 @@ export function SystemSettings({
         vision_probe_mode: visionProbeMode,
         vendor_accounts_enabled: vendorAccountsEnabled,
         vendor_subscriptions_enabled: vendorSubscriptionsEnabled,
+        vendor_account_sharing_enabled: vendorAccountSharingEnabled,
+        vendor_subscription_sharing_enabled: vendorSubscriptionSharingEnabled,
         anthropic_prompt_caching_enabled: anthropicPromptCaching,
         vendor_account_routing_mode: vendorRoutingMode,
         // Only when edited: the loaded value is the EFFECTIVE one, so re-sending it
@@ -302,6 +319,8 @@ export function SystemSettings({
       setPendingVisionProbeMode(null);
       setPendingVendorAccountsEnabled(null);
       setPendingVendorSubscriptionsEnabled(null);
+      setPendingVendorAccountSharingEnabled(null);
+      setPendingVendorSubscriptionSharingEnabled(null);
       setPendingVendorRoutingMode(null);
       setPendingAnthropicPromptCaching(null);
       setPendingCodexClientVersion(null);
@@ -564,6 +583,38 @@ export function SystemSettings({
               />
               <FormHelperText sx={{ ml: 0, mt: 0.25 }}>
                 {t.systemVendorSubscriptionsEnabledNote}
+              </FormHelperText>
+            </Box>
+            {/* Sharing (#183): the master switch, then the subscription switch that
+                only means something while the master is on -- so it is shown but
+                not editable until then (its stored value is kept and still saved). */}
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={vendorAccountSharingEnabled}
+                    onChange={(e) => setPendingVendorAccountSharingEnabled(e.target.checked)}
+                  />
+                }
+                label={t.systemVendorAccountSharingEnabledLabel}
+              />
+              <FormHelperText sx={{ ml: 0, mt: 0.25 }}>
+                {t.systemVendorAccountSharingEnabledNote}
+              </FormHelperText>
+            </Box>
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={vendorSubscriptionSharingEnabled}
+                    disabled={!vendorAccountSharingEnabled}
+                    onChange={(e) => setPendingVendorSubscriptionSharingEnabled(e.target.checked)}
+                  />
+                }
+                label={t.systemVendorSubscriptionSharingEnabledLabel}
+              />
+              <FormHelperText sx={{ ml: 0, mt: 0.25 }}>
+                {t.systemVendorSubscriptionSharingEnabledNote}
               </FormHelperText>
             </Box>
             <SelectField

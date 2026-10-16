@@ -149,6 +149,7 @@ export function ResourceGroupsView({
   t,
   api,
   role,
+  vendorAccountSharingEnabled,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -168,6 +169,11 @@ export function ResourceGroupsView({
     | 'updateResourceGroup'
   >;
   role: string;
+  // The vendor_account_sharing_enabled master flag (off by default). While it is
+  // off the backend answers every resource-group vendor-account endpoint 409, so
+  // the provider-account panel is not shown and its candidates are not requested.
+  // The group's stored links are paused, not removed.
+  vendorAccountSharingEnabled: boolean;
 }>) {
   const isAdmin = role === 'admin' || role === 'system_admin';
   const { showError, showSuccess } = useToast();
@@ -295,7 +301,8 @@ export function ResourceGroupsView({
   }, [api, detailGroupId]);
 
   useEffect(() => {
-    if (!detailGroupId) {
+    // Sharing off: the panel is not shown and the endpoint answers 409.
+    if (!detailGroupId || !vendorAccountSharingEnabled) {
       setVendorAccountCandidates([]);
       return;
     }
@@ -313,7 +320,7 @@ export function ResourceGroupsView({
     return () => {
       cancelled = true;
     };
-  }, [api, detailGroupId]);
+  }, [api, detailGroupId, vendorAccountSharingEnabled]);
 
   useEffect(() => {
     if (!detailGroupId) {
@@ -783,33 +790,38 @@ export function ResourceGroupsView({
             never offers one the write path would reject); a current link that is not
             a candidate is shown too, so the manager can see and drop it. Adding a
             refused account (or a candidate that became unusable between fetch and
-            save) surfaces as a toast via saveVendorAccounts' catch. */}
-        <Box sx={{ mt: 3 }}>
-          <Panel
-            titleId="resource-group-vendor-accounts-heading"
-            title={t.resourceGroupVendorAccountsSectionTitle}
-          >
-            <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 480px)', gap: 2.25 }}>
-              <MultiSelectField
-                id="resource-group-vendor-accounts-edit"
-                label={t.resourceGroupVendorAccountsLabel}
-                options={vendorAccountOptions(group.vendor_accounts, vendorAccountCandidates)}
-                selected={editVendorAccountIds}
-                onChange={setEditVendorAccountIds}
-              />
-              <Box>
-                <Button
-                  type="button"
-                  variant="contained"
-                  disabled={vendorAccountsBusy}
-                  onClick={saveVendorAccounts}
-                >
-                  {t.resourceGroupVendorAccountsSave}
-                </Button>
+            save) surfaces as a toast via saveVendorAccounts' catch. Not shown at all
+            while sharing is switched off (vendor_account_sharing_enabled): every
+            account is personal then and the endpoints answer 409; the group's
+            stored links are paused, not removed. */}
+        {vendorAccountSharingEnabled && (
+          <Box sx={{ mt: 3 }}>
+            <Panel
+              titleId="resource-group-vendor-accounts-heading"
+              title={t.resourceGroupVendorAccountsSectionTitle}
+            >
+              <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 480px)', gap: 2.25 }}>
+                <MultiSelectField
+                  id="resource-group-vendor-accounts-edit"
+                  label={t.resourceGroupVendorAccountsLabel}
+                  options={vendorAccountOptions(group.vendor_accounts, vendorAccountCandidates)}
+                  selected={editVendorAccountIds}
+                  onChange={setEditVendorAccountIds}
+                />
+                <Box>
+                  <Button
+                    type="button"
+                    variant="contained"
+                    disabled={vendorAccountsBusy}
+                    onClick={saveVendorAccounts}
+                  >
+                    {t.resourceGroupVendorAccountsSave}
+                  </Button>
+                </Box>
               </Box>
-            </Box>
-          </Panel>
-        </Box>
+            </Panel>
+          </Box>
+        )}
 
         {/* Provisioning editor (Phase 2, spec
             2026-08-12-resource-groups-phase-2-provisioning): grants use of

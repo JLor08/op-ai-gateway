@@ -293,11 +293,17 @@ export function vendorAccountsApi(fetcher: Fetcher) {
     // system switch (on by default) the same way, so every user's Anbieter page
     // can flag its subscription accounts without the system-scoped settings read.
     // Optional on the wire: a response without it means the switch is on.
+    //
+    // sharing_enabled mirrors the vendor_account_sharing_enabled master switch the
+    // same way (#183), so the Anbieter page and the resource-group manager can hide
+    // the controls that create or change sharing without the system-scoped settings
+    // read. Sharing is opt-in, so a response without it means the switch is OFF.
     vendorAccountsEnabled: () =>
-      request<{ module_enabled: boolean; subscriptions_enabled?: boolean }>(
-        fetcher,
-        '/api/portal/vendor-accounts/enabled',
-      ),
+      request<{
+        module_enabled: boolean;
+        subscriptions_enabled?: boolean;
+        sharing_enabled?: boolean;
+      }>(fetcher, '/api/portal/vendor-accounts/enabled'),
     // The accounts the caller OWNS, then the ones they manage as a co-manager of a
     // shared account, then the ones they can only route to as a member (each arm
     // oldest first; a member row is the minimal view -- see VendorAccount). System

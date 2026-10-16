@@ -49,6 +49,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       role?: string;
       userId?: string;
       systemAdminMode?: boolean;
+      // The vendor_account_sharing_enabled master flag as the shell reads it; on
+      // unless a test turns it off, so the provider-accounts column is there.
+      sharingEnabled?: boolean;
       overrides?: Partial<PortalApi>;
     } = {},
   ) {
@@ -97,6 +100,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           role={opts.role ?? 'user'}
           userId={opts.userId ?? 'usr_1'}
           systemAdminMode={opts.systemAdminMode ?? false}
+          vendorAccountSharingEnabled={opts.sharingEnabled ?? true}
         />
       </ToastProvider>,
     );
@@ -830,6 +834,69 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
       expect(serversBox).not.toBeChecked();
       fireEvent.click(serversBox);
+      await waitFor(() =>
+        expect(fakeApi.setManagerPermissions).toHaveBeenCalledWith('ugrp_1', 'usr_vendor_manager', {
+          canManageUsers: false,
+          canManageGroup: true,
+          canManageServers: true,
+          canManageServices: true,
+          canManageResources: false,
+          canManageVendorAccounts: true,
+        }),
+      );
+    });
+
+    // Spec 2026-10-15 section 13: while vendor-account sharing is off the Groups UI
+    // hides the provider-accounts permission column (it only matters once accounts can
+    // be shared). The other five columns stay, and the hidden column's STORED value is
+    // still carried over by every other toggle, so hiding never strips a permission.
+    it('owner: hides the vendor-accounts column while sharing is off, keeps the other five and carries the stored value over', async () => {
+      const { fakeApi } = renderGroupsView({
+        role: 'user',
+        landscape: makeOwnedGroupLandscape(),
+        sharingEnabled: false,
+        overrides: {
+          groupMembers: vi.fn(async () => [
+            makeMember({ user_id: 'usr_owner', display_name: 'Owner Person', is_owner: true }),
+            makeMember({
+              user_id: 'usr_vendor_manager',
+              display_name: 'Vendor Manager',
+              is_manager: true,
+              can_manage_users: false,
+              can_manage_group: true,
+              can_manage_servers: false,
+              can_manage_services: true,
+              can_manage_resources: false,
+              can_manage_vendor_accounts: true,
+            }),
+          ]),
+        },
+      });
+
+      await openMembers();
+      await screen.findByText('Vendor Manager');
+
+      expect(
+        screen.queryByRole('columnheader', { name: new RegExp(t.groupsPermVendorAccounts) }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('checkbox', { name: `${t.groupsPermVendorAccounts} – Vendor Manager` }),
+      ).not.toBeInTheDocument();
+      // The five others are still there, and toggling one still sends the stored TRUE.
+      for (const label of [
+        t.groupsPermUsers,
+        t.groupsPermGroup,
+        t.groupsPermServers,
+        t.groupsPermServices,
+        t.groupsPermResources,
+      ]) {
+        expect(
+          screen.getByRole('checkbox', { name: `${label} – Vendor Manager` }),
+        ).toBeInTheDocument();
+      }
+      fireEvent.click(
+        screen.getByRole('checkbox', { name: `${t.groupsPermServers} – Vendor Manager` }),
+      );
       await waitFor(() =>
         expect(fakeApi.setManagerPermissions).toHaveBeenCalledWith('ugrp_1', 'usr_vendor_manager', {
           canManageUsers: false,

@@ -173,6 +173,7 @@ export function GroupsView({
   role,
   userId,
   systemAdminMode = false,
+  vendorAccountSharingEnabled,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -204,6 +205,12 @@ export function GroupsView({
       role prop; CurrentUser.role is untyped string on the wire). */
   role: string;
   userId: string;
+  /** The vendor_account_sharing_enabled master flag (off by default; #183 spec
+      section 13). The "provider accounts" permission only matters while sharing is
+      on (it lets a co-manager manage shared vendor accounts), so its column is
+      hidden while it is off. A stored value is untouched: every permission patch
+      carries it over unchanged. */
+  vendorAccountSharingEnabled: boolean;
 }>) {
   const { showError } = useToast();
   const {
@@ -967,7 +974,8 @@ export function GroupsView({
       // The six per-co-manager permission columns don't apply to a
       // system-tier group (no owner/manager concept there -- every row's
       // is_manager is always false), so they're omitted entirely rather
-      // than rendered as a column of dashes.
+      // than rendered as a column of dashes. The sixth (provider accounts) is
+      // also omitted while vendor-account sharing is switched off.
       ...(group.tier !== 'system'
         ? [
             {
@@ -1005,13 +1013,18 @@ export function GroupsView({
               searchable: false,
               render: (m: GroupMember) => memberPermCell(m, 'can_manage_resources'),
             },
-            {
-              id: 'perm-vendor-accounts',
-              label: t.groupsPermVendorAccounts,
-              value: (m: GroupMember) => (m.is_manager ? String(m.can_manage_vendor_accounts) : ''),
-              searchable: false,
-              render: (m: GroupMember) => memberPermCell(m, 'can_manage_vendor_accounts'),
-            },
+            ...(vendorAccountSharingEnabled
+              ? [
+                  {
+                    id: 'perm-vendor-accounts',
+                    label: t.groupsPermVendorAccounts,
+                    value: (m: GroupMember) =>
+                      m.is_manager ? String(m.can_manage_vendor_accounts) : '',
+                    searchable: false,
+                    render: (m: GroupMember) => memberPermCell(m, 'can_manage_vendor_accounts'),
+                  },
+                ]
+              : []),
           ]
         : []),
     ];

@@ -32,7 +32,7 @@ import { vendorAccountAccess } from './shared/vendorAccountAccess';
 import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountReadOnlyDetail } from './VendorAccountReadOnlyDetail';
 import { VendorAccountResourceGroupsSection } from './VendorAccountResourceGroupsSection';
-import { VendorAccountSharePanel } from './VendorAccountSharePanel';
+import { VendorAccountSharePanel, VendorAccountSharingOffPanel } from './VendorAccountSharePanel';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
 import { VendorSubscriptionConnect } from './VendorSubscriptionConnect';
@@ -69,7 +69,12 @@ function hasCredential(account: VendorAccount): boolean {
  * read-only, minimal view (VendorAccountReadOnlyDetail). The "Sharing" area
  * (VendorAccountSharePanel) holds the share level and the management groups, and
  * the OWNER of a shared account also gets the resource-group link
- * (VendorAccountResourceGroupsSection), a join/leave switch table.
+ * (VendorAccountResourceGroupsSection), a join/leave switch table. While the
+ * vendor_account_sharing_enabled master flag is off (`sharingEnabled`) none of
+ * those sharing controls is offered, since the backend answers each 409 and every
+ * account behaves as personal: a notice (VendorAccountSharingOffPanel) stands in
+ * for the sharing area, an already-shared account stays readable, and the owner's
+ * own account management is untouched.
  *
  * The API key is a WRITE-ONLY secret, following ApplicationSection's api-token
  * pattern: the DTO only says `api_key_set`, never the value, so the detail
@@ -113,12 +118,21 @@ export function VendorAccountsView({
   t,
   api,
   isAdmin,
+  sharingEnabled,
   subscriptionsEnabled = true,
 }: Readonly<{
   t: Translation;
   // Whether the signed-in user is an admin or system_admin right now: only an admin
   // owner is offered the raise of an account's share level.
   isAdmin: boolean;
+  // The vendor_account_sharing_enabled master switch (off by default). While it is
+  // off every account behaves as personal and the backend answers the share-level,
+  // management-group and resource-group endpoints 409, so the sharing area, the
+  // management-group editor and the resource-group link are not offered: a notice
+  // stands in for them. Only what creates or changes sharing is gated; the owner's
+  // own account management (credentials, name, status, prefix, the upstream panels)
+  // and the member's read view are not.
+  sharingEnabled: boolean;
   // The vendor_subscriptions_enabled system switch (on by default). While it is
   // off every subscription account is shown inactive with a notice: the backend
   // no longer routes it, nor lets it be created or connected, but it stays listed.
@@ -672,7 +686,10 @@ export function VendorAccountsView({
     // co-manager 403) and only once the account is shared (a private one is a 400
     // vendor_account.not_shared). Not gated on the admin role: an owner who has lost
     // it keeps the links they made, and may still manage them.
-    const canLinkResourceGroups = access.tier === 'owner' && access.level !== 'none';
+    // Not offered while sharing is off either (a 409 there, and every account is
+    // personal).
+    const canLinkResourceGroups =
+      sharingEnabled && access.tier === 'owner' && access.level !== 'none';
     const keyStored = account.api_key_set && !keyCleared;
     // A viewer who may not even operate the account (a member) reads it only.
     if (!access.canOperate) {
@@ -844,19 +861,24 @@ export function VendorAccountsView({
         </Panel>
 
         {/* Sharing: the share level and the management groups, for the viewer who
-            has anything to do or see there. Keyed by id, so another account never
-            inherits a half-filled raise form. */}
+            has anything to do or see there; while sharing is switched off, only the
+            notice that says why there is nothing to do. Keyed by id, so another
+            account never inherits a half-filled raise form. */}
         {access.showSharePanel && (
           <Box sx={{ mt: 3 }}>
-            <VendorAccountSharePanel
-              key={account.id}
-              t={t}
-              api={api}
-              account={account}
-              access={access}
-              busy={busy}
-              onChanged={accountShareChanged}
-            />
+            {sharingEnabled ? (
+              <VendorAccountSharePanel
+                key={account.id}
+                t={t}
+                api={api}
+                account={account}
+                access={access}
+                busy={busy}
+                onChanged={accountShareChanged}
+              />
+            ) : (
+              <VendorAccountSharingOffPanel t={t} access={access} />
+            )}
           </Box>
         )}
 

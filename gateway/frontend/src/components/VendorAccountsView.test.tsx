@@ -293,6 +293,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           t={t}
           api={fakeApi}
           isAdmin={false}
+          sharingEnabled
           {...(opts.subscriptionsEnabled === undefined
             ? {}
             : { subscriptionsEnabled: opts.subscriptionsEnabled })}
@@ -677,7 +678,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         rerender(
           <ToastProvider>
-            <VendorAccountsView t={t} api={fakeApi} isAdmin={false} subscriptionsEnabled={false} />
+            <VendorAccountsView
+              t={t}
+              api={fakeApi}
+              isAdmin={false}
+              sharingEnabled
+              subscriptionsEnabled={false}
+            />
           </ToastProvider>,
         );
 

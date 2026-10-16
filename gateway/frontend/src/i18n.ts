@@ -2572,6 +2572,12 @@ const de = {
     'Dem Konto ist keine Verwaltungsgruppe zugeordnet. Zuerst unten eine Verwaltungsgruppe zuordnen.',
   vendorAccountShareReadOnlyNote: 'Die Freigabe dieses Kontos verwaltet der Besitzer.',
   vendorAccountShareSaved: 'Freigabe gespeichert.',
+  // Shown in place of the sharing controls while sharing is switched off (the
+  // vendor_account_sharing_enabled system setting): every account behaves as
+  // personal, so nothing can be raised, lowered or reassigned.
+  vendorAccountSharingOffNotice:
+    'Das Teilen von Anbieter-Konten ist deaktiviert. Ein Systemadministrator kann es in den Systemeinstellungen aktivieren. Bis dahin gilt jedes Konto als persönlich; gespeicherte Freigaben bleiben erhalten und wirken wieder, sobald das Teilen aktiviert wird.',
+  vendorAccountSharingOffStoredLevel: (level: string) => `Gespeicherte Freigabestufe: ${level}`,
   vendorAccountAdminGroupLabel: 'Verwaltungsgruppe(n)',
   vendorAccountAdminGroupAuto: (name: string) => `Verwaltungsgruppe: ${name}`,
   vendorAccountAdminGroupSystemGroupLabel: 'System-Gruppe',
@@ -2820,6 +2826,12 @@ const de = {
   systemVendorSubscriptionsEnabledLabel: 'Abonnement-Konten zulassen',
   systemVendorSubscriptionsEnabledNote:
     'Abonnement-Konten (OAuth-Anmeldung mit einem ChatGPT- oder Claude-Abonnement) sind experimentell und verstoßen gegen die Nutzungsbedingungen der Anbieter für Privatkunden. Aus: Abonnement-Konten können weder angelegt noch verbunden oder genutzt werden; bereits angelegte Konten bleiben erhalten, sind aber nicht nutzbar. Konten mit API-Schlüssel sind nicht betroffen.',
+  systemVendorAccountSharingEnabledLabel: 'Teilen von Anbieter-Konten zulassen',
+  systemVendorAccountSharingEnabledNote:
+    'Aus (Standard): Jedes Anbieter-Konto gilt als persönlich. Gespeicherte Freigaben bleiben erhalten, wirken aber nicht, und die Freigabe-Funktionen (Freigabestufe, Verwaltungsgruppen, Ressourcengruppen) sind im Portal ausgeblendet. Ein: Administratoren können ihre eigenen Konten für Verwaltungsgruppen freigeben und über Ressourcengruppen anbieten. Wirkt nur, solange Anbieter aktiviert sind.',
+  systemVendorSubscriptionSharingEnabledLabel: 'Teilen von Abonnement-Konten zulassen',
+  systemVendorSubscriptionSharingEnabledNote:
+    'Abonnement-Konten sind experimentell und verstoßen gegen die Nutzungsbedingungen der Anbieter für Privatkunden; sie lassen sich höchstens auf „Geteilt“ stellen. Wirkt nur, solange das Teilen von Anbieter-Konten zugelassen ist (solange es aus ist, nicht änderbar). Aus: Abonnement-Konten können nicht geteilt werden. Konten mit API-Schlüssel sind nicht betroffen.',
   systemVendorAccountRoutingModeLabel: 'Vorrang bei der Anbieter-Auswahl',
   systemVendorAccountRoutingModeNote:
     'Legt fest, ob ein eigenes Anbieter-Konto Vorrang vor selbst gehosteten und gemeinsamen Servern hat. Wirkt nur, solange Anbieter aktiviert sind.',
@@ -5428,6 +5440,12 @@ const en: PortalMessages = {
     'The account has no management group. Assign a management group below first.',
   vendorAccountShareReadOnlyNote: "This account's sharing is managed by its owner.",
   vendorAccountShareSaved: 'Sharing saved.',
+  // Shown in place of the sharing controls while sharing is switched off (the
+  // vendor_account_sharing_enabled system setting): every account behaves as
+  // personal, so nothing can be raised, lowered or reassigned.
+  vendorAccountSharingOffNotice:
+    'Sharing provider accounts is disabled. A system administrator can enable it in the system settings. Until then every account behaves as personal; stored sharing is kept and applies again once sharing is enabled.',
+  vendorAccountSharingOffStoredLevel: (level: string) => `Stored sharing level: ${level}`,
   vendorAccountAdminGroupLabel: 'Admin group(s)',
   vendorAccountAdminGroupAuto: (name: string) => `Admin group: ${name}`,
   vendorAccountAdminGroupSystemGroupLabel: 'System group',
@@ -5668,6 +5686,12 @@ const en: PortalMessages = {
   systemVendorSubscriptionsEnabledLabel: 'Allow subscription accounts',
   systemVendorSubscriptionsEnabledNote:
     "Subscription accounts (OAuth sign-in with a ChatGPT or Claude subscription) are experimental and against the vendors' consumer terms. Off: subscription accounts can no longer be created, connected or used; existing ones are kept but cannot be used. API-key accounts are not affected.",
+  systemVendorAccountSharingEnabledLabel: 'Allow sharing of provider accounts',
+  systemVendorAccountSharingEnabledNote:
+    'Off (default): every provider account behaves as personal. Stored sharing is kept but has no effect, and the sharing controls (sharing level, management groups, resource groups) are hidden in the portal. On: administrators can share their own accounts with management groups and offer them through resource groups. Only takes effect while providers are enabled.',
+  systemVendorSubscriptionSharingEnabledLabel: 'Allow sharing of subscription accounts',
+  systemVendorSubscriptionSharingEnabledNote:
+    'Subscription accounts are experimental and against the vendors\' consumer terms; they can be shared at most as "Shared". Only takes effect while sharing of provider accounts is allowed (it cannot be changed while that is off). Off: subscription accounts cannot be shared. API-key accounts are not affected.',
   systemVendorAccountRoutingModeLabel: 'Provider routing precedence',
   systemVendorAccountRoutingModeNote:
     "Whether a user's own provider account takes precedence over self-hosted and shared servers. Only takes effect while providers are enabled.",

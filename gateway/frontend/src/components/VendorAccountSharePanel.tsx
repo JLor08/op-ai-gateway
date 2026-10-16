@@ -335,6 +335,37 @@ export function VendorAccountSharePanel({
   );
 }
 
+/**
+ * What the "Sharing" area shows INSTEAD of VendorAccountSharePanel while sharing is
+ * switched off (the vendor_account_sharing_enabled master flag; spec 2026-10-15
+ * section 13): no control, because the backend answers every one of them 409. Every
+ * account behaves as personal, so an account that was already shared is read the
+ * same way (the stored level and links are kept, and apply again once the flag is
+ * back on); the stored level is named so the owner can see what is paused.
+ */
+export function VendorAccountSharingOffPanel({
+  t,
+  access,
+}: Readonly<{
+  t: Translation;
+  access: VendorAccountAccess;
+}>) {
+  return (
+    <Panel titleId="vendor-account-share-heading" title={t.vendorAccountShareTitle}>
+      <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 480px)', gap: 2.25 }}>
+        <Alert severity="info" role="status">
+          {t.vendorAccountSharingOffNotice}
+        </Alert>
+        {access.level !== 'none' && (
+          <Typography variant="body2" color="text.secondary">
+            {t.vendorAccountSharingOffStoredLevel(levelLabel(t, access.level))}
+          </Typography>
+        )}
+      </Box>
+    </Panel>
+  );
+}
+
 // The management-group editor panel. Owns the pending selection, seeded from the
 // account's groups: the parent re-keys it whenever those change.
 function ManagementGroupsPanel({

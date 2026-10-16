@@ -52,7 +52,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
 
   function renderResourceGroupsView(
-    opts: { groups?: ResourceGroup[]; role?: string; overrides?: Partial<PortalApi> } = {},
+    opts: {
+      groups?: ResourceGroup[];
+      role?: string;
+      // The vendor_account_sharing_enabled master flag as the shell reads it; on
+      // unless a test turns it off, so the provider-account panel is there to test.
+      sharingEnabled?: boolean;
+      overrides?: Partial<PortalApi>;
+    } = {},
   ) {
     const groups = opts.groups ?? [makeResourceGroup()];
     const fakeApi = {
@@ -96,7 +103,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
     render(
       <ToastProvider>
-        <ResourceGroupsView t={t} api={fakeApi} role={opts.role ?? 'admin'} />
+        <ResourceGroupsView
+          t={t}
+          api={fakeApi}
+          role={opts.role ?? 'admin'}
+          vendorAccountSharingEnabled={opts.sharingEnabled ?? true}
+        />
       </ToastProvider>,
     );
     return { fakeApi };
@@ -175,7 +187,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       };
       render(
         <ToastProvider>
-          <ResourceGroupsView t={t} api={fakeApi} role="admin" />
+          <ResourceGroupsView t={t} api={fakeApi} role="admin" vendorAccountSharingEnabled />
         </ToastProvider>,
       );
       return { createResourceGroup: create as ReturnType<typeof vi.fn> };
@@ -584,6 +596,50 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(alert.textContent ?? '').toContain(
         t.errorResourceGroupVendorAccountSystemGroupMismatch,
       );
+    });
+  });
+
+  // While vendor_account_sharing_enabled is off the backend answers every
+  // resource-group vendor-account endpoint 409 (the candidates and the full-replace
+  // PUT alike), so the manager is not offered the panel at all and nothing is
+  // fetched for it. The group's stored links are paused, not deleted. The rest of the
+  // detail view (servers, provisions) is unaffected.
+  describe(`ResourceGroupsView provider-account panel with sharing switched off [${locale}]`, () => {
+    it('hides the panel and requests no candidates, while the other sections stay', async () => {
+      const group = makeResourceGroup({
+        id: 'rgrp_off',
+        vendor_accounts: [{ id: 'va_1', name: 'Team OpenAI' }],
+      });
+      const { fakeApi } = renderResourceGroupsView({ groups: [group], sharingEnabled: false });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText(t.resourceGroupServersSectionTitle);
+      await screen.findByText(t.resourceGroupProvisionsSectionTitle);
+
+      expect(
+        screen.queryByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.resourceGroupVendorAccountsLabel)).not.toBeInTheDocument();
+      expect(screen.queryByText('Team OpenAI')).not.toBeInTheDocument();
+      expect(fakeApi.resourceGroupVendorAccountCandidates).not.toHaveBeenCalled();
+      // The servers panel still loads its own candidates.
+      await waitFor(() =>
+        expect(fakeApi.resourceGroupServerCandidates).toHaveBeenCalledWith('rgrp_off'),
+      );
+    });
+
+    it('shows the panel and loads its candidates with the flag on', async () => {
+      const group = makeResourceGroup({ id: 'rgrp_on', vendor_accounts: [] });
+      const { fakeApi } = renderResourceGroupsView({ groups: [group], sharingEnabled: true });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      expect(
+        await screen.findByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle }),
+      ).toBeInTheDocument();
+      await waitFor(() =>
+        expect(fakeApi.resourceGroupVendorAccountCandidates).toHaveBeenCalledWith('rgrp_on'),
+      );
+      expect(fakeApi.setResourceGroupVendorAccounts).not.toHaveBeenCalled();
     });
   });
 

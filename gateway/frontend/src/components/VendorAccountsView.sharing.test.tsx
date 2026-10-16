@@ -158,6 +158,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     opts: {
       accounts?: VendorAccount[];
       isAdmin?: boolean;
+      // The vendor_account_sharing_enabled master flag as the shell reads it; the
+      // sharing area is the only thing it gates. On unless a test turns it off.
+      sharingEnabled?: boolean;
       candidates?: AdminGroupCandidate[];
       resourceGroups?: VendorAccountResourceGroup[];
       setVendorAccountShareLevel?: PortalApi['setVendorAccountShareLevel'];
@@ -260,7 +263,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     };
     const view = render(
       <ToastProvider>
-        <VendorAccountsView t={t} api={fakeApi} isAdmin={opts.isAdmin ?? false} />
+        <VendorAccountsView
+          t={t}
+          api={fakeApi}
+          isAdmin={opts.isAdmin ?? false}
+          sharingEnabled={opts.sharingEnabled ?? true}
+        />
       </ToastProvider>,
     );
     return { fakeApi, ...view };
@@ -774,6 +782,154 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       renderView({ accounts: [shared(subscription)] });
       await openDetail();
       expect(await screen.findByRole('region', { name: t.vendorConnectTitle })).toBeInTheDocument();
+    });
+  });
+
+  // The master flag (vendor_account_sharing_enabled) gates ONLY what creates or changes
+  // sharing -- the share-level control, the management-group editor and the
+  // resource-group link -- because the backend answers each of them 409 while it is
+  // off. What the owner does with their own account (credentials, name, status,
+  // prefix, the upstream panels) is untouched, and an account that is already shared
+  // behaves personal (spec 2026-10-15 section 13): it still renders, read-only as far
+  // as sharing goes, with a notice in place of the controls.
+  describe(`VendorAccountsView with sharing switched off [${locale}]`, () => {
+    const rgRegion = () =>
+      screen.queryByRole('region', { name: t.vendorAccountResourceGroupsTitle });
+    const GROUPS: VendorAccountResourceGroup[] = [{ id: 'rg-1', name: 'Alpha', member: true }];
+
+    it('offers an admin owner of a personal account no share control, only the notice, and fetches nothing', async () => {
+      const { fakeApi } = renderView({ isAdmin: true, sharingEnabled: false });
+      await openDetail();
+      await screen.findByText(t.vendorAccountSettingsTitle);
+
+      const panel = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      expect(panel.getByRole('status')).toHaveTextContent(t.vendorAccountSharingOffNotice);
+      // No level control, no raise target, no raise button, no group picker.
+      expect(panel.queryByLabelText(t.vendorAccountShareLevelLabel)).not.toBeInTheDocument();
+      expect(panel.queryByLabelText(t.vendorAccountShareTargetLabel)).not.toBeInTheDocument();
+      expect(panel.queryByRole('button')).not.toBeInTheDocument();
+      expect(groupsRegion()).not.toBeInTheDocument();
+      // Nothing the backend would answer 409 is asked for.
+      expect(fakeApi.vendorAccountAdminGroupCandidates).not.toHaveBeenCalled();
+      expect(fakeApi.setVendorAccountShareLevel).not.toHaveBeenCalled();
+    });
+
+    it('shows a plain owner of a personal account nothing about sharing at all (no area, no notice)', async () => {
+      const { fakeApi } = renderView({ isAdmin: false, sharingEnabled: false });
+      await openDetail();
+      await screen.findByText(t.vendorAccountSettingsTitle);
+
+      expect(shareRegion()).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorAccountSharingOffNotice)).not.toBeInTheDocument();
+      expect(fakeApi.vendorAccountAdminGroupCandidates).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['an admin owner at Shared', () => shared(), true],
+      ['a plain owner at Shared', () => shared(), false],
+      ['the owner at Fully shared', () => shared({ share_level: 'full' }), false],
+    ] as const)(
+      'renders an already-shared account of %s with the notice and its stored level, no sharing controls and no group/resource-group sections',
+      async (_who, makeAccount, isAdmin) => {
+        const account = makeAccount();
+        const { fakeApi } = renderView({
+          accounts: [account],
+          isAdmin,
+          sharingEnabled: false,
+          resourceGroups: GROUPS,
+        });
+        await openDetail();
+        await screen.findByText(t.vendorAccountSettingsTitle);
+
+        const levelName =
+          account.share_level === 'full'
+            ? t.vendorAccountShareLevelFull
+            : t.vendorAccountShareLevelShared;
+        const panel = within(
+          await screen.findByRole('region', { name: t.vendorAccountShareTitle }),
+        );
+        expect(panel.getByRole('status')).toHaveTextContent(t.vendorAccountSharingOffNotice);
+        expect(
+          panel.getByText(t.vendorAccountSharingOffStoredLevel(levelName)),
+        ).toBeInTheDocument();
+        // None of the editable controls: no raise, no lower, no stop, no level field.
+        expect(panel.queryByLabelText(t.vendorAccountShareLevelLabel)).not.toBeInTheDocument();
+        expect(panel.queryByRole('button')).not.toBeInTheDocument();
+        expect(groupsRegion()).not.toBeInTheDocument();
+        expect(rgRegion()).not.toBeInTheDocument();
+        // None of what the backend would answer 409 is requested.
+        expect(fakeApi.vendorAccountAdminGroupCandidates).not.toHaveBeenCalled();
+        expect(fakeApi.vendorAccountResourceGroups).not.toHaveBeenCalled();
+      },
+    );
+
+    it('keeps the owner of an already-shared account fully able to manage it: credentials, rename, delete, models, checks', async () => {
+      const { fakeApi } = renderView({
+        accounts: [shared()],
+        isAdmin: true,
+        sharingEnabled: false,
+      });
+      await openDetail();
+      await screen.findByText(t.vendorAccountSettingsTitle);
+
+      expect(screen.getByLabelText(t.vendorAccountApiKeyLabel)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.vendorAccountActionDelete })).toBeInTheDocument();
+      expect(screen.getByRole('region', { name: t.vendorCheckTitle })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.vendorModelsRefreshAction })).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+        target: { value: 'Renamed' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(fakeApi.updateVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.updateVendorAccount.mock.calls[0][1]).toMatchObject({ name: 'Renamed' });
+    });
+
+    it('does not crash on a co-manager row of a shared account (a stale view) and keeps its read/operate panels', async () => {
+      renderView({ accounts: [managed()], sharingEnabled: false });
+      await openDetail();
+      await screen.findByText(t.vendorAccountSettingsTitle);
+
+      expect(screen.getByLabelText(t.vendorAccountSharedBy)).toHaveValue('Olga Owner');
+      expect(
+        within(screen.getByRole('region', { name: t.vendorAccountShareTitle })).getByRole('status'),
+      ).toHaveTextContent(t.vendorAccountSharingOffNotice);
+      expect(groupsRegion()).not.toBeInTheDocument();
+      expect(rgRegion()).not.toBeInTheDocument();
+    });
+
+    it('still renders the minimal member view, which has no sharing area to gate', async () => {
+      renderView({ accounts: [member()], sharingEnabled: false });
+      await openDetail();
+
+      expect(
+        await screen.findByRole('region', { name: t.vendorAccountMemberTitle }),
+      ).toBeInTheDocument();
+      expect(shareRegion()).not.toBeInTheDocument();
+      expect(screen.queryByText(t.vendorAccountSharingOffNotice)).not.toBeInTheDocument();
+    });
+
+    it('shows the share control, the group editor and the resource-group section again with the flag on', async () => {
+      const { fakeApi } = renderView({
+        accounts: [shared()],
+        isAdmin: true,
+        sharingEnabled: true,
+        resourceGroups: GROUPS,
+      });
+      await openDetail();
+
+      const panel = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      expect(panel.getByLabelText(t.vendorAccountShareLevelLabel)).toHaveValue(
+        t.vendorAccountShareLevelShared,
+      );
+      expect(panel.queryByText(t.vendorAccountSharingOffNotice)).not.toBeInTheDocument();
+      expect(
+        await screen.findByRole('region', { name: t.vendorAccountAdminGroupsSectionTitle }),
+      ).toBeInTheDocument();
+      expect(
+        await screen.findByRole('region', { name: t.vendorAccountResourceGroupsTitle }),
+      ).toBeInTheDocument();
+      expect(fakeApi.vendorAccountResourceGroups).toHaveBeenCalledWith('va_1');
     });
   });
 

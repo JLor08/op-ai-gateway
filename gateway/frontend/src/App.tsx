@@ -93,6 +93,12 @@ export default function App() {
   // the same portal-scoped probe. It does not gate any nav item: the providers
   // page uses it to flag its subscription accounts as unusable while it is off.
   const [vendorSubscriptionsEnabled, setVendorSubscriptionsEnabled] = useState(true);
+  // Whether vendor-account SHARING is on (#183): the vendor_account_sharing_enabled
+  // master flag AND the vendor-accounts module, off by default, from the same probe.
+  // It gates no nav item either: the providers page, the resource-group manager and
+  // the Groups permission column use it to hide the controls that create or change
+  // sharing (the backend answers each 409 while it is off).
+  const [vendorAccountSharingEnabled, setVendorAccountSharingEnabled] = useState(false);
   const t = messages[locale];
   const tRef = useRef(t);
   tRef.current = t;
@@ -294,6 +300,9 @@ export default function App() {
         setVendorAccountsEnabled(Boolean(r.module_enabled));
         // Absent = on (the default), so an older backend never shows the notice.
         setVendorSubscriptionsEnabled(r.subscriptions_enabled !== false);
+        // Sharing is opt-in AND needs the module (the backend checks the module
+        // first), so an absent field, or a module that is off, reads as off.
+        setVendorAccountSharingEnabled(Boolean(r.module_enabled) && r.sharing_enabled === true);
       })
       .catch(() => {
         /* not reachable → the "Anbieter" nav item stays hidden */
@@ -423,6 +432,7 @@ export default function App() {
   const renderCtx: ViewRenderCtx = {
     ...gateCtx,
     vendorSubscriptionsEnabled,
+    vendorAccountSharingEnabled,
     t,
     api,
     locale,
