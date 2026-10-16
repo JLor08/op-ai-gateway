@@ -139,6 +139,37 @@ func TestExtractClientSession(t *testing.T) {
 			raw:    `{"model":"m","input":"hello"}`,
 			wantID: "", wantSource: "", wantAgent: "",
 		},
+		{
+			// Transcription (/v1/audio/transcriptions) is the same story as speech
+			// (see the cases above): no per-endpoint header and no body field is
+			// read; both are explicit, empty cases (endpointTranscription in
+			// extractClientSession's header switch and in sessionFromBody). Every
+			// OTHER endpoint's signal is present at once -- both per-endpoint
+			// headers feed the header switch, and the body (reached because the
+			// headers yielded nothing) feeds sessionFromBody -- so wantID/wantSource
+			// stay empty only if endpointTranscription reads none of them through
+			// either switch.
+			name: "transcription: every other endpoint's signal present -> still empty", endpoint: endpointTranscription,
+			h:      hdr("session_id", "would-be-codex", "x-claude-code-session-id", "would-be-claude-code"),
+			raw:    `{"model":"m","prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
+			wantID: "", wantSource: "",
+		},
+		{
+			// The agent id is read only on endpointMessages; a transcription
+			// request that carries the header must not pick it up.
+			name: "transcription: claude-code agent id is not read", endpoint: endpointTranscription,
+			h:      hdr("x-claude-code-agent-id", "agent_9"),
+			raw:    `{"model":"m"}`,
+			wantID: "", wantSource: "", wantAgent: "",
+		},
+		{
+			// Only the explicit override header is honoured on transcription, like
+			// every other endpoint: the no-signal cases above are about the
+			// per-endpoint signals, not about the gateway's own session header.
+			name: "transcription: explicit header still wins", endpoint: endpointTranscription,
+			h:      hdr("X-OP-AI-Gateway-Session-ID", "sess_t"),
+			wantID: "sess_t", wantSource: "header", wantExpl: "sess_t",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
