@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
@@ -782,5 +783,279 @@ func TestSpeechRelayLeavesAnUnsizedUpstreamChunked(t *testing.T) {
 	}
 	if !bytes.Equal(got, wav) {
 		t.Fatalf("body = %x, want the upstream WAV %x byte for byte", got, wav)
+	}
+}
+
+// The speech error relay is as narrow as the images one: only a speech request
+// whose upstream answered a non-2xx status is diverted from the streaming
+// copier. A 2xx audio/wav must keep streaming, and every other flavor's errors
+// stay on the copier byte for byte.
+func TestNeedsSpeechErrorRelay(t *testing.T) {
+	cases := []struct {
+		name   string
+		flavor string
+		status int
+		want   bool
+	}{
+		{"speech 200", apiFlavorSpeech, 200, false},
+		{"speech 204", apiFlavorSpeech, 204, false},
+		{"speech 299", apiFlavorSpeech, 299, false},
+		{"speech 199 is outside the 2xx window", apiFlavorSpeech, 199, true},
+		{"speech 300 is outside the 2xx window", apiFlavorSpeech, 300, true},
+		{"speech 400", apiFlavorSpeech, 400, true},
+		{"speech 404", apiFlavorSpeech, 404, true},
+		{"speech 500, audio.cpp's answer to a client error too", apiFlavorSpeech, 500, true},
+		{"speech 502", apiFlavorSpeech, 502, true},
+		{"images 500 has its own relay", apiFlavorImages, 500, false},
+		{"openai chat 500", "openai", 500, false},
+		{"openai_responses 500", "openai_responses", 500, false},
+		{"anthropic_messages 500", "anthropic_messages", 500, false},
+		{"empty flavor 500", "", 500, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := needsSpeechErrorRelay(tc.flavor, tc.status); got != tc.want {
+				t.Fatalf("needsSpeechErrorRelay(%q, %d) = %v, want %v", tc.flavor, tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+// The gateway's own classification of a normalised speech error is API surface
+// (clients branch on the code), so it is pinned by value.
+func TestSpeechUpstreamErrorClassificationIsStable(t *testing.T) {
+	if speechUpstreamErrorType != "upstream_error" {
+		t.Errorf("speechUpstreamErrorType = %q, want %q", speechUpstreamErrorType, "upstream_error")
+	}
+	if speechUpstreamErrorCode != "speech.upstream_error" {
+		t.Errorf("speechUpstreamErrorCode = %q, want %q", speechUpstreamErrorCode, "speech.upstream_error")
+	}
+}
+
+// audio.cpp already answers with an OpenAI-shaped object, so the normaliser has
+// nothing to translate: the upstream's own bytes, its own type and no invented
+// code reach the client. Re-normalising would restate a gateway-authored value
+// as the upstream's.
+func TestNormalizeSpeechUpstreamErrorPassesAnOpenAIObjectThrough(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"audio.cpp's own shape", `{"error":{"message":"unknown model id: x","type":"server_error"}}`},
+		{"a full OpenAI object", `{"error":{"message":"bad request","type":"invalid_request_error","code":"bad_prompt","param":"input"}}`},
+		{"an object with only a message", `{"error":{"message":"boom"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := normalizeSpeechUpstreamError([]byte(tc.body), http.StatusInternalServerError)
+			if !ok {
+				t.Fatal("an OpenAI-shaped body must be accepted")
+			}
+			if string(got) != tc.body {
+				t.Fatalf("body = %s, want the upstream's bytes untouched: %s", got, tc.body)
+			}
+		})
+	}
+}
+
+// A plain-string body ({"error":"..."}) is not an OpenAI object, so it is
+// wrapped: the upstream's string is the message verbatim, and type and code are
+// the GATEWAY's, fixed regardless of the upstream status.
+func TestNormalizeSpeechUpstreamErrorWrapsAPlainString(t *testing.T) {
+	for _, status := range []int{400, 500, 502} {
+		got, ok := normalizeSpeechUpstreamError([]byte(`{"error":"out of memory"}`), status)
+		if !ok {
+			t.Fatalf("status %d: a plain-string error body must normalise", status)
+		}
+		var body apierror.Body
+		if err := json.Unmarshal(got, &body); err != nil {
+			t.Fatalf("status %d: result is not an OpenAI error object: %v (%s)", status, err, got)
+		}
+		if body.Error.Message != "out of memory" {
+			t.Errorf("status %d: message = %q, want the upstream string verbatim", status, body.Error.Message)
+		}
+		if body.Error.Type != speechUpstreamErrorType || body.Error.Code != speechUpstreamErrorCode {
+			t.Errorf("status %d: type/code = %q/%q, want the gateway's %q/%q", status, body.Error.Type, body.Error.Code, speechUpstreamErrorType, speechUpstreamErrorCode)
+		}
+	}
+}
+
+// A body that is neither shape is not guessed at: ok is false and the caller
+// relays the upstream bytes unchanged.
+func TestNormalizeSpeechUpstreamErrorLeavesAnUnrecognisedBodyAlone(t *testing.T) {
+	for _, body := range []string{
+		``,
+		`<html>502 Bad Gateway</html>`,
+		`not json at all`,
+		`{}`,
+		`null`,
+		`[]`,
+		`{"error":null}`,
+		`{"error":""}`,
+		`{"error":{}}`,
+		`{"error":{"message":""}}`,
+		`{"error":{"type":"server_error"}}`,
+		`{"error":42}`,
+		`{"message":"no error key"}`,
+		"RIFF\x2c\x00\x00\x00WAVE\xff\xfe",
+	} {
+		if got, ok := normalizeSpeechUpstreamError([]byte(body), 500); ok {
+			t.Errorf("body %q: ok = true (result %s), want false so the upstream bytes are relayed unchanged", body, got)
+		}
+	}
+}
+
+// newSpeechErrorUpstream starts an audio.cpp stand-in that answers every request
+// with the given status, content type and body.
+func newSpeechErrorUpstream(t *testing.T, status int, contentType, body string) *httptest.Server {
+	t.Helper()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(up.Close)
+	return up
+}
+
+// The reachability proof for the unit tests above: a REAL non-2xx response from
+// an audio.cpp-shaped upstream goes through the actual mux and the client sees
+// the OpenAI object -- audio.cpp's own, untouched (its type is not overwritten
+// with ours) -- under the upstream's status. The row is an error row with the
+// audio_second unit and no billed audio.
+func TestSpeechRelayPassesAnAudioCppErrorThroughOverHTTP(t *testing.T) {
+	const upstreamBody = `{"error":{"message":"unknown model id: x","type":"server_error"}}`
+	up := newSpeechErrorUpstream(t, http.StatusInternalServerError, "application/json", upstreamBody)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there."}`)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (the upstream's own status); body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	var body apierror.Body
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("client body is not an OpenAI error object: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error.Message != "unknown model id: x" || body.Error.Type != "server_error" || body.Error.Code != "" {
+		t.Fatalf("error = %+v, want audio.cpp's own message and type with no gateway code added", body.Error)
+	}
+
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.HTTPStatus != http.StatusInternalServerError || got.ErrorCode != "upstream.500" {
+		t.Fatalf("row = %q/%d/%q, want error/500/upstream.500", got.Status, got.HTTPStatus, got.ErrorCode)
+	}
+	if got.ContentType != "application/json" || got.APIFlavor != apiFlavorSpeech || got.ReqPath != "/v1/audio/speech" {
+		t.Fatalf("row content type/flavor/path = %q/%q/%q, want application/json/%s//v1/audio/speech", got.ContentType, got.APIFlavor, got.ReqPath, apiFlavorSpeech)
+	}
+	if got.BillingQuantity != 0 {
+		t.Errorf("BillingQuantity = %v, want 0 for a failed relay", got.BillingQuantity)
+	}
+	requireSpeechNonTokenRow(t, got)
+}
+
+// An upstream error that is NOT an OpenAI object but a plain string reaches the
+// client wrapped, with the gateway's type and code, under the upstream's status.
+func TestSpeechRelayWrapsAPlainStringErrorOverHTTP(t *testing.T) {
+	up := newSpeechErrorUpstream(t, http.StatusBadRequest, "application/json", `{"error":"voice not found"}`)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there.","voice":"nobody"}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (the upstream's own status); body = %s", rec.Code, rec.Body.String())
+	}
+	var body apierror.Body
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("client body is not an OpenAI error object: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error.Message != "voice not found" || body.Error.Type != speechUpstreamErrorType || body.Error.Code != speechUpstreamErrorCode {
+		t.Fatalf("error = %+v, want the upstream string with the gateway's type/code", body.Error)
+	}
+	if got := lastUsageEvent(t, srv); got.ErrorCode != "upstream.400" || got.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("row = %q/%d, want upstream.400/400", got.ErrorCode, got.HTTPStatus)
+	}
+}
+
+// A body the normaliser does not recognise is relayed exactly as the upstream
+// sent it -- bytes, status and Content-Type -- never replaced by a guess.
+func TestSpeechRelayRelaysAnUnrecognisedErrorBodyUnchanged(t *testing.T) {
+	const upstreamBody = "<html>502 Bad Gateway</html>"
+	up := newSpeechErrorUpstream(t, http.StatusBadGateway, "text/html; charset=utf-8", upstreamBody)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there."}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want the upstream's own", got)
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Fatalf("body = %q, want the upstream's bytes %q", rec.Body.String(), upstreamBody)
+	}
+	if got := lastUsageEvent(t, srv); got.ErrorCode != "upstream.502" || got.ContentType != "text/html; charset=utf-8" {
+		t.Fatalf("row = %q/%q, want upstream.502 and the upstream's content type", got.ErrorCode, got.ContentType)
+	}
+}
+
+// A 2xx audio/wav is not an error: it is relayed byte for byte (not through the
+// error relay's bounded buffer) and recorded as a success.
+func TestSpeechRelayDoesNotTreatASuccessfulWAVAsAnError(t *testing.T) {
+	wav := speechTestWAV()
+	up, _ := newSpeechUpstream(t, wav)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there."}`)
+
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), wav) {
+		t.Fatalf("status = %d, body = %x, want 200 and the WAV byte for byte", rec.Code, rec.Body.Bytes())
+	}
+	if got := lastUsageEvent(t, srv); got.Status != "success" || got.ErrorCode != "" {
+		t.Fatalf("row = %q/%q, want success with no error code", got.Status, got.ErrorCode)
+	}
+}
+
+// The metering headers a skipped speech body's capture keeps are the audio.cpp
+// ones (the X-AudioCPP- family: duration, wall time, real-time factor), and only
+// those: the upstream's other headers are not metering.
+func TestSpeechMeteringHeaders(t *testing.T) {
+	if !strings.HasPrefix(strings.ToLower(speechDurationHeader), speechMeteringHeaderPrefix) {
+		t.Fatalf("the billing duration header %q is not in the metering family %q", speechDurationHeader, speechMeteringHeaderPrefix)
+	}
+	upstream := http.Header{}
+	upstream.Set("Content-Type", "audio/wav")
+	upstream.Set("Content-Length", "52")
+	upstream.Set("X-AudioCPP-Audio-Duration-Ms", "1500.000000")
+	upstream.Set("X-AudioCPP-Wall-Ms", "120.5")
+	upstream.Set("x-audiocpp-rtf", "0.08")
+	upstream.Set("X-Unrelated", "keep-out")
+
+	got := speechMeteringHeaders(upstream)
+
+	want := http.Header{}
+	want.Set("X-AudioCPP-Audio-Duration-Ms", "1500.000000")
+	want.Set("X-AudioCPP-Wall-Ms", "120.5")
+	want.Set("X-AudioCPP-RTF", "0.08")
+	if len(got) != len(want) {
+		t.Fatalf("metering headers = %v, want exactly %v", got, want)
+	}
+	for name := range want {
+		if got.Get(name) != want.Get(name) {
+			t.Errorf("%s = %q, want %q", name, got.Get(name), want.Get(name))
+		}
+	}
+	if speechMeteringHeaders(http.Header{"Content-Type": {"audio/wav"}}) != nil {
+		t.Error("an upstream with no metering headers must yield nil, not an empty header")
+	}
+	if speechMeteringHeaders(nil) != nil {
+		t.Error("a nil header must yield nil")
 	}
 }

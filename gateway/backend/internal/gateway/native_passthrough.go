@@ -664,6 +664,18 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		return
 	}
 
+	// The same for a non-2xx from the SPEECH upstream (audio.cpp), gated just as
+	// narrowly: a 2xx audio/wav still streams through the copier below. audio.cpp
+	// already answers with an OpenAI-shaped object, which the relay passes through
+	// untouched; the gateway's own type/code are added only to a shape that is not
+	// one -- see normalizeSpeechUpstreamError. An audio.cpp error is always a single
+	// small buffered body, so reading it whole changes nothing the client can see
+	// beyond the normalisation.
+	if needsSpeechErrorRelay(rel.pfReq.APIFlavor, resp.StatusCode) {
+		s.relaySpeechUpstreamError(w, r, ex, resp)
+		return
+	}
+
 	// A body carrying the key WE added was refused the way an upstream refuses a
 	// body it cannot accept. Two things happen, and both are the whole of issue
 	// #81's rejection residual:
@@ -791,10 +803,22 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// resp.Header is passed alongside the exchange -- see
 	// setSpeechBillingQuantity (speech_handler.go).
 	setSpeechBillingQuantity(&meta, ex, resp.Header, status)
+	// The capture is told how many bytes were actually relayed, and (speech only)
+	// which metering headers the upstream sent: an audio body is not stored (see
+	// captureResponseBody), so these are all of it a capture keeps, and neither can
+	// be read off what it does hold -- respBuf is clipped at the capture cap, and
+	// the client's own response headers carry none of the upstream's metering.
+	capIn := buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor)
+	if capIn != nil {
+		capIn.RespBytes = copier.written
+		if rel.pfReq.APIFlavor == apiFlavorSpeech {
+			capIn.RespMetering = speechMeteringHeaders(resp.Header)
+		}
+	}
 	// resp.Header is the UPSTREAM provider response headers (the native-passthrough
 	// path holds them directly), threaded in for the best-effort vendor rate-limit
 	// scrape -- a no-op for a non-vendor target.
-	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor), resp.Header)
+	s.recordUsage(start, rel.token, req, rel.target, provider.Response{Usage: usg}, errorCode, status, meta, id, capIn, resp.Header)
 }
 
 // declaredContentLength reports the body length an upstream response declared in
@@ -874,9 +898,9 @@ type nativeRelay struct {
 // needs.
 //
 // It exists so a helper that finishes a request on its own —
-// relayImagesUpstreamError, which writes the client's response AND records its
-// usage row — can take that identity as one value instead of eight positional
-// parameters.
+// relayImagesUpstreamError and its speech twin relaySpeechUpstreamError, which
+// write the client's response AND record its usage row — can take that identity
+// as one value instead of eight positional parameters.
 type nativeExchange struct {
 	token      auth.Token
 	req        inference.Request
@@ -908,6 +932,10 @@ type nativeCopier struct {
 	capBytes   int
 	scanner    *usageScanner
 	imgCounter *imagesDataCounter
+	// written counts every body byte the client's writer took, past the capture
+	// cap too (respBuf stops growing there), so a capture that does not store the
+	// body can still say how large it was.
+	written int64
 }
 
 // run streams the upstream body to the client chunk by chunk and returns the
@@ -948,7 +976,9 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 		c.watchdog.Reset(c.idle)
 		_ = c.rc.SetWriteDeadline(time.Now().Add(c.idle))
 	}
-	if _, err := c.w.Write(chunk); err != nil {
+	n, err := c.w.Write(chunk)
+	c.written += int64(n)
+	if err != nil {
 		return err
 	}
 	if c.flusher != nil {

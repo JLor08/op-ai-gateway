@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
@@ -368,4 +370,145 @@ func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.
 		return
 	}
 	meta.BillingQuantity = seconds
+}
+
+// speechMeteringHeaderPrefix is the lower-cased prefix of the headers audio.cpp
+// meters a synthesized clip with: speechDurationHeader (the billing quantity) and
+// its siblings, wall time and real-time factor.
+const speechMeteringHeaderPrefix = "x-audiocpp-"
+
+// speechMeteringHeaders returns the upstream's metering headers (every header in
+// the speechMeteringHeaderPrefix family) and nothing else, or nil when there are
+// none. The relay hands the client neither these nor a body it can read them
+// back from, so they reach the capture only through this: the one place the
+// capture of a skipped audio body (captureResponseBody) can still say what the
+// upstream measured.
+func speechMeteringHeaders(upstream http.Header) http.Header {
+	var metering http.Header
+	for name, values := range upstream {
+		if !strings.HasPrefix(strings.ToLower(name), speechMeteringHeaderPrefix) {
+			continue
+		}
+		if metering == nil {
+			metering = http.Header{}
+		}
+		metering[name] = append([]string(nil), values...)
+	}
+	return metering
+}
+
+// speechUpstreamErrorType and speechUpstreamErrorCode are the GATEWAY's own
+// classification for a speech upstream error whose shape is not already an
+// OpenAI error object (see normalizeSpeechUpstreamError). They are fixed
+// regardless of the upstream's HTTP status, for the reason the images pair
+// documents: the upstream stated neither, so a status-dependent value would claim
+// a distinction it never drew. The code is API surface.
+const (
+	speechUpstreamErrorType = "upstream_error"
+	speechUpstreamErrorCode = "speech.upstream_error"
+)
+
+// needsSpeechErrorRelay reports whether a native-passthrough response must go
+// through relaySpeechUpstreamError instead of proxyNative's streaming copier: a
+// speech request whose upstream answered a non-2xx status. It is
+// needsImagesErrorRelay's twin and exactly as narrow: the flavor test keeps every
+// other flavor's errors on the copier, byte for byte, and the status test is the
+// 2xx window proxyNative's own success path uses, so a 2xx audio/wav still
+// streams.
+func needsSpeechErrorRelay(apiFlavor string, statusCode int) bool {
+	return apiFlavor == apiFlavorSpeech && (statusCode < 200 || statusCode >= 300)
+}
+
+// normalizeSpeechUpstreamError turns a speech upstream's non-2xx body into the
+// bytes the client is sent, and reports whether it recognised the shape. status
+// is the upstream's HTTP status; it is not consulted, because the classification
+// is deliberately independent of it (speechUpstreamErrorType).
+//
+// Two shapes are recognised, in this order:
+//
+//   - An OpenAI error object ({"error":{"message":...}}, the message being what
+//     identifies one) passes through untouched, byte for byte. audio.cpp answers
+//     this way -- {"error":{"message":...,"type":"server_error"}} -- so this is
+//     the ordinary case. Re-normalising it would overwrite the upstream's own
+//     type with the gateway's, restating an attested value as a gateway-authored
+//     one, and would drop whatever else the object carries.
+//   - A plain string ({"error":"..."}) is wrapped into an OpenAI object whose
+//     message is that string verbatim. Its type and code are the gateway's own
+//     (speechUpstreamErrorType, speechUpstreamErrorCode), the one case the
+//     upstream attested neither.
+//
+// ok is false for anything else -- audio, HTML from an intermediary, an empty
+// body, JSON of another shape -- and the caller then relays the upstream bytes
+// unchanged instead of guessing. The status audio.cpp answers with is relayed by
+// the caller as it came (audio.cpp uses 500 for client errors too; correcting
+// that is a decision the gateway makes before the relay, in validateSpeechRequest,
+// not here).
+func normalizeSpeechUpstreamError(body []byte, status int) ([]byte, bool) {
+	var already apierror.Body
+	if err := json.Unmarshal(body, &already); err == nil && already.Error.Message != "" {
+		return body, true
+	}
+	var plain struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &plain); err == nil && plain.Error != "" {
+		// Marshal cannot fail on this type (three strings), so there is no failure
+		// to report.
+		wrapped, _ := json.Marshal(apierror.Body{Error: apierror.ErrorBody{
+			Message: plain.Error,
+			Type:    speechUpstreamErrorType,
+			Code:    speechUpstreamErrorCode,
+		}})
+		return wrapped, true
+	}
+	return nil, false
+}
+
+// relaySpeechUpstreamError handles a non-2xx response from the speech upstream
+// (audio.cpp): it buffers the (bounded) body, normalises it via
+// normalizeSpeechUpstreamError, and relays either the normalised body or -- when
+// the shape is not recognised -- the original bytes unchanged, under the
+// upstream's own status either way. It is relayImagesUpstreamError's twin and is
+// called from proxyNative behind needsSpeechErrorRelay, so no other flavor's error
+// handling changes.
+//
+// ex carries this request's identity -- principal, session-enriched request,
+// target, client bytes and the start/id/capturing bookkeeping -- as one value:
+// the function both writes the client's response and records its usage row, so it
+// needs everything proxyNative's own terminal step does (see nativeExchange).
+//
+// The whole body is read before anything is written, unlike the copier's
+// byte-as-it-arrives design: normalising needs all of it, and a speech request
+// never streams (validateSpeechRequest refuses stream), so an error is one small
+// payload. The read is bounded by s.captureMaxBytes, the cap the copier's capture
+// buffer already uses; an error body has no reason to exceed it.
+func (s *Server) relaySpeechUpstreamError(w http.ResponseWriter, r *http.Request, ex nativeExchange, resp *provider.ProxyResponse) {
+	upstreamBody, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(s.captureMaxBytes)))
+	errorCode := fmt.Sprintf("upstream.%d", resp.StatusCode)
+	if readErr != nil {
+		// A read failure this late (the status line arrived, the body broke) is the
+		// class nativeTerminalStatus names provider.stream_copy_error on the
+		// streaming path; named the same way here for one consistent code.
+		errorCode = "provider.stream_copy_error"
+		slog.Error("inference native passthrough copy error", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "err", readErr)
+	} else {
+		slog.Warn("inference native passthrough upstream error", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "status", resp.StatusCode)
+	}
+
+	written, sentContentType := upstreamBody, resp.Header.Get("Content-Type")
+	if body, ok := normalizeSpeechUpstreamError(upstreamBody, resp.StatusCode); ok {
+		written, sentContentType = body, jsonContentType
+	} else if sentContentType == "" {
+		// Neither recognised shape: the upstream's bytes go out unchanged, under its
+		// own Content-Type, or JSON when it named none (the relay's default).
+		sentContentType = jsonContentType
+	}
+	w.Header().Set("Content-Type", sentContentType)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(written)
+
+	// The unit is set unconditionally: this is speech-only, so the flavor is always
+	// apiFlavorSpeech, and a failed relay produced no audio -- BillingQuantity stays
+	// 0, as recordSpeechRoutingFailure leaves it for a refused request.
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor), nil)
 }
