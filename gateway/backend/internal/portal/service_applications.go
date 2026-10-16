@@ -1793,8 +1793,9 @@ func (s *Service) classifyApplicationWriteConflict(ctx context.Context, app rout
 }
 
 // normalizeFlavors validates + dedups api-flavor entries (defaults empty ->
-// both), returning errInvalid on any unrecognized value so each caller keeps
-// its own honest error code: normalizeApplicationFlavors below reports
+// both text flavors; openai_images and openai_audio are opt-in and never part
+// of the default), returning errInvalid on any unrecognized value so each
+// caller keeps its own honest error code: normalizeApplicationFlavors below reports
 // ErrApplicationFlavorInvalid, and the runtime-spec path (service_runtime.go)
 // reports its own ErrRuntimeSpecFlavorInvalid rather than borrowing this
 // package's application-scoped code.
@@ -1807,7 +1808,7 @@ func normalizeFlavors(raw []string, errInvalid error) ([]string, error) {
 	for _, candidate := range raw {
 		flavor := strings.TrimSpace(candidate)
 		switch flavor {
-		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages:
+		case routing.APIFlavorOpenAI, routing.APIFlavorAnthropic, routing.APIFlavorOpenAIImages, routing.APIFlavorOpenAIAudio:
 		default:
 			return nil, errInvalid
 		}
@@ -1950,6 +1951,14 @@ type ModelMappingDTO struct {
 	// it up front. It is advisory: a failed spec read reports false, and the
 	// gateway's own check still refuses.
 	ImagesOnly bool `json:"images_only"`
+	// AudioOnly is ImagesOnly's speech twin: the mapping's effective flavors
+	// (the same routing.EffectiveFields) are audio-only
+	// (routing.FlavorsAreAudioOnly), so the gateway refuses to send it a chat
+	// prompt and the portal can disable the same chat-prompt jobs up front. A
+	// list naming both non-text flavors is both. Advisory in the same way, and
+	// always present: false is sent, not omitted. Both markers come out of one
+	// spec read (mappingFlavorMarkers).
+	AudioOnly bool `json:"audio_only"`
 }
 
 type MappingListResponse struct {
@@ -2129,10 +2138,10 @@ func (s *Service) ListMappings(ctx context.Context, principal auth.Token, appID 
 	if err != nil {
 		return MappingListResponse{}, err
 	}
-	imagesOnly := s.mappingsImagesOnly(ctx, app, mappings)
+	markers := s.mappingsFlavorMarkers(ctx, app, mappings)
 	out := make([]ModelMappingDTO, 0, len(mappings))
 	for _, mapping := range mappings {
-		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID]), imagesOnly[mapping.ID]))
+		out = append(out, mappingDTO(mapping, routing.CapabilityRowsByName(capsByMapping[mapping.ID]), markers[mapping.ID]))
 	}
 	return MappingListResponse{Data: out}, nil
 }
@@ -2318,7 +2327,7 @@ func (s *Service) CreateMapping(ctx context.Context, principal auth.Token, appID
 	// notifyRuntimeChangedForMapping -- the gate is the owning application's
 	// type, not which field this request set.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping, capsByName, s.mappingImagesOnly(ctx, app, mapping.ID)), nil
+	return mappingDTO(mapping, capsByName, s.mappingFlavorMarkersFor(ctx, app, mapping.ID)), nil
 }
 
 // UpdateMapping partially updates a mapping, re-validating any changed fields.
@@ -2558,7 +2567,7 @@ func (s *Service) UpdateMapping(ctx context.Context, principal auth.Token, mappi
 	// the agent's router for up to a minute while the old one still routes. See
 	// notifyRuntimeChangedForMapping.
 	s.notifyRuntimeChangedForMapping(server.ID, app.Type)
-	return mappingDTO(mapping, capsByName, s.mappingImagesOnly(ctx, app, mapping.ID)), nil
+	return mappingDTO(mapping, capsByName, s.mappingFlavorMarkersFor(ctx, app, mapping.ID)), nil
 }
 
 // DeleteMapping removes the mapping.
@@ -3066,8 +3075,8 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // mappingDTO projects a mapping onto the wire shape the portal's mapping form
 // binds to. caps is that mapping's stored capability rows keyed by capability
 // name (routing.CapabilityRowsByName; an empty/nil map is the legitimate
-// "nothing determined"). imagesOnly is the mapping's ImagesOnly marker, from
-// mappingsImagesOnly or mappingImagesOnly.
+// "nothing determined"). markers is the mapping's ImagesOnly and AudioOnly
+// pair, from mappingsFlavorMarkers or mappingFlavorMarkersFor.
 //
 // Capabilities is what MappingForm.tsx SEEDS its two capability selects
 // from: one entry per determined row, and the ABSENCE of an entry is the
@@ -3089,7 +3098,7 @@ func (s *Service) resetOperatorCapabilities(ctx context.Context, mappingID strin
 // the truth; UpdateMapping's compare-before-write is the other half of the
 // same guarantee, and the way back out is an empty verdict in
 // UpdateMappingRequest.CapabilityVerdicts.
-func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow, imagesOnly bool) ModelMappingDTO {
+func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.CapabilityRow, markers mappingFlavorMarkers) ModelMappingDTO {
 	return ModelMappingDTO{
 		ID:                           mapping.ID,
 		ApplicationID:                mapping.ApplicationID,
@@ -3111,7 +3120,8 @@ func mappingDTO(mapping routing.ModelMapping, caps map[string]routing.Capability
 		MetricsSource:                mapping.MetricsSource,
 		MetricsUpdatedAt:             mapping.MetricsUpdatedAt,
 		CreatedAt:                    mapping.CreatedAt,
-		ImagesOnly:                   imagesOnly,
+		ImagesOnly:                   markers.ImagesOnly,
+		AudioOnly:                    markers.AudioOnly,
 	}
 }
 

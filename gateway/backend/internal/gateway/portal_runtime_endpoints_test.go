@@ -160,6 +160,38 @@ func TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400(t *testing.T) {
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutAcceptsAudioCppAndOpenAIAudio pins the
+// wire side of the audio.cpp configuration: an explicit audio_cpp type with the
+// openai_audio flavor is saved and echoed (200, neither runtime_spec.type_invalid
+// nor runtime_spec.flavor_invalid), and the type_invalid message names audio_cpp
+// among the accepted kinds, so an operator who typos the kind is told it exists.
+func TestHandlePortalMappingRuntimeSpecPutAcceptsAudioCppAndOpenAIAudio(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/opt/audiocpp/audiocpp_server","type":"audio_cpp","api_flavors":["openai_audio"]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		Type       string   `json:"type"`
+		APIFlavors []string `json:"api_flavors"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body.String(), err)
+	}
+	if saved.Type != "audio_cpp" || len(saved.APIFlavors) != 1 || saved.APIFlavors[0] != "openai_audio" {
+		t.Fatalf("saved type/api_flavors = %q/%v, want audio_cpp/[openai_audio]", saved.Type, saved.APIFlavors)
+	}
+
+	bad := httptest.NewRecorder()
+	srv.ServeHTTP(bad, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", `{"binary":"/usr/local/bin/llama-server","type":"bogus"}`))
+	if !strings.Contains(bad.Body.String(), "audio_cpp") {
+		t.Fatalf("type_invalid body = %s, want the message to list audio_cpp", bad.Body.String())
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutLiveTimingsOnIncapableKindReturns400
 // pins the WIRE contract of
 // portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported, mirroring

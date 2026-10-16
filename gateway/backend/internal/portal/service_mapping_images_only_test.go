@@ -189,7 +189,7 @@ func TestListMappingsImagesOnlyIsFalseWhenTheSpecReadFails(t *testing.T) {
 // and that the key is always present: false is sent, not omitted.
 func TestModelMappingDTOImagesOnlyWireName(t *testing.T) {
 	for _, imagesOnly := range []bool{true, false} {
-		raw, err := json.Marshal(mappingDTO(routing.ModelMapping{ID: "map_x"}, nil, imagesOnly))
+		raw, err := json.Marshal(mappingDTO(routing.ModelMapping{ID: "map_x"}, nil, mappingFlavorMarkers{ImagesOnly: imagesOnly}))
 		if err != nil {
 			t.Fatalf("Marshal: %v", err)
 		}

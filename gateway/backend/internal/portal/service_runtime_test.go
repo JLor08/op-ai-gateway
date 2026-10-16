@@ -744,7 +744,7 @@ func seedMapping(t *testing.T, routeStore *routing.MemoryStore, appID, name stri
 	// subjects, and their names are not MTP-suggesting, so the two
 	// capability-derived DTO fields are false either way. (A mapping has no
 	// capability FIELD to seed instead -- migration 79 dropped the columns.)
-	return mappingDTO(mapping, nil, false)
+	return mappingDTO(mapping, nil, mappingFlavorMarkers{})
 }
 
 // seedTwoMappings creates a server_agent application on server and two
@@ -2715,9 +2715,10 @@ func TestPutRuntimeSpecAPITokenValidation(t *testing.T) {
 	}
 }
 
-// TestPutRuntimeSpecTypeValidation covers validRuntimeSpecType: the five
-// routing.RuntimeSpecType values plus "" (auto-detect) are accepted, anything
-// else is ErrRuntimeSpecTypeInvalid. Mirrors TestPutRuntimeSpecAPITokenValidation's
+// TestPutRuntimeSpecTypeValidation covers validRuntimeSpecType: every
+// routing.RuntimeSpecType value (seven since audio_cpp, which an operator must
+// be able to pick explicitly) plus "" (auto-detect) is accepted, anything else
+// is ErrRuntimeSpecTypeInvalid. Mirrors TestPutRuntimeSpecAPITokenValidation's
 // shape for the sibling api_token_mode validator.
 func TestPutRuntimeSpecTypeValidation(t *testing.T) {
 	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
@@ -2745,6 +2746,8 @@ func TestPutRuntimeSpecTypeValidation(t *testing.T) {
 		string(routing.RuntimeSpecTypeLlamaCpp),
 		string(routing.RuntimeSpecTypeTGI),
 		string(routing.RuntimeSpecTypeOllama),
+		string(routing.RuntimeSpecTypeStableDiffusionCpp),
+		string(routing.RuntimeSpecTypeAudioCpp),
 		string(routing.RuntimeSpecTypeCustom),
 	}
 	for _, typ := range validTypes {
@@ -2755,6 +2758,37 @@ func TestPutRuntimeSpecTypeValidation(t *testing.T) {
 				t.Fatalf("type %q must save: %v", typ, err)
 			}
 		})
+	}
+}
+
+// TestPutRuntimeSpecSavesAnAudioCppSpec is the audio counterpart of an
+// sd-server spec save: an explicit audio_cpp type and an openai_audio flavor
+// are stored and echoed back, neither refused as ErrRuntimeSpecTypeInvalid or
+// ErrRuntimeSpecFlavorInvalid. The health path stays the stock /health
+// (runtimeSpecHealthPathDefault falls through for audio_cpp, and audio.cpp
+// serves GET /health), unlike sd-server's /v1/models.
+func TestPutRuntimeSpecSavesAnAudioCppSpec(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
+
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Binary:     "/opt/audiocpp/audiocpp_server",
+		Type:       string(routing.RuntimeSpecTypeAudioCpp),
+		APIFlavors: []string{routing.APIFlavorOpenAIAudio},
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec(audio_cpp, [openai_audio]): %v", err)
+	}
+	if dto.Type != string(routing.RuntimeSpecTypeAudioCpp) || dto.EffectiveType != string(routing.RuntimeSpecTypeAudioCpp) {
+		t.Fatalf("type/effective_type = %q/%q, want audio_cpp for both", dto.Type, dto.EffectiveType)
+	}
+	if want := []string{routing.APIFlavorOpenAIAudio}; !slices.Equal(dto.APIFlavors, want) {
+		t.Fatalf("api_flavors = %#v, want %#v", dto.APIFlavors, want)
+	}
+	if dto.HealthPath != defaultRuntimeSpecHealthPath {
+		t.Fatalf("health_path = %q, want the stock %q", dto.HealthPath, defaultRuntimeSpecHealthPath)
 	}
 }
 

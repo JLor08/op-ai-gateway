@@ -108,7 +108,8 @@ var (
 	// checkHeaderName's shape check. HTTP 400.
 	ErrRuntimeSpecAPITokenHeaderInvalid = errors.New("runtime_spec.api_token_header_invalid")
 	// ErrRuntimeSpecTypeInvalid rejects a type that is not one of
-	// ""/vllm/llama_cpp/tgi/ollama/custom (design 2026-09-07). "" is valid --
+	// ""/vllm/llama_cpp/tgi/ollama/stable_diffusion_cpp/audio_cpp/custom
+	// (design 2026-09-07; see validRuntimeSpecType). "" is valid --
 	// it means auto-detect from Binary (routing.EffectiveRuntimeSpecType) --
 	// so this is the same "empty is fine, everything else must be a known
 	// value" shape as validVisibleDevicesMode, not validRuntimeAPITokenMode's
@@ -1331,17 +1332,19 @@ func validRuntimeAPITokenMode(s string) bool {
 }
 
 // validRuntimeSpecType reports whether s is "" (auto-detect from Binary, the
-// default and every pre-feature row's stored value) or one of the six
-// routing.RuntimeSpecType values. Unlike validRuntimeAPITokenMode, empty IS
-// accepted directly here (mirrors validVisibleDevicesMode) -- callers pass
-// req.Type through untouched, they don't normalize "" to a concrete value
+// default and every pre-feature row's stored value) or one of the seven
+// routing.RuntimeSpecType values (vllm, llama_cpp, tgi, ollama,
+// stable_diffusion_cpp, audio_cpp, custom). Unlike validRuntimeAPITokenMode,
+// empty IS accepted directly here (mirrors validVisibleDevicesMode) -- callers
+// pass req.Type through untouched, they don't normalize "" to a concrete value
 // first, because "" is itself a legitimate stored/wire value (auto), not a
-// default that collapses into one of the six kinds.
+// default that collapses into one of the seven kinds.
 func validRuntimeSpecType(s string) bool {
 	switch routing.RuntimeSpecType(s) {
 	case "", routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeLlamaCpp,
 		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama,
-		routing.RuntimeSpecTypeStableDiffusionCpp, routing.RuntimeSpecTypeCustom:
+		routing.RuntimeSpecTypeStableDiffusionCpp, routing.RuntimeSpecTypeAudioCpp,
+		routing.RuntimeSpecTypeCustom:
 		return true
 	}
 	return false
