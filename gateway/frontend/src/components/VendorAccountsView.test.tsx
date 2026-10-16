@@ -277,6 +277,15 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       vendorAccountAdminGroupCandidates: vi.fn<PortalApi['vendorAccountAdminGroupCandidates']>(
         async () => [],
       ),
+      // The owner's resource-group link: only a shared account's owner is offered
+      // it, so these suites never reach it either.
+      vendorAccountResourceGroups: vi.fn<PortalApi['vendorAccountResourceGroups']>(async () => []),
+      joinVendorAccountResourceGroup: vi.fn<PortalApi['joinVendorAccountResourceGroup']>(
+        async () => ({ ok: true }),
+      ),
+      leaveVendorAccountResourceGroup: vi.fn<PortalApi['leaveVendorAccountResourceGroup']>(
+        async () => ({ ok: true }),
+      ),
     };
     const view = render(
       <ToastProvider>

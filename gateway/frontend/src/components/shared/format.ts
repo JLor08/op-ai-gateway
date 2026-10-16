@@ -216,6 +216,12 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account.admin_group_parent_mismatch': 'errorVendorAccountAdminGroupParentMismatch',
   'vendor_account.root_mismatch': 'errorVendorAccountRootMismatch',
   'vendor_account.not_shared': 'errorVendorAccountNotShared',
+  // The resource-group link of a shared account, from both sides (the owner's
+  // self-service join and the group manager's add): the account's containment root
+  // is not the group's. Mapped although both pickers pre-filter by root, because a
+  // stale list or a root fixed in between still reaches it.
+  'resource_group.vendor_account_system_group_mismatch':
+    'errorResourceGroupVendorAccountSystemGroupMismatch',
   // System settings: a Codex client_version the OpenAI model discovery would
   // send that is not version-shaped (400). The portal checks the same shape
   // inline, so this is the backstop.

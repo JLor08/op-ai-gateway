@@ -14,7 +14,12 @@ import { VendorAccountsView } from './VendorAccountsView';
 import { ToastProvider } from './shared/ToastProvider';
 import { messages, type Locale } from '../i18n';
 import { PortalApiError } from '../api';
-import type { AdminGroupCandidate, VendorAccount, VendorAccountUsage } from '../api';
+import type {
+  AdminGroupCandidate,
+  VendorAccount,
+  VendorAccountResourceGroup,
+  VendorAccountUsage,
+} from '../api';
 import type { PortalApi } from './shared/types';
 
 // The zero time.Time a Go DTO serializes for a timestamp it withholds from a member.
@@ -154,6 +159,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       accounts?: VendorAccount[];
       isAdmin?: boolean;
       candidates?: AdminGroupCandidate[];
+      resourceGroups?: VendorAccountResourceGroup[];
       setVendorAccountShareLevel?: PortalApi['setVendorAccountShareLevel'];
       setVendorAccountAdminGroups?: PortalApi['setVendorAccountAdminGroups'];
       updateVendorAccount?: PortalApi['updateVendorAccount'];
@@ -239,6 +245,17 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ),
       vendorAccountAdminGroupCandidates: vi.fn<PortalApi['vendorAccountAdminGroupCandidates']>(
         async () => opts.candidates ?? [GROUP_A],
+      ),
+      // The owner's resource-group link: the groups the account can join, with the
+      // member flag; join and leave only flip it.
+      vendorAccountResourceGroups: vi.fn<PortalApi['vendorAccountResourceGroups']>(async () =>
+        (opts.resourceGroups ?? []).map((g) => ({ ...g })),
+      ),
+      joinVendorAccountResourceGroup: vi.fn<PortalApi['joinVendorAccountResourceGroup']>(
+        async () => ({ ok: true }),
+      ),
+      leaveVendorAccountResourceGroup: vi.fn<PortalApi['leaveVendorAccountResourceGroup']>(
+        async () => ({ ok: true }),
       ),
     };
     const view = render(
@@ -586,6 +603,115 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         // (the raise picker) ever fetches candidates.
         expect(fakeApi.vendorAccountAdminGroupCandidates).not.toHaveBeenCalled();
       }
+    });
+  });
+
+  // The owner's resource-group link (spec 9, "owner self-service RG link"): the owner
+  // of an account that is `shared` or `full` enters it into the resource groups they
+  // reach. It is the OWNER's alone (the backend answers a co-manager 403) and only once
+  // the account is shared (400 vendor_account.not_shared below that), so a personal
+  // account, a co-manager and a member are never offered it, and nothing is fetched.
+  // Whether the viewer is an admin does not matter: an owner who lost the role keeps it.
+  describe(`VendorAccountsView resource-group link by tier [${locale}]`, () => {
+    const rgRegion = () =>
+      screen.queryByRole('region', { name: t.vendorAccountResourceGroupsTitle });
+    const GROUPS: VendorAccountResourceGroup[] = [
+      { id: 'rg-1', name: 'Alpha', member: true },
+      { id: 'rg-2', name: 'Beta', member: false },
+    ];
+
+    it.each([
+      ['an admin owner at Shared', () => shared(), true, true],
+      ['a plain owner at Shared', () => shared(), false, true],
+      ['the owner at Fully shared', () => shared({ share_level: 'full' }), false, true],
+      ['the owner of a personal account', () => makeVendorAccount(), true, false],
+      ['a co-manager at Shared', () => managed(), true, false],
+      ['a co-manager at Fully shared', () => managed({ share_level: 'full' }), true, false],
+      ['a member', () => member(), true, false],
+    ] as const)('shows the section to %s: %s', async (_who, makeAccount, isAdmin, visible) => {
+      const { fakeApi } = renderView({
+        accounts: [makeAccount()],
+        isAdmin,
+        resourceGroups: GROUPS,
+      });
+      await openDetail();
+      // Wait for the detail view to settle (its panels all mount in one render).
+      await waitFor(() =>
+        expect(
+          screen.queryByText(t.vendorAccountSettingsTitle) ??
+            screen.queryByText(t.vendorAccountMemberTitle),
+        ).toBeInTheDocument(),
+      );
+
+      if (visible) {
+        expect(
+          await screen.findByRole('region', { name: t.vendorAccountResourceGroupsTitle }),
+        ).toBeInTheDocument();
+        expect(await screen.findByRole('switch', { name: 'Alpha' })).toBeChecked();
+        expect(fakeApi.vendorAccountResourceGroups).toHaveBeenCalledWith('va_1');
+      } else {
+        expect(rgRegion()).not.toBeInTheDocument();
+        // Nothing the backend would refuse is even asked for.
+        expect(fakeApi.vendorAccountResourceGroups).not.toHaveBeenCalled();
+      }
+    });
+
+    it('lets the owner join a group, sending the account and group ids', async () => {
+      const { fakeApi } = renderView({ accounts: [shared()], resourceGroups: GROUPS });
+      await openDetail();
+
+      const region = within(
+        await screen.findByRole('region', { name: t.vendorAccountResourceGroupsTitle }),
+      );
+      fireEvent.click(await region.findByRole('switch', { name: 'Beta' }));
+
+      await waitFor(() =>
+        expect(fakeApi.joinVendorAccountResourceGroup).toHaveBeenCalledWith('va_1', 'rg-2'),
+      );
+      expect(fakeApi.leaveVendorAccountResourceGroup).not.toHaveBeenCalled();
+    });
+
+    it('lets the owner leave a group, sending the account and group ids', async () => {
+      const { fakeApi } = renderView({ accounts: [shared()], resourceGroups: GROUPS });
+      await openDetail();
+
+      const region = within(
+        await screen.findByRole('region', { name: t.vendorAccountResourceGroupsTitle }),
+      );
+      fireEvent.click(await region.findByRole('switch', { name: 'Alpha' }));
+
+      await waitFor(() =>
+        expect(fakeApi.leaveVendorAccountResourceGroup).toHaveBeenCalledWith('va_1', 'rg-1'),
+      );
+      expect(fakeApi.joinVendorAccountResourceGroup).not.toHaveBeenCalled();
+    });
+
+    it('offers the section the moment an admin owner raises a personal account to Shared', async () => {
+      const { fakeApi } = renderView({ isAdmin: true, resourceGroups: GROUPS });
+      await openDetail();
+      const share = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      await share.findByText(t.vendorAccountAdminGroupAuto('Group A'));
+      expect(rgRegion()).not.toBeInTheDocument();
+
+      fireEvent.click(share.getByRole('button', { name: raiseTo('Shared') }));
+
+      expect(
+        await screen.findByRole('region', { name: t.vendorAccountResourceGroupsTitle }),
+      ).toBeInTheDocument();
+      await waitFor(() => expect(fakeApi.vendorAccountResourceGroups).toHaveBeenCalledWith('va_1'));
+    });
+
+    it('drops the section once the owner stops sharing (the backend clears the links)', async () => {
+      renderView({ accounts: [shared()], resourceGroups: GROUPS });
+      await openDetail();
+      await screen.findByRole('region', { name: t.vendorAccountResourceGroupsTitle });
+
+      const share = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      fireEvent.click(share.getByRole('button', { name: t.vendorAccountShareStopAction }));
+      const dialog = within(await screen.findByRole('dialog'));
+      fireEvent.click(dialog.getByRole('button', { name: t.vendorAccountShareStopAction }));
+
+      await waitFor(() => expect(rgRegion()).not.toBeInTheDocument());
     });
   });
 

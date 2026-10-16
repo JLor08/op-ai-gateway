@@ -24,6 +24,7 @@ import type {
   ResourceGroupProvisionCandidates,
   ResourceGroupProvisionKind,
   ResourceGroupServerRef,
+  ResourceGroupVendorAccountRef,
 } from '../api';
 import type { Translation, PortalApi } from './shared/types';
 import { formatPortalError } from './shared/format';
@@ -100,6 +101,25 @@ function candidatesForKind(
   }
 }
 
+// The provider-account picker's options (#183): every account the group ALREADY
+// links -- so each is shown and the manager can drop it, including a link they could
+// not add themselves (an owner's `shared` link, an account they no longer operate),
+// which the candidates (what they may ADD) do not list -- plus the candidates, one
+// entry per id.
+function vendorAccountOptions(
+  current: ResourceGroupVendorAccountRef[],
+  candidates: ResourceGroupVendorAccountRef[],
+): { value: string; label: string }[] {
+  const nameById = new Map<string, string>();
+  for (const account of current) nameById.set(account.id, account.name);
+  for (const account of candidates) {
+    if (!nameById.has(account.id)) nameById.set(account.id, account.name);
+  }
+  return [...nameById]
+    .map(([value, label]) => ({ value, label }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
 type Mode = 'list' | 'create' | { kind: 'detail'; group: ResourceGroup };
 
 // Resource-group<->admin-group linkage (Resource Groups Phase 1, spec
@@ -139,10 +159,12 @@ export function ResourceGroupsView({
     | 'resourceGroupProvisionCandidates'
     | 'resourceGroupProvisions'
     | 'resourceGroupServerCandidates'
+    | 'resourceGroupVendorAccountCandidates'
     | 'resourceGroups'
     | 'setResourceGroupAdminGroups'
     | 'setResourceGroupProvisions'
     | 'setResourceGroupServers'
+    | 'setResourceGroupVendorAccounts'
     | 'updateResourceGroup'
   >;
   role: string;
@@ -226,6 +248,16 @@ export function ResourceGroupsView({
   const [editServerIds, setEditServerIds] = useState<string[]>([]);
   const [serversBusy, setServersBusy] = useState(false);
 
+  // Provider-account ("Anbieter") editor state (#183, spec 2026-10-15 section 9): the
+  // accounts the manager may ADD to the group (server-side: full accounts they operate
+  // under the group's root) + the currently-selected link ids. The group's CURRENT
+  // links come from its own DTO (see vendorAccountOptions).
+  const [vendorAccountCandidates, setVendorAccountCandidates] = useState<
+    ResourceGroupVendorAccountRef[]
+  >([]);
+  const [editVendorAccountIds, setEditVendorAccountIds] = useState<string[]>([]);
+  const [vendorAccountsBusy, setVendorAccountsBusy] = useState(false);
+
   // Provisioning editor state (Phase 2, spec
   // 2026-08-12-resource-groups-phase-2-provisioning): the group's current
   // "provisioned for" set (users/user groups/admin groups/services) +
@@ -256,6 +288,27 @@ export function ResourceGroupsView({
       })
       .catch(() => {
         if (!cancelled) setServerCandidates([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, detailGroupId]);
+
+  useEffect(() => {
+    if (!detailGroupId) {
+      setVendorAccountCandidates([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .resourceGroupVendorAccountCandidates(detailGroupId)
+      .then((list) => {
+        if (!cancelled) setVendorAccountCandidates(list);
+      })
+      .catch(() => {
+        // e.g. the 409 while the vendor-accounts module or sharing is off: nothing
+        // to add, but the group's current links stay visible and droppable.
+        if (!cancelled) setVendorAccountCandidates([]);
       });
     return () => {
       cancelled = true;
@@ -304,6 +357,7 @@ export function ResourceGroupsView({
     setStatus(group.status);
     setEditAdminGroupIds(group.admin_groups.map((g) => g.id));
     setEditServerIds(group.servers.map((s) => s.id));
+    setEditVendorAccountIds(group.vendor_accounts.map((a) => a.id));
     setAddProvisionKind('user');
     setAddProvisionTargetId('');
     setMode({ kind: 'detail', group });
@@ -383,6 +437,26 @@ export function ResourceGroupsView({
       showError(formatPortalError(err, t));
     } finally {
       setServersBusy(false);
+    }
+  }
+
+  // Provider-account editor save (#183): a full-replace of the group's linked-account
+  // set via its own endpoint. A rejection (an account the manager cannot operate, one
+  // that is not `full`, another system group) surfaces as a toast; the selection is
+  // left untouched so the manager can adjust and retry.
+  async function saveVendorAccounts() {
+    if (typeof mode === 'string' || mode.kind !== 'detail') return;
+    setVendorAccountsBusy(true);
+    try {
+      const updated = await api.setResourceGroupVendorAccounts(mode.group.id, editVendorAccountIds);
+      setGroupsData((current) => (current ?? []).map((g) => (g.id === updated.id ? updated : g)));
+      setMode({ kind: 'detail', group: updated });
+      setEditVendorAccountIds(updated.vendor_accounts.map((a) => a.id));
+      showSuccess(t.resourceGroupVendorAccountsSaved);
+    } catch (err) {
+      showError(formatPortalError(err, t));
+    } finally {
+      setVendorAccountsBusy(false);
     }
   }
 
@@ -576,7 +650,7 @@ export function ResourceGroupsView({
   }
 
   // Detail sub-view: settings (name/status + delete) + the admin-group
-  // linkage editor + the server-membership editor.
+  // linkage editor + the server-membership editor + the provider-account editor.
   if (typeof mode !== 'string' && mode.kind === 'detail') {
     const group = groups.find((g) => g.id === mode.group.id) ?? mode.group;
     return (
@@ -695,6 +769,42 @@ export function ResourceGroupsView({
                   onClick={saveServers}
                 >
                   {t.resourceGroupServersSave}
+                </Button>
+              </Box>
+            </Box>
+          </Panel>
+        </Box>
+
+        {/* Provider-account ("Anbieter") editor (#183, spec 2026-10-15 sections 9
+            and 14): add/remove the shared accounts this group offers its members,
+            beside the servers. The options are the group's current links plus the
+            candidates (what the manager may ADD: fully shared accounts they operate,
+            under the group's root -- already filtered server-side, so the picker
+            never offers one the write path would reject); a current link that is not
+            a candidate is shown too, so the manager can see and drop it. Adding a
+            refused account (or a candidate that became unusable between fetch and
+            save) surfaces as a toast via saveVendorAccounts' catch. */}
+        <Box sx={{ mt: 3 }}>
+          <Panel
+            titleId="resource-group-vendor-accounts-heading"
+            title={t.resourceGroupVendorAccountsSectionTitle}
+          >
+            <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(260px, 480px)', gap: 2.25 }}>
+              <MultiSelectField
+                id="resource-group-vendor-accounts-edit"
+                label={t.resourceGroupVendorAccountsLabel}
+                options={vendorAccountOptions(group.vendor_accounts, vendorAccountCandidates)}
+                selected={editVendorAccountIds}
+                onChange={setEditVendorAccountIds}
+              />
+              <Box>
+                <Button
+                  type="button"
+                  variant="contained"
+                  disabled={vendorAccountsBusy}
+                  onClick={saveVendorAccounts}
+                >
+                  {t.resourceGroupVendorAccountsSave}
                 </Button>
               </Box>
             </Box>

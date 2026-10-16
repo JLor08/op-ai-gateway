@@ -177,6 +177,13 @@ describe('formatPortalError', () => {
     ],
     [400, 'vendor_account.root_mismatch', 'errorVendorAccountRootMismatch'],
     [400, 'vendor_account.not_shared', 'errorVendorAccountNotShared'],
+    // The resource-group link (both the owner's self-service join and the group
+    // manager's add): the account's containment root is not the group's.
+    [
+      400,
+      'resource_group.vendor_account_system_group_mismatch',
+      'errorResourceGroupVendorAccountSystemGroupMismatch',
+    ],
   ] as const)('labels %i %s with %s, in both locales', (status, code, key) => {
     const err = new PortalApiError(status, code, 'raw server text');
     for (const locale of ['de', 'en'] as const) {

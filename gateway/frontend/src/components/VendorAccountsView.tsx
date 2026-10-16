@@ -31,6 +31,7 @@ import {
 import { vendorAccountAccess } from './shared/vendorAccountAccess';
 import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountReadOnlyDetail } from './VendorAccountReadOnlyDetail';
+import { VendorAccountResourceGroupsSection } from './VendorAccountResourceGroupsSection';
 import { VendorAccountSharePanel } from './VendorAccountSharePanel';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
@@ -66,7 +67,9 @@ function hasCredential(account: VendorAccount): boolean {
  * credential, the api key and the delete at `shared`; the credential-opening
  * test, refresh and usage pull on a SUBSCRIPTION account); a member sees a
  * read-only, minimal view (VendorAccountReadOnlyDetail). The "Sharing" area
- * (VendorAccountSharePanel) holds the share level and the management groups.
+ * (VendorAccountSharePanel) holds the share level and the management groups, and
+ * the OWNER of a shared account also gets the resource-group link
+ * (VendorAccountResourceGroupsSection), a join/leave switch table.
  *
  * The API key is a WRITE-ONLY secret, following ApplicationSection's api-token
  * pattern: the DTO only says `api_key_set`, never the value, so the detail
@@ -141,6 +144,9 @@ export function VendorAccountsView({
     | 'setVendorAccountShareLevel'
     | 'setVendorAccountAdminGroups'
     | 'vendorAccountAdminGroupCandidates'
+    | 'vendorAccountResourceGroups'
+    | 'joinVendorAccountResourceGroup'
+    | 'leaveVendorAccountResourceGroup'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -662,6 +668,11 @@ export function VendorAccountsView({
   if (typeof mode !== 'string' && mode.kind === 'detail') {
     const account = accounts.find((a) => a.id === mode.account.id) ?? mode.account;
     const access = vendorAccountAccess(account, isAdmin);
+    // The resource-group link is the OWNER's self-service (the backend answers a
+    // co-manager 403) and only once the account is shared (a private one is a 400
+    // vendor_account.not_shared). Not gated on the admin role: an owner who has lost
+    // it keeps the links they made, and may still manage them.
+    const canLinkResourceGroups = access.tier === 'owner' && access.level !== 'none';
     const keyStored = account.api_key_set && !keyCleared;
     // A viewer who may not even operate the account (a member) reads it only.
     if (!access.canOperate) {
@@ -845,6 +856,23 @@ export function VendorAccountsView({
               access={access}
               busy={busy}
               onChanged={accountShareChanged}
+            />
+          </Box>
+        )}
+
+        {/* The owner's resource-group self-service: which resource groups this
+            shared account is entered into, with join/leave -- the analogue of the
+            server-owner section, placed straight after the sharing area it follows
+            from (the groups decide who can borrow the account). Owner-only and only
+            at shared/full (see canLinkResourceGroups); the section's own load treats
+            any refusal as the empty state. key= resets its state per account. */}
+        {canLinkResourceGroups && (
+          <Box sx={{ mt: 3 }}>
+            <VendorAccountResourceGroupsSection
+              key={`rg-${account.id}`}
+              t={t}
+              api={api}
+              account={account}
             />
           </Box>
         )}

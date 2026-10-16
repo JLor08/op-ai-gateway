@@ -14,6 +14,7 @@ import type {
   ResourceGroupProvision,
   ResourceGroupProvisionCandidates,
   ResourceGroupServerRef,
+  ResourceGroupVendorAccountRef,
   UpdateResourceGroupRequest,
 } from '../api';
 import type { PortalApi } from './shared/types';
@@ -26,6 +27,7 @@ function makeResourceGroup(overrides: Partial<ResourceGroup> = {}): ResourceGrou
     system_group: { id: 'sg_default', name: 'Default System Group' },
     admin_groups: [{ id: 'ag_default', name: 'Default Admin Group' }],
     servers: [],
+    vendor_accounts: [],
     ...overrides,
   };
 }
@@ -74,6 +76,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       setResourceGroupAdminGroups: vi.fn(async () => makeResourceGroup()),
       resourceGroupServerCandidates: vi.fn(async () => [] as ResourceGroupServerRef[]),
       setResourceGroupServers: vi.fn(async () => makeResourceGroup()),
+      resourceGroupVendorAccountCandidates: vi.fn(
+        async () => [] as ResourceGroupVendorAccountRef[],
+      ),
+      setResourceGroupVendorAccounts: vi.fn(async () => makeResourceGroup()),
       resourceGroupProvisions: vi.fn(async () => [] as ResourceGroupProvision[]),
       resourceGroupProvisionCandidates: vi.fn(
         async () =>
@@ -151,6 +157,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         setResourceGroupAdminGroups: vi.fn(async () => makeResourceGroup()),
         resourceGroupServerCandidates: vi.fn(async () => [] as ResourceGroupServerRef[]),
         setResourceGroupServers: vi.fn(async () => makeResourceGroup()),
+        resourceGroupVendorAccountCandidates: vi.fn(
+          async () => [] as ResourceGroupVendorAccountRef[],
+        ),
+        setResourceGroupVendorAccounts: vi.fn(async () => makeResourceGroup()),
         resourceGroupProvisions: vi.fn(async () => [] as ResourceGroupProvision[]),
         resourceGroupProvisionCandidates: vi.fn(
           async () =>
@@ -391,6 +401,189 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       const alert = await screen.findByRole('alert');
       expect(alert.textContent ?? '').toContain('resource_group.server_system_group_mismatch');
+    });
+  });
+
+  // The provider-account ("Anbieter") panel (#183, spec 2026-10-15 sections 9 and 14):
+  // the resource-group MANAGER side of a shared vendor account, mirroring the server
+  // editor above. The group's current links come from its own DTO; the candidates are
+  // what the manager may ADD (full accounts under the group's root, which the manager
+  // operates) -- not the whole selection, since the group may also hold links the
+  // manager could not add themselves (an owner's `shared` link, an account they no
+  // longer operate) that they may still drop.
+  describe(`ResourceGroupsView provider-account panel (#183, spec 2026-10-15) [${locale}]`, () => {
+    const vendorAccountsRegion = () =>
+      screen.getByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle });
+
+    it("pre-fills the group's current accounts, adds a candidate, and saves via setResourceGroupVendorAccounts", async () => {
+      // va_1 is linked but is NOT among the candidates (e.g. the owner linked it at
+      // Shared): it must still be shown AND kept when the manager adds another one.
+      const group = makeResourceGroup({
+        id: 'rgrp_va',
+        vendor_accounts: [{ id: 'va_1', name: 'Team OpenAI' }],
+      });
+      const candidates: ResourceGroupVendorAccountRef[] = [
+        { id: 'va_2', name: 'Team Anthropic' },
+        { id: 'va_3', name: 'Team Gemini' },
+      ];
+      const resourceGroupVendorAccountCandidates = vi.fn(async () => candidates);
+      const setResourceGroupVendorAccounts = vi.fn(async () => ({
+        ...group,
+        vendor_accounts: [
+          { id: 'va_1', name: 'Team OpenAI' },
+          { id: 'va_2', name: 'Team Anthropic' },
+        ],
+      }));
+      renderResourceGroupsView({
+        groups: [group],
+        overrides: { resourceGroupVendorAccountCandidates, setResourceGroupVendorAccounts },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle });
+      await waitFor(() =>
+        expect(resourceGroupVendorAccountCandidates).toHaveBeenCalledWith('rgrp_va'),
+      );
+      expect(within(vendorAccountsRegion()).getByText('Team OpenAI')).toBeInTheDocument();
+
+      fireEvent.mouseDown(screen.getByLabelText(t.resourceGroupVendorAccountsLabel));
+      // The listbox offers the candidates and the accounts already linked are not
+      // offered a second time (they are the selection).
+      expect(await screen.findByRole('option', { name: 'Team Gemini' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: 'Team OpenAI' })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('option', { name: 'Team Anthropic' }));
+      fireEvent.click(
+        within(vendorAccountsRegion()).getByRole('button', {
+          name: t.resourceGroupVendorAccountsSave,
+        }),
+      );
+
+      await waitFor(() =>
+        expect(setResourceGroupVendorAccounts).toHaveBeenCalledWith('rgrp_va', ['va_1', 'va_2']),
+      );
+      expect(await screen.findByText(t.resourceGroupVendorAccountsSaved)).toBeInTheDocument();
+    });
+
+    it('drops a linked account the manager removes, sending the remaining set', async () => {
+      const group = makeResourceGroup({
+        id: 'rgrp_drop',
+        vendor_accounts: [
+          { id: 'va_1', name: 'Team OpenAI' },
+          { id: 'va_2', name: 'Team Anthropic' },
+        ],
+      });
+      const setResourceGroupVendorAccounts = vi.fn(async () => ({
+        ...group,
+        vendor_accounts: [{ id: 'va_2', name: 'Team Anthropic' }],
+      }));
+      renderResourceGroupsView({ groups: [group], overrides: { setResourceGroupVendorAccounts } });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle });
+      const chip = within(vendorAccountsRegion()).getByText('Team OpenAI').closest('.MuiChip-root');
+      fireEvent.click(within(chip as HTMLElement).getByTestId('CancelIcon'));
+      fireEvent.click(
+        within(vendorAccountsRegion()).getByRole('button', {
+          name: t.resourceGroupVendorAccountsSave,
+        }),
+      );
+
+      await waitFor(() =>
+        expect(setResourceGroupVendorAccounts).toHaveBeenCalledWith('rgrp_drop', ['va_2']),
+      );
+    });
+
+    it('still lets the manager see and drop the current links when the candidates cannot be loaded', async () => {
+      // The candidate GET is a 409 while the module or the sharing switch is off.
+      const group = makeResourceGroup({
+        id: 'rgrp_off',
+        vendor_accounts: [{ id: 'va_1', name: 'Team OpenAI' }],
+      });
+      const setResourceGroupVendorAccounts = vi.fn(async () => ({ ...group, vendor_accounts: [] }));
+      renderResourceGroupsView({
+        groups: [group],
+        overrides: {
+          resourceGroupVendorAccountCandidates: vi.fn(async () => {
+            throw new PortalApiError(409, 'vendor_accounts.sharing_disabled', 'sharing is off');
+          }),
+          setResourceGroupVendorAccounts,
+        },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle });
+      expect(within(vendorAccountsRegion()).getByText('Team OpenAI')).toBeInTheDocument();
+
+      fireEvent.click(within(vendorAccountsRegion()).getByTestId('CancelIcon'));
+      fireEvent.click(
+        within(vendorAccountsRegion()).getByRole('button', {
+          name: t.resourceGroupVendorAccountsSave,
+        }),
+      );
+      await waitFor(() =>
+        expect(setResourceGroupVendorAccounts).toHaveBeenCalledWith('rgrp_off', []),
+      );
+    });
+
+    it('surfaces a refused add as a toast and keeps the selection so the manager can adjust', async () => {
+      const group = makeResourceGroup({ id: 'rgrp_refused', vendor_accounts: [] });
+      const setResourceGroupVendorAccounts = vi.fn(async () => {
+        throw new PortalApiError(403, 'vendor_account.forbidden', 'not allowed');
+      });
+      renderResourceGroupsView({
+        groups: [group],
+        overrides: {
+          resourceGroupVendorAccountCandidates: vi.fn(async () => [{ id: 'va_x', name: 'Team X' }]),
+          setResourceGroupVendorAccounts,
+        },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle });
+      fireEvent.mouseDown(screen.getByLabelText(t.resourceGroupVendorAccountsLabel));
+      fireEvent.click(await screen.findByRole('option', { name: 'Team X' }));
+      fireEvent.click(
+        within(vendorAccountsRegion()).getByRole('button', {
+          name: t.resourceGroupVendorAccountsSave,
+        }),
+      );
+
+      const alert = await screen.findByRole('alert');
+      expect(alert.textContent ?? '').toContain('vendor_account.forbidden');
+      expect(alert.textContent ?? '').toContain(t.errorVendorAccountForbidden);
+      expect(within(vendorAccountsRegion()).getByText('Team X')).toBeInTheDocument();
+    });
+
+    it('labels a root-mismatch refusal in the active locale, not the raw server text', async () => {
+      const group = makeResourceGroup({ id: 'rgrp_mismatch_va', vendor_accounts: [] });
+      renderResourceGroupsView({
+        groups: [group],
+        overrides: {
+          resourceGroupVendorAccountCandidates: vi.fn(async () => [{ id: 'va_x', name: 'Team X' }]),
+          setResourceGroupVendorAccounts: vi.fn(async () => {
+            throw new PortalApiError(
+              400,
+              'resource_group.vendor_account_system_group_mismatch',
+              "vendor account must belong to the resource group's system group",
+            );
+          }),
+        },
+      });
+
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByRole('region', { name: t.resourceGroupVendorAccountsSectionTitle });
+      fireEvent.mouseDown(screen.getByLabelText(t.resourceGroupVendorAccountsLabel));
+      fireEvent.click(await screen.findByRole('option', { name: 'Team X' }));
+      fireEvent.click(
+        within(vendorAccountsRegion()).getByRole('button', {
+          name: t.resourceGroupVendorAccountsSave,
+        }),
+      );
+
+      const alert = await screen.findByRole('alert');
+      expect(alert.textContent ?? '').toContain(
+        t.errorResourceGroupVendorAccountSystemGroupMismatch,
+      );
     });
   });
 

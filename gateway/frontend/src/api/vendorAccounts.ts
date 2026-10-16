@@ -153,6 +153,13 @@ export type VendorAccount = {
   shared_by: string;
 };
 
+// One resource group the OWNER of a shared account may enter it into (spec
+// 2026-10-15 section 9): id + name + whether the account is currently in it.
+// Mirrors portal.VendorAccountResourceGroupDTO. Drives the owner's "Resource
+// groups" join/leave section in the Anbieter detail; never exposes any other
+// server, account or target of the resource group.
+export type VendorAccountResourceGroup = { id: string; name: string; member: boolean };
+
 // POST /api/portal/vendor-accounts body. status defaults to active when
 // omitted/empty; api_key is only meaningful (and only accepted) for an api_key
 // account -- the backend rejects one on a subscription account with
@@ -362,6 +369,34 @@ export function vendorAccountsApi(fetcher: Fetcher) {
         fetcher,
         '/api/portal/vendor-account-admin-group-candidates',
       ).then((r) => r.data),
+    // Owner self-service resource-group link (spec 2026-10-15 section 9; the
+    // vendor-account analogue of the server-owner trio in api/servers.ts): the
+    // OWNER of a `shared` or `full` account lists the resource groups linked to an
+    // admin group they are a MEMBER of and whose root is the account's (each with a
+    // `member` flag) and joins/leaves their OWN account. Neither admin nor
+    // resource-management permission required. A caller who is not the owner gets
+    // the 403/404 of the account, a private account a 400
+    // vendor_account.not_shared; a join under another root is a 400
+    // resource_group.vendor_account_system_group_mismatch. Join and leave are
+    // idempotent and write only this account's own link row. All three are a 409
+    // while the vendor-accounts module or the sharing switch is off.
+    vendorAccountResourceGroups: (id: string) =>
+      request<{ data: VendorAccountResourceGroup[] }>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/resource-groups`,
+      ).then((r) => r.data),
+    joinVendorAccountResourceGroup: (id: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/resource-groups/${encodeURIComponent(rgId)}`,
+        { method: 'PUT' },
+      ),
+    leaveVendorAccountResourceGroup: (id: string, rgId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/resource-groups/${encodeURIComponent(rgId)}`,
+        { method: 'DELETE' },
+      ),
     // The explicit "test connection": the backend opens the account's stored
     // credential and asks the vendor whether it is accepted, answering 200 with
     // the credential-free verdict whichever way it came out (a rejected credential

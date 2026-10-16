@@ -2468,6 +2468,11 @@ const de = {
   resourceGroupServersLabel: 'Server dieser Ressourcengruppe',
   resourceGroupServersSave: 'Server speichern',
   resourceGroupServersSaved: 'Server gespeichert.',
+  // The provider-account ("Anbieter") panel of the resource-group detail (#183).
+  resourceGroupVendorAccountsSectionTitle: 'Anbieter-Konten',
+  resourceGroupVendorAccountsLabel: 'Anbieter-Konten dieser Ressourcengruppe',
+  resourceGroupVendorAccountsSave: 'Anbieter-Konten speichern',
+  resourceGroupVendorAccountsSaved: 'Anbieter-Konten gespeichert.',
   resourceGroupProvisionsSectionTitle: 'Bereitgestellt für',
   resourceGroupProvisionsColKind: 'Art',
   resourceGroupProvisionsColTarget: 'Ziel',
@@ -2561,6 +2566,14 @@ const de = {
   vendorAccountAdminGroupsSectionTitle: 'Verwaltungsgruppen',
   vendorAccountAdminGroupsSave: 'Verwaltungsgruppen speichern',
   vendorAccountAdminGroupsSaved: 'Verwaltungsgruppen gespeichert.',
+  // The owner's resource-group link of a shared provider account (#183): the
+  // Anbieter-Konto analogue of the serverResourceGroups* keys.
+  vendorAccountResourceGroupsTitle: 'Ressourcengruppen',
+  vendorAccountResourceGroupsColGroup: 'Ressourcengruppe',
+  vendorAccountResourceGroupsColMember: 'Mitglied',
+  vendorAccountResourceGroupsEmpty: 'Keine berechtigten Ressourcengruppen.',
+  vendorAccountResourceGroupsJoinError: 'Anbieter-Konto konnte nicht eingetragen werden.',
+  vendorAccountResourceGroupsLeaveError: 'Anbieter-Konto konnte nicht entfernt werden.',
   vendorAccountMemberTitle: 'Geteiltes Konto',
   vendorAccountMemberNote:
     'Dieses Konto wird über eine Ressourcengruppe bereitgestellt. Seine Modelle lassen sich nutzen, das Konto selbst aber nicht verwalten.',
@@ -2749,6 +2762,8 @@ const de = {
     'Die Verwaltungsgruppen müssen unter der System-Gruppe liegen, in der das Konto bereits geteilt ist.',
   errorVendorAccountNotShared:
     'Das ist nur bei einem geteilten Konto möglich. Zuerst die Freigabestufe erhöhen.',
+  errorResourceGroupVendorAccountSystemGroupMismatch:
+    'Das Anbieter-Konto muss zur System-Gruppe der Ressourcengruppe gehören.',
   errorVendorAccountNotSubscription:
     'Nur ein Konto mit Abonnement-Authentifizierung kann mit einem Abonnement verbunden werden',
   errorVendorAccountConnectTokenRequired: 'Ein Access-Token ist erforderlich',
@@ -5294,6 +5309,11 @@ const en: PortalMessages = {
   resourceGroupServersLabel: 'Servers in this resource group',
   resourceGroupServersSave: 'Save servers',
   resourceGroupServersSaved: 'Servers saved.',
+  // The provider-account ("Anbieter") panel of the resource-group detail (#183).
+  resourceGroupVendorAccountsSectionTitle: 'Provider accounts',
+  resourceGroupVendorAccountsLabel: 'Provider accounts in this resource group',
+  resourceGroupVendorAccountsSave: 'Save provider accounts',
+  resourceGroupVendorAccountsSaved: 'Provider accounts saved.',
   resourceGroupProvisionsSectionTitle: 'Provisioned for',
   resourceGroupProvisionsColKind: 'Kind',
   resourceGroupProvisionsColTarget: 'Target',
@@ -5387,6 +5407,14 @@ const en: PortalMessages = {
   vendorAccountAdminGroupsSectionTitle: 'Admin groups',
   vendorAccountAdminGroupsSave: 'Save admin groups',
   vendorAccountAdminGroupsSaved: 'Admin groups saved.',
+  // The owner's resource-group link of a shared provider account (#183): the
+  // provider-account analogue of the serverResourceGroups* keys.
+  vendorAccountResourceGroupsTitle: 'Resource groups',
+  vendorAccountResourceGroupsColGroup: 'Resource group',
+  vendorAccountResourceGroupsColMember: 'Member',
+  vendorAccountResourceGroupsEmpty: 'No eligible resource groups.',
+  vendorAccountResourceGroupsJoinError: 'Could not add the provider account.',
+  vendorAccountResourceGroupsLeaveError: 'Could not remove the provider account.',
   vendorAccountMemberTitle: 'Shared account',
   vendorAccountMemberNote:
     'This account is provided through a resource group. Its models can be used, but the account itself cannot be managed.',
@@ -5567,6 +5595,8 @@ const en: PortalMessages = {
     'The management groups must sit under the system group the account is already shared in.',
   errorVendorAccountNotShared:
     'This is only possible for a shared account. Raise the sharing level first.',
+  errorResourceGroupVendorAccountSystemGroupMismatch:
+    "The provider account must belong to the resource group's system group.",
   errorVendorAccountNotSubscription:
     'Only an account with subscription authentication can be connected to a subscription',
   errorVendorAccountConnectTokenRequired: 'An access token is required',

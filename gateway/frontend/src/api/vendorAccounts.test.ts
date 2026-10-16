@@ -487,4 +487,50 @@ describe('vendorAccountsApi', () => {
     });
     expect(resp).toEqual([candidate]);
   });
+
+  // Owner self-service resource-group link (#183, spec 2026-10-15 section 9): the
+  // vendor-account analogue of the server-owner trio in api/servers.ts.
+  it('GETs the resource groups an account can join from the {data:[...]} envelope, id URL-encoded', async () => {
+    const groups = [
+      { id: 'rg-1', name: 'Alpha', member: true },
+      { id: 'rg-2', name: 'Beta', member: false },
+    ];
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ data: groups }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.vendorAccountResourceGroups('va/1');
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/vendor-accounts/va%2F1/resource-groups', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(resp).toEqual(groups);
+  });
+
+  it('PUTs .../resource-groups/{rgId} to join, both ids URL-encoded, with the CSRF header', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.joinVendorAccountResourceGroup('va/1', 'rg/2');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/resource-groups/rg%2F2');
+    expect(init.method).toBe('PUT');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.body).toBeUndefined();
+    expect(resp.ok).toBe(true);
+  });
+
+  it('DELETEs .../resource-groups/{rgId} to leave, both ids URL-encoded, with the CSRF header', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ ok: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.leaveVendorAccountResourceGroup('va/1', 'rg/2');
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/resource-groups/rg%2F2');
+    expect(init.method).toBe('DELETE');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(resp.ok).toBe(true);
+  });
 });
