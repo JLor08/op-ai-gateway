@@ -2226,7 +2226,7 @@ Three kinds of principal can touch an account:
   call;
 - a **member**: a principal provisioned into a resource group that contains the account.
   A member may *read* a minimal view (§8.2) and *use* the account once a token opts in
-  (§11); it never operates it.
+  (§11); it never operates it, and a write it attempts is a `403`, not a `404` (§8.1).
 
 **System scope stays read-only and never bypasses a write.** It may read any account
 (`GetVendorAccount`, the management view), but it lists only its own, and on an account that is
@@ -2246,6 +2246,7 @@ credential upstream, so they are authorized like a write, not like a metadata re
 | **Delete** | owner | owner | owner, CM |
 | **Raise** (`none` to `shared` to `full`) | owner and admin | owner and admin | nobody (already the top) |
 | **Lower** | not available | owner | owner, CM |
+| **Answer to a write the caller may not perform** | `404` for everyone (only the owner writes) | `403` for a CM or a member (they can read it), `404` for everyone else | `403` for a member, or a CM attempting a raise, `404` for everyone else |
 
 (¹) **Subscription operate-op caveat.** For a **subscription** account the operate
 calls that open the sealed OAuth token set, the **connection test, the model refresh
@@ -2275,16 +2276,31 @@ Notes on how the matrix is enforced:
   with no user identity, an account whose level was lowered or whose sharing is paused:
   indistinguishable from an unknown id, the no-existence-leak rule), and
   `403 vendor_account.forbidden` when the caller **can already see** the account, a CM of
-  a `shared` or `full` one, and the operation is simply not theirs (a credential call, the
-  delete or an assignment at `shared`, a raise, a token-opening call on a subscription):
-  "not found" would be a lie to them. This is a deliberate departure from the servers'
-  posture, where every object-level denial is a `404` (`server.forbidden` is only a create or
-  a field the caller may not set).
+  a `shared` or `full` one or a **member** of it (reading it through a resource group, §8.2),
+  and the operation is simply not theirs (a credential call, the delete or an assignment
+  at `shared`, a raise, a token-opening call on a subscription, and for a member every
+  write): "not found" would be a lie to them. This is a deliberate departure from the
+  servers' posture, where every object-level denial is a `404` (`server.forbidden` is only
+  a create or a field the caller may not set).
+- **The member's `403` opens no existence oracle.** Both write gates ask it **last**, after
+  the owner and CM checks (so a CM keeps the answer it always had), and only through
+  `isMemberOfSharedVendorAccount`, **the very predicate the read gate discloses the
+  account by** (§8.2). So the `403` reaches exactly the principals who can already read
+  the account and nobody else: a stranger, a principal with no user identity (a service
+  provisioned into the group included), system scope that is no member, an account at
+  `none` or an unrecognised level, the master sharing switch off, a subscription account
+  without subscription sharing, an account in no resource group and a principal
+  provisioned into none of them all keep the `404`. A store error while deciding
+  membership fails the call with that error: it is never read as a grant, and it does not
+  fall back to a `404` that would hide the outage. A regression test states the property
+  directly (every `403` of either gate is a principal whose read of the account
+  succeeds).
 - **The gates.** There is a read gate (`authorizeVendorAccountRead`, which returns the
   viewer's tier, §8.2) and three write gates: **operate**
   (`authorizeVendorAccountOperate`: the owner, or a CM at `shared`/`full`), **credential**
   (`authorizeVendorAccountCredential`: the owner, or a CM at `full`; also the gate of
-  the connect calls, the delete, the lowering and the management-group assignment) and
+  the connect calls, the delete, the lowering and the management-group assignment; both
+  turn a member away with the `403` above) and
   **raise** (`authorizeVendorAccountRaise`: the owner who is a current admin). The two
   resource-group link paths differ: the owner's self-service is owner-only at `shared`
   and `full` (a CM links through the other path), and the resource-group manager's side

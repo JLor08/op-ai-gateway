@@ -843,9 +843,11 @@ the owner's single-use refresh token. The properties that matter for the securit
   role can still lower the level.
 - **Two denials, deliberately.** A caller with no business knowing the account exists
   (a stranger, system scope on a write, a co-manager without the flag) gets the
-  `404 vendor_account.not_found` of an unknown id; a CM, who can already see the
-  account, gets `403 vendor_account.forbidden` for an operation that is not theirs,
-  because "not found" would be a lie. This is the one resource where a 403 is a normal
+  `404 vendor_account.not_found` of an unknown id; a CM or a member (a principal that
+  reads the account through a resource group), who can already see the account, gets
+  `403 vendor_account.forbidden` for an operation that is not theirs, because "not found"
+  would be a lie. The member's `403` is gated on exactly the read gate's disclosure
+  predicate, so it reaches nobody who could not read the account. This is the one resource where a 403 is a normal
   by-level answer, in contrast to the servers above, where every object-level denial is a
   404 (`server.forbidden` is only a create or a field the caller may not set).
 - **Field-level, deny-by-default PATCH**: `name`, `status`, `model_prefix` take the

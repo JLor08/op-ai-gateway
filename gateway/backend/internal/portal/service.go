@@ -131,8 +131,10 @@ var (
 	// principal that is not a real user (no UserID to own the account). And it is
 	// authorizeVendorAccountCredential's answer to a CM of a `shared` account: they
 	// can see and operate the account, so a credential operation is forbidden, not
-	// "not found". It is NEVER returned to a principal who cannot see the account
-	// (that is ErrVendorAccountNotFound, so a stranger learns nothing).
+	// "not found". Both write gates also answer it to a MEMBER of a shared account
+	// (one that reaches it through a resource group), who can read it. It is NEVER
+	// returned to a principal who cannot see the account (that is
+	// ErrVendorAccountNotFound, so a stranger learns nothing).
 	// ErrVendorAccountAPIKeyNotAllowed rejects an api_key on a subscription
 	// account, whose only credential is the OAuth token set.
 	// ErrVendorAccountAPIKeyInvalid rejects a whitespace-only api_key on update:
