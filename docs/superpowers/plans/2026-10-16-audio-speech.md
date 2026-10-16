@@ -78,8 +78,9 @@ Inputs/conditions the spec implies that no single happy-path task exercises, mos
 **Files:**
 - Create: `gateway/backend/internal/provider/audiocpp_models.go`
 - Modify: `gateway/backend/internal/provider/multiplexer.go` (add `ProbeAudioCppModels` + `dispatchProbeAudioCppModels`, mirror `ProbeSdcppCapabilities` ~314–346)
-- Create: `server-agent/internal/collector/audiocpp.go` (the identical parser twin — the agent module cannot import the gateway)
-- Test: `gateway/backend/internal/provider/audiocpp_models_test.go`; `server-agent/internal/collector/audiocpp_test.go`; a cross-module parity test `TestAudioCppSpeechCasesMatchTheAgentsTable` (mirror `TestSdcppImageCasesMatchTheAgentsTable`)
+- Test: `gateway/backend/internal/provider/audiocpp_models_test.go`
+
+(Gateway-only, per the 2026-10-16 ruling: the server-agent twin `collector/audiocpp.go` and the cross-module parity test belong to the agent-side capability source, deferred to a follow-up (spec §8.3). The gateway health loop (Task 4) probes the running server directly.)
 
 **Interfaces:**
 - Produces: interface `AudioCppModelsProber interface { ProbeAudioCppModels(ctx, target, modelID string) (AudioCppVerdicts, error) }`; `AudioCppVerdicts{ Speech string }` (verdict `"yes"`/`"no"`/`""`); `audiocppModelsPath = "/v1/models"`; `parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts`.
@@ -239,7 +240,8 @@ chat-prompt background jobs would ping audio models.)
 **Files:**
 - Modify: `gateway/backend/internal/portal/service_applications.go` (`normalizeFlavors` ~1790–1794; also used for `ErrRuntimeSpecFlavorInvalid` in `service_runtime.go`)
 - Modify: `gateway/backend/internal/portal/service.go` (`knownAPIFlavors`/`callableModelNames` ~2036–2044; model-offering gating ~3008–3022) and `service_model_offering.go`
-- Test: `service_applications_test.go`, `service_runtime_test.go`, `service_model_offering_test.go`
+- Modify: `gateway/backend/internal/portal/service_runtime.go` (`validRuntimeSpecType` closed switch ~1340–1347 + its "six kinds" doc comment ~1335–1339) and `gateway/backend/internal/gateway/portal_runtime_endpoints.go` (the `runtime_spec.type_invalid` message listing the kinds ~87) — add `audio_cpp` so an operator can configure an `audio_cpp` runtime spec explicitly. (Added per Task 2 ruling. Note: `runtimeSpecHealthPathDefault` ~214 already defaults to `/health` for an unknown kind, which is correct for audio.cpp — no change.)
+- Test: `service_applications_test.go`, `service_runtime_test.go` (incl. `TestPutRuntimeSpecTypeValidation` — add the `audio_cpp` accepted case), `service_model_offering_test.go`
 
 - [ ] **Step 1: Write failing tests** — an application and a runtime spec can be saved with flavor `openai_audio` (no `ErrApplicationFlavorInvalid`/`ErrRuntimeSpecFlavorInvalid`); `knownAPIFlavors` includes it; the `openai_audio` flavor is offered **only** behind a `(speech,yes)` verdict (the speech analog of the image-verdict gate) — a model without the verdict does not offer `openai_audio`.
 - [ ] **Step 2: Run, verify fail.**
@@ -270,7 +272,7 @@ chat-prompt background jobs would ping audio models.)
 - Modify: `gateway/frontend/src/api/usage.ts` (`ActiveRequest` type ~147–189)
 - Modify: `gateway/frontend/src/components/ActiveRequestsPanel.tsx` (output-tokens column ~237–244)
 - Modify: `gateway/frontend/src/i18n.ts` (add `applicationFlavorOpenaiAudio` DE+EN next to `applicationFlavorOpenaiImages`; `billingUnitHelpAudioSecond` already exists)
-- Modify: the flavor-checkbox component and `RuntimeAdminSection.tsx` (audio-only default for `audio_cpp`)
+- Modify: the flavor-checkbox component and `RuntimeAdminSection.tsx` (audio-only default for `audio_cpp`); the runtime-kind lists `gateway/frontend/src/api/runtime.ts` and `runtimeSpecTypeFlavors.ts` must include `audio_cpp` (added per Task 2 ruling)
 - Test: `gateway/frontend/src/components/*.test.tsx` (ActiveRequestsPanel; flavor UI)
 
 **Interfaces:**
