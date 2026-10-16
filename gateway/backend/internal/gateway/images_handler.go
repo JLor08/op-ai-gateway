@@ -14,7 +14,6 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
-	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
@@ -295,12 +294,11 @@ func (c *imagesDataCounter) bytesFed() int {
 // site is added here; there is exactly one in this package and its comment
 // records what broke when there were four.
 //
-// Run-as: exactly handleOpenAIChat's block, copied rather than shared because
-// the two handlers' surrounding code differs too much to factor out cleanly.
-// token.ID == "" only for the loopback principal (never a bearer principal,
-// whose id is always populated -- see authenticateInternalOrBearer), so this
-// only ever fires for the run executor's own loopback calls, exactly as it
-// does for chat. Without it an image turn started under a run-as token would
+// Run-as: the shared runAsPrincipal helper. token.ID == "" only for the loopback
+// principal (never a bearer principal, whose id is always populated -- see
+// authenticateInternalOrBearer), so this only ever fires for the run executor's
+// own loopback calls, exactly as it does for chat. Without it an image turn
+// started under a run-as token would
 // bill to the bare session instead, capture under the session user's own
 // capture flags instead of the token's, and skip the token's server-override
 // and model-override rules -- three attribution bugs a later task (the image
@@ -326,25 +324,9 @@ func (s *Server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, err)
 		return
 	}
-	if token.ID == "" { // loopback principal (not a bearer token): honor optional run-as, exactly as handleOpenAIChat
-		if runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName)); runAsID != "" {
-			if s.Portal == nil {
-				// Fail closed rather than silently fall back to the bare
-				// session principal: the caller explicitly asked to run as a
-				// specific token, and with no Portal there is no way to
-				// authorize it. Mirrors this package's other s.Portal == nil
-				// guards (agent_ca.go, agent_certificates.go, ...), which all
-				// refuse rather than proceed unauthorized.
-				writePortalTokenError(w, portal.ErrTokenForbidden)
-				return
-			}
-			runAs, rErr := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
-			if rErr != nil {
-				writePortalTokenError(w, rErr)
-				return
-			}
-			token = runAs
-		}
+	token, ok = s.runAsPrincipal(w, r, token)
+	if !ok {
+		return
 	}
 	pf, handled := s.inferencePreflight(w, r, token, raw, inferenceShape{
 		apiFlavor:            apiFlavorImages,

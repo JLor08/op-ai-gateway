@@ -39,15 +39,9 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeRequestError(w, err)
 		return
 	}
-	if token.ID == "" { // session principal (not a bearer token): honor optional run-as
-		if runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName)); runAsID != "" {
-			runAs, rErr := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
-			if rErr != nil {
-				writePortalTokenError(w, rErr)
-				return
-			}
-			token = runAs
-		}
+	token, ok = s.runAsPrincipal(w, r, token)
+	if !ok {
+		return
 	}
 	// Chat has no native-passthrough path, so the preflight gate always runs
 	// against the fully-parsed request (no probe needed) -- see

@@ -15,7 +15,6 @@ import (
 	"net/textproto"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
-	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"strconv"
 	"strings"
@@ -214,7 +213,7 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
-	token, ok = s.imageEditRunAs(w, r, token)
+	token, ok = s.runAsPrincipal(w, r, token)
 	if !ok {
 		return
 	}
@@ -228,36 +227,6 @@ func (s *Server) handleOpenAIImagesEdit(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.relayImageEdit(w, r, token, pf.Req, form, raw, maskPNG)
-}
-
-// imageEditRunAs is the run-as block of handleOpenAIImages, which is
-// handleOpenAIChat's -- copied for the same reason (the surrounding code differs too
-// much to factor out) and with the same effect: only the loopback principal
-// (token.ID == "") ever reaches it, and without it a portal edit would bill and
-// capture against the bare session instead of the token the run executes as. It
-// returns the token the edit executes as -- token itself unless the loopback
-// principal named a token to run as -- and false when it has refused the request
-// and written the response.
-func (s *Server) imageEditRunAs(w http.ResponseWriter, r *http.Request, token auth.Token) (auth.Token, bool) {
-	if token.ID != "" {
-		return token, true
-	}
-	runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName))
-	if runAsID == "" {
-		return token, true
-	}
-	if s.Portal == nil {
-		// Fail closed: the caller explicitly asked to run as a specific token and,
-		// with no Portal, there is no way to authorize it.
-		writePortalTokenError(w, portal.ErrTokenForbidden)
-		return token, false
-	}
-	runAs, err := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
-	if err != nil {
-		writePortalTokenError(w, err)
-		return token, false
-	}
-	return runAs, true
 }
 
 // readImageEditBody reads the whole multipart body, bounded by limit (the
