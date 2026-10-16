@@ -1512,14 +1512,16 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 // (the model catalog, the management-group and resource-group links). It is the
 // CREDENTIAL gate's row (spec 2026-10-15 section 6): the owner at every level, a CM
 // of a `full` account (complete owner-equivalent delegation); a CM of a `shared`
-// account is ErrVendorAccountForbidden (they can see it, so "not found" would be a
-// lie) and everyone else -- system scope included -- ErrVendorAccountNotFound
-// (404-no-leak). The bool reports that a row was removed (always true on a nil
-// error): there is no best-effort side effect to flag, unlike DeleteServer.
+// account, like a MEMBER of a shared one (it reads the account through a resource
+// group, isMemberOfSharedVendorAccount), is ErrVendorAccountForbidden (they can see
+// it, so "not found" would be a lie) and everyone else -- system scope included --
+// ErrVendorAccountNotFound (404-no-leak). The bool reports that a row was removed
+// (always true on a nil error): there is no best-effort side effect to flag, unlike
+// DeleteServer.
 // ErrVendorAccountsDisabled while the module flag is off. Deleting is not a sharing
 // endpoint, so the sharing flag does not REFUSE it; but the credential gate reads the
-// effective share level, so while vendor_account_sharing_enabled is off a CM is a
-// stranger (404) and only the owner can delete.
+// effective share level, so while vendor_account_sharing_enabled is off a CM and a
+// member are strangers (404) and only the owner can delete.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return false, err
