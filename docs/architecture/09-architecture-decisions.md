@@ -1803,7 +1803,7 @@ step. → [Routing & Model Selection
 (the second endpoint, `POST /v1/audio/speech`).** The Decision's claim that the next
 endpoint "inherits this gate, and both of its affinity write guards, by naming their
 own capability" is now exercised: speech declares `RequiredCapabilities = ["speech"]`
-and nothing in the resolver changed. Two forecasts above did not come true as
+and neither the capability gate nor the affinity guards changed. Two forecasts above did not come true as
 written. Speech did **not** share a coarse flavor with a text endpoint, as the
 affinity paragraph allowed for: it took a coarse flavor of its own, `openai_audio`,
 so the guards stay redundant for it exactly as for images. And a capability list is
@@ -5000,11 +5000,13 @@ opt-in and owner-credentialed).
 
 ## ADR-061 — Speech is the second endpoint on the capability gate: a distinct `speech` capability, a coarse `openai_audio` flavor, the `audio_cpp` kind, and a binary relay that serves WAV only
 
-**Context:** `POST /v1/audio/speech` (issue #68) is the third multi-modal endpoint
-after the billing pair ([ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar))
-and images ([ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
-[ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)),
-and the first whose response is **not JSON at all**: it relays a binary `audio/wav`
+**Context:** `POST /v1/audio/speech` (issue #68) is the next multi-modal endpoint
+after image generation
+([ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
+[ADR-044](#adr-044--stable-diffusioncpp-is-a-first-class-type-and-openai_images-is-a-coarse-opt-in-flavor)).
+It bills on the non-token pair of
+[ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar), and it is
+the first whose response is **not JSON at all**: it relays a binary `audio/wav`
 body. The images template carries over almost whole, a dedicated handler relaying
 through `proxyNative` behind a required-capability gate, so this entry records what
 speech decided *differently*, and why. The inputs are facts about the backend,
@@ -5039,9 +5041,10 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   ([Routing & Model Selection §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
   ADR-042's three rules all carry over: an absent row is unknown and **refuses**, a
   store error refuses, and `(speech, no)` is reserved in `reservedManualVerdicts` so a
-  rank-3 manual `no` can never veto the probe that is entitled to write it. Nothing in
-  the resolver changed for speech, which is the return on ADR-042's cost comparison:
-  the second endpoint paid for a constant and a verdict writer. One dependency is worth
+  rank-3 manual `no` can never veto the probe that is entitled to write it. The
+  capability gate and the affinity guards did not change for speech, which is the return
+  on ADR-042's cost comparison: the endpoint paid for a constant, a flavor case in
+  `NormalizeAPIFlavor` and a verdict writer. One dependency is worth
   naming because it is easy to lose: the capability list is also what keeps a speech
   request **off the vendor-account path**. `vendorAccountRoutingEligible` excludes the
   images flavor by name and has no `openai_audio` twin; it declines a request only
@@ -5176,7 +5179,7 @@ no `openai_audio` application serves no speech: a route without the flavor answe
 `routing.no_model_route`, and a route with it and no `(speech, yes)` verdict answers 404
 `routing.model_not_capable`. For an `audio_cpp` application that verdict arrives with the
 first health tick that finds the mapped model loaded, and a model that is not loaded
-stays unknown until it is. Every speech request is one buffered call governed by one
+stays unknown until it is. Every speech request is one non-streaming call governed by one
 **total** deadline, the application's `timeout_ms`: the `audio_cpp` type defaults it to
 600000, an application of any other type that serves speech needs it raised by hand, and
 the idle watchdog does not apply. Speech takes **no affinity pin**, by the guard ADR-042

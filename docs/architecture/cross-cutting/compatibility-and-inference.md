@@ -355,12 +355,12 @@ bounded by `captureMaxBytes`, not by a wider cap.
   `UnknownModelRedirect` ([Routing & Model Selection
   §2.1](routing-and-model-selection.md#21-per-token-model-resolution)). That
   redirect asks the `openai` offering, whose `Callable` holds a name only when
-  its application declares `openai` and its effective flavors are not
-  images-only
+  its application declares `openai` and its effective flavors are neither
+  images-only nor audio-only
   ([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)):
   an application declaring only `openai_images` (the `stable_diffusion_cpp`
   default) keeps the image model out, and so does an agent-managed child whose
-  spec is images-only, under a parent that declares `openai` for its text
+  spec is images-only (or audio-only), under a parent that declares `openai` for its text
   children. What it can still pick is an image model whose effective flavors
   also carry a text flavor; nothing on the chat path requires a capability, so
   the chat request is sent to that upstream. The images request's own redirect
@@ -1270,7 +1270,7 @@ watchdog (below). The helper works with two timers:
 - **The first-data timer** runs for the first-data budget, the larger of the
   target's `Timeout` (the application's `timeout_ms`) and the idle budget. It is
   armed only when that budget exceeds the idle budget: by default 600 s for a
-  `server_agent` or `stable_diffusion_cpp` application, while a stock
+  `server_agent`, `stable_diffusion_cpp` or `audio_cpp` application, while a stock
   application's 30000 ms, against the default 120 s idle budget, leaves the
   budget at the idle budget and arms nothing.
   While it is armed and nothing has been emitted, every SSE comment line (the
