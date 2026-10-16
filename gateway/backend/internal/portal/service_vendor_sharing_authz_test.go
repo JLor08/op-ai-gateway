@@ -88,6 +88,10 @@ func newVendorAuthzEnv(t *testing.T) *vendorAuthzEnv {
 	t.Helper()
 	e := &vendorAuthzEnv{groupTestEnv: newGroupTestEnv(t), accounts: map[string]routing.VendorAccount{}}
 	setVendorAccountsEnabled(t, e.svc, true)
+	// The gates read the EFFECTIVE share level: with vendor_account_sharing_enabled
+	// off every account reads as `none` (spec section 13), so the fixture that
+	// exercises shared and full accounts runs with sharing ON.
+	setVendorSetting(t, e.svc, vendorAccountSharingEnabledKey, true)
 	installFakeVendorValidators(e.svc)
 	e.discoverers = installFakeVendorDiscoverers(e.svc)
 

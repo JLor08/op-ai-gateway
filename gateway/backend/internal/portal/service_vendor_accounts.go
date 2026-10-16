@@ -408,10 +408,33 @@ func vendorAccountSharedLevel(level string) bool {
 	return level == routing.VendorShareLevelShared || level == routing.VendorShareLevelFull
 }
 
+// effectiveVendorAccountShareLevel is the share level an account is treated as
+// having RIGHT NOW: VendorShareLevelNone while the vendor_account_sharing_enabled
+// master flag is off, the account's stored ShareLevel while it is on (spec
+// 2026-10-15 section 13: with the master off "share_level is ignored, every account
+// behaves personal"). The flag is read through the same fail-closed accessor as
+// requireVendorAccountSharingEnabled, so no settings store, or one that cannot be
+// read, reads as off.
+//
+// Turning the master off is a global PAUSE, not an un-share: nothing stored (the
+// level, the root, the management-group and resource-group links) is touched, so
+// switching it back on honours the stored level again. Every decision that lets a
+// NON-OWNER through on the strength of the share level reads this, not
+// acc.ShareLevel: the two write gates below (and with them the delete and the
+// share-level lower), and the listings and the routing grant that follow
+// must do the same.
+func (s *Service) effectiveVendorAccountShareLevel(ctx context.Context, acc routing.VendorAccount) string {
+	if !s.VendorAccountSharingEnabled(ctx) {
+		return routing.VendorShareLevelNone
+	}
+	return acc.ShareLevel
+}
+
 // authorizeVendorAccountOperate is the gate of the OPERATE operations: status,
 // model prefix, rename, model refresh, connection test, usage refresh (spec
-// 2026-10-15 section 6). acc is the record as the store returned it, so the share
-// level it carries is the live one. Allowed for:
+// 2026-10-15 section 6). acc is the record as the store returned it; the share level
+// it is judged by is the EFFECTIVE one (effectiveVendorAccountShareLevel: the stored
+// level while sharing is enabled, `none` while the master flag is off). Allowed for:
 //
 //   - the owner, at every level;
 //   - a CM of the account, while it is `shared` or `full`.
@@ -429,7 +452,7 @@ func (s *Service) authorizeVendorAccountOperate(ctx context.Context, principal a
 	if isVendorAccountOwner(principal, acc) {
 		return nil
 	}
-	if !vendorAccountSharedLevel(acc.ShareLevel) {
+	if !vendorAccountSharedLevel(s.effectiveVendorAccountShareLevel(ctx, acc)) {
 		return ErrVendorAccountNotFound
 	}
 	manager, err := s.isVendorAccountManager(ctx, principal, acc)
@@ -459,13 +482,15 @@ func (s *Service) authorizeVendorAccountOperate(ctx context.Context, principal a
 //     CM whose link outlived the shared level) gets ErrVendorAccountNotFound
 //     (404-no-leak), identical to an unknown id.
 //
-// Like the operate gate it works on the loaded record's share level, and an
-// unrecognised level is treated as private.
+// Like the operate gate it works on the EFFECTIVE share level (the stored level while
+// sharing is enabled, `none` while the master flag is off; read once, so one call
+// cannot see two answers), and an unrecognised level is treated as private.
 func (s *Service) authorizeVendorAccountCredential(ctx context.Context, principal auth.Token, acc routing.VendorAccount) error {
 	if isVendorAccountOwner(principal, acc) {
 		return nil
 	}
-	if !vendorAccountSharedLevel(acc.ShareLevel) {
+	level := s.effectiveVendorAccountShareLevel(ctx, acc)
+	if !vendorAccountSharedLevel(level) {
 		return ErrVendorAccountNotFound
 	}
 	manager, err := s.isVendorAccountManager(ctx, principal, acc)
@@ -475,7 +500,7 @@ func (s *Service) authorizeVendorAccountCredential(ctx context.Context, principa
 	if !manager {
 		return ErrVendorAccountNotFound
 	}
-	if acc.ShareLevel == routing.VendorShareLevelFull {
+	if level == routing.VendorShareLevelFull {
 		return nil
 	}
 	return ErrVendorAccountForbidden
@@ -957,8 +982,10 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 // lie) and everyone else -- system scope included -- ErrVendorAccountNotFound
 // (404-no-leak). The bool reports that a row was removed (always true on a nil
 // error): there is no best-effort side effect to flag, unlike DeleteServer.
-// ErrVendorAccountsDisabled while the master flag is off. Deleting is not a sharing
-// endpoint, so the sharing flag does not gate it.
+// ErrVendorAccountsDisabled while the module flag is off. Deleting is not a sharing
+// endpoint, so the sharing flag does not REFUSE it; but the credential gate reads the
+// effective share level, so while vendor_account_sharing_enabled is off a CM is a
+// stranger (404) and only the owner can delete.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return false, err
