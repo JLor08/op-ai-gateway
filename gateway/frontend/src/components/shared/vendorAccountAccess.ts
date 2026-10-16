@@ -73,6 +73,38 @@ function memberAccess(): VendorAccountAccess {
   };
 }
 
+// The levels an owner-admin may raise `account` to (empty for anyone else). Only an
+// owner who is an admin may raise; a subscription account is shared at most as
+// `shared`, never `full`.
+function vendorAccountRaiseTargets(
+  owner: boolean,
+  viewerIsAdmin: boolean,
+  level: VendorAccountShareLevel,
+  full: boolean,
+  apiKey: boolean,
+): VendorAccountAccess['raiseTargets'] {
+  if (!owner || !viewerIsAdmin) return [];
+  const targets: VendorAccountAccess['raiseTargets'] = [];
+  if (level === 'none') targets.push('shared');
+  if (!full && apiKey) targets.push('full');
+  return targets;
+}
+
+// The levels the viewer may lower `account` to, highest first. Lowering needs only
+// ownership at `shared` (an owner must be able to un-share after losing the admin
+// role) and ownership or co-management at `full`.
+function vendorAccountLowerTargets(
+  owner: boolean,
+  shared: boolean,
+  full: boolean,
+): VendorAccountAccess['lowerTargets'] {
+  if (!(owner ? shared : full)) return [];
+  const targets: VendorAccountAccess['lowerTargets'] = [];
+  if (full) targets.push('shared');
+  targets.push('none');
+  return targets;
+}
+
 /**
  * What `viewerIsAdmin` (the portal user's CURRENT admin or system_admin role) may do
  * with `account`. Only an owner who is an admin may raise the level; lowering needs
@@ -93,18 +125,8 @@ export function vendorAccountAccess(
   const full = level === 'full';
   const apiKey = account.auth_type === 'api_key';
 
-  const raiseTargets: VendorAccountAccess['raiseTargets'] = [];
-  if (owner && viewerIsAdmin) {
-    if (level === 'none') raiseTargets.push('shared');
-    // A subscription account is shared at most as `shared`, never `full`.
-    if (!full && apiKey) raiseTargets.push('full');
-  }
-
-  const lowerTargets: VendorAccountAccess['lowerTargets'] = [];
-  if (owner ? shared : full) {
-    if (full) lowerTargets.push('shared');
-    lowerTargets.push('none');
-  }
+  const raiseTargets = vendorAccountRaiseTargets(owner, viewerIsAdmin, level, full, apiKey);
+  const lowerTargets = vendorAccountLowerTargets(owner, shared, full);
 
   return {
     tier: owner ? 'owner' : 'manager',
