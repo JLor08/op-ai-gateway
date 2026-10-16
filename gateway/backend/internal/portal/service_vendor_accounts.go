@@ -744,11 +744,15 @@ func (s *Service) effectiveVendorAccountShareLevel(ctx context.Context, acc rout
 //   - the owner, at every level;
 //   - a CM of the account, while it is `shared` or `full`.
 //
-// Everyone else, system scope included, gets ErrVendorAccountNotFound
-// (404-no-leak): an operate call opens the owner's sealed credential and sends it
-// upstream, and system scope never bypasses a write. At `none` the account has no
-// management group, so no CM can exist and owner-only falls out; the level check
-// comes first anyway so a leftover admin-group link at `none` grants nothing.
+// Everyone else, system scope included, is denied, and the two denials differ on
+// purpose (vendorAccountWriteDenial): a MEMBER of the shared account (one that can
+// already READ it through a resource group) gets ErrVendorAccountForbidden (403), since
+// "not found" would be a lie to them; anyone who cannot read it gets
+// ErrVendorAccountNotFound (404-no-leak). An operate call opens the owner's sealed
+// credential and sends it upstream, and system scope never bypasses a write. At `none`
+// the account has no management group, so no CM can exist and owner-only falls out; the
+// level check comes first anyway so a leftover admin-group link at `none` grants
+// nothing.
 //
 // This gate says nothing about the credential-bearing operations (see
 // authorizeVendorAccountCredential), nor about the subscription exception that
@@ -768,6 +772,33 @@ func (s *Service) authorizeVendorAccountOperate(ctx context.Context, principal a
 	}
 	if manager {
 		return nil
+	}
+	return s.vendorAccountWriteDenial(ctx, principal, acc)
+}
+
+// vendorAccountWriteDenial is the answer of a write gate to a non-owner who is not a CM
+// of the account: ErrVendorAccountForbidden (403) when the principal is a MEMBER of the
+// shared account (isMemberOfSharedVendorAccount), ErrVendorAccountNotFound (404-no-leak)
+// for everyone else.
+//
+// The 403 is gated on that predicate and nothing wider because it is the exact one the
+// read gate (authorizeVendorAccountRead) discloses the account by: whoever is told
+// "forbidden" can already read the account, so the answer confirms nothing the principal
+// does not have. It already fails closed for a principal with no user identity, a level
+// that is not `shared`/`full` by the EFFECTIVE level (the master flag off, `none`, an
+// unrecognised value), a subscription account without subscription sharing, an account
+// in no resource group and a principal provisioned into none of them. A store error is
+// returned, never read as a grant (nor as a 404, which would hide an outage).
+//
+// It is asked only AFTER the manager check of both gates, so a CM keeps the answer it
+// always had.
+func (s *Service) vendorAccountWriteDenial(ctx context.Context, principal auth.Token, acc routing.VendorAccount) error {
+	member, err := s.isMemberOfSharedVendorAccount(ctx, principal, acc)
+	if err != nil {
+		return err
+	}
+	if member {
+		return ErrVendorAccountForbidden
 	}
 	return ErrVendorAccountNotFound
 }
@@ -814,7 +845,9 @@ func requireOwnerForSubscriptionOperate(principal auth.Token, acc routing.Vendor
 // The two denials differ on purpose:
 //
 //   - a CM at `shared` gets ErrVendorAccountForbidden (403): they can already see
-//     and operate the account, so "not found" would be a lie;
+//     and operate the account, so "not found" would be a lie; so does a MEMBER of the
+//     shared account (a principal that can read it through a resource group,
+//     isMemberOfSharedVendorAccount), at `shared` and `full` alike;
 //   - anyone who cannot see the account at all (a stranger, a co-manager without
 //     the vendor-account flag, system scope, a principal with no user identity, or a
 //     CM whose link outlived the shared level) gets ErrVendorAccountNotFound
@@ -836,7 +869,7 @@ func (s *Service) authorizeVendorAccountCredential(ctx context.Context, principa
 		return err
 	}
 	if !manager {
-		return ErrVendorAccountNotFound
+		return s.vendorAccountWriteDenial(ctx, principal, acc)
 	}
 	if level == routing.VendorShareLevelFull {
 		return nil

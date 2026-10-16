@@ -104,7 +104,7 @@ func (s *Service) SetVendorAccountShareLevel(ctx context.Context, principal auth
 //  1. vendor_account_sharing_enabled (ErrVendorAccountSharingDisabled, a 409);
 //  2. the OWNER, who must be an admin RIGHT NOW (authorizeVendorAccountRaise): a
 //     non-owner is ErrVendorAccountNotFound unless they can already see the account (a
-//     CM), who is ErrVendorAccountForbidden; an owner who is not an admin is
+//     CM or a member), who is ErrVendorAccountForbidden; an owner who is not an admin is
 //     ErrVendorAccountForbidden. System scope is a stranger, as for every write;
 //  3. a target level above the stored one (else ErrVendorAccountShareLevelUnchanged);
 //  4. for a SUBSCRIPTION account (anything not api_key), the cap and the flag: never
@@ -176,8 +176,8 @@ func (s *Service) RaiseVendorAccountShareLevel(ctx context.Context, principal au
 // LowerVendorAccountShareLevel lowers an account to `shared` (from `full`) or to
 // `none` (spec sections 6 and 7). It is the CREDENTIAL gate's row: the owner always --
 // ownership is all it takes, so an owner can un-share after losing the admin role --
-// and a CM only at `full`; a CM of a `shared` account is ErrVendorAccountForbidden,
-// everyone else ErrVendorAccountNotFound. It deliberately does NOT look at the
+// and a CM only at `full`; a CM of a `shared` account (and a member of a shared one) is
+// ErrVendorAccountForbidden, everyone else ErrVendorAccountNotFound. It deliberately does NOT look at the
 // subscription flag: an account can always be un-shared.
 //
 // Lowering to `none` is ClearVendorAccountSharing: in one transaction the level goes
@@ -222,8 +222,8 @@ func (s *Service) LowerVendorAccountShareLevel(ctx context.Context, principal au
 // an admin right now (spec 6: raise is owner+admin, not the operate or credential
 // gate). The two denials differ on purpose, exactly like the credential gate's:
 //
-//   - a caller who can already SEE the account (a CM of a shared/full account) but is
-//     not its owner, and an owner who is no longer an admin, get
+//   - a caller who can already SEE the account (a CM or a member of a shared/full
+//     account) but is not its owner, and an owner who is no longer an admin, get
 //     ErrVendorAccountForbidden (403): the account is no secret to them;
 //   - everyone else (a stranger, system scope, a co-manager without the flag, a
 //     principal with no user identity) gets ErrVendorAccountNotFound (404-no-leak),
@@ -289,8 +289,9 @@ func (s *Service) checkVendorAccountSubscriptionRaise(ctx context.Context, acc r
 //     any account is loaded, so the answer is global and reveals nothing;
 //  2. the CREDENTIAL gate (authorizeVendorAccountCredential), which is the spec's
 //     "Management-group assignment" row exactly: the owner at every level, a CM at
-//     `full` only. A CM of a `shared` account is ErrVendorAccountForbidden (they can
-//     see the account), everyone else -- a stranger, system scope, a co-manager
+//     `full` only. A CM of a `shared` account (and a member of a shared one) is
+//     ErrVendorAccountForbidden (they can see the account), everyone else -- a
+//     stranger, system scope, a co-manager
 //     without the vendor-account flag, a principal with no user identity -- is
 //     ErrVendorAccountNotFound, identical to an unknown id. The operate gate plus a
 //     `full` restriction would give the same outcomes; the credential gate already
@@ -508,8 +509,8 @@ func vendorAccountRootMatches(acc routing.VendorAccount, rg routing.ResourceGrou
 //  2. the OWNER, strictly: a co-manager at `full` reaches a resource group through the
 //     resource-group manager side, never through this path (like a server's
 //     co-manager), and system scope never bypasses an account write. A caller who can
-//     already SEE the account (a CM of a shared/full one) but does not own it is
-//     ErrVendorAccountForbidden (403); everyone else -- a stranger, system scope, a
+//     already SEE the account (a CM or a member of a shared/full one) but does not own it
+//     is ErrVendorAccountForbidden (403); everyone else -- a stranger, system scope, a
 //     co-manager without the vendor flag, a principal with no user identity -- is
 //     ErrVendorAccountNotFound, identical to an unknown id (the operate gate decides
 //     who can see it);

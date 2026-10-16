@@ -24,10 +24,13 @@ import (
 //     (404-no-leak: a stranger must not learn the account exists);
 //   - a CM who can see (and operate) the account at `shared` but may not touch
 //     its credential gets ErrVendorAccountForbidden (403): the account is no
-//     secret to them, so "not found" would be a lie.
+//     secret to them, so "not found" would be a lie;
+//   - so does a MEMBER, a principal that reads the account through a resource
+//     group it is provisioned into, on both gates (#234; its columns are in
+//     service_vendor_sharing_member_write_test.go).
 //
-// At Phase 2 nobody is a "member" yet (resource-group routing and opt-in are
-// Phase 3), so a non-owner non-CM is simply a stranger here.
+// The fixture below links no account into a resource group, so a non-owner
+// non-CM is simply a stranger in this file's matrix.
 
 // authzOutcome is what a gate must answer for one principal.
 type authzOutcome int

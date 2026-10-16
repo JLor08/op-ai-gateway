@@ -826,10 +826,12 @@ func (s *Service) SetResourceGroupVendorAccounts(ctx context.Context, principal 
 // rg from the resource-group manager side (see SetResourceGroupVendorAccounts, step 3).
 // The order matters for what each answer reveals: an account the caller cannot operate is
 // ErrVendorAccountNotFound whatever its level (so nothing about a stranger's account
-// leaks), and only then is the level asked: `shared` is ErrVendorAccountForbidden (the
-// caller can see and operate the account, so "not found" would be a lie; the owner links
-// a `shared` account through their own self-service), anything below `full` is
-// ErrVendorAccountNotShared, and last comes the root.
+// leaks), except that a caller who is a MEMBER of the account, and so can already read
+// it, is told ErrVendorAccountForbidden by the operate gate. Only then is the level
+// asked: `shared` is ErrVendorAccountForbidden (the caller can see and operate the
+// account, so "not found" would be a lie; the owner links a `shared` account through
+// their own self-service), anything below `full` is ErrVendorAccountNotShared, and last
+// comes the root.
 func (s *Service) authorizeResourceGroupVendorAccountAdd(ctx context.Context, principal auth.Token, rg routing.ResourceGroup, accountID string) error {
 	acc, err := s.loadVendorAccount(ctx, accountID)
 	if err != nil {

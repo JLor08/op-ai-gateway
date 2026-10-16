@@ -129,9 +129,9 @@ func vendorConnectExpired(p pendingVendorConnect, now time.Time) bool {
 // code-paste begin and complete, device begin and poll; a RE-connect of an already
 // connected account is the same call): the master flag first, then the CREDENTIAL
 // gate (authorizeVendorAccountCredential: the owner, or a CM of a `full` account;
-// a CM of a `shared` account is ErrVendorAccountForbidden, and a stranger, system
-// scope and an unknown id are all ErrVendorAccountNotFound, even for a body that is
-// invalid anyway), then the subscription-only check, then the
+// a CM of a `shared` account, like a member of a shared one, is
+// ErrVendorAccountForbidden, and a stranger, system scope and an unknown id are all
+// ErrVendorAccountNotFound, even for a body that is invalid anyway), then the subscription-only check, then the
 // vendor_subscriptions_enabled switch (ErrVendorSubscriptionsDisabled while it is
 // off). It returns the freshly loaded account. It is the ONLY authorization of
 // the connect family, so a new connect method must come through it.
