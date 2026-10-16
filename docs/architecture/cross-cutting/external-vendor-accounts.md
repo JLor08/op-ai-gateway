@@ -2273,7 +2273,8 @@ Notes on how the matrix is enforced:
   a `shared` or `full` one, and the operation is simply not theirs (a credential call, the
   delete or an assignment at `shared`, a raise, a token-opening call on a subscription):
   "not found" would be a lie to them. This is a deliberate departure from the servers'
-  never-a-403 posture.
+  posture, where every object-level denial is a `404` (`server.forbidden` is only a create or
+  a field the caller may not set).
 - **The gates.** There is a read gate (`authorizeVendorAccountRead`, which returns the
   viewer's tier, §8.2) and three write gates: **operate**
   (`authorizeVendorAccountOperate`: the owner, or a CM at `shared`/`full`), **credential**

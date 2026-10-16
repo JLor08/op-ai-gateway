@@ -1697,12 +1697,15 @@ paths:
         CM of a shared account gets 403 vendor_account.forbidden, anyone else the
         404 of an unknown id (system scope included). The delete cascades the
         account's models, usage, management-group links and resource-group links,
-        and so revokes every borrower. Answers ok true.
+        and so revokes every borrower. Answers ok true. A 409
+        vendor_accounts.module_disabled while the vendor_accounts_enabled master
+        flag is off, whoever asks.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OkTrue' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/connect/import:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -1728,6 +1731,8 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/check:
     parameters:
@@ -1753,6 +1758,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VendorConnectionCheck' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: >
@@ -1799,6 +1805,7 @@ paths:
                 properties:
                   account: { $ref: '#/components/schemas/VendorAccount' }
                   refresh: { $ref: '#/components/schemas/VendorModelsRefreshResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: >
@@ -1872,6 +1879,7 @@ paths:
                       - { $ref: '#/components/schemas/VendorAccountUsage' }
                       - { type: 'null' }
                   refresh: { $ref: '#/components/schemas/VendorUsageRefreshResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '405': { description: 'Any method other than POST (Allow: POST).' }
         '409':

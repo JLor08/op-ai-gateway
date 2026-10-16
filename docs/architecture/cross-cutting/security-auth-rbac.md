@@ -825,7 +825,7 @@ has the full matrix):
 
 | Operation | `none` | `shared` | `full` |
 |---|---|---|---|
-| Read (key-free) | owner | owner, CM, member (minimal view) | owner, CM, member (minimal view) |
+| Read (key-free) | owner, system scope | owner, CM, member (minimal view), system scope | owner, CM, member (minimal view), system scope |
 | Operate: status, prefix, rename, test, model refresh, usage refresh | owner | owner, CM | owner, CM |
 | Credential, management-group and resource-group assignment, delete, lowering | owner | **owner only** | owner, CM |
 | Raise | owner who is an admin | owner who is an admin | nobody (already the top) |
@@ -846,7 +846,8 @@ the owner's single-use refresh token. The properties that matter for the securit
   `404 vendor_account.not_found` of an unknown id; a CM, who can already see the
   account, gets `403 vendor_account.forbidden` for an operation that is not theirs,
   because "not found" would be a lie. This is the one resource where a 403 is a normal
-  by-level answer, in contrast to the never-a-403 servers above.
+  by-level answer, in contrast to the servers above, where every object-level denial is a
+  404 (`server.forbidden` is only a create or a field the caller may not set).
 - **Field-level, deny-by-default PATCH**: `name`, `status`, `model_prefix` take the
   operate gate and every other field takes the credential gate, so an overlooked field
   can never fall through to the weaker gate.

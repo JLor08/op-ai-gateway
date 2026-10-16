@@ -3496,12 +3496,19 @@ needed for this need).
 **Amended by [ADR-060](#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in) (sharing).** The policy and the single helper
 stand, with three changes. The policy may now also name an account **shared** with the
 token's principal, and **`all: true` covers only the principal's own accounts**, never a
-shared one, so borrowing stays a named choice (this refines (a) and (e): the interactive
-session is still `all: true`, and so sees its own accounts only). `routing.TokenVendorPrefix`
+shared one, so borrowing stays a named choice (this refines (a), (d) and (e): the
+interactive session is still `all: true`, and so sees its own accounts only; (d) is spelled out
+at the end). `routing.TokenVendorPrefix`
 takes the whole token, because the own-versus-shared line depends on its principal. And a
 **service token** is no longer inert: it carries the policy, create-only, and reaches a
 shared account only when it names it and the service is directly provisioned into a
-resource group that contains it (this supersedes (e)'s "stays inert").
+resource group that contains it (this supersedes (e)'s "stays inert"). On (d) and the
+Consequence's last sentence: `all: true` now coexists with
+explicit entries naming a shared account, and each such entry is validated and
+collision-checked at save like an `all: false` entry (an id the token's principal cannot
+reach is the "unknown" `400`), so only an entry naming an **own** account goes unchecked
+and rests on the backstop, and a policy now names accounts its principal can *reach*, not
+only ones the owner owns, though it still never widens that reach.
 
 ## ADR-051 — Anthropic translate prompt caching is flag-gated, decided at the gateway by a hybrid auto-switch, and placed by the provider
 **Context:** Anthropic caches a prompt prefix only where the request carries a
@@ -4859,8 +4866,11 @@ the key or hands a delegate the owner's token.
   **complete owner-equivalent delegation** (the credential, the group and
   resource-group assignment, the delete and the lowering too), except raising the
   level. Three named states express a reach that two flags cannot, and give the
-  subscription cap (d) something to be capped at. The level is read **live** by every
-  gate, listing and grant, so a lowering or a pause never waits on a cache.
+  subscription cap (d) something to be capped at. The stored level is read **live** by
+  every gate, listing and grant, so a lowering never waits on a cache; the two sharing
+  switches come from one 5 s cache that every portal settings write drops, so a pause from
+  the portal is just as immediate and only an out-of-band edit of a switch has a tail of up
+  to 5 s.
 - **(b) Management mirrors AI servers; routing eligibility is a PURE grant.** A shared
   account is assigned to **management groups** (`vendor_account_admin_groups`), rooted
   in one **containment root** (`system_group_id`, immutable while shared) and linked
@@ -4893,7 +4903,8 @@ the key or hands a delegate the owner's token.
   lowering needs only ownership at `shared` (an owner who lost the role can still
   un-share). A caller who **cannot see** the account gets the `404` of an unknown id; a
   CM who **can** gets a `403`, because "not found" would be a lie to them, a deliberate
-  departure from the servers' never-a-403 posture. A **member** reads a minimal,
+  departure from the servers' posture, where every object-level denial is a `404`
+  (`server.forbidden` is only a create or a field the caller may not set). A **member** reads a minimal,
   allowlist-built key-free view and operates nothing, and no response to any viewer
   ever carries a credential.
 - **(d) A subscription is capped at `shared`, and its token-opening operate calls stay
