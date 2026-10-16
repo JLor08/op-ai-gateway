@@ -2175,13 +2175,11 @@ the very next decision), and the TTL only bounds an **out-of-band** change such 
 direct database edit. It fails **closed** exactly like the accessors: an unreadable or
 missing settings store reads as both switches off for that call, and a failed read is
 **not retained** (the next call reads again), so an outage is never pinned for a TTL
-window. The raw accessors stay uncached on purpose: the gateway defines its own cached
-wrappers around them (`vendorAccountSharingEnabledCached`,
-`vendorSubscriptionSharingEnabledCached` on `Server`, dropped by
-`invalidateVendorSettingsCache` on a PUT that carries either key, though no production
-path consults them today), and a cache inside the accessors would stack two TTL windows
-under that one. The grant's remaining per-request cost when sharing is on is its
-structural reads, not the switches ([Risks
+window. The raw accessors stay uncached on purpose: the guards and the probe that read
+them run once per request on a rare path, and an admin acting right after a flip is told
+the truth. The gateway's resolver accessors cache only the other three vendor flags;
+it holds no cache of the sharing switches. The grant's remaining per-request cost when
+sharing is on is its structural reads, not the switches ([Risks
 §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 The frontend reads the switches through a portal-scoped
