@@ -216,6 +216,7 @@ type API interface {
 	SetServiceAdminGroups(context.Context, auth.Token, string, []string) (ServiceDTO, error)
 	SetUserLimits(context.Context, auth.Token, string, LimitConfigDTO) (UserLimitsDTO, error)
 	SetUserPreference(context.Context, string, string, json.RawMessage) error
+	SetVendorAccountShareLevel(context.Context, auth.Token, string, SetVendorAccountShareLevelRequest) (VendorAccountDTO, error)
 	SyncApplicationModels(context.Context, auth.Token, string) (SyncResultDTO, error)
 	SyncApplicationModelsForApp(context.Context, routing.AIServer, routing.Application) (SyncResultDTO, error)
 	SystemAdminModeRequirePassword(context.Context) bool

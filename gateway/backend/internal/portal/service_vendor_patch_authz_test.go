@@ -630,9 +630,17 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"CreateVendorAccount": "create",
 		// The PATCH picks its gate per field (authorizeVendorAccountPatch).
 		"UpdateVendorAccount": "patch",
-		// Delete is owner-only for now (the safe side of the spec's credential-gate
-		// row); widening it to a CM at `full` belongs to its own step.
+		// Delete is the spec's credential-gate row (owner always, a CM at `full`),
+		// pinned per level by TestDeleteVendorAccountUsesTheCredentialGate. It is a
+		// removal, not a credential write, so it is not in credentialOps.
 		"DeleteVendorAccount": "delete",
+		// The share-level lifecycle (service_vendor_sharing.go), pinned by
+		// service_vendor_sharing_lifecycle_test.go. Raise is owner + a current admin
+		// role, NOT one of the two write gates; lower is the credential gate's shape
+		// (owner always, a CM at `full`); the endpoint's dispatcher picks one of the two.
+		"RaiseVendorAccountShareLevel": "raise",
+		"LowerVendorAccountShareLevel": "lower",
+		"SetVendorAccountShareLevel":   "share-level",
 		// Operate gate (authorizeVendorAccountOperate).
 		"TestVendorAccountConnection": "operate",
 		"RefreshVendorAccountModels":  "operate",

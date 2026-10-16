@@ -340,12 +340,12 @@ func (s *Service) loadVendorAccount(ctx context.Context, id string) (routing.Ven
 // who is not the owner is a stranger too.
 //
 // This is the pre-sharing owner-only gate. It still guards the reads
-// (GetVendorAccount and the name lookup widen to CMs in the management read) and
-// DeleteVendorAccount, which belongs to a later step of the sharing work; owner-only
-// is the safe side of both new gates, so a site left here is merely stricter than
-// the spec, never looser. Writes use authorizeVendorAccountOperate or
+// (GetVendorAccount and the name lookup widen to CMs in the management read);
+// owner-only is the safe side of both new gates, so a site left here is merely
+// stricter than the spec, never looser. Writes use authorizeVendorAccountOperate or
 // authorizeVendorAccountCredential: the PATCH picks between them per field
-// (authorizeVendorAccountPatch) and every credential method uses the latter.
+// (authorizeVendorAccountPatch) and every credential method, the delete and the
+// share-level lower use the latter.
 func (s *Service) authorizeVendorAccount(ctx context.Context, principal auth.Token, id string, write bool) (routing.VendorAccount, error) {
 	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
@@ -949,17 +949,25 @@ func (s *Service) UpdateVendorAccount(ctx context.Context, principal auth.Token,
 	return s.vendorAccountDTO(ctx, saved)
 }
 
-// DeleteVendorAccount removes an account the principal owns (owner-only, system
-// scope included); the store cascades its dependent rows (the model catalog).
-// The bool reports that a row was removed (always true on a nil error): there is
-// no best-effort side effect to flag, unlike DeleteServer.
-// ErrVendorAccountsDisabled while the master flag is off.
+// DeleteVendorAccount removes an account; the store cascades its dependent rows
+// (the model catalog, the management-group and resource-group links). It is the
+// CREDENTIAL gate's row (spec 2026-10-15 section 6): the owner at every level, a CM
+// of a `full` account (complete owner-equivalent delegation); a CM of a `shared`
+// account is ErrVendorAccountForbidden (they can see it, so "not found" would be a
+// lie) and everyone else -- system scope included -- ErrVendorAccountNotFound
+// (404-no-leak). The bool reports that a row was removed (always true on a nil
+// error): there is no best-effort side effect to flag, unlike DeleteServer.
+// ErrVendorAccountsDisabled while the master flag is off. Deleting is not a sharing
+// endpoint, so the sharing flag does not gate it.
 func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token, id string) (bool, error) {
 	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
 		return false, err
 	}
-	acc, err := s.authorizeVendorAccount(ctx, principal, id, true)
+	acc, err := s.loadVendorAccount(ctx, id)
 	if err != nil {
+		return false, err
+	}
+	if err := s.authorizeVendorAccountCredential(ctx, principal, acc); err != nil {
 		return false, err
 	}
 	if err := s.routes.DeleteVendorAccount(ctx, acc.ID); err != nil {

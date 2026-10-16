@@ -27,6 +27,10 @@ const (
 	codeVendorAccountCheckFailed   = "vendor_account.check_failed"
 	codeVendorAccountRefreshFailed = "vendor_account.refresh_failed"
 
+	// codeVendorAccountShareLevelFailed is the uncategorized fallback of the
+	// share-level endpoint (PUT .../share-level): a store failure.
+	codeVendorAccountShareLevelFailed = "vendor_account.share_level_failed"
+
 	// codeVendorAccountUsageRefreshFailed is the uncategorized fallback of the
 	// dedicated usage refresh (POST .../usage/refresh): a store failure.
 	codeVendorAccountUsageRefreshFailed = "vendor_account.usage_refresh_failed"
@@ -102,9 +106,12 @@ func (s *Server) handlePortalVendorAccounts(w http.ResponseWriter, r *http.Reque
 // the OPTIONAL device-code connect sub-resources
 // "/api/portal/vendor-accounts/{id}/connect/device/{begin|poll}" (POST), the
 // test-connection action "/api/portal/vendor-accounts/{id}/check" (POST), the
-// model-discovery action "/api/portal/vendor-accounts/{id}/models/refresh" (POST)
-// and the usage-pull action "/api/portal/vendor-accounts/{id}/usage/refresh" (POST).
-// Any other deeper path is answered with the same 404 as an unknown id.
+// model-discovery action "/api/portal/vendor-accounts/{id}/models/refresh" (POST),
+// the usage-pull action "/api/portal/vendor-accounts/{id}/usage/refresh" (POST) and
+// the share-level lifecycle "/api/portal/vendor-accounts/{id}/share-level" (PUT).
+// Any other deeper path is answered with the same 404 as an unknown id. The
+// "/api/portal/vendor-accounts/" subtree route in server.go already covers every one
+// of these sub-resources, so a new sub-route needs no registration of its own.
 func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
 	if !ok {
@@ -143,8 +150,8 @@ func (s *Server) handlePortalVendorAccountItem(w http.ResponseWriter, r *http.Re
 }
 
 // routeVendorAccountSubpath dispatches the sub-routes of
-// /api/portal/vendor-accounts/{id}/... (the /check, /models/refresh and
-// /usage/refresh actions and the /connect/... family) and reports whether it
+// /api/portal/vendor-accounts/{id}/... (the /check, /models/refresh, /usage/refresh
+// and /share-level actions and the /connect/... family) and reports whether it
 // handled the request. The item handler falls through to the {id}
 // GET/PATCH/DELETE surface when this returns false.
 func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Request, token auth.Token, parts []string) bool {
@@ -158,6 +165,10 @@ func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Reques
 	}
 	if len(parts) == 3 && parts[0] != "" && parts[1] == "usage" && parts[2] == "refresh" {
 		s.handlePortalVendorAccountUsageRefresh(w, r, token, parts[0])
+		return true
+	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "share-level" {
+		s.handlePortalVendorAccountShareLevel(w, r, token, parts[0])
 		return true
 	}
 	return s.routeVendorAccountConnectSubpath(w, r, token, parts)
@@ -211,6 +222,42 @@ func (s *Server) handlePortalVendorAccountPatch(w http.ResponseWriter, r *http.R
 	dto, err := s.Portal.UpdateVendorAccount(r.Context(), token, id, req)
 	if err != nil {
 		writePortalVendorAccountError(w, err, codeVendorAccountUpdateFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// handlePortalVendorAccountShareLevel (PUT .../share-level) moves an account to the
+// level in the body ({"level": "none"|"shared"|"full", "admin_group_ids": [...]}):
+// the share-level lifecycle of shared vendor accounts. The handler only decodes; the
+// service compares the requested level with the stored one and runs the RAISE (owner
+// + a current admin role, >= 1 management group in admin_group_ids, a subscription
+// account only to `shared`) or the LOWER (the credential gate: the owner always, a CM
+// at `full`; to `none` it clears the management groups, the resource-group links and
+// the containment root), and decides who may do which. The response is the
+// credential-free account. While the vendor_account_sharing_enabled switch is off
+// (default) it is a 409 vendor_accounts.sharing_disabled, whoever asks and whatever
+// the id (the vendor_accounts_enabled module flag answers first); a subscription
+// account raised while vendor_subscription_sharing_enabled is off is a 409
+// vendor_accounts.subscription_sharing_disabled, and raised to `full` a 400
+// vendor_account.subscription_share_capped; a stranger and an unknown id are the same
+// 404, and a caller who can see the account but may not raise or lower it a 403.
+func (s *Server) handlePortalVendorAccountShareLevel(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPut) {
+		return
+	}
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return
+	}
+	var req portal.SetVendorAccountShareLevelRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+		return
+	}
+	dto, err := s.Portal.SetVendorAccountShareLevel(r.Context(), token, id, req)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountShareLevelFailed)
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
@@ -437,6 +484,12 @@ var portalVendorAccountErrRows = []errRow{
 	// The vendor_subscriptions_enabled switch is off: creating or connecting a
 	// SUBSCRIPTION account is a 409 too (api_key accounts are never refused).
 	{err: portal.ErrVendorSubscriptionsDisabled, status: http.StatusConflict, code: "vendor_accounts.subscriptions_disabled", msg: "vendor subscription accounts are not enabled"},
+	// The vendor_account_sharing_enabled switch is off: every share / management /
+	// resource-group endpoint is a 409 (the account does not even get looked at). The
+	// subscription switch narrows it: raising a SUBSCRIPTION account while
+	// vendor_subscription_sharing_enabled is off is a 409 too.
+	{err: portal.ErrVendorAccountSharingDisabled, status: http.StatusConflict, code: "vendor_accounts.sharing_disabled", msg: "vendor account sharing is not enabled"},
+	{err: portal.ErrVendorSubscriptionSharingDisabled, status: http.StatusConflict, code: "vendor_accounts.subscription_sharing_disabled", msg: "sharing subscription accounts is not enabled"},
 	{err: portal.ErrVendorAccountNotFound, status: http.StatusNotFound, code: portal.CodeVendorAccountNotFound, msg: msgVendorAccountNotFound},
 	{err: portal.ErrVendorAccountNameRequired, status: http.StatusBadRequest, code: "vendor_account.name_required", msg: "vendor account name is required"},
 	{err: portal.ErrVendorAccountVendorInvalid, status: http.StatusBadRequest, code: "vendor_account.vendor_invalid", msg: "vendor account vendor is invalid"},
@@ -452,6 +505,17 @@ var portalVendorAccountErrRows = []errRow{
 	// refused for every caller (a 400; the gate has already answered 404/403 for a
 	// caller who may not touch the credential).
 	{err: portal.ErrVendorAccountFieldImmutable, status: http.StatusBadRequest, code: "vendor_account.field_immutable", msg: "base_url and auth_type are fixed when the account is created and cannot be changed"},
+	// Share level (PUT .../share-level). All 400s: the request is wrong for this
+	// account, never a 401 (the portal reads that as an expired session). They are
+	// answered only AFTER the 404/403 gate, so none of them confirms an account to a
+	// caller who may not see it (the level's own shape is account-independent).
+	{err: portal.ErrVendorAccountShareLevelInvalid, status: http.StatusBadRequest, code: "vendor_account.share_level_invalid", msg: "the share level must be none, shared or full"},
+	{err: portal.ErrVendorAccountShareLevelUnchanged, status: http.StatusBadRequest, code: "vendor_account.share_level_unchanged", msg: "the request does not change the share level in the direction asked for; use a higher level to raise or a lower one to lower"},
+	{err: portal.ErrVendorAccountSubscriptionShareCapped, status: http.StatusBadRequest, code: "vendor_account.subscription_share_capped", msg: "a subscription account can be shared at most at the shared level, never full"},
+	{err: portal.ErrVendorAccountAdminGroupRequired, status: http.StatusBadRequest, code: "vendor_account.admin_group_required", msg: "at least one management group is required to share an account"},
+	{err: portal.ErrVendorAccountAdminGroupInvalid, status: http.StatusBadRequest, code: "vendor_account.admin_group_invalid", msg: "management group is invalid"},
+	{err: portal.ErrVendorAccountAdminGroupParentMismatch, status: http.StatusBadRequest, code: "vendor_account.admin_group_parent_mismatch", msg: "management groups must share one parent system group"},
+	{err: portal.ErrVendorAccountRootMismatch, status: http.StatusBadRequest, code: "vendor_account.root_mismatch", msg: "management groups must sit under the system group the account is already shared in"},
 	// Subscription connect. A vendor refusal of the pasted code is a 400, never a
 	// 401: the portal treats a 401 from this API as an expired session. The vendor
 	// being unreachable or answering with something unusable is a 502. The rows

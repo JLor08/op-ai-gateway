@@ -176,6 +176,35 @@ var (
 	// (on by default) is off. api_key accounts are never affected. Mapped to a 409.
 	ErrVendorSubscriptionsDisabled = errors.New("vendor_accounts.subscriptions_disabled")
 
+	// Sharing (spec 2026-10-15 sections 6, 7, 11 and 13).
+	// ErrVendorAccountSharingDisabled is the SHARING master guard (system setting
+	// vendor_account_sharing_enabled, off by default): the share-level methods, and the
+	// management-group and resource-group methods after them, return it before doing
+	// anything while the flag is off. Mapped to a 409, like ErrVendorAccountsDisabled.
+	// ErrVendorSubscriptionSharingDisabled refuses RAISING a subscription account while
+	// vendor_subscription_sharing_enabled (subordinate to the master) is off. A 409.
+	// ErrVendorAccountSubscriptionShareCapped: a subscription account is raised to
+	// `shared` at most, never `full` (its OAuth credential stays owner-only). A 400.
+	// ErrVendorAccountShareLevelInvalid: the requested level is not none, shared or
+	// full. ErrVendorAccountShareLevelUnchanged: the request does not move the level in
+	// the direction asked for (a raise to a level at or below the stored one, a lower to
+	// one at or above it). Both 400.
+	// ErrVendorAccountAdminGroupRequired / Invalid / ParentMismatch are the management-
+	// group set's three failures (the vendor-account counterparts of the
+	// ErrServerAdminGroup* trio): no group at all, a group that is not an existing
+	// admin-tier group the caller may name, groups under different parents. All 400.
+	// ErrVendorAccountRootMismatch: groups whose parent differs from the account's
+	// retained containment root (immutable while the account stays shared/full). A 400.
+	ErrVendorAccountSharingDisabled          = errors.New("vendor_accounts.sharing_disabled")
+	ErrVendorSubscriptionSharingDisabled     = errors.New("vendor_accounts.subscription_sharing_disabled")
+	ErrVendorAccountSubscriptionShareCapped  = errors.New("vendor_account.subscription_share_capped")
+	ErrVendorAccountShareLevelInvalid        = errors.New("vendor_account.share_level_invalid")
+	ErrVendorAccountShareLevelUnchanged      = errors.New("vendor_account.share_level_unchanged")
+	ErrVendorAccountAdminGroupRequired       = errors.New("vendor_account.admin_group_required")
+	ErrVendorAccountAdminGroupInvalid        = errors.New("vendor_account.admin_group_invalid")
+	ErrVendorAccountAdminGroupParentMismatch = errors.New("vendor_account.admin_group_parent_mismatch")
+	ErrVendorAccountRootMismatch             = errors.New("vendor_account.root_mismatch")
+
 	// Subscription connect (the OAuth code-paste flow and the token import).
 	// ErrVendorAccountNotSubscription: connect operates on an auth_type
 	// subscription account only (the auth type is immutable, so an api_key account

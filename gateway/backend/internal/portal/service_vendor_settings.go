@@ -322,3 +322,38 @@ func (s *Service) requireVendorAccountsEnabled(ctx context.Context) error {
 	}
 	return nil
 }
+
+// requireVendorAccountSharingEnabled is the SHARING guard (spec 2026-10-15 section
+// 13): every method behind the share / management / resource-group endpoints runs it
+// before it does anything else -- before it loads an account, so the answer is global
+// and reveals nothing about any account. The vendor-accounts module flag answers first
+// (ErrVendorAccountsDisabled, the more fundamental switch), then the sharing master
+// flag (ErrVendorAccountSharingDisabled); both are a 409. The sharing flag fails
+// closed: no settings store, or one that cannot be read, is "off".
+//
+// The share-level methods use it today; the management-group assignment and the
+// resource-group link methods MUST call it first as well.
+func (s *Service) requireVendorAccountSharingEnabled(ctx context.Context) error {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return err
+	}
+	if !s.VendorAccountSharingEnabled(ctx) {
+		return ErrVendorAccountSharingDisabled
+	}
+	return nil
+}
+
+// requireVendorSubscriptionSharingEnabled is the guard of sharing a SUBSCRIPTION
+// account (spec section 11): the vendor_subscription_sharing_enabled switch is
+// subordinate to the master, so the effective condition is the AND of both. It runs
+// requireVendorAccountSharingEnabled first (module flag, then the master flag), so a
+// caller can never reach the subscription flag with sharing off.
+func (s *Service) requireVendorSubscriptionSharingEnabled(ctx context.Context) error {
+	if err := s.requireVendorAccountSharingEnabled(ctx); err != nil {
+		return err
+	}
+	if !s.VendorSubscriptionSharingEnabled(ctx) {
+		return ErrVendorSubscriptionSharingDisabled
+	}
+	return nil
+}
