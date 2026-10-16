@@ -1350,6 +1350,7 @@ const de = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
+  capabilityTranscription: 'Transkription',
   // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
   // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
   // hat deshalb nur in dieser einen Richtung etwas anzuzeigen. Siehe
@@ -4291,6 +4292,7 @@ const en: PortalMessages = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
+  capabilityTranscription: 'Transcription',
   // The chip for the operator's EXCEPTION (image editing = No), not for a
   // capability: image editing is derived from image generation, so it has
   // something to show in this one direction only. See capabilityChips in
