@@ -282,6 +282,10 @@ let vendorSubscriptionsEnabledMock: boolean | undefined = undefined;
 // stays hidden. A saved vendor_account_sharing_enabled in the System-settings PUT
 // flips it, like the module flag.
 let vendorSharingEnabledMock: boolean | undefined = undefined;
+// The vendor_subscription_sharing_enabled switch as the same endpoint reports it
+// (`subscription_sharing_enabled`, #236). undefined = absent, which the shell must
+// read as OFF (opt-in): a subscription account is then not offered the raise.
+let vendorSubscriptionSharingEnabledMock: boolean | undefined = undefined;
 // The caller's own accounts as GET /api/portal/vendor-accounts lists them.
 let vendorAccountsListMock: Array<Record<string, unknown>> = [];
 // The resource groups as GET /api/portal/resource-groups lists them.
@@ -325,6 +329,7 @@ beforeEach(() => {
   vendorAccountsEnabledMock = false;
   vendorSubscriptionsEnabledMock = undefined;
   vendorSharingEnabledMock = undefined;
+  vendorSubscriptionSharingEnabledMock = undefined;
   vendorAccountsListMock = [];
   resourceGroupsListMock = [];
   systemAdminModeMock = false;
@@ -600,6 +605,9 @@ beforeEach(() => {
           ...(vendorSharingEnabledMock === undefined
             ? {}
             : { sharing_enabled: vendorSharingEnabledMock }),
+          ...(vendorSubscriptionSharingEnabledMock === undefined
+            ? {}
+            : { subscription_sharing_enabled: vendorSubscriptionSharingEnabledMock }),
         });
       }
       if (path === '/api/portal/vendor-accounts' && (!init?.method || init.method === 'GET')) {
@@ -2963,6 +2971,49 @@ describe('App', () => {
       expect(share).not.toBeInTheDocument();
     }
   });
+
+  // #236: the shell also reads the subordinate vendor_subscription_sharing_enabled
+  // switch from the probe (`subscription_sharing_enabled`) and threads it into the
+  // providers view: only while it is on is a personal SUBSCRIPTION account offered the
+  // raise to Shared (the backend answers it 409 otherwise). Absent from the answer, an
+  // older backend or a failed probe, reads as off. An api-key account is not affected.
+  it.each([
+    ['on', true, true],
+    ['off', false, false],
+    ['absent from the answer (default off)', undefined, false],
+  ])(
+    'offers the share area of a personal subscription account only while subscription sharing is %s',
+    async (_l, flag, offered) => {
+      vendorAccountsEnabledMock = true;
+      vendorSharingEnabledMock = true;
+      vendorSubscriptionSharingEnabledMock = flag;
+      vendorAccountsListMock = vendorAccountRows;
+      currentRole = 'admin';
+      renderApp();
+      await screen.findByText('Dev User');
+      await gotoNav(messages.de.providers);
+
+      // The api-key account keeps its share area whatever the switch says.
+      const keyRow = (await screen.findByText('Plain Key')).closest('tr')!;
+      fireEvent.click(within(keyRow).getByRole('button', { name: messages.de.modelDetailsAction }));
+      await screen.findByText(messages.de.vendorAccountSettingsTitle);
+      expect(
+        screen.getByRole('region', { name: messages.de.vendorAccountShareTitle }),
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: messages.de.back }));
+
+      const subRow = (await screen.findByText('Team Claude Max')).closest('tr')!;
+      fireEvent.click(within(subRow).getByRole('button', { name: messages.de.modelDetailsAction }));
+      await screen.findByText(messages.de.vendorAccountSettingsTitle);
+
+      const share = screen.queryByRole('region', { name: messages.de.vendorAccountShareTitle });
+      if (offered) {
+        expect(share).toBeInTheDocument();
+      } else {
+        expect(share).not.toBeInTheDocument();
+      }
+    },
+  );
 
   // #183: the shell reads the vendor_account_sharing_enabled master flag from the same
   // portal-scoped probe (`sharing_enabled`) and threads it into the providers view and

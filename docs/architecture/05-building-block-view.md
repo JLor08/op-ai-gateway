@@ -174,10 +174,12 @@ servers, services, models, usage, system, netbird, chat, vendorAccounts), a
 `theme/` subsystem (MUI + CSS-variable bridge + `ThemeRoot`), and `i18n.ts`
 (de/en). It talks only to the gateway HTTP APIs. The `providers` view is gated on
 the `vendorAccountsEnabled` flag — threaded through `App.tsx` and `NavSidebar`
-from `GET /api/portal/vendor-accounts/enabled`, which reports **three** booleans
-(`module_enabled`, `subscriptions_enabled` and `sharing_enabled`; the third gates the
-sharing controls of the Anbieter page, the resource-group manager's vendor-accounts
-panel and the Groups page's `can_manage_vendor_accounts` column) — so the nav item and
+from `GET /api/portal/vendor-accounts/enabled`, which reports **four** booleans
+(`module_enabled`, `subscriptions_enabled`, `sharing_enabled` and
+`subscription_sharing_enabled`; the third gates the sharing controls of the Anbieter
+page, the resource-group manager's vendor-accounts panel and the Groups page's
+`can_manage_vendor_accounts` column, and the fourth the raise of a subscription account
+to `shared`) — so the nav item and
 the routed content are both hidden while the vendor-accounts module is off
 ([External Vendor Accounts §7](cross-cutting/external-vendor-accounts.md#7-feature-flag-and-routing-mode)).
 Its create form offers the five OpenAI-compatible providers (x.ai, OpenRouter, Kilo,
@@ -190,8 +192,11 @@ read-only in the detail view, since the root is immutable
 The Anbieter view is tiered by what the viewer may do with each account
 (`vendorAccountAccess`: owner, co-manager or member, mirroring the backend's
 authorization by share level): an owner who is an admin gets the share area
-(`VendorAccountSharePanel`: the share level and the management groups) and the
-resource-group link (`VendorAccountResourceGroupsSection`), a co-manager the same view
+(`VendorAccountSharePanel`: the share level and the management groups; a personal
+**subscription** account is offered the raise to `shared` only while
+`subscription_sharing_enabled` is on, so with sharing itself on and that switch off
+the share area is absent for it; with sharing off, the "sharing is off" notice
+stands in as for any account) and the resource-group link (`VendorAccountResourceGroupsSection`), a co-manager the same view
 minus what the backend refuses, and a member a read-only, minimal view
 (`VendorAccountReadOnlyDetail`); a service's detail view gets the resource-group
 self-service that provisions it into the groups offering shared accounts

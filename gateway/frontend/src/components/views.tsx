@@ -80,6 +80,10 @@ export type ViewRenderCtx = ViewGateCtx & {
   // together with the module flag, off by default. Render-only: it gates no nav
   // item, the views that offer sharing hide those controls while it is off.
   vendorAccountSharingEnabled: boolean;
+  // The vendor_subscription_sharing_enabled switch (#236) together with the module
+  // flag and the sharing master flag, off by default. Render-only: the providers page
+  // offers the raise to Shared of a subscription account only while it is on.
+  vendorSubscriptionSharingEnabled: boolean;
   t: Translation;
   api: PortalApi;
   locale: Locale;
@@ -259,6 +263,7 @@ export const viewRegistry: Record<View, ViewEntry> = {
         isAdmin={ctx.isAdmin}
         subscriptionsEnabled={ctx.vendorSubscriptionsEnabled}
         sharingEnabled={ctx.vendorAccountSharingEnabled}
+        subscriptionSharingEnabled={ctx.vendorSubscriptionSharingEnabled}
       />
     ),
   },

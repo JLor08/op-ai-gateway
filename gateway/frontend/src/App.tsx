@@ -99,6 +99,11 @@ export default function App() {
   // the Groups permission column use it to hide the controls that create or change
   // sharing (the backend answers each 409 while it is off).
   const [vendorAccountSharingEnabled, setVendorAccountSharingEnabled] = useState(false);
+  // Whether a SUBSCRIPTION account may be shared (#236): the subordinate
+  // vendor_subscription_sharing_enabled switch AND sharing as above, off by default,
+  // from the same probe. The providers page offers the raise to Shared of a
+  // subscription account only while it is on (the backend answers it 409 otherwise).
+  const [vendorSubscriptionSharingEnabled, setVendorSubscriptionSharingEnabled] = useState(false);
   const t = messages[locale];
   const tRef = useRef(t);
   tRef.current = t;
@@ -302,7 +307,10 @@ export default function App() {
         setVendorSubscriptionsEnabled(r.subscriptions_enabled !== false);
         // Sharing is opt-in AND needs the module (the backend checks the module
         // first), so an absent field, or a module that is off, reads as off.
-        setVendorAccountSharingEnabled(Boolean(r.module_enabled) && r.sharing_enabled === true);
+        const sharingOn = Boolean(r.module_enabled) && r.sharing_enabled === true;
+        setVendorAccountSharingEnabled(sharingOn);
+        // The subordinate switch only narrows sharing, and is opt-in too.
+        setVendorSubscriptionSharingEnabled(sharingOn && r.subscription_sharing_enabled === true);
       })
       .catch(() => {
         /* not reachable → the "Anbieter" nav item stays hidden */
@@ -433,6 +441,7 @@ export default function App() {
     ...gateCtx,
     vendorSubscriptionsEnabled,
     vendorAccountSharingEnabled,
+    vendorSubscriptionSharingEnabled,
     t,
     api,
     locale,

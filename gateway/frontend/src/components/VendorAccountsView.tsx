@@ -119,6 +119,7 @@ export function VendorAccountsView({
   api,
   isAdmin,
   sharingEnabled,
+  subscriptionSharingEnabled = false,
   subscriptionsEnabled = true,
 }: Readonly<{
   t: Translation;
@@ -133,6 +134,11 @@ export function VendorAccountsView({
   // own account management (credentials, name, status, prefix, the upstream panels)
   // and the member's read view are not.
   sharingEnabled: boolean;
+  // The vendor_subscription_sharing_enabled switch (off by default, #236): whether a
+  // SUBSCRIPTION account may be raised to Shared. While it is off the backend answers
+  // that raise 409, so a personal subscription account is not offered it. It only
+  // narrows `sharingEnabled`, and is moot while that is off.
+  subscriptionSharingEnabled?: boolean;
   // The vendor_subscriptions_enabled system switch (on by default). While it is
   // off every subscription account is shown inactive with a notice: the backend
   // no longer routes it, nor lets it be created or connected, but it stays listed.
@@ -681,7 +687,14 @@ export function VendorAccountsView({
   // offered.
   if (typeof mode !== 'string' && mode.kind === 'detail') {
     const account = accounts.find((a) => a.id === mode.account.id) ?? mode.account;
-    const access = vendorAccountAccess(account, isAdmin);
+    // While sharing is off the notice stands in for the whole area whatever the
+    // subordinate switch says (it only narrows the master), so a subscription account
+    // keeps that notice like any other.
+    const access = vendorAccountAccess(
+      account,
+      isAdmin,
+      subscriptionSharingEnabled || !sharingEnabled,
+    );
     // The resource-group link is the OWNER's self-service (the backend answers a
     // co-manager 403) and only once the account is shared (a private one is a 400
     // vendor_account.not_shared). Not gated on the admin role: an owner who has lost

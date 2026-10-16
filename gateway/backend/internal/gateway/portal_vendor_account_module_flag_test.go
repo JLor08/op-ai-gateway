@@ -117,8 +117,10 @@ func TestVendorAccountEndpointsFollowTheMasterFlagLive(t *testing.T) {
 // (the vendor_subscriptions_enabled switch, default on) lets the page explain why
 // subscription accounts are inert, without the system-scoped settings read. It
 // answers while the module is off (that is its whole point) and is not shadowed
-// by the {id} item route. The body is exactly three booleans: those two and
-// sharing_enabled (see TestVendorAccountsEnabledEndpointSharing).
+// by the {id} item route. The body is exactly four booleans: those two,
+// sharing_enabled (see TestVendorAccountsEnabledEndpointSharing) and
+// subscription_sharing_enabled (see
+// TestVendorAccountsEnabledEndpointSubscriptionSharing).
 func TestVendorAccountsEnabledEndpoint(t *testing.T) {
 	srv, _, _ := newVendorAccountSettingsTestServer(t, true)
 	const path = "/api/portal/vendor-accounts/enabled"
@@ -133,8 +135,8 @@ func TestVendorAccountsEnabledEndpoint(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
 		}
-		if len(body) != 3 {
-			t.Fatalf("body = %v, want exactly the module_enabled, subscriptions_enabled and sharing_enabled booleans", body)
+		if len(body) != 4 {
+			t.Fatalf("body = %v, want exactly the module_enabled, subscriptions_enabled, sharing_enabled and subscription_sharing_enabled booleans", body)
 		}
 		module, ok := body["module_enabled"].(bool)
 		if !ok {
@@ -237,6 +239,62 @@ func TestVendorAccountsEnabledEndpointSharing(t *testing.T) {
 	putVendorSystemSetting(t, srv, `{"vendor_account_sharing_enabled":false}`)
 	if sharing(vaOtherSecret) {
 		t.Fatal("sharing_enabled = true after the master switch was turned off, want false (subscription sharing must not keep it on)")
+	}
+}
+
+// The probe also carries subscription_sharing_enabled, the subordinate
+// vendor_subscription_sharing_enabled switch (default OFF, opt-in) that decides
+// whether a SUBSCRIPTION account may be raised to `shared`, so the Anbieter page can
+// stop offering that raise (the backend answers it 409
+// vendor_accounts.subscription_sharing_disabled) to an owner-admin who cannot read
+// GET /api/system/settings. Like sharing_enabled it is the raw switch, read live by a
+// plain user and independent of the module flag and of the sharing master switch: the
+// consumer combines them.
+func TestVendorAccountsEnabledEndpointSubscriptionSharing(t *testing.T) {
+	srv, _, _ := newVendorAccountSettingsTestServer(t, true)
+	const path = "/api/portal/vendor-accounts/enabled"
+
+	subscriptionSharing := func(secret string) bool {
+		t.Helper()
+		rec := vaDo(t, srv, http.MethodGet, path, secret, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200, body = %s", path, rec.Code, rec.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("unmarshal: %v (%s)", err, rec.Body.String())
+		}
+		got, ok := body["subscription_sharing_enabled"].(bool)
+		if !ok {
+			t.Fatalf("subscription_sharing_enabled = %#v, want a boolean (%s)", body["subscription_sharing_enabled"], rec.Body.String())
+		}
+		return got
+	}
+
+	for _, secret := range []string{vaOwnerSecret, vaOtherSecret} {
+		if subscriptionSharing(secret) {
+			t.Fatalf("default subscription_sharing_enabled for %s = true, want false (opt-in)", secret)
+		}
+	}
+
+	// Read live and by a plain user, with the module flag and the sharing master
+	// switch both still at their defaults (off): the probe reports the switch as
+	// stored.
+	putVendorSystemSetting(t, srv, `{"vendor_subscription_sharing_enabled":true}`)
+	for _, secret := range []string{vaOwnerSecret, vaOtherSecret} {
+		if !subscriptionSharing(secret) {
+			t.Fatalf("subscription_sharing_enabled for %s after enabling = false, want true", secret)
+		}
+	}
+
+	// The master switch is a different one: it neither turns this on nor off.
+	putVendorSystemSetting(t, srv, `{"vendor_account_sharing_enabled":true}`)
+	if !subscriptionSharing(vaOwnerSecret) {
+		t.Fatal("enabling the sharing master switch turned subscription_sharing_enabled off")
+	}
+	putVendorSystemSetting(t, srv, `{"vendor_subscription_sharing_enabled":false}`)
+	if subscriptionSharing(vaOtherSecret) {
+		t.Fatal("subscription_sharing_enabled = true after its switch was turned off, want false (the master switch must not keep it on)")
 	}
 }
 

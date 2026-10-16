@@ -14,11 +14,15 @@ import type { VendorAccount, VendorAccountShareLevel } from '../../api';
 //   | test / refresh / usage pull        | owner | owner + CM (1) | owner + CM (1) |
 //   | credential (connect, key, delete)  | owner | owner          | owner + CM     |
 //   | management groups                  | -     | owner          | owner + CM     |
-//   | raise                              | owner + admin (until full)                |
+//   | raise (2)                          | owner + admin (until full)                |
 //   | lower                              | -     | owner          | owner + CM     |
 //
 //   (1) a SUBSCRIPTION account: owner only -- the three open the owner's single-use
 //   OAuth token set and can rotate it (spec 11).
+//
+//   (2) raising a SUBSCRIPTION account to `shared` also needs the subordinate
+//   vendor_subscription_sharing_enabled switch (#236); the backend refuses it
+//   otherwise, so it is not offered. Lowering never looks at that switch.
 //
 // There are three viewers. The DTO carries no "is a co-manager" bit and does not
 // need one: `is_owner` is the owner; a non-owner who is handed a share level
@@ -75,17 +79,19 @@ function memberAccess(): VendorAccountAccess {
 
 // The levels an owner-admin may raise `account` to (empty for anyone else). Only an
 // owner who is an admin may raise; a subscription account is shared at most as
-// `shared`, never `full`.
+// `shared`, never `full`, and only while the subscription-sharing switch is on (the
+// backend answers the raise 409 otherwise).
 function vendorAccountRaiseTargets(
   owner: boolean,
   viewerIsAdmin: boolean,
   level: VendorAccountShareLevel,
   full: boolean,
   apiKey: boolean,
+  subscriptionSharingEnabled: boolean,
 ): VendorAccountAccess['raiseTargets'] {
   if (!owner || !viewerIsAdmin) return [];
   const targets: VendorAccountAccess['raiseTargets'] = [];
-  if (level === 'none') targets.push('shared');
+  if (level === 'none' && (apiKey || subscriptionSharingEnabled)) targets.push('shared');
   if (!full && apiKey) targets.push('full');
   return targets;
 }
@@ -110,10 +116,17 @@ function vendorAccountLowerTargets(
  * with `account`. Only an owner who is an admin may raise the level; lowering needs
  * only ownership at `shared` (an owner must be able to un-share after losing the
  * admin role) and ownership or co-management at `full`.
+ *
+ * `subscriptionSharingEnabled` is the subordinate vendor_subscription_sharing_enabled
+ * switch (#236): while it is off a subscription account is not offered the raise to
+ * `shared`, which the backend would refuse. It is off unless the caller says
+ * otherwise, like the switch itself, and it touches neither api-key accounts nor
+ * lowering.
  */
 export function vendorAccountAccess(
   account: Pick<VendorAccount, 'auth_type' | 'share_level' | 'is_owner'>,
   viewerIsAdmin: boolean,
+  subscriptionSharingEnabled = false,
 ): VendorAccountAccess {
   const owner = account.is_owner;
   if (!owner && !isShareLevel(account.share_level)) return memberAccess();
@@ -125,7 +138,14 @@ export function vendorAccountAccess(
   const full = level === 'full';
   const apiKey = account.auth_type === 'api_key';
 
-  const raiseTargets = vendorAccountRaiseTargets(owner, viewerIsAdmin, level, full, apiKey);
+  const raiseTargets = vendorAccountRaiseTargets(
+    owner,
+    viewerIsAdmin,
+    level,
+    full,
+    apiKey,
+    subscriptionSharingEnabled,
+  );
   const lowerTargets = vendorAccountLowerTargets(owner, shared, full);
 
   return {

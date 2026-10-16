@@ -59,21 +59,23 @@ const (
 	codeVendorAccountUsageRefreshFailed = "vendor_account.usage_refresh_failed"
 )
 
-// handlePortalVendorAccountsEnabled reports three booleans for any portal user
+// handlePortalVendorAccountsEnabled reports four booleans for any portal user
 // (gateway:use, GET-only): module_enabled, the vendor-accounts master flag (system
 // setting vendor_accounts_enabled); subscriptions_enabled, the
 // vendor_subscriptions_enabled switch (default on) that gates only subscription
-// accounts; and sharing_enabled, the vendor_account_sharing_enabled master switch
+// accounts; sharing_enabled, the vendor_account_sharing_enabled master switch
 // (default off, #183) behind the share-level, management-group and resource-group
-// endpoints, so the portal can hide the controls that would answer 409 without the
-// system-scoped settings read a plain owner, an un-elevated admin or a group manager
-// lacks. sharing_enabled is the switch as stored: the module flag is checked first
-// by the endpoints themselves, and the consumer combines the two. It returns ONLY
-// those three -- no routing mode or other setting (in particular not
-// vendor_subscription_sharing_enabled) -- so any user's shell can show or hide the
-// "Anbieter" nav item, and the Anbieter page can explain why subscription accounts
-// are inert, without being granted the system-scoped settings read. It answers
-// while the module is off (that is its purpose), and the exact-path route
+// endpoints; and subscription_sharing_enabled, the subordinate
+// vendor_subscription_sharing_enabled switch (default off) that decides whether a
+// subscription account may be raised to shared (#236). The portal hides the controls
+// that would answer 409 without the system-scoped settings read a plain owner, an
+// un-elevated admin or a group manager lacks. sharing_enabled and
+// subscription_sharing_enabled are the switches as stored: the module flag is checked
+// first by the endpoints themselves, and the consumer combines them. It returns ONLY
+// those four -- no routing mode or other setting -- so any user's shell can show or
+// hide the "Anbieter" nav item, and the Anbieter page can explain why subscription
+// accounts are inert, without being granted the system-scoped settings read. It
+// answers while the module is off (that is its purpose), and the exact-path route
 // registered for it wins over the "/api/portal/vendor-accounts/{id}" subtree
 // (account ids are "va_"-prefixed, so none can be called "enabled").
 func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +89,10 @@ func (s *Server) handlePortalVendorAccountsEnabled(w http.ResponseWriter, r *htt
 		"module_enabled":        s.Portal.VendorAccountsEnabled(r.Context()),
 		"subscriptions_enabled": s.Portal.VendorSubscriptionsEnabled(r.Context()),
 		"sharing_enabled":       s.Portal.VendorAccountSharingEnabled(r.Context()),
+		// The subordinate switch, read fresh like the three above (the raw accessor,
+		// not the cached hot-path read): an admin acting right after a flip is told
+		// the truth.
+		"subscription_sharing_enabled": s.Portal.VendorSubscriptionSharingEnabled(r.Context()),
 	})
 }
 
