@@ -2781,6 +2781,77 @@ func TestCapabilitiesSampleEmitsImageBetweenNamedFieldsAndExtra(t *testing.T) {
 	}
 }
 
+// TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra pins where the
+// two audio.cpp verdicts land on the wire: after the five other named fields
+// and before every Extra entry, in both directions, and not at all when
+// undetermined. As for image, the position is the load-bearing part: the
+// gateway keeps the FIRST entry for a name, so a "speech" that also appears in
+// Extra (Extra can only say "yes") must lose to the structured field.
+func TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra(t *testing.T) {
+	cases := []struct {
+		name string
+		caps collector.Capabilities
+		want []sample.CapabilityVerdict
+	}{
+		{
+			name: "both verdicts, no other field",
+			caps: collector.Capabilities{Speech: "yes", Transcription: "no"},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "transcription", Verdict: "no"},
+			},
+		},
+		{
+			name: "follow the five other named fields and precede Extra",
+			caps: collector.Capabilities{
+				Vision: "yes", Video: "no", Audio: "no", Tools: "yes", Image: "no",
+				Speech: "no", Transcription: "yes", Extra: []string{"thinking"},
+			},
+			want: []sample.CapabilityVerdict{
+				{Name: "vision", Verdict: "yes"},
+				{Name: "video", Verdict: "no"},
+				{Name: "audio", Verdict: "no"},
+				{Name: "tools", Verdict: "yes"},
+				{Name: "image", Verdict: "no"},
+				{Name: "speech", Verdict: "no"},
+				{Name: "transcription", Verdict: "yes"},
+				{Name: "thinking", Verdict: "yes"},
+			},
+		},
+		{
+			name: "a no is carried, ahead of an Extra entry of the same name",
+			caps: collector.Capabilities{Speech: "no", Extra: []string{"speech"}},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "no"},
+				{Name: "speech", Verdict: "yes"},
+			},
+		},
+		{
+			name: "undetermined is omitted, one at a time",
+			caps: collector.Capabilities{Transcription: "yes"},
+			want: []sample.CapabilityVerdict{
+				{Name: "transcription", Verdict: "yes"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := capabilitiesSample(tc.caps, sample.CapabilitySourceAudioCppModels)
+			if got == nil {
+				t.Fatal("capabilitiesSample = nil, want a non-nil pointer")
+			}
+			if !reflect.DeepEqual(got.Verdicts, tc.want) {
+				t.Errorf("Verdicts = %+v, want exactly %+v", got.Verdicts, tc.want)
+			}
+			// The literal, not the constant: the gateway matches this string
+			// byte for byte, so the constant's value is what is under test.
+			if got.Source != "audiocpp_models" {
+				t.Errorf("Source = %q, want %q", got.Source, "audiocpp_models")
+			}
+		})
+	}
+}
+
 // TestCollectOnceRuntimeCapabilitiesCachedAcrossCycles proves the widened
 // cache carries capabilities too, exactly as it already does for
 // LiveProgressSupport (TestCollectOnceRuntimeLiveProgressApiKeyRefusalCachedAcrossCycles
@@ -3746,6 +3817,266 @@ func TestProbeRuntimeChildPropsOtherTypesIgnoreTheSdcppFeature(t *testing.T) {
 				t.Errorf("gateway feature fetches = %d, want 0 (only a stable_diffusion_cpp child consults the gateway's feature set)", n)
 			}
 		})
+	}
+}
+
+const (
+	audioCppModelsRoute = "GET /v1/models"
+	audioCppModelID     = "kokoro-82m"
+	// A listing in which audioCppModelID is a speech model, an ASR model, a
+	// model of a task that is neither, and absent. Another entry is always
+	// present, so the probe must pick the entry whose id is the spec's model.
+	audioCppTTSDoc    = `{"object":"list","data":[{"id":"whisper-small","task":"asr"},{"id":"kokoro-82m","task":"tts","loaded":false}]}`
+	audioCppASRDoc    = `{"object":"list","data":[{"id":"whisper-small","task":"tts"},{"id":"kokoro-82m","task":"asr","loaded":true}]}`
+	audioCppAbsentDoc = `{"object":"list","data":[{"id":"whisper-small","task":"asr"}]}`
+)
+
+// audioCppStatus is a running audio_cpp Status served by child, for the model
+// audioCppModelID, and the loopback base URL the probe would build for it.
+func audioCppStatus(t *testing.T, child *probeChild, pid int) (runtimectl.Status, string) {
+	t.Helper()
+	st, base := child.status(t, "audio_cpp", pid)
+	st.Model = audioCppModelID
+	return st, base
+}
+
+// audioCppCaps is the capability set an audio_cpp child reports: the speech
+// and transcription verdicts, in that order, under the literal source the
+// gateway matches.
+func audioCppCaps(speech, transcription string) *sample.Capabilities {
+	return &sample.Capabilities{
+		Verdicts: []sample.CapabilityVerdict{
+			{Name: "speech", Verdict: speech},
+			{Name: "transcription", Verdict: transcription},
+		},
+		Source: "audiocpp_models",
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppReadsItsModelListing is the wiring proof
+// for audio.cpp: when the gateway declares capability_source_audiocpp, an
+// audio_cpp child is asked exactly one thing, GET /v1/models, and never
+// /props. The verdicts are the ones its listing states for the spec's own
+// model, cached per (pid, type, model) like every other probe's, so a cached
+// child costs no child request and no gateway round trip inside the gate's
+// memo interval. A new pid asks again, and the new answer replaces the old.
+func TestProbeRuntimeChildPropsAudioCppReadsItsModelListing(t *testing.T) {
+	child := newProbeChild(t, map[string]string{audioCppModelsRoute: audioCppTTSDoc})
+	features := &fakeGatewayFeatures{names: []string{"runtime_manager", "capability_source_audiocpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	st, base := audioCppStatus(t, child, 7201)
+	probe := func() sample.RuntimeSample {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		return rs
+	}
+
+	rs := probe()
+	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests = %v, want exactly %v (the model listing, and no /props)", got, want)
+	}
+	if want := audioCppCaps("yes", "no"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Fatalf("Capabilities = %+v, want %+v", rs.Capabilities, want)
+	}
+	if rs.LiveProgressSupport != "" {
+		t.Errorf("LiveProgressSupport = %q, want \"\" (audio.cpp has no timings surface)", rs.LiveProgressSupport)
+	}
+	if rs.ImageOptions != nil {
+		t.Errorf("ImageOptions = %+v, want nil (only a stable_diffusion_cpp child reports image options)", rs.ImageOptions)
+	}
+
+	rs = probe()
+	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests after a same-pid call = %v, want still %v (a conclusive answer is cached)", got, want)
+	}
+	if want := audioCppCaps("yes", "no"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Errorf("Capabilities (cache hit) = %+v, want %+v", rs.Capabilities, want)
+	}
+	if n := features.fetches(); n != 1 {
+		t.Errorf("gateway feature fetches = %d, want 1 (a cached child re-checks the gate from the memo, not the gateway)", n)
+	}
+
+	child.serve(audioCppModelsRoute, audioCppASRDoc)
+	st.PID = 7202
+	rs = probe()
+	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child requests after a restart = %v, want %v (a new pid asks again)", got, want)
+	}
+	if want := audioCppCaps("no", "yes"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+		t.Errorf("Capabilities (new pid) = %+v, want %+v (the new process's answer, not the cached one)", rs.Capabilities, want)
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppConclusiveSilenceIsCachedAndReported pins
+// the nil/non-nil distinction for audio.cpp: a listing that does not name the
+// spec's model is a conclusive "detection ran, found nothing" -- a non-nil
+// capability set with no verdicts, under the audio.cpp source -- and is cached,
+// so the child is asked once, not once per cycle.
+func TestProbeRuntimeChildPropsAudioCppConclusiveSilenceIsCachedAndReported(t *testing.T) {
+	child := newProbeChild(t, map[string]string{audioCppModelsRoute: audioCppAbsentDoc})
+	features := &fakeGatewayFeatures{names: []string{"capability_source_audiocpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	st, base := audioCppStatus(t, child, 7210)
+
+	for _, name := range []string{"miss", "hit"} {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		want := &sample.Capabilities{Verdicts: []sample.CapabilityVerdict{}, Source: "audiocpp_models"}
+		if rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+			t.Errorf("%s: Capabilities = %+v, want %+v", name, rs.Capabilities, want)
+		}
+	}
+	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Errorf("child requests = %v, want %v (a conclusive non-answer is cached)", got, want)
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppWaitsForTheGatewayFeature pins the gate:
+// while the gateway does not declare capability_source_audiocpp, an audio_cpp
+// child is asked NOTHING, the sample carries no capability set, and nothing is
+// cached -- the gateway would drop the rows of a source it does not accept.
+// The child serves a conclusive listing throughout, so a probe that ran would
+// both be seen and be cached. Declaring ONLY the sdcpp source does not open
+// this gate: each source has its own feature. Once the gateway declares the
+// feature, the first call after the agent next asks the gateway probes, with
+// the same pid.
+func TestProbeRuntimeChildPropsAudioCppWaitsForTheGatewayFeature(t *testing.T) {
+	cases := []struct {
+		name  string
+		names []string
+		err   error
+	}{
+		{"empty set", []string{}, nil},
+		{"other features only", []string{"runtime_manager", "runtime_upstream_props"}, nil},
+		{"only the sdcpp source", []string{"runtime_manager", "capability_source_sdcpp"}, nil},
+		{"fetch error", nil, errors.New("simulated features fetch failure")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newProbeChild(t, map[string]string{audioCppModelsRoute: audioCppTTSDoc})
+			features := &fakeGatewayFeatures{names: tc.names, err: tc.err}
+			a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+			clk := newFakeClock()
+			a.now = clk.now
+			st, base := audioCppStatus(t, child, 7220)
+
+			for cycle := 1; cycle <= 3; cycle++ {
+				var rs sample.RuntimeSample
+				a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+				if got := child.requests(); len(got) != 0 {
+					t.Fatalf("cycle %d: child requests = %v, want none (the gateway cannot accept this child's source yet)", cycle, got)
+				}
+				if rs.Capabilities != nil {
+					t.Errorf("cycle %d: Capabilities = %+v, want nil", cycle, rs.Capabilities)
+				}
+				if rs.LiveProgressSupport != "" {
+					t.Errorf("cycle %d: LiveProgressSupport = %q, want \"\"", cycle, rs.LiveProgressSupport)
+				}
+				if _, ok := a.runtimeCapabilityCache[st.SpecID]; ok {
+					t.Fatalf("cycle %d: runtimeCapabilityCache has an entry for %q, want none (a skipped probe must not be cached)", cycle, st.SpecID)
+				}
+			}
+
+			features.set([]string{"capability_source_audiocpp"}, nil)
+			clk.advance(gatewayFeatureRecheckInterval)
+			var rs sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+			if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("child requests after the gateway declares the feature = %v, want %v (an upgrade is picked up without a child restart)", got, want)
+			}
+			if want := audioCppCaps("yes", "no"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+				t.Errorf("Capabilities after the upgrade = %+v, want %+v", rs.Capabilities, want)
+			}
+		})
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppWithoutAFeatureSourceProbesNothing pins
+// that an agent built without Deps.GatewayFeatures reads it as "not declared":
+// such an agent cannot know that the gateway accepts the audio.cpp source, so
+// it sends what an older gateway expects, which is nothing for this child.
+func TestProbeRuntimeChildPropsAudioCppWithoutAFeatureSourceProbesNothing(t *testing.T) {
+	child := newProbeChild(t, map[string]string{audioCppModelsRoute: audioCppTTSDoc})
+	a := NewFromDeps(config.Config{}, Deps{})
+	st, base := audioCppStatus(t, child, 7230)
+
+	for cycle := 1; cycle <= 2; cycle++ {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		if got := child.requests(); len(got) != 0 {
+			t.Fatalf("cycle %d: child requests = %v, want none", cycle, got)
+		}
+		if rs.Capabilities != nil || rs.LiveProgressSupport != "" {
+			t.Errorf("cycle %d: Capabilities = %+v, LiveProgressSupport = %q, want nil and \"\"", cycle, rs.Capabilities, rs.LiveProgressSupport)
+		}
+		if _, ok := a.runtimeCapabilityCache[st.SpecID]; ok {
+			t.Fatalf("cycle %d: runtimeCapabilityCache has an entry for %q, want none", cycle, st.SpecID)
+		}
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppWithholdsACachedVerdictOnRollback pins the
+// cache-hit half of the gate: a verdict cached while the gateway declared
+// capability_source_audiocpp is NOT sent once the gateway stops declaring it (a
+// rollback -- that gateway would drop the sample's rows with a warning every
+// cycle), the entry is KEPT, and re-declaring the source sends it again
+// without a second child request. The rollback here leaves the sdcpp source
+// declared, which must not keep the audio.cpp verdict flowing.
+func TestProbeRuntimeChildPropsAudioCppWithholdsACachedVerdictOnRollback(t *testing.T) {
+	child := newProbeChild(t, map[string]string{audioCppModelsRoute: audioCppTTSDoc})
+	features := &fakeGatewayFeatures{names: []string{"capability_source_audiocpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	clk := newFakeClock()
+	a.now = clk.now
+	st, base := audioCppStatus(t, child, 7240)
+	probe := func() sample.RuntimeSample {
+		var rs sample.RuntimeSample
+		a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+		return rs
+	}
+
+	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *audioCppCaps("yes", "no")) {
+		t.Fatalf("Capabilities while declared = %+v, want %+v", rs.Capabilities, audioCppCaps("yes", "no"))
+	}
+
+	features.set([]string{"runtime_manager", "capability_source_sdcpp"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval)
+	rs := probe()
+	if rs.Capabilities != nil || rs.LiveProgressSupport != "" {
+		t.Fatalf("after the rollback: Capabilities = %+v, LiveProgressSupport = %q, want nil and \"\" (withheld, not sent)", rs.Capabilities, rs.LiveProgressSupport)
+	}
+	entry, ok := a.runtimeCapabilityCache[st.SpecID]
+	if !ok || entry.source != "audiocpp_models" {
+		t.Fatalf("runtimeCapabilityCache[%q] = %+v (present %v), want the audiocpp_models entry kept", st.SpecID, entry, ok)
+	}
+
+	features.set([]string{"capability_source_audiocpp"}, nil)
+	clk.advance(gatewayFeatureRecheckInterval)
+	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *audioCppCaps("yes", "no")) {
+		t.Fatalf("Capabilities after the source is declared again = %+v, want %+v", rs.Capabilities, audioCppCaps("yes", "no"))
+	}
+	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+		t.Errorf("child requests = %v, want %v (the kept entry answers; the child is not asked again)", got, want)
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppAndSdcppGatesAreIndependent pins that the
+// two sources do not share a gate in the other direction either: declaring
+// only capability_source_audiocpp neither probes a stable_diffusion_cpp child
+// nor lets its cached verdict through.
+func TestProbeRuntimeChildPropsAudioCppAndSdcppGatesAreIndependent(t *testing.T) {
+	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
+	features := &fakeGatewayFeatures{names: []string{"capability_source_audiocpp"}}
+	a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+	st, base := child.status(t, "stable_diffusion_cpp", 7250)
+
+	var rs sample.RuntimeSample
+	a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+	if got := child.requests(); len(got) != 0 {
+		t.Fatalf("child requests = %v, want none (the sdcpp source is not declared)", got)
+	}
+	if rs.Capabilities != nil {
+		t.Errorf("Capabilities = %+v, want nil", rs.Capabilities)
 	}
 }
 

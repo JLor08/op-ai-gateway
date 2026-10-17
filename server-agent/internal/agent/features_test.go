@@ -308,10 +308,13 @@ func TestFeaturesDeclareMultipartProxy(t *testing.T) {
 	// runtime_ensure; 0.8.1 and 0.8.2 were PATCH because they gained nothing
 	// (0.8.2 added the image_options telemetry field, gated on the
 	// gateway-declared capability_source_sdcpp, which is not an agent.Features
-	// entry); 0.9.0 is MINOR because agent.Features gained multipart_proxy.
-	// A Since records the version a feature shipped in, so runtime_ensure's
-	// stays 0.8.0.
-	if Version != "0.9.0" {
-		t.Fatalf("Version = %q, want 0.9.0 (agent.Features gains multipart_proxy, so the bump from 0.8.2 is MINOR)", Version)
+	// entry); 0.9.0 is MINOR because agent.Features gained multipart_proxy;
+	// 0.9.1 is PATCH because it gained nothing (it probes an audio_cpp child's
+	// /v1/models for speech/transcription, gated on the gateway-declared
+	// capability_source_audiocpp, which is not an agent.Features entry
+	// either). A Since records the version a feature shipped in, so
+	// runtime_ensure's stays 0.8.0 and multipart_proxy's stays 0.9.0.
+	if Version != "0.9.1" {
+		t.Fatalf("Version = %q, want 0.9.1 (agent.Features gained nothing since multipart_proxy at 0.9.0, so the bump is PATCH)", Version)
 	}
 }
