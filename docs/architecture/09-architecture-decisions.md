@@ -5216,7 +5216,7 @@ accepted are named, not hidden
 ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)): no
 streaming, no `mp3`/`opus`/`flac`/`json`, no automatic verdict for an agent-managed
 `audio_cpp` child, and a capture gate that trusts the upstream's `Content-Type`. The
-portal's Models listing carries no speech flag, so its "Available via" column cannot gate
+portal's Models view reads no speech flag, so its "Available via" column cannot gate
 `openai_audio` behind a verdict the way it gates `openai_images` behind `image`; the
 request itself is still gated server-side.
 

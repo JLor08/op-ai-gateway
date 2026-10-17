@@ -80,8 +80,9 @@ import (
 // groupCapabilityFlags), the rules behind ModelDTO.Image and ModelDTO.ImageEdit,
 // so a name is a candidate exactly when the portal lists it as generating
 // images (or as editable, for an edit); for speech it is judged by
-// speechFlagsByName, so the openai_audio flavor is offered ONLY behind a
-// (speech, yes) verdict. With no required capability Capable is
+// speechFlagsByName, the rule behind ModelDTO.Speech, so the openai_audio
+// flavor is offered ONLY behind a (speech, yes) verdict and a name is a
+// candidate exactly when the portal lists it as speech-capable. With no required capability Capable is
 // Callable itself. A required capability that has no fold makes Capable empty:
 // nothing is known to carry it, so nothing is a candidate. The requested-name
 // question never asks Capable: a callable name without the capability is the
@@ -313,7 +314,7 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 // the listing folds over for this token (Models() reads visibleMappingViews),
 // with the listing's own rules: for a model name, the listing's own fold for
 // that capability (imageFlagsByName for "image", imageEditFlagsByName for
-// "image_edit"), and groupCapabilityFlags over the group overlay for a group
+// "image_edit", speechFlagsByName for "speech"), and groupCapabilityFlags over the group overlay for a group
 // name -- so Capable and the listing's ModelDTO flags are one rule, not two.
 // idx is the caller's runtime-spec index and must cover views; capableNames
 // makes no spec read of its own.

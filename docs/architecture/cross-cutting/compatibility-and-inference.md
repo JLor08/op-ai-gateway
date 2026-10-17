@@ -1782,20 +1782,23 @@ candidacy refuses an application without the flavor however capable the
 mapping is. A model group's `image` is the AND of its offerable members', and
 an offered alias carries its target's.
 
-**Speech has the fold but no listing flag.** The same fail-closed AND exists for
+**Speech has the fold and a portal listing flag.** The same fail-closed AND exists for
 `speech` (`speechFlagsByName`, `viewServesAudio`, `internal/portal/service.go`): a name
 is speech-capable only when **every** offering mapping carries a `(speech, yes)`
 verdict **and** passes both flavor stages for `openai_audio` (the application, and for
 an agent-launched mapping with a spec, the spec), failing closed on a missing or `no`
-row and on a failed spec read; a group folds over its offerable members. It is read
-by the unknown-model redirect (`ModelOffering.Capable`, [Routing & Model Selection
-§2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither)),
-but **no `speech` field is carried on the portal model DTO or on either `capabilities`
-object**, so nothing on the wire advertises it and the portal's "Available via" column
-cannot gate `openai_audio` behind a verdict the way it gates `openai_images` behind
-`image`. The request itself is still refused server-side
-(`routing.model_not_capable`); recorded in [Risks
-§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+row and on a failed spec read; a group folds over its offerable members, and an offered
+alias carries its target's. It is read by the unknown-model redirect
+(`ModelOffering.Capable`, [Routing & Model Selection
+§2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither))
+and is the portal model DTO's `speech` flag (`ModelDTO.Speech`, on `/api/portal/models`
+including `?manage=1`), independent of `image` and `vision`, which the portal chat reads
+to switch its composer to a speech turn. **Neither `capabilities` object carries it**
+(`/v1/models` and the LM Studio listing keep `vision`, `image` and `image_edit`), and the
+portal's Models view "Available via" column does not read it, so it cannot gate
+`openai_audio` behind a verdict the way it gates `openai_images` behind `image`. The
+request itself is still refused server-side (`routing.model_not_capable`); recorded in
+[Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 **Transcription has neither the fold nor a listing flag**: `transcription` is not in
 `hasCapabilityFold`, so the unknown-model redirect never takes a transcription
 candidate (§3.7) and nothing on the wire advertises the verdict, while the request is
