@@ -1870,44 +1870,44 @@ default level is `info`, so at
 row it ever sent with nothing anywhere to say why, and the rows' absence
 reads as plain "unknown".
 
-**Two combinations are refused outright rather than attributed: a
-live-progress verdict sourced `ollama_api_show` or `sdcpp_capabilities`** (and, since
-issue #255, `audiocpp_models`, on the same ground: audio.cpp has no timings surface and
-`ProbeAudioCppVerdicts` leaves the field `""` too).
-Such a sample writes no `live_progress` row at all. Neither Ollama nor
-`sd-server` exposes a `timings_per_token`-style surface, so neither
-document can carry evidence about live progress in *either* direction, and a
-row attributed to either probe would be a false provenance whatever verdict
+**Three combinations are refused outright rather than attributed: a
+live-progress verdict sourced `ollama_api_show`, `sdcpp_capabilities` or
+`audiocpp_models` (the last since issue #255).**
+Such a sample writes no `live_progress` row at all. None of Ollama, `sd-server`
+and audio.cpp exposes a `timings_per_token`-style surface, so none of those
+documents can carry evidence about live progress in *either* direction, and a
+row attributed to any of those probes would be a false provenance whatever verdict
 it held — which is exactly the claim `routing.CapabilityRow`'s own source
-documentation makes. No honest agent sends either combination
-(`ProbeOllamaVerdicts` and `ProbeSdcppVerdicts` both leave the field `""` on
-every return path), and that is *why* the ingest enforces it rather than
-documenting it: an invariant a caller can violate is not an invariant. The
-rest of the pass still lands in both cases — a `vision`/`tools` verdict is
-something `/api/show` really can answer, and the `image` verdict is what
-`/sdcpp/v1/capabilities` answers, and the audio.cpp listing's `speech` and
-`transcription` verdicts — and each dropped row is logged at `Warn`.
-One consequence follows: a `live_progress` row can now only ever carry
+documentation makes. No honest agent sends any of the three combinations
+(`ProbeOllamaVerdicts`, `ProbeSdcppVerdicts` and `ProbeAudioCppVerdicts` all
+leave the field `""` on every return path), and that is *why* the ingest
+enforces it rather than documenting it: an invariant a caller can violate is not
+an invariant. The rest of the pass still lands in every case — a `vision`/`tools`
+verdict is something `/api/show` really can answer, the `image` verdict is what
+`/sdcpp/v1/capabilities` answers, and the `speech` and `transcription` verdicts
+are what the audio.cpp listing answers — and each dropped row is logged at
+`Warn`. One consequence follows: a `live_progress` row can now only ever carry
 `llama_cpp_props`.
 
-**A third combination is refused for the same reason, generalised: any
+**A fourth combination is refused for the same reason, generalised: any
 `sdcpp_capabilities` row that is not `image`.** `/sdcpp/v1/capabilities`
 answers exactly one question — whether the loaded model's `supported_modes`
 list holds `img_gen` — so a row under this source for `vision`, `tools`, or
 any other name is a claim the document never made, in either verdict
 direction (`no` is writable for `image` here, unlike under
 `ollama_api_show`, because `supported_modes` is exhaustive). Dropped at
-`Warn`, same as the two above; the `image` verdict itself still rides the
+`Warn`, same as the three above; the `image` verdict itself still rides the
 pass.
 
-**A fourth is refused on the same argument with a two-name allowlist: any
-`audiocpp_models` row that is not `speech` or `transcription` (issue #255).** audio.cpp's
-`/v1/models` listing states each model's one `task`, from which exactly two questions are
-answered, so a row under this source for `vision`, `tools` or any other name is a claim
-the listing never made. Both names stay writable in **both** directions, unlike the
-single `image` name above, because the listing's task is authoritative: a `tts` model is
-`(speech, yes)` with `(transcription, no)`, an `asr` model the reverse. Dropped at
-`Warn`; the speech and transcription verdicts still ride the pass.
+**A fifth is refused on the same argument with a two-name allowlist: any
+`audiocpp_models` row that is not `speech` or `transcription` (issue #255).**
+audio.cpp's `/v1/models` listing states each model's one `task`, from which
+exactly two questions are answered, so a row under this source for `vision`,
+`tools` or any other name is a claim the listing never made. Both names stay
+writable in **both** directions, unlike the single `image` name above, because
+the listing's task is authoritative: a `tts` model is `(speech, yes)` with
+`(transcription, no)`, an `asr` model the reverse. Dropped at `Warn`; the
+`speech` and `transcription` verdicts still ride the pass.
 
 **Four names are RESERVED and may not arrive from a probe at all: `mtp`,
 `live_progress`, `speculation_observed` and `image_edit`.** The criterion is that

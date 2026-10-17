@@ -683,9 +683,11 @@ export function MappingForm({
             the one writer entitled to state it. When that probe HAS stated it,
             the option is rendered disabled so the control shows the stored
             verdict instead of a blank that reads as unknown. "yes" is the
-            operator's enablement path for a model the server agent launches:
-            nothing detects those automatically yet, so the unknown hint says
-            to set it there. */}
+            operator's override of that probe and the fallback where it has
+            stated nothing (a model the listing does not name, or a model an
+            agent older than 0.9.1 launches): the server agent reports the
+            probe's verdict for a model it launches since 0.9.1, and the
+            unknown hint says when to set it by hand. */}
         <SelectField
           id="mapping-speech-capable"
           label={t.mappingSpeechCapable}

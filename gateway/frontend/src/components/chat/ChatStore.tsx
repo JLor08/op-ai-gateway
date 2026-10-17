@@ -438,8 +438,9 @@ export function ChatStoreProvider({
   // same story and is admitted only behind a speech verdict, but that rule is
   // the CHAT's alone and lives here: offeredFlavors passes openai_audio through
   // because it is shared with the Models view, whose "Available via" column
-  // must keep showing an audio row's flavor (transcription, unprobed and
-  // agent-managed models have no speech verdict and are listed there anyway).
+  // must keep showing an audio row's flavor (transcription models, unprobed
+  // ones and agent-managed ones whose agent has not reported a speech verdict
+  // have none and are listed there anyway).
   // anthropic alone offers nothing: the chat sends no /v1/messages request.
   const chatModels = useMemo(
     () =>

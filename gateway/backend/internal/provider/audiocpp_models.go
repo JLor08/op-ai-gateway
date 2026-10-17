@@ -146,6 +146,15 @@ type audioCppModelsDoc struct {
 // whitespace: a "TTS" or "ASR" the server might one day emit must not fall to
 // the "no" default, which is a bidirectional verdict that switches a route off.
 // The first entry that carries the id answers.
+//
+// This is a DUPLICATE, on purpose, of parseAudioCppModels in
+// server-agent/internal/collector/audiocpp.go, which reads the same listing
+// from an audio.cpp child the agent launched. The two are separate Go modules
+// and cannot share code, the same precedent as parseSdcppCapabilities. The
+// audioCppModelCases table, duplicated verbatim in both modules' tests, pins
+// both copies, and TestAudioCppModelsCasesMatchTheAgentsTable holds the two
+// tables identical. Whoever changes this rule must change that copy, and both
+// tables, identically.
 func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 	if modelID == "" {
 		return AudioCppVerdicts{}

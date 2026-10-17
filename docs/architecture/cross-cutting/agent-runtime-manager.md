@@ -3604,13 +3604,13 @@ mirror). Three different cadences share the one collect cycle:
     §3.4](compatibility-and-inference.md#34-openai-images-generations)).
   - `audio_cpp` — `collector.ProbeAudioCppVerdicts` GETs
     `collector.AudioCppModelsPath` (`/v1/models`, issue #255), **the child's own
-    loopback listing and never the router's**. audio.cpp serves no `/props` either,
-    and its listing is the only place it states what a model does: the entry whose
+    loopback listing and never the router's**. audio.cpp is not known to serve a
+    `/props` document either, and its listing is the only place it states what a model does: the entry whose
     `id` is `st.Model` carries a `task`, and one parser decides both verdicts from it
     (`tts` or `clone` is `(speech, yes)` with `(transcription, no)`, `asr` the
     reverse, any other non-empty task `no` for both, an unlisted model or a taskless
-    entry no verdict). The verdict is per **model**, so unlike the other documents
-    this probe takes the model. Its `LiveProgressSupport` is always `""` as well,
+    entry no verdict). The verdict is per **model**, so, like Ollama's and unlike
+    `/props` and sd-server's, this probe takes the model. Its `LiveProgressSupport` is always `""` as well,
     because audio.cpp has no timings surface, and it yields no image options.
     **This branch is gated too**, below, on its own feature name.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`

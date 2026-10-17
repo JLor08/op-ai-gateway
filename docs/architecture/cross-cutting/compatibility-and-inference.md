@@ -2491,7 +2491,8 @@ additionally keeps a model whose offered flavors include `openai_audio` **and** 
 polarity `openai_images` has behind `image`. The rule lives in `ChatStore`, **not** in
 `offeredFlavors`: that helper is shared with the Models view, whose "Available via" column
 must keep showing an audio row's flavor whether or not the row has a speech verdict
-(transcription models, unprobed ones, and agent-managed ones whose agent has not yet reported one have none), so it passes
+(transcription models, unprobed ones, and agent-managed ones whose agent has not yet
+reported one have none), so it passes
 `openai_audio` through and the chat applies its stricter filter on top. A
 transcription-only model carries no `speech` flag and stays out of the picker. A
 speech-capable model puts an empty thread into the speech composer

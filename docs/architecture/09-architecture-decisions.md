@@ -325,8 +325,8 @@ would void every such capability pass. `capability_source_audiocpp` (issue #255)
 same shape for the `audiocpp_models` source and an agent-launched audio.cpp child. The
 agent declares nothing back: the gateway is the side that must accept the source,
 nothing on the gateway waits on the agent, and an agent-side name would therefore gate
-nothing — so a flag on one list only is not a half-finished negotiation, it is the name placed on
-the side whose fact it is.
+nothing — so a flag on one list only is not a half-finished negotiation, it is the
+name placed on the side whose fact it is.
 → [Agent-Managed Model Runtime §7](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-026 — Gateway→agent control is desired state, not commands
@@ -5257,11 +5257,12 @@ the idle watchdog does not apply. Speech takes **no affinity pin**, by the guard
 wrote for exactly this: a capability-carrying request never creates one. The costs
 accepted are named, not hidden
 ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)): no
-streaming, no `mp3`/`opus`/`flac`/`json`, no automatic verdict for an agent-managed
-`audio_cpp` child, and a capture gate that trusts the upstream's `Content-Type`. The
-portal's Models view reads no speech flag, so its "Available via" column cannot gate
-`openai_audio` behind a verdict the way it gates `openai_images` behind `image`; the
-request itself is still gated server-side.
+streaming, no `mp3`/`opus`/`flac`/`json`, an unlisted model reading as unknown (an
+agent-launched `audio_cpp` child's verdict comes from the agent's probe of its own
+listing, once per process generation), and a capture gate that trusts the upstream's
+`Content-Type`. The portal's Models view reads no speech flag, so its "Available via"
+column cannot gate `openai_audio` behind a verdict the way it gates `openai_images`
+behind `image`; the request itself is still gated server-side.
 
 **Rejected:** **a new fine flavor or a per-capability column** (ADR-042's argument,
 unchanged and now twice avoided). **Mapping `speech` onto `audio`** (`audio` is an input
@@ -5382,9 +5383,10 @@ chosen:
   is unknown and **refuses**; and `(transcription, no)` is reserved in
   `reservedManualVerdicts`, so a rank-3 manual `no` can never veto the probe that is
   entitled to write it. `(transcription, yes)` stays writable, and the name stays
-  **off** `reservedAgentCapabilityNames`, because an agent-side writer may report it
-  later. The list does its second job as it does for speech: it keeps the request off
-  the vendor-account path, which has no `openai_audio` twin of its images exclusion.
+  **off** `reservedAgentCapabilityNames`, because the agent reports it (issue #255), and
+  an agent-reported `no` is legitimate. The list does its second job as it does for
+  speech: it keeps the request off the vendor-account path, which has no `openai_audio`
+  twin of its images exclusion.
   **The capability has no portal fold.** `hasCapabilityFold` admits `image`,
   `image_edit` and `speech` only, so `ModelOffering.Capable` is empty for a transcription
   request: the unknown-model redirect never takes a `LastUsedModel` or fallback for it
@@ -5758,10 +5760,10 @@ could have chosen:
   model's flag selects the speech composer for a thread that has no transcript yet.
   **The shared `offeredFlavors` is deliberately untouched.** It also feeds the Models
   view's "Available via" column, and gating `openai_audio` behind a speech verdict there
-  would drop the flavor from transcription, unprobed and not-yet-reported agent-managed audio rows (and from
-  the image-worded "no verdict" notes that read it). The chat needs a stricter rule than
-  that column, so the stricter rule lives in the chat and the shared function keeps
-  answering what it did. An agent-managed `audio_cpp` model appears in the chat once its
+  would drop the flavor from transcription, unprobed and not-yet-reported agent-managed
+  audio rows (and from the image-worded "no verdict" notes that read it). The chat needs
+  a stricter rule than that column, so the stricter rule lives in the chat and the
+  shared function keeps answering what it did. An agent-managed `audio_cpp` model appears in the chat once its
   agent has reported a `(speech, yes)` verdict from the child's own listing (ADR-061 (d),
   agent 0.9.1) or an operator has set `speech: yes` by hand.
 - **(f) `voice` is free text, and there is no voices dropdown.** The settings panel

@@ -438,10 +438,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
 
     // speech and transcription are the audio twins of the image control: yes is
-    // the operator's enablement path for an agent-launched audio model (the one
-    // population with no automatic source yet), and a selectable no is never
-    // offered because (speech, no) and (transcription, no) are reserved -- a
-    // manual no would outrank, and so permanently mask, the audio.cpp /v1/models
+    // the operator's override of the automatic audio.cpp /v1/models probe (and
+    // the fallback for an older agent or an unlisted model), and a selectable no
+    // is never offered because (speech, no) and (transcription, no) are
+    // reserved -- a manual no would outrank, and so permanently mask, that
     // probe. The probe's own no is shown, disabled.
     for (const control of [
       {

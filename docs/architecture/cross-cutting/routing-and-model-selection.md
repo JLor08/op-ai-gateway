@@ -921,9 +921,8 @@ gate excludes on, and it has the same writers as `speech`, **from the same listi
   on the same terms as `(speech, no)`: an absent row already refuses a transcription
   request, while a manual `no` is rank 3 and would outrank the probe entitled to
   establish it, forever. `(transcription, yes)` stays writable, as the operator's override
-  of the probe. The name is deliberately **not** in `reservedAgentCapabilityNames`: an
-  agent-side writer may report it later, and an agent-reported `no` would then be
-  legitimate.
+  of the probe. The name is deliberately **not** in `reservedAgentCapabilityNames`: the
+  agent reports it (issue #255), and an agent-reported `no` is legitimate.
 
 A transcription request avoids the vendor-account path for speech's reason: the
 capability list. `vendorAccountRoutingEligible` has no `openai_audio` twin of its images
