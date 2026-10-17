@@ -63,6 +63,9 @@ var (
 const (
 	// chatKindImage is the ChatRunSettings.Kind of an image-generation thread.
 	chatKindImage = "image"
+	// chatKindSpeech is the ChatRunSettings.Kind of a text-to-speech thread: each
+	// send turns the user's text into an audio answer via /v1/audio/speech.
+	chatKindSpeech = "speech"
 	// maxChatTitleLen caps the plaintext chat title (in runes).
 	maxChatTitleLen = 200
 	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB. It
@@ -393,10 +396,10 @@ type ChatRunSettings struct {
 	// whenever ServerOverride is "" — see the self-heal in PrepareChatRun.
 	ServerOverrideForceUnreachable bool `json:"server_override_force_unreachable,omitempty"`
 	// Kind pins what this thread's runs are: "" (text, the default and every
-	// pre-existing chat) or "image". It is established by the FIRST send and
-	// then forced by PrepareChatRun on every later send, because the composer's
-	// affordances follow the thread rather than the currently-picked model --
-	// see ADR-043 (b) in docs/architecture/09-architecture-decisions.md.
+	// pre-existing chat), "image" or "speech". It is established by the FIRST
+	// send and then forced by PrepareChatRun on every later send, because the
+	// composer's affordances follow the thread rather than the currently-picked
+	// model -- see ADR-043 (b) in docs/architecture/09-architecture-decisions.md.
 	//
 	// It is a UI constraint, NOT an authorization: this struct is the POST
 	// body verbatim (chat_run_endpoints.go), so a client can submit any value
@@ -417,6 +420,15 @@ type ChatRunSettings struct {
 	// buildImagesBody (chat_runs_images.go) forwards the set ones and the gateway
 	// passes them through unexamined.
 	Image *ChatImageSettings `json:"image,omitempty"`
+	// Audio carries the text-to-speech knobs of a "speech" thread. It follows
+	// Image's contract exactly: nil (and omitted) for a text or image thread, so
+	// their persisted settings stay byte-identical; PrepareChatRun clears it for
+	// any non-speech kind to hold that even against a raw API client; and it is
+	// NOT force-pinned -- a client sends the thread's CURRENT audio settings on
+	// every send and they are persisted, so the composer can change voice/speed
+	// between sends. Declared last, after Image, on purpose: a field added later
+	// must not move an existing chat's serialized bytes.
+	Audio *ChatAudioSettings `json:"audio,omitempty"`
 }
 
 // ChatImageSettings are the image-generation knobs a portal "image" thread
@@ -468,6 +480,33 @@ type ChatImageSettings struct {
 	// sd-server keeps its default. sd-server ignores it for a generation (no source
 	// image), so a thread that carries it can still generate.
 	Strength *float64 `json:"strength,omitempty"`
+}
+
+// ChatAudioSettings are the text-to-speech knobs a portal "speech" thread
+// forwards to /v1/audio/speech. Every field is optional and omitted when unset,
+// so an unset field leaves the model on its own default rather than being handed
+// an inert zero. Only the OpenAI-shaped first-class knobs live here; everything
+// else -- the OpenAI "instructions" field and any native audio.cpp knob -- rides
+// Passthrough. buildSpeechBody (chat_runs_audio.go) forwards the set fields and
+// merges Passthrough into the request JSON (the gateway relays the body to
+// audio.cpp unchanged), refusing the keys that would override the body the run
+// itself owns (model/input/stream/response_format). The response is always WAV
+// (the gateway serves only wav), so there is no format knob.
+type ChatAudioSettings struct {
+	// Voice is the free-text voice name; "" leaves the model's default voice.
+	// audio.cpp voices are not discovered, so it is whatever the user types.
+	Voice string `json:"voice,omitempty"`
+	// Speed is the speaking-rate multiplier, passed through as given (the
+	// model's own range applies). A POINTER so an explicit value stays
+	// distinguishable from "unset" -- nil is omitted, so only a speed the
+	// composer set is forwarded.
+	Speed *float64 `json:"speed,omitempty"`
+	// Passthrough is the advanced extra-JSON surface: top-level request fields
+	// merged into the /v1/audio/speech body verbatim, keyed by field name. The
+	// values are raw JSON so a string, number, bool or object each reach the
+	// upstream with the exact type the user wrote, and they round-trip through
+	// the stored document untouched. A nil or empty map is omitted.
+	Passthrough map[string]json.RawMessage `json:"passthrough,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole
@@ -635,6 +674,12 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if req.Settings.Kind != chatKindImage {
 		req.Settings.Image = nil
 	}
+	// The same holds for the audio settings and a speech thread: they are cleared
+	// for every other kind, and a speech thread in turn carries no image settings
+	// (the line above already clears them, as speech is not image).
+	if req.Settings.Kind != chatKindSpeech {
+		req.Settings.Audio = nil
+	}
 
 	settingsRaw, err := json.Marshal(req.Settings)
 	if err != nil {
@@ -666,6 +711,10 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// This is before the commit on purpose: a run refused for its history's size,
 	// or whose images cannot be read, stores nothing, so retrying it is not a
 	// duplicate turn.
+	//
+	// A speech run takes the text branch on purpose: its input is the last user
+	// message's text and its history carries no image to resolve beyond what a
+	// text thread's would, so it needs no special source resolution of its own.
 	if req.Settings.Kind != chatKindImage {
 		if history, err = s.resolveChatBlobRefs(ctx, chatID, history); err != nil {
 			return nil, ChatRunSettings{}, err
