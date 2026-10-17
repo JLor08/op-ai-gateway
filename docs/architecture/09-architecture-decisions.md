@@ -5115,14 +5115,20 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   health loop.** `probeAudioCppModels` finds the entry whose `id` equals the mapping's
   application-side model name and derives: `task` `tts` or `clone` is `(speech, yes)`;
   the model present with any other non-empty task is `(speech, no)`, authoritative
-  because the listing states each loaded model's task; the model absent, the task
+  because the listing states each loaded model's task (the loaded-only reading in this
+  paragraph is superseded, see the note at the end of this choice); the model absent, the task
   absent or the body unreadable writes **nothing**, because none of those says the
   model cannot speak and a `no` can switch a route off. It is a new probe-rank source,
   `audiocpp_models`, ranking 1 with the other probes (never able to outrank a `manual`
   or `vision_benchmark` row, always able to repair its own drift), and it writes the
   `speech` row only. **A model that is not loaded reads as unknown and refuses**
   until the health loop sees it loaded; for an operator-run server the mapped model is
-  loaded, and `speech: yes` set by hand covers the rest. **The agent-managed source is
+  loaded, and `speech: yes` set by hand covers the rest. (*Superseded in part by
+  [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint) (c) and
+  the amendment note below: the listing was found to name an unloaded model too, with
+  `loaded: false`, and the prober never decoded `loaded`, so read "a model that is not
+  loaded" in this choice and in the Consequence as "a model the listing does not
+  name".*) **The agent-managed source is
   deferred:** the agent router's `/v1/models` carries no `task`, so an agent-launched
   `audio_cpp` child has no automatic verdict until an agent-side source exists (a
   feature flag and an ingest acceptance, as `capability_source_sdcpp` is for images); an
@@ -5200,7 +5206,8 @@ no `openai_audio` application serves no speech: a route without the flavor answe
 `routing.no_model_route`, and a route with it and no `(speech, yes)` verdict answers 404
 `routing.model_not_capable`. For an `audio_cpp` application that verdict arrives with the
 first health tick that finds the mapped model loaded, and a model that is not loaded
-stays unknown until it is. Every speech request is one non-streaming call governed by one
+stays unknown until it is (superseded in part, as in choice (d): read "not loaded" as
+"not named by the listing", [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint) (c)). Every speech request is one non-streaming call governed by one
 **total** deadline, the application's `timeout_ms`: the `audio_cpp` type defaults it to
 600000, an application of any other type that serves speech needs it raised by hand, and
 the idle watchdog does not apply. Speech takes **no affinity pin**, by the guard ADR-042

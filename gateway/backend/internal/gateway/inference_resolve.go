@@ -75,9 +75,10 @@ func (s *Server) resolveTarget(ctx context.Context, token *auth.Token, req infer
 // tryProxyNative handed back or never saw (a body whose model the routing
 // probe could not read) -- plus the one spec-flavor refusal that dispatch
 // makes: a resolved target that serves images only (targetIsImagesOnly) or
-// speech only (targetIsAudioOnly) is refused with routing.ErrNoModelRoute.
-// Every request reaching it is a text request (images and speech have no
-// translate path), so the refusal needs no flavor test of its own. It is
+// audio only, speech or transcription (targetIsAudioOnly), is refused with
+// routing.ErrNoModelRoute.
+// Every request reaching it is a text request (images, speech and transcription
+// have no translate path), so the refusal needs no flavor test of its own. It is
 // deliberately not the general effective-served rule; see targetIsImagesOnly
 // for why.
 //

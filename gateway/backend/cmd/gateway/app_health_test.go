@@ -3712,7 +3712,7 @@ func TestNetbirdOnlyExcludesOffMeshFromRouting(t *testing.T) {
 // yes or a no -- and NO row for anything else.
 //
 // "" is the case that matters. parseAudioCppModels answers "" for everything
-// the /v1/models listing does not say (the model is not loaded, the listing is
+// the /v1/models listing does not say (the model is not named, the listing is
 // empty or unreadable, the entry carries no task), and a "no" here can switch a
 // model's route off, so "unknown" must be the ABSENCE of a row and never a
 // written no -- on each axis independently.

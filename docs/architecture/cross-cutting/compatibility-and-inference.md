@@ -964,8 +964,10 @@ gives). The redirect for a **transcription** request, however, asks the `openai_
 offering together with the required capability, and `transcription` has **no portal
 fold** (`hasCapabilityFold`): `ModelOffering.Capable` is empty, so no `LastUsedModel` or
 fallback is ever taken for it and an unknown model name stays an unknown-model refusal.
-That fails closed, and nothing is lost by it that the gate would not refuse anyway; it
-is recorded in [Risks
+That fails closed, and the gate still refuses a model without the verdict, but the
+redirect **convenience** is lost for transcription: a token with the redirect on and a
+transcription-capable `LastUsedModel` or fallback is **not** redirected to it, unlike a
+speech request, whose fold finds such a candidate. It is recorded in [Risks
 §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances) together with
 the absence of a listing flag.
 

@@ -98,8 +98,8 @@ func (w *modelWarmer) warmOnce(name string) {
 	// Resolve candidates for the model. ActiveMappingsForModel filters by API flavor, so try
 	// the two TEXT flavors and take the first that yields a candidate. openai_images and
 	// openai_audio are left out on purpose: the warm call below is a chat prompt, which a model
-	// that only generates images or speech cannot answer, so an application declaring only one
-	// of them is never asked. Candidacy judges a server_agent application by its own flavors,
+	// that only generates images or only serves audio (speech, transcription) cannot answer,
+	// so an application declaring only one of them is never asked. Candidacy judges a server_agent application by its own flavors,
 	// though, so a child whose runtime spec lists only openai_images (or only openai_audio) can
 	// still arrive here under a parent that declares openai; textCandidates drops it by its
 	// effective flavors.
@@ -118,7 +118,7 @@ func (w *modelWarmer) warmOnce(name string) {
 	cands = w.textCandidates(ctx, cands)
 	cands = w.unreservedCandidates(cands)
 	if len(cands) == 0 {
-		return // nothing to warm (not a real model, no active mapping, images or speech only, or every server reserved)
+		return // nothing to warm (not a real model, no active mapping, images-only or audio-only, or every server reserved)
 	}
 	cand := w.pickCandidate(cands)
 	// The one benchmarkTarget built WITHOUT Server.benchmarkTargetFor: the
@@ -154,10 +154,11 @@ func (w *modelWarmer) warmOnce(name string) {
 	}
 }
 
-// textCandidates drops the candidates that serve only images or only speech, by their
+// textCandidates drops the candidates that serve only images or only audio (speech or
+// transcription), by their
 // effective flavors (mappingSpecIsImagesOnly, mappingSpecIsAudioOnly), keeping the order. A
 // candidate whose spec cannot be read is dropped too: the warm is a best-effort load-ahead,
-// and a chat prompt to a child that may serve only images or speech is the one thing it must
+// and a chat prompt to a child that may serve only images or only audio is the one thing it must
 // not send. The spec is read once per candidate and both tests are asked of that one read.
 func (w *modelWarmer) textCandidates(ctx context.Context, cands []routing.MappingCandidate) []routing.MappingCandidate {
 	out := cands[:0:0]

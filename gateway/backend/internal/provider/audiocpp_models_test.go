@@ -14,8 +14,9 @@ import (
 
 // audioCppLiveListing is the shape audio.cpp v0.9.1 really answers on
 // GET /v1/models, probed live: an OpenAI-style list whose entries add family,
-// task, mode, loaded and path. The list names LOADED models only. The task
-// field is the capability signal this prober reads.
+// task, mode, loaded and path. It may also name an unloaded model, with
+// loaded:false; this prober never reads loaded. The task field is the capability
+// signal this prober reads.
 const audioCppLiveListing = `{"object":"list","data":[
   {"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}
 ]}`

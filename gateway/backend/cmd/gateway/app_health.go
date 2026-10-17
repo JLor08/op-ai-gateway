@@ -600,12 +600,12 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 //
 // The empty verdict is the case this guards. provider.AudioCppVerdicts answers
 // "" for everything the listing does not say -- the model is not in it
-// (/v1/models names LOADED models only), the listing is empty or unreadable, or
+// (the server does not name it in /v1/models), the listing is empty or unreadable, or
 // the entry carries no task -- and none of those is a statement that the model
 // cannot speak or cannot transcribe. A written "no" can switch a model's route
 // off, so an unknown verdict must never become one.
 //
-// A "no" is a real verdict where it IS stated: the listing names the loaded
+// A "no" is a real verdict where it IS stated: the listing names the
 // model's task, so a model present with a task that does not serve the
 // capability (an asr model for speech, a tts model for transcription, a music
 // model for both) is authoritatively not that kind of model, which is what

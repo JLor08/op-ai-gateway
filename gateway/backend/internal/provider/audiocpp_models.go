@@ -20,7 +20,7 @@ import (
 // field of each listed model.
 const audiocppModelsPath = "/v1/models"
 
-// audio.cpp task values. The listing's task names what the loaded model DOES:
+// audio.cpp task values. The listing's task names what the listed model DOES:
 // "tts" synthesises speech from text and "clone" synthesises it in a reference
 // voice, so both are a speech "yes"; "asr" transcribes speech to text, so it is
 // a transcription "yes". Every other task (the music tasks, ...) is a model that
@@ -37,14 +37,15 @@ const (
 //
 // Speech and Transcription are each routing.CapabilityYes,
 // routing.CapabilityNo, or "" for "no answer". Both are BIDIRECTIONAL: the
-// listing states each loaded model's task, so a model it names with a task that
+// listing states each listed model's task, so a model it names with a task that
 // does not serve the capability is a real "no", like sdcpp's exhaustive
 // supported_modes and unlike Ollama's capability array. The two verdicts are
 // decided together from the one task, so they are either both set or both "".
 // "" is reserved for everything the listing does not say: the model is not in
-// it (/v1/models lists only LOADED models, so a missing entry says nothing
-// about the model), the listing is empty, it cannot be read, or the named entry
-// carries no task. See routing.CapabilitySourceAudioCppModels.
+// it (the listing was first taken to name LOADED models only, but audio.cpp
+// v0.9.1 also names an unloaded one with loaded:false, so a missing entry says
+// only that the server does not name the model), the listing is empty, it
+// cannot be read, or the named entry carries no task. See routing.CapabilitySourceAudioCppModels.
 //
 // The verdict is the capability axis and is decided from the task alone. Whether
 // the model is loaded RIGHT NOW is the health axis: an asr model the server

@@ -3901,8 +3901,8 @@ func TestSpeechNoIsAReservedManualVerdict(t *testing.T) {
 		t.Error("(speech, no) must be reserved")
 	}
 	// yes stays writable: it is the operator's override of the probe, and the
-	// enablement path where no probe verdict exists (an audio.cpp model that is
-	// not loaded, so the listing does not name it).
+	// enablement path where no probe verdict exists (an audio.cpp model the
+	// listing does not name).
 	if reservedManualVerdict(routing.CapabilitySpeech, routing.CapabilityYes) {
 		t.Error("(speech, yes) must stay writable: it is the operator's override of the audiocpp_models probe and the enablement path for a model that is not loaded")
 	}

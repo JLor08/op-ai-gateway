@@ -872,7 +872,7 @@ document and one deferred producer
   its feature flag, as `capability_source_sdcpp` is for images.
 - **`manual`**, the operator's `speech: yes` on the mapping, the enablement path for
   every case the probe does not reach (an agent-launched `audio_cpp` child, a model
-  that is not loaded). `(speech, no)` is reserved in `reservedManualVerdicts` for the
+  the listing does not name). `(speech, no)` is reserved in `reservedManualVerdicts` for the
   reason `(image, no)` is: an absent row already refuses a speech request, so
   "cannot synthesise speech" costs an operator nothing to leave unsaid, while a
   manual `no` is rank 3, would outrank the probe entitled to establish it forever, and
