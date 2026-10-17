@@ -710,6 +710,16 @@ const de = {
   mappingImageEdit: 'Bildbearbeitung',
   mappingImageEditUnknownHint:
     'Unbekannt = aus der Bilderzeugung abgeleitet: Ein Modell, das Bilder erzeugt, nimmt auch Bildbearbeitungen an (/v1/images/edits). Setze „Nein“ für eine Zuordnung, die keine Bildbearbeitung bedienen soll, zum Beispiel einen Upstream ohne /v1/images/edits. Die Bilderzeugung bleibt davon unberührt. Ein „Ja“ gibt es nicht, weil das Gateway es bereits ableitet.',
+  // Sprachsynthese und Transkription sind erkannte Merkmale wie die
+  // Bilderzeugung: Ein „Nein“ steht nur dem Probe-Schreiber zu und wird hier
+  // nie angeboten. Bei einem vom Server-Agent gestarteten Audio-Modell gibt es
+  // noch keine automatische Quelle, dort ist „Ja“ der Weg des Betreibers.
+  mappingSpeechCapable: 'Sprachsynthese',
+  mappingSpeechCapableUnknownHint:
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Sprache synthetisiert. Bei einem statischen audio.cpp-Server, den das Gateway direkt erreicht, wird das automatisch aus dem Feld „task“ in dessen /v1/models erkannt (mit dem nächsten Health-Check). Für ein Modell, das der Server-Agent startet, gibt es dafür noch keine automatische Quelle: Setze es dort auf Ja, um die Sprachsynthese freizugeben.',
+  mappingTranscriptionCapable: 'Transkription',
+  mappingTranscriptionCapableUnknownHint:
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Audio transkribiert. Bei einem statischen audio.cpp-Server, den das Gateway direkt erreicht, wird das automatisch aus dem Feld „task“ in dessen /v1/models erkannt („asr“ steht für Transkription, mit dem nächsten Health-Check). Für ein Modell, das der Server-Agent startet, gibt es dafür noch keine automatische Quelle: Setze es dort auf Ja, um die Transkription freizugeben.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -3762,6 +3772,16 @@ const en: PortalMessages = {
   mappingImageEdit: 'Image editing',
   mappingImageEditUnknownHint:
     'Unknown = derived from image generation: a model that generates images also accepts image edits (/v1/images/edits). Set it to No for a mapping that should not serve image edits, for example an upstream without /v1/images/edits. Image generation is unaffected. There is no Yes, because the gateway already derives it.',
+  // Speech synthesis and transcription are detected traits like image
+  // generation: a No belongs to the probe writer alone and is never offered
+  // here. A model the server agent launches has no automatic source yet, so Yes
+  // is the operator's path for it.
+  mappingSpeechCapable: 'Speech synthesis',
+  mappingSpeechCapableUnknownHint:
+    'Unknown: whether this mapping synthesises speech is not on file. For a static audio.cpp server the gateway reaches directly, it is detected automatically from the "task" field of that server\'s /v1/models (on the next health check). For a model the server agent launches there is no automatic source yet: set it to Yes there to enable speech synthesis.',
+  mappingTranscriptionCapable: 'Transcription',
+  mappingTranscriptionCapableUnknownHint:
+    'Unknown: whether this mapping transcribes audio is not on file. For a static audio.cpp server the gateway reaches directly, it is detected automatically from the "task" field of that server\'s /v1/models ("asr" means transcription; on the next health check). For a model the server agent launches there is no automatic source yet: set it to Yes there to enable transcription.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
