@@ -38,8 +38,7 @@ const (
 
 	// codeBenchmarkAudioOnly is codeBenchmarkImagesOnly for a mapping that
 	// serves only audio, speech or transcription (mappingSpecIsAudioOnly): the
-	// same refusals, for the same reason. (The message below still says "speech",
-	// the first audio endpoint; the code, and the mapping test, cover both.)
+	// same refusals, for the same reason.
 	codeBenchmarkAudioOnly = "benchmark.audio_only"
 	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"
 
