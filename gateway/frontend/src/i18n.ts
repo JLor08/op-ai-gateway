@@ -238,6 +238,28 @@ const de = {
   // dropped from the request without a word, with the Advanced section collapsed).
   chatAudioPassthroughInvalid:
     'Die erweiterten Felder müssen ein JSON-Objekt sein, zum Beispiel {"seed": 1}. Korrigieren Sie sie oder leeren Sie das Feld, bevor Sie senden.',
+  // The composer of a speech (text-to-speech) thread: the prompt field's label and
+  // the hint under it, and the attach button's tooltip (a speech run sends only the
+  // text, so an image can never be attached -- whatever the model could read).
+  chatSpeechPromptLabel: 'Text zum Sprechen',
+  chatSpeechOnlyHint:
+    'Dieses Modell spricht Text. Dieser Thread nimmt nur Text zum Sprechen an; die Antwort ist eine Audiodatei.',
+  chatSpeechNoImageInput:
+    'Dieses Modell spricht Text; eine Sprachsynthese nimmt keine Bilder als Eingabe entgegen.',
+  // The speech-thread settings panel, shown in place of the text-chat controls. The
+  // voice is free text (audio.cpp does not list its voices) with the model's own
+  // default as placeholder, never written; a blank speed leaves the model's rate. The
+  // output is always WAV, so there is no format control, only the static hint.
+  chatSpeechVoice: 'Stimme',
+  chatSpeechVoiceDefault: 'Standard (Modell)',
+  chatSpeechSpeed: 'Geschwindigkeit',
+  chatSpeechFormatHint: 'Das Audio wird immer als WAV zurückgegeben.',
+  // The collapsible "Advanced" section: extra request fields as a JSON object (the
+  // OpenAI `instructions` field or a model-native option).
+  chatSpeechAdvanced: 'Erweitert',
+  chatSpeechPassthrough: 'Zusätzliche Anfragefelder (JSON)',
+  chatSpeechPassthroughHint:
+    'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format legt der Chat selbst fest. Leer lassen, um nichts Zusätzliches zu senden.',
   // The mask of an edit (inpainting): an optional PNG, the size of the source
   // image, whose transparent area marks the region to change. Its slot is next to
   // the attach button of an edit and needs the source image first.
@@ -3282,6 +3304,19 @@ const en: PortalMessages = {
   chatImageEditSourceType: 'An image edit takes a PNG or JPEG image.',
   chatAudioPassthroughInvalid:
     'The advanced fields must be a JSON object, for example {"seed": 1}. Fix them or clear the field before sending.',
+  chatSpeechPromptLabel: 'Text to speak',
+  chatSpeechOnlyHint:
+    'This model speaks text. This thread accepts text to speak only; the reply is an audio file.',
+  chatSpeechNoImageInput:
+    'This model speaks text; speech synthesis does not accept images as input.',
+  chatSpeechVoice: 'Voice',
+  chatSpeechVoiceDefault: 'Default (model)',
+  chatSpeechSpeed: 'Speed',
+  chatSpeechFormatHint: 'The audio is always returned as WAV.',
+  chatSpeechAdvanced: 'Advanced',
+  chatSpeechPassthrough: 'Extra request fields (JSON)',
+  chatSpeechPassthroughHint:
+    'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are set by the chat. Leave blank to send nothing extra.',
   chatAttachMask: 'Attach a mask',
   chatAttachMaskTooltip:
     'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',

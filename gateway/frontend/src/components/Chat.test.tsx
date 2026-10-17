@@ -2,6 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { heicTo } from 'heic-to';
 
@@ -1060,6 +1061,336 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await pickOption(t.chatModel, models[0].display_name);
 
       expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
+    });
+  });
+
+  // A text-to-speech model is picked like an image generator: the chat offers it and an
+  // empty thread's composer follows it (the store's prospective kind). The input stays
+  // text; the settings panel swaps the text-chat controls for the speech ones (a
+  // free-text voice, a speed, and a collapsed Advanced JSON passthrough). The output
+  // is WAV only, so no format control exists.
+  describe(`Chat: the composer of a speech thread [${locale}]`, () => {
+    const speechModels: ModelOption[] = [
+      {
+        id: 'kokoro',
+        display_name: 'kokoro',
+        flavors: ['openai_audio'],
+        loading_on_count: 0,
+        speech: true,
+      },
+    ];
+
+    async function renderSpeechThread(models: ModelOption[] = speechModels) {
+      renderChat(tokens, models);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'kokoro');
+    }
+
+    // Opens the settings panel and the Advanced section; returns the passthrough field.
+    function openPassthrough() {
+      openSettings();
+      fireEvent.click(screen.getByRole('button', { name: t.chatSpeechAdvanced }));
+      return screen.getByLabelText(t.chatSpeechPassthrough);
+    }
+
+    async function sendSpeech(text = 'hello there') {
+      fireEvent.change(screen.getByLabelText(t.chatSpeechPromptLabel), { target: { value: text } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+    }
+
+    function startedSettings() {
+      return (chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody).settings;
+    }
+
+    it('labels the prompt field as the text to speak, still a text input', async () => {
+      await renderSpeechThread();
+
+      const prompt = screen.getByLabelText(t.chatSpeechPromptLabel);
+      expect(prompt.tagName).toBe('TEXTAREA');
+      expect(screen.getByText(t.chatSpeechOnlyHint)).toBeInTheDocument();
+      // The text and image labels are gone, not merely shadowed.
+      expect(screen.queryByLabelText(t.messageLabel)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatImagePromptLabel)).not.toBeInTheDocument();
+    });
+
+    it('shows the speech controls and hides the text and image controls', async () => {
+      await renderSpeechThread();
+      openSettings();
+
+      expect(screen.getByRole('textbox', { name: t.chatSpeechVoice })).toBeInTheDocument();
+      expect(screen.getByRole('spinbutton', { name: t.chatSpeechSpeed })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.chatSpeechAdvanced })).toBeInTheDocument();
+      // A system prompt, temperature and a token cap mean nothing to /v1/audio/speech...
+      expect(screen.queryByLabelText(t.chatSystemPrompt)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatMaxTokens)).not.toBeInTheDocument();
+      // ...and neither do the image knobs.
+      expect(screen.queryByRole('combobox', { name: t.chatImageSize })).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatImageCount)).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.chatImageAdvanced })).not.toBeInTheDocument();
+    });
+
+    // The speech controls belong to a speech THREAD only.
+    function expectNoSpeechControls() {
+      expect(screen.queryByLabelText(t.chatSpeechVoice)).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatSpeechSpeed)).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.chatSpeechAdvanced })).not.toBeInTheDocument();
+      expect(screen.queryByLabelText(t.chatSpeechPromptLabel)).not.toBeInTheDocument();
+    }
+
+    it('hides the speech controls on a text thread', async () => {
+      renderChat();
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+      openSettings();
+
+      expect(screen.getByLabelText(t.chatSystemPrompt)).toBeInTheDocument();
+      expectNoSpeechControls();
+    });
+
+    it('hides the speech controls on an image thread', async () => {
+      renderChat(tokens, [
+        {
+          id: 'sd-turbo',
+          display_name: 'sd-turbo',
+          flavors: ['openai'],
+          loading_on_count: 0,
+          image: true,
+        },
+      ]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'sd-turbo');
+      openSettings();
+
+      expect(screen.getByRole('combobox', { name: t.chatImageSize })).toBeInTheDocument();
+      expectNoSpeechControls();
+    });
+
+    it('offers the voice as free text and the speed as a number, both blank by default', async () => {
+      await renderSpeechThread();
+      openSettings();
+
+      // Not a dropdown: audio.cpp's voices are not discoverable, so any name may be typed.
+      const voice = screen.getByRole('textbox', { name: t.chatSpeechVoice });
+      expect(voice).toHaveValue('');
+      // The placeholder says "model default" -- it is a hint, never written.
+      expect(voice).toHaveAttribute('placeholder', t.chatSpeechVoiceDefault);
+      expect(screen.queryByRole('combobox', { name: t.chatSpeechVoice })).not.toBeInTheDocument();
+
+      const speed = screen.getByRole('spinbutton', { name: t.chatSpeechSpeed });
+      expect(speed).toHaveValue(null); // a blank number field: the model keeps its own rate
+      expect(speed).toHaveAttribute('placeholder', '1.0');
+    });
+
+    it('does not offer a response format: the answer is always WAV', async () => {
+      await renderSpeechThread();
+      openSettings();
+      fireEvent.click(screen.getByRole('button', { name: t.chatSpeechAdvanced }));
+
+      // No control of any kind for it, and the panel says why.
+      expect(screen.queryByLabelText(/format/i)).not.toBeInTheDocument();
+      expect(screen.queryByRole('combobox', { name: /format/i })).not.toBeInTheDocument();
+      expect(screen.getByText(t.chatSpeechFormatHint)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText(t.chatSpeechPromptLabel), { target: { value: 'x' } });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(startedSettings().audio).not.toHaveProperty('response_format');
+    });
+
+    it('keeps the advanced passthrough collapsed until asked for', async () => {
+      await renderSpeechThread();
+      openSettings();
+
+      const toggle = screen.getByRole('button', { name: t.chatSpeechAdvanced });
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      expect(screen.queryByLabelText(t.chatSpeechPassthrough)).not.toBeInTheDocument();
+
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      const field = screen.getByLabelText(t.chatSpeechPassthrough);
+      expect(field.tagName).toBe('TEXTAREA');
+      expect(field).toHaveValue('');
+      expect(field).toHaveAccessibleDescription(t.chatSpeechPassthroughHint);
+
+      fireEvent.click(toggle);
+      expect(screen.queryByLabelText(t.chatSpeechPassthrough)).not.toBeInTheDocument();
+    });
+
+    it('sends the voice, the speed and the parsed passthrough in the started run', async () => {
+      await renderSpeechThread();
+      openSettings();
+      fireEvent.change(screen.getByRole('textbox', { name: t.chatSpeechVoice }), {
+        target: { value: 'bf_emma' },
+      });
+      fireEvent.change(screen.getByRole('spinbutton', { name: t.chatSpeechSpeed }), {
+        target: { value: '0.8' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.chatSpeechAdvanced }));
+      fireEvent.change(screen.getByLabelText(t.chatSpeechPassthrough), {
+        target: { value: '{"instructions": "Speak slowly.", "seed": 1}' },
+      });
+      await sendSpeech();
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      const settings = startedSettings();
+      expect(settings.kind).toBe('speech');
+      // The numeric field is parsed to a wire number; the passthrough keeps each value's
+      // JSON type.
+      expect(settings.audio).toEqual({
+        voice: 'bf_emma',
+        speed: 0.8,
+        passthrough: { instructions: 'Speak slowly.', seed: 1 },
+      });
+      expect(settings).not.toHaveProperty('image');
+    });
+
+    it('sends no audio knob that was left blank', async () => {
+      await renderSpeechThread();
+      await sendSpeech();
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(startedSettings().audio).toEqual({});
+    });
+
+    it('seeds the fields from a saved speech thread', async () => {
+      chatApi.rows.push({
+        id: 'c_speech_seed',
+        title: '',
+        created_at: '2026-07-22T12:00:00Z',
+        updated_at: '2026-07-22T12:00:00Z',
+        content: {
+          settings: {
+            model: 'kokoro',
+            kind: 'speech',
+            audio: { voice: 'bf_emma', speed: 0.8, passthrough: { seed: 1 } },
+          },
+          messages: [],
+        },
+      });
+      renderChat(tokens, speechModels);
+      await waitForChatReady();
+      openSettings();
+
+      expect(screen.getByRole('textbox', { name: t.chatSpeechVoice })).toHaveValue('bf_emma');
+      expect(screen.getByRole('spinbutton', { name: t.chatSpeechSpeed })).toHaveValue(0.8);
+      fireEvent.click(screen.getByRole('button', { name: t.chatSpeechAdvanced }));
+      expect(screen.getByLabelText(t.chatSpeechPassthrough)).toHaveValue(
+        JSON.stringify({ seed: 1 }, null, 2),
+      );
+    });
+
+    describe('an advanced passthrough that is not a JSON object', () => {
+      it('is flagged on the field itself, and clears once fixed', async () => {
+        await renderSpeechThread();
+        const field = openPassthrough();
+
+        fireEvent.change(field, { target: { value: '[1, 2]' } }); // valid JSON, but not an object
+        expect(field).toBeInvalid();
+        expect(field).toHaveAccessibleDescription(t.chatAudioPassthroughInvalid);
+
+        fireEvent.change(field, { target: { value: '{"seed": 1}' } });
+        expect(field).toBeValid();
+        expect(field).toHaveAccessibleDescription(t.chatSpeechPassthroughHint);
+      });
+
+      it('does not flag a blank field or an empty object', async () => {
+        await renderSpeechThread();
+        const field = openPassthrough();
+
+        expect(field).toBeValid();
+        fireEvent.change(field, { target: { value: '{}' } });
+        expect(field).toBeValid();
+      });
+
+      it('keeps the Advanced section open however it is toggled, so the refusal names a visible field', async () => {
+        await renderSpeechThread();
+        const field = openPassthrough();
+        fireEvent.change(field, { target: { value: '{"seed": ' } }); // malformed
+
+        // A collapse is refused while the text is invalid...
+        fireEvent.click(screen.getByRole('button', { name: t.chatSpeechAdvanced }));
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toBeInTheDocument();
+
+        // ...and the click left nothing behind: fixing the text (its last keystroke makes
+        // it valid) does not collapse the field out from under the user.
+        fireEvent.change(screen.getByLabelText(t.chatSpeechPassthrough), {
+          target: { value: '{"seed": 1}' },
+        });
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toBeInTheDocument();
+
+        // From then on the toggle collapses it as usual.
+        fireEvent.click(screen.getByRole('button', { name: t.chatSpeechAdvanced }));
+        expect(screen.queryByLabelText(t.chatSpeechPassthrough)).not.toBeInTheDocument();
+      });
+
+      it('keeps the settings panel open too: the send refusal leaves the field in view', async () => {
+        await renderSpeechThread();
+        const field = openPassthrough();
+        fireEvent.change(field, { target: { value: '{oops' } });
+
+        // The user closes the whole panel, then sends.
+        openSettings();
+        await sendSpeech();
+
+        // Refused, said so in the toast...
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioPassthroughInvalid);
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        // ...and the field that must be fixed is on screen, not hidden behind either toggle.
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toHaveValue('{oops');
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toBeInvalid();
+      });
+
+      // The store lives above the view switch, so the text outlives the Chat view while
+      // the view's own open/closed state does not: coming back to the chat finds the
+      // text still invalid with every section collapsed.
+      it('is shown again when the chat view is left and re-entered with the text still invalid', async () => {
+        function Harness() {
+          const [shown, setShown] = useState(true);
+          return (
+            <>
+              <button onClick={() => setShown((s) => !s)}>toggle-chat-view</button>
+              {shown && <Chat t={t} />}
+            </>
+          );
+        }
+        render(
+          <ToastProvider>
+            <ChatStoreProvider
+              api={chatApi.api}
+              models={speechModels}
+              tokens={tokens}
+              servers={[]}
+              onRefresh={vi.fn(async () => {})}
+              t={t}
+            >
+              <Harness />
+            </ChatStoreProvider>
+          </ToastProvider>,
+        );
+        await waitForChatReady();
+        await pickOption(t.chatModel, 'kokoro');
+        fireEvent.change(openPassthrough(), { target: { value: '{oops' } });
+
+        fireEvent.click(screen.getByRole('button', { name: 'toggle-chat-view' }));
+        expect(screen.queryByLabelText(t.chatSpeechPassthrough)).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', { name: 'toggle-chat-view' }));
+
+        // A fresh view (settings closed, Advanced collapsed) still shows the bad field.
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toHaveValue('{oops');
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toBeInvalid();
+      });
+    });
+
+    // The thread's kind decides the attach control: a speech run sends only the text,
+    // so an image could never be used -- not even for a vision-capable model, whose
+    // button would otherwise read as merely "attach an image" while being disabled.
+    it('disables the attach button and says why, even for a vision-capable model', async () => {
+      await renderSpeechThread([{ ...speechModels[0], vision: true }]);
+
+      const attach = screen.getByRole('button', { name: t.chatAttachImage });
+      expect(attach).toHaveAttribute('aria-disabled', 'true');
+      fireEvent.mouseOver(attach);
+      expect(await screen.findByRole('tooltip')).toHaveTextContent(t.chatSpeechNoImageInput);
     });
   });
 
