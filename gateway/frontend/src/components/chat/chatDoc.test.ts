@@ -10,6 +10,7 @@ import {
   IMAGE_SCHEDULERS,
   MASK_PURPOSE,
   attachModeOf,
+  audioPassthroughMessage,
   audioSetting,
   audioSettingsFrom,
   imageSetting,
@@ -489,6 +490,57 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
     expect(parseAudioPassthrough('"text"')).toEqual({ status: 'invalid' });
   });
 
+  // The client mirror of the backend's speechReservedFields: the run owns these fields,
+  // and the backend would end the run gateway.chat_run_speech_reserved_field only after
+  // the turn is committed. Matched ignoring case, like the backend.
+  it('rejects a passthrough naming a reserved field, in any letter case, and names it', () => {
+    for (const key of ['model', 'input', 'stream', 'response_format']) {
+      expect(parseAudioPassthrough(JSON.stringify({ [key]: 'x' }))).toEqual({
+        status: 'invalid',
+        reservedField: key,
+      });
+      const shouted = key.toUpperCase();
+      expect(parseAudioPassthrough(JSON.stringify({ [shouted]: 1 }))).toEqual({
+        status: 'invalid',
+        reservedField: shouted, // as the user wrote it
+      });
+    }
+    expect(parseAudioPassthrough('{"Model": "x"}')).toEqual({
+      status: 'invalid',
+      reservedField: 'Model',
+    });
+    // A reserved key among others still poisons the whole object (nothing is dropped
+    // in silence), and the first in sorted order is the one named, like the backend.
+    expect(parseAudioPassthrough('{"seed": 1, "stream": true, "input": "x"}')).toEqual({
+      status: 'invalid',
+      reservedField: 'input',
+    });
+  });
+
+  it('does not reserve its look-alikes: stream_format, voice, speed, a prefix or a nested key', () => {
+    for (const text of [
+      '{"stream_format": "sse"}',
+      '{"voice": "af"}',
+      '{"speed": 1.2}',
+      '{"models": 1, "inputs": 2, "response": 3, "format": 4}',
+      '{"nested": {"model": "x", "stream": true}}',
+    ]) {
+      expect(parseAudioPassthrough(text).status, text).toBe('ok');
+    }
+  });
+
+  it('picks the message for an invalid passthrough: the reserved one names the field', () => {
+    const t = {
+      chatAudioPassthroughInvalid: 'not an object',
+      chatSpeechPassthroughReserved: (field: string) => `reserved ${field}`,
+    };
+    expect(audioPassthroughMessage(parseAudioPassthrough('[1]'), t)).toBe('not an object');
+    expect(audioPassthroughMessage(parseAudioPassthrough('{"seed":'), t)).toBe('not an object');
+    expect(audioPassthroughMessage(parseAudioPassthrough('{"model": 1}'), t)).toBe(
+      'reserved model',
+    );
+  });
+
   it('refuses a run only for a speech thread whose passthrough is not a JSON object', () => {
     const bad = { ...DEFAULT_AUDIO_SETTINGS, passthrough: '{"seed":' };
     expect(speechPassthroughInvalid('speech', bad)).toBe(true);
@@ -497,6 +549,13 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
     expect(speechPassthroughInvalid('speech', DEFAULT_AUDIO_SETTINGS)).toBe(false);
     expect(speechPassthroughInvalid('speech', { ...bad, passthrough: '{}' })).toBe(false);
     expect(speechPassthroughInvalid('speech', { ...bad, passthrough: '{"seed": 1}' })).toBe(false);
+    // ...and so is one naming a field the run owns (the backend would fail it post-commit).
+    expect(speechPassthroughInvalid('speech', { ...bad, passthrough: '{"model": "x"}' })).toBe(
+      true,
+    );
+    expect(speechPassthroughInvalid('image', { ...bad, passthrough: '{"model": "x"}' })).toBe(
+      false,
+    );
     // Other kinds have no passthrough, so stale text in the state never blocks them.
     expect(speechPassthroughInvalid('', bad)).toBe(false);
     expect(speechPassthroughInvalid(undefined, bad)).toBe(false);

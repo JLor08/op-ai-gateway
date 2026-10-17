@@ -242,6 +242,18 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       >
         break-audio-passthrough
       </button>
+      {/* ...or valid JSON naming a field the run owns (case-insensitively). */}
+      <button
+        type="button"
+        onClick={() =>
+          c.setAudioSettings((s) => ({
+            ...s,
+            passthrough: '{"seed": 1, "Response_Format": "mp3"}',
+          }))
+        }
+      >
+        reserve-audio-passthrough
+      </button>
       {/* Selects a caller-supplied model id (a test's "pick an available model"
           action) without needing a full SearchableSelect in this probe. */}
       <button type="button" onClick={() => c.setModel(altModelId)}>
@@ -3790,6 +3802,44 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
 
       expect(await screen.findByText(t.chatAudioPassthroughInvalid)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    // The backend ends such a run gateway.chat_run_speech_reserved_field AFTER the turn is
+    // committed; the store mirrors the list and refuses the send first, naming the field.
+    it('refuses to send a speech turn whose passthrough names a reserved field, and says which', async () => {
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      fireEvent.click(screen.getByRole('button', { name: 'reserve-audio-passthrough' }));
+      sendText('hello');
+
+      expect(
+        await screen.findByText(t.chatSpeechPassthroughReserved('Response_Format')),
+      ).toBeTruthy();
+      expect(screen.queryByText(t.chatAudioPassthroughInvalid)).toBeNull();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // Nothing was stored or cleared.
+      expect((screen.getByLabelText('probe-input') as HTMLInputElement).value).toBe('hello');
+      expect(screen.getByTestId('count').textContent).toBe('0');
+
+      // Fixing the text lets the same send through.
+      fireEvent.click(screen.getByRole('button', { name: 'set-audio' }));
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+    });
+
+    it('refuses a regenerate whose passthrough names a reserved field, transcript untouched', async () => {
+      chatApi = makeChatApi(speechThread());
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'reserve-audio-passthrough' }));
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      expect(
+        await screen.findByText(t.chatSpeechPassthroughReserved('Response_Format')),
+      ).toBeTruthy();
       expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
       expect(screen.getByTestId('count').textContent).toBe('2');
     });

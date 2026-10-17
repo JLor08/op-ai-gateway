@@ -1049,7 +1049,7 @@ is the gateway path `/api/portal/chat-blobs/{id}`
   decrypted and private, so they are not parked in a browser's disk cache. The body is
   written whole with a `Content-Length` and the handler answers **no `Range` request**
   (it does not go through `http.ServeContent`), which an `<img>` does not need and an
-  audio player on Safari and iOS does; the portal's `AudioTurn` therefore fetches the
+  audio player on Safari and iOS likely does; the portal's `AudioTurn` therefore fetches the
   blob once and plays an object URL it revokes on unmount, rather than pointing
   `<audio>` at this URL.
 - **The client's fetch guard is a literal prefix (a hardening note).** The audio

@@ -500,8 +500,9 @@ export type AudioSettings = {
   // extra top-level request fields merged verbatim into /v1/audio/speech -- the OpenAI
   // `instructions` field and any audio.cpp-native knob -- each value keeping the JSON
   // type the user wrote, which is why this is JSON and not key=value lines. "" = none.
-  // audioSetting() sends it parsed, or omits it when it is not a non-empty object;
-  // parseAudioPassthrough() says which, so the composer and send() can name a bad one.
+  // audioSetting() sends it parsed, or omits it when it is not a non-empty object free
+  // of reserved fields; parseAudioPassthrough() says which, so the composer and send()
+  // can name a bad one.
   passthrough: string;
 };
 
@@ -511,11 +512,30 @@ export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   passthrough: '',
 };
 
+// The request fields a thread's passthrough may not set: the run's own (`model` is
+// the thread's pinned model, `input` the user's text) and the two the speech
+// endpoint's one-complete-WAV contract depends on (`stream`, `response_format`).
+// This mirrors speechReservedFields in the backend's chat_runs_audio.go -- keep the
+// two in step. The backend still refuses such a key (gateway.chat_run_speech_reserved_field,
+// matched ignoring case), but only AFTER the turn is committed; this copy lets the
+// composer refuse it inline, before a turn is sent. Keys compare lower-cased, as the
+// backend's strings.EqualFold does for the ASCII names here.
+export const SPEECH_RESERVED_FIELDS: readonly string[] = [
+  'model',
+  'input',
+  'stream',
+  'response_format',
+];
+
 // What the passthrough text is: nothing to send ('empty': blank or `{}`), a JSON
-// object to send ('ok') or something that is not one ('invalid': malformed JSON, or
-// valid JSON that is not an object -- an array, a string, a number, null).
+// object to send ('ok') or something that cannot be sent ('invalid'): malformed JSON,
+// valid JSON that is not an object (an array, a string, a number, null), or an object
+// naming a field the run owns (SPEECH_RESERVED_FIELDS), in which case `reservedField`
+// is the first such key as the user wrote it, so the UI can name it.
 export type AudioPassthroughParse =
-  { status: 'empty' } | { status: 'ok'; value: Record<string, unknown> } | { status: 'invalid' };
+  | { status: 'empty' }
+  | { status: 'ok'; value: Record<string, unknown> }
+  | { status: 'invalid'; reservedField?: string };
 
 export function parseAudioPassthrough(raw: string): AudioPassthroughParse {
   const text = raw.trim();
@@ -527,17 +547,41 @@ export function parseAudioPassthrough(raw: string): AudioPassthroughParse {
     return { status: 'invalid' };
   }
   if (!isJsonObject(parsed)) return { status: 'invalid' };
-  return Object.keys(parsed).length === 0 ? { status: 'empty' } : { status: 'ok', value: parsed };
+  const keys = Object.keys(parsed);
+  // Sorted, like the backend's, so the field named is deterministic.
+  const reservedField = keys.sort().find(isSpeechReservedField);
+  if (reservedField !== undefined) return { status: 'invalid', reservedField };
+  return keys.length === 0 ? { status: 'empty' } : { status: 'ok', value: parsed };
+}
+
+function isSpeechReservedField(key: string): boolean {
+  return SPEECH_RESERVED_FIELDS.includes(key.toLowerCase());
 }
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+// The message for a passthrough text that parseAudioPassthrough called invalid: the
+// reserved-field one names the offending field, any other says it must be a JSON
+// object. Takes only the two keys it reads so chatDoc stays free of the i18n module.
+export function audioPassthroughMessage(
+  parse: AudioPassthroughParse,
+  t: {
+    chatAudioPassthroughInvalid: string;
+    chatSpeechPassthroughReserved: (field: string) => string;
+  },
+): string {
+  return parse.status === 'invalid' && parse.reservedField !== undefined
+    ? t.chatSpeechPassthroughReserved(parse.reservedField)
+    : t.chatAudioPassthroughInvalid;
+}
+
 // Whether a run of this thread must be refused for its advanced passthrough: a speech
-// thread whose passthrough text is not a JSON object. audioSetting would omit it, and
+// thread whose passthrough text is not a JSON object (audioSetting would omit it, and
 // the user's extra fields would vanish from the request in silence -- the Advanced
-// section may be collapsed when they send -- so the store refuses the send (and a
+// section may be collapsed when they send) or names a reserved field (the run would
+// commit the turn and then fail it server-side). The store refuses the send (and a
 // replay) and says so instead. Only a speech thread has a passthrough.
 export function speechPassthroughInvalid(kind: string | undefined, s: AudioSettings): boolean {
   return kind === 'speech' && parseAudioPassthrough(s.passthrough).status === 'invalid';
@@ -548,7 +592,7 @@ export function speechPassthroughInvalid(kind: string | undefined, s: AudioSetti
 // set -- so a text or image thread stays byte-identical and an untouched knob leaves
 // the model on its own default. (The key is present for a speech thread even when
 // nothing is set, as image's is for an image thread: `audio: {}`.) A passthrough that
-// is not a non-empty JSON object is omitted here; the store refuses the turn before it
+// is not a sendable non-empty JSON object is omitted here; the store refuses the turn before it
 // gets that far (speechPassthroughInvalid), so it is never dropped in silence. Both the
 // document writer (buildDoc) and the state seeder (normalizeDoc) go through this, so
 // neither can give the key to another kind of thread from the client side.

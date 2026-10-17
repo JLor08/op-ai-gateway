@@ -33,6 +33,7 @@ import {
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
   IMAGE_SIZE_OPTIONS,
+  audioPassthroughMessage,
   optionsOr,
   parseAudioPassthrough,
   useChatStore,
@@ -226,7 +227,8 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   const isTextThread = !isImageThread && !isSpeechThread;
 
   // The advanced passthrough is the one speech setting the store REFUSES a send (and a
-  // regenerate) for when it is not a JSON object (chatAudioPassthroughInvalid), and the
+  // regenerate) for when it is not a JSON object or names a field the run owns
+  // (chatAudioPassthroughInvalid, chatSpeechPassthroughReserved), and the
   // field is inside two things the user can close: the settings panel and the Advanced
   // section. A refusal that names a field the user cannot see is useless, so while the
   // text is invalid (the same parse the store refuses on) both stay open: the toast and
@@ -234,8 +236,8 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // hide it, but a remount can -- the store (and so the text) outlives this view, whose
   // own open/closed state starts collapsed again -- hence the derivation here rather
   // than only the toggles' guard below. Once the text is fixed or blank, neither is held open.
-  const passthroughInvalid =
-    isSpeechThread && parseAudioPassthrough(c.audioSettings.passthrough).status === 'invalid';
+  const passthroughParse = parseAudioPassthrough(c.audioSettings.passthrough);
+  const passthroughInvalid = isSpeechThread && passthroughParse.status === 'invalid';
   const settingsOpen = showSettings || passthroughInvalid;
   const speechAdvancedOpen = showSpeechAdvanced || passthroughInvalid;
   // The toggles' updater: a click while the text is invalid keeps the thing OPEN
@@ -673,7 +675,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       slotProps={{
                         inputLabel: { shrink: true },
                         input: { notched: true },
-                        htmlInput: { step: 0.1 },
+                        htmlInput: { min: 0, step: 0.1 },
                       }}
                     />
                   </Box>
@@ -704,7 +706,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       error={passthroughInvalid}
                       helperText={
                         passthroughInvalid
-                          ? t.chatAudioPassthroughInvalid
+                          ? audioPassthroughMessage(passthroughParse, t)
                           : t.chatSpeechPassthroughHint
                       }
                       slotProps={{ htmlInput: { spellCheck: false } }}

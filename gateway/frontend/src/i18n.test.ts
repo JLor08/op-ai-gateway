@@ -3384,6 +3384,20 @@ describe('portal chat speech i18n keys', () => {
     'chatAudioLoadError',
   ] as const;
 
+  // The one function-valued speech key: it names the offending passthrough field.
+  it('names the reserved passthrough field in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].chatSpeechPassthroughReserved('Response_Format');
+      expect(text, locale).toContain('Response_Format');
+      for (const reserved of ['model', 'input', 'stream', 'response_format']) {
+        expect(text, `${locale} lists ${reserved}`).toContain(reserved);
+      }
+    }
+    expect(messages.de.chatSpeechPassthroughReserved('x')).not.toBe(
+      messages.en.chatSpeechPassthroughReserved('x'),
+    );
+  });
+
   it('defines every speech composer, settings and audio-answer key in de and en', () => {
     for (const k of keys) {
       expect(typeof messages.de[k], k).toBe('string');
@@ -3406,10 +3420,11 @@ describe('portal chat speech i18n keys', () => {
     }
   });
 
-  // The hint says what the BACKEND does with the passthrough (buildSpeechBody,
-  // chat_runs_audio.go), not what a reader might assume. A reserved key (model,
-  // input, stream, response_format -- speechReservedFields, matched ignoring case)
-  // fails the run and sends nothing; it is NOT silently "set by the chat". And the
+  // The hint says what happens to the passthrough (the composer's reserved-field check,
+  // mirroring buildSpeechBody in chat_runs_audio.go), not what a reader might assume. A
+  // reserved key (model, input, stream, response_format -- speechReservedFields, matched
+  // ignoring case) is refused before anything is sent; it is NOT silently "set by the
+  // chat". And the
   // voice and speed fields of the panel win over a same-named passthrough key. The
   // old sentence ("legt der Chat selbst fest" / "are set by the chat") implied the
   // reserved keys were harmlessly overridden, so it must not come back.
@@ -3423,13 +3438,12 @@ describe('portal chat speech i18n keys', () => {
         }
       });
 
-      it('says a reserved field fails the response instead of being overridden', () => {
+      it('says a reserved field stops the request instead of being overridden', () => {
         expect(t.chatSpeechPassthroughHint).not.toMatch(
           /legt der Chat selbst fest|set by the chat/i,
         );
-        expect(t.chatSpeechPassthroughHint).toMatch(locale === 'de' ? /schlägt .* fehl/ : /fails/);
         expect(t.chatSpeechPassthroughHint).toMatch(
-          locale === 'de' ? /nichts gesendet/ : /nothing is sent/,
+          locale === 'de' ? /nicht gesendet/ : /not sent/,
         );
       });
 

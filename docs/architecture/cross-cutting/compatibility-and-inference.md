@@ -2843,13 +2843,16 @@ emits the key, `{}` when empty):
   nothing**, since dropping the key and sending the rest would answer a request the user
   did not make. `stream_format` is not reserved (the endpoint already refuses it, §3.6),
   and a `voice` or `speed` passthrough key yields to the same field when the first-class
-  control is set. The composer refuses text that is not a JSON object on send and on
-  replay (with the Advanced section held open), because it would otherwise be omitted
-  from the request in silence; the reserved-key list is backend-only.
+  control is set. The composer refuses, on send and on replay, text that is not a JSON
+  object (it would otherwise be omitted from the request in silence) and an object that
+  names a reserved key (so a turn is not committed only to fail): the reserved list is
+  copied to the client (`SPEECH_RESERVED_FIELDS`, matched ignoring case), the Advanced
+  section is held open and the error names the offending field. The backend check stays
+  the authority for every other caller.
 
 Four terminal codes name the conditions a user has to tell apart from an ordinary
 failure, each with its image namesake's meaning restated for audio:
-`gateway.chat_run_speech_dispatch_failed` (the loopback request never went out; the Go
+`gateway.chat_run_speech_dispatch_failed` (the loopback request never completed; the Go
 error names the gateway's own address, so it goes to the log and the user gets the
 code); `gateway.chat_run_no_audio` (a 2xx with an empty body: an error, not an empty
 success, which would render as a blank bubble);
@@ -2874,7 +2877,7 @@ news is coming, with no progress figure, since the endpoint reports none. The fi
 is `AudioTurn`: an HTML5 `<audio controls>` and a download button. The blob endpoint
 answers **no `Range` request** ([Security
 §13.1](security-auth-rbac.md#131-chat-binary-payloads-a-sealed-store-ownership-on-read-a-hardened-serving-url)),
-which Safari and iOS require to play from a URL, so `AudioTurn` does not give the
+which Safari and iOS likely require to play from a URL, so `AudioTurn` does not give the
 element the stored `/api/portal/chat-blobs/` URL: it fetches it **once**, same-origin with the session cookie, and plays an object URL
 made from the bytes, and the effect's cleanup **revokes the object URL** when the turn
 unmounts or the URL changes (it pins the whole WAV in memory until then) and aborts a

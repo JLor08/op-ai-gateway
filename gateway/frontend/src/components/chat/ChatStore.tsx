@@ -40,6 +40,7 @@ import {
   DEFAULTS,
   MAX_IMAGES,
   attachModeOf,
+  audioPassthroughMessage,
   audioSetting,
   audioSettingsFrom,
   byNewest,
@@ -59,6 +60,7 @@ import {
   lsSet,
   nextId,
   normalizeDoc,
+  parseAudioPassthrough,
   readLegacyDoc,
   resolveTokenOverride,
   speechPassthroughInvalid,
@@ -81,7 +83,7 @@ export type { AttachMode, ChatUiMessage };
 // re-exported for Chat.tsx for the same reason as the image presets below: the
 // composer must not reach into chatDoc.ts (arch.test.ts), and it needs to name a
 // passthrough text that is not a JSON object before the user sends it.
-export { parseAudioPassthrough } from './chatDoc';
+export { audioPassthroughMessage, parseAudioPassthrough } from './chatDoc';
 export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
 
 // The image-settings presets (and the optionsOr helper that merges a per-model
@@ -1116,9 +1118,15 @@ export function ChatStoreProvider({
       }
       // Same guard as send()'s for a speech thread's advanced passthrough: a replay
       // sends the thread's CURRENT audio settings too, and one that is not a JSON
-      // object would be dropped from the request in silence.
+      // object would be dropped from the request in silence, and one that names a
+      // field the run owns would fail the replay after the turn is committed.
       if (speechPassthroughInvalid(chatKindRef.current, audioSettingsRef.current)) {
-        showErrorRef.current(tRef.current.chatAudioPassthroughInvalid);
+        showErrorRef.current(
+          audioPassthroughMessage(
+            parseAudioPassthrough(audioSettingsRef.current.passthrough),
+            tRef.current,
+          ),
+        );
         return;
       }
       // Same guard for image support: the REPLAYED history (what is actually
@@ -1356,12 +1364,19 @@ export function ChatStoreProvider({
         return;
       }
     }
-    // A speech thread's advanced passthrough must be a JSON object (or blank): any
-    // other text would be dropped from the run in silence (audioSetting omits it) while
-    // the Advanced section that holds it may be collapsed. Refused here with the
-    // composer left as it is, before anything is stored or cleared.
+    // A speech thread's advanced passthrough must be a JSON object (or blank) that
+    // names none of the fields the run owns: any other text would be dropped from the
+    // run in silence (audioSetting omits it) while the Advanced section that holds it
+    // may be collapsed, and a reserved field would fail the run only after the turn is
+    // committed. Refused here with the composer left as it is, before anything is
+    // stored or cleared.
     if (speechPassthroughInvalid(chatKindRef.current, audioSettingsRef.current)) {
-      showErrorRef.current(tRef.current.chatAudioPassthroughInvalid);
+      showErrorRef.current(
+        audioPassthroughMessage(
+          parseAudioPassthrough(audioSettingsRef.current.passthrough),
+          tRef.current,
+        ),
+      );
       return;
     }
     // This send pins the thread's kind server-side when the thread is still

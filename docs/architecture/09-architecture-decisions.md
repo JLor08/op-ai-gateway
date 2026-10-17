@@ -4238,7 +4238,7 @@ includes the bounds that replace it.
   type the endpoint returns is one of five strings.) The body is written whole with a
   `Content-Length`; the handler does not go through `http.ServeContent` and answers **no
   `Range` request**, which an `<img>` does not need and an audio player on Safari or
-  iOS does, so the portal's player plays an object URL it fetched instead of this URL
+  iOS likely does, so the portal's player plays an object URL it fetched instead of this URL
   (ADR-063 (d)). The response carries `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`
   and `Cache-Control: private, no-store` — the id is immutable, but the bytes are
@@ -5229,8 +5229,9 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   handling changed.
 - **(j) The admission surface is the images one, and `GET /v1/audio/voices` is
   deliberately not proxied.** Auth is a bearer token **or** the internal loopback pair,
-  never the session cookie (a third user of that leg after generations and edits), with
-  the same run-as block copied in. The voices listing is an audio.cpp and llama-swap
+  never the session cookie (a third user of that leg after generations and edits; the
+  portal chat's speech run is now a caller of it, amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)),
+  with the same run-as block copied in. The voices listing is an audio.cpp and llama-swap
   convention, not an OpenAI endpoint, so clients learn voice names out of band.
 
 **Consequence:** speech has the images day-one cost, in a milder form. A deployment with
@@ -5504,7 +5505,8 @@ chosen:
 - **(j) The admission surface is the image and speech one.** Auth is
   `requireInternalOrBearerAnyScope`: a bearer token **or** the internal loopback pair,
   never the session cookie (a fourth user of that leg, though no portal flow calls this
-  endpoint), with the shared run-as block. The request takes **no affinity pin**, by the
+  endpoint: the portal chat's speech run calls `/v1/audio/speech` over the same leg,
+  [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs), and transcription stays API-only, (k)), with the shared run-as block. The request takes **no affinity pin**, by the
   guard ADR-042 wrote for exactly this, and has an empty `sessionEndpoint` case (OpenAI's
   transcription request has no session field, and its body is multipart). The handler lifts
   the connection deadlines, since an upload can take longer than 30 seconds to arrive.
@@ -5600,8 +5602,8 @@ could have chosen:
 - The blob-serving endpoint answers **no `Range` request**: it writes the decrypted
   body with a `Content-Length` and does not go through `http.ServeContent`
   ([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
-  (e), a handler locked down on purpose). Safari and iOS will not play audio from a
-  URL that cannot be range-read.
+  (e), a handler locked down on purpose). Safari and iOS will likely not play audio from
+  a URL that cannot be range-read (WebKit's known behaviour, not measured here).
 - The `speech` verdict is the verdict of audio.cpp's `tts` **and** `clone` tasks
   (ADR-061 (d)), and a clone model needs a reference voice a text-only chat cannot
   supply.
@@ -5700,8 +5702,8 @@ could have chosen:
   as `gateway.chat_run_commit_failed`, as an image does.
 - **(d) Playback fetches the blob into an object URL.** `AudioTurn` renders an HTML5
   `<audio controls>` and a download button, but does **not** hand the gateway URL to the
-  element: the endpoint answers no `Range` request, and Safari and iOS will not play
-  from a URL that cannot be range-read. It fetches the stored URL **once**, same-origin
+  element: the endpoint answers no `Range` request, and Safari and iOS will likely not play
+  from a URL that cannot be range-read (WebKit's known behaviour, not measured here). It fetches the stored URL **once**, same-origin
   with the session cookie (the endpoint is owner-scoped), and plays an object URL made
   from the bytes. An object URL pins the whole WAV in memory until it is revoked and a
   transcript can hold many audio turns, so the effect's cleanup **revokes it** when the turn
@@ -5757,8 +5759,8 @@ could have chosen:
   attach mode of a speech thread is `none`). The reason there is no dropdown is a chain
   of two reversals: discovering voices needs the gateway to proxy
   `/v1/audio/voices`, which ADR-061 (j) refused on purpose, **and** the agent router to
-  grow a voices route, which is an agent change with its own feature flag and version
-  bump. Each is a decision of its own, so a discoverable voice list is a deferred
+  grow a voices route, which would likely be an agent change with its own feature flag
+  and version bump. Each is a decision of its own, so a discoverable voice list is a deferred
   enhancement with its own ADR, and the free-text field is the approved first step. No
   `/api/portal/model-audio-options` endpoint exists for the same reason: there is nothing
   to put in it.
@@ -5778,11 +5780,14 @@ could have chosen:
   endpoint already refuses it with `speech.stream_unsupported`. A key that repeats a
   first-class setting that **is** set (`voice`, `speed`) is not sent twice: the visible
   control wins, and with it blank the passthrough key is the only statement of it and
-  goes through. On the client, text that is not a JSON object blocks both Send and a
-  replay (regenerate, edit a message), with the Advanced section held open and the
-  error inline, because `audioSetting` would otherwise omit it from the request in
-  silence; the reserved-key list stays **backend-only**, one definition that the client
-  does not copy.
+  goes through. On the client, text that is not a JSON object, or that names a reserved
+  key, blocks both Send and a replay (regenerate, edit a message), with the Advanced
+  section held open and the error inline: the first because `audioSetting` would
+  otherwise omit it from the request in silence, the second so that a turn is not
+  committed only to fail. The reserved-key list is therefore **copied** to the client
+  (`SPEECH_RESERVED_FIELDS` in `chatDoc.ts`, matched ignoring case, the inline error
+  naming the offending field), and the backend check stays the authority for every other
+  caller and the backstop should the two lists ever drift.
 - **(h) Clone-task models are offered and may fail.** The `speech` verdict does not
   distinguish `tts` from `clone` (ADR-061 (d)) and the model DTO carries no task, so a clone
   model carries the flag and appears in the chat. Used text-only it has no reference
@@ -5814,7 +5819,7 @@ proxy a listing ADR-061 (j) refused and an agent route that does not exist), and
 `/api/portal/model-audio-options` endpoint** (nothing to serve). **Reusing `image_url`
 for the WAV** (every consumer would read audio as a picture). **A clone-model filter**
 (the verdict does not distinguish the task). **Playing the blob URL directly** (no
-`Range`, so Safari and iOS cannot play it) and **making the blob handler
+`Range`, so Safari and iOS would likely not play it) and **making the blob handler
 range-capable** (a change to a handler locked down on purpose, for one consumer; an
 object URL costs the player a fetch it makes anyway). **Stating `response_format`**
 (the endpoint answers WAV without it and refuses every other value). **An

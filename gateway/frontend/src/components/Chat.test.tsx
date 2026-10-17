@@ -1179,6 +1179,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const speed = screen.getByRole('spinbutton', { name: t.chatSpeechSpeed });
       expect(speed).toHaveValue(null); // a blank number field: the model keeps its own rate
       expect(speed).toHaveAttribute('placeholder', '1.0');
+      // A negative rate is inert, so the field refuses it; otherwise unclamped (no max):
+      // the model's own range applies.
+      expect(speed).toHaveAttribute('min', '0');
+      expect(speed).not.toHaveAttribute('max');
     });
 
     it('does not offer a response format: the answer is always WAV', async () => {
@@ -1291,6 +1295,39 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         fireEvent.change(field, { target: { value: '{"seed": 1}' } });
         expect(field).toBeValid();
         expect(field).toHaveAccessibleDescription(t.chatSpeechPassthroughHint);
+      });
+
+      // The backend ends such a run only after the turn is committed; the composer mirrors
+      // the reserved list and says so inline, naming the field.
+      it('flags a field the run owns, naming it, and opens the Advanced section for it', async () => {
+        await renderSpeechThread();
+        const field = openPassthrough();
+
+        fireEvent.change(field, { target: { value: '{"seed": 1, "Model": "x"}' } });
+        expect(field).toBeInvalid();
+        expect(field).toHaveAccessibleDescription(t.chatSpeechPassthroughReserved('Model'));
+
+        fireEvent.change(field, { target: { value: '{"seed": 1}' } });
+        expect(field).toBeValid();
+        expect(field).toHaveAccessibleDescription(t.chatSpeechPassthroughHint);
+      });
+
+      it('refuses a send for a field the run owns, with the field and panel held open', async () => {
+        await renderSpeechThread();
+        const field = openPassthrough();
+        fireEvent.change(field, { target: { value: '{"stream": true}' } });
+
+        // The user closes the whole panel, then sends.
+        openSettings();
+        await sendSpeech();
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(
+          t.chatSpeechPassthroughReserved('stream'),
+        );
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        // Both toggles stay held open, so the toast points at a field that is on screen.
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toHaveValue('{"stream": true}');
+        expect(screen.getByLabelText(t.chatSpeechPassthrough)).toBeInvalid();
       });
 
       it('does not flag a blank field or an empty object', async () => {

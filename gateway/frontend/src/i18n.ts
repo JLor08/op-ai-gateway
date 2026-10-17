@@ -238,6 +238,11 @@ const de = {
   // dropped from the request without a word, with the Advanced section collapsed).
   chatAudioPassthroughInvalid:
     'Die erweiterten Felder müssen ein JSON-Objekt sein, zum Beispiel {"seed": 1}. Korrigieren Sie sie oder leeren Sie das Feld, bevor Sie senden.',
+  // The refusal of a speech turn whose "Advanced" passthrough names a field the run sets
+  // itself (model, input, stream, response_format; matched ignoring case), raised
+  // BEFORE anything is sent or stored. Names the field as the user wrote it.
+  chatSpeechPassthroughReserved: (field: string) =>
+    `Das Feld „${field}“ in den erweiterten Feldern ist reserviert: Der Lauf setzt model, input, stream und response_format selbst. Entfernen Sie es, bevor Sie senden.`,
   // The composer of a speech (text-to-speech) thread: the prompt field's label and
   // the hint under it, and the attach button's tooltip (a speech run sends only the
   // text, so an image can never be attached -- whatever the model could read).
@@ -259,7 +264,7 @@ const de = {
   chatSpeechAdvanced: 'Erweitert',
   chatSpeechPassthrough: 'Zusätzliche Anfragefelder (JSON)',
   chatSpeechPassthroughHint:
-    'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format sind reserviert: Steht eines davon hier, schlägt die Antwort fehl, und es wird nichts gesendet. Haben Sie oben „Stimme“ oder „Geschwindigkeit“ eingestellt, gilt dieser Wert, nicht ein voice- oder speed-Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
+    'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Haben Sie oben „Stimme“ oder „Geschwindigkeit“ eingestellt, gilt dieser Wert, nicht ein voice- oder speed-Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
   // The mask of an edit (inpainting): an optional PNG, the size of the source
   // image, whose transparent area marks the region to change. Its slot is next to
   // the attach button of an edit and needs the source image first.
@@ -3345,6 +3350,8 @@ const en: PortalMessages = {
   chatImageEditSourceType: 'An image edit takes a PNG or JPEG image.',
   chatAudioPassthroughInvalid:
     'The advanced fields must be a JSON object, for example {"seed": 1}. Fix them or clear the field before sending.',
+  chatSpeechPassthroughReserved: (field: string) =>
+    `The field "${field}" in the advanced fields is reserved: the run sets model, input, stream and response_format itself. Remove it before sending.`,
   chatSpeechPromptLabel: 'Text to speak',
   chatSpeechOnlyHint:
     'This model speaks text. This thread accepts text to speak only; the reply is an audio file.',
@@ -3357,7 +3364,7 @@ const en: PortalMessages = {
   chatSpeechAdvanced: 'Advanced',
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:
-    'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are reserved: if one of them appears here, the response fails and nothing is sent. If you set "Voice" or "Speed" above, that value wins over a voice or speed field here. Leave blank to send nothing extra.',
+    'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are reserved (in any letter case): if one of them appears here, the request is not sent. If you set "Voice" or "Speed" above, that value wins over a voice or speed field here. Leave blank to send nothing extra.',
   chatAttachMask: 'Attach a mask',
   chatAttachMaskTooltip:
     'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',
