@@ -544,10 +544,13 @@ func compactHex(n int) string {
 // force multiple checkpoint ticks within a run.
 var runCheckpointInterval = 3 * time.Second
 
-// chatRunKindImage is the one kind a run can have besides text ("") -- the
-// value portal.ChatRunSettings.Kind pins to the thread. Named here because the
-// gateway branches on it in more than one place.
-const chatRunKindImage = "image"
+// chatRunKindImage and chatRunKindSpeech are the two kinds a run can have besides
+// text ("") -- the values portal.ChatRunSettings.Kind pins to the thread. Named
+// here because the gateway branches on them in more than one place.
+const (
+	chatRunKindImage  = "image"
+	chatRunKindSpeech = "speech"
+)
 
 // imageRunDeadline bounds an IMAGE run end to end. It exists because such a run
 // emits NOTHING between dispatch and its finished image: with no incremental
@@ -556,19 +559,31 @@ const chatRunKindImage = "image"
 // var, not a const, so tests can shrink it -- mirroring runCheckpointInterval.
 var imageRunDeadline = 10 * time.Minute
 
+// speechRunDeadline bounds a SPEECH run end to end, for exactly the reason
+// imageRunDeadline bounds an image run: it too is one buffered request that emits
+// nothing between dispatch and its finished audio, so "this finishes or fails
+// within N minutes" is the only honest thing the UI can promise about the wait.
+// Same value, its own var, so the two kinds' promises can move independently and
+// a test can shrink one without touching the other.
+var speechRunDeadline = 10 * time.Minute
+
 // runDeadlineFor returns the end-to-end bound for a run of this kind, and false
 // when the kind is UNBOUNDED.
 //
-// Only image runs are bounded. A text run streams deltas, so the user can see
-// for themselves that it is alive and the honesty argument above simply does
-// not apply to it -- while a ceiling would newly kill long generations from a
-// slow local model that complete today. Extending the bound to text would
-// therefore be a behaviour change to an existing, overwhelmingly common path,
-// and it needs its own decision rather than arriving as a side effect of the
-// image feature. Do not "simplify" this back into one global deadline.
+// Only image and speech runs are bounded: both are a single buffered request with
+// no incremental output. A text run streams deltas, so the user can see for
+// themselves that it is alive and the honesty argument above simply does not apply
+// to it -- while a ceiling would newly kill long generations from a slow local
+// model that complete today. Extending the bound to text would therefore be a
+// behaviour change to an existing, overwhelmingly common path, and it needs its
+// own decision rather than arriving as a side effect of the image or speech
+// features. Do not "simplify" this back into one global deadline.
 func runDeadlineFor(kind string) (time.Duration, bool) {
-	if kind == chatRunKindImage {
+	switch kind {
+	case chatRunKindImage:
 		return imageRunDeadline, true
+	case chatRunKindSpeech:
+		return speechRunDeadline, true
 	}
 	return 0, false
 }
@@ -771,6 +786,13 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	// path byte-for-byte what it was.
 	if prep.Settings.Kind == chatRunKindImage {
 		s.executeImageRun(ctx, owner, run, prep)
+		return
+	}
+	// The speech kind is the image kind's sibling in everything that matters here:
+	// one buffered request to a different gateway endpoint, a binary response, no
+	// deltas. See chat_runs_audio.go.
+	if prep.Settings.Kind == chatRunKindSpeech {
+		s.executeAudioRun(ctx, owner, run, prep)
 		return
 	}
 

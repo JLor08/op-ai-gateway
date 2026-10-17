@@ -1058,16 +1058,19 @@ func TestTextRunIsNotBoundedByTheImageDeadline(t *testing.T) {
 	}
 }
 
-// TestRunDeadlineForOnlyBoundsImages states the rule directly, so a future
-// change that folds the two kinds back into one global deadline fails here
+// TestRunDeadlineForOnlyBoundsImageAndSpeechRuns states the rule directly, so a
+// future change that folds the kinds back into one global deadline fails here
 // with the reason attached rather than only in a timing-dependent test.
-func TestRunDeadlineForOnlyBoundsImages(t *testing.T) {
+func TestRunDeadlineForOnlyBoundsImageAndSpeechRuns(t *testing.T) {
 	if d, bounded := runDeadlineFor(chatRunKindImage); !bounded || d != imageRunDeadline {
 		t.Fatalf("image run: got (%v, %v), want (%v, true)", d, bounded, imageRunDeadline)
 	}
+	if d, bounded := runDeadlineFor(chatRunKindSpeech); !bounded || d != speechRunDeadline {
+		t.Fatalf("speech run: got (%v, %v), want (%v, true)", d, bounded, speechRunDeadline)
+	}
 	for _, kind := range []string{"", "text", "unknown"} {
 		if d, bounded := runDeadlineFor(kind); bounded || d != 0 {
-			t.Fatalf("kind %q: got (%v, %v), want (0, false) -- only image runs are bounded", kind, d, bounded)
+			t.Fatalf("kind %q: got (%v, %v), want (0, false) -- only image and speech runs are bounded", kind, d, bounded)
 		}
 	}
 }
