@@ -19,49 +19,102 @@ import (
 )
 
 const (
-	// chatBlobURLPrefix is where a stored chat image is served from. A content
-	// part's image_url.url is rewritten to chatBlobURLPrefix + blob id once the
-	// bytes live in chat_blobs.
+	// chatBlobURLPrefix is where a stored chat blob (an image, or a speech
+	// reply's WAV) is served from. A content part's image_url.url or
+	// audio_url.url is rewritten to chatBlobURLPrefix + blob id once the bytes
+	// live in chat_blobs.
 	chatBlobURLPrefix = "/api/portal/chat-blobs/"
 	// chatBlobIDPrefix starts every blob id; the rest is 32 random hex digits.
 	chatBlobIDPrefix = "blob_"
 )
 
-// chatBlobMediaTypes is the allow-list of media types a stored chat image may
+// chatBlobMediaTypes is the allow-list of media types a stored chat blob may
 // carry. The type is attacker-influenced (it comes from a client's data url) and
 // becomes the Content-Type of a same-origin, cookie-authenticated URL, so
 // nothing outside this set is ever stored -- in particular never text/html or
 // image/svg+xml. Extend it deliberately, per consumer.
 //
-// It must stay in sync with the image pipeline's output formats: a generated
+// It holds two families, and a part only ever takes its own (blobPartKind.accepts):
+// the image types an image_url part may carry, and audio/wav, the one type an
+// audio_url part (a speech chat turn's reply) may carry.
+//
+// It must stay in sync with the pipelines' output formats: a generated
 // image is committed as "image/" + the upstream's output_format (see
-// imagePartsFrom / imageSubtypePattern in gateway/chat_runs_images.go), and the
-// commit refuses a type missing from this set, losing the image. Every format
-// the pipeline can emit has to be listed here; TestChatBlobAllowListCoversTheGeneratedImageFormats
-// pins the ones it emits today (png, jpeg, webp).
+// imagePartsFrom / imageSubtypePattern in gateway/chat_runs_images.go), and a
+// speech reply as audio/wav (speechAudioMediaType in gateway/chat_runs_audio.go,
+// which normalises every alias a server may send to that one string); the commit
+// refuses a type missing from this set, losing the image or the audio. Every
+// format a pipeline can emit has to be listed here;
+// TestChatBlobAllowListCoversTheGeneratedImageFormats pins the image formats it
+// emits today (png, jpeg, webp).
 var chatBlobMediaTypes = map[string]struct{}{
 	"image/png":  {},
 	"image/jpeg": {},
 	"image/webp": {},
 	"image/gif":  {},
+	"audio/wav":  {},
 }
 
-// extractChatBlobs moves the inline data: images of a chat document into
-// chat_blobs rows and rewrites their urls to the gateway path, so the document
-// that is sealed next no longer carries the bytes. It is called at exactly the
+// blobPartKind is the family of a content part that references a stored blob:
+// what member names its url and which media types it may hold. It is a bit set so
+// a walk can ask for one family or both.
+type blobPartKind uint8
+
+const (
+	// imagePartKind is {"type":"image_url","image_url":{"url":...}}.
+	imagePartKind blobPartKind = 1 << iota
+	// audioPartKind is {"type":"audio_url","audio_url":{"url":...}}, image_url's
+	// twin (see speechAudioPart in gateway/chat_runs_audio.go).
+	audioPartKind
+)
+
+// blobPartKindOf is the kind of part a member name introduces. Names are matched
+// without regard to case, like every other reader of the document.
+func blobPartKindOf(member string) (blobPartKind, bool) {
+	switch {
+	case strings.EqualFold(member, "image_url"):
+		return imagePartKind, true
+	case strings.EqualFold(member, "audio_url"):
+		return audioPartKind, true
+	}
+	return 0, false
+}
+
+// accepts reports whether a part of this kind may hold a blob of mediaType: the
+// type must be on the allow-list AND of the kind's own family, so audio cannot be
+// filed under an image part (where a run's history would read it as a picture) nor
+// an image under an audio part.
+func (k blobPartKind) accepts(mediaType string) bool {
+	if _, listed := chatBlobMediaTypes[mediaType]; !listed {
+		return false
+	}
+	switch k {
+	case imagePartKind:
+		return strings.HasPrefix(mediaType, "image/")
+	case audioPartKind:
+		return strings.HasPrefix(mediaType, "audio/")
+	}
+	return false
+}
+
+// extractChatBlobs moves the inline data: images and audio of a chat document
+// into chat_blobs rows and rewrites their urls to the gateway path, so the
+// document that is sealed next no longer carries the bytes. It is called at exactly the
 // two run commits (PrepareChatRun, writeAssistant) -- never on create, where the
 // chat row a blob would reference does not exist yet, and never on a bare
 // autosave, which only carries what an earlier run already stored.
 //
 // It walks doc.Messages; a message's content that is an array of parts is
-// searched for {image_url:{url}} parts, and for each one:
+// searched for {image_url:{url}} and {audio_url:{url}} parts (a speech reply is
+// one audio part), and for each one:
 //
-//   - a data: url must be exactly data:<allow-listed type>;base64,<standard
-//     padded base64>. The decoded bytes are stored (sealed when a cipher is
-//     configured), so what is stored is what was uploaded, byte for byte, and
-//     anything that cannot be decoded losslessly -- another alphabet, missing
-//     padding, a charset parameter -- is refused rather than guessed at. The
-//     part's url becomes chatBlobURLPrefix + a new blob id.
+//   - a data: url must be exactly data:<allow-listed type of the part's own
+//     family>;base64,<standard padded base64>: an image type for an image part,
+//     audio/wav for an audio part. The decoded bytes are stored (sealed when a
+//     cipher is configured), so what is stored is what was uploaded, byte for
+//     byte, and anything that cannot be decoded losslessly -- another alphabet,
+//     missing padding, a charset parameter -- is refused rather than guessed at.
+//     The part's url becomes chatBlobURLPrefix + a new blob id.
 //   - a chatBlobURLPrefix url is left alone, and verified first when it sits in
 //     a message at index >= verifyFrom: the blob must belong to chatID, or a
 //     client could graft another chat's or user's id into its own transcript.
@@ -115,7 +168,7 @@ type blobExtraction struct {
 	blobs    []store.ChatBlob
 }
 
-// message rewrites the image parts of one message. The object is rebuilt only
+// message rewrites the image and audio parts of one message. The object is rebuilt only
 // along the path that changed, keys in their original order, every other value
 // byte for byte; a message with nothing to rewrite is returned as it came.
 //
@@ -134,7 +187,7 @@ func (x *blobExtraction) message(raw json.RawMessage) (json.RawMessage, bool, er
 		if !strings.EqualFold(msg[i].key, "content") {
 			continue
 		}
-		val, c, err := rewriteImageParts(msg[i].val, x.visit)
+		val, c, err := rewriteBlobParts(msg[i].val, imagePartKind|audioPartKind, x.visit)
 		if err != nil {
 			return nil, false, err
 		}
@@ -149,20 +202,20 @@ func (x *blobExtraction) message(raw json.RawMessage) (json.RawMessage, bool, er
 	return out, err == nil, err
 }
 
-// visit is url as an imageURLVisitor: an extraction only ever changes the url of
+// visit is url as a mediaURLVisitor: an extraction only ever changes the url of
 // a part, never replaces the part.
-func (x *blobExtraction) visit(url string) (string, json.RawMessage, error) {
-	out, err := x.url(url)
+func (x *blobExtraction) visit(kind blobPartKind, url string) (string, json.RawMessage, error) {
+	out, err := x.url(kind, url)
 	return out, nil, err
 }
 
-// url decides what one image url becomes: the gateway url of a freshly stored
+// url decides what one part's url becomes: the gateway url of a freshly stored
 // blob (inline data), itself (a gateway url this chat holds, or any other url),
 // or an error.
-func (x *blobExtraction) url(url string) (string, error) {
+func (x *blobExtraction) url(kind blobPartKind, url string) (string, error) {
 	switch {
 	case isDataURL(url):
-		return x.store(url)
+		return x.store(kind, url)
 	case strings.HasPrefix(url, chatBlobURLPrefix):
 		if x.verify {
 			if err := x.checkOwned(strings.TrimPrefix(url, chatBlobURLPrefix)); err != nil {
@@ -173,10 +226,10 @@ func (x *blobExtraction) url(url string) (string, error) {
 	return url, nil
 }
 
-// store decodes one data url into a new chat_blobs entry and returns the
-// gateway url that replaces it.
-func (x *blobExtraction) store(url string) (string, error) {
-	mediaType, raw, err := x.s.decodeInlineImage(url)
+// store decodes one data url of a part of the given kind into a new chat_blobs
+// entry and returns the gateway url that replaces it.
+func (x *blobExtraction) store(kind blobPartKind, url string) (string, error) {
+	mediaType, raw, err := x.s.decodeInlineBlob(url, kind)
 	if err != nil {
 		return "", err
 	}
@@ -228,22 +281,31 @@ func isDataURL(url string) bool {
 
 // DecodeImageDataURL parses data:<type>;base64,<payload> and returns the media
 // type (canonical lower case) and the decoded bytes. Only that exact form is
-// accepted: a type outside the allow-list, a parameter (charset=...), a payload
-// that is not base64, an empty payload, or base64 that is not the standard
-// padded alphabet (the url-safe alphabet, missing padding) is
+// accepted: a type outside the allow-list or outside the image family (audio/wav
+// is on the allow-list, but is not an image), a parameter (charset=...), a
+// payload that is not base64, an empty payload, or base64 that is not the
+// standard padded alphabet (the url-safe alphabet, missing padding) is
 // ErrChatBlobTypeUnsupported -- all of them are "not an image this store can
 // hold and give back unchanged". What the decoder is lenient about -- line
 // breaks, and set bits in the unused tail of the last character -- cannot change
 // the decoded bytes, which are what is stored, so those are simply normalised
 // away: what is served back is re-encoded as standard padded base64.
 //
-// It is exported, and has no size bound of its own (decodeInlineImage adds the
+// It is exported, and has no size bound of its own (decodeInlineBlob adds the
 // per-blob cap), because it is the ONE definition of what an inline image url is:
 // the run commit that stores an upload and the image-run executor that sends an
 // upload (or a resolved reference, see resolveImageRunSource) as an edit's source
 // image both parse through it, so the executor cannot accept a spelling the store
-// refused, and a url it cannot read is never sent anywhere.
+// refused, and a url it cannot read is never sent anywhere. An audio part's url
+// goes through the same parse with its own family (decodeDataURL).
 func DecodeImageDataURL(url string) (string, []byte, error) {
+	return decodeDataURL(url, imagePartKind)
+}
+
+// decodeDataURL is DecodeImageDataURL for a part of any kind: the one parse of
+// an inline blob url, differing between the kinds only in which media types the
+// part may hold (blobPartKind.accepts).
+func decodeDataURL(url string, kind blobPartKind) (string, []byte, error) {
 	if !isDataURL(url) {
 		return "", nil, ErrChatBlobTypeUnsupported
 	}
@@ -256,7 +318,7 @@ func DecodeImageDataURL(url string) (string, []byte, error) {
 		return "", nil, ErrChatBlobTypeUnsupported
 	}
 	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
-	if _, allowed := chatBlobMediaTypes[mediaType]; !allowed {
+	if !kind.accepts(mediaType) {
 		return "", nil, ErrChatBlobTypeUnsupported
 	}
 	raw, err := base64.StdEncoding.DecodeString(payload)
@@ -266,10 +328,10 @@ func DecodeImageDataURL(url string) (string, []byte, error) {
 	return mediaType, raw, nil
 }
 
-// decodeInlineImage is DecodeImageDataURL under the per-blob cap: a payload that
+// decodeInlineBlob is decodeDataURL under the per-blob cap: a payload that
 // decodes to more than s.maxChatBlobBytes is ErrChatBlobTooLarge.
-func (s *Service) decodeInlineImage(url string) (string, []byte, error) {
-	mediaType, raw, err := DecodeImageDataURL(url)
+func (s *Service) decodeInlineBlob(url string, kind blobPartKind) (string, []byte, error) {
+	mediaType, raw, err := decodeDataURL(url, kind)
 	if err != nil {
 		return "", nil, err
 	}
@@ -281,7 +343,7 @@ func (s *Service) decodeInlineImage(url string) (string, []byte, error) {
 
 // sealChatBlob returns the key version and the bytes to store for a blob: the
 // bytes sealed with the capture cipher (nonce||AEAD, no gzip -- images are
-// already compressed) when one is configured, else the plain bytes with key
+// already compressed, and a WAV is stored as the upstream produced it) when one is configured, else the plain bytes with key
 // version 0, which only the volatile RAM store ever holds (the same
 // arrangement as the sealed chat document, see sealChat).
 func (s *Service) sealChatBlob(raw []byte) (int, []byte) {
@@ -379,26 +441,52 @@ func (s *Service) openChatBlob(row store.ChatBlob) ([]byte, error) {
 // replaces the whole part instead; an error aborts the walk.
 type imageURLVisitor func(url string) (out string, replacement json.RawMessage, err error)
 
+// mediaURLVisitor is imageURLVisitor told which kind of part the url belongs to,
+// for the one walk that visits more than images (the extraction at a run commit).
+type mediaURLVisitor func(kind blobPartKind, url string) (out string, replacement json.RawMessage, err error)
+
+// imageOnly adapts an imageURLVisitor to the generalised walk.
+func imageOnly(visit imageURLVisitor) mediaURLVisitor {
+	return func(_ blobPartKind, url string) (string, json.RawMessage, error) {
+		return visit(url)
+	}
+}
+
 // rewriteImageParts walks one message's content: when it is an array, every
 // part that is an image part -- an object whose image_url is an object with a
 // string url -- goes through visit. Every other shape is not an image part and
-// is left as it is, as is a content that is not an array (a plain string).
+// is left as it is, as is a content that is not an array (a plain string). An
+// audio part is NOT an image part: the resolution of a run's history reads the
+// images of a thread and nothing else, so a stored speech reply is neither
+// fetched nor counted against the run's size bound.
 //
 // It is the ONE definition of what an image url is, shared by the extraction at
-// a run commit and the resolution of a run's history, so the two cannot disagree
-// about a spelling: members are matched without regard to case (the readers of
-// this document decode into tagged structs, which encoding/json matches that
-// way), and a part that changes is rebuilt along the changed path only, members
-// in their original order, every other value byte for byte. The returned bool is
-// whether anything changed; when it is false the input comes back as it was.
+// a run commit (through rewriteBlobParts, which adds the audio kind) and the
+// resolution of a run's history, so the two cannot disagree about a spelling:
+// members are matched without regard to case (the readers of this document
+// decode into tagged structs, which encoding/json matches that way), and a part
+// that changes is rebuilt along the changed path only, members in their original
+// order, every other value byte for byte. The returned bool is whether anything
+// changed; when it is false the input comes back as it was.
 func rewriteImageParts(content json.RawMessage, visit imageURLVisitor) (json.RawMessage, bool, error) {
+	return rewriteBlobParts(content, imagePartKind, imageOnly(visit))
+}
+
+// rewriteImagePart is rewriteImageParts for one part.
+func rewriteImagePart(raw json.RawMessage, visit imageURLVisitor) (json.RawMessage, bool, error) {
+	return rewriteBlobPart(raw, imagePartKind, imageOnly(visit))
+}
+
+// rewriteBlobParts is rewriteImageParts for the kinds of part in kinds: every part
+// of one of those kinds goes through visit, told which it is.
+func rewriteBlobParts(content json.RawMessage, kinds blobPartKind, visit mediaURLVisitor) (json.RawMessage, bool, error) {
 	parts, ok := parseJSONArray(content)
 	if !ok {
 		return content, false, nil
 	}
 	changed := false
 	for i := range parts {
-		out, c, err := rewriteImagePart(parts[i], visit)
+		out, c, err := rewriteBlobPart(parts[i], kinds, visit)
 		if err != nil {
 			return nil, false, err
 		}
@@ -413,18 +501,19 @@ func rewriteImageParts(content json.RawMessage, visit imageURLVisitor) (json.Raw
 	return out, err == nil, err
 }
 
-// rewriteImagePart is rewriteImageParts for one part.
-func rewriteImagePart(raw json.RawMessage, visit imageURLVisitor) (json.RawMessage, bool, error) {
+// rewriteBlobPart is rewriteBlobParts for one part.
+func rewriteBlobPart(raw json.RawMessage, kinds blobPartKind, visit mediaURLVisitor) (json.RawMessage, bool, error) {
 	part, ok := parseJSONObject(raw)
 	if !ok {
 		return raw, false, nil
 	}
 	changed := false
 	for i := range part {
-		if !strings.EqualFold(part[i].key, "image_url") {
+		kind, isBlobMember := blobPartKindOf(part[i].key)
+		if !isBlobMember || kind&kinds == 0 {
 			continue
 		}
-		res, err := rewriteImageTarget(part[i].val, visit)
+		res, err := rewriteBlobTarget(part[i].val, kind, visit)
 		if err != nil {
 			return nil, false, err
 		}
@@ -442,7 +531,7 @@ func rewriteImagePart(raw json.RawMessage, visit imageURLVisitor) (json.RawMessa
 	return out, err == nil, err
 }
 
-// memberRewrite is the outcome of visiting one member of an image part. When
+// memberRewrite is the outcome of visiting one member of a blob part. When
 // replacement is non-nil it replaces the whole part and nothing else matters;
 // otherwise val is the member's new value when changed, and is unused when not.
 type memberRewrite struct {
@@ -451,10 +540,10 @@ type memberRewrite struct {
 	replacement json.RawMessage
 }
 
-// rewriteImageTarget is rewriteImagePart for the value of one image_url member:
-// anything that is not an object is left as it is, and so is an object none of
-// whose url members changes.
-func rewriteImageTarget(raw json.RawMessage, visit imageURLVisitor) (memberRewrite, error) {
+// rewriteBlobTarget is rewriteBlobPart for the value of one image_url/audio_url
+// member: anything that is not an object is left as it is, and so is an object
+// none of whose url members changes.
+func rewriteBlobTarget(raw json.RawMessage, kind blobPartKind, visit mediaURLVisitor) (memberRewrite, error) {
 	target, ok := parseJSONObject(raw)
 	if !ok {
 		return memberRewrite{}, nil
@@ -464,7 +553,7 @@ func rewriteImageTarget(raw json.RawMessage, visit imageURLVisitor) (memberRewri
 		if !strings.EqualFold(target[k].key, "url") {
 			continue
 		}
-		res, err := rewriteImageURL(target[k].val, visit)
+		res, err := rewriteBlobURL(target[k].val, kind, visit)
 		if err != nil {
 			return memberRewrite{}, err
 		}
@@ -485,15 +574,15 @@ func rewriteImageTarget(raw json.RawMessage, visit imageURLVisitor) (memberRewri
 	return memberRewrite{val: val, changed: true}, nil
 }
 
-// rewriteImageURL sends the value of one url member through visit. A value that
-// is not a string is not an image url and is left as it is, as is a url the
+// rewriteBlobURL sends the value of one url member through visit. A value that
+// is not a string is not a blob url and is left as it is, as is a url the
 // visitor returns unchanged.
-func rewriteImageURL(raw json.RawMessage, visit imageURLVisitor) (memberRewrite, error) {
+func rewriteBlobURL(raw json.RawMessage, kind blobPartKind, visit mediaURLVisitor) (memberRewrite, error) {
 	var url string
 	if json.Unmarshal(raw, &url) != nil {
 		return memberRewrite{}, nil
 	}
-	rewritten, replacement, err := visit(url)
+	rewritten, replacement, err := visit(kind, url)
 	if err != nil {
 		return memberRewrite{}, err
 	}

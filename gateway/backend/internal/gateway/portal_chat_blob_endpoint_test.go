@@ -178,7 +178,7 @@ func TestChatBlobEndpointServesTheOwnersImageHardened(t *testing.T) {
 func TestChatBlobEndpointServesEachAllowListedType(t *testing.T) {
 	e := newChatBlobEnv(t)
 	chatID := e.newChat(t, "usr_a", `{"settings":{},"messages":[]}`)
-	for i, contentType := range []string{"image/png", "image/jpeg", "image/webp", "image/gif"} {
+	for i, contentType := range []string{"image/png", "image/jpeg", "image/webp", "image/gif", "audio/wav"} {
 		id := fmt.Sprintf("blob_type_%d", i)
 		e.putBlob(t, chatID, id, contentType, pngLike(64+i))
 		rec := e.getBlob(e.cookieA, id)
@@ -188,12 +188,50 @@ func TestChatBlobEndpointServesEachAllowListedType(t *testing.T) {
 	}
 }
 
-// A row whose type is not an allow-listed image type is never served, even to
-// its owner: the store-time allow-list is not the only line of defense.
+// A speech reply's WAV is served as audio/wav with the same hardening as an
+// image, byte for byte: the stored (allow-listed) type and nothing else as
+// Content-Type, nosniff, a CSP that forbids everything, inline disposition and no
+// caching of the decrypted bytes.
+func TestChatBlobEndpointServesASpeechReplyHardened(t *testing.T) {
+	e := newChatBlobEnv(t)
+	chatID := e.newChat(t, "usr_a", `{"settings":{},"messages":[]}`)
+	raw := append([]byte("RIFF\x00\x00\x00\x00WAVEfmt "), pngLike(3000)...)
+	e.putBlob(t, chatID, "blob_speech", "audio/wav", raw)
+
+	rec := e.getBlob(e.cookieA, "blob_speech")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %.200s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), raw) {
+		t.Fatalf("served %d bytes, want the %d stored (unsealed) bytes", rec.Body.Len(), len(raw))
+	}
+	want := map[string]string{
+		"Content-Type":            "audio/wav",
+		"X-Content-Type-Options":  "nosniff",
+		"Content-Security-Policy": "default-src 'none'",
+		"Content-Disposition":     "inline",
+		"Cache-Control":           "private, no-store",
+		"Content-Length":          strconv.Itoa(len(raw)),
+	}
+	for name, value := range want {
+		if got := rec.Header().Get(name); got != value {
+			t.Errorf("%s = %q, want %q", name, got, value)
+		}
+	}
+
+	// Another user's speech reply is the same 404 as any other blob.
+	if other := e.getBlob(e.cookieB, "blob_speech"); other.Code != http.StatusNotFound || errorCodeOf(t, other.Body.Bytes()) != codeChatBlobNotFound {
+		t.Errorf("non-owner: status %d, body %.200s; want 404 %s", other.Code, other.Body.String(), codeChatBlobNotFound)
+	}
+}
+
+// A row whose type is not an allow-listed type is never served, even to its
+// owner: the store-time allow-list is not the only line of defense. Only audio/wav
+// is listed of the audio types, so the other spellings of it are refused too.
 func TestChatBlobEndpointNeverServesAnUnlistedType(t *testing.T) {
 	e := newChatBlobEnv(t)
 	chatID := e.newChat(t, "usr_a", `{"settings":{},"messages":[]}`)
-	for i, contentType := range []string{"text/html", "image/svg+xml", "application/javascript", "image/png; charset=utf-8"} {
+	for i, contentType := range []string{"text/html", "image/svg+xml", "application/javascript", "image/png; charset=utf-8", "audio/mpeg", "audio/x-wav", "audio/wav; codecs=1"} {
 		id := fmt.Sprintf("blob_bad_%d", i)
 		e.putBlob(t, chatID, id, contentType, []byte(`<html><script>alert(document.cookie)</script></html>`))
 		rec := e.getBlob(e.cookieA, id)

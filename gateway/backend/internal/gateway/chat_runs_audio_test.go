@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -598,8 +599,9 @@ func TestSpeechRunTurnCarriesTheWAVAsAnAudioURLPart(t *testing.T) {
 		t.Fatalf("content parts = %s\nwant            %s", snap.ContentParts, want)
 	}
 
-	// The turn is committed complete, not left pending, and its content is the
-	// audio part (inline today; the blob store replaces the url, never the part).
+	// The turn is committed complete, not left pending, and its content is still
+	// the audio part: the commit moved the WAV into the chat blob store and
+	// replaced the part's url, never the part.
 	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
 	if err != nil {
 		t.Fatal(err)
@@ -607,6 +609,56 @@ func TestSpeechRunTurnCarriesTheWAVAsAnAudioURLPart(t *testing.T) {
 	if !strings.Contains(string(stored.Content), `"type":"audio_url"`) || !strings.Contains(string(stored.Content), `"status":"complete"`) {
 		t.Fatalf("the stored turn must be a complete audio turn: %s", stored.Content)
 	}
+	if strings.Contains(string(stored.Content), "data:") {
+		t.Fatalf("the stored turn still carries the WAV inline: %.300s", stored.Content)
+	}
+	id := storedAudioBlobID(t, stored.Content)
+	got, mediaType, err := srv.Portal.ChatBlobBytes(context.Background(), owner, id)
+	if err != nil {
+		t.Fatalf("ChatBlobBytes(%s): %v", id, err)
+	}
+	if mediaType != "audio/wav" || !bytes.Equal(got, wav) {
+		t.Fatalf("the blob is %d bytes as %s, want the %d WAV bytes as audio/wav", len(got), mediaType, len(wav))
+	}
+}
+
+// storedAudioBlobID is the blob id the one audio_url part of a stored chat
+// document points at; the url must be the gateway's chat-blob path.
+func storedAudioBlobID(t *testing.T, content json.RawMessage) string {
+	t.Helper()
+	var doc struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(content, &doc); err != nil {
+		t.Fatalf("stored document is not JSON: %v", err)
+	}
+	var urls []string
+	for _, m := range doc.Messages {
+		var parts []struct {
+			Type     string `json:"type"`
+			AudioURL struct {
+				URL string `json:"url"`
+			} `json:"audio_url"`
+		}
+		if json.Unmarshal(m.Content, &parts) != nil {
+			continue
+		}
+		for _, p := range parts {
+			if p.Type == "audio_url" {
+				urls = append(urls, p.AudioURL.URL)
+			}
+		}
+	}
+	if len(urls) != 1 {
+		t.Fatalf("stored audio urls = %v, want exactly one", urls)
+	}
+	id, ok := strings.CutPrefix(urls[0], chatBlobRoutePrefix)
+	if !ok {
+		t.Fatalf("stored audio url = %.80q, want a %s path", urls[0], chatBlobRoutePrefix)
+	}
+	return id
 }
 
 // Aliases of audio/wav that a server may legitimately send are accepted and all
