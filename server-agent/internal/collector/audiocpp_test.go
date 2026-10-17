@@ -19,22 +19,23 @@ const audioCppLiveListing = `{"object":"list","data":[
   {"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}
 ]}`
 
-// audioCppTaskCases is the verdict table for audio.cpp's /v1/models listing.
-// It is duplicated from the cases of TestParseAudioCppModels in
+// audioCppModelCases is the verdict table for audio.cpp's /v1/models listing.
+// It is duplicated VERBATIM in
 // gateway/backend/internal/provider/audiocpp_models_test.go, because the two
 // Go modules share no package and each keeps its own copy of the rule
 // (parseAudioCppModels there, parseAudioCppModels here). The two copies must
 // decide identically on identical input: if a case fails, fix the parser, not
-// this table, and change both tables together. The gateway's real-listing case
-// ("real v0.9.1 entry, task tts") is the first row.
-var audioCppTaskCases = []struct {
-	name          string
-	body          string
-	modelID       string
-	wantSpeech    string // "yes" | "no" | ""
-	wantTranscrip string // "yes" | "no" | ""
+// this table, and change both tables together.
+// TestAudioCppModelsCasesMatchTheAgentsTable there fails when the two
+// declarations differ by a byte.
+var audioCppModelCases = []struct {
+	name              string
+	body              string
+	model             string
+	wantSpeech        string // "yes" | "no" | ""
+	wantTranscription string // "yes" | "no" | ""
 }{
-	{"real v0.9.1 entry, task tts", audioCppLiveListing, "pocket_tts_english_bf16", "yes", "no"},
+	{"real v0.9.1 entry, task tts", `{"object":"list","data":[{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}]}`, "pocket_tts_english_bf16", "yes", "no"},
 	{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", "yes", "no"},
 	{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", "yes", "no"},
 	{"task asr transcribes and does not speak", `{"data":[{"id":"m","task":"asr"}]}`, "m", "no", "yes"},
@@ -66,12 +67,12 @@ var audioCppTaskCases = []struct {
 }
 
 func TestParseAudioCppModelsTwinTable(t *testing.T) {
-	for _, tc := range audioCppTaskCases {
+	for _, tc := range audioCppModelCases {
 		t.Run(tc.name, func(t *testing.T) {
-			speech, transcription := parseAudioCppModels([]byte(tc.body), tc.modelID)
-			if speech != tc.wantSpeech || transcription != tc.wantTranscrip {
+			speech, transcription := parseAudioCppModels([]byte(tc.body), tc.model)
+			if speech != tc.wantSpeech || transcription != tc.wantTranscription {
 				t.Fatalf("speech=%q transcription=%q, want speech=%q transcription=%q",
-					speech, transcription, tc.wantSpeech, tc.wantTranscrip)
+					speech, transcription, tc.wantSpeech, tc.wantTranscription)
 			}
 		})
 	}
@@ -98,18 +99,18 @@ func serveAudioCppModels(t *testing.T, status int, body string) *httptest.Server
 // will answer the same way. A body that is not JSON reads as a child still
 // mid-response, so it is transient and carries no verdict.
 func TestProbeAudioCppVerdictsTaskCases(t *testing.T) {
-	for _, tc := range audioCppTaskCases {
+	for _, tc := range audioCppModelCases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := serveAudioCppModels(t, 200, tc.body)
 			defer srv.Close()
-			got, stable := ProbeAudioCppVerdicts(context.Background(), srv.Client(), srv.URL, tc.modelID)
+			got, stable := ProbeAudioCppVerdicts(context.Background(), srv.Client(), srv.URL, tc.model)
 			wantStable := json.Valid([]byte(tc.body))
 			if stable != wantStable {
 				t.Fatalf("stable = %v, want %v", stable, wantStable)
 			}
-			if got.Caps.Speech != tc.wantSpeech || got.Caps.Transcription != tc.wantTranscrip {
+			if got.Caps.Speech != tc.wantSpeech || got.Caps.Transcription != tc.wantTranscription {
 				t.Fatalf("speech=%q transcription=%q, want speech=%q transcription=%q",
-					got.Caps.Speech, got.Caps.Transcription, tc.wantSpeech, tc.wantTranscrip)
+					got.Caps.Speech, got.Caps.Transcription, tc.wantSpeech, tc.wantTranscription)
 			}
 			assertAudioCppOnlyCaps(t, got)
 		})
