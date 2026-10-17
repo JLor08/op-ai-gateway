@@ -400,6 +400,12 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * `imageRunFormatUnknownMessage`, `imageRunResponseUnreadableMessage`,
    * `chatRunCommitFailedMessage`).
    *
+   * The four `gateway.chat_run_*` codes of a SPEECH (text-to-speech) run are
+   * `speechRunDispatchFailedMessage`, `speechRunNoAudioMessage`,
+   * `speechRunResponseUnreadableMessage` and `speechRunReservedFieldMessage`
+   * (chat_runs_audio.go): the audio twins of the image-run codes above, worded
+   * about speech because the image labels talk about images.
+   *
    * `portal.chat_run_history_too_large` is `portal.ErrChatRunHistoryTooLarge`
    * (service_chats.go, row in error_map.go): the run's image history, resolved
    * from the chat-blob store for inference, exceeded its bound. A 400 at run
@@ -432,6 +438,12 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     // uploaded webp/gif): `imageRunSourceUnsupportedMessage`, chat_runs_images.go.
     'gateway.chat_run_image_source_unsupported',
     'gateway.chat_run_commit_failed',
+    // A speech run's own terminal codes (chat_runs_audio.go). The reserved-field
+    // one is the run refusing, before anything is sent, a passthrough key it owns.
+    'gateway.chat_run_speech_dispatch_failed',
+    'gateway.chat_run_no_audio',
+    'gateway.chat_run_speech_response_unreadable',
+    'gateway.chat_run_speech_reserved_field',
   ] as const;
 
   it('carries every chat-run-lifecycle and mapping-capability code, by its exact wire string', () => {
@@ -524,6 +536,80 @@ describe('errorLabelByCode (whole-map invariants)', () => {
       expect(t[key].length).toBeGreaterThan(0);
       expect(formatChatRunErrorCode(code, t)).toBe(t[key]);
       expect(formatChatRunErrorCode(code, t)).not.toBe(code);
+    }
+    expect(messages.de[key]).not.toBe(messages.en[key]);
+  });
+
+  /**
+   * The four `speech.*` codes of POST /v1/audio/speech a chat run can surface,
+   * the speech twins of the `images.*` group above (the run relays the loopback
+   * endpoint's error.code through `upstreamErrorCode`). Declared in Go as
+   * `speechInputRequired`, `speechResponseFormatUnsupported` and
+   * `speechStreamUnsupported` (speech_handler.go, validateSpeechRequest) and
+   * `speechUpstreamErrorCode` (the gateway's own classification of an audio.cpp
+   * error that is not already an OpenAI error object). Pinned as literals for the
+   * same reason as the groups above.
+   *
+   * `speech.model_required` is unmapped on purpose, exactly as the images
+   * endpoint's `images.model_required` is: a run always sends the thread's pinned
+   * model, so the portal can never raise it. `speech.response_format_unsupported`
+   * is mapped although the run states response_format itself (a passthrough key
+   * of that name is refused as `gateway.chat_run_speech_reserved_field` before
+   * anything is sent), because the endpoint can answer it to any client and the
+   * run relays whatever code comes back; `speech.stream_unsupported` IS reachable
+   * from the portal, through a `stream_format` passthrough key (the one
+   * streaming-related field the run does not reserve).
+   */
+  const speechWireCodes = [
+    'speech.input_required',
+    'speech.response_format_unsupported',
+    'speech.stream_unsupported',
+    'speech.upstream_error',
+  ] as const;
+
+  it('carries every speech.* code reachable from a chat run, by its exact wire string', () => {
+    for (const code of speechWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the user sees the raw wire code`,
+      ).toBeDefined();
+    }
+    expect(
+      entries
+        .filter(([code]) => code.startsWith('speech.'))
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(speechWireCodes.slice().sort());
+  });
+
+  // A speech run's failures reach the transcript as the terminal CODE (the run
+  // carries no server text), so each must map to its own localized sentence in BOTH
+  // locales and never degrade to the bare code -- the speech twin of the image-edit
+  // table above. The label keys are pinned too, so a code cannot be re-pointed at an
+  // image sentence (which would tell a speech user about an image).
+  it.each([
+    ['gateway.chat_run_speech_dispatch_failed', 'errorChatRunSpeechDispatchFailed'],
+    ['gateway.chat_run_no_audio', 'errorChatRunNoAudio'],
+    ['gateway.chat_run_speech_response_unreadable', 'errorChatRunSpeechResponseUnreadable'],
+    ['gateway.chat_run_speech_reserved_field', 'errorChatRunSpeechReservedField'],
+    ['speech.input_required', 'errorSpeechInputRequired'],
+    ['speech.response_format_unsupported', 'errorSpeechResponseFormatUnsupported'],
+    ['speech.stream_unsupported', 'errorSpeechStreamUnsupported'],
+    ['speech.upstream_error', 'errorSpeechUpstreamError'],
+  ] as const)('labels the speech code %s with %s, in both locales', (code, key) => {
+    expect(errorLabelByCode[code]).toBe(key);
+    for (const locale of ['de', 'en'] as const) {
+      const t = messages[locale];
+      expect(t[key].length).toBeGreaterThan(0);
+      expect(formatChatRunErrorCode(code, t)).toBe(t[key]);
+      expect(formatChatRunErrorCode(code, t)).not.toBe(code);
+      // A toast for the endpoint's own refusal shows the label after the code,
+      // never the server's English.
+      if (code.startsWith('speech.')) {
+        expect(formatPortalError(new PortalApiError(400, code, 'raw server text'), t)).toBe(
+          `${code}: ${t[key]}`,
+        );
+      }
     }
     expect(messages.de[key]).not.toBe(messages.en[key]);
   });

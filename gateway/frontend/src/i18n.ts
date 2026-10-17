@@ -259,7 +259,7 @@ const de = {
   chatSpeechAdvanced: 'Erweitert',
   chatSpeechPassthrough: 'Zusätzliche Anfragefelder (JSON)',
   chatSpeechPassthroughHint:
-    'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format legt der Chat selbst fest. Leer lassen, um nichts Zusätzliches zu senden.',
+    'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format sind reserviert: Steht eines davon hier, schlägt die Antwort fehl, und es wird nichts gesendet. Haben Sie oben „Stimme“ oder „Geschwindigkeit“ eingestellt, gilt dieser Wert, nicht ein voice- oder speed-Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
   // The mask of an edit (inpainting): an optional PNG, the size of the source
   // image, whose transparent area marks the region to change. Its slot is next to
   // the attach button of an edit and needs the source image first.
@@ -1632,6 +1632,34 @@ const de = {
     'Ein Bild im Verlauf gehört nicht zu diesem Chat. Bitte laden Sie die Seite neu und versuchen Sie es erneut.',
   errorChatRunHistoryTooLarge:
     'Die Bilder in diesem Verlauf sind zu groß, um sie an das Modell zu senden. Entfernen Sie ältere Bilder aus dem Verlauf und versuchen Sie es erneut.',
+  // Sprachsynthese im Chat (#248): die Lauf-Codes eines Sprach-Laufs
+  // (chat_runs_audio.go) und die speech.*-Codes von /v1/audio/speech, die ein Lauf
+  // erreichen kann -- die Gegenstücke der Bild-Codes oben, aber auf Sprache
+  // formuliert. Wire-Codes siehe format.ts (errorLabelByCode).
+  // Die Anfrage hat das Gateway nie verlassen; der Go-Fehler nennt die interne
+  // Adresse und steht nur im Log.
+  errorChatRunSpeechDispatchFailed:
+    'Die Sprachsynthese konnte nicht gestartet werden. Bitte versuchen Sie es erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator, falls dies anhält.',
+  errorChatRunNoAudio: 'Es wurde kein Audio erzeugt. Bitte versuchen Sie es erneut.',
+  // Entweder war der Antwortkörper nicht bis zum Ende lesbar, oder er war nicht als
+  // WAV gekennzeichnet (eine HTML-Fehlerseite, ein anderes Audioformat).
+  errorChatRunSpeechResponseUnreadable:
+    'Die Antwort der Sprachsynthese konnte nicht als WAV-Audio gelesen werden. Bitte versuchen Sie es erneut.',
+  // Der Lauf bricht ab, BEVOR er etwas sendet, wenn die erweiterten Felder ein Feld
+  // nennen, das er selbst besitzt (Groß-/Kleinschreibung egal). Der Text nennt das
+  // Steuerelement mit seiner Beschriftung (chatSpeechAdvanced).
+  errorChatRunSpeechReservedField:
+    'Die erweiterten Felder dieses Chats enthalten ein reserviertes Feld (model, input, stream oder response_format). Die Anfrage wurde nicht gesendet. Entfernen Sie das Feld unter „Erweitert“, und versuchen Sie es erneut.',
+  errorSpeechInputRequired:
+    'Für die Sprachsynthese wird ein Text benötigt. Bitte geben Sie den Text ein, der gesprochen werden soll.',
+  errorSpeechResponseFormatUnsupported:
+    'Nicht unterstütztes Antwortformat für die Sprachsynthese. Unterstützt wird nur WAV.',
+  // Vom Portal nur über ein stream_format-Feld in den erweiterten Feldern erreichbar
+  // (stream selbst ist reserviert und wird vorher abgelehnt).
+  errorSpeechStreamUnsupported:
+    'Die Sprachsynthese unterstützt kein Streaming; die Antwort ist immer eine vollständige Audiodatei. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
+  errorSpeechUpstreamError:
+    'Der Sprachsynthese-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).
@@ -3329,7 +3357,7 @@ const en: PortalMessages = {
   chatSpeechAdvanced: 'Advanced',
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:
-    'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are set by the chat. Leave blank to send nothing extra.',
+    'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are reserved: if one of them appears here, the response fails and nothing is sent. If you set "Voice" or "Speed" above, that value wins over a voice or speed field here. Leave blank to send nothing extra.',
   chatAttachMask: 'Attach a mask',
   chatAttachMaskTooltip:
     'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',
@@ -4565,6 +4593,33 @@ const en: PortalMessages = {
     'An image in the history does not belong to this chat. Please reload the page and try again.',
   errorChatRunHistoryTooLarge:
     'The images in this conversation are too large to send to the model. Remove some older images from the conversation and try again.',
+  // Speech in the chat (#248): the run codes of a speech run (chat_runs_audio.go)
+  // and the speech.* codes of /v1/audio/speech a run can reach -- the namesakes of
+  // the image codes above, worded about speech. Wire codes: see format.ts
+  // (errorLabelByCode).
+  // The request never left the gateway; the Go error names the internal address
+  // and stays in the log.
+  errorChatRunSpeechDispatchFailed:
+    'Speech synthesis could not be started. Please try again, or contact an administrator if this continues.',
+  errorChatRunNoAudio: 'No audio was generated. Please try again.',
+  // Either the response body could not be read to its end, or it was not labelled
+  // as WAV (an HTML error page, another audio format).
+  errorChatRunSpeechResponseUnreadable:
+    'The speech synthesis response could not be read as WAV audio. Please try again.',
+  // The run stops BEFORE sending anything when the advanced fields name a field it
+  // owns (case-insensitive). The text names the control by its label
+  // (chatSpeechAdvanced).
+  errorChatRunSpeechReservedField:
+    'The advanced fields of this chat contain a reserved field (model, input, stream or response_format). The request was not sent. Remove the field under "Advanced" and try again.',
+  errorSpeechInputRequired:
+    'Speech synthesis needs text to speak. Please enter the text to be spoken.',
+  errorSpeechResponseFormatUnsupported:
+    'Unsupported response format for speech synthesis. Only WAV is supported.',
+  // Reachable from the portal only through a stream_format field in the advanced
+  // fields (stream itself is reserved and refused earlier).
+  errorSpeechStreamUnsupported:
+    'Speech synthesis does not support streaming; the response is always one complete audio file. If present, remove the stream_format field from the advanced fields.',
+  errorSpeechUpstreamError: 'The speech synthesis server reported an error. Please try again.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).
