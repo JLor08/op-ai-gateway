@@ -39,11 +39,11 @@ several architectural decisions exist specifically to satisfy them.
   encryption key
   ([§13](cross-cutting/security-auth-rbac.md#13-secrets-at-rest)). The
   transcript's text is under its own 4 MiB whole-document cap. A chat's binary
-  payloads — a portal-generated or uploaded image — are **not** in that
-  document: each lives in its own row of the owner-scoped `chat_blobs` store,
-  sealed with the **same** capture key (so it inherits that sealing rather than
-  escaping it) and referenced from the transcript by a gateway URL, which only
-  the owner's session can read —
+  payloads — a portal-generated or uploaded image, or a speech reply's WAV — are
+  **not** in that document: each lives in its own row of the owner-scoped
+  `chat_blobs` store, sealed with the **same** capture key (so it inherits that
+  sealing rather than escaping it) and referenced from the transcript by a
+  gateway URL, which only the owner's session can read —
   [ADR-056](09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
   (it resolves the inline storage of
   [ADR-043](09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (c)).
@@ -56,10 +56,10 @@ several architectural decisions exist specifically to satisfy them.
   the internal trusted-loopback header pair (nginx blanks it at the public
   edge, so it is never reachable from a browser) additionally lets the
   gateway's own portal-chat run executor call `/v1/chat/completions`,
-  `/v1/images/generations` and `/v1/images/edits` as a token-less session
-  principal. `/v1/audio/speech` and `/v1/audio/transcriptions` accept the
-  loopback pair as well, on the same leg as the two image endpoints, though no
-  portal flow calls either today. No inference endpoint other than those five
+  `/v1/images/generations`, `/v1/images/edits` and `/v1/audio/speech` as a
+  token-less session principal. `/v1/audio/transcriptions` accepts the loopback
+  pair as well, on the same leg as the two image endpoints and speech, though no
+  portal flow calls it today. No inference endpoint other than those five
   accepts the loopback pair, and none accepts the session cookie other than
   `/v1/chat/completions`.
 - **The public listener and the mesh (agent) listener are separate enforcement

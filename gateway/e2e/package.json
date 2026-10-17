@@ -8,6 +8,7 @@
     "e2e:agent": "playwright test -c playwright.agent.config.ts",
     "e2e:capture": "playwright test -c playwright.capture.config.ts",
     "e2e:capture-ram": "playwright test -c playwright.capture-ram.config.ts",
+    "e2e:chat-speech": "playwright test -c playwright.chat-speech.config.ts",
     "e2e:certificates": "playwright test -c playwright.certificates.config.ts",
     "e2e:active": "playwright test -c playwright.active.config.ts",
     "e2e:health": "playwright test -c playwright.health.config.ts",

@@ -130,6 +130,63 @@ transcript**, which is output-sensitive. See [Compatibility & Inference
 §3.7](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions) and
 [ADR-062](09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint).
 
+### 6.1.3 Portal speech chat turn (through loopback to a chat blob)
+
+A speech turn in the portal chat is the one place the speech relay of §6.1.1 is called
+by the gateway itself. The browser never calls `/v1/audio/speech`: it starts a **run**
+like any chat turn, and the run executor calls the endpoint over loopback, stores the
+WAV it gets back as a chat blob and lets the browser fetch that blob for playback.
+Like an image turn, it emits no incremental event between dispatch and the finished
+reply, so the browser shows a wait state fed by a server-measured clock.
+
+```mermaid
+sequenceDiagram
+    participant B as Portal (browser)
+    participant GW as Gateway (run executor)
+    participant SP as Gateway (/v1/audio/speech)
+    participant AC as audio.cpp server
+    participant S as chat store (chat_blobs)
+    participant U as usage
+
+    B->>GW: POST /api/portal/chats/{id}/runs {user_message, settings: kind speech, model, audio} (session + CSRF)
+    GW->>GW: PrepareChatRun pins the kind, clears non-speech settings, stores the user turn
+    GW-->>B: 201 {run id, kind: speech}
+    B->>GW: GET .../runs/{runId}/events (snapshot with elapsed_ms, no deltas)
+    GW->>GW: executeAudioRun under speechRunDeadline (10 minutes)
+    GW->>GW: buildSpeechBody {model, input = last user text, voice, speed, passthrough}
+    Note over GW: a passthrough key named model, input, stream or response_format ends the run gateway.chat_run_speech_reserved_field and sends nothing
+    GW->>SP: POST /v1/audio/speech over loopback (internal pair, chat-id, run-as)
+    SP->>AC: resolve (openai_audio, capability speech), relay as in 6.1.1
+    alt 2xx WAV
+        AC-->>SP: audio/wav + Content-Length + X-AudioCPP-* headers
+        SP->>U: audio_second under the run-as token
+        SP-->>GW: audio/wav
+        GW->>GW: read the whole body, require a WAV Content-Type, build ONE audio_url part (data:audio/wav)
+        GW->>S: commit the turn, extractChatBlobs moves the WAV into chat_blobs and rewrites the URL
+        GW-->>B: SSE done with content_parts (the part as produced)
+        B->>GW: GET /api/portal/chat-blobs/{id} (once, session cookie, owner-scoped)
+        GW-->>B: audio/wav (no Range support)
+        B->>B: AudioTurn plays an object URL in audio controls, revoked on unmount
+    else error
+        SP-->>GW: the endpoint's own error, or an empty, unreadable or non-WAV 2xx
+        GW-->>B: SSE done, status error with gateway.chat_run_* or speech.* code
+    end
+```
+
+What differs from the speech relay of §6.1.1: the caller is the executor and the
+credential the internal loopback pair (never a session cookie, [Security
+§1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)), so
+billing, capture and routing run under the **run-as token**; the response is read
+whole and checked before anything is stored (empty, unreadable or not labelled WAV is
+`gateway.chat_run_no_audio` or `gateway.chat_run_speech_response_unreadable`); and the
+WAV leaves the sealed transcript for `chat_blobs`, so the document carries a short gateway
+URL. A failed commit (a WAV over `MaxChatBlobBytes`) ends the run
+`gateway.chat_run_commit_failed`. Playback is the browser's own concern: the blob
+endpoint answers no `Range` request, so `AudioTurn` fetches the blob once and plays an
+object URL. See [Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) and
+[ADR-063](09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs).
+
 ## 6.2 Portal login (session + CSRF) with optional TOTP
 
 ```mermaid

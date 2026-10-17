@@ -40,7 +40,11 @@ var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailab
 //     carry any id (create and a bare autosave store what they are given), so
 //     this scoping is what stops a grafted reference from becoming someone
 //     else's bytes. It is not the only guard: a row of another chat, or of a type
-//     that is not an allow-listed image type, is refused here too.
+//     that is not an allow-listed image type, is refused here too. An audio blob
+//     (a speech reply's WAV) is not an image type: a run's history is resolved
+//     through the image walk alone, so a stored WAV is never fetched, unsealed or
+//     counted by this resolution, and an image reference that happens to name one
+//     is refused like any other row that is not an image.
 //   - An absent image is replaced by unavailableImagePart and the run goes on.
 //     The alternatives are worse: leaving the reference sends an upstream a
 //     relative url it rejects, or (Anthropic) drops silently; refusing the run
@@ -181,8 +185,8 @@ func usableChatBlobs(chatID string, ids []string, occurrences map[string]int, ro
 		if !ok || row.ChatID != chatID {
 			continue
 		}
-		if _, listed := chatBlobMediaTypes[row.ContentType]; !listed {
-			log.Printf("portal: chat blob %s has a content type that is not sendable; leaving it out of the run history", id)
+		if !imagePartKind.accepts(row.ContentType) {
+			log.Printf("portal: chat blob %s has a content type that is not a sendable image; leaving it out of the run history", id)
 			continue
 		}
 		usable[id] = row

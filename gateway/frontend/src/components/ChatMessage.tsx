@@ -11,11 +11,13 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
 import type { ChatContent, ChatContentPart } from './shared/chatContent';
-import { imageUrlsOf, isMaskPart } from './shared/chatContent';
+import { audioUrlsOf, imageUrlsOf, isMaskPart } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
 import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
+import { AudioTurn } from './AudioTurn';
+import { AudioPendingTurn } from './AudioPendingTurn';
 
 function contentText(content: ChatContent): string {
   if (typeof content === 'string') return content;
@@ -81,16 +83,16 @@ function ChatMessageComponent({
   reasoning?: string;
   reasoningMs?: number;
   streaming?: boolean;
-  // The kind of the RUN this row is streaming ("" text | "image") --
+  // The kind of the RUN this row is streaming ("" text | "image" | "speech") --
   // ChatStore's runKind, read from the run's own reports (its 201, an
   // active-runs entry, an SSE snapshot), NOT the thread-level chatKind.
   // The distinction is the whole point: chatKind is the client's guess at
   // what the composer should offer and can be stale, while this is what the
   // executor is actually running, and rendering the image wait state over a
   // text run is exactly what the stale value produces. Only meaningful
-  // together with `streaming`: it selects the image-run pending render below
-  // for the one turn that is both streaming and imageless. Absent on every
-  // call site that predates image threads.
+  // together with `streaming`: it selects the image-run (or speech-run) pending
+  // render below for the one turn that is both streaming and imageless (or
+  // audioless). Absent on every call site that predates image threads.
   kind?: string;
   // The active run's server-anchored elapsed ms (ChatStore's runElapsedMs),
   // passed through untouched -- see ImagePendingTurn for how it is
@@ -114,6 +116,9 @@ function ChatMessageComponent({
 }>) {
   const text = contentText(content);
   const images = imageUrlsOf(content);
+  // A speech turn's reply is exactly one WAV (see AudioTurn), so only the first audio
+  // part is rendered; its presence is what tells a finished speech turn from a pending one.
+  const audioUrl: string | undefined = audioUrlsOf(content)[0];
   const mask = contentMask(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
@@ -134,6 +139,12 @@ function ChatMessageComponent({
     // even computed, so the ordinary text-pending branch never sees it.
     if (streaming && kind === 'image' && images.length === 0) {
       return <ImagePendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
+    }
+    // A speech run is the same shape of wait -- one buffered WAV at the end, no
+    // incremental events -- so it gets the same state, worded for audio, under the same
+    // `no audio yet` guard that keeps it from replacing an arriving reply.
+    if (streaming && kind === 'speech' && audioUrl === undefined) {
+      return <AudioPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }
 
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
@@ -308,6 +319,7 @@ function ChatMessageComponent({
             onRefine={onRefine}
           />
         )}
+        {audioUrl !== undefined && <AudioTurn t={t} url={audioUrl} turnId={turnId ?? ''} />}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
           {onRegenerate && (
             <Tooltip title={t.chatRegenerate}>

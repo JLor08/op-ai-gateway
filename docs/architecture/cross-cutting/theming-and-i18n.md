@@ -290,6 +290,18 @@ again, set the format to PNG or JPEG and regenerate, wait for the agent to
 report, or supply a mask the size of the source
 ([API Compatibility & Inference §12](compatibility-and-inference.md#12-in-portal-chat-playground)).
 
+**The speech codes are in the same lists.** The four codes of a speech chat run
+(`gateway.chat_run_speech_dispatch_failed`, `gateway.chat_run_no_audio`,
+`gateway.chat_run_speech_response_unreadable` and `gateway.chat_run_speech_reserved_field`)
+are in the chat-run list, and the four `speech.*` refusals of `POST /v1/audio/speech` that a
+run relays (`speech.input_required`, `speech.response_format_unsupported`,
+`speech.stream_unsupported` and `speech.upstream_error`) are in a list of their own,
+pinned in both directions like the `images.*` set. `speech.model_required` is unmapped on
+purpose, as `images.model_required` is, since a run always sends its pinned model. Each
+maps to its own speech-worded sentence with a different German and English text, never to
+an image label, which would tell a speech user about an image
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).
+
 ## See also
 
 - [Security, Authentication & Authorization](security-auth-rbac.md) — the session/CSRF model that the theme endpoints deliberately sit outside of (they are public and pre-auth by design).

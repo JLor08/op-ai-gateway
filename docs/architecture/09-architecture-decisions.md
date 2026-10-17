@@ -63,7 +63,11 @@ one reachable over **loopback** — read the parenthesis above as naming a leg t
 ADR-043 later granted separately. `/v1/images/edits`, added by
 [ADR-057](#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance),
 takes the same loopback-or-bearer leg as `/v1/images/generations` and never the
-session cookie; the portal's edit turns reach it over the same loopback pair. See
+session cookie; the portal's edit turns reach it over the same loopback pair.
+`/v1/audio/speech` takes that leg too
+([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
+(j)), and the portal's speech turns reach it over the same loopback pair
+([ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)). See
 [Security, Authentication & Authorization
 §1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)
 for the current three-leg table.
@@ -1937,7 +1941,10 @@ thread's entire multi-megabyte image history is then POSTed to
 thread the rule called image-only. So the kind is persisted on
 `portal.ChatRunSettings` as a `kind` **string** (not an `image_only` boolean:
 the same value selects the request URL, and it extends to a future audio or
-speech kind without a second flag) (Amended by [ADR-057](#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance):
+speech kind without a second flag; **`speech` is that kind now**, a third value beside
+`""` and `image` that selects `/v1/audio/speech`, with the pin, the clearing of
+non-matching settings and the UI-constraint-not-authorization rule below carried over
+unchanged, [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (a)) (Amended by [ADR-057](#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance):
 the kind alone no longer selects the request URL — for the image kind the URL is a function of the kind
 **and** the turn: a last user message that carries an image posts to
 `/v1/images/edits`, any other to `/v1/images/generations`. The kind stays `image`
@@ -2131,7 +2138,14 @@ precisely this reason, and a progress bar, a percentage or an ETA over an
 endpoint that reports none of them would each be the same fabrication in a
 louder form.
 
-**(e) The run deadline applies to the IMAGE kind only.** A bound is what turns
+**(e) The run deadline applies to the IMAGE kind only.** (Amended by
+[ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(b): the **speech** kind is bounded too, by a variable of its own,
+`speechRunDeadline`, of the same 10 minutes and for the same reason, since a speech run
+is also one buffered request with no incremental output. Read "the IMAGE kind only" in
+this choice as "the kinds that emit nothing between dispatch and the finished artifact".
+The text kind stays unbounded, and the checkpoint polarity at the end of this choice
+holds for speech as it does for image: only the text executor checkpoints.) A bound is what turns
 an open-ended wait into one the UI can make a true promise about, and without
 it the likeliest real failure is a user cancelling a run that would have
 succeeded. It is applied in `executeRun` — the first point at which the run's
@@ -2367,7 +2381,9 @@ the application's flavors and, for an agent-launched model with a spec, the
 spec's — so a model the images endpoint would refuse is never an image model
 in the portal. The portal chat offers a model that carries `openai`, or
 `openai_images` together with `image: true` — the only images-only model the
-gate would serve. ADR-042 (d)'s gap therefore narrows:
+gate would serve. (Amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(e): the chat also offers an `openai_audio` model that carries `speech: true`, by a rule
+of the chat's own that leaves the shared offering function as it is.) ADR-042 (d)'s gap therefore narrows:
 an images-only model on an application declaring only `openai_images` is no
 longer advertised to chat clients, but the per-flavor filter behind
 `/v1/models` and the listing's `flavors` field still read application flavors
@@ -2596,7 +2612,9 @@ A shared frontend helper (`offeredFlavors`) derives them from a DTO: its
 `flavors`, minus `openai_images` unless `image` is true. `ModelList.tsx` shows
 them, and the chat's `chatModels` uses the same helper, unchanged in
 behaviour: it offers a model whose offered flavors include `openai` or
-`openai_images`. A model whose `flavors` are exactly `[openai_images]` with
+`openai_images` (amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(e): it also offers an `openai_audio` model that carries `speech: true`, by a rule of the
+chat's own applied on top of the helper, which this choice keeps unchanged). A model whose `flavors` are exactly `[openai_images]` with
 `image` false shows a muted "no image verdict" note, and one with
 `flavors: []` a "none" warning chip; the chip's tooltip is static, one text
 for a model row and one for a group row, because the DTO carries no
@@ -4132,7 +4150,10 @@ includes the bounds that replace it.
   serving path are ready for another payload type (audio, PDF, a file), which
   would need a deliberate allow-list entry, a part shape the extract and
   resolve walk understands, and a renderer — but no new storage layer; none of
-  that exists yet. The memory driver keeps a parallel map that is dropped
+  that exists yet. (Amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+  (c): audio is now the second consumer. `audio/wav` is on the allow-list, an
+  `audio_url` part is extracted, and `AudioTurn` renders it, with no new storage layer
+  and no schema change; the resolve walk deliberately stays image-only.) The memory driver keeps a parallel map that is dropped
   with its chat on both `DeleteChat` and the FIFO `evict()`, and whose bytes
   **count against the 64 MiB memory budget** — otherwise the RAM path would be
   unbounded, which is the very problem this decision exists to fix on the other
@@ -4143,7 +4164,11 @@ includes the bounds that replace it.
   (`<img src={url}>`) and the wire format are unchanged, history construction
   still treats it as an `image_url` part. The store and the serving endpoint are
   payload-type-agnostic, but only `image_url` parts are extracted and resolved
-  today (the walk, `rewriteImageParts`, knows no other part shape). **Old inline `data:`
+  today (the walk, `rewriteImageParts`, knows no other part shape). (Amended by
+  [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+  (c): the extraction at the run commit also walks `audio_url` parts, each kind taking
+  only its own media family; the resolution of a run's history still reads image parts
+  alone.) **Old inline `data:`
   parts keep rendering and keep running** (additive, no forced migration): a
   legacy chat converts lazily, on its next run, and one that is never run again
   stays inline and works.
@@ -4208,7 +4233,13 @@ includes the bounds that replace it.
   (`image/png`, `image/jpeg`, `image/webp`, `image/gif`) at store time
   (`images.blob_type_unsupported`, so `text/html` and `image/svg+xml` never get
   in) **and again at read time**, and nothing else is ever echoed as
-  `Content-Type`. The response carries `X-Content-Type-Options: nosniff`,
+  `Content-Type`. (Amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+  (c): the list also holds `audio/wav`, which only an `audio_url` part may carry, so the
+  type the endpoint returns is one of five strings.) The body is written whole with a
+  `Content-Length`; the handler does not go through `http.ServeContent` and answers **no
+  `Range` request**, which an `<img>` does not need and an audio player on Safari or
+  iOS likely does, so the portal's player plays an object URL it fetched instead of this URL
+  (ADR-063 (d)). The response carries `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`
   and `Cache-Control: private, no-store` — the id is immutable, but the bytes are
   decrypted and private, and a long-lived `immutable` entry would park them in
@@ -4273,7 +4304,8 @@ adapter drops them without an error); trimming the oldest images to fit
 `MaxRunHistoryBytes` (the model would answer a different conversation than the
 user sees, silently — a refusal is a clear, retryable answer); a new content
 part type instead of reusing `image_url` (a second wire format and a renderer
-fork for nothing); a long `immutable` cache lifetime (above); gzip of the
+fork for nothing; for an *image*, since [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(c) adds `audio_url` for a WAV, which `image_url` would mislabel as a picture); a long `immutable` cache lifetime (above); gzip of the
 payload (above); content-hash dedup, a dedicated upload endpoint, a forced
 one-time migration of old chats and a soft per-chat ceiling (all deferred, none
 needed for correctness).
@@ -5197,8 +5229,9 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   handling changed.
 - **(j) The admission surface is the images one, and `GET /v1/audio/voices` is
   deliberately not proxied.** Auth is a bearer token **or** the internal loopback pair,
-  never the session cookie (a third user of that leg after generations and edits), with
-  the same run-as block copied in. The voices listing is an audio.cpp and llama-swap
+  never the session cookie (a third user of that leg after generations and edits; the
+  portal chat's speech run is now a caller of it, amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)),
+  with the same run-as block copied in. The voices listing is an audio.cpp and llama-swap
   convention, not an OpenAI endpoint, so clients learn voice names out of band.
 
 **Consequence:** speech has the images day-one cost, in a milder form. A deployment with
@@ -5216,7 +5249,7 @@ accepted are named, not hidden
 ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)): no
 streaming, no `mp3`/`opus`/`flac`/`json`, no automatic verdict for an agent-managed
 `audio_cpp` child, and a capture gate that trusts the upstream's `Content-Type`. The
-portal's Models listing carries no speech flag, so its "Available via" column cannot gate
+portal's Models view reads no speech flag, so its "Available via" column cannot gate
 `openai_audio` behind a verdict the way it gates `openai_images` behind `image`; the
 request itself is still gated server-side.
 
@@ -5248,6 +5281,17 @@ read `loaded`, so nothing in the code changed. (h): the `audio/*` Content-Type g
 unchanged, but the flavor-plus-2xx **backstop** behind it,
 `isBinarySpeechResponse`, now excludes a transcription, whose 2xx body is a JSON
 transcript the capture must keep.
+
+**Amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(the portal chat is now a speech caller).** (j)'s loopback leg has a caller: the portal
+chat's `speech` run kind posts to this endpoint through the internal pair, with the
+run-as header, and the WAV it gets back is stored as a chat blob. The endpoint, its
+validation and its relay did not change. The Models listing now carries a `speech` flag
+(`ModelDTO.Speech`, from the fold the unknown-model redirect already read), which the
+chat's picker reads; the Models view's "Available via" column still does not, so the
+Consequence's sentence about it stands. (j)'s decision not to proxy
+`GET /v1/audio/voices` also stands, and it is why the chat's `voice` field is free
+text.
 
 → [API Compatibility & Inference §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
@@ -5335,8 +5379,9 @@ chosen:
   `image_edit` and `speech` only, so `ModelOffering.Capable` is empty for a transcription
   request: the unknown-model redirect never takes a `LastUsedModel` or fallback for it
   (fail-closed, a plain unknown-model answer instead of a redirect), and the Models
-  listing carries no transcription flag, as it carries none for speech. The gate itself
-  is unaffected.
+  listing carries no transcription flag (speech has one, `ModelDTO.Speech`, since
+  [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).
+  The gate itself is unaffected.
 - **(c) One probe, one `task`, both capabilities.** The `audiocpp_models` source and
   `probeAudioCppModels` are unchanged in shape and now decide **two** rows from the one
   `task` they read: `asr` writes `(transcription, yes)` and `(speech, no)`; `tts` and
@@ -5460,14 +5505,16 @@ chosen:
 - **(j) The admission surface is the image and speech one.** Auth is
   `requireInternalOrBearerAnyScope`: a bearer token **or** the internal loopback pair,
   never the session cookie (a fourth user of that leg, though no portal flow calls this
-  endpoint), with the shared run-as block. The request takes **no affinity pin**, by the
+  endpoint: the portal chat's speech run calls `/v1/audio/speech` over the same leg,
+  [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs), and transcription stays API-only, (k)), with the shared run-as block. The request takes **no affinity pin**, by the
   guard ADR-042 wrote for exactly this, and has an empty `sessionEndpoint` case (OpenAI's
   transcription request has no session field, and its body is multipart). The handler lifts
   the connection deadlines, since an upload can take longer than 30 seconds to arrive.
-- **(k) The portal is API-only, with a chip and a mock.** The operator portal gains a
-  `transcription` capability chip (a `KNOWN_CAPABILITY_ORDER` entry and a DE/EN
-  string), so a `transcription: yes` verdict renders as a translated chip instead of a raw
-  standby string, and there is no audio composer. The built-in mock provider answers the
+- **(k) Transcription is API-only in the portal, with a chip and a mock.** The operator
+  portal gains a `transcription` capability chip (a `KNOWN_CAPABILITY_ORDER` entry and a
+  DE/EN string), so a `transcription: yes` verdict renders as a translated chip instead of
+  a raw standby string, and there is no transcription composer (the portal chat's speech
+  composer is [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)'s, and transcription in the chat is deferred). The built-in mock provider answers the
   transcription path with the `{text, timing}` document, so a dev or e2e run is not handed
   a Responses event stream.
 
@@ -5521,5 +5568,277 @@ multipart, and a second body shape doubles the validation and capture surface).
 §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Configuration Reference](reference/config-env.md#encrypted-payload-capture),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-063 — Speech in the portal chat is a third run kind: the model is the affordance, the run reuses the speech endpoint over loopback, and the WAV lives in `chat_blobs`
+**Context:** `POST /v1/audio/speech`
+([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+issue #68) was built as an API and, deliberately, so that the portal chat could call
+it: its auth leg is the internal trusted-loopback pair, never the session cookie
+([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
+(j), the leg [ADR-006](#adr-006--two-auth-modes-chat-completions-also-session-reachable)
+split off for images). Nothing in the portal used it, so an operator with a
+text-to-speech model could not hear it without writing a client. Issue #248 closes
+that: pick a TTS model in the chat, type text, and get a **playable, downloadable
+audio reply**. The feature is overwhelmingly a mirror of the image turn
+([ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread))
+and of the blob store
+([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)),
+re-pointed at the audio endpoint, so this entry records only where speech had to
+decide *differently*, and why. Four facts about the pieces it joins that no design
+could have chosen:
+
+- `/v1/audio/speech` answers **one buffered, binary `audio/wav` body** and refuses a
+  streamed request, so a speech turn, like an image turn, emits **zero** incremental
+  events across a wait of seconds (the first synthesis after a model load pays a
+  warm-up).
+- audio.cpp's voice names are **not discoverable through the gateway**: ADR-061 (j)
+  does not proxy `GET /v1/audio/voices` (an audio.cpp and llama-swap convention, not an
+  OpenAI endpoint), and the agent router has no voices route. audio.cpp also has no
+  capabilities endpoint (the analogue of `/sdcpp/v1/capabilities` answers 404), so its
+  native knobs (a kokoro model's `seed`, `language`, `phonemes`, ...) cannot be learned
+  at runtime either.
+- The blob-serving endpoint answers **no `Range` request**: it writes the decrypted
+  body with a `Content-Length` and does not go through `http.ServeContent`
+  ([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
+  (e), a handler locked down on purpose). Safari and iOS will likely not play audio from
+  a URL that cannot be range-read (WebKit's known behaviour, not measured here).
+- The `speech` verdict is the verdict of audio.cpp's `tts` **and** `clone` tasks
+  (ADR-061 (d)), and a clone model needs a reference voice a text-only chat cannot
+  supply.
+
+**Decision — eight choices, taken together.**
+
+- **(a) `speech` is a third run kind, and the picked model is its only affordance.**
+  `portal.ChatRunSettings.Kind` gains `speech` beside `""` (text) and `image`, and
+  everything [ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)
+  (a) and (b) decided for the image kind carries over unchanged: no mode toggle and no
+  "speak" button; the kind is established by the thread's first send, forced back on
+  every later one by `PrepareChatRun` (the stored-kind lift and the has-the-thread-been-sent
+  signal, never a `stored.Kind != ""` guard), and **a UI constraint, not an
+  authorization**: a thread pinned to `speech` whose mapping loses its `(speech, yes)`
+  verdict fails the capability gate exactly as an unpinned request would, and
+  `filterCapable` stays the only authority
+  ([Routing & Model Selection §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate)).
+  The speech knobs are a `ChatAudioSettings` (`voice`, `speed`, and the passthrough
+  of (g)) on `ChatRunSettings.Audio`, declared **after** `Image` and `omitempty`, and
+  `PrepareChatRun` clears it for every other kind, so a text or image chat's stored
+  and wire bytes are unchanged, even against a raw API client. The settings are **not**
+  force-pinned: the composer sends the thread's current voice and speed on every send, so
+  they can change between turns. A speech thread takes the **text** branch of
+  run-start history resolution, which looks at image parts only, so a stored WAV is
+  never fetched, unsealed or counted against `MaxRunHistoryBytes`. The kind is
+  surfaced like the image kind's (`kind` on the run's `201`, the active-runs rows and
+  the `snapshot`/`done` events), and the browser picks the speech wait state from the
+  **run's own** reported kind, never from the thread guess, for the reason ADR-043 gives.
+  A model that is both `image` and `speech` capable is an image model (image was the
+  kind first, so a model that gains a speech verdict never changes what an existing
+  image model does); no catalogue entry is both today.
+- **(b) The executor reuses `POST /v1/audio/speech` over loopback; there is no second
+  audio path, and nothing on the endpoint changed.** `executeAudioRun`
+  (`chat_runs_audio.go`) is the image executor's near twin and shares with the text
+  half exactly what the image half shares: the reservation, the deadline, the loopback
+  header set (`setRunLoopbackHeaders`: the internal pair, the chat-id session header
+  and the run-as header) and the one terminal commit
+  (`finishRunWithParts`). It cannot reuse the stream consumer, for ADR-043's reason:
+  that assumes deltas and a checkpoint, and there is nothing to checkpoint. The body is
+  `model` (the thread's pinned model), `input` (the **last user message's text**) and
+  whichever of `voice` and `speed` the thread set, plus the passthrough of (g);
+  `response_format` is **not stated**, because the endpoint answers WAV when it is
+  absent and refuses every other value (ADR-061 (e)), so there is nothing to choose and
+  nothing for an unset field to default to. Auth, run-as billing and capture are the
+  loopback path's, unchanged: the call bills `audio_second` under the run-as token and,
+  where the token or the system opts in to capture, stores the request JSON and a
+  redacted summary of the audio, never the WAV
+  ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+  [Security §14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+  The run is bounded like an image run (`runDeadlineFor` gives the speech kind
+  `speechRunDeadline`, 10 minutes, a variable of its own so the two promises can move
+  independently), a firing deadline is `gateway.chat_run_timeout` and never a cancel,
+  and the terminal commit keeps its fresh 30 s bound (ADR-043 (e), which this decision amends).
+  **The response is read whole and checked, never assumed.** It is not bounded by
+  `captureMaxBytes` (an ordinary clip exceeds 1 MiB; the store's `MaxChatBlobBytes`
+  refusing the commit is the backstop, as for images). A 2xx with an empty body is
+  `gateway.chat_run_no_audio` (an error, not an empty success: a turn with no audio
+  would render as a blank bubble); a 2xx whose body cannot be read to its end, or whose
+  `Content-Type` is not a WAV label (`audio/wav`, `audio/x-wav`, `audio/wave`,
+  `audio/vnd.wave`, parameters ignored), is
+  `gateway.chat_run_speech_response_unreadable`, because the media type is the one
+  fact about the audio that must come from the response and a default would stay
+  stated in the transcript and in every download; a loopback hop that never completed
+  is `gateway.chat_run_speech_dispatch_failed` (the Go error names the gateway's own
+  address, so it goes to the log); and a non-2xx surfaces the endpoint's own code
+  through `upstreamErrorCode` (`speech.input_required`, `speech.upstream_error`, ...).
+  Every one of them, and the endpoint's own `speech.*` refusals, has a German and an
+  English label in the portal (`errorLabelByCode`), pinned by exhaustiveness tests in
+  both directions.
+- **(c) The reply is one `audio_url` part, and the WAV is moved into `chat_blobs` like an
+  image.** The executor commits exactly one part,
+  `{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,…"}}`, `image_url`'s
+  twin (same nesting, `type` first), so the extraction and the renderer each learn one
+  more part type rather than a new document shape. `image_url` itself could not be
+  reused, as ADR-056 (b) did for an uploaded image: a WAV filed under it would be read
+  by every consumer as a picture, and a run's history would send audio upstream as vision
+  input. `extractChatBlobs` now walks both kinds (`blobPartKind`), and **each kind accepts
+  only its own media family**: an image part takes `image/*` and an audio part takes
+  `audio/wav`, so neither can be filed under the other. `chatBlobMediaTypes`, the
+  allow-list that is ADR-056 (e)'s stored-XSS control, gains exactly one entry,
+  `audio/wav`, and the executor normalises every WAV alias to that one string so the
+  store and the renderer key on a single value (it grows deliberately, per consumer, as
+  ADR-056 (a) said it must). The history resolution stays **image-only**
+  (`resolveChatBlobRefs`, `usableChatBlobs`), and `usableChatBlobs` now additionally
+  requires an image type for an image reference: without it an `image_url` reference
+  naming a WAV blob would have resolved to `data:audio/wav` inside an image part. This
+  is the "allow-list entry, a part shape the extract and resolve walk understands, and a
+  renderer" ADR-056 (a) listed as everything an audio consumer would need and the
+  statement that **no new storage layer** would. There is **no schema change**: the store
+  is payload-type-agnostic (bytes plus a content type), so the migration, the cascade, the
+  sealing and the memory budget are exactly what they were. The serving endpoint changes
+  only the allow-list its read-time re-check consults; its headers (`nosniff`,
+  `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`,
+  `Cache-Control: private, no-store`) and its owner scoping are untouched. A WAV the
+  store refuses at the assistant commit (too large, or a type off the list) ends the run
+  as `gateway.chat_run_commit_failed`, as an image does.
+- **(d) Playback fetches the blob into an object URL.** `AudioTurn` renders an HTML5
+  `<audio controls>` and a download button, but does **not** hand the gateway URL to the
+  element: the endpoint answers no `Range` request, and Safari and iOS will likely not play
+  from a URL that cannot be range-read (WebKit's known behaviour, not measured here). It fetches the stored URL **once**, same-origin
+  with the session cookie (the endpoint is owner-scoped), and plays an object URL made
+  from the bytes. An object URL pins the whole WAV in memory until it is revoked and a
+  transcript can hold many audio turns, so the effect's cleanup **revokes it** when the turn
+  unmounts or the URL changes, and aborts a request still in flight (a response that
+  lands after the abort creates nothing, since nothing would ever revoke it). A run's
+  own terminal event carries the part as it was produced (the inline `data:audio/wav`
+  URL), which the element plays directly until the post-`done` refetch swaps in the
+  stored URL; any other shape is refused inline rather than fetched. Download goes
+  through `downloadBinary`, a second fetch on click only, so the saved file's type
+  and extension come from what the server actually served; its extension map is now keyed
+  on the **whole media type** (`image/png`, `image/jpeg`, `image/webp`, `image/gif`,
+  `audio/wav`), so a known subtype under the wrong top-level type borrows nothing, and
+  the file is named from the turn's own id, as an image's is. The wait is
+  `AudioPendingTurn`, the image wait's twin over a shared `RunPendingTurn`: liveness from
+  the run's own status, a **server-measured** elapsed clock and one static sentence that no
+  intermediate news is coming, with **no** progress figure, for ADR-043 (d)'s reason.
+  **Hardening note, not a defect:** the playback fetch relies on the same
+  `isFetchableUrl` guard the image download uses (`downloadBinary.ts`, now exported), and
+  that guard is a **literal-prefix** check, `url.startsWith('/api/portal/chat-blobs/')`,
+  on a URL that comes out of a persisted transcript. It names no host (`//host/x`,
+  `/\host/x` and every absolute URL fail the prefix), but it does not normalise path
+  segments, so a stored `/api/portal/chat-blobs/../…` would be resolved by the browser to
+  another path **on the same origin**. That is still a relative, same-origin `GET` with
+  the user's own cookie, planted only by someone who can already write that user's own
+  transcript, and its response goes to an object URL that is played or saved under an
+  allow-listed extension: not SSRF and not a cross-user read. Tightening it to the exact
+  blob-id shape is a cheap, deferred hardening, and no code changes here.
+- **(e) The chat's picker widens, and the shared offering view does not.** The Models
+  listing carries a **`speech` flag** on `ModelDTO` (`/api/portal/models`, always
+  present), the one fail-closed fold the unknown-model redirect already read
+  (`speechFlagsByName`): every offering mapping holds a `(speech, yes)` verdict **and**
+  declares `openai_audio` on its application and, for an agent-launched model with a
+  spec, on the spec; AND-ed across a model's mappings and a group's offerable members,
+  inherited by an alias, `false` for every model when the capability read fails. It is
+  not on `/v1/models` or the LM Studio listing. The chat's own filter
+  (`chatModels` in `ChatStore.tsx`) admits an `openai_audio` model **only** behind
+  `speech: true`, the polarity `openai_images` has behind `image`, and the effective
+  model's flag selects the speech composer for a thread that has no transcript yet.
+  **The shared `offeredFlavors` is deliberately untouched.** It also feeds the Models
+  view's "Available via" column, and gating `openai_audio` behind a speech verdict there
+  would drop the flavor from transcription, unprobed and agent-managed audio rows (and from
+  the image-worded "no verdict" notes that read it). The chat needs a stricter rule than
+  that column, so the stricter rule lives in the chat and the shared function keeps
+  answering what it did. An agent-managed `audio_cpp` model appears in the chat only with
+  a manual `speech: yes`, ADR-061 (d)'s accepted deferral.
+- **(f) `voice` is free text, and there is no voices dropdown.** The settings panel
+  carries a free-text `voice` field whose placeholder hints that the model's own default
+  applies and is **never written** (blank leaves the model on its default voice, the
+  rule the image defaults follow), and a `speed` number field (placeholder `1.0`, passed
+  through as given: the model's own range applies and the composer does not clamp
+  it). There is no `response_format` control, only a static caption that the reply is
+  always WAV (the endpoint's WAV-only surface, ADR-061 (e)), and no image attach (the
+  attach mode of a speech thread is `none`). The reason there is no dropdown is a chain
+  of two reversals: discovering voices needs the gateway to proxy
+  `/v1/audio/voices`, which ADR-061 (j) refused on purpose, **and** the agent router to
+  grow a voices route, which would likely be an agent change with its own feature flag
+  and version bump. Each is a decision of its own, so a discoverable voice list is a deferred
+  enhancement with its own ADR, and the free-text field is the approved first step. No
+  `/api/portal/model-audio-options` endpoint exists for the same reason: there is nothing
+  to put in it.
+- **(g) The Advanced section is a JSON passthrough, guarded against the fields the run
+  owns.** A collapsible "Advanced" holds one text box for a **JSON object**; every key is
+  merged into the request body as a top-level field, verbatim (`map[string]json.RawMessage`,
+  so a string, number, bool or object reaches audio.cpp with the type the user wrote),
+  which is how the OpenAI `instructions` field and audio.cpp's native knobs travel. It is
+  not an `<sd_cpp_extra_args>` block: that is sd-server's convention for a prompt that
+  has nowhere else to carry a knob, and speech is JSON in. `model`, `input`, `stream`
+  and `response_format` are **reserved**, matched ignoring case (the readers of the body
+  decode that way): a key that names one fails the run with
+  `gateway.chat_run_speech_reserved_field` and **sends nothing**, since forwarding the
+  rest without the offending key would answer a request the user did not make. The
+  guard turns what would be an opaque upstream refusal, or an override of the run's own
+  value, into one that names its cause. `stream_format` is not reserved, because the
+  endpoint already refuses it with `speech.stream_unsupported`. A key that repeats a
+  first-class setting that **is** set (`voice`, `speed`) is not sent twice: the visible
+  control wins, and with it blank the passthrough key is the only statement of it and
+  goes through. On the client, text that is not a JSON object, or that names a reserved
+  key, blocks both Send and a replay (regenerate, edit a message), with the Advanced
+  section held open and the error inline: the first because `audioSetting` would
+  otherwise omit it from the request in silence, the second so that a turn is not
+  committed only to fail. The reserved-key list is therefore **copied** to the client
+  (`SPEECH_RESERVED_FIELDS` in `chatDoc.ts`, matched ignoring case, the inline error
+  naming the offending field), and the backend check stays the authority for every other
+  caller and the backstop should the two lists ever drift.
+- **(h) Clone-task models are offered and may fail.** The `speech` verdict does not
+  distinguish `tts` from `clone` (ADR-061 (d)) and the model DTO carries no task, so a clone
+  model carries the flag and appears in the chat. Used text-only it has no reference
+  voice, so it can answer an upstream error, which the run surfaces as the endpoint's
+  own code. Excluding clone models would need a new per-mapping fact the verdict does not
+  hold. Recorded as an accepted limitation
+  ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+**Consequence:** a speech turn has the image turn's costs in a milder form. It is one
+buffered request with no progress to show, so the wait is the elapsed clock and an
+honest "no intermediate news"; the first synthesis after a model load can take long
+enough to matter inside the 10-minute bound. The WAV is uncompressed, so a long text can
+produce a payload near `MaxChatBlobBytes` (20 MiB by default), and the commit of one over
+it fails the run as `gateway.chat_run_commit_failed`; the executor holds each in-flight
+run's whole response in memory, and the browser holds one object URL per audio turn it
+has rendered until it unmounts. Stored WAVs are retained for the chat's lifetime like
+every blob, with no prune (ADR-056). The gateway never converts or re-encodes: the reply
+is WAV because the endpoint serves only WAV, and mp3, streaming and per-model native
+controls need the translation, streaming contract or discovery this project has not
+built. Nothing else moved: no change to `handleOpenAISpeech` or the relay, no schema
+change, no migration, no new auth leg, and no ServerAgent version bump. The portal
+side is gateway and frontend only.
+
+**Rejected:** **A mode toggle or a "speak" button** (ADR-043's argument, the composer
+could then offer what the gate refuses). **Widening the shared `offeredFlavors`** (it
+would regress the Models view for every audio row without a speech verdict; the chat's
+stricter rule belongs in the chat). **A voices dropdown now** (it needs the gateway to
+proxy a listing ADR-061 (j) refused and an agent route that does not exist), and **a
+`/api/portal/model-audio-options` endpoint** (nothing to serve). **Reusing `image_url`
+for the WAV** (every consumer would read audio as a picture). **A clone-model filter**
+(the verdict does not distinguish the task). **Playing the blob URL directly** (no
+`Range`, so Safari and iOS would likely not play it) and **making the blob handler
+range-capable** (a change to a handler locked down on purpose, for one consumer; an
+object URL costs the player a fetch it makes anyway). **Stating `response_format`**
+(the endpoint answers WAV without it and refuses every other value). **An
+`<sd_cpp_extra_args>`-style tag** (a prompt-embedded convention for a different
+upstream; speech is JSON in). **Dropping a reserved passthrough key and sending the
+rest** (a request the user did not make). **Storing the WAV inline in the transcript**
+(ADR-056 retired that for images, and a WAV is larger). **A second blob endpoint or
+table for audio** (the store is payload-type-agnostic).
+→ [API Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[§3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
+[§9](cross-cutting/compatibility-and-inference.md#9-model-discovery),
+[Runtime View §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
+[Routing & Model Selection
+§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[Security, Authentication & Authorization
+§1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance),
+[§13.1](cross-cutting/security-auth-rbac.md#131-chat-binary-payloads-a-sealed-store-ownership-on-read-a-hardened-serving-url),
+[Data Model](reference/data-model.md#portal-chat),
+[HTTP API Surface](reference/api-surface.md#tokens-chats-usage),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

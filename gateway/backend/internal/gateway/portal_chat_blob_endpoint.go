@@ -18,9 +18,10 @@ import (
 const chatBlobRoutePrefix = "/api/portal/chat-blobs/"
 
 // handlePortalChatBlob serves GET /api/portal/chat-blobs/{id}: the raw bytes of
-// a chat image that the transcript references by this url (the run commit moved
-// them out of the sealed document into chat_blobs). It feeds the browser's
-// <img>, so it takes the standard portal auth like every other /api/portal/chats*
+// a chat image -- or a speech reply's WAV -- that the transcript references by
+// this url (the run commit moved them out of the sealed document into
+// chat_blobs). It feeds the browser's <img> (and the audio player's fetch), so it
+// takes the standard portal auth like every other /api/portal/chats*
 // read (requireWebScopeNoTouch: the internal loopback principal, else the session
 // cookie, else a bearer token, scope gateway:use); the cookie leg is the passive
 // no-touch variant, so an <img> load does not extend the idle window. It is not an

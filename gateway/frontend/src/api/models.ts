@@ -483,6 +483,16 @@ export type ModelOption = {
   // OPTIONAL, like `image`: a fixture that omits it derives `image_edit ===
   // false`, the fail-closed reading.
   image_edit?: boolean;
+  // True when this model — and, for a group, EVERY offered member — SYNTHESIZES
+  // speech (serves /v1/audio/speech). The speech twin of `image`: the chat reads it
+  // to switch an empty thread's composer to a text-to-speech turn and to offer an
+  // openai_audio-only model in its picker at all. It is the backend's own fold of
+  // the (speech, yes) verdict, fail-closed like `image` (ModelDTO.Speech); the
+  // client never recomputes it. Independent of `image` and `vision`.
+  //
+  // OPTIONAL, like `image`: a fixture that omits it derives `speech === false`,
+  // which is what keeps every pre-existing non-speech test meaningful.
+  speech?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options

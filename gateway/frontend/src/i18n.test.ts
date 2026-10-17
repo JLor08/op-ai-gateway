@@ -3358,6 +3358,176 @@ describe('portal chat image generation error i18n keys', () => {
   });
 });
 
+// Portal chat speech (text-to-speech, #248): every key the speech composer, the
+// speech settings panel and the audio answer use, defined in both locales. The
+// build already refuses a key missing from `en` (`en: PortalMessages = typeof de`);
+// this pins the other half -- that nothing is blank and nothing is one locale's
+// text copied into the other, the way the image keys are guarded above.
+describe('portal chat speech i18n keys', () => {
+  const keys = [
+    'chatAudioPassthroughInvalid',
+    'chatSpeechPromptLabel',
+    'chatSpeechOnlyHint',
+    'chatSpeechNoImageInput',
+    'chatSpeechVoice',
+    'chatSpeechVoiceDefault',
+    'chatSpeechSpeed',
+    'chatSpeechFormatHint',
+    'chatSpeechAdvanced',
+    'chatSpeechPassthrough',
+    'chatSpeechPassthroughHint',
+    'chatAudioRunPending',
+    'chatAudioNoIntermediateNews',
+    'chatGeneratedAudio',
+    'chatDownloadAudio',
+    'chatAudioDownloadError',
+    'chatAudioLoadError',
+  ] as const;
+
+  // The one function-valued speech key: it names the offending passthrough field.
+  it('names the reserved passthrough field in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].chatSpeechPassthroughReserved('Response_Format');
+      expect(text, locale).toContain('Response_Format');
+      for (const reserved of ['model', 'input', 'stream', 'response_format']) {
+        expect(text, `${locale} lists ${reserved}`).toContain(reserved);
+      }
+    }
+    expect(messages.de.chatSpeechPassthroughReserved('x')).not.toBe(
+      messages.en.chatSpeechPassthroughReserved('x'),
+    );
+  });
+
+  it('defines every speech composer, settings and audio-answer key in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k], k).toBe('string');
+      expect(typeof messages.en[k], k).toBe('string');
+      expect(messages.de[k].length, k).toBeGreaterThan(0);
+      expect(messages.en[k].length, k).toBeGreaterThan(0);
+      expect(messages.de[k], `${k} is the English text copied into de`).not.toBe(messages.en[k]);
+    }
+  });
+
+  // The audio answer's strings must not reuse the generated-IMAGE ones: a speech
+  // reply is announced as audio, downloaded as audio, and its wait is for audio.
+  it('words the audio answer as audio, not as the image answer', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      expect(t.chatGeneratedAudio).not.toBe(t.chatGeneratedImage);
+      expect(t.chatDownloadAudio).not.toBe(t.chatDownloadImage);
+      expect(t.chatAudioRunPending).not.toBe(t.chatImageRunPending);
+      expect(t.chatAudioDownloadError).not.toBe(t.chatImageDownloadError);
+    }
+  });
+
+  // The hint says what happens to the passthrough (the composer's reserved-field check,
+  // mirroring buildSpeechBody in chat_runs_audio.go), not what a reader might assume. A
+  // reserved key (model, input, stream, response_format -- speechReservedFields, matched
+  // ignoring case) is refused before anything is sent; it is NOT silently "set by the
+  // chat". And the
+  // voice and speed fields of the panel win over a same-named passthrough key. The
+  // old sentence ("legt der Chat selbst fest" / "are set by the chat") implied the
+  // reserved keys were harmlessly overridden, so it must not come back.
+  for (const locale of ['de', 'en'] as readonly Locale[]) {
+    describe(`passthrough hint (${locale})`, () => {
+      const t = messages[locale];
+
+      it('names every reserved field the run refuses', () => {
+        for (const field of ['model', 'input', 'stream', 'response_format']) {
+          expect(t.chatSpeechPassthroughHint).toContain(field);
+        }
+      });
+
+      it('says a reserved field stops the request instead of being overridden', () => {
+        expect(t.chatSpeechPassthroughHint).not.toMatch(
+          /legt der Chat selbst fest|set by the chat/i,
+        );
+        expect(t.chatSpeechPassthroughHint).toMatch(
+          locale === 'de' ? /nicht gesendet/ : /not sent/,
+        );
+      });
+
+      it('names the voice and speed controls that take precedence, by their labels', () => {
+        expect(t.chatSpeechPassthroughHint).toContain(t.chatSpeechVoice);
+        expect(t.chatSpeechPassthroughHint).toContain(t.chatSpeechSpeed);
+        expect(t.chatSpeechPassthroughHint).toContain('voice');
+        expect(t.chatSpeechPassthroughHint).toContain('speed');
+      });
+
+      // The example and the empty-field instruction are the useful part of the
+      // hint; rewording the constraint must not drop them.
+      it('keeps the examples and the leave-empty instruction', () => {
+        expect(t.chatSpeechPassthroughHint).toContain('{"instructions"');
+        expect(t.chatSpeechPassthroughHint).toContain('{"seed": 1}');
+      });
+    });
+  }
+});
+
+// The speech twins of the chat-run / images.* error labels above. The wire codes
+// themselves are pinned in format.test.ts; this guards the label keys in both
+// locales and what the sentences say.
+describe('portal chat speech error i18n keys', () => {
+  const keys = [
+    'errorChatRunSpeechDispatchFailed',
+    'errorChatRunNoAudio',
+    'errorChatRunSpeechResponseUnreadable',
+    'errorChatRunSpeechReservedField',
+    'errorSpeechInputRequired',
+    'errorSpeechResponseFormatUnsupported',
+    'errorSpeechStreamUnsupported',
+    'errorSpeechUpstreamError',
+  ] as const;
+
+  it('defines a user-facing label for each speech error code in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k], k).toBe('string');
+      expect(typeof messages.en[k], k).toBe('string');
+      expect(messages.de[k].length, k).toBeGreaterThan(0);
+      expect(messages.en[k].length, k).toBeGreaterThan(0);
+      expect(messages.de[k], k).not.toBe(messages.en[k]);
+    }
+  });
+
+  // These codes are the speech namesakes of the image ones, whose labels talk
+  // about images; a speech user told "no image was generated" would be misled.
+  it('does not talk about images', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      for (const k of keys) {
+        expect(messages[locale][k], `${locale} ${k}`).not.toMatch(/bild|image/i);
+      }
+    }
+  });
+
+  // The run refuses a reserved passthrough key BEFORE sending anything, so the
+  // sentence must say that nothing went out, and it must send the user to the
+  // control that holds the offending key by the label the panel shows.
+  it('tells the user which control holds a reserved field and that nothing was sent', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      const label = t.errorChatRunSpeechReservedField;
+      expect(label).toContain(t.chatSpeechAdvanced);
+      for (const field of ['model', 'input', 'stream', 'response_format']) {
+        expect(label).toContain(field);
+      }
+      expect(label).toMatch(locale === 'de' ? /nicht gesendet/ : /not sent/);
+    }
+  });
+
+  // speech.stream_unsupported is reachable from the portal only through a
+  // stream_format passthrough key, so the sentence names the field to remove.
+  it('names the stream_format field in the streaming refusal', () => {
+    expect(messages.de.errorSpeechStreamUnsupported).toContain('stream_format');
+    expect(messages.en.errorSpeechStreamUnsupported).toContain('stream_format');
+  });
+
+  // The endpoint answers WAV only; the format refusal states the one that works.
+  it('names WAV as the only supported format', () => {
+    expect(messages.de.errorSpeechResponseFormatUnsupported).toContain('WAV');
+    expect(messages.en.errorSpeechResponseFormatUnsupported).toContain('WAV');
+  });
+});
+
 // Fix round, finding 1: the nine completion-error codes (routing.*,
 // provider.*, model.not_allowed) reachable from the chat text path now that
 // a non-200 keeps its body. The wire codes are pinned in format.test.ts;

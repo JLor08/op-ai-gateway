@@ -3,11 +3,16 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_AUDIO_SETTINGS,
   DEFAULT_IMAGE_SETTINGS,
   DEFAULTS,
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
   MASK_PURPOSE,
+  attachModeOf,
+  audioPassthroughMessage,
+  audioSetting,
+  audioSettingsFrom,
   imageSetting,
   imageSettingsFrom,
   isChatBlobUrl,
@@ -18,10 +23,12 @@ import {
   metricsOf,
   normalizeDoc,
   optionsOr,
+  parseAudioPassthrough,
+  speechPassthroughInvalid,
   userTurnContent,
   type ChatUiMessage,
 } from './chatDoc';
-import { imageUrlsOf } from '../shared/chatContent';
+import { audioUrlsOf, imageUrlsOf } from '../shared/chatContent';
 
 describe('metricsOf', () => {
   it('maps the snake_case SSE metrics onto the camelCase message fields', () => {
@@ -408,5 +415,283 @@ describe('the images of a message', () => {
     expect(isChatBlobUrl('data:image/png;base64,AAAA')).toBe(false);
     expect(isChatBlobUrl('https://example.test/api/portal/chat-blobs/blob_abc')).toBe(false);
     expect(isChatBlobUrl('')).toBe(false);
+  });
+});
+
+// Audio (text-to-speech) settings follow the image settings' discipline exactly:
+// present only on a "speech" thread, never on the wire/persisted document of a
+// text or image thread, and carrying only what the user moved off the default.
+describe('the persisted audio settings mirror the backend omitempty', () => {
+  it('omits the audio key for any non-speech thread', () => {
+    const moved = { ...DEFAULT_AUDIO_SETTINGS, voice: 'af_heart', speed: '1.2' };
+    expect(audioSetting('', moved)).toEqual({});
+    expect(audioSetting(undefined, moved)).toEqual({});
+    expect(audioSetting('image', moved)).toEqual({});
+    expect(audioSetting('video', moved)).toEqual({});
+  });
+
+  it('has blank defaults: a fresh speech thread leaves the model on its own voice and speed', () => {
+    expect(DEFAULT_AUDIO_SETTINGS).toEqual({ voice: '', speed: '', passthrough: '' });
+    // The key is present for a speech thread (as image's is for an image one),
+    // but carries nothing: every knob stays the model's default.
+    expect(audioSetting('speech', DEFAULT_AUDIO_SETTINGS)).toEqual({ audio: {} });
+  });
+
+  it('sends voice and speed when set, speed parsed to a wire number', () => {
+    expect(
+      audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, voice: 'af_heart', speed: '1.25' }),
+    ).toEqual({ audio: { voice: 'af_heart', speed: 1.25 } });
+  });
+
+  it('trims the voice and sends nothing for a whitespace-only one', () => {
+    expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, voice: '  af_heart ' })).toEqual({
+      audio: { voice: 'af_heart' },
+    });
+    expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, voice: '   ' })).toEqual({
+      audio: {},
+    });
+  });
+
+  it('omits a blank or unparseable speed, so the model keeps its own', () => {
+    for (const speed of ['', '   ', 'fast', 'NaN', 'Infinity']) {
+      const audio = audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, speed }).audio ?? {};
+      expect('speed' in audio).toBe(false);
+    }
+  });
+
+  it('sends the passthrough as the JSON object the user wrote, value types intact', () => {
+    const passthrough = JSON.stringify({
+      instructions: 'speak softly',
+      seed: 7,
+      phonemes: true,
+      nested: { a: [1, 2] },
+    });
+    expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, passthrough }).audio).toEqual({
+      passthrough: { instructions: 'speak softly', seed: 7, phonemes: true, nested: { a: [1, 2] } },
+    });
+  });
+
+  it('omits a passthrough that is blank, empty, malformed or not an object', () => {
+    for (const passthrough of ['', '   ', '{}', '{"a":', 'null', '[1]', '"text"', '7', 'a=b']) {
+      const audio = audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, passthrough }).audio ?? {};
+      expect('passthrough' in audio).toBe(false);
+    }
+  });
+
+  it('classifies a passthrough text for the composer: empty, valid or why it is not', () => {
+    expect(parseAudioPassthrough('')).toEqual({ status: 'empty' });
+    expect(parseAudioPassthrough('  \n ')).toEqual({ status: 'empty' });
+    expect(parseAudioPassthrough('{}')).toEqual({ status: 'empty' });
+    expect(parseAudioPassthrough('{"seed": 1}')).toEqual({ status: 'ok', value: { seed: 1 } });
+    expect(parseAudioPassthrough('{"seed":')).toEqual({ status: 'invalid' });
+    expect(parseAudioPassthrough('seed=1')).toEqual({ status: 'invalid' });
+    expect(parseAudioPassthrough('[1, 2]')).toEqual({ status: 'invalid' });
+    expect(parseAudioPassthrough('null')).toEqual({ status: 'invalid' });
+    expect(parseAudioPassthrough('"text"')).toEqual({ status: 'invalid' });
+  });
+
+  // The client mirror of the backend's speechReservedFields: the run owns these fields,
+  // and the backend would end the run gateway.chat_run_speech_reserved_field only after
+  // the turn is committed. Matched ignoring case, like the backend.
+  it('rejects a passthrough naming a reserved field, in any letter case, and names it', () => {
+    for (const key of ['model', 'input', 'stream', 'response_format']) {
+      expect(parseAudioPassthrough(JSON.stringify({ [key]: 'x' }))).toEqual({
+        status: 'invalid',
+        reservedField: key,
+      });
+      const shouted = key.toUpperCase();
+      expect(parseAudioPassthrough(JSON.stringify({ [shouted]: 1 }))).toEqual({
+        status: 'invalid',
+        reservedField: shouted, // as the user wrote it
+      });
+    }
+    expect(parseAudioPassthrough('{"Model": "x"}')).toEqual({
+      status: 'invalid',
+      reservedField: 'Model',
+    });
+    // A reserved key among others still poisons the whole object (nothing is dropped
+    // in silence), and the first in sorted order is the one named, like the backend.
+    expect(parseAudioPassthrough('{"seed": 1, "stream": true, "input": "x"}')).toEqual({
+      status: 'invalid',
+      reservedField: 'input',
+    });
+  });
+
+  it('does not reserve its look-alikes: stream_format, voice, speed, a prefix or a nested key', () => {
+    for (const text of [
+      '{"stream_format": "sse"}',
+      '{"voice": "af"}',
+      '{"speed": 1.2}',
+      '{"models": 1, "inputs": 2, "response": 3, "format": 4}',
+      '{"nested": {"model": "x", "stream": true}}',
+    ]) {
+      expect(parseAudioPassthrough(text).status, text).toBe('ok');
+    }
+  });
+
+  it('picks the message for an invalid passthrough: the reserved one names the field', () => {
+    const t = {
+      chatAudioPassthroughInvalid: 'not an object',
+      chatSpeechPassthroughReserved: (field: string) => `reserved ${field}`,
+    };
+    expect(audioPassthroughMessage(parseAudioPassthrough('[1]'), t)).toBe('not an object');
+    expect(audioPassthroughMessage(parseAudioPassthrough('{"seed":'), t)).toBe('not an object');
+    expect(audioPassthroughMessage(parseAudioPassthrough('{"model": 1}'), t)).toBe(
+      'reserved model',
+    );
+  });
+
+  it('refuses a run only for a speech thread whose passthrough is not a JSON object', () => {
+    const bad = { ...DEFAULT_AUDIO_SETTINGS, passthrough: '{"seed":' };
+    expect(speechPassthroughInvalid('speech', bad)).toBe(true);
+    expect(speechPassthroughInvalid('speech', { ...bad, passthrough: '[1]' })).toBe(true);
+    // Blank, `{}` and a real object all pass: there is nothing to drop or it is sent.
+    expect(speechPassthroughInvalid('speech', DEFAULT_AUDIO_SETTINGS)).toBe(false);
+    expect(speechPassthroughInvalid('speech', { ...bad, passthrough: '{}' })).toBe(false);
+    expect(speechPassthroughInvalid('speech', { ...bad, passthrough: '{"seed": 1}' })).toBe(false);
+    // ...and so is one naming a field the run owns (the backend would fail it post-commit).
+    expect(speechPassthroughInvalid('speech', { ...bad, passthrough: '{"model": "x"}' })).toBe(
+      true,
+    );
+    expect(speechPassthroughInvalid('image', { ...bad, passthrough: '{"model": "x"}' })).toBe(
+      false,
+    );
+    // Other kinds have no passthrough, so stale text in the state never blocks them.
+    expect(speechPassthroughInvalid('', bad)).toBe(false);
+    expect(speechPassthroughInvalid(undefined, bad)).toBe(false);
+    expect(speechPassthroughInvalid('image', bad)).toBe(false);
+  });
+
+  it('round-trips voice, speed and passthrough through audioSettingsFrom', () => {
+    const wire = {
+      voice: 'af_heart',
+      speed: 0.9,
+      passthrough: { instructions: 'calm', seed: 0, flag: false },
+    };
+    const state = audioSettingsFrom(wire);
+    expect(state.voice).toBe('af_heart');
+    expect(state.speed).toBe('0.9');
+    // Shown to the composer as editable JSON text, and read back to the same object.
+    expect(JSON.parse(state.passthrough)).toEqual(wire.passthrough);
+    expect(audioSetting('speech', state)).toEqual({ audio: wire });
+  });
+
+  it('coerces a missing/mistyped persisted audio back to defaults', () => {
+    expect(audioSettingsFrom(undefined)).toEqual(DEFAULT_AUDIO_SETTINGS);
+    expect(
+      audioSettingsFrom({
+        voice: 7 as unknown as string,
+        speed: 'x' as unknown as number,
+        passthrough: 'oops' as unknown as Record<string, unknown>,
+      }),
+    ).toEqual(DEFAULT_AUDIO_SETTINGS);
+    expect(audioSettingsFrom({ passthrough: [1] as unknown as Record<string, unknown> })).toEqual(
+      DEFAULT_AUDIO_SETTINGS,
+    );
+    expect(audioSettingsFrom({ passthrough: {} })).toEqual(DEFAULT_AUDIO_SETTINGS);
+  });
+
+  it('keeps a speed of 0 (a value, not "unset") across a save/load', () => {
+    expect(audioSettingsFrom({ speed: 0 }).speed).toBe('0');
+    expect(audioSetting('speech', audioSettingsFrom({ speed: 0 })).audio?.speed).toBe(0);
+  });
+
+  it('round-trips through the document for a speech thread (normalizeDoc)', () => {
+    const settings = normalizeDoc({
+      settings: {
+        model: 'tts',
+        kind: 'speech',
+        audio: { voice: 'bf_emma', speed: 1.1, passthrough: { seed: 3 } },
+      },
+      messages: [],
+    }).settings;
+    expect(settings.kind).toBe('speech');
+    expect(settings.audio).toEqual({ voice: 'bf_emma', speed: 1.1, passthrough: { seed: 3 } });
+  });
+
+  it('never puts an audio key on a text or image document normalizeDoc rebuilds', () => {
+    // Even a (malformed) client that stored audio settings on another kind of thread
+    // must not have them re-emitted -- audioSetting keys off the kind.
+    const text = normalizeDoc({
+      settings: { model: 'm', audio: { voice: 'x' } },
+      messages: [],
+    }).settings;
+    expect('audio' in text).toBe(false);
+    const image = normalizeDoc({
+      settings: { model: 'm', kind: 'image', audio: { voice: 'x' } },
+      messages: [],
+    }).settings;
+    expect('audio' in image).toBe(false);
+  });
+
+  it('keeps an image thread free of the audio key, and a speech thread free of the image key', () => {
+    const speech = normalizeDoc({
+      settings: { model: 'm', kind: 'speech', image: { size: '512x512' } },
+      messages: [],
+    }).settings;
+    expect('image' in speech).toBe(false);
+  });
+
+  it('carries no audio key on the defaults a fresh chat is created with', () => {
+    expect('audio' in DEFAULTS).toBe(false);
+  });
+
+  it('writes the speech kind through kindSetting unchanged, like any other', () => {
+    expect(kindSetting('speech')).toEqual({ kind: 'speech' });
+    expect(kindSetting('')).toEqual({});
+    expect(kindSetting('image')).toEqual({ kind: 'image' });
+  });
+});
+
+describe('what an attachment means on a speech thread', () => {
+  const flags = { vision: false, image: false, imageEdit: false };
+
+  it('is none: text-to-speech takes no image input, even from a vision-capable model', () => {
+    expect(attachModeOf('speech', flags)).toBe('none');
+    expect(attachModeOf('speech', { ...flags, vision: true })).toBe('none');
+    // A (hypothetical) edit-capable image model on a speech thread still takes none.
+    expect(attachModeOf('speech', { vision: false, image: true, imageEdit: true })).toBe('none');
+  });
+
+  it('leaves the text and image meanings as they were', () => {
+    expect(attachModeOf('', { ...flags, vision: true })).toBe('vision');
+    expect(attachModeOf('', flags)).toBe('none');
+    expect(attachModeOf('image', { ...flags, image: true, imageEdit: true })).toBe('edit');
+    expect(attachModeOf('image', { ...flags, image: true })).toBe('none');
+  });
+});
+
+// The audio ANSWER part mirrors the image one: `audio_url` carries the WAV (inline
+// while the run streams, a /api/portal/chat-blobs/{id} reference once committed) and
+// is read by its own helper, so the image list never picks it up.
+describe('the audio of a message', () => {
+  const ref = '/api/portal/chat-blobs/blob_wav';
+  const textPart = (text: string) => ({ type: 'text' as const, text });
+  const imagePart = (url: string) => ({ type: 'image_url' as const, image_url: { url } });
+  const audioPart = (url: string) => ({ type: 'audio_url' as const, audio_url: { url } });
+
+  it('lists the urls of the audio parts in order, text and images left out', () => {
+    expect(
+      audioUrlsOf([
+        textPart('x'),
+        audioPart(ref),
+        imagePart('data:image/png;base64,AAAA'),
+        audioPart('data:audio/wav;base64,UklGRg=='),
+      ]),
+    ).toEqual([ref, 'data:audio/wav;base64,UklGRg==']);
+  });
+
+  it('is empty for a message with no audio, whatever its shape', () => {
+    expect(audioUrlsOf('plain')).toEqual([]);
+    expect(audioUrlsOf([textPart('x'), imagePart(ref)])).toEqual([]);
+    expect(audioUrlsOf([])).toEqual([]);
+  });
+
+  it('is never mistaken for an image, so an image list stays images only', () => {
+    expect(imageUrlsOf([audioPart(ref)])).toEqual([]);
+  });
+
+  it('keeps a stored reference exactly as it is: no copy, no rewrite', () => {
+    expect(audioUrlsOf([audioPart(ref)])[0]).toBe(ref);
   });
 });

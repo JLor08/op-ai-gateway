@@ -271,6 +271,20 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // older upload): refused before anything was sent (imageRunSourceUnsupportedMessage).
   'gateway.chat_run_image_source_unsupported': 'errorChatRunImageSourceUnsupported',
   'gateway.chat_run_commit_failed': 'errorChatRunCommitFailed',
+  // Portal chat speech (#248): a speech run's own terminal codes
+  // (chat_runs_audio.go) and the speech.* codes of POST /v1/audio/speech, which the
+  // run relays verbatim through upstreamErrorCode (speech_handler.go). Mapped to
+  // their own speech-worded labels rather than the image ones, which talk about
+  // images. speech.model_required is left out on purpose, as is its images twin: a
+  // run always sends the thread's pinned model.
+  'gateway.chat_run_speech_dispatch_failed': 'errorChatRunSpeechDispatchFailed',
+  'gateway.chat_run_no_audio': 'errorChatRunNoAudio',
+  'gateway.chat_run_speech_response_unreadable': 'errorChatRunSpeechResponseUnreadable',
+  'gateway.chat_run_speech_reserved_field': 'errorChatRunSpeechReservedField',
+  'speech.input_required': 'errorSpeechInputRequired',
+  'speech.response_format_unsupported': 'errorSpeechResponseFormatUnsupported',
+  'speech.stream_unsupported': 'errorSpeechStreamUnsupported',
+  'speech.upstream_error': 'errorSpeechUpstreamError',
   'images.prompt_required': 'errorImagesPromptRequired',
   'images.stream_unsupported': 'errorImagesStreamUnsupported',
   'images.response_format_unsupported': 'errorImagesResponseFormatUnsupported',

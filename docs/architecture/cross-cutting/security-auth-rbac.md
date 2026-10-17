@@ -24,8 +24,10 @@ token — see [§7](#7-request-authentication-decision-flow). `/v1/images/genera
 session cookie: they are reachable by the gateway's own background executor over
 loopback, never by a logged-in browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
 `internal/gateway/auth_internal_or_bearer.go`; speech is the third user of that leg and
-transcription the fourth, and no portal flow calls either today, so the loopback half is
-there for parity with the image endpoints rather than for a current caller,
+transcription the fourth. The portal chat's `speech` run kind calls `/v1/audio/speech`
+over the loopback pair ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)), while no portal flow calls
+transcription, so for it the loopback half is there for parity with the image endpoints
+rather than for a current caller,
 [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
 [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)). Every remaining inference
 endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
@@ -996,10 +998,12 @@ them back — only to compare a freshly hashed presented value.
 
 ### 13.1 Chat binary payloads: a sealed store, ownership on read, a hardened serving URL
 
-A portal chat's images (generated and uploaded) are **not** inside the sealed
-transcript: each is a row of `chat_blobs`, and the transcript's `image_url.url`
+A portal chat's binary payloads (generated and uploaded images, and a speech reply's
+WAV) are **not** inside the sealed transcript: each is a row of `chat_blobs`, and the
+transcript's `image_url.url` (`audio_url.url` for the WAV)
 is the gateway path `/api/portal/chat-blobs/{id}`
-([ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url),
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs),
+[ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url),
 [Data Model](../reference/data-model.md#portal-chat)).
 
 - **Sealed with the same key, no new secret.** The decoded bytes are sealed with
@@ -1031,16 +1035,35 @@ is the gateway path `/api/portal/chat-blobs/{id}`
   originates in a client's `data:` URL and becomes the `Content-Type` of a
   same-origin, cookie-authenticated, navigable URL, which is the classic
   stored-XSS shape. Only `image/png`, `image/jpeg`, `image/webp` and `image/gif`
-  are accepted at store time (anything else, `text/html` and `image/svg+xml`
-  included, is `400 images.blob_type_unsupported`, and a non-standard base64
-  form is refused too), and the type is checked **again at read time**, exactly
-  as stored, so a row that somehow differs is never served. The type returned is
-  therefore always one of those four strings.
+  (in an `image_url` part) and `audio/wav` (in an `audio_url` part, the one audio type a
+  speech reply is normalised to; a part kind takes only its own media family, so
+  audio cannot be filed as a picture) are accepted at store time (anything else,
+  `text/html` and `image/svg+xml` included, is `400 images.blob_type_unsupported`, and
+  a non-standard base64 form is refused too), and the type is checked **again at read
+  time**, exactly as stored, so a row that somehow differs is never served. The type
+  returned is therefore always one of those five strings.
 - **The response is locked down.** `X-Content-Type-Options: nosniff`,
   `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`
   (an `<img>` renders it; a navigation to it cannot execute anything) and
   `Cache-Control: private, no-store`: the id is immutable, but the bytes are
-  decrypted and private, so they are not parked in a browser's disk cache.
+  decrypted and private, so they are not parked in a browser's disk cache. The body is
+  written whole with a `Content-Length` and the handler answers **no `Range` request**
+  (it does not go through `http.ServeContent`), which an `<img>` does not need and an
+  audio player on Safari and iOS likely does; the portal's `AudioTurn` therefore fetches the
+  blob once and plays an object URL it revokes on unmount, rather than pointing
+  `<audio>` at this URL.
+- **The client's fetch guard is a literal prefix (a hardening note).** The audio
+  player's fetch and the image and audio download share `isFetchableUrl`
+  (`downloadBinary.ts`), which accepts a URL from a persisted transcript only when it
+  starts with `/api/portal/chat-blobs/`. That names no host, since `//host/x`, `/\host/x`
+  and every absolute URL fail the prefix, but it does not normalise path segments, so a
+  stored `/api/portal/chat-blobs/../…` would resolve to another path **on the same
+  origin**. It stays a relative, same-origin `GET` carrying the user's own cookie, the
+  planted URL needs write access to that user's own transcript, and the response only ever
+  reaches an object URL that is played or a download saved under an allow-listed
+  extension: not SSRF and not a cross-user read. Tightening it to the exact blob-id shape
+  is a deferred hardening, and no code changes with
+  [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (d).
 - **Standard portal auth, with a passive cookie check, deliberately.** The
   route is guarded like any portal read (`requireWebScopeNoTouch` →
   `authenticateWebSession`): the internal loopback principal first, else the

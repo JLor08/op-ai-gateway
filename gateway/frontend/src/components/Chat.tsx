@@ -33,12 +33,19 @@ import {
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
   IMAGE_SIZE_OPTIONS,
+  audioPassthroughMessage,
   optionsOr,
+  parseAudioPassthrough,
   useChatStore,
 } from './chat/ChatStore';
 import { ChatSidebar } from './chat/ChatSidebar';
 
 const SIDEBAR_COLLAPSED_KEY = 'op.chat.sidebarCollapsed';
+
+// The speaking-rate hint of the speech settings: the neutral rate every OpenAI-style
+// speech endpoint documents. A placeholder only -- a blank speed is never written, so
+// the model keeps its own default (and its own range, which the portal does not clamp).
+const SPEECH_SPEED_PLACEHOLDER = '1.0';
 
 // The small round close button on the corner of an attached image's (or mask's)
 // thumbnail in the composer's attach strip.
@@ -152,6 +159,10 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // The advanced (sd-server) image knobs are collapsed by default: they are
   // power-user controls below the common size/count/format settings.
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // The speech thread's own collapsible "Advanced" (the JSON passthrough). Separate
+  // from the image one: the two never show together, and a speech thread should not
+  // open expanded because an image thread's section was left open.
+  const [showSpeechAdvanced, setShowSpeechAdvanced] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(readSidebarCollapsed);
 
   // A refine (the per-image action on a generated result) seeds the composer with that
@@ -210,6 +221,29 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // pins the kind at the first send and forces it from then on), and an image
   // thread keeps its composer even while its model is momentarily unreachable.
   const isImageThread = c.chatKind === 'image';
+  // Likewise for a text-to-speech thread: the composer keeps its text input but the
+  // settings become the speech knobs, and the reply is audio.
+  const isSpeechThread = c.chatKind === 'speech';
+  const isTextThread = !isImageThread && !isSpeechThread;
+
+  // The advanced passthrough is the one speech setting the store REFUSES a send (and a
+  // regenerate) for when it is not a JSON object or names a field the run owns
+  // (chatAudioPassthroughInvalid, chatSpeechPassthroughReserved), and the
+  // field is inside two things the user can close: the settings panel and the Advanced
+  // section. A refusal that names a field the user cannot see is useless, so while the
+  // text is invalid (the same parse the store refuses on) both stay open: the toast and
+  // the field's own error then always point at something on screen. Typing alone cannot
+  // hide it, but a remount can -- the store (and so the text) outlives this view, whose
+  // own open/closed state starts collapsed again -- hence the derivation here rather
+  // than only the toggles' guard below. Once the text is fixed or blank, neither is held open.
+  const passthroughParse = parseAudioPassthrough(c.audioSettings.passthrough);
+  const passthroughInvalid = isSpeechThread && passthroughParse.status === 'invalid';
+  const settingsOpen = showSettings || passthroughInvalid;
+  const speechAdvancedOpen = showSpeechAdvanced || passthroughInvalid;
+  // The toggles' updater: a click while the text is invalid keeps the thing OPEN
+  // (rather than flipping state the user cannot see), so fixing the text -- whose last
+  // keystroke makes it valid -- does not collapse the field out from under the cursor.
+  const toggleOpen = (open: boolean) => passthroughInvalid || !open;
 
   // The attach control follows ONE predicate, the store's attachMode (the
   // thread's kind and the picked model -- ADR-043 R1): 'edit' offers the image as
@@ -222,7 +256,11 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   let attachTooltip: string = t.chatAttachImage;
   if (c.attachMode === 'edit') attachTooltip = t.chatAttachImageEdit;
   else if (c.attachMode === 'none') {
-    if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
+    // A speech thread takes no image whatever the picked model can read (the thread's
+    // kind decides, as for an image thread), so a vision-capable model must not leave
+    // the disabled button reading as a plain "attach an image".
+    if (isSpeechThread) attachTooltip = t.chatSpeechNoImageInput;
+    else if (c.modelImageCapable) attachTooltip = t.chatImageGeneratorNoInput;
     else if (!c.modelVisionCapable) attachTooltip = t.chatImageModelUnsupported;
   }
 
@@ -231,8 +269,13 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // is no mode to switch, the image is the operand). A generator that cannot be
   // edited keeps the old wording.
   let promptHelperText: string | undefined;
+  let promptLabel = t.messageLabel;
   if (isImageThread) {
     promptHelperText = c.attachMode === 'edit' ? t.chatImageEditHint : t.chatImageOnlyHint;
+    promptLabel = t.chatImagePromptLabel;
+  } else if (isSpeechThread) {
+    promptHelperText = t.chatSpeechOnlyHint;
+    promptLabel = t.chatSpeechPromptLabel;
   }
 
   let modelHelperText: string | undefined;
@@ -301,11 +344,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
           </Box>
 
           <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 1, mb: 1.5 }}>
-            <Button
-              variant="outlined"
-              size="small"
-              onClick={() => setShowSettings((open) => !open)}
-            >
+            <Button variant="outlined" size="small" onClick={() => setShowSettings(toggleOpen)}>
               {t.chatSettings}
             </Button>
             {c.streaming && (
@@ -315,7 +354,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             )}
           </Stack>
 
-          {showSettings && (
+          {settingsOpen && (
             <Box
               sx={{
                 display: 'grid',
@@ -327,9 +366,10 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               }}
             >
               {/* Text-chat controls: a system prompt, sampling temperature and a
-                token cap are all meaningless to the images endpoint, so an image
-                thread hides them and shows the image knobs below instead. */}
-              {!isImageThread && (
+                token cap are all meaningless to the images and speech endpoints, so
+                an image or speech thread hides them and shows its own knobs below
+                instead. */}
+              {isTextThread && (
                 <>
                   <TextField
                     id="chat-system-prompt"
@@ -592,6 +632,89 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   )}
                 </>
               )}
+              {/* Speech-synthesis knobs (/v1/audio/speech). The voice is FREE TEXT:
+                audio.cpp's voices are not discoverable, so the model's own default
+                is only a placeholder, never written. A blank speed leaves the
+                model's rate (placeholder 1.0; not clamped, the model's own range
+                applies). The output is always WAV, so there is no format control,
+                just the static hint. The "Advanced" section holds a JSON object of
+                extra request fields (OpenAI `instructions`, model-native knobs). */}
+              {isSpeechThread && (
+                <>
+                  <Box
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                      gap: 2,
+                    }}
+                  >
+                    <TextField
+                      id="chat-speech-voice"
+                      label={t.chatSpeechVoice}
+                      value={c.audioSettings.voice}
+                      placeholder={t.chatSpeechVoiceDefault}
+                      onChange={(event) =>
+                        c.setAudioSettings((s) => ({ ...s, voice: event.target.value }))
+                      }
+                      disabled={c.streaming}
+                      // Pin the label shrunk and the notch open (as the prompt field
+                      // does) so the placeholder -- the model-default hint -- is
+                      // visible instead of hidden behind the resting label.
+                      slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+                    />
+                    <TextField
+                      id="chat-speech-speed"
+                      label={t.chatSpeechSpeed}
+                      type="number"
+                      value={c.audioSettings.speed}
+                      placeholder={SPEECH_SPEED_PLACEHOLDER}
+                      onChange={(event) =>
+                        c.setAudioSettings((s) => ({ ...s, speed: event.target.value }))
+                      }
+                      disabled={c.streaming}
+                      slotProps={{
+                        inputLabel: { shrink: true },
+                        input: { notched: true },
+                        htmlInput: { min: 0, step: 0.1 },
+                      }}
+                    />
+                  </Box>
+                  <Typography variant="caption" color="text.secondary">
+                    {t.chatSpeechFormatHint}
+                  </Typography>
+                  <Button
+                    variant="text"
+                    size="small"
+                    aria-expanded={speechAdvancedOpen}
+                    onClick={() => setShowSpeechAdvanced(toggleOpen)}
+                    sx={{ justifySelf: 'start' }}
+                  >
+                    {t.chatSpeechAdvanced}
+                  </Button>
+                  {speechAdvancedOpen && (
+                    <TextField
+                      id="chat-speech-passthrough"
+                      label={t.chatSpeechPassthrough}
+                      multiline
+                      minRows={4}
+                      fullWidth
+                      value={c.audioSettings.passthrough}
+                      onChange={(event) =>
+                        c.setAudioSettings((s) => ({ ...s, passthrough: event.target.value }))
+                      }
+                      disabled={c.streaming}
+                      error={passthroughInvalid}
+                      helperText={
+                        passthroughInvalid
+                          ? audioPassthroughMessage(passthroughParse, t)
+                          : t.chatSpeechPassthroughHint
+                      }
+                      slotProps={{ htmlInput: { spellCheck: false } }}
+                      sx={{ '& textarea': { fontFamily: 'var(--font-mono, monospace)' } }}
+                    />
+                  )}
+                </>
+              )}
               {/* The server-override picker is hidden entirely when the caller
                 manages zero servers AND the run-as token does not lock it —
                 otherwise there would be nothing to override onto. A locked
@@ -741,7 +864,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
           >
             <TextField
               id="chat-message"
-              label={isImageThread ? t.chatImagePromptLabel : t.messageLabel}
+              label={promptLabel}
               helperText={promptHelperText}
               multiline
               minRows={4}

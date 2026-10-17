@@ -70,6 +70,33 @@ describe('extensionFor', () => {
       expect(extensionFor(`data:${type};base64,AAAA`)).toBe('bin');
     },
   );
+
+  // A speech turn's answer is a WAV (the only audio the chat stores, ADR-056).
+  it('maps audio/wav to wav, from a data: URL and from a bare Content-Type', () => {
+    expect(extensionFor('data:audio/wav;base64,AAAA')).toBe('wav');
+    expect(extensionFor('audio/wav')).toBe('wav');
+    expect(extensionFor('audio/wav; charset=binary')).toBe('wav');
+    expect(extensionFor('AUDIO/WAV')).toBe('wav');
+  });
+
+  // Same rule as for images: the served subtype is server input and lands in a
+  // file name, so an audio subtype nothing stores is `bin`, never echoed.
+  it.each(['audio/bat', 'audio/mpeg', 'audio/constructor', 'audio/__proto__'])(
+    'falls back to bin for the audio subtype outside the allow-list: %s',
+    (type) => {
+      expect(extensionFor(type)).toBe('bin');
+      expect(extensionFor(`data:${type};base64,AAAA`)).toBe('bin');
+    },
+  );
+
+  // The allow-list is keyed on the WHOLE media type, not the subtype alone: a
+  // known subtype under the wrong top-level type must not borrow its extension.
+  it.each(['audio/png', 'image/wav', 'video/wav', 'text/wav'])(
+    'does not mix a subtype with the wrong top-level type: %s',
+    (type) => {
+      expect(extensionFor(type)).toBe('bin');
+    },
+  );
 });
 
 describe('downloadBinary', () => {
@@ -167,6 +194,36 @@ describe('downloadBinary', () => {
     // Back-compat: a persisted data: URL is decoded in place, never fetched.
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it('saves an inline data:audio/wav URL as a .wav file, decoded in place', async () => {
+    let anchor: HTMLAnchorElement | undefined;
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+      const el = nativeCreateElement(tag, options as ElementCreationOptions);
+      if (tag === 'a') {
+        anchor = el as HTMLAnchorElement;
+        anchor.click = () => {};
+      }
+      return el;
+    });
+    const blobs: Blob[] = [];
+    vi.stubGlobal('URL', {
+      ...URL,
+      createObjectURL: vi.fn((b: Blob) => {
+        blobs.push(b);
+        return 'blob:stub';
+      }),
+      revokeObjectURL: vi.fn(),
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ok = await downloadBinary((ext) => `reply.${ext}`, 'data:audio/wav;base64,AAAA');
+
+    expect(ok).toBe(true);
+    expect(anchor?.download).toBe('reply.wav');
+    expect(blobs[0].type).toBe('audio/wav');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 // A stored image is a short /api/portal/chat-blobs/{id} url, not a data: URL.
@@ -259,6 +316,21 @@ describe('downloadBinary from a gateway url', () => {
     await downloadBinary((extension) => `cat.${extension}`, GATEWAY_URL);
 
     expect(anchor?.download).toBe(`cat.${ext}`);
+  });
+
+  // A speech turn's answer lives behind the same endpoint: the chat-blobs path
+  // stays fetchable and the served audio/wav is saved as .wav.
+  it('fetches a stored audio reply and saves it under the .wav extension', async () => {
+    const fetchMock = vi.fn(async () => okResponse([1, 2, 3, 4], 'audio/wav'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const ok = await downloadBinary((ext) => `reply.${ext}`, GATEWAY_URL);
+
+    expect(ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(GATEWAY_URL, { credentials: 'same-origin' });
+    expect(blobs[0].type).toBe('audio/wav');
+    expect(anchor?.download).toBe('reply.wav');
+    expect(clicks).toBe(1);
   });
 
   it('falls back to the bin extension when the response carries no image Content-Type', async () => {

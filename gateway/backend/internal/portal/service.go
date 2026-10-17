@@ -1374,6 +1374,17 @@ type ModelDTO struct {
 	// model on one server that opted out and one that did not is served by the
 	// gate but advertised false here: the safe direction.
 	ImageEdit bool `json:"image_edit"`
+	// Speech is true only when the speech endpoint would serve the model --
+	// EVERY offering mapping (or, for a group, every offerable member) has a
+	// (speech, yes) verdict and passes both flavor stages of a speech request
+	// (the application's openai_audio and, for an agent-launched model with a
+	// spec, the spec's): AND aggregation, fail-closed, exactly like Image. It is
+	// speechFlagsByName's result, the one speech fold ModelOffering.Capable asks
+	// too, so the portal chat offers a speech turn only for a model the redirect
+	// would also name. It is INDEPENDENT of Image and Vision: Speech means the
+	// model SYNTHESISES audio from text, and another capability's yes verdict
+	// never makes a model a speech candidate.
+	Speech bool `json:"speech"`
 	// OriginalModelID is set ONLY on a generated Claude alias row (the token's
 	// claude_model_aliases setting): the real gateway model/group id the
 	// `anthropic-local-<hash>` ID resolves to. DisplayName on such a row is the
@@ -2532,16 +2543,17 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			}
 			capsByMapping, capErr := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
 			if capErr != nil {
-				// LOUDLY: this degrade withholds BOTH vision and image from
-				// EVERY model in the listing gateway-wide (the fold below
-				// AND-s a missing row in as false for each), which the
-				// portal renders as a perfectly normal page whose image-
-				// ATTACH affordance (gated on vision) and image-GENERATION
-				// affordance (gated on image) are simply both gone -- a
-				// fail-closed outage with no diagnostic trail unless it is
-				// logged. Every sibling best-effort read in this package
-				// logs for exactly that reason.
-				slog.Warn("portal: models-listing capability read failed; vision, image and image_edit withheld for every model",
+				// LOUDLY: this degrade withholds vision, image, image_edit AND
+				// speech from EVERY model in the listing gateway-wide (the
+				// folds below AND a missing row in as false for each), which
+				// the portal renders as a perfectly normal page whose image-
+				// ATTACH affordance (gated on vision), image-GENERATION
+				// affordance (gated on image) and speech-synthesis affordance
+				// (gated on speech) are simply all gone -- a fail-closed
+				// outage with no diagnostic trail unless it is logged. Every
+				// sibling best-effort read in this package logs for exactly
+				// that reason.
+				slog.Warn("portal: models-listing capability read failed; vision, image, image_edit and speech withheld for every model",
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
@@ -2569,6 +2581,12 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// routing.ImpliedImageEdit (image:yes and no image_edit:no), the
 			// same function the routing gate reads.
 			imageEditOn := imageEditFlagsByName(views, capsByMapping, idx)
+			// speech is speechFlagsByName, the one speech fold the unknown-model
+			// redirect asks too (ModelOffering.Capable): the (speech, yes)
+			// verdict and the openai_audio flavor half, read from the same
+			// capability batch and the same runtime-spec index as the image folds,
+			// so the flag costs no further store read.
+			speechOn := speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
 			// Each model's flavors are the ones dispatch serves it under
 			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
 			// flavorSetsFromViews applies for /v1/models too. Every model keeps
@@ -2709,7 +2727,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 						groupContext[e.Name] = minContext
 					}
 				}
-				// A group's vision, image and image_edit flags are the AND of its
+				// A group's vision, image, image_edit and speech flags are the AND of its
 				// offerable members' flags (same fail-closed rule as a plain
 				// model); an EMPTY offerable member set is false (fail-closed —
 				// never claim a capability on a group with nothing to serve it).
@@ -2717,6 +2735,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				groupVision := groupCapabilityFlags(entries, visionOn)
 				groupImage := groupCapabilityFlags(entries, imageOn)
 				groupImageEdit := groupCapabilityFlags(entries, imageEditOn)
+				groupSpeech := groupCapabilityFlags(entries, speechOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2754,6 +2773,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					visionOn[e.Name] = groupVision[e.Name]
 					imageOn[e.Name] = groupImage[e.Name]
 					imageEditOn[e.Name] = groupImageEdit[e.Name]
+					speechOn[e.Name] = groupSpeech[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2796,7 +2816,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
 				// An alias name added to the flavor map still needs the target's
 				// OTHER listing data (loaded state, offered-on count, context size,
-				// vision/image/image_edit, and whether the target is itself a model
+				// vision/image/image_edit/speech, and whether the target is itself a model
 				// GROUP) copied over under the alias name -- the alias entry is
 				// meant to look exactly like its target's row, just filed under a
 				// different name (this is a display, not a leak: the alias really
@@ -2823,6 +2843,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					if v, ok := imageEditOn[target]; ok {
 						imageEditOn[name] = v
+					}
+					if v, ok := speechOn[target]; ok {
+						speechOn[name] = v
 					}
 					if _, ok := isGroup[target]; ok {
 						isGroup[name] = struct{}{}
@@ -2888,6 +2911,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.Vision = visionOn[id]
 				dto.Image = imageOn[id]
 				dto.ImageEdit = imageEditOn[id]
+				dto.Speech = speechOn[id]
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}
@@ -2969,11 +2993,11 @@ func imageEditFlagsByName(views []mappingView, capsByMapping map[string][]routin
 
 // speechFlagsByName is THE speech fold, the speech twin of imageFlagsByName:
 // per gateway model name among views, whether the speech endpoint would serve
-// it. It backs the unknown-model redirect's ModelOffering.Capable for a request
-// that requires routing.CapabilitySpeech (capableNames). No listing field reads
-// it yet, but it is a fold of its own rather than an inlined rule so that one
-// does not grow a second copy of it. idx supplies each mapping's runtime spec
-// (runtimeSpecIndex) and must cover every view.
+// it. It backs the listing's ModelDTO.Speech and the unknown-model redirect's
+// ModelOffering.Capable for a request that requires routing.CapabilitySpeech
+// (capableNames), so the two can never disagree about which model synthesises
+// speech. idx supplies each mapping's runtime spec (runtimeSpecIndex) and must
+// cover every view.
 //
 // This is the gate behind "openai_audio is offered only behind a speech
 // verdict": a name carries the speech capability only when EVERY one of its

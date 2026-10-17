@@ -52,6 +52,26 @@ export type ChatImageSettings = {
   strength?: number;
 };
 
+// The text-to-speech knobs of a "speech" thread, as sent on the wire and persisted
+// inside `content.settings.audio`. Like ChatImageSettings every field is OPTIONAL: an
+// unset knob is omitted so the model keeps its own default, and the whole object is
+// omitted for a text or image thread (mirroring `kind`), so their persisted settings
+// stay byte-identical. The reply is always WAV (the gateway serves only wav), so there
+// is no format knob. See the backend's portal.ChatAudioSettings.
+export type ChatAudioSettings = {
+  // The free-text voice name (audio.cpp voices are not discovered); omitted = the
+  // model's default voice.
+  voice?: string;
+  // The speaking-rate multiplier, passed through as given (the model's own range
+  // applies); omitted = the model's default.
+  speed?: number;
+  // The advanced extra-JSON surface: top-level request fields merged verbatim into the
+  // /v1/audio/speech body (the OpenAI `instructions` field and any audio.cpp-native
+  // knob). The values keep the JSON type the user wrote. The backend refuses the keys
+  // the run owns (model / input / stream / response_format).
+  passthrough?: Record<string, unknown>;
+};
+
 // The per-chat settings the frontend persists inside `content`.
 export type ChatSettings = {
   model: string;
@@ -66,7 +86,7 @@ export type ChatSettings = {
   server_override: string;
   server_override_force_unreachable: boolean;
   // The thread's pinned kind: "" (text — the default and every pre-existing
-  // chat) or "image". Established by the FIRST send and then FORCED by the
+  // chat), "image" or "speech". Established by the FIRST send and then FORCED by the
   // backend on every later send (PrepareChatRun), because the composer's
   // affordances follow the THREAD, not the currently-picked model.
   //
@@ -87,6 +107,11 @@ export type ChatSettings = {
   // store holds a concrete ImageSettings (chatDoc.ts) and both writers go
   // through imageSetting() so neither can reintroduce the key for a text thread.
   image?: ChatImageSettings;
+  // The text-to-speech knobs, present only on a "speech" thread (omitted for a text or
+  // image thread so their settings stay byte-identical, exactly like `kind` and
+  // `image`). The store holds a concrete AudioSettings (chatDoc.ts) and both writers go
+  // through audioSetting() so neither can reintroduce the key for another kind.
+  audio?: ChatAudioSettings;
 };
 
 // The full opaque content document the frontend stores per chat. Messages are
@@ -105,7 +130,7 @@ export type ActiveChatRun = {
   chat_id: string;
   run_id: string;
   status: ChatRunStatus;
-  // Present only for a run whose thread is pinned "image" (both omitempty on
+  // Present only for a run whose thread is pinned "image" or "speech" (both omitempty on
   // the wire, mirroring activeRunDTO in chat_run_endpoints.go): the run's
   // kind and its server-measured age in ms. elapsed_ms is what lets a
   // REOPENED browser anchor the composer's pending clock on the same true
@@ -143,6 +168,10 @@ export type StartChatRunBody = {
     // /v1/images/generations (buildImagesBody) and clears them for a non-image
     // kind.
     image?: ChatImageSettings;
+    // Mirrors ChatSettings.audio: the text-to-speech knobs a speech thread sends.
+    // Absent for any other kind. The backend forwards the set fields to
+    // /v1/audio/speech (buildSpeechBody) and clears them for a non-speech kind.
+    audio?: ChatAudioSettings;
   };
 };
 export type StartChatRunResponse = {

@@ -40,8 +40,12 @@ import {
   DEFAULTS,
   MAX_IMAGES,
   attachModeOf,
+  audioPassthroughMessage,
+  audioSetting,
+  audioSettingsFrom,
   byNewest,
   clearLegacyKeys,
+  DEFAULT_AUDIO_SETTINGS,
   DEFAULT_IMAGE_SETTINGS,
   IMAGE_EDIT_SOURCE_TYPES,
   deriveTitle,
@@ -56,11 +60,14 @@ import {
   lsSet,
   nextId,
   normalizeDoc,
+  parseAudioPassthrough,
   readLegacyDoc,
   resolveTokenOverride,
+  speechPassthroughInvalid,
   summaryOf,
   userTurnContent,
   type AttachMode,
+  type AudioSettings,
   type ChatUiMessage,
   type ImageSettings,
 } from './chatDoc';
@@ -71,6 +78,13 @@ import { useChatPersistence } from './useChatPersistence';
 // working unchanged after the FA-2 extraction into chatDoc.ts.
 export type { ActiveChatDoc, ChatMessageStatus } from './chatDoc';
 export type { AttachMode, ChatUiMessage };
+
+// The speech composer's advanced-passthrough check and the settings type it edits,
+// re-exported for Chat.tsx for the same reason as the image presets below: the
+// composer must not reach into chatDoc.ts (arch.test.ts), and it needs to name a
+// passthrough text that is not a JSON object before the user sends it.
+export { audioPassthroughMessage, parseAudioPassthrough } from './chatDoc';
+export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
 
 // The image-settings presets (and the optionsOr helper that merges a per-model
 // fetched list over them) the composer (Chat.tsx, OUTSIDE components/chat/)
@@ -169,6 +183,11 @@ export type ChatStore = {
   // same derivation, so the composer never offers an edit the gate would refuse.
   // Independent of modelVisionCapable (an sd model edits and is vision:false).
   modelImageEdit: boolean;
+  // Whether the effective model SYNTHESIZES speech (the backend's `speech` verdict,
+  // ModelOption.speech, read as served). The speech twin of modelImageCapable: it gates
+  // only what the composer NEWLY OFFERS on an unpinned thread (the speech composer, via
+  // prospectiveKind) -- never what an existing thread DOES: that is chatKind's job.
+  modelSpeechCapable: boolean;
   // What an attached image MEANS for the next send: 'edit' (the source of an image
   // edit), 'vision' (an input a text model reads) or 'none' (not accepted). One
   // predicate of chatKind and the model's flags (attachModeOf, chatDoc.ts) that
@@ -183,12 +202,12 @@ export type ChatStore = {
   // ("unknown"), so the composer's dropdowns merge it over their static
   // Phase 1b-i superset (optionsOr) rather than trusting it to be complete.
   modelImageOptions: ImageModelOptions | null;
-  // The THREAD's kind: "" (text) or "image". Pinned by the backend at the
+  // The THREAD's kind: "" (text), "image" or "speech". Pinned by the backend at the
   // thread's first send and authoritative from then on; while the thread is
   // still empty it follows the picked model, because that is what the next
   // send will pin it to. Render composer affordances off THIS, not off
   // modelImageCapable — a text thread stays a text thread even if the user
-  // later picks an image model.
+  // later picks an image or speech model.
   chatKind: string;
   // The image-generation knobs of the active thread (size / n / output_format /
   // output_compression), as concrete store state. The settings panel edits them
@@ -196,7 +215,13 @@ export type ChatStore = {
   // for a text thread (see imageSetting in chatDoc.ts).
   imageSettings: ImageSettings;
   setImageSettings: Dispatch<SetStateAction<ImageSettings>>;
-  // The active chat's LIVE RUN's own reported kind ("" text | "image"),
+  // The text-to-speech knobs of the active thread (voice / speed / passthrough text), as
+  // concrete store state. The speech composer edits them when chatKind === "speech";
+  // they are omitted from the wire and persistence for any other kind (see audioSetting
+  // in chatDoc.ts). A passthrough that is not a JSON object blocks the send (see send()).
+  audioSettings: AudioSettings;
+  setAudioSettings: Dispatch<SetStateAction<AudioSettings>>;
+  // The active chat's LIVE RUN's own reported kind ("" text | "image" | "speech"),
   // read from useChatRuns' kindOf -- deliberately NOT chatKind above.
   // chatKind is the client's own "is this thread's first send" guess
   // (messagesRef.current.length === 0) and can disagree with the server's
@@ -359,6 +384,10 @@ export function ChatStoreProvider({
   // Seeded from the loaded document in activateChat, sent on run via
   // currentSettings, persisted via buildDoc -- all gated on chatKind "image".
   const [imageSettings, setImageSettings] = useState<ImageSettings>(DEFAULT_IMAGE_SETTINGS);
+  // The active speech thread's text-to-speech knobs (concrete, see AudioSettings): the
+  // image settings' twin, seeded in activateChat, sent via currentSettings, persisted
+  // via buildDoc -- all gated on chatKind "speech".
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>(DEFAULT_AUDIO_SETTINGS);
   const [messages, setMessages] = useState<ChatUiMessage[]>([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
@@ -401,17 +430,26 @@ export function ChatStoreProvider({
 
   // A model is offered when the chat can send it something the gateway will
   // serve: a text request (chat completions, the openai flavor) or an image
-  // request (the openai_images flavor). offeredFlavors keeps openai_images
-  // only behind an image verdict, because the images gate refuses a model
-  // without image: yes -- an images-only model (an sd-server, whose upstream
-  // has no chat endpoint) without that verdict could only ever produce a
-  // request that fails. anthropic alone offers nothing: the chat sends no
-  // /v1/messages request.
+  // request (the openai_images flavor) or a speech request (the openai_audio
+  // flavor). offeredFlavors keeps openai_images only behind an image verdict,
+  // because the images gate refuses a model without image: yes -- an images-only
+  // model (an sd-server, whose upstream has no chat endpoint) without that
+  // verdict could only ever produce a request that fails. openai_audio is the
+  // same story and is admitted only behind a speech verdict, but that rule is
+  // the CHAT's alone and lives here: offeredFlavors passes openai_audio through
+  // because it is shared with the Models view, whose "Available via" column
+  // must keep showing an audio row's flavor (transcription, unprobed and
+  // agent-managed models have no speech verdict and are listed there anyway).
+  // anthropic alone offers nothing: the chat sends no /v1/messages request.
   const chatModels = useMemo(
     () =>
       models.filter((option) => {
         const offered = offeredFlavors(option);
-        return offered.includes('openai') || offered.includes('openai_images');
+        return (
+          offered.includes('openai') ||
+          offered.includes('openai_images') ||
+          (offered.includes('openai_audio') && option.speech === true)
+        );
       }),
     [models],
   );
@@ -495,13 +533,23 @@ export function ChatStoreProvider({
   // gate and this flag are one derivation (routing.ImpliedImageEdit).
   const modelImageEdit =
     chatModels.find((option) => option.id === effectiveModel)?.image_edit ?? false;
+  // Whether the effective model SYNTHESIZES speech (drives the speech-thread composer),
+  // read as served like `image`: the backend's own fold of the speech verdict.
+  const modelSpeechCapable =
+    chatModels.find((option) => option.id === effectiveModel)?.speech ?? false;
 
   // The kind the NEXT send would pin, derived from the picked model. Only
   // ever consulted while the thread has no transcript at all (below), which
   // is why the synthetic model option injected for a picked-but-uncatalogued
   // model — no capability fields, so image === false — is harmless here: the
   // PINNED kind is the thread's truth the moment one exists.
-  const prospectiveKind = modelImageCapable ? 'image' : '';
+  //
+  // A model both image- and speech-capable is an image model here: image was the
+  // kind first, so a model that gains a speech verdict never changes what an
+  // existing image model does. (Nothing in the catalogue is both today.)
+  let prospectiveKind = '';
+  if (modelImageCapable) prospectiveKind = 'image';
+  else if (modelSpeechCapable) prospectiveKind = 'speech';
   // The thread's kind, and the whole distinction in one line: once the thread
   // has a transcript the backend has already pinned it (PrepareChatRun forces
   // the stored kind on every send after the first), so the pin wins and the
@@ -526,6 +574,7 @@ export function ChatStoreProvider({
   const temperatureRef = useRef(temperature);
   const maxTokensRef = useRef(maxTokens);
   const imageSettingsRef = useRef(imageSettings);
+  const audioSettingsRef = useRef(audioSettings);
   const selectedTokenIdRef = useRef(selectedTokenId);
   const serverOverrideRef = useRef(serverOverride);
   const serverOverrideForceUnreachableRef = useRef(serverOverrideForceUnreachable);
@@ -643,6 +692,7 @@ export function ChatStoreProvider({
       temperatureRef,
       maxTokensRef,
       imageSettingsRef,
+      audioSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -660,6 +710,7 @@ export function ChatStoreProvider({
       temperature,
       maxTokens,
       imageSettings,
+      audioSettings,
       selectedTokenId,
       serverOverride,
       serverOverrideForceUnreachable,
@@ -698,6 +749,7 @@ export function ChatStoreProvider({
     temperatureRef.current = temperature;
     maxTokensRef.current = maxTokens;
     imageSettingsRef.current = imageSettings;
+    audioSettingsRef.current = audioSettings;
     selectedTokenIdRef.current = selectedTokenId;
     serverOverrideRef.current = serverOverride;
     serverOverrideForceUnreachableRef.current = serverOverrideForceUnreachable;
@@ -740,6 +792,11 @@ export function ChatStoreProvider({
       // persisted `image` only for an image thread, so a text thread seeds
       // defaults harmlessly.
       setImageSettings(imageSettingsFrom(doc.settings.image));
+      // The audio knobs, seeded the same way and for the same reason (a speech thread
+      // activateChat does not seed reverts to defaults and is written over the stored
+      // value by the next save). normalizeDoc kept the persisted `audio` only for a
+      // speech thread, so any other thread seeds defaults harmlessly.
+      setAudioSettings(audioSettingsFrom(doc.settings.audio));
       // Seed the transcript from the per-chat buffer when this chat has an active
       // or recently-finished run (the server owns/owned its tail); otherwise use
       // the freshly-loaded server content. Prefer the buffer ONLY when it actually
@@ -803,6 +860,10 @@ export function ChatStoreProvider({
       // The image knobs, present only on an image thread (imageSetting keys off
       // the kind). The backend forwards the set fields to the images endpoint.
       ...imageSetting(chatKindRef.current, imageSettingsRef.current),
+      // The audio knobs, present only on a speech thread (audioSetting keys off the
+      // kind), so a text or image thread's run body carries no audio key. The backend
+      // forwards the set fields to /v1/audio/speech.
+      ...audioSetting(chatKindRef.current, audioSettingsRef.current),
     }),
     [],
   );
@@ -1057,6 +1118,19 @@ export function ChatStoreProvider({
         showErrorRef.current(tRef.current.chatModelUnavailable);
         return;
       }
+      // Same guard as send()'s for a speech thread's advanced passthrough: a replay
+      // sends the thread's CURRENT audio settings too, and one that is not a JSON
+      // object would be dropped from the request in silence, and one that names a
+      // field the run owns would fail the replay after the turn is committed.
+      if (speechPassthroughInvalid(chatKindRef.current, audioSettingsRef.current)) {
+        showErrorRef.current(
+          audioPassthroughMessage(
+            parseAudioPassthrough(audioSettingsRef.current.passthrough),
+            tRef.current,
+          ),
+        );
+        return;
+      }
       // Same guard for image support: the REPLAYED history (what is actually
       // sent as edited_history below) must not carry an image the model can't
       // process. Checking `history` (not the full messagesRef.current) matters
@@ -1291,6 +1365,21 @@ export function ChatStoreProvider({
         showErrorRef.current(tRef.current.chatImageEditPromptRequired);
         return;
       }
+    }
+    // A speech thread's advanced passthrough must be a JSON object (or blank) that
+    // names none of the fields the run owns: any other text would be dropped from the
+    // run in silence (audioSetting omits it) while the Advanced section that holds it
+    // may be collapsed, and a reserved field would fail the run only after the turn is
+    // committed. Refused here with the composer left as it is, before anything is
+    // stored or cleared.
+    if (speechPassthroughInvalid(chatKindRef.current, audioSettingsRef.current)) {
+      showErrorRef.current(
+        audioPassthroughMessage(
+          parseAudioPassthrough(audioSettingsRef.current.passthrough),
+          tRef.current,
+        ),
+      );
+      return;
     }
     // This send pins the thread's kind server-side when the thread is still
     // empty (PrepareChatRun accepts the client's kind only on a genuine first
@@ -1622,11 +1711,14 @@ export function ChatStoreProvider({
     modelVisionCapable,
     modelImageCapable,
     modelImageEdit,
+    modelSpeechCapable,
     attachMode,
     modelImageOptions,
     chatKind,
     imageSettings,
     setImageSettings,
+    audioSettings,
+    setAudioSettings,
     runKind,
     runElapsedMs,
     chats,

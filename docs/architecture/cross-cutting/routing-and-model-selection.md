@@ -664,8 +664,10 @@ edit. `speech` has its own fold (`speechFlagsByName` and `viewServesAudio`, the 
 file): a `speech: yes` verdict on every mapping of the name this token reaches, the
 application's `openai_audio` and, for an agent-launched model with a spec, the spec's
 too, failing closed on a missing or `no` row and on a failed spec read, and a group
-only when every offerable member qualifies. The fold gates `Capable` only; no listing
-field carries it. The flavor cannot answer this by itself:
+only when every offerable member qualifies. The fold backs `Capable` and the portal
+listing's `speech` flag (`ModelDTO.Speech`, the rule behind the chat's speech
+composer), so the two cannot disagree; neither `/v1/models` nor the LM Studio
+`capabilities` object carries it. The flavor cannot answer this by itself:
 `Callable` for `openai_images` holds every model whose route declares the
 flavor — its application and, for an agent-launched model with a spec, the
 spec too — whatever its verdict. A required capability with no fold
