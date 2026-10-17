@@ -328,6 +328,19 @@ const de = {
   // turn reaches exactly this. The whole point of this feature is to stop a
   // download from failing silently, so the user is told, not just logged to.
   chatImageDownloadError: 'Bild konnte nicht heruntergeladen werden.',
+  // The audio twin of the image answer keys above, for a speech (text-to-speech) turn.
+  // chatAudioRunPending words the WAIT, not the work (the same reasoning as
+  // chatImageRunPending): the request may still be queued or waiting on a model load.
+  // chatGeneratedAudio is the player's accessible name.
+  chatAudioRunPending: 'Warte auf Audio',
+  chatAudioNoIntermediateNews:
+    'Keine Zwischenmeldungen – das Audio erscheint fertig oder gar nicht.',
+  chatGeneratedAudio: 'Erzeugtes Audio',
+  chatDownloadAudio: 'Audio herunterladen',
+  // Inline next to the player, in two cases: the download itself failed, or the stored
+  // reply could not be fetched for playback (a purged blob, a network error).
+  chatAudioDownloadError: 'Audio konnte nicht heruntergeladen werden.',
+  chatAudioLoadError: 'Audio konnte nicht geladen werden.',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -3355,6 +3368,13 @@ const en: PortalMessages = {
   chatRefineImage: 'Refine this image',
   chatGeneratedImage: 'Generated image',
   chatImageDownloadError: 'Could not download the image.',
+  chatAudioRunPending: 'Waiting for audio',
+  chatAudioNoIntermediateNews:
+    'No intermediate updates – the audio arrives finished or not at all.',
+  chatGeneratedAudio: 'Generated audio',
+  chatDownloadAudio: 'Download audio',
+  chatAudioDownloadError: 'Could not download the audio.',
+  chatAudioLoadError: 'Could not load the audio.',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',

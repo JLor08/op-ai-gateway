@@ -212,6 +212,201 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getAllByRole('img')).toHaveLength(1);
     });
 
+    // A speech (text-to-speech) run is as silent as an image run -- the endpoint
+    // answers once, with the finished WAV -- so it gets the same non-streaming wait,
+    // worded for audio.
+    describe('a speech run', () => {
+      it('shows the audio wait label, a clock and the no-news sentence while pending', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            elapsedMs={107_000}
+          />,
+        );
+        expect(screen.getByText(t.chatAudioRunPending)).toBeInTheDocument();
+        expect(screen.getByText('1:47')).toBeInTheDocument();
+        expect(screen.getByText(t.chatAudioNoIntermediateNews)).toBeInTheDocument();
+        // Not the image copy, and not the text-pending state either.
+        expect(screen.queryByText(t.chatImageRunPending)).toBeNull();
+        expect(screen.queryByText(new RegExp(t.chatCharsUnit))).toBeNull();
+        expect(screen.queryByText(new RegExp(t.chatReasoningActive))).toBeNull();
+        expect(screen.queryByTestId('chat-stream-cursor')).toBeNull();
+      });
+
+      it('hides the ticking clock from assistive technology, but not the label or sentence', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            elapsedMs={5_000}
+          />,
+        );
+        expect(screen.getByText('5s').closest('[aria-hidden="true"]')).not.toBeNull();
+        expect(screen.getByText(t.chatAudioRunPending).closest('[aria-hidden="true"]')).toBeNull();
+        expect(
+          screen.getByText(t.chatAudioNoIntermediateNews).closest('[aria-hidden="true"]'),
+        ).toBeNull();
+      });
+
+      it('ticks the clock once a second from the server anchor', async () => {
+        vi.useFakeTimers();
+        try {
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              content=""
+              streaming
+              kind="speech"
+              elapsedMs={3_000}
+            />,
+          );
+          expect(screen.getByText('3s')).toBeInTheDocument();
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(2_000);
+          });
+          expect(screen.getByText('5s')).toBeInTheDocument();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('does not show the pending state once the audio has arrived, even while still streaming', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,AAAA' } }]}
+            streaming
+            kind="speech"
+            elapsedMs={12_000}
+          />,
+        );
+        expect(screen.queryByText(t.chatAudioRunPending)).toBeNull();
+        expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+      });
+
+      it('shows no pending state when the run is not streaming (a failed or finished turn)', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content="the run failed"
+            kind="speech"
+            elapsedMs={1_000}
+          />,
+        );
+        expect(screen.queryByText(t.chatAudioRunPending)).toBeNull();
+        expect(screen.getByText('the run failed')).toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+      });
+
+      it('renders a finished turn as an <audio controls> player and a download button', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="msg_a1b2"
+            content={[{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,AAAA' } }]}
+          />,
+        );
+        const audio = screen.getByLabelText(t.chatGeneratedAudio);
+        expect(audio.tagName).toBe('AUDIO');
+        expect(audio).toHaveAttribute('controls');
+        expect(audio).toHaveAttribute('src', 'data:audio/wav;base64,AAAA');
+        expect(screen.getByRole('button', { name: t.chatDownloadAudio })).toBeInTheDocument();
+        // An audio part is not an image: no thumbnail, no image download.
+        expect(screen.queryAllByRole('img')).toHaveLength(0);
+        expect(screen.queryByRole('button', { name: t.chatDownloadImage })).toBeNull();
+      });
+
+      // Review Focus 3, end to end through the message: the stored reply plays from an
+      // object URL, and that URL is released when the turn leaves the transcript.
+      it('plays a stored reply from a fetched object URL and revokes it on unmount', async () => {
+        const createObjectURL = vi.fn(() => 'blob:speech-reply');
+        const revokeObjectURL = vi.fn();
+        vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
+        const fetchMock = vi.fn(async () => ({
+          ok: true,
+          status: 200,
+          blob: async () => new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/wav' }),
+        }));
+        vi.stubGlobal('fetch', fetchMock);
+
+        const { unmount } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="msg_a1b2"
+            content={[
+              {
+                type: 'audio_url',
+                audio_url: { url: '/api/portal/chat-blobs/6f1c2a52-0f43-4d0b-bb0d-8c7a3a1d9e10' },
+              },
+            ]}
+          />,
+        );
+
+        await waitFor(() =>
+          expect(screen.getByLabelText(t.chatGeneratedAudio)).toHaveAttribute(
+            'src',
+            'blob:speech-reply',
+          ),
+        );
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(revokeObjectURL).not.toHaveBeenCalled();
+
+        unmount();
+
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:speech-reply');
+      });
+
+      it('does not re-fetch the audio when the message re-renders with the same content', async () => {
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => 'blob:speech-reply'),
+          revokeObjectURL: vi.fn(),
+        });
+        const fetchMock = vi.fn(async () => ({
+          ok: true,
+          status: 200,
+          blob: async () => new Blob([new Uint8Array([1])], { type: 'audio/wav' }),
+        }));
+        vi.stubGlobal('fetch', fetchMock);
+        const content = [
+          {
+            type: 'audio_url' as const,
+            audio_url: { url: '/api/portal/chat-blobs/6f1c2a52-0f43-4d0b-bb0d-8c7a3a1d9e10' },
+          },
+        ];
+
+        const { rerender } = render(
+          <ChatMessage t={t} role="assistant" turnId="msg_a1b2" content={content} />,
+        );
+        await waitFor(() =>
+          expect(screen.getByLabelText(t.chatGeneratedAudio)).toHaveAttribute('src'),
+        );
+        rerender(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="msg_a1b2"
+            content={[...content]}
+            ttftMs={500}
+          />,
+        );
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it('summarizes reasoning with char count and seconds once finished', () => {
       render(
         <ChatMessage

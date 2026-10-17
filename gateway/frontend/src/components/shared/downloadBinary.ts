@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-// Saving an image URL as a real file. The sibling downloadText wraps a STRING
-// in a Blob -- it was written for PEM/text blobs and its own doc says so -- so
-// handing it a data URL saves a text file whose contents are the data URL
+// Saving an image or audio URL as a real file. The sibling downloadText wraps a
+// STRING in a Blob -- it was written for PEM/text blobs and its own doc says so --
+// so handing it a data URL saves a text file whose contents are the data URL
 // itself. That is not a smaller problem than a missing button: the user thinks
 // they saved their image.
 //
@@ -13,7 +13,8 @@
 //    the binary payload store existed, and what an old transcript still holds.
 //    Decoded in place; the media type is the URL's own prefix. Nothing here
 //    assumes PNG.
-//  - A gateway url (/api/portal/chat-blobs/{id}): what a stored image is now.
+//  - A gateway url (/api/portal/chat-blobs/{id}): what a stored image (or a
+//    speech turn's WAV) is now.
 //    The bytes live behind an owner-scoped endpoint, so they are fetched (with
 //    the session cookie) and the media type is whatever the response's
 //    Content-Type says. The url comes out of a persisted transcript, so only a
@@ -58,7 +59,7 @@ const CHAT_BLOBS_PATH = '/api/portal/chat-blobs/';
 // the rest of a url only change the path or query. A scripting scheme, a blob:
 // url, a bare word, "//host/x", "/\host/x" and any absolute (cross-origin)
 // url all come back as a plain false, never a fetch.
-function isFetchableUrl(url: string): boolean {
+export function isFetchableUrl(url: string): boolean {
   return url.startsWith(CHAT_BLOBS_PATH);
 }
 
@@ -120,24 +121,30 @@ function saveBlob(blob: Blob, filename: string): void {
   }
 }
 
-// The extensions a download may be saved under, by image subtype. An allow-list
-// on purpose: the subtype of a fetched response's Content-Type is server input,
-// and echoing it into the file name would let a hostile "image/bat" save as
-// "x.bat". A Map rather than an object literal so a subtype named like an
+// The extensions a download may be saved under, by whole media type. An
+// allow-list on purpose: the subtype of a fetched response's Content-Type is
+// server input, and echoing it into the file name would let a hostile
+// "image/bat" save as "x.bat". Keyed on the full type, not the subtype alone, so
+// a known subtype under the wrong top-level type ("audio/png") borrows nothing.
+// A Map rather than an object literal so a subtype named like an
 // Object.prototype member ("constructor") is not a hit.
-const EXTENSION_BY_SUBTYPE = new Map([
-  ['png', 'png'],
-  ['jpeg', 'jpg'],
-  ['webp', 'webp'],
-  ['gif', 'gif'],
+//
+// Images are what the gateway stores for an image turn; audio/wav is the one
+// audio format it stores, for a speech turn's reply (there is no format knob).
+const EXTENSION_BY_MEDIA_TYPE = new Map([
+  ['image/png', 'png'],
+  ['image/jpeg', 'jpg'],
+  ['image/webp', 'webp'],
+  ['image/gif', 'gif'],
+  ['audio/wav', 'wav'],
 ]);
 
 // extensionFor maps a media type to a file extension for the download name. It
 // accepts a bare media type (a response's Content-Type: parameters and letter
-// case are ignored) or a data: URL, whose prefix is one. Only the image
-// formats the gateway stores and serves map to their own extension (jpeg
-// becomes the conventional jpg); anything else is `bin`.
+// case are ignored) or a data: URL, whose prefix is one. Only the formats the
+// gateway stores and serves map to their own extension (jpeg becomes the
+// conventional jpg); anything else is `bin`.
 export function extensionFor(mediaTypeOrDataUrl: string): string {
-  const match = /^(?:data:)?image\/([a-z0-9+.-]+)/i.exec(mediaTypeOrDataUrl);
-  return (match && EXTENSION_BY_SUBTYPE.get(match[1].toLowerCase())) || 'bin';
+  const match = /^(?:data:)?((?:image|audio)\/[a-z0-9+.-]+)/i.exec(mediaTypeOrDataUrl);
+  return (match && EXTENSION_BY_MEDIA_TYPE.get(match[1].toLowerCase())) || 'bin';
 }
