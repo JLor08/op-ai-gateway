@@ -2315,6 +2315,260 @@ func TestIngestSdcppImageVerdictDoesNotOverwriteAManualVerdict(t *testing.T) {
 		routing.CapabilityYes, routing.CapabilitySourceSdcppCapabilities)
 }
 
+// audioCppWarnRecord returns the first WARN record whose message contains
+// substr and whose source attr is audiocpp_models, the audio twin of
+// sdcppWarnRecord: the fragment names the audio probe itself so a sample routed
+// into another source's refusal by mistake cannot satisfy it.
+func audioCppWarnRecord(recs []logbuffer.Record, substr string) (logbuffer.Record, bool) {
+	for _, r := range recs {
+		if r.Level != "WARN" || !strings.Contains(r.Msg, substr) {
+			continue
+		}
+		if got, _ := r.Attrs["source"].(string); got == routing.CapabilitySourceAudioCppModels {
+			return r, true
+		}
+	}
+	return logbuffer.Record{}, false
+}
+
+// TestIngestLandsTheAudioCppProbesSpeechAndTranscriptionVerdicts pins the
+// audiocpp_models source as one this ingest ACCEPTS: an agent that read an
+// agent-launched audio.cpp child's /v1/models listing reports the speech and
+// transcription verdicts under that source, and both rows land on the spec's
+// mapping stamped with it.
+//
+// Both NAMES and both DIRECTIONS, which is what sets this source apart from
+// sdcpp_capabilities' single image row. The listing states a model's one task,
+// so a tts model is (speech, yes) with (transcription, no) and an asr model is
+// the reverse; each "no" is a real answer, not an absence. A refusal that
+// guarded only one of the two names, or only the "yes" direction, would drop a
+// row here and the matching subtest is what fails then.
+func TestIngestLandsTheAudioCppProbesSpeechAndTranscriptionVerdicts(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, speech, transcription string
+	}{
+		{"a tts model lands speech yes and transcription no", "rspec_audiocpp_tts", routing.CapabilityYes, routing.CapabilityNo},
+		{"an asr model lands transcription yes and speech no", "rspec_audiocpp_asr", routing.CapabilityNo, routing.CapabilityYes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			counting := countingRowStore(srv)
+
+			// Reported in the order the asr shape would arrive: the
+			// transcription verdict first when it is the "yes".
+			verdicts := `{"name":"speech","verdict":"` + tc.speech + `"},{"name":"transcription","verdict":"` + tc.transcription + `"}`
+			if tc.transcription == routing.CapabilityYes {
+				verdicts = `{"name":"transcription","verdict":"` + tc.transcription + `"},{"name":"speech","verdict":"` + tc.speech + `"}`
+			}
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[`+verdicts+`],"source":"audiocpp_models"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 1 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 -- audiocpp_models is a source this gateway can attribute", got)
+			}
+			sent := counting.lastSent()
+			if len(sent) != 2 {
+				t.Fatalf("the write carried %+v, want exactly the speech and transcription rows", sent)
+			}
+			for _, row := range sent {
+				if row.Source != routing.CapabilitySourceAudioCppModels {
+					t.Fatalf("sent row %+v carries source %q, want audiocpp_models", row, row.Source)
+				}
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilitySpeech, tc.speech, routing.CapabilitySourceAudioCppModels)
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityTranscription, tc.transcription, routing.CapabilitySourceAudioCppModels)
+		})
+	}
+}
+
+// TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist pins the rule that
+// confines audiocpp_models to the two capabilities its document answers.
+// audio.cpp's /v1/models states each model's task, from which the agent derives
+// the speech and transcription verdicts and nothing else, so a row under this
+// source for any other capability is a false provenance -- the argument that
+// confines sdcpp_capabilities to image, applied to a document that answers two
+// rows instead of one.
+//
+// Only the foreign rows go, in both directions (vision "yes" and tools "no"
+// alike), while the speech and transcription verdicts in the same document still
+// land. Unfalsifiable the way the sdcpp sibling is: the mapping already holds
+// vision "no" from the OTHER probe at EQUAL rank, which a leaked "yes" would
+// flip, and the two audio rows prove the write path ran. The drop is visible at
+// the level a real gateway runs at, and the record names what was dropped.
+func TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_foreign", false)
+	seedCapabilityRow(t, srv, "map_rspec_audiocpp_foreign", routing.CapabilityVision,
+		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_audiocpp_foreign",
+		`{"verdicts":[{"name":"vision","verdict":"yes"},{"name":"tools","verdict":"no"},`+
+			`{"name":"speech","verdict":"yes"},{"name":"transcription","verdict":"no"}],"source":"audiocpp_models"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the two audio rows together)", got)
+	}
+	sent := counting.lastSent()
+	if len(sent) != 2 {
+		t.Fatalf("the write carried %+v, want exactly the speech and transcription rows -- the audio.cpp listing answers those two and nothing else", sent)
+	}
+	for _, row := range sent {
+		if row.Capability != routing.CapabilitySpeech && row.Capability != routing.CapabilityTranscription {
+			t.Fatalf("the write carried %+v, want only speech and transcription rows", sent)
+		}
+	}
+	assertCapabilityRow(t, srv, "map_rspec_audiocpp_foreign", routing.CapabilitySpeech,
+		routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	assertCapabilityRow(t, srv, "map_rspec_audiocpp_foreign", routing.CapabilityTranscription,
+		routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+	assertCapabilityRow(t, srv, "map_rspec_audiocpp_foreign", routing.CapabilityVision,
+		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	if row, ok := capabilityRow(t, srv, "map_rspec_audiocpp_foreign", routing.CapabilityTools); ok {
+		t.Fatalf("a tools row exists (%+v), want none -- the audio.cpp listing cannot speak about tools", row)
+	}
+
+	recs := buf.Snapshot()
+	rec, ok := audioCppWarnRecord(recs, "other than speech or transcription to the audio.cpp probe")
+	if !ok {
+		t.Fatalf("no WARN record about the dropped foreign rows at the gateway's own default level (info); records = %+v", recs)
+	}
+	if got, _ := rec.Attrs["capabilities"].([]string); !reflect.DeepEqual(got, []string{routing.CapabilityVision, routing.CapabilityTools}) {
+		t.Fatalf("WARN record capabilities attr = %#v, want [vision tools] -- the record must name what was dropped", rec.Attrs["capabilities"])
+	}
+	if got, _ := rec.Attrs["spec_id"].(string); got != "rspec_audiocpp_foreign" {
+		t.Fatalf("WARN record spec_id attr = %q, want rspec_audiocpp_foreign", got)
+	}
+}
+
+// TestIngestDropsAVisionVerdictFromTheAudioCppProbeAlone is the narrow shape
+// of the allowlist: a report whose ONLY verdict is outside it. Nothing may be
+// written at all -- not even an empty write -- and the drop is still named.
+func TestIngestDropsAVisionVerdictFromTheAudioCppProbeAlone(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_vision", false)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_audiocpp_vision",
+		`{"verdicts":[{"name":"vision","verdict":"yes"}],"source":"audiocpp_models"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 0 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want 0 -- a vision verdict is outside the audio.cpp source's allowlist", got)
+	}
+	if row, ok := capabilityRow(t, srv, "map_rspec_audiocpp_vision", routing.CapabilityVision); ok {
+		t.Fatalf("a vision row exists (%+v), want none", row)
+	}
+	if _, ok := audioCppWarnRecord(buf.Snapshot(), "other than speech or transcription to the audio.cpp probe"); !ok {
+		t.Fatalf("no WARN record about the dropped vision row at the gateway's own default level (info)")
+	}
+}
+
+// TestIngestRefusesALiveProgressRowFromTheAudioCppProbe is the live-progress
+// refusal for the audiocpp_models source, in either direction. audio.cpp
+// exposes no timings surface, so its /v1/models listing is evidence for neither
+// answer, and a live_progress row attributed to it would be a false provenance
+// whatever verdict it carried -- the same argument that refuses the combination
+// under ollama_api_show and sdcpp_capabilities.
+//
+// No honest agent sends it, which is why the refusal lives at the boundary
+// where the agent's bytes arrive. The pass is NOT voided: the speech verdict is
+// what the listing can answer, so it still lands.
+func TestIngestRefusesALiveProgressRowFromTheAudioCppProbe(t *testing.T) {
+	for _, support := range []string{"supported", "unsupported"} {
+		t.Run(support, func(t *testing.T) {
+			buf := withCapturedSlogAtTheDefaultLevel(t)
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_lp", false)
+			counting := countingRowStore(srv)
+
+			body := `{"host":{"cpu_util_pct":1},"capabilities":{"features":["runtime_model_probe"]},` +
+				`"runtimes":[{"spec_id":"rspec_audiocpp_lp","state":"running","live_progress_support":"` + support + `",` +
+				`"capabilities":{"verdicts":[{"name":"speech","verdict":"yes"}],"source":"audiocpp_models"}}]}`
+			req, raw := ingestReq(t, body)
+			if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 1 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the speech row alone)", got)
+			}
+			if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilitySpeech {
+				t.Fatalf("the write carried %+v, want exactly the speech row -- only the row the audio.cpp listing could not have produced may be dropped", sent)
+			}
+			assertCapabilityRow(t, srv, "map_rspec_audiocpp_lp", routing.CapabilitySpeech,
+				routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+			if row, ok := capabilityRow(t, srv, "map_rspec_audiocpp_lp", routing.CapabilityLiveProgress); ok {
+				t.Fatalf("a live_progress row exists (%+v), want none -- audio.cpp exposes no timings surface, so its listing is evidence for neither answer", row)
+			}
+			recs := buf.Snapshot()
+			if _, ok := audioCppWarnRecord(recs, "live-progress verdict to the audio.cpp probe"); !ok {
+				t.Fatalf("no WARN record about the dropped live-progress row under audiocpp_models at the gateway's own default level (info); records = %+v", recs)
+			}
+		})
+	}
+}
+
+// TestIngestAudioCppVerdictDoesNotOverwriteAManualVerdict pins that the audio
+// source ranks like every probe (rank 1 through capabilitySourceRank's default
+// branch): an operator's manual (speech, yes) -- the #254 override that enables
+// a child the probe has not yet judged -- is not talked over by the probe's
+// (speech, no). The rule is routing.WritableCapabilityRows', asked rather than
+// restated.
+//
+// The control is the SAME document's other row. An asr-shaped listing answers
+// (speech, no) AND (transcription, yes); the mapping holds the manual speech
+// row only, so exactly one write must fire and it must carry the transcription
+// row alone. "Nothing was written to the speech row" therefore cannot be
+// satisfied by a write path that had simply stopped working.
+func TestIngestAudioCppVerdictDoesNotOverwriteAManualVerdict(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_audiocpp_manual", false)
+	seedCapabilityRow(t, srv, "map_rspec_audiocpp_manual", routing.CapabilitySpeech,
+		routing.CapabilityYes, routing.CapabilitySourceManual)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody("rspec_audiocpp_manual",
+		`{"verdicts":[{"name":"speech","verdict":"no"},{"name":"transcription","verdict":"yes"}],"source":"audiocpp_models"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the transcription row alone)", got)
+	}
+	if sent := counting.lastSent(); len(sent) != 1 || sent[0].Capability != routing.CapabilityTranscription {
+		t.Fatalf("the write carried %+v, want exactly the transcription row -- the manual speech verdict outranks the probe", sent)
+	}
+	assertCapabilityRow(t, srv, "map_rspec_audiocpp_manual", routing.CapabilitySpeech,
+		routing.CapabilityYes, routing.CapabilitySourceManual)
+	assertCapabilityRow(t, srv, "map_rspec_audiocpp_manual", routing.CapabilityTranscription,
+		routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+}
+
+// TestAudioCppRowsAreNotReservedAgentCapabilityNames pins the premise the audio
+// source's acceptance rests on: neither "speech" nor "transcription" is a
+// reserved agent capability name, so the reserved-name gate in
+// runtimeSampleCapabilityRows lets both through. The reserved set holds the
+// names whose OWN producers this codebase defined (mtp, live_progress,
+// speculation_observed, image_edit); a synthesis or transcription verdict is
+// reported on the open list like any other.
+func TestAudioCppRowsAreNotReservedAgentCapabilityNames(t *testing.T) {
+	for _, name := range []string{routing.CapabilitySpeech, routing.CapabilityTranscription} {
+		if reservedAgentCapabilityNames[name] {
+			t.Errorf("%q is a reserved agent capability name, want it open so the audiocpp_models source can report it", name)
+		}
+	}
+}
+
 // TestIngestCapabilitiesEmptyNeverClears proves an all-empty capabilities
 // object -- detection ran and determined nothing -- leaves stored rows
 // untouched and calls the writer zero times: unknown must never overwrite a

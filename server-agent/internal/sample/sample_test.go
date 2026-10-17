@@ -914,3 +914,20 @@ func TestRuntimeImageOptionsOmittedWhenNilAndKeepsItsObjectsWhenZero(t *testing.
 		t.Errorf("zero image_options = %s, want exactly limits (5 keys) and defaults (10 keys)", zero)
 	}
 }
+
+// TestCapabilitySourceLiteralsMatchTheGateway pins the closed vocabulary of
+// capability sources byte for byte. The two modules share no code, so the
+// strings are the contract: the gateway matches each one literally, and a
+// rename here silently voids every row it would have written.
+func TestCapabilitySourceLiteralsMatchTheGateway(t *testing.T) {
+	for _, tc := range []struct{ name, got, want string }{
+		{"CapabilitySourceLlamaCppProps", CapabilitySourceLlamaCppProps, "llama_cpp_props"},
+		{"CapabilitySourceOllamaAPIShow", CapabilitySourceOllamaAPIShow, "ollama_api_show"},
+		{"CapabilitySourceSdcppCapabilities", CapabilitySourceSdcppCapabilities, "sdcpp_capabilities"},
+		{"CapabilitySourceAudioCppModels", CapabilitySourceAudioCppModels, "audiocpp_models"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+}

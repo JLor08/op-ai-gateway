@@ -1522,17 +1522,28 @@ const (
 //
 // CapabilitySourceAudioCppModels names the fifth probe-rank source: audio.cpp's
 // own model listing, GET /v1/models, from whose per-model task field the
-// CapabilitySpeech verdict is derived. It is named for the document it read,
-// like the sources above, and ranks 1 through capabilitySourceRank's DEFAULT
-// branch for the same reason: never able to overwrite manual (3) or
-// vision_benchmark (2), always able to repair its own drift (1 vs 1).
+// CapabilitySpeech and CapabilityTranscription verdicts are derived. It is named
+// for the document it read, like the sources above, and ranks 1 through
+// capabilitySourceRank's DEFAULT branch for the same reason: never able to
+// overwrite manual (3) or vision_benchmark (2), always able to repair its own
+// drift (1 vs 1).
+//
+// It has two producers, each reading that listing from where it can reach it:
+// the gateway's health loop, for an audio_cpp application (audioCppCapabilityRows
+// in cmd/gateway), and the agent's own read of the /v1/models of an audio.cpp
+// child it launched, which the gateway's agent ingest accepts under this source
+// for the speech and transcription rows only (and only when the gateway declares
+// the capability_source_audiocpp feature).
 //
 // It is the sdcpp_capabilities source's twin in the one respect that matters:
-// it is entitled to establish (speech, no) as well as (speech, yes). The
-// listing states each model's task, so a model it names with a task that is not
-// a synthesis task is a real CapabilityNo, not an absence -- while a model the
-// listing does not name at all is still no verdict, because a missing entry
-// says nothing about that model. It writes the speech row only.
+// it is entitled to establish a "no" as well as a "yes", for each of its two
+// rows. The listing states each model's task, so a model it names with a task
+// that does not serve a capability is a real CapabilityNo for that capability,
+// not an absence (a tts or clone model is (speech, yes) with (transcription,
+// no), an asr model the reverse, any other task no for both) -- while a model
+// the listing does not name at all is still no verdict, because a missing entry
+// says nothing about that model. It writes the speech and transcription rows,
+// and no other.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"

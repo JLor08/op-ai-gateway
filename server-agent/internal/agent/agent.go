@@ -238,7 +238,22 @@ import (
 // cannot be told apart by trying (it answers 404 runtime.model_not_managed, as
 // for an unmanaged model). The same reasoning made 0.7.4 -> 0.8.0
 // (runtime_ensure) a MINOR.
-const Version = "0.9.0"
+//
+// 0.9.0 -> 0.9.1 is the single bump for the audio-cpp-capabilities branch
+// (issue #255): for an "audio_cpp" child the capability probe now reads
+// audio.cpp's own /v1/models listing and reports the speech and transcription
+// verdicts, "yes" or "no", under the new sample.CapabilitySourceAudioCppModels
+// source -- but only while the gateway declares "capability_source_audiocpp".
+// While it does not, such a child is not probed at all, and a verdict cached
+// while it did is not sent; it is sent again once the gateway declares the
+// source again, without asking the child a second time. PATCH, and the rule
+// decides it: agent.Features gains NO entry. The negotiation runs through the
+// gateway's declared feature list rather than the agent's, because it is the
+// gateway that must be able to accept the new source and nothing on the
+// gateway side waits on the agent. The same reasoning made 0.7.3 -> 0.7.4
+// (#154, the sdcpp_capabilities source) and 0.8.1 -> 0.8.2 (the image
+// options on that gate) a PATCH.
+const Version = "0.9.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -440,14 +455,22 @@ type gatewayFeatureSource interface {
 // time.
 const gatewayFeatureCapabilitySourceSdcpp = "capability_source_sdcpp"
 
+// gatewayFeatureCapabilitySourceAudioCpp is the gateway-declared feature that
+// says the gateway's capability ingest accepts the audiocpp_models source (the
+// gateway's capabilitySourceAudioCppFeature). The agent sends that source only
+// when the gateway declares it: a gateway that knows the audio_cpp spec type
+// but not the source would otherwise drop the capability rows of every sample
+// from such a child, with a warning each time.
+const gatewayFeatureCapabilitySourceAudioCpp = "capability_source_audiocpp"
+
 // gatewayFeatureRecheckInterval is how long gatewayDeclares answers from the
 // feature set it last fetched before it asks the gateway again. Every
-// stable_diffusion_cpp child in every collect cycle shares that one answer,
-// so the question costs at most one conditional GET per interval per agent,
-// however many sd children run, instead of one per child per collect cycle
-// (1s by default). The runtime driver reads the same endpoint for
-// runtime_manager at least every runtimePollInterval (60s), and sooner on a
-// wake. 30s is half that backstop: it adds at most two requests a minute per
+// stable_diffusion_cpp and audio_cpp child in every collect cycle shares that
+// one answer, so the question costs at most one conditional GET per interval
+// per agent, however many such children run, instead of one per child per
+// collect cycle (1s by default). The runtime driver reads the same endpoint
+// for runtime_manager at least every runtimePollInterval (60s), and sooner on
+// a wake. 30s is half that backstop: it adds at most two requests a minute per
 // agent, and a gateway upgrade or rollback reaches the capability probe on
 // the first collect cycle at least 30s after the agent last asked, so within
 // about 30s of the gateway serving it.
@@ -1331,10 +1354,11 @@ type runtimeCtxEntry struct {
 //
 // specType joined the key in #154. st.Type decides which document is read
 // ("ollama" -> /api/show, "stable_diffusion_cpp" ->
-// /sdcpp/v1/capabilities, everything else -> /props), and a Type change is
-// launch METADATA: the runtime manager applies it to a RUNNING child in
-// place, same PID (runtime.sameLaunchShape ignores Type). The case that
-// made it matter: a spec with no explicit type and an sd-server binary is
+// /sdcpp/v1/capabilities, "audio_cpp" -> /v1/models, everything else ->
+// /props), and a Type change is launch METADATA: the runtime manager
+// applies it to a RUNNING child in place, same PID
+// (runtime.sameLaunchShape ignores Type). The case that made it matter: a
+// spec with no explicit type and an sd-server binary is
 // "custom" under a gateway that predates the stable_diffusion_cpp type and
 // "stable_diffusion_cpp" under one that knows it, so a gateway upgrade
 // retypes the running child. Without the type in the key, the /props 404
@@ -1345,8 +1369,8 @@ type runtimeCtxEntry struct {
 // set type costs is this pid's cached verdicts, replaced by whatever the new
 // type's document says (typically a conclusive 404 and an empty set); the
 // gateway keeps the rows it already stored, because an empty set writes no
-// row. The probe path needs no place in the key: all three paths are package
-// constants, and an edit to ContextProbePath has no bearing here.
+// row. The probe path needs no place in the key: every probe path is a
+// package constant, and an edit to ContextProbePath has no bearing here.
 //
 // verdicts == (collector.PropsVerdicts{}) is a valid, cached entry here, not
 // a zero-value placeholder: it means the probe got a CONCLUSIVE non-answer
@@ -1576,8 +1600,8 @@ func (a *Agent) clock() time.Time {
 // was that a child is never asked a second time just to answer a second
 // question.
 //
-// WHICH document is read, one of three, is what st.Type decides here (and,
-// for one of them, whether the gateway lets it be sent at all -- see the
+// WHICH document is read, one of four, is what st.Type decides here (and,
+// for two of them, whether the gateway lets it be sent at all -- see the
 // gate below):
 //
 //   - "ollama": collector.ProbeOllamaVerdicts POSTs /api/show with
@@ -1592,24 +1616,30 @@ func (a *Agent) clock() time.Time {
 //     supported_modes list is exhaustive, so it answers the image
 //     capability as "yes" or "no" and nothing else; its LiveProgress is
 //     ALWAYS "", because sd-server has no timings surface.
+//   - "audio_cpp": collector.ProbeAudioCppVerdicts GETs
+//     collector.AudioCppModelsPath ("/v1/models"), audio.cpp's only
+//     capability signal: each listed model carries a task, and the entry for
+//     st.Model answers the speech and transcription capabilities as "yes" or
+//     "no" and nothing else; its LiveProgress is ALWAYS "", because audio.cpp
+//     has no timings surface.
 //   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
 //     GETs collector.LiveProgressProbePath ("/props").
 //
 // That last branch is deliberately a default, not a list of types -- it
 // names no type and does not care whether st.ContextProbePath is even set
-// -- and the reason it must stay that way is unchanged by the two named
+// -- and the reason it must stay that way is unchanged by the three named
 // branches above: routing.DeriveProbePaths gives a "custom"-typed spec no
 // context path at all, and "custom" is the type-detection FALLBACK, so a
 // custom-typed llama.cpp child -- exactly the case a type-based rule refuses
 // -- would never be probed for this capability if this half were type-gated
 // too. A type may therefore be claimed by name only when its binary serves
 // no /props, so that claiming it loses nothing a /props probe could have
-// found: Ollama serves none, and neither does sd-server. "custom" can never
-// be claimed, whatever binary it turns out to run, or that fallback loses
-// its probe. One extra loopback request per child lifetime once a verdict
-// set is cached; there is no SSRF guard to apply to any of the three paths
-// (unlike MetricsPath/ContextProbePath, all are package constants, never
-// operator/config-supplied).
+// found: Ollama serves none, and neither does sd-server or audio.cpp.
+// "custom" can never be claimed, whatever binary it turns out to run, or
+// that fallback loses its probe. One extra loopback request per child
+// lifetime once a verdict set is cached; there is no SSRF guard to apply to
+// any of these paths (unlike MetricsPath/ContextProbePath, all are package
+// constants, never operator/config-supplied).
 //
 // The gate: a gateway can know the stable_diffusion_cpp spec type and still
 // not accept the sdcpp_capabilities source, and it drops the capability rows
@@ -1621,7 +1651,10 @@ func (a *Agent) clock() time.Time {
 // set instead). While it does not, NOTHING is probed and NOTHING is cached,
 // so a gateway upgrade takes effect without restarting the child. The
 // /props fallback is no substitute: sd-server serves no /props, so it would
-// say nothing anyway.
+// say nothing anyway. An audio_cpp child is gated the same way on its own
+// feature, gatewayFeatureCapabilitySourceAudioCpp, for the audiocpp_models
+// source: the two features are independent, and declaring one opens nothing
+// for the other.
 //
 // The gateway's answer is memoized for gatewayFeatureRecheckInterval (30s)
 // and shared by every child, so the agent asks at most once per interval
@@ -1632,13 +1665,13 @@ func (a *Agent) clock() time.Time {
 // probe that may follow it.
 //
 // The gate is re-checked on a cache hit too, for an entry whose source is
-// sdcpp_capabilities: a verdict cached while the gateway declared the
-// source is not sent while it no longer does (a rollback), since that
-// gateway would drop the sample's capability rows with a warning every
-// cycle. The entry is kept and sent again once the gateway declares the
-// source again, without asking the child. Inside the memo's interval that
-// re-check costs nothing; no other source, and no other type, consults the
-// gateway at all.
+// sdcpp_capabilities or audiocpp_models: a verdict cached while the gateway
+// declared the source is not sent while it no longer does (a rollback),
+// since that gateway would drop the sample's capability rows with a warning
+// every cycle. The entry is kept and sent again once the gateway declares
+// the source again, without asking the child. Inside the memo's interval
+// that re-check costs nothing; no other source, and no other type, consults
+// the gateway at all.
 //
 // Caching policy -- STABLE vs TRANSIENT, not "determined" vs "undetermined":
 //
@@ -1649,9 +1682,9 @@ func (a *Agent) clock() time.Time {
 // forever, for a question whose answer cannot change while that pid lives
 // -- a permanent per-cycle cost, not a one-time one. The fix caches on WHY
 // no verdict came back, using the probe's stable return
-// (collector.ProbePropsVerdicts, collector.ProbeOllamaVerdicts and
-// collector.ProbeSdcppVerdicts all answer to one identical
-// conclusive/transient contract):
+// (collector.ProbePropsVerdicts, collector.ProbeOllamaVerdicts,
+// collector.ProbeSdcppVerdicts and collector.ProbeAudioCppVerdicts all
+// answer to one identical conclusive/transient contract):
 //
 //   - STABLE (a real "supported"/"unsupported" verdict and/or real
 //     capability verdicts, OR a zero-value collector.PropsVerdicts{} that is
@@ -1693,10 +1726,10 @@ func (a *Agent) clock() time.Time {
 // This never overwrites an already-cached value with a fabricated one:
 // rs.LiveProgressSupport, rs.Capabilities and rs.ImageOptions are only ever
 // set from a verdict set the probe (or a prior cache write) actually
-// produced, and an uncached probe, a stable_diffusion_cpp child the gate
-// skips, or a cached sdcpp_capabilities entry the gate withholds leaves
-// rs.LiveProgressSupport at its zero value (""), and rs.Capabilities and
-// rs.ImageOptions at theirs (nil).
+// produced, and an uncached probe, a stable_diffusion_cpp or audio_cpp child
+// the gate skips, or a cached sdcpp_capabilities or audiocpp_models entry the
+// gate withholds leaves rs.LiveProgressSupport at its zero value (""), and
+// rs.Capabilities and rs.ImageOptions at theirs (nil).
 //
 // rs.ImageOptions is the stable-diffusion.cpp image options, read from the
 // same capability document as the image verdict (collector.PropsVerdicts.
@@ -1717,6 +1750,12 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 			slog.Debug("runtime capability verdict withheld: gateway no longer declares the sdcpp source", "spec_id", st.SpecID)
 			return
 		}
+		if entry.source == sample.CapabilitySourceAudioCppModels && !a.gatewayDeclares(ctx, gatewayFeatureCapabilitySourceAudioCpp) {
+			// The same rollback case for the audio.cpp source: send nothing,
+			// keep the entry.
+			slog.Debug("runtime capability verdict withheld: gateway no longer declares the audiocpp source", "spec_id", st.SpecID)
+			return
+		}
 		rs.LiveProgressSupport = entry.verdicts.LiveProgress
 		rs.Capabilities = capabilitiesSample(entry.verdicts.Caps, entry.source)
 		rs.ImageOptions = imageOptionsSample(entry.verdicts.ImageOptions)
@@ -1729,6 +1768,13 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 		// sd-server serves no /props, so the fallback document would say
 		// nothing anyway.
 		slog.Debug("runtime capability probe skipped: gateway does not declare the sdcpp source", "spec_id", st.SpecID)
+		return
+	}
+	if st.Type == "audio_cpp" && !a.gatewayDeclares(ctx, gatewayFeatureCapabilitySourceAudioCpp) {
+		// The same for audio.cpp: its /v1/models listing is its only
+		// capability document, and the gateway cannot accept the source it
+		// would be reported under yet. Probe nothing, cache nothing.
+		slog.Debug("runtime capability probe skipped: gateway does not declare the audiocpp source", "spec_id", st.SpecID)
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
@@ -1744,6 +1790,9 @@ func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client,
 	case "stable_diffusion_cpp":
 		source = sample.CapabilitySourceSdcppCapabilities
 		verdicts, stable = collector.ProbeSdcppVerdicts(cctx, client, base)
+	case "audio_cpp":
+		source = sample.CapabilitySourceAudioCppModels
+		verdicts, stable = collector.ProbeAudioCppVerdicts(cctx, client, base, st.Model)
 	default:
 		source = sample.CapabilitySourceLlamaCppProps
 		verdicts, stable = collector.ProbePropsVerdicts(cctx, client, base)
@@ -1811,12 +1860,12 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into
-// RuntimeSample.Capabilities' wire pointer type: each of the five named
-// fields becomes one CapabilityVerdict entry keyed by its name, every Extra
-// name becomes a "yes" entry (a reported extra capability is a positive
-// assertion), and an empty ("" -- undetermined) field is skipped entirely
-// rather than carried as an entry, mirroring the store's
-// row-absence-means-unknown model.
+// RuntimeSample.Capabilities' wire pointer type: each of the seven named
+// fields (vision, video, audio, tools, image, speech, transcription) becomes
+// one CapabilityVerdict entry keyed by its name, every Extra name becomes a
+// "yes" entry (a reported extra capability is a positive assertion), and an
+// empty ("" -- undetermined) field is skipped entirely rather than carried as
+// an entry, mirroring the store's row-absence-means-unknown model.
 //
 // source is the caller's answer to "which probe produced this document" (a
 // sample.CapabilitySource* constant), carried onto the wrapper so the
@@ -1830,7 +1879,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // side the ingest folds this list into capability rows and keeps the FIRST
 // entry for a given name, dropping every later one -- so a name that appears
 // both as a structured field and in Extra resolves to the STRUCTURED answer.
-// The five named fields therefore go first and Extra after; swapping the two
+// The seven named fields therefore go first and Extra after; swapping the two
 // blocks silently hands the open list the last word.
 //
 // Always returns a non-nil pointer whose Verdicts is itself non-nil (though
@@ -1840,7 +1889,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // uncached, undetermined probe -- see sample.RuntimeSample.Capabilities' own
 // doc comment for why that distinction is load-bearing.
 func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabilities {
-	verdicts := make([]sample.CapabilityVerdict, 0, 5+len(c.Extra))
+	verdicts := make([]sample.CapabilityVerdict, 0, 7+len(c.Extra))
 	if c.Vision != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "vision", Verdict: c.Vision})
 	}
@@ -1855,6 +1904,12 @@ func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabil
 	}
 	if c.Image != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "image", Verdict: c.Image})
+	}
+	if c.Speech != "" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "speech", Verdict: c.Speech})
+	}
+	if c.Transcription != "" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "transcription", Verdict: c.Transcription})
 	}
 	for _, name := range c.Extra {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: name, Verdict: "yes"})

@@ -796,8 +796,8 @@ yet recognize fall back to — never a hard failure, since a spec's real backend
 is exactly what an operator picking `custom` is telling the gateway it cannot
 assume.
 
-**`audio_cpp` is the second kind with no probe paths, and it is the agent-managed
-half of a feature whose other half is not here.** audio.cpp's `audiocpp_server`
+**`audio_cpp` is the second kind with no probe paths, and its capability verdicts come
+from the agent's own read of the child's `/v1/models` (issue #255).** audio.cpp's `audiocpp_server`
 (`routing.RuntimeSpecTypeAudioCpp`) is the backend of `POST /v1/audio/speech` and of
 `POST /v1/audio/transcriptions` ([API Compatibility & Inference
 §3.6](compatibility-and-inference.md#36-openai-audio-speech),
@@ -809,27 +809,33 @@ small and entirely gateway-side: a binary basename containing `audiocpp_server` 
 `disabled`, when an untouched spec's Type is switched to the kind), and `health_path`
 takes the stock `/health`, because audio.cpp serves
 `GET /health` (the one place it differs from `stable_diffusion_cpp`, whose server
-answers it with 404 and so takes `/v1/models`). The agent holds no branch of its own
-for the kind: it receives the gateway-resolved type string and the derived probe paths,
-and its capability probe treats the kind like `custom` (the default `/props` branch of
-[§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time), one loopback read per
-process generation of a document an audio.cpp server is not known to serve), so it
-reports no capability verdict for such a child. **The agent-managed audio.cpp
-capability source is deferred, for transcription exactly as for speech.** The gateway's
-`speech` and `transcription` verdicts are read from audio.cpp's
-`GET /v1/models` `task` field by the gateway's own health loop, and only for a **static**
-`audio_cpp` *application*; the agent router's `/v1/models` carries no `task`, so that
-read could state nothing for a child launched behind the router, and the health loop
-deliberately does not probe a `server_agent` application at all. Until an agent-side
-source exists (a feature flag and an ingest acceptance, as `capability_source_sdcpp` is
-for images), an agent-launched `audio_cpp` child serves speech only after an operator
-sets `speech: yes` on its mapping by hand, and transcription only after an operator sets
-`transcription: yes` (the name is deliberately **not** on the ingest's reserved agent
-names, so an agent-side writer can report it later), and its agent-side launch shape
-(arguments, ensure route, VRAM measurement) has no worked example here. **Transcription
-needed no agent change:** an agent-launched child is sent the upload through the router's
-existing multipart branch (§4.2), which peeks the model from the form whatever the
-path and relays the child's JSON response untouched, so the agent version did not move,
+answers it with 404 and so takes `/v1/models`). The agent's **path** derivation has no
+branch of its own for the kind: it receives the gateway-resolved type string and the
+derived probe paths, both empty, so it scrapes no metrics and probes no context window.
+Its **capability** probe does have one ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)):
+an `audio_cpp` child's probe GETs the child's **own** `/v1/models` over loopback
+(`collector.ProbeAudioCppVerdicts`, path `collector.AudioCppModelsPath`), because that
+listing is the only place audio.cpp states what a model does. The entry whose `id` is the
+spec's model carries a `task`, and one parser decides both verdicts from it: `tts` or
+`clone` is `(speech, yes)` with `(transcription, no)`, `asr` the reverse, any other
+non-empty task `no` for both, and an unlisted model or a taskless entry no verdict. The
+verdicts ride the sample under the source `audiocpp_models`, and the agent sends them
+**only while the gateway declares `capability_source_audiocpp`**, a name on the
+**gateway's** list alone that mirrors `capability_source_sdcpp` for images (§7): while the
+gateway does not declare it the child is not probed and nothing is cached, and a verdict
+cached earlier is withheld. The agent reads the child directly because the agent router's
+aggregate `/v1/models` carries no `task`; that is also why the gateway's own health loop,
+whose audio.cpp pass reads the same document from a **static** `audio_cpp` *application*,
+deliberately leaves a `server_agent` application alone. The gateway's ingest accepts the
+source for the `speech` and `transcription` rows only, at the probe rank, so an
+operator's manual verdict still outranks it and remains the override, and the fallback
+for an agent before 0.9.1 and for a model the listing does not name (the `transcription`
+name was deliberately left off the ingest's reserved agent names so that this source
+could report it). The kind's agent-side launch shape (arguments, ensure route, VRAM
+measurement) has no worked example here. **Serving transcription needed no agent
+change:** an agent-launched child is sent the upload through the router's existing
+multipart branch (§4.2), which peeks the model from the form whatever the path and
+relays the child's JSON response untouched, so the agent version did not move for it,
 and the gateway gates the relay on the same `multipart_proxy` feature as the image edit
 (§7, [API Compatibility & Inference
 §3.7](compatibility-and-inference.md#37-openai-audio-transcriptions))
@@ -2552,8 +2558,9 @@ other side reads it off that side's list without declaring it back (the gateway
 declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Six
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
-`runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`); one, `capability_source_sdcpp`, is
-on the gateway's list only and read by the agent (below).
+`runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`); two,
+`capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
+only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
 | Direction | Channel |
@@ -2581,11 +2588,12 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_ensure` ([§4.1](#41-control-routes),
 [§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`, and
 `multipart_proxy` ([§4.2](#42-model-routing)), `Since: "0.9.0"`
-— and, on the gateway's list alone, `capability_source_sdcpp`
-([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which has no
-`Since` because the agent's registry does not carry it. The gateway's own list is
-`runtime_manager`, `runtime_logs`, `runtime_config_ack` and
-`capability_source_sdcpp` (`gatewayAgentFeatures`,
+— and, on the gateway's list alone, `capability_source_sdcpp` and
+`capability_source_audiocpp`
+([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
+`Since` because the agent's registry does not carry them. The gateway's own list is
+`runtime_manager`, `runtime_logs`, `runtime_config_ack`, `capability_source_sdcpp` and
+`capability_source_audiocpp` (`gatewayAgentFeatures`,
 `internal/gateway/agent_features.go`).
 
 `gpu_selection` is declared for the **portal's** benefit, not gated by the
@@ -2776,6 +2784,15 @@ serves keeps whatever `image` verdict it had, and no gateway path has a
 fallback to choose — so an agent-side name would gate nothing, and
 `agent.Features` gained no entry for it.
 
+`capability_source_audiocpp` (issue #255) is the second flag of that shape, and the two
+are independent facts, not one: it states that the gateway's capability ingest accepts the
+`audiocpp_models` source, for the `speech` and `transcription` rows only. The agent reads
+it before it probes an `audio_cpp` child's `/v1/models` and before it sends a verdict
+cached from one, with the same 30 s memo and the same rule that while the name is missing
+nothing is probed or cached for that child. Declaring one name opens nothing for the
+other: a gateway build can accept one source and not the other, and the agent must not
+send a source its gateway would drop.
+
 **Negotiation is continuous, not decided at boot.** The manager, config source
 and driver are constructed unconditionally with no startup-blocking probe, and
 every driver `Sync` re-decides whether the gateway currently declares the flag.
@@ -2895,6 +2912,14 @@ the **flag** the rule counts. The bump is one for the whole branch, made when th
 agent change landed, however many commits it spans, and the version assertion
 moved to `TestFeaturesDeclareMultipartProxy` beside the newest feature
 (`runtime_ensure`'s test keeps its own presence and `Since` check).
+
+**`0.9.0` → `0.9.1` (issue #255) is PATCH, on the `0.7.3` → `0.7.4` precedent.** The agent
+gained a fourth capability probe (`/v1/models` for an `audio_cpp` child) and a fourth
+`source` value, `audiocpp_models`, gated on a name on the **gateway's** list,
+`capability_source_audiocpp` (§7). `agent.Features` gained nothing, so the rule makes it
+PATCH, and what a flag is FOR agrees: the gateway is the side that must accept the source,
+so the agent waits on the gateway's name and nothing on the gateway waits on the agent.
+The bump is one for the whole branch, made when the agent change landed.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -3549,7 +3574,7 @@ mirror). Three different cadences share the one collect cycle:
   Analytics &
   Observability §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
   **`st.Type` decides WHICH document this probe reads, and nothing else
-  about it** (since issue #154 there are exactly three):
+  about it** (since issue #255 there are exactly four):
 
   - `ollama` — `collector.ProbeOllamaVerdicts` **POSTs** `/api/show` with
     `{"model": st.Model}` and reads the `capabilities` array out of the
@@ -3577,19 +3602,30 @@ mirror). Three different cadences share the one collect cycle:
     holds them only in memory for the portal composer
     ([API Compatibility & Inference
     §3.4](compatibility-and-inference.md#34-openai-images-generations)).
+  - `audio_cpp` — `collector.ProbeAudioCppVerdicts` GETs
+    `collector.AudioCppModelsPath` (`/v1/models`, issue #255), **the child's own
+    loopback listing and never the router's**. audio.cpp is not known to serve a
+    `/props` document either, and its listing is the only place it states what a model does: the entry whose
+    `id` is `st.Model` carries a `task`, and one parser decides both verdicts from it
+    (`tts` or `clone` is `(speech, yes)` with `(transcription, no)`, `asr` the
+    reverse, any other non-empty task `no` for both, an unlisted model or a taskless
+    entry no verdict). The verdict is per **model**, so, like Ollama's and unlike
+    `/props` and sd-server's, this probe takes the model. Its `LiveProgressSupport` is always `""` as well,
+    because audio.cpp has no timings surface, and it yields no image options.
+    **This branch is gated too**, below, on its own feature name.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.
 
-  That last branch stays deliberately unconditional, and neither named branch
-  above weakens the reason: `DeriveProbePaths` gives a `custom`-typed spec no
+  That last branch stays deliberately unconditional, and no named branch above
+  weakens the reason: `DeriveProbePaths` gives a `custom`-typed spec no
   context path at all
   ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)), so a
   *type-based* rule would never probe a `custom`-typed llama.cpp child for
   either capability, which is exactly the case this probe exists to recover.
   A type may be claimed by name only when its binary serves no `/props` at
   all, so that claiming it loses nothing a `/props` probe could have found —
-  true of `ollama` and of `stable_diffusion_cpp`, and of nothing else; `custom`
+  true of `ollama`, of `stable_diffusion_cpp` and of `audio_cpp`, and of nothing else; `custom`
   can never be claimed, whatever binary it turns out to run, or that fallback
   loses its probe. Either way it is one extra loopback request per child
   lifetime once a verdict set is cached, on a path that is a package
@@ -3614,13 +3650,16 @@ mirror). Three different cadences share the one collect cycle:
   known-good set (§7). While the gateway does not declare the name,
   **nothing is probed and nothing is cached** for that child, so a gateway
   upgrade takes effect without restarting the child; the `/props` fallback
-  is no substitute, since `sd-server` serves none.
+  is no substitute, since `sd-server` serves none. **`audio_cpp` is gated the same way
+  on its own name**, `gatewayFeatureCapabilitySourceAudioCpp`
+  (`"capability_source_audiocpp"`), for the `audiocpp_models` source: the two names are
+  independent, and the gateway declaring one opens nothing for the other.
 
   **The answer is memoized, once per agent.** `gatewayDeclares` keeps the
   feature set it last fetched, with the time it fetched it, and asks the
   gateway again only once `gatewayFeatureRecheckInterval` (**30 s**) has
-  passed; every `stable_diffusion_cpp` child of every collect cycle reads the
-  same answer. Without the memo, a gateway that knows the
+  passed; every `stable_diffusion_cpp` and `audio_cpp` child of every collect cycle
+  reads the same answer. Without the memo, a gateway that knows the
   `stable_diffusion_cpp` type but not the source cost one authenticated
   `GET /api/agent/v1/features` per sd child per collect cycle (1 s default),
   for as long as that pairing lasted. 30 s is half the runtime driver's own
@@ -3634,8 +3673,8 @@ mirror). Three different cadences share the one collect cycle:
   child probe that may follow it — the same reasoning that bounds every
   other per-child call on this loop.
 
-  **The gate is re-checked on a cache hit, for an `sdcpp_capabilities`
-  entry.** A verdict cached while the gateway declared the name is not sent
+  **The gate is re-checked on a cache hit, for an `sdcpp_capabilities` or
+  `audiocpp_models` entry.** A verdict cached while the gateway declared the name is not sent
   while it no longer does — a gateway rolled back to a build without the
   source would otherwise drop every such sample's capability rows with a
   `Warn`, once per collect cycle, until the child restarted. The entry is
@@ -3645,7 +3684,7 @@ mirror). Three different cadences share the one collect cycle:
 
   **The branch also NAMES the probe it took, and the name rides the wire**
   as `capabilities.source` (`sample.Capabilities.Source`:
-  `llama_cpp_props`, `ollama_api_show`, or `sdcpp_capabilities`). The gateway
+  `llama_cpp_props`, `ollama_api_show`, `sdcpp_capabilities` or `audiocpp_models`). The gateway
   stamps its capability rows with what was reported rather than re-deriving
   the provenance from the spec type it pushed itself — the wire carries a
   `spec_id` but no runtime type, and an inferred provenance is the exact
@@ -3662,10 +3701,11 @@ mirror). Three different cadences share the one collect cycle:
   context cache, stores the whole verdict set
   (`collector.PropsVerdicts{LiveProgress, Caps}`
   — `LiveProgress` one of `"supported"`/`"unsupported"`/a deliberate `""`;
-  `Caps` the five capability verdicts (issue #154 added `Image`) plus
+  `Caps` the seven capability verdicts (issue #154 added `Image`, issue #255
+  `Speech` and `Transcription`) plus
   `Extra`) **and the source that produced it** only once the probe's
-  answer is *stable*: a real `/props`, `/api/show`, or
-  `/sdcpp/v1/capabilities` document, any other well-formed body
+  answer is *stable*: a real `/props`, `/api/show`,
+  `/sdcpp/v1/capabilities` or `/v1/models` document, any other well-formed body
   that simply is not that document, or one of exactly four conclusive
   refusals — **404** (no such route on this build), **401** or **403** (the
   route is behind an api key this probe cannot supply), **405** (the route

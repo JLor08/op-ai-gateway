@@ -453,7 +453,15 @@ type Capabilities struct {
 	// stable-diffusion.cpp probe (ProbeSdcppVerdicts) sets it; the /props and
 	// /api/show detectors never do.
 	Image string
-	Extra []string
+	// Speech is whether the model SYNTHESISES speech from text, and
+	// Transcription whether it TRANSCRIBES speech to text ("yes"/"no"/"").
+	// Only the audio.cpp probe (ProbeAudioCppVerdicts) sets them; the /props,
+	// /api/show and sd-server detectors never do. Both come from the one task
+	// the model's /v1/models entry states, so they are either both set or
+	// both "".
+	Speech        string
+	Transcription string
+	Extra         []string
 }
 
 // detectCapabilities is the capability detector for a llama.cpp /props

@@ -1811,28 +1811,49 @@ gateway only mirrors it into the volatile runtime-status registry for the
 portal composer ([API Compatibility & Inference
 §3.4](compatibility-and-inference.md#34-openai-images-generations)).
 
+**A third twin, for a different document: audio.cpp's `GET /v1/models` (issue #255).**
+The agent's `parseAudioCppModels` (`server-agent/internal/collector/audiocpp.go`, called
+by `ProbeAudioCppVerdicts`) and the gateway's (`internal/provider/audiocpp_models.go`,
+which reads a static `audio_cpp` application's copy of the same listing) are the same
+kind of deliberate duplicate, each doc comment naming the other. Both read the one entry
+whose `id` is the model and decide **both** verdicts from its `task`: `tts` or `clone`
+is `(speech, yes)` with `(transcription, no)`, `asr` the reverse, any other non-empty
+task `no` for both, and an absent task, an unlisted model or an unreadable body no
+verdict; the task match ignores case and surrounding whitespace, and `loaded` is
+deliberately never decoded (whether a model is resident is the health axis, not the
+capability axis). The `audioCppModelCases` table, duplicated verbatim in both modules'
+tests, pins both copies, and the gateway's `TestAudioCppModelsCasesMatchTheAgentsTable`
+reads the agent's test file and fails when the two declarations differ by a byte, or when
+either is missing, so a change to one parser and its own table cannot pass both suites.
+The result rides the sample as `runtimes[].capabilities` under the source
+`audiocpp_models`, and the agent sends it only while the gateway declares
+`capability_source_audiocpp` ([Agent-Managed Model Runtime
+§3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+
 **The probe NAMES itself, and its name ranks with the other probes.** The
 agent reports `capabilities.source` on the wire — `llama_cpp_props`,
-`ollama_api_show`, or, since issue #154, `sdcpp_capabilities`
-(`routing.CapabilitySourceOllamaAPIShow`/`routing.CapabilitySourceSdcppCapabilities`)
+`ollama_api_show`, since issue #154 `sdcpp_capabilities` and since issue #255
+`audiocpp_models`
+(`routing.CapabilitySourceOllamaAPIShow`/`routing.CapabilitySourceSdcppCapabilities`/`routing.CapabilitySourceAudioCppModels`)
 — and the gateway stamps its rows with what was reported instead of
 re-deriving the provenance from the spec type it pushed itself. The sample
 carries a `spec_id` but no runtime type, so the gateway cannot tell the
-three documents apart on its own; two alternatives were refused, and for the
+four documents apart on its own; two alternatives were refused, and for the
 same reason. Guessing the probe from row CONTENT (Ollama never reports a
 `no` and never a live-progress verdict; `sdcpp_capabilities` never reports
-anything but `image`) is a heuristic that an all-`yes` `/props` document
+anything but `image`; `audiocpp_models` never anything but `speech` and
+`transcription`) is a heuristic that an all-`yes` `/props` document
 defeats, and re-deriving `routing.EffectiveRuntimeSpecType` from the spec the
 ingest already loads would trade the reporter's report for an inference from
 configuration, duplicating the agent's branch condition in a second module
-where the two can drift. Both `ollama_api_show` and `sdcpp_capabilities` rank
-**1** through `capabilitySourceRank`'s default branch, with no case of their
-own and no rank-table edit: neither can ever overwrite `manual` (3) or
-`vision_benchmark` (2), and each repairs its own drift at 1 against 1.
+where the two can drift. `ollama_api_show`, `sdcpp_capabilities` and
+`audiocpp_models` all rank **1** through `capabilitySourceRank`'s default branch,
+with no case of their own and no rank-table edit: none can ever overwrite `manual`
+(3) or `vision_benchmark` (2), and each repairs its own drift at 1 against 1.
 
 **The gateway's allowlist of claimable sources is a trust boundary, not a
 typo filter.** `rowSource` (`internal/gateway/agent_ingest.go`) accepts
-exactly the three PROBE names an agent runs, plus an absent/empty field for
+exactly the four PROBE names an agent runs, plus an absent/empty field for
 an agent that predates the field (which keeps the historical
 `llama_cpp_props` default — safe rather than merely convenient, since such an
 agent probes `/props`, and an Ollama child answers that with a `404`, hence
@@ -1845,36 +1866,48 @@ option that stays safe against the rank, since an unrecognised source ranks 1
 and a blind write would let unknown provenance overwrite a real probe at
 equal rank. The drop is logged at **`Warn`**, not `Debug`: the gateway's
 default level is `info`, so at
-`Debug` a newer agent reporting a fourth source would lose every capability
+`Debug` a newer agent reporting a fifth source would lose every capability
 row it ever sent with nothing anywhere to say why, and the rows' absence
 reads as plain "unknown".
 
-**Two combinations are refused outright rather than attributed: a
-live-progress verdict sourced `ollama_api_show` or `sdcpp_capabilities`.**
-Such a sample writes no `live_progress` row at all. Neither Ollama nor
-`sd-server` exposes a `timings_per_token`-style surface, so neither
-document can carry evidence about live progress in *either* direction, and a
-row attributed to either probe would be a false provenance whatever verdict
+**Three combinations are refused outright rather than attributed: a
+live-progress verdict sourced `ollama_api_show`, `sdcpp_capabilities` or
+`audiocpp_models` (the last since issue #255).**
+Such a sample writes no `live_progress` row at all. None of Ollama, `sd-server`
+and audio.cpp exposes a `timings_per_token`-style surface, so none of those
+documents can carry evidence about live progress in *either* direction, and a
+row attributed to any of those probes would be a false provenance whatever verdict
 it held — which is exactly the claim `routing.CapabilityRow`'s own source
-documentation makes. No honest agent sends either combination
-(`ProbeOllamaVerdicts` and `ProbeSdcppVerdicts` both leave the field `""` on
-every return path), and that is *why* the ingest enforces it rather than
-documenting it: an invariant a caller can violate is not an invariant. The
-rest of the pass still lands in both cases — a `vision`/`tools` verdict is
-something `/api/show` really can answer, and the `image` verdict is what
-`/sdcpp/v1/capabilities` answers — and each dropped row is logged at `Warn`.
-One consequence follows: a `live_progress` row can now only ever carry
+documentation makes. No honest agent sends any of the three combinations
+(`ProbeOllamaVerdicts`, `ProbeSdcppVerdicts` and `ProbeAudioCppVerdicts` all
+leave the field `""` on every return path), and that is *why* the ingest
+enforces it rather than documenting it: an invariant a caller can violate is not
+an invariant. The rest of the pass still lands in every case — a `vision`/`tools`
+verdict is something `/api/show` really can answer, the `image` verdict is what
+`/sdcpp/v1/capabilities` answers, and the `speech` and `transcription` verdicts
+are what the audio.cpp listing answers — and each dropped row is logged at
+`Warn`. One consequence follows: a `live_progress` row can now only ever carry
 `llama_cpp_props`.
 
-**A third combination is refused for the same reason, generalised: any
+**A fourth combination is refused for the same reason, generalised: any
 `sdcpp_capabilities` row that is not `image`.** `/sdcpp/v1/capabilities`
 answers exactly one question — whether the loaded model's `supported_modes`
 list holds `img_gen` — so a row under this source for `vision`, `tools`, or
 any other name is a claim the document never made, in either verdict
 direction (`no` is writable for `image` here, unlike under
 `ollama_api_show`, because `supported_modes` is exhaustive). Dropped at
-`Warn`, same as the two above; the `image` verdict itself still rides the
+`Warn`, same as the three above; the `image` verdict itself still rides the
 pass.
+
+**A fifth is refused on the same argument with a two-name allowlist: any
+`audiocpp_models` row that is not `speech` or `transcription` (issue #255).**
+audio.cpp's `/v1/models` listing states each model's one `task`, from which
+exactly two questions are answered, so a row under this source for `vision`,
+`tools` or any other name is a claim the listing never made. Both names stay
+writable in **both** directions, unlike the single `image` name above, because
+the listing's task is authoritative: a `tts` model is `(speech, yes)` with
+`(transcription, no)`, an `asr` model the reverse. Dropped at `Warn`; the
+`speech` and `transcription` verdicts still ride the pass.
 
 **Four names are RESERVED and may not arrive from a probe at all: `mtp`,
 `live_progress`, `speculation_observed` and `image_edit`.** The criterion is that
@@ -2025,27 +2058,30 @@ nobody can make from a count:
   `task`, never `loaded`), an entry with no task, an unreachable server
   or an unreadable body writes **no row**, because none of those states that the
   model cannot speak or transcribe. It is written through the same `writeCapabilityRows`, so every
-  guard below applies unchanged. It is **gateway-only**: the agent ingest does not
-  accept `audiocpp_models`, so an agent-launched `audio_cpp` child has no automatic
-  `speech` or `transcription` verdict until an agent-side source exists, and the pass does not probe a
-  `server_agent` application at all, because the agent router's `/v1/models` carries
-  no `task` ([Routing & Model Selection
+  guard below applies unchanged. The pass reaches a **static** application only: it does
+  not probe a `server_agent` application at all, because the agent router's `/v1/models`
+  carries no `task`, and an agent-launched `audio_cpp` child's verdicts come from the
+  agent's own read of the child's listing, reported under the same source through the
+  ingest below ([Routing & Model Selection
   §2.3](routing-and-model-selection.md#23-the-capability-gate),
   [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
   [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 - **The agent's telemetry ingest**
   (`internal/gateway/agent_ingest.go`, `writeBackRuntimeCapabilities` →
   `runtimeSampleCapabilityRows`). It stamps whichever of
-  `llama_cpp_props`/`ollama_api_show`/`sdcpp_capabilities` the agent
-  **reported** (above), because the agent probes three kinds of child and
+  `llama_cpp_props`/`ollama_api_show`/`sdcpp_capabilities`/`audiocpp_models` the agent
+  **reported** (above), because the agent probes four kinds of child and
   only its report says which document a verdict came off. The third is
-  accepted for the `image` row only (`rowSource`,
+  accepted for the `image` row only and the fourth for the `speech` and
+  `transcription` rows only (`rowSource`,
   `runtimeSampleCapabilityRows`, with no feature check). What the agent
-  feature `capability_source_sdcpp` gates is the AGENT's sending: the agent
-  reports the source only while this gateway declares the name, as the agent
-  last read it (up to about 30 s old). The third is
+  features `capability_source_sdcpp` and `capability_source_audiocpp` gate is the
+  AGENT's sending: the agent reports a source only while this gateway declares its
+  name, as the agent last read it (up to about 30 s old). The third is
   an **agent-launched** `stable_diffusion_cpp` child's own read of the
-  identical document the bullet above reads externally (issue #154,
+  identical document the sd-server bullet above reads externally (issue #154), and the
+  fourth is an **agent-launched** `audio_cpp` child's own read of the `/v1/models`
+  listing the audio.cpp bullet above reads from a static application (issue #255,
   [Routing & Model Selection
   §2.3](routing-and-model-selection.md#23-the-capability-gate)).
 
@@ -2078,7 +2114,7 @@ vocabulary cannot mean. `image_edit` is on the probe list above and **not** on t
 one: `image_edit: "no"` is the operator's own opt-out
 ([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
 while `(image, no)`, by contrast, is reserved here, and `(speech, no)` and
-`(transcription, no)` with it, for the same reason: the audio.cpp pass is the writer
+`(transcription, no)` with it, for the same reason: the audio.cpp read (the gateway's pass or the agent's) is the writer
 entitled to establish it, and a rank-3 manual `no` would outrank that probe forever. **`mtp` is on neither list**, because it is the one
 internal name that HAS an operator control, whose rank-3 permanence is exactly
 how that control is meant to work.
@@ -2285,9 +2321,10 @@ a **nameless** verdict set (capability evidence with no `model`/`model_path`
 in the body) out to every mapping of the one-endpoint application, mirroring
 the live-progress nameless-entry rule above. A nil `Capabilities` on the wire
 (an agent predating capability detection, a child not yet probed
-conclusively, or a `stable_diffusion_cpp` child whose `sdcpp_capabilities`
-report the agent withholds because the gateway does not declare
-`capability_source_sdcpp`) and an all-empty one (detection ran, determined
+conclusively, or a `stable_diffusion_cpp` or `audio_cpp` child whose
+`sdcpp_capabilities` or `audiocpp_models` report the agent withholds because the
+gateway does not declare `capability_source_sdcpp` or `capability_source_audiocpp`)
+and an all-empty one (detection ran, determined
 nothing) are both "no write," but they are different facts a
 pointer field can distinguish and a bare struct cannot — why
 `sample.RuntimeSample.Capabilities` is `*Capabilities`.

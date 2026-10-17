@@ -93,6 +93,35 @@ func TestAgentFeaturesDeclaresTheSdcppCapabilitySource(t *testing.T) {
 	}
 }
 
+// TestAgentFeaturesDeclaresTheAudioCppCapabilitySource is the audio twin of
+// the sdcpp pin above: the agent sends the audiocpp_models source only when
+// this endpoint lists "capability_source_audiocpp"
+// (gatewayFeatureCapabilitySourceAudioCpp on its side). The name is compared as
+// the literal the agent matches, read off the served body, so a renamed
+// constant or a dropped list entry both fail here, where the agent would
+// otherwise just go quiet and an agent-launched audio.cpp child would keep
+// reading as "unknown" for speech and transcription.
+func TestAgentFeaturesDeclaresTheAudioCppCapabilitySource(t *testing.T) {
+	srv := NewTestServer()
+	seedTestAgentToken(t, srv, "agt_features", "mock-host-qwen", "features-secret")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, agentFeaturesRequest("features-secret", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var got agentFeaturesDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body %s: %v", rec.Body.String(), err)
+	}
+	if !slices.Contains(got.Features, "capability_source_audiocpp") {
+		t.Fatalf("features = %v, want it to declare capability_source_audiocpp", got.Features)
+	}
+	if !slices.Contains(got.Features, "capability_source_sdcpp") {
+		t.Fatalf("features = %v, want the sdcpp source still declared beside the audio one", got.Features)
+	}
+}
+
 // TestAgentFeaturesEndpointAuthAndMethod pins the shared agent-endpoint
 // skeleton: Cache-Control:no-store even on a failure, 401 with no bearer
 // (never reaching the feature list), and 405 on a non-GET.

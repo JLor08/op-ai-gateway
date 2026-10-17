@@ -4,11 +4,13 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
+	"os"
 	"testing"
 )
 
@@ -21,61 +23,105 @@ const audioCppLiveListing = `{"object":"list","data":[
   {"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}
 ]}`
 
+// audioCppModelCases is the verdict table for audio.cpp's /v1/models listing.
+// It is duplicated VERBATIM in
+// server-agent/internal/collector/audiocpp_test.go, because the two Go modules
+// share no package and each keeps its own copy of the rule
+// (parseAudioCppModels here, parseAudioCppModels there). The two copies must
+// decide identically on identical input: if a case fails, fix the parser, not
+// this table, and change both tables together.
+// TestAudioCppModelsCasesMatchTheAgentsTable below fails when the two
+// declarations differ by a byte. The declaration is self-contained on purpose
+// (plain "yes"/"no" literals, every body inline) so that it can be compared.
+var audioCppModelCases = []struct {
+	name              string
+	body              string
+	model             string
+	wantSpeech        string // "yes" | "no" | ""
+	wantTranscription string // "yes" | "no" | ""
+}{
+	{"real v0.9.1 entry, task tts", `{"object":"list","data":[{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}]}`, "pocket_tts_english_bf16", "yes", "no"},
+	{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", "yes", "no"},
+	{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", "yes", "no"},
+	{"task asr transcribes and does not speak", `{"data":[{"id":"m","task":"asr"}]}`, "m", "no", "yes"},
+	{"an asr model the server lists as not loaded is still a yes", `{"data":[{"id":"m","task":"asr","loaded":false}]}`, "m", "no", "yes"},
+	{"a music task is a no on both axes", `{"data":[{"id":"m","task":"music"}]}`, "m", "no", "no"},
+	{"an unknown task is a no on both axes", `{"data":[{"id":"m","task":"some-future-task"}]}`, "m", "no", "no"},
+	{"model absent from the listing", `{"data":[{"id":"other","task":"tts"}]}`, "m", "", ""},
+	{"empty data", `{"object":"list","data":[]}`, "m", "", ""},
+	{"data absent", `{"object":"list"}`, "m", "", ""},
+	{"data null", `{"data":null}`, "m", "", ""},
+	{"the entry is picked out by id among several", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"},{"id":"c","task":"asr"}]}`, "b", "yes", "no"},
+	{"the sibling's task does not leak", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"}]}`, "a", "no", "yes"},
+	{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","task":"tts"}]}`, "pocket_tts", "", ""},
+	{"id match is case-sensitive", `{"data":[{"id":"M","task":"tts"}]}`, "m", "", ""},
+	{"a task padded with whitespace still maps", `{"data":[{"id":"m","task":" tts "}]}`, "m", "yes", "no"},
+	{"task match ignores case", `{"data":[{"id":"m","task":"TTS"}]}`, "m", "yes", "no"},
+	{"task match ignores case and padding for clone", `{"data":[{"id":"m","task":" Clone "}]}`, "m", "yes", "no"},
+	{"a differently-cased asr task is still a transcription yes", `{"data":[{"id":"m","task":"ASR"}]}`, "m", "no", "yes"},
+	{"an asr task padded with whitespace still maps", `{"data":[{"id":"m","task":" asr "}]}`, "m", "no", "yes"},
+	{"a named entry without a task says nothing", `{"data":[{"id":"m"}]}`, "m", "", ""},
+	{"a named entry with an empty task says nothing", `{"data":[{"id":"m","task":""}]}`, "m", "", ""},
+	{"a named entry with a blank task says nothing", `{"data":[{"id":"m","task":"  "}]}`, "m", "", ""},
+	{"an empty model id never matches", `{"data":[{"id":"","task":"tts"}]}`, "", "", ""},
+	{"unknown and extra fields are ignored", `{"object":"list","x":1,"data":[{"id":"m","task":"tts","loaded":false,"extra":{"k":[1,2]}}]}`, "m", "yes", "no"},
+	{"data of the wrong type", `{"data":"m"}`, "m", "", ""},
+	{"a task of the wrong type", `{"data":[{"id":"m","task":1}]}`, "m", "", ""},
+	{"not JSON", `<html>502</html>`, "m", "", ""},
+	{"empty body", ``, "m", "", ""},
+}
+
 // TestParseAudioCppModels pins the mapping rule: the loaded entry's own task is
 // authoritative, for BOTH capability axes at once. A synthesis task (tts, clone)
 // is a speech "yes" and a transcription "no"; asr is a transcription "yes" and
 // a speech "no"; any other task is a "no" on both; and a model the listing does
 // not name -- or a listing this code cannot read -- is no verdict on either.
 func TestParseAudioCppModels(t *testing.T) {
-	const (
-		yes = routing.CapabilityYes
-		no  = routing.CapabilityNo
-	)
-	cases := []struct {
-		name          string
-		body          string
-		modelID       string
-		wantSpeech    string // "yes" | "no" | ""
-		wantTranscrip string // "yes" | "no" | ""
-	}{
-		{"real v0.9.1 entry, task tts", audioCppLiveListing, "pocket_tts_english_bf16", yes, no},
-		{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", yes, no},
-		{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", yes, no},
-		{"task asr transcribes and does not speak", `{"data":[{"id":"m","task":"asr"}]}`, "m", no, yes},
-		{"an asr model the server lists as not loaded is still a yes", `{"data":[{"id":"m","task":"asr","loaded":false}]}`, "m", no, yes},
-		{"a music task is a no on both axes", `{"data":[{"id":"m","task":"music"}]}`, "m", no, no},
-		{"an unknown task is a no on both axes", `{"data":[{"id":"m","task":"some-future-task"}]}`, "m", no, no},
-		{"model absent from the listing", `{"data":[{"id":"other","task":"tts"}]}`, "m", "", ""},
-		{"empty data", `{"object":"list","data":[]}`, "m", "", ""},
-		{"data absent", `{"object":"list"}`, "m", "", ""},
-		{"data null", `{"data":null}`, "m", "", ""},
-		{"the entry is picked out by id among several", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"},{"id":"c","task":"asr"}]}`, "b", yes, no},
-		{"the sibling's task does not leak", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"}]}`, "a", no, yes},
-		{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","task":"tts"}]}`, "pocket_tts", "", ""},
-		{"id match is case-sensitive", `{"data":[{"id":"M","task":"tts"}]}`, "m", "", ""},
-		{"a task padded with whitespace still maps", `{"data":[{"id":"m","task":" tts "}]}`, "m", yes, no},
-		{"task match ignores case", `{"data":[{"id":"m","task":"TTS"}]}`, "m", yes, no},
-		{"task match ignores case and padding for clone", `{"data":[{"id":"m","task":" Clone "}]}`, "m", yes, no},
-		{"a differently-cased asr task is still a transcription yes", `{"data":[{"id":"m","task":"ASR"}]}`, "m", no, yes},
-		{"an asr task padded with whitespace still maps", `{"data":[{"id":"m","task":" asr "}]}`, "m", no, yes},
-		{"a named entry without a task says nothing", `{"data":[{"id":"m"}]}`, "m", "", ""},
-		{"a named entry with an empty task says nothing", `{"data":[{"id":"m","task":""}]}`, "m", "", ""},
-		{"a named entry with a blank task says nothing", `{"data":[{"id":"m","task":"  "}]}`, "m", "", ""},
-		{"an empty model id never matches", `{"data":[{"id":"","task":"tts"}]}`, "", "", ""},
-		{"unknown and extra fields are ignored", `{"object":"list","x":1,"data":[{"id":"m","task":"tts","loaded":false,"extra":{"k":[1,2]}}]}`, "m", yes, no},
-		{"data of the wrong type", `{"data":"m"}`, "m", "", ""},
-		{"a task of the wrong type", `{"data":[{"id":"m","task":1}]}`, "m", "", ""},
-		{"not JSON", `<html>502</html>`, "m", "", ""},
-		{"empty body", ``, "m", "", ""},
-	}
-	for _, tc := range cases {
+	for _, tc := range audioCppModelCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseAudioCppModels([]byte(tc.body), tc.modelID)
-			want := AudioCppVerdicts{Speech: tc.wantSpeech, Transcription: tc.wantTranscrip}
+			got := parseAudioCppModels([]byte(tc.body), tc.model)
+			want := AudioCppVerdicts{Speech: tc.wantSpeech, Transcription: tc.wantTranscription}
 			if got != want {
 				t.Fatalf("parseAudioCppModels = %+v, want %+v", got, want)
 			}
 		})
+	}
+}
+
+// agentAudioCppCasesPath is the agent's copy of audioCppModelCases, relative to
+// this package's directory, where go test runs it. Both Go modules live in one
+// repository, and CI checks the whole repository out before it tests this
+// module (the same prefix as agentSdcppCasesPath).
+const agentAudioCppCasesPath = "../../../../server-agent/internal/collector/audiocpp_test.go"
+
+// TestAudioCppModelsCasesMatchTheAgentsTable holds the two copies of
+// audioCppModelCases identical. Each copy is pinned against its own module's
+// parseAudioCppModels, so a change to one parser together with its own table
+// would pass both suites while the two rules drift apart. This reads the
+// agent's test file off disk and compares the two declarations byte for byte.
+// Both extracts must be non-empty: a renamed or reshaped table would otherwise
+// compare nothing with nothing and pass.
+func TestAudioCppModelsCasesMatchTheAgentsTable(t *testing.T) {
+	const ownPath = "audiocpp_models_test.go"
+	own, err := os.ReadFile(ownPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", ownPath, err)
+	}
+	agent, err := os.ReadFile(agentAudioCppCasesPath)
+	if err != nil {
+		t.Fatalf("read the agent's copy %s: %v (the two modules are one repository, and this check needs both)", agentAudioCppCasesPath, err)
+	}
+	ownBlock, agentBlock := sdcppVarBlock(own, "audioCppModelCases"), sdcppVarBlock(agent, "audioCppModelCases")
+	if len(ownBlock) == 0 {
+		t.Fatalf("no `var audioCppModelCases = ...` declaration ending in a line \"}\" found in %s", ownPath)
+	}
+	if len(agentBlock) == 0 {
+		t.Fatalf("no `var audioCppModelCases = ...` declaration ending in a line \"}\" found in %s", agentAudioCppCasesPath)
+	}
+	if !bytes.Equal(ownBlock, agentBlock) {
+		t.Fatalf("audioCppModelCases differs between gateway/backend/internal/provider/audiocpp_models_test.go and "+
+			"server-agent/internal/collector/audiocpp_test.go. The two parseAudioCppModels copies must decide identically: "+
+			"change both tables, and both parsers, together.\n--- gateway\n%s\n--- agent\n%s", ownBlock, agentBlock)
 	}
 }
 

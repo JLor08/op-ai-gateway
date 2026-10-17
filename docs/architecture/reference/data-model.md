@@ -788,27 +788,32 @@ plausible-looking validation rule would break the normal case:
   store repeats the same `rank(incoming) >= rank(current)` inside its upsert as
   a backstop for the check-then-act interleaving the writer cannot see (issue
   #79, [ADR-039](../09-architecture-decisions.md#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)).
-  The three PROBE sources an agent reports are `llama_cpp_props` (a `GET` of
+  The four PROBE sources an agent reports are `llama_cpp_props` (a `GET` of
   llama.cpp's `/props`), `ollama_api_show` (a `POST` of Ollama's `/api/show`,
-  since #54), and `sdcpp_capabilities` (a `GET` of an agent-launched
+  since #54), `sdcpp_capabilities` (a `GET` of an agent-launched
   `stable_diffusion_cpp` child's own `/sdcpp/v1/capabilities`, since #154,
   accepted for the `image` row only; the agent reports it only while the
   gateway declares the agent feature `capability_source_sdcpp`, as the agent
   last read it (up to about 30 s old), and the
-  ingest's acceptance does not depend on the feature). The gateway's own
+  ingest's acceptance does not depend on the feature), and `audiocpp_models` (a
+  `GET` of an agent-launched `audio_cpp` child's own `/v1/models`, since #255,
+  accepted for the `speech` and `transcription` rows only; the agent reports it
+  only while the gateway declares the agent feature `capability_source_audiocpp`,
+  on the same terms as the sdcpp one). The gateway's own
   passes write `llama_cpp_props` too, and, for an **external** `stable_diffusion_cpp`
   application, `sdcpp_capabilities` directly — the only source that answers
-  `image` in both directions, whichever of its two producers wrote it — plus
-  two probe-ranked sources no agent may report: `llama_cpp_timings` (read off
-  a completion it relayed) and `audiocpp_models` (the gateway's own `GET` of an
-  `audio_cpp` application's `/v1/models`, the only source of the `speech` and
-  `transcription` rows and one that answers both in both directions, from the one
-  `task` of the listed model; a vocabulary addition only, with no schema
-  change, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
-  [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
-  The probing agent REPORTS which of its three
+  `image` in both directions, whichever of its two producers wrote it — and, for a
+  static `audio_cpp` application, `audiocpp_models` directly (a `GET` of its
+  `/v1/models`, the only source of the `speech` and `transcription` rows and one
+  that answers both in both directions, from the one `task` of the listed model,
+  whichever of its two producers wrote it; a vocabulary addition only, with no
+  schema change), plus one probe-ranked source no agent may report:
+  `llama_cpp_timings` (read off a completion it relayed). The audio rows:
+  [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+  [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint).
+  The probing agent REPORTS which of its four
   produced a verdict set rather than the gateway inferring it, and the
-  ingest boundary accepts exactly those three from an agent — a sample
+  ingest boundary accepts exactly those four from an agent — a sample
   claiming `manual` or `vision_benchmark` writes nothing at all, since an
   agent has no standing to put "an operator said so" in front of an operator
   or to lock a real benchmark out of its own row

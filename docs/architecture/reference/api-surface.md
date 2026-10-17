@@ -1236,11 +1236,13 @@ header-only representation would silently disagree across the two transports.
 A pushed frame must therefore carry the full document **including** its `etag`.
 
 `/features` returns the gateway's declared names —
-`{"features":["runtime_manager","runtime_logs","runtime_config_ack","capability_source_sdcpp"]}`. Gating is
+`{"features":["runtime_manager","runtime_logs","runtime_config_ack","capability_source_sdcpp","capability_source_audiocpp"]}`. Gating is
 name-based string equality: a flag both sides declare is active only when the
 gateway and the agent both declare it. A flag that states a fact about one side
-alone need only be on that side's list, and `capability_source_sdcpp` is on the
-gateway's alone: the agent reads it here and does not declare it back
+alone need only be on that side's list, and `capability_source_sdcpp` (the ingest accepts
+the `sdcpp_capabilities` source, for the `image` row) and `capability_source_audiocpp` (the
+ingest accepts the `audiocpp_models` source, for the `speech` and `transcription` rows) are
+on the gateway's alone: the agent reads them here and does not declare them back
 ([Agent-Managed Model Runtime
 §7](../cross-cutting/agent-runtime-manager.md#7-feature-negotiation)). A **404 is
 not an error** for an agent — it means an older gateway, and reads as the empty

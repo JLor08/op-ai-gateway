@@ -321,9 +321,11 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// and on the same terms as (image, no): an absent row already refuses a
 	// speech request, so "cannot synthesise speech" costs the operator nothing to
 	// leave unsaid, while a manual no is rank 3 and would outrank forever the
-	// writer entitled to establish it -- the gateway health loop's read of
-	// audio.cpp's own /v1/models listing (routing.CapabilitySourceAudioCppModels),
-	// whose per-model task is authoritative for a model it names, so its no is real.
+	// writer entitled to establish it -- a read of audio.cpp's own /v1/models
+	// listing (routing.CapabilitySourceAudioCppModels), by either of its two
+	// producers: the gateway health loop's, for an audio_cpp application, and
+	// the agent's, for an audio.cpp child it launched. The listing's per-model
+	// task is authoritative for a model it names, so its no is real.
 	// (speech, yes) stays writable: it is the operator's override of that probe
 	// and the enablement path for a model the listing does not name (the listing
 	// was first taken to name loaded models only, so that was every model not
@@ -333,12 +335,13 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// reason and on the same terms as (speech, no): an absent row already refuses
 	// a transcription request, so "cannot transcribe audio" costs the operator
 	// nothing to leave unsaid, while a manual no is rank 3 and would outrank
-	// forever the writer entitled to establish it -- the gateway health loop's
-	// read of audio.cpp's own /v1/models listing, whose per-model task ("asr" for
-	// transcription) is authoritative, so its no is real. (transcription, yes)
-	// stays writable: it is the operator's override of that probe and the
-	// enablement path for a model the listing does not name or does not give a
-	// task, such as one behind an agent router, whose listing carries none.
+	// forever the writer entitled to establish it -- a read of audio.cpp's own
+	// /v1/models listing, by either of the same two producers (the gateway health
+	// loop and the agent), whose per-model task ("asr" for transcription) is
+	// authoritative, so its no is real. (transcription, yes) stays writable: it
+	// is the operator's override of that probe and the enablement path for a
+	// model the listing does not name or does not give a task, or one whose
+	// agent predates the source and so never reports it.
 	routing.CapabilityTranscription: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }

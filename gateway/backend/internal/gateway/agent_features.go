@@ -18,11 +18,11 @@ import (
 // the binary can actually do. A name both sides declare is ACTIVE iff BOTH
 // the gateway and the agent declare it; each side computes that intersection
 // independently. A name that states a fact about one side alone need only be
-// on that side's list: capability_source_sdcpp is on this list only, and the
-// agent-declared gpu_selection, runtime_api_token, runtime_model_probe,
-// runtime_upstream_props (RuntimeUpstreamPropsFeature), runtime_ensure
-// (runtimeEnsureFeature) and multipart_proxy (multipartProxyFeature) are on the
-// agent's only.
+// on that side's list: capability_source_sdcpp and capability_source_audiocpp
+// are on this list only, and the agent-declared gpu_selection,
+// runtime_api_token, runtime_model_probe, runtime_upstream_props
+// (RuntimeUpstreamPropsFeature), runtime_ensure (runtimeEnsureFeature) and
+// multipart_proxy (multipartProxyFeature) are on the agent's only.
 // Append-only: once shipped, a name is never removed or renamed here, only
 // added to.
 // runtime_logs is declared here for completeness of the negotiation contract
@@ -51,13 +51,28 @@ import (
 // all. The ingest's acceptance does not consult the name; a gateway build
 // without the name simply has no such acceptance, which is why the agent
 // does not send the source there.
-var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature}
+//
+// capability_source_audiocpp is the same shape, for the audiocpp_models source
+// and an audio.cpp child: one-sided, this gateway's statement of what its
+// ingest accepts (rowSource, runtimeSampleCapabilityRows), read by the agent as
+// a precondition before it reports a child's speech and transcription verdicts
+// under that source. It is a separate name rather than a reuse of the sdcpp one
+// because the two acceptances are independent facts: a gateway build can accept
+// one source and not the other, and the agent must not send a source its
+// gateway would drop.
+var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature}
 
 // capabilitySourceSdcppFeature says this gateway's capability ingest accepts
 // the sdcpp_capabilities source from an agent (rowSource), for the image row
 // only. The agent sends that source only when this name is declared (its
 // gatewayFeatureCapabilitySourceSdcpp).
 const capabilitySourceSdcppFeature = "capability_source_sdcpp"
+
+// capabilitySourceAudioCppFeature says this gateway's capability ingest accepts
+// the audiocpp_models source from an agent (rowSource), for the speech and
+// transcription rows only. The agent sends that source only when this name is
+// declared (its gatewayFeatureCapabilitySourceAudioCpp).
+const capabilitySourceAudioCppFeature = "capability_source_audiocpp"
 
 // RuntimeUpstreamPropsFeature is the agent-declared capability naming the
 // runtime router's GET /upstream/{model}/props passthrough

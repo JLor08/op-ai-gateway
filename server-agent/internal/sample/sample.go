@@ -312,9 +312,9 @@ type CapabilityVerdict struct {
 // feed; nothing here ranks anything.
 const (
 	// CapabilitySourceLlamaCppProps is a GET of a llama.cpp /props document
-	// (collector.ProbePropsVerdicts) -- every spec type except "ollama" and
-	// "stable_diffusion_cpp", "custom" included, since "custom" is the
-	// type-detection fallback.
+	// (collector.ProbePropsVerdicts) -- every spec type except "ollama",
+	// "stable_diffusion_cpp" and "audio_cpp", "custom" included, since
+	// "custom" is the type-detection fallback.
 	CapabilitySourceLlamaCppProps = "llama_cpp_props"
 	// CapabilitySourceOllamaAPIShow is a POST of Ollama's /api/show
 	// (collector.ProbeOllamaVerdicts): what Ollama DECLARES about a model,
@@ -325,6 +325,12 @@ const (
 	// answers the image capability in both directions and nothing else.
 	// Identical to the gateway's routing.CapabilitySourceSdcppCapabilities.
 	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
+	// CapabilitySourceAudioCppModels is a GET of audio.cpp's /v1/models
+	// (collector.ProbeAudioCppVerdicts), where each listed model's task names
+	// what it does: it answers the speech and transcription capabilities in
+	// both directions and nothing else. Identical to the gateway's
+	// routing.CapabilitySourceAudioCppModels.
+	CapabilitySourceAudioCppModels = "audiocpp_models"
 )
 
 // ProxyRouteSample is one TLS-proxy route's observed state, mirroring

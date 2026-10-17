@@ -842,7 +842,7 @@ why).
 
 **Who writes the `speech` verdict.** `speech` is the second capability the gate
 excludes on, and it has the same two writers an `image` verdict has, with a different
-document and one deferred producer
+document, from two producers
 ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
 
 - **`audiocpp_models`** answers **speech and transcription** in both directions, from the
@@ -869,12 +869,30 @@ document and one deferred producer
   named model's verdict stands either way. For an operator-run server the mapped model is
   loaded, and a manual `speech: yes` covers the rest. And the pass is gated on the application
   **type**: a `server_agent` mapping whose runtime spec is of kind `audio_cpp` is
-  **not probed**, because the agent router's `/v1/models` carries no `task` and so
-  could state no verdict. That is the deferred half; it needs an agent-side source and
-  its feature flag, as `capability_source_sdcpp` is for images.
+  **not probed** by the health loop, because the agent router's `/v1/models` carries no
+  `task` and so could state no verdict. The agent covers that case itself, below.
+- **`audiocpp_models`, reported by the agent** (issue #255, agent 0.9.1) answers the same
+  two rows for an **agent-launched** `audio_cpp` child. The agent GETs the child's **own**
+  `/v1/models` over its loopback connection (`collector.ProbeAudioCppVerdicts`; the
+  router's aggregate listing carries no `task`, the child's does), decides both verdicts
+  from the entry whose `id` is the spec's model with a deliberate duplicate of the
+  gateway's parser (the two copies pinned by one shared case table, [Telemetry
+  §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)),
+  and reports them under this same source name, but only while the gateway declares the
+  agent feature `capability_source_audiocpp`: a gateway that knows the `audio_cpp` spec
+  type but not this source would otherwise drop the capability rows of every such sample,
+  with a warning. While the gateway does not declare it, the agent probes and caches
+  nothing for that child and withholds a verdict it cached earlier, so a gateway upgrade
+  takes effect without a child restart. The ingest accepts the source for the `speech`
+  and `transcription` rows only, at probe rank 1, so a manual verdict (rank 3) still
+  outranks it. Unlike the health loop, which asks again every tick, the agent asks
+  **once per process generation**: a listing that does not name the model is a conclusive
+  answer there, cached with the child's pid, so such a child reads as unknown until it
+  restarts or its spec's model changes ([Agent-Managed Model Runtime
+  §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
 - **`manual`**, the operator's `speech: yes` on the mapping, the enablement path for
-  every case the probe does not reach (an agent-launched `audio_cpp` child, a model
-  the listing does not name). `(speech, no)` is reserved in `reservedManualVerdicts` for the
+  every case the probe does not reach (a model the listing does not name, a child
+  whose agent predates the source). `(speech, no)` is reserved in `reservedManualVerdicts` for the
   reason `(image, no)` is: an absent row already refuses a speech request, so
   "cannot synthesise speech" costs an operator nothing to leave unsaid, while a
   manual `no` is rank 3, would outrank the probe entitled to establish it forever, and
@@ -894,18 +912,17 @@ gate excludes on, and it has the same writers as `speech`, **from the same listi
   rows, each only when stated, so an unanswered axis never suppresses the other. The
   task match ignores case and surrounding whitespace, so an `ASR` the server might one day
   emit does not fall to the `no` default. The same ranking, the same type gate (a
-  `server_agent` mapping with an `audio_cpp` spec is **not probed**) and the same
-  deferral hold: the agent router's `/v1/models` carries no `task`, so an agent-launched
-  `audio_cpp` child has no automatic verdict until an agent-side source exists, and an
-  operator's manual `transcription: yes` serves it meanwhile.
+  `server_agent` mapping with an `audio_cpp` spec is **not probed** by the health loop)
+  and the same agent-side producer hold: the agent reads an agent-launched child's own
+  `/v1/models` and reports both rows under `audiocpp_models` (the speech block above),
+  and an operator's manual `transcription: yes` still outranks it.
 - **`manual`**, the operator's `transcription: yes`, the enablement path for what the
   probe does not reach. `(transcription, no)` is **reserved** in `reservedManualVerdicts`
   on the same terms as `(speech, no)`: an absent row already refuses a transcription
   request, while a manual `no` is rank 3 and would outrank the probe entitled to
   establish it, forever. `(transcription, yes)` stays writable, as the operator's override
-  of the probe. The name is deliberately **not** in `reservedAgentCapabilityNames`: an
-  agent-side writer may report it later, and an agent-reported `no` would then be
-  legitimate.
+  of the probe. The name is deliberately **not** in `reservedAgentCapabilityNames`: the
+  agent reports it (issue #255), and an agent-reported `no` is legitimate.
 
 A transcription request avoids the vendor-account path for speech's reason: the
 capability list. `vendorAccountRoutingEligible` has no `openai_audio` twin of its images
