@@ -57,10 +57,11 @@ several architectural decisions exist specifically to satisfy them.
   edge, so it is never reachable from a browser) additionally lets the
   gateway's own portal-chat run executor call `/v1/chat/completions`,
   `/v1/images/generations` and `/v1/images/edits` as a token-less session
-  principal. `/v1/audio/speech` accepts the loopback pair as well, on the same
-  leg as the two image endpoints, though no portal flow calls it today. No
-  inference endpoint other than those four accepts the loopback pair, and none
-  accepts the session cookie other than `/v1/chat/completions`.
+  principal. `/v1/audio/speech` and `/v1/audio/transcriptions` accept the
+  loopback pair as well, on the same leg as the two image endpoints, though no
+  portal flow calls either today. No inference endpoint other than those five
+  accepts the loopback pair, and none accepts the session cookie other than
+  `/v1/chat/completions`.
 - **The public listener and the mesh (agent) listener are separate enforcement
   surfaces** with independent TLS and authorization.
 

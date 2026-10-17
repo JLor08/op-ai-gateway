@@ -34,6 +34,16 @@ type captureInput struct {
 	APIFlavor   string
 	OwnerUserID string
 	Secret      bool
+	// Endpoint is the client endpoint the exchange arrived on, for the one decision
+	// the flavor cannot make: speech and transcription share the openai_audio flavor,
+	// and the first answers with one binary WAV while the second answers with JSON
+	// (isBinarySpeechResponse). relayTranscriptionResponse -- the one 2xx producer that
+	// shares speech's flavor -- stamps it; every other producer leaves it zero
+	// (endpointChat), which nothing reads. That is why the one reader carves
+	// transcription out of speech instead of requiring endpointSpeech: a speech
+	// capture built without an endpoint is still a speech capture, and the way that
+	// can go wrong is a binary body kept redacted, not a WAV run through json.Marshal.
+	Endpoint sessionEndpoint
 	// RespBytes is how many body bytes the relay actually sent the client, and
 	// RespMetering the upstream's metering headers. Both are set only by
 	// proxyNative's streaming terminal step, and both are read only when the
@@ -214,8 +224,15 @@ func isAudioContentType(contentType string) bool {
 // contract, so its body must never reach json.Marshal even when its Content-Type
 // is missing or wrong. It is narrow on purpose: a speech request answered with an
 // error, and every other flavor, are decided by the Content-Type alone.
+//
+// The flavor alone cannot say "speech": a transcription shares openai_audio, and
+// its 2xx answer is a JSON document -- the transcript -- that the capture exists to
+// keep. The endpoint carves it out (captureInput.Endpoint). The carve-out is
+// negative, as needsSpeechErrorRelay's is, so a speech capture built without an
+// endpoint (the zero value is endpointChat) is still redacted: the failure that
+// would leave is a transcript lost to a summary, never a WAV in the envelope.
 func isBinarySpeechResponse(in *captureInput) bool {
-	return in.APIFlavor == apiFlavorSpeech && in.HTTPStatus >= 200 && in.HTTPStatus < 300
+	return in.APIFlavor == apiFlavorSpeech && in.Endpoint != endpointTranscription && in.HTTPStatus >= 200 && in.HTTPStatus < 300
 }
 
 // captureResponseBody returns what the envelope stores as the response body, and
@@ -233,8 +250,9 @@ func isBinarySpeechResponse(in *captureInput) bool {
 // any other JSON body, and the same holds for anything else that is not audio.
 // There is one backstop behind it, isBinarySpeechResponse: a speech request that was
 // answered 2xx got audio whatever its Content-Type says (proxyNative defaults a
-// missing one to application/json), so it is skipped too. Nothing is cut off by the
-// skip, so truncated is false.
+// missing one to application/json), so it is skipped too. A transcription is not
+// one: it shares the flavor but answers with a JSON transcript, which is stored like
+// any other body. Nothing is cut off by the skip, so truncated is false.
 func captureResponseBody(in *captureInput, maxBytes int) (string, bool) {
 	contentType := in.RespHeaders.Get("Content-Type")
 	if !isAudioContentType(contentType) && !isBinarySpeechResponse(in) {

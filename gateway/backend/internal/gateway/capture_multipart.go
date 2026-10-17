@@ -16,8 +16,11 @@ import (
 )
 
 // captureTextPartMaxBytes is the largest part captureRequestBody will take for a
-// text field. The edit handler refuses a field past 1 MiB (maxImageEditFieldBytes),
-// so a bigger part is not one of the fields -- and is redacted rather than read.
+// text field. Every multipart endpoint refuses a field past 1 MiB -- the image edit
+// (maxImageEditFieldBytes) and the transcription (maxTranscriptionFieldBytes) alike
+// -- so a bigger part is not one of the fields, and is redacted rather than read. It
+// is not endpoint-specific, and must stay at least as large as each endpoint's own
+// cap: a field a handler accepted would otherwise be redacted in its capture.
 const captureTextPartMaxBytes = maxImageEditFieldBytes
 
 // captureMultipartPart is one entry of the stored summary of a multipart body:

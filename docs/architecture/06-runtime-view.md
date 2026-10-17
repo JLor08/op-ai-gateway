@@ -36,10 +36,12 @@ sequenceDiagram
 ```
 
 Notes: the six JSON inference endpoints read the request body with no size cap
-(large multimodal payloads); the seventh, the multipart image edit
-(`POST /v1/images/edits`), is the one capped body
-(`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB). All seven lift the
-server read/write deadlines; SSE streams are bounded by an idle watchdog and
+(large multimodal payloads); the other two, the multipart image edit
+(`POST /v1/images/edits`) and the multipart audio transcription
+(`POST /v1/audio/transcriptions`), are the capped bodies, each at a setting of its
+own (`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`,
+`OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, default 32 MiB each). All eight
+lift the server read/write deadlines; SSE streams are bounded by an idle watchdog and
 client disconnect, not a total cap. See
 [Compatibility & Inference](cross-cutting/compatibility-and-inference.md).
 
@@ -82,6 +84,51 @@ from the server's `/v1/models` `task`; the flavor is the application's own
 summary of the audio, never the WAV bytes. See [Compatibility & Inference
 §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech) and
 [ADR-061](09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only).
+
+### 6.1.2 Transcription relay (`POST /v1/audio/transcriptions`)
+
+Speech-to-text is speech's mirror image: its request is a **multipart audio upload** and
+its response is **JSON**, and the quantity it bills is in that JSON, so its relay is the
+one that reads its response before it writes. It shares speech's flavor, so what differs
+is keyed on the endpoint.
+
+```mermaid
+sequenceDiagram
+    participant C as AI client
+    participant GW as Gateway (edge)
+    participant R as routing (resolver)
+    participant AC as audio.cpp server
+    participant U as usage
+
+    C->>GW: POST /v1/audio/transcriptions multipart {model, file} (Bearer token)
+    GW->>GW: authenticate (bearer or loopback, never a session)
+    GW->>GW: read the body (capped), peek the model from the form, validate
+    Note over GW: 400 transcription.* here (exactly one non-empty file, response_format json only, no stream), 413 over the cap, before any admission, not recorded
+    GW->>R: resolve(model, openai_audio, required capability transcription)
+    R-->>GW: candidate with transcription: yes, or 404 no_model_route / model_not_capable
+    GW->>GW: agent target needs multipart_proxy, else 404 transcription.unavailable
+    GW->>AC: POST /v1/audio/transcriptions (form verbatim, or rebuilt once: model renamed, empty file dropped)
+    alt 2xx
+        AC-->>GW: application/json {text, timing{audio_duration_ms}}
+        GW->>GW: buffer the whole body up to the cap, then write it verbatim
+        GW-->>C: the same JSON, timing kept
+        GW->>U: audio_second = timing.audio_duration_ms / 1000, zero tokens
+    else 2xx over the cap, or broken off
+        GW-->>C: 502 transcription.upstream_error, nothing of the body written
+        GW->>U: audio_second error row, quantity 0
+    else non-2xx
+        AC-->>GW: error body (an OpenAI object, or a plain string)
+        GW-->>C: OpenAI-shaped error at the upstream's status
+        GW->>U: audio_second error row, quantity 0
+    end
+```
+
+The gate is `RequiredCapabilities = ["transcription"]`, whose verdict the health loop wrote
+from the same `/v1/models` `task` as speech's (`asr` is a transcription `yes`). A payload
+capture keeps the form's text fields (the audio `file` part is redacted) **and the
+transcript**, which is output-sensitive. See [Compatibility & Inference
+§3.7](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions) and
+[ADR-062](09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint).
 
 ## 6.2 Portal login (session + CSRF) with optional TOTP
 

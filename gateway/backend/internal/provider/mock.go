@@ -123,16 +123,27 @@ const mockImagesPathPrefix = "/v1/images/"
 // decodes or renders the result, such as the portal chat, works against the mock.
 const mockImagePNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 
+// mockTranscriptionsPath is the upstream transcription endpoint. The mock answers it
+// with a transcription document, never a Responses stream.
+const mockTranscriptionsPath = "/v1/audio/transcriptions"
+
+// mockTranscriptionBody is the document audio.cpp answers a transcription with: the
+// text, and the timing block whose audio_duration_ms the gateway bills audio_second
+// from (2 seconds here, so a mock transcription records a non-zero quantity).
+const mockTranscriptionBody = `{"text":"Mock transcription.","timing":{"audio_duration_ms":2000}}`
+
 // ProxyNative returns a canned answer so a native-passthrough application works in
 // dev/mock mode. contentType is accepted for the NativeProxyClient seam but not
 // inspected: the mock does not parse the request body.
 //
 // An images path (/v1/images/...) gets the generations-shaped body sd-server
 // returns, {created, output_format, data:[{b64_json}]} with one image, so a
-// gateway images relay counts a billable image. Every other path gets an
-// OpenAI-Responses-style SSE stream that echoes the resolved upstream model and a
-// terminal response.completed carrying usage, mirroring what a real Codex-capable
-// upstream would emit.
+// gateway images relay counts a billable image. The transcription path
+// (/v1/audio/transcriptions) gets the JSON document audio.cpp returns,
+// {text, timing:{audio_duration_ms}}, so a gateway transcription relay finds the
+// duration it bills. Every other path gets an OpenAI-Responses-style SSE stream that
+// echoes the resolved upstream model and a terminal response.completed carrying
+// usage, mirroring what a real Codex-capable upstream would emit.
 func (m Mock) ProxyNative(_ context.Context, target routing.Target, path string, _ []byte, _ string) (*ProxyResponse, error) {
 	if m.Unreachable {
 		return nil, ErrUnavailable
@@ -143,6 +154,13 @@ func (m Mock) ProxyNative(_ context.Context, target routing.Target, path string,
 			StatusCode: 200,
 			Header:     http.Header{"Content-Type": []string{jsonContentType}},
 			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	}
+	if path == mockTranscriptionsPath {
+		return &ProxyResponse{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{jsonContentType}},
+			Body:       io.NopCloser(strings.NewReader(mockTranscriptionBody)),
 		}, nil
 	}
 	model := target.ProviderModel

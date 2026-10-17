@@ -35,9 +35,10 @@
 //     below.
 //   - everything else -- the model-routed reverse proxy. The model comes from
 //     the JSON body or, when the request is multipart/form-data (an image
-//     edit, "multipart_proxy" in the agent's feature registry), from the
-//     form's "model" part, read the way the gateway reads it
-//     (peekMultipartModel). A multipart request is always a plain relay.
+//     edit or an audio transcription, "multipart_proxy" in the agent's
+//     feature registry), from the form's "model" part, read the way the
+//     gateway reads it (peekMultipartModel). A multipart request is always a
+//     plain relay, and the router is blind to the path it was sent to.
 //
 // STREAMING ASYMMETRY (the whole point of this design): request bodies are
 // buffered (bounded by maxBodyBytes) because `model`/`stream` must be read
@@ -126,8 +127,9 @@ const maxBodyBytes = 32 << 20
 
 // maxMultipartModelBytes bounds the read of the one multipart part the router
 // reads, the form's "model" field. It is the gateway's own bound on a text field
-// of an image edit (maxImageEditFieldBytes), so the two parsers agree on which
-// model fields are too large to be a model name at all.
+// of an image edit (maxImageEditFieldBytes) and of a transcription
+// (maxTranscriptionFieldBytes), so the parsers agree on which model fields are
+// too large to be a model name at all.
 const maxMultipartModelBytes = 1 << 20
 
 // headerContentType is the Content-Type header name, read off the inbound request
@@ -588,12 +590,13 @@ type modelStreamPeek struct {
 // JSON, stream), and hands off to the plain or streaming path.
 //
 // The body is read as a multipart form when the request's Content-Type is
-// multipart/form-data (an image edit) and as JSON otherwise; see
+// multipart/form-data (an image edit or an audio transcription) and as JSON
+// otherwise; see
 // peekMultipartModel. The Content-Type decides the shape, and a request that
 // declares the multipart one is never read as JSON, whatever its bytes look like.
 // A multipart request is always relayed by servePlainProxy: it has no stream
-// notion (the gateway refuses an edit that asks to stream), so a form field that
-// happens to be named stream is not read at all.
+// notion (the gateway refuses an edit or a transcription that asks to stream), so
+// a form field that happens to be named stream is not read at all.
 func (rt *router) serveProxy(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
@@ -648,7 +651,8 @@ func writeModelNotNamed(w http.ResponseWriter) {
 //
 // SECURITY: this reads the form the way the gateway does and must keep doing
 // so. The gateway peeks the model out of the same bytes (parseImageEditForm,
-// gateway/backend/internal/gateway/images_edit_handler.go), decides routing and
+// gateway/backend/internal/gateway/images_edit_handler.go, and parseTranscriptionForm,
+// transcription_handler.go in the same package), decides routing and
 // the operator's model allowlist on it, and then this router starts a process
 // on its own reading. Were the two to read different models out of one body, an
 // allowlisted name in the one and an arbitrary managed name in the other would

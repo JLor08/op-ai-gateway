@@ -661,12 +661,14 @@ type usageMeta struct {
 	// Endpoint is the client endpoint this request arrived on. recordUsage reads
 	// it for exactly one thing: the row's ProviderPath, which it recomputes from
 	// the target and the request's FLAVOR rather than taking the path the relay
-	// actually called -- and the flavor cannot tell endpoints that share it apart
-	// (openai_images covers both /v1/images/generations and /v1/images/edits). Only
-	// an images call site needs to set it, and it must: left at its zero value
-	// (endpointChat) it records the generations path, which is wrong for an edit.
-	// Every other call site leaves it zero, which changes nothing for them --
-	// upstreamPath ignores the endpoint for every non-images flavor.
+	// actually called -- and the flavor cannot tell endpoints that share it apart:
+	// openai_images covers both /v1/images/generations and /v1/images/edits, and
+	// openai_audio covers both /v1/audio/speech and /v1/audio/transcriptions. So
+	// the images call sites and the audio ones set it, and must: left at its zero
+	// value (endpointChat) a row records the generations path for an edit and the
+	// speech path for a transcription. Every other call site leaves it zero, which
+	// changes nothing for them -- upstreamPath ignores the endpoint for every
+	// flavor but those two.
 	Endpoint sessionEndpoint
 	// GenStart is when the first content delta of a TRANSLATE stream arrived (the
 	// requestProgress first-token stamp); the zero time means "no generation
@@ -985,6 +987,12 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, errImageEditTooLarge) {
 		message = fmt.Sprintf("the image edit is too large for this model's server: its request limit is %d MiB, counted after the mask and model are prepared", agentRouterMaxBodyBytes>>20)
 	}
+	if errors.Is(err, errTranscriptionUnavailable) {
+		message = "transcription is not available on this model's server: its agent has not declared the " + multipartProxyFeature + " feature. The agent is older than 0.9.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported"
+	}
+	if errors.Is(err, errTranscriptionTooLarge) {
+		message = fmt.Sprintf("the transcription is too large for this model's server: its request limit is %d MiB, counted after the model name is prepared", agentRouterMaxBodyBytes>>20)
+	}
 	return apierror.Response(code, message, "")
 }
 
@@ -1031,6 +1039,16 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, errImageEditTooLarge) {
 		return http.StatusRequestEntityTooLarge
 	}
+	// A transcription's agent target cannot take one (errTranscriptionUnavailable):
+	// 404 for the reasons the image edit's twin gives, and a transcription whose
+	// prepared body is past the agent's own request limit (errTranscriptionTooLarge)
+	// is the same 413 the client's own oversized body gets.
+	if errors.Is(err, errTranscriptionUnavailable) {
+		return http.StatusNotFound
+	}
+	if errors.Is(err, errTranscriptionTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
 	if errors.Is(err, routing.ErrNoHealthyHost) {
 		return http.StatusServiceUnavailable
 	}
@@ -1046,6 +1064,10 @@ func completionErrorCode(err error) string {
 	case errors.Is(err, errImageEditUnavailable):
 		return codeImageEditUnavailable
 	case errors.Is(err, errImageEditTooLarge):
+		return codeRequestBodyTooLarge
+	case errors.Is(err, errTranscriptionUnavailable):
+		return codeTranscriptionUnavailable
+	case errors.Is(err, errTranscriptionTooLarge):
 		return codeRequestBodyTooLarge
 	case errors.Is(err, routing.ErrNoHealthyHost):
 		return routing.ErrNoHealthyHost.Error()

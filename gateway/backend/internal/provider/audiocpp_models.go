@@ -20,36 +20,47 @@ import (
 // field of each listed model.
 const audiocppModelsPath = "/v1/models"
 
-// audio.cpp task values that produce speech. The listing's task names what the
-// loaded model DOES: "tts" synthesises speech from text and "clone" synthesises
-// it in a reference voice, so both are a speech "yes". Every other task (asr,
-// the music tasks, ...) is a model that does not produce speech.
+// audio.cpp task values. The listing's task names what the listed model DOES:
+// "tts" synthesises speech from text and "clone" synthesises it in a reference
+// voice, so both are a speech "yes"; "asr" transcribes speech to text, so it is
+// a transcription "yes". Every other task (the music tasks, ...) is a model that
+// does neither. One task answers BOTH capabilities at once: a model is never
+// both a synthesiser and a transcriber.
 const (
 	audioCppTaskTTS   = "tts"
 	audioCppTaskClone = "clone"
+	audioCppTaskASR   = "asr"
 )
 
 // AudioCppVerdicts is what one audio.cpp /v1/models listing says about ONE
-// model.
+// model, one verdict per capability the listing can answer.
 //
-// Speech is routing.CapabilityYes, routing.CapabilityNo, or "" for "no
-// answer". It is BIDIRECTIONAL: the listing states each loaded model's task, so
-// a model it names with a task that is not a synthesis task is a real "no",
-// like sdcpp's exhaustive supported_modes and unlike Ollama's capability array.
+// Speech and Transcription are each routing.CapabilityYes,
+// routing.CapabilityNo, or "" for "no answer". Both are BIDIRECTIONAL: the
+// listing states each listed model's task, so a model it names with a task that
+// does not serve the capability is a real "no", like sdcpp's exhaustive
+// supported_modes and unlike Ollama's capability array. The two verdicts are
+// decided together from the one task, so they are either both set or both "".
 // "" is reserved for everything the listing does not say: the model is not in
-// it (/v1/models lists only LOADED models, so a missing entry says nothing
-// about the model), the listing is empty, it cannot be read, or the named entry
-// carries no task. See routing.CapabilitySourceAudioCppModels.
+// it (the listing was first taken to name LOADED models only, but audio.cpp
+// v0.9.1 also names an unloaded one with loaded:false, so a missing entry says
+// only that the server does not name the model), the listing is empty, it
+// cannot be read, or the named entry carries no task. See routing.CapabilitySourceAudioCppModels.
+//
+// The verdict is the capability axis and is decided from the task alone. Whether
+// the model is loaded RIGHT NOW is the health axis: an asr model the server
+// lists as unloaded still carries task "asr", and stays a transcription "yes".
 type AudioCppVerdicts struct {
-	Speech string
+	Speech        string
+	Transcription string
 }
 
 // AudioCppModelsProber is an optional provider capability: it GETs
-// target.Endpoint + /v1/models and derives the speech verdict the listing
-// states for modelID. A transport failure or a non-2xx status is an error and
-// carries no verdict, so the caller writes nothing. A 2xx body that does not
-// name the model, or cannot be read, is NOT an error, only an empty Speech --
-// the caller writes nothing for an empty verdict either.
+// target.Endpoint + /v1/models and derives the speech and transcription
+// verdicts the listing states for modelID. A transport failure or a non-2xx
+// status is an error and carries no verdict, so the caller writes nothing. A 2xx
+// body that does not name the model, or cannot be read, is NOT an error, only
+// empty verdicts -- the caller writes nothing for an empty verdict either.
 //
 // It is a client method, like ProbeSdcppCapabilities, and not a free function,
 // because the request must ride the client's own *http.Client: cmd/gateway
@@ -100,8 +111,8 @@ func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target ro
 
 // audioCppModelsDoc is the part of the listing this code reads: each entry's id
 // and task. The rest of an entry (object, owned_by, family, mode, loaded, path)
-// answers no question the gateway has and is left undecoded, so an unknown or
-// added field never breaks the read.
+// answers no capability question and is left undecoded, so an unknown or added
+// field never breaks the read.
 type audioCppModelsDoc struct {
 	Data []struct {
 		ID   string `json:"id"`
@@ -109,21 +120,31 @@ type audioCppModelsDoc struct {
 	} `json:"data"`
 }
 
-// parseAudioCppModels derives the speech verdict for modelID from a /v1/models
-// body. It is TOLERANT, unlike the strict sdcpp document parser: a body that is
-// not the listing, or an entry of the wrong shape, yields the empty verdict
-// rather than an error, so a probe never breaks over an unexpected shape.
+// parseAudioCppModels derives the speech and transcription verdicts for modelID
+// from a /v1/models body. It is TOLERANT, unlike the strict sdcpp document
+// parser: a body that is not the listing, or an entry of the wrong shape, yields
+// the empty verdict rather than an error, so a probe never breaks over an
+// unexpected shape.
 //
 // The rule, with the loaded entry's task authoritative:
-//   - the entry whose id is modelID, with task "tts" or "clone" -> "yes"
-//   - the entry whose id is modelID, with any other non-empty task -> "no"
-//   - the entry whose id is modelID, with no task -> "" (an absent field is
-//     not a statement, and a "no" can switch the model's speech route off)
-//   - no entry for modelID, an empty data list, or an unreadable body -> ""
+//   - the entry whose id is modelID, with task "tts" or "clone" ->
+//     speech "yes", transcription "no"
+//   - the entry whose id is modelID, with task "asr" ->
+//     speech "no", transcription "yes"
+//   - the entry whose id is modelID, with any other non-empty task ->
+//     both "no"
+//   - the entry whose id is modelID, with no task -> both "" (an absent field
+//     is not a statement, and a "no" can switch the model's route off)
+//   - no entry for modelID, an empty data list, or an unreadable body -> both ""
+//
+// Only id and task are read: loaded (and family, mode, path) is deliberately
+// not decoded. Whether a model is loaded is the health axis, not the capability
+// axis, so the server listing an asr model with loaded:false does not turn its
+// transcription "yes" into anything else.
 //
 // The id match is exact. The task match ignores case and surrounding
-// whitespace: a "TTS" the server might one day emit must not fall to the "no"
-// default, which is a bidirectional verdict that switches a speech route off.
+// whitespace: a "TTS" or "ASR" the server might one day emit must not fall to
+// the "no" default, which is a bidirectional verdict that switches a route off.
 // The first entry that carries the id answers.
 func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 	if modelID == "" {
@@ -141,9 +162,11 @@ func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 		case "":
 			return AudioCppVerdicts{}
 		case audioCppTaskTTS, audioCppTaskClone:
-			return AudioCppVerdicts{Speech: routing.CapabilityYes}
+			return AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}
+		case audioCppTaskASR:
+			return AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes}
 		default:
-			return AudioCppVerdicts{Speech: routing.CapabilityNo}
+			return AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityNo}
 		}
 	}
 	return AudioCppVerdicts{}

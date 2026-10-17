@@ -37,10 +37,10 @@ const (
 	msgBenchmarkImagesOnly  = "this model, or every model in the run's scope, serves only images, so no chat prompt is sent"
 
 	// codeBenchmarkAudioOnly is codeBenchmarkImagesOnly for a mapping that
-	// serves only speech (mappingSpecIsAudioOnly): the same refusals, for the
-	// same reason, worded for speech.
+	// serves only audio, speech or transcription (mappingSpecIsAudioOnly): the
+	// same refusals, for the same reason.
 	codeBenchmarkAudioOnly = "benchmark.audio_only"
-	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves only speech, so no chat prompt is sent"
+	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"
 
 	// codeBenchmarkAgentEnsureUnsupported: an images-only agent child loads
 	// only through the agent's ensure route, and the server's agent has not
@@ -92,7 +92,7 @@ var loadRefusalErrs = map[string]error{
 const benchmarkSkippedImagesOnly = "images_only"
 
 // benchmarkSkippedAudioOnly is benchmarkSkippedImagesOnly for a mapping that
-// serves only speech.
+// serves only audio (speech or transcription).
 const benchmarkSkippedAudioOnly = "audio_only"
 
 // benchmarkSpecUnreadable prefixes the error an application- or server-scope
@@ -138,7 +138,7 @@ func mappingSpecIsAudioOnly(app routing.Application, spec routing.RuntimeSpec, h
 // (hasSpec: whether the mapping has one), and ensureSupported, whether the
 // mapping's server declared runtime_ensure.
 //
-// A mapping that serves only images, or only speech, cannot load by
+// A mapping that serves only images, or only audio, cannot load by
 // generating, because the Load's one-token chat completion is exactly what it
 // cannot answer:
 //   - a server_agent child loads through the agent's ensure route instead, so
@@ -173,7 +173,7 @@ func loadRefusal(app routing.Application, spec routing.RuntimeSpec, hasSpec bool
 
 // loadTargetFor builds a Load's target from the spec its starter read, for a
 // mapping loadRefusal did not refuse. Such a mapping, if it serves only
-// images or only speech, is a server_agent child whose agent declared
+// images or only audio, is a server_agent child whose agent declared
 // runtime_ensure, so its target loads without generating.
 func (s *Server) loadTargetFor(ctx context.Context, v portal.BenchmarkTargetView, spec routing.RuntimeSpec, hasSpec bool) benchmarkTarget {
 	tgt := s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec)
@@ -217,20 +217,20 @@ type benchmarkViewPartition struct {
 	runnable []benchmarkTarget
 	// recorded are the results the run records before it measures anything,
 	// in view order: a skip for each view that serves only images or only
-	// speech, and an error for each view whose spec read failed. Neither gets a
+	// audio, and an error for each view whose spec read failed. Neither gets a
 	// history row.
 	recorded []BenchmarkResult
 	// unreadable counts the views whose spec read failed.
 	unreadable int
 	// imagesOnly and audioOnly count the views skipped because they serve only
-	// images, or only speech. refuseNothingRunnable names the kind.
+	// images, or only audio. refuseNothingRunnable names the kind.
 	imagesOnly, audioOnly int
 }
 
 // partitionBenchmarkViews reads each view's runtime spec once
 // (mappingRuntimeSpec) and sorts the view into runnable, skipped (it serves
-// only images or only speech, so it cannot answer the run's chat prompt) or
-// unreadable (the read failed, so whether it serves only images or speech is
+// only images or only audio, so it cannot answer the run's chat prompt) or
+// unreadable (the read failed, so whether it serves only images or only audio is
 // unknown). A view naming both non-text flavors is skipped as images-only. A
 // runnable target is built from the spec that was read. An unreadable view is
 // logged with its mapping id.
@@ -258,7 +258,7 @@ func (s *Server) partitionBenchmarkViews(ctx context.Context, views []portal.Ben
 
 // refuseNothingRunnable answers a partition with no runnable view, and
 // reports whether it did: 409 benchmark.audio_only when every skipped view
-// serves only speech, 409 benchmark.images_only otherwise (a skipped
+// serves only audio, 409 benchmark.images_only otherwise (a skipped
 // images-only view among them, or none skipped at all), and 500
 // benchmark.request_failed when a spec read failed, because then either
 // refusal would be a guess.

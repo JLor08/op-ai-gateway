@@ -58,11 +58,11 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 //
 // Every mode sends each target a chat prompt, so before the reservation the
 // scope's views are partitioned (partitionBenchmarkViews): a view that serves
-// only images or only speech is skipped, and one whose runtime spec cannot be
+// only images or only audio (speech, transcription) is skipped, and one whose runtime spec cannot be
 // read is not measured either, because the answer is unknown and is not
 // guessed at. A scope with no runnable view reserves nothing and answers 409
 // benchmark.images_only when every view serves only images (or images and
-// speech), 409 benchmark.audio_only when every view serves only speech, else
+// audio), 409 benchmark.audio_only when every view serves only audio, else
 // 500 benchmark.request_failed (refuseNothingRunnable); a mapping scope's
 // single view therefore gets exactly those answers. Otherwise the skipped and
 // unreadable views are recorded as the run's first results, before it measures
@@ -129,7 +129,7 @@ func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token au
 //
 // The warm-load is a chat prompt, so before the reservation the probe reads the mapping's
 // runtime spec once (starterSpec) and refuses a mapping that serves only images with 409
-// benchmark.images_only, and one that serves only speech with 409 benchmark.audio_only (images
+// benchmark.images_only, and one that serves only audio with 409 benchmark.audio_only (images
 // first, for a list naming both non-text flavors, as loadRefusal does). The probe's target is
 // built from that same spec.
 //

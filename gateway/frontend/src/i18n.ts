@@ -1218,7 +1218,7 @@ const de = {
   benchmarkAudioOnlyHint:
     'Dieses Modell erzeugt nur Sprache: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Sprachsynthese-Modell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
-  benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Sprache, kein Chat-Prompt gesendet',
+  benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Audio, kein Chat-Prompt gesendet',
   benchmarkResultLoadTimeNotMeasured: 'Ladezeit nicht gemessen',
   benchmarkNotMeasured: 'Nicht gemessen',
   // Die VRAM-Messung: ein eigener Lauf mit eigenem Endpunkt, der jedes
@@ -1350,6 +1350,7 @@ const de = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
+  capabilityTranscription: 'Transkription',
   // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
   // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
   // hat deshalb nur in dieser einen Richtung etwas anzuzeigen. Siehe
@@ -4181,7 +4182,7 @@ const en: PortalMessages = {
   benchmarkAudioOnlyHint:
     'This model only generates speech: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which a speech synthesis model does not answer, so they are disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
-  benchmarkResultSkippedAudioOnly: 'skipped — generates speech only, no chat prompt sent',
+  benchmarkResultSkippedAudioOnly: 'skipped — generates audio only, no chat prompt sent',
   benchmarkResultLoadTimeNotMeasured: 'load time not measured',
   benchmarkNotMeasured: 'Not measured',
   // See the German block for the two rules these texts carry: 0 always means
@@ -4291,6 +4292,7 @@ const en: PortalMessages = {
   capabilityAudio: 'Audio',
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
+  capabilityTranscription: 'Transcription',
   // The chip for the operator's EXCEPTION (image editing = No), not for a
   // capability: image editing is derived from image generation, so it has
   // something to show in this one direction only. See capabilityChips in

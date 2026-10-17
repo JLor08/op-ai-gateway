@@ -3901,13 +3901,33 @@ func TestSpeechNoIsAReservedManualVerdict(t *testing.T) {
 		t.Error("(speech, no) must be reserved")
 	}
 	// yes stays writable: it is the operator's override of the probe, and the
-	// enablement path where no probe verdict exists (an audio.cpp model that is
-	// not loaded, so the listing does not name it).
+	// enablement path where no probe verdict exists (an audio.cpp model the
+	// listing does not name).
 	if reservedManualVerdict(routing.CapabilitySpeech, routing.CapabilityYes) {
 		t.Error("(speech, yes) must stay writable: it is the operator's override of the audiocpp_models probe and the enablement path for a model that is not loaded")
 	}
 	// The reset is never refused, for any pair.
 	if reservedManualVerdict(routing.CapabilitySpeech, "") {
+		t.Error("the reset must never be refused")
+	}
+}
+
+// (transcription, no) is reserved for the same reason (speech, no) is. A manual
+// row is rank 3 and outranks every automated source, and nothing re-derives it,
+// so a manual `no` would permanently veto a transcription probe -- the writer
+// entitled to establish it -- against a genuinely capable model. The cost to the
+// operator is nil: an ABSENT row already refuses a transcription request.
+func TestTranscriptionNoIsAReservedManualVerdict(t *testing.T) {
+	if !reservedManualVerdict(routing.CapabilityTranscription, routing.CapabilityNo) {
+		t.Error("(transcription, no) must be reserved")
+	}
+	// yes stays writable: it is the operator's override of the probe and the
+	// enablement path where no probe verdict exists.
+	if reservedManualVerdict(routing.CapabilityTranscription, routing.CapabilityYes) {
+		t.Error("(transcription, yes) must stay writable: it is the operator's override of the probe and the enablement path for a model no probe has named")
+	}
+	// The reset is never refused, for any pair.
+	if reservedManualVerdict(routing.CapabilityTranscription, "") {
 		t.Error("the reset must never be refused")
 	}
 }

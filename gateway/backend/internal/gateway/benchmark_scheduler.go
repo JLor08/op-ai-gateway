@@ -50,8 +50,8 @@ func benchmarkDue(app routing.Application, lastRun map[string]time.Time, now tim
 // runner verbatim. Returns true if a run was launched OR one is already in progress OR there
 // was nothing to do; false only if the idle-gate deferred (so the caller retries next tick).
 //
-// It also skips a mapping that serves only images (mappingSpecIsImagesOnly) or only speech
-// (mappingSpecIsAudioOnly): the scheduled run is a speed benchmark, a chat prompt, which such
+// It also skips a mapping that serves only images (mappingSpecIsImagesOnly) or only audio,
+// speech or transcription (mappingSpecIsAudioOnly): the scheduled run is a speed benchmark, a chat prompt, which such
 // a mapping cannot answer, so every run of it would fail, unattended, every interval. The
 // test is by EFFECTIVE flavors (routing.FlavorsAreImagesOnly, routing.FlavorsAreAudioOnly),
 // never by the application type: an external stable_diffusion_cpp application whose operator

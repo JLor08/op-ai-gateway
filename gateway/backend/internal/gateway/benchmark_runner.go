@@ -83,7 +83,7 @@ type benchmarkTarget struct {
 	// loadWithoutGenerating marks a target whose model the load core
 	// (ensureResidentForRun) starts through the agent's ensure route instead
 	// of loading it by generating: a server_agent child that serves only
-	// images or only speech, on a server whose agent declared runtime_ensure
+	// images or only audio, on a server whose agent declared runtime_ensure
 	// (loadRefusal).
 	// The Load starter sets it (loadTargetFor); the VRAM run copies it from
 	// its plan (vramRunPlanned.ensure) onto the target it loads.

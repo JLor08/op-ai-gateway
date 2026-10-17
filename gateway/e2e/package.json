@@ -24,6 +24,7 @@
     "e2e:speech": "playwright test -c playwright.speech.config.ts",
     "e2e:smtp": "playwright test -c playwright.smtp.config.ts",
     "e2e:totp": "playwright test -c playwright.totp.config.ts",
+    "e2e:transcription": "playwright test -c playwright.transcription.config.ts",
     "e2e:system-admin-mode": "playwright test -c playwright.system-admin-mode.config.ts"
   },
   "devDependencies": {

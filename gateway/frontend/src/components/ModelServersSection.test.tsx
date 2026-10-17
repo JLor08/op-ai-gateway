@@ -1049,6 +1049,49 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText(t.capabilityImage)).not.toBeInTheDocument();
     });
 
+    // POST /v1/audio/transcriptions is gated on a `transcription` verdict. Before
+    // this chip existed a `transcription: yes` row fell into the open-vocabulary
+    // bucket and rendered as a raw lowercase `transcription` standby chip, so
+    // this pins BOTH halves: the translated "success" chip appears, the raw
+    // string and its neutral standby styling do not.
+    it('renders the transcription capability with a translated label, not as a raw standby chip', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a' ? { ...r, capabilities: [capRow('transcription', 'yes')] } : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilityTranscription)).toBeInTheDocument();
+      expect(within(cell).queryByText('transcription')).not.toBeInTheDocument();
+      // A vetted verdict chip ("active"), not the neutral "standby" key the
+      // unrecognized-name bucket uses.
+      expect(within(cell).getByText(t.capabilityTranscription)).toHaveAttribute(
+        'data-status',
+        'active',
+      );
+    });
+
+    it('renders no transcription chip for a `no` verdict or a missing row', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? { ...r, capabilities: [capRow('vision', 'yes'), capRow('transcription', 'no')] }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).queryByText(t.capabilityTranscription)).not.toBeInTheDocument();
+      expect(within(cell).queryByText('transcription')).not.toBeInTheDocument();
+    });
+
     // image_edit is DERIVED by the gateway from the image verdict, so the only
     // row it ever carries that matters is the operator's opt-out (`no`). That
     // opt-out is a NEGATIVE, which this column otherwise renders as no chip --

@@ -121,6 +121,11 @@ type ServerDeps struct {
 	// into memory (config OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES). <= 0 defaults
 	// in New to defaultMaxImageEditBodyBytes.
 	MaxImageEditBodyBytes int
+	// MaxAudioTranscriptionBodyBytes caps the multipart body POST
+	// /v1/audio/transcriptions reads into memory (config
+	// OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES). <= 0 defaults in New to
+	// defaultMaxAudioTranscriptionBodyBytes.
+	MaxAudioTranscriptionBodyBytes int
 	// SettingsVolatile is true only for the memory driver (a RAM-only settings
 	// store). It is the volatile flag the dispatch path passes to SealTokenSet
 	// when it reseals a refreshed subscription OAuth token: with a cipher it
@@ -392,6 +397,10 @@ type Server struct {
 	Active                   *activeRegistry
 	AppHealth                *AppHealthRegistry
 	AppImageOptions          *AppImageOptionsRegistry
+	// maxAudioTranscriptionBodyBytes is the multipart read cap of POST
+	// /v1/audio/transcriptions, defaulted in New; a bare &Server{} leaves it 0,
+	// which transcriptionBodyLimit reads as the default.
+	maxAudioTranscriptionBodyBytes int64
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -450,7 +459,8 @@ type Server struct {
 	// (auth.go); its two callers are authenticateWeb (auth.go, for
 	// /v1/chat/completions and every Portal/Admin/System route) and
 	// authenticateInternalOrBearer (auth_internal_or_bearer.go, for
-	// /v1/images/generations, /v1/images/edits and /v1/audio/speech only), which
+	// /v1/images/generations, /v1/images/edits, /v1/audio/speech and
+	// /v1/audio/transcriptions only), which
 	// differ in what they fall back to and in nothing else. internalAuthSecret
 	// empty disables the branch entirely (fail-closed) for both, because the
 	// check is the same code.
@@ -751,6 +761,10 @@ func New(deps ServerDeps) *Server {
 	if maxImageEditBodyBytes <= 0 {
 		maxImageEditBodyBytes = defaultMaxImageEditBodyBytes
 	}
+	maxAudioTranscriptionBodyBytes := int64(deps.MaxAudioTranscriptionBodyBytes)
+	if maxAudioTranscriptionBodyBytes <= 0 {
+		maxAudioTranscriptionBodyBytes = defaultMaxAudioTranscriptionBodyBytes
+	}
 	serverPerf := deps.ServerPerf
 	if serverPerf == nil {
 		serverPerf = NewServerPerfRegistry()
@@ -971,6 +985,8 @@ func New(deps ServerDeps) *Server {
 		edgeScheme:                  edgeScheme,
 		certEdgeRequireHTTPSDisable: deps.CertEdgeRequireHTTPSDisable,
 		certMeshRequireTLSDisable:   deps.CertMeshRequireTLSDisable,
+		// multipart read cap of POST /v1/audio/transcriptions (defaulted above)
+		maxAudioTranscriptionBodyBytes: maxAudioTranscriptionBodyBytes,
 	}
 	if s.newMailer == nil {
 		s.newMailer = func(cfg mail.Config) Mailer { return mail.New(cfg) }
@@ -1320,6 +1336,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/images/edits", s.handleOpenAIImagesEdit)
 	s.mux.HandleFunc("/openai/v1/audio/speech", s.handleOpenAISpeech)
 	s.mux.HandleFunc("/v1/audio/speech", s.handleOpenAISpeech)
+	s.mux.HandleFunc("/openai/v1/audio/transcriptions", s.handleOpenAITranscription)
+	s.mux.HandleFunc("/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/openai/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/openai/api/v1/models", s.handleLMStudioV1Models)

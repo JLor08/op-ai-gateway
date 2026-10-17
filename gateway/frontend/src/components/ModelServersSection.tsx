@@ -178,6 +178,12 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   { capability: 'audio', label: (t) => t.capabilityAudio },
   { capability: 'tools', label: (t) => t.capabilityTools },
   { capability: 'image', label: (t) => t.capabilityImage },
+  // "transcription" gates POST /v1/audio/transcriptions. Like image it is a
+  // declared/probed trait of the endpoint, so it sits with the declared
+  // capabilities, ahead of the observed "speculation_observed" below. "speech"
+  // (text-to-speech) deliberately has no chip of its own here and renders as a
+  // raw standby chip from the open-vocabulary bucket.
+  { capability: 'transcription', label: (t) => t.capabilityTranscription },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },
 ];
 const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capability));
@@ -214,9 +220,9 @@ const IMAGE_EDIT_CAPABILITY = 'image_edit';
 type CapabilityChip = { status: 'success' | 'standby'; label: string; row: ModelServerCapability };
 
 // capabilityChips returns one chip per DETERMINED `yes` verdict, in a fixed
-// order (Vision, Video, Audio, Tools, Speculation observed) so the column
-// reads the same on every row regardless of which verdicts happen to be set,
-// followed by every OTHER
+// order (Vision, Video, Audio, Tools, Image, Transcription, Speculation
+// observed -- KNOWN_CAPABILITY_ORDER) so the column reads the same on every
+// row regardless of which verdicts happen to be set, followed by every OTHER
 // capability name this build has no dedicated column for, VERBATIM
 // (including a string this portal build doesn't recognize -- the vocabulary
 // is open-ended upstream, e.g. Ollama passes manifest-declared capabilities

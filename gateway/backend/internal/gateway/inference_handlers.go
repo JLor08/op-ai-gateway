@@ -539,12 +539,17 @@ func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, toke
 	// original wish either way — the usage events already carry it, so a
 	// redirect stays traceable afterwards.
 	//
-	// The offering is asked for the request's required capabilities too. Today
-	// only /v1/images/generations carries any (["image"]), and the capability
-	// gate refuses a model without them, so a candidate is taken only when it
-	// carries every one (ModelOffering.Capable): a LastUsedModel or fallback
-	// that lacks the image capability is skipped rather than turned into a 404
-	// model_not_capable about a model the client never named.
+	// The offering is asked for the request's required capabilities too. The
+	// native endpoints that carry any set them from their own identity:
+	// /v1/images/generations ["image"], /v1/images/edits ["image_edit"],
+	// /v1/audio/speech ["speech"] and /v1/audio/transcriptions ["transcription"];
+	// the translate-capable text endpoints require none. The capability gate
+	// refuses a model without them, so a candidate is taken only when it
+	// carries every one (ModelOffering.Capable): a
+	// LastUsedModel or fallback that lacks the capability is skipped rather than
+	// turned into a 404 model_not_capable about a model the client never named.
+	// A required capability with no fold in the portal (transcription today)
+	// leaves Capable empty, so no candidate is ever taken for it.
 	if token.UnknownModelRedirect && s.Portal != nil {
 		off := s.Portal.ModelOfferingFor(r.Context(), token, routing.NormalizeAPIFlavor(shape.apiFlavor), shape.requiredCapabilities)
 		if to := redirectUnknownModel(token, req.Model, off); to != "" {

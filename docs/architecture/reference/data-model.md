@@ -707,8 +707,10 @@ plausible-looking validation rule would break the normal case:
   is validated only for emptiness; the vocabulary is otherwise open on purpose
   (`vision`,
   `video`, `audio`, `tools`, `mtp`, `live_progress`,
-  `speculation_observed`, `image` and `speech` (the verdict `POST /v1/audio/speech`
-  is gated on, distinct from `audio`, which means a model *accepts* audio) and
+  `speculation_observed`, `image`, `speech` (the verdict `POST /v1/audio/speech`
+  is gated on, distinct from `audio`, which means a model *accepts* audio),
+  `transcription` (the verdict `POST /v1/audio/transcriptions` is gated on,
+  distinct from both `audio` and `speech`) and
   `image_edit` are the names the code itself reasons
   about — `image_edit` is **derived** from `image` at the gate and its only
   stored row is an operator's `no` opt-out, [ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
@@ -799,9 +801,11 @@ plausible-looking validation rule would break the normal case:
   `image` in both directions, whichever of its two producers wrote it — plus
   two probe-ranked sources no agent may report: `llama_cpp_timings` (read off
   a completion it relayed) and `audiocpp_models` (the gateway's own `GET` of an
-  `audio_cpp` application's `/v1/models`, the only source of the `speech` row and one
-  that answers it in both directions; a vocabulary addition only, with no schema
-  change, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+  `audio_cpp` application's `/v1/models`, the only source of the `speech` and
+  `transcription` rows and one that answers both in both directions, from the one
+  `task` of the listed model; a vocabulary addition only, with no schema
+  change, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+  [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
   The probing agent REPORTS which of its three
   produced a verdict set rather than the gateway inferring it, and the
   ingest boundary accepts exactly those three from an agent — a sample

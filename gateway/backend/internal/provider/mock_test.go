@@ -257,6 +257,44 @@ func TestMockProxyNativeImagesPathReturnsGenerationsBody(t *testing.T) {
 
 // Every other path keeps the canned Responses-style SSE stream the mock has always
 // returned, whatever content type the caller sends.
+// The transcription path answers with the document audio.cpp returns, not a Responses
+// stream: the text, and the timing block the gateway bills audio_second from
+// (timing.audio_duration_ms). Without this case a dev/e2e transcription would be
+// handed an SSE body for a request that wants JSON, and the relay would find no
+// duration to meter.
+func TestMockProxyNativeTranscriptionPathReturnsTranscriptionBody(t *testing.T) {
+	resp, err := NewMock().ProxyNative(context.Background(), routing.Target{ProviderModel: "whisper_x"}, "/v1/audio/transcriptions", []byte("ignored"), "multipart/form-data; boundary=X")
+	if err != nil {
+		t.Fatalf("ProxyNative: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type = %q, want application/json (not the Responses event stream)", ct)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Text   string `json:"text"`
+		Timing struct {
+			AudioDurationMs *float64 `json:"audio_duration_ms"`
+		} `json:"timing"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("body %q is not JSON: %v", raw, err)
+	}
+	if out.Text == "" {
+		t.Fatalf("body %q carries no transcript text", raw)
+	}
+	if out.Timing.AudioDurationMs == nil || *out.Timing.AudioDurationMs != 2000 {
+		t.Fatalf("body %q: timing.audio_duration_ms = %v, want 2000 (the duration the gateway bills from)", raw, out.Timing.AudioDurationMs)
+	}
+	if strings.Contains(string(raw), "event:") {
+		t.Fatalf("body %q looks like an SSE stream", raw)
+	}
+}
+
 func TestMockProxyNativeOtherPathsKeepResponsesStream(t *testing.T) {
 	resp, err := NewMock().ProxyNative(context.Background(), routing.Target{ProviderModel: "qwen-coder"}, "/v1/responses", []byte(`{}`), "application/json")
 	if err != nil {
@@ -274,6 +312,13 @@ func TestMockProxyNativeOtherPathsKeepResponsesStream(t *testing.T) {
 
 func TestMockProxyNativeUnreachableFailsOnImagesPathToo(t *testing.T) {
 	_, err := NewMock().WithUnreachable(true).ProxyNative(context.Background(), routing.Target{}, "/v1/images/edits", nil, "multipart/form-data; boundary=X")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ProxyNative error = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestMockProxyNativeUnreachableFailsOnTranscriptionPathToo(t *testing.T) {
+	_, err := NewMock().WithUnreachable(true).ProxyNative(context.Background(), routing.Target{}, "/v1/audio/transcriptions", nil, "multipart/form-data; boundary=X")
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("ProxyNative error = %v, want ErrUnavailable", err)
 	}

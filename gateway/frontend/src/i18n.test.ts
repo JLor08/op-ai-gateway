@@ -3233,6 +3233,13 @@ describe('mapping image capability i18n keys', () => {
   }
 });
 
+describe('transcription capability i18n key', () => {
+  it('labels the transcription chip in de and en', () => {
+    expect(messages.de.capabilityTranscription).toBe('Transkription');
+    expect(messages.en.capabilityTranscription).toBe('Transcription');
+  });
+});
+
 // Responses live-timings (issue #81 part 2, design D10): the shared
 // API-variant block's own checkbox strings plus the three backend refusals
 // part 1 introduced. The codes are read verbatim from the Go errRow tables in

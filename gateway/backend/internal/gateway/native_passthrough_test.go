@@ -806,6 +806,44 @@ func TestUpstreamPathSpeechFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 	}
 }
 
+// TestUpstreamPathTranscriptionKeysOnEndpointNotFlavor pins the one place
+// transcription differs from every other single-purpose flavor: it shares the
+// openai_audio flavor with speech (apiFlavorSpeech), so the flavor cannot
+// tell the two upstream paths apart and the ENDPOINT has to. The same flavor
+// string must therefore answer /v1/audio/transcriptions for endpointTranscription
+// and still /v1/audio/speech for endpointSpeech -- a transcription request must
+// never fall into the speech branch, and speech must not be disturbed. The
+// providers are ones whose OWN fallbacks would otherwise answer here
+// (ProviderOllama -> "/api/chat", ProviderVendorAnthropic -> "/v1/messages",
+// ProviderAudioCpp -> the chat-completions default), and an empty Provider
+// still yields "" (the unresolved-target guard sits above both branches).
+func TestUpstreamPathTranscriptionKeysOnEndpointNotFlavor(t *testing.T) {
+	cases := []struct {
+		name      string
+		provider  string
+		apiFlavor string
+		endpoint  sessionEndpoint
+		want      string
+	}{
+		{"audio.cpp transcription", routing.ProviderAudioCpp, apiFlavorSpeech, endpointTranscription, "/v1/audio/transcriptions"},
+		{"ollama transcription", routing.ProviderOllama, apiFlavorSpeech, endpointTranscription, "/v1/audio/transcriptions"},
+		{"vendor anthropic transcription", routing.ProviderVendorAnthropic, apiFlavorSpeech, endpointTranscription, "/v1/audio/transcriptions"},
+		{"unresolved target keeps the empty answer", "", apiFlavorSpeech, endpointTranscription, ""},
+		{"speech keeps its path on the shared flavor", routing.ProviderAudioCpp, apiFlavorSpeech, endpointSpeech, "/v1/audio/speech"},
+		{"transcription does not disturb images", routing.ProviderOllama, apiFlavorImages, endpointImages, "/v1/images/generations"},
+		{"transcription does not disturb image edits", routing.ProviderOllama, apiFlavorImages, endpointImagesEdit, "/v1/images/edits"},
+		{"transcription does not disturb chat", routing.ProviderOllama, "openai_chat_completions", endpointChat, "/api/chat"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := routing.Target{Provider: tc.provider}
+			if got := upstreamPath(target, tc.apiFlavor, tc.endpoint); got != tc.want {
+				t.Fatalf("upstreamPath(%q, %q, endpoint %d) = %q, want %q", tc.provider, tc.apiFlavor, tc.endpoint, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestUpstreamPathLabelsVendorProvidersByTheirTranslatePath pins the translate
 // path of the vendor-account provider kinds: a vendor_anthropic target is
 // served by the native Anthropic client at /v1/messages (not the chat-completions

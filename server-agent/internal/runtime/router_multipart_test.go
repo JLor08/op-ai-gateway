@@ -15,12 +15,14 @@ import (
 	"testing"
 )
 
-// The tests below cover the router's multipart branch: POST /v1/images/edits
-// reaches the agent as a multipart/form-data body, and the router must find the
-// model to start in the form instead of in a JSON document.
+// The tests below cover the router's multipart branch: POST /v1/images/edits and
+// POST /v1/audio/transcriptions reach the agent as a multipart/form-data body, and
+// the router must find the model to start in the form instead of in a JSON
+// document. The router does not look at the path, so one branch serves both.
 //
-// The model it finds MUST be the one the gateway's own parser finds
-// (gateway/backend/internal/gateway/images_edit_handler.go, parseImageEditForm):
+// The model it finds MUST be the one the gateway's own parsers find
+// (gateway/backend/internal/gateway/images_edit_handler.go, parseImageEditForm, and
+// transcription_handler.go, parseTranscriptionForm):
 // mime/multipart.NewReader over the buffered body and a part whose FormName() is
 // "model". The gateway decides routing and the operator's allowlist on its
 // answer, and the agent starts a process on its own; two answers to "which
@@ -28,8 +30,9 @@ import (
 // differential-parse cases -- bodies on which a hand-rolled scanner and
 // mime/multipart disagree.
 
-// editChild is a stand-in for an image-edit child: it records what the router
-// forwarded to it and answers a b64_json document.
+// editChild is a stand-in for a multipart child (an image edit's, and through
+// newRecordingChild a transcription's): it records what the router forwarded to it
+// and answers a document of the caller's choosing (by default a b64_json one).
 type editChild struct {
 	srv         *httptest.Server
 	mu          sync.Mutex
@@ -41,6 +44,15 @@ type editChild struct {
 
 func newEditChild(t *testing.T) *editChild {
 	t.Helper()
+	return newRecordingChild(t, `{"data":[{"b64_json":"AAAA"}]}`)
+}
+
+// newRecordingChild is newEditChild with the child's reply a parameter: the
+// transcription tests answer a transcript document instead of an image one. It
+// records the request the same way (path, Content-Type, body), so the one
+// recorder pins the forwarded request for every multipart flavor.
+func newRecordingChild(t *testing.T, reply string) *editChild {
+	t.Helper()
 	c := &editChild{}
 	c.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -51,7 +63,7 @@ func newEditChild(t *testing.T) *editChild {
 		c.body = b
 		c.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"data":[{"b64_json":"AAAA"}]}`)
+		_, _ = io.WriteString(w, reply)
 	}))
 	t.Cleanup(c.srv.Close)
 	return c
@@ -126,7 +138,14 @@ func crlf(s string) []byte { return []byte(strings.ReplaceAll(s, "\n", "\r\n")) 
 // router over mgr, on the test goroutine.
 func postMultipart(t *testing.T, mgr managerPort, contentType string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(body))
+	return postMultipartTo(t, mgr, "/v1/images/edits", contentType, body)
+}
+
+// postMultipartTo is postMultipart for any proxied path: the router's multipart
+// branch keys on the Content-Type, never on the path.
+func postMultipartTo(t *testing.T, mgr managerPort, path, contentType string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -539,4 +558,184 @@ func TestRouterJSONUnchangedByMultipartBranch(t *testing.T) {
 			t.Errorf("EnsureRunning was called for %q, want no call", got)
 		}
 	})
+}
+
+// The tests below pin that the same multipart branch serves POST
+// /v1/audio/transcriptions. No router code is specific to it -- the branch keys
+// on the Content-Type and reads the form's model part, whatever the path and
+// whatever the other parts are -- so these tests exist to keep it that way: a
+// change that made the branch path- or flavor-aware would break the
+// transcription relay without touching a single image-edit test.
+
+const (
+	transcriptionPath  = "/v1/audio/transcriptions"
+	transcriptionReply = `{"text":"hello world","timing":{"audio_duration_ms":1500}}`
+)
+
+// audioPayload is a deterministic, binary-looking stand-in for an audio file,
+// large enough (a real recording is far larger than an image's prompt part) that
+// the Reader has to skip a part of real size to reach a model that follows it.
+func audioPayload() []byte {
+	pattern := make([]byte, 256)
+	for i := range pattern {
+		pattern[i] = byte(i)
+	}
+	return append([]byte("RIFF....WAVEfmt "), bytes.Repeat(pattern, 1024)...)
+}
+
+// transcriptionBody builds a well-formed multipart transcription body with
+// mime/multipart's own writer: a model field, the transcription's own scalar
+// fields and one audio file part, the file before the model when fileFirst
+// (curl -F lists whatever the user wrote first, and the gateway's form does not
+// fix an order either).
+func transcriptionBody(t *testing.T, model string, fileFirst bool) (body []byte, contentType string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	writeFile := func() {
+		fw, err := mw.CreateFormFile("file", "speech.wav")
+		if err != nil {
+			t.Fatalf("create file part: %v", err)
+		}
+		if _, err := fw.Write(audioPayload()); err != nil {
+			t.Fatalf("write audio: %v", err)
+		}
+	}
+	writeField := func(name, value string) {
+		if err := mw.WriteField(name, value); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if fileFirst {
+		writeFile()
+	}
+	writeField("model", model)
+	writeField("language", "en")
+	writeField("response_format", "json")
+	if !fileFirst {
+		writeFile()
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	return buf.Bytes(), mw.FormDataContentType()
+}
+
+// TestRouterMultipartRoutesATranscriptionByFormModel is the headline for the
+// audio path: a multipart transcription is routed on the model in its form, the
+// child is started for exactly that model, and the child sees the request the
+// client sent -- the same path, the same Content-Type with its boundary, the
+// same bytes -- wherever in the form the audio part sits.
+func TestRouterMultipartRoutesATranscriptionByFormModel(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fileFirst bool
+	}{
+		{name: "model before the audio part", fileFirst: false},
+		{name: "model after the audio part", fileFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newRecordingChild(t, transcriptionReply)
+			mgr := &recordingManager{endpoint: child.srv.URL}
+			body, contentType := transcriptionBody(t, "whisper-large", tc.fileFirst)
+
+			rec := postMultipartTo(t, mgr, transcriptionPath, contentType, body)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if got := mgr.asked(); len(got) != 1 || got[0] != "whisper-large" {
+				t.Fatalf("EnsureRunning was asked for %q, want exactly [whisper-large]", got)
+			}
+			hits, path, gotType, gotBody := child.snapshot()
+			if hits != 1 {
+				t.Fatalf("child hit %d times, want 1", hits)
+			}
+			if path != transcriptionPath {
+				t.Errorf("child path = %q, want %s", path, transcriptionPath)
+			}
+			if gotType != contentType {
+				t.Errorf("child Content-Type = %q, want the client's %q", gotType, contentType)
+			}
+			if !bytes.Equal(gotBody, body) {
+				t.Errorf("child body differs from the client's (%d bytes vs %d); the relay must be byte-faithful", len(gotBody), len(body))
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Errorf("response Content-Type = %q, want the child's application/json", got)
+			}
+			if rec.Body.String() != transcriptionReply {
+				t.Errorf("response body = %q, want the child's %q", rec.Body.String(), transcriptionReply)
+			}
+		})
+	}
+}
+
+// TestRouterMultipartTranscriptionRefusals mirrors TestRouterMultipartRefusals
+// for a transcription body: one with no model, an empty one or two of them is,
+// to the router, a body that names no managed model -- the same 404
+// runtime.model_not_managed, EnsureRunning never called, no child started and
+// nothing forwarded.
+func TestRouterMultipartTranscriptionRefusals(t *testing.T) {
+	const ct = "multipart/form-data; boundary=BOUNDARY"
+
+	// A well-formed transcription used as the tail of the bodies below, so the
+	// only thing wrong with each is the model.
+	const rest = "--BOUNDARY\n" +
+		"Content-Disposition: form-data; name=\"language\"\n\nen\n" +
+		"--BOUNDARY\n" +
+		"Content-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\n" +
+		"Content-Type: audio/wav\n\nWAVDATA\n"
+
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "no model part",
+			body: crlf(rest + "--BOUNDARY--\n"),
+		},
+		{
+			name: "empty model value",
+			body: crlf("--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\n\n" +
+				rest + "--BOUNDARY--\n"),
+		},
+		{
+			// The gateway refuses a repeated model and the router must not
+			// pick one of the two answers.
+			name: "model named twice",
+			body: crlf("--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nwhisper-large\n" +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nother-model\n" +
+				rest + "--BOUNDARY--\n"),
+		},
+		{
+			// The same repeat with the audio part between the two: the Reader
+			// has to walk past the file to see the second one.
+			name: "model named twice around the audio part",
+			body: crlf("--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nwhisper-large\n" +
+				rest +
+				"--BOUNDARY\n" +
+				"Content-Disposition: form-data; name=\"model\"\n\nother-model\n" +
+				"--BOUNDARY--\n"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newRecordingChild(t, transcriptionReply)
+			mgr := &recordingManager{endpoint: child.srv.URL}
+
+			rec := postMultipartTo(t, mgr, transcriptionPath, ct, tc.body)
+
+			assertNotManaged(t, rec)
+			if got := mgr.asked(); len(got) != 0 {
+				t.Errorf("EnsureRunning was called for %q; a refused body must start no child", got)
+			}
+			if hits, _, _, _ := child.snapshot(); hits != 0 {
+				t.Errorf("child hit %d times, want 0", hits)
+			}
+		})
+	}
 }

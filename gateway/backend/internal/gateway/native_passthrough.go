@@ -173,11 +173,14 @@ func targetIsAudioOnly(target routing.Target) bool {
 // persisted usage row + the live ActiveRequest agree on the value.
 //
 // endpoint is the client endpoint the request arrived on, and it matters for
-// exactly one flavor: openai_images covers two endpoints, generations and edits,
+// exactly two flavors. openai_images covers two endpoints, generations and edits,
 // so for that flavor the endpoint -- not the flavor -- picks the upstream path
-// (endpointImagesEdit -> /v1/images/edits, anything else -> generations). For
-// every other flavor it is ignored, which is why the translate handlers (which
-// can never serve images, and do not know which of the three text endpoints they
+// (endpointImagesEdit -> /v1/images/edits, anything else -> generations).
+// openai_audio covers two endpoints as well, speech and transcription, and
+// again the endpoint picks the path (endpointTranscription ->
+// /v1/audio/transcriptions, anything else -> /v1/audio/speech). For every other
+// flavor it is ignored, which is why the translate handlers (which can never
+// serve images or audio, and do not know which of the three text endpoints they
 // were reached from) pass endpointChat as a placeholder that cannot change the
 // answer.
 //
@@ -201,6 +204,14 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 			return "/v1/images/edits"
 		}
 		return "/v1/images/generations"
+	}
+	// transcription is answered here for the same reason as images and speech
+	// (no EndpointMode to look up, no translate fallback, none of the provider
+	// fallbacks below applies), and it MUST be answered before the speech
+	// branch: it shares the openai_audio flavor with speech, so the flavor
+	// cannot tell the two upstream paths apart and the endpoint has to.
+	if endpoint == endpointTranscription {
+		return "/v1/audio/transcriptions"
 	}
 	// speech is answered here for the same reason: no EndpointMode to look up,
 	// no translate fallback, and none of the provider fallbacks below applies.
@@ -671,8 +682,27 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// one -- see normalizeSpeechUpstreamError. An audio.cpp error is always a single
 	// small buffered body, so reading it whole changes nothing the client can see
 	// beyond the normalisation.
-	if needsSpeechErrorRelay(rel.pfReq.APIFlavor, resp.StatusCode) {
+	if needsSpeechErrorRelay(rel.pfReq.APIFlavor, rel.endpoint, resp.StatusCode) {
 		s.relaySpeechUpstreamError(w, r, ex, resp)
+		return
+	}
+
+	// The TRANSCRIPTION upstream (audio.cpp) shares the openai_audio flavor with speech,
+	// so both of its response-side paths are keyed on the endpoint, never the flavor
+	// (needsSpeechErrorRelay above is carved the other way for the same reason). A non-2xx is
+	// normalised like speech's -- a transcription-specific code, see
+	// normalizeTranscriptionUpstreamError. A 2xx is the one response in this relay that
+	// cannot stream: the billable duration is the TRAILING timing block of a JSON body,
+	// so the whole body is read, bounded, before a byte is written, and then written
+	// verbatim -- see relayTranscriptionResponse. Both return, so no transcription ever
+	// reaches the speech-shaped streaming copier below (and its speech-only
+	// Content-Length forwarding and metering-header capture).
+	if needsTranscriptionErrorRelay(rel.endpoint, resp.StatusCode) {
+		s.relayTranscriptionUpstreamError(w, r, ex, resp)
+		return
+	}
+	if rel.endpoint == endpointTranscription {
+		s.relayTranscriptionResponse(w, r, ex, resp)
 		return
 	}
 
@@ -745,7 +775,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// the bytes. An upstream that declared none (a genuinely streamed body) is
 	// left chunked.
 	//
-	// Speech only: every other flavor keeps relaying chunked, exactly as before.
+	// Speech only: every other flavor keeps relaying chunked, exactly as before. (A
+	// transcription shares the openai_audio flavor this test reads, but never gets
+	// here: its 2xx is buffered and written by relayTranscriptionResponse above.)
 	// provider.ProxyResponse carries no ContentLength field, so the declared
 	// length is read off the header; Go's client drops that header both for a
 	// chunked response and for one it decompressed itself, so a value that
