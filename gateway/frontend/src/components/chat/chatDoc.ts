@@ -10,6 +10,7 @@
 
 import type {
   Chat,
+  ChatAudioSettings,
   ChatImageSettings,
   ChatRunStatus,
   ChatSettings,
@@ -157,6 +158,10 @@ export function attachModeOf(
   model: { vision: boolean; image: boolean; imageEdit: boolean },
 ): AttachMode {
   if (kind === 'image') return model.imageEdit ? 'edit' : 'none';
+  // Text-to-speech takes no image input whatever the model can otherwise read: a
+  // speech run sends only the last user message's text, so an attachment would be
+  // dropped in silence. (Without this the vision branch below would offer one.)
+  if (kind === 'speech') return 'none';
   return model.vision && !model.image ? 'vision' : 'none';
 }
 
@@ -354,6 +359,7 @@ export function optionsOr(
 
 // Parse a blank-able numeric knob string to a wire number, or undefined when
 // blank/unparseable (so imageSetting omits it and sd-server keeps its default).
+// Shared with the audio speed knob (audioSetting), which is blank-able the same way.
 function toImageNumber(raw: string): number | undefined {
   const trimmed = raw.trim();
   if (trimmed === '') return undefined;
@@ -480,6 +486,104 @@ export function imageSettingsFrom(image: ChatImageSettings | undefined): ImageSe
   };
 }
 
+// The text-to-speech knobs the composer edits, as CONCRETE store state (every field
+// defined, unlike the all-optional wire ChatAudioSettings). Every unset knob is the
+// blank sentinel that audioSetting() below omits from the wire, so the model keeps its
+// own default (its default voice is shown as a placeholder, never written).
+export type AudioSettings = {
+  voice: string; // free text; "" = the model's default voice
+  // The speaking-rate multiplier as a BLANK-ABLE string ("" = the model's own default),
+  // parsed to a number on the wire by audioSetting(); a blank or unparseable one is
+  // omitted. Not clamped: the model's own range applies.
+  speed: string;
+  // The advanced passthrough as the TEXT of a JSON object (the composer's textarea):
+  // extra top-level request fields merged verbatim into /v1/audio/speech -- the OpenAI
+  // `instructions` field and any audio.cpp-native knob -- each value keeping the JSON
+  // type the user wrote, which is why this is JSON and not key=value lines. "" = none.
+  // audioSetting() sends it parsed, or omits it when it is not a non-empty object;
+  // parseAudioPassthrough() says which, so the composer and send() can name a bad one.
+  passthrough: string;
+};
+
+export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
+  voice: '',
+  speed: '',
+  passthrough: '',
+};
+
+// What the passthrough text is: nothing to send ('empty': blank or `{}`), a JSON
+// object to send ('ok') or something that is not one ('invalid': malformed JSON, or
+// valid JSON that is not an object -- an array, a string, a number, null).
+export type AudioPassthroughParse =
+  { status: 'empty' } | { status: 'ok'; value: Record<string, unknown> } | { status: 'invalid' };
+
+export function parseAudioPassthrough(raw: string): AudioPassthroughParse {
+  const text = raw.trim();
+  if (text === '') return { status: 'empty' };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { status: 'invalid' };
+  }
+  if (!isJsonObject(parsed)) return { status: 'invalid' };
+  return Object.keys(parsed).length === 0 ? { status: 'empty' } : { status: 'ok', value: parsed };
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// Whether a run of this thread must be refused for its advanced passthrough: a speech
+// thread whose passthrough text is not a JSON object. audioSetting would omit it, and
+// the user's extra fields would vanish from the request in silence -- the Advanced
+// section may be collapsed when they send -- so the store refuses the send (and a
+// replay) and says so instead. Only a speech thread has a passthrough.
+export function speechPassthroughInvalid(kind: string | undefined, s: AudioSettings): boolean {
+  return kind === 'speech' && parseAudioPassthrough(s.passthrough).status === 'invalid';
+}
+
+// The `audio` entry of a settings object, as a SPREADABLE fragment, mirroring
+// imageSetting: present ONLY on a "speech" thread, and carrying only what the user
+// set -- so a text or image thread stays byte-identical and an untouched knob leaves
+// the model on its own default. (The key is present for a speech thread even when
+// nothing is set, as image's is for an image thread: `audio: {}`.) A passthrough that
+// is not a non-empty JSON object is omitted here; the store refuses the turn before it
+// gets that far (speechPassthroughInvalid), so it is never dropped in silence. Both the
+// document writer (buildDoc) and the state seeder (normalizeDoc) go through this, so
+// neither can give the key to another kind of thread from the client side.
+export function audioSetting(
+  kind: string | undefined,
+  s: AudioSettings,
+): { audio?: ChatAudioSettings } {
+  if (kind !== 'speech') return {};
+  const audio: ChatAudioSettings = {};
+  const voice = s.voice.trim();
+  if (voice) audio.voice = voice;
+  const speed = toImageNumber(s.speed);
+  if (speed !== undefined) audio.speed = speed;
+  const passthrough = parseAudioPassthrough(s.passthrough);
+  if (passthrough.status === 'ok') audio.passthrough = passthrough.value;
+  return { audio };
+}
+
+// Coerce a persisted (all-optional) ChatAudioSettings into the concrete store state,
+// filling anything missing/mistyped from the defaults. The inverse of audioSetting,
+// used to seed the composer when a chat is loaded: the passthrough object comes back
+// as pretty-printed JSON text for the textarea.
+export function audioSettingsFrom(audio: ChatAudioSettings | undefined): AudioSettings {
+  const s = audio ?? {};
+  const passthrough =
+    isJsonObject(s.passthrough) && Object.keys(s.passthrough).length > 0
+      ? JSON.stringify(s.passthrough, null, 2)
+      : DEFAULT_AUDIO_SETTINGS.passthrough;
+  return {
+    voice: typeof s.voice === 'string' ? s.voice : DEFAULT_AUDIO_SETTINGS.voice,
+    speed: imageNumToStr(s.speed),
+    passthrough,
+  };
+}
+
 // Coerce an opaque `content` blob into a well-formed active-chat document,
 // applying sane defaults for anything missing/mistyped.
 export function normalizeDoc(content: unknown): ActiveChatDoc {
@@ -523,6 +627,13 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
       ...imageSetting(
         typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
         imageSettingsFrom(s.image),
+      ),
+      // The audio knobs, round-tripped for a speech thread for the same reason as the
+      // image ones above (the PUT full-replaces the blob). audioSetting keys off the
+      // kind, so a text or image thread stays byte-identical (no audio key).
+      ...audioSetting(
+        typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
+        audioSettingsFrom(s.audio),
       ),
     },
     messages,

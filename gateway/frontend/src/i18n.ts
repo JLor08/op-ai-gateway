@@ -233,6 +233,11 @@ const de = {
   chatImageEditPromptRequired:
     'Beschreiben Sie, wie das Bild bearbeitet werden soll, bevor Sie senden.',
   chatImageEditSourceType: 'Eine Bildbearbeitung nimmt ein PNG- oder JPEG-Bild.',
+  // The refusal of a speech turn whose "Advanced" passthrough is not a JSON object,
+  // raised BEFORE anything is sent or stored (the extra fields would otherwise be
+  // dropped from the request without a word, with the Advanced section collapsed).
+  chatAudioPassthroughInvalid:
+    'Die erweiterten Felder müssen ein JSON-Objekt sein, zum Beispiel {"seed": 1}. Korrigieren Sie sie oder leeren Sie das Feld, bevor Sie senden.',
   // The mask of an edit (inpainting): an optional PNG, the size of the source
   // image, whose transparent area marks the region to change. Its slot is next to
   // the attach button of an edit and needs the source image first.
@@ -3275,6 +3280,8 @@ const en: PortalMessages = {
   chatImageEditSingleSource: 'An image edit takes exactly one source image.',
   chatImageEditPromptRequired: 'Describe how the image should be edited before sending.',
   chatImageEditSourceType: 'An image edit takes a PNG or JPEG image.',
+  chatAudioPassthroughInvalid:
+    'The advanced fields must be a JSON object, for example {"seed": 1}. Fix them or clear the field before sending.',
   chatAttachMask: 'Attach a mask',
   chatAttachMaskTooltip:
     'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',

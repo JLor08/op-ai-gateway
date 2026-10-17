@@ -21,12 +21,14 @@ import type { ChatSummary, PortalApi } from '../../api';
 import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
 import {
+  audioSetting,
   byNewest,
   imageSetting,
   kindSetting,
   pruneEmptyAssistantTail,
   SAVE_DEBOUNCE_MS,
   type ActiveChatDoc,
+  type AudioSettings,
   type ChatUiMessage,
   type ImageSettings,
 } from './chatDoc';
@@ -78,10 +80,11 @@ export function useChatPersistence(
     temperatureRef: RefObject<number>;
     maxTokensRef: RefObject<number>;
     imageSettingsRef: RefObject<ImageSettings>;
+    audioSettingsRef: RefObject<AudioSettings>;
     selectedTokenIdRef: RefObject<string>;
     serverOverrideRef: RefObject<string>;
     serverOverrideForceUnreachableRef: RefObject<boolean>;
-    // The active thread's pinned kind ("" text | "image"). Read here because
+    // The active thread's pinned kind ("" text | "image" | "speech"). Read here because
     // buildDoc has to write it back: the backend's PUT full-replaces the
     // opaque content blob with NO merge, so any setting missing from buildDoc
     // is erased from the stored document on the very next autosave — which is
@@ -104,6 +107,8 @@ export function useChatPersistence(
     // The image knobs are one reactive value (the whole object): a new object
     // identity on any knob change schedules a save, like the primitives above.
     imageSettings: ImageSettings;
+    // Likewise one reactive value: the speech thread's audio knobs.
+    audioSettings: AudioSettings;
     selectedTokenId: string;
     serverOverride: string;
     serverOverrideForceUnreachable: boolean;
@@ -127,6 +132,7 @@ export function useChatPersistence(
     temperatureRef,
     maxTokensRef,
     imageSettingsRef,
+    audioSettingsRef,
     selectedTokenIdRef,
     serverOverrideRef,
     serverOverrideForceUnreachableRef,
@@ -144,6 +150,7 @@ export function useChatPersistence(
     temperature,
     maxTokens,
     imageSettings,
+    audioSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,
@@ -181,6 +188,9 @@ export function useChatPersistence(
         // The image knobs, likewise present only for an image thread (keyed off
         // the kind by imageSetting): a knob this omits is erased by the next PUT.
         ...imageSetting(chatKindRef.current, imageSettingsRef.current),
+        // The audio knobs, likewise present only for a speech thread (keyed off the
+        // kind by audioSetting): a knob this omits is erased by the next PUT.
+        ...audioSetting(chatKindRef.current, audioSettingsRef.current),
       },
       messages: pruneEmptyAssistantTail(messagesRef.current),
     }),
@@ -190,6 +200,7 @@ export function useChatPersistence(
       temperatureRef,
       maxTokensRef,
       imageSettingsRef,
+      audioSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -261,6 +272,7 @@ export function useChatPersistence(
     temperature,
     maxTokens,
     imageSettings,
+    audioSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,

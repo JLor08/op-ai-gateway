@@ -81,6 +81,33 @@ describe('portal api', () => {
     ]);
   });
 
+  it('carries the backend-folded speech flag on a model option, independent of image', async () => {
+    // ModelDTO.speech is folded in the backend (every offering mapping has a speech:yes
+    // verdict, fail-closed), so the client never recomputes it. It travels beside
+    // `image`, not instead of it, and a row that omits it reads as not speech-capable.
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: 'kokoro', speech: true },
+            { id: 'whisper', speech: false },
+            { id: 'sd-turbo', image: true },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const api = createPortalApi(fetcher);
+
+    const { data } = await api.models();
+
+    expect(data.map((m) => [m.id, m.speech ?? false, m.image ?? false])).toEqual([
+      ['kokoro', true, false],
+      ['whisper', false, false],
+      ['sd-turbo', false, true],
+    ]);
+  });
+
   it('sends the CSRF header on mutating requests', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(

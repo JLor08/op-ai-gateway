@@ -10,9 +10,18 @@ export type ChatRole = 'system' | 'user' | 'assistant';
 // 'mask'` marks the MASK of an image edit (inpainting) -- see maskPart below -- and
 // a part without it is an ordinary image (an attachment, a source, a generated
 // result).
+//
+// An `audio_url` part is the ANSWER of a speech (text-to-speech) turn, the audio twin
+// of a generated image: `{ type: 'audio_url', audio_url: { url } }`, the WAV as an
+// inline `data:audio/wav;base64,...` url while the run streams and as the
+// /api/portal/chat-blobs/{id} reference once the run's commit moved it into the chat
+// blob store. It is OUTPUT only -- the composer never attaches one -- and the key
+// and the `audio_url` name are the contract with the backend's executor and blob
+// extraction (portal extractChatBlobs).
 export type ChatContentPart =
   | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string }; purpose?: 'mask' };
+  | { type: 'image_url'; image_url: { url: string }; purpose?: 'mask' }
+  | { type: 'audio_url'; audio_url: { url: string } };
 export type ChatContent = string | ChatContentPart[];
 
 // The MASK of an image edit (inpainting) -- a PNG whose transparent pixels mark the
@@ -55,4 +64,16 @@ export function imageUrlsOf(content: ChatContent): string[] {
   return content
     .filter((part): part is ImagePart => part.type === 'image_url' && !isMaskPart(part))
     .map((part) => part.image_url.url);
+}
+
+type AudioPart = Extract<ChatContentPart, { type: 'audio_url' }>;
+
+// The urls of the audio of a message -- a speech turn's synthesized reply -- in order:
+// every audio part. The audio twin of imageUrlsOf above, which never lists one. The
+// message renderer plays and offers for download exactly these.
+export function audioUrlsOf(content: ChatContent): string[] {
+  if (typeof content === 'string') return [];
+  return content
+    .filter((part): part is AudioPart => part.type === 'audio_url')
+    .map((part) => part.audio_url.url);
 }

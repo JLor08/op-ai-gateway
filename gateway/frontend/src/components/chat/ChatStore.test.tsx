@@ -177,9 +177,11 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="last-parts">
         {Array.isArray(last?.content)
           ? last.content
-              .map((p) =>
-                p.type === 'image_url' ? `image_url:${p.image_url.url}` : `text:${p.text}`,
-              )
+              .map((p) => {
+                if (p.type === 'image_url') return `image_url:${p.image_url.url}`;
+                if (p.type === 'audio_url') return `audio_url:${p.audio_url.url}`;
+                return `text:${p.text}`;
+              })
               .join('|')
           : ''}
       </span>
@@ -194,6 +196,9 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="run-elapsed-ms">{c.runElapsedMs ?? ''}</span>
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
       <span data-testid="model-image-edit">{String(c.modelImageEdit)}</span>
+      <span data-testid="model-speech-capable">{String(c.modelSpeechCapable)}</span>
+      {/* The speech thread's concrete audio settings (voice / speed / passthrough text). */}
+      <span data-testid="audio-settings">{JSON.stringify(c.audioSettings)}</span>
       <span data-testid="attach-mode">{c.attachMode}</span>
       {/* The composer's attachment strip: the source image(s) and the mask, as the
           urls the next send would carry. */}
@@ -220,6 +225,22 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       </button>
       <button type="button" onClick={() => c.setSystemPrompt('hi')}>
         set-system
+      </button>
+      {/* The speech composer's settings, moved off their defaults, and then the
+          passthrough text broken (not a JSON object) without touching the rest. */}
+      <button
+        type="button"
+        onClick={() =>
+          c.setAudioSettings({ voice: 'af_heart', speed: '1.25', passthrough: '{"seed":3}' })
+        }
+      >
+        set-audio
+      </button>
+      <button
+        type="button"
+        onClick={() => c.setAudioSettings((s) => ({ ...s, passthrough: '{"seed":' }))}
+      >
+        break-audio-passthrough
       </button>
       {/* Selects a caller-supplied model id (a test's "pick an available model"
           action) without needing a full SearchableSelect in this probe. */}
@@ -3554,6 +3575,337 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
       expect(optionsShown()).toBe(JSON.stringify(xlOptions));
     });
+  });
+
+  // A text-to-speech model is picked like an image generator: the chat offers it, the
+  // empty thread's composer follows it (prospectiveKind), and the first send pins the
+  // thread as "speech". The audio settings ride the run only for that kind.
+  describe(`ChatStoreProvider speech-thread kind [${locale}]`, () => {
+    // A TTS model: only the openai_audio flavor, with the backend's speech verdict.
+    const kokoro: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const speechModels: ModelOption[] = [kokoro];
+    const wav = [{ type: 'audio_url' as const, audio_url: { url: 'data:audio/wav;base64,UklG' } }];
+    const speechThread = (audio?: unknown, withTurn = true): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: {
+          settings: { model: kokoro.id, kind: 'speech', ...(audio ? { audio } : {}) },
+          messages: withTurn
+            ? [
+                { id: 'u1', role: 'user', content: 'say hi' },
+                { id: 'a1', role: 'assistant', content: wav, status: 'complete' },
+              ]
+            : [],
+        },
+      },
+    ];
+    const startSettings = (call = 0) =>
+      (chatApi.spies.startChatRun.mock.calls[call][1] as { settings: Record<string, unknown> })
+        .settings;
+    const sendText = (text: string) => {
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: text } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    };
+
+    it('offers a speech-capable audio model, and only that one of the audio models', async () => {
+      const shape = (id: string, flavors: string[], speech?: boolean): ModelOption => ({
+        id,
+        display_name: id,
+        flavors,
+        loading_on_count: 0,
+        speech,
+      });
+      renderProvider([], {
+        models: [
+          shape('text-model', ['openai', 'anthropic']),
+          // Transcription / unprobed audio: openai_audio without a speech verdict.
+          shape('whisper-no-verdict', ['openai_audio']),
+          shape('whisper-no', ['openai_audio'], false),
+          shape('tts-yes', ['openai_audio'], true),
+          // A verdict without the flavor the speech endpoint is served under.
+          shape('tts-wrong-flavor', ['anthropic'], true),
+          shape('audio-and-text', ['openai', 'openai_audio'], false),
+        ],
+      });
+      await waitForReady();
+      expect(screen.getByTestId('model-options').textContent).toBe(
+        'text-model,tts-yes,audio-and-text',
+      );
+    });
+
+    it('leaves the offered text and image models exactly as they were', async () => {
+      // The existing offered-models rule, restated with a speech model alongside:
+      // adding the speech admission changed nothing for the others.
+      const shape = (id: string, flavors: string[], image?: boolean): ModelOption => ({
+        id,
+        display_name: id,
+        flavors,
+        loading_on_count: 0,
+        image,
+      });
+      renderProvider([], {
+        models: [
+          shape('text-model', ['openai']),
+          shape('sd-verdict', ['openai_images'], true),
+          shape('sd-no-verdict', ['openai_images'], false),
+          kokoro,
+        ],
+      });
+      await waitForReady();
+      expect(screen.getByTestId('model-options').textContent).toBe('text-model,sd-verdict,kokoro');
+    });
+
+    it('switches an empty thread to the speech kind when a speech model is picked', async () => {
+      renderProvider([], { models: [...models, kokoro] });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('true');
+      expect(screen.getByTestId('model-image-capable').textContent).toBe('false');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('speech');
+      // Text-to-speech takes no image input, so nothing can be attached.
+      expect(screen.getByTestId('attach-mode').textContent).toBe('none');
+
+      // And back to a text model: the empty thread follows the pick again.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('false');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+    });
+
+    it('lets the image verdict win for a model that is both image and speech capable', async () => {
+      renderProvider([], {
+        models: [{ ...kokoro, id: 'both', display_name: 'both', image: true }],
+      });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-both' }));
+      expect(screen.getByTestId('model-image-capable').textContent).toBe('true');
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('true');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('image');
+    });
+
+    it('starts the first send as a speech run carrying the audio settings, and pins the thread', async () => {
+      renderProvider([], { models: [...models, kokoro] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      fireEvent.click(screen.getByRole('button', { name: 'set-audio' }));
+      sendText('hello there');
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      const settings = startSettings();
+      expect(settings.model).toBe('kokoro');
+      expect(settings.kind).toBe('speech');
+      expect(settings.audio).toEqual({ voice: 'af_heart', speed: 1.25, passthrough: { seed: 3 } });
+      // A speech run carries no image knobs.
+      expect('image' in settings).toBe(false);
+
+      // The pin wins from now on: a text model picked afterwards does not turn the
+      // thread back into a text thread.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+      expect(screen.getByTestId('chat-kind').textContent).toBe('speech');
+    });
+
+    it('sends only the audio fields the user moved off the default', async () => {
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      sendText('hello');
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(startSettings().kind).toBe('speech');
+      expect(startSettings().audio).toEqual({});
+    });
+
+    // Review focus: a text or image thread must be byte-identical. Neither carries an
+    // audio key on the run body, and a text thread still carries no image one.
+    it.each([
+      ['a text thread', [models[0]], 'gpt-oss-20b', ''],
+      [
+        'an image thread',
+        [
+          {
+            id: 'sd-turbo',
+            display_name: 'sd-turbo',
+            flavors: ['openai'],
+            loading_on_count: 0,
+            image: true,
+          },
+        ],
+        'sd-turbo',
+        'image',
+      ],
+    ] as [string, ModelOption[], string, string][])(
+      'sends no audio key with the run of %s',
+      async (_label, pool, pick, kind) => {
+        renderProvider([], { models: pool });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: `pick-${pick}` }));
+        // Audio state that is not defaults must still never reach another kind.
+        fireEvent.click(screen.getByRole('button', { name: 'set-audio' }));
+        sendText('hello');
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const settings = startSettings();
+        expect(settings.kind).toBe(kind);
+        expect('audio' in settings).toBe(false);
+        expect('image' in settings).toBe(kind === 'image');
+      },
+    );
+
+    it('refuses to send a speech turn whose advanced passthrough is not a JSON object', async () => {
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      fireEvent.click(screen.getByRole('button', { name: 'set-audio' }));
+      fireEvent.click(screen.getByRole('button', { name: 'break-audio-passthrough' }));
+      sendText('hello');
+
+      // Said, not silently dropped: the knob the user typed would otherwise vanish.
+      expect(await screen.findByText(t.chatAudioPassthroughInvalid)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // Nothing was stored or cleared: the composer keeps the text, the thread no turn.
+      expect((screen.getByLabelText('probe-input') as HTMLInputElement).value).toBe('hello');
+      expect(screen.getByTestId('count').textContent).toBe('0');
+
+      // Fixing the text lets the same send through.
+      fireEvent.click(screen.getByRole('button', { name: 'set-audio' }));
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+    });
+
+    it('refuses a regenerate whose advanced passthrough is not a JSON object, transcript untouched', async () => {
+      chatApi = makeChatApi(speechThread());
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'break-audio-passthrough' }));
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      expect(await screen.findByText(t.chatAudioPassthroughInvalid)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    it('regenerates a speech turn without the vision guard: an audio part is not an image', async () => {
+      chatApi = makeChatApi(speechThread());
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('speech');
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+      expect(startSettings().kind).toBe('speech');
+    });
+
+    it('shows a stored audio answer part as it arrived', async () => {
+      chatApi = makeChatApi(speechThread());
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      expect(screen.getByTestId('last-parts').textContent).toBe(
+        'audio_url:data:audio/wav;base64,UklG',
+      );
+    });
+
+    it('persists the audio settings with the speech thread and seeds them back on reload', async () => {
+      chatApi = makeChatApi(speechThread({ voice: 'bf_emma', speed: 0.8 }));
+      const { unmount } = renderProvider([], { models: speechModels });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('speech');
+      // Seeded from the loaded document, speed shown as the blank-able string.
+      expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toEqual({
+        voice: 'bf_emma',
+        speed: '0.8',
+        passthrough: '',
+      });
+
+      // The audio settings are the ONLY thing that changes here, so this also holds
+      // the debounced save's dependency list: without audioSettings in it, no save
+      // is ever scheduled for a settings-only edit.
+      fireEvent.click(screen.getByRole('button', { name: 'set-audio' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { kind?: string; audio?: unknown } };
+      };
+      expect(saved.content.settings.kind).toBe('speech');
+      expect(saved.content.settings.audio).toEqual({
+        voice: 'af_heart',
+        speed: 1.25,
+        passthrough: { seed: 3 },
+      });
+
+      // ...and the reload reads them back out of the saved document (the PUT
+      // full-replaces the blob, so a setting not seeded here is erased next save).
+      unmount();
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toMatchObject({
+        voice: 'af_heart',
+        speed: '1.25',
+      });
+    });
+
+    it('keeps the stored audio settings when an unrelated setting is saved', async () => {
+      chatApi = makeChatApi(speechThread({ voice: 'bf_emma', speed: 0.8, passthrough: { a: 1 } }));
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { audio?: unknown } };
+      };
+      expect(saved.content.settings.audio).toEqual({
+        voice: 'bf_emma',
+        speed: 0.8,
+        passthrough: { a: 1 },
+      });
+    });
+
+    it.each([
+      ['text', undefined],
+      ['image', 'image'],
+    ] as const)(
+      'writes no audio key when saving a %s thread, whatever the audio state holds',
+      async (_label, kind) => {
+        chatApi = makeChatApi([
+          {
+            id: 'c1',
+            title: 'C1',
+            created_at: T,
+            updated_at: T,
+            content: {
+              settings: { model: models[0].id, ...(kind ? { kind } : {}) },
+              messages: [
+                { id: 'u1', role: 'user', content: 'hello' },
+                { id: 'a1', role: 'assistant', content: 'hi', status: 'complete' },
+              ],
+            },
+          },
+        ]);
+        renderProvider();
+        await waitForReady();
+
+        // Audio state moved on a thread that is not a speech one: it must not persist.
+        fireEvent.click(screen.getByRole('button', { name: 'set-audio' }));
+        fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+        const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+          content: { settings: Record<string, unknown> };
+        };
+        expect(Object.keys(saved.content.settings)).not.toContain('audio');
+        if (!kind) expect(Object.keys(saved.content.settings)).not.toContain('kind');
+      },
+    );
   });
 
   describe(`useChatStreaming isolation [${locale}]`, () => {
