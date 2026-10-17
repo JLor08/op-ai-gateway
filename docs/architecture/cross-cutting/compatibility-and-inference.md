@@ -786,7 +786,16 @@ so a candidate without the verdict is skipped rather than turned into a
 **8. `GET /v1/audio/voices` is deliberately not proxied.** The voices listing is an
 audio.cpp and llama-swap convention, not an OpenAI endpoint, and the gateway proxies the
 OpenAI surface. A client learns the voice names its model accepts out of band and sends
-one as `voice`; the gateway passes it through unexamined.
+one as `voice`; the gateway passes it through unexamined. The portal chat's speech
+composer follows the same rule, so its `voice` field is free text (§12).
+
+**9. The portal chat is a caller of this endpoint.** A chat thread of kind `speech`
+reaches `POST /v1/audio/speech` through the run executor, over the internal loopback pair
+with the run-as header, which is the leg this endpoint admits instead of a session
+cookie. The endpoint, its validation, its relay and its billing are unchanged; the chat
+takes the whole WAV, stores it as a chat blob and plays it back
+([§12](#12-in-portal-chat-playground),
+[ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).
 
 ### 3.7 OpenAI audio transcriptions
 
@@ -1810,7 +1819,9 @@ deliberately carries neither.** Every listing keeps only the coarse flavors it k
 that is served only under `openai_images` reaches the portal's model DTO with
 `flavors: ["openai_images"]` — which is what lets the portal chat offer it
 (§12) — and a speech-only or transcription-only model with `flavors: ["openai_audio"]`,
-which the portal chat does not offer (it needs `openai`, or `openai_images` with `image`). `/v1/models` keeps
+which the portal chat offers only when it also carries `speech: true` (its rule needs
+`openai`, or `openai_images` with `image`, or `openai_audio` with `speech`), so a
+transcription-only model is never offered. `/v1/models` keeps
 only the rows that carry `openai`, so the same models are **not** listed there (nor in
 `/api/v1/models`): that listing is what an external OpenAI client fills its *chat*
 picker from, and an images-only or audio-only model offered for chat would fail.
@@ -2337,18 +2348,21 @@ from the browser. Instead:
    `internal/gateway/chat_runs.go`) makes a **loopback** `POST` to its own
    `/v1/chat/completions` — or, when the run's kind is `image` (below), to
    `/v1/images/generations`, or to `/v1/images/edits` when the turn carries a
-   source image — authenticating via the internal trusted-loopback
+   source image, or, when the kind is `speech` (below), to `/v1/audio/speech` —
+   authenticating via the internal trusted-loopback
    header pair (`X-OP-Internal-Auth` + `X-OP-Internal-User` — checked *first*
    by `loopbackPrincipal`, `internal/gateway/auth.go`, which both
-   `authenticateWeb` and, for the images hop, `authenticateInternalOrBearer`
-   call before anything else; blanked by nginx at the public edge so an
-   external client can never inject them), plus the same `X-OP-CSRF` header a
-   direct browser call would need.
-3. `/v1/chat/completions`, `/v1/images/generations` and `/v1/images/edits` are
-   the only three inference endpoints reachable through a token-less,
-   session-shaped principal — chat completions via `requireWebAnyScope` →
-   `authenticateWeb` (session cookie, internal loopback, or bearer), both images
-   endpoints via
+   `authenticateWeb` and, for the images and audio hops,
+   `authenticateInternalOrBearer` call before anything else; blanked by nginx at
+   the public edge so an external client can never inject them), plus the same
+   `X-OP-CSRF` header a direct browser call would need.
+3. `/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits` and
+   `/v1/audio/speech` are the four inference endpoints the run executor reaches
+   through a token-less, session-shaped principal (`/v1/audio/transcriptions`
+   admits the same loopback pair, but no portal flow calls it) — chat
+   completions via `requireWebAnyScope` →
+   `authenticateWeb` (session cookie, internal loopback, or bearer), the images
+   and audio endpoints via
    `requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`
    (`auth_internal_or_bearer.go`, `authenticateWeb` minus its cookie branch:
    internal loopback or bearer, **never** a session cookie). `/v1/responses`
@@ -2356,15 +2370,16 @@ from the browser. Instead:
    `authenticate` → `LookupBearer`, which always yields a populated token id).
    That populated-vs-empty token id — not the headers a request happens to
    carry — is what actually gates the run-as header (`X-OP-Run-As-Token`):
-   `handleOpenAIChat`, `handleOpenAIImages` and `handleOpenAIImagesEdit` all
-   honour it, guarded on `token.ID == ""`, so it can only ever act on a
-   session-shaped principal from one of those three endpoints; it structurally
-   cannot reach
+   `handleOpenAIChat`, `handleOpenAIImages`, `handleOpenAIImagesEdit` and
+   `handleOpenAISpeech` (like the transcription handler, through the shared
+   `runAsPrincipal`) all honour it, guarded on `token.ID == ""`, so it can only
+   ever act on a session-shaped principal from one of those endpoints; it
+   structurally cannot reach
    `/v1/responses` or `/v1/messages`, whose bearer-derived token id is never
    empty. `applyServerOverride` runs from `inferencePreflight`
-   (`internal/gateway/inference_handlers.go`), which **all four** inference
-   flavors call (chat, responses, messages, images), so `server_override` is
-   not distinctive of any of them either.
+   (`internal/gateway/inference_handlers.go`), which **every** inference
+   endpoint calls (chat, responses, messages, images, speech, transcription), so
+   `server_override` is not distinctive of any of them either.
 4. The executor relays the resulting SSE deltas into the chat's own live-run
    state, which the browser's `EventSource` streams to the UI — the browser
    itself never opens a fetch stream.
@@ -2379,6 +2394,8 @@ the **thread** rather than of the model the picker currently shows
 when the turn is an edit, below), with the prompt built from
 the last user message and `response_format: "b64_json"` stated explicitly
 rather than inherited from the endpoint's tolerance of an absent value (§3.4).
+`speech` posts to `/v1/audio/speech`, with the last user message's text as the
+`input` ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs), the speech paragraphs below).
 An image thread also carries a `ChatImageSettings` that the composer's settings
 panel edits in place of the text-chat controls (which the images endpoint uses
 none of); `buildImagesBody` forwards each field the user actually set, so an
@@ -2468,6 +2485,22 @@ declare `openai_images` is offered as the text model it is, not as an image
 model every turn of which would 404. A saved model that is no longer listed
 still appears, as a synthetic trailing option.
 
+**The picker also offers a speech model, by a rule of the chat's own.** `chatModels`
+additionally keeps a model whose offered flavors include `openai_audio` **and** whose
+`speech` flag is true (`ModelOption.speech`, the backend's `ModelDTO.Speech`, §9), the
+polarity `openai_images` has behind `image`. The rule lives in `ChatStore`, **not** in
+`offeredFlavors`: that helper is shared with the Models view, whose "Available via" column
+must keep showing an audio row's flavor whether or not the row has a speech verdict
+(transcription, unprobed and agent-managed audio models have none), so it passes
+`openai_audio` through and the chat applies its stricter filter on top. A
+transcription-only model carries no `speech` flag and stays out of the picker. A
+speech-capable model puts an empty thread into the speech composer
+(`prospectiveKind`), and a model that is both image- and speech-capable is an image
+model, image having been the kind first. A clone-task model carries the verdict too, since
+the verdict cannot tell it from a `tts` one, so it is offered, and used text-only it has
+no reference voice and may answer an upstream error
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (e), (h)).
+
 **The attach control follows what the picked model can do with an image, and a
 generated image can be refined in place.** `ModelOption.image_edit` carries the
 backend's folded `ModelDTO.ImageEdit` (§3.5; the client never re-derives it), and
@@ -2475,8 +2508,9 @@ backend's folded `ModelDTO.ImageEdit` (§3.5; the client never re-derives it), a
 `chatDoc.ts`, turns the thread's kind and the picked model's flags into
 `'edit'`, `'vision'` or `'none'`: on an **image** thread it is `'edit'` exactly
 when the model is edit-capable — it never consults `vision`, because an sd model is
-`vision: false` and edits — and on a text thread it is `'vision'` for a model that
-reads images and does not generate them, as before. It drives the attach button
+`vision: false` and edits — on a text thread it is `'vision'` for a model that
+reads images and does not generate them, as before, and on a **speech** thread it is
+always `'none'` (the speech composer takes no image). It drives the attach button
 (disabled while a run is live or in mode `'none'`, with the tooltip for the
 reason), the file picker (`multiple` off for an edit), the prompt field's hint, the
 clear-on-model-switch effect (an attachment is dropped only when the mode becomes
@@ -2557,13 +2591,16 @@ The executor also derives the turn's display metrics (`consumeRunStream`):
   tokens/s metric and is kept so old transcripts still render); the real
   tokens/s is always the separate `tokens_per_second`/`tokensPerSecond` key.
 
-**Only an image run is bounded.** `runDeadlineFor` gives the image kind an
-end-to-end deadline (`imageRunDeadline`, 10 minutes) and leaves the text kind
+**Only an image or speech run is bounded.** `runDeadlineFor` gives the image kind an
+end-to-end deadline (`imageRunDeadline`, 10 minutes) and the speech kind one of its
+own (`speechRunDeadline`, also 10 minutes, a separate variable so the two can move
+independently), and leaves the text kind
 unbounded exactly as it is today: a text run streams deltas, so its liveness is
 visible, while a process-wide ceiling would newly kill long generations from a
 slow local model that complete perfectly well now — a behaviour change to the
 text path arriving as a side effect rather than a simplification
-([ADR-043](../09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (e)).
+([ADR-043](../09-architecture-decisions.md#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread) (e),
+amended by [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (b) for speech).
 The deadline is applied in `executeRun`, the first point at which the kind is
 known, as a child of the reservation's context — so Stop still cancels it — and
 it is released on every terminal path, the ordinary success one included.
@@ -2602,9 +2639,10 @@ rather than the run's context: a checkpoint records progress that has already
 happened, so a cancel must not erase it either.
 
 **That makes TEXT the exposed kind here, the reverse of the run deadline
-above.** Only the text executor checkpoints — `executeImageRun` makes one
-buffered request and has no periodic write — so a hung store reaches a text
-run by two routes and an image run by one. Both bounds applying to text is
+above.** Only the text executor checkpoints — `executeImageRun` and
+`executeAudioRun` each make one buffered request and have no periodic write —
+so a hung store reaches a text run by two routes and an image or speech run by
+one. Both bounds applying to text is
 therefore required rather than merely tolerated; a kilobyte text write that
 has not returned in 30 s is already pathological, so nothing legitimate is cut
 short ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
@@ -2775,6 +2813,82 @@ that knows a turn is an edit on every path (send, edit a message, regenerate).
 Together with the source limit above it means a webp thread's results cannot be
 refined until its format is PNG or JPEG.
 
+**A speech run is the image run's twin against `/v1/audio/speech`
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).**
+`executeAudioRun` (`chat_runs_audio.go`) shares with the text half what the image half
+shares (the reservation, the deadline, the loopback header set and the one terminal
+commit) and nothing of the stream consumer. Its request is JSON, so nothing overrides the
+shared header set's `Content-Type` as the edit hop does. `buildSpeechBody` sends `model`
+(the thread's pinned model), `input` (the **last user message's text**) and, when set,
+`voice` and `speed`, plus the thread's advanced passthrough, and **no `response_format`**:
+the endpoint answers WAV when it is absent and refuses every other value (§3.6), so there
+is no format knob and the reply is always WAV. The run's knobs are a
+`ChatAudioSettings` (`voice`, `speed`, `passthrough`), persisted under `settings.audio` the
+way `kind` and `image` are (`omitempty`, and cleared server-side for any non-speech kind,
+so a text or image chat's stored and wire bytes are unchanged; a speech thread always
+emits the key, `{}` when empty):
+
+- **`voice` is free text.** Its placeholder says the model's own default applies and is
+  never written, and a blank leaves the model on that default. audio.cpp's voices are not
+  discoverable through the gateway (the voices listing is not proxied, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
+  (j), and the agent router has no voices route), so there is no dropdown: a
+  discoverable list is a deferred enhancement with its own decision.
+- **`speed` is passed through as given** (placeholder `1.0`, no clamp: the model's own
+  range applies).
+- **Advanced is a JSON passthrough.** One text box takes a JSON object whose keys are
+  merged into the body verbatim as top-level fields (the OpenAI `instructions` field and
+  audio.cpp's native knobs; each value keeps the JSON type the user wrote). `model`,
+  `input`, `stream` and `response_format` are **reserved**, matched ignoring case: a key
+  that names one ends the run `gateway.chat_run_speech_reserved_field` and **sends
+  nothing**, since dropping the key and sending the rest would answer a request the user
+  did not make. `stream_format` is not reserved (the endpoint already refuses it, §3.6),
+  and a `voice` or `speed` passthrough key yields to the same field when the first-class
+  control is set. The composer refuses text that is not a JSON object on send and on
+  replay (with the Advanced section held open), because it would otherwise be omitted
+  from the request in silence; the reserved-key list is backend-only.
+
+Four terminal codes name the conditions a user has to tell apart from an ordinary
+failure, each with its image namesake's meaning restated for audio:
+`gateway.chat_run_speech_dispatch_failed` (the loopback request never went out; the Go
+error names the gateway's own address, so it goes to the log and the user gets the
+code); `gateway.chat_run_no_audio` (a 2xx with an empty body: an error, not an empty
+success, which would render as a blank bubble);
+`gateway.chat_run_speech_response_unreadable` (a 2xx body that could not be read to its
+end, or whose `Content-Type` is not a WAV label — `audio/wav`, `audio/x-wav`,
+`audio/wave` or `audio/vnd.wave`, all normalised to `audio/wav`, since the media type is
+the one fact about the audio that must come from the response); and
+`gateway.chat_run_speech_reserved_field`. The endpoint's own refusals reach the run as
+their codes through `upstreamErrorCode` — `speech.input_required`,
+`speech.response_format_unsupported`, `speech.stream_unsupported` and
+`speech.upstream_error` (§3.6, §13) — and all eight have German and English labels in
+`format.ts`'s `errorLabelByCode`, worded for speech rather than reusing the image labels,
+which talk about images. `speech.model_required` is left unlabelled, as its images twin
+is: a run always sends the thread's pinned model. Both-directions tests pin the speech
+run codes and the speech endpoint codes, so a code added to the map without being named
+there fails. A deadline is the shared `gateway.chat_run_timeout`, never a cancel.
+
+**The speech wait and the audio answer.** During the run the bubble is
+`AudioPendingTurn`, the image wait's twin over a shared `RunPendingTurn`: liveness from the
+run's own status, a server-measured elapsed clock and one sentence saying no intermediate
+news is coming, with no progress figure, since the endpoint reports none. The finished turn
+is `AudioTurn`: an HTML5 `<audio controls>` and a download button. The blob endpoint
+answers **no `Range` request** ([Security
+§13.1](security-auth-rbac.md#131-chat-binary-payloads-a-sealed-store-ownership-on-read-a-hardened-serving-url)),
+which Safari and iOS require to play from a URL, so `AudioTurn` does not give the
+element the stored `/api/portal/chat-blobs/` URL: it fetches it **once**, same-origin with the session cookie, and plays an object URL
+made from the bytes, and the effect's cleanup **revokes the object URL** when the turn
+unmounts or the URL changes (it pins the whole WAV in memory until then) and aborts a
+fetch still in flight. The run's own terminal event carries the part as produced, an inline
+`data:audio/wav` URL the element plays directly until the post-`done` refetch swaps in the
+stored one; any other URL shape is refused inline rather than fetched. The download goes
+through `downloadBinary` (a second fetch, on click), whose extension map is keyed on the
+whole media type so `audio/wav` saves as `.wav`; the file is named from the turn's id. The
+fetch guard `isFetchableUrl` is the same literal-prefix check the image download uses
+(`/api/portal/chat-blobs/`, on a URL read from a persisted transcript): it names no host
+and is a same-origin, cookie-carrying `GET` of the user's own content, but it does not
+normalise path segments, so tightening it to the exact blob-id shape is a deferred
+hardening rather than a defect.
+
 **The turn is committed as structured content.** `portal.AssistantTurn` carries
 an optional `ContentParts`, written as the message's `content` when it is
 non-empty and ignored otherwise, so a text turn's stored shape stays
@@ -2784,12 +2898,15 @@ plural by design because the billed quantity comes from the response rather
 than from the request's `n` (§3.4). That is the same shape an *uploaded* vision
 image already has (§11), so history construction feeds a generated image back
 as a vision input on the next turn with no extra code, and the transcript
-renderer already understood it.
+renderer already understood it. A speech turn's one part is an `audio_url` part,
+`{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,…"}}`, `image_url`'s
+twin, which no history construction ever feeds back as a vision input.
 
 **Images live outside the transcript ([ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)).**
 The `data:` parts above exist only until the commit: both an uploaded and a
-generated image are moved into the owner-scoped `chat_blobs` store
-(`extractChatBlobs`), and the part that is sealed into the chat document carries
+generated image, and a speech reply's WAV, are moved into the owner-scoped `chat_blobs`
+store (`extractChatBlobs`, which walks `image_url` and `audio_url` parts), and the part
+that is sealed into the chat document carries
 `/api/portal/chat-blobs/{id}` instead, so the document stays small and the
 4 MiB cap bounds the text only. The extraction runs at exactly the **two run
 commits** — `PrepareChatRun` (an upload, an `edited_history` image, an old
@@ -2800,9 +2917,12 @@ already stored). It happens **before** the cap check, so an old, nearly full
 inline thread can take its next turn, and the rewritten document and its new
 blobs are written in one store transaction (`SaveChatWithBlobs`), so a refused
 turn leaves nothing behind. It accepts only a standard-padded base64 `data:`
-URL of `image/png`, `image/jpeg`, `image/webp` or `image/gif`, within
+URL of `image/png`, `image/jpeg`, `image/webp` or `image/gif` in an `image_url` part, or
+of `audio/wav` in an `audio_url` part (each kind takes only its own media family, so
+audio cannot be filed as a picture nor the reverse), within
 `MaxChatBlobBytes` (else `400 images.blob_type_unsupported` /
-`images.blob_too_large`); a `/chat-blobs/` URL arriving in request-supplied
+`images.blob_too_large`, codes that keep their image wording); a `/chat-blobs/` URL
+arriving in request-supplied
 content must reference a blob **this chat holds** (`400 images.blob_not_owned`),
 verified only from the first message the request supplied (`verifyFrom`), so the
 images the chat itself stored are not re-verified on every turn and checkpoint.
@@ -2821,6 +2941,10 @@ returns (`resolveChatBlobRefs`) for every **non-image** run: all
 through **one** batched, **chat-scoped** `ChatBlobsByIDs` call, so a foreign id
 grafted into the transcript is simply absent and never resolves to another
 user's bytes, and a real remote provider receives real bytes exactly as before.
+Only **image** references are resolved: a speech thread takes this branch too (it
+carries no image of its own), but the walk reads image parts alone, so a stored WAV is
+never fetched, unsealed or counted against `MaxRunHistoryBytes`, and an `image_url`
+reference that names a non-image blob is treated as an image the chat does not hold.
 A reference with no stored bytes (a foreign or never-stored id) is replaced by a `[image unavailable]` text part: the model is told, the
 run continues, and the stored document is untouched. The bytes one run carries
 are bounded by `MaxRunHistoryBytes`, counted per occurrence; a run over it is

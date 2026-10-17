@@ -895,9 +895,9 @@ type AssistantTurn struct {
 	TokensPerSecond float64
 	// ContentParts is a structured message content (an array of OpenAI-style
 	// content parts) for a turn whose output is not text -- an image run's
-	// generated image_url part. When it is non-EMPTY it is written as the
-	// message's `content` and Content is ignored; otherwise Content is written
-	// as before, byte for byte.
+	// generated image_url parts or a speech run's audio_url part. When it is
+	// non-EMPTY it is written as the message's `content` and Content is ignored;
+	// otherwise Content is written as before, byte for byte.
 	//
 	// The guard is on LENGTH, not on nil: json.Marshal turns a nil RawMessage
 	// into `null` but FAILS outright on a non-nil zero-length one

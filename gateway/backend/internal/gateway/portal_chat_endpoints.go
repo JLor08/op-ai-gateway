@@ -112,7 +112,7 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 		// chat: SaveChat below writes the WHOLE document, so a save racing an
 		// active run would silently overwrite whatever the run has already
 		// committed (a checkpoint) or is about to commit (the terminal turn) --
-		// data loss whose window an image run stretches from seconds to
+		// data loss whose window an image or speech run stretches from seconds to
 		// minutes. Reuses the same sentinel the run-start endpoint returns for
 		// "already active" (ErrRunAlreadyActive), through THIS handler's own
 		// mapper (writePortalChatError) rather than reaching across to

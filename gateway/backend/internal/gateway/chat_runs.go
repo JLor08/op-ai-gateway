@@ -145,10 +145,10 @@ type runEvent struct {
 	ElapsedMs int64  `json:"elapsed_ms,omitempty"`
 	// ContentParts is the turn's STRUCTURED content, exactly as
 	// CommitAssistant stored it (portal.AssistantTurn.ContentParts) -- the
-	// image run's one and only output. Content above is the streamed TEXT
-	// buffer, and an image run never writes a byte into it, so without this
-	// field the terminal event of a successful image run carries no content at
-	// all: the client sets the bubble to "" and its own
+	// one and only output of an image or speech run. Content above is the
+	// streamed TEXT buffer, and such a run never writes a byte into it, so
+	// without this field the terminal event of a successful image or speech run
+	// carries no content at all: the client sets the bubble to "" and its own
 	// empty-tail prune then deletes the turn it just generated, leaving the
 	// post-`done` canonical refetch as the ONLY thing between the user and a
 	// blank thread. The event now carries what was stored, so the refetch is an
@@ -623,9 +623,10 @@ const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
 //
 // THE BOUND APPLIES TO TEXT RUNS TOO -- and text is in fact the EXPOSED kind
 // here, not the protected one. finishRunWithParts is the one terminal step
-// both kinds share, but only the text executor checkpoints: executeImageRun
-// makes a single buffered request and has no periodic write at all. So a
-// hung store write reaches a text run by two routes and an image run by one.
+// every kind shares, but only the text executor checkpoints: executeImageRun
+// and executeAudioRun each make a single buffered request and have no periodic
+// write at all. So a hung store write reaches a text run by two routes and an
+// image or speech run by one.
 // Either way, a commit or checkpoint that has not returned in 30 s is already
 // pathological -- a text turn is kilobytes -- so there is nothing legitimate
 // for the bound to cut short on either kind.
@@ -637,11 +638,11 @@ const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
 // or a LAN is well under a second even with fsync on a busy WAL -- so 30 s is
 // roughly two orders of magnitude of headroom over the legitimate worst case
 // and cannot plausibly fire for a write that is merely slow. In the other
-// direction it is 20x shorter than the image run's own 10-minute deadline
-// (imageRunDeadline) and equal to runEvictionDelay, the grace a terminal run
-// already spends in the registry -- so a wedged commit resolves inside a
-// window the product already asks a user to wait, rather than the unbounded
-// one that needs a restart.
+// direction it is 20x shorter than the image and speech runs' own 10-minute
+// deadlines (imageRunDeadline, speechRunDeadline) and equal to
+// runEvictionDelay, the grace a terminal run already spends in the registry --
+// so a wedged commit resolves inside a window the product already asks a user
+// to wait, rather than the unbounded one that needs a restart.
 //
 // A package-level var, not a const, for the same reason runCheckpointInterval
 // and imageRunDeadline are: the tests that prove a blocked store still reaches
@@ -1002,9 +1003,9 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 			// answered 200 the deadline lands here, as a read error on a
 			// cancelled request, rather than on the Do above.
 			//
-			// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image
-			// kind is bounded (runDeadlineFor) and an image run never enters
-			// consumeRunStream -- it has no stream to consume -- while the
+			// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image and
+			// speech kinds are bounded (runDeadlineFor) and neither ever enters
+			// consumeRunStream -- they have no stream to consume -- while the
 			// reservation's context is a plain WithCancel over
 			// context.Background(), so no deadline reaches a text run from
 			// the HTTP request either. Bounding the text kind, or adding a
@@ -1075,10 +1076,11 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 }
 
 // finishRunWithParts is finishRun for a run whose output is NOT the streamed
-// text buffer: an image run commits its generated image(s) as the turn's
-// structured content instead (portal.AssistantTurn.ContentParts, which is
-// written as the message's `content` when it is non-empty). parts is nil for
-// every text run and on every failing image run, which is byte-for-byte the
+// text buffer: an image run commits its generated image(s), and a speech run
+// its one audio part, as the turn's structured content instead
+// (portal.AssistantTurn.ContentParts, which is written as the message's
+// `content` when it is non-empty). parts is nil for every text run and on every
+// failing image or speech run, which is byte-for-byte the
 // behaviour finishRun had before this parameter existed.
 //
 // The parts also ride on the run's TERMINAL EVENT, but only once the commit
@@ -1087,17 +1089,18 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 // already handed, instead of depending on a refetch of the whole
 // (multi-megabyte) document to discover a turn the event told it nothing about.
 //
-// Keeping ONE commit function rather than a second one for images is what
-// keeps the retire/finish/log bookkeeping below single-sourced: a run's
-// terminal step is the same step whatever it produced.
+// Keeping ONE commit function rather than a second one for images (and for
+// speech) is what keeps the retire/finish/log bookkeeping below
+// single-sourced: a run's terminal step is the same step whatever it produced.
 func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string, parts json.RawMessage) {
 	// The commit must outlive the deadline that ended the run: this is called
 	// with the run's OWN ctx on every failing path (the two
 	// request-construction failures, the Do failure and the non-200 on the
-	// text path; all of them on the image path, which has a single terminal
-	// call site), so on a timeout the ctx is ALREADY expired and the commit
-	// below would be cancelled before it wrote -- losing the turn instead of
-	// recording why it ended. Same idiom as benchmark_vram_runner.go:236.
+	// text path; all of them on the image and speech paths, which each have a
+	// single terminal call site), so on a timeout the ctx is ALREADY expired
+	// and the commit below would be cancelled before it wrote -- losing the turn
+	// instead of recording why it ended. Same idiom as
+	// benchmark_vram_runner.go:236.
 	//
 	// It must not, however, be UNBOUNDED: everything that makes this run
 	// terminal (run.finish, retire) is below the commit, so a store write
