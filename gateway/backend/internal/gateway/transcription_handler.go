@@ -861,7 +861,7 @@ func (s *Server) relayTranscriptionUpstreamError(w http.ResponseWriter, r *http.
 		slog.Warn("inference native passthrough upstream error", "path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "status", resp.StatusCode)
 	}
 
-	written, sentContentType := upstreamBody, resp.Header.Get("Content-Type")
+	written, sentContentType := upstreamBody, resp.Header.Get(contentTypeHeader)
 	if body, ok := normalizeTranscriptionUpstreamError(upstreamBody, resp.StatusCode); ok {
 		written, sentContentType = body, jsonContentType
 	} else if sentContentType == "" {
@@ -869,7 +869,7 @@ func (s *Server) relayTranscriptionUpstreamError(w http.ResponseWriter, r *http.
 		// Content-Type, or JSON when it named none (the relay's default).
 		sentContentType = jsonContentType
 	}
-	w.Header().Set("Content-Type", sentContentType)
+	w.Header().Set(contentTypeHeader, sentContentType)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(written)
 
@@ -922,11 +922,11 @@ func (s *Server) relayTranscriptionResponse(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	contentType := resp.Header.Get("Content-Type")
+	contentType := resp.Header.Get(contentTypeHeader)
 	if contentType == "" {
 		contentType = jsonContentType
 	}
-	w.Header().Set("Content-Type", contentType)
+	w.Header().Set(contentTypeHeader, contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(resp.StatusCode)
 	written, writeErr := w.Write(body)
