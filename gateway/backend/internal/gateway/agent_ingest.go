@@ -241,6 +241,14 @@ type agentRuntimeCapabilitiesSample struct {
 // here only decides the provenance; what that provenance may say is decided
 // there, row by row.
 //
+// CapabilitySourceAudioCppModels is claimable on the same footing: the agent's
+// collector probe reads an agent-launched audio.cpp child's /v1/models listing,
+// whose per-model task answers two questions, whether the model synthesises
+// speech and whether it transcribes. The source may speak about those two rows
+// only (speech and transcription, each in both directions):
+// runtimeSampleCapabilityRows drops every other row it arrives with, and a
+// live-progress verdict with it.
+//
 // It lives in this package rather than in routing on purpose: routing owns
 // the store-side RANK, which is about how two sources compare; which sources
 // one PRODUCER may claim is a property of this ingest boundary, where the
@@ -256,6 +264,8 @@ func (c *agentRuntimeCapabilitiesSample) rowSource() (string, bool) {
 		return routing.CapabilitySourceOllamaAPIShow, true
 	case routing.CapabilitySourceSdcppCapabilities:
 		return routing.CapabilitySourceSdcppCapabilities, true
+	case routing.CapabilitySourceAudioCppModels:
+		return routing.CapabilitySourceAudioCppModels, true
 	default:
 		return "", false
 	}
@@ -1271,14 +1281,15 @@ var reservedAgentCapabilityNames = map[string]bool{
 // provenance is what was unrecognisable, and no part of it is more
 // attributable than the rest.
 //
-// THREE shapes are refused rather than stamped, and each is a refusal of a
+// FOUR shapes are refused rather than stamped, and each is a refusal of a
 // FALSE PROVENANCE that the source it names cannot carry, whatever the
 // sender intended -- see each refusal below for its own argument:
 //
-//  1. a live-progress verdict attributed to ollama_api_show or to
-//     sdcpp_capabilities, in either direction. Neither Ollama nor sd-server
-//     exposes a timings_per_token-style surface at all, so neither document
-//     is evidence for either answer.
+//  1. a live-progress verdict attributed to ollama_api_show, to
+//     sdcpp_capabilities or to audiocpp_models, in either direction. None of
+//     Ollama, sd-server and audio.cpp exposes a timings_per_token-style
+//     surface at all, so none of their documents is evidence for either
+//     answer.
 //  2. ANY capability's "no" verdict attributed to ollama_api_show.
 //     Ollama's capability array is not exhaustive, so the detector behind
 //     that source can only ever produce "yes" or nothing -- which is the
@@ -1289,11 +1300,20 @@ var reservedAgentCapabilityNames = map[string]bool{
 //     exactly one question -- whether its supported_modes list img_gen --
 //     so a row under that source for any other capability says something
 //     the document never said.
+//  4. ANY capability other than speech or transcription attributed to
+//     audiocpp_models, in either direction. audio.cpp's /v1/models listing
+//     states each model's one task, from which exactly two questions are
+//     answered -- does it synthesise speech, does it transcribe -- so a row
+//     under that source for any other capability says something the listing
+//     never said. Unlike rule 3 the allowlist has two names, and both are
+//     kept in both directions: a tts model is (speech, yes) with
+//     (transcription, no), an asr model the reverse.
 //
 // All are one-line rules for the same reason: an invariant a caller can
 // violate is not an invariant, and this is the boundary where the agent's
 // bytes arrive. None voids the pass -- what the same document CAN answer
 // (/api/show's "yes" verdicts, the sdcpp document's image verdict in either
+// direction, the audio listing's speech and transcription verdicts in either
 // direction) still rides it.
 //
 // A consequence worth stating, because it is a limit on what the tests here
@@ -1382,6 +1402,20 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 			// for the same reason as the ollama line above.
 			slog.Warn("runtime capability sample attributes a live-progress verdict to the sdcpp probe, dropping that row",
 				"spec_id", rt.SpecID, "verdict", verdict, "source", source)
+		case routing.CapabilitySourceAudioCppModels:
+			// REFUSED, for the two refusals above and just as independent of
+			// intent. audio.cpp exposes no timings surface at all, so its
+			// /v1/models listing is evidence for neither answer, and a
+			// live_progress row under that source is a false provenance
+			// whatever it says. The agent's audio probe leaves LiveProgress ""
+			// on every path, so no honest agent sends this; the boundary
+			// refuses it anyway because a caller can.
+			//
+			// Only the live-progress row goes; the speech and transcription
+			// verdicts below are what that listing answers, so they still ride
+			// the pass. Warn for the same reason as the lines above.
+			slog.Warn("runtime capability sample attributes a live-progress verdict to the audio.cpp probe, dropping that row",
+				"spec_id", rt.SpecID, "verdict", verdict, "source", source)
 		default:
 			rows = append(rows, routing.CapabilityRow{
 				Capability: routing.CapabilityLiveProgress, Verdict: verdict,
@@ -1391,7 +1425,7 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 	}
 	reported := rt.Capabilities.capabilityRows(source, at)
 	kept := make([]routing.CapabilityRow, 0, len(reported))
-	var dropped, deniedNo, notImage []string
+	var dropped, deniedNo, notImage, notAudio []string
 	for _, row := range reported {
 		switch {
 		case reservedAgentCapabilityNames[row.Capability]:
@@ -1440,6 +1474,25 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 			// supported_modes is exhaustive, so a list without img_gen is a
 			// real answer (routing.CapabilitySourceSdcppCapabilities).
 			notImage = append(notImage, row.Capability)
+		case source == routing.CapabilitySourceAudioCppModels &&
+			row.Capability != routing.CapabilitySpeech && row.Capability != routing.CapabilityTranscription:
+			// REFUSED, in either direction: the sdcpp refusal's argument
+			// applied to a listing that answers two questions rather than one.
+			// audio.cpp's /v1/models states each model's task, and the agent
+			// derives the speech verdict (does the task synthesise) and the
+			// transcription verdict (does it transcribe) from it. It says
+			// nothing about vision, tools or any other capability, so a row
+			// under this source for one of them could not have come from that
+			// listing -- a buggy or hostile agent's claim, stamped with a
+			// provenance that cannot produce it.
+			//
+			// Speech and transcription both stay writable in BOTH directions,
+			// unlike sdcpp's single image name: the listing names the model's
+			// task, so a model it lists with a task that does not serve a
+			// capability is a real "no" for that capability
+			// (routing.CapabilitySourceAudioCppModels), and an asr model is
+			// exactly (transcription, yes) with (speech, no).
+			notAudio = append(notAudio, row.Capability)
 		default:
 			kept = append(kept, row)
 		}
@@ -1465,6 +1518,12 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 		// agent build sends, and the absent rows read as plain "unknown".
 		slog.Warn("runtime capability sample attributes a non-image capability to the sdcpp probe, dropping those rows",
 			"spec_id", rt.SpecID, "source", source, "capabilities", notImage)
+	}
+	if len(notAudio) > 0 {
+		// Warn, same argument again: the drop repeats for every sample this
+		// agent build sends, and the absent rows read as plain "unknown".
+		slog.Warn("runtime capability sample attributes a capability other than speech or transcription to the audio.cpp probe, dropping those rows",
+			"spec_id", rt.SpecID, "source", source, "capabilities", notAudio)
 	}
 	return append(rows, kept...)
 }

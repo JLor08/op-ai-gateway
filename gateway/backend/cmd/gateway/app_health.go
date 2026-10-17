@@ -731,7 +731,11 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // there is no per-mapping kind to ask about and no runtime spec to read -- a
 // static server has none. (An agent-managed audio.cpp, a server_agent mapping
 // whose runtime spec is of kind audio_cpp, is NOT probed here: the agent
-// router's /v1/models carries no task, so it could state no verdict.)
+// router's /v1/models carries no task, so it could state no verdict. That gap
+// is closed agent-side, not here: the agent reads the child's own /v1/models
+// and reports the speech and transcription verdicts under the same
+// audiocpp_models source, which the gateway's agent ingest accepts, so this
+// loop deliberately leaves an agent-launched child alone.)
 //
 // The model id handed to the prober is the mapping's AppModelName, the name the
 // upstream is addressed by and so the id audio.cpp lists the model under. The
