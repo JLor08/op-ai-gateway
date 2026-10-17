@@ -1092,6 +1092,71 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText('transcription')).not.toBeInTheDocument();
     });
 
+    // POST /v1/audio/speech is gated on a `speech` verdict. The mirror of the
+    // transcription chip above: a `speech: yes` row used to fall into the
+    // open-vocabulary bucket and render as a raw lowercase `speech` standby
+    // chip next to a translated `transcription` one, so this pins both halves.
+    it('renders the speech capability with a translated label, not as a raw standby chip', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a' ? { ...r, capabilities: [capRow('speech', 'yes')] } : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilitySpeech)).toBeInTheDocument();
+      expect(within(cell).queryByText('speech')).not.toBeInTheDocument();
+      // A vetted verdict chip ("active"), not the neutral "standby" key the
+      // unrecognized-name bucket uses.
+      expect(within(cell).getByText(t.capabilitySpeech)).toHaveAttribute('data-status', 'active');
+    });
+
+    it('renders no speech chip for a `no` verdict or a missing row', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? { ...r, capabilities: [capRow('vision', 'yes'), capRow('speech', 'no')] }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      // `no` verdict: no translated chip and no raw fallback chip either.
+      const noCell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(noCell).queryByText(t.capabilitySpeech)).not.toBeInTheDocument();
+      expect(within(noCell).queryByText('speech')).not.toBeInTheDocument();
+      // Missing row (GPU-Box-B carries no capability rows at all).
+      const missingCell = cellForColumn('GPU-Box-B', t.modelServerColCapabilities);
+      expect(within(missingCell).queryByText(t.capabilitySpeech)).not.toBeInTheDocument();
+      expect(within(missingCell).queryByText('speech')).not.toBeInTheDocument();
+    });
+
+    // The two audio endpoint traits stay distinct from the `audio` input
+    // modality: a model with `speech` and `transcription` but no `audio` row
+    // shows its own two chips and never an "Audio" one.
+    it('keeps the speech and transcription chips distinct from the audio input modality', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? { ...r, capabilities: [capRow('speech', 'yes'), capRow('transcription', 'yes')] }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilitySpeech)).toBeInTheDocument();
+      expect(within(cell).getByText(t.capabilityTranscription)).toBeInTheDocument();
+      expect(within(cell).queryByText(t.capabilityAudio)).not.toBeInTheDocument();
+    });
+
     // image_edit is DERIVED by the gateway from the image verdict, so the only
     // row it ever carries that matters is the operator's opt-out (`no`). That
     // opt-out is a NEGATIVE, which this column otherwise renders as no chip --

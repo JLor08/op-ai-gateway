@@ -679,7 +679,7 @@ const de = {
   mappingProbeContextImagesOnly:
     'Nicht verfügbar: Dieses Modell erzeugt nur Bilder (seine API-Varianten nennen openai_images, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein Bildmodell nicht beantwortet.',
   mappingProbeContextAudioOnly:
-    'Nicht verfügbar: Dieses Modell erzeugt nur Sprache (seine API-Varianten nennen openai_audio, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein Sprachsynthese-Modell nicht beantwortet.',
+    'Nicht verfügbar: Dieses Modell stellt nur Audio bereit (seine API-Varianten nennen openai_audio, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein reines Audio-Modell nicht beantwortet.',
   runtimeAdmin: 'Agent-gesteuerte Runtime',
   runtimeSpecs: 'Runtime-Spezifikationen',
   runtimeSpecEdit: 'Runtime-Spezifikation bearbeiten',
@@ -1216,7 +1216,7 @@ const de = {
   benchmarkImagesOnlyHint:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Bildmodell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkAudioOnlyHint:
-    'Dieses Modell erzeugt nur Sprache: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Sprachsynthese-Modell nicht beantwortet, und sind deshalb gesperrt.',
+    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
   benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Audio, kein Chat-Prompt gesendet',
   benchmarkResultLoadTimeNotMeasured: 'Ladezeit nicht gemessen',
@@ -1351,6 +1351,7 @@ const de = {
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
   capabilityTranscription: 'Transkription',
+  capabilitySpeech: 'Sprachsynthese',
   // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
   // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
   // hat deshalb nur in dieser einen Richtung etwas anzuzeigen. Siehe
@@ -1485,9 +1486,9 @@ const de = {
   errorBenchmarkImagesOnly:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Bildmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.',
   errorBenchmarkAudioOnly:
-    'Dieses Modell erzeugt nur Sprache: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Sprachsynthese-Modell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Sprache erzeugt.',
+    'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Audio bereitstellt.',
   errorBenchmarkAgentEnsureUnsupported:
-    'Dieses Modell erzeugt nur Bilder oder nur Sprache und lässt sich deshalb nur laden, indem der Agent es ohne Chat-Prompt startet. Das kann erst ein Agent mit der Fähigkeit runtime_ensure (Agent 0.8.0 oder neuer). Der Agent dieses Servers meldet sie nicht: Er ist älter, oder er hat sich seit dem Neustart des Gateways noch nicht gemeldet. Aktualisieren Sie den Agenten, oder versuchen Sie es erneut, sobald er sich gemeldet hat.',
+    'Dieses Modell erzeugt nur Bilder oder stellt nur Audio bereit und lässt sich deshalb nur laden, indem der Agent es ohne Chat-Prompt startet. Das kann erst ein Agent mit der Fähigkeit runtime_ensure (Agent 0.8.0 oder neuer). Der Agent dieses Servers meldet sie nicht: Er ist älter, oder er hat sich seit dem Neustart des Gateways noch nicht gemeldet. Aktualisieren Sie den Agenten, oder versuchen Sie es erneut, sobald er sich gemeldet hat.',
   errorBenchmarkSpecForceStopped:
     'Die Startkonfiguration dieses Modells hat die Admin-Übersteuerung „Stopp erzwingen“ (force_stopped), und Laden hebt keine Übersteuerung auf. Heben Sie sie zuerst auf („Übersteuerung aufheben“ im Reiter „Live-Status“ der Anwendung) und laden Sie das Modell dann erneut.',
   // The VRAM benchmark's own refusals (benchmark.vram_*). Each names a
@@ -3676,7 +3677,7 @@ const en: PortalMessages = {
   mappingProbeContextImagesOnly:
     'Not available: this model only generates images (its API flavors name openai_images but neither openai nor anthropic). The context size is determined with a chat prompt, which an image model does not answer.',
   mappingProbeContextAudioOnly:
-    'Not available: this model only generates speech (its API flavors name openai_audio but neither openai nor anthropic). The context size is determined with a chat prompt, which a speech synthesis model does not answer.',
+    'Not available: this model only serves audio (its API flavors name openai_audio but neither openai nor anthropic). The context size is determined with a chat prompt, which an audio-only model does not answer.',
   runtimeAdmin: 'Agent-managed runtime',
   runtimeSpecs: 'Runtime specs',
   runtimeSpecEdit: 'Edit runtime spec',
@@ -4180,7 +4181,7 @@ const en: PortalMessages = {
   benchmarkImagesOnlyHint:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an image model does not answer, so they are disabled.',
   benchmarkAudioOnlyHint:
-    'This model only generates speech: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which a speech synthesis model does not answer, so they are disabled.',
+    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an audio-only model does not answer, so they are disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
   benchmarkResultSkippedAudioOnly: 'skipped — generates audio only, no chat prompt sent',
   benchmarkResultLoadTimeNotMeasured: 'load time not measured',
@@ -4293,6 +4294,7 @@ const en: PortalMessages = {
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
   capabilityTranscription: 'Transcription',
+  capabilitySpeech: 'Speech synthesis',
   // The chip for the operator's EXCEPTION (image editing = No), not for a
   // capability: image editing is derived from image generation, so it has
   // something to show in this one direction only. See capabilityChips in
@@ -4410,9 +4412,9 @@ const en: PortalMessages = {
   errorBenchmarkImagesOnly:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an image model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates images.',
   errorBenchmarkAudioOnly:
-    'This model only generates speech: its API flavors name openai_audio but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which a speech synthesis model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates speech.',
+    'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an audio-only model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only serves audio.',
   errorBenchmarkAgentEnsureUnsupported:
-    "This model only generates images, or only speech, so it can only be loaded by the agent starting it without a chat prompt. Only an agent with the runtime_ensure capability can do that (agent 0.8.0 or newer). This server's agent does not report it: it is older, or the agent has not reported since the gateway restarted. Update the agent, or try again once it has reported.",
+    "This model only generates images, or only serves audio, so it can only be loaded by the agent starting it without a chat prompt. Only an agent with the runtime_ensure capability can do that (agent 0.8.0 or newer). This server's agent does not report it: it is older, or the agent has not reported since the gateway restarted. Update the agent, or try again once it has reported.",
   errorBenchmarkSpecForceStopped:
     'This model\'s launch spec has the admin override "Force stop" (force_stopped), and a Load never lifts an override. Clear it first ("Clear override" on the application\'s "Live status" tab), then load the model again.',
   // The VRAM benchmark's own refusals (benchmark.vram_*). Each names a

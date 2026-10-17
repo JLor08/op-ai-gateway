@@ -178,11 +178,12 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   { capability: 'audio', label: (t) => t.capabilityAudio },
   { capability: 'tools', label: (t) => t.capabilityTools },
   { capability: 'image', label: (t) => t.capabilityImage },
-  // "transcription" gates POST /v1/audio/transcriptions. Like image it is a
-  // declared/probed trait of the endpoint, so it sits with the declared
-  // capabilities, ahead of the observed "speculation_observed" below. "speech"
-  // (text-to-speech) deliberately has no chip of its own here and renders as a
-  // raw standby chip from the open-vocabulary bucket.
+  // "speech" gates POST /v1/audio/speech and "transcription" gates POST
+  // /v1/audio/transcriptions. Like image, both are declared/probed traits of the
+  // endpoint, so they sit with the declared capabilities, ahead of the observed
+  // "speculation_observed" below. Both are distinct from "audio" above, which is
+  // an input modality (a chat model that accepts audio), not an audio endpoint.
+  { capability: 'speech', label: (t) => t.capabilitySpeech },
   { capability: 'transcription', label: (t) => t.capabilityTranscription },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },
 ];
