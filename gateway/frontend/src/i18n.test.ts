@@ -1004,7 +1004,7 @@ describe('images-only and Load-refusal i18n keys', () => {
       expect(t[key]).toContain('openai_images');
     });
 
-    // The speech twins name the same field and the one flavor their rule looks
+    // The audio twins name the same field and the one flavor their rule looks
     // for, openai_audio.
     it.each([
       'errorBenchmarkAudioOnly',
@@ -1013,15 +1013,29 @@ describe('images-only and Load-refusal i18n keys', () => {
     ] as const)(`names the API flavors field and openai_audio in %s (${locale})`, (key) => {
       expect(t[key]).toContain(t.applicationFlavors);
       expect(t[key]).toContain('openai_audio');
-      // It is the speech sentence, not the images one reworded.
+      // It is the audio sentence, not the images one reworded.
       expect(t[key]).not.toContain('openai_images');
+    });
+
+    // An audio-only server is any model whose flavors name openai_audio without
+    // a chat flavor: text-to-speech AND transcription-only (asr) models. The
+    // sentences must not narrow that to speech, which would mislabel an asr
+    // model as one that "generates speech".
+    it.each([
+      'errorBenchmarkAudioOnly',
+      'benchmarkAudioOnlyHint',
+      'mappingProbeContextAudioOnly',
+      'errorBenchmarkAgentEnsureUnsupported',
+    ] as const)(`says audio, not speech, in %s (${locale})`, (key) => {
+      expect(t[key].toLowerCase()).toContain('audio');
+      expect(t[key].toLowerCase()).not.toContain(locale === 'de' ? 'sprache' : 'speech');
     });
 
     it(`names the whole-scope case in the audio-only refusal (${locale})`, () => {
       const sentence =
         locale === 'de'
-          ? 'Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Sprache erzeugt.'
-          : 'An application or server run is refused this way when every model in it only generates speech.';
+          ? 'Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Audio bereitstellt.'
+          : 'An application or server run is refused this way when every model in it only serves audio.';
       expect(t.errorBenchmarkAudioOnly.endsWith(` ${sentence}`), t.errorBenchmarkAudioOnly).toBe(
         true,
       );
@@ -1038,9 +1052,7 @@ describe('images-only and Load-refusal i18n keys', () => {
       expect(t.errorBenchmarkAgentEnsureUnsupported).toContain(
         locale === 'de' ? 'Bilder' : 'images',
       );
-      expect(t.errorBenchmarkAgentEnsureUnsupported).toContain(
-        locale === 'de' ? 'Sprache' : 'speech',
-      );
+      expect(t.errorBenchmarkAgentEnsureUnsupported).toContain(locale === 'de' ? 'Audio' : 'audio');
     });
 
     // The gateway keeps the agents' features in memory, so right after a
@@ -3237,6 +3249,19 @@ describe('transcription capability i18n key', () => {
   it('labels the transcription chip in de and en', () => {
     expect(messages.de.capabilityTranscription).toBe('Transkription');
     expect(messages.en.capabilityTranscription).toBe('Transcription');
+  });
+});
+
+describe('speech capability i18n key', () => {
+  it('labels the speech chip in de and en', () => {
+    expect(messages.de.capabilitySpeech).toBe('Sprachsynthese');
+    expect(messages.en.capabilitySpeech).toBe('Speech synthesis');
+  });
+
+  // "speech" is the text-to-speech endpoint, "audio" the input modality.
+  it('keeps the speech chip label distinct from the audio modality label', () => {
+    expect(messages.de.capabilitySpeech).not.toBe(messages.de.capabilityAudio);
+    expect(messages.en.capabilitySpeech).not.toBe(messages.en.capabilityAudio);
   });
 });
 
