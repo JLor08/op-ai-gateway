@@ -15,12 +15,14 @@ import (
 	"testing"
 )
 
-// The tests below cover the router's multipart branch: POST /v1/images/edits
-// reaches the agent as a multipart/form-data body, and the router must find the
-// model to start in the form instead of in a JSON document.
+// The tests below cover the router's multipart branch: POST /v1/images/edits and
+// POST /v1/audio/transcriptions reach the agent as a multipart/form-data body, and
+// the router must find the model to start in the form instead of in a JSON
+// document. The router does not look at the path, so one branch serves both.
 //
-// The model it finds MUST be the one the gateway's own parser finds
-// (gateway/backend/internal/gateway/images_edit_handler.go, parseImageEditForm):
+// The model it finds MUST be the one the gateway's own parsers find
+// (gateway/backend/internal/gateway/images_edit_handler.go, parseImageEditForm, and
+// transcription_handler.go, parseTranscriptionForm):
 // mime/multipart.NewReader over the buffered body and a part whose FormName() is
 // "model". The gateway decides routing and the operator's allowlist on its
 // answer, and the agent starts a process on its own; two answers to "which
@@ -28,8 +30,9 @@ import (
 // differential-parse cases -- bodies on which a hand-rolled scanner and
 // mime/multipart disagree.
 
-// editChild is a stand-in for an image-edit child: it records what the router
-// forwarded to it and answers a b64_json document.
+// editChild is a stand-in for a multipart child (an image edit's, and through
+// newRecordingChild a transcription's): it records what the router forwarded to it
+// and answers a document of the caller's choosing (by default a b64_json one).
 type editChild struct {
 	srv         *httptest.Server
 	mu          sync.Mutex

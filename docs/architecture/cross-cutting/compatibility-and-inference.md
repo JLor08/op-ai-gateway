@@ -54,6 +54,8 @@ flowchart TD
         CT["POST /v1/messages/count_tokens"]
         Img["POST /v1/images/generations\n/openai/v1/images/generations"]
         ImgEdit["POST /v1/images/edits (multipart)\n/openai/v1/images/edits"]
+        Speech["POST /v1/audio/speech\n/openai/v1/audio/speech"]
+        Transcribe["POST /v1/audio/transcriptions (multipart)\n/openai/v1/audio/transcriptions"]
     end
 
     Chat --> ParseChat["compat.ParseOpenAIChatCompletions"]
@@ -66,6 +68,12 @@ flowchart TD
     ImgEdit --> CapGateE{"Resolve with\nRequiredCapabilities=[image_edit]"}
     CapGateE -->|refused| Reject4["404 routing.model_not_capable /\nimages.edit_unavailable"]
     CapGateE -->|target| Native4["relayImageEdit -> proxyNative:\nmultipart body verbatim (or rebuilt once)\nto upstream /v1/images/edits"]
+    Speech --> CapGateS{"Resolve with\nRequiredCapabilities=[speech]"}
+    CapGateS -->|refused| Reject5["404 routing.model_not_capable"]
+    CapGateS -->|target| Native5["relaySpeech -> proxyNative:\nJSON body to upstream /v1/audio/speech,\nbinary audio/wav streamed back"]
+    Transcribe --> CapGateT{"Resolve with\nRequiredCapabilities=[transcription]"}
+    CapGateT -->|refused| Reject6["404 routing.model_not_capable /\ntranscription.unavailable"]
+    CapGateT -->|target| Native6["relayTranscription -> proxyNative:\nmultipart body verbatim (or rebuilt once)\nto upstream /v1/audio/transcriptions,\nJSON response buffered, metered, written"]
 
     NativeGate -->|passthrough| Native["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/responses"]
     NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
@@ -84,6 +92,8 @@ flowchart TD
     Native2 --> ProxyMux
     Native3 --> ProxyMux
     Native4 --> ProxyMux
+    Native5 --> ProxyMux
+    Native6 --> ProxyMux
 
     Mux --> Ollama["OllamaClient\n/api/chat"]
     Mux --> OAIC["OpenAICompatibleClient\n{prefix}/chat/completions (default /v1)"]
@@ -129,6 +139,7 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | OpenAI Images generations | `/v1/images/generations`, `/openai/v1/images/generations` | `handleOpenAIImages` | `requireInternalOrBearerAnyScope` (bearer or internal loopback — never a session cookie) | **always** — there is no translate path (§3.4) |
 | OpenAI Images edits (multipart) | `/v1/images/edits`, `/openai/v1/images/edits` | `handleOpenAIImagesEdit` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a multipart relay, no translate path (§3.5) |
 | OpenAI audio speech | `/v1/audio/speech`, `/openai/v1/audio/speech` | `handleOpenAISpeech` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a binary-response relay, no translate path (§3.6) |
+| OpenAI audio transcriptions (multipart) | `/v1/audio/transcriptions`, `/openai/v1/audio/transcriptions` | `handleOpenAITranscription` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a multipart-in, JSON-out relay, no translate path (§3.7) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
@@ -138,10 +149,11 @@ extractor (§4) discriminates them by `sessionEndpoint`
 service token's sole `llm:invoke` scope (service accounts); `requireWebAnyScope`
 additionally accepts the portal session cookie (+ CSRF header on state-changing
 methods) — `/v1/chat/completions` is deliberately the one inference endpoint
-reachable that way (§9). Every body but the edits one is read with
-`readRawJSONUnlimited` (§7); the edits body is `multipart/form-data` and is read
-by its own capped reader (§3.5, §10). All seven POST endpoints call
-`liftInferenceDeadlines` before reading the body (§6).
+reachable that way (§9). Every body but the two multipart ones (the image edits
+and the audio transcriptions) is read with `readRawJSONUnlimited` (§7); those two
+bodies are `multipart/form-data` and each is read by its own capped reader (§3.5,
+§3.7, §10). All eight POST endpoints call `liftInferenceDeadlines` before reading
+the body (§6).
 
 ### 3.1 OpenAI Chat Completions
 
@@ -776,6 +788,187 @@ audio.cpp and llama-swap convention, not an OpenAI endpoint, and the gateway pro
 OpenAI surface. A client learns the voice names its model accepts out of band and sends
 one as `voice`; the gateway passes it through unexamined.
 
+### 3.7 OpenAI audio transcriptions
+
+`POST /v1/audio/transcriptions` (`handleOpenAITranscription`,
+`internal/gateway/transcription_handler.go`) relays a multipart audio upload to a
+natively OpenAI-shaped speech-to-text backend: the same audio.cpp `audiocpp_server`,
+registered as the same `audio_cpp` application type, and under the same `openai_audio`
+flavor, as §3.6. It is **speech's twin on the gate and the image edit's twin on the
+request**, and it keeps all of §3.4's structure: **no translate path**, two gates (the
+application's coarse `openai_audio` flavor, §6, and the model's `transcription`
+capability, `RequiredCapabilities = ["transcription"]`, [Routing & Model Selection
+§2.3](routing-and-model-selection.md#23-the-capability-gate)), a handler that
+validates its own shape and never calls `inference.Request.Validate()`, `upstreamPath`
+answering `/v1/audio/transcriptions` directly, an empty `sessionEndpoint` case (OpenAI's
+transcription request has no session field, and its body is multipart), and **no
+affinity pin**. What follows is what transcription decides differently
+([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
+
+**1. The flavor is speech's, so every difference is keyed on the endpoint.** Both
+endpoints carry the `openai_audio` flavor string, which therefore cannot say which of
+them a request is. The upstream path (answered **before** speech's flavor branch), the
+source of the billing quantity, the upstream-error relay and the capture predicate are
+keyed on `endpoint == endpointTranscription`, and the speech-side guards
+(`setSpeechBillingQuantity`, `needsSpeechErrorRelay`, `isBinarySpeechResponse`) each
+skip a transcription **and nothing else**, so a speech call site built without an
+endpoint is still speech. The flavor-keyed behavior that remains, the `audio_second`
+unit and the nil usage scanner, is right for both. A transcription never reaches the
+speech-shaped streaming copier or its speech-only `Content-Length` forwarding.
+
+**2. The request is `multipart/form-data`, read once and bounded.** The handler checks
+the method, authenticates a bearer token **or** the internal loopback pair (never the
+session cookie, a fourth user of that leg, [Security
+§1](security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)), lifts the
+connection deadlines, and reads the whole body with `readTranscriptionBody`, capped by
+`OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES` (default 32 MiB, §10; `413
+request.body_too_large`, from a declared `Content-Length` without a read or from
+`http.MaxBytesReader` when none was declared). `parseTranscriptionForm` then walks it
+**once** with `mime/multipart` and the request's own boundary, never `ParseMultipartForm`
+(which spills to temp files and consumes a body the relay still needs), reading `model`,
+`language`, `prompt`, `response_format`, `stream` and `stream_format` (each a single
+value of at most 1 MiB; a **repeated** one is 400 `transcription.invalid`), counting the
+`file` parts, and reading **every** part to its end, so a truncated tail fails here and
+not after admission. A body that is not multipart, has no boundary or is malformed is
+400 `transcription.invalid`; **a JSON body is refused the same way**, although audio.cpp
+would take one, because OpenAI's contract is multipart. The **model is read exactly as
+the agent router reads it** (`peekMultipartModel`): a single-use part whose form-data
+name is `model`, with the whole body walked, because the gateway allowlists the name it
+read and the router then starts a process on the name it read, and a parity test holds
+this parser to the image edit's. All of it runs **before** the run-as block and the
+preflight that makes the one admission call, so a refused request spends no admission
+and is not recorded.
+
+**3. Exactly one non-empty `file`, and only `file`.** `validateTranscriptionRequest`
+requires a non-empty `model` (`transcription.model_required`) and **exactly one
+non-empty part named `file`**: none is `transcription.file_required`, and more than one
+is `transcription.invalid`, since a form with two audio files is two answers to "which
+audio". audio.cpp reads the upload from `file` alone, so the image edit's `image[]`
+spelling has no twin here and a `file[]`-only form has no file. An **empty** `file` part
+is not a file (it does not count, and one beside the real upload is accepted), but it is
+stripped before the relay (item 6). Every other field (`temperature`,
+`timestamp_granularities[]`, and `language` and `prompt`, which are read but not
+checked) reaches the upstream unexamined.
+
+**4. `response_format` accepts only `json` or an absent value; everything else is 400
+`transcription.response_format_unsupported`.**
+
+| `response_format` sent | The gateway | Why |
+|---|---|---|
+| absent, empty or `json` | relays | the one shape audio.cpp produces, `{"text", "timing"}` |
+| `verbose_json` | 400 | audio.cpp ignores the field and answers the same plain document, with none of the `segments` or `language` the format promises |
+| `text`, `srt`, `vtt` | 400 | audio.cpp ignores the field and answers JSON, so the client would be handed JSON where it asked for text, and a non-JSON answer would carry no duration to bill from |
+| any other value | 400 | no transcription format at all |
+
+The match is exact after trimming whitespace, and case-sensitive as OpenAI's is. **The
+compatibility cost is stated rather than discovered.** OpenAI's default is `json`, so a
+client that sends nothing is served, but one that needs timestamps, a language, plain
+text or subtitles is refused, and the 400 is the only answer that is neither wrong nor
+silent. Lifting it later means a real `verbose_json` shape, or honoring `text`, `srt` and
+`vtt`, which is a translation this project does not do.
+
+**5. Streaming is refused: `stream` on, a non-boolean `stream` and any `stream_format`
+are 400 `transcription.stream_unsupported`.** The relay's buffering and billing contract
+is one complete JSON response, and the router's multipart branch is a plain relay with
+no heartbeat. `stream: false` and an absent or empty `stream` and `stream_format`
+describe what the endpoint already does and are accepted.
+
+**6. The upload is relayed verbatim only when nothing in it must change.** The relay
+sends the **client's bytes and its own `Content-Type`**, boundary included, unless the
+form needs one of two changes, in which case it is **rebuilt once**
+(`rebuildTranscriptionBody`: every other part copied with its headers, bytes and
+position, a fresh boundary). The first is the **`model` value**: when the mapping's own
+name for the model (`Target.ProviderModel`) differs from the form's, for **every** target,
+because an agent's router keys the child on that name and an external upstream is handed
+it as the JSON relay hands it; the comparison is against the form's value, since a token
+override or a redirect can land on a mapping whose two names are equal. The second is
+**an empty `file` part**, which is **dropped**: validation ignores it, but audio.cpp
+reads the upload from `file` and, handed two parts of that name, could take the empty
+one. So a form with any empty `file` part is rebuilt even when its model needs no
+rewrite, and this relay is **not purely verbatim**. `nativeRelay.raw` stays the client's
+bytes, which is what capture records, and the usage row's `provider_path` is
+`/v1/audio/transcriptions`. For a `server_agent` target only, the relay checks that its
+agent has **declared `multipart_proxy`**, the image edit's check on the same feature
+([Agent-Managed Model Runtime
+§7](agent-runtime-manager.md#7-feature-negotiation)): without it the agent's router would
+answer the multipart body 404 `runtime.model_not_managed`, the answer it gives an
+unmanaged model. A target that fails it is refused **before anything is relayed** with
+**404 `transcription.unavailable`**, recorded as one error row billed as `audio_second`
+and with no upstream; the check is fail-closed (also false for an agent that has not
+reported since the gateway restarted), its message names both causes, it does not apply
+to an external target, and, like the served-flavor conjunct (`resolveTranscriptionTarget`,
+speech's `resolveSpeechTarget` twin), it is **not retried against another application**.
+The body finally handed to an agent-launched target is checked against **the agent's own
+32 MiB** *after* the rebuild (§10), and one over it is `413 request.body_too_large`,
+recorded, not sent. **No agent change was needed**: the router reads the model from the
+form whatever the path and relays the response untouched, so the agent version did not
+move.
+
+**7. The response is buffered, metered from its body and written verbatim.** audio.cpp
+answers `application/json`: `{"text": "...", "timing": {"wall_ms": ..., "audio_duration_ms":
+..., "rtf": ...}}`. The `timing` block comes **after** the text, so the billable duration
+is unknown until the body has been read to its end, and the gateway must not have sent a
+byte by then, or an unreadable or oversized body could not become an error. This is the
+one success in `proxyNative` that cannot stream. `relayTranscriptionResponse` reads
+the whole body up to the transcription body cap, through a `LimitReader` of `limit + 1`
+so that exceeding the cap is **detected, not clipped**, then writes it **verbatim**: the
+upstream's status and `Content-Type`, an exact `Content-Length`, and the `timing`
+extension **kept** (the gateway proxies a natively shaped backend and does not
+translate; OpenAI clients ignore unknown fields). A response **over the cap**, or one
+that **breaks off mid-read**, is **HTTP 502 `transcription.upstream_error`** (an OpenAI
+error object of `type: upstream_error`, the gateway's own, since there is no upstream
+status worth relaying): **nothing of the body is written**, and the row is an error
+row with quantity `0`. The bound is the body cap and **not** `captureMaxBytes`, which
+is for error bodies and would hand the client a truncated success. 32 MiB is orders of
+magnitude above a real transcript (a 32 MiB upload transcribes to a few MB of text at
+most), and the memory held per in-flight request is bounded by it. Because `Stream` is
+never set there is no idle watchdog and no usage scanner: the application's
+`timeout_ms` is the one **total** deadline (§7), `audio_cpp` defaults it to 600000 ms,
+an application of any other type that serves transcription has the stock 30000 and
+needs it raised by hand (§7.1), and the first call after a model load pays a warm-up of
+several seconds inside it.
+
+**8. A non-2xx upstream response is normalised, as speech's is.**
+`relayTranscriptionUpstreamError` (behind `needsTranscriptionErrorRelay`: the
+transcription endpoint and a non-2xx status) reads the error body, bounded by
+`captureMaxBytes`, and `normalizeTranscriptionUpstreamError` treats it in speech's
+order. A body that is **already an OpenAI error object** (an `error.message` identifies
+one) passes through byte for byte, because audio.cpp answers `{"error":{"message":...,
+"type":"server_error"}}` and re-normalising it would overwrite the upstream's attested
+type. A **plain-string** `{"error":"..."}` is wrapped into an OpenAI object whose message
+is that string, with `type: "upstream_error"` and `code: "transcription.upstream_error"`,
+the gateway's own. Anything else (HTML from an intermediary, an empty body) is relayed
+unchanged under its own `Content-Type`. The upstream's **HTTP status is relayed as it
+came**. audio.cpp answers **500 for a client error** (a missing file, an unknown model),
+which is why items 2, 3 and 4 validate up front instead of handing a client's own mistake
+back as a server failure. A refused or failed request is one `error`-status usage row
+billed as `audio_second` with quantity `0`.
+
+**9. A transcription bills in seconds read from the response body, and its capture holds
+the form and the transcript.** The usage row carries `billing_unit = audio_second` and a
+quantity of `timing.audio_duration_ms / 1000`, **from the body and not from a header**
+as speech's is, because audio.cpp sends no `X-AudioCPP-*` header on this endpoint
+([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event)). A payload
+capture stores the multipart **request** as a JSON summary, the text fields kept and the
+`file` part redacted, and stores the **response** transcript as an ordinary text body:
+the transcript is the user's spoken content, **output-sensitive**, captured like any
+response under the opt-in and clipped, like any, at the capture cap
+([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+
+**10. Resolving a transcription writes the token's last-used-model marker, but the
+redirect never takes a transcription candidate.** `relayTranscription` resolves through
+`resolveTarget`, so a transcription model becomes the marker a later request's
+unknown-model redirect tries first, and a later **chat** request is not redirected onto
+it (an audio-only model is not in the `openai` offering's `Callable`, the rule §3.6
+gives). The redirect for a **transcription** request, however, asks the `openai_audio`
+offering together with the required capability, and `transcription` has **no portal
+fold** (`hasCapabilityFold`): `ModelOffering.Capable` is empty, so no `LastUsedModel` or
+fallback is ever taken for it and an unknown model name stays an unknown-model refusal.
+That fails closed, and nothing is lost by it that the gate would not refuse anyway; it
+is recorded in [Risks
+§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances) together with
+the absence of a listing flag.
+
 ## 4. Session / continuity signals
 
 `extractClientSession` (`internal/gateway/session_extract.go`) derives a
@@ -923,6 +1116,13 @@ endpoint that *produces* it. Every speech upstream is given the flavor explicitl
 the `audio_cpp` application type's default or by the flavor checkbox, and a model that
 has it and no `(speech, yes)` verdict answers 404 `routing.model_not_capable`
 ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+**Transcription shares that flavor** rather than taking one of its own
+(`POST /v1/audio/transcriptions`, §3.7): an application that lists `openai_audio` is a
+candidate for both audio endpoints, and what tells the two apart is the **endpoint**, not
+the flavor string, which is why `upstreamPath` takes the endpoint as a parameter for this
+flavor as it does for `openai_images`. The model decides which endpoint it serves, by its
+`speech` or `transcription` verdict
+([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 
 So an endpoint can be off two independent ways: the coarse `openai`/`anthropic`
 flavor is unchecked, or the flavor stays checked and the mode is set to
@@ -967,13 +1167,15 @@ only resolves per-model, after a candidate has already been picked:
    reaches the translate path. That holds only for the target it judged; what
    reaches the translate path unjudged is set out below.
 
-**The images and speech relays apply the same flavor conjunct.** `relayImages`,
-`relayImageEdit` and `relaySpeech` (`internal/gateway/images_handler.go`,
-`images_edit_handler.go`, `speech_handler.go`) call `proxyNative` directly rather
+**The images, speech and transcription relays apply the same flavor conjunct.**
+`relayImages`, `relayImageEdit`, `relaySpeech` and `relayTranscription`
+(`internal/gateway/images_handler.go`, `images_edit_handler.go`,
+`speech_handler.go`, `transcription_handler.go`) call `proxyNative` directly rather
 than through `tryProxyNative`, so they run `targetServesFlavor` themselves after
 resolution — in `resolveImagesTarget`, the one shared step the two image relays
-share, and in its twin `resolveSpeechTarget`: an agent-launched child whose spec
-excludes `openai_images` (or, for speech, `openai_audio`) is
+share, and in its twins `resolveSpeechTarget` and `resolveTranscriptionTarget`: an
+agent-launched child whose spec excludes `openai_images` (or, for speech and
+transcription, `openai_audio`) is
 refused with 404 `routing.no_model_route`, the answer candidacy would have
 given had it been the model's only route. The usage row records no upstream,
 since none was called. **The refusal is not retried against another
@@ -1154,7 +1356,7 @@ watchdog timer is reset on every event the provider emits, so an arbitrarily
 long but continuously-producing stream never times out. `http.ResponseController`
 (`SetReadDeadline`/`SetWriteDeadline`) is used for two distinct purposes:
 `liftInferenceDeadlines` clears the connection's default 30s read/write
-deadline entirely for all seven POST inference endpoints at request start (a
+deadline entirely for all eight POST inference endpoints at request start (a
 large multimodal upload can take longer than 30s to arrive), and the streaming
 handlers then re-arm just the write deadline to `now + idle` before every SSE
 write — so a stalled real socket (as opposed to an idle *upstream*) is still
@@ -1174,7 +1376,10 @@ request can legitimately occupy that whole budget without emitting anything,
 the application's `timeout_ms` is the only thing standing between a working
 long generation and a cancelled one — see §3.4. `/v1/audio/speech` is on that side
 too: it never sets `Stream` (a stream request is refused up front), so a long
-synthesis is bounded by the application's `timeout_ms` alone (§3.6).
+synthesis is bounded by the application's `timeout_ms` alone (§3.6). So is
+`/v1/audio/transcriptions`, whose `timeout_ms` also covers the buffered read of the
+response body and the first call after a model load, which pays the model's warm-up
+(§3.7).
 
 The control plane (every `/api/portal/*`, `/api/admin/*`, `/api/system/*`
 handler) keeps the server's default 30s `ReadTimeout`/`WriteTimeout` (60s
@@ -1388,14 +1593,17 @@ verbatim as the request's `Content-Type` (there is no empty-string fallback; the
 method is still `POST`, and the defaults and `applyUpstreamAuth` ordering are
 untouched). Every JSON caller passes `application/json`, the same value the
 method used to hard-code, so a JSON passthrough is byte-for-byte what it was; the
-image edit relay (§3.5) passes the multipart type **with its boundary**, which the
-upstream needs to read the body. All six implementers
+image edit relay (§3.5) and the transcription relay (§3.7) pass the multipart type
+**with its boundary**, which the upstream needs to read the body. All six implementers
 (`multiplexer`, `openai_compatible`, `anthropic_messages`, `openai_responses`,
 `gemini`, `mock`) thread it through. The **mock** answers any path under
 `/v1/images/` — generations and edits alike — with a one-image generations-shaped
 body (`{created, output_format, data:[{b64_json}]}`, a real decodable 1×1 PNG) and
 `Content-Type: application/json`, so an images request round-trips end to end
-without an upstream; every other path keeps its canned Responses-shaped SSE.
+without an upstream. It answers `/v1/audio/transcriptions` with the transcription
+document audio.cpp returns (`{"text": ..., "timing": {"audio_duration_ms": 2000}}`,
+`Content-Type: application/json`), so a transcription relay finds the duration it bills;
+every other path keeps its canned Responses-shaped SSE.
 
 The mock, Ollama and OpenAI-compatible clients also implement `Prober` (reachability probe) and, where applicable,
 `LoadedModelLister`/`ModelInfoProber`/`MemoryProber`/`ModelUnloader` for the
@@ -1410,8 +1618,8 @@ relay is a native passthrough; the same holds for `audio_cpp` and the speech rel
 That shared client also implements the optional `AudioCppModelsProber` capability
 (`ProbeAudioCppModels`, `internal/provider/audiocpp_models.go`): a `GET /v1/models`
 through the client's own transport, with the application's credential and a 1 MiB
-bound, from which the gateway's health loop derives the `speech` verdict of an
-`audio_cpp` application ([Routing & Model Selection
+bound, from which the gateway's health loop derives the `speech` and `transcription`
+verdicts of an `audio_cpp` application ([Routing & Model Selection
 §2.3](routing-and-model-selection.md#23-the-capability-gate)). A transport failure or
 a non-2xx status is an error and states nothing; a 2xx body that does not name the
 model, or cannot be read, is an empty verdict, not an error.
@@ -1586,14 +1794,18 @@ cannot gate `openai_audio` behind a verdict the way it gates `openai_images` beh
 `image`. The request itself is still refused server-side
 (`routing.model_not_capable`); recorded in [Risks
 §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+**Transcription has neither the fold nor a listing flag**: `transcription` is not in
+`hasCapabilityFold`, so the unknown-model redirect never takes a transcription
+candidate (§3.7) and nothing on the wire advertises the verdict, while the request is
+refused server-side exactly as speech's is.
 
 **The portal listing carries `openai_images` and `openai_audio`; `/v1/models`
 deliberately carries neither.** Every listing keeps only the coarse flavors it knows
 (`knownAPIFlavors`: `anthropic`, `openai`, `openai_audio`, `openai_images`), so a model
 that is served only under `openai_images` reaches the portal's model DTO with
 `flavors: ["openai_images"]` — which is what lets the portal chat offer it
-(§12) — and a speech-only model with `flavors: ["openai_audio"]`, which the portal chat
-does not offer (it needs `openai`, or `openai_images` with `image`). `/v1/models` keeps
+(§12) — and a speech-only or transcription-only model with `flavors: ["openai_audio"]`,
+which the portal chat does not offer (it needs `openai`, or `openai_images` with `image`). `/v1/models` keeps
 only the rows that carry `openai`, so the same models are **not** listed there (nor in
 `/api/v1/models`): that listing is what an external OpenAI client fills its *chat*
 picker from, and an images-only or audio-only model offered for chat would fail.
@@ -1990,6 +2202,7 @@ gateway sent it, is the check to run. The reasoning is recorded in [ADR-059](../
 |---|---|---|
 | The six JSON inference endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/generations`, `/v1/audio/speech`) | `readRawJSONUnlimited` | none — a large base64-encoded multimodal payload is read in full (a speech body is a short JSON object, read the same way) |
 | The image edit endpoint (`/v1/images/edits`), whose body is `multipart/form-data` | `readImageEditBody` (`internal/gateway/images_edit_handler.go`; `readRawJSONLimit` would refuse anything but one JSON value) | `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB: a declared `Content-Length` over it is refused without a read, an undeclared body is stopped by `http.MaxBytesReader`, both `413 request.body_too_large` |
+| The audio transcription endpoint (`/v1/audio/transcriptions`), whose body is `multipart/form-data` | `readTranscriptionBody` (`internal/gateway/transcription_handler.go`; the same reasoning) | `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, default 32 MiB, a variable of its own, independent of the image-edit one: the same two refusals, both `413 request.body_too_large`; the same value also bounds the **response** the relay buffers (§3.7) |
 | The portal chat documents (`POST /api/portal/chats`, `PUT /api/portal/chats/{id}`, `POST /api/portal/chats/{id}/runs`) | `readRawJSONLimit` | `portal.MaxChatRequestBytes` = 5 MiB (the 4 MiB content cap plus the JSON envelope); the bundled nginx allows the same on `/api/portal/chats` |
 | Everything else (control plane: `/api/portal/*`, `/api/admin/*`, `/api/system/*`) | `readRawJSON` | `maxJSONBodyBytes` = 1 MiB (`http.MaxBytesReader`) |
 
@@ -1998,7 +2211,7 @@ size limit. The chat documents are bounded, not uncapped: the gateway reads
 them at the chat request cap and the service enforces the content cap —
 unrelated to the inference size policy documented here.
 
-**The edit endpoint is the one inference body that is capped, and the cap has a
+**The two multipart endpoints are the inference bodies that are capped, and the cap has a
 second half** ([ADR-009](../09-architecture-decisions.md#adr-009--no-body-size-cap-on-inference-1-mib-on-control-plane),
 [ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
 (j)). The handler holds the body whole — it peeks the form before routing and may
@@ -2012,6 +2225,21 @@ refused `413 request.body_too_large` at the gateway (and recorded) rather than
 sent to come back as the agent's own refusal; raising the setting only admits
 larger bodies to **external** edit upstreams. Edge nginx is uncapped for `/v1/`
 (`client_max_body_size 0`), so the gateway's setting is the effective limit.
+
+**The transcription endpoint carries the same two halves under its own setting**
+([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
+The upload is a body of one audio file plus a handful of short fields, held whole to
+peek the form and, when the model name or an empty `file` part forces it, to rebuild
+it, so `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES` (default 32 MiB, the agent
+router's limit) bounds what the **client** sends, and the body handed to an
+**agent-launched** target is re-checked against the agent's 32 MiB after the rebuild
+(`413 request.body_too_large`, recorded, not sent); raising the setting only admits
+larger uploads to **external** transcription upstreams. It is its own variable so that
+audio and images are sized independently. It has a **second use** the edit has no
+analogue of: the same value is the bound on the response the relay buffers to read the
+trailing `timing` block (§3.7), so one transcription can hold up to that many bytes of
+upload and up to that many of response in memory at once, per in-flight request, and a
+response past it is `502 transcription.upstream_error`, not a clipped transcript.
 A portal edit's body is the source image, the optional mask and a handful of
 fields, and three bounds apply by where the bytes are. A freshly **uploaded**
 source or mask additionally rides **inline** in the run-start body, which is read
@@ -2701,15 +2929,21 @@ Every inference error response uses the gateway-wide envelope
 | `images.mask_invalid` | 400 | an edit's mask that is not the first source's size, is past 16 megapixels, or has no transparent pixel (§3.5) |
 | `images.edit_unsupported_format` | 400 | an edit's mask that is not a readable PNG, or — when a mask is sent — a source that is not a readable PNG or JPEG (§3.5) |
 | `images.edit_unavailable` | 404 | an edit resolved to an agent-launched model whose agent has not declared `multipart_proxy` (an agent older than 0.9.0, or one that has not reported since the gateway restarted or the agent was upgraded); nothing is relayed (§3.5) |
-| `request.body_too_large` | 413 | an edit body over `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, or one that is over the agent router's 32 MiB once the gateway has prepared it (§10) |
+| `request.body_too_large` | 413 | an edit body over `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, a transcription body over `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, or either one over the agent router's 32 MiB once the gateway has prepared it (§10) |
 | `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) — an edit relays it the same way |
 | `speech.model_required` / `speech.input_required` | 400 | the speech body failed `validateSpeechRequest` (§3.6): no `model`, or no non-empty string `input` |
 | `speech.response_format_unsupported` | 400 | a `response_format` other than `wav` or absent — `mp3`, `opus`, `flac`, `aac`, `pcm`, `json`, `b64_json` and any non-string value (§3.6) |
 | `speech.stream_unsupported` | 400 | a speech request asking for a streamed response: `stream: true`, a non-boolean `stream`, or any `stream_format` (§3.6) |
 | `speech.upstream_error` | the upstream's own status | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"`; an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged (§3.6) |
-| `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images and speech relays answer when the resolved agent-launched child's spec excludes `openai_images` (`openai_audio` for speech), and what the text translate path answers when that child's spec is images-only or audio-only (§6) |
+| `transcription.model_required` / `transcription.file_required` | 400 | the transcription form failed `validateTranscriptionRequest` (§3.7): no `model`, or no non-empty part named `file` |
+| `transcription.invalid` | 400 | a structurally broken form (§3.7): not `multipart/form-data` or no boundary (a JSON body included), a truncated or malformed part, a field over 1 MiB, a repeated single-use field, a body that could not be read — or **more than one** non-empty `file` part |
+| `transcription.response_format_unsupported` | 400 | a `response_format` other than `json` or absent — `verbose_json`, `text`, `srt`, `vtt` and any other value (§3.7) |
+| `transcription.stream_unsupported` | 400 | a transcription asking for a streamed response: `stream` on, a non-boolean `stream`, or any `stream_format` (§3.7) |
+| `transcription.unavailable` | 404 | a transcription resolved to an agent-launched model whose agent has not declared `multipart_proxy` (an agent older than 0.9.0, or one that has not reported since the gateway restarted or the agent was upgraded); nothing is relayed (§3.7) |
+| `transcription.upstream_error` | the upstream's own status, or **502** | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"` (an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged); **and**, as a 502, a 2xx response that was **over the buffer bound** or broke off mid-read, with nothing of the body written (§3.7) |
+| `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images, speech and transcription relays answer when the resolved agent-launched child's spec excludes `openai_images` (`openai_audio` for speech and transcription), and what the text translate path answers when that child's spec is images-only or audio-only (§6) |
 | `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |
-| `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires — for an edit's `image_edit`, one that is not **derived**: no `image: yes`, or an operator's `image_edit: no` ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |
+| `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires — for an edit's `image_edit`, one that is not **derived**: no `image: yes`, or an operator's `image_edit: no`; for speech or transcription, no `(speech, yes)` or `(transcription, yes)` verdict, an unprobed model included ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |
 | `routing.admission_queue_timeout` / `_full` | 503 | admission queue (see [Routing & Model Selection §6.3](routing-and-model-selection.md)) |
 | `provider.timeout` / `.invalid_response` / `.unavailable` | 502 | upstream call failed or returned something unparseable |
 | `provider.stream_idle_timeout` | mid-stream error frame | idle watchdog fired (§7) |
@@ -2759,7 +2993,14 @@ attempted) `routing.Target`, so a request refused *before* `Resolve` leaves no
   codes split the same way: the `speech.*` 400s of §3.6 are pre-`Resolve`
   validation and are **not** recorded, while a speech request that fails from
   `Resolve` onward (an upstream error included) **is**, carrying
-  `billing_unit: "audio_second"` with a zero quantity.
+  `billing_unit: "audio_second"` with a zero quantity. The transcription codes split
+  the same way: the `transcription.*` 400s of §3.7 (`model_required`, `file_required`,
+  `invalid`, `response_format_unsupported`, `stream_unsupported`) and the client-body
+  `413` are pre-`Resolve` validation and are **not** recorded, while
+  `transcription.unavailable`, the `413` of a prepared body that is too large for the
+  agent, `transcription.upstream_error` (a normalised upstream error and the 502 of an
+  over-bound or broken 2xx response alike) and every other failure from `Resolve` onward
+  **are**, carrying `billing_unit: "audio_second"` with a zero quantity.
 
 So the honest answer to "is my 429'd request in Activity?" is *it depends which
 429*: a principal-limiter denial is not, a 503 from the capacity queue is.

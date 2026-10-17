@@ -661,12 +661,14 @@ type usageMeta struct {
 	// Endpoint is the client endpoint this request arrived on. recordUsage reads
 	// it for exactly one thing: the row's ProviderPath, which it recomputes from
 	// the target and the request's FLAVOR rather than taking the path the relay
-	// actually called -- and the flavor cannot tell endpoints that share it apart
-	// (openai_images covers both /v1/images/generations and /v1/images/edits). Only
-	// an images call site needs to set it, and it must: left at its zero value
-	// (endpointChat) it records the generations path, which is wrong for an edit.
-	// Every other call site leaves it zero, which changes nothing for them --
-	// upstreamPath ignores the endpoint for every non-images flavor.
+	// actually called -- and the flavor cannot tell endpoints that share it apart:
+	// openai_images covers both /v1/images/generations and /v1/images/edits, and
+	// openai_audio covers both /v1/audio/speech and /v1/audio/transcriptions. So
+	// the images call sites and the audio ones set it, and must: left at its zero
+	// value (endpointChat) a row records the generations path for an edit and the
+	// speech path for a transcription. Every other call site leaves it zero, which
+	// changes nothing for them -- upstreamPath ignores the endpoint for every
+	// flavor but those two.
 	Endpoint sessionEndpoint
 	// GenStart is when the first content delta of a TRANSLATE stream arrived (the
 	// requestProgress first-token stamp); the zero time means "no generation

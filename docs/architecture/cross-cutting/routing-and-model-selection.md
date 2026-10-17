@@ -113,6 +113,21 @@ audio.cpp server needs no further step, and a deployment with no such applicatio
 serves no speech and answers 404 `routing.no_model_route`
 ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
 
+**Transcription takes the same flavor and a verdict of its own.** `POST
+/v1/audio/transcriptions` is served under the **same** `openai_audio` flavor, with no
+flavor, application type or runtime kind of its own, and paired with a `transcription:
+yes` verdict on the mapping (§2.3). `transcription` means the model *transcribes* audio
+to text; it is neither `CapabilityAudio` (the model *accepts* audio as chat input) nor
+`CapabilitySpeech` (the model *synthesises* speech), the three are orthogonal and can
+co-occur on one model, and none is ever mapped onto another. Because the flavor string is
+the same, an audio application is a candidate for **both** audio endpoints and the
+**verdict** is what says which one a model serves: an `asr` model carries
+`(transcription, yes)` and `(speech, no)`, a `tts` model the reverse. Everything keyed on
+the flavor (the audio-only rule below, candidacy, the affinity key) is therefore the same
+for the two, and everything that must tell them apart is keyed on the endpoint
+([API Compatibility & Inference §3.7](compatibility-and-inference.md#37-openai-audio-transcriptions),
+[ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
+
 **An audio-only server is kept out of the chat flavors, exactly as an images-only one
 is.** `routing.FlavorsAreAudioOnly` (a flavor list naming `openai_audio` and neither
 text flavor; an empty list is never audio-only) is read beside
@@ -142,8 +157,9 @@ is enforced afterwards, and not to the same degree everywhere:
   whose spec lacks the endpoint's flavor is refused with `*.endpoint_disabled`
   rather than translated.
 - **In full** on `/v1/images/generations` and `/v1/images/edits`, by
-  `targetServesFlavor` in the images relays, and on `/v1/audio/speech`, by the
-  same check in the speech relay (`resolveSpeechTarget`).
+  `targetServesFlavor` in the images relays, and on `/v1/audio/speech` and
+  `/v1/audio/transcriptions`, by the same check in the speech and transcription
+  relays (`resolveSpeechTarget`, `resolveTranscriptionTarget`).
 - **Only against an images-only or audio-only spec** on the text translate dispatch
   (`complete`/`beginStream`, through `resolveTranslateTarget`), which every
   `/v1/chat/completions` request takes, and so does every `/v1/responses` or
@@ -275,8 +291,9 @@ The type's `image` verdict comes from the `sdcpp_capabilities` source (§2.3).
 
 `audio_cpp` is the application type for a **static, operator-run** audio.cpp
 `audiocpp_server` (`routing.ProviderAudioCpp`), and it dispatches to the same shared
-client for the same reason: the speech relay is a native passthrough, and that client
-also reads the server's `/v1/models` for the speech verdict. A static server has no
+client for the same reason: the speech and transcription relays are native
+passthroughs, and that client also reads the server's `/v1/models` for the speech and
+transcription verdicts. A static server has no
 runtime spec; the agent-launched counterpart is the runtime spec kind of the same name
 (a different namespace, [Agent-Managed Model Runtime
 §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
@@ -291,12 +308,13 @@ holds the previous type's default and leaves a changed field alone:
 | `timeout_ms` | 600000 (also the backend's default for the type when `timeout_ms` is 0) |
 | `api_flavors` | `["openai_audio"]` |
 | `responses_mode` / `messages_mode` | both `disabled` |
-| `context_probe_path` | empty — a speech model has no context window |
+| `context_probe_path` | empty — a speech or transcription model has no context window |
 
 Unlike `stable_diffusion_cpp`, **model discovery is the default**: audio.cpp's
 `GET /v1/models` names its real models (no placeholder), so `modelDiscoveryFor` has no
 case for the type, and `health_path` mode works because a real health endpoint exists.
-The type's `speech` verdict comes from the `audiocpp_models` source (§2.3).
+The type's `speech` and `transcription` verdicts come from the `audiocpp_models` source
+(§2.3).
 
 `ModelGroup` also carries five selection-setting columns, added append-only by
 migration `62`: `loaded_only`, `member_order`, `climb_speed_margin_percent`,
@@ -377,7 +395,8 @@ Steps 1–3 are `resolveModelOverride`; step 4 is `redirectUnknownModel`
 (`internal/gateway/inference_redirect.go`). For a request that requires a
 capability — today the two image endpoints, `/v1/images/generations`, which
 requires `image`, and `/v1/images/edits`, which requires the derived `image_edit`,
-and `/v1/audio/speech`, which requires `speech` (§2.3) — step 4
+`/v1/audio/speech`, which requires `speech`, and `/v1/audio/transcriptions`, which
+requires `transcription` (§2.3) — step 4
 takes a `LastUsedModel` or fallback only when that name also carries every
 required capability (`ModelOffering.Capable`, §2.2). A candidate without it is
 skipped and the chain moves on, because the capability gate would refuse it
@@ -386,7 +405,9 @@ never named. So an images request for an unknown name is served by an
 image-capable fallback, and answers 404 `routing.no_model_route` for its own
 name when neither candidate carries `image` (an edit: `image_edit`, which an
 operator's opt-out removes from a model that still generates; a speech request:
-`speech`, by the same rule). Step 4 judges the **effective**
+`speech`, by the same rule; a **transcription** request: no candidate at all, since
+`transcription` has no fold, §2.2, so it answers for its own name). Step 4 judges the
+**effective**
 name steps 1–3 produced, so an override that already resolves to a usable
 model ends the chain there. The catch-all has no requested name of its own —
 it is a single string, not a row — and therefore carries none of the per-row
@@ -456,7 +477,7 @@ redirect each of these answers a 404:
 | `/v1/responses` | an images-only child | `responses.endpoint_disabled` |
 | `/v1/messages` | an agent child whose spec lacks `anthropic` | `messages.endpoint_disabled` |
 | `/v1/images/generations`, `/v1/images/edits` | a name whose every mapping is an agent child whose spec lacks `openai_images` while its application declares it (the text children of a mixed application), or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a verdict (for an edit: without the derived `image_edit`) |
-| `/v1/audio/speech` | the same shape for `openai_audio`: every mapping an agent child whose spec lacks the flavor while its application declares it, or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a `speech: yes` verdict |
+| `/v1/audio/speech`, `/v1/audio/transcriptions` | the same shape for `openai_audio`: every mapping an agent child whose spec lacks the flavor while its application declares it, or a group of only such names | `routing.no_model_route`, or `routing.model_not_capable` without a `speech: yes` (a transcription: `transcription: yes`) verdict |
 | `/v1/chat/completions` | an audio-only child | `routing.no_model_route` |
 
 An override that targets such a child counts the same way, because step 4
@@ -648,7 +669,14 @@ field carries it. The flavor cannot answer this by itself:
 `Callable` for `openai_images` holds every model whose route declares the
 flavor — its application and, for an agent-launched model with a spec, the
 spec too — whatever its verdict. A required capability with no fold
-leaves `Capable` empty, so nothing is a candidate. The listing is neither a subset nor a superset of
+leaves `Capable` empty, so nothing is a candidate. **`transcription` is that case, on
+purpose:** `hasCapabilityFold` admits `image`, `image_edit` and `speech` only, so for a
+transcription request the unknown-model redirect finds no candidate (the chain of §2.1
+ends at step 5 and the request fails as it would without the redirect), and no portal
+listing carries a transcription flag. The gate is not affected: a model without a
+`(transcription, yes)` verdict is still refused by §2.3. A fold that is
+`speechFlagsByName`'s twin is the way back, recorded in [Risks
+§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances). The listing is neither a subset nor a superset of
 `Callable`: it loses the suppressed names and gains the token's own aliases (its
 manual override aliases and its generated Claude aliases,
 [§2.4](#24-generated-claude-model-aliases)), which are rewritten before routing
@@ -706,7 +734,8 @@ from its **own identity** and never from the request body — nil for chat,
 Responses and Messages, `["image"]` for `/v1/images/generations`
 ([API Compatibility & Inference §3.4](compatibility-and-inference.md#34-openai-images-generations)),
 `["image_edit"]` for `/v1/images/edits` ([§3.5](compatibility-and-inference.md#35-openai-images-edits)),
-`["speech"]` for `/v1/audio/speech` ([§3.6](compatibility-and-inference.md#36-openai-audio-speech)).
+`["speech"]` for `/v1/audio/speech` ([§3.6](compatibility-and-inference.md#36-openai-audio-speech)),
+`["transcription"]` for `/v1/audio/transcriptions` ([§3.7](compatibility-and-inference.md#37-openai-audio-transcriptions)).
 A candidate survives only if its mapping carries a `yes` verdict for **every**
 name in that list. The verdicts come from one bulk
 `Store.MappingCapabilitiesForMappings` read over the candidate list (§1), not
@@ -814,24 +843,29 @@ excludes on, and it has the same two writers an `image` verdict has, with a diff
 document and one deferred producer
 ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
 
-- **`audiocpp_models`** answers **speech** in both directions, from the gateway's own
-  health loop reading an **`audio_cpp` application's** `GET /v1/models`
+- **`audiocpp_models`** answers **speech and transcription** in both directions, from the
+  gateway's own health loop reading an **`audio_cpp` application's** `GET /v1/models`
   (`probeAudioCppModels`, `cmd/gateway/app_health.go`), on the application's own
   health cadence, through the same prober and outbound transport as every other probe.
-  The listing names each **loaded** model's `task`, so the verdict is **per mapping**,
+  The listing names each model's `task`, so the verdict is **per mapping**,
   keyed on the mapping's application-side model name (`AppModelName`, matched exactly
   against the entry's `id`; one small `GET` per active named mapping per cadence
   tick): `tts` or `clone` writes `(speech, yes)`; the model present with any other
-  non-empty task (`asr`, a music task) writes a real `(speech, no)`; and the model
+  non-empty task (`asr`, a music task) writes a real `(speech, no)` (the transcription
+  half is below); and the model
   **absent** from the listing, an empty task, an unreachable server, a non-2xx status
   (a 401 or 403 is logged as a misconfigured token) or an unreadable body writes
   **nothing** and the next tick asks again, because none of those says the model
   cannot speak. The source ranks 1 like every probe, so an operator's `manual` row
-  (rank 3) always wins and the probe repairs its own drift, and it writes the
-  `speech` row only. Two consequences are stated rather than discovered. A model
-  that is **not currently loaded** is not in the listing and so reads as unknown, which
-  the gate refuses; for an operator-run server the mapped model is loaded, and a
-  manual `speech: yes` covers the rest. And the pass is gated on the application
+  (rank 3) always wins and the probe repairs its own drift, and it writes the `speech`
+  row and the `transcription` row (the next entry). Two consequences are stated rather
+  than discovered. A model that the listing **does not name** reads as unknown, which
+  the gate refuses; the listing was first taken to name **loaded** models only, which
+  would make that every model that is not currently loaded, but a probe of v0.9.1 saw it
+  name an unloaded model with `loaded: false`, and the prober reads `task` and never
+  `loaded` (whether a model is resident is the health axis, not the capability axis), so a
+  named model's verdict stands either way. For an operator-run server the mapped model is
+  loaded, and a manual `speech: yes` covers the rest. And the pass is gated on the application
   **type**: a `server_agent` mapping whose runtime spec is of kind `audio_cpp` is
   **not probed**, because the agent router's `/v1/models` carries no `task` and so
   could state no verdict. That is the deferred half; it needs an agent-side source and
@@ -843,6 +877,39 @@ document and one deferred producer
   "cannot synthesise speech" costs an operator nothing to leave unsaid, while a
   manual `no` is rank 3, would outrank the probe entitled to establish it forever, and
   nothing re-derives it. `(speech, yes)` stays writable.
+
+**Who writes the `transcription` verdict.** `transcription` is the third capability the
+gate excludes on, and it has the same writers as `speech`, **from the same listing**
+([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
+
+- **`audiocpp_models`** decides both rows from the one `task` of the entry whose `id`
+  equals the mapping's application-side model name, in both directions: `asr` writes
+  `(transcription, yes)` **and** `(speech, no)`; `tts` or `clone` writes `(speech, yes)`
+  **and** `(transcription, no)`; any other non-empty task writes both `no`; and an absent
+  task, an unnamed model, an unreachable server, a non-2xx status or an unreadable body
+  writes **nothing**, because none of those says a model cannot transcribe and a `no` can
+  switch a route off. `audioCppCapabilityRows` projects the two verdicts into at most two
+  rows, each only when stated, so an unanswered axis never suppresses the other. The
+  task match ignores case and surrounding whitespace, so an `ASR` the server might one day
+  emit does not fall to the `no` default. The same ranking, the same type gate (a
+  `server_agent` mapping with an `audio_cpp` spec is **not probed**) and the same
+  deferral hold: the agent router's `/v1/models` carries no `task`, so an agent-launched
+  `audio_cpp` child has no automatic verdict until an agent-side source exists, and an
+  operator's manual `transcription: yes` serves it meanwhile.
+- **`manual`**, the operator's `transcription: yes`, the enablement path for what the
+  probe does not reach. `(transcription, no)` is **reserved** in `reservedManualVerdicts`
+  on the same terms as `(speech, no)`: an absent row already refuses a transcription
+  request, while a manual `no` is rank 3 and would outrank the probe entitled to
+  establish it, forever. `(transcription, yes)` stays writable, as the operator's override
+  of the probe. The name is deliberately **not** in `reservedAgentCapabilityNames`: an
+  agent-side writer may report it later, and an agent-reported `no` would then be
+  legitimate.
+
+A transcription request avoids the vendor-account path for speech's reason: the
+capability list. `vendorAccountRoutingEligible` has no `openai_audio` twin of its images
+exclusion and declines a capability-carrying request, so the handler always sets
+`RequiredCapabilities = ["transcription"]`, and dropping the list would skip the gate
+**and** make a transcription routable to a hosted vendor model of the same name.
 
 **A speech request avoids the vendor-account path only because it carries a capability
 list.** `vendorAccountRoutingEligible` (`internal/routing/resolver.go`) excludes the
@@ -955,7 +1022,7 @@ gating it would silently empty an operator's server list. The model warmer
 flavors in turn, and it is endpoint-agnostic by definition. It leaves
 `openai_images` and `openai_audio` out on purpose, because its warm call is a chat
 prompt, and for the same reason it drops a candidate whose effective flavors serve
-only images or only speech — an agent-launched child whose spec lists only
+only images or only audio — an agent-launched child whose spec lists only
 `openai_images` (or `openai_audio`), which candidacy still admits under a parent that
 declares `openai` — so an images-only or audio-only model is never warmed. That makes five production callers of `ActiveMappingsForModel` in
 total: sites 1–3 of the table above, plus these two. Site 4 is not one of them —
@@ -1259,7 +1326,10 @@ pin-free. Speech turned out to be no such endpoint: it was expected to share `op
 but took a coarse flavor of its own, `openai_audio` (§1), so its key never matches a
 chat client's either and its two guards are redundant in the same way. It declares
 `RequiredCapabilities = ["speech"]` and so also never creates a pin
-([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)). What each still does:
+([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)). Transcription shares speech's flavor, so
+its key is `openai_audio`-keyed too and cannot collide with a chat client's; it declares
+`RequiredCapabilities = ["transcription"]` and also never creates a pin
+([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)). What each still does:
 
 - **On the READ side, a refusal does not delete.** A pin that fails the
   request's capability re-check is skipped and resolution falls through; the
@@ -1279,8 +1349,8 @@ chat client's either and its two guards are redundant in the same way. It declar
   damage. For images it is what keeps an image request re-selecting every
   time.
 
-The cost accepted is that image traffic (and speech traffic) takes **no** affinity
-pin and re-selects every request. For a single-JSON, non-conversational endpoint that is not a
+The cost accepted is that image traffic (and speech and transcription traffic) takes
+**no** affinity pin and re-selects every request. For a single-JSON, non-conversational endpoint that is not a
 regression worth a schema change; a capability-aware affinity key would be a
 `route_affinity` migration
 ([ADR-042](../09-architecture-decisions.md#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses)).
@@ -1629,9 +1699,9 @@ caller may see, for a dashboard-style overview without subscribing per server.
 
 | Routing error | HTTP status | When |
 |---|---|---|
-| `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what two dispatch checks answer after resolution for a `server_agent` mapping's spec: the images and speech relays when the spec excludes `openai_images` (`openai_audio` for speech), and the text translate dispatch when the spec is images-only or audio-only ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Neither post-resolve refusal is advertised, except on a name that mixes a refused mapping with a served one (issue #145), or while its application's spec read fails: the listings and `Callable` take the spec's flavors by the same rule, and for a token with the unknown-model redirect on, a request whose effective model fails the flavor half for the request's flavor is redirected before it gets here whenever its LastUsedModel or fallback is usable (§2.1, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)) |
+| `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what two dispatch checks answer after resolution for a `server_agent` mapping's spec: the images, speech and transcription relays when the spec excludes `openai_images` (`openai_audio` for speech and transcription), and the text translate dispatch when the spec is images-only or audio-only ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Neither post-resolve refusal is advertised, except on a name that mixes a refused mapping with a served one (issue #145), or while its application's spec read fails: the listings and `Callable` take the spec's flavors by the same rule, and for a token with the unknown-model redirect on, a request whose effective model fails the flavor half for the request's flavor is redirected before it gets here whenever its LastUsedModel or fallback is usable (§2.1, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)) |
 | `ErrNoHealthyHost` | **503** | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
-| `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate; for speech, no `speech: yes` (a model that is not loaded reads as unknown) |
+| `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate; for speech, no `speech: yes`, and for transcription no `transcription: yes` (a model the listing does not name reads as unknown) |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |
 | `ErrServerOverrideModelUnavailable` | 404 | a server-override request named a server with no *usable* live offering of the model: either no live mapping for it at all, **or** one whose mapping does not carry a `yes` verdict for a capability the endpoint requires (§2.3 site 2). The two share this sentinel deliberately — an override names one server, so there is no second candidate the distinction could steer to |
@@ -1644,7 +1714,7 @@ indistinguishable from an upstream *outage*. Both were remapped in the same
 change that added `ErrModelNotCapable`, because a gate that refuses legibly on
 one branch and illegibly on another is not a legible gate. **The remap is
 global**: it applies to `/v1/chat/completions`, `/v1/responses`, `/v1/messages`
-and `/v1/images/generations` (and `/v1/images/edits` and `/v1/audio/speech`, which have only ever had
+and `/v1/images/generations` (and `/v1/images/edits`, `/v1/audio/speech` and `/v1/audio/transcriptions`, which have only ever had
 the remapped answers), their prefixed aliases and their streaming variants alike. It is the one externally visible behavior change, and a
 consumer that retries 502 but not 404 now sees the second where it used to see
 the first — the correct reading of both facts

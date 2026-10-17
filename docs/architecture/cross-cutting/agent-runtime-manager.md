@@ -785,7 +785,7 @@ winning **per field** over the type's own default:
 | `tgi` | `/metrics` (Prometheus; `tgi_batch_current_size`=active, `tgi_queue_size`=queue) | `/info` | `max_total_tokens` |
 | `ollama` | *(none)* — Ollama exposes no Prometheus-style `/metrics` endpoint at all | `/api/show` — **POST**, body `{"model": "<the spec's model>"}` (see below) | `model_info["<arch>.context_length"]`, matched by suffix (e.g. `llama.context_length`) |
 | `stable_diffusion_cpp` | *(none)* — measured: `sd-server` serves no metrics endpoint of any kind | *(none)* — no `/props`, no context-length field in its capability document, and an image model has no context window | — |
-| `audio_cpp` | *(none)* — a speech server's design relies on no Prometheus-style scrape | *(none)* — `/v1/models` entries carry `family`, `task`, `mode`, `loaded` and `path`, not a context length, and a speech model has no context window | — |
+| `audio_cpp` | *(none)* — an audio server's design relies on no Prometheus-style scrape | *(none)* — `/v1/models` entries carry `family`, `task`, `mode`, `loaded` and `path`, not a context length, and a speech or transcription model has no context window | — |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -798,9 +798,10 @@ assume.
 
 **`audio_cpp` is the second kind with no probe paths, and it is the agent-managed
 half of a feature whose other half is not here.** audio.cpp's `audiocpp_server`
-(`routing.RuntimeSpecTypeAudioCpp`) is the backend of `POST /v1/audio/speech`
-([API Compatibility & Inference
-§3.6](compatibility-and-inference.md#36-openai-audio-speech)). What this kind does is
+(`routing.RuntimeSpecTypeAudioCpp`) is the backend of `POST /v1/audio/speech` and of
+`POST /v1/audio/transcriptions` ([API Compatibility & Inference
+§3.6](compatibility-and-inference.md#36-openai-audio-speech),
+[§3.7](compatibility-and-inference.md#37-openai-audio-transcriptions)). What this kind does is
 small and entirely gateway-side: a binary basename containing `audiocpp_server` or
 `audio.cpp` detects as it (an explicit `type` always wins), `DeriveProbePaths` answers
 `("", "")` (an operator override still wins per field), the spec accepts the
@@ -814,18 +815,28 @@ and its capability probe treats the kind like `custom` (the default `/props` bra
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time), one loopback read per
 process generation of a document an audio.cpp server is not known to serve), so it
 reports no capability verdict for such a child. **The agent-managed audio.cpp
-capability source is deferred.** The gateway's `speech` verdict is read from audio.cpp's
+capability source is deferred, for transcription exactly as for speech.** The gateway's
+`speech` and `transcription` verdicts are read from audio.cpp's
 `GET /v1/models` `task` field by the gateway's own health loop, and only for a **static**
 `audio_cpp` *application*; the agent router's `/v1/models` carries no `task`, so that
 read could state nothing for a child launched behind the router, and the health loop
 deliberately does not probe a `server_agent` application at all. Until an agent-side
 source exists (a feature flag and an ingest acceptance, as `capability_source_sdcpp` is
 for images), an agent-launched `audio_cpp` child serves speech only after an operator
-sets `speech: yes` on its mapping by hand, and its agent-side launch shape (arguments,
-ensure route, VRAM measurement) has no worked example here
+sets `speech: yes` on its mapping by hand, and transcription only after an operator sets
+`transcription: yes` (the name is deliberately **not** on the ingest's reserved agent
+names, so an agent-side writer can report it later), and its agent-side launch shape
+(arguments, ensure route, VRAM measurement) has no worked example here. **Transcription
+needed no agent change:** an agent-launched child is sent the upload through the router's
+existing multipart branch (§4.2), which peeks the model from the form whatever the
+path and relays the child's JSON response untouched, so the agent version did not move,
+and the gateway gates the relay on the same `multipart_proxy` feature as the image edit
+(§7, [API Compatibility & Inference
+§3.7](compatibility-and-inference.md#37-openai-audio-transcriptions))
 ([Routing & Model Selection
 §2.3](routing-and-model-selection.md#23-the-capability-gate),
-[ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+[ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+[ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 
 **`ollama` is the one row whose verb is not `GET`, and having it wrong made
 that probe unsatisfiable for as long as it existed (issue #54, fixed).**
@@ -1322,7 +1333,11 @@ on the multipart branch below).
   the plain proxy** (agent 0.9.0, feature `multipart_proxy`, §7). It exists for
   the gateway's image **edit** (`POST /v1/images/edits`, [API Compatibility &
   Inference §3.5](compatibility-and-inference.md#35-openai-images-edits)), whose
-  body is a multipart form rather than one JSON value. A multipart `Content-Type`
+  body is a multipart form rather than one JSON value, and it serves the audio
+  **transcription** (`POST /v1/audio/transcriptions`, [§3.7](compatibility-and-inference.md#37-openai-audio-transcriptions))
+  without any change: the router reads the model from the form and never looks at the
+  path, and a transcription's response is a plain JSON document it relays untouched
+  (the gateway, not the router, buffers it to read the billable duration). A multipart `Content-Type`
   commits the request to this branch: a JSON body under it is **not** read as JSON,
   and a type that does not parse at all takes the JSON default as before. The
   router has already buffered the body (32 MiB, above), and it finds the model
@@ -2702,14 +2717,17 @@ router finds a managed child from the `model` **part** of a `multipart/form-data
 body (§4.2), and the gateway reads it off the agent's sample
 (`s.AgentFeatures.Has(target.ServerID, multipartProxyFeature)`) before relaying an
 **image edit** to an agent-launched model ([API Compatibility & Inference
-§3.5](compatibility-and-inference.md#35-openai-images-edits)). Trying the route
+§3.5](compatibility-and-inference.md#35-openai-images-edits)), and before relaying an
+**audio transcription** to one (§3.7, where the refusal is **404
+`transcription.unavailable`**, [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)). Trying the route
 instead could not tell the two cases apart: a router that predates the branch
 peeks the model out of a JSON body, cannot read one out of a form, and answers
 `404 runtime.model_not_managed` — the code it gives an unmanaged model. Without
 the name the gateway refuses the edit with **404 `images.edit_unavailable`** and
 sends the agent nothing. The gate sits after the resolve and the served-flavor
-check, applies to the **edit only** (a generation is JSON, which every router
-serves; an external `openai_images` target has no agent in front of it), and is
+check, applies to the two **multipart** endpoints only (a generation and a speech request
+are JSON, which every router serves; an external `openai_images` or `openai_audio`
+target has no agent in front of it), and is
 not retried against another application that could have served the model. It
 shipped **before** the agent change, so no window exists in which an agent target
 silently breaks. The refusal also covers an agent that has **not reported since
@@ -4612,7 +4630,7 @@ mapping routed on. Its `enabled: false` is a zero value too, so that Edit
 opens with Enabled ticked, as the create form does. `openai_images` and
 `openai_audio` are left out of the template **only when a text flavor survives the
 exclusion**: both are opt-in on the spec too, and a parent that declares one for its
-image or speech children would otherwise hand it to every new text model's spec. Under
+image, speech or transcription children would otherwise hand it to every new text model's spec. Under
 a parent whose flavors are *exactly* `[openai_images]` (or `[openai_audio]`) the
 exclusion is skipped and the flavor is inherited as is, because dropping it there
 would leave every flavor unticked, a form the launch-spec form refuses to save. This is a
@@ -6276,8 +6294,8 @@ convention its neighbouring count columns already use.
 **Everything in this section holds, unchanged, for an audio-only mapping** (effective
 flavors listing `openai_audio` and neither text flavor,
 `mappingSpecIsAudioOnly`/`routing.FlavorsAreAudioOnly`, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)): a
-speech server answers no chat prompt either. Each refusal and skip below has a twin
-that is the same mechanism under a speech-worded name: 409 `benchmark.audio_only`
+speech or transcription server answers no chat prompt either. Each refusal and skip below has a twin
+that is the same mechanism under an audio-worded name: 409 `benchmark.audio_only`
 for `benchmark.images_only`, `skipped: "audio_only"` for `skipped: "images_only"`,
 `load_refusal: "audio_only"` on the model-server row, and the portal's `audio_only`
 mapping marker beside `images_only`. A scope that holds both kinds answers

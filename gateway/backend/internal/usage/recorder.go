@@ -99,11 +99,14 @@ type Event struct {
 	// and TokensPerSecond) are 0. See ValidateBillingXOR.
 	//
 	// Both ARE real usage_events columns (unlike CostEUR below, which never is).
-	// No producer writes a non-empty unit yet -- every event today carries ""/0,
-	// which is what makes migration v81's defaults a truthful no-op over all
-	// history. "" is a POSITIVE assertion of token-metering and is never inferred:
+	// Three kinds of producer write a non-empty unit: the image endpoints
+	// (BillingUnitImage), and the speech and transcription endpoints
+	// (BillingUnitAudioSecond). Every other event carries ""/0, which is what
+	// makes migration v81's defaults a truthful no-op over all history before
+	// them. "" is a POSITIVE assertion of token-metering and is never inferred:
 	// a unit may only ever come from endpoint identity, never from an upstream
-	// response.
+	// response -- the QUANTITY is the part an endpoint reads off the response (an
+	// image count, a duration), the unit never is.
 	BillingUnit     string    `json:"billing_unit"`
 	BillingQuantity float64   `json:"billing_quantity"`
 	CreatedAt       time.Time `json:"created_at"`

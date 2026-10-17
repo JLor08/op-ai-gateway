@@ -68,7 +68,8 @@ import (
 // request requires, and it answers only the redirect's CANDIDATE question. A
 // request that requires a capability (today /v1/images/generations, which
 // requires "image", /v1/images/edits, which requires the derived
-// "image_edit", and /v1/audio/speech, which requires "speech") is refused by
+// "image_edit", /v1/audio/speech, which requires "speech", and
+// /v1/audio/transcriptions, which requires "transcription") is refused by
 // the capability gate for a model without it,
 // so a LastUsedModel or fallback outside Capable would turn a legible "unknown
 // model" into a 404 model_not_capable about a model the client never named.
@@ -317,9 +318,13 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 // idx is the caller's runtime-spec index and must cover views; capableNames
 // makes no spec read of its own.
 //
-// "image", "image_edit" and "speech" are the capabilities a request requires
-// today and the only ones with a fold here; any other makes the result empty
-// (fail-closed), alone or beside one that has a fold. "image_edit" is DERIVED
+// "image", "image_edit" and "speech" are the capabilities with a fold here;
+// any other makes the result empty (fail-closed), alone or beside one that has
+// a fold. "transcription" (/v1/audio/transcriptions) is a required capability
+// WITHOUT a fold, deliberately: a transcription request's unknown-model redirect
+// finds no candidate and the portal listing carries no transcription flag, while
+// the gate still refuses a model without the verdict. A fold that is
+// speechFlagsByName's twin is the way back. "image_edit" is DERIVED
 // (routing.ImpliedImageEdit), which is why it is handled here at all: with no
 // fold for it, an edit request for an unknown model found Capable empty and
 // the preflight redirect, which needs a capable candidate, was dead for edits
@@ -375,8 +380,9 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 }
 
 // hasCapabilityFold reports whether capability is one capableNames can fold:
-// the closed set of capabilities a request requires today, image, image_edit
-// and speech. Keep it in step with capabilityFlagsByName.
+// the closed set of capabilities that have a fold, image, image_edit and
+// speech (a request also requires "transcription", which has none). Keep it in
+// step with capabilityFlagsByName.
 func hasCapabilityFold(capability string) bool {
 	switch capability {
 	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech:

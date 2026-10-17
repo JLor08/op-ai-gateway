@@ -110,7 +110,7 @@ type Config struct {
 	MaxChatBlobBytes                int // per-blob ceiling for one chat binary payload (#124); config only, the service layer enforces it
 	MaxRunHistoryBytes              int // ceiling on the stored-image bytes one chat run resolves into its upstream history (#124); config only, the service layer enforces it
 	MaxImageEditBodyBytes           int // cap on the multipart body POST /v1/images/edits holds in memory; default 32 MiB, the server agent's own cap (an edit to an agent-launched model is also refused past that, whatever this is set to)
-	MaxAudioTranscriptionBodyBytes  int // cap on the multipart body POST /v1/audio/transcriptions holds in memory; default 32 MiB, the server agent's own cap (its own setting, independent of the image-edit cap)
+	MaxAudioTranscriptionBodyBytes  int // cap on the multipart body POST /v1/audio/transcriptions holds in memory, and on the JSON response it buffers to read the billable duration; default 32 MiB, the server agent's own cap (its own setting, independent of the image-edit cap)
 	MockDelay                       time.Duration
 	MockUnreachable                 bool
 	SeedAppHealthMode               string

@@ -805,10 +805,41 @@ the header is present only on audio.cpp's `audio/wav` answer, and `json` and
 `b64_json` carry none, so a relayed one would trip this log on every success. The
 other metering headers (`X-AudioCPP-Wall-Ms`, `X-AudioCPP-RTF`) are not billed and
 are not forwarded to the client; they reach only the payload capture's summary
-([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
-A later transcription endpoint (#69) that shares the `openai_audio` flavor will have
-to tell itself apart from speech here, or read its own header
-([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers),
+[ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+
+**`/v1/audio/transcriptions` is the third producer: `audio_second` again, with the
+duration read off the response BODY.** It shares speech's `openai_audio` flavor, so the
+flavor cannot tell the two apart and the quantity's source is keyed on the endpoint
+(`ex.endpoint == endpointTranscription`): `setSpeechBillingQuantity` skips a
+transcription, which sends no `X-AudioCPP-Audio-Duration-Ms` header and would otherwise
+log an Error on every success while leaving its quantity at 0, and
+`setTranscriptionBillingQuantity` (`internal/gateway/transcription_handler.go`) is the
+transcription's setter. The unit is endpoint identity, as for speech, so **every**
+transcription `recordUsage` site, a refused or failed request included, carries
+`billing_unit: "audio_second"`, with token counts and both rates at zero (`ValidateBillingXOR`,
+since the usage scanner is nil for the flavor), and its `provider_path` is
+`/v1/audio/transcriptions` (the endpoint is threaded through `usageMeta.Endpoint`, as for
+an image edit, because `recordUsage` recomputes the path from the flavor and the flavor
+would say speech). The quantity is audio.cpp's own measurement of the **input** audio,
+`timing.audio_duration_ms` of the JSON response divided by 1000. The `timing` block is
+the **trailing** field of `{"text": ..., "timing": {...}}`, so the relay buffers the
+whole body, up to the transcription body cap, before it writes (a response over the cap or
+one that breaks off is a 502 `transcription.upstream_error` with quantity `0`; [API
+Compatibility & Inference §3.7](compatibility-and-inference.md#37-openai-audio-transcriptions)),
+and the quantity is decoded from the very bytes that went to the client. It follows
+speech's rule: set only when the full body reached the client (`status == "success"`),
+`0` on every other outcome, a client that disconnects mid-write included. A duration is
+*usable* when `timing.audio_duration_ms` is a JSON **number** that is finite and greater
+than zero; an absent `timing` or field, a `null`, a numeric **string** (`"2000"`, a shape
+the upstream does not produce, so billing on it would be a guess), zero, a negative, a
+value past float range, or a body that is no JSON object is not. **A 2xx transcription
+with no usable duration is logged once at `Error`** with the request id, path, model,
+server, the field name and the **size** of the body, and the row records `0`, for
+speech's reason (`(audio_second, 0)` on a successful relay is indistinguishable from a
+genuinely empty recording). The body's **content is deliberately not logged**: it is the
+transcript, which is the user's spoken content. Only the one numeric field is decoded; the
+text is skipped, not copied ([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
@@ -969,8 +1000,8 @@ wire value**, with an explanatory tooltip keyed on the full enum value in both
 UI languages; a value this build does not recognise gets the chip and **no**
 tooltip, because silence is honest where a guessed label would not be. The
 `billing_unit` and `billing_quantity` columns ship **hidden**, revealed from the
-Activity column menu: only the image and speech endpoints write a unit (#71, #68;
-the transcription endpoint #69 will be the next), so on traffic without them every
+Activity column menu: only the image, speech and transcription endpoints write a unit
+(#71, #68, #69), so on traffic without them every
 row is token-metered and both cells read as an em dash. The disclosure count and both
 rules were in place *before* the first producer, which is
 the point — they are what makes a non-token row readable on arrival
@@ -1009,17 +1040,18 @@ token count.** `ActiveRequest.BillingUnit` (JSON `billing_unit`, always sent, `"
 for a token-metered request) is set at **every** registration site from the same
 `billingUnitFor(apiFlavor)` chokepoint the completed row uses: the non-streaming
 chat path, the streaming chat path (`beginStream`) and the native-passthrough path,
-the last being the shared site for images generations, image edits and speech. It is
+the last being the shared site for images generations, image edits, speech and
+transcription. It is
 the in-flight twin of the completed row's field, and it is populated for **every**
 flavor, chat included (`""`), rather than only the non-token ones, so the portal
 never has to guess a missing field. The Active Requests panel applies the per-row
 two-state rule to its (opt-in) `Generated (live)` column from it: a row whose unit is
 not `""` shows an em dash with the "not token-metered" tooltip, a token-metered row
 beside it still shows its count, and a non-token row's zero is **not applicable**
-rather than "nothing reported yet" (an image or speech request is buffered and has no
+rather than "nothing reported yet" (an image, speech or transcription request has no
 usage scanner, so its other live fields are the "not measured" values too). Before the
 field existed the column printed the
-same dash for an image or speech request, but with no explanation, so the delta is
+same dash for an image, speech or transcription request, but with no explanation, so the delta is
 the tooltip; a gateway older than the field reads as token-metered
 ([HTTP API Surface](../reference/api-surface.md#live-per-request-progress-apiportalusageactive),
 [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
@@ -1984,19 +2016,23 @@ nobody can make from a count:
   active application of type `audio_cpp` (a static, operator-run server): one
   `GET /v1/models` **per active mapping** (the verdict is per model, so unlike the
   sd-server pass it is not one probe per application), projected by
-  `audioCppCapabilityRows` into at most one `speech` row with
-  `source = audiocpp_models`. The listing's per-model `task` decides: `tts`/`clone`
-  is `yes`, any other non-empty task is a real `no`, and a model the listing does not
-  name (it lists **loaded** models only), an entry with no task, an unreachable server
+  `audioCppCapabilityRows` into at most **two** rows, `speech` and `transcription`, each
+  with `source = audiocpp_models` and each only when stated. The listing's per-model
+  `task` decides both at once: `tts`/`clone` is `(speech, yes)` and `(transcription,
+  no)`, `asr` is `(transcription, yes)` and `(speech, no)`, any other non-empty task is
+  `no` for both, and a model the listing does not name (it was taken to list **loaded**
+  models only; a v0.9.1 probe also saw an unloaded model named, and the prober decodes
+  `task`, never `loaded`), an entry with no task, an unreachable server
   or an unreadable body writes **no row**, because none of those states that the
-  model cannot speak. It is written through the same `writeCapabilityRows`, so every
+  model cannot speak or transcribe. It is written through the same `writeCapabilityRows`, so every
   guard below applies unchanged. It is **gateway-only**: the agent ingest does not
   accept `audiocpp_models`, so an agent-launched `audio_cpp` child has no automatic
-  `speech` verdict until an agent-side source exists, and the pass does not probe a
+  `speech` or `transcription` verdict until an agent-side source exists, and the pass does not probe a
   `server_agent` application at all, because the agent router's `/v1/models` carries
   no `task` ([Routing & Model Selection
   §2.3](routing-and-model-selection.md#23-the-capability-gate),
-  [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+  [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+  [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 - **The agent's telemetry ingest**
   (`internal/gateway/agent_ingest.go`, `writeBackRuntimeCapabilities` →
   `runtimeSampleCapabilityRows`). It stamps whichever of
@@ -2041,9 +2077,9 @@ so a manual row survives even a restart, and a `"no"` states something its
 vocabulary cannot mean. `image_edit` is on the probe list above and **not** on this
 one: `image_edit: "no"` is the operator's own opt-out
 ([ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
-while `(image, no)`, by contrast, is reserved here, and `(speech, no)` with it, for
-the same reason: the audio.cpp pass is the writer entitled to establish it, and a
-rank-3 manual `no` would outrank that probe forever. **`mtp` is on neither list**, because it is the one
+while `(image, no)`, by contrast, is reserved here, and `(speech, no)` and
+`(transcription, no)` with it, for the same reason: the audio.cpp pass is the writer
+entitled to establish it, and a rank-3 manual `no` would outrank that probe forever. **`mtp` is on neither list**, because it is the one
 internal name that HAS an operator control, whose rank-3 permanence is exactly
 how that control is meant to work.
 

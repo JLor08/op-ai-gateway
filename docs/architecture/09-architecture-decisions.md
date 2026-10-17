@@ -124,6 +124,20 @@ on `/v1/`; a reverse proxy in front must allow at least the configured value on
 effective limit ([Configuration
 Reference](reference/config-env.md#encrypted-payload-capture)).
 
+**Amended again by [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)
+(the second capped inference body).** `POST /v1/audio/transcriptions` is the eighth
+inference endpoint and the second whose body is `multipart/form-data`, so it reads
+capped for the same reason, at its own setting,
+`OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES` (default **32 MiB**, the agent
+router's cap; junk, `0` or a negative value uses the default), refused `413
+request.body_too_large` from a declared `Content-Length` without a read or by
+`http.MaxBytesReader`, and re-checked against the agent's 32 MiB after a rebuild. It
+is a variable of its own so that audio and images are sized independently. The same
+value also bounds the **response** the relay buffers to read the trailing `timing` block,
+so a 2xx over it is refused 502 `transcription.upstream_error` rather than clipped
+([Compatibility & Inference
+§3.7](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions)).
+
 ## ADR-010 — Streaming: idle watchdog + lifted deadlines, no total cap
 **Decision:** the inference endpoints lift the 30 s server read/write deadlines and
 bound SSE streams by an inactivity watchdog plus client disconnect, not a total
@@ -1809,6 +1823,13 @@ affinity paragraph allowed for: it took a coarse flavor of its own, `openai_audi
 so the guards stay redundant for it exactly as for images. And a capability list is
 now known to do a second job, keeping a request off the vendor-account path, which
 excludes the images flavor by name and has no audio twin.
+
+**Generalised again by [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)
+(the third endpoint, `POST /v1/audio/transcriptions`).** Transcription declares
+`RequiredCapabilities = ["transcription"]` and neither the gate nor the affinity guards
+changed. It shares speech's coarse flavor, so the guards are redundant for it as for
+speech, and its one new lesson is that two endpoints may share a flavor, which moves
+their differences off the flavor string and onto the endpoint.
 
 → [API Compatibility & Inference
 §3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
@@ -5205,6 +5226,22 @@ writer on `server_agent` plus a spec kind** (it never opens for a static server,
 agent router's listing states no `task`). **Normalising an already-OpenAI-shaped error**
 (it would overwrite the upstream's attested type with the gateway's). **Proxying the
 voices listing** (not an OpenAI endpoint).
+
+**Amended by [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)
+(transcription, the third endpoint on the gate).** Speech's `openai_audio` flavor and `audio_cpp`
+kind are now shared with `POST /v1/audio/transcriptions`, which changes three claims
+above. (b): the flavor no longer implies the endpoint, so what differs between the two
+is keyed on the **endpoint**, and (i) and (g) are carved the same way (a transcription
+is normalised under `transcription.upstream_error` and billed from its response body, not
+a header). (d): the same probe now writes **two** rows from one `task`, so an `asr` model
+reads `(speech, no)` **and** `(transcription, yes)`; and the live probe that wrote
+ADR-062 saw the listing name an **unloaded** model with `loaded: false`, so the claim that
+it names loaded models only was not a measured property of the server. The parser never
+read `loaded`, so nothing in the code changed. (h): the `audio/*` Content-Type gate is
+unchanged, but the flavor-plus-2xx **backstop** behind it,
+`isBinarySpeechResponse`, now excludes a transcription, whose 2xx body is a JSON
+transcript the capture must keep.
+
 → [API Compatibility & Inference §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
 [§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
@@ -5214,5 +5251,268 @@ voices listing** (not an OpenAI endpoint).
 [Agent-Managed Model Runtime
 §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-062 — Transcription is multipart in and JSON out on the shared `openai_audio` flavor: a distinct `transcription` capability, billing read from the response body, and every divergence from speech keyed on the endpoint
+
+**Context:** `POST /v1/audio/transcriptions` (issue #69) is the last of the
+originally paired multipart endpoints, after the image edit
+([ADR-057](#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance))
+and speech
+([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
+It is the mirror image of speech on two axes at once. **Like speech** it takes the
+capability gate, the coarse `openai_audio` flavor, the static `audio_cpp` application
+type, the non-token `audio_second` unit of
+[ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar) and no
+affinity pin. **Like the image edit** its request is `multipart/form-data` (an audio
+upload), so it rides the multipart request path: a model peeked from the form, a
+bounded buffered body, a model rewrite when the provider's name differs. And it is
+**unlike both** in one decisive way: the billable quantity, the input audio's
+duration, is in the **JSON response body**, not in a header, so it is the first
+endpoint whose relay must parse a response to meter the request. This entry records
+what transcription decided *differently* from speech and from the edit, and why. The
+inputs are facts about the backend, audio.cpp's `audiocpp_server` (v0.9.1, probed
+live on 2026-10-16 with an `asr` model and a short WAV), that no design could have
+chosen:
+
+- Its capability signal is the per-model `task` of its own `GET /v1/models` (`asr`
+  transcribes). That listing also named an **unloaded** `asr` model, with
+  `loaded: false`.
+- A success is `application/json`, `{"text": ..., "timing": {"wall_ms", "audio_duration_ms",
+  "rtf"}}`, and `audio_duration_ms` is the input audio's duration. `timing` comes
+  **after** the text, and there is **no `X-AudioCPP-*` header** on this endpoint.
+- It **ignores `response_format`**: `json`, `verbose_json` and `text` all return the
+  identical `{"text", "timing"}` document. It never produces OpenAI's `verbose_json`
+  (no `segments`, no `language`) or plain text.
+- Its errors are OpenAI-object-shaped but **HTTP 500** with `type: "server_error"`
+  even for a client error (a missing file, an unknown model), and it has no
+  authentication of its own. Its first call after a model load pays a warm-up of
+  several seconds; a warm call is several times faster than real time.
+
+**Decision — eleven choices, taken together.**
+
+- **(a) The flavor is shared, so every divergence from speech is keyed on the
+  endpoint, never on the flavor string.** Transcription reuses the coarse
+  `openai_audio` flavor and the `audio_cpp` application type and runtime kind; it needs
+  no flavor, type or transport of its own, and `FlavorsAreAudioOnly` already keeps an
+  audio-only server off chat, warmer and benchmark traffic. The price is that code which
+  tested `apiFlavor == apiFlavorSpeech` now sees two endpoints, and each such test was
+  audited. Four behaviors differ and each is keyed on `endpoint == endpointTranscription`
+  (`sessionEndpoint`): `upstreamPath` answers `/v1/audio/transcriptions` and **must do so
+  before** the speech flavor branch; the **billing-quantity source** is the body, not
+  the header; the **error-relay gate**, which is the speech normaliser for speech and
+  its own for transcription; and the **capture predicate** (h). The carve-outs on the
+  speech side are all written **negatively** (`setSpeechBillingQuantity`,
+  `needsSpeechErrorRelay` and `isBinarySpeechResponse` each skip a transcription and
+  nothing else), so a speech call site built without an endpoint, whose zero value is
+  `endpointChat`, is still a speech call site. What stays flavor-keyed is right for
+  both: `billingUnitFor` answers `audio_second` for the flavor, and `newUsageScanner`
+  answers nil, since neither response has chat usage in it.
+- **(b) `transcription` is a capability of its own, and the gate carries it
+  unchanged.** `routing.CapabilityTranscription = "transcription"` means the model
+  **transcribes** audio to text. It is neither `CapabilityAudio` (the model *accepts*
+  audio as chat input, a llama.cpp `/props` modality with its own writer) nor
+  `CapabilitySpeech` (the model *synthesises* speech); the three are orthogonal, can
+  co-occur on one model and are never mapped onto each other. The handler sets
+  `RequiredCapabilities = ["transcription"]` from its own identity, and ADR-042's three
+  rules carry over: `filterCapable` refuses a model without a `yes` verdict on every
+  resolve branch, **the affinity pin and the server override included**; an absent row
+  is unknown and **refuses**; and `(transcription, no)` is reserved in
+  `reservedManualVerdicts`, so a rank-3 manual `no` can never veto the probe that is
+  entitled to write it. `(transcription, yes)` stays writable, and the name stays
+  **off** `reservedAgentCapabilityNames`, because an agent-side writer may report it
+  later. The list does its second job as it does for speech: it keeps the request off
+  the vendor-account path, which has no `openai_audio` twin of its images exclusion.
+  **The capability has no portal fold.** `hasCapabilityFold` admits `image`,
+  `image_edit` and `speech` only, so `ModelOffering.Capable` is empty for a transcription
+  request: the unknown-model redirect never takes a `LastUsedModel` or fallback for it
+  (fail-closed, a plain unknown-model answer instead of a redirect), and the Models
+  listing carries no transcription flag, as it carries none for speech. The gate itself
+  is unaffected.
+- **(c) One probe, one `task`, both capabilities.** The `audiocpp_models` source and
+  `probeAudioCppModels` are unchanged in shape and now decide **two** rows from the one
+  `task` they read: `asr` writes `(transcription, yes)` and `(speech, no)`; `tts` and
+  `clone` write `(speech, yes)` and `(transcription, no)`; any other non-empty task
+  writes both `no`, authoritative because the listing states each model's task; an
+  absent task, a model the listing does not name or an unreadable body writes
+  **nothing**, because none of those says a model cannot transcribe and a `no` can
+  switch a route off. The prober decodes `task` only and never `loaded`: whether a model
+  is resident right now is the **health** axis, not the capability axis, so an `asr`
+  model the listing names with `loaded: false` still reads `(transcription, yes)` and
+  an operator loads the mapped model. That sits against ADR-061 (d), which describes
+  the listing as naming loaded models only, while the transcription probe saw an unloaded
+  one named. Nothing in the parser depends on which holds (speech reads it the same
+  way), but "a model that is not loaded reads as unknown" is a floor, not a guarantee,
+  on that server version. **The agent-managed
+  source is deferred, as for speech:** the agent router's `/v1/models` carries no
+  `task`, so an agent-launched `audio_cpp` child has no automatic verdict, and an
+  operator's manual `transcription: yes` serves it meanwhile.
+- **(d) The request is multipart, rides the edit's path, and is not relayed purely
+  verbatim.** The body is read whole under a **cap of its own**,
+  `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES` (default 32 MiB, the agent
+  router's own cap; independent of the image-edit cap so an operator can size audio
+  separately), then walked once with `mime/multipart` by the request's own boundary,
+  never `ParseMultipartForm`, with every part read to its end. The **model is read
+  exactly as the agent router's `peekMultipartModel` reads it**, a single-use part
+  whose `FormName()` is `model` with the whole body walked, because the gateway
+  allowlists the name it read and the router then starts a process on the name *it*
+  read, and a parity test pins this parser to the image edit's. The handler validates
+  its own shape **before** the preflight that makes the one admission call: a non-empty
+  `model` (`transcription.model_required`) and **exactly one non-empty part named
+  `file`**, zero being `transcription.file_required` and more than one
+  `transcription.invalid`, a malformed or non-multipart body also being
+  `transcription.invalid`. Only `file` counts: audio.cpp reads the upload from that
+  field alone, so the image edit's `image[]` spelling has no twin. A JSON body, which
+  audio.cpp itself accepts, is refused: OpenAI's contract is multipart. **An empty
+  `file` part is no file for validation but is stripped before the relay**: audio.cpp,
+  handed two `file` parts, could take the empty one, so the relay rebuilds the body
+  (every part's headers, bytes and position copied, a fresh boundary, the `model` value
+  replaced when the mapping's own name differs, every empty `file` part dropped) whenever
+  the model needs a rewrite **or** an empty `file` part is present. The client's bytes
+  are relayed verbatim, boundary included, only when neither holds. An
+  agent-launched target is sent the upload only when its agent has declared
+  `multipart_proxy` (fail-closed, 404 `transcription.unavailable`, **no agent version
+  bump** because the router is blind to the path), and the body actually handed to it is
+  re-checked against the agent's own 32 MiB **after** the rebuild (413
+  `request.body_too_large`, recorded, not sent).
+- **(e) Transcription bills `audio_second` from the response body.** The unit is endpoint
+  identity, so every `recordUsage` site, a refused or failed request included, carries
+  `billing_unit = audio_second` with tokens and both rates at zero
+  (`ValidateBillingXOR`). The quantity is the **response's own measurement**,
+  `timing.audio_duration_ms` divided by 1000, which is where audio.cpp reports it on
+  this endpoint, **not a header** as speech's is. It is set only on a clean `success`,
+  once the full body has reached the client, so a client that disconnects mid-write
+  records `0`, as speech's does. A success with **no usable duration** (an absent
+  `timing` or field, a `null`, a non-number, a numeric **string** included, zero, a
+  negative, a value past float range, or a body that is no JSON object) records `0` and
+  is logged once at `Error`, because the pair has no "unknown" and the gap is made
+  loud, not repaired (ADR-041). The log line carries the body's **size** only: the
+  body is the transcript, which is the user's content.
+- **(f) The relay buffers the response up to the body cap, writes it verbatim, and an
+  over-cap response is a 502.** `timing` is trailing, so the duration is unknown until
+  the body has been read to its end, and the gateway must not have sent a byte by then,
+  or an unreadable or oversized body could not be turned into an error. So the one
+  success in `proxyNative` that cannot stream goes **read, decide, write**: it reads up
+  to the transcription cap through a `LimitReader` of `limit + 1`, so that exceeding it is
+  **detected rather than clipped**; then the buffered bytes go to the client verbatim,
+  with the upstream's status and `Content-Type`, an exact `Content-Length` and the
+  `timing` block **kept** (the project proxies natively shaped backends and does not
+  translate; OpenAI clients ignore the unknown field). A response **over the cap**, or
+  one that **breaks off mid-read**, is HTTP **502** `transcription.upstream_error` (the
+  gateway's own OpenAI-shaped error, `type: upstream_error`, there being no upstream
+  status worth relaying): nothing of the body is written, the row is an error row with
+  quantity `0`, and a transcript is **never delivered in part**. The bound is the body
+  cap, **not** `captureMaxBytes`, which is for error bodies and would hand the client a
+  truncated success. 32 MiB is orders of magnitude above any real transcript (a 32 MiB
+  upload transcribes to a few MB of text at most), and memory under concurrency is
+  bounded by that cap per in-flight request, which is the price of metering a trailing
+  field. There is no idle watchdog and no usage scanner: the request is one
+  non-streaming call under the application's `timeout_ms` as its single **total**
+  deadline.
+- **(g) The request surface takes `json` only, and streaming is refused.**
+  `response_format` must be `json` or absent (whitespace trimmed, the match
+  case-sensitive as OpenAI's is), and **every other value is 400
+  `transcription.response_format_unsupported`**: `verbose_json`, `text`, `srt`, `vtt`
+  and anything that is no transcription format at all. audio.cpp only ever produces its
+  own `{"text", "timing"}` document, so `verbose_json` would promise `segments` and a
+  `language` it does not produce, and the plain-text formats would promise a non-JSON
+  body that carries no duration, so a relayed one would bill zero on every success. It is
+  the tight mirror of speech's WAV-only surface, with the same way back: a real
+  `verbose_json` shape, or honoring `text`, `srt` and `vtt`, needs a translation this
+  project does not do. `stream` on, a non-boolean `stream` and any `stream_format` are
+  400 `transcription.stream_unsupported`, because the relay's buffering and billing
+  contract is one complete JSON response; `stream: false` and an absent or empty `stream`
+  and `stream_format` are accepted.
+- **(h) Capture stores the form and the transcript, and the binary predicate is
+  endpoint-gated.** The multipart **request** is captured by the edit's path as a JSON
+  summary: the text fields kept, the `file` part `redacted`. The **response** is the JSON
+  transcript, stored as an ordinary text body under the opt-in, and it is
+  **output-sensitive**: it is the user's spoken content, and no transcription-specific
+  redaction applies to it. It gets what every captured body gets: the capture's own
+  per-body size cap (a long transcript is stored clipped, with `truncated` set, while the
+  client still receives all of it) and the same sealing at rest
+  ([Security §14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+  The flavor was the wrong key here: `isBinarySpeechResponse` stored **every** 2xx
+  `openai_audio` response as a redacted binary summary, which would have turned a
+  transcript into a metadata stub, so `captureInput` gained an `Endpoint`, stamped by the
+  transcription success relay, and the predicate skips `endpointTranscription`. The
+  carve-out is negative, so a speech capture built without an endpoint stays redacted:
+  the failure that leaves is a transcript lost to a summary, never a WAV in the envelope.
+  The capture's text-part bound must stay at least each endpoint's own field cap (both
+  1 MiB), or a field a handler accepted would be redacted.
+- **(i) A non-2xx upstream response is normalised to the OpenAI error shape.** As
+  ADR-061 (i), keyed on the endpoint: the error body is buffered, bounded by
+  `captureMaxBytes`; an OpenAI error object passes through **byte for byte** (audio.cpp's
+  attested `type` is not overwritten); a plain `{"error":"..."}` string is wrapped with
+  `type: upstream_error` and `code: transcription.upstream_error`; anything else is
+  relayed unchanged under its own `Content-Type`; the upstream's status is relayed as it
+  came, and a failed relay records an `audio_second` error row with quantity zero. The
+  500 that audio.cpp answers for a client error is why validation (d) and (g) run up
+  front rather than leaving the client with a "server failure" about its own mistake.
+- **(j) The admission surface is the image and speech one.** Auth is
+  `requireInternalOrBearerAnyScope`: a bearer token **or** the internal loopback pair,
+  never the session cookie (a fourth user of that leg, though no portal flow calls this
+  endpoint), with the shared run-as block. The request takes **no affinity pin**, by the
+  guard ADR-042 wrote for exactly this, and has an empty `sessionEndpoint` case (OpenAI's
+  transcription request has no session field, and its body is multipart). The handler lifts
+  the connection deadlines, since an upload can take longer than 30 seconds to arrive.
+- **(k) The portal is API-only, with a chip and a mock.** The operator portal gains a
+  `transcription` capability chip (a `KNOWN_CAPABILITY_ORDER` entry and a DE/EN
+  string), so a `transcription: yes` verdict renders as a translated chip instead of a raw
+  standby string, and there is no audio composer. The built-in mock provider answers the
+  transcription path with the `{text, timing}` document, so a dev or e2e run is not handed
+  a Responses event stream.
+
+**Consequence:** transcription has speech's day-one cost. A deployment with no
+`openai_audio` application serves no transcription: a route without the flavor answers
+404 `routing.no_model_route`, and one with it and no `(transcription, yes)` verdict
+answers 404 `routing.model_not_capable`. For an `audio_cpp` application the verdict
+arrives with the first health tick that finds the mapped model named in the listing. Every
+request is one non-streaming call, so a first call after a model load can occupy several
+seconds of warm-up inside the application's `timeout_ms` (600000 by default for the
+`audio_cpp` type; any other type that serves transcription needs it raised by hand). The
+memory profile is the new cost: a transcription holds its **upload** whole (up to 32 MiB,
+and a second copy while a rebuild is in flight) and, separately, its **response** up to
+the same cap, per in-flight request. The costs accepted are named, not hidden
+([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)): no
+streaming, no `response_format` but `json`, bounded buffering of the upload **and** the
+response, no automatic verdict for an agent-managed `audio_cpp` child, no portal fold
+(so no redirect candidate and no listing flag), a capture gate that trusts the endpoint,
+and a captured transcript that is output-sensitive.
+
+**Rejected:** **A fine flavor of its own** (ADR-042's and ADR-061's argument, now three
+times avoided; the shared flavor costs one rule, to key on the endpoint, and an audit).
+**Mapping `transcription` onto `audio` or `speech`** (an input modality with its own
+writer, and the opposite direction; advertising one as the other fails far from its
+cause). **Billing from the request** (decoding every container format to learn a
+duration the upstream has already measured, and a number that need not agree with the
+one it computes). **Streaming the response while scanning for `timing`** (the field is
+trailing, so by the time it is known the status and the transcript have gone, and an
+unreadable or oversized body can no longer become an error). **Clipping the buffer at
+`captureMaxBytes`** (a silently truncated success, billed at zero). **Honoring `text`,
+`srt`, `vtt` or `verbose_json`** (a shape the upstream does not produce, and a billing
+gap for the non-JSON ones). **Accepting `file[]`, or several files** (audio.cpp reads
+`file` alone, and a form with two audio files is two answers to "which audio").
+**Relaying an empty `file` part** (the upstream could read it instead of the upload).
+**Passing audio.cpp's 500 for a client error through** (the gateway would hand a client's
+own mistake on as a server failure). **Normalising an already OpenAI-shaped error** (it
+would overwrite the upstream's attested type). **A flavor-keyed capture predicate** (a
+transcript stored as a redacted summary, with the opt-in's whole point lost). **Sharing
+the image edit's body cap** (audio and images are sized by different operators for
+different reasons). **Gating the verdict writer on `server_agent`** (as ADR-061 rejected
+it). **Serving a JSON-bodied request** (audio.cpp accepts it; OpenAI's contract is
+multipart, and a second body shape doubles the validation and capture surface).
+→ [API Compatibility & Inference §3.7](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions),
+[§10](cross-cutting/compatibility-and-inference.md#10-request-bodies-and-size-limits),
+[Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
+[§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[Telemetry, Usage Analytics & Observability
+§8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[Security §14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers),
+[Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Configuration Reference](reference/config-env.md#encrypted-payload-capture),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
