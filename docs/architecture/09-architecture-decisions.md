@@ -321,10 +321,11 @@ The mirror image exists too: a fact the **gateway** states about itself, on the
 gateway's list alone. `capability_source_sdcpp` (issue #154) says the gateway's
 capability ingest accepts the `sdcpp_capabilities` source, and the agent reads
 it before it sends that source at all, because a gateway without the name
-would void every such capability pass. The agent declares nothing back: the
-gateway is the side that must accept the source, nothing on the gateway waits
-on the agent, and an agent-side name would therefore gate nothing — so a flag
-on one list only is not a half-finished negotiation, it is the name placed on
+would void every such capability pass. `capability_source_audiocpp` (issue #255) is the
+same shape for the `audiocpp_models` source and an agent-launched audio.cpp child. The
+agent declares nothing back: the gateway is the side that must accept the source,
+nothing on the gateway waits on the agent, and an agent-side name would therefore gate
+nothing — so a flag on one list only is not a half-finished negotiation, it is the name placed on
 the side whose fact it is.
 → [Agent-Managed Model Runtime §7](cross-cutting/agent-runtime-manager.md).
 
@@ -5153,18 +5154,27 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   model cannot speak and a `no` can switch a route off. It is a new probe-rank source,
   `audiocpp_models`, ranking 1 with the other probes (never able to outrank a `manual`
   or `vision_benchmark` row, always able to repair its own drift), and it writes the
-  `speech` row only. **A model that is not loaded reads as unknown and refuses**
+  `speech` row only (the `transcription` row joined it in ADR-062 (c)). **A model that is
+  not loaded reads as unknown and refuses**
   until the health loop sees it loaded; for an operator-run server the mapped model is
   loaded, and `speech: yes` set by hand covers the rest. (*Superseded in part by
   [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint) (c) and
   the amendment note below: the listing was found to name an unloaded model too, with
   `loaded: false`, and the prober never decoded `loaded`, so read "a model that is not
   loaded" in this choice and in the Consequence as "a model the listing does not
-  name".*) **The agent-managed source is
-  deferred:** the agent router's `/v1/models` carries no `task`, so an agent-launched
-  `audio_cpp` child has no automatic verdict until an agent-side source exists (a
-  feature flag and an ingest acceptance, as `capability_source_sdcpp` is for images); an
-  operator's manual `speech: yes` serves it meanwhile.
+  name".*) **The agent-managed source was deferred here, and it now exists** (issue
+  #255, agent 0.9.1). The agent router's `/v1/models` still carries no `task`, so the
+  agent does not read it: it GETs an agent-launched `audio_cpp` child's **own**
+  `/v1/models` over loopback, the base address every per-child probe already uses,
+  derives the verdicts with a deliberate duplicate of the gateway's parser (the two
+  copies pinned to one case table), and reports them under the same `audiocpp_models`
+  source, **only while the gateway declares `capability_source_audiocpp`** (a name on the
+  gateway's list alone, as `capability_source_sdcpp` is for images: the agent's own
+  `Features` gained no entry, so the version bump is a PATCH). The ingest accepts the
+  source for the `speech` and `transcription` rows only, at the probe rank, so an
+  operator's manual `speech: yes` (rank 3) still outranks it and stays the override, and
+  the enablement path for an agent before 0.9.1 and for a model the listing does not
+  name.
 - **(e) The request surface is WAV-only, and streaming is refused rather than
   half-served.** `response_format` must be `wav` or absent, and **every other value is
   400 `speech.response_format_unsupported`**: `mp3`, `opus`, `flac`, `aac` and `pcm`
@@ -5397,9 +5407,12 @@ chosen:
   one named. Nothing in the parser depends on which holds (speech reads it the same
   way), but "a model that is not loaded reads as unknown" is a floor, not a guarantee,
   on that server version. **The agent-managed
-  source is deferred, as for speech:** the agent router's `/v1/models` carries no
-  `task`, so an agent-launched `audio_cpp` child has no automatic verdict, and an
-  operator's manual `transcription: yes` serves it meanwhile.
+  source exists, as for speech** (ADR-061 (d), issue #255): the agent reads an
+  agent-launched `audio_cpp` child's own `/v1/models` and reports both rows under
+  `audiocpp_models` while the gateway declares `capability_source_audiocpp`. The ingest
+  accepts the source for `speech` and `transcription` only, which is why this name was
+  left off `reservedAgentCapabilityNames`, and an operator's manual `transcription: yes`
+  (rank 3) still outranks it.
 - **(d) The request is multipart, rides the edit's path, and is not relayed purely
   verbatim.** The body is read whole under a **cap of its own**,
   `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES` (default 32 MiB, the agent
@@ -5531,9 +5544,10 @@ and a second copy while a rebuild is in flight) and, separately, its **response*
 the same cap, per in-flight request. The costs accepted are named, not hidden
 ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)): no
 streaming, no `response_format` but `json`, bounded buffering of the upload **and** the
-response, no automatic verdict for an agent-managed `audio_cpp` child, no portal fold
-(so no redirect candidate and no listing flag), a capture gate that trusts the endpoint,
-and a captured transcript that is output-sensitive.
+response, an unlisted model reading as unknown (an agent-launched child's verdict
+arrives from the agent's probe of its own listing, once per process generation), no
+portal fold (so no redirect candidate and no listing flag), a capture gate that trusts
+the endpoint, and a captured transcript that is output-sensitive.
 
 **Rejected:** **A fine flavor of its own** (ADR-042's and ADR-061's argument, now three
 times avoided; the shared flavor costs one rule, to key on the endpoint, and an audit).
@@ -5744,11 +5758,12 @@ could have chosen:
   model's flag selects the speech composer for a thread that has no transcript yet.
   **The shared `offeredFlavors` is deliberately untouched.** It also feeds the Models
   view's "Available via" column, and gating `openai_audio` behind a speech verdict there
-  would drop the flavor from transcription, unprobed and agent-managed audio rows (and from
+  would drop the flavor from transcription, unprobed and not-yet-reported agent-managed audio rows (and from
   the image-worded "no verdict" notes that read it). The chat needs a stricter rule than
   that column, so the stricter rule lives in the chat and the shared function keeps
-  answering what it did. An agent-managed `audio_cpp` model appears in the chat only with
-  a manual `speech: yes`, ADR-061 (d)'s accepted deferral.
+  answering what it did. An agent-managed `audio_cpp` model appears in the chat once its
+  agent has reported a `(speech, yes)` verdict from the child's own listing (ADR-061 (d),
+  agent 0.9.1) or an operator has set `speech: yes` by hand.
 - **(f) `voice` is free text, and there is no voices dropdown.** The settings panel
   carries a free-text `voice` field whose placeholder hints that the model's own default
   applies and is **never written** (blank leaves the model on its default voice, the

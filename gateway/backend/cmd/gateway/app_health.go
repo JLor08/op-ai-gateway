@@ -1292,20 +1292,23 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 
 		// audio.cpp capability pass: for every active audio_cpp application,
 		// read the server's own /v1/models listing for each of its active
-		// mappings and write the speech verdict that listing states for that
-		// model (probeAudioCppModels). A separate branch from the context
-		// probe for the same reason as the sdcpp one: audio_cpp has no
-		// context probe path, and the listing is not a ModelInfo. It shares
-		// that branch's cadence (the application's effective interval) and
-		// wg+sem, under its own "audiocpp:"+id key, seen-marked for every such
-		// app so the cleanup keeps its last-probe time.
+		// mappings and write the speech and transcription verdicts that
+		// listing states for that model (probeAudioCppModels). A separate
+		// branch from the context probe for the same reason as the sdcpp one:
+		// audio_cpp has no context probe path, and the listing is not a
+		// ModelInfo. It shares that branch's cadence (the application's
+		// effective interval) and wg+sem, under its own "audiocpp:"+id key,
+		// seen-marked for every such app so the cleanup keeps its last-probe
+		// time.
 		//
 		// Gated on the application's TYPE alone, like the sdcpp pass: the type
 		// is a static, operator-run audio.cpp server, which has no runtime
 		// spec, so the pass neither needs nor reads one. It reaches such a
 		// server only. An agent-managed audio.cpp is a server_agent mapping
 		// behind the agent's router, whose /v1/models carries no task, so this
-		// pass could state no verdict for it; that path is deferred.
+		// pass could state no verdict for it and deliberately leaves it alone:
+		// the agent reports that child's verdicts itself, from the child's own
+		// listing, under the same audiocpp_models source.
 		//
 		// No unstamp-on-miss, unlike the sdcpp pass: it asks about mappings
 		// that already exist, so no verdict can arrive before its mapping.

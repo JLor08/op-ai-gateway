@@ -4062,8 +4062,8 @@ func TestProbeRuntimeChildPropsAudioCppWithholdsACachedVerdictOnRollback(t *test
 
 // TestProbeRuntimeChildPropsAudioCppAndSdcppGatesAreIndependent pins that the
 // two sources do not share a gate in the other direction either: declaring
-// only capability_source_audiocpp neither probes a stable_diffusion_cpp child
-// nor lets its cached verdict through.
+// only capability_source_audiocpp does not open a stable_diffusion_cpp child,
+// which is not probed and reports no capabilities.
 func TestProbeRuntimeChildPropsAudioCppAndSdcppGatesAreIndependent(t *testing.T) {
 	child := newProbeChild(t, map[string]string{sdcppCapabilitiesRoute: sdcppImageYesDoc})
 	features := &fakeGatewayFeatures{names: []string{"capability_source_audiocpp"}}

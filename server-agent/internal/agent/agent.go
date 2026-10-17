@@ -1636,10 +1636,10 @@ func (a *Agent) clock() time.Time {
 // no /props, so that claiming it loses nothing a /props probe could have
 // found: Ollama serves none, and neither does sd-server or audio.cpp.
 // "custom" can never be claimed, whatever binary it turns out to run, or
-// that fallback loses its probe. One extra loopback request per child lifetime once a verdict
-// set is cached; there is no SSRF guard to apply to any of these paths
-// (unlike MetricsPath/ContextProbePath, all are package constants, never
-// operator/config-supplied).
+// that fallback loses its probe. One extra loopback request per child
+// lifetime once a verdict set is cached; there is no SSRF guard to apply to
+// any of these paths (unlike MetricsPath/ContextProbePath, all are package
+// constants, never operator/config-supplied).
 //
 // The gate: a gateway can know the stable_diffusion_cpp spec type and still
 // not accept the sdcpp_capabilities source, and it drops the capability rows
@@ -1863,10 +1863,9 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // RuntimeSample.Capabilities' wire pointer type: each of the seven named
 // fields (vision, video, audio, tools, image, speech, transcription) becomes
 // one CapabilityVerdict entry keyed by its name, every Extra name becomes a
-// "yes" entry (a reported extra capability is a positive
-// assertion), and an empty ("" -- undetermined) field is skipped entirely
-// rather than carried as an entry, mirroring the store's
-// row-absence-means-unknown model.
+// "yes" entry (a reported extra capability is a positive assertion), and an
+// empty ("" -- undetermined) field is skipped entirely rather than carried as
+// an entry, mirroring the store's row-absence-means-unknown model.
 //
 // source is the caller's answer to "which probe produced this document" (a
 // sample.CapabilitySource* constant), carried onto the wrapper so the

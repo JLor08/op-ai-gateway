@@ -41,8 +41,9 @@ type audioCppModelsDoc struct {
 // parseAudioCppModels is a DUPLICATE, on purpose, of the gateway's
 // provider.parseAudioCppModels (gateway/backend/internal/provider/
 // audiocpp_models.go): the two Go modules share no package. The two copies
-// must decide identically on identical input, and audioCppTaskCases pins both.
-// Change them together.
+// must decide identically on identical input, and audioCppModelCases pins
+// both (the gateway's TestAudioCppModelsCasesMatchTheAgentsTable holds the
+// two copies of that table byte-identical). Change them together.
 //
 // It derives the speech and transcription verdicts for model from a
 // /v1/models body, each "yes", "no" or "" (no answer). It is TOLERANT: a body
