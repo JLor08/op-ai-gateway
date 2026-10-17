@@ -437,6 +437,101 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(submitted[0]).not.toHaveProperty('capability_verdicts');
     });
 
+    // speech and transcription are the audio twins of the image control: yes is
+    // the operator's enablement path for an agent-launched audio model (the one
+    // population with no automatic source yet), and a selectable no is never
+    // offered because (speech, no) and (transcription, no) are reserved -- a
+    // manual no would outrank, and so permanently mask, the audio.cpp /v1/models
+    // probe. The probe's own no is shown, disabled.
+    for (const control of [
+      {
+        capability: 'speech',
+        label: t.mappingSpeechCapable,
+        hint: t.mappingSpeechCapableUnknownHint,
+      },
+      {
+        capability: 'transcription',
+        label: t.mappingTranscriptionCapable,
+        hint: t.mappingTranscriptionCapableUnknownHint,
+      },
+    ] as const) {
+      const { capability, label, hint } = control;
+
+      it(`offers unknown and yes for ${capability}, never a selectable no`, async () => {
+        renderForm({ row: makeMapping({ capabilities: [] }) });
+        fireEvent.mouseDown(screen.getByRole('combobox', { name: label }));
+        expect(
+          await screen.findByRole('option', { name: t.mappingCapabilityUnknown }),
+        ).toBeInTheDocument();
+        expect(screen.getByRole('option', { name: t.mappingCapabilityYes })).toBeInTheDocument();
+        expect(
+          screen.queryByRole('option', { name: t.mappingCapabilityNo }),
+        ).not.toBeInTheDocument();
+      });
+
+      it(`sends the ${capability} verdict when the control is moved to yes`, async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await pickOption(label, t.mappingCapabilityYes);
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ [capability]: 'yes' });
+      });
+
+      it(`sends nothing for an untouched ${capability} control`, async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+      });
+
+      it(`shows a probe's ${capability} no as a disabled option, without offering it`, async () => {
+        // The audio.cpp /v1/models probe is the one writer entitled to state
+        // no. The control must SHOW that verdict -- a Select whose value has no
+        // option renders blank, which reads as unknown -- while never offering
+        // no as a pick.
+        const { submitted } = renderForm({
+          row: makeMapping({
+            capabilities: [
+              {
+                capability,
+                verdict: 'no',
+                source: 'audiocpp_models',
+                checked_at: '2026-09-25T12:00:00Z',
+              },
+            ],
+          }),
+        });
+        const combo = screen.getByRole('combobox', { name: label });
+        expect(combo.textContent).toBe(t.mappingCapabilityNo);
+
+        fireEvent.mouseDown(combo);
+        const no = await screen.findByRole('option', { name: t.mappingCapabilityNo });
+        expect(no).toHaveAttribute('aria-disabled', 'true');
+        fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+        // Untouched, it is not sent: the probe's row stays the probe's.
+        await save();
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+      });
+
+      it(`shows a ${capability} unknown hint of its own`, async () => {
+        renderForm({ row: makeMapping({ capabilities: [] }) });
+        expect(screen.getByText(hint)).toBeInTheDocument();
+        // Each audio capability names its own probe task and its own
+        // enablement, so no two hints -- neither the pair nor any sibling
+        // control's -- may share one text.
+        expect(hint).not.toBe(t.mappingImageCapableUnknownHint);
+        expect(hint).not.toBe(t.mappingVisionCapableUnknownHint);
+        expect(hint).not.toBe(t.mappingImageEditUnknownHint);
+        expect(t.mappingSpeechCapableUnknownHint).not.toBe(
+          t.mappingTranscriptionCapableUnknownHint,
+        );
+      });
+    }
+
     it('leaves metrics_locked a CHECKBOX', () => {
       // A policy flag over the numeric metrics, not a capability -- ADR-039 is
       // explicit that it does not guard the capability table any more, so it

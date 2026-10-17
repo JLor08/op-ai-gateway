@@ -308,6 +308,13 @@ export function MappingForm({
   const [imageCapable, setImageCapable] = useState<CapabilityChoice>(imageCapableSeed);
   const [imageEditSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'image_edit'));
   const [imageEdit, setImageEdit] = useState<CapabilityChoice>(imageEditSeed);
+  const [speechCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'speech'));
+  const [speechCapable, setSpeechCapable] = useState<CapabilityChoice>(speechCapableSeed);
+  const [transcriptionCapableSeed] = useState<CapabilityChoice>(() =>
+    capabilitySeed(row, 'transcription'),
+  );
+  const [transcriptionCapable, setTranscriptionCapable] =
+    useState<CapabilityChoice>(transcriptionCapableSeed);
   const [metricsLocked, setMetricsLocked] = useState(() => row?.metrics_locked ?? false);
   const [maxConcurrency, setMaxConcurrency] = useState(() => text(row?.max_concurrency));
   const [recommendedConcurrency, setRecommendedConcurrency] = useState(() =>
@@ -430,6 +437,8 @@ export function MappingForm({
       { capability: 'vision', value: visionCapable, seed: visionCapableSeed },
       { capability: 'image', value: imageCapable, seed: imageCapableSeed },
       { capability: 'image_edit', value: imageEdit, seed: imageEditSeed },
+      { capability: 'speech', value: speechCapable, seed: speechCapableSeed },
+      { capability: 'transcription', value: transcriptionCapable, seed: transcriptionCapableSeed },
     ] as const) {
       if (control.value === control.seed) continue;
       verdicts[control.capability] = control.value;
@@ -665,6 +674,47 @@ export function MappingForm({
             </option>
           )}
           <option value="no">{t.mappingCapabilityNo}</option>
+        </SelectField>
+        {/* speech and transcription follow the image control above exactly:
+            unknown and yes are the picks, and there is NO "no" choice because
+            reservedManualVerdicts refuses (speech, no) and (transcription, no)
+            -- a manual no outranks every automated source forever and would
+            permanently mask the audio.cpp /v1/models probe (audiocpp_models),
+            the one writer entitled to state it. When that probe HAS stated it,
+            the option is rendered disabled so the control shows the stored
+            verdict instead of a blank that reads as unknown. "yes" is the
+            operator's enablement path for a model the server agent launches:
+            nothing detects those automatically yet, so the unknown hint says
+            to set it there. */}
+        <SelectField
+          id="mapping-speech-capable"
+          label={t.mappingSpeechCapable}
+          value={speechCapable}
+          onChange={(e) => setSpeechCapable(e.target.value as CapabilityChoice)}
+          {...unknownHint(speechCapable, t.mappingSpeechCapableUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {speechCapableSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
+        </SelectField>
+        <SelectField
+          id="mapping-transcription-capable"
+          label={t.mappingTranscriptionCapable}
+          value={transcriptionCapable}
+          onChange={(e) => setTranscriptionCapable(e.target.value as CapabilityChoice)}
+          {...unknownHint(transcriptionCapable, t.mappingTranscriptionCapableUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {transcriptionCapableSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
         </SelectField>
         {/* metrics_locked stays a CHECKBOX: it is a policy flag over the
             numeric metrics, not a capability, and ADR-039 is explicit that it
