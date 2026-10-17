@@ -548,8 +548,9 @@ export function parseAudioPassthrough(raw: string): AudioPassthroughParse {
   }
   if (!isJsonObject(parsed)) return { status: 'invalid' };
   const keys = Object.keys(parsed);
-  // Sorted, like the backend's, so the field named is deterministic.
-  const reservedField = keys.sort().find(isSpeechReservedField);
+  // Scan a sorted copy, like the backend's, so the field named is deterministic;
+  // `keys` keeps its original order for the length check below.
+  const reservedField = [...keys].sort((a, b) => a.localeCompare(b)).find(isSpeechReservedField);
   if (reservedField !== undefined) return { status: 'invalid', reservedField };
   return keys.length === 0 ? { status: 'empty' } : { status: 'ok', value: parsed };
 }

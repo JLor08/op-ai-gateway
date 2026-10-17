@@ -547,7 +547,9 @@ export function ChatStoreProvider({
   // A model both image- and speech-capable is an image model here: image was the
   // kind first, so a model that gains a speech verdict never changes what an
   // existing image model does. (Nothing in the catalogue is both today.)
-  const prospectiveKind = modelImageCapable ? 'image' : modelSpeechCapable ? 'speech' : '';
+  let prospectiveKind = '';
+  if (modelImageCapable) prospectiveKind = 'image';
+  else if (modelSpeechCapable) prospectiveKind = 'speech';
   // The thread's kind, and the whole distinction in one line: once the thread
   // has a transcript the backend has already pinned it (PrepareChatRun forces
   // the stored kind on every send after the first), so the pin wins and the
