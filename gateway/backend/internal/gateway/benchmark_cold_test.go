@@ -350,6 +350,39 @@ func TestBenchmarkSiblingModelSkipsAnImagesOnlySibling(t *testing.T) {
 	})
 }
 
+// TestBenchmarkSiblingModelSkipsAnAudioOnlySibling is the audio twin of the images-only case
+// above: a speech- or transcription-only sibling (openai_audio) cannot answer a chat prompt
+// either, so benchmarkSiblingModel passes over it exactly as it passes over an images-only one,
+// and picks the first text sibling after it. With no such sibling it picks none.
+func TestBenchmarkSiblingModelSkipsAnAudioOnlySibling(t *testing.T) {
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	text := []string{routing.APIFlavorOpenAI}
+	t.Run("a text sibling after them", func(t *testing.T) {
+		mem, app := coldSeedAgentStore(t,
+			map[string]string{"map1": "up-model", "map2": "asr-model", "map3": "unread-model", "map4": "up-model-4"},
+			map[string][]string{"map1": text, "map2": audio, "map3": text, "map4": text})
+		specs := &refusalSpecStore{Store: mem, fail: map[string]bool{"map3": true}, reads: map[string]int{}}
+		srv := &Server{Routes: specs}
+		tgt := coldTestTarget()
+		tgt.app = app
+		sib, ok := srv.benchmarkSiblingModel(context.Background(), tgt)
+		if !ok || sib != "up-model-4" {
+			t.Fatalf("benchmarkSiblingModel = %q, %v; want up-model-4, true: not the audio-only or the unreadable sibling", sib, ok)
+		}
+	})
+	t.Run("only an audio-only sibling", func(t *testing.T) {
+		mem, app := coldSeedAgentStore(t,
+			map[string]string{"map1": "up-model", "map2": "asr-model"},
+			map[string][]string{"map1": text, "map2": audio})
+		srv := &Server{Routes: mem}
+		tgt := coldTestTarget()
+		tgt.app = app
+		if sib, ok := srv.benchmarkSiblingModel(context.Background(), tgt); ok {
+			t.Fatalf("benchmarkSiblingModel = %q, true; want none: no sibling can take the swap", sib)
+		}
+	})
+}
+
 // TestEnsureColdLoadAgentTargetNeverSwapsOrUnloads: the cold pass never evicts a resident
 // target of a server_agent application, not even through a provider that could unload it or
 // swap it out through a text sibling. It cannot confirm a cold start then. The agent's runtime

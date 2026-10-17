@@ -181,6 +181,20 @@ func (s *Server) mappingIsImagesOnly(ctx context.Context, app routing.Applicatio
 	return mappingSpecIsImagesOnly(app, spec, hasSpec), nil
 }
 
+// mappingIsAudioOnly is mappingIsImagesOnly's audio twin: it reads the
+// mapping's runtime spec and reports whether its EFFECTIVE flavors are
+// audio-only (mappingSpecIsAudioOnly) -- a speech- or transcription-only
+// server that benchmarkSiblingModel must also pass over, since it cannot
+// answer a chat prompt either. Same "no spec" kept apart from a failed read
+// as mappingIsImagesOnly.
+func (s *Server) mappingIsAudioOnly(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
+	spec, hasSpec, err := s.mappingRuntimeSpec(ctx, app, mappingID)
+	if err != nil {
+		return false, err
+	}
+	return mappingSpecIsAudioOnly(app, spec, hasSpec), nil
+}
+
 // benchmarkSpecFor resolves the RuntimeSpec the model warmer's
 // benchmarkTarget carries (its .spec field) for later auth resolution via
 // routing.SpecUpstreamAuth, mirroring routing.Resolver.targetFrom's
@@ -736,8 +750,9 @@ func (s *Server) waitModelUnloaded(ctx context.Context, lister provider.LoadedMo
 // application (a distinct AppModelName), for the swap-workaround eviction.
 //
 // The swap sends that sibling a chat prompt, so a sibling that serves only images
-// (mappingIsImagesOnly) is passed over, and so is one whose runtime spec cannot be read,
-// since whether it serves only images is then unknown.
+// (mappingIsImagesOnly) or only audio (mappingIsAudioOnly) is passed over, and so is one
+// whose runtime spec cannot be read, since whether it serves only images or audio is then
+// unknown.
 func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget) (string, bool) {
 	mappings, err := s.Routes.MappingsByApplication(ctx, tgt.app.ID)
 	if err != nil {
@@ -748,6 +763,9 @@ func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget)
 			continue
 		}
 		if imagesOnly, err := s.mappingIsImagesOnly(ctx, tgt.app, m.ID); err != nil || imagesOnly {
+			continue
+		}
+		if audioOnly, err := s.mappingIsAudioOnly(ctx, tgt.app, m.ID); err != nil || audioOnly {
 			continue
 		}
 		return m.AppModelName, true
