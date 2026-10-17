@@ -100,7 +100,7 @@ func FlavorsAreAudioOnly(flavors []string) bool {
 //
 //   - openai: the application declares it (applicationHasAPIFlavor, which text
 //     candidacy admits on), and eff's flavors are neither images-only nor
-//     audio-only: a server that can only generate images or speech does not
+//     audio-only: a server that can only generate images or audio does not
 //     serve chat completions. So a spec narrowed to [anthropic], or stored as
 //     [], keeps openai: chat completions serve it.
 //   - anthropic, openai_images, openai_audio: the application declares it, and
@@ -158,7 +158,7 @@ func listedEndpoint(flavor string) (endpoint string, known bool) {
 
 // effectiveHasAPIFlavor is the half of both mapping rules that eff answers:
 // for openai that its flavors are neither images-only nor audio-only (a server
-// that can only generate images or speech answers no chat prompt), for any
+// that can only generate images or audio answers no chat prompt), for any
 // other flavor that they list it.
 func effectiveHasAPIFlavor(eff EffectiveSpecFields, flavor string) bool {
 	if flavor == APIFlavorOpenAI {

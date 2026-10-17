@@ -41,7 +41,7 @@ const (
 	// same refusals, for the same reason. (The message below still says "speech",
 	// the first audio endpoint; the code, and the mapping test, cover both.)
 	codeBenchmarkAudioOnly = "benchmark.audio_only"
-	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves only speech, so no chat prompt is sent"
+	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"
 
 	// codeBenchmarkAgentEnsureUnsupported: an images-only agent child loads
 	// only through the agent's ensure route, and the server's agent has not

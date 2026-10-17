@@ -100,7 +100,7 @@ func (s *Server) resolveTranslateTarget(r *http.Request, token *auth.Token, req 
 		return target, err
 	}
 	if targetIsImagesOnly(target) || targetIsAudioOnly(target) {
-		slog.Debug("inference request rejected: resolved target serves images or speech only",
+		slog.Debug("inference request rejected: resolved target serves images or audio only",
 			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
 		return routing.Target{}, routing.ErrNoModelRoute

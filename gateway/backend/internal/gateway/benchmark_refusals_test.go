@@ -287,7 +287,7 @@ func TestBenchmarkRefusalErrorsArePinned(t *testing.T) {
 		msg  string
 	}{
 		{errBenchmarkImagesOnly, "benchmark.images_only", "this model, or every model in the run's scope, serves only images, so no chat prompt is sent"},
-		{errBenchmarkAudioOnly, "benchmark.audio_only", "this model, or every model in the run's scope, serves only speech, so no chat prompt is sent"},
+		{errBenchmarkAudioOnly, "benchmark.audio_only", "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"},
 		{errBenchmarkAgentEnsureUnsupported, "benchmark.agent_ensure_unsupported", "this model serves only images, and starting it without a chat prompt needs the agent feature runtime_ensure (agent 0.8.0 or newer), or the agent has not reported since the gateway restarted"},
 		{errBenchmarkSpecForceStopped, "benchmark.spec_force_stopped", "this model's runtime spec is force-stopped; clear the admin override before loading it"},
 	} {
