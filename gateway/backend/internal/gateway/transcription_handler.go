@@ -555,14 +555,32 @@ func transcriptionNeedsModelRewrite(target routing.Target, formModel string) boo
 	return target.ProviderModel != "" && formModel != target.ProviderModel
 }
 
+// streamEdit is what rebuildTranscriptionBody does to the client's `stream` part.
+type streamEdit int
+
+const (
+	// streamKeep copies the part exactly as the client sent it.
+	streamKeep streamEdit = iota
+	// streamDrop omits it: the request is answered buffered, a plain one-shot
+	// transcription.
+	streamDrop
+	// streamSetTrue writes it, in its place, as the literal true. A client may spell a
+	// boolean stream any way strconv.ParseBool reads (1, t, TRUE, ...), but audio.cpp is
+	// not known to read more than true; a spelling it ignores would be answered one-shot,
+	// and the relay -- which expects a stream -- would be left running it under the idle
+	// watchdog instead of the first-byte grace a stream gets.
+	streamSetTrue
+)
+
 // rebuildTranscriptionBody returns raw as a new multipart body and its Content-Type (a
 // fresh boundary), with up to three changes: the value of the model field is replaced
 // by model when that is non-empty (the field the agent's router, and any model-routing
-// upstream, reads), every EMPTY `file` part is dropped, and the `stream` part is
-// dropped when dropStream is set (a streamed request that is answered buffered: up
-// front, when the route is not known to stream (relayTranscription), or as the retry
-// of a refused stream, see bufferedTranscriptionBody). Every other part -- its headers,
-// its bytes and its position -- is copied exactly as the client sent it.
+// upstream, reads), every EMPTY `file` part is dropped, and the `stream` part is edited
+// as stream says: dropped (a streamed request that is answered buffered: up front, when
+// the route is not known to stream (relayTranscription), or as the retry of a refused
+// stream, see bufferedTranscriptionBody) or stated as the literal true (a stream the
+// route serves, whatever the client's spelling of the boolean). Every other part -- its
+// headers, its bytes and its position -- is copied exactly as the client sent it.
 //
 // The empty parts are dropped because validation counts only the non-empty ones
 // (validateTranscriptionRequest accepts one beside the real upload): audio.cpp reads
@@ -579,7 +597,7 @@ func transcriptionNeedsModelRewrite(target routing.Target, formModel string) boo
 // The body is built in memory at roughly the client's size; the size cap
 // (transcriptionBodyLimit) is applied to what the client sends, not to this, which is
 // why relayTranscription checks what it hands an agent against the agent's own.
-func rebuildTranscriptionBody(raw []byte, boundary, model string, dropStream bool) ([]byte, string, error) {
+func rebuildTranscriptionBody(raw []byte, boundary, model string, stream streamEdit) ([]byte, string, error) {
 	mr := multipart.NewReader(bytes.NewReader(raw), boundary)
 	var out bytes.Buffer
 	out.Grow(len(raw) + len(model) + 512)
@@ -592,7 +610,7 @@ func rebuildTranscriptionBody(raw []byte, boundary, model string, dropStream boo
 		if err != nil {
 			return nil, "", fmt.Errorf("read part: %w", err)
 		}
-		if err := writeRebuiltTranscriptionPart(mw, part, model, dropStream); err != nil {
+		if err := writeRebuiltTranscriptionPart(mw, part, model, stream); err != nil {
 			return nil, "", err
 		}
 	}
@@ -603,13 +621,21 @@ func rebuildTranscriptionBody(raw []byte, boundary, model string, dropStream boo
 }
 
 // writeRebuiltTranscriptionPart writes one part of the client's form into the rebuilt
-// body: the model field with model for its value when that is set, nothing at all for
-// an empty `file` part or (when dropStream is set) the `stream` part, and every other
-// part -- its headers and its bytes -- as the client sent it.
-func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, model string, dropStream bool) error {
+// body: the model field with model for its value when that is set, the `stream` part as
+// stream says (nothing at all, or the literal true), nothing at all for an empty `file`
+// part, and every other part -- its headers and its bytes -- as the client sent it.
+func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, model string, stream streamEdit) error {
 	name := part.FormName()
-	if dropStream && name == "stream" {
-		return nil
+	if name == "stream" {
+		switch stream {
+		case streamDrop:
+			return nil
+		case streamSetTrue:
+			if err := mw.WriteField("stream", "true"); err != nil {
+				return fmt.Errorf("write stream field: %w", err)
+			}
+			return nil
+		}
 	}
 	if model != "" && name == "model" {
 		if err := mw.WriteField("model", model); err != nil {
@@ -656,10 +682,11 @@ func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, m
 // The client's multipart body is relayed VERBATIM, with the client's own
 // Content-Type, unless there is something to change in it: the model field, when the
 // target needs a different name in it than the form carries
-// (transcriptionNeedsModelRewrite -- every target, agent or external), or an empty
-// `file` part the upstream must not see (form.emptyFiles). Either makes the body be
-// rebuilt ONCE (rebuildTranscriptionBody), sent with its own Content-Type; any other
-// form stays verbatim. The Content-Type is ALWAYS set, the client's or the rebuilt
+// (transcriptionNeedsModelRewrite -- every target, agent or external), an empty
+// `file` part the upstream must not see (form.emptyFiles), or the `stream` part when
+// it is to be dropped or restated (below). Any of them makes the body be rebuilt ONCE
+// (rebuildTranscriptionBody), sent with its own Content-Type; any other form stays
+// verbatim. The Content-Type is ALWAYS set, the client's or the rebuilt
 // one's: left empty, proxyNative would treat the body as JSON and try to rewrite a
 // model field out of a form. nativeRelay.raw stays the client's bytes either way: that
 // is what capture records. The relay names the transcriptions endpoint, so the
@@ -680,7 +707,10 @@ func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, m
 // one that cannot be read) decides up front that the request is answered buffered:
 // the client's form is rebuilt without its `stream` part and sent as a plain one-shot
 // transcription, so the upstream is never asked for what it would refuse and the
-// client's answer costs one upstream call.
+// client's answer costs one upstream call. A stream the route serves is sent with the
+// literal true as its value whatever the client's spelling of the boolean (1, TRUE, ...:
+// strconv.ParseBool reads them, audio.cpp is not known to), so a spelling the upstream
+// would ignore cannot turn a call the relay treats as a stream into a one-shot answer.
 //
 // proxyNative then finishes the exchange through this file's response side, keyed on
 // the endpoint (the openai_audio flavor is speech's too): a non-2xx answer is
@@ -722,6 +752,14 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 	// built, because answering buffered means a body without the client's `stream` part.
 	streaming := form.wantsStream() && s.mappingStreamsTranscription(r.Context(), target.RouteID)
 	dropStream := form.wantsStream() && !streaming
+	stream := streamKeep
+	switch {
+	case dropStream:
+		stream = streamDrop
+	case streaming && form.stream != "true":
+		// Any other spelling of the boolean is stated to the upstream as the literal.
+		stream = streamSetTrue
+	}
 	if dropStream {
 		slog.Debug("transcription asked to stream but the route is not known to: answering buffered",
 			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
@@ -733,8 +771,8 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 	if rewrite {
 		model = target.ProviderModel
 	}
-	if rewrite || form.emptyFiles > 0 || dropStream {
-		body, contentType, err := rebuildTranscriptionBody(raw, form.boundary, model, dropStream)
+	if rewrite || form.emptyFiles > 0 || stream != streamKeep {
+		body, contentType, err := rebuildTranscriptionBody(raw, form.boundary, model, stream)
 		if err != nil {
 			// Not expected for a body parseTranscriptionForm accepted: it walked every
 			// part of it to its end with the same reader and boundary. Were it to
@@ -757,7 +795,8 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 	}
 	if streaming {
 		// A client that asked for a stream, on a route known to stream, is sent one:
-		// stream=true reaches the upstream as it came. A yes that went stale (the model
+		// stream=true reaches the upstream, as the literal true whatever the client's
+		// spelling of the boolean was. A yes that went stale (the model
 		// was swapped to offline mode while the verdict stood) is answered with the
 		// refusal proxyNative turns into the buffered retry built here. The relay's
 		// request (pfReq) is marked a stream for the deadline policy, the active row
@@ -783,7 +822,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 // that does not fit is errTranscriptionTooLarge, and the caller then relays the
 // upstream's refusal instead.
 func bufferedTranscriptionBody(target routing.Target, raw []byte, boundary, model string) ([]byte, string, error) {
-	body, contentType, err := rebuildTranscriptionBody(raw, boundary, model, true)
+	body, contentType, err := rebuildTranscriptionBody(raw, boundary, model, streamDrop)
 	if err != nil {
 		return nil, "", err
 	}

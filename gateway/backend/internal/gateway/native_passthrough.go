@@ -600,14 +600,22 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
 	// activity for `idle`), a buffered completion uses a total timeout. Both cancel
 	// the upstream request context.
+	//
+	// A stream's watchdog is armed from the request, so what it allows BEFORE the
+	// first byte is its first-byte budget -- idle itself, except for a transcription
+	// (see streamFirstByteBudget); every byte of the body re-arms it to idle (the
+	// copier's writeChunk).
 	idle := s.streamIdleTimeout
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	var idledOut atomic.Bool
 	var watchdog *time.Timer
+	// The instant a total timeout counts from, whether it is armed here or -- for a
+	// stream answered with a plain document -- once that answer is seen.
+	deadlineBase := time.Now()
 	switch {
 	case rel.pfReq.Stream && idle > 0:
-		watchdog = time.AfterFunc(idle, func() { idledOut.Store(true); cancel() })
+		watchdog = time.AfterFunc(streamFirstByteBudget(rel, idle), func() { idledOut.Store(true); cancel() })
 		defer watchdog.Stop()
 	case !rel.pfReq.Stream && rel.target.Timeout > 0:
 		var tcancel context.CancelFunc
@@ -734,9 +742,18 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	}
 	if rel.endpoint == endpointTranscription && !isStreamedTranscription(rel.endpoint, rel.pfReq.Stream, resp.Header) {
 		// A stream request that was answered with a plain document is no stream, and
-		// the idle watchdog armed for it above must not run on a buffered read.
+		// the idle watchdog armed for it above must not run on a buffered read. It is
+		// a buffered read all the same, so it gets what every buffered request has: the
+		// total timeout. That was never armed for it -- the stream case above armed the
+		// watchdog in its place -- and with the watchdog stopped nothing would bound a
+		// body the upstream never finishes. It counts from the same instant the total
+		// timeout of a request made as a one-shot one does.
 		if watchdog != nil {
 			watchdog.Stop()
+		}
+		if rel.pfReq.Stream && rel.target.Timeout > 0 {
+			total := time.AfterFunc(max(rel.target.Timeout-time.Since(deadlineBase), 0), cancel)
+			defer total.Stop()
 		}
 		s.relayTranscriptionResponse(w, r, ex, resp)
 		return
@@ -1008,6 +1025,21 @@ type nativeExchange struct {
 	start      time.Time
 	id         string
 	capturing  bool
+}
+
+// streamFirstByteBudget is how long a stream may stay silent before its FIRST byte:
+// the idle timeout, which then governs every gap after it (nativeCopier.writeChunk
+// re-arms the watchdog to idle on each chunk). A streamed transcription is the one
+// stream that gets more -- the larger of the application's own timeout (what a one-shot
+// request of it is allowed end to end) and the idle timeout, coldStartBudget -- because
+// its first frame is its time to first token: a streaming model's cold start, or a model
+// still loading, can run far past an idle timeout sized for a stream that is already
+// flowing, and cutting it would turn a slow start into a failed transcription.
+func streamFirstByteBudget(rel nativeRelay, idle time.Duration) time.Duration {
+	if rel.endpoint == endpointTranscription {
+		return coldStartBudget(rel.target, idle)
+	}
+	return idle
 }
 
 // nativeCopier bundles everything proxyNative's body-copy needs: the client

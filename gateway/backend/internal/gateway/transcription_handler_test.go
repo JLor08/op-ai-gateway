@@ -1966,7 +1966,7 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 	}
 
 	t.Run("replaces the model and drops the empty file part", func(t *testing.T) {
-		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name", false)
+		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name", streamKeep)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
@@ -1981,14 +1981,14 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 		})
 	})
 	t.Run("an empty model keeps the model field and still drops the empty file part", func(t *testing.T) {
-		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "", false)
+		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "", streamKeep)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
 		requireSameParts(t, readEditParts(t, out, outCT), []editPart{parts[0], parts[1], parts[3], parts[4]})
 	})
 	t.Run("the rebuilt form parses to the same single file and the new model", func(t *testing.T) {
-		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name", false)
+		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name", streamKeep)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
@@ -1997,7 +1997,7 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 			t.Fatalf("parse of the rebuilt form = %+v, %v, want model mapped-name, one file, no empty file", got, err)
 		}
 	})
-	t.Run("dropStream drops the stream part and nothing else", func(t *testing.T) {
+	t.Run("streamDrop drops the stream part and nothing else", func(t *testing.T) {
 		streamParts := append(append([]editPart(nil), parts...), editPart{name: "stream", body: []byte("true")})
 		streamBody, streamCT := buildEditMultipart(t, streamParts)
 		streamForm, err := parseTranscriptionForm(streamCT, streamBody)
@@ -2005,7 +2005,7 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 			t.Fatalf("parseTranscriptionForm: %v", err)
 		}
 
-		out, outCT, err := rebuildTranscriptionBody(streamBody, streamForm.boundary, "mapped-name", true)
+		out, outCT, err := rebuildTranscriptionBody(streamBody, streamForm.boundary, "mapped-name", streamDrop)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
@@ -2016,16 +2016,45 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 			parts[4],
 		})
 
-		kept, keptCT, err := rebuildTranscriptionBody(streamBody, streamForm.boundary, "mapped-name", false)
+		kept, keptCT, err := rebuildTranscriptionBody(streamBody, streamForm.boundary, "mapped-name", streamKeep)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
 		if v, ok := formFieldOf(t, kept, keptCT, "stream"); !ok || v != "true" {
-			t.Fatalf("stream field = %q (present %v) without dropStream, want it kept", v, ok)
+			t.Fatalf("stream field = %q (present %v) with streamKeep, want it kept", v, ok)
+		}
+	})
+	t.Run("streamSetTrue states the stream part as the literal true, in its place, and changes nothing else", func(t *testing.T) {
+		streamParts := append(append([]editPart(nil), parts...), editPart{name: "stream", body: []byte("TRUE")})
+		streamBody, streamCT := buildEditMultipart(t, streamParts)
+		streamForm, err := parseTranscriptionForm(streamCT, streamBody)
+		if err != nil {
+			t.Fatalf("parseTranscriptionForm: %v", err)
+		}
+
+		out, outCT, err := rebuildTranscriptionBody(streamBody, streamForm.boundary, "mapped-name", streamSetTrue)
+		if err != nil {
+			t.Fatalf("rebuildTranscriptionBody: %v", err)
+		}
+		requireSameParts(t, readEditParts(t, out, outCT), []editPart{
+			parts[0],
+			{name: "model", body: []byte("mapped-name")},
+			parts[3],
+			parts[4],
+			{name: "stream", body: []byte("true")},
+		})
+	})
+	t.Run("streamSetTrue adds nothing to a form that carries no stream part", func(t *testing.T) {
+		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name", streamSetTrue)
+		if err != nil {
+			t.Fatalf("rebuildTranscriptionBody: %v", err)
+		}
+		if v, ok := formFieldOf(t, out, outCT, "stream"); ok {
+			t.Fatalf("stream field = %q, want none: the form never asked for a stream", v)
 		}
 	})
 	t.Run("a body that is not the form it was parsed from is an error, not a panic", func(t *testing.T) {
-		if _, _, err := rebuildTranscriptionBody(body[:len(body)-40], form.boundary, "mapped-name", false); err == nil {
+		if _, _, err := rebuildTranscriptionBody(body[:len(body)-40], form.boundary, "mapped-name", streamKeep); err == nil {
 			t.Fatal("rebuilding a truncated body succeeded, want an error")
 		}
 	})
