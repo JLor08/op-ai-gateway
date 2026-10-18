@@ -18,7 +18,9 @@ import {
   audioPassthroughMessage,
   audioSetting,
   audioSettingsFrom,
+  audioTurnContent,
   bareAudioMediaType,
+  canonicalAudioMediaType,
   deriveTitleFromTranscript,
   historyHasImage,
   imageSetting,
@@ -26,6 +28,7 @@ import {
   isChatBlobUrl,
   isMaskPart,
   kindSetting,
+  lastUserHasAudio,
   lastUserHasImage,
   maskPart,
   metricsOf,
@@ -870,8 +873,9 @@ describe('the persisted transcription settings mirror the backend omitempty', ()
 
   it('picks the message for an invalid passthrough: the reserved one names the field', () => {
     const t = {
-      chatAudioPassthroughInvalid: 'not an object',
+      chatTranscriptionPassthroughInvalid: 'not an object',
       chatTranscriptionPassthroughReserved: (field: string) => `reserved ${field}`,
+      chatTranscriptionPassthroughBadKey: (field: string) => `bad key ${field}`,
     };
     expect(transcriptionPassthroughMessage(parseTranscriptionPassthrough('[1]'), t)).toBe(
       'not an object',
@@ -1190,5 +1194,260 @@ describe('titling a transcription chat from its transcript', () => {
         assistant('second', 'a2'),
       ]),
     ).toBe('second');
+  });
+});
+
+// A browser reports a clip's type in whatever spelling its platform uses, and the backend's
+// allow-list is exact: a clip leaves the composer under one of the five canonical types or not
+// at all.
+describe('the canonical media type of a clip', () => {
+  it.each([
+    // Already canonical.
+    ['audio/wav', 'audio/wav'],
+    ['audio/webm', 'audio/webm'],
+    ['audio/mpeg', 'audio/mpeg'],
+    ['audio/mp4', 'audio/mp4'],
+    ['audio/ogg', 'audio/ogg'],
+    // The aliases a platform reports for them.
+    ['audio/x-wav', 'audio/wav'],
+    ['audio/wave', 'audio/wav'],
+    ['audio/vnd.wave', 'audio/wav'],
+    ['audio/mp3', 'audio/mpeg'],
+    ['audio/x-mp3', 'audio/mpeg'],
+    ['audio/mpeg3', 'audio/mpeg'],
+    ['audio/x-m4a', 'audio/mp4'],
+    ['audio/m4a', 'audio/mp4'],
+    ['application/ogg', 'audio/ogg'],
+    ['audio/x-ogg', 'audio/ogg'],
+    // Chrome reports a .webm file as video/webm whatever it holds.
+    ['video/webm', 'audio/webm'],
+    // A recorder's parameter is dropped, and case and space do not matter.
+    ['audio/webm;codecs=opus', 'audio/webm'],
+    ['audio/ogg; codecs=opus', 'audio/ogg'],
+    ['  Audio/X-WAV ', 'audio/wav'],
+    ['audio/mp4;codecs="mp4a.40.2"', 'audio/mp4'],
+  ])('maps %s to %s', (reported, canonical) => {
+    expect(canonicalAudioMediaType(reported)).toBe(canonical);
+  });
+
+  it('refuses a type outside the allow-list, whatever the file is called', () => {
+    for (const type of ['audio/flac', 'audio/aac', 'text/plain', 'image/png', 'video/mp4']) {
+      expect(canonicalAudioMediaType(type), type).toBeUndefined();
+      expect(canonicalAudioMediaType(type, 'clip.wav'), type).toBeUndefined();
+    }
+  });
+
+  // FileReader and some file dialogs give no type for a format they do not know.
+  it('reads an empty or generic type from the file extension instead', () => {
+    for (const type of ['', 'application/octet-stream', ' Application/Octet-Stream ']) {
+      expect(canonicalAudioMediaType(type, 'memo.wav'), type).toBe('audio/wav');
+      expect(canonicalAudioMediaType(type, 'memo.WEBM'), type).toBe('audio/webm');
+      expect(canonicalAudioMediaType(type, 'my.voice.memo.mp3'), type).toBe('audio/mpeg');
+      expect(canonicalAudioMediaType(type, 'memo.m4a'), type).toBe('audio/mp4');
+      expect(canonicalAudioMediaType(type, 'memo.ogg'), type).toBe('audio/ogg');
+    }
+  });
+
+  it('refuses an unknown type with no usable extension', () => {
+    expect(canonicalAudioMediaType('')).toBeUndefined();
+    expect(canonicalAudioMediaType('', 'memo')).toBeUndefined();
+    expect(canonicalAudioMediaType('', 'memo.txt')).toBeUndefined();
+    expect(canonicalAudioMediaType('application/octet-stream', 'memo.flac')).toBeUndefined();
+    // An extension is no key into the table's own prototype.
+    expect(canonicalAudioMediaType('', 'memo.constructor')).toBeUndefined();
+    expect(canonicalAudioMediaType('', 'memo.__proto__')).toBeUndefined();
+  });
+
+  it('never invents a type: every answer is one of the five the backend takes', () => {
+    for (const type of [
+      'audio/x-wav',
+      'audio/mp3',
+      'audio/x-m4a',
+      'application/ogg',
+      'video/webm',
+    ]) {
+      expect(TRANSCRIPTION_AUDIO_TYPES).toContain(canonicalAudioMediaType(type));
+    }
+  });
+
+  // The part builders alias too, so no path that reaches them can put a non-canonical type
+  // on the wire.
+  it('is what the part builders write: audio/x-wav is sent as audio/wav', () => {
+    expect(audioInputPart('audio/x-wav', 'UklGRg==')).toEqual({
+      type: 'audio_url',
+      audio_url: { url: 'data:audio/wav;base64,UklGRg==' },
+    });
+    expect(audioInputPart('audio/mp3', 'AAAA')).toEqual({
+      type: 'audio_url',
+      audio_url: { url: 'data:audio/mpeg;base64,AAAA' },
+    });
+    expect(normalizeAudioDataUrl('data:audio/x-m4a;base64,AAAA')).toBe(
+      'data:audio/mp4;base64,AAAA',
+    );
+    expect(normalizeAudioDataUrl('data:audio/x-wav;codecs=pcm;base64,AAAA')).toBe(
+      'data:audio/wav;base64,AAAA',
+    );
+    // A type with no alias is only made bare, as before (the backend then decides).
+    expect(audioInputPart('audio/flac', 'AAAA')).toEqual({
+      type: 'audio_url',
+      audio_url: { url: 'data:audio/flac;base64,AAAA' },
+    });
+  });
+});
+
+describe('the user turn of a transcription chat', () => {
+  const url = 'data:audio/webm;base64,AAAA';
+  const clipTurn = (id = 'u'): ChatUiMessage => ({
+    id,
+    role: 'user',
+    content: [{ type: 'audio_url', audio_url: { url } }],
+  });
+
+  it('is the clip alone, as one audio_url part', () => {
+    expect(audioTurnContent(url)).toEqual([{ type: 'audio_url', audio_url: { url } }]);
+  });
+
+  describe('lastUserHasAudio', () => {
+    it('is true when the last user message carries a clip', () => {
+      expect(lastUserHasAudio([clipTurn()])).toBe(true);
+      expect(
+        lastUserHasAudio([
+          {
+            id: 'u',
+            role: 'user',
+            content: [{ type: 'text', text: 'x' }, ...audioTurnContentOf(url)],
+          },
+        ]),
+      ).toBe(true);
+      // A stored reference counts: it is what a committed turn holds.
+      expect(
+        lastUserHasAudio([
+          {
+            id: 'u',
+            role: 'user',
+            content: [{ type: 'audio_url', audio_url: { url: '/api/portal/chat-blobs/blob_a' } }],
+          },
+        ]),
+      ).toBe(true);
+    });
+
+    it('is false for a text turn, an image turn and an empty history', () => {
+      expect(lastUserHasAudio([])).toBe(false);
+      expect(lastUserHasAudio([{ id: 'u', role: 'user', content: 'hello' }])).toBe(false);
+      expect(
+        lastUserHasAudio([
+          {
+            id: 'u',
+            role: 'user',
+            content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }],
+          },
+        ]),
+      ).toBe(false);
+    });
+
+    // Role-aware: a transcript is text, but an assistant turn that held audio (a speech
+    // reply in a history that was edited into a transcription thread) is never the input.
+    it('looks at the LAST user message only', () => {
+      const text: ChatUiMessage = { id: 'u2', role: 'user', content: 'now just text' };
+      expect(lastUserHasAudio([clipTurn('u1'), text])).toBe(false);
+      expect(lastUserHasAudio([text, clipTurn('u1')])).toBe(true);
+      const reply: ChatUiMessage = {
+        id: 'a',
+        role: 'assistant',
+        content: [{ type: 'audio_url', audio_url: { url } }],
+      };
+      expect(lastUserHasAudio([text, reply])).toBe(false);
+      // The assistant turn after a clip does not hide it.
+      expect(lastUserHasAudio([clipTurn(), { id: 'a', role: 'assistant', content: 'hi' }])).toBe(
+        true,
+      );
+    });
+  });
+});
+
+// Local helper: the parts of a clip turn, for composing a mixed text + audio message.
+function audioTurnContentOf(url: string) {
+  return audioTurnContent(url) as Exclude<ChatUiMessage['content'], string>;
+}
+
+// The transcription run sends the passthrough as multipart form fields: a key becomes the NAME
+// of a part, in a header line that a quote or a backslash cuts short and a line break splits in
+// two. The backend refuses such a key (gateway.chat_run_transcription_dispatch_failed) only after
+// the turn is committed, so the composer refuses it first.
+describe('a transcription passthrough key that cannot be a form field name', () => {
+  const badKeyOf = (raw: string) => {
+    const parse = parseTranscriptionPassthrough(raw);
+    return parse.status === 'invalid' ? parse.badKey : undefined;
+  };
+
+  it.each([
+    ['an empty key', '{"": 1}', ''],
+    ['a double quote', '{"a\\"b": 1}', 'a"b'],
+    ['a backslash', '{"a\\\\b": 1}', 'a\\b'],
+    ['a line feed', '{"a\\nb": 1}', 'a\nb'],
+    ['a carriage return', '{"a\\rb": 1}', 'a\rb'],
+    ['a NUL', '{"a\\u0000b": 1}', 'a\u0000b'],
+    ['a tab', '{"a\\tb": 1}', 'a\tb'],
+    ['DEL', '{"a\\u007fb": 1}', 'a\u007fb'],
+  ])('is refused: %s', (_name, raw, key) => {
+    expect(parseTranscriptionPassthrough(raw)).toEqual({ status: 'invalid', badKey: key });
+  });
+
+  it('finds the bad key among good ones, whichever is first', () => {
+    expect(badKeyOf('{"beam": 5, "x\\"y": 1, "temperature_inc": 0.2}')).toBe('x"y');
+    expect(badKeyOf('{"x\\"y": 1, "beam": 5}')).toBe('x"y');
+  });
+
+  it('accepts what a form field name may be', () => {
+    for (const raw of [
+      '{"beam": 5}',
+      '{"timestamp_granularities[]": "word"}',
+      '{"with space": 1, "dots.and-dashes": 2, "ünïcode": 3, "日本語": 4}',
+      '{"single\'quote": 1}',
+    ]) {
+      expect(parseTranscriptionPassthrough(raw).status, raw).toBe('ok');
+    }
+  });
+
+  it("is only for a key at the top: the VALUES are the user's own JSON", () => {
+    expect(
+      parseTranscriptionPassthrough('{"nested": {"a\\"b": 1}, "text": "q\\"uote\\n"}').status,
+    ).toBe('ok');
+  });
+
+  // A reserved name is the more useful thing to say, and it is the older refusal.
+  it('names a reserved field before a bad key', () => {
+    expect(parseTranscriptionPassthrough('{"x\\"y": 1, "Model": 2}')).toEqual({
+      status: 'invalid',
+      reservedField: 'Model',
+    });
+  });
+
+  it('is a transcription rule: the speech passthrough is a JSON body, where any key is fine', () => {
+    expect(parseAudioPassthrough('{"a\\"b": 1, "": 2}').status).toBe('ok');
+    expect(parseAudioPassthrough('{"a\\nb": 1}').status).toBe('ok');
+  });
+
+  it('refuses a transcription run for it, like any other unsendable passthrough', () => {
+    const settings = { ...DEFAULT_TRANSCRIPTION_SETTINGS, passthrough: '{"a\\"b": 1}' };
+    expect(transcriptionPassthroughInvalid('transcription', settings)).toBe(true);
+    expect(transcriptionPassthroughInvalid('speech', settings)).toBe(false);
+  });
+
+  it('says so, naming the key as the user wrote it (escaped, so a line break is readable)', () => {
+    const t = {
+      chatTranscriptionPassthroughInvalid: 'not an object',
+      chatTranscriptionPassthroughReserved: (field: string) => `reserved ${field}`,
+      chatTranscriptionPassthroughBadKey: (field: string) => `bad key ${field}`,
+    };
+    expect(transcriptionPassthroughMessage(parseTranscriptionPassthrough('{"a\\"b": 1}'), t)).toBe(
+      'bad key "a\\"b"',
+    );
+    expect(transcriptionPassthroughMessage(parseTranscriptionPassthrough('{"": 1}'), t)).toBe(
+      'bad key ""',
+    );
+    expect(transcriptionPassthroughMessage(parseTranscriptionPassthrough('{"a\\nb": 1}'), t)).toBe(
+      'bad key "a\\nb"',
+    );
   });
 });

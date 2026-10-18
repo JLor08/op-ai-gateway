@@ -25,6 +25,7 @@ import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import { PageTitle } from './shared/PageTitle';
 import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
+import { TranscriptionComposer } from './TranscriptionComposer';
 import {
   IMAGE_EDIT_SOURCE_ACCEPT,
   IMAGE_LOSSY_FORMATS,
@@ -36,6 +37,8 @@ import {
   audioPassthroughMessage,
   optionsOr,
   parseAudioPassthrough,
+  parseTranscriptionPassthrough,
+  transcriptionPassthroughMessage,
   useChatStore,
 } from './chat/ChatStore';
 import { ChatSidebar } from './chat/ChatSidebar';
@@ -163,6 +166,9 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // from the image one: the two never show together, and a speech thread should not
   // open expanded because an image thread's section was left open.
   const [showSpeechAdvanced, setShowSpeechAdvanced] = useState(false);
+  // And the transcription thread's: its own, for the same reason (a transcription thread should
+  // not open expanded because a speech thread's section was left open).
+  const [showTranscriptionAdvanced, setShowTranscriptionAdvanced] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(readSidebarCollapsed);
 
   // A refine (the per-image action on a generated result) seeds the composer with that
@@ -224,11 +230,16 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // Likewise for a text-to-speech thread: the composer keeps its text input but the
   // settings become the speech knobs, and the reply is audio.
   const isSpeechThread = c.chatKind === 'speech';
-  const isTextThread = !isImageThread && !isSpeechThread;
+  // And for a speech-to-text thread: the composer's text prompt gives way to an audio input (an
+  // attached or recorded clip is the turn), the settings become the transcription knobs, and the
+  // reply is text.
+  const isTranscriptionThread = c.chatKind === 'transcription';
+  const isTextThread = !isImageThread && !isSpeechThread && !isTranscriptionThread;
 
-  // The advanced passthrough is the one speech setting the store REFUSES a send (and a
-  // regenerate) for when it is not a JSON object or names a field the run owns
-  // (chatAudioPassthroughInvalid, chatSpeechPassthroughReserved), and the
+  // The advanced passthrough is the one speech or transcription setting the store REFUSES a send
+  // (and a regenerate) for when it is not a JSON object or names a field the run owns
+  // (chatAudioPassthroughInvalid, chatSpeechPassthroughReserved and their transcription twins --
+  // the transcription one also refuses a field name a form cannot carry), and the
   // field is inside two things the user can close: the settings panel and the Advanced
   // section. A refusal that names a field the user cannot see is useless, so while the
   // text is invalid (the same parse the store refuses on) both stay open: the toast and
@@ -238,12 +249,21 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // than only the toggles' guard below. Once the text is fixed or blank, neither is held open.
   const passthroughParse = parseAudioPassthrough(c.audioSettings.passthrough);
   const passthroughInvalid = isSpeechThread && passthroughParse.status === 'invalid';
-  const settingsOpen = showSettings || passthroughInvalid;
+  const transcriptionPassthroughParse = parseTranscriptionPassthrough(
+    c.transcriptionSettings.passthrough,
+  );
+  const transcriptionPassthroughInvalid =
+    isTranscriptionThread && transcriptionPassthroughParse.status === 'invalid';
+  const settingsOpen = showSettings || passthroughInvalid || transcriptionPassthroughInvalid;
   const speechAdvancedOpen = showSpeechAdvanced || passthroughInvalid;
+  const transcriptionAdvancedOpen = showTranscriptionAdvanced || transcriptionPassthroughInvalid;
   // The toggles' updater: a click while the text is invalid keeps the thing OPEN
   // (rather than flipping state the user cannot see), so fixing the text -- whose last
   // keystroke makes it valid -- does not collapse the field out from under the cursor.
-  const toggleOpen = (open: boolean) => passthroughInvalid || !open;
+  // The two kinds' flags can never both be set (each needs its own kind of thread), so one
+  // updater serves the settings panel's toggle and both Advanced toggles.
+  const toggleOpen = (open: boolean) =>
+    passthroughInvalid || transcriptionPassthroughInvalid || !open;
 
   // The attach control follows ONE predicate, the store's attachMode (the
   // thread's kind and the picked model -- ADR-043 R1): 'edit' offers the image as
@@ -366,9 +386,9 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               }}
             >
               {/* Text-chat controls: a system prompt, sampling temperature and a
-                token cap are all meaningless to the images and speech endpoints, so
-                an image or speech thread hides them and shows its own knobs below
-                instead. */}
+                token cap are all meaningless to the images, speech and transcription
+                endpoints, so an image, speech or transcription thread hides them and
+                shows its own knobs below instead. */}
               {isTextThread && (
                 <>
                   <TextField
@@ -715,6 +735,110 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   )}
                 </>
               )}
+              {/* Speech-to-text knobs (/v1/audio/transcriptions). The language is FREE TEXT
+                (an ISO-639-1 code; blank = the model detects it), the prompt is free text, and
+                a blank temperature leaves the model's own (a typed 0 is a value, not blank;
+                not clamped, the model's own range applies). The reply is always text, so there
+                is no format control, just the static hint. The "Advanced" section holds a JSON
+                object of extra request fields, sent as form fields. */}
+              {isTranscriptionThread && (
+                <>
+                  <Box
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                      gap: 2,
+                    }}
+                  >
+                    <TextField
+                      id="chat-transcription-language"
+                      label={t.chatTranscriptionLanguage}
+                      value={c.transcriptionSettings.language}
+                      placeholder={t.chatTranscriptionDefault}
+                      helperText={t.chatTranscriptionLanguageHint}
+                      onChange={(event) =>
+                        c.setTranscriptionSettings((s) => ({ ...s, language: event.target.value }))
+                      }
+                      disabled={c.streaming}
+                      // Pinned shrunk with the notch open, like the speech fields, so the
+                      // placeholder (the model-default hint) is visible, not hidden behind the
+                      // resting label.
+                      slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+                    />
+                    <TextField
+                      id="chat-transcription-temperature"
+                      label={t.chatTranscriptionTemperature}
+                      type="number"
+                      value={c.transcriptionSettings.temperature}
+                      placeholder={t.chatTranscriptionDefault}
+                      onChange={(event) =>
+                        c.setTranscriptionSettings((s) => ({
+                          ...s,
+                          temperature: event.target.value,
+                        }))
+                      }
+                      disabled={c.streaming}
+                      slotProps={{
+                        inputLabel: { shrink: true },
+                        input: { notched: true },
+                        htmlInput: { min: 0, step: 0.1 },
+                      }}
+                    />
+                    <TextField
+                      id="chat-transcription-prompt"
+                      label={t.chatTranscriptionPrompt}
+                      multiline
+                      minRows={2}
+                      value={c.transcriptionSettings.prompt}
+                      placeholder={t.chatTranscriptionDefault}
+                      helperText={t.chatTranscriptionPromptHint}
+                      onChange={(event) =>
+                        c.setTranscriptionSettings((s) => ({ ...s, prompt: event.target.value }))
+                      }
+                      disabled={c.streaming}
+                      slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+                      sx={{ gridColumn: '1 / -1' }}
+                    />
+                  </Box>
+                  <Typography variant="caption" color="text.secondary">
+                    {t.chatTranscriptionFormatHint}
+                  </Typography>
+                  <Button
+                    variant="text"
+                    size="small"
+                    aria-expanded={transcriptionAdvancedOpen}
+                    onClick={() => setShowTranscriptionAdvanced(toggleOpen)}
+                    sx={{ justifySelf: 'start' }}
+                  >
+                    {t.chatTranscriptionAdvanced}
+                  </Button>
+                  {transcriptionAdvancedOpen && (
+                    <TextField
+                      id="chat-transcription-passthrough"
+                      label={t.chatTranscriptionPassthrough}
+                      multiline
+                      minRows={4}
+                      fullWidth
+                      value={c.transcriptionSettings.passthrough}
+                      onChange={(event) =>
+                        c.setTranscriptionSettings((s) => ({
+                          ...s,
+                          passthrough: event.target.value,
+                        }))
+                      }
+                      disabled={c.streaming}
+                      error={transcriptionPassthroughInvalid}
+                      helperText={
+                        transcriptionPassthroughInvalid
+                          ? transcriptionPassthroughMessage(transcriptionPassthroughParse, t)
+                          : t.chatTranscriptionPassthroughHint
+                      }
+                      slotProps={{ htmlInput: { spellCheck: false } }}
+                      sx={{ '& textarea': { fontFamily: 'var(--font-mono, monospace)' } }}
+                    />
+                  )}
+                </>
+              )}
               {/* The server-override picker is hidden entirely when the caller
                 manages zero servers AND the run-as token does not lock it —
                 otherwise there would be nothing to override onto. A locked
@@ -852,167 +976,127 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             })}
           </Box>
 
-          <Box
-            component="form"
-            sx={{
-              display: 'grid',
-              gridTemplateColumns: 'minmax(0, 1fr) auto',
-              alignItems: 'end',
-              gap: 1,
-            }}
-            onSubmit={submit}
-          >
-            <TextField
-              id="chat-message"
-              label={promptLabel}
-              helperText={promptHelperText}
-              multiline
-              minRows={4}
-              fullWidth
-              // Keep the floating label + its outline notch in sync. MUI derives the
-              // notch from the OutlinedInput's own filled/focused state, which does
-              // not track a controlled multiline value here — so the label shrinks
-              // but the notch stays closed and the label sits ON the border. Pin the
-              // label shrunk and the notch open so they always match.
-              slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
-              inputRef={promptRef}
-              value={c.input}
-              onChange={(event) => c.setInput(event.target.value)}
-              onKeyDown={(event) => {
-                // Enter sends; Shift+Enter inserts a newline. Ignore Enter while an
-                // IME composition is active (CJK etc.) so it does not send mid-word.
-                // Also ignore it while streaming or while the effective model is
-                // unavailable — mirrors the Send button's disabled condition (the
-                // store's send() guards too, but the key handler must not even try).
-                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  if (!c.streaming && c.modelAvailable) c.send();
-                }
+          {/* A transcription thread's turn is an audio clip, not text: its composer is a
+            component of its own (the attach and record controls, the clip, Send). Every other
+            thread keeps the text composer below, unchanged. */}
+          {isTranscriptionThread ? (
+            <TranscriptionComposer t={t} />
+          ) : (
+            <Box
+              component="form"
+              sx={{
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1fr) auto',
+                alignItems: 'end',
+                gap: 1,
               }}
-              disabled={c.streaming}
-            />
-            {(c.images.length > 0 || c.mask !== null) && (
-              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                {c.images.map((url, index) => (
-                  // Key/remove by index (matching the sent-message renderer):
-                  // attaching the identical file twice must not collapse to one
-                  // key or remove both copies.
-                  <Box sx={{ position: 'relative', width: 72, height: 72 }} key={index}>
-                    <Box
-                      component="img"
-                      src={url}
-                      alt={t.chatAttachedImage}
-                      sx={{
-                        display: 'block',
-                        width: 72,
-                        height: 72,
-                        objectFit: 'cover',
-                        border: '1px solid var(--line)',
-                        borderRadius: '8px',
-                      }}
-                    />
-                    <IconButton
-                      size="small"
-                      aria-label={t.chatCancel}
-                      onClick={() => c.removeImage(index)}
-                      sx={thumbnailRemoveSx}
-                    >
-                      <CloseIcon fontSize="small" />
-                    </IconButton>
-                  </Box>
-                ))}
-                {c.mask !== null && (
-                  <Box sx={{ position: 'relative', width: 72, height: 72 }}>
-                    <Box
-                      component="img"
-                      src={c.mask}
-                      alt={t.chatAttachedMask}
-                      sx={{
-                        display: 'block',
-                        width: 72,
-                        height: 72,
-                        objectFit: 'cover',
-                        border: '1px solid var(--line)',
-                        borderRadius: '8px',
-                        background: MASK_THUMBNAIL_BACKGROUND,
-                      }}
-                    />
-                    <IconButton
-                      size="small"
-                      aria-label={t.chatRemoveMask}
-                      onClick={c.removeMask}
-                      sx={thumbnailRemoveSx}
-                    >
-                      <CloseIcon fontSize="small" />
-                    </IconButton>
-                  </Box>
-                )}
-              </Box>
-            )}
-            <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 1, mb: 1.5 }}>
-              {/* describeChild -> Tooltip uses aria-describedby (not aria-label), so it
+              onSubmit={submit}
+            >
+              <TextField
+                id="chat-message"
+                label={promptLabel}
+                helperText={promptHelperText}
+                multiline
+                minRows={4}
+                fullWidth
+                // Keep the floating label + its outline notch in sync. MUI derives the
+                // notch from the OutlinedInput's own filled/focused state, which does
+                // not track a controlled multiline value here — so the label shrinks
+                // but the notch stays closed and the label sits ON the border. Pin the
+                // label shrunk and the notch open so they always match.
+                slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+                inputRef={promptRef}
+                value={c.input}
+                onChange={(event) => c.setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  // Enter sends; Shift+Enter inserts a newline. Ignore Enter while an
+                  // IME composition is active (CJK etc.) so it does not send mid-word.
+                  // Also ignore it while streaming or while the effective model is
+                  // unavailable — mirrors the Send button's disabled condition (the
+                  // store's send() guards too, but the key handler must not even try).
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    if (!c.streaming && c.modelAvailable) c.send();
+                  }
+                }}
+                disabled={c.streaming}
+              />
+              {(c.images.length > 0 || c.mask !== null) && (
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                  {c.images.map((url, index) => (
+                    // Key/remove by index (matching the sent-message renderer):
+                    // attaching the identical file twice must not collapse to one
+                    // key or remove both copies.
+                    <Box sx={{ position: 'relative', width: 72, height: 72 }} key={index}>
+                      <Box
+                        component="img"
+                        src={url}
+                        alt={t.chatAttachedImage}
+                        sx={{
+                          display: 'block',
+                          width: 72,
+                          height: 72,
+                          objectFit: 'cover',
+                          border: '1px solid var(--line)',
+                          borderRadius: '8px',
+                        }}
+                      />
+                      <IconButton
+                        size="small"
+                        aria-label={t.chatCancel}
+                        onClick={() => c.removeImage(index)}
+                        sx={thumbnailRemoveSx}
+                      >
+                        <CloseIcon fontSize="small" />
+                      </IconButton>
+                    </Box>
+                  ))}
+                  {c.mask !== null && (
+                    <Box sx={{ position: 'relative', width: 72, height: 72 }}>
+                      <Box
+                        component="img"
+                        src={c.mask}
+                        alt={t.chatAttachedMask}
+                        sx={{
+                          display: 'block',
+                          width: 72,
+                          height: 72,
+                          objectFit: 'cover',
+                          border: '1px solid var(--line)',
+                          borderRadius: '8px',
+                          background: MASK_THUMBNAIL_BACKGROUND,
+                        }}
+                      />
+                      <IconButton
+                        size="small"
+                        aria-label={t.chatRemoveMask}
+                        onClick={c.removeMask}
+                        sx={thumbnailRemoveSx}
+                      >
+                        <CloseIcon fontSize="small" />
+                      </IconButton>
+                    </Box>
+                  )}
+                </Box>
+              )}
+              <Stack
+                direction="row"
+                sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 1, mb: 1.5 }}
+              >
+                {/* describeChild -> Tooltip uses aria-describedby (not aria-label), so it
                 does not add a second element matching getByLabelText. The file input
                 is named by the visually-hidden label text (like the old text button),
                 so getByLabelText(chatAttachImage) still resolves to the input alone.
                 The wrapping <span> lets the Tooltip work while the button is disabled
                 (streaming) without an MUI warning. */}
-              <Tooltip title={attachTooltip} describeChild>
-                <span>
-                  <IconButton
-                    component="label"
-                    size="small"
-                    disabled={c.streaming || c.attachMode === 'none'}
-                  >
-                    <AddPhotoAlternateIcon fontSize="small" />
-                    <Box
-                      component="span"
-                      sx={{
-                        position: 'absolute',
-                        width: 1,
-                        height: 1,
-                        p: 0,
-                        m: '-1px',
-                        overflow: 'hidden',
-                        clip: 'rect(0 0 0 0)',
-                        whiteSpace: 'nowrap',
-                        border: 0,
-                      }}
-                    >
-                      {t.chatAttachImage}
-                    </Box>
-                    <input
-                      type="file"
-                      // An edit's source is png or jpeg (all the edit route of
-                      // sd-server reads); a text model reads any image.
-                      accept={c.attachMode === 'edit' ? IMAGE_EDIT_SOURCE_ACCEPT : 'image/*'}
-                      // An edit has one source image; a text model reads several.
-                      multiple={c.attachMode !== 'edit'}
-                      hidden
-                      onChange={(event) => {
-                        void c.handleFiles(event.target.files);
-                        event.target.value = '';
-                      }}
-                    />
-                  </IconButton>
-                </span>
-              </Tooltip>
-              {/* The mask slot of an edit (inpainting): a PNG the size of the source
-                image whose transparent area marks the region to change. Only an edit
-                has one, and it needs the source first -- so it is disabled, and
-                says why, until one is attached. Same structure as the attach
-                button above: the file input is named by the hidden label text. */}
-              {c.attachMode === 'edit' && (
-                <Tooltip
-                  title={c.images.length === 0 ? t.chatMaskNeedsSource : t.chatAttachMaskTooltip}
-                  describeChild
-                >
+                <Tooltip title={attachTooltip} describeChild>
                   <span>
                     <IconButton
                       component="label"
                       size="small"
-                      disabled={c.streaming || c.images.length === 0}
+                      disabled={c.streaming || c.attachMode === 'none'}
                     >
-                      <LayersIcon fontSize="small" />
+                      <AddPhotoAlternateIcon fontSize="small" />
                       <Box
                         component="span"
                         sx={{
@@ -1027,37 +1111,87 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                           border: 0,
                         }}
                       >
-                        {t.chatAttachMask}
+                        {t.chatAttachImage}
                       </Box>
                       <input
                         type="file"
-                        accept="image/png"
+                        // An edit's source is png or jpeg (all the edit route of
+                        // sd-server reads); a text model reads any image.
+                        accept={c.attachMode === 'edit' ? IMAGE_EDIT_SOURCE_ACCEPT : 'image/*'}
+                        // An edit has one source image; a text model reads several.
+                        multiple={c.attachMode !== 'edit'}
                         hidden
                         onChange={(event) => {
-                          void c.handleMaskFile(event.target.files);
+                          void c.handleFiles(event.target.files);
                           event.target.value = '';
                         }}
                       />
                     </IconButton>
                   </span>
                 </Tooltip>
-              )}
-            </Stack>
-            <Tooltip
-              title={!c.streaming && !c.modelAvailable ? t.chatModelUnavailable : ''}
-              describeChild
-            >
-              <span>
-                <Button
-                  type="submit"
-                  variant="contained"
-                  disabled={c.streaming || !c.modelAvailable}
-                >
-                  {t.send}
-                </Button>
-              </span>
-            </Tooltip>
-          </Box>
+                {/* The mask slot of an edit (inpainting): a PNG the size of the source
+                image whose transparent area marks the region to change. Only an edit
+                has one, and it needs the source first -- so it is disabled, and
+                says why, until one is attached. Same structure as the attach
+                button above: the file input is named by the hidden label text. */}
+                {c.attachMode === 'edit' && (
+                  <Tooltip
+                    title={c.images.length === 0 ? t.chatMaskNeedsSource : t.chatAttachMaskTooltip}
+                    describeChild
+                  >
+                    <span>
+                      <IconButton
+                        component="label"
+                        size="small"
+                        disabled={c.streaming || c.images.length === 0}
+                      >
+                        <LayersIcon fontSize="small" />
+                        <Box
+                          component="span"
+                          sx={{
+                            position: 'absolute',
+                            width: 1,
+                            height: 1,
+                            p: 0,
+                            m: '-1px',
+                            overflow: 'hidden',
+                            clip: 'rect(0 0 0 0)',
+                            whiteSpace: 'nowrap',
+                            border: 0,
+                          }}
+                        >
+                          {t.chatAttachMask}
+                        </Box>
+                        <input
+                          type="file"
+                          accept="image/png"
+                          hidden
+                          onChange={(event) => {
+                            void c.handleMaskFile(event.target.files);
+                            event.target.value = '';
+                          }}
+                        />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                )}
+              </Stack>
+              <Tooltip
+                title={!c.streaming && !c.modelAvailable ? t.chatModelUnavailable : ''}
+                describeChild
+              >
+                <span>
+                  <Button
+                    type="submit"
+                    variant="contained"
+                    disabled={c.streaming || !c.modelAvailable}
+                  >
+                    {t.send}
+                  </Button>
+                </span>
+              </Tooltip>
+            </Box>
+          )}
         </Paper>
       </Box>
     </>

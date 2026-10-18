@@ -537,18 +537,44 @@ export const SPEECH_RESERVED_FIELDS: readonly string[] = [
 // valid JSON that is not an object (an array, a string, a number, null), or an object
 // naming a field the run owns (SPEECH_RESERVED_FIELDS), in which case `reservedField`
 // is the first such key as the user wrote it, so the UI can name it.
+//
+// `badKey` is the one refusal that only a MULTIPART passthrough has (the transcription one): a key
+// that cannot be a form field name, as the user wrote it ('' for an empty key, so test it against
+// undefined, not for truthiness). See isFormFieldName.
 export type AudioPassthroughParse =
   | { status: 'empty' }
   | { status: 'ok'; value: Record<string, unknown> }
-  | { status: 'invalid'; reservedField?: string };
+  | { status: 'invalid'; reservedField?: string; badKey?: string };
 
 export function parseAudioPassthrough(raw: string): AudioPassthroughParse {
-  return parsePassthrough(raw, SPEECH_RESERVED_FIELDS);
+  return parsePassthrough(raw, SPEECH_RESERVED_FIELDS, false);
+}
+
+// Whether a passthrough key can be the NAME of a multipart form part: non-empty, free of control
+// characters (a line break would end the part's header line and begin another), a double quote and
+// a backslash (the name sits between quotes in `Content-Disposition: form-data; name="..."`, and
+// the upstream's form parser, cpp-httplib, reads it with a pattern a quote or a backslash cuts
+// short). This mirrors the backend's isTranscriptionFieldName in chat_runs_transcription.go, which
+// refuses an empty or control-character key and lets a quote or a backslash through (its writer
+// escapes them, which that upstream parser does not undo), so this side refuses those too -- keep
+// the two in step. The speech passthrough is a JSON body, where any key is fine, so it does not ask.
+function isFormFieldName(key: string): boolean {
+  if (key === '' || key.includes('"') || key.includes('\\')) return false;
+  for (const char of key) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  return true;
 }
 
 // The one parse of a passthrough text, for the thread kinds that have one: they differ only
-// in which fields their run owns. `reserved` holds the lower-case names.
-function parsePassthrough(raw: string, reserved: readonly string[]): AudioPassthroughParse {
+// in which fields their run owns (`reserved` holds the lower-case names) and in whether the keys
+// become form field names (`formFields`).
+function parsePassthrough(
+  raw: string,
+  reserved: readonly string[],
+  formFields: boolean,
+): AudioPassthroughParse {
   const text = raw.trim();
   if (text === '') return { status: 'empty' };
   let parsed: unknown;
@@ -561,10 +587,13 @@ function parsePassthrough(raw: string, reserved: readonly string[]): AudioPassth
   const keys = Object.keys(parsed);
   // Scan a sorted copy, like the backend's, so the field named is deterministic;
   // `keys` keeps its original order for the length check below.
-  const reservedField = [...keys]
-    .sort((a, b) => a.localeCompare(b))
-    .find((key) => reserved.includes(key.toLowerCase()));
+  const sorted = [...keys].sort((a, b) => a.localeCompare(b));
+  const reservedField = sorted.find((key) => reserved.includes(key.toLowerCase()));
   if (reservedField !== undefined) return { status: 'invalid', reservedField };
+  if (formFields) {
+    const badKey = sorted.find((key) => !isFormFieldName(key));
+    if (badKey !== undefined) return { status: 'invalid', badKey };
+  }
   return keys.length === 0 ? { status: 'empty' } : { status: 'ok', value: parsed };
 }
 
@@ -687,23 +716,29 @@ export const TRANSCRIPTION_RESERVED_FIELDS: readonly string[] = [
 export type TranscriptionPassthroughParse = AudioPassthroughParse;
 
 export function parseTranscriptionPassthrough(raw: string): TranscriptionPassthroughParse {
-  return parsePassthrough(raw, TRANSCRIPTION_RESERVED_FIELDS);
+  return parsePassthrough(raw, TRANSCRIPTION_RESERVED_FIELDS, true);
 }
 
 // The message for a passthrough text that parseTranscriptionPassthrough called invalid: the
-// reserved-field one names the offending field, any other says it must be a JSON object (the
-// same sentence the speech passthrough uses). Takes only the two keys it reads so chatDoc
-// stays free of the i18n module.
+// reserved-field one names the offending field, the bad-key one names the key (JSON-escaped, so a
+// quote, a backslash or a line break in it is readable instead of cutting the sentence), any other
+// says it must be a JSON object. Takes only the three keys it reads so chatDoc stays free of the
+// i18n module.
 export function transcriptionPassthroughMessage(
   parse: TranscriptionPassthroughParse,
   t: {
-    chatAudioPassthroughInvalid: string;
+    chatTranscriptionPassthroughInvalid: string;
     chatTranscriptionPassthroughReserved: (field: string) => string;
+    chatTranscriptionPassthroughBadKey: (field: string) => string;
   },
 ): string {
-  return parse.status === 'invalid' && parse.reservedField !== undefined
-    ? t.chatTranscriptionPassthroughReserved(parse.reservedField)
-    : t.chatAudioPassthroughInvalid;
+  if (parse.status === 'invalid' && parse.reservedField !== undefined) {
+    return t.chatTranscriptionPassthroughReserved(parse.reservedField);
+  }
+  if (parse.status === 'invalid' && parse.badKey !== undefined) {
+    return t.chatTranscriptionPassthroughBadKey(JSON.stringify(parse.badKey));
+  }
+  return t.chatTranscriptionPassthroughInvalid;
 }
 
 // Whether a run of this thread must be refused for its advanced passthrough: a transcription
@@ -801,17 +836,88 @@ export function bareAudioMediaType(mediaType: string): string {
   return mediaType.split(';', 1)[0].trim().toLowerCase();
 }
 
+// The spellings a platform reports for the five canonical types, mapped to them (keys are bare
+// types). The backend's allow-list is exact, so a clip typed audio/x-wav would be refused when
+// the run commits the turn; here it is relabelled before it is sent. What each one is:
+//   wav  -- audio/x-wav (Windows, older Chrome), audio/wave, audio/vnd.wave;
+//   mpeg -- audio/mp3 (Windows and some Linux dialogs), audio/x-mp3, audio/mpeg3;
+//   mp4  -- audio/x-m4a and audio/m4a (macOS and Safari report an .m4a so);
+//   ogg  -- application/ogg (Firefox and Windows report a .ogg/.oga so), audio/x-ogg;
+//   webm -- video/webm: Chrome types EVERY .webm file so, an audio-only recording included, and
+//           the accept list offers .webm, so a picked audio .webm must not be refused for it.
+// Only the type's name changes; the bytes are relayed untouched, as ever.
+const AUDIO_TYPE_ALIASES: ReadonlyMap<string, string> = new Map([
+  ['audio/x-wav', 'audio/wav'],
+  ['audio/wave', 'audio/wav'],
+  ['audio/vnd.wave', 'audio/wav'],
+  ['audio/mp3', 'audio/mpeg'],
+  ['audio/x-mp3', 'audio/mpeg'],
+  ['audio/mpeg3', 'audio/mpeg'],
+  ['audio/x-m4a', 'audio/mp4'],
+  ['audio/m4a', 'audio/mp4'],
+  ['application/ogg', 'audio/ogg'],
+  ['audio/x-ogg', 'audio/ogg'],
+  ['video/webm', 'audio/webm'],
+]);
+
+// What a file extension says about a clip whose type the platform did not give (an empty type,
+// or the generic application/octet-stream a FileReader or a file dialog falls back to for a
+// format it does not know): the extensions the picker's accept list offers. Lower case, no dot.
+const AUDIO_EXTENSION_TYPES: ReadonlyMap<string, string> = new Map([
+  ['wav', 'audio/wav'],
+  ['webm', 'audio/webm'],
+  ['mp3', 'audio/mpeg'],
+  ['m4a', 'audio/mp4'],
+  ['ogg', 'audio/ogg'],
+]);
+
+// The bare type with its alias applied, or the bare type itself when it has none.
+function aliasedAudioMediaType(mediaType: string): string {
+  const bare = bareAudioMediaType(mediaType);
+  return AUDIO_TYPE_ALIASES.get(bare) ?? bare;
+}
+
+// The canonical media type of a clip a browser or a file reported as `mediaType` (and, for a file,
+// named `fileName`): one of TRANSCRIPTION_AUDIO_TYPES, or undefined when the clip is in no format
+// the backend takes -- which the composer says ("unsupported audio format") instead of sending a
+// clip that would be refused after the turn is committed.
+//
+// The type is trusted when it says anything: parameters dropped, an alias mapped, and a type
+// outside the allow-list refused whatever the file is called (a .wav that reports text/plain is
+// not audio the composer can vouch for). Only an EMPTY or generic type is read from the file's
+// extension, the one situation where the name is all there is.
+export function canonicalAudioMediaType(mediaType: string, fileName = ''): string | undefined {
+  const bare = bareAudioMediaType(mediaType);
+  if (bare === '' || bare === 'application/octet-stream') {
+    const dot = fileName.lastIndexOf('.');
+    return dot < 0 ? undefined : AUDIO_EXTENSION_TYPES.get(fileName.slice(dot + 1).toLowerCase());
+  }
+  const canonical = AUDIO_TYPE_ALIASES.get(bare) ?? bare;
+  return TRANSCRIPTION_AUDIO_TYPES.includes(canonical) ? canonical : undefined;
+}
+
+// The inline data url of a clip: `data:<type>;base64,<bytes>`, the type reduced to its bare,
+// canonical spelling (bareAudioMediaType and the alias table), which is what the backend reads.
+// `base64` is the clip's bytes, standard-alphabet base64 without the data-url prefix.
+export function audioDataUrl(mediaType: string, base64: string): string {
+  return `data:${aliasedAudioMediaType(mediaType)};base64,${base64}`;
+}
+
 // The user-turn part carrying a transcription turn's clip: an `audio_url` part holding the
 // audio as an inline `data:<type>;base64,...` url (the image attach's `image_url` part has the
 // same shape), which the run's commit moves into the chat's blob store, leaving a
-// /api/portal/chat-blobs/{id} reference in the transcript. `base64` is the clip's bytes,
-// standard-alphabet base64 without the data-url prefix; the type is normalized
-// (bareAudioMediaType), so a recorder's audio/webm;codecs=opus becomes audio/webm.
+// /api/portal/chat-blobs/{id} reference in the transcript. The type is normalized
+// (audioDataUrl), so a recorder's audio/webm;codecs=opus becomes audio/webm and a file's
+// audio/x-wav audio/wav.
 export function audioInputPart(mediaType: string, base64: string): ChatContentPart {
-  return {
-    type: 'audio_url',
-    audio_url: { url: `data:${bareAudioMediaType(mediaType)};base64,${base64}` },
-  };
+  return { type: 'audio_url', audio_url: { url: audioDataUrl(mediaType, base64) } };
+}
+
+// The content of the user turn a transcription composer sends: the clip alone, as one audio_url
+// part (`url` is the clip's data url, see audioDataUrl). There is no text part: the turn IS the
+// audio, and nothing else of it is read.
+export function audioTurnContent(url: string): ChatContent {
+  return [{ type: 'audio_url', audio_url: { url } }];
 }
 
 // audioInputPart's counterpart for a clip that already is a data url -- what a FileReader
@@ -825,7 +931,7 @@ export function normalizeAudioDataUrl(url: string): string {
   if (comma < 0) return url;
   const header = url.slice('data:'.length, comma).split(';');
   if (header.at(-1)?.trim().toLowerCase() !== 'base64') return url;
-  return `data:${bareAudioMediaType(header[0])};base64,${url.slice(comma + 1)}`;
+  return `data:${aliasedAudioMediaType(header[0])};base64,${url.slice(comma + 1)}`;
 }
 
 // Coerce an opaque `content` blob into a well-formed active-chat document,
@@ -1021,6 +1127,21 @@ export function lastUserHasImage(messages: ChatUiMessage[]): boolean {
       return (
         Array.isArray(content) && content.some((p) => p.type === 'image_url' && !isMaskPart(p))
       );
+    }
+  }
+  return false;
+}
+
+// Whether the LAST user message of a replayed history carries an audio clip -- which is what a
+// transcription replay transcribes (the executor reads exactly that message's audio and nothing
+// else of the history). Role-aware like lastUserHasImage: only a user turn's clip is an input.
+// A stored /api/portal/chat-blobs/{id} reference counts as one, as it is what a committed turn
+// holds.
+export function lastUserHasAudio(messages: ChatUiMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const { role, content } = messages[i];
+    if (role === 'user') {
+      return Array.isArray(content) && content.some((p) => p.type === 'audio_url');
     }
   }
   return false;

@@ -43,6 +43,7 @@ import {
   audioPassthroughMessage,
   audioSetting,
   audioSettingsFrom,
+  audioTurnContent,
   byNewest,
   clearLegacyKeys,
   DEFAULT_AUDIO_SETTINGS,
@@ -56,6 +57,7 @@ import {
   imageSetting,
   imageSettingsFrom,
   isChatBlobUrl,
+  lastUserHasAudio,
   lastUserHasImage,
   lastUserText,
   lsGet,
@@ -79,6 +81,7 @@ import {
   type ImageSettings,
   type TranscriptionSettings,
 } from './chatDoc';
+import { AudioAttachError, prepareAudioClip, type AudioClip } from './audioAttach';
 import { useChatRuns } from './useChatRuns';
 import { useChatPersistence } from './useChatPersistence';
 
@@ -86,6 +89,8 @@ import { useChatPersistence } from './useChatPersistence';
 // working unchanged after the FA-2 extraction into chatDoc.ts.
 export type { ActiveChatDoc, ChatMessageStatus } from './chatDoc';
 export type { AttachMode, ChatUiMessage };
+// The transcription composer's clip, for the view that previews it.
+export type { AudioClip };
 
 // The speech composer's advanced-passthrough check and the settings type it edits,
 // re-exported for Chat.tsx for the same reason as the image presets below: the
@@ -97,7 +102,8 @@ export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
 // The transcription composer's twin of the above (its own reserved fields and message), and
 // what its audio input needs: the allow-listed clip formats for the attach picker, and the
 // constructors of the user-turn audio part, which strip a recorder's media-type parameter
-// (audio/webm;codecs=opus) before the clip becomes a data url the backend accepts.
+// (audio/webm;codecs=opus) and map a platform's alias (audio/x-wav) to the canonical type
+// before the clip becomes a data url the backend accepts.
 export {
   audioInputPart,
   bareAudioMediaType,
@@ -147,6 +153,12 @@ export type ChatStore = {
   isChatRunning: (id: string) => boolean;
   input: string;
   images: string[];
+  // The transcription composer's clip -- the audio the next send transcribes -- or null. It
+  // exists only on a transcription thread (handleFiles takes audio there, and it is dropped when
+  // the thread is anything else) and is the WHOLE turn: a transcription send needs it and sends
+  // nothing else. `url` is the inline data url the turn will carry, already under its canonical
+  // media type (what the preview plays too); `name` is the file's, '' for a recording.
+  audio: AudioClip | null;
   model: string;
   systemPrompt: string;
   temperature: number;
@@ -299,8 +311,16 @@ export type ChatStore = {
   stop: () => void;
   newChat: () => void;
   setInput: Dispatch<SetStateAction<string>>;
+  // Attach what the composer's attach control picked: on a transcription thread the first file
+  // is the audio clip (replacing the one it had), anywhere else the images of a text or an
+  // image-edit turn. Refusals (a format, a size) are toasts.
   handleFiles: (fileList: FileList | null) => Promise<void>;
   removeImage: (index: number) => void;
+  // Attach a browser recording (the in-browser recorder's blob, typed as the recorder reports it:
+  // audio/webm;codecs=opus) as the transcription turn's clip, by the same path and refusals as a
+  // picked file. removeAudio drops the clip again.
+  attachRecording: (blob: Blob) => Promise<void>;
+  removeAudio: () => void;
   // The mask of an image EDIT (inpainting): one PNG data url, or null. It exists
   // only beside a source image in edit mode (handleMaskFile refuses it otherwise,
   // and it is dropped with its source or when the mode changes) and is sent as a
@@ -337,6 +357,25 @@ function attachErrorText(err: unknown, t: Translation): string {
     }
   }
   return t.chatImageError;
+}
+
+// The user-facing sentence for a refused audio clip: its format, its size, an empty file --
+// or anything else, which is generic.
+function audioAttachErrorText(err: unknown, t: Translation): string {
+  if (err instanceof AudioAttachError) {
+    switch (err.reason) {
+      case 'type':
+        return t.chatAudioErrorType;
+      case 'size':
+        return t.chatAudioErrorSize;
+      case 'empty':
+        return t.chatAudioErrorEmpty;
+      default:
+        // "read" (or any future reason) -> generic
+        return t.chatAudioError;
+    }
+  }
+  return t.chatAudioError;
 }
 
 // Exported so tests can inject a store value directly (e.g. the Chat view)
@@ -432,6 +471,8 @@ export function ChatStoreProvider({
   const [messages, setMessages] = useState<ChatUiMessage[]>([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
+  // The transcription composer's clip (see ChatStore.audio).
+  const [audio, setAudio] = useState<AudioClip | null>(null);
   const [mask, setMask] = useState<string | null>(null);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [selectedTokenId, setSelectedTokenId] = useState<string>(DEFAULTS.run_as_token_id);
@@ -1090,6 +1131,15 @@ export function ChatStoreProvider({
     if (attachMode !== 'edit' || images.length === 0) setMask(null);
   }, [mask, attachMode, images.length]);
 
+  // A clip belongs to the transcription composer: once the thread is anything else (a different
+  // model picked on an empty thread, another chat opened) there is no control that shows or
+  // removes it, and it would otherwise sit unseen in memory -- up to 20 MB of it -- ready to
+  // reappear in a later transcription composer. So it goes with the composer, without a word:
+  // there is nothing on screen left to say it about.
+  useEffect(() => {
+    if (audio !== null && chatKind !== 'transcription') setAudio(null);
+  }, [audio, chatKind]);
+
   // Reset a stale run-as selection: onRefresh reloads `tokens` after every
   // stream, and a chat may persist a run-as token that was later
   // deleted/disabled/expired or lost gateway:use — it would otherwise keep
@@ -1220,6 +1270,17 @@ export function ChatStoreProvider({
       const refusal = passthroughRefusal();
       if (refusal) {
         showErrorRef.current(refusal);
+        return;
+      }
+      // A transcription replay transcribes the LAST user turn's clip and reads nothing else
+      // of the history, so a turn without one has nothing to transcribe -- a stray text turn
+      // (an edit of it keeps only its text), or one whose clip an earlier edit dropped. The
+      // run would be started after the transcript was truncated and the endpoint would
+      // refuse it with nothing to say about why; refused here instead, with the transcript
+      // untouched. Judged on the REPLAYED history, like the image guard below: replaying an
+      // earlier turn drops every later clip.
+      if (chatKindRef.current === 'transcription' && !lastUserHasAudio(history)) {
+        showErrorRef.current(tRef.current.chatTranscriptionReplayNoAudio);
         return;
       }
       // Same guard for image support: the REPLAYED history (what is actually
@@ -1435,9 +1496,19 @@ export function ChatStoreProvider({
       showErrorRef.current(tRef.current.chatBusy);
       return;
     }
-    const text = input.trim();
-    if (!text && images.length === 0) return;
-    if (images.length > 0) {
+    // A transcription turn is its clip and nothing else: no text stands in for it (the composer
+    // has no text field, and whatever was typed before the model was picked is not part of it),
+    // and no image reaches it (the thread's attach mode is 'none', which also clears one). So
+    // it needs the clip, and ignores the text and the images.
+    const transcribing = chatKindRef.current === 'transcription';
+    const clip = transcribing ? audio : null;
+    if (transcribing && clip === null) {
+      showErrorRef.current(tRef.current.chatTranscriptionNeedsAudio);
+      return;
+    }
+    const text = transcribing ? '' : input.trim();
+    if (!clip && !text && images.length === 0) return;
+    if (!transcribing && images.length > 0) {
       const mode = attachModeRef.current;
       if (mode === 'none') {
         showErrorRef.current(
@@ -1480,8 +1551,11 @@ export function ChatStoreProvider({
     // thread's kind comes from the pin rather than from the picked model.
     if (messagesRef.current.length === 0) setPinnedChatKind(chatKindRef.current);
 
-    // The text, the attached source and -- for an edit -- the mask, tagged as one.
-    const content = userTurnContent(text, images, mask, attachModeRef.current);
+    // The text, the attached source and -- for an edit -- the mask, tagged as one; or, on a
+    // transcription thread, the clip alone.
+    const content = clip
+      ? audioTurnContent(clip.url)
+      : userTurnContent(text, images, mask, attachModeRef.current);
     maybeAutoTitle(text);
     const userMessage: ChatUiMessage = { id: nextId(), role: 'user', content };
     const next = [...messagesRef.current, userMessage];
@@ -1491,6 +1565,7 @@ export function ChatStoreProvider({
     setInput('');
     setImages([]);
     setMask(null);
+    setAudio(null);
 
     try {
       const res = await apiRef.current.startChatRun(chatId, {
@@ -1733,8 +1808,31 @@ export function ChatStoreProvider({
     [],
   );
 
+  // Vet and attach one audio clip (a picked file, or a recording with no name) as the
+  // transcription turn's clip, replacing the one it had; a refused clip leaves that one as it
+  // was and says why. It lands only while the thread is still a transcription one: the picker
+  // may have been left behind by a model switch while the file was being read.
+  async function attachAudioClip(file: Blob, name: string) {
+    try {
+      const clip = await prepareAudioClip(file, name);
+      if (chatKindRef.current === 'transcription') setAudio(clip);
+    } catch (err) {
+      showError(audioAttachErrorText(err, t));
+    }
+  }
+
+  const attachRecording = (blob: Blob) => attachAudioClip(blob, '');
+  const removeAudio = useCallback(() => setAudio(null), []);
+
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
+    // On a transcription thread the attachment is the audio clip -- the one thing the turn is --
+    // not an image: the attach control there offers audio only, and what it picks is the first
+    // file (a turn has one clip).
+    if (chatKind === 'transcription') {
+      await attachAudioClip(fileList[0], fileList[0].name);
+      return;
+    }
     // An image edit has ONE source image; every other attachment is capped at
     // MAX_IMAGES. The cap follows the attach mode like everything else about the
     // attachment does.
@@ -1813,6 +1911,7 @@ export function ChatStoreProvider({
     isChatRunning: (id: string) => runningChatIds.has(id),
     input,
     images,
+    audio,
     model,
     systemPrompt,
     temperature,
@@ -1861,6 +1960,8 @@ export function ChatStoreProvider({
     setInput,
     handleFiles,
     removeImage,
+    attachRecording,
+    removeAudio,
     mask,
     handleMaskFile,
     removeMask,

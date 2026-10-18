@@ -271,6 +271,70 @@ const de = {
   chatSpeechPassthrough: 'Zusätzliche Anfragefelder (JSON)',
   chatSpeechPassthroughHint:
     'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Haben Sie oben „Stimme“ oder „Geschwindigkeit“ eingestellt, gilt dieser Wert, nicht ein voice- oder speed-Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
+  // The composer of a transcription (speech-to-text) thread: the audio input replaces the
+  // text prompt. The group's label and the hint under it; the refusals of a send with no clip
+  // (also the Send button's tooltip) and of a replay whose last user turn has none (a
+  // transcription run reads that turn's audio and nothing else, so there would be nothing to
+  // transcribe).
+  chatTranscriptionInputLabel: 'Audio zum Transkribieren',
+  chatTranscriptionOnlyHint:
+    'Dieses Modell wandelt Sprache in Text um. Hängen Sie eine Audiodatei an oder nehmen Sie direkt im Browser auf; die Antwort ist das Transkript als Text.',
+  chatTranscriptionNeedsAudio: 'Hängen Sie zuerst eine Audiodatei an oder nehmen Sie Audio auf.',
+  chatTranscriptionReplayNoAudio:
+    'Diese Nachricht enthält kein Audio, es gibt also nichts zu transkribieren. Hängen Sie eine Audiodatei an oder nehmen Sie Audio auf und senden Sie es als neue Nachricht.',
+  // The audio clip of the turn, attached from a file or recorded: the attach button, the
+  // preview of what is attached, its remove button, and the name a recording is shown under.
+  chatAttachAudio: 'Audiodatei anhängen',
+  chatAttachedAudio: 'Angehängtes Audio',
+  chatRemoveAudio: 'Audio entfernen',
+  chatAudioRecordingLabel: 'Aufnahme',
+  // Why a clip could not be attached (the picker's `accept` is only a hint, so the type is
+  // checked again): its format, its size (the backend stores up to 20 MB per clip), an empty
+  // file, or anything else.
+  chatAudioError: 'Audio konnte nicht angehängt werden.',
+  chatAudioErrorType: 'Nicht unterstütztes Audioformat. Erlaubt sind WAV, MP3, M4A, OGG und WEBM.',
+  chatAudioErrorSize: 'Audio ist zu groß (max. 20 MB).',
+  chatAudioErrorEmpty: 'Die Audiodatei ist leer.',
+  // The in-browser recorder: the controls (record, stop, use or discard the take), the clock
+  // and the preview player, the wait for the microphone permission, and why a recording could
+  // not be made (permission refused, a browser without recording, anything else).
+  chatRecordStart: 'Aufnahme starten',
+  chatRecordStop: 'Aufnahme beenden',
+  chatRecordUse: 'Aufnahme verwenden',
+  chatRecordDiscard: 'Aufnahme verwerfen',
+  chatRecordElapsed: 'Aufnahmedauer',
+  chatRecordPreview: 'Vorschau der Aufnahme',
+  chatRecordRequesting: 'Warte auf die Freigabe des Mikrofons…',
+  chatRecordDenied:
+    'Der Zugriff auf das Mikrofon wurde verweigert. Erlauben Sie ihn in den Einstellungen Ihres Browsers und versuchen Sie es erneut.',
+  chatRecordUnsupported:
+    'Dieser Browser kann hier nicht aufnehmen: Aufnahmen brauchen einen aktuellen Browser und eine sichere Verbindung (HTTPS). Hängen Sie stattdessen eine Audiodatei an.',
+  chatRecordFailed:
+    'Die Aufnahme ist fehlgeschlagen. Prüfen Sie das Mikrofon und versuchen Sie es erneut.',
+  // The transcription-thread settings panel, shown in place of the text-chat controls. The
+  // language is free text (an ISO-639-1 code) and a blank one is detected by the model; the
+  // prompt is free text; a blank temperature leaves the model's own. The reply is always
+  // text, so there is no format control, only the static hint. The collapsible "Advanced"
+  // section holds a JSON object of extra request fields, and the refusals of one that is not
+  // an object or has a field name a form cannot carry (the reserved-field refusal is
+  // chatTranscriptionPassthroughReserved above).
+  chatTranscriptionLanguage: 'Sprache',
+  chatTranscriptionLanguageHint:
+    'ISO-639-1-Code der gesprochenen Sprache, zum Beispiel de oder en. Leer lassen, damit das Modell sie erkennt.',
+  chatTranscriptionPrompt: 'Hinweis (Prompt)',
+  chatTranscriptionPromptHint:
+    'Optionaler Text, der das Modell leitet, etwa mit der Schreibweise von Namen und Fachbegriffen aus dem Audio.',
+  chatTranscriptionTemperature: 'Temperatur',
+  chatTranscriptionDefault: 'Standard (Modell)',
+  chatTranscriptionFormatHint: 'Die Antwort ist immer Text (das Transkript).',
+  chatTranscriptionAdvanced: 'Erweitert',
+  chatTranscriptionPassthrough: 'Zusätzliche Anfragefelder (JSON)',
+  chatTranscriptionPassthroughHint:
+    'Ein JSON-Objekt mit zusätzlichen Feldern für die Transkriptionsanfrage, zum Beispiel {"key": "value"} oder eine modellspezifische Option; jeder Wert behält seinen JSON-Typ. Die Felder model, file, response_format und stream sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Feldnamen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\\) enthalten. Haben Sie oben „Sprache“, „Hinweis“ oder „Temperatur“ eingestellt, gilt dieser Wert, nicht ein gleichnamiges Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
+  chatTranscriptionPassthroughInvalid:
+    'Die erweiterten Felder müssen ein JSON-Objekt sein, zum Beispiel {"key": "value"}. Korrigieren Sie sie oder leeren Sie das Feld, bevor Sie senden.',
+  chatTranscriptionPassthroughBadKey: (field: string) =>
+    `Der Feldname ${field} in den erweiterten Feldern ist ungültig: Namen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\\) enthalten. Korrigieren Sie ihn, bevor Sie senden.`,
   // The mask of an edit (inpainting): an optional PNG, the size of the source
   // image, whose transparent area marks the region to change. Its slot is next to
   // the attach button of an edit and needs the source image first.
@@ -3385,6 +3449,49 @@ const en: PortalMessages = {
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:
     'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are reserved (in any letter case): if one of them appears here, the request is not sent. If you set "Voice" or "Speed" above, that value wins over a voice or speed field here. Leave blank to send nothing extra.',
+  chatTranscriptionInputLabel: 'Audio to transcribe',
+  chatTranscriptionOnlyHint:
+    'This model turns speech into text. Attach an audio file or record right in the browser; the reply is the transcript as text.',
+  chatTranscriptionNeedsAudio: 'Attach an audio file or record audio first.',
+  chatTranscriptionReplayNoAudio:
+    'This message has no audio, so there is nothing to transcribe. Attach an audio file or record audio and send it as a new message.',
+  chatAttachAudio: 'Attach audio file',
+  chatAttachedAudio: 'Attached audio',
+  chatRemoveAudio: 'Remove audio',
+  chatAudioRecordingLabel: 'Recording',
+  chatAudioError: 'Could not attach the audio.',
+  chatAudioErrorType: 'Unsupported audio format. Use WAV, MP3, M4A, OGG or WEBM.',
+  chatAudioErrorSize: 'Audio is too large (max 20 MB).',
+  chatAudioErrorEmpty: 'The audio file is empty.',
+  chatRecordStart: 'Start recording',
+  chatRecordStop: 'Stop recording',
+  chatRecordUse: 'Use recording',
+  chatRecordDiscard: 'Discard recording',
+  chatRecordElapsed: 'Recording time',
+  chatRecordPreview: 'Recording preview',
+  chatRecordRequesting: 'Waiting for microphone permission…',
+  chatRecordDenied:
+    'Microphone access was denied. Allow it in your browser settings and try again.',
+  chatRecordUnsupported:
+    'This browser cannot record here: recording needs a current browser and a secure connection (HTTPS). Attach an audio file instead.',
+  chatRecordFailed: 'The recording failed. Check your microphone and try again.',
+  chatTranscriptionLanguage: 'Language',
+  chatTranscriptionLanguageHint:
+    'ISO-639-1 code of the spoken language, for example en or de. Leave blank to let the model detect it.',
+  chatTranscriptionPrompt: 'Prompt',
+  chatTranscriptionPromptHint:
+    'Optional text that guides the model, for example the spelling of names and terms in the audio.',
+  chatTranscriptionTemperature: 'Temperature',
+  chatTranscriptionDefault: 'Default (model)',
+  chatTranscriptionFormatHint: 'The reply is always text (the transcript).',
+  chatTranscriptionAdvanced: 'Advanced',
+  chatTranscriptionPassthrough: 'Extra request fields (JSON)',
+  chatTranscriptionPassthroughHint:
+    'A JSON object of extra fields for the transcription request, for example {"key": "value"} or a model-specific option; each value keeps its JSON type. The fields model, file, response_format and stream are reserved (in any letter case): if one of them appears here, the request is not sent. Field names may not be empty or contain control characters, quotation marks (") or backslashes (\\). If you set "Language", "Prompt" or "Temperature" above, that value wins over a field of the same name here. Leave blank to send nothing extra.',
+  chatTranscriptionPassthroughInvalid:
+    'The advanced fields must be a JSON object, for example {"key": "value"}. Fix them or clear the field before sending.',
+  chatTranscriptionPassthroughBadKey: (field: string) =>
+    `The field name ${field} in the advanced fields is invalid: names may not be empty or contain control characters, quotation marks (") or backslashes (\\). Fix it before sending.`,
   chatAttachMask: 'Attach a mask',
   chatAttachMaskTooltip:
     'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',
