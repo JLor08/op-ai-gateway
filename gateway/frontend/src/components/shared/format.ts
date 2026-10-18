@@ -285,6 +285,27 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'speech.response_format_unsupported': 'errorSpeechResponseFormatUnsupported',
   'speech.stream_unsupported': 'errorSpeechStreamUnsupported',
   'speech.upstream_error': 'errorSpeechUpstreamError',
+  // Portal chat transcription (#249): a transcription run's own terminal codes
+  // (chat_runs_transcription.go) and the transcription.* codes of POST
+  // /v1/audio/transcriptions, which the run relays verbatim through upstreamErrorCode
+  // (transcription_handler.go). Mapped to their own transcription-worded labels rather
+  // than the speech or image ones, which talk about generated audio or images. As for
+  // speech, transcription.model_required is left out on purpose (a run always sends the
+  // thread's pinned model); so is transcription.invalid, a structurally broken form,
+  // the twin of the image edit's unmapped request.invalid (the run builds its own form).
+  // transcription.unavailable is the 404 of a target agent that has not declared
+  // multipart_proxy, the twin of images.edit_unavailable below.
+  'gateway.chat_run_transcription_dispatch_failed': 'errorChatRunTranscriptionDispatchFailed',
+  'gateway.chat_run_transcription_source_unreadable': 'errorChatRunTranscriptionSourceUnreadable',
+  'gateway.chat_run_transcription_response_unreadable':
+    'errorChatRunTranscriptionResponseUnreadable',
+  'gateway.chat_run_transcription_no_transcript': 'errorChatRunNoTranscript',
+  'gateway.chat_run_transcription_reserved_field': 'errorChatRunTranscriptionReservedField',
+  'transcription.file_required': 'errorTranscriptionFileRequired',
+  'transcription.response_format_unsupported': 'errorTranscriptionResponseFormatUnsupported',
+  'transcription.stream_unsupported': 'errorTranscriptionStreamUnsupported',
+  'transcription.unavailable': 'errorTranscriptionUnavailable',
+  'transcription.upstream_error': 'errorTranscriptionUpstreamError',
   'images.prompt_required': 'errorImagesPromptRequired',
   'images.stream_unsupported': 'errorImagesStreamUnsupported',
   'images.response_format_unsupported': 'errorImagesResponseFormatUnsupported',

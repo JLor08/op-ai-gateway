@@ -1754,6 +1754,47 @@ const de = {
     'Die Sprachsynthese unterstützt kein Streaming; die Antwort ist immer eine vollständige Audiodatei. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
   errorSpeechUpstreamError:
     'Der Sprachsynthese-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
+  // Transkription im Chat (#249): die Lauf-Codes eines Transkriptions-Laufs
+  // (chat_runs_transcription.go) und die transcription.*-Codes von
+  // /v1/audio/transcriptions, die ein Lauf erreichen kann -- die Gegenstücke der
+  // Sprach-Codes oben, aber auf die Gegenrichtung formuliert: Audio geht hinein, ein
+  // Transkript kommt heraus. Wire-Codes siehe format.ts (errorLabelByCode).
+  // Die Anfrage hat das Gateway nie verlassen; der Go-Fehler nennt die interne
+  // Adresse und steht nur im Log.
+  errorChatRunTranscriptionDispatchFailed:
+    'Die Transkription konnte nicht gestartet werden. Bitte versuchen Sie es erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator, falls dies anhält.',
+  // Der Lauf sendet NICHTS, wenn das angehängte Audio nicht als Audiodatei gelesen
+  // werden kann (er transkribiert nie ein anderes Audio als das angehängte).
+  errorChatRunTranscriptionSourceUnreadable:
+    'Das angehängte Audio konnte nicht gelesen werden. Bitte hängen Sie es erneut an oder nehmen Sie es neu auf.',
+  // Entweder war der Antwortkörper nicht bis zum Ende lesbar, oder er war nicht das
+  // erwartete JSON mit dem Transkript (eine HTML-Fehlerseite, die Antwort eines Proxys).
+  errorChatRunTranscriptionResponseUnreadable:
+    'Die Antwort der Transkription konnte nicht gelesen werden. Bitte versuchen Sie es erneut.',
+  // Eine gültige Antwort ohne Text: Stille, Rauschen oder ein Modell, das keine Sprache
+  // erkannt hat. Ein Fehler statt einer leeren Antwort, damit die Nachricht nicht wie
+  // ein Defekt aussieht.
+  errorChatRunNoTranscript:
+    'Im Audio wurde keine Sprache erkannt, es gibt also keinen Text. Prüfen Sie das Audio, und versuchen Sie es mit einer anderen oder neuen Aufnahme erneut.',
+  // Der Lauf bricht ab, BEVOR er etwas sendet, wenn die erweiterten Felder ein Feld
+  // nennen, das er selbst besitzt (Groß-/Kleinschreibung egal). Der Text nennt das
+  // Steuerelement mit seiner Beschriftung (chatTranscriptionAdvanced).
+  errorChatRunTranscriptionReservedField:
+    'Die erweiterten Felder dieses Chats enthalten ein reserviertes Feld (model, file, response_format oder stream). Die Anfrage wurde nicht gesendet. Entfernen Sie das Feld unter „Erweitert“, und versuchen Sie es erneut.',
+  errorTranscriptionFileRequired:
+    'Für die Transkription wird eine Audiodatei benötigt. Bitte hängen Sie Audio an oder nehmen Sie welches auf.',
+  errorTranscriptionResponseFormatUnsupported:
+    'Nicht unterstütztes Antwortformat für die Transkription. Unterstützt wird nur JSON.',
+  // Vom Portal nur über ein stream_format-Feld in den erweiterten Feldern erreichbar
+  // (stream selbst ist reserviert und wird vorher abgelehnt).
+  errorTranscriptionStreamUnsupported:
+    'Die Transkription unterstützt kein Streaming; die Antwort ist immer das vollständige Transkript. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
+  // Das Ziel ist ein Agent, der multipart_proxy nicht gemeldet hat (älter als 0.9.0,
+  // oder seit einem Neustart des Gateways noch nicht gemeldet).
+  errorTranscriptionUnavailable:
+    'Dieser Server kann Audio derzeit nicht transkribieren: Sein Agent unterstützt die Transkription noch nicht, oder er hat sich seit einem Neustart des Gateways noch nicht gemeldet. Bitte versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator.',
+  errorTranscriptionUpstreamError:
+    'Der Transkriptions-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).
@@ -4775,6 +4816,45 @@ const en: PortalMessages = {
   errorSpeechStreamUnsupported:
     'Speech synthesis does not support streaming; the response is always one complete audio file. If present, remove the stream_format field from the advanced fields.',
   errorSpeechUpstreamError: 'The speech synthesis server reported an error. Please try again.',
+  // Transcription in the chat (#249): the run codes of a transcription run
+  // (chat_runs_transcription.go) and the transcription.* codes of
+  // /v1/audio/transcriptions a run can reach -- the counterparts of the speech codes
+  // above, worded for the opposite direction: audio goes in, a transcript comes out.
+  // Wire codes: see format.ts (errorLabelByCode).
+  // The request never left the gateway; the Go error names the internal address
+  // and stays in the log.
+  errorChatRunTranscriptionDispatchFailed:
+    'The transcription could not be started. Please try again, or contact an administrator if this continues.',
+  // The run sends NOTHING when the attached audio cannot be read as an audio file (it
+  // never transcribes a different clip than the one attached).
+  errorChatRunTranscriptionSourceUnreadable:
+    'The attached audio could not be read. Please attach it again or record it again.',
+  // Either the response body could not be read to its end, or it was not the expected
+  // JSON holding the transcript (an HTML error page, a proxy's own reply).
+  errorChatRunTranscriptionResponseUnreadable:
+    'The transcription response could not be read. Please try again.',
+  // A valid reply with no text: silence, noise, or a model that heard no speech. An
+  // error rather than an empty reply, so the message does not look like a defect.
+  errorChatRunNoTranscript:
+    'No speech was detected in the audio, so there is no text. Check the audio and try again with a different or a new recording.',
+  // The run stops BEFORE sending anything when the advanced fields name a field it
+  // owns (case-insensitive). The text names the control by its label
+  // (chatTranscriptionAdvanced).
+  errorChatRunTranscriptionReservedField:
+    'The advanced fields of this chat contain a reserved field (model, file, response_format or stream). The request was not sent. Remove the field under "Advanced" and try again.',
+  errorTranscriptionFileRequired:
+    'Transcription needs an audio file. Please attach audio or record some.',
+  errorTranscriptionResponseFormatUnsupported:
+    'Unsupported response format for transcription. Only JSON is supported.',
+  // Reachable from the portal only through a stream_format field in the advanced
+  // fields (stream itself is reserved and refused earlier).
+  errorTranscriptionStreamUnsupported:
+    'Transcription does not support streaming; the response is always the complete transcript. If present, remove the stream_format field from the advanced fields.',
+  // The target is an agent that has not declared multipart_proxy (older than 0.9.0, or
+  // not reported since the gateway restarted).
+  errorTranscriptionUnavailable:
+    'This server cannot transcribe audio right now: its agent does not support transcription yet, or it has not reported in since the gateway restarted. Please try again shortly, or contact an administrator.',
+  errorTranscriptionUpstreamError: 'The transcription server reported an error. Please try again.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).

@@ -406,6 +406,13 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * (chat_runs_audio.go): the audio twins of the image-run codes above, worded
    * about speech because the image labels talk about images.
    *
+   * The five `gateway.chat_run_*` codes of a TRANSCRIPTION (speech-to-text) run are
+   * `transcriptionRunDispatchFailedMessage`, `transcriptionRunSourceUnreadableMessage`,
+   * `transcriptionRunResponseUnreadableMessage`, `transcriptionRunNoTranscriptMessage`
+   * and `transcriptionRunReservedFieldMessage` (chat_runs_transcription.go): the
+   * speech codes' counterparts for the opposite direction, worded about audio going
+   * in and a transcript coming out.
+   *
    * `portal.chat_run_history_too_large` is `portal.ErrChatRunHistoryTooLarge`
    * (service_chats.go, row in error_map.go): the run's image history, resolved
    * from the chat-blob store for inference, exceeded its bound. A 400 at run
@@ -444,6 +451,15 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     'gateway.chat_run_no_audio',
     'gateway.chat_run_speech_response_unreadable',
     'gateway.chat_run_speech_reserved_field',
+    // A transcription run's own terminal codes (chat_runs_transcription.go). The
+    // source-unreadable one is the run refusing, before anything is sent, a clip it
+    // cannot read as audio (it never transcribes a different clip than the user
+    // attached), and the no-transcript one is a 2xx that held no text.
+    'gateway.chat_run_transcription_dispatch_failed',
+    'gateway.chat_run_transcription_source_unreadable',
+    'gateway.chat_run_transcription_response_unreadable',
+    'gateway.chat_run_transcription_no_transcript',
+    'gateway.chat_run_transcription_reserved_field',
   ] as const;
 
   it('carries every chat-run-lifecycle and mapping-capability code, by its exact wire string', () => {
@@ -606,6 +622,97 @@ describe('errorLabelByCode (whole-map invariants)', () => {
       // A toast for the endpoint's own refusal shows the label after the code,
       // never the server's English.
       if (code.startsWith('speech.')) {
+        expect(formatPortalError(new PortalApiError(400, code, 'raw server text'), t)).toBe(
+          `${code}: ${t[key]}`,
+        );
+      }
+    }
+    expect(messages.de[key]).not.toBe(messages.en[key]);
+  });
+
+  /**
+   * The five `transcription.*` codes of POST /v1/audio/transcriptions a chat run can
+   * surface, the transcription twins of the `speech.*` group above (the run relays the
+   * loopback endpoint's error.code through `upstreamErrorCode`). Declared in Go as
+   * `transcriptionFileRequired`, `transcriptionResponseFormatUnsupported` and
+   * `transcriptionStreamUnsupported` (transcription_handler.go,
+   * validateTranscriptionRequest), `codeTranscriptionUnavailable` (the 404 of a target
+   * agent that has not declared multipart_proxy, the image edit's
+   * `images.edit_unavailable` twin) and `transcriptionUpstreamErrorCode` (the gateway's
+   * own classification of an audio.cpp error that is not already an OpenAI error
+   * object). Pinned as literals for the same reason as the groups above.
+   *
+   * Two are unmapped on purpose. `transcription.model_required` is, exactly as
+   * `speech.model_required` and `images.model_required` are: a run always sends the
+   * thread's pinned model, so the portal can never raise it. `transcription.invalid`
+   * (a structurally broken form) is, as the image edit's twin `request.invalid` is: the
+   * run builds its own form, so only a field over the endpoint's 1 MiB bound could
+   * raise it. `transcription.file_required` is mapped although the run attaches its
+   * clip itself (a clip that decodes to nothing ends the run as
+   * `gateway.chat_run_transcription_source_unreadable` before anything is sent), and so
+   * is `transcription.response_format_unsupported` although the run reserves
+   * response_format: the endpoint can answer both to any client and the run relays
+   * whatever code comes back, as `speech.response_format_unsupported` is for speech.
+   * `transcription.stream_unsupported` IS reachable from the portal, through a
+   * `stream_format` passthrough key (the one streaming-related field the run does not
+   * reserve).
+   */
+  const transcriptionWireCodes = [
+    'transcription.file_required',
+    'transcription.response_format_unsupported',
+    'transcription.stream_unsupported',
+    'transcription.unavailable',
+    'transcription.upstream_error',
+  ] as const;
+
+  it('carries every transcription.* code reachable from a chat run, by its exact wire string', () => {
+    for (const code of transcriptionWireCodes) {
+      expect(
+        errorLabelByCode[code],
+        `${code} is not mapped: the user sees the raw wire code`,
+      ).toBeDefined();
+    }
+    expect(
+      entries
+        .filter(([code]) => code.startsWith('transcription.'))
+        .map(([code]) => code)
+        .sort(),
+    ).toEqual(transcriptionWireCodes.slice().sort());
+  });
+
+  // A transcription run's failures reach the transcript as the terminal CODE (the run
+  // carries no server text), so each must map to its own localized sentence in BOTH
+  // locales and never degrade to the bare code -- the transcription twin of the speech
+  // table above. The label keys are pinned too, so a code cannot be re-pointed at a
+  // speech or image sentence (which would tell a transcription user about synthesized
+  // audio or an image).
+  it.each([
+    ['gateway.chat_run_transcription_dispatch_failed', 'errorChatRunTranscriptionDispatchFailed'],
+    [
+      'gateway.chat_run_transcription_source_unreadable',
+      'errorChatRunTranscriptionSourceUnreadable',
+    ],
+    [
+      'gateway.chat_run_transcription_response_unreadable',
+      'errorChatRunTranscriptionResponseUnreadable',
+    ],
+    ['gateway.chat_run_transcription_no_transcript', 'errorChatRunNoTranscript'],
+    ['gateway.chat_run_transcription_reserved_field', 'errorChatRunTranscriptionReservedField'],
+    ['transcription.file_required', 'errorTranscriptionFileRequired'],
+    ['transcription.response_format_unsupported', 'errorTranscriptionResponseFormatUnsupported'],
+    ['transcription.stream_unsupported', 'errorTranscriptionStreamUnsupported'],
+    ['transcription.unavailable', 'errorTranscriptionUnavailable'],
+    ['transcription.upstream_error', 'errorTranscriptionUpstreamError'],
+  ] as const)('labels the transcription code %s with %s, in both locales', (code, key) => {
+    expect(errorLabelByCode[code]).toBe(key);
+    for (const locale of ['de', 'en'] as const) {
+      const t = messages[locale];
+      expect(t[key].length).toBeGreaterThan(0);
+      expect(formatChatRunErrorCode(code, t)).toBe(t[key]);
+      expect(formatChatRunErrorCode(code, t)).not.toBe(code);
+      // A toast for the endpoint's own refusal shows the label after the code,
+      // never the server's English.
+      if (code.startsWith('transcription.')) {
         expect(formatPortalError(new PortalApiError(400, code, 'raw server text'), t)).toBe(
           `${code}: ${t[key]}`,
         );

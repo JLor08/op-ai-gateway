@@ -3759,3 +3759,98 @@ describe('user-facing strings never use a double hyphen as a dash', () => {
     });
   }
 });
+
+// The transcription twins of the speech error labels above: the five terminal codes of a
+// transcription chat run (chat_runs_transcription.go) and the transcription.* refusals of
+// POST /v1/audio/transcriptions a run relays. The wire codes themselves are pinned in
+// format.test.ts; this guards the label keys in both locales and what the sentences say.
+describe('portal chat transcription error i18n keys', () => {
+  const keys = [
+    'errorChatRunTranscriptionDispatchFailed',
+    'errorChatRunTranscriptionSourceUnreadable',
+    'errorChatRunTranscriptionResponseUnreadable',
+    'errorChatRunNoTranscript',
+    'errorChatRunTranscriptionReservedField',
+    'errorTranscriptionFileRequired',
+    'errorTranscriptionResponseFormatUnsupported',
+    'errorTranscriptionStreamUnsupported',
+    'errorTranscriptionUnavailable',
+    'errorTranscriptionUpstreamError',
+  ] as const;
+
+  it('defines a user-facing label for each transcription error code in de and en', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k], k).toBe('string');
+      expect(typeof messages.en[k], k).toBe('string');
+      expect(messages.de[k].length, k).toBeGreaterThan(0);
+      expect(messages.en[k].length, k).toBeGreaterThan(0);
+      expect(messages.de[k], `${k} is the English text copied into de`).not.toBe(messages.en[k]);
+    }
+  });
+
+  // These codes are the transcription namesakes of the image and speech ones, whose labels
+  // talk about images and about synthesizing speech; a transcription user told "no audio was
+  // generated" (the audio goes IN here) would be misled.
+  it('does not talk about images or speech synthesis', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      for (const k of keys) {
+        expect(messages[locale][k], `${locale} ${k}`).not.toMatch(
+          /bild|image|sprachsynthese|speech synthesis|generated|erzeugt/i,
+        );
+      }
+    }
+  });
+
+  // The run refuses a reserved passthrough key BEFORE sending anything, so the sentence must
+  // say that nothing went out, and it must send the user to the control that holds the
+  // offending key by the label the panel shows.
+  it('tells the user which control holds a reserved field and that nothing was sent', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      const label = t.errorChatRunTranscriptionReservedField;
+      expect(label).toContain(t.chatTranscriptionAdvanced);
+      for (const field of ['model', 'file', 'response_format', 'stream']) {
+        expect(label).toContain(field);
+      }
+      expect(label).toMatch(locale === 'de' ? /nicht gesendet/ : /not sent/);
+    }
+  });
+
+  // The reserved set the label names is the one the composer's own refusal names: the two
+  // must not drift apart (one says the run owns four fields, the other lists a different four).
+  it('names the same reserved fields as the composer refusal', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      const composer = t.chatTranscriptionPassthroughReserved('x');
+      for (const field of ['model', 'file', 'response_format', 'stream']) {
+        expect(composer, `${locale} composer refusal ${field}`).toContain(field);
+        expect(t.errorChatRunTranscriptionReservedField, `${locale} run label ${field}`).toContain(
+          field,
+        );
+      }
+    }
+  });
+
+  // transcription.stream_unsupported is reachable from the portal only through a
+  // stream_format passthrough key, so the sentence names the field to remove.
+  it('names the stream_format field in the streaming refusal', () => {
+    expect(messages.de.errorTranscriptionStreamUnsupported).toContain('stream_format');
+    expect(messages.en.errorTranscriptionStreamUnsupported).toContain('stream_format');
+  });
+
+  // The endpoint answers JSON only; the format refusal states the one that works.
+  it('names JSON as the only supported format', () => {
+    expect(messages.de.errorTranscriptionResponseFormatUnsupported).toContain('JSON');
+    expect(messages.en.errorTranscriptionResponseFormatUnsupported).toContain('JSON');
+  });
+
+  // The two conditions a user can act on, where the others are a retry or an administrator:
+  // a clip that cannot be read (attach it again) and a clip with no speech in it (record
+  // again). They must tell the user so rather than only that something failed.
+  it('tells the user to attach the clip again when it cannot be read, and what no transcript means', () => {
+    expect(messages.de.errorChatRunTranscriptionSourceUnreadable).toMatch(/erneut an/);
+    expect(messages.en.errorChatRunTranscriptionSourceUnreadable).toMatch(/again/);
+    expect(messages.de.errorChatRunNoTranscript).toMatch(/Sprache|Text/);
+    expect(messages.en.errorChatRunNoTranscript).toMatch(/speech|text/i);
+  });
+});
