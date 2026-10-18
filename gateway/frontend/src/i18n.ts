@@ -243,6 +243,12 @@ const de = {
   // BEFORE anything is sent or stored. Names the field as the user wrote it.
   chatSpeechPassthroughReserved: (field: string) =>
     `Das Feld „${field}“ in den erweiterten Feldern ist reserviert: Der Lauf setzt model, input, stream und response_format selbst. Entfernen Sie es, bevor Sie senden.`,
+  // The same refusal for a transcription (speech-to-text) turn: its run sets model, file,
+  // response_format and stream itself (matched ignoring case). Raised BEFORE anything is sent
+  // or stored; names the field as the user wrote it. The not-a-JSON-object case reuses
+  // chatAudioPassthroughInvalid above.
+  chatTranscriptionPassthroughReserved: (field: string) =>
+    `Das Feld „${field}“ in den erweiterten Feldern ist reserviert: Der Lauf setzt model, file, response_format und stream selbst. Entfernen Sie es, bevor Sie senden.`,
   // The composer of a speech (text-to-speech) thread: the prompt field's label and
   // the hint under it, and the attach button's tooltip (a speech run sends only the
   // text, so an image can never be attached -- whatever the model could read).
@@ -3364,6 +3370,8 @@ const en: PortalMessages = {
     'The advanced fields must be a JSON object, for example {"seed": 1}. Fix them or clear the field before sending.',
   chatSpeechPassthroughReserved: (field: string) =>
     `The field "${field}" in the advanced fields is reserved: the run sets model, input, stream and response_format itself. Remove it before sending.`,
+  chatTranscriptionPassthroughReserved: (field: string) =>
+    `The field "${field}" in the advanced fields is reserved: the run sets model, file, response_format and stream itself. Remove it before sending.`,
   chatSpeechPromptLabel: 'Text to speak',
   chatSpeechOnlyHint:
     'This model speaks text. This thread accepts text to speak only; the reply is an audio file.',

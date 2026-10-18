@@ -27,10 +27,12 @@ import {
   kindSetting,
   pruneEmptyAssistantTail,
   SAVE_DEBOUNCE_MS,
+  transcriptionSetting,
   type ActiveChatDoc,
   type AudioSettings,
   type ChatUiMessage,
   type ImageSettings,
+  type TranscriptionSettings,
 } from './chatDoc';
 
 export type ChatPersistenceApi = {
@@ -81,11 +83,12 @@ export function useChatPersistence(
     maxTokensRef: RefObject<number>;
     imageSettingsRef: RefObject<ImageSettings>;
     audioSettingsRef: RefObject<AudioSettings>;
+    transcriptionSettingsRef: RefObject<TranscriptionSettings>;
     selectedTokenIdRef: RefObject<string>;
     serverOverrideRef: RefObject<string>;
     serverOverrideForceUnreachableRef: RefObject<boolean>;
-    // The active thread's pinned kind ("" text | "image" | "speech"). Read here because
-    // buildDoc has to write it back: the backend's PUT full-replaces the
+    // The active thread's pinned kind ("" text | "image" | "speech" | "transcription"). Read
+    // here because buildDoc has to write it back: the backend's PUT full-replaces the
     // opaque content blob with NO merge, so any setting missing from buildDoc
     // is erased from the stored document on the very next autosave — which is
     // exactly how the server-side kind pin was being destroyed before it was
@@ -109,6 +112,8 @@ export function useChatPersistence(
     imageSettings: ImageSettings;
     // Likewise one reactive value: the speech thread's audio knobs.
     audioSettings: AudioSettings;
+    // And the transcription thread's speech-to-text knobs.
+    transcriptionSettings: TranscriptionSettings;
     selectedTokenId: string;
     serverOverride: string;
     serverOverrideForceUnreachable: boolean;
@@ -133,6 +138,7 @@ export function useChatPersistence(
     maxTokensRef,
     imageSettingsRef,
     audioSettingsRef,
+    transcriptionSettingsRef,
     selectedTokenIdRef,
     serverOverrideRef,
     serverOverrideForceUnreachableRef,
@@ -151,6 +157,7 @@ export function useChatPersistence(
     maxTokens,
     imageSettings,
     audioSettings,
+    transcriptionSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,
@@ -191,6 +198,9 @@ export function useChatPersistence(
         // The audio knobs, likewise present only for a speech thread (keyed off the
         // kind by audioSetting): a knob this omits is erased by the next PUT.
         ...audioSetting(chatKindRef.current, audioSettingsRef.current),
+        // The transcription knobs, likewise present only for a transcription thread (keyed
+        // off the kind by transcriptionSetting): a knob this omits is erased by the next PUT.
+        ...transcriptionSetting(chatKindRef.current, transcriptionSettingsRef.current),
       },
       messages: pruneEmptyAssistantTail(messagesRef.current),
     }),
@@ -201,6 +211,7 @@ export function useChatPersistence(
       maxTokensRef,
       imageSettingsRef,
       audioSettingsRef,
+      transcriptionSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -273,6 +284,7 @@ export function useChatPersistence(
     maxTokens,
     imageSettings,
     audioSettings,
+    transcriptionSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,

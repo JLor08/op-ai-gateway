@@ -47,9 +47,11 @@ import {
   clearLegacyKeys,
   DEFAULT_AUDIO_SETTINGS,
   DEFAULT_IMAGE_SETTINGS,
+  DEFAULT_TRANSCRIPTION_SETTINGS,
   IMAGE_EDIT_SOURCE_TYPES,
   deriveTitle,
   deriveTitleFromMessages,
+  deriveTitleFromTranscript,
   historyHasImage,
   imageSetting,
   imageSettingsFrom,
@@ -61,15 +63,21 @@ import {
   nextId,
   normalizeDoc,
   parseAudioPassthrough,
+  parseTranscriptionPassthrough,
   readLegacyDoc,
   resolveTokenOverride,
   speechPassthroughInvalid,
   summaryOf,
+  transcriptionPassthroughInvalid,
+  transcriptionPassthroughMessage,
+  transcriptionSetting,
+  transcriptionSettingsFrom,
   userTurnContent,
   type AttachMode,
   type AudioSettings,
   type ChatUiMessage,
   type ImageSettings,
+  type TranscriptionSettings,
 } from './chatDoc';
 import { useChatRuns } from './useChatRuns';
 import { useChatPersistence } from './useChatPersistence';
@@ -85,6 +93,21 @@ export type { AttachMode, ChatUiMessage };
 // passthrough text that is not a JSON object before the user sends it.
 export { audioPassthroughMessage, parseAudioPassthrough } from './chatDoc';
 export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
+
+// The transcription composer's twin of the above (its own reserved fields and message), and
+// what its audio input needs: the allow-listed clip formats for the attach picker, and the
+// constructors of the user-turn audio part, which strip a recorder's media-type parameter
+// (audio/webm;codecs=opus) before the clip becomes a data url the backend accepts.
+export {
+  audioInputPart,
+  bareAudioMediaType,
+  normalizeAudioDataUrl,
+  parseTranscriptionPassthrough,
+  TRANSCRIPTION_AUDIO_ACCEPT,
+  TRANSCRIPTION_AUDIO_TYPES,
+  transcriptionPassthroughMessage,
+} from './chatDoc';
+export type { TranscriptionPassthroughParse, TranscriptionSettings } from './chatDoc';
 
 // The image-settings presets (and the optionsOr helper that merges a per-model
 // fetched list over them) the composer (Chat.tsx, OUTSIDE components/chat/)
@@ -188,6 +211,11 @@ export type ChatStore = {
   // only what the composer NEWLY OFFERS on an unpinned thread (the speech composer, via
   // prospectiveKind) -- never what an existing thread DOES: that is chatKind's job.
   modelSpeechCapable: boolean;
+  // Whether the effective model TRANSCRIBES speech (the backend's `transcription` verdict,
+  // ModelOption.transcription, read as served). The speech flag's twin: it gates only what the
+  // composer NEWLY OFFERS on an unpinned thread (the transcription composer, via
+  // prospectiveKind) -- never what an existing thread DOES: that is chatKind's job.
+  modelTranscriptionCapable: boolean;
   // What an attached image MEANS for the next send: 'edit' (the source of an image
   // edit), 'vision' (an input a text model reads) or 'none' (not accepted). One
   // predicate of chatKind and the model's flags (attachModeOf, chatDoc.ts) that
@@ -202,12 +230,12 @@ export type ChatStore = {
   // ("unknown"), so the composer's dropdowns merge it over their static
   // Phase 1b-i superset (optionsOr) rather than trusting it to be complete.
   modelImageOptions: ImageModelOptions | null;
-  // The THREAD's kind: "" (text), "image" or "speech". Pinned by the backend at the
-  // thread's first send and authoritative from then on; while the thread is
+  // The THREAD's kind: "" (text), "image", "speech" or "transcription". Pinned by the backend
+  // at the thread's first send and authoritative from then on; while the thread is
   // still empty it follows the picked model, because that is what the next
   // send will pin it to. Render composer affordances off THIS, not off
   // modelImageCapable — a text thread stays a text thread even if the user
-  // later picks an image or speech model.
+  // later picks an image, speech or transcription model.
   chatKind: string;
   // The image-generation knobs of the active thread (size / n / output_format /
   // output_compression), as concrete store state. The settings panel edits them
@@ -221,8 +249,15 @@ export type ChatStore = {
   // in chatDoc.ts). A passthrough that is not a JSON object blocks the send (see send()).
   audioSettings: AudioSettings;
   setAudioSettings: Dispatch<SetStateAction<AudioSettings>>;
-  // The active chat's LIVE RUN's own reported kind ("" text | "image" | "speech"),
-  // read from useChatRuns' kindOf -- deliberately NOT chatKind above.
+  // The speech-to-text knobs of the active thread (language / prompt / temperature /
+  // passthrough text), as concrete store state: the audio settings' twin. The transcription
+  // composer edits them when chatKind === "transcription"; they are omitted from the wire and
+  // persistence for any other kind (see transcriptionSetting in chatDoc.ts). A passthrough
+  // that is not a JSON object, or that names a field the run owns, blocks the send (see send()).
+  transcriptionSettings: TranscriptionSettings;
+  setTranscriptionSettings: Dispatch<SetStateAction<TranscriptionSettings>>;
+  // The active chat's LIVE RUN's own reported kind ("" text | "image" | "speech" |
+  // "transcription"), read from useChatRuns' kindOf -- deliberately NOT chatKind above.
   // chatKind is the client's own "is this thread's first send" guess
   // (messagesRef.current.length === 0) and can disagree with the server's
   // (len(doc.Messages) > 0): a second tab whose transcript view is stale
@@ -388,6 +423,12 @@ export function ChatStoreProvider({
   // image settings' twin, seeded in activateChat, sent via currentSettings, persisted
   // via buildDoc -- all gated on chatKind "speech".
   const [audioSettings, setAudioSettings] = useState<AudioSettings>(DEFAULT_AUDIO_SETTINGS);
+  // The active transcription thread's speech-to-text knobs (concrete, see
+  // TranscriptionSettings): the audio settings' twin, seeded in activateChat, sent via
+  // currentSettings, persisted via buildDoc -- all gated on chatKind "transcription".
+  const [transcriptionSettings, setTranscriptionSettings] = useState<TranscriptionSettings>(
+    DEFAULT_TRANSCRIPTION_SETTINGS,
+  );
   const [messages, setMessages] = useState<ChatUiMessage[]>([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState<string[]>([]);
@@ -410,7 +451,8 @@ export function ChatStoreProvider({
   // server-override picker renders at all and its option list.
   const manageableServers = useMemo(() => servers ?? [], [servers]);
 
-  // The THREAD's pinned kind as last loaded/established ("" text | "image").
+  // The THREAD's pinned kind as last loaded/established ("" text | "image" | "speech" |
+  // "transcription").
   // Real state, not a value read once at load: the pin is established by the
   // thread's FIRST send, and a live session (new chat -> pick an image model
   // -> send -> send again -> regenerate, no reload) must see it immediately.
@@ -430,17 +472,18 @@ export function ChatStoreProvider({
 
   // A model is offered when the chat can send it something the gateway will
   // serve: a text request (chat completions, the openai flavor) or an image
-  // request (the openai_images flavor) or a speech request (the openai_audio
-  // flavor). offeredFlavors keeps openai_images only behind an image verdict,
-  // because the images gate refuses a model without image: yes -- an images-only
-  // model (an sd-server, whose upstream has no chat endpoint) without that
-  // verdict could only ever produce a request that fails. openai_audio is the
-  // same story and is admitted only behind a speech verdict, but that rule is
-  // the CHAT's alone and lives here: offeredFlavors passes openai_audio through
-  // because it is shared with the Models view, whose "Available via" column
-  // must keep showing an audio row's flavor (transcription models, unprobed
-  // ones and agent-managed ones whose agent has not reported a speech verdict
-  // have none and are listed there anyway).
+  // request (the openai_images flavor) or a speech or transcription request (the
+  // openai_audio flavor). offeredFlavors keeps openai_images only behind an image
+  // verdict, because the images gate refuses a model without image: yes -- an
+  // images-only model (an sd-server, whose upstream has no chat endpoint) without
+  // that verdict could only ever produce a request that fails. openai_audio is the
+  // same story and is admitted only behind a speech or a transcription verdict
+  // (the two endpoints are both served under that one flavor, and each gate
+  // refuses a model without its own verdict), but that rule is the CHAT's alone
+  // and lives here: offeredFlavors passes openai_audio through because it is
+  // shared with the Models view, whose "Available via" column must keep showing
+  // an audio row's flavor (unprobed ones and agent-managed ones whose agent has
+  // not reported either verdict have none and are listed there anyway).
   // anthropic alone offers nothing: the chat sends no /v1/messages request.
   const chatModels = useMemo(
     () =>
@@ -449,7 +492,8 @@ export function ChatStoreProvider({
         return (
           offered.includes('openai') ||
           offered.includes('openai_images') ||
-          (offered.includes('openai_audio') && option.speech === true)
+          (offered.includes('openai_audio') &&
+            (option.speech === true || option.transcription === true))
         );
       }),
     [models],
@@ -538,6 +582,10 @@ export function ChatStoreProvider({
   // read as served like `image`: the backend's own fold of the speech verdict.
   const modelSpeechCapable =
     chatModels.find((option) => option.id === effectiveModel)?.speech ?? false;
+  // Whether the effective model TRANSCRIBES speech (drives the transcription-thread composer),
+  // read as served like `speech`: the backend's own fold of the transcription verdict.
+  const modelTranscriptionCapable =
+    chatModels.find((option) => option.id === effectiveModel)?.transcription ?? false;
 
   // The kind the NEXT send would pin, derived from the picked model. Only
   // ever consulted while the thread has no transcript at all (below), which
@@ -545,12 +593,17 @@ export function ChatStoreProvider({
   // model — no capability fields, so image === false — is harmless here: the
   // PINNED kind is the thread's truth the moment one exists.
   //
-  // A model both image- and speech-capable is an image model here: image was the
-  // kind first, so a model that gains a speech verdict never changes what an
-  // existing image model does. (Nothing in the catalogue is both today.)
+  // The precedence is image -> speech -> transcription, each kind the later one never
+  // displaces: a model both image- and speech-capable is an image model here (image was the
+  // kind first, so a model that gains a speech verdict never changes what an existing image
+  // model does), and one both speech- and transcription-capable is a speech model. Nothing in
+  // the catalogue carries two verdicts today: the audio.cpp probe gives an asr model a
+  // transcription verdict only and a tts model a speech one only, so two arise solely from
+  // manual configuration, and then the later mode is simply unreachable for that one model.
   let prospectiveKind = '';
   if (modelImageCapable) prospectiveKind = 'image';
   else if (modelSpeechCapable) prospectiveKind = 'speech';
+  else if (modelTranscriptionCapable) prospectiveKind = 'transcription';
   // The thread's kind, and the whole distinction in one line: once the thread
   // has a transcript the backend has already pinned it (PrepareChatRun forces
   // the stored kind on every send after the first), so the pin wins and the
@@ -576,6 +629,7 @@ export function ChatStoreProvider({
   const maxTokensRef = useRef(maxTokens);
   const imageSettingsRef = useRef(imageSettings);
   const audioSettingsRef = useRef(audioSettings);
+  const transcriptionSettingsRef = useRef(transcriptionSettings);
   const selectedTokenIdRef = useRef(selectedTokenId);
   const serverOverrideRef = useRef(serverOverride);
   const serverOverrideForceUnreachableRef = useRef(serverOverrideForceUnreachable);
@@ -694,6 +748,7 @@ export function ChatStoreProvider({
       maxTokensRef,
       imageSettingsRef,
       audioSettingsRef,
+      transcriptionSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -712,6 +767,7 @@ export function ChatStoreProvider({
       maxTokens,
       imageSettings,
       audioSettings,
+      transcriptionSettings,
       selectedTokenId,
       serverOverride,
       serverOverrideForceUnreachable,
@@ -735,6 +791,9 @@ export function ChatStoreProvider({
   // stable ref, assigned at render time" style (see apiRef/showErrorRef above).
   onTerminal((chatId) => {
     if (chatId === activeChatIdRef.current) clearDirty();
+    // Names an untitled transcription chat after its transcript. Defined below, with the
+    // renameChat it goes through; this callback only ever RUNS after the render is done.
+    titleFromTranscript(chatId);
   });
   // ...and persistence's save suppression into the run engine's canonical
   // refetch. NOT gated on the active chat: the engine adopts background chats
@@ -751,6 +810,7 @@ export function ChatStoreProvider({
     maxTokensRef.current = maxTokens;
     imageSettingsRef.current = imageSettings;
     audioSettingsRef.current = audioSettings;
+    transcriptionSettingsRef.current = transcriptionSettings;
     selectedTokenIdRef.current = selectedTokenId;
     serverOverrideRef.current = serverOverride;
     serverOverrideForceUnreachableRef.current = serverOverrideForceUnreachable;
@@ -798,6 +858,10 @@ export function ChatStoreProvider({
       // value by the next save). normalizeDoc kept the persisted `audio` only for a
       // speech thread, so any other thread seeds defaults harmlessly.
       setAudioSettings(audioSettingsFrom(doc.settings.audio));
+      // The transcription knobs, seeded likewise: normalizeDoc kept the persisted
+      // `transcription` only for a transcription thread, so any other thread seeds defaults
+      // harmlessly, and one activateChat did not seed would be written over by the next save.
+      setTranscriptionSettings(transcriptionSettingsFrom(doc.settings.transcription));
       // Seed the transcript from the per-chat buffer when this chat has an active
       // or recently-finished run (the server owns/owned its tail); otherwise use
       // the freshly-loaded server content. Prefer the buffer ONLY when it actually
@@ -865,6 +929,11 @@ export function ChatStoreProvider({
       // kind), so a text or image thread's run body carries no audio key. The backend
       // forwards the set fields to /v1/audio/speech.
       ...audioSetting(chatKindRef.current, audioSettingsRef.current),
+      // The transcription knobs, present only on a transcription thread
+      // (transcriptionSetting keys off the kind), so a text, image or speech thread's run
+      // body carries no transcription key. The backend forwards the set fields as form fields
+      // of /v1/audio/transcriptions.
+      ...transcriptionSetting(chatKindRef.current, transcriptionSettingsRef.current),
     }),
     [],
   );
@@ -1105,6 +1174,31 @@ export function ChatStoreProvider({
   // useChatRuns.ts (FA-2); `runs` above exposes the narrow interface this
   // provider needs (subscribeRun, isRunning, chatBuffers, onTerminal, ...).
 
+  // The refusal for a run of this thread whose advanced passthrough cannot be sent, as the
+  // sentence to show ('' when it can): a speech or transcription thread whose passthrough text
+  // is not a JSON object (the setting would omit it, and the user's extra fields would vanish
+  // from the request in silence, with the Advanced section that holds them perhaps collapsed)
+  // or names a field the run owns (the run would commit the turn and then fail it
+  // server-side). Read by send() and by the replay entry points, which send the thread's
+  // CURRENT settings too; only the thread's own kind has a passthrough, so another kind's
+  // stale text never blocks anything.
+  const passthroughRefusal = useCallback((): string => {
+    const kind = chatKindRef.current;
+    if (speechPassthroughInvalid(kind, audioSettingsRef.current)) {
+      return audioPassthroughMessage(
+        parseAudioPassthrough(audioSettingsRef.current.passthrough),
+        tRef.current,
+      );
+    }
+    if (transcriptionPassthroughInvalid(kind, transcriptionSettingsRef.current)) {
+      return transcriptionPassthroughMessage(
+        parseTranscriptionPassthrough(transcriptionSettingsRef.current.passthrough),
+        tRef.current,
+      );
+    }
+    return '';
+  }, []);
+
   // Start a run whose message history REPLACES the chat's transcript (edit /
   // regenerate). The optimistic history is shown immediately; the server run
   // then generates a fresh assistant turn appended after it.
@@ -1119,17 +1213,13 @@ export function ChatStoreProvider({
         showErrorRef.current(tRef.current.chatModelUnavailable);
         return;
       }
-      // Same guard as send()'s for a speech thread's advanced passthrough: a replay
-      // sends the thread's CURRENT audio settings too, and one that is not a JSON
-      // object would be dropped from the request in silence, and one that names a
-      // field the run owns would fail the replay after the turn is committed.
-      if (speechPassthroughInvalid(chatKindRef.current, audioSettingsRef.current)) {
-        showErrorRef.current(
-          audioPassthroughMessage(
-            parseAudioPassthrough(audioSettingsRef.current.passthrough),
-            tRef.current,
-          ),
-        );
+      // Same guard as send()'s for a speech or transcription thread's advanced
+      // passthrough: a replay sends the thread's CURRENT settings too, and one that is not a
+      // JSON object would be dropped from the request in silence, and one that names a field
+      // the run owns would fail the replay after the turn is committed.
+      const refusal = passthroughRefusal();
+      if (refusal) {
+        showErrorRef.current(refusal);
         return;
       }
       // Same guard for image support: the REPLAYED history (what is actually
@@ -1193,7 +1283,7 @@ export function ChatStoreProvider({
         showErrorRef.current(formatPortalError(err, tRef.current));
       }
     },
-    [subscribeRun, currentSettings, chatBuffers],
+    [subscribeRun, currentSettings, chatBuffers, passthroughRefusal],
   );
 
   // Set the active chat's title from the first user message, when it is still
@@ -1227,9 +1317,14 @@ export function ChatStoreProvider({
       if (Array.isArray(original.content)) {
         // Every image part of the turn goes back as it was -- an image thread's edit
         // turn keeps its source, and a masked edit its tagged mask part too (it is an
-        // image_url part like the source), in their original order.
-        const attachedImages = original.content.filter((part) => part.type === 'image_url');
-        content = [{ type: 'text', text }, ...attachedImages];
+        // image_url part like the source), in their original order. So does a
+        // transcription turn's clip (its audio_url part, which only a USER turn of that kind
+        // carries): it is the one thing the run reads, so an edit that dropped it would leave
+        // the replayed turn with nothing to transcribe.
+        const attachments = original.content.filter(
+          (part) => part.type === 'image_url' || part.type === 'audio_url',
+        );
+        content = [{ type: 'text', text }, ...attachments];
       }
       const edited: ChatUiMessage = {
         ...original,
@@ -1367,19 +1462,15 @@ export function ChatStoreProvider({
         return;
       }
     }
-    // A speech thread's advanced passthrough must be a JSON object (or blank) that
-    // names none of the fields the run owns: any other text would be dropped from the
-    // run in silence (audioSetting omits it) while the Advanced section that holds it
-    // may be collapsed, and a reserved field would fail the run only after the turn is
-    // committed. Refused here with the composer left as it is, before anything is
-    // stored or cleared.
-    if (speechPassthroughInvalid(chatKindRef.current, audioSettingsRef.current)) {
-      showErrorRef.current(
-        audioPassthroughMessage(
-          parseAudioPassthrough(audioSettingsRef.current.passthrough),
-          tRef.current,
-        ),
-      );
+    // A speech or transcription thread's advanced passthrough must be a JSON object (or
+    // blank) that names none of the fields the run owns: any other text would be dropped
+    // from the run in silence (audioSetting / transcriptionSetting omit it) while the
+    // Advanced section that holds it may be collapsed, and a reserved field would fail the
+    // run only after the turn is committed. Refused here with the composer left as it is,
+    // before anything is stored or cleared.
+    const refusal = passthroughRefusal();
+    if (refusal) {
+      showErrorRef.current(refusal);
       return;
     }
     // This send pins the thread's kind server-side when the thread is still
@@ -1604,6 +1695,39 @@ export function ChatStoreProvider({
     })();
   }, []);
 
+  // Name an untitled TRANSCRIPTION chat after its transcript when a run of it completes (Fork 4
+  // of the transcription design). A transcription thread's first user turn is audio only, so
+  // maybeAutoTitle (which names a chat from the first message's TEXT, at send) has nothing to
+  // use and the chat would stay untitled; the transcript is the natural name, and it exists
+  // only now. Wired into the run engine's terminal callback (above), so it fires once per run
+  // that reached a terminal state, for ANY chat -- the run's own reported kind and status
+  // decide, never the active chat's.
+  //
+  // Gated on the run's own kind ("transcription": the post-force value the executor ran, not
+  // the picker) so a text or speech chat is named as before, on a COMPLETED run (a failed or
+  // canceled one has no transcript worth a name), and on the chat having no title yet, the
+  // new-chat placeholder counting as none exactly as maybeAutoTitle counts it. An empty
+  // transcript names nothing: the chat keeps the sidebar's localized "untitled" placeholder.
+  //
+  // It goes through renameChat, so the title shows at once and is PERSISTED by a title-only
+  // save that never touches the transcript -- which is what keeps it for a chat that is not
+  // the active one (the debounced autosave only ever saves the active chat), and for one whose
+  // canonical refetch failed (its saves are blocked, see setTranscriptStale).
+  const titleFromTranscript = useCallback(
+    (chatId: string) => {
+      if (kindOf(chatId) !== 'transcription' || runStatusOf(chatId) !== 'completed') return;
+      const current = (
+        chatId === activeChatIdRef.current
+          ? activeTitleRef.current
+          : (chatsRef.current.find((chat) => chat.id === chatId)?.title ?? '')
+      ).trim();
+      if (current !== '' && current !== tRef.current.chatNewChat) return;
+      const title = deriveTitleFromTranscript(chatBuffers.get(chatId) ?? []);
+      if (title) renameChat(chatId, title);
+    },
+    [kindOf, runStatusOf, chatBuffers, renameChat],
+  );
+
   const removeImage = useCallback(
     (index: number) => setImages((prev) => prev.filter((_, position) => position !== index)),
     [],
@@ -1713,6 +1837,7 @@ export function ChatStoreProvider({
     modelImageCapable,
     modelImageEdit,
     modelSpeechCapable,
+    modelTranscriptionCapable,
     attachMode,
     modelImageOptions,
     chatKind,
@@ -1720,6 +1845,8 @@ export function ChatStoreProvider({
     setImageSettings,
     audioSettings,
     setAudioSettings,
+    transcriptionSettings,
+    setTranscriptionSettings,
     runKind,
     runElapsedMs,
     chats,

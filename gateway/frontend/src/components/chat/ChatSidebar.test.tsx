@@ -5,7 +5,11 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatSidebar } from './ChatSidebar';
 import { ChatStoreContext, type ChatStore } from './ChatStore';
-import { DEFAULT_AUDIO_SETTINGS, DEFAULT_IMAGE_SETTINGS } from './chatDoc';
+import {
+  DEFAULT_AUDIO_SETTINGS,
+  DEFAULT_IMAGE_SETTINGS,
+  DEFAULT_TRANSCRIPTION_SETTINGS,
+} from './chatDoc';
 import { messages, type Locale } from '../../i18n';
 
 // A minimal fake store injected via the context — the sidebar only reads the
@@ -43,6 +47,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     modelImageCapable: false,
     modelImageEdit: false,
     modelSpeechCapable: false,
+    modelTranscriptionCapable: false,
     attachMode: 'vision',
     modelImageOptions: null,
     chatKind: '',
@@ -50,6 +55,8 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     setImageSettings: vi.fn(),
     audioSettings: DEFAULT_AUDIO_SETTINGS,
     setAudioSettings: vi.fn(),
+    transcriptionSettings: DEFAULT_TRANSCRIPTION_SETTINGS,
+    setTranscriptionSettings: vi.fn(),
     runKind: undefined,
     runElapsedMs: undefined,
     chats: [

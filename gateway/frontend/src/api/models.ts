@@ -493,6 +493,18 @@ export type ModelOption = {
   // OPTIONAL, like `image`: a fixture that omits it derives `speech === false`,
   // which is what keeps every pre-existing non-speech test meaningful.
   speech?: boolean;
+  // True when this model — and, for a group, EVERY offered member — TRANSCRIBES
+  // speech (serves /v1/audio/transcriptions). The speech flag's twin: the chat
+  // reads it to switch an empty thread's composer to a speech-to-text turn and to
+  // offer an openai_audio-only model in its picker at all. It is the backend's own
+  // fold of the (transcription, yes) verdict, fail-closed like `speech`
+  // (ModelDTO.Transcription); the client never recomputes it. Independent of
+  // `image`, `speech` and `vision`.
+  //
+  // OPTIONAL, like `speech`: a fixture that omits it derives `transcription ===
+  // false`, which is what keeps every pre-existing non-transcription test
+  // meaningful.
+  transcription?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options

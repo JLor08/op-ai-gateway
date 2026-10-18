@@ -72,6 +72,31 @@ export type ChatAudioSettings = {
   passthrough?: Record<string, unknown>;
 };
 
+// The speech-to-text knobs of a "transcription" thread, as sent on the wire and persisted
+// inside `content.settings.transcription`. Like ChatAudioSettings every field is OPTIONAL:
+// an unset knob is omitted so the model keeps its own default, and the whole object is
+// omitted for a text, image or speech thread (mirroring `kind`), so their persisted
+// settings stay byte-identical. The reply is always the transcript as text (the gateway
+// asks the endpoint for JSON), so there is no response format knob. See the backend's
+// portal.ChatTranscriptionSettings.
+export type ChatTranscriptionSettings = {
+  // The ISO-639-1 code of the spoken language (e.g. "de"); omitted = the model detects it.
+  language?: string;
+  // Optional text that steers the transcription's style or primes it with names and
+  // jargon; omitted = none.
+  prompt?: string;
+  // The sampling temperature, passed through as given (the model's own range applies).
+  // A number INCLUDING an explicit 0 (a real, deterministic setting, not "unset");
+  // omitted = the model's default.
+  temperature?: number;
+  // The advanced extra-JSON surface: extra request fields merged into the
+  // /v1/audio/transcriptions form verbatim (the OpenAI timestamp granularities and any
+  // audio.cpp-native knob). The values keep the JSON type the user wrote (the backend
+  // writes a string as itself and any other value as its compact JSON). The backend
+  // refuses the keys the run owns (model / file / response_format / stream).
+  passthrough?: Record<string, unknown>;
+};
+
 // The per-chat settings the frontend persists inside `content`.
 export type ChatSettings = {
   model: string;
@@ -86,8 +111,8 @@ export type ChatSettings = {
   server_override: string;
   server_override_force_unreachable: boolean;
   // The thread's pinned kind: "" (text — the default and every pre-existing
-  // chat), "image" or "speech". Established by the FIRST send and then FORCED by the
-  // backend on every later send (PrepareChatRun), because the composer's
+  // chat), "image", "speech" or "transcription". Established by the FIRST send and then
+  // FORCED by the backend on every later send (PrepareChatRun), because the composer's
   // affordances follow the THREAD, not the currently-picked model.
   //
   // Typed as a plain string rather than a closed union on purpose: a kind this
@@ -112,6 +137,12 @@ export type ChatSettings = {
   // `image`). The store holds a concrete AudioSettings (chatDoc.ts) and both writers go
   // through audioSetting() so neither can reintroduce the key for another kind.
   audio?: ChatAudioSettings;
+  // The speech-to-text knobs, present only on a "transcription" thread (omitted for a
+  // text, image or speech thread so their settings stay byte-identical, exactly like
+  // `kind`, `image` and `audio`). The store holds a concrete TranscriptionSettings
+  // (chatDoc.ts) and both writers go through transcriptionSetting() so neither can
+  // reintroduce the key for another kind.
+  transcription?: ChatTranscriptionSettings;
 };
 
 // The full opaque content document the frontend stores per chat. Messages are
@@ -130,8 +161,8 @@ export type ActiveChatRun = {
   chat_id: string;
   run_id: string;
   status: ChatRunStatus;
-  // Present only for a run whose thread is pinned "image" or "speech" (both omitempty on
-  // the wire, mirroring activeRunDTO in chat_run_endpoints.go): the run's
+  // Present only for a run whose thread is pinned "image", "speech" or "transcription"
+  // (all omitempty on the wire, mirroring activeRunDTO in chat_run_endpoints.go): the run's
   // kind and its server-measured age in ms. elapsed_ms is what lets a
   // REOPENED browser anchor the composer's pending clock on the same true
   // value the sending tab saw, rather than starting it over from zero (see
@@ -172,6 +203,11 @@ export type StartChatRunBody = {
     // Absent for any other kind. The backend forwards the set fields to
     // /v1/audio/speech (buildSpeechBody) and clears them for a non-speech kind.
     audio?: ChatAudioSettings;
+    // Mirrors ChatSettings.transcription: the speech-to-text knobs a transcription
+    // thread sends. Absent for any other kind. The backend forwards the set fields as
+    // form fields of /v1/audio/transcriptions (buildTranscriptionBody) and clears them
+    // for a non-transcription kind.
+    transcription?: ChatTranscriptionSettings;
   };
 };
 export type StartChatRunResponse = {
