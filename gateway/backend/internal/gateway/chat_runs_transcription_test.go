@@ -1217,10 +1217,11 @@ func TestTranscriptionRunHandlesBufferedAnswer(t *testing.T) {
 
 // A streaming model's first delta can be a long time coming (a cold start, a model
 // still loading), and the run waits for it: nothing is published, the run stays
-// running and shows nothing, however long the stream stays silent -- the gateway's
-// stream idle timeout is a bound on a stream's SILENCE once it flows, not on the wait
-// for its first delta. The stand-in answers the headers at once and holds the first
-// delta back past an idle timeout a tenth of that wait.
+// running and shows nothing, however long the stream stays silent before it. The stand-in (which plays the gateway's own endpoint, so no
+// relay watchdog is involved) answers the headers at once and holds the first delta back
+// for 300ms behind nothing but heartbeat comments. What is pinned is the run's side of
+// it: silence before the first delta does not cancel or fail the run, nothing is
+// published meanwhile, and the wait is measured as the turn's time to first token.
 func TestTranscriptionRunWaitsForASlowFirstDelta(t *testing.T) {
 	first := make(chan struct{})
 	slow, _ := newStreamingRunLoopback(t, func(s streamingStub) {
@@ -1239,13 +1240,12 @@ func TestTranscriptionRunWaitsForASlowFirstDelta(t *testing.T) {
 	})
 	srv, owner, chatID, _ := newSpeechRunTestServer(t, slow.URL)
 	srv.selfBaseURL = slow.URL
-	srv.streamIdleTimeout = 25 * time.Millisecond
 
 	run, err := srv.startChatRun(owner, chatID, transcriptionRunPrep(t, "audio/wav", speechTestWAV()))
 	if err != nil {
 		t.Fatalf("startChatRun: %v", err)
 	}
-	time.Sleep(300 * time.Millisecond) // twelve idle timeouts, with no delta in sight
+	time.Sleep(300 * time.Millisecond) // a long silence: heartbeats only, no delta in sight
 	if got := run.statusValue(); got != "running" {
 		t.Fatalf("status = %q (err %q) before the first delta, want the run still waiting", got, runError(t, run))
 	}
@@ -1438,5 +1438,42 @@ func TestTranscriptionRunUserCancelMidStreamStaysACancel(t *testing.T) {
 	stored := storedChatContent(t, srv, owner, chatID)
 	if !strings.Contains(stored, `"content":"so far"`) || !strings.Contains(stored, `"status":"canceled"`) {
 		t.Fatalf("the canceled turn must keep the published text: %s", stored)
+	}
+}
+
+// The deadline a run arms is only for a kind runDeadlineFor bounds: a kind it leaves
+// unbounded arms no timer at all, rather than a zero-length one that would cancel the
+// run on the next tick, and lifting it is harmless. A bounded kind's timer cancels the
+// context with the deadline cause, and lifting it stops that.
+func TestArmRunDeadlineArmsOnlyForABoundedKind(t *testing.T) {
+	restore := transcriptionRunDeadline
+	transcriptionRunDeadline = 30 * time.Millisecond
+	t.Cleanup(func() { transcriptionRunDeadline = restore })
+
+	arm := func(kind string) (context.Context, func()) {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		t.Cleanup(func() { cancel(nil) })
+		return ctx, armRunDeadline(kind, cancel)
+	}
+
+	unbounded, liftUnbounded := arm("") // the text kind: runDeadlineFor leaves it unbounded
+	time.Sleep(100 * time.Millisecond)
+	if unbounded.Err() != nil {
+		t.Fatalf("an unbounded kind's context ended (%v), want no deadline armed at all", context.Cause(unbounded))
+	}
+	liftUnbounded()
+	liftUnbounded() // lifting a deadline that was never armed, twice, is harmless
+
+	lifted, lift := arm(chatRunKindTranscription)
+	lift()
+	time.Sleep(100 * time.Millisecond)
+	if lifted.Err() != nil {
+		t.Fatalf("a lifted deadline still ended the context (%v)", context.Cause(lifted))
+	}
+
+	bounded, _ := arm(chatRunKindTranscription)
+	waitFor(t, func() bool { return bounded.Err() != nil })
+	if !errors.Is(context.Cause(bounded), context.DeadlineExceeded) {
+		t.Fatalf("cause = %v, want context.DeadlineExceeded", context.Cause(bounded))
 	}
 }

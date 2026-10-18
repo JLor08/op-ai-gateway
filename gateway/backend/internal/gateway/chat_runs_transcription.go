@@ -175,12 +175,25 @@ var transcriptionFilenames = map[string]string{
 func (s *Server) executeTranscriptionRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	d, _ := runDeadlineFor(chatRunKindTranscription)
-	deadline := time.AfterFunc(d, func() { cancel(context.DeadlineExceeded) })
-	defer deadline.Stop()
+	liftDeadline := armRunDeadline(chatRunKindTranscription, cancel)
+	defer liftDeadline()
 
-	parts, status, errMsg := s.generateTranscriptionTurn(ctx, owner, run, prep, func() { deadline.Stop() })
+	parts, status, errMsg := s.generateTranscriptionTurn(ctx, owner, run, prep, liftDeadline)
 	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts)
+}
+
+// armRunDeadline starts the deadline of a run of this kind -- a timer that cancels the
+// run's context with the cause context.DeadlineExceeded -- and returns the function that
+// lifts it (stops the timer; safe to call more than once). A kind runDeadlineFor does not
+// bound arms nothing, so its lift is a no-op: the run is unbounded, like a text run, and
+// not cancelled on the next tick by a zero-length timer.
+func armRunDeadline(kind string, cancel context.CancelCauseFunc) (lift func()) {
+	d, bounded := runDeadlineFor(kind)
+	if !bounded {
+		return func() { /* no deadline was armed: nothing to lift */ }
+	}
+	deadline := time.AfterFunc(d, func() { cancel(context.DeadlineExceeded) })
+	return func() { deadline.Stop() }
 }
 
 // generateTranscriptionTurn performs the single loopback request a transcription run
