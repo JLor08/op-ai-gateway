@@ -185,6 +185,12 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // an input modality (a chat model that accepts audio), not an audio endpoint.
   { capability: 'speech', label: (t) => t.capabilitySpeech },
   { capability: 'transcription', label: (t) => t.capabilityTranscription },
+  // "transcription_streaming" refines "transcription": the model delivers its transcript
+  // incrementally (audio.cpp mode=streaming) rather than as one document at the end. It is a
+  // probed trait of the endpoint just like the two above, so it sits right after
+  // "transcription" and shows only on a `yes` -- the one-shot model (`no`) and the unknown
+  // (no row) both render no chip, as for every other known capability.
+  { capability: 'transcription_streaming', label: (t) => t.capabilityTranscriptionStreaming },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },
 ];
 const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capability));
@@ -221,9 +227,10 @@ const IMAGE_EDIT_CAPABILITY = 'image_edit';
 type CapabilityChip = { status: 'success' | 'standby'; label: string; row: ModelServerCapability };
 
 // capabilityChips returns one chip per DETERMINED `yes` verdict, in a fixed
-// order (Vision, Video, Audio, Tools, Image, Transcription, Speculation
-// observed -- KNOWN_CAPABILITY_ORDER) so the column reads the same on every
-// row regardless of which verdicts happen to be set, followed by every OTHER
+// order (Vision, Video, Audio, Tools, Image, Speech, Transcription, Streaming
+// transcription, Speculation observed -- KNOWN_CAPABILITY_ORDER) so the
+// column reads the same on every row regardless of which verdicts happen to
+// be set, followed by every OTHER
 // capability name this build has no dedicated column for, VERBATIM
 // (including a string this portal build doesn't recognize -- the vocabulary
 // is open-ended upstream, e.g. Ollama passes manifest-declared capabilities

@@ -1092,6 +1092,69 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText('transcription')).not.toBeInTheDocument();
     });
 
+    // `transcription_streaming` refines `transcription`: yes = the model streams
+    // its transcript incrementally (audio.cpp mode=streaming), a `no` or a missing
+    // row = a one-shot model or an unknown mode. It is a vetted name, so like every
+    // other known capability it must read as a translated "success" chip after the
+    // Transcription one, never as the raw snake_case string in the neutral
+    // open-vocabulary standby bucket.
+    it('renders transcription_streaming as a translated chip after Transcription, not a raw standby chip', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              capabilities: [
+                capRow('transcription_streaming', 'yes'),
+                capRow('transcription', 'yes'),
+              ],
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilityTranscriptionStreaming)).toBeInTheDocument();
+      expect(within(cell).queryByText('transcription_streaming')).not.toBeInTheDocument();
+      expect(within(cell).getByText(t.capabilityTranscriptionStreaming)).toHaveAttribute(
+        'data-status',
+        'active',
+      );
+      // Fixed order, whatever order the rows arrive in: Transcription, then its
+      // streaming refinement.
+      const labels = within(cell)
+        .getAllByText((_, el) => el?.getAttribute('data-status') === 'active')
+        .map((el) => el.textContent);
+      expect(labels).toEqual([t.capabilityTranscription, t.capabilityTranscriptionStreaming]);
+    });
+
+    it('renders no transcription_streaming chip for a `no` verdict, and never a raw one', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              capabilities: [
+                capRow('transcription', 'yes'),
+                capRow('transcription_streaming', 'no'),
+              ],
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilityTranscription)).toBeInTheDocument();
+      expect(within(cell).queryByText(t.capabilityTranscriptionStreaming)).not.toBeInTheDocument();
+      expect(within(cell).queryByText('transcription_streaming')).not.toBeInTheDocument();
+    });
+
     // POST /v1/audio/speech is gated on a `speech` verdict. The mirror of the
     // transcription chip above: a `speech: yes` row used to fall into the
     // open-vocabulary bucket and render as a raw lowercase `speech` standby

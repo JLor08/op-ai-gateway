@@ -423,11 +423,14 @@ const de = {
   chatAudioLoadError: 'Audio konnte nicht geladen werden.',
   // The wait of a running transcription (speech-to-text) turn, the transcript twin of the
   // audio wait above: it words the WAIT (the request may still be queued or waiting on a model
-  // load), and the sentence says no intermediate news is coming -- the transcript is one
-  // finished document, with nothing to count meanwhile.
+  // load), and the sentence says no intermediate news is coming BEFORE the first text -- there
+  // is nothing to count meanwhile. It is shown only until text arrives, and that is true on both
+  // paths: a one-shot model answers the whole transcript at once, a streaming one starts filling
+  // the turn in with its first delta, so the sentence promises neither "finished" nor "all at
+  // once".
   chatTranscriptionRunPending: 'Warte auf Transkript',
   chatTranscriptionNoIntermediateNews:
-    'Keine Zwischenmeldungen – das Transkript erscheint fertig oder gar nicht.',
+    'Keine Zwischenmeldungen – das Transkript erscheint, sobald das Modell Text liefert.',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -1490,6 +1493,9 @@ const de = {
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
   capabilityTranscription: 'Transkription',
+  // Refines "Transkription": the model delivers the transcript incrementally
+  // (audio.cpp mode=streaming) instead of as one document at the end.
+  capabilityTranscriptionStreaming: 'Streaming-Transkription',
   capabilitySpeech: 'Sprachsynthese',
   // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
   // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
@@ -3594,7 +3600,7 @@ const en: PortalMessages = {
   chatAudioLoadError: 'Could not load the audio.',
   chatTranscriptionRunPending: 'Waiting for transcript',
   chatTranscriptionNoIntermediateNews:
-    'No intermediate updates – the transcript arrives finished or not at all.',
+    'No intermediate updates – the transcript appears as soon as the model delivers text.',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',
@@ -4587,6 +4593,9 @@ const en: PortalMessages = {
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
   capabilityTranscription: 'Transcription',
+  // Refines "Transcription": the model delivers the transcript incrementally
+  // (audio.cpp mode=streaming) instead of as one document at the end.
+  capabilityTranscriptionStreaming: 'Streaming transcription',
   capabilitySpeech: 'Speech synthesis',
   // The chip for the operator's EXCEPTION (image editing = No), not for a
   // capability: image editing is derived from image generation, so it has
