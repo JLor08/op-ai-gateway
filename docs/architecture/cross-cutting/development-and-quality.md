@@ -274,7 +274,17 @@ reports success on a broken corpus is worse than no checker.
   `/v1/audio/speech` call from the chat run executor, the playable and
   downloadable audio turn served from the chat blob store, its survival of a
   reload, the advanced passthrough reaching the upstream body, and the
-  `audio_second` usage row; local-only), `e2e:smtp` (local
+  `audio_second` usage row; local-only),
+  `e2e:chat-transcription` (covers a speech-to-text turn in the portal chat
+  end to end: the same in-process stub audio.cpp behind a form-created
+  `audio_cpp` application, the probe's `transcription` verdict deciding what
+  the chat picker offers, the composer switching to the audio input, a clip
+  attached from a file or recorded with the real browser recorder arriving at
+  the one multipart `/v1/audio/transcriptions` call of the chat run executor
+  byte for byte, the transcript turn next to the user's own clip served from
+  the chat blob store, their survival of a reload, the advanced passthrough
+  reaching the form, and the `audio_second` usage row; local-only),
+  `e2e:smtp` (local
   mail catcher module in `gateway/e2e/e2e-smtp/mailcatcher`), `e2e:totp`,
   `e2e:transcription` (covers `POST /v1/audio/transcriptions` end to end, the
   multipart twin of `e2e:speech` over the same `audio_cpp` application type:
@@ -288,7 +298,7 @@ reports success on a broken corpus is worse than no checker.
   expected to require matching spec updates; plan the e2e rewrite as part of
   such a change.
 
-> **Only `e2e:runtime` runs in CI; the other 22 Playwright suites do not.**
+> **Only `e2e:runtime` runs in CI; the other 23 Playwright suites do not.**
 > `.github/workflows/ci.yml` has six jobs — `go`, `docs`, `sonar-scripts`,
 > `opencode-config-script`, `frontend`, and `e2e-runtime`, the last running `npm run e2e:runtime` alone (the newest and
 > least-exercised subsystem, and the one whose three-commit regression no gate
