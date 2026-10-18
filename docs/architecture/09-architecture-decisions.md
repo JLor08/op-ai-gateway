@@ -6061,7 +6061,7 @@ pieces it joins that no design could have chosen:
   microphone **tracks are released** (`stopTracks`) at stop (the recorder's `onstop`
   finish), on a failed start, on a recorder error and on unmount, so the browser's recording
   indicator never lingers — the care issue #249 took after its own early defect of leaving
-  the mic held when the recorder could not start (fixed in commit `ce79188`); **send and
+  the mic held when the recorder could not start (#249's own fix); **send and
   discard** operate on an already-stopped recorder and only revoke the preview's object URL.
   The attached or recorded clip shows in the user bubble as an audio player: the
   ADR-063 (d) `AudioTurn` is **reused for the input**, fetching the blob once into an
@@ -6089,8 +6089,10 @@ is one buffered request with no progress to show, so the wait is the elapsed clo
 honest "no intermediate news"; the first ASR call after a model load can take long enough
 to matter inside the `transcriptionRunDeadline` 10-minute bound (`runDeadlineFor`, a
 variable of its own so the three bounded kinds can move independently). One clip is bounded
-at **20 MiB** (the client's `MAX_AUDIO_BYTES` and the store's `MaxChatBlobBytes`, both the
-composer's own upload limit, as a speech WAV is); the executor holds
+at **20 MiB** by default: the composer rejects a larger file at the client's
+`MAX_AUDIO_BYTES` (20 MiB), and the store refuses a larger blob at `MaxChatBlobBytes`
+(`OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES`, default 20 MiB, operator-configurable), the same
+store limit a speech WAV is held to; the executor holds
 the clip whole in memory for the multipart body, and the browser holds one object URL per
 input clip it has rendered until it unmounts, as a speech reply's player does. Stored
 clips are retained for the chat's lifetime like every blob, with no prune (ADR-056). The

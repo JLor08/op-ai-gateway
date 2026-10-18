@@ -59,8 +59,9 @@ several architectural decisions exist specifically to satisfy them.
   gateway's own portal-chat run executor call `/v1/chat/completions`,
   `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech` and
   `/v1/audio/transcriptions` as a
-  token-less session principal — the executor reaches all five, one per run kind
-  (text, image, speech, transcription; image covers both generations and edits). No
+  token-less session principal — the executor reaches all five inference endpoints across
+  its four run kinds (text, image, speech, transcription), since the image kind covers
+  both image generation and edits. No
   inference endpoint other than those five
   accepts the loopback pair, and none accepts the session cookie other than
   `/v1/chat/completions`.
