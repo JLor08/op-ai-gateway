@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -558,9 +559,10 @@ func transcriptionNeedsModelRewrite(target routing.Target, formModel string) boo
 // fresh boundary), with up to three changes: the value of the model field is replaced
 // by model when that is non-empty (the field the agent's router, and any model-routing
 // upstream, reads), every EMPTY `file` part is dropped, and the `stream` part is
-// dropped when dropStream is set (the buffered retry of a streamed request, see
-// bufferedTranscriptionBody). Every other part -- its headers, its bytes and its
-// position -- is copied exactly as the client sent it.
+// dropped when dropStream is set (a streamed request that is answered buffered: up
+// front, when the route is not known to stream (relayTranscription), or as the retry
+// of a refused stream, see bufferedTranscriptionBody). Every other part -- its headers,
+// its bytes and its position -- is copied exactly as the client sent it.
 //
 // The empty parts are dropped because validation counts only the non-empty ones
 // (validateTranscriptionRequest accepts one beside the real upload): audio.cpp reads
@@ -668,12 +670,17 @@ func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, m
 // client sends does not guarantee (rebuilding can grow a body): one that does not is
 // refused here, recorded, instead of being sent.
 //
-// A form that asks for a stream (form.wantsStream) is relayed as one: the relay is
-// marked a stream (nativeRelay.pfReq.Stream) and carries bufferedRetry, the builder of
-// the request proxyNative sends once more, buffered, when the upstream refuses to
-// stream (peekStreamingRefusal). Whether the mapped model can stream is not
-// consulted here: every streamed request is sent as asked, and the retry is what a
-// model that cannot stream is answered with.
+// A form that asks for a stream (form.wantsStream) is relayed as one only when the
+// mapped route is KNOWN to stream: its transcription_streaming verdict is yes
+// (mappingStreamsTranscription). Then the relay is marked a stream
+// (nativeRelay.pfReq.Stream) and carries bufferedRetry, the builder of the request
+// proxyNative sends once more, buffered, when the upstream refuses to stream
+// (peekStreamingRefusal) -- the net for a yes that has gone stale, a model swapped to
+// offline mode behind the verdict's back. Any other answer (a no, no verdict at all,
+// one that cannot be read) decides up front that the request is answered buffered:
+// the client's form is rebuilt without its `stream` part and sent as a plain one-shot
+// transcription, so the upstream is never asked for what it would refuse and the
+// client's answer costs one upstream call.
 //
 // proxyNative then finishes the exchange through this file's response side, keyed on
 // the endpoint (the openai_audio flavor is speech's too): a non-2xx answer is
@@ -711,14 +718,23 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		endpoint:    endpointTranscription,
 		contentType: r.Header.Get(contentTypeHeader),
 	}
+	// The stream-versus-buffered decision is made HERE, before the upstream body is
+	// built, because answering buffered means a body without the client's `stream` part.
+	streaming := form.wantsStream() && s.mappingStreamsTranscription(r.Context(), target.RouteID)
+	dropStream := form.wantsStream() && !streaming
+	if dropStream {
+		slog.Debug("transcription asked to stream but the route is not known to: answering buffered",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+			"route_id", target.RouteID, "capability", routing.CapabilityTranscriptionStreaming)
+	}
 	sent := len(raw)
 	rewrite := transcriptionNeedsModelRewrite(target, form.model)
 	model := ""
 	if rewrite {
 		model = target.ProviderModel
 	}
-	if rewrite || form.emptyFiles > 0 {
-		body, contentType, err := rebuildTranscriptionBody(raw, form.boundary, model, false)
+	if rewrite || form.emptyFiles > 0 || dropStream {
+		body, contentType, err := rebuildTranscriptionBody(raw, form.boundary, model, dropStream)
 		if err != nil {
 			// Not expected for a body parseTranscriptionForm accepted: it walked every
 			// part of it to its end with the same reader and boundary. Were it to
@@ -739,14 +755,14 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		s.recordTranscriptionRoutingFailure(w, r, token, req, raw, start, errTranscriptionTooLarge)
 		return
 	}
-	if form.wantsStream() {
-		// A client that asked for a stream is sent one: stream=true reaches the upstream
-		// as it came, unconditionally -- the relay does not know whether the mapped model
-		// is in streaming mode, and an upstream that is not answers with the refusal
-		// proxyNative turns into the buffered retry built here. The relay's request
-		// (pfReq) is marked a stream for the deadline policy, the active row and the
-		// usage row; the preflight request is not, so the gate and the resolve above
-		// judged the same request a plain transcription would be.
+	if streaming {
+		// A client that asked for a stream, on a route known to stream, is sent one:
+		// stream=true reaches the upstream as it came. A yes that went stale (the model
+		// was swapped to offline mode while the verdict stood) is answered with the
+		// refusal proxyNative turns into the buffered retry built here. The relay's
+		// request (pfReq) is marked a stream for the deadline policy, the active row
+		// and the usage row; the preflight request is not, so the gate and the resolve
+		// above judged the same request a plain transcription would be.
 		rel.pfReq.Stream = true
 		rel.bufferedRetry = func() ([]byte, string, error) {
 			return bufferedTranscriptionBody(target, raw, form.boundary, model)
@@ -775,6 +791,35 @@ func bufferedTranscriptionBody(target routing.Target, raw []byte, boundary, mode
 		return nil, "", errTranscriptionTooLarge
 	}
 	return body, contentType, nil
+}
+
+// mappingStreamsTranscription reports whether the mapped route is known to answer a
+// streamed transcription: its stored transcription_streaming verdict, keyed by the
+// route (target.RouteID, the mapping id), is yes. It is the up-front half of the
+// stream-versus-buffered decision; peekStreamingRefusal and the buffered retry remain
+// the net under a yes that has gone stale.
+//
+// Everything but a yes is false: a no, no row at all (the verdict is "unknown" until a
+// probe states the model's mode, and the answer for unknown is the buffered one-shot,
+// which every model serves), a route that is no mapping (a vendor account's route id
+// names none), no route store, and a read that fails. A failed read is logged at
+// Warn: it is a store error and not an expected outcome, and it silently changes what
+// the client was answered with.
+//
+// The verdict is read per request with a keyed MappingCapabilities, not carried on the
+// routing.Target: the resolver builds a target for every inference shape and this is
+// the one reader.
+func (s *Server) mappingStreamsTranscription(ctx context.Context, routeID string) bool {
+	if s.Routes == nil || routeID == "" {
+		return false
+	}
+	rows, err := s.Routes.MappingCapabilities(ctx, routeID)
+	if err != nil {
+		slog.Warn("transcription streaming verdict could not be read; answering buffered",
+			"route_id", routeID, "capability", routing.CapabilityTranscriptionStreaming, "err", err)
+		return false
+	}
+	return routing.CapabilityRowsByName(rows)[routing.CapabilityTranscriptionStreaming].Verdict == routing.CapabilityYes
 }
 
 // transcriptionStreamingRefusal is the sentence audio.cpp's error carries when

@@ -378,6 +378,119 @@ func TestTranscriptionWithoutStreamIsNeverRetried(t *testing.T) {
 	}
 }
 
+// capabilityReadFailingStore is the server's route store with one reader broken: a
+// MappingCapabilities that fails, as a store that has gone away would.
+type capabilityReadFailingStore struct{ routing.Store }
+
+func (capabilityReadFailingStore) MappingCapabilities(context.Context, string) ([]routing.CapabilityRow, error) {
+	return nil, errors.New("capability store unavailable")
+}
+
+// The relay requests a stream upstream ONLY when the client asked for one AND the
+// mapped route's transcription_streaming verdict is yes. Every other answer -- a no,
+// no verdict at all, a verdict that cannot be read, a client that did not ask -- is
+// the buffered one-shot, and for those `stream` is never sent: the upstream is not
+// asked for something it would refuse, so the client's answer costs ONE upstream call,
+// not a refused one and a retry. The stub streams when (and only when) it is asked to,
+// like audio.cpp's streaming mode, so which answer the client gets shows which
+// request the gateway sent.
+func TestTranscriptionHandlerStreamsOnlyWhenVerdictYes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model string
+		// verdict, when set, replaces the route's transcription_streaming row before
+		// the request: it puts a no on a mapping whose gateway and upstream names are
+		// equal, which the fixtures have no mapping for.
+		route, verdict string
+		clientStreams  bool
+		failRead       bool
+		wantStream     bool
+		wantUpstream   string // the model name the upstream must be sent
+	}{
+		{name: "a yes and a client that asked", model: transcriptionGatewayModel, clientStreams: true, wantStream: true, wantUpstream: transcriptionUpstreamModel},
+		{name: "a yes and a client that asked, no model rewrite", model: "asr-same", clientStreams: true, wantStream: true, wantUpstream: "asr-same"},
+		{name: "a yes and a client that did not ask", model: transcriptionGatewayModel, wantUpstream: transcriptionUpstreamModel},
+		{name: "a no", model: "asr-offline", clientStreams: true, wantUpstream: "whisper_offline"},
+		{name: "a no, no model rewrite", model: "asr-same", route: "route-asr-same", verdict: routing.CapabilityNo, clientStreams: true, wantUpstream: "asr-same"},
+		{name: "no verdict at all", model: "asr-unprobed", clientStreams: true, wantUpstream: "whisper_unprobed"},
+		{name: "a verdict that cannot be read", model: transcriptionGatewayModel, clientStreams: true, failRead: true, wantUpstream: transcriptionUpstreamModel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, calls := newScriptedTranscriptionUpstream(t, func(_ int, w http.ResponseWriter, call transcriptionUpstreamCall) {
+				if bytes.Contains(call.body, []byte(`name="stream"`)) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, transcriptionSSEDelta+transcriptionSSEDone+transcriptionSSEEnd)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, transcriptionOKBody)
+			})
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+			if tc.verdict != "" {
+				row := routing.CapabilityRow{Capability: routing.CapabilityTranscriptionStreaming, Verdict: tc.verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: time.Now().UTC()}
+				if err := srv.Routes.UpsertMappingCapabilities(context.Background(), tc.route, []routing.CapabilityRow{row}); err != nil {
+					t.Fatalf("UpsertMappingCapabilities: %v", err)
+				}
+			}
+			if tc.failRead {
+				srv.Routes = capabilityReadFailingStore{Store: srv.Routes}
+			}
+			parts := validTranscriptionParts(tc.model)
+			if tc.clientStreams {
+				parts = streamingTranscriptionParts(tc.model)
+			}
+
+			rec := postTranscriptionParts(t, srv, parts)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+			}
+			all := drainTranscriptionUpstreamCalls(calls)
+			if len(all) != 1 {
+				t.Fatalf("upstream calls = %d, want exactly 1: the answer must not cost a refused stream and a retry", len(all))
+			}
+			ev := onlyUsageEvent(t, srv)
+			if tc.wantStream {
+				if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+					t.Fatalf("Content-Type = %q, want the relayed event stream", got)
+				}
+				if rec.Body.String() != transcriptionSSEDelta+transcriptionSSEDone+transcriptionSSEEnd {
+					t.Fatalf("body = %q, want the upstream's frames", rec.Body.String())
+				}
+				if v, ok := formFieldOf(t, all[0].body, all[0].contentType, "stream"); !ok || v != "true" {
+					t.Fatalf("upstream stream field = %q (present %v), want the client's true", v, ok)
+				}
+				if !ev.Stream {
+					t.Fatal("usage row Stream = false, want true for a streamed call")
+				}
+			} else {
+				if got := rec.Header().Get("Content-Type"); got != "application/json" {
+					t.Fatalf("Content-Type = %q, want the one-shot application/json", got)
+				}
+				if rec.Body.String() != transcriptionOKBody {
+					t.Fatalf("body = %s, want the one-shot document byte for byte", rec.Body.String())
+				}
+				if v, ok := formFieldOf(t, all[0].body, all[0].contentType, "stream"); ok {
+					t.Fatalf("upstream stream field = %q, want NO stream field sent", v)
+				}
+				if ev.Stream {
+					t.Fatal("usage row Stream = true, want a buffered call")
+				}
+				if ev.Status != "success" || ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 2 {
+					t.Fatalf("usage row = %q billing %v %q, want success billed 2 audio_second from the one-shot body's timing block", ev.Status, ev.BillingQuantity, ev.BillingUnit)
+				}
+				requireSameParts(t, readEditParts(t, all[0].body, all[0].contentType), []editPart{
+					{name: "model", body: []byte(tc.wantUpstream)},
+					validTranscriptionParts(tc.model)[1], // the audio, byte for byte
+				})
+			}
+			if got := modelFieldOf(t, all[0].body, all[0].contentType); got != tc.wantUpstream {
+				t.Fatalf("upstream model = %q, want the mapped %q", got, tc.wantUpstream)
+			}
+		})
+	}
+}
+
 // An upstream that answers a stream=true request with a plain 2xx JSON document (it
 // did not stream) is relayed like any buffered transcription: verbatim, and billed
 // from its timing block.

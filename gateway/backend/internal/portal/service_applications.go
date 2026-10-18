@@ -343,6 +343,18 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// model the listing does not name or does not give a task, or one whose
 	// agent predates the source and so never reports it.
 	routing.CapabilityTranscription: {routing.CapabilityNo: true},
+	// routing.CapabilityTranscriptionStreaming + CapabilityNo is reserved on the same
+	// terms as (transcription, no): an absent row already answers a streamed
+	// transcription with the buffered one-shot, so "cannot stream" costs the operator
+	// nothing to leave unsaid, while a manual no is rank 3 and would outrank forever
+	// the writer entitled to establish it -- a read of audio.cpp's own /v1/models
+	// listing (routing.CapabilitySourceAudioCppModels), whose per-model mode
+	// ("offline" or "streaming") is authoritative for a model it names. A stale manual
+	// no would otherwise keep a model that streams buffered, with nothing to show
+	// why. (transcription_streaming, yes) stays writable: it is the operator's
+	// override of that probe and the enablement path for a model whose mode the
+	// listing does not state, or one whose agent predates the verdict.
+	routing.CapabilityTranscriptionStreaming: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 

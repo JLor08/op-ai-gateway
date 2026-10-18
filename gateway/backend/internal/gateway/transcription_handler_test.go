@@ -781,7 +781,15 @@ func requireNoTranscriptionUpstreamCall(t *testing.T, calls <-chan transcription
 //   - asr-same: a (transcription, yes) verdict whose gateway and upstream names
 //     are EQUAL, so a body that needs no rewrite is relayed verbatim;
 //   - asr-denied: an explicit (transcription, no), the verdict a probed model whose
-//     task is not asr gets.
+//     task is not asr gets;
+//   - asr-offline: a (transcription, yes) verdict beside a (transcription_streaming,
+//     no) one, the answer for a model audio.cpp lists with mode=offline;
+//   - asr-unprobed: a (transcription, yes) verdict and NO transcription_streaming
+//     row at all, a model whose mode no probe has stated.
+//
+// asr-model and asr-same also carry (transcription_streaming, yes): the verdict a
+// mode=streaming model gets, and the only one a stream=true request is relayed as a
+// stream on (relayTranscription).
 //
 // The Provider is the real OpenAI-compatible client making a genuine HTTP round
 // trip to the stub.
@@ -793,13 +801,24 @@ func newTranscriptionCapableTestServer(t *testing.T, upstreamURL string) (*Serve
 	for _, m := range []struct{ id, gateway, upstream string }{
 		{"route-asr-same", "asr-same", "asr-same"},
 		{"route-asr-denied", "asr-denied", "whisper_denied"},
+		{"route-asr-offline", "asr-offline", "whisper_offline"},
+		{"route-asr-unprobed", "asr-unprobed", "whisper_unprobed"},
 	} {
 		if err := srv.Routes.CreateMapping(ctx, routing.ModelMapping{ID: m.id, ApplicationID: "app-audio", GatewayModelName: m.gateway, AppModelName: m.upstream, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateMapping %s: %v", m.id, err)
 		}
 	}
-	for id, verdict := range map[string]string{"route-asr": routing.CapabilityYes, "route-asr-same": routing.CapabilityYes, "route-asr-denied": routing.CapabilityNo} {
-		if err := srv.Routes.UpsertMappingCapabilities(ctx, id, []routing.CapabilityRow{{Capability: routing.CapabilityTranscription, Verdict: verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now}}); err != nil {
+	row := func(capability, verdict string) routing.CapabilityRow {
+		return routing.CapabilityRow{Capability: capability, Verdict: verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now}
+	}
+	for id, rows := range map[string][]routing.CapabilityRow{
+		"route-asr":          {row(routing.CapabilityTranscription, routing.CapabilityYes), row(routing.CapabilityTranscriptionStreaming, routing.CapabilityYes)},
+		"route-asr-same":     {row(routing.CapabilityTranscription, routing.CapabilityYes), row(routing.CapabilityTranscriptionStreaming, routing.CapabilityYes)},
+		"route-asr-denied":   {row(routing.CapabilityTranscription, routing.CapabilityNo)},
+		"route-asr-offline":  {row(routing.CapabilityTranscription, routing.CapabilityYes), row(routing.CapabilityTranscriptionStreaming, routing.CapabilityNo)},
+		"route-asr-unprobed": {row(routing.CapabilityTranscription, routing.CapabilityYes)},
+	} {
+		if err := srv.Routes.UpsertMappingCapabilities(ctx, id, rows); err != nil {
 			t.Fatalf("UpsertMappingCapabilities %s: %v", id, err)
 		}
 	}
@@ -809,7 +828,8 @@ func newTranscriptionCapableTestServer(t *testing.T, upstreamURL string) (*Serve
 // newServerAgentTranscriptionTestServer is the server_agent speech fixture with its
 // one mapping renamed so the client-facing name (gatewayName) and the name the
 // agent's router keys the child on (appName) can differ, and given a
-// (transcription, yes) verdict. specFlavors is the runtime spec's flavor list, the
+// (transcription, yes) verdict and a (transcription_streaming, yes) one, so a streamed
+// request is relayed as a stream. specFlavors is the runtime spec's flavor list, the
 // per-model authority the relay's effective-flavor check reads. The agent has NOT
 // declared multipart_proxy: a test that wants one that has calls
 // declareTranscriptionMultipartProxy.
@@ -821,7 +841,10 @@ func newServerAgentTranscriptionTestServer(t *testing.T, prov provider.Client, g
 	if err := srv.Routes.UpdateMapping(ctx, routing.ModelMapping{ID: "route-agent-audio", ApplicationID: "app-agent-audio", GatewayModelName: gatewayName, AppModelName: appName, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("UpdateMapping: %v", err)
 	}
-	if err := srv.Routes.UpsertMappingCapabilities(ctx, "route-agent-audio", []routing.CapabilityRow{{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now}}); err != nil {
+	if err := srv.Routes.UpsertMappingCapabilities(ctx, "route-agent-audio", []routing.CapabilityRow{
+		{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+		{Capability: routing.CapabilityTranscriptionStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now},
+	}); err != nil {
 		t.Fatalf("UpsertMappingCapabilities: %v", err)
 	}
 	return srv

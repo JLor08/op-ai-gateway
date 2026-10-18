@@ -1428,6 +1428,26 @@ const (
 	// (usage.BillingUnitAudioSecond is "audio_second"): the capability names what
 	// a model can do, the unit names what a served request is metered in.
 	CapabilityTranscription = "transcription"
+
+	// CapabilityTranscriptionStreaming means the model can answer a STREAMED
+	// transcription: POST /v1/audio/transcriptions with stream=true. It refines
+	// CapabilityTranscription rather than standing beside it, and it is the one
+	// name here that does not gate a route: no request declares it required, so a
+	// model without it is still a transcription candidate. What reads it is the
+	// transcription handler, which relays stream=true as a stream only on a yes and
+	// answers the buffered one-shot for a no and for no row at all -- the absence
+	// is "unknown", and the handler's retry-buffered fallback covers a yes that
+	// has gone stale.
+	//
+	// It is DERIVED from audio.cpp's /v1/models, the per-model mode field of the same
+	// listing the speech and transcription verdicts come from
+	// (CapabilitySourceAudioCppModels): mode "streaming" is a yes, "offline" a no,
+	// anything else no row. Unlike those two it is read from the mode and not the
+	// task, so it needs no asr model behind it to be stated.
+	//
+	// Like CapabilityTranscription the string does not coincide with the billable
+	// unit (usage.BillingUnitAudioSecond).
+	CapabilityTranscriptionStreaming = "transcription_streaming"
 )
 
 // Capability verdicts.
