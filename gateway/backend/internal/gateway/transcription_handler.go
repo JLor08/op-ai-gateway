@@ -60,8 +60,9 @@ const (
 	// transcriptionResponseFormatUnsupported is the code for a response_format this
 	// relay cannot honor -- every value but "json"; see validateTranscriptionRequest.
 	transcriptionResponseFormatUnsupported = "transcription.response_format_unsupported"
-	// transcriptionStreamUnsupported is the code for a request asking for a streamed
-	// response, which v1 does not produce; see validateTranscriptionRequest.
+	// transcriptionStreamUnsupported is the code for a request whose streaming this
+	// relay will not honor -- a `stream` that is no boolean, or any stream_format;
+	// see validateTranscriptionRequest. (A boolean stream=true is served.)
 	transcriptionStreamUnsupported = "transcription.stream_unsupported"
 	// invalidTranscriptionRequest is the code for a structurally broken form: not
 	// multipart, no boundary, truncated or malformed parts, a field too large to
@@ -89,8 +90,9 @@ type transcriptionForm struct {
 	prompt         string
 	responseFormat string
 	stream         string
-	// streamFormat is the stream_format field. The endpoint has no streamed answer,
-	// so the only question about it is whether it was set at all.
+	// streamFormat is the stream_format field. The gateway relays the upstream's own
+	// event shape and translates none, so the only question about it is whether it
+	// was set at all.
 	streamFormat string
 	// files counts the NON-EMPTY parts named `file`, the one field OpenAI's API and
 	// the audio.cpp server read the upload from. (There is no `file[]` spelling: a
@@ -106,6 +108,18 @@ type transcriptionForm struct {
 }
 
 func (f transcriptionForm) routingModel() string { return strings.TrimSpace(f.model) }
+
+// wantsStream reports whether the client asked for a streamed answer: a stream field
+// that reads as the boolean true (validateTranscriptionRequest has already refused one
+// that reads as no boolean, so false and absent are the only other cases).
+func (f transcriptionForm) wantsStream() bool {
+	v := strings.TrimSpace(f.stream)
+	if v == "" {
+		return false
+	}
+	stream, err := strconv.ParseBool(v)
+	return err == nil && stream
+}
 
 func invalidTranscription(message string) *inference.Error {
 	return &inference.Error{Code: invalidTranscriptionRequest, Message: message}
@@ -292,15 +306,16 @@ func readTranscriptionField(part *multipart.Part) (string, error) {
 // client can act on beats both silent outcomes. The match is exact (case-sensitive,
 // as OpenAI's is) after trimming surrounding whitespace.
 //
-// stream decision: `stream` on and ANY stream_format are refused with
-// transcriptionStreamUnsupported. The relay's buffering and billing contract is
-// that of a single complete JSON response, and relaying a streaming request would
-// hand the client a shape the gateway has not been built, metered or tested for.
-// An absent or empty stream, `stream` false and an absent or empty stream_format
-// describe what the endpoint already does and are accepted (a multipart form has no
-// null: an empty value is the closest thing to one, and is treated as absent, as the
-// image edit treats an empty stream). A stream that is no boolean is refused too,
-// rather than guessed at.
+// stream decision: a boolean `stream` is accepted, true included -- the relay then
+// passes the upstream's event stream through unbuffered (relayTranscription,
+// proxyNative). A `stream` that is no boolean is refused with
+// transcriptionStreamUnsupported rather than guessed at, and so is ANY stream_format:
+// audio.cpp answers a streamed transcription in its own event shape and the gateway
+// translates it into no other, so a client asking for another shape would be handed
+// one it did not ask for. An absent or empty stream, `stream` false and an absent or
+// empty stream_format describe what the endpoint always did and are accepted (a
+// multipart form has no null: an empty value is the closest thing to one, and is
+// treated as absent, as the image edit treats an empty stream).
 //
 // The result is the concrete *inference.Error, nil for a valid request. Callers
 // compare it to nil as returned and only then hand it on as an error, which avoids
@@ -319,16 +334,12 @@ func validateTranscriptionRequest(form transcriptionForm) *inference.Error {
 		return &inference.Error{Code: transcriptionResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only \"json\" is", format)}
 	}
 	if v := strings.TrimSpace(form.stream); v != "" {
-		stream, err := strconv.ParseBool(v)
-		if err != nil {
-			return &inference.Error{Code: transcriptionStreamUnsupported, Message: fmt.Sprintf("stream must be the boolean false or absent; got %q", v)}
-		}
-		if stream {
-			return &inference.Error{Code: transcriptionStreamUnsupported, Message: "stream is not supported on this endpoint; it always returns a single complete JSON response"}
+		if _, err := strconv.ParseBool(v); err != nil {
+			return &inference.Error{Code: transcriptionStreamUnsupported, Message: fmt.Sprintf("stream must be a boolean or absent; got %q", v)}
 		}
 	}
 	if strings.TrimSpace(form.streamFormat) != "" {
-		return &inference.Error{Code: transcriptionStreamUnsupported, Message: "stream_format is not supported on this endpoint; it always returns a single complete JSON response"}
+		return &inference.Error{Code: transcriptionStreamUnsupported, Message: "stream_format is not supported on this endpoint; a streamed transcription is relayed in the upstream's own event format"}
 	}
 	return nil
 }
@@ -544,10 +555,12 @@ func transcriptionNeedsModelRewrite(target routing.Target, formModel string) boo
 }
 
 // rebuildTranscriptionBody returns raw as a new multipart body and its Content-Type (a
-// fresh boundary), with two changes: the value of the model field is replaced by
-// model when that is non-empty (the field the agent's router, and any model-routing
-// upstream, reads), and every EMPTY `file` part is dropped. Every other part -- its
-// headers, its bytes and its position -- is copied exactly as the client sent it.
+// fresh boundary), with up to three changes: the value of the model field is replaced
+// by model when that is non-empty (the field the agent's router, and any model-routing
+// upstream, reads), every EMPTY `file` part is dropped, and the `stream` part is
+// dropped when dropStream is set (the buffered retry of a streamed request, see
+// bufferedTranscriptionBody). Every other part -- its headers, its bytes and its
+// position -- is copied exactly as the client sent it.
 //
 // The empty parts are dropped because validation counts only the non-empty ones
 // (validateTranscriptionRequest accepts one beside the real upload): audio.cpp reads
@@ -564,7 +577,7 @@ func transcriptionNeedsModelRewrite(target routing.Target, formModel string) boo
 // The body is built in memory at roughly the client's size; the size cap
 // (transcriptionBodyLimit) is applied to what the client sends, not to this, which is
 // why relayTranscription checks what it hands an agent against the agent's own.
-func rebuildTranscriptionBody(raw []byte, boundary, model string) ([]byte, string, error) {
+func rebuildTranscriptionBody(raw []byte, boundary, model string, dropStream bool) ([]byte, string, error) {
 	mr := multipart.NewReader(bytes.NewReader(raw), boundary)
 	var out bytes.Buffer
 	out.Grow(len(raw) + len(model) + 512)
@@ -577,7 +590,7 @@ func rebuildTranscriptionBody(raw []byte, boundary, model string) ([]byte, strin
 		if err != nil {
 			return nil, "", fmt.Errorf("read part: %w", err)
 		}
-		if err := writeRebuiltTranscriptionPart(mw, part, model); err != nil {
+		if err := writeRebuiltTranscriptionPart(mw, part, model, dropStream); err != nil {
 			return nil, "", err
 		}
 	}
@@ -589,10 +602,13 @@ func rebuildTranscriptionBody(raw []byte, boundary, model string) ([]byte, strin
 
 // writeRebuiltTranscriptionPart writes one part of the client's form into the rebuilt
 // body: the model field with model for its value when that is set, nothing at all for
-// an empty `file` part, and every other part -- its headers and its bytes -- as the
-// client sent it.
-func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, model string) error {
+// an empty `file` part or (when dropStream is set) the `stream` part, and every other
+// part -- its headers and its bytes -- as the client sent it.
+func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, model string, dropStream bool) error {
 	name := part.FormName()
+	if dropStream && name == "stream" {
+		return nil
+	}
 	if model != "" && name == "model" {
 		if err := mw.WriteField("model", model); err != nil {
 			return fmt.Errorf("write model field: %w", err)
@@ -652,10 +668,19 @@ func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, m
 // client sends does not guarantee (rebuilding can grow a body): one that does not is
 // refused here, recorded, instead of being sent.
 //
+// A form that asks for a stream (form.wantsStream) is relayed as one: the relay is
+// marked a stream (nativeRelay.pfReq.Stream) and carries bufferedRetry, the builder of
+// the request proxyNative sends once more, buffered, when the upstream refuses to
+// stream (refusedStreamingTranscription). Whether the mapped model can stream is not
+// consulted here: every streamed request is sent as asked, and the retry is what a
+// model that cannot stream is answered with.
+//
 // proxyNative then finishes the exchange through this file's response side, keyed on
 // the endpoint (the openai_audio flavor is speech's too): a non-2xx answer is
-// normalised (relayTranscriptionUpstreamError) and a 2xx one is buffered, metered from
-// the timing block of its body and written verbatim (relayTranscriptionResponse).
+// normalised (relayTranscriptionUpstreamError); a 2xx event stream of a streamed
+// request is relayed unbuffered by the native copier (isStreamedTranscription,
+// setStreamedTranscriptionBillingQuantity); any other 2xx one is buffered, metered
+// from the timing block of its body and written verbatim (relayTranscriptionResponse).
 func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, form transcriptionForm, raw []byte) {
 	start := time.Now()
 	target, ok := s.resolveTranscriptionTarget(w, r, &token, req, raw, start)
@@ -686,12 +711,12 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 	}
 	sent := len(raw)
 	rewrite := transcriptionNeedsModelRewrite(target, form.model)
+	model := ""
+	if rewrite {
+		model = target.ProviderModel
+	}
 	if rewrite || form.emptyFiles > 0 {
-		model := ""
-		if rewrite {
-			model = target.ProviderModel
-		}
-		body, contentType, err := rebuildTranscriptionBody(raw, form.boundary, model)
+		body, contentType, err := rebuildTranscriptionBody(raw, form.boundary, model, false)
 		if err != nil {
 			// Not expected for a body parseTranscriptionForm accepted: it walked every
 			// part of it to its end with the same reader and boundary. Were it to
@@ -712,7 +737,92 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		s.recordTranscriptionRoutingFailure(w, r, token, req, raw, start, errTranscriptionTooLarge)
 		return
 	}
+	if form.wantsStream() {
+		// A client that asked for a stream is sent one: stream=true reaches the upstream
+		// as it came, unconditionally -- the relay does not know whether the mapped model
+		// is in streaming mode, and an upstream that is not answers with the refusal
+		// proxyNative turns into the buffered retry built here. The relay's request
+		// (pfReq) is marked a stream for the deadline policy, the active row and the
+		// usage row; the preflight request is not, so the gate and the resolve above
+		// judged the same request a plain transcription would be.
+		rel.pfReq.Stream = true
+		rel.bufferedRetry = func() ([]byte, string, error) {
+			return bufferedTranscriptionBody(target, raw, form.boundary, model)
+		}
+	}
 	s.proxyNative(w, r, rel)
+}
+
+// bufferedTranscriptionBody builds the request that is sent INSTEAD of a streamed one
+// the upstream refused (see refusedStreamingTranscription): the client's form, still
+// held whole in memory, rebuilt with the `stream` part dropped and, as for the first
+// attempt, the mapped model name and no empty `file` part. It is built only when the
+// retry happens, so the common streamed call never holds a second copy of the upload.
+//
+// The body must fit the agent router's own request limit, as the first attempt's did
+// (relayTranscription): dropping `stream` shrinks the form, but a client boundary
+// shorter than the rebuilt one's can make the whole larger than what was checked. One
+// that does not fit is errTranscriptionTooLarge, and the caller then relays the
+// upstream's refusal instead.
+func bufferedTranscriptionBody(target routing.Target, raw []byte, boundary, model string) ([]byte, string, error) {
+	body, contentType, err := rebuildTranscriptionBody(raw, boundary, model, true)
+	if err != nil {
+		return nil, "", err
+	}
+	if target.Provider == routing.ProviderServerAgent && len(body) > agentRouterMaxBodyBytes {
+		return nil, "", errTranscriptionTooLarge
+	}
+	return body, contentType, nil
+}
+
+// transcriptionStreamingRefusal is the sentence audio.cpp's error carries when
+// stream=true reaches a model that is not loaded with mode=streaming (an offline
+// model). It answers HTTP 500, as it does for every error, so the sentence -- not the
+// status alone -- is what tells this refusal from a server that is really failing.
+const transcriptionStreamingRefusal = "requires a model configured with mode=streaming"
+
+// transcriptionRefusalPeekBytes bounds how much of a 500 body is read looking for
+// transcriptionStreamingRefusal: audio.cpp puts the sentence in a one-line error
+// object, so the head of the body is where it is.
+const transcriptionRefusalPeekBytes = 64 << 10
+
+// replayedBody is a response body some of whose bytes have already been read: the
+// reader yields them again in front of the rest, and Close closes the original.
+type replayedBody struct {
+	io.Reader
+	io.Closer
+}
+
+// refusedStreamingTranscription reports whether resp is the upstream's refusal to
+// stream a transcription: HTTP 500 whose body names transcriptionStreamingRefusal.
+// Any other status, and any other 500, is false -- those are the upstream's errors and
+// reach the client as they always did.
+//
+// It reads the head of the body to look, and puts what it read back: resp.Body is
+// replaced by a body that still yields every byte, so an error that is not the refusal
+// reaches relayTranscriptionUpstreamError whole.
+func refusedStreamingTranscription(resp *provider.ProxyResponse) bool {
+	if resp.StatusCode != http.StatusInternalServerError {
+		return false
+	}
+	head, err := io.ReadAll(io.LimitReader(resp.Body, transcriptionRefusalPeekBytes))
+	resp.Body = replayedBody{Reader: io.MultiReader(bytes.NewReader(head), resp.Body), Closer: resp.Body}
+	return err == nil && bytes.Contains(head, []byte(transcriptionStreamingRefusal))
+}
+
+// isStreamedTranscription reports whether a transcription's 2xx answer is relayed as
+// a stream rather than buffered: the request asked for one (the relay's pfReq.Stream)
+// AND the upstream answered with an event stream. Either alone is not enough. An
+// upstream that answered a stream request with a plain JSON document did not stream,
+// and its document is buffered, read for its timing block and written verbatim like
+// any one-shot transcription; and an event stream nobody asked for is no stream this
+// relay was set up for.
+func isStreamedTranscription(endpoint sessionEndpoint, streamRequested bool, header http.Header) bool {
+	if endpoint != endpointTranscription || !streamRequested {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(header.Get(contentTypeHeader))
+	return err == nil && mediaType == "text/event-stream"
 }
 
 // transcriptionDurationSeconds reads the billable quantity out of a transcription
@@ -775,6 +885,21 @@ func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []
 		return
 	}
 	meta.BillingQuantity = seconds
+}
+
+// setStreamedTranscriptionBillingQuantity is the interim billing of a STREAMED
+// transcription: a loud zero. The event stream states no duration (its done event
+// carries a time to first token, not audio_duration_ms), so the quantity of a finished
+// stream is left at 0 and said so at Error, exactly as setTranscriptionBillingQuantity
+// says a one-shot body without one (ADR-041) -- never a silent bare zero. Like it, it
+// does nothing for another endpoint or a relay that did not finish cleanly.
+//
+// TODO(Task 3): bill from WAV header
+func setStreamedTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, status string) {
+	if ex.endpoint != endpointTranscription || status != "success" {
+		return
+	}
+	slog.Error("streamed transcription relayed with no billable duration: billed zero until it is read from the upload", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName)
 }
 
 // transcriptionUpstreamErrorType and transcriptionUpstreamErrorCode are the GATEWAY's
@@ -841,7 +966,8 @@ func normalizeTranscriptionUpstreamError(body []byte, status int) ([]byte, bool)
 // proxyNative behind needsTranscriptionErrorRelay.
 //
 // The whole body is read before anything is written, as speech's is: normalising needs
-// all of it, and a transcription never streams, so an error is one small payload. The
+// all of it, and an error is one small payload -- a streamed request's too: a non-2xx
+// status is the answer INSTEAD of a stream, not a part of one. The
 // read is bounded by s.captureMaxBytes, the cap an ERROR body has no reason to exceed
 // (the success path's bound is the transcription cap instead: a transcript is not an
 // error body, and is never clipped).
@@ -876,12 +1002,14 @@ func (s *Server) relayTranscriptionUpstreamError(w http.ResponseWriter, r *http.
 	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor), nil)
 }
 
-// relayTranscriptionResponse finishes a transcription whose upstream answered 2xx. It
-// is the one relay in proxyNative that BUFFERS a success instead of streaming it, and
-// that is forced, not chosen: the billable duration is the timing block of the JSON
-// body, written AFTER the transcript, so it cannot be known before the body has been
-// read to its end -- and the gateway must not have sent a byte by then, or a body that
-// turns out unreadable or too large could not be turned into an error.
+// relayTranscriptionResponse finishes a transcription whose upstream answered 2xx with
+// a one-shot JSON document -- every 2xx but the event stream of a streamed request
+// (isStreamedTranscription). It is the one relay in proxyNative that BUFFERS a success
+// instead of streaming it, and that is forced, not chosen: the billable duration is
+// the timing block of the JSON body, written AFTER the transcript, so it cannot be
+// known before the body has been read to its end -- and the gateway must not have sent
+// a byte by then, or a body that turns out unreadable or too large could not be turned
+// into an error.
 //
 // So the sequence is read, decide, write:
 //
@@ -903,9 +1031,9 @@ func (s *Server) relayTranscriptionUpstreamError(w http.ResponseWriter, r *http.
 //
 // ex carries this request's identity (see nativeExchange); the function both writes
 // the client's response and records its usage row, as relayTranscriptionUpstreamError
-// does. There is no idle watchdog and no usage scanner here: a transcription never
-// streams (validateTranscriptionRequest refuses it), so proxyNative arms neither, and
-// the row's token columns stay 0.
+// does. There is no idle watchdog and no usage scanner here: a one-shot document is
+// not a stream (proxyNative stops the watchdog of a streamed request that was answered
+// with one), and the row's token columns stay 0.
 func (s *Server) relayTranscriptionResponse(w http.ResponseWriter, r *http.Request, ex nativeExchange, resp *provider.ProxyResponse) {
 	limit := s.transcriptionBodyLimit()
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))

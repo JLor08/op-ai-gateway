@@ -105,11 +105,12 @@ const (
 
 // transcriptionReservedFields are the form fields a thread's passthrough may not
 // set. model and file are the run's own (the thread's pinned model and the clip of
-// the turn); stream and response_format are the two the endpoint's contract -- one
-// complete JSON answer -- depends on, and it refuses a streamed request or any
-// format but json anyway (validateTranscriptionRequest). Rejecting them here turns
-// what would be an opaque upstream refusal, or worse an override of the run's own
-// value, into a refusal that names its cause.
+// the turn); stream and response_format are the two this run's contract -- one
+// complete JSON answer -- depends on (the endpoint itself now serves a streamed
+// request, but this run does not consume one, and it refuses any format but json,
+// validateTranscriptionRequest). Rejecting them here turns what would be an opaque
+// upstream refusal, or worse an override of the run's own value, into a refusal that
+// names its cause.
 //
 // stream_format is deliberately not listed, for speechReservedFields' reason: the
 // endpoint already refuses any non-empty one with transcription.stream_unsupported,

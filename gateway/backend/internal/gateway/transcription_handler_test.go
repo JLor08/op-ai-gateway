@@ -520,7 +520,8 @@ func TestTranscriptionAndImageEditFormsReadTheSameModel(t *testing.T) {
 
 // validateTranscriptionRequest is the multipart shape's validation twin: a
 // model and exactly one non-empty file are required, response_format may only be
-// "json" (or absent), and neither stream nor stream_format may be on.
+// "json" (or absent), stream may be a boolean (true streams) or absent, and
+// stream_format may not be set at all.
 func TestValidateTranscriptionRequest(t *testing.T) {
 	valid := transcriptionForm{model: "asr-model", files: 1}
 	with := func(mut func(*transcriptionForm)) transcriptionForm {
@@ -560,16 +561,19 @@ func TestValidateTranscriptionRequest(t *testing.T) {
 		{"stream absent", with(func(f *transcriptionForm) { f.stream = "" }), ""},
 		{"stream false", with(func(f *transcriptionForm) { f.stream = "false" }), ""},
 		{"stream 0, padded", with(func(f *transcriptionForm) { f.stream = " 0 " }), ""},
-		{"stream true", with(func(f *transcriptionForm) { f.stream = "true" }), "transcription.stream_unsupported"},
-		{"stream TRUE", with(func(f *transcriptionForm) { f.stream = "TRUE" }), "transcription.stream_unsupported"},
-		{"stream 1", with(func(f *transcriptionForm) { f.stream = "1" }), "transcription.stream_unsupported"},
+		{"stream true", with(func(f *transcriptionForm) { f.stream = "true" }), ""},
+		{"stream TRUE", with(func(f *transcriptionForm) { f.stream = "TRUE" }), ""},
+		{"stream 1", with(func(f *transcriptionForm) { f.stream = "1" }), ""},
+		{"stream true, padded", with(func(f *transcriptionForm) { f.stream = " true\n" }), ""},
 		{"stream that is no boolean", with(func(f *transcriptionForm) { f.stream = "maybe" }), "transcription.stream_unsupported"},
+		{"stream null (a form has no null, and this is no boolean)", with(func(f *transcriptionForm) { f.stream = "null" }), "transcription.stream_unsupported"},
 
 		{"stream_format absent", with(func(f *transcriptionForm) { f.streamFormat = "" }), ""},
 		{"stream_format blank", with(func(f *transcriptionForm) { f.streamFormat = " " }), ""},
 		{"stream_format sse", with(func(f *transcriptionForm) { f.streamFormat = "sse" }), "transcription.stream_unsupported"},
 		{"stream_format audio", with(func(f *transcriptionForm) { f.streamFormat = "audio" }), "transcription.stream_unsupported"},
 		{"stream_format with stream false", with(func(f *transcriptionForm) { f.stream, f.streamFormat = "false", "sse" }), "transcription.stream_unsupported"},
+		{"stream_format with stream true", with(func(f *transcriptionForm) { f.stream, f.streamFormat = "true", "sse" }), "transcription.stream_unsupported"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -607,7 +611,8 @@ func TestParseThenValidateTranscriptionRequest(t *testing.T) {
 		{"a file and a file[] part: the file[] part is no file", append(validTranscriptionParts("asr-model"), editPart{name: "file[]", filename: "b.wav", body: []byte("more audio")}), ""},
 		{"a file and an empty second file", append(validTranscriptionParts("asr-model"), editPart{name: "file", filename: "e.wav"}), ""},
 		{"verbose_json", append(validTranscriptionParts("asr-model"), editPart{name: "response_format", body: []byte("verbose_json")}), "transcription.response_format_unsupported"},
-		{"stream", append(validTranscriptionParts("asr-model"), editPart{name: "stream", body: []byte("true")}), "transcription.stream_unsupported"},
+		{"stream", append(validTranscriptionParts("asr-model"), editPart{name: "stream", body: []byte("true")}), ""},
+		{"stream that is no boolean", append(validTranscriptionParts("asr-model"), editPart{name: "stream", body: []byte("maybe")}), "transcription.stream_unsupported"},
 		{"stream_format", append(validTranscriptionParts("asr-model"), editPart{name: "stream_format", body: []byte("sse")}), "transcription.stream_unsupported"},
 	}
 	for _, tc := range cases {
@@ -900,7 +905,7 @@ func TestTranscriptionInferenceShape(t *testing.T) {
 		t.Fatalf("requiredCapabilities = %v, want exactly [%s]: the list feeds the capability gate AND keeps the request off the vendor-account path", shape.requiredCapabilities, routing.CapabilityTranscription)
 	}
 	if shape.stream {
-		t.Fatal("stream = true, want false: the endpoint never streams")
+		t.Fatal("stream = true, want false: the preflight shape is that of any transcription; relayTranscription marks the relay's own request a stream")
 	}
 }
 
@@ -1117,7 +1122,7 @@ func TestTranscriptionRejectsAnInvalidRequestBeforeRouting(t *testing.T) {
 		{"two files", with(editPart{name: "file", filename: "b.wav", body: []byte("x")}), "transcription.invalid"},
 		{"verbose_json", with(editPart{name: "response_format", body: []byte("verbose_json")}), "transcription.response_format_unsupported"},
 		{"srt", with(editPart{name: "response_format", body: []byte("srt")}), "transcription.response_format_unsupported"},
-		{"stream", with(editPart{name: "stream", body: []byte("true")}), "transcription.stream_unsupported"},
+		{"a stream that is no boolean", with(editPart{name: "stream", body: []byte("maybe")}), "transcription.stream_unsupported"},
 		{"stream_format", with(editPart{name: "stream_format", body: []byte("sse")}), "transcription.stream_unsupported"},
 		{"a repeated model", with(editPart{name: "model", body: []byte("other")}), "transcription.invalid"},
 	}
@@ -1938,7 +1943,7 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 	}
 
 	t.Run("replaces the model and drops the empty file part", func(t *testing.T) {
-		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name")
+		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name", false)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
@@ -1953,14 +1958,14 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 		})
 	})
 	t.Run("an empty model keeps the model field and still drops the empty file part", func(t *testing.T) {
-		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "")
+		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "", false)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
 		requireSameParts(t, readEditParts(t, out, outCT), []editPart{parts[0], parts[1], parts[3], parts[4]})
 	})
 	t.Run("the rebuilt form parses to the same single file and the new model", func(t *testing.T) {
-		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name")
+		out, outCT, err := rebuildTranscriptionBody(body, form.boundary, "mapped-name", false)
 		if err != nil {
 			t.Fatalf("rebuildTranscriptionBody: %v", err)
 		}
@@ -1969,8 +1974,35 @@ func TestRebuildTranscriptionBody(t *testing.T) {
 			t.Fatalf("parse of the rebuilt form = %+v, %v, want model mapped-name, one file, no empty file", got, err)
 		}
 	})
+	t.Run("dropStream drops the stream part and nothing else", func(t *testing.T) {
+		streamParts := append(append([]editPart(nil), parts...), editPart{name: "stream", body: []byte("true")})
+		streamBody, streamCT := buildEditMultipart(t, streamParts)
+		streamForm, err := parseTranscriptionForm(streamCT, streamBody)
+		if err != nil {
+			t.Fatalf("parseTranscriptionForm: %v", err)
+		}
+
+		out, outCT, err := rebuildTranscriptionBody(streamBody, streamForm.boundary, "mapped-name", true)
+		if err != nil {
+			t.Fatalf("rebuildTranscriptionBody: %v", err)
+		}
+		requireSameParts(t, readEditParts(t, out, outCT), []editPart{
+			parts[0],
+			{name: "model", body: []byte("mapped-name")},
+			parts[3],
+			parts[4],
+		})
+
+		kept, keptCT, err := rebuildTranscriptionBody(streamBody, streamForm.boundary, "mapped-name", false)
+		if err != nil {
+			t.Fatalf("rebuildTranscriptionBody: %v", err)
+		}
+		if v, ok := formFieldOf(t, kept, keptCT, "stream"); !ok || v != "true" {
+			t.Fatalf("stream field = %q (present %v) without dropStream, want it kept", v, ok)
+		}
+	})
 	t.Run("a body that is not the form it was parsed from is an error, not a panic", func(t *testing.T) {
-		if _, _, err := rebuildTranscriptionBody(body[:len(body)-40], form.boundary, "mapped-name"); err == nil {
+		if _, _, err := rebuildTranscriptionBody(body[:len(body)-40], form.boundary, "mapped-name", false); err == nil {
 			t.Fatal("rebuilding a truncated body succeeded, want an error")
 		}
 	})
