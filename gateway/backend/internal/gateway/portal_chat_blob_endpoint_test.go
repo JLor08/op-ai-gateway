@@ -174,16 +174,27 @@ func TestChatBlobEndpointServesTheOwnersImageHardened(t *testing.T) {
 	}
 }
 
-// Each allow-listed type is served as itself.
+// Each allow-listed type is served as itself: the image types, the speech reply's
+// WAV, and the transcription composer's input formats.
 func TestChatBlobEndpointServesEachAllowListedType(t *testing.T) {
 	e := newChatBlobEnv(t)
 	chatID := e.newChat(t, "usr_a", `{"settings":{},"messages":[]}`)
-	for i, contentType := range []string{"image/png", "image/jpeg", "image/webp", "image/gif", "audio/wav"} {
+	for i, contentType := range []string{
+		"image/png", "image/jpeg", "image/webp", "image/gif",
+		"audio/wav", "audio/webm", "audio/mpeg", "audio/mp4", "audio/ogg",
+	} {
 		id := fmt.Sprintf("blob_type_%d", i)
 		e.putBlob(t, chatID, id, contentType, pngLike(64+i))
 		rec := e.getBlob(e.cookieA, id)
 		if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != contentType {
 			t.Errorf("%s: status %d, Content-Type %q", contentType, rec.Code, rec.Header().Get("Content-Type"))
+		}
+		// Every served type keeps the hardening that makes a same-origin blob url safe.
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", contentType, got)
+		}
+		if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'none'" {
+			t.Errorf("%s: Content-Security-Policy = %q, want default-src 'none'", contentType, got)
 		}
 	}
 }
@@ -226,12 +237,13 @@ func TestChatBlobEndpointServesASpeechReplyHardened(t *testing.T) {
 }
 
 // A row whose type is not an allow-listed type is never served, even to its
-// owner: the store-time allow-list is not the only line of defense. Only audio/wav
-// is listed of the audio types, so the other spellings of it are refused too.
+// owner: the store-time allow-list is not the only line of defense. Only the
+// listed audio types are served (wav, and the transcription input formats), so an
+// unlisted subtype and the other spellings of a listed one are refused too.
 func TestChatBlobEndpointNeverServesAnUnlistedType(t *testing.T) {
 	e := newChatBlobEnv(t)
 	chatID := e.newChat(t, "usr_a", `{"settings":{},"messages":[]}`)
-	for i, contentType := range []string{"text/html", "image/svg+xml", "application/javascript", "image/png; charset=utf-8", "audio/mpeg", "audio/x-wav", "audio/wav; codecs=1"} {
+	for i, contentType := range []string{"text/html", "image/svg+xml", "application/javascript", "image/png; charset=utf-8", "audio/flac", "audio/x-wav", "audio/wav; codecs=1", "audio/webm; codecs=opus"} {
 		id := fmt.Sprintf("blob_bad_%d", i)
 		e.putBlob(t, chatID, id, contentType, []byte(`<html><script>alert(document.cookie)</script></html>`))
 		rec := e.getBlob(e.cookieA, id)

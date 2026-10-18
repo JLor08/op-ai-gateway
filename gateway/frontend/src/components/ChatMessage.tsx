@@ -14,10 +14,12 @@ import type { ChatContent, ChatContentPart } from './shared/chatContent';
 import { audioUrlsOf, imageUrlsOf, isMaskPart } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
+import { keyedUrls } from './shared/urlKeys';
 import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
 import { AudioTurn } from './AudioTurn';
 import { AudioPendingTurn } from './AudioPendingTurn';
+import { TranscriptionPendingTurn } from './TranscriptionPendingTurn';
 
 function contentText(content: ChatContent): string {
   if (typeof content === 'string') return content;
@@ -83,16 +85,17 @@ function ChatMessageComponent({
   reasoning?: string;
   reasoningMs?: number;
   streaming?: boolean;
-  // The kind of the RUN this row is streaming ("" text | "image" | "speech") --
+  // The kind of the RUN this row is streaming ("" text | "image" | "speech" | "transcription") --
   // ChatStore's runKind, read from the run's own reports (its 201, an
   // active-runs entry, an SSE snapshot), NOT the thread-level chatKind.
   // The distinction is the whole point: chatKind is the client's guess at
   // what the composer should offer and can be stale, while this is what the
   // executor is actually running, and rendering the image wait state over a
   // text run is exactly what the stale value produces. Only meaningful
-  // together with `streaming`: it selects the image-run (or speech-run) pending
-  // render below for the one turn that is both streaming and imageless (or
-  // audioless). Absent on every call site that predates image threads.
+  // together with `streaming`: it selects the image-run (or speech-run, or
+  // transcription-run) pending render below for the one turn that is both streaming
+  // and imageless (or audioless, or textless). Absent on every call site that
+  // predates image threads.
   kind?: string;
   // The active run's server-anchored elapsed ms (ChatStore's runElapsedMs),
   // passed through untouched -- see ImagePendingTurn for how it is
@@ -116,9 +119,12 @@ function ChatMessageComponent({
 }>) {
   const text = contentText(content);
   const images = imageUrlsOf(content);
+  const audioUrls = audioUrlsOf(content);
   // A speech turn's reply is exactly one WAV (see AudioTurn), so only the first audio
-  // part is rendered; its presence is what tells a finished speech turn from a pending one.
-  const audioUrl: string | undefined = audioUrlsOf(content)[0];
+  // part of an ASSISTANT turn is rendered; its presence is what tells a finished speech
+  // turn from a pending one. A USER turn's audio parts are a transcription turn's input
+  // clip and are all rendered (the user branch below).
+  const audioUrl: string | undefined = audioUrls[0];
   const mask = contentMask(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
@@ -145,6 +151,15 @@ function ChatMessageComponent({
     // `no audio yet` guard that keeps it from replacing an arriving reply.
     if (streaming && kind === 'speech' && audioUrl === undefined) {
       return <AudioPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
+    }
+    // A transcription run is the same shape of wait -- one finished transcript at the end,
+    // no incremental events (the run is asked for no stream) -- but its answer is TEXT, so
+    // without this the ordinary text-pending branch below would claim the turn: "Denkt ...
+    // 0 Zeichen" and a cursor for a run that is not reasoning and emits nothing to count.
+    // `text.length === 0` is the `no answer yet` guard that keeps it from replacing an
+    // arriving transcript, as images / audioUrl do for the kinds above.
+    if (streaming && kind === 'transcription' && text.length === 0) {
+      return <TranscriptionPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }
 
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
@@ -466,7 +481,16 @@ function ChatMessageComponent({
               )}
             </Box>
           )}
-          {onEdit && (
+          {/* A transcription turn's input clip: the user's own audio, played from the same
+              fetch-once object URL (revoked on unmount) as a speech reply, and offered for
+              download. */}
+          {keyedUrls(audioUrls).map(({ key, url }) => (
+            <AudioTurn key={key} t={t} url={url} turnId={turnId ?? ''} variant="input" />
+          ))}
+          {/* No edit on a turn that carries audio: it is a transcription turn, whose clip is
+              all the run reads -- editing its (empty) text would change nothing a run uses
+              and a replay would transcribe the same clip. */}
+          {onEdit && audioUrls.length === 0 && (
             <Stack direction="row" sx={{ flexWrap: 'wrap', gap: 1, mt: 1.25 }}>
               <Tooltip title={t.chatEdit}>
                 <span>

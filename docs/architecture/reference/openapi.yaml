@@ -805,11 +805,12 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string }, description: 'Blob id, "blob_" + 32 hex digits, as it appears in an image_url.url or audio_url.url of a stored chat transcript.' }
     get:
       tags: [portal]
-      summary: Raw bytes of one stored chat image or speech WAV (owner-scoped, hardened)
+      summary: Raw bytes of one stored chat image, speech WAV or transcription clip (owner-scoped, hardened)
       description: >
-        Serves a chat binary payload (an image, or a speech reply's WAV)
+        Serves a chat binary payload (an image, a speech reply's WAV, or a
+        transcription run's input audio clip)
         referenced from a transcript by image_url.url or audio_url.url
-        "/api/portal/chat-blobs/{id}" (ADR-056, ADR-063). Standard portal
+        "/api/portal/chat-blobs/{id}" (ADR-056, ADR-063, ADR-064). Standard portal
         auth (session cookie, else bearer or internal loopback, scope
         gateway:use); the browser's <img> uses the cookie, through the passive
         variant of the session check (the session is validated but its idle
@@ -818,7 +819,9 @@ paths:
         the session's user, otherwise 404 portal.chat_blob_not_found, which is
         also the answer for a missing, deleted, evicted or non-servable blob (no
         existence leak). The response Content-Type is always one of the
-        allow-listed image/png, image/jpeg, image/webp, image/gif, audio/wav,
+        allow-listed image/png, image/jpeg, image/webp, image/gif, audio/wav
+        (a speech reply) and the transcription clip input types audio/webm,
+        audio/mpeg, audio/mp4, audio/ogg,
         and the response carries X-Content-Type-Options nosniff, a
         Content-Security-Policy of default-src 'none', Content-Disposition
         inline and Cache-Control private, no-store. The body is written whole
@@ -827,7 +830,7 @@ paths:
       security: [{ sessionCookie: [] }, { bearerAuth: [] }]
       responses:
         '200':
-          description: The decrypted image or WAV bytes.
+          description: The decrypted image, speech WAV or transcription clip bytes.
           headers:
             X-Content-Type-Options: { schema: { type: string, enum: [nosniff] } }
             Content-Security-Policy: { schema: { type: string, enum: ["default-src 'none'"] } }
@@ -839,6 +842,10 @@ paths:
             image/webp: { schema: { type: string, format: binary } }
             image/gif: { schema: { type: string, format: binary } }
             audio/wav: { schema: { type: string, format: binary } }
+            audio/webm: { schema: { type: string, format: binary } }
+            audio/mpeg: { schema: { type: string, format: binary } }
+            audio/mp4: { schema: { type: string, format: binary } }
+            audio/ogg: { schema: { type: string, format: binary } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '405': { description: 'Any method other than GET (Allow: GET).' }

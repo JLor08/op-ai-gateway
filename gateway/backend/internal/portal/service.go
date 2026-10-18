@@ -1385,6 +1385,19 @@ type ModelDTO struct {
 	// model SYNTHESISES audio from text, and another capability's yes verdict
 	// never makes a model a speech candidate.
 	Speech bool `json:"speech"`
+	// Transcription is true only when the transcription endpoint would serve the
+	// model -- EVERY offering mapping (or, for a group, every offerable member) has
+	// a (transcription, yes) verdict and passes both flavor stages of a
+	// transcription request (the application's openai_audio and, for an
+	// agent-launched model with a spec, the spec's): AND aggregation, fail-closed,
+	// exactly like Speech. It is transcriptionFlagsByName's result, the one
+	// transcription fold ModelOffering.Capable asks too, so the portal chat offers
+	// a transcription turn only for a model the redirect would also name. It is
+	// INDEPENDENT of Speech, Image and Vision: Transcription means the model
+	// TRANSCRIBES audio to text, and another capability's yes verdict never makes
+	// a model a transcription candidate -- a pure-ASR model folds
+	// transcription=true, speech=false.
+	Transcription bool `json:"transcription"`
 	// OriginalModelID is set ONLY on a generated Claude alias row (the token's
 	// claude_model_aliases setting): the real gateway model/group id the
 	// `anthropic-local-<hash>` ID resolves to. DisplayName on such a row is the
@@ -2543,17 +2556,18 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			}
 			capsByMapping, capErr := s.routes.MappingCapabilitiesForMappings(ctx, mappingIDs)
 			if capErr != nil {
-				// LOUDLY: this degrade withholds vision, image, image_edit AND
-				// speech from EVERY model in the listing gateway-wide (the
-				// folds below AND a missing row in as false for each), which
-				// the portal renders as a perfectly normal page whose image-
-				// ATTACH affordance (gated on vision), image-GENERATION
-				// affordance (gated on image) and speech-synthesis affordance
-				// (gated on speech) are simply all gone -- a fail-closed
+				// LOUDLY: this degrade withholds vision, image, image_edit,
+				// speech AND transcription from EVERY model in the listing
+				// gateway-wide (the folds below AND a missing row in as false
+				// for each), which the portal renders as a perfectly normal page
+				// whose image-ATTACH affordance (gated on vision),
+				// image-GENERATION affordance (gated on image), speech-synthesis
+				// affordance (gated on speech) and transcription affordance
+				// (gated on transcription) are simply all gone -- a fail-closed
 				// outage with no diagnostic trail unless it is logged. Every
 				// sibling best-effort read in this package logs for exactly
 				// that reason.
-				slog.Warn("portal: models-listing capability read failed; vision, image, image_edit and speech withheld for every model",
+				slog.Warn("portal: models-listing capability read failed; vision, image, image_edit, speech and transcription withheld for every model",
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
@@ -2587,6 +2601,12 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// capability batch and the same runtime-spec index as the image folds,
 			// so the flag costs no further store read.
 			speechOn := speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
+			// transcription is transcriptionFlagsByName, speech's twin and the one
+			// transcription fold the redirect asks too: the (transcription, yes)
+			// verdict and the same openai_audio flavor half, from the same
+			// capability batch and runtime-spec index, so it costs no further
+			// store read either.
+			transcriptionOn := transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
 			// Each model's flavors are the ones dispatch serves it under
 			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
 			// flavorSetsFromViews applies for /v1/models too. Every model keeps
@@ -2727,15 +2747,17 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 						groupContext[e.Name] = minContext
 					}
 				}
-				// A group's vision, image, image_edit and speech flags are the AND of its
-				// offerable members' flags (same fail-closed rule as a plain
-				// model); an EMPTY offerable member set is false (fail-closed —
-				// never claim a capability on a group with nothing to serve it).
+				// A group's vision, image, image_edit, speech and transcription flags
+				// are the AND of its offerable members' flags (same fail-closed rule
+				// as a plain model); an EMPTY offerable member set is false
+				// (fail-closed — never claim a capability on a group with nothing to
+				// serve it).
 				// Captured before suppression, mirroring groupOffered/groupContext.
 				groupVision := groupCapabilityFlags(entries, visionOn)
 				groupImage := groupCapabilityFlags(entries, imageOn)
 				groupImageEdit := groupCapabilityFlags(entries, imageEditOn)
 				groupSpeech := groupCapabilityFlags(entries, speechOn)
+				groupTranscription := groupCapabilityFlags(entries, transcriptionOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2774,6 +2796,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					imageOn[e.Name] = groupImage[e.Name]
 					imageEditOn[e.Name] = groupImageEdit[e.Name]
 					speechOn[e.Name] = groupSpeech[e.Name]
+					transcriptionOn[e.Name] = groupTranscription[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2816,8 +2839,8 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				applyOverrideAliases(flavors, preSuppress, token.ModelOverrideRules)
 				// An alias name added to the flavor map still needs the target's
 				// OTHER listing data (loaded state, offered-on count, context size,
-				// vision/image/image_edit/speech, and whether the target is itself a model
-				// GROUP) copied over under the alias name -- the alias entry is
+				// vision/image/image_edit/speech/transcription, and whether the
+				// target is itself a model GROUP) copied over under the alias name -- the alias entry is
 				// meant to look exactly like its target's row, just filed under a
 				// different name (this is a display, not a leak: the alias really
 				// does route to this target). Models and groups share one
@@ -2846,6 +2869,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					}
 					if v, ok := speechOn[target]; ok {
 						speechOn[name] = v
+					}
+					if v, ok := transcriptionOn[target]; ok {
+						transcriptionOn[name] = v
 					}
 					if _, ok := isGroup[target]; ok {
 						isGroup[name] = struct{}{}
@@ -2912,6 +2938,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.Image = imageOn[id]
 				dto.ImageEdit = imageEditOn[id]
 				dto.Speech = speechOn[id]
+				dto.Transcription = transcriptionOn[id]
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}
@@ -3014,6 +3041,31 @@ func speechFlagsByName(views []mappingView, speechRows map[string]routing.Capabi
 	})
 }
 
+// transcriptionFlagsByName is THE transcription fold, speechFlagsByName's twin:
+// per gateway model name among views, whether the transcription endpoint would
+// serve it. It backs the listing's ModelDTO.Transcription and the unknown-model
+// redirect's ModelOffering.Capable for a request that requires
+// routing.CapabilityTranscription (capableNames), so the two can never disagree
+// about which model transcribes audio. idx supplies each mapping's runtime spec
+// (runtimeSpecIndex) and must cover every view.
+//
+// A name carries the transcription capability only when EVERY one of its
+// mappings has a (transcription, yes) verdict (transcriptionRows, keyed by
+// mapping id) AND would pass both flavor stages of a transcription request
+// (viewServesAudio): transcription is the same openai_audio flavor as speech,
+// so the flavor half is identical and only the verdict row differs. It is
+// fail-closed exactly as speechFlagsByName is: a "no" row and a MISSING row
+// (never probed) both AND in as false, and a name starts true on its first
+// mapping and is only ever ANDed down, never up. Transcription is independent
+// of every other capability: a speech=yes, image=yes or vision=yes verdict never
+// makes a model a transcription candidate, and a pure-ASR model (transcription
+// yes, speech no) folds transcription=true beside speech=false.
+func transcriptionFlagsByName(views []mappingView, transcriptionRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return transcriptionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesAudio(view, idx)
+	})
+}
+
 // foldMappingFlags is the per-name AND shared by the capability folds: for each
 // gateway model name among views, true only when ok holds for EVERY one of its
 // mappings. A name starts true on its first mapping and is only ever ANDed
@@ -3066,14 +3118,16 @@ func viewServesImages(view mappingView, idx runtimeSpecIndex) bool {
 	return viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorOpenAIImages)
 }
 
-// viewServesAudio is viewServesImages' speech twin: whether a speech request
-// resolved to this mapping would pass both flavor stages. That is the
+// viewServesAudio is viewServesImages' speech twin: whether a speech or a
+// transcription request (both are the openai_audio flavor) resolved to this
+// mapping would pass both flavor stages. That is the
 // openai_audio flavor half (routing.MappingHasAPIFlavor): CANDIDACY admits only
 // an application that declares openai_audio, and the speech relay then holds the
 // mapping's effective flavors to it too -- the spec's for a server_agent mapping
 // with a spec row, the application's otherwise. The same fail-closed answer for
 // an application whose spec read failed: its spec may exclude openai_audio, and
-// a speech flag that is wrong sends a speech request to a model that refuses it.
+// a speech or transcription flag that is wrong sends a request to a model that
+// refuses it.
 func viewServesAudio(view mappingView, idx runtimeSpecIndex) bool {
 	return viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorOpenAIAudio)
 }

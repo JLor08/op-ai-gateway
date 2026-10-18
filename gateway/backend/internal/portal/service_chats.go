@@ -66,6 +66,10 @@ const (
 	// chatKindSpeech is the ChatRunSettings.Kind of a text-to-speech thread: each
 	// send turns the user's text into an audio answer via /v1/audio/speech.
 	chatKindSpeech = "speech"
+	// chatKindTranscription is the ChatRunSettings.Kind of a speech-to-text
+	// thread: each send turns the audio the user attached into a text transcript
+	// via /v1/audio/transcriptions.
+	chatKindTranscription = "transcription"
 	// maxChatTitleLen caps the plaintext chat title (in runes).
 	maxChatTitleLen = 200
 	// MaxChatContentBytes caps the pre-seal (raw JSON) content blob at 4 MiB. It
@@ -396,10 +400,11 @@ type ChatRunSettings struct {
 	// whenever ServerOverride is "" — see the self-heal in PrepareChatRun.
 	ServerOverrideForceUnreachable bool `json:"server_override_force_unreachable,omitempty"`
 	// Kind pins what this thread's runs are: "" (text, the default and every
-	// pre-existing chat), "image" or "speech". It is established by the FIRST
-	// send and then forced by PrepareChatRun on every later send, because the
-	// composer's affordances follow the thread rather than the currently-picked
-	// model -- see ADR-043 (b) in docs/architecture/09-architecture-decisions.md.
+	// pre-existing chat), "image", "speech" or "transcription". It is established
+	// by the FIRST send and then forced by PrepareChatRun on every later send,
+	// because the composer's affordances follow the thread rather than the
+	// currently-picked model -- see ADR-043 (b) in
+	// docs/architecture/09-architecture-decisions.md.
 	//
 	// It is a UI constraint, NOT an authorization: this struct is the POST
 	// body verbatim (chat_run_endpoints.go), so a client can submit any value
@@ -429,6 +434,16 @@ type ChatRunSettings struct {
 	// between sends. Declared last, after Image, on purpose: a field added later
 	// must not move an existing chat's serialized bytes.
 	Audio *ChatAudioSettings `json:"audio,omitempty"`
+	// Transcription carries the speech-to-text knobs of a "transcription" thread.
+	// It follows Audio's contract exactly: nil (and omitted) for a text, image or
+	// speech thread, so their persisted settings stay byte-identical;
+	// PrepareChatRun clears it for any non-transcription kind to hold that even
+	// against a raw API client; and it is NOT force-pinned -- a client sends the
+	// thread's CURRENT transcription settings on every send and they are
+	// persisted, so the composer can change language/prompt between sends.
+	// Declared last, after Audio, on purpose: a field added later must not move an
+	// existing chat's serialized bytes.
+	Transcription *ChatTranscriptionSettings `json:"transcription,omitempty"`
 }
 
 // ChatImageSettings are the image-generation knobs a portal "image" thread
@@ -509,6 +524,41 @@ type ChatAudioSettings struct {
 	Passthrough map[string]json.RawMessage `json:"passthrough,omitempty"`
 }
 
+// ChatTranscriptionSettings are the speech-to-text knobs a portal
+// "transcription" thread forwards to /v1/audio/transcriptions. Every field is
+// optional and omitted when unset, so an unset field leaves the model on its own
+// default rather than being handed an inert zero. Only the OpenAI-shaped
+// first-class knobs live here; everything else -- the OpenAI "timestamp
+// granularities" and any native audio.cpp knob -- rides Passthrough. The
+// transcription request is multipart, so buildTranscriptionBody
+// (chat_runs_transcription.go) forwards the set fields as form fields next to
+// the audio file and merges Passthrough into the same form (the gateway relays
+// the body to audio.cpp unchanged), refusing the keys that would override the
+// form the run itself owns (model/file/response_format/stream). A raw-JSON
+// passthrough value is written as its natural form text: a string as itself, any
+// other value as its compact JSON. The gateway always asks for JSON and the
+// answer is rendered as text, so there is no response_format knob.
+type ChatTranscriptionSettings struct {
+	// Language is the ISO-639-1 code of the spoken language (e.g. "de"); "" leaves
+	// the model to detect it.
+	Language string `json:"language,omitempty"`
+	// Prompt is the optional text that steers the transcription's style or primes
+	// it with names and jargon; "" sends none.
+	Prompt string `json:"prompt,omitempty"`
+	// Temperature is the sampling temperature, passed through as given (the
+	// model's own range applies). A POINTER so an explicit 0 -- a real,
+	// deterministic setting -- stays distinguishable from "unset", exactly as
+	// ChatImageSettings.CFG does: nil is omitted, so only a temperature the
+	// composer set is forwarded.
+	Temperature *float64 `json:"temperature,omitempty"`
+	// Passthrough is the advanced extra-JSON surface: extra request fields merged
+	// into the /v1/audio/transcriptions form verbatim, keyed by field name. The
+	// values are raw JSON so a string, number, bool or object each reach the
+	// upstream with the exact type the user wrote, and they round-trip through
+	// the stored document untouched. A nil or empty map is omitted.
+	Passthrough map[string]json.RawMessage `json:"passthrough,omitempty"`
+}
+
 // PrepareRunRequest either appends a new user message or replaces the whole
 // message history (edit/regenerate). Exactly one of UserMessage / EditedHistory
 // is set.
@@ -551,7 +601,9 @@ func (d chatDoc) marshal() (json.RawMessage, error) {
 // (resolveChatBlobRefs); an image run's history is returned as stored, except
 // that the source image of its turn -- the image its last user message carries,
 // which makes the turn an edit -- is resolved to a data url too, or the run is
-// refused (resolveImageRunSource). Owner-scoped.
+// refused (resolveImageRunSource); a transcription run's likewise, except that
+// the source is the audio clip its last user message carries
+// (resolveTranscriptionRunSource). Owner-scoped.
 func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID string, req PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {
@@ -680,6 +732,13 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if req.Settings.Kind != chatKindSpeech {
 		req.Settings.Audio = nil
 	}
+	// And for the transcription settings and a transcription thread: they are
+	// cleared for every other kind (text, image and speech alike), while the two
+	// lines above already clear the image and audio settings of a transcription
+	// thread, as transcription is neither image nor speech.
+	if req.Settings.Kind != chatKindTranscription {
+		req.Settings.Transcription = nil
+	}
 
 	settingsRaw, err := json.Marshal(req.Settings)
 	if err != nil {
@@ -712,14 +771,25 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// or whose images cannot be read, stores nothing, so retrying it is not a
 	// duplicate turn.
 	//
+	// A transcription run is the audio twin of that: its input is the clip its
+	// last user message carries, so it resolves that one message's audio and no
+	// other (resolveTranscriptionRunSource), and refuses a clip the chat does not
+	// hold. It reads audio parts and nothing else; every other run reads image
+	// parts and nothing else, so a stored clip in a text, image or speech thread's
+	// history is left as the reference it is.
+	//
 	// A speech run takes the text branch on purpose: its input is the last user
 	// message's text and its history carries no image to resolve beyond what a
 	// text thread's would, so it needs no special source resolution of its own.
-	if req.Settings.Kind != chatKindImage {
-		if history, err = s.resolveChatBlobRefs(ctx, chatID, history); err != nil {
-			return nil, ChatRunSettings{}, err
-		}
-	} else if history, err = s.resolveImageRunSource(ctx, chatID, history); err != nil {
+	switch req.Settings.Kind {
+	case chatKindImage:
+		history, err = s.resolveImageRunSource(ctx, chatID, history)
+	case chatKindTranscription:
+		history, err = s.resolveTranscriptionRunSource(ctx, chatID, history)
+	default:
+		history, err = s.resolveChatBlobRefs(ctx, chatID, history)
+	}
+	if err != nil {
 		return nil, ChatRunSettings{}, err
 	}
 	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
@@ -880,6 +950,31 @@ func isMaskPart(raw json.RawMessage) bool {
 		mask = json.Unmarshal(member.val, &purpose) == nil && purpose == ImagePurposeMask
 	}
 	return mask
+}
+
+// MessageAudio is the url of every audio part of a message content, in order: what
+// a transcription-run executor sends as the clip to transcribe (an array content;
+// a plain string has none). It is MessageImages' audio twin and exported for the
+// same reason as MessageText, and it reads through rewriteBlobPart with the audio
+// kind -- the one definition of an audio part the extraction at a run commit and
+// the resolution of a transcription run's source already share -- so the executor
+// and the resolution cannot disagree about what counts as a clip (an object whose
+// audio_url is an object with a string url, members matched without regard to
+// case). An audio part has no mask, nor any other tag, so only the urls are
+// returned.
+func MessageAudio(content json.RawMessage) []string {
+	parts, ok := parseJSONArray(content)
+	if !ok {
+		return nil
+	}
+	var urls []string
+	for _, raw := range parts {
+		_, _, _ = rewriteBlobPart(raw, audioPartKind, func(_ blobPartKind, url string) (string, json.RawMessage, error) {
+			urls = append(urls, url)
+			return url, nil, nil
+		})
+	}
+	return urls
 }
 
 // AssistantTurn is the generated assistant message a run persists.

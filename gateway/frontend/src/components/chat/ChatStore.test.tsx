@@ -14,6 +14,7 @@ import {
   type ChatStore,
 } from './ChatStore';
 import { ToastProvider } from '../shared/ToastProvider';
+import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
 import { PortalApiError } from '../../api/transport';
 import { messages, type Locale } from '../../i18n';
 import type {
@@ -23,6 +24,14 @@ import type {
   PortalToken,
   ServerModelOption,
 } from '../../api';
+
+// jsdom has no WebAudio, so the browser-side conversion of a clip to WAV (audioToWav.test.ts's
+// subject) is a stand-in here: it "converts" by prefixing the bytes, so a part's payload says
+// whether the CONVERTED clip (not the upload, merely relabelled) is what the turn carries.
+vi.mock('../shared/audioToWav', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../shared/audioToWav')>()),
+  audioBlobToWav: vi.fn(async (blob: Blob) => new Blob(['WAV:', blob], { type: 'audio/wav' })),
+}));
 
 const models: ModelOption[] = [
   { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
@@ -197,13 +206,39 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
       <span data-testid="model-image-edit">{String(c.modelImageEdit)}</span>
       <span data-testid="model-speech-capable">{String(c.modelSpeechCapable)}</span>
+      <span data-testid="model-transcription-capable">{String(c.modelTranscriptionCapable)}</span>
       {/* The speech thread's concrete audio settings (voice / speed / passthrough text). */}
       <span data-testid="audio-settings">{JSON.stringify(c.audioSettings)}</span>
+      {/* The transcription thread's concrete settings (language / prompt / temperature /
+          passthrough text). */}
+      <span data-testid="transcription-settings">{JSON.stringify(c.transcriptionSettings)}</span>
       <span data-testid="attach-mode">{c.attachMode}</span>
       {/* The composer's attachment strip: the source image(s) and the mask, as the
           urls the next send would carry. */}
       <span data-testid="composer-images">{c.images.join('|')}</span>
       <span data-testid="composer-mask">{c.mask ?? ''}</span>
+      {/* The transcription composer's clip: the data url the next send would carry, and the
+          name it is shown under ('' for a recording). */}
+      <span data-testid="composer-audio">{c.audio?.url ?? ''}</span>
+      <span data-testid="composer-audio-name">{c.audio?.name ?? ''}</span>
+      <input
+        type="file"
+        aria-label="probe-audio-file"
+        onChange={(e) => void c.handleFiles(e.target.files)}
+      />
+      {/* A browser recording, as the recorder hands it over: the recorder's own type, with the
+          codec parameter. */}
+      <button
+        type="button"
+        onClick={() =>
+          void c.attachRecording(new Blob(['recorded'], { type: 'audio/webm;codecs=opus' }))
+        }
+      >
+        attach-recording
+      </button>
+      <button type="button" onClick={() => c.removeAudio()}>
+        remove-audio
+      </button>
       {/* The fetched per-model image options ("null" until/unless one arrives). */}
       <span data-testid="model-image-options">{JSON.stringify(c.modelImageOptions)}</span>
       <span data-testid="model-options">{c.modelOptions.map((o) => o.id).join(',')}</span>
@@ -253,6 +288,39 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
         }
       >
         reserve-audio-passthrough
+      </button>
+      {/* The transcription composer's settings, moved off their defaults (an explicit
+          temperature of 0 among them), then the passthrough text broken, and then naming a
+          field the run owns (case-insensitively), each without touching the rest. */}
+      <button
+        type="button"
+        onClick={() =>
+          c.setTranscriptionSettings({
+            language: 'de',
+            prompt: 'Namen: Zoe',
+            temperature: '0',
+            passthrough: '{"beam":5}',
+          })
+        }
+      >
+        set-transcription
+      </button>
+      <button
+        type="button"
+        onClick={() => c.setTranscriptionSettings((s) => ({ ...s, passthrough: '{"beam":' }))}
+      >
+        break-transcription-passthrough
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          c.setTranscriptionSettings((s) => ({
+            ...s,
+            passthrough: '{"beam": 1, "File": "x"}',
+          }))
+        }
+      >
+        reserve-transcription-passthrough
       </button>
       {/* Selects a caller-supplied model id (a test's "pick an available model"
           action) without needing a full SearchableSelect in this probe. */}
@@ -3956,6 +4024,938 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         if (!kind) expect(Object.keys(saved.content.settings)).not.toContain('kind');
       },
     );
+  });
+
+  // A speech-to-text model is picked like a text-to-speech one: the chat offers it, the
+  // empty thread's composer follows it (prospectiveKind), and the first send pins the thread as
+  // "transcription". The transcription settings ride the run only for that kind.
+  describe(`ChatStoreProvider transcription-thread kind [${locale}]`, () => {
+    // An ASR model: only the openai_audio flavor, with the backend's transcription verdict.
+    const whisper: ModelOption = {
+      id: 'whisper',
+      display_name: 'whisper',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      transcription: true,
+    };
+    const kokoro: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const transcriptionModels: ModelOption[] = [whisper];
+    const clip = [
+      { type: 'audio_url' as const, audio_url: { url: 'data:audio/webm;base64,AAAA' } },
+    ];
+    const transcriptionThread = (
+      transcription?: unknown,
+      opts: { withTurn?: boolean; title?: string } = {},
+    ): ChatRow[] => [
+      {
+        id: 'c1',
+        title: opts.title ?? 'C1',
+        created_at: T,
+        updated_at: T,
+        content: {
+          settings: {
+            model: whisper.id,
+            kind: 'transcription',
+            ...(transcription ? { transcription } : {}),
+          },
+          messages:
+            (opts.withTurn ?? true)
+              ? [
+                  { id: 'u1', role: 'user', content: clip },
+                  { id: 'a1', role: 'assistant', content: 'hello there', status: 'complete' },
+                ]
+              : [],
+        },
+      },
+    ];
+    const startSettings = (call = 0) =>
+      (chatApi.spies.startChatRun.mock.calls[call][1] as { settings: Record<string, unknown> })
+        .settings;
+    // A transcription turn is audio only: the clip is attached through handleFiles (a wav
+    // file here) and Send sends it. sendText stands in as the turn of the OTHER kinds.
+    const sendText = (text: string) => {
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: text } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    };
+    const attachClip = async (file = new File(['RIFFclip'], 'clip.wav', { type: 'audio/wav' })) => {
+      fireEvent.change(screen.getByLabelText('probe-audio-file'), { target: { files: [file] } });
+      await waitFor(() => expect(screen.getByTestId('composer-audio').textContent).not.toBe(''));
+    };
+    const sendClip = async () => {
+      await attachClip();
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    };
+    // The data url of a clip the converter stand-in (see the vi.mock above) made of an upload
+    // that held `text`: always audio/wav, the converted bytes.
+    const wavUrl = (text: string) => `data:audio/wav;base64,${btoa(`WAV:${text}`)}`;
+    const clipUrl = wavUrl('RIFFclip');
+    const toWav = vi.mocked(audioBlobToWav);
+    beforeEach(() => toWav.mockClear());
+
+    it('offers a transcription-capable audio model, and only that one of the audio models', async () => {
+      const shape = (
+        id: string,
+        flavors: string[],
+        flags: { speech?: boolean; transcription?: boolean } = {},
+      ): ModelOption => ({ id, display_name: id, flavors, loading_on_count: 0, ...flags });
+      renderProvider([], {
+        models: [
+          shape('text-model', ['openai', 'anthropic']),
+          // Unprobed audio: openai_audio without any verdict.
+          shape('audio-no-verdict', ['openai_audio']),
+          shape('asr-no', ['openai_audio'], { transcription: false }),
+          shape('asr-yes', ['openai_audio'], { transcription: true }),
+          // A verdict without the flavor the transcription endpoint is served under.
+          shape('asr-wrong-flavor', ['anthropic'], { transcription: true }),
+          shape('audio-and-text', ['openai', 'openai_audio'], { transcription: false }),
+          // The speech admission is untouched next to it.
+          shape('tts-yes', ['openai_audio'], { speech: true }),
+        ],
+      });
+      await waitForReady();
+      expect(screen.getByTestId('model-options').textContent).toBe(
+        'text-model,asr-yes,audio-and-text,tts-yes',
+      );
+    });
+
+    it('leaves the offered text, image and speech models exactly as they were', async () => {
+      const shape = (id: string, flavors: string[], image?: boolean): ModelOption => ({
+        id,
+        display_name: id,
+        flavors,
+        loading_on_count: 0,
+        image,
+      });
+      renderProvider([], {
+        models: [
+          shape('text-model', ['openai']),
+          shape('sd-verdict', ['openai_images'], true),
+          shape('sd-no-verdict', ['openai_images'], false),
+          kokoro,
+          whisper,
+        ],
+      });
+      await waitForReady();
+      expect(screen.getByTestId('model-options').textContent).toBe(
+        'text-model,sd-verdict,kokoro,whisper',
+      );
+    });
+
+    it('switches an empty thread to the transcription kind when a transcription model is picked', async () => {
+      renderProvider([], { models: [...models, whisper] });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+      expect(screen.getByTestId('model-transcription-capable').textContent).toBe('false');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      expect(screen.getByTestId('model-transcription-capable').textContent).toBe('true');
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('false');
+      expect(screen.getByTestId('model-image-capable').textContent).toBe('false');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+      // A transcription run reads only its audio, so no image can be attached.
+      expect(screen.getByTestId('attach-mode').textContent).toBe('none');
+
+      // And back to a text model: the empty thread follows the pick again.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+      expect(screen.getByTestId('model-transcription-capable').textContent).toBe('false');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('');
+    });
+
+    // The precedence chain is image -> speech -> transcription. A model carrying two of the
+    // verdicts only arises from manual configuration (the probe never produces it), and the
+    // earlier kind keeps what it always did.
+    it.each([
+      ['image and transcription', { image: true, transcription: true }, 'image'],
+      ['speech and transcription', { speech: true, transcription: true }, 'speech'],
+      [
+        'image, speech and transcription',
+        { image: true, speech: true, transcription: true },
+        'image',
+      ],
+      ['transcription alone', { transcription: true }, 'transcription'],
+    ] as [string, Partial<ModelOption>, string][])(
+      'picks the %s model’s kind by that precedence',
+      async (_label, flags, kind) => {
+        renderProvider([], {
+          models: [{ ...whisper, id: 'multi', display_name: 'multi', ...flags }],
+        });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-multi' }));
+        expect(screen.getByTestId('model-transcription-capable').textContent).toBe('true');
+        expect(screen.getByTestId('chat-kind').textContent).toBe(kind);
+      },
+    );
+
+    it('starts the first send as a transcription run carrying the settings, and pins the thread', async () => {
+      renderProvider([], { models: [...models, whisper] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      fireEvent.click(screen.getByRole('button', { name: 'set-transcription' }));
+      await sendClip();
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      const settings = startSettings();
+      expect(settings.model).toBe('whisper');
+      expect(settings.kind).toBe('transcription');
+      // temperature 0 is an explicit, deterministic setting and is sent as such.
+      expect(settings.transcription).toEqual({
+        language: 'de',
+        prompt: 'Namen: Zoe',
+        temperature: 0,
+        passthrough: { beam: 5 },
+      });
+      // A transcription run carries no image or speech knobs.
+      expect('image' in settings).toBe(false);
+      expect('audio' in settings).toBe(false);
+
+      // The pin wins from now on: a text model picked afterwards does not turn the thread
+      // back into a text thread.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+      expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+    });
+
+    it('sends only the transcription fields the user set', async () => {
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      await sendClip();
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(startSettings().kind).toBe('transcription');
+      expect(startSettings().transcription).toEqual({});
+    });
+
+    // Review focus 2: a text, image or speech thread must be byte-identical. None carries a
+    // transcription key on the run body, whatever the transcription state holds.
+    it.each([
+      ['a text thread', [models[0]], 'gpt-oss-20b', ''],
+      [
+        'an image thread',
+        [
+          {
+            id: 'sd-turbo',
+            display_name: 'sd-turbo',
+            flavors: ['openai'],
+            loading_on_count: 0,
+            image: true,
+          },
+        ],
+        'sd-turbo',
+        'image',
+      ],
+      ['a speech thread', [kokoro], 'kokoro', 'speech'],
+    ] as [string, ModelOption[], string, string][])(
+      'sends no transcription key with the run of %s',
+      async (_label, pool, pick, kind) => {
+        renderProvider([], { models: pool });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: `pick-${pick}` }));
+        // Transcription state that is not defaults must still never reach another kind.
+        fireEvent.click(screen.getByRole('button', { name: 'set-transcription' }));
+        sendText('hello');
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const settings = startSettings();
+        expect(settings.kind).toBe(kind);
+        expect('transcription' in settings).toBe(false);
+        expect('image' in settings).toBe(kind === 'image');
+        expect('audio' in settings).toBe(kind === 'speech');
+      },
+    );
+
+    it('refuses to send a transcription turn whose advanced passthrough is not a JSON object', async () => {
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      fireEvent.click(screen.getByRole('button', { name: 'set-transcription' }));
+      fireEvent.click(screen.getByRole('button', { name: 'break-transcription-passthrough' }));
+      await sendClip();
+
+      // Said, not silently dropped: the knob the user typed would otherwise vanish.
+      expect(await screen.findByText(t.chatTranscriptionPassthroughInvalid)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // Nothing was stored or cleared: the composer keeps the clip, the thread no turn.
+      expect(screen.getByTestId('composer-audio').textContent).toBe(clipUrl);
+      expect(screen.getByTestId('count').textContent).toBe('0');
+
+      // Fixing the text lets the same send through.
+      fireEvent.click(screen.getByRole('button', { name: 'set-transcription' }));
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+    });
+
+    it('refuses a regenerate whose advanced passthrough is not a JSON object, transcript untouched', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'break-transcription-passthrough' }));
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      expect(await screen.findByText(t.chatTranscriptionPassthroughInvalid)).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    // The backend ends such a run gateway.chat_run_transcription_reserved_field AFTER the
+    // turn is committed; the store mirrors the list and refuses the send first, naming the
+    // field exactly as the user wrote it.
+    it('refuses to send a transcription turn whose passthrough names a reserved field, and says which', async () => {
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      fireEvent.click(screen.getByRole('button', { name: 'reserve-transcription-passthrough' }));
+      await sendClip();
+
+      expect(await screen.findByText(t.chatTranscriptionPassthroughReserved('File'))).toBeTruthy();
+      expect(screen.queryByText(t.chatTranscriptionPassthroughInvalid)).toBeNull();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      // Nothing was stored or cleared.
+      expect(screen.getByTestId('composer-audio').textContent).toBe(clipUrl);
+      expect(screen.getByTestId('count').textContent).toBe('0');
+
+      // Fixing the text lets the same send through.
+      fireEvent.click(screen.getByRole('button', { name: 'set-transcription' }));
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+    });
+
+    it('refuses a regenerate whose passthrough names a reserved field, transcript untouched', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'reserve-transcription-passthrough' }));
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      expect(await screen.findByText(t.chatTranscriptionPassthroughReserved('File'))).toBeTruthy();
+      expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('count').textContent).toBe('2');
+    });
+
+    it('does not apply the transcription guard to a speech thread, nor the speech one to a transcription thread', async () => {
+      // A speech thread whose TRANSCRIPTION state is broken still sends...
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      fireEvent.click(screen.getByRole('button', { name: 'break-transcription-passthrough' }));
+      sendText('hello');
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(startSettings().kind).toBe('speech');
+      cleanup();
+
+      // ...and a transcription thread whose AUDIO (speech) state is broken still sends.
+      chatApi = makeChatApi();
+      FakeEventSource.instances = [];
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      fireEvent.click(screen.getByRole('button', { name: 'break-audio-passthrough' }));
+      await sendClip();
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(startSettings().kind).toBe('transcription');
+    });
+
+    describe('the audio turn', () => {
+      const bodyOf = (call = 0) =>
+        chatApi.spies.startChatRun.mock.calls[call][1] as {
+          user_message?: unknown;
+          edited_history?: { role: string; content: unknown }[];
+        };
+
+      it('sends the clip as an audio-only user turn, shows it in the transcript and clears the composer', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await sendClip();
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        // The turn IS the clip: one audio_url part, as audio/wav, no text part.
+        expect(bodyOf().user_message).toEqual([{ type: 'audio_url', audio_url: { url: clipUrl } }]);
+        expect(startSettings().kind).toBe('transcription');
+        expect(screen.getByTestId('count').textContent).toBe('1');
+        expect(screen.getByTestId('last-parts').textContent).toBe(`audio_url:${clipUrl}`);
+        // Sent: the clip is no longer waiting in the composer.
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+        expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+      });
+
+      it('takes the clip of a recording through the same path, converted to audio/wav', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        fireEvent.click(screen.getByRole('button', { name: 'attach-recording' }));
+        await waitFor(() => expect(screen.getByTestId('composer-audio').textContent).not.toBe(''));
+
+        // A recording has no file name; the composer labels it itself. The recorder's own
+        // audio/webm;codecs=opus is what the converter was given, and not what is attached.
+        expect(screen.getByTestId('composer-audio-name').textContent).toBe('');
+        expect(toWav.mock.calls[0][0].type).toBe('audio/webm;codecs=opus');
+        expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('recorded'));
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(bodyOf().user_message).toEqual([
+          { type: 'audio_url', audio_url: { url: wavUrl('recorded') } },
+        ]);
+      });
+
+      it('refuses a recording the browser cannot convert, attaching nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('unsupported'));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        fireEvent.click(screen.getByRole('button', { name: 'attach-recording' }));
+
+        expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+      });
+
+      it('names a picked file by its own name, and attaches it as the audio/wav it was converted to', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip(new File(['x'], 'standup.m4a', { type: 'audio/x-m4a' }));
+
+        expect(screen.getByTestId('composer-audio-name').textContent).toBe('standup.m4a');
+        expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('x'));
+      });
+
+      // The payload is whatever follows the LAST comma of the reader's data url: base64 has none,
+      // but a media-type parameter may. (The converted blob is audio/wav, so a stand-in that
+      // reports a parameterised type is what reaches the reader here.)
+      it('reads the payload of a converted clip whose reported type contains a comma', async () => {
+        toWav.mockResolvedValueOnce(new Blob(['pcm'], { type: 'audio/wav;note=a,b' }));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip(new File(['x'], 'clip.wav', { type: 'audio/wav' }));
+
+        expect(screen.getByTestId('composer-audio').textContent).toBe(
+          `data:audio/wav;base64,${btoa('pcm')}`,
+        );
+      });
+
+      // Not audio the decoder can read: said, and nothing attached.
+      it('refuses a file the browser cannot decode, attaching nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+          target: { files: [new File(['x'], 'broken.mp3', { type: 'audio/mpeg' })] },
+        });
+
+        expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+      });
+
+      it('keeps the clip it had when the next one cannot be decoded', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip();
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+          target: { files: [new File(['x'], 'broken.mp3', { type: 'audio/mpeg' })] },
+        });
+
+        expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
+        expect(screen.getByTestId('composer-audio').textContent).toBe(clipUrl);
+      });
+
+      it('removes the clip, and sending then has nothing to send', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip();
+
+        fireEvent.click(screen.getByRole('button', { name: 'remove-audio' }));
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        expect(await screen.findByText(t.chatTranscriptionNeedsAudio)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      });
+
+      // A transcription turn has no text to send: typed text cannot stand in for the clip, and
+      // is not lost when the clip goes.
+      it('refuses a send with no clip, whatever text was typed', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        sendText('please transcribe this');
+
+        expect(await screen.findByText(t.chatTranscriptionNeedsAudio)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('0');
+      });
+
+      it('sends the clip alone: text typed before the model was picked is neither in the turn nor its title', async () => {
+        renderProvider([], { models: [...models, whisper] });
+        await waitForReady();
+        fireEvent.change(screen.getByLabelText('probe-input'), {
+          target: { value: 'typed first' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await sendClip();
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(bodyOf().user_message).toEqual([{ type: 'audio_url', audio_url: { url: clipUrl } }]);
+        // The text would have named the chat (maybeAutoTitle), had the turn been its text.
+        expect(screen.getByTestId('chats').textContent).not.toContain('typed first');
+        expect(screen.getByTestId('last-parts').textContent).not.toContain('typed first');
+      });
+
+      it('rolls the user turn back when the run cannot be started', async () => {
+        chatApi.spies.startChatRun.mockRejectedValueOnce(new Error('boom'));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await sendClip();
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(screen.getByTestId('count').textContent).toBe('0'));
+      });
+
+      // An image is not what a transcription thread takes, and an audio file is not what a
+      // text thread's attach button takes: the thread's kind decides what handleFiles does.
+      it('refuses an image on a transcription thread instead of attaching it', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+          target: { files: [new File(['x'], 'cat.png', { type: 'image/png' })] },
+        });
+
+        expect(await screen.findByText(t.chatAudioErrorType)).toBeTruthy();
+        expect(screen.getByTestId('composer-images').textContent).toBe('');
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+      });
+
+      it('keeps an audio file out of a text thread', async () => {
+        renderProvider([], { models: [models[0], whisper] });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: `pick-${models[0].id}` }));
+        fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+          target: { files: [new File(['x'], 'clip.wav', { type: 'audio/wav' })] },
+        });
+
+        // Not an image, so the image path says so as it always did; no clip appears.
+        expect(await screen.findByText(t.chatImageErrorType)).toBeTruthy();
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+      });
+
+      it('drops a clip when the thread stops being a transcription one', async () => {
+        renderProvider([], { models: [models[0], whisper] });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip();
+
+        fireEvent.click(screen.getByRole('button', { name: `pick-${models[0].id}` }));
+
+        await waitFor(() => expect(screen.getByTestId('composer-audio').textContent).toBe(''));
+      });
+
+      it('keeps a clip across a switch to another transcription model', async () => {
+        const other: ModelOption = { ...whisper, id: 'whisper-2', display_name: 'whisper-2' };
+        renderProvider([], { models: [whisper, other] });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip();
+
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper-2' }));
+
+        expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+        expect(screen.getByTestId('composer-audio').textContent).toBe(clipUrl);
+      });
+    });
+
+    // A replay sends the thread's last user turn again, and what it transcribes is that turn's
+    // clip: a transcription turn without one has nothing to transcribe, and the endpoint would
+    // answer only after the transcript was truncated and the turn stored.
+    describe('replaying a turn that has no audio', () => {
+      const withTurns = (messages: unknown[]): ChatRow[] => [
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: {
+            settings: { model: whisper.id, kind: 'transcription' },
+            messages,
+          },
+        },
+      ];
+      const audioless = [
+        { id: 'u1', role: 'user', content: 'a stray text turn' },
+        { id: 'a1', role: 'assistant', content: 'hello there', status: 'complete' },
+      ];
+
+      it('blocks a regenerate, says why and leaves the transcript alone', async () => {
+        chatApi = makeChatApi(withTurns(audioless));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        expect(await screen.findByText(t.chatTranscriptionReplayNoAudio)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('2');
+      });
+
+      it('blocks an edit of such a turn too: its text is not what is transcribed', async () => {
+        chatApi = makeChatApi(withTurns(audioless));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'edit-u1' }));
+
+        expect(await screen.findByText(t.chatTranscriptionReplayNoAudio)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('2');
+      });
+
+      it('judges the history that is replayed, not the whole transcript', async () => {
+        chatApi = makeChatApi(
+          withTurns([
+            ...audioless,
+            { id: 'u2', role: 'user', content: clip },
+            { id: 'a2', role: 'assistant', content: 'second take', status: 'complete' },
+          ]),
+        );
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+
+        // The later turn has its clip, but replaying the FIRST turn drops it: blocked.
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+        expect(await screen.findByText(t.chatTranscriptionReplayNoAudio)).toBeTruthy();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(screen.getByTestId('count').textContent).toBe('4');
+
+        // Replaying the second turn keeps its clip in the history: allowed.
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a2' }));
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+          edited_history: { id: string }[];
+        };
+        expect(body.edited_history.map((m) => m.id)).toEqual(['u1', 'a1', 'u2']);
+      });
+
+      it('lets a turn with a stored clip through: a committed turn holds a blob reference', async () => {
+        const stored = [
+          {
+            type: 'audio_url',
+            audio_url: { url: '/api/portal/chat-blobs/blob_0123456789abcdef0123456789abcdef' },
+          },
+        ];
+        chatApi = makeChatApi(
+          withTurns([
+            { id: 'u1', role: 'user', content: stored },
+            { id: 'a1', role: 'assistant', content: 'hello there', status: 'complete' },
+          ]),
+        );
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(screen.queryByText(t.chatTranscriptionReplayNoAudio)).toBeNull();
+      });
+
+      it('is a transcription rule: a text thread replays its text turn as ever', async () => {
+        chatApi = makeChatApi([
+          {
+            id: 'c1',
+            title: 'C1',
+            created_at: T,
+            updated_at: T,
+            content: { settings: { model: 'gpt-oss-20b' }, messages: audioless },
+          },
+        ]);
+        renderProvider([], { models });
+        await waitForReady();
+
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(screen.queryByText(t.chatTranscriptionReplayNoAudio)).toBeNull();
+      });
+    });
+
+    it('regenerates a transcription turn without the vision guard: an audio input is not an image', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+
+      fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(screen.queryByText(t.chatImageModelUnsupported)).toBeNull();
+      expect(startSettings().kind).toBe('transcription');
+      // The replayed history still carries the clip: it is what the run transcribes.
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+        edited_history: { role: string; content: unknown }[];
+      };
+      expect(body.edited_history).toEqual([
+        expect.objectContaining({ role: 'user', content: clip }),
+      ]);
+    });
+
+    it('keeps the clip when the text of a transcription turn is edited', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'edit-u1' }));
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+        edited_history: { role: string; content: unknown }[];
+      };
+      // The edited turn still holds the audio the run reads; losing it would leave the run
+      // with nothing to transcribe.
+      expect(body.edited_history).toHaveLength(1);
+      expect(body.edited_history[0].content).toEqual([
+        { type: 'text', text: 'edited text' },
+        ...clip,
+      ]);
+    });
+
+    it('persists the transcription settings with the thread and seeds them back on reload', async () => {
+      chatApi = makeChatApi(transcriptionThread({ language: 'en', temperature: 0.8 }));
+      const { unmount } = renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+      // Seeded from the loaded document, temperature shown as the blank-able string.
+      expect(JSON.parse(screen.getByTestId('transcription-settings').textContent!)).toEqual({
+        language: 'en',
+        prompt: '',
+        temperature: '0.8',
+        passthrough: '',
+      });
+
+      // The transcription settings are the ONLY thing that changes here, so this also holds
+      // the debounced save's dependency list: without transcriptionSettings in it, no save
+      // is ever scheduled for a settings-only edit.
+      fireEvent.click(screen.getByRole('button', { name: 'set-transcription' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { kind?: string; transcription?: unknown } };
+      };
+      expect(saved.content.settings.kind).toBe('transcription');
+      expect(saved.content.settings.transcription).toEqual({
+        language: 'de',
+        prompt: 'Namen: Zoe',
+        temperature: 0,
+        passthrough: { beam: 5 },
+      });
+
+      // ...and the reload reads them back out of the saved document (the PUT full-replaces
+      // the blob, so a setting not seeded here is erased next save).
+      unmount();
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+      expect(JSON.parse(screen.getByTestId('transcription-settings').textContent!)).toMatchObject({
+        language: 'de',
+        prompt: 'Namen: Zoe',
+        temperature: '0',
+      });
+    });
+
+    it('keeps the stored transcription settings when an unrelated setting is saved', async () => {
+      chatApi = makeChatApi(
+        transcriptionThread({ language: 'en', temperature: 0, passthrough: { a: 1 } }),
+      );
+      renderProvider([], { models: transcriptionModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { transcription?: unknown } };
+      };
+      expect(saved.content.settings.transcription).toEqual({
+        language: 'en',
+        temperature: 0,
+        passthrough: { a: 1 },
+      });
+    });
+
+    it.each([
+      ['text', undefined],
+      ['image', 'image'],
+      ['speech', 'speech'],
+    ] as const)(
+      'writes no transcription key when saving a %s thread, whatever the transcription state holds',
+      async (_label, kind) => {
+        chatApi = makeChatApi([
+          {
+            id: 'c1',
+            title: 'C1',
+            created_at: T,
+            updated_at: T,
+            content: {
+              settings: { model: models[0].id, ...(kind ? { kind } : {}) },
+              messages: [
+                { id: 'u1', role: 'user', content: 'hello' },
+                { id: 'a1', role: 'assistant', content: 'hi', status: 'complete' },
+              ],
+            },
+          },
+        ]);
+        renderProvider();
+        await waitForReady();
+
+        // Transcription state moved on a thread that is not a transcription one: it must not
+        // persist.
+        fireEvent.click(screen.getByRole('button', { name: 'set-transcription' }));
+        fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+        const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+          content: { settings: Record<string, unknown> };
+        };
+        expect(Object.keys(saved.content.settings)).not.toContain('transcription');
+        if (!kind) expect(Object.keys(saved.content.settings)).not.toContain('kind');
+      },
+    );
+
+    // Fork 4: the first user turn is audio only, so the usual title (the first user message's
+    // text) is empty. A completed transcription run names an untitled chat after its transcript.
+    //
+    // The runs below are REPLAYS (regenerate) of a loaded audio-only turn: it is the one way to
+    // start a run from an audio-only turn before the composer can attach a clip (a typed text
+    // would itself title the chat as it is sent), and a replay is also a real way for a chat to
+    // reach its first transcript -- the first run failed, the user tries again.
+    describe('titling from the transcript', () => {
+      const untitled = (title = ''): ChatRow[] => transcriptionThread(undefined, { title });
+      const regenerateAndFinish = async (done: Record<string, unknown>) => {
+        fireEvent.click(screen.getByRole('button', { name: 'regenerate-a1' }));
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+        await act(async () => {
+          FakeEventSource.instances[0].emit('done', done);
+        });
+        await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+      };
+      const transcriptDone = (text: string, extra: Record<string, unknown> = {}) => ({
+        status: 'completed',
+        kind: 'transcription',
+        content_parts: [{ type: 'text', text }],
+        ...extra,
+      });
+      // The saves that carry a title and nothing else (no `content` key): the title-only PUT
+      // a rename makes, as against the autosave of the whole document.
+      const titleOnlySaves = () =>
+        chatApi.spies.saveChat.mock.calls.filter(([, body]) => !('content' in body));
+
+      it('titles an untitled chat from the transcript, shows it and persists it', async () => {
+        chatApi = makeChatApi(untitled());
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        expect(screen.getByTestId('chats').textContent).toBe('c1:');
+
+        await regenerateAndFinish(
+          transcriptDone('Good morning, this is a note about the quarterly planning meeting'),
+        );
+
+        // deriveTitle's 40-character cut, as it falls.
+        const title = 'Good morning, this is a note about the q';
+        await waitFor(() => expect(screen.getByTestId('chats').textContent).toBe(`c1:${title}`));
+        // Persisted by a title-only save, so it holds with no later autosave and for a chat that
+        // is not the active one.
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalledWith('c1', { title }));
+      });
+
+      it('leaves a chat that already has a title alone', async () => {
+        chatApi = makeChatApi(untitled('My memo'));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+
+        await regenerateAndFinish(transcriptDone('Something else entirely'));
+
+        expect(screen.getByTestId('chats').textContent).toBe('c1:My memo');
+        expect(titleOnlySaves()).toEqual([]);
+      });
+
+      it('treats the new-chat placeholder as no title yet', async () => {
+        chatApi = makeChatApi(untitled(t.chatNewChat));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        expect(screen.getByTestId('chats').textContent).toBe(`c1:${t.chatNewChat}`);
+
+        await regenerateAndFinish(transcriptDone('Hello world'));
+
+        await waitFor(() => expect(screen.getByTestId('chats').textContent).toBe('c1:Hello world'));
+      });
+
+      it('leaves the chat untitled when the transcript is empty', async () => {
+        chatApi = makeChatApi(untitled());
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+
+        await regenerateAndFinish(transcriptDone('   \n '));
+
+        expect(screen.getByTestId('chats').textContent).toBe('c1:');
+        expect(titleOnlySaves()).toEqual([]);
+      });
+
+      it.each([
+        ['error', { status: 'error', error: 'gateway.chat_run_timeout' }],
+        ['canceled', { status: 'canceled' }],
+      ] as const)('does not title from a run that ended %s', async (_status, outcome) => {
+        chatApi = makeChatApi(untitled());
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+
+        await regenerateAndFinish({
+          kind: 'transcription',
+          content_parts: [{ type: 'text', text: 'partial words' }],
+          ...outcome,
+        });
+
+        expect(screen.getByTestId('chats').textContent).toBe('c1:');
+        expect(titleOnlySaves()).toEqual([]);
+      });
+
+      // The title comes from the transcript only for a transcription run: a text or speech
+      // reply is not a transcript, and those chats are named by the first message as before.
+      it.each([
+        ['a text run', '', 'Hello from the model'],
+        ['a speech run', 'speech', 'Say this please'],
+      ] as const)('does not title %s from its reply', async (_label, kind, reply) => {
+        chatApi = makeChatApi([
+          {
+            id: 'c1',
+            title: '',
+            created_at: T,
+            updated_at: T,
+            content: {
+              settings: { model: kokoro.id, ...(kind ? { kind } : {}) },
+              messages: [
+                { id: 'u1', role: 'user', content: 'say hi' },
+                { id: 'a1', role: 'assistant', content: 'hi', status: 'complete' },
+              ],
+            },
+          },
+        ]);
+        renderProvider([], { models: [kokoro] });
+        await waitForReady();
+
+        await regenerateAndFinish({
+          status: 'completed',
+          kind,
+          content_parts: [{ type: 'text', text: reply }],
+        });
+
+        expect(screen.getByTestId('chats').textContent).toBe('c1:');
+        expect(titleOnlySaves()).toEqual([]);
+      });
+    });
   });
 
   describe(`useChatStreaming isolation [${locale}]`, () => {

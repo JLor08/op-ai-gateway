@@ -243,6 +243,12 @@ const de = {
   // BEFORE anything is sent or stored. Names the field as the user wrote it.
   chatSpeechPassthroughReserved: (field: string) =>
     `Das Feld „${field}“ in den erweiterten Feldern ist reserviert: Der Lauf setzt model, input, stream und response_format selbst. Entfernen Sie es, bevor Sie senden.`,
+  // The same refusal for a transcription (speech-to-text) turn: its run sets model, file,
+  // response_format and stream itself (matched ignoring case). Raised BEFORE anything is sent
+  // or stored; names the field as the user wrote it. The not-a-JSON-object case reuses
+  // chatAudioPassthroughInvalid above.
+  chatTranscriptionPassthroughReserved: (field: string) =>
+    `Das Feld „${field}“ in den erweiterten Feldern ist reserviert: Der Lauf setzt model, file, response_format und stream selbst. Entfernen Sie es, bevor Sie senden.`,
   // The composer of a speech (text-to-speech) thread: the prompt field's label and
   // the hint under it, and the attach button's tooltip (a speech run sends only the
   // text, so an image can never be attached -- whatever the model could read).
@@ -265,6 +271,72 @@ const de = {
   chatSpeechPassthrough: 'Zusätzliche Anfragefelder (JSON)',
   chatSpeechPassthroughHint:
     'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Haben Sie oben „Stimme“ oder „Geschwindigkeit“ eingestellt, gilt dieser Wert, nicht ein voice- oder speed-Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
+  // The composer of a transcription (speech-to-text) thread: the audio input replaces the
+  // text prompt. The group's label and the hint under it; the refusals of a send with no clip
+  // (also the Send button's tooltip) and of a replay whose last user turn has none (a
+  // transcription run reads that turn's audio and nothing else, so there would be nothing to
+  // transcribe).
+  chatTranscriptionInputLabel: 'Audio zum Transkribieren',
+  chatTranscriptionOnlyHint:
+    'Dieses Modell wandelt Sprache in Text um. Hängen Sie eine Audiodatei an oder nehmen Sie direkt im Browser auf; die Antwort ist das Transkript als Text.',
+  chatTranscriptionNeedsAudio: 'Hängen Sie zuerst eine Audiodatei an oder nehmen Sie Audio auf.',
+  chatTranscriptionReplayNoAudio:
+    'Diese Nachricht enthält kein Audio, es gibt also nichts zu transkribieren. Hängen Sie eine Audiodatei an oder nehmen Sie Audio auf und senden Sie es als neue Nachricht.',
+  // The audio clip of the turn, attached from a file or recorded: the attach button, the
+  // preview of what is attached, its remove button, and the name a recording is shown under.
+  chatAttachAudio: 'Audiodatei anhängen',
+  chatAttachedAudio: 'Angehängtes Audio',
+  chatRemoveAudio: 'Audio entfernen',
+  chatAudioRecordingLabel: 'Aufnahme',
+  // Why a clip could not be attached (the picker's `accept` is only a hint, so the type is
+  // checked again): a file that is not audio, its size (the backend stores up to 20 MB per
+  // clip, counted on the WAV the browser converts it to), an empty file, audio the browser
+  // cannot decode, or anything else.
+  chatAudioError: 'Audio konnte nicht angehängt werden.',
+  chatAudioErrorType:
+    'Nicht unterstützter Dateityp. Hängen Sie eine Audiodatei an, zum Beispiel WAV, MP3, M4A, OGG oder WEBM.',
+  chatAudioErrorSize: 'Audio ist zu groß (max. 20 MB).',
+  chatAudioErrorEmpty: 'Die Audiodatei ist leer.',
+  chatAudioErrorDecode: 'Diese Audiodatei konnte nicht verarbeitet werden.',
+  // The in-browser recorder: the controls (record, stop, use or discard the take), the clock
+  // and the preview player, the wait for the microphone permission, and why a recording could
+  // not be made (permission refused, a browser without recording, anything else).
+  chatRecordStart: 'Aufnahme starten',
+  chatRecordStop: 'Aufnahme beenden',
+  chatRecordUse: 'Aufnahme verwenden',
+  chatRecordDiscard: 'Aufnahme verwerfen',
+  chatRecordElapsed: 'Aufnahmedauer',
+  chatRecordPreview: 'Vorschau der Aufnahme',
+  chatRecordRequesting: 'Warte auf die Freigabe des Mikrofons…',
+  chatRecordDenied:
+    'Der Zugriff auf das Mikrofon wurde verweigert. Erlauben Sie ihn in den Einstellungen Ihres Browsers und versuchen Sie es erneut.',
+  chatRecordUnsupported:
+    'Dieser Browser kann hier nicht aufnehmen: Aufnahmen brauchen einen aktuellen Browser und eine sichere Verbindung (HTTPS). Hängen Sie stattdessen eine Audiodatei an.',
+  chatRecordFailed:
+    'Die Aufnahme ist fehlgeschlagen. Prüfen Sie das Mikrofon und versuchen Sie es erneut.',
+  // The transcription-thread settings panel, shown in place of the text-chat controls. The
+  // language is free text (an ISO-639-1 code) and a blank one is detected by the model; the
+  // prompt is free text; a blank temperature leaves the model's own. The reply is always
+  // text, so there is no format control, only the static hint. The collapsible "Advanced"
+  // section holds a JSON object of extra request fields, and the refusals of one that is not
+  // an object or has a field name a form cannot carry (the reserved-field refusal is
+  // chatTranscriptionPassthroughReserved above).
+  chatTranscriptionLanguage: 'Sprache',
+  chatTranscriptionLanguageHint:
+    'ISO-639-1-Code der gesprochenen Sprache, zum Beispiel de oder en. Leer lassen, damit das Modell sie erkennt.',
+  chatTranscriptionPrompt: 'Hinweis (Prompt)',
+  chatTranscriptionPromptHint:
+    'Optionaler Text, der das Modell leitet, etwa mit der Schreibweise von Namen und Fachbegriffen aus dem Audio.',
+  chatTranscriptionTemperature: 'Temperatur',
+  chatTranscriptionDefault: 'Standard (Modell)',
+  chatTranscriptionFormatHint: 'Die Antwort ist immer Text (das Transkript).',
+  chatTranscriptionAdvanced: 'Erweitert',
+  chatTranscriptionPassthrough: 'Zusätzliche Anfragefelder (JSON)',
+  chatTranscriptionPassthroughHint: String.raw`Ein JSON-Objekt mit zusätzlichen Feldern für die Transkriptionsanfrage, zum Beispiel {"key": "value"} oder eine modellspezifische Option; jeder Wert behält seinen JSON-Typ. Die Felder model, file, response_format und stream sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Feldnamen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\) enthalten. Haben Sie oben „Sprache“, „Hinweis“ oder „Temperatur“ eingestellt, gilt dieser Wert, nicht ein gleichnamiges Feld hier. Leer lassen, um nichts Zusätzliches zu senden.`,
+  chatTranscriptionPassthroughInvalid:
+    'Die erweiterten Felder müssen ein JSON-Objekt sein, zum Beispiel {"key": "value"}. Korrigieren Sie sie oder leeren Sie das Feld, bevor Sie senden.',
+  chatTranscriptionPassthroughBadKey: (field: string) =>
+    String.raw`Der Feldname ${field} in den erweiterten Feldern ist ungültig: Namen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\) enthalten. Korrigieren Sie ihn, bevor Sie senden.`,
   // The mask of an edit (inpainting): an optional PNG, the size of the source
   // image, whose transparent area marks the region to change. Its slot is next to
   // the attach button of an edit and needs the source image first.
@@ -346,6 +418,13 @@ const de = {
   // reply could not be fetched for playback (a purged blob, a network error).
   chatAudioDownloadError: 'Audio konnte nicht heruntergeladen werden.',
   chatAudioLoadError: 'Audio konnte nicht geladen werden.',
+  // The wait of a running transcription (speech-to-text) turn, the transcript twin of the
+  // audio wait above: it words the WAIT (the request may still be queued or waiting on a model
+  // load), and the sentence says no intermediate news is coming -- the transcript is one
+  // finished document, with nothing to count meanwhile.
+  chatTranscriptionRunPending: 'Warte auf Transkript',
+  chatTranscriptionNoIntermediateNews:
+    'Keine Zwischenmeldungen – das Transkript erscheint fertig oder gar nicht.',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -1677,6 +1756,47 @@ const de = {
     'Die Sprachsynthese unterstützt kein Streaming; die Antwort ist immer eine vollständige Audiodatei. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
   errorSpeechUpstreamError:
     'Der Sprachsynthese-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
+  // Transkription im Chat (#249): die Lauf-Codes eines Transkriptions-Laufs
+  // (chat_runs_transcription.go) und die transcription.*-Codes von
+  // /v1/audio/transcriptions, die ein Lauf erreichen kann -- die Gegenstücke der
+  // Sprach-Codes oben, aber auf die Gegenrichtung formuliert: Audio geht hinein, ein
+  // Transkript kommt heraus. Wire-Codes siehe format.ts (errorLabelByCode).
+  // Die Anfrage hat das Gateway nie verlassen; der Go-Fehler nennt die interne
+  // Adresse und steht nur im Log.
+  errorChatRunTranscriptionDispatchFailed:
+    'Die Transkription konnte nicht gestartet werden. Bitte versuchen Sie es erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator, falls dies anhält.',
+  // Der Lauf sendet NICHTS, wenn das angehängte Audio nicht als Audiodatei gelesen
+  // werden kann (er transkribiert nie ein anderes Audio als das angehängte).
+  errorChatRunTranscriptionSourceUnreadable:
+    'Das angehängte Audio konnte nicht gelesen werden. Bitte hängen Sie es erneut an oder nehmen Sie es neu auf.',
+  // Entweder war der Antwortkörper nicht bis zum Ende lesbar, oder er war nicht das
+  // erwartete JSON mit dem Transkript (eine HTML-Fehlerseite, die Antwort eines Proxys).
+  errorChatRunTranscriptionResponseUnreadable:
+    'Die Antwort der Transkription konnte nicht gelesen werden. Bitte versuchen Sie es erneut.',
+  // Eine gültige Antwort ohne Text: Stille, Rauschen oder ein Modell, das keine Sprache
+  // erkannt hat. Ein Fehler statt einer leeren Antwort, damit die Nachricht nicht wie
+  // ein Defekt aussieht.
+  errorChatRunNoTranscript:
+    'Im Audio wurde keine Sprache erkannt, es gibt also keinen Text. Prüfen Sie das Audio, und versuchen Sie es mit einer anderen oder neuen Aufnahme erneut.',
+  // Der Lauf bricht ab, BEVOR er etwas sendet, wenn die erweiterten Felder ein Feld
+  // nennen, das er selbst besitzt (Groß-/Kleinschreibung egal). Der Text nennt das
+  // Steuerelement mit seiner Beschriftung (chatTranscriptionAdvanced).
+  errorChatRunTranscriptionReservedField:
+    'Die erweiterten Felder dieses Chats enthalten ein reserviertes Feld (model, file, response_format oder stream). Die Anfrage wurde nicht gesendet. Entfernen Sie das Feld unter „Erweitert“, und versuchen Sie es erneut.',
+  errorTranscriptionFileRequired:
+    'Für die Transkription wird eine Audiodatei benötigt. Bitte hängen Sie Audio an oder nehmen Sie welches auf.',
+  errorTranscriptionResponseFormatUnsupported:
+    'Nicht unterstütztes Antwortformat für die Transkription. Unterstützt wird nur JSON.',
+  // Vom Portal nur über ein stream_format-Feld in den erweiterten Feldern erreichbar
+  // (stream selbst ist reserviert und wird vorher abgelehnt).
+  errorTranscriptionStreamUnsupported:
+    'Die Transkription unterstützt kein Streaming; die Antwort ist immer das vollständige Transkript. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
+  // Das Ziel ist ein Agent, der multipart_proxy nicht gemeldet hat (älter als 0.9.0,
+  // oder seit einem Neustart des Gateways noch nicht gemeldet).
+  errorTranscriptionUnavailable:
+    'Dieser Server kann Audio derzeit nicht transkribieren: Sein Agent unterstützt die Transkription noch nicht, oder er hat sich seit einem Neustart des Gateways noch nicht gemeldet. Bitte versuchen Sie es in Kürze erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator.',
+  errorTranscriptionUpstreamError:
+    'Der Transkriptions-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).
@@ -3364,6 +3484,8 @@ const en: PortalMessages = {
     'The advanced fields must be a JSON object, for example {"seed": 1}. Fix them or clear the field before sending.',
   chatSpeechPassthroughReserved: (field: string) =>
     `The field "${field}" in the advanced fields is reserved: the run sets model, input, stream and response_format itself. Remove it before sending.`,
+  chatTranscriptionPassthroughReserved: (field: string) =>
+    `The field "${field}" in the advanced fields is reserved: the run sets model, file, response_format and stream itself. Remove it before sending.`,
   chatSpeechPromptLabel: 'Text to speak',
   chatSpeechOnlyHint:
     'This model speaks text. This thread accepts text to speak only; the reply is an audio file.',
@@ -3377,6 +3499,50 @@ const en: PortalMessages = {
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:
     'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are reserved (in any letter case): if one of them appears here, the request is not sent. If you set "Voice" or "Speed" above, that value wins over a voice or speed field here. Leave blank to send nothing extra.',
+  chatTranscriptionInputLabel: 'Audio to transcribe',
+  chatTranscriptionOnlyHint:
+    'This model turns speech into text. Attach an audio file or record right in the browser; the reply is the transcript as text.',
+  chatTranscriptionNeedsAudio: 'Attach an audio file or record audio first.',
+  chatTranscriptionReplayNoAudio:
+    'This message has no audio, so there is nothing to transcribe. Attach an audio file or record audio and send it as a new message.',
+  chatAttachAudio: 'Attach audio file',
+  chatAttachedAudio: 'Attached audio',
+  chatRemoveAudio: 'Remove audio',
+  chatAudioRecordingLabel: 'Recording',
+  chatAudioError: 'Could not attach the audio.',
+  chatAudioErrorType:
+    'Unsupported file type. Attach an audio file, for example WAV, MP3, M4A, OGG or WEBM.',
+  chatAudioErrorSize: 'Audio is too large (max 20 MB).',
+  chatAudioErrorEmpty: 'The audio file is empty.',
+  chatAudioErrorDecode: 'This audio file could not be processed.',
+  chatRecordStart: 'Start recording',
+  chatRecordStop: 'Stop recording',
+  chatRecordUse: 'Use recording',
+  chatRecordDiscard: 'Discard recording',
+  chatRecordElapsed: 'Recording time',
+  chatRecordPreview: 'Recording preview',
+  chatRecordRequesting: 'Waiting for microphone permission…',
+  chatRecordDenied:
+    'Microphone access was denied. Allow it in your browser settings and try again.',
+  chatRecordUnsupported:
+    'This browser cannot record here: recording needs a current browser and a secure connection (HTTPS). Attach an audio file instead.',
+  chatRecordFailed: 'The recording failed. Check your microphone and try again.',
+  chatTranscriptionLanguage: 'Language',
+  chatTranscriptionLanguageHint:
+    'ISO-639-1 code of the spoken language, for example en or de. Leave blank to let the model detect it.',
+  chatTranscriptionPrompt: 'Prompt',
+  chatTranscriptionPromptHint:
+    'Optional text that guides the model, for example the spelling of names and terms in the audio.',
+  chatTranscriptionTemperature: 'Temperature',
+  chatTranscriptionDefault: 'Default (model)',
+  chatTranscriptionFormatHint: 'The reply is always text (the transcript).',
+  chatTranscriptionAdvanced: 'Advanced',
+  chatTranscriptionPassthrough: 'Extra request fields (JSON)',
+  chatTranscriptionPassthroughHint: String.raw`A JSON object of extra fields for the transcription request, for example {"key": "value"} or a model-specific option; each value keeps its JSON type. The fields model, file, response_format and stream are reserved (in any letter case): if one of them appears here, the request is not sent. Field names may not be empty or contain control characters, quotation marks (") or backslashes (\). If you set "Language", "Prompt" or "Temperature" above, that value wins over a field of the same name here. Leave blank to send nothing extra.`,
+  chatTranscriptionPassthroughInvalid:
+    'The advanced fields must be a JSON object, for example {"key": "value"}. Fix them or clear the field before sending.',
+  chatTranscriptionPassthroughBadKey: (field: string) =>
+    String.raw`The field name ${field} in the advanced fields is invalid: names may not be empty or contain control characters, quotation marks (") or backslashes (\). Fix it before sending.`,
   chatAttachMask: 'Attach a mask',
   chatAttachMaskTooltip:
     'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',
@@ -3422,6 +3588,9 @@ const en: PortalMessages = {
   chatDownloadAudio: 'Download audio',
   chatAudioDownloadError: 'Could not download the audio.',
   chatAudioLoadError: 'Could not load the audio.',
+  chatTranscriptionRunPending: 'Waiting for transcript',
+  chatTranscriptionNoIntermediateNews:
+    'No intermediate updates – the transcript arrives finished or not at all.',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',
@@ -4650,6 +4819,45 @@ const en: PortalMessages = {
   errorSpeechStreamUnsupported:
     'Speech synthesis does not support streaming; the response is always one complete audio file. If present, remove the stream_format field from the advanced fields.',
   errorSpeechUpstreamError: 'The speech synthesis server reported an error. Please try again.',
+  // Transcription in the chat (#249): the run codes of a transcription run
+  // (chat_runs_transcription.go) and the transcription.* codes of
+  // /v1/audio/transcriptions a run can reach -- the counterparts of the speech codes
+  // above, worded for the opposite direction: audio goes in, a transcript comes out.
+  // Wire codes: see format.ts (errorLabelByCode).
+  // The request never left the gateway; the Go error names the internal address
+  // and stays in the log.
+  errorChatRunTranscriptionDispatchFailed:
+    'The transcription could not be started. Please try again, or contact an administrator if this continues.',
+  // The run sends NOTHING when the attached audio cannot be read as an audio file (it
+  // never transcribes a different clip than the one attached).
+  errorChatRunTranscriptionSourceUnreadable:
+    'The attached audio could not be read. Please attach it again or record it again.',
+  // Either the response body could not be read to its end, or it was not the expected
+  // JSON holding the transcript (an HTML error page, a proxy's own reply).
+  errorChatRunTranscriptionResponseUnreadable:
+    'The transcription response could not be read. Please try again.',
+  // A valid reply with no text: silence, noise, or a model that heard no speech. An
+  // error rather than an empty reply, so the message does not look like a defect.
+  errorChatRunNoTranscript:
+    'No speech was detected in the audio, so there is no text. Check the audio and try again with a different or a new recording.',
+  // The run stops BEFORE sending anything when the advanced fields name a field it
+  // owns (case-insensitive). The text names the control by its label
+  // (chatTranscriptionAdvanced).
+  errorChatRunTranscriptionReservedField:
+    'The advanced fields of this chat contain a reserved field (model, file, response_format or stream). The request was not sent. Remove the field under "Advanced" and try again.',
+  errorTranscriptionFileRequired:
+    'Transcription needs an audio file. Please attach audio or record some.',
+  errorTranscriptionResponseFormatUnsupported:
+    'Unsupported response format for transcription. Only JSON is supported.',
+  // Reachable from the portal only through a stream_format field in the advanced
+  // fields (stream itself is reserved and refused earlier).
+  errorTranscriptionStreamUnsupported:
+    'Transcription does not support streaming; the response is always the complete transcript. If present, remove the stream_format field from the advanced fields.',
+  // The target is an agent that has not declared multipart_proxy (older than 0.9.0, or
+  // not reported since the gateway restarted).
+  errorTranscriptionUnavailable:
+    'This server cannot transcribe audio right now: its agent does not support transcription yet, or it has not reported in since the gateway restarted. Please try again shortly, or contact an administrator.',
+  errorTranscriptionUpstreamError: 'The transcription server reported an error. Please try again.',
   // Fix round, finding 1: the nine codes completionErrorResponse /
   // completionErrorCode can now surface from a chat run's own text path
   // (see format.ts's own comment on this block for why).

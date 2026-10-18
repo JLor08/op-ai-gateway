@@ -548,8 +548,11 @@ func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, toke
 	// carries every one (ModelOffering.Capable): a
 	// LastUsedModel or fallback that lacks the capability is skipped rather than
 	// turned into a 404 model_not_capable about a model the client never named.
-	// A required capability with no fold in the portal (transcription today)
-	// leaves Capable empty, so no candidate is ever taken for it.
+	// Every required capability a native endpoint sets has a portal fold
+	// (image, image_edit, speech and transcription), so Capable is never empty
+	// for want of one. A capability added to RequiredCapabilities without a fold
+	// in hasCapabilityFold/capabilityFlagsByName would leave Capable empty, and
+	// no candidate would ever be taken for it.
 	if token.UnknownModelRedirect && s.Portal != nil {
 		off := s.Portal.ModelOfferingFor(r.Context(), token, routing.NormalizeAPIFlavor(shape.apiFlavor), shape.requiredCapabilities)
 		if to := redirectUnknownModel(token, req.Model, off); to != "" {

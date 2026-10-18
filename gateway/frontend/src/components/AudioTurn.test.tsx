@@ -247,6 +247,72 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // The same player also shows a transcription turn's INPUT clip in the user's bubble
+    // (variant "input"): it is the user's own audio, so it is announced and saved as such, not
+    // as generated audio. Playback and the object-URL discipline are the one code path.
+    describe('as the input clip of a user turn', () => {
+      const clip = () => screen.getByLabelText(t.chatAttachedAudio) as HTMLAudioElement;
+
+      it('is announced as the attached audio, not as generated audio', () => {
+        stubObjectUrls();
+        vi.stubGlobal('fetch', vi.fn());
+
+        render(<AudioTurn t={t} url={DATA_URL} turnId="msg_u1" variant="input" />);
+
+        expect(clip()).toHaveAttribute('controls');
+        expect(clip()).toHaveAttribute('src', DATA_URL);
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).not.toBeInTheDocument();
+      });
+
+      it('plays a stored clip from one object URL and revokes it on unmount', async () => {
+        const { createObjectURL, revokeObjectURL } = stubObjectUrls();
+        const fetchMock = vi.fn(async () => wavResponse());
+        vi.stubGlobal('fetch', fetchMock);
+
+        const { unmount } = render(
+          <AudioTurn t={t} url={BLOB_URL} turnId="msg_u1" variant="input" />,
+        );
+        await waitFor(() => expect(clip()).toHaveAttribute('src', 'blob:audio-1'));
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(createObjectURL).toHaveBeenCalledTimes(1);
+        expect(revokeObjectURL).not.toHaveBeenCalled();
+
+        unmount();
+
+        expect(revokeObjectURL).toHaveBeenCalledTimes(1);
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:audio-1');
+      });
+
+      it('saves under an input name, with the extension of the clip own type', async () => {
+        stubObjectUrls();
+        const names = recordDownloads();
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async () => ({
+            ok: true,
+            status: 200,
+            blob: async () => new Blob([new Uint8Array([1])], { type: 'audio/mp4' }),
+          })),
+        );
+
+        render(<AudioTurn t={t} url={BLOB_URL} turnId="msg_u1" variant="input" />);
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadAudio }));
+
+        await waitFor(() => expect(names).toEqual(['input-audio-msg_u1.m4a']));
+      });
+
+      it('falls back to a bare input name without a turn id', async () => {
+        stubObjectUrls();
+        const names = recordDownloads();
+        vi.stubGlobal('fetch', vi.fn());
+
+        render(<AudioTurn t={t} url="data:audio/webm;base64,AAAA" turnId="" variant="input" />);
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadAudio }));
+
+        await waitFor(() => expect(names).toEqual(['input-audio.webm']));
+      });
+    });
+
     describe('the download button', () => {
       it('saves a stored reply as a .wav named after the turn', async () => {
         stubObjectUrls();

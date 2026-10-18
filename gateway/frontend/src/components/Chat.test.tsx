@@ -15,6 +15,7 @@ import {
   IMAGE_SIZE_OPTIONS,
 } from './chat/ChatStore';
 import { ToastProvider } from './shared/ToastProvider';
+import { AudioDecodeError, audioBlobToWav } from './shared/audioToWav';
 import { messages, type Locale } from '../i18n';
 import type {
   ActiveChatRun,
@@ -31,6 +32,14 @@ import type {
 // through the real upload pipeline (prepareImageDataUrl) into the sent message.
 vi.mock('heic-to', () => ({
   heicTo: vi.fn(async () => new Blob(['jpeg-bytes'], { type: 'image/jpeg' })),
+}));
+
+// jsdom has no WebAudio, so the browser-side conversion of a clip to WAV (audioToWav.test.ts's
+// subject) is a stand-in here: it "converts" by prefixing the bytes, so a part's payload says
+// whether the CONVERTED clip (not the upload, merely relabelled) is what the turn carries.
+vi.mock('./shared/audioToWav', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./shared/audioToWav')>()),
+  audioBlobToWav: vi.fn(async (blob: Blob) => new Blob(['WAV:', blob], { type: 'audio/wav' })),
 }));
 
 // Captured before any spy is installed, so a mocked createElement can build a
@@ -341,6 +350,13 @@ function installStubs() {
 async function pickOption(comboLabel: string, optionText: string) {
   fireEvent.mouseDown(screen.getByRole('combobox', { name: comboLabel }));
   fireEvent.click(await screen.findByRole('option', { name: optionText }));
+}
+
+// Lets the promise continuations a click sets off (the recorder's awaited getUserMedia and its
+// recorder callbacks) run and their state updates land. act() wraps exactly that -- code that is
+// not a Testing Library call -- and not the click itself, which fireEvent already wraps.
+async function flushMicrotasks() {
+  await act(async () => {});
 }
 
 beforeEach(() => {
@@ -1428,6 +1444,720 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(attach).toHaveAttribute('aria-disabled', 'true');
       fireEvent.mouseOver(attach);
       expect(await screen.findByRole('tooltip')).toHaveTextContent(t.chatSpeechNoImageInput);
+    });
+  });
+
+  // A transcription (speech-to-text) thread: the composer is AUDIO first -- there is no text
+  // prompt, the turn is a clip, attached from a file or recorded in the browser -- and the
+  // settings are the transcription knobs. The reply is text, so there is no format control.
+  describe(`Chat: the composer of a transcription thread [${locale}]`, () => {
+    const asrModels: ModelOption[] = [
+      {
+        id: 'whisper',
+        display_name: 'whisper',
+        flavors: ['openai_audio'],
+        loading_on_count: 0,
+        transcription: true,
+      },
+    ];
+
+    // The browser's recording stack, small enough to drive from here: a microphone whose track
+    // says when it is released, and a recorder that reports what a Chromium one does.
+    class FakeRecorder {
+      state: 'inactive' | 'recording' = 'inactive';
+      mimeType = 'audio/webm;codecs=opus';
+      ondataavailable: ((event: { data: Blob }) => void) | null = null;
+      onstop: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      start() {
+        this.state = 'recording';
+      }
+      stop() {
+        this.state = 'inactive';
+        this.ondataavailable?.({
+          data: new Blob(['voice-bytes'], { type: 'audio/webm;codecs=opus' }),
+        });
+        this.onstop?.();
+      }
+    }
+    let getUserMedia: ReturnType<typeof vi.fn>;
+    let micTrackStop: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      micTrackStop = vi.fn();
+      getUserMedia = vi.fn(async () => ({ getTracks: () => [{ stop: micTrackStop }] }));
+      Object.defineProperty(navigator, 'mediaDevices', {
+        value: { getUserMedia },
+        configurable: true,
+      });
+      vi.stubGlobal('MediaRecorder', FakeRecorder);
+      Object.defineProperty(URL, 'createObjectURL', {
+        value: vi.fn(() => 'blob:recording'),
+        configurable: true,
+      });
+      Object.defineProperty(URL, 'revokeObjectURL', { value: vi.fn(), configurable: true });
+    });
+
+    afterEach(() => {
+      Reflect.deleteProperty(navigator, 'mediaDevices');
+      Reflect.deleteProperty(URL, 'createObjectURL');
+      Reflect.deleteProperty(URL, 'revokeObjectURL');
+    });
+
+    async function renderTranscriptionThread(models: ModelOption[] = asrModels) {
+      renderChat(tokens, models);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'whisper');
+    }
+
+    const sendButton = () => screen.getByRole('button', { name: t.send });
+
+    function attachAudio(file: File) {
+      fireEvent.change(screen.getByLabelText(t.chatAttachAudio), { target: { files: [file] } });
+    }
+
+    const wavFile = (type = 'audio/x-wav', name = 'memo.wav') =>
+      new File(['RIFFwave-bytes'], name, { type });
+
+    // The data url of a clip the converter stand-in (see the vi.mock above) made of an upload
+    // that held `text`: always audio/wav, the converted bytes.
+    const wavUrl = (text: string) => `data:audio/wav;base64,${btoa(`WAV:${text}`)}`;
+    const toWav = vi.mocked(audioBlobToWav);
+    beforeEach(() => toWav.mockClear());
+
+    // Records a clip through the real recorder and attaches it to the turn.
+    async function recordClip() {
+      fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+      await flushMicrotasks();
+      fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
+      await flushMicrotasks();
+      fireEvent.click(screen.getByRole('button', { name: t.chatRecordUse }));
+    }
+
+    function startedBody() {
+      return chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
+    }
+
+    // Opens the settings panel and the Advanced section; returns the passthrough field.
+    function openPassthrough() {
+      openSettings();
+      fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionAdvanced }));
+      return screen.getByLabelText(t.chatTranscriptionPassthrough);
+    }
+
+    describe('the audio input', () => {
+      it('replaces the text prompt: a clip, not a message, is the turn', async () => {
+        await renderTranscriptionThread();
+
+        expect(
+          screen.getByRole('group', { name: t.chatTranscriptionInputLabel }),
+        ).toBeInTheDocument();
+        expect(screen.getByText(t.chatTranscriptionOnlyHint)).toBeInTheDocument();
+        // There is nothing to type into: none of the text, image or speech prompts.
+        expect(screen.queryByLabelText(t.messageLabel)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatImagePromptLabel)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatSpeechPromptLabel)).not.toBeInTheDocument();
+        expect(document.getElementById('chat-message')).toBeNull();
+      });
+
+      it('offers an attach button for any audio and a record button', async () => {
+        await renderTranscriptionThread();
+
+        const input = screen.getByLabelText(t.chatAttachAudio);
+        expect(input).toHaveAttribute('type', 'file');
+        // Any audio the browser can decode: it is converted to WAV before it is attached.
+        const accepted = (input.getAttribute('accept') ?? '').split(',');
+        expect(accepted).toContain('audio/*');
+        // One clip is the turn.
+        expect(input).not.toHaveAttribute('multiple');
+        expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeEnabled();
+      });
+
+      it('hides the image and speech controls', async () => {
+        await renderTranscriptionThread();
+        openSettings();
+
+        // No image attach, mask or knobs...
+        expect(screen.queryByLabelText(t.chatAttachImage)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatAttachImageEdit)).not.toBeInTheDocument();
+        expect(screen.queryByRole('combobox', { name: t.chatImageSize })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.chatImageAdvanced })).not.toBeInTheDocument();
+        // ...no speech knobs...
+        expect(screen.queryByLabelText(t.chatSpeechVoice)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatSpeechSpeed)).not.toBeInTheDocument();
+        // ...and none of the text chat's (a system prompt and a token cap mean nothing here).
+        expect(screen.queryByLabelText(t.chatSystemPrompt)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatMaxTokens)).not.toBeInTheDocument();
+      });
+
+      it('belongs to a transcription thread only', async () => {
+        renderChat();
+        await waitForChatReady();
+        await pickOption(t.chatModel, models[0].display_name);
+
+        expect(screen.queryByLabelText(t.chatAttachAudio)).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.chatRecordStart })).not.toBeInTheDocument();
+        expect(screen.getByLabelText(t.messageLabel)).toBeInTheDocument();
+        expect(sendButton()).toBeEnabled();
+      });
+
+      it('keeps Send disabled until a clip is attached, and says what is missing', async () => {
+        await renderTranscriptionThread();
+
+        expect(sendButton()).toBeDisabled();
+        fireEvent.mouseOver(sendButton().parentElement as HTMLElement);
+        expect(await screen.findByRole('tooltip')).toHaveTextContent(t.chatTranscriptionNeedsAudio);
+
+        attachAudio(wavFile());
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+      });
+
+      it('shows the attached clip with its name and a player, and removes it again', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'standup.wav'));
+
+        const player = await screen.findByLabelText(t.chatAttachedAudio);
+        expect(player.tagName).toBe('AUDIO');
+        expect(player).toHaveAttribute('controls');
+        expect(player.getAttribute('src')).toMatch(/^data:audio\/wav;base64,/);
+        expect(screen.getByText('standup.wav')).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatRemoveAudio }));
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(screen.queryByText('standup.wav')).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('replaces the clip when another is attached: a turn has one', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'first.wav'));
+        await screen.findByText('first.wav');
+
+        attachAudio(wavFile('audio/wav', 'second.wav'));
+        await screen.findByText('second.wav');
+
+        expect(screen.queryByText('first.wav')).not.toBeInTheDocument();
+        expect(screen.getAllByLabelText(t.chatAttachedAudio)).toHaveLength(1);
+      });
+
+      it('disables the audio input while a run is in flight', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile());
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+
+        // The run is live (no `done` yet): nothing may be attached or recorded under it.
+        await waitFor(() =>
+          expect(screen.getByRole('button', { name: t.chatAttachAudio })).toHaveAttribute(
+            'aria-disabled',
+            'true',
+          ),
+        );
+        expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeDisabled();
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('drops a clip that is left behind when the thread turns out not to be a transcription one', async () => {
+        renderChat(tokens, [...asrModels, ...models]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, 'whisper');
+        attachAudio(wavFile('audio/wav', 'gone.wav'));
+        await screen.findByText('gone.wav');
+
+        await pickOption(t.chatModel, models[0].display_name);
+
+        expect(screen.queryByText('gone.wav')).not.toBeInTheDocument();
+        expect(screen.getByLabelText(t.messageLabel)).toBeInTheDocument();
+        // And a text turn sends as it always did, with no leftover clip in it.
+        fireEvent.change(screen.getByLabelText(t.messageLabel), { target: { value: 'hi' } });
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        expect(startedBody().user_message).toBe('hi');
+      });
+    });
+
+    describe('attaching a file', () => {
+      it('sends a wav file as an audio/wav part', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/x-wav'));
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        fireEvent.click(sendButton());
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        // The whole turn: the clip alone, as the converter made it (a wav is converted too, to
+        // the 16 kHz mono the server reads), under audio/wav.
+        expect(startedBody().user_message).toEqual([
+          { type: 'audio_url', audio_url: { url: wavUrl('RIFFwave-bytes') } },
+        ]);
+        expect(startedBody().settings.kind).toBe('transcription');
+      });
+
+      // The server reads WAV only, so whatever the browser can decode is converted to one
+      // (audioToWav) BEFORE it is attached: the player, the part and the stored turn all carry the
+      // wav, never the upload's own format.
+      it.each([
+        ['audio/mp3', 'take.mp3'],
+        ['audio/x-m4a', 'take.m4a'],
+        ['audio/ogg;codecs=opus', 'take.ogg'],
+        ['video/webm', 'take.webm'],
+        ['audio/flac', 'take.flac'],
+        // No type at all (a file dialog that does not know the format): the decoder decides.
+        ['', 'take.MP3'],
+        ['application/octet-stream', 'take.m4a'],
+      ])('converts a %s file called %s to an audio/wav part', async (type, name) => {
+        await renderTranscriptionThread();
+        const upload = new File(['bytes'], name, { type });
+        attachAudio(upload);
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        expect(toWav).toHaveBeenCalledWith(upload);
+        // The preview plays the wav that will be sent.
+        expect(screen.getByLabelText(t.chatAttachedAudio).getAttribute('src')).toBe(
+          wavUrl('bytes'),
+        );
+        fireEvent.click(sendButton());
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        expect(startedBody().user_message).toEqual([
+          { type: 'audio_url', audio_url: { url: wavUrl('bytes') } },
+        ]);
+      });
+
+      it.each([
+        ['an image', new File(['x'], 'cat.png', { type: 'image/png' })],
+        ['a text file', new File(['x'], 'notes.txt', { type: 'text/plain' })],
+        ['a pdf', new File(['x'], 'paper.pdf', { type: 'application/pdf' })],
+      ])('refuses %s with the unsupported-format message', async (_name, file) => {
+        await renderTranscriptionThread();
+        attachAudio(file);
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorType);
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+        expect(toWav).not.toHaveBeenCalled();
+      });
+
+      it('says so when the browser cannot decode the audio, and attaches nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        await renderTranscriptionThread();
+        attachAudio(new File(['x'], 'broken.mp3', { type: 'audio/mpeg' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorDecode);
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('says so, and keeps the clip it had, when the next one cannot be decoded', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'keep.wav'));
+        await screen.findByText('keep.wav');
+
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        attachAudio(new File(['x'], 'broken.mp3', { type: 'audio/mpeg' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorDecode);
+        expect(screen.getByText('keep.wav')).toBeInTheDocument();
+        expect(sendButton()).toBeEnabled();
+      });
+
+      it('refuses audio whose WAV would be over the 20 MB the backend stores', async () => {
+        // A small compressed upload that decodes to a long clip: the converted size counts.
+        const long = new Blob(['x'], { type: 'audio/wav' });
+        Object.defineProperty(long, 'size', { value: 20 * 1024 * 1024 + 1 });
+        toWav.mockResolvedValueOnce(long);
+        await renderTranscriptionThread();
+        attachAudio(new File(['small'], 'long.mp3', { type: 'audio/mpeg' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorSize);
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('refuses a clip over the 20 MB the backend stores', async () => {
+        await renderTranscriptionThread();
+        const big = wavFile('audio/wav');
+        Object.defineProperty(big, 'size', { value: 20 * 1024 * 1024 + 1 });
+        attachAudio(big);
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorSize);
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('refuses an empty file', async () => {
+        await renderTranscriptionThread();
+        attachAudio(new File([], 'silence.wav', { type: 'audio/wav' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorEmpty);
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('keeps the clip it had when the next one is refused', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'keep.wav'));
+        await screen.findByText('keep.wav');
+
+        attachAudio(new File(['x'], 'cat.png', { type: 'image/png' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorType);
+        expect(screen.getByText('keep.wav')).toBeInTheDocument();
+        expect(sendButton()).toBeEnabled();
+      });
+
+      it('clears the clip and the composer when the turn is sent', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'sent.wav'));
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+
+        expect(screen.queryByText('sent.wav')).not.toBeInTheDocument();
+        // The composer's preview is gone; the clip now lives in the sent user bubble of the
+        // transcript, a player of the same name (the attached-audio label is shared with the
+        // composer's, as the attached-image alt text is), so the two are told apart by where
+        // they are.
+        const composer = screen.getByRole('group', { name: t.chatTranscriptionInputLabel });
+        expect(within(composer).queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(
+          within(screen.getByRole('log')).getByLabelText(t.chatAttachedAudio),
+        ).toBeInTheDocument();
+      });
+    });
+
+    describe('recording', () => {
+      it('converts a recorded audio/webm;codecs=opus clip to an audio/wav part', async () => {
+        await renderTranscriptionThread();
+        await recordClip();
+
+        // The take is attached, labelled as a recording, and Send is open.
+        expect(await screen.findByText(t.chatAudioRecordingLabel)).toBeInTheDocument();
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        fireEvent.click(sendButton());
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        // The recorder's own format never leaves the browser: the take was converted to WAV when
+        // it was used (the bytes are the converter's, not the recorder's).
+        expect(toWav).toHaveBeenCalledTimes(1);
+        expect(startedBody().user_message).toEqual([
+          { type: 'audio_url', audio_url: { url: wavUrl('voice-bytes') } },
+        ]);
+        expect(JSON.stringify(startedBody().user_message)).not.toContain('webm');
+        expect(startedBody().settings.kind).toBe('transcription');
+      });
+
+      it('says so when the take cannot be converted, and attaches nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('unsupported'));
+        await renderTranscriptionThread();
+        await recordClip();
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorDecode);
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioRecordingLabel)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('releases the microphone once the take is stopped', async () => {
+        await renderTranscriptionThread();
+        await recordClip();
+
+        expect(getUserMedia).toHaveBeenCalledWith({ audio: true });
+        expect(micTrackStop).toHaveBeenCalled();
+      });
+
+      it('says so when the microphone is denied, and the composer still works', async () => {
+        getUserMedia.mockRejectedValueOnce(new DOMException('denied', 'NotAllowedError'));
+        await renderTranscriptionThread();
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
+
+        expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordDenied);
+        expect(sendButton()).toBeDisabled();
+        // A file can still be attached, and the error is about the microphone only.
+        attachAudio(wavFile());
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+      });
+
+      it('says so when the browser cannot record at all', async () => {
+        Reflect.deleteProperty(navigator, 'mediaDevices');
+        await renderTranscriptionThread();
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
+
+        expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordUnsupported);
+      });
+
+      it('discards a take without attaching anything', async () => {
+        await renderTranscriptionThread();
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
+        await flushMicrotasks();
+        expect(screen.getByLabelText(t.chatRecordPreview)).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordDiscard }));
+
+        expect(screen.queryByLabelText(t.chatRecordPreview)).not.toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('lets go of a take in progress when the thread leaves the transcription composer', async () => {
+        renderChat(tokens, [...asrModels, ...models]);
+        await waitForChatReady();
+        await pickOption(t.chatModel, 'whisper');
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
+        expect(screen.getByRole('button', { name: t.chatRecordStop })).toBeInTheDocument();
+
+        await pickOption(t.chatModel, models[0].display_name);
+
+        // The recorder went with the composer, and the microphone with it.
+        expect(screen.queryByRole('button', { name: t.chatRecordStop })).not.toBeInTheDocument();
+        expect(micTrackStop).toHaveBeenCalled();
+      });
+    });
+
+    describe('the settings panel', () => {
+      it('shows language, prompt, temperature and an Advanced section', async () => {
+        await renderTranscriptionThread();
+        openSettings();
+
+        const language = screen.getByRole('textbox', { name: t.chatTranscriptionLanguage });
+        expect(language).toHaveValue('');
+        expect(language).toHaveAttribute('placeholder', t.chatTranscriptionDefault);
+        expect(language).toHaveAccessibleDescription(t.chatTranscriptionLanguageHint);
+
+        const prompt = screen.getByRole('textbox', { name: t.chatTranscriptionPrompt });
+        expect(prompt).toHaveValue('');
+        expect(prompt).toHaveAccessibleDescription(t.chatTranscriptionPromptHint);
+
+        // A number, blank by default (the model keeps its own), never negative.
+        const temperature = screen.getByRole('spinbutton', {
+          name: t.chatTranscriptionTemperature,
+        });
+        expect(temperature).toHaveValue(null);
+        expect(temperature).toHaveAttribute('min', '0');
+        expect(temperature).not.toHaveAttribute('max');
+
+        expect(
+          screen.getByRole('button', { name: t.chatTranscriptionAdvanced }),
+        ).toBeInTheDocument();
+      });
+
+      it('has no response format control: the reply is always text, and the panel says so', async () => {
+        await renderTranscriptionThread();
+        openSettings();
+        fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionAdvanced }));
+
+        // No control of any kind for it...
+        expect(screen.queryByLabelText(/format/i)).not.toBeInTheDocument();
+        expect(screen.queryByRole('combobox', { name: /format/i })).not.toBeInTheDocument();
+        expect(screen.queryByRole('textbox', { name: /format/i })).not.toBeInTheDocument();
+        // ...and a static caption instead.
+        expect(screen.getByText(t.chatTranscriptionFormatHint)).toBeInTheDocument();
+
+        attachAudio(wavFile());
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        fireEvent.click(sendButton());
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        expect(startedBody().settings.transcription).not.toHaveProperty('response_format');
+      });
+
+      it('keeps the advanced passthrough collapsed until asked for', async () => {
+        await renderTranscriptionThread();
+        openSettings();
+
+        const toggle = screen.getByRole('button', { name: t.chatTranscriptionAdvanced });
+        expect(toggle).toHaveAttribute('aria-expanded', 'false');
+        expect(screen.queryByLabelText(t.chatTranscriptionPassthrough)).not.toBeInTheDocument();
+
+        fireEvent.click(toggle);
+        expect(toggle).toHaveAttribute('aria-expanded', 'true');
+        const field = screen.getByLabelText(t.chatTranscriptionPassthrough);
+        expect(field.tagName).toBe('TEXTAREA');
+        expect(field).toHaveValue('');
+        expect(field).toHaveAccessibleDescription(t.chatTranscriptionPassthroughHint);
+
+        fireEvent.click(toggle);
+        expect(screen.queryByLabelText(t.chatTranscriptionPassthrough)).not.toBeInTheDocument();
+      });
+
+      it('sends language, prompt, temperature and the parsed passthrough with the clip', async () => {
+        await renderTranscriptionThread();
+        openSettings();
+        fireEvent.change(screen.getByRole('textbox', { name: t.chatTranscriptionLanguage }), {
+          target: { value: 'de' },
+        });
+        fireEvent.change(screen.getByRole('textbox', { name: t.chatTranscriptionPrompt }), {
+          target: { value: 'Namen: Zoe, Jörg' },
+        });
+        fireEvent.change(screen.getByRole('spinbutton', { name: t.chatTranscriptionTemperature }), {
+          target: { value: '0' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionAdvanced }));
+        fireEvent.change(screen.getByLabelText(t.chatTranscriptionPassthrough), {
+          target: { value: '{"beam": 5, "word_timestamps": true}' },
+        });
+        attachAudio(wavFile());
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        fireEvent.click(sendButton());
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        const { settings } = startedBody();
+        expect(settings.kind).toBe('transcription');
+        // An explicit 0 is a value (deterministic decoding), not blank; the passthrough keeps
+        // each value's JSON type.
+        expect(settings.transcription).toEqual({
+          language: 'de',
+          prompt: 'Namen: Zoe, Jörg',
+          temperature: 0,
+          passthrough: { beam: 5, word_timestamps: true },
+        });
+        expect(settings).not.toHaveProperty('audio');
+        expect(settings).not.toHaveProperty('image');
+      });
+
+      it('sends no knob that was left blank', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile());
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+        fireEvent.click(sendButton());
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        expect(startedBody().settings.transcription).toEqual({});
+      });
+
+      it('seeds the fields from a saved transcription thread', async () => {
+        chatApi.rows.push({
+          id: 'c_asr_seed',
+          title: '',
+          created_at: '2026-07-22T12:00:00Z',
+          updated_at: '2026-07-22T12:00:00Z',
+          content: {
+            settings: {
+              model: 'whisper',
+              kind: 'transcription',
+              transcription: {
+                language: 'de',
+                prompt: 'Zoe',
+                temperature: 0.4,
+                passthrough: { beam: 5 },
+              },
+            },
+            messages: [],
+          },
+        });
+        renderChat(tokens, asrModels);
+        await waitForChatReady();
+        openSettings();
+
+        expect(screen.getByRole('textbox', { name: t.chatTranscriptionLanguage })).toHaveValue(
+          'de',
+        );
+        expect(screen.getByRole('textbox', { name: t.chatTranscriptionPrompt })).toHaveValue('Zoe');
+        expect(
+          screen.getByRole('spinbutton', { name: t.chatTranscriptionTemperature }),
+        ).toHaveValue(0.4);
+        fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionAdvanced }));
+        expect(screen.getByLabelText(t.chatTranscriptionPassthrough)).toHaveValue(
+          JSON.stringify({ beam: 5 }, null, 2),
+        );
+      });
+
+      it('does not show the transcription knobs on a text or a speech thread', async () => {
+        renderChat(tokens, [
+          ...models,
+          {
+            id: 'kokoro',
+            display_name: 'kokoro',
+            flavors: ['openai_audio'],
+            loading_on_count: 0,
+            speech: true,
+          },
+        ]);
+        await waitForChatReady();
+        for (const model of [models[0].display_name, 'kokoro']) {
+          await pickOption(t.chatModel, model);
+          openSettings();
+          expect(screen.queryByLabelText(t.chatTranscriptionLanguage)).not.toBeInTheDocument();
+          expect(screen.queryByLabelText(t.chatTranscriptionPrompt)).not.toBeInTheDocument();
+          expect(screen.queryByLabelText(t.chatTranscriptionTemperature)).not.toBeInTheDocument();
+          expect(screen.queryByText(t.chatTranscriptionFormatHint)).not.toBeInTheDocument();
+          openSettings();
+        }
+      });
+    });
+
+    describe('an advanced passthrough that cannot be sent', () => {
+      it('is flagged on the field when it is not a JSON object, without a speech example', async () => {
+        await renderTranscriptionThread();
+        const field = openPassthrough();
+
+        fireEvent.change(field, { target: { value: '[1, 2]' } });
+        expect(field).toBeInvalid();
+        expect(field).toHaveAccessibleDescription(t.chatTranscriptionPassthroughInvalid);
+
+        fireEvent.change(field, { target: { value: '{"beam": 5}' } });
+        expect(field).toBeValid();
+        expect(field).toHaveAccessibleDescription(t.chatTranscriptionPassthroughHint);
+      });
+
+      it('flags a field the run owns, naming it', async () => {
+        await renderTranscriptionThread();
+        const field = openPassthrough();
+
+        fireEvent.change(field, { target: { value: '{"beam": 1, "Response_Format": "srt"}' } });
+        expect(field).toBeInvalid();
+        expect(field).toHaveAccessibleDescription(
+          t.chatTranscriptionPassthroughReserved('Response_Format'),
+        );
+      });
+
+      it.each([
+        ['a double quote', '{"a\\"b": 1}', '"a\\"b"'],
+        ['a line break', '{"a\\nb": 1}', '"a\\nb"'],
+        ['a backslash', '{"a\\\\b": 1}', '"a\\\\b"'],
+        ['an empty name', '{"": 1}', '""'],
+      ])('flags a field name with %s, naming it', async (_name, text, shown) => {
+        await renderTranscriptionThread();
+        const field = openPassthrough();
+
+        fireEvent.change(field, { target: { value: text } });
+
+        expect(field).toBeInvalid();
+        expect(field).toHaveAccessibleDescription(t.chatTranscriptionPassthroughBadKey(shown));
+      });
+
+      it('refuses the send, with the field and the panel held open, and keeps the clip', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'held.wav'));
+        await screen.findByText('held.wav');
+        const field = openPassthrough();
+        fireEvent.change(field, { target: { value: '{"a\\"b": 1}' } });
+
+        // The user closes the whole panel, then sends.
+        openSettings();
+        fireEvent.click(sendButton());
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(
+          t.chatTranscriptionPassthroughBadKey('"a\\"b"'),
+        );
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        // Both toggles stay held open so the toast points at a field that is on screen, and
+        // nothing the user composed is lost.
+        expect(screen.getByLabelText(t.chatTranscriptionPassthrough)).toBeInvalid();
+        expect(screen.getByText('held.wav')).toBeInTheDocument();
+      });
+
+      it('does not flag a field name a form can carry', async () => {
+        await renderTranscriptionThread();
+        const field = openPassthrough();
+
+        fireEvent.change(field, {
+          target: { value: '{"timestamp_granularities[]": "word", "with space": 1}' },
+        });
+
+        expect(field).toBeValid();
+      });
     });
   });
 

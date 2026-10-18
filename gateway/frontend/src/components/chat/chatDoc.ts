@@ -15,6 +15,7 @@ import type {
   ChatRunStatus,
   ChatSettings,
   ChatSummary,
+  ChatTranscriptionSettings,
   PortalToken,
 } from '../../api';
 import {
@@ -162,6 +163,9 @@ export function attachModeOf(
   // speech run sends only the last user message's text, so an attachment would be
   // dropped in silence. (Without this the vision branch below would offer one.)
   if (kind === 'speech') return 'none';
+  // Likewise speech-to-text: a transcription run reads only the audio of the last user
+  // message, so an attached image would be dropped in silence.
+  if (kind === 'transcription') return 'none';
   return model.vision && !model.image ? 'vision' : 'none';
 }
 
@@ -359,7 +363,8 @@ export function optionsOr(
 
 // Parse a blank-able numeric knob string to a wire number, or undefined when
 // blank/unparseable (so imageSetting omits it and sd-server keeps its default).
-// Shared with the audio speed knob (audioSetting), which is blank-able the same way.
+// Shared with the audio speed knob (audioSetting) and the transcription temperature
+// (transcriptionSetting), which are blank-able the same way.
 function toImageNumber(raw: string): number | undefined {
   const trimmed = raw.trim();
   if (trimmed === '') return undefined;
@@ -532,12 +537,44 @@ export const SPEECH_RESERVED_FIELDS: readonly string[] = [
 // valid JSON that is not an object (an array, a string, a number, null), or an object
 // naming a field the run owns (SPEECH_RESERVED_FIELDS), in which case `reservedField`
 // is the first such key as the user wrote it, so the UI can name it.
+//
+// `badKey` is the one refusal that only a MULTIPART passthrough has (the transcription one): a key
+// that cannot be a form field name, as the user wrote it ('' for an empty key, so test it against
+// undefined, not for truthiness). See isFormFieldName.
 export type AudioPassthroughParse =
   | { status: 'empty' }
   | { status: 'ok'; value: Record<string, unknown> }
-  | { status: 'invalid'; reservedField?: string };
+  | { status: 'invalid'; reservedField?: string; badKey?: string };
 
 export function parseAudioPassthrough(raw: string): AudioPassthroughParse {
+  return parsePassthrough(raw, SPEECH_RESERVED_FIELDS, false);
+}
+
+// Whether a passthrough key can be the NAME of a multipart form part: non-empty, free of control
+// characters (a line break would end the part's header line and begin another), a double quote and
+// a backslash (the name sits between quotes in `Content-Disposition: form-data; name="..."`, and
+// the upstream's form parser, cpp-httplib, reads it with a pattern a quote or a backslash cuts
+// short). This mirrors the backend's isTranscriptionFieldName in chat_runs_transcription.go, which
+// refuses an empty or control-character key and lets a quote or a backslash through (its writer
+// escapes them, which that upstream parser does not undo), so this side refuses those too -- keep
+// the two in step. The speech passthrough is a JSON body, where any key is fine, so it does not ask.
+function isFormFieldName(key: string): boolean {
+  if (key === '' || key.includes('"') || key.includes('\\')) return false;
+  for (const char of key) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  return true;
+}
+
+// The one parse of a passthrough text, for the thread kinds that have one: they differ only
+// in which fields their run owns (`reserved` holds the lower-case names) and in whether the keys
+// become form field names (`formFields`).
+function parsePassthrough(
+  raw: string,
+  reserved: readonly string[],
+  formFields: boolean,
+): AudioPassthroughParse {
   const text = raw.trim();
   if (text === '') return { status: 'empty' };
   let parsed: unknown;
@@ -550,13 +587,14 @@ export function parseAudioPassthrough(raw: string): AudioPassthroughParse {
   const keys = Object.keys(parsed);
   // Scan a sorted copy, like the backend's, so the field named is deterministic;
   // `keys` keeps its original order for the length check below.
-  const reservedField = [...keys].sort((a, b) => a.localeCompare(b)).find(isSpeechReservedField);
+  const sorted = [...keys].sort((a, b) => a.localeCompare(b));
+  const reservedField = sorted.find((key) => reserved.includes(key.toLowerCase()));
   if (reservedField !== undefined) return { status: 'invalid', reservedField };
+  if (formFields) {
+    const badKey = sorted.find((key) => !isFormFieldName(key));
+    if (badKey !== undefined) return { status: 'invalid', badKey };
+  }
   return keys.length === 0 ? { status: 'empty' } : { status: 'ok', value: parsed };
-}
-
-function isSpeechReservedField(key: string): boolean {
-  return SPEECH_RESERVED_FIELDS.includes(key.toLowerCase());
 }
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
@@ -629,6 +667,183 @@ export function audioSettingsFrom(audio: ChatAudioSettings | undefined): AudioSe
   };
 }
 
+// The speech-to-text knobs the composer edits, as CONCRETE store state (every field
+// defined, unlike the all-optional wire ChatTranscriptionSettings): the speech settings'
+// twin. Every unset knob is the blank sentinel that transcriptionSetting() below omits
+// from the wire, so the model keeps its own default.
+export type TranscriptionSettings = {
+  language: string; // free text (an ISO-639-1 code); "" = the model detects it
+  prompt: string; // free text; "" = none
+  // The sampling temperature as a BLANK-ABLE string ("" = the model's own default), parsed
+  // to a number on the wire by transcriptionSetting(); a blank or unparseable one is
+  // omitted. A typed 0 is a value (deterministic decoding), not blank. Not clamped: the
+  // model's own range applies.
+  temperature: string;
+  // The advanced passthrough as the TEXT of a JSON object (the composer's textarea): extra
+  // request fields merged verbatim into the /v1/audio/transcriptions form -- the OpenAI
+  // timestamp granularities and any audio.cpp-native knob -- each value keeping the JSON
+  // type the user wrote. "" = none. transcriptionSetting() sends it parsed, or omits it
+  // when it is not a non-empty object free of reserved fields; parseTranscriptionPassthrough()
+  // says which, so the composer and send() can name a bad one.
+  passthrough: string;
+};
+
+export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
+  language: '',
+  prompt: '',
+  temperature: '',
+  passthrough: '',
+};
+
+// The form fields a transcription thread's passthrough may not set: the run's own (`model`
+// is the thread's pinned model, `file` the user's clip) and the two its one-complete-JSON
+// contract depends on (`response_format`, which the gateway forces to json, and `stream`,
+// which the endpoint refuses outright). This mirrors transcriptionReservedFields in the
+// backend's chat_runs_transcription.go -- keep the two in step. The backend still refuses
+// such a key (gateway.chat_run_transcription_reserved_field, matched ignoring case), but only
+// AFTER the turn is committed; this copy lets the composer refuse it inline, before a turn
+// is sent. Keys compare lower-cased, as the backend's strings.EqualFold does for the ASCII
+// names here.
+export const TRANSCRIPTION_RESERVED_FIELDS: readonly string[] = [
+  'model',
+  'file',
+  'response_format',
+  'stream',
+];
+
+// What the transcription passthrough text is: the same classification as the speech one
+// (parseAudioPassthrough, hence the same AudioPassthroughParse), against this run's reserved
+// fields.
+export function parseTranscriptionPassthrough(raw: string): AudioPassthroughParse {
+  return parsePassthrough(raw, TRANSCRIPTION_RESERVED_FIELDS, true);
+}
+
+// The message for a passthrough text that parseTranscriptionPassthrough called invalid: the
+// reserved-field one names the offending field, the bad-key one names the key (JSON-escaped, so a
+// quote, a backslash or a line break in it is readable instead of cutting the sentence), any other
+// says it must be a JSON object. Takes only the three keys it reads so chatDoc stays free of the
+// i18n module.
+export function transcriptionPassthroughMessage(
+  parse: AudioPassthroughParse,
+  t: {
+    chatTranscriptionPassthroughInvalid: string;
+    chatTranscriptionPassthroughReserved: (field: string) => string;
+    chatTranscriptionPassthroughBadKey: (field: string) => string;
+  },
+): string {
+  if (parse.status === 'invalid' && parse.reservedField !== undefined) {
+    return t.chatTranscriptionPassthroughReserved(parse.reservedField);
+  }
+  if (parse.status === 'invalid' && parse.badKey !== undefined) {
+    return t.chatTranscriptionPassthroughBadKey(JSON.stringify(parse.badKey));
+  }
+  return t.chatTranscriptionPassthroughInvalid;
+}
+
+// Whether a run of this thread must be refused for its advanced passthrough: a transcription
+// thread whose passthrough text is not a JSON object (transcriptionSetting would omit it, and
+// the user's extra fields would vanish from the request in silence -- the Advanced section may
+// be collapsed when they send) or names a reserved field (the run would commit the turn and
+// then fail it server-side). The store refuses the send (and a replay) and says so instead.
+// Only a transcription thread has this passthrough.
+export function transcriptionPassthroughInvalid(
+  kind: string | undefined,
+  s: TranscriptionSettings,
+): boolean {
+  return (
+    kind === 'transcription' && parseTranscriptionPassthrough(s.passthrough).status === 'invalid'
+  );
+}
+
+// The `transcription` entry of a settings object, as a SPREADABLE fragment, mirroring
+// audioSetting: present ONLY on a "transcription" thread, and carrying only what the user
+// set -- so a text, image or speech thread stays byte-identical and an untouched knob leaves
+// the model on its own default. (The key is present for a transcription thread even when
+// nothing is set, as audio's is for a speech thread: `transcription: {}`.) A passthrough that
+// is not a sendable non-empty JSON object is omitted here; the store refuses the turn before
+// it gets that far (transcriptionPassthroughInvalid), so it is never dropped in silence. Both
+// the document writer (buildDoc) and the state seeder (normalizeDoc) go through this, so
+// neither can give the key to another kind of thread from the client side.
+export function transcriptionSetting(
+  kind: string | undefined,
+  s: TranscriptionSettings,
+): { transcription?: ChatTranscriptionSettings } {
+  if (kind !== 'transcription') return {};
+  const transcription: ChatTranscriptionSettings = {};
+  const language = s.language.trim();
+  if (language) transcription.language = language;
+  const prompt = s.prompt.trim();
+  if (prompt) transcription.prompt = prompt;
+  const temperature = toImageNumber(s.temperature);
+  if (temperature !== undefined) transcription.temperature = temperature;
+  const passthrough = parseTranscriptionPassthrough(s.passthrough);
+  if (passthrough.status === 'ok') transcription.passthrough = passthrough.value;
+  return { transcription };
+}
+
+// Coerce a persisted (all-optional) ChatTranscriptionSettings into the concrete store state,
+// filling anything missing/mistyped from the defaults. The inverse of transcriptionSetting,
+// used to seed the composer when a chat is loaded: the passthrough object comes back as
+// pretty-printed JSON text for the textarea.
+export function transcriptionSettingsFrom(
+  transcription: ChatTranscriptionSettings | undefined,
+): TranscriptionSettings {
+  const s = transcription ?? {};
+  const passthrough =
+    isJsonObject(s.passthrough) && Object.keys(s.passthrough).length > 0
+      ? JSON.stringify(s.passthrough, null, 2)
+      : DEFAULT_TRANSCRIPTION_SETTINGS.passthrough;
+  return {
+    language: typeof s.language === 'string' ? s.language : DEFAULT_TRANSCRIPTION_SETTINGS.language,
+    prompt: typeof s.prompt === 'string' ? s.prompt : DEFAULT_TRANSCRIPTION_SETTINGS.prompt,
+    temperature: imageNumToStr(s.temperature),
+    passthrough,
+  };
+}
+
+// The picker's `accept` list: any audio, plus the extensions a file dialog matches when it has no
+// MIME type to go by (IMAGE_EDIT_SOURCE_ACCEPT's twin). A clip is converted to WAV in the browser
+// before it is attached (shared/audioToWav), so whatever the browser can decode is welcome, not a
+// fixed list of formats; the extensions keep a file the platform does not type as audio/* (an
+// audio-only .webm is video/webm in Chrome, an .opus or .flac may have no type at all) from being
+// greyed out in the dialog.
+export const TRANSCRIPTION_AUDIO_ACCEPT = [
+  'audio/*',
+  '.wav',
+  '.webm',
+  '.mp3',
+  '.m4a',
+  '.ogg',
+  '.oga',
+  '.opus',
+  '.flac',
+  '.aac',
+].join(',');
+
+// The bare media type of a clip: its `type/subtype` without parameters, lower-cased and
+// trimmed, which is the only spelling the backend takes (DecodeAudioDataURL refuses a data
+// url whose type carries a parameter). A browser reports a recording or a picked file with
+// whatever its platform says (audio/webm;codecs=opus, audio/x-m4a, application/ogg ...), so a
+// type is read through here before it is judged or becomes a data url.
+export function bareAudioMediaType(mediaType: string): string {
+  return mediaType.split(';', 1)[0].trim().toLowerCase();
+}
+
+// The inline data url of a clip: `data:<type>;base64,<bytes>`, the type reduced to its bare
+// spelling (bareAudioMediaType), which is what the backend reads. `base64` is the clip's bytes,
+// standard-alphabet base64 without the data-url prefix. The composer's clip is always the WAV it
+// converted the upload to (audioAttach passes audio/wav), whatever the upload was.
+export function audioDataUrl(mediaType: string, base64: string): string {
+  return `data:${bareAudioMediaType(mediaType)};base64,${base64}`;
+}
+
+// The content of the user turn a transcription composer sends: the clip alone, as one audio_url
+// part (`url` is the clip's data url, see audioDataUrl). There is no text part: the turn IS the
+// audio, and nothing else of it is read.
+export function audioTurnContent(url: string): ChatContent {
+  return [{ type: 'audio_url', audio_url: { url } }];
+}
+
 // Coerce an opaque `content` blob into a well-formed active-chat document,
 // applying sane defaults for anything missing/mistyped.
 export function normalizeDoc(content: unknown): ActiveChatDoc {
@@ -679,6 +894,13 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
       ...audioSetting(
         typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
         audioSettingsFrom(s.audio),
+      ),
+      // The transcription knobs, round-tripped for a transcription thread for the same
+      // reason (the PUT full-replaces the blob). transcriptionSetting keys off the kind, so
+      // a text, image or speech thread stays byte-identical (no transcription key).
+      ...transcriptionSetting(
+        typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
+        transcriptionSettingsFrom(s.transcription),
       ),
     },
     messages,
@@ -748,6 +970,17 @@ export function deriveTitleFromMessages(messages: ChatUiMessage[]): string {
   return firstUser ? deriveTitle(textOf(firstUser.content)) : '';
 }
 
+// The title of a transcription chat, from its transcript: the latest assistant turn's text, as
+// deriveTitle shortens it ('' when there is none). A transcription thread's first user turn is
+// audio only, so deriveTitleFromMessages (the first user message's text) finds nothing there;
+// the transcript is what names the chat, once a run has produced one.
+export function deriveTitleFromTranscript(messages: ChatUiMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === 'assistant') return deriveTitle(textOf(messages[i].content));
+  }
+  return '';
+}
+
 export function summaryOf(chat: Chat): ChatSummary {
   return {
     id: chat.id,
@@ -804,6 +1037,21 @@ export function lastUserHasImage(messages: ChatUiMessage[]): boolean {
       return (
         Array.isArray(content) && content.some((p) => p.type === 'image_url' && !isMaskPart(p))
       );
+    }
+  }
+  return false;
+}
+
+// Whether the LAST user message of a replayed history carries an audio clip -- which is what a
+// transcription replay transcribes (the executor reads exactly that message's audio and nothing
+// else of the history). Role-aware like lastUserHasImage: only a user turn's clip is an input.
+// A stored /api/portal/chat-blobs/{id} reference counts as one, as it is what a committed turn
+// holds.
+export function lastUserHasAudio(messages: ChatUiMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const { role, content } = messages[i];
+    if (role === 'user') {
+      return Array.isArray(content) && content.some((p) => p.type === 'audio_url');
     }
   }
   return false;

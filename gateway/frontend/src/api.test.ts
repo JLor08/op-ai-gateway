@@ -108,6 +108,78 @@ describe('portal api', () => {
     ]);
   });
 
+  it('carries the backend-folded transcription flag on a model option, independent of speech', async () => {
+    // ModelDTO.transcription is folded in the backend (every offering mapping has a
+    // transcription:yes verdict, fail-closed), the speech flag's twin, so the client never
+    // recomputes it. It travels beside `speech`, not instead of it, and a row that omits it
+    // reads as not transcription-capable.
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: 'whisper', transcription: true },
+            { id: 'kokoro', speech: true, transcription: false },
+            { id: 'text-model' },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const api = createPortalApi(fetcher);
+
+    const { data } = await api.models();
+
+    expect(data.map((m) => [m.id, m.transcription ?? false, m.speech ?? false])).toEqual([
+      ['whisper', true, false],
+      ['kokoro', false, true],
+      ['text-model', false, false],
+    ]);
+  });
+
+  it('starts a transcription run with the thread kind and the knobs exactly as typed', async () => {
+    // ChatTranscriptionSettings is the wire twin of the backend's portal.ChatTranscriptionSettings
+    // (all fields optional, temperature a number including an explicit 0, passthrough values
+    // raw JSON): the run body must carry it untouched, and `kind` must accept "transcription".
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ run_id: 'run_1', chat_id: 'c_1', status: 'running' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    await api.startChatRun('c_1', {
+      user_message: [{ type: 'audio_url', audio_url: { url: 'data:audio/webm;base64,AAAA' } }],
+      settings: {
+        model: 'whisper',
+        system_prompt: '',
+        temperature: 1,
+        max_tokens: 0,
+        run_as_token_id: '',
+        server_override: '',
+        server_override_force_unreachable: false,
+        kind: 'transcription',
+        transcription: {
+          language: 'de',
+          prompt: 'Namen: Zoe',
+          temperature: 0,
+          passthrough: { timestamp_granularities: ['word'], beam: 5, verbose: true },
+        },
+      },
+    });
+
+    const [path, init] = fetcher.mock.calls[0];
+    expect(path).toBe('/api/portal/chats/c_1/runs');
+    const body = JSON.parse(init.body as string);
+    expect(body.settings.kind).toBe('transcription');
+    expect(body.settings.transcription).toEqual({
+      language: 'de',
+      prompt: 'Namen: Zoe',
+      temperature: 0,
+      passthrough: { timestamp_granularities: ['word'], beam: 5, verbose: true },
+    });
+  });
+
   it('sends the CSRF header on mutating requests', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(

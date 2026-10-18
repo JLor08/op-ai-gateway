@@ -7,16 +7,25 @@ import DownloadIcon from '@mui/icons-material/Download';
 import { downloadBinary, isFetchableUrl } from './shared/downloadBinary';
 import type { Translation } from './shared/types';
 
+// What the player is showing. A speech turn's REPLY is audio the gateway generated; a
+// transcription turn's INPUT is the user's own clip (the user bubble). Playback, the
+// object-URL lifecycle and the download are one and the same for both -- only the words
+// differ, so the clip is neither announced nor saved as "generated" audio.
+export type AudioVariant = 'reply' | 'input';
+
 // A download name is built from the TURN's own id, for the reason ImageTurn spells out
 // at length: without it every speech turn of a conversation would offer the same
 // `generated-audio.wav` and the second save would silently become "(1)". The id is the
 // transcript message's own (ChatUiMessage.id, threaded down through ChatMessage); it is
 // filtered to the characters a file name can carry because it comes back out of a
 // persisted document, and an empty id (only the standalone-props tests render
-// ChatMessage without one) falls back to the bare name.
-function downloadNameFor(turnId: string, extension: string): string {
+// ChatMessage without one) falls back to the bare name. An input clip is named
+// `input-audio-...` rather than `generated-audio-...`: it is not something the gateway
+// generated.
+function downloadNameFor(variant: AudioVariant, turnId: string, extension: string): string {
   const safeId = turnId.replace(/[^A-Za-z0-9._-]/g, '-');
-  const base = safeId ? `generated-audio-${safeId}` : 'generated-audio';
+  const stem = variant === 'input' ? 'input-audio' : 'generated-audio';
+  const base = safeId ? `${stem}-${safeId}` : stem;
   return `${base}.${extension}`;
 }
 
@@ -35,7 +44,7 @@ function isInlineAudio(url: string): boolean {
 // So the bytes are fetched ONCE, same-origin with the session cookie (the endpoint is
 // owner-scoped), and the element plays an object URL made from them.
 //
-// An object URL pins the whole WAV in memory until it is revoked, and a transcript can
+// An object URL pins the whole clip in memory until it is revoked, and a transcript can
 // hold many audio turns, so the effect's cleanup revokes it -- when the turn unmounts
 // and when the url changes. A request still in flight at that point is aborted, and a
 // response that lands after the abort creates nothing (nothing would ever revoke it).
@@ -85,9 +94,11 @@ function useAudioSource(url: string): AudioSource {
   return { src: current?.src ?? undefined, failed: current !== null && current.src === null };
 }
 
-// Renders the audio_url part of a speech assistant turn: an HTML5 `<audio controls>`
-// player and a download button. A speech reply is exactly ONE WAV (the executor writes a
-// single audio part), so unlike ImageTurn this takes one url, not a list.
+// Renders one audio_url part: an HTML5 `<audio controls>` player and a download button.
+// It serves the speech ASSISTANT turn (the reply, variant "reply", the default -- exactly
+// ONE WAV, the executor writes a single audio part) and the transcription USER turn (the
+// attached or recorded clip, variant "input"). Unlike ImageTurn it takes one url, not a
+// list; a turn with several parts renders one player per part.
 //
 // The download handler lives here, next to the url it downloads, rather than arriving
 // from ChatMessage as an onDownload prop -- an inline arrow built in the parent's render
@@ -103,10 +114,12 @@ export function AudioTurn({
   t,
   url,
   turnId,
+  variant = 'reply',
 }: Readonly<{
   t: Translation;
   url: string;
   turnId: string;
+  variant?: AudioVariant;
 }>) {
   const { src, failed } = useAudioSource(url);
   // Whether the most recent download attempt failed -- a truncated persisted data: URL
@@ -130,14 +143,14 @@ export function AudioTurn({
       }}
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minWidth: 0 }}>
-        {/* No src until a stored reply's bytes have arrived: the element renders as an
+        {/* No src until a stored clip's bytes have arrived: the element renders as an
             inert player meanwhile, which is the loading state. */}
         <Box
           component="audio"
           controls
           preload="metadata"
           src={src}
-          aria-label={t.chatGeneratedAudio}
+          aria-label={variant === 'input' ? t.chatAttachedAudio : t.chatGeneratedAudio}
           sx={{ display: 'block', width: 320, maxWidth: '100%', minWidth: 0 }}
         />
         <Tooltip title={t.chatDownloadAudio}>
@@ -150,7 +163,7 @@ export function AudioTurn({
               // resolves false for every failure it knows of; the catch is for the one
               // it does not (a browser API throwing while the file is built), so that
               // surfaces as the same inline error instead of an unhandled rejection.
-              void downloadBinary((extension) => downloadNameFor(turnId, extension), url)
+              void downloadBinary((extension) => downloadNameFor(variant, turnId, extension), url)
                 .then((ok) => setDownloadFailed(!ok))
                 .catch(() => setDownloadFailed(true));
             }}

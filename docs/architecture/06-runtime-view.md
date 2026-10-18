@@ -187,6 +187,62 @@ object URL. See [Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) and
 [ADR-063](09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs).
 
+### 6.1.4 Portal transcription chat turn (through loopback from a chat blob)
+
+A transcription turn **inverts** the speech turn of §6.1.3: the audio is the run's
+**input**, not its output, and the reply is the ordinary text turn. The browser attaches a
+file or records a clip in the composer and **converts it to a 16 kHz mono 16-bit PCM WAV**
+(audio.cpp reads WAV only, so the upload is always a WAV, whatever was attached or
+recorded); the clip is stored as a chat blob on the user turn, and the run executor
+resolves it, relays it multipart to `/v1/audio/transcriptions` over loopback, and commits
+the transcript as a text turn.
+
+```mermaid
+sequenceDiagram
+    participant B as Portal (browser)
+    participant GW as Gateway (run executor)
+    participant TR as Gateway (/v1/audio/transcriptions)
+    participant AC as audio.cpp server
+    participant S as chat store (chat_blobs)
+    participant U as usage
+
+    B->>B: attach a file or record: WebAudio decodes the clip, an OfflineAudioContext downmixes and resamples it to 16 kHz mono, a 16-bit PCM WAV is written (data:audio/wav)
+    B->>GW: POST /api/portal/chats/{id}/runs {user_message with audio_url clip (the WAV), settings: kind transcription, model, transcription} (session + CSRF)
+    GW->>GW: PrepareChatRun pins the kind, clears non-transcription settings, extractChatBlobs moves the clip into chat_blobs, resolveTranscriptionRunSource resolves the last user clip (or refuses: not owned)
+    GW-->>B: 201 {run id, kind: transcription}
+    B->>GW: GET .../runs/{runId}/events (snapshot with elapsed_ms, no deltas)
+    GW->>GW: executeTranscriptionRun under transcriptionRunDeadline (10 minutes)
+    GW->>GW: buildTranscriptionBody multipart {file = clip, model, language?, prompt?, temperature?, passthrough}, response_format NOT sent
+    Note over GW: a passthrough key named model, file, stream or response_format ends the run gateway.chat_run_transcription_reserved_field and sends nothing
+    GW->>TR: POST /v1/audio/transcriptions over loopback (internal pair, chat-id, run-as), Content-Type overridden to multipart
+    TR->>AC: resolve (openai_audio, capability transcription), relay as in 6.1.2
+    alt 2xx JSON
+        AC-->>TR: application/json {text, timing{audio_duration_ms}}
+        TR->>U: audio_second from the body under the run-as token
+        TR-->>GW: the JSON transcript
+        GW->>GW: read the body, take text, build ONE text part (no new part type, no output blob)
+        GW->>S: commit the turn (the input clip is already a chat blob)
+        GW-->>B: SSE done with the transcript as a text turn
+        B->>B: title an untitled chat from the transcript, and play the input clip via a fetched object URL (reused AudioTurn)
+    else error
+        TR-->>GW: the endpoint's own error, or an empty or unreadable 2xx
+        GW-->>B: SSE done, status error with gateway.chat_run_transcription_* or transcription.* code
+    end
+```
+
+What differs from the transcription relay of §6.1.2: the caller is the executor and the
+credential the internal loopback pair (never a session cookie, [Security
+§1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)), so
+billing, capture and routing run under the **run-as token**; the clip is a user-turn
+**input resolved before the run** (like an image-edit source,
+[ADR-057](09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
+not a client-supplied multipart body; and the transcript is committed as the **ordinary
+text turn**, with no output part and no output blob — the inverse of the speech turn, whose
+WAV becomes an `audio_url` blob. The wait is `TranscriptionPendingTurn` (one buffered
+zero-delta call). See [Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) and
+[ADR-064](09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn).
+
 ## 6.2 Portal login (session + CSRF) with optional TOTP
 
 ```mermaid

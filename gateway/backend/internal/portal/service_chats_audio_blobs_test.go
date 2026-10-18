@@ -6,10 +6,12 @@ package portal
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"op-ai-gateway/internal/store"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -182,8 +184,11 @@ func TestCommitAssistantRefusesBadSpeechAudio(t *testing.T) {
 		url    string
 		want   error
 	}{
-		{"mp3", "audio_url", dataURL("audio/mpeg", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
-		{"ogg", "audio_url", dataURL("audio/ogg", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
+		// Only the types the portal's consumers need are listed: the speech reply's
+		// WAV and the transcription composer's input formats (webm, mpeg, mp4, ogg,
+		// wav). Any other audio subtype stays refused.
+		{"flac", "audio_url", dataURL("audio/flac", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
+		{"aac", "audio_url", dataURL("audio/aac", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
 		// The executor normalises the aliases to audio/wav before it commits, so the
 		// store has no need to know them.
 		{"audio/x-wav alias", "audio_url", dataURL("audio/x-wav", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
@@ -196,6 +201,12 @@ func TestCommitAssistantRefusesBadSpeechAudio(t *testing.T) {
 		{"empty payload", "audio_url", "data:audio/wav;base64,", ErrChatBlobTypeUnsupported},
 		{"an image in an audio part", "audio_url", dataURL("image/png", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
 		{"audio in an image part", "image_url", dataURL("audio/wav", wavLike(64)), ErrChatBlobTypeUnsupported},
+		// The input formats join the audio family only: an image part still cannot
+		// take them.
+		{"webm in an image part", "image_url", dataURL("audio/webm", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
+		{"mpeg in an image part", "image_url", dataURL("audio/mpeg", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
+		{"mp4 in an image part", "image_url", dataURL("audio/mp4", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
+		{"ogg in an image part", "image_url", dataURL("audio/ogg", []byte{1, 2, 3}), ErrChatBlobTypeUnsupported},
 		{"too large", "audio_url", dataURL("audio/wav", wavLike(1001)), ErrChatBlobTooLarge},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -294,14 +305,14 @@ func TestDataURLDecodersKeepToTheirOwnMediaFamily(t *testing.T) {
 		t.Fatalf("decodeDataURL(upper case, audio) = %q, %v: want the canonical lower-case type", mediaType, err)
 	}
 	for _, url := range []string{
-		dataURL("image/png", raw), dataURL("audio/mpeg", raw), dataURL("audio/x-wav", raw), dataURL("text/html", raw),
+		dataURL("image/png", raw), dataURL("audio/flac", raw), dataURL("audio/x-wav", raw), dataURL("text/html", raw),
 		gatewayBlobPrefix + "blob_" + strings.Repeat("a", 32), "https://example.com/a.wav", "",
 	} {
 		if mediaType, _, err := decodeDataURL(url, audioPartKind); !errors.Is(err, ErrChatBlobTypeUnsupported) {
 			t.Errorf("decodeDataURL(%.40q, audio) = %q, %v; want ErrChatBlobTypeUnsupported", url, mediaType, err)
 		}
 	}
-	for _, url := range []string{wav, dataURL("audio/mpeg", raw)} {
+	for _, url := range []string{wav, dataURL("audio/mpeg", raw), dataURL("audio/webm", raw)} {
 		if mediaType, _, err := DecodeImageDataURL(url); !errors.Is(err, ErrChatBlobTypeUnsupported) {
 			t.Errorf("DecodeImageDataURL(%.40q) = %q, %v; want ErrChatBlobTypeUnsupported: audio is not a source image", url, mediaType, err)
 		}
@@ -392,21 +403,34 @@ func TestRunHistoryResolutionIgnoresAudioParts(t *testing.T) {
 	}
 }
 
-// collectBlobRefIDs is where the walk is decided; pin it directly too.
-func TestCollectBlobRefIDsReadsImagePartsOnly(t *testing.T) {
+// collectBlobRefIDs is where the walk is decided; pin it directly too. The walk is
+// told which family it reads: a text, image or speech run's history is read as
+// images (the images only, a stored audio reference is never listed, so never
+// fetched), a transcription run's source as audio.
+func TestCollectBlobRefIDsReadsTheKindItIsAskedFor(t *testing.T) {
 	ref := func(id string) string { return gatewayBlobPrefix + "blob_" + strings.Repeat(id, 32) }
 	history := []ChatAPIMessage{
 		{Role: "user", Content: imageContent("see", ref("a"))},
 		{Role: "assistant", Content: audioContent(ref("b"))},
 		{Role: "user", Content: json.RawMessage(fmt.Sprintf(
-			`[{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}},{"type":"image_url","image_url":{"url":%q}}]`, ref("a"), ref("c"), ref("a")))},
+			`[{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}},{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}}]`, ref("a"), ref("c"), ref("a"), ref("c")))},
 	}
-	ids, occurrences, err := collectBlobRefIDs(history)
+	idOf := func(c string) string { return "blob_" + strings.Repeat(c, 32) }
+
+	ids, occurrences, err := collectBlobRefIDs(history, imagePartKind)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != 1 || ids[0] != "blob_"+strings.Repeat("a", 32) || occurrences[ids[0]] != 3 {
-		t.Fatalf("ids = %v, occurrences = %v; want only the image blob, three times", ids, occurrences)
+	if len(ids) != 1 || ids[0] != idOf("a") || occurrences[ids[0]] != 3 {
+		t.Fatalf("image walk: ids = %v, occurrences = %v; want only the image blob, three times", ids, occurrences)
+	}
+
+	ids, occurrences, err = collectBlobRefIDs(history, audioPartKind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(ids, []string{idOf("b"), idOf("c")}) || occurrences[idOf("b")] != 1 || occurrences[idOf("c")] != 2 {
+		t.Fatalf("audio walk: ids = %v, occurrences = %v; want only the audio blobs, in order first seen", ids, occurrences)
 	}
 }
 
@@ -440,11 +464,14 @@ func TestPrepareChatRunNeverResolvesAnImageReferenceToAnAudioBlob(t *testing.T) 
 }
 
 // The store carries any content type; the allow-list lives in the portal. The
-// set is pinned so a later edit cannot admit another audio type by accident --
-// extend it deliberately, together with the consumer that needs the type.
-func TestChatBlobAllowListHoldsExactlyTheImageTypesAndWAV(t *testing.T) {
+// set is pinned so a later edit cannot admit another type by accident -- extend it
+// deliberately, together with the consumer that needs the type. The audio side is
+// the speech reply's WAV plus the transcription composer's input formats (what the
+// browser's recorder and an attached file produce).
+func TestChatBlobAllowListHoldsExactlyTheImageTypesAndTheAudioFormats(t *testing.T) {
 	want := map[string]struct{}{
-		"image/png": {}, "image/jpeg": {}, "image/webp": {}, "image/gif": {}, "audio/wav": {},
+		"image/png": {}, "image/jpeg": {}, "image/webp": {}, "image/gif": {},
+		"audio/wav": {}, "audio/webm": {}, "audio/mpeg": {}, "audio/mp4": {}, "audio/ogg": {},
 	}
 	if len(chatBlobMediaTypes) != len(want) {
 		t.Fatalf("chatBlobMediaTypes = %v, want exactly %v", chatBlobMediaTypes, want)
@@ -456,12 +483,159 @@ func TestChatBlobAllowListHoldsExactlyTheImageTypesAndWAV(t *testing.T) {
 	}
 }
 
+// The widened allow-list keeps the two families apart: every audio input format
+// is accepted by an audio part and refused by an image part, and every image type
+// is still refused by an audio part -- the family test (blobPartKind.accepts) is
+// the prefix AND the allow-list, so a new audio type joins the audio family only.
+func TestAudioInputTypesJoinTheAudioFamilyOnly(t *testing.T) {
+	for _, mediaType := range []string{"audio/wav", "audio/webm", "audio/mpeg", "audio/mp4", "audio/ogg"} {
+		if !audioPartKind.accepts(mediaType) {
+			t.Errorf("audioPartKind.accepts(%q) = false, want true", mediaType)
+		}
+		if imagePartKind.accepts(mediaType) {
+			t.Errorf("imagePartKind.accepts(%q) = true, want false: audio is never filed under an image part", mediaType)
+		}
+	}
+	for _, mediaType := range []string{"image/png", "image/jpeg", "image/webp", "image/gif"} {
+		if audioPartKind.accepts(mediaType) {
+			t.Errorf("audioPartKind.accepts(%q) = true, want false: an image is never filed under an audio part", mediaType)
+		}
+		if !imagePartKind.accepts(mediaType) {
+			t.Errorf("imagePartKind.accepts(%q) = false, want true", mediaType)
+		}
+	}
+	for _, mediaType := range []string{"audio/flac", "audio/aac", "audio/x-wav", "audio/webm;codecs=opus", "video/webm", "text/html", ""} {
+		if audioPartKind.accepts(mediaType) || imagePartKind.accepts(mediaType) {
+			t.Errorf("%q is accepted by a part kind, want it refused by both", mediaType)
+		}
+	}
+}
+
+// DecodeAudioDataURL is the ONE definition of an inline audio url, the audio twin
+// of DecodeImageDataURL: the run commit that stores an attached or recorded clip
+// and the transcription executor that sends it parse the same text, so the
+// executor can never accept a spelling the store refused.
+func TestDecodeAudioDataURL(t *testing.T) {
+	raw := blobTestBytes(131, 17)
+	payload := base64.StdEncoding.EncodeToString(raw)
+	for _, mediaType := range []string{"audio/webm", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav"} {
+		got, bytesOut, err := DecodeAudioDataURL(dataURL(mediaType, raw))
+		if err != nil || got != mediaType || !bytes.Equal(bytesOut, raw) {
+			t.Errorf("DecodeAudioDataURL(%s) = %q, %d bytes, %v; want the type and the %d bytes", mediaType, got, len(bytesOut), err, len(raw))
+		}
+	}
+	// The scheme, the base64 flag and the type are matched without regard to case,
+	// and the type comes back canonical.
+	if got, _, err := DecodeAudioDataURL("DATA:AUDIO/WEBM;BASE64," + payload); err != nil || got != "audio/webm" {
+		t.Errorf("DecodeAudioDataURL(upper case) = %q, %v; want the canonical lower-case type", got, err)
+	}
+	for name, url := range map[string]string{
+		"an image type":         dataURL("image/png", raw),
+		"an unlisted audio":     dataURL("audio/flac", raw),
+		"a non-audio webm":      dataURL("video/webm", raw),
+		"html":                  dataURL("text/html", raw),
+		"a codec parameter":     "data:audio/webm;codecs=opus;base64," + payload,
+		"not base64":            "data:audio/webm,AAEC",
+		"unpadded":              "data:audio/webm;base64,AQ",
+		"the url-safe alphabet": "data:audio/webm;base64," + strings.NewReplacer("+", "-", "/", "_").Replace(base64.StdEncoding.EncodeToString([]byte{0xfb, 0xff, 0xfe})),
+		"an empty payload":      "data:audio/webm;base64,",
+		"a gateway url":         gatewayBlobPrefix + "blob_" + strings.Repeat("a", 32),
+		"an https url":          "https://example.com/a.webm",
+		"empty":                 "",
+	} {
+		if mediaType, got, err := DecodeAudioDataURL(url); !errors.Is(err, ErrChatBlobTypeUnsupported) || mediaType != "" || got != nil {
+			t.Errorf("DecodeAudioDataURL(%s: %.50q) = %q, %d bytes, %v; want ErrChatBlobTypeUnsupported", name, url, mediaType, len(got), err)
+		}
+	}
+	// It and DecodeImageDataURL are siblings, not a loosening of each other: the
+	// image decoder still refuses every audio input format.
+	for _, mediaType := range []string{"audio/webm", "audio/mpeg", "audio/mp4", "audio/ogg"} {
+		if _, _, err := DecodeImageDataURL(dataURL(mediaType, raw)); !errors.Is(err, ErrChatBlobTypeUnsupported) {
+			t.Errorf("DecodeImageDataURL(%s) = %v; want ErrChatBlobTypeUnsupported", mediaType, err)
+		}
+	}
+}
+
+// MessageAudio reads the audio parts of a message the way the extraction and the
+// resolution do (through rewriteBlobPart with the audio kind): an object whose
+// audio_url is an object with a string url, members matched without regard to
+// case, in order. An image part is not an audio part, and neither is a content
+// that is not an array.
+func TestMessageAudio(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    []string
+	}{
+		{"a plain string", `"hello"`, nil},
+		{"null", `null`, nil},
+		{"no audio part", `[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]`, nil},
+		{"one clip", `[{"type":"audio_url","audio_url":{"url":"data:audio/webm;base64,AAEC"}}]`, []string{"data:audio/webm;base64,AAEC"}},
+		{"beside text and an image", `[{"type":"text","text":"transcribe"},{"type":"image_url","image_url":{"url":"/img"}},{"type":"audio_url","audio_url":{"url":"/api/portal/chat-blobs/blob_x"}}]`, []string{"/api/portal/chat-blobs/blob_x"}},
+		{"two clips, in order", `[{"type":"audio_url","audio_url":{"url":"/a"}},{"type":"text","text":"t"},{"type":"audio_url","audio_url":{"url":"/b"}}]`, []string{"/a", "/b"}},
+		{"member spelling", `[{"type":"audio_url","Audio_Url":{"URL":"/c"}}]`, []string{"/c"}},
+		{"audio_url is not an object", `[{"type":"audio_url","audio_url":"/d"}]`, nil},
+		{"the url is not a string", `[{"type":"audio_url","audio_url":{"url":7}}]`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MessageAudio(json.RawMessage(tc.content))
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("MessageAudio(%s) = %v, want %v", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
+// A transcription thread's user turn carries the attached or recorded clip inline.
+// The run commit moves it into chat_blobs under its own type (sealed when a cipher
+// is configured) and rewrites the part's url, so the sealed document never holds
+// the bytes, and the blob is served back as the very bytes under the same type.
+func TestPrepareChatRunStoresTheTranscriptionInputAudio(t *testing.T) {
+	ctx := context.Background()
+	for _, mediaType := range []string{"audio/webm", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav"} {
+		for _, withCipher := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/cipher=%v", mediaType, withCipher), func(t *testing.T) {
+				e := newBlobTestEnv(t, withCipher, 0)
+				chatID := e.emptyChat(t)
+				raw := blobTestBytes(2500, 5)
+
+				if _, _, err := e.svc.PrepareChatRun(ctx, e.owner, chatID, PrepareRunRequest{
+					UserMessage: audioContent(dataURL(mediaType, raw)),
+					Settings:    ChatRunSettings{Model: "whisper", Kind: chatKindTranscription},
+				}); err != nil {
+					t.Fatalf("PrepareChatRun: %v", err)
+				}
+				doc := string(e.stored(t, chatID))
+				if strings.Contains(doc, "data:") || strings.Contains(doc, "base64") {
+					t.Fatalf("the clip was not stored as a reference: %.300s", doc)
+				}
+				urls := storedMemberURLs(t, json.RawMessage(doc), "audio_url")
+				if len(urls) != 1 || !strings.HasPrefix(urls[0], gatewayBlobPrefix) || !blobIDPattern.MatchString(strings.TrimPrefix(urls[0], gatewayBlobPrefix)) {
+					t.Fatalf("stored audio urls = %v, want one gateway url", urls)
+				}
+				id := strings.TrimPrefix(urls[0], gatewayBlobPrefix)
+				row, err := e.mem.ChatBlobByID(ctx, id)
+				if err != nil {
+					t.Fatalf("ChatBlobByID: %v", err)
+				}
+				if row.ChatID != chatID || row.ContentType != mediaType || row.ByteLen != int64(len(raw)) || !bytes.Equal(e.blobBytes(t, row), raw) {
+					t.Fatalf("blob row = chat %s type %s, %d bytes: not the clip", row.ChatID, row.ContentType, row.ByteLen)
+				}
+				served, servedType, err := e.svc.ChatBlobBytes(ctx, e.owner, id)
+				if err != nil || servedType != mediaType || !bytes.Equal(served, raw) {
+					t.Fatalf("served %d bytes as %q, err %v; want the %d stored bytes as %s", len(served), servedType, err, len(raw), mediaType)
+				}
+			})
+		}
+	}
+}
+
 // Unlisted audio rows are never served, whatever the row says.
 func TestChatBlobBytesNeverServesAnUnlistedAudioType(t *testing.T) {
 	ctx := context.Background()
 	e := newBlobTestEnv(t, false, 0)
 	chatID := e.emptyChat(t)
-	for i, mediaType := range []string{"audio/mpeg", "audio/x-wav", "audio/wav; codecs=1", "AUDIO/WAV"} {
+	for i, mediaType := range []string{"audio/flac", "audio/x-wav", "audio/wav; codecs=1", "AUDIO/WAV", "audio/webm; codecs=opus", "AUDIO/WEBM"} {
 		id := fmt.Sprintf("blob_audio_%d", i)
 		if err := e.mem.PutChatBlob(ctx, store.ChatBlob{ID: id, ChatID: chatID, Blob: wavLike(32), ContentType: mediaType, ByteLen: 32}); err != nil {
 			t.Fatal(err)

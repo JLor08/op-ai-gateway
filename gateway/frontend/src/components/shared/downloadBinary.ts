@@ -14,7 +14,7 @@
 //    Decoded in place; the media type is the URL's own prefix. Nothing here
 //    assumes PNG.
 //  - A gateway url (/api/portal/chat-blobs/{id}): what a stored image (or a
-//    speech turn's WAV) is now.
+//    speech turn's WAV, or a transcription turn's input clip) is now.
 //    The bytes live behind an owner-scoped endpoint, so they are fetched (with
 //    the session cookie) and the media type is whatever the response's
 //    Content-Type says. The url comes out of a persisted transcript, so only a
@@ -130,13 +130,21 @@ function saveBlob(blob: Blob, filename: string): void {
 // Object.prototype member ("constructor") is not a hit.
 //
 // Images are what the gateway stores for an image turn; audio/wav is the one
-// audio format it stores, for a speech turn's reply (there is no format knob).
+// format it WRITES for audio, a speech turn's reply (there is no format knob). The
+// other audio types are what a transcription turn's input clip is stored as, in the
+// type it was attached or recorded in (the chat-blob allow-list, chatBlobMediaTypes in
+// service_chats_blobs.go -- keep the two in step): mp4 audio is the conventional .m4a
+// and mpeg audio is .mp3, like jpeg becomes jpg.
 const EXTENSION_BY_MEDIA_TYPE = new Map([
   ['image/png', 'png'],
   ['image/jpeg', 'jpg'],
   ['image/webp', 'webp'],
   ['image/gif', 'gif'],
   ['audio/wav', 'wav'],
+  ['audio/webm', 'webm'],
+  ['audio/mpeg', 'mp3'],
+  ['audio/mp4', 'm4a'],
+  ['audio/ogg', 'ogg'],
 ]);
 
 // extensionFor maps a media type to a file extension for the download name. It

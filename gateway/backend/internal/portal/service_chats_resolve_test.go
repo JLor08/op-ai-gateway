@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/store"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -786,5 +787,351 @@ func TestPrepareChatRunResolutionLeavesTheRestOfTheHistoryAlone(t *testing.T) {
 		if history[i].Role != tc.role || string(history[i].Content) != tc.content {
 			t.Fatalf("history[%d] = %s %.160s\n want      %s %.160s", i, history[i].Role, history[i].Content, tc.role, tc.content)
 		}
+	}
+}
+
+// sendAudio sends one inline clip as a turn of the given thread kind and returns
+// the id of the blob it was stored under (read back from the stored document).
+func (e *resolveEnv) sendAudio(t *testing.T, chatID, kind, mediaType string, raw []byte) string {
+	t.Helper()
+	if _, err := e.sendKind(chatID, kind, audioContent(dataURL(mediaType, raw))); err != nil {
+		t.Fatalf("PrepareChatRun(%q): %v", kind, err)
+	}
+	urls := storedMemberURLs(t, e.stored(t, chatID), "audio_url")
+	if len(urls) == 0 {
+		t.Fatal("the stored document carries no audio url")
+	}
+	return strings.TrimPrefix(urls[len(urls)-1], gatewayBlobPrefix)
+}
+
+// A transcription thread's turn is a run over the clip its LAST user message
+// carries: the executor sends that clip's bytes to /v1/audio/transcriptions. Like
+// the image-edit source, it is resolved from the last user message alone, through
+// the chat-scoped, bounded resolution a text run uses, with the audio family: the
+// executor finds a data: url there whether the clip was just attached or recorded
+// (inline already) or is a stored reference (a replayed turn).
+func TestPrepareChatRunTranscriptionKindResolvesTheAudioSource(t *testing.T) {
+	for _, withCipher := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cipher=%v", withCipher), func(t *testing.T) {
+			e := newResolveEnv(t, withCipher, 0)
+			chatID := e.emptyChat(t)
+			clip := blobTestBytes(3000, 21)
+
+			// A fresh clip arrives inline and is handed to the run as it was sent: no
+			// round trip through the store for bytes already in hand.
+			history, err := e.sendKind(chatID, chatKindTranscription, audioContent(dataURL("audio/webm", clip)))
+			if err != nil {
+				t.Fatalf("PrepareChatRun: %v", err)
+			}
+			if len(e.byIDs.calls) != 0 {
+				t.Fatalf("a fresh clip issued %d ChatBlobsByIDs calls, want 0", len(e.byIDs.calls))
+			}
+			urls := MessageAudio(history[len(history)-1].Content)
+			if len(urls) != 1 {
+				t.Fatalf("history carries %d audio urls, want the one clip", len(urls))
+			}
+			if mediaType, raw := decodeResolvedURL(t, urls[0]); mediaType != "audio/webm" || !bytes.Equal(raw, clip) {
+				t.Fatalf("the fresh clip arrived as %s with %d bytes, want the %d attached bytes", mediaType, len(raw), len(clip))
+			}
+
+			// The stored copy is a reference. A later turn that names it (a replayed
+			// run) gets the bytes back, from ONE lookup scoped to this chat.
+			stored := storedMemberURLs(t, e.stored(t, chatID), "audio_url")
+			if len(stored) != 1 || !strings.HasPrefix(stored[0], gatewayBlobPrefix) {
+				t.Fatalf("stored audio urls = %v, want one gateway reference", stored)
+			}
+			e.byIDs.calls = nil
+			history, err = e.sendKind(chatID, chatKindTranscription, audioContent(stored[0]))
+			if err != nil {
+				t.Fatalf("PrepareChatRun(replay): %v", err)
+			}
+			if len(e.byIDs.calls) != 1 || e.byIDs.calls[0].chatID != chatID || !slices.Equal(e.byIDs.calls[0].ids, []string{strings.TrimPrefix(stored[0], gatewayBlobPrefix)}) {
+				t.Fatalf("calls = %+v, want ONE batch scoped to chat %s for exactly the stored clip", e.byIDs.calls, chatID)
+			}
+			if len(history) != 2 {
+				t.Fatalf("history has %d messages, want the first turn and the replay", len(history))
+			}
+			// Only the last user message is the run's source: the older turn keeps its
+			// reference.
+			if older := MessageAudio(history[0].Content); !slices.Equal(older, stored) {
+				t.Fatalf("the older turn's audio = %.80v, want its reference %v left alone", older, stored)
+			}
+			lastURLs := MessageAudio(history[1].Content)
+			if len(lastURLs) != 1 {
+				t.Fatalf("the replayed turn carries %d audio urls, want the one source", len(lastURLs))
+			}
+			if mediaType, raw := decodeResolvedURL(t, lastURLs[0]); mediaType != "audio/webm" || !bytes.Equal(raw, clip) {
+				t.Fatalf("the source resolved to %s with %d bytes, want the stored %d bytes", mediaType, len(raw), len(clip))
+			}
+
+			// The stored document is not touched by the resolution: references only.
+			if doc := string(e.stored(t, chatID)); strings.Contains(doc, "data:") {
+				t.Fatalf("the stored document gained inline bytes: %.200s", doc)
+			}
+			if ids := e.storedBlobIDs(t, chatID); len(ids) != 0 {
+				t.Fatalf("image blob ids = %v, want none: the walk read the audio family", ids)
+			}
+		})
+	}
+}
+
+// The transcription run's resolution reads the audio family and nothing else, and
+// the last user message and nothing else: an image ref beside the clip is not
+// fetched, an older message's clip is not fetched, and a turn whose last user
+// message is plain text touches the blob store not at all.
+func TestPrepareChatRunTranscriptionKindResolvesTheLastUserMessagesAudioOnly(t *testing.T) {
+	ctx := context.Background()
+	e := newResolveEnv(t, true, 0)
+	chatID := e.emptyChat(t)
+	image, first, second := blobTestBytes(400, 1), blobTestBytes(500, 2), blobTestBytes(600, 3)
+
+	// First turn: a clip and an image, both stored by the commit.
+	if _, _, err := e.svc.PrepareChatRun(ctx, e.owner, chatID, PrepareRunRequest{
+		UserMessage: json.RawMessage(fmt.Sprintf(
+			`[{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}}]`, dataURL("image/png", image), dataURL("audio/mp4", first))),
+		Settings: ChatRunSettings{Model: "whisper", Kind: chatKindTranscription},
+	}); err != nil {
+		t.Fatalf("PrepareChatRun: %v", err)
+	}
+	doc := e.stored(t, chatID)
+	imageRef := storedImageURLs(t, doc)[0]
+	firstRef := storedMemberURLs(t, doc, "audio_url")[0]
+	secondID := e.sendAudio(t, chatID, chatKindTranscription, "audio/ogg", second)
+	secondRef := gatewayBlobPrefix + secondID
+
+	// Third turn: names the image and the second clip by reference.
+	e.byIDs.calls = nil
+	history, _, err := e.svc.PrepareChatRun(ctx, e.owner, chatID, PrepareRunRequest{
+		UserMessage: json.RawMessage(fmt.Sprintf(
+			`[{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}}]`, imageRef, secondRef)),
+		Settings: ChatRunSettings{Model: "whisper", Kind: chatKindTranscription},
+	})
+	if err != nil {
+		t.Fatalf("PrepareChatRun: %v", err)
+	}
+	if len(e.byIDs.calls) != 1 || !slices.Equal(e.byIDs.calls[0].ids, []string{secondID}) {
+		t.Fatalf("calls = %+v, want ONE batch naming only the last message's clip %s", e.byIDs.calls, secondID)
+	}
+	last := history[len(history)-1].Content
+	if mediaType, raw := decodeResolvedURL(t, MessageAudio(last)[0]); mediaType != "audio/ogg" || !bytes.Equal(raw, second) {
+		t.Fatalf("the clip resolved to %s with %d bytes, want the %d stored bytes", mediaType, len(raw), len(second))
+	}
+	if urls := messageImageURLs(last); !slices.Equal(urls, []string{imageRef}) {
+		t.Fatalf("the image in the last message = %.80v, want its reference %s left alone (the audio walk does not resolve images)", urls, imageRef)
+	}
+	if got := MessageAudio(history[0].Content); !slices.Equal(got, []string{firstRef}) {
+		t.Fatalf("the first turn's clip = %.80v, want its reference %s left alone", got, firstRef)
+	}
+
+	// A turn whose last user message is plain text: nothing to resolve, no store call.
+	e.byIDs.calls = nil
+	history, err = e.sendKind(chatID, chatKindTranscription, json.RawMessage(`"just words"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.byIDs.calls) != 0 {
+		t.Fatalf("a text-only last message issued %d ChatBlobsByIDs calls, want 0", len(e.byIDs.calls))
+	}
+	if got := MessageText(history[len(history)-1].Content); got != "just words" {
+		t.Fatalf("the last prompt = %q", got)
+	}
+}
+
+// A clip the chat does not hold is never turned into bytes, whoever's it is -- and,
+// unlike a stored clip of a text thread (left as a reference, the run carries on),
+// it fails the run: a transcription cannot proceed without its audio, and an upstream
+// handed a placeholder where the clip was would transcribe nothing. The refusal is the
+// error a foreign blob already is at run start, before anything is stored.
+func TestPrepareChatRunTranscriptionKindRefusesAClipTheChatDoesNotHold(t *testing.T) {
+	ctx := context.Background()
+	e := newResolveEnv(t, true, 0)
+	secretID := e.sendAudio(t, e.emptyChat(t), chatKindTranscription, "audio/webm", blobTestBytes(2048, 77)) // the same owner holds it in ANOTHER chat
+
+	graft := func(url string) string {
+		return fmt.Sprintf(`{"settings":{"kind":"transcription"},"messages":[{"id":"u1","role":"user","content":[{"type":"text","text":"mine"},{"type":"audio_url","audio_url":{"url":%q}}]}]}`, url)
+	}
+	foreignRef := gatewayBlobPrefix + secretID
+	missingRef := gatewayBlobPrefix + "blob_" + strings.Repeat("0", 32)
+
+	for _, tc := range []struct {
+		name string
+		ref  string
+	}{
+		{"another chat's blob", foreignRef},
+		{"a blob that never existed", missingRef},
+	} {
+		t.Run("stored last message: "+tc.name, func(t *testing.T) {
+			// A transcript can carry any id (create and a bare autosave store whatever
+			// they are given), so this is the shape a run that supplies no message of
+			// its own sees: the stored last user message, not vetted at this request.
+			chatID := e.newChat(t, graft(tc.ref))
+			before := docMessages(t, mustContent(t, e.svc, e.owner, chatID))
+			history, _, err := e.svc.PrepareChatRun(ctx, e.owner, chatID, PrepareRunRequest{Settings: ChatRunSettings{Model: "whisper", Kind: chatKindTranscription}})
+			if !errors.Is(err, ErrChatBlobNotOwned) {
+				t.Fatalf("err = %v, want ErrChatBlobNotOwned (and no history)", err)
+			}
+			if history != nil {
+				t.Fatalf("a refused source still returned a history: %.200s", history)
+			}
+			after := docMessages(t, mustContent(t, e.svc, e.owner, chatID))
+			if !slices.Equal(before, after) {
+				t.Fatalf("a refused run changed the stored document:\n before %v\n after  %v", before, after)
+			}
+		})
+		t.Run("new message: "+tc.name, func(t *testing.T) {
+			chatID := e.emptyChat(t)
+			if _, err := e.sendKind(chatID, chatKindTranscription, audioContent(tc.ref)); !errors.Is(err, ErrChatBlobNotOwned) {
+				t.Fatalf("err = %v, want ErrChatBlobNotOwned", err)
+			}
+		})
+	}
+
+	// The service does not trust the store's chat scoping alone either: a row of
+	// another chat, a row of a type outside the allow-list, and a row that is an
+	// IMAGE (not an audio type) are not a clip -- the refusal, not a placeholder.
+	for _, tc := range []struct {
+		name   string
+		mutate func(row *store.ChatBlob)
+	}{
+		{"row of another chat", func(row *store.ChatBlob) { row.ChatID = "chat_someone_else" }},
+		{"unlisted type", func(row *store.ChatBlob) { row.ContentType = "text/html" }},
+		{"an image row", func(row *store.ChatBlob) { row.ContentType = "image/png" }},
+	} {
+		t.Run("misreporting store: "+tc.name, func(t *testing.T) {
+			own := newResolveEnv(t, true, 0)
+			chatID := own.emptyChat(t)
+			id := own.sendAudio(t, chatID, chatKindTranscription, "audio/webm", blobTestBytes(300, 8))
+			own.byIDs.rewrite = func(got map[string]store.ChatBlob) {
+				for k, row := range got {
+					tc.mutate(&row)
+					got[k] = row
+				}
+			}
+			_, _, err := own.svc.PrepareChatRun(ctx, own.owner, chatID, PrepareRunRequest{
+				UserMessage: audioContent(gatewayBlobPrefix + id),
+				Settings:    ChatRunSettings{Model: "whisper", Kind: chatKindTranscription},
+			})
+			if !errors.Is(err, ErrChatBlobNotOwned) {
+				t.Fatalf("err = %v, want ErrChatBlobNotOwned", err)
+			}
+		})
+	}
+}
+
+// resolveTranscriptionRunSource on its own: a history with no user message comes
+// back as it is, and the history it is given is never modified.
+func TestResolveTranscriptionRunSourceLeavesTheHistoryAlone(t *testing.T) {
+	e := newResolveEnv(t, true, 0)
+	chatID := e.emptyChat(t)
+	id := e.sendAudio(t, chatID, chatKindTranscription, "audio/webm", blobTestBytes(100, 4))
+	e.byIDs.calls = nil
+
+	noUser := []ChatAPIMessage{{Role: "system", Content: json.RawMessage(`"s"`)}, {Role: "assistant", Content: audioContent(gatewayBlobPrefix + id)}}
+	got, err := e.svc.resolveTranscriptionRunSource(context.Background(), chatID, noUser)
+	if err != nil || !reflect.DeepEqual(got, noUser) || len(e.byIDs.calls) != 0 {
+		t.Fatalf("resolveTranscriptionRunSource(no user message) = %v, %v, %d store calls; want the history as it is and no store call", got, err, len(e.byIDs.calls))
+	}
+
+	ref := audioContent(gatewayBlobPrefix + id)
+	history := []ChatAPIMessage{{Role: "user", Content: ref}}
+	got, err = e.svc.resolveTranscriptionRunSource(context.Background(), chatID, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(history[0].Content) != string(ref) {
+		t.Fatalf("the caller's history was modified: %s", history[0].Content)
+	}
+	if urls := MessageAudio(got[0].Content); len(urls) != 1 || !strings.HasPrefix(urls[0], "data:audio/webm;base64,") {
+		t.Fatalf("the returned history's clip = %.60v, want a data url", urls)
+	}
+}
+
+// The other runs still resolve their history through the image walk alone, so an
+// audio_url reference in a text, image or speech thread (a user turn's attached or
+// recorded clip, which the commit stores for any kind) is never fetched, never
+// unsealed and never counted against the run-size bound: the audio walk is the
+// transcription run's own.
+func TestOtherRunKindsNeverResolveAnAudioInputReference(t *testing.T) {
+	for _, kind := range []string{"", chatKindImage, chatKindSpeech} {
+		t.Run(fmt.Sprintf("kind=%q", kind), func(t *testing.T) {
+			e := newResolveEnv(t, true, 1000) // bound 1000 bytes; the clip below is 5000
+			chatID := e.emptyChat(t)
+			id := e.sendAudio(t, chatID, kind, "audio/webm", blobTestBytes(5000, 6))
+			e.byIDs.calls = nil
+
+			history, err := e.sendKind(chatID, kind, json.RawMessage(`"and now?"`))
+			if err != nil {
+				t.Fatalf("PrepareChatRun: %v (the 5000 audio bytes must not count against the 1000 bound)", err)
+			}
+			if len(e.byIDs.calls) != 0 {
+				t.Fatalf("the run asked the blob store for %d batches (%v), want none: it has no image to resolve", len(e.byIDs.calls), e.byIDs.calls)
+			}
+			var sawRef bool
+			for _, m := range history {
+				if strings.Contains(string(m.Content), "data:") {
+					t.Fatalf("the run history carries inline bytes: %.200s", m.Content)
+				}
+				sawRef = sawRef || slices.Equal(MessageAudio(m.Content), []string{gatewayBlobPrefix + id})
+			}
+			if !sawRef {
+				t.Fatal("the audio reference was dropped from the history instead of being left alone")
+			}
+		})
+	}
+}
+
+// The image-run arm of the same guard. TestOtherRunKindsNeverResolveAnAudioInputReference
+// leaves the clip in an older turn, which resolveImageRunSource never walks whatever
+// family it is given; this is the shape that pins the family: the image thread's LAST
+// user message -- the edit source, the one message that run does resolve -- carries a
+// stored image reference AND a stored audio reference. The edit source is read as
+// images alone: the batched lookup names only the image's id, the clip stays the
+// reference it is, and the clip's bytes (larger than the run bound, which the image
+// is under) are neither fetched nor counted.
+func TestImageRunEditSourceNeverResolvesAnAudioReference(t *testing.T) {
+	ctx := context.Background()
+	e := newResolveEnv(t, true, 1000) // bound 1000 bytes: the image below is 400, the clip 5000
+	chatID := e.emptyChat(t)
+	image, clip := blobTestBytes(400, 12), blobTestBytes(5000, 13)
+
+	// First turn: an edit whose source carries both inline; the commit stores them.
+	if _, _, err := e.svc.PrepareChatRun(ctx, e.owner, chatID, PrepareRunRequest{
+		UserMessage: json.RawMessage(fmt.Sprintf(
+			`[{"type":"text","text":"edit it"},{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}}]`,
+			dataURL("image/png", image), dataURL("audio/webm", clip))),
+		Settings: ChatRunSettings{Model: "m", Kind: chatKindImage},
+	}); err != nil {
+		t.Fatalf("PrepareChatRun: %v", err)
+	}
+	doc := e.stored(t, chatID)
+	imageRefs, audioRefs := storedImageURLs(t, doc), storedMemberURLs(t, doc, "audio_url")
+	if len(imageRefs) != 1 || len(audioRefs) != 1 {
+		t.Fatalf("stored image urls %v, audio urls %v: want one reference of each", imageRefs, audioRefs)
+	}
+	imageID := strings.TrimPrefix(imageRefs[0], gatewayBlobPrefix)
+
+	// Second turn: the last user message names both stored blobs.
+	e.byIDs.calls = nil
+	history, err := e.sendKind(chatID, chatKindImage, json.RawMessage(fmt.Sprintf(
+		`[{"type":"text","text":"again"},{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}}]`, imageRefs[0], audioRefs[0])))
+	if err != nil {
+		t.Fatalf("PrepareChatRun: %v (the %d clip bytes must not count against the 1000 bound)", err, len(clip))
+	}
+	if len(e.byIDs.calls) != 1 || !slices.Equal(e.byIDs.calls[0].ids, []string{imageID}) {
+		t.Fatalf("calls = %+v, want ONE batch naming only the image %s: the clip must not be fetched", e.byIDs.calls, imageID)
+	}
+	last := history[len(history)-1].Content
+	urls := messageImageURLs(last)
+	if len(urls) != 1 {
+		t.Fatalf("the edit source carries %d image urls, want 1", len(urls))
+	}
+	if mediaType, raw := decodeResolvedURL(t, urls[0]); mediaType != "image/png" || !bytes.Equal(raw, image) {
+		t.Fatalf("the source image resolved to %s with %d bytes, want the %d stored bytes", mediaType, len(raw), len(image))
+	}
+	if got := MessageAudio(last); !slices.Equal(got, audioRefs) {
+		t.Fatalf("the clip in the edit source = %.80v, want its reference %v left alone", got, audioRefs)
+	}
+	if strings.Contains(string(last), "data:audio") {
+		t.Fatalf("the clip was resolved into the edit source: %.200s", last)
 	}
 }
