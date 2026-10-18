@@ -407,6 +407,231 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // A transcription (speech-to-text) run is silent like a speech run -- the endpoint answers
+    // once, with the finished transcript -- so it gets a wait of its own, not the text-pending
+    // state's "reasoning active - 0 chars" (a measured zero where nothing was ever measured).
+    describe('a transcription run', () => {
+      const STORED_CLIP = '/api/portal/chat-blobs/6f1c2a52-0f43-4d0b-bb0d-8c7a3a1d9e10';
+      const INLINE_CLIP = 'data:audio/webm;base64,AAAA';
+
+      it('shows the transcription wait label, a clock and the no-news sentence while pending', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="transcription"
+            elapsedMs={107_000}
+          />,
+        );
+        expect(screen.getByText(t.chatTranscriptionRunPending)).toBeInTheDocument();
+        expect(screen.getByText('1:47')).toBeInTheDocument();
+        expect(screen.getByText(t.chatTranscriptionNoIntermediateNews)).toBeInTheDocument();
+        // Not the text-pending state ("Denkt ... 0 Zeichen", the cursor), and not another kind's
+        // wait copy.
+        expect(screen.queryByText(new RegExp(t.chatCharsUnit))).toBeNull();
+        expect(screen.queryByText(new RegExp(t.chatReasoningActive))).toBeNull();
+        expect(screen.queryByTestId('chat-stream-cursor')).toBeNull();
+        expect(screen.queryByText(t.chatAudioRunPending)).toBeNull();
+        expect(screen.queryByText(t.chatImageRunPending)).toBeNull();
+        // The output is text: no player, no download.
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+      });
+
+      it('does not show the pending state once transcript text has arrived, even while streaming', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[{ type: 'text', text: 'hello there' }]}
+            streaming
+            kind="transcription"
+            elapsedMs={12_000}
+          />,
+        );
+        expect(screen.queryByText(t.chatTranscriptionRunPending)).toBeNull();
+        expect(screen.getByText('hello there')).toBeInTheDocument();
+      });
+
+      it('shows no pending state when the run is not streaming (a failed or finished turn)', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content="the run failed"
+            kind="transcription"
+            elapsedMs={1_000}
+          />,
+        );
+        expect(screen.queryByText(t.chatTranscriptionRunPending)).toBeNull();
+        expect(screen.getByText('the run failed')).toBeInTheDocument();
+      });
+
+      it('renders a finished transcript as ordinary text, with no player and no download', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="msg_t1"
+            content={[{ type: 'text', text: 'Guten Morgen, wie geht es Ihnen?' }]}
+          />,
+        );
+        expect(screen.getByText('Guten Morgen, wie geht es Ihnen?')).toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+        expect(screen.queryByRole('button', { name: t.chatDownloadAudio })).toBeNull();
+        // The ordinary assistant controls are all there.
+        expect(screen.getByRole('button', { name: t.chatCopy })).toBeInTheDocument();
+      });
+
+      describe('the user turn that carries the clip', () => {
+        const player = () => screen.getByLabelText(t.chatAttachedAudio) as HTMLAudioElement;
+
+        it('renders an inline clip as an <audio controls> player with a download button', () => {
+          render(
+            <ChatMessage
+              t={t}
+              role="user"
+              turnId="msg_u1"
+              content={[{ type: 'audio_url', audio_url: { url: INLINE_CLIP } }]}
+            />,
+          );
+          expect(player().tagName).toBe('AUDIO');
+          expect(player()).toHaveAttribute('controls');
+          expect(player()).toHaveAttribute('src', INLINE_CLIP);
+          expect(screen.getByRole('button', { name: t.chatDownloadAudio })).toBeInTheDocument();
+          // An audio part is not an image.
+          expect(screen.queryAllByRole('img')).toHaveLength(0);
+          // It is the user's own clip, not generated audio.
+          expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+        });
+
+        it('plays a stored clip from a fetched object URL and revokes it on unmount', async () => {
+          const createObjectURL = vi.fn(() => 'blob:input-clip');
+          const revokeObjectURL = vi.fn();
+          vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
+          const fetchMock = vi.fn(async () => ({
+            ok: true,
+            status: 200,
+            blob: async () => new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/webm' }),
+          }));
+          vi.stubGlobal('fetch', fetchMock);
+
+          const { unmount } = render(
+            <ChatMessage
+              t={t}
+              role="user"
+              turnId="msg_u1"
+              content={[{ type: 'audio_url', audio_url: { url: STORED_CLIP } }]}
+            />,
+          );
+
+          await waitFor(() => expect(player()).toHaveAttribute('src', 'blob:input-clip'));
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+          expect(fetchMock).toHaveBeenCalledWith(
+            STORED_CLIP,
+            expect.objectContaining({ credentials: 'same-origin' }),
+          );
+          expect(revokeObjectURL).not.toHaveBeenCalled();
+
+          unmount();
+
+          expect(revokeObjectURL).toHaveBeenCalledTimes(1);
+          expect(revokeObjectURL).toHaveBeenCalledWith('blob:input-clip');
+        });
+
+        it('saves the clip under an input name and the extension of its own type', async () => {
+          vi.stubGlobal('URL', {
+            ...URL,
+            createObjectURL: vi.fn(() => 'blob:input-clip'),
+            revokeObjectURL: vi.fn(),
+          });
+          vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => ({
+              ok: true,
+              status: 200,
+              blob: async () => new Blob([new Uint8Array([1])], { type: 'audio/webm' }),
+            })),
+          );
+          const names: string[] = [];
+          vi.spyOn(document, 'createElement').mockImplementation(
+            (tag: string, options?: unknown) => {
+              const el = nativeCreateElement(tag, options as ElementCreationOptions);
+              if (tag === 'a') {
+                const anchor = el as HTMLAnchorElement;
+                anchor.click = () => names.push(anchor.download);
+              }
+              return el;
+            },
+          );
+
+          render(
+            <ChatMessage
+              t={t}
+              role="user"
+              turnId="msg_u1"
+              content={[{ type: 'audio_url', audio_url: { url: STORED_CLIP } }]}
+            />,
+          );
+          fireEvent.click(screen.getByRole('button', { name: t.chatDownloadAudio }));
+
+          await waitFor(() => expect(names).toEqual(['input-audio-msg_u1.webm']));
+        });
+
+        it('has no edit control on an audio-only bubble, whatever onEdit is passed', () => {
+          render(
+            <ChatMessage
+              t={t}
+              role="user"
+              content={[{ type: 'audio_url', audio_url: { url: INLINE_CLIP } }]}
+              onEdit={vi.fn()}
+            />,
+          );
+          expect(screen.queryByRole('button', { name: t.chatEdit })).toBeNull();
+        });
+
+        it('keeps the edit control on a text bubble, and on a text-and-image bubble', () => {
+          const first = render(<ChatMessage t={t} role="user" content="words" onEdit={vi.fn()} />);
+          expect(screen.getByRole('button', { name: t.chatEdit })).toBeInTheDocument();
+          first.unmount();
+          render(
+            <ChatMessage
+              t={t}
+              role="user"
+              content={[
+                { type: 'text', text: 'look' },
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+              ]}
+              onEdit={vi.fn()}
+            />,
+          );
+          expect(screen.getByRole('button', { name: t.chatEdit })).toBeInTheDocument();
+        });
+
+        it('shows no player on a user turn without audio', () => {
+          render(<ChatMessage t={t} role="user" content="just words" />);
+          expect(screen.queryByLabelText(t.chatAttachedAudio)).toBeNull();
+          expect(screen.queryByRole('button', { name: t.chatDownloadAudio })).toBeNull();
+        });
+      });
+
+      // A speech thread is untouched: its audio is the ASSISTANT's, still the generated-audio
+      // player, never the attached-clip one.
+      it('leaves a speech reply on the generated-audio player', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="msg_s1"
+            content={[{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,AAAA' } }]}
+          />,
+        );
+        expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).toBeNull();
+      });
+    });
+
     it('summarizes reasoning with char count and seconds once finished', () => {
       render(
         <ChatMessage

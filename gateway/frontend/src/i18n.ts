@@ -416,6 +416,13 @@ const de = {
   // reply could not be fetched for playback (a purged blob, a network error).
   chatAudioDownloadError: 'Audio konnte nicht heruntergeladen werden.',
   chatAudioLoadError: 'Audio konnte nicht geladen werden.',
+  // The wait of a running transcription (speech-to-text) turn, the transcript twin of the
+  // audio wait above: it words the WAIT (the request may still be queued or waiting on a model
+  // load), and the sentence says no intermediate news is coming -- the transcript is one
+  // finished document, with nothing to count meanwhile.
+  chatTranscriptionRunPending: 'Warte auf Transkript',
+  chatTranscriptionNoIntermediateNews:
+    'Keine Zwischenmeldungen – das Transkript erscheint fertig oder gar nicht.',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -3537,6 +3544,9 @@ const en: PortalMessages = {
   chatDownloadAudio: 'Download audio',
   chatAudioDownloadError: 'Could not download the audio.',
   chatAudioLoadError: 'Could not load the audio.',
+  chatTranscriptionRunPending: 'Waiting for transcript',
+  chatTranscriptionNoIntermediateNews:
+    'No intermediate updates – the transcript arrives finished or not at all.',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',

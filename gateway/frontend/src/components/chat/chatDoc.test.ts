@@ -710,6 +710,14 @@ describe('the audio of a message', () => {
   it('keeps a stored reference exactly as it is: no copy, no rewrite', () => {
     expect(audioUrlsOf([audioPart(ref)])[0]).toBe(ref);
   });
+
+  // An audio part is the INPUT of a transcription turn as well as the reply of a speech turn:
+  // the one reader serves both, so a user turn's clip is listed like an assistant's.
+  it('lists the clip of a transcription user turn, inline and once stored', () => {
+    const inline = 'data:audio/webm;base64,AAAA';
+    expect(audioUrlsOf(audioTurnContent(inline))).toEqual([inline]);
+    expect(audioUrlsOf([textPart(''), audioPart(ref)])).toEqual([ref]);
+  });
 });
 
 // Transcription (speech-to-text) settings are the audio settings' twin and follow the same

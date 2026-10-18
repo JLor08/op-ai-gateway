@@ -11,13 +11,16 @@ export type ChatRole = 'system' | 'user' | 'assistant';
 // a part without it is an ordinary image (an attachment, a source, a generated
 // result).
 //
-// An `audio_url` part is the ANSWER of a speech (text-to-speech) turn, the audio twin
-// of a generated image: `{ type: 'audio_url', audio_url: { url } }`, the WAV as an
-// inline `data:audio/wav;base64,...` url while the run streams and as the
-// /api/portal/chat-blobs/{id} reference once the run's commit moved it into the chat
-// blob store. It is OUTPUT only -- the composer never attaches one -- and the key
-// and the `audio_url` name are the contract with the backend's executor and blob
-// extraction (portal extractChatBlobs).
+// An `audio_url` part is audio in either direction, told apart by the role of the turn
+// that carries it: `{ type: 'audio_url', audio_url: { url } }`. In an ASSISTANT turn it is
+// the ANSWER of a speech (text-to-speech) turn, the audio twin of a generated image, the
+// WAV as an inline `data:audio/wav;base64,...` url while the run streams. In a USER turn it
+// is the INPUT of a transcription (speech-to-text) turn: the clip the composer attached or
+// recorded, as an inline `data:audio/<type>;base64,...` url (wav, webm, mpeg, mp4 or ogg),
+// which the turn consists of entirely (its reply is an ordinary text part, the transcript).
+// Either way it is a /api/portal/chat-blobs/{id} reference once the run's commit moved it
+// into the chat blob store, and the key and the `audio_url` name are the contract with the
+// backend's executors and blob extraction (portal extractChatBlobs).
 export type ChatContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string }; purpose?: 'mask' }
@@ -68,9 +71,10 @@ export function imageUrlsOf(content: ChatContent): string[] {
 
 type AudioPart = Extract<ChatContentPart, { type: 'audio_url' }>;
 
-// The urls of the audio of a message -- a speech turn's synthesized reply -- in order:
-// every audio part. The audio twin of imageUrlsOf above, which never lists one. The
-// message renderer plays and offers for download exactly these.
+// The urls of the audio of a message -- a speech turn's synthesized reply, or a
+// transcription turn's input clip -- in order: every audio part, whichever role carries
+// it. The audio twin of imageUrlsOf above, which never lists one. The message renderer
+// plays and offers for download exactly these.
 export function audioUrlsOf(content: ChatContent): string[] {
   if (typeof content === 'string') return [];
   return content

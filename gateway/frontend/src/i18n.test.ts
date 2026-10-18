@@ -3464,6 +3464,36 @@ describe('portal chat speech i18n keys', () => {
   }
 });
 
+// Portal chat transcription (speech-to-text, #249): the strings the transcript's own rendering
+// adds -- the wait of a running transcription turn. The composer and settings keys are guarded
+// where they were introduced; the chat-run error labels come with their own error mapping.
+describe('portal chat transcription render i18n keys', () => {
+  const keys = ['chatTranscriptionRunPending', 'chatTranscriptionNoIntermediateNews'] as const;
+
+  it('defines the transcription wait strings in de and en, translated', () => {
+    for (const k of keys) {
+      expect(typeof messages.de[k], k).toBe('string');
+      expect(typeof messages.en[k], k).toBe('string');
+      expect(messages.de[k].length, k).toBeGreaterThan(0);
+      expect(messages.en[k].length, k).toBeGreaterThan(0);
+      expect(messages.de[k], `${k} is the English text copied into de`).not.toBe(messages.en[k]);
+    }
+  });
+
+  // The wait is for a TRANSCRIPT: it must not read as the audio or image wait (a transcription
+  // user is not waiting for audio), and it words the wait, not the work (the request may still
+  // be queued for admission or waiting on a model load).
+  it('words the wait as a transcript, not as the audio or image answer', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const t = messages[locale];
+      expect(t.chatTranscriptionRunPending).not.toBe(t.chatAudioRunPending);
+      expect(t.chatTranscriptionRunPending).not.toBe(t.chatImageRunPending);
+      expect(t.chatTranscriptionNoIntermediateNews).not.toBe(t.chatAudioNoIntermediateNews);
+      expect(t.chatTranscriptionNoIntermediateNews).not.toBe(t.chatImageNoIntermediateNews);
+    }
+  });
+});
+
 // The speech twins of the chat-run / images.* error labels above. The wire codes
 // themselves are pinned in format.test.ts; this guards the label keys in both
 // locales and what the sentences say.

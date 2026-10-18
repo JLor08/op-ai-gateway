@@ -79,9 +79,28 @@ describe('extensionFor', () => {
     expect(extensionFor('AUDIO/WAV')).toBe('wav');
   });
 
+  // A transcription turn's INPUT clip is stored as the type it was attached or recorded in (the
+  // chat-blob allow-list: wav, webm, mpeg, mp4, ogg), so each saves under its own extension --
+  // mp4 audio is the conventional .m4a, mpeg is .mp3.
+  it.each([
+    ['audio/webm', 'webm'],
+    ['audio/mpeg', 'mp3'],
+    ['audio/mp4', 'm4a'],
+    ['audio/ogg', 'ogg'],
+    ['audio/wav', 'wav'],
+  ])(
+    'maps the stored input type %s to .%s, from a data: URL and from a Content-Type',
+    (type, ext) => {
+      expect(extensionFor(`data:${type};base64,AAAA`)).toBe(ext);
+      expect(extensionFor(type)).toBe(ext);
+      expect(extensionFor(`${type}; codecs=opus`)).toBe(ext);
+      expect(extensionFor(type.toUpperCase())).toBe(ext);
+    },
+  );
+
   // Same rule as for images: the served subtype is server input and lands in a
   // file name, so an audio subtype nothing stores is `bin`, never echoed.
-  it.each(['audio/bat', 'audio/mpeg', 'audio/constructor', 'audio/__proto__'])(
+  it.each(['audio/bat', 'audio/flac', 'audio/constructor', 'audio/__proto__'])(
     'falls back to bin for the audio subtype outside the allow-list: %s',
     (type) => {
       expect(extensionFor(type)).toBe('bin');
@@ -331,6 +350,26 @@ describe('downloadBinary from a gateway url', () => {
     expect(blobs[0].type).toBe('audio/wav');
     expect(anchor?.download).toBe('reply.wav');
     expect(clicks).toBe(1);
+  });
+
+  // A transcription turn's input clip lives behind the same endpoint, in the type it was
+  // attached or recorded in: each saves under its own extension, not as `bin`.
+  it.each([
+    ['audio/webm', 'webm'],
+    ['audio/mpeg', 'mp3'],
+    ['audio/mp4', 'm4a'],
+    ['audio/ogg', 'ogg'],
+  ])('fetches a stored %s input clip and saves it under .%s', async (type, ext) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => okResponse([1, 2, 3], type)),
+    );
+
+    const ok = await downloadBinary((e) => `input.${e}`, GATEWAY_URL);
+
+    expect(ok).toBe(true);
+    expect(blobs[0].type).toBe(type);
+    expect(anchor?.download).toBe(`input.${ext}`);
   });
 
   it('falls back to the bin extension when the response carries no image Content-Type', async () => {

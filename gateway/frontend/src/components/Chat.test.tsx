@@ -1755,7 +1755,15 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
 
         expect(screen.queryByText('sent.wav')).not.toBeInTheDocument();
-        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        // The composer's preview is gone; the clip now lives in the sent user bubble of the
+        // transcript, a player of the same name (the attached-audio label is shared with the
+        // composer's, as the attached-image alt text is), so the two are told apart by where
+        // they are.
+        const composer = screen.getByRole('group', { name: t.chatTranscriptionInputLabel });
+        expect(within(composer).queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(
+          within(screen.getByRole('log')).getByLabelText(t.chatAttachedAudio),
+        ).toBeInTheDocument();
       });
     });
 
