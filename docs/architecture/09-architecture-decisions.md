@@ -6092,9 +6092,19 @@ pieces it joins that no design could have chosen:
   without WebAudio and a clip with no frames are refused in the composer with a decode
   message and **nothing is attached**; and the 20 MiB ceiling is checked on the upload
   **and again on the WAV**, since 16 kHz mono 16-bit is 32 KB a second and a small
-  compressed upload can come out far larger. The attach picker's `accept` is `audio/*`
-  plus extension fallbacks for platforms that do not type an audio file as `audio/*`. The
-  conversion's own costs — decode memory, no progress indicator, the two-stage resample
+  compressed upload can come out far larger. The conversion takes a moment for a long
+  clip, so `ChatStore.attachAudioClip` (the one caller of `prepareAudioClip`) exposes
+  `audioConverting`, and the composer shows an indeterminate "Converting audio…"
+  indicator (a spinner and its label, announced as a status) beside the attach controls
+  while it runs, holding the attach button, the recorder's start and "Use recording", and
+  Send until the clip has landed or the attach has failed. The conversions may overlap and
+  finish in any order, so **each attach takes the next number from a monotonic counter and
+  only the newest one counts**: a conversion that finishes after another attach started —
+  or after the clip was removed or sent, which takes a number too and so voids the attach
+  in flight — is discarded (its clip is not set, its refusal is not said, and it does not
+  end the converting state that belongs to the newer attach). The attach picker's `accept`
+  is `audio/*` plus extension fallbacks for platforms that do not type an audio file as
+  `audio/*`. The conversion's own costs — decode memory, no progress figure, the two-stage resample
   (`decodeAudioData` to the context's own rate, then the offline context to 16 kHz), old
   Safari — are accepted in
   [Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -6131,9 +6141,9 @@ part are the same WAV, relayed byte for byte, and in-browser recording and any a
 format the browser can decode work end to end (the `e2e:chat-transcription` suite drives
 a real WebM/Opus recording, a WebM file and an MP3 file through the real WebAudio
 conversion and asserts that the upstream receives a 16 kHz mono 16-bit PCM WAV). The price
-is paid in the user's browser: the clip is decoded in memory before it is sent, there is no
-"converting" indicator for a long file, and the audio is resampled twice
-(`decodeAudioData` first brings it to the `AudioContext`'s device-dependent rate, then
+is paid in the user's browser: the clip is decoded in memory before it is sent, a long file
+shows only an indeterminate "converting" indicator and no progress figure, and the audio is
+resampled twice (`decodeAudioData` first brings it to the `AudioContext`'s device-dependent rate, then
 the offline context to 16 kHz), each stage of an implementation-defined quality; each is
 a stated acceptance in
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances). Nothing else

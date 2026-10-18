@@ -221,6 +221,8 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           name it is shown under ('' for a recording). */}
       <span data-testid="composer-audio">{c.audio?.url ?? ''}</span>
       <span data-testid="composer-audio-name">{c.audio?.name ?? ''}</span>
+      {/* Whether a clip is being converted to WAV (the attach that has not landed yet). */}
+      <span data-testid="audio-converting">{String(c.audioConverting)}</span>
       <input
         type="file"
         aria-label="probe-audio-file"
@@ -4465,6 +4467,217 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
         expect(screen.getByTestId('composer-audio').textContent).toBe(clipUrl);
+      });
+
+      // The conversion of a long clip takes a moment (audioToWav), and the composer says so while
+      // it runs (audioConverting). The converter stand-in answers at once, so these tests hold a
+      // conversion open by hand: `deferConversion` makes the NEXT call to the converter a promise
+      // the test settles itself, in the order it chooses.
+      describe('converting a clip', () => {
+        const deferConversion = () => {
+          let resolve!: (wav: Blob) => void;
+          let reject!: (err: unknown) => void;
+          const pending = new Promise<Blob>((res, rej) => {
+            resolve = res;
+            reject = rej;
+          });
+          toWav.mockImplementationOnce(() => pending);
+          return {
+            finish: (text: string) => resolve(new Blob(['WAV:', text], { type: 'audio/wav' })),
+            fail: (err: unknown) => reject(err),
+          };
+        };
+        const converting = () => screen.getByTestId('audio-converting').textContent;
+        const pickFile = (text: string, name: string) =>
+          fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+            target: { files: [new File([text], name, { type: 'audio/wav' })] },
+          });
+        // Lets everything a settled conversion still has to do (the data url is read from the
+        // WAV by a FileReader, a macrotask) run, so a result that WOULD land has landed.
+        const settle = () =>
+          act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          });
+        const start = async () => {
+          renderProvider([], { models: transcriptionModels });
+          await waitForReady();
+          fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        };
+
+        it('is not converting until a clip is attached', async () => {
+          await start();
+          expect(converting()).toBe('false');
+        });
+
+        it('is converting from the moment a file is picked until its clip lands', async () => {
+          const conversion = deferConversion();
+          await start();
+          pickFile('long', 'long.wav');
+
+          expect(converting()).toBe('true');
+          expect(screen.getByTestId('composer-audio').textContent).toBe('');
+
+          conversion.finish('long');
+          await waitFor(() =>
+            expect(screen.getByTestId('composer-audio').textContent).not.toBe(''),
+          );
+          // The clip and the end of the conversion arrive together: never a clip that is still
+          // reported as converting, nor a converted flag with no clip yet.
+          expect(converting()).toBe('false');
+          expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('long'));
+        });
+
+        it('is converting while a recording is converted, by the same path', async () => {
+          const conversion = deferConversion();
+          await start();
+          fireEvent.click(screen.getByRole('button', { name: 'attach-recording' }));
+
+          expect(converting()).toBe('true');
+          conversion.finish('recorded');
+          await waitFor(() => expect(converting()).toBe('false'));
+          expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('recorded'));
+        });
+
+        it('stops converting when the conversion fails, and says why', async () => {
+          const conversion = deferConversion();
+          await start();
+          pickFile('x', 'broken.mp3');
+          expect(converting()).toBe('true');
+
+          conversion.fail(new AudioDecodeError('corrupt'));
+
+          expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
+          expect(converting()).toBe('false');
+          expect(screen.getByTestId('composer-audio').textContent).toBe('');
+        });
+
+        it('stops converting when the clip is refused before it is converted', async () => {
+          await start();
+          fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+            target: { files: [new File(['x'], 'cat.png', { type: 'image/png' })] },
+          });
+
+          expect(await screen.findByText(t.chatAudioErrorType)).toBeTruthy();
+          expect(converting()).toBe('false');
+        });
+
+        // Attach A (long) and then B (short): B lands first, and A -- which resolves last -- must
+        // not overwrite it. The clip is the one attached LAST, whatever order they finish in.
+        it('discards a superseded conversion that finishes after the newer one', async () => {
+          const first = deferConversion();
+          await start();
+          pickFile('A', 'a.wav');
+          pickFile('B', 'b.wav');
+
+          // B (the default stand-in, immediate) lands; A is still being converted.
+          await waitFor(() =>
+            expect(screen.getByTestId('composer-audio').textContent).not.toBe(''),
+          );
+          expect(screen.getByTestId('composer-audio-name').textContent).toBe('b.wav');
+          expect(converting()).toBe('false');
+
+          first.finish('A');
+          await settle();
+
+          expect(screen.getByTestId('composer-audio-name').textContent).toBe('b.wav');
+          expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('B'));
+          expect(converting()).toBe('false');
+        });
+
+        it('keeps converting until the newest attach lands, whichever finishes first', async () => {
+          const first = deferConversion();
+          const second = deferConversion();
+          await start();
+          pickFile('A', 'a.wav');
+          pickFile('B', 'b.wav');
+
+          // A, the older, finishes first: it is superseded, so it neither lands nor ends the
+          // conversion of B, which is still in flight.
+          first.finish('A');
+          await settle();
+          expect(screen.getByTestId('composer-audio').textContent).toBe('');
+          expect(converting()).toBe('true');
+
+          second.finish('B');
+          await waitFor(() =>
+            expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('B')),
+          );
+          expect(converting()).toBe('false');
+        });
+
+        it('says nothing of a superseded conversion that fails', async () => {
+          const first = deferConversion();
+          await start();
+          pickFile('A', 'a.wav');
+          pickFile('B', 'b.wav');
+          await waitFor(() =>
+            expect(screen.getByTestId('composer-audio').textContent).not.toBe(''),
+          );
+
+          first.fail(new AudioDecodeError('corrupt'));
+          await settle();
+
+          expect(screen.queryByText(t.chatAudioErrorDecode)).toBeNull();
+          expect(screen.getByTestId('composer-audio-name').textContent).toBe('b.wav');
+          expect(converting()).toBe('false');
+        });
+
+        it('does not reattach a clip that was removed while it was being converted', async () => {
+          const conversion = deferConversion();
+          await start();
+          pickFile('A', 'a.wav');
+          expect(converting()).toBe('true');
+
+          fireEvent.click(screen.getByRole('button', { name: 'remove-audio' }));
+          // Removing the clip abandons the attach in flight, so nothing is converting any more.
+          expect(converting()).toBe('false');
+
+          conversion.finish('A');
+          await settle();
+
+          expect(screen.getByTestId('composer-audio').textContent).toBe('');
+          expect(converting()).toBe('false');
+        });
+
+        it('does not reattach a clip once the turn it was replacing has been sent', async () => {
+          await start();
+          await attachClip();
+          const conversion = deferConversion();
+          pickFile('late', 'late.wav');
+          expect(converting()).toBe('true');
+
+          // The clip that was in the composer goes out with a send made mid-conversion.
+          fireEvent.click(screen.getByRole('button', { name: 'send' }));
+          await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+          expect(bodyOf().user_message).toEqual([
+            { type: 'audio_url', audio_url: { url: clipUrl } },
+          ]);
+          expect(screen.getByTestId('composer-audio').textContent).toBe('');
+          expect(converting()).toBe('false');
+
+          conversion.finish('late');
+          await settle();
+
+          // The stale result must not turn up in the composer after the send emptied it.
+          expect(screen.getByTestId('composer-audio').textContent).toBe('');
+          expect(converting()).toBe('false');
+        });
+
+        it('lands nowhere when the thread stopped being a transcription one, and stops converting', async () => {
+          const conversion = deferConversion();
+          renderProvider([], { models: [models[0], whisper] });
+          await waitForReady();
+          fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+          pickFile('A', 'a.wav');
+          expect(converting()).toBe('true');
+
+          fireEvent.click(screen.getByRole('button', { name: `pick-${models[0].id}` }));
+          conversion.finish('A');
+          await settle();
+
+          expect(screen.getByTestId('composer-audio').textContent).toBe('');
+          expect(converting()).toBe('false');
+        });
       });
 
       it('removes the clip, and sending then has nothing to send', async () => {

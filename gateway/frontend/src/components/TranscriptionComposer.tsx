@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import type { SubmitEvent } from 'react';
-import { Box, Button, IconButton, Tooltip, Typography } from '@mui/material';
+import { Box, Button, CircularProgress, IconButton, Tooltip, Typography } from '@mui/material';
 import AudioFileIcon from '@mui/icons-material/AudioFile';
 import CloseIcon from '@mui/icons-material/Close';
 import type { Translation } from './shared/types';
@@ -18,7 +18,10 @@ import { TRANSCRIPTION_AUDIO_ACCEPT, useChatStore } from './chat/ChatStore';
 // A clip is attached by the store (handleFiles / attachRecording): both ways go through the same
 // checks and the same conversion, in the browser, to the WAV the transcription server reads, so
 // the clip shown here (and played by its preview) is always an audio/wav. This view only offers
-// the controls and shows the result.
+// the controls and shows the result. The conversion takes a moment for a long clip, so while it
+// runs (c.audioConverting) the composer says so beside the attach controls and holds them -- and
+// Send -- until the clip has landed or the attach has failed, so nothing is stacked on it and
+// nothing is sent from under it.
 export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
   const c = useChatStore();
   const labelId = 'chat-transcription-input-label';
@@ -28,11 +31,16 @@ export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
     c.send();
   }
 
+  // What holds the attach controls and Send besides a running chat: a clip being converted.
+  const busy = c.streaming || c.audioConverting;
+
   // Why Send is closed, when it is (and nothing is running): the model is unreachable, or there is
-  // no clip yet. A running chat disables it without a word, like the text composer's.
+  // no clip yet. A running chat disables it without a word, like the text composer's, and so does
+  // a conversion (the indicator beside the attach controls is what says so, and "attach audio
+  // first" would contradict the clip that is just arriving).
   let sendHint = '';
   if (!c.streaming && !c.modelAvailable) sendHint = t.chatModelUnavailable;
-  else if (!c.streaming && c.audio === null) sendHint = t.chatTranscriptionNeedsAudio;
+  else if (!busy && c.audio === null) sendHint = t.chatTranscriptionNeedsAudio;
 
   return (
     <Box component="form" sx={{ display: 'grid', gap: 1.5 }} onSubmit={submit}>
@@ -84,7 +92,7 @@ export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
         <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 1 }}>
           <AudioRecorder
             t={t}
-            disabled={c.streaming}
+            disabled={busy}
             onRecorded={(blob) => void c.attachRecording(blob)}
           />
           {/* A label-wrapped file input, the same shape as the image attach of the text
@@ -97,7 +105,7 @@ export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
             variant="outlined"
             size="small"
             startIcon={<AudioFileIcon />}
-            disabled={c.streaming}
+            disabled={busy}
           >
             {t.chatAttachAudio}
             <input
@@ -110,6 +118,20 @@ export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
               }}
             />
           </Button>
+          {/* The conversion in flight: a spinner and its label, announced as a status. The
+            spinner is decoration (the label is the message), so it is hidden from the
+            accessibility tree. */}
+          {c.audioConverting && (
+            <Box
+              role="status"
+              sx={{ display: 'inline-flex', alignItems: 'center', gap: 1, minHeight: 30 }}
+            >
+              <CircularProgress size={16} aria-hidden />
+              <Typography variant="body2" color="text.secondary">
+                {t.chatTranscriptionConverting}
+              </Typography>
+            </Box>
+          )}
         </Box>
       </Box>
       <Box>
@@ -118,7 +140,7 @@ export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
             <Button
               type="submit"
               variant="contained"
-              disabled={c.streaming || !c.modelAvailable || c.audio === null}
+              disabled={busy || !c.modelAvailable || c.audio === null}
             >
               {t.send}
             </Button>

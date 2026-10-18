@@ -288,6 +288,9 @@ const de = {
   chatAttachedAudio: 'Angehängtes Audio',
   chatRemoveAudio: 'Audio entfernen',
   chatAudioRecordingLabel: 'Aufnahme',
+  // The indicator beside the attach controls while a clip is being converted to WAV in the
+  // browser (it takes a moment for a long one); Send and the attach controls wait for it.
+  chatTranscriptionConverting: 'Konvertiere Audio…',
   // Why a clip could not be attached (the picker's `accept` is only a hint, so the type is
   // checked again): a file that is not audio, its size (the backend stores up to 20 MB per
   // clip, counted on the WAV the browser converts it to), an empty file, audio the browser
@@ -3509,6 +3512,7 @@ const en: PortalMessages = {
   chatAttachedAudio: 'Attached audio',
   chatRemoveAudio: 'Remove audio',
   chatAudioRecordingLabel: 'Recording',
+  chatTranscriptionConverting: 'Converting audio…',
   chatAudioError: 'Could not attach the audio.',
   chatAudioErrorType:
     'Unsupported file type. Attach an audio file, for example WAV, MP3, M4A, OGG or WEBM.',
