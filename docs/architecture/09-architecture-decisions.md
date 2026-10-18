@@ -5913,11 +5913,13 @@ pieces it joins that no design could have chosen:
   (the first ASR call after a model load pays a warm-up).
 - The browser's `MediaRecorder` produces a container the **browser** chooses, not one the
   operator picks: `audio/webm;codecs=opus` in Chromium, `audio/mp4` in Safari,
-  `audio/ogg` in Firefox, with the `codecs` parameter riding on the type string. Whether
-  audio.cpp **decodes** any container but WAV is **not yet verified** against a live ASR
-  model — only WAV is confirmed (the issue #69 probe, v0.9.1, 2026-10-16, used a WAV), so
-  `audio/webm`, `audio/mpeg`, `audio/mp4` and `audio/ogg` are all unverified, because the
-  current audio.cpp test server has no ASR model loaded to probe against.
+  `audio/ogg` in Firefox, with the `codecs` parameter riding on the type string. And
+  **audio.cpp's transcription endpoint reads WAV only.** The first design relayed the
+  recorder's container as recorded, with whether audio.cpp decodes it left as an open
+  item; a **live probe** against a live audio.cpp server (2026-10-18) settled it: a
+  `webm`, `ogg`, `m4a` or `mp3` upload is refused with **HTTP 400**, *"only WAV audio
+  uploads are currently supported for transcription; MP3 support is planned"*, so a
+  recording, and any compressed file a user attaches, cannot be transcribed as it is.
 - audio.cpp bills `audio_second` from the **response body** (`timing.audio_duration_ms`),
   and the **endpoint**, not the chat run, meters it (ADR-062 (e)).
 - A transcription model and a speech model are **distinct verdicts** on the one shared
@@ -6001,27 +6003,29 @@ pieces it joins that no design could have chosen:
   exhaustiveness tests — **except** `transcription.model_required` and `transcription.invalid`,
   left unlabelled on purpose (as `speech.model_required` and `images.model_required` are): a
   run always sends the thread's pinned model, and a structurally broken form is not a
-  user-correctable run condition. The gateway converts nothing: the clip is relayed byte for byte.
-- **(e) The blob allow-list's audio family widens to the input formats, and the family
+  user-correctable run condition. The gateway converts nothing: the clip — a WAV by then, because
+  the composer made it one ((e), (h)) — is relayed byte for byte.
+- **(e) The blob allow-list's audio family keeps the broader input formats, and the family
   split holds.** `chatBlobMediaTypes`, ADR-056 (e)'s stored-XSS control, gains
   `audio/webm`, `audio/mpeg`, `audio/mp4` and `audio/ogg` beside `audio/wav`.
   `blobPartKind.accepts` keys on the `audio/` prefix **and** the allow-list, so a widened
   audio type joins the **audio family only**: an image part still cannot take it, and an
   image type is still refused by an audio part (the separation ADR-063 (c) established).
-  These are **input** formats — what a client may upload for a run to read — listed for
-  the composer that produces them, the other direction from a generated image or a speech
-  WAV. The composer **canonicalises** a clip's type to one of these exact strings before the
-  part is built (`chatDoc.ts`), because `decodeDataURL` / `extractChatBlobs` match the
-  allow-list exactly: it strips the `;codecs=…` parameter (a recorder reports
-  `audio/webm;codecs=opus`), maps the platform spellings through an alias table
-  (`audio/x-wav`/`audio/wave` → `audio/wav`, `audio/mp3`/`audio/mpeg3` → `audio/mpeg`,
-  `audio/x-m4a`/`audio/m4a` → `audio/mp4`, `application/ogg` → `audio/ogg`, `video/webm` →
-  `audio/webm`, …), and falls back to the file extension when the type is empty or
-  `application/octet-stream`; a clip in no accepted format is refused in the composer
-  ("unsupported audio format") rather than sent to be refused after the turn commits. There
-  is **no schema change**: the store is payload-type-agnostic (bytes plus a
-  content type), so the migration, the cascade, the sealing and the memory budget are
-  exactly what they were.
+  These are **input** formats — what a client may upload for a run to read — the other
+  direction from a generated image or a speech WAV. They were listed for the composer that
+  was first designed to relay the recorder's container, and **they stay deliberately
+  although the composer now produces only `audio/wav`** ((h)): the store is
+  payload-type-agnostic (bytes plus a content type), so the wider list costs nothing, is
+  as safe as the narrow one (it is an exact-match allow-list of audio types, checked on
+  write and again on read), and is harmless forward compatibility — the server's own
+  refusal says MP3 support is planned, and a composer that relays more than WAV later then
+  needs no backend change. What the composer **no longer does** is relabel a clip: the
+  per-format media-type aliasing it needed to hit the exact allow-list (stripping
+  `;codecs=…`, mapping `audio/x-m4a`, `application/ogg`, `video/webm` and the other
+  platform spellings, an extension fallback for an empty type) is **removed**, because
+  every clip is converted and then labelled with the one fixed type `audio/wav`, an exact
+  member of the list, whatever the upload was. There is **no schema change**: the
+  migration, the cascade, the sealing and the memory budget are exactly what they were.
 - **(f) The transcription portal fold is new, and it amends ADR-062 (b).** The Models
   listing carries a **`transcription` flag** on `ModelDTO` (`/api/portal/models`, always
   present) via a new `transcriptionFlagsByName` = a `(transcription, yes)` verdict **and**
@@ -6054,9 +6058,9 @@ pieces it joins that no design could have chosen:
   There is **no `response_format` control**: the gateway forces JSON and refuses every
   other value (ADR-062 (g)), so a static caption states the reply is **text** — the twin
   of speech's "always WAV" caption. Send is enabled once a clip is attached or recorded.
-- **(h) The composer records or attaches audio, and the input clip plays through a fetched
-  object URL.** A transcription thread's composer replaces the text prompt with an audio
-  input control: a **file-attach** button (reuse `handleFiles`, audio accept) **and** a
+- **(h) The composer records or attaches audio and converts it to WAV, and the input clip
+  plays through a fetched object URL.** A transcription thread's composer replaces the
+  text prompt with an audio input control: a **file-attach** button (reuse `handleFiles`, audio accept) **and** a
   **record** button (`MediaRecorder`; the mic permission is requested on record). The
   microphone **tracks are released** (`stopTracks`) at stop (the recorder's `onstop`
   finish), on a failed start, on a recorder error and on unmount, so the browser's recording
@@ -6067,10 +6071,28 @@ pieces it joins that no design could have chosen:
   ADR-063 (d) `AudioTurn` is **reused for the input**, fetching the blob once into an
   object URL (the blob endpoint answers no `Range` request, ADR-056 (e)) and **revoking it
   on unmount**. The attach mode of a transcription thread is otherwise `none` (it takes no
-  image). Client-side WAV conversion is **deferred**: the broad recorder set is relayed
-  byte for byte, and **only if** a live probe shows audio.cpp rejects a native container is
-  a client-side conversion to WAV the way forward — settled by
-  the probe, not by guessing ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+  image). **Every clip is converted to WAV in the browser, before it enters the turn**,
+  because the live probe showed audio.cpp reads WAV only (see Context). `prepareAudioClip`
+  (`chat/audioAttach.ts`), the one path both a picked file and the recorder's "Use
+  recording" take, calls `audioBlobToWav` (`shared/audioToWav.ts`, dependency free): WebAudio's
+  `decodeAudioData` **decodes** whatever the browser can (it sniffs the bytes, not the type
+  or the name, so webm/opus, mp4/aac, mp3, ogg, flac and wav all work wherever the browser
+  has the codec; Safari's `webkit` prefixes are honoured) → an
+  `OfflineAudioContext(1, frames, 16000)` **resamples and downmixes** (the browser's own
+  mix to mono and conversion to 16 kHz, the rate speech models take, which also keeps the
+  clip small) → the samples are written as a canonical 44-byte RIFF/WAVE header plus
+  **16-bit little-endian PCM**: a **16 kHz mono 16-bit PCM WAV**. The clip that is stored
+  and sent is therefore always `data:audio/wav`, so what the user hears in the preview is
+  exactly what is stored and relayed. The type gate before decoding is only "plainly not
+  audio is refused" (an image, text or a PDF); audio the browser cannot decode, a browser
+  without WebAudio and a clip with no frames are refused in the composer with a decode
+  message and **nothing is attached**; and the 20 MiB ceiling is checked on the upload
+  **and again on the WAV**, since 16 kHz mono 16-bit is 32 KB a second and a small
+  compressed upload can come out far larger. The attach picker's `accept` is `audio/*`
+  plus extension fallbacks for platforms that do not type an audio file as `audio/*`. The
+  conversion's own costs — decode memory, no progress indicator, the double resample, old
+  Safari — are accepted in
+  [Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 - **(i) The wait is `TranscriptionPendingTurn`, and an untitled transcription chat is
   titled from its transcript.** The run is one buffered zero-delta call (like image and
   speech), so the text-pending "reasoning active · 0 chars" indicator must not be the wait;
@@ -6096,11 +6118,15 @@ store limit a speech WAV is held to; the executor holds
 the clip whole in memory for the multipart body, and the browser holds one object URL per
 input clip it has rendered until it unmounts, as a speech reply's player does. Stored
 clips are retained for the chat's lifetime like every blob, with no prune (ADR-056). The
-gateway never converts or re-encodes: it relays the recorder's container as recorded, and
-**whether audio.cpp decodes any container but WAV is not yet verified** — only WAV is
-confirmed (the issue #69 probe used a WAV), so `audio/webm`, `audio/mpeg`, `audio/mp4` and
-`audio/ogg` are all unverified, because the current audio.cpp test server has no ASR model
-loaded; an **open item** recorded in
+**gateway still never converts or re-encodes**: the conversion that audio.cpp's WAV-only
+input requires happens in the **browser**, so the stored clip and the upstream `file`
+part are the same WAV, relayed byte for byte, and in-browser recording and any attached
+format the browser can decode work end to end (the `e2e:chat-transcription` suite drives
+a real WebM/Opus recording, a WebM file and an MP3 file through the real WebAudio
+conversion and asserts that the upstream receives a 16 kHz mono 16-bit PCM WAV). The price
+is paid in the user's browser: the clip is decoded in memory before it is sent, there is no
+"converting" indicator for a long file, and the resample is applied to audio a compressed
+codec already shaped; each is a stated acceptance in
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances). Nothing else
 moved: no change to `handleOpenAITranscription` or the relay, no schema change, no
 migration, no new auth leg (the loopback pair ADR-062 (j) already admits gains its first
@@ -6117,8 +6143,12 @@ the inverse of speech, which needed a part and a blob because its reply is binar
 **Widening the shared `offeredFlavors`** (it would regress the Models view for every audio
 row without a transcription or speech verdict; the chat's stricter rule belongs in the
 chat, the ADR-063 (e) correction). **Gateway-side transcoding of the clip to WAV** (the
-project never re-encodes, ADR-063; client-side conversion, if a live probe shows it is
-needed, is the way forward). **A second multipart/audio code path** (the image-edit
+project never re-encodes, ADR-063; the conversion is client-side, which is where the
+recorder's audio is born and where the codecs already are). **Relaying the recorder's
+container byte for byte** (the first design: the live probe showed audio.cpp reads WAV
+only, so every recording and every compressed attachment would fail upstream). **An
+audio-conversion library in the portal** (WebAudio already decodes, downmixes and
+resamples, and the encoder is a 44-byte header). **A second multipart/audio code path** (the image-edit
 multipart machinery and the ADR-063 blob/player machinery are reused with a transcription
 branch, not a parallel system). **A disambiguation affordance for a model carrying both
 audio verdicts** (it arises only from manual/agent config, never from the audio.cpp probe;

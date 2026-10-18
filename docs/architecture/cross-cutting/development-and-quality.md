@@ -279,9 +279,11 @@ reports success on a broken corpus is worse than no checker.
   end to end: the same in-process stub audio.cpp behind a form-created
   `audio_cpp` application, the probe's `transcription` verdict deciding what
   the chat picker offers, the composer switching to the audio input, a clip
-  attached from a file or recorded with the real browser recorder arriving at
-  the one multipart `/v1/audio/transcriptions` call of the chat run executor
-  byte for byte, the transcript turn next to the user's own clip served from
+  attached from a file (a WebM and an MP3 fixture) or recorded with the real
+  browser recorder being converted to WAV by the composer's real WebAudio path
+  and arriving at the one multipart `/v1/audio/transcriptions` call of the chat
+  run executor as a 16 kHz mono 16-bit PCM WAV, the same bytes the chat blob
+  store holds, the transcript turn next to the user's own clip served from
   the chat blob store, their survival of a reload, the advanced passthrough
   reaching the form, and the `audio_second` usage row; local-only),
   `e2e:smtp` (local

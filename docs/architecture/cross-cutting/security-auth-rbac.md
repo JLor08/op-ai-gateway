@@ -1039,9 +1039,11 @@ is the gateway path `/api/portal/chat-blobs/{id}`
   same-origin, cookie-authenticated, navigable URL, which is the classic
   stored-XSS shape. Only `image/png`, `image/jpeg`, `image/webp` and `image/gif`
   (in an `image_url` part) and the audio types in an `audio_url` part — `audio/wav`
-  (the one type a speech reply is normalised to) plus a transcription clip's input
-  `audio/webm`, `audio/mpeg`, `audio/mp4` and `audio/ogg`, the formats the composer's
-  attach and record produce; a part kind takes only its own media family, so
+  (the one type a speech reply is normalised to, and the one type the portal's
+  transcription composer produces, since it converts every clip to WAV) plus the broader
+  input family `audio/webm`, `audio/mpeg`, `audio/mp4` and `audio/ogg`, which stays
+  allow-listed on purpose (the store is payload-type-agnostic, so it is harmless
+  forward compatibility, [ADR-064 (e)](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)); a part kind takes only its own media family, so
   audio cannot be filed as a picture — are accepted at store time (anything else,
   `text/html` and `image/svg+xml` included, is `400 images.blob_type_unsupported`, and
   a non-standard base64 form is refused too), and the type is checked **again at read

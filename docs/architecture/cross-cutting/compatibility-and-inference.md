@@ -857,7 +857,13 @@ spelling has no twin here and a `file[]`-only form has no file. An **empty** `fi
 is not a file (it does not count, and one beside the real upload is accepted), but it is
 stripped before the relay (item 6). Every other field (`temperature`,
 `timestamp_granularities[]`, and `language` and `prompt`, which are read but not
-checked) reaches the upstream unexamined.
+checked) reaches the upstream unexamined. **The audio itself is not examined either**, and
+audio.cpp's transcription endpoint reads **WAV only** (a live probe: a `webm`, `ogg`,
+`m4a` or `mp3` upload is answered 400, "only WAV audio uploads are currently supported for
+transcription; MP3 support is planned"): an API client has to send WAV, and a refusal of
+anything else is the upstream's own, relayed with its status and normalised by item 8. The
+portal chat is such a client and never sends anything else, because its composer converts
+every clip to WAV in the browser (§12).
 
 **4. `response_format` accepts only `json` or an absent value; everything else is 400
 `transcription.response_format_unsupported`.**
@@ -2968,7 +2974,21 @@ no progress figure). The **input** clip shows in the user bubble through the reu
 `Range`) and revokes it on unmount. The composer attaches a file **or records** in-browser
 (`MediaRecorder`), releasing the microphone tracks on stop, on a failed start, on a
 recorder error and on unmount (#249's own fix), while send and discard revoke the preview's
-object URL. A transcription thread's first user turn is audio-only, so
+object URL. **Whichever way the clip arrives, the composer converts it to WAV before it
+enters the turn, so the upload is always a WAV**, because audio.cpp reads WAV only (§3.7):
+`prepareAudioClip` (`chat/audioAttach.ts`, the one path both a picked file and the
+recorder's "Use recording" take) decodes the bytes with WebAudio's `decodeAudioData`
+(whatever the browser has the codec for: webm/opus, mp4/aac, mp3, ogg, flac or wav), renders
+them through an `OfflineAudioContext` into one channel at 16 kHz and writes a canonical
+44-byte RIFF/WAVE header plus 16-bit little-endian PCM (`shared/audioToWav.ts`), so the
+data URL the turn carries, the stored blob and the upstream `file` part (named `audio.wav`)
+are all `audio/wav` and the same bytes. The composer's own gate is only "plainly not audio
+is refused" (an image, text, a PDF) before decoding; audio the browser cannot decode, a
+browser without WebAudio and an empty clip are refused as such with nothing attached; and
+the 20 MiB ceiling is checked on the upload and again on the WAV (16 kHz mono 16-bit is
+32 KB a second, so a small compressed upload can come out far larger). The gateway
+transcodes nothing; the conversion's accepted costs are in [Risks
+§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances). A transcription thread's first user turn is audio-only, so
 `deriveTitleFromMessages` (the first user message's text) and the backend `deriveChatTitle`
 find nothing; an untitled transcription chat is **titled from its transcript** on
 completion (`titleFromTranscript`), falling back to the localized "Untitled" placeholder.
@@ -3002,8 +3022,11 @@ inline thread can take its next turn, and the rewritten document and its new
 blobs are written in one store transaction (`SaveChatWithBlobs`), so a refused
 turn leaves nothing behind. It accepts only a standard-padded base64 `data:`
 URL of `image/png`, `image/jpeg`, `image/webp` or `image/gif` in an `image_url` part, or
-of the audio types in an `audio_url` part — `audio/wav` (a speech reply) and a
-transcription clip's input `audio/webm`, `audio/mpeg`, `audio/mp4` or `audio/ogg` (each
+of the audio types in an `audio_url` part — `audio/wav` (a speech reply, and since the
+composer converts every transcription clip to WAV, the clip the portal itself stores) and
+the broader input family `audio/webm`, `audio/mpeg`, `audio/mp4` or `audio/ogg`, which the
+allow-list **deliberately retains** although the composer no longer produces them (the store
+is payload-type-agnostic and upstream plans MP3 support; each
 kind takes only its own media family, so audio cannot be filed as a picture nor the
 reverse), within
 `MaxChatBlobBytes` (else `400 images.blob_type_unsupported` /

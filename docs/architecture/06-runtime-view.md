@@ -191,9 +191,11 @@ object URL. See [Compatibility & Inference
 
 A transcription turn **inverts** the speech turn of §6.1.3: the audio is the run's
 **input**, not its output, and the reply is the ordinary text turn. The browser attaches a
-file or records a clip in the composer; the clip is stored as a chat blob on the user
-turn, and the run executor resolves it, relays it multipart to
-`/v1/audio/transcriptions` over loopback, and commits the transcript as a text turn.
+file or records a clip in the composer and **converts it to a 16 kHz mono 16-bit PCM WAV**
+(audio.cpp reads WAV only, so the upload is always a WAV, whatever was attached or
+recorded); the clip is stored as a chat blob on the user turn, and the run executor
+resolves it, relays it multipart to `/v1/audio/transcriptions` over loopback, and commits
+the transcript as a text turn.
 
 ```mermaid
 sequenceDiagram
@@ -204,7 +206,8 @@ sequenceDiagram
     participant S as chat store (chat_blobs)
     participant U as usage
 
-    B->>GW: POST /api/portal/chats/{id}/runs {user_message with audio_url clip, settings: kind transcription, model, transcription} (session + CSRF)
+    B->>B: attach a file or record: WebAudio decodes the clip, an OfflineAudioContext downmixes and resamples it to 16 kHz mono, a 16-bit PCM WAV is written (data:audio/wav)
+    B->>GW: POST /api/portal/chats/{id}/runs {user_message with audio_url clip (the WAV), settings: kind transcription, model, transcription} (session + CSRF)
     GW->>GW: PrepareChatRun pins the kind, clears non-transcription settings, extractChatBlobs moves the clip into chat_blobs, resolveTranscriptionRunSource resolves the last user clip (or refuses: not owned)
     GW-->>B: 201 {run id, kind: transcription}
     B->>GW: GET .../runs/{runId}/events (snapshot with elapsed_ms, no deltas)
