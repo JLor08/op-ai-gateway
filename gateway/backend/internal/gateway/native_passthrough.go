@@ -861,7 +861,14 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// stream for the completion that bills it and the transcript that is captured
 	// (transcriptionStreamScan). Nil, and so inert, for every other relay.
 	transcriptScan := s.newTranscriptionStreamScan(rel.endpoint, capturing)
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan}
+	// That relay's capture is built from the scan (stampCapture below), which keeps the
+	// transcript itself, so it gets no tee of the event framing: respBuf stays empty
+	// and the copier is handed none.
+	teeBuf := &respBuf
+	if transcriptScan != nil {
+		teeBuf = nil
+	}
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan}
 	copyErr := copier.run(resp.Body)
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, rel.pfReq, serverName, idledOut.Load(), copyErr, start)
@@ -894,8 +901,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		if speechRelay {
 			capIn.RespMetering = speechMeteringHeaders(resp.Header)
 		}
-		// A streamed transcription is captured as its transcript, not as the event
-		// framing respBuf holds nor as speech's redacted audio summary.
+		// A streamed transcription is captured as its transcript (respBuf is empty for
+		// it, see teeBuf), not as the event framing nor as speech's redacted audio
+		// summary.
 		transcriptScan.stampCapture(capIn)
 	}
 	// resp.Header is the UPSTREAM provider response headers (the native-passthrough
@@ -1013,11 +1021,13 @@ type nativeExchange struct {
 // only care about the copy mechanics, and every non-images flavor never builds
 // an imgCounter at all — simply skips that scan.
 type nativeCopier struct {
-	w          http.ResponseWriter
-	rc         *http.ResponseController
-	flusher    http.Flusher
-	watchdog   *time.Timer
-	idle       time.Duration
+	w        http.ResponseWriter
+	rc       *http.ResponseController
+	flusher  http.Flusher
+	watchdog *time.Timer
+	idle     time.Duration
+	// respBuf is nil for a relay whose capture is not built from the raw bytes (a
+	// streamed transcription's is the scan's transcript): nothing is teed then.
 	respBuf    *bytes.Buffer
 	capBytes   int
 	scanner    *usageScanner
@@ -1084,7 +1094,7 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 	c.scanner.feed(chunk, time.Now())
 	c.imgCounter.feed(chunk)
 	c.transcript.feed(chunk)
-	if c.respBuf.Len() <= c.capBytes {
+	if c.respBuf != nil && c.respBuf.Len() <= c.capBytes {
 		c.respBuf.Write(chunk)
 	}
 	return nil

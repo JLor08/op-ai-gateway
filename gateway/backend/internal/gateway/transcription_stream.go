@@ -6,6 +6,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime"
@@ -33,14 +34,16 @@ const (
 //     that says "success" when the body simply stops, so the only evidence that a
 //     transcript was delivered whole is that its terminal frames arrived. Billing
 //     is decided on that (setStreamedTranscriptionBillingQuantity).
-//   - the TRANSCRIPT, for the capture: the done event's text when there is one (the
+//   - the TRANSCRIPT, for the capture: the done event's text when it states one (the
 //     authoritative statement of the whole text), else the deltas assembled so far,
 //     which is what a stream that broke off delivered. Kept only when the request is
 //     being captured, and bounded by the capture cap (one byte past it, so the capture
 //     can tell a clipped transcript from one that fits exactly).
 //
-// A nil *transcriptionStreamScan is a scan that sees nothing, and every method is
-// nil-safe: a relay that is not a streamed transcription carries no scan.
+// A nil *transcriptionStreamScan is a scan that sees nothing: a relay that is not a
+// streamed transcription carries no scan. The methods nativeCopier and proxyNative
+// call on it -- feed, finish, complete, transcript and stampCapture -- are nil-safe;
+// the helpers behind them are reached only through those and are not.
 //
 // Frames are read line by line, as usageScanner reads them: a frame can straddle two
 // chunks, so the unterminated tail of a chunk is carried to the next. The carry is
@@ -61,11 +64,10 @@ type transcriptionStreamScan struct {
 	carry    []byte // the unterminated tail of the chunks so far
 	skipping bool   // inside a line dropped for its length: discard up to its newline
 
-	deltas       []byte // the deltas' text, in order
-	doneText     []byte // the done event's text
-	haveDoneText bool
-	sawDone      bool // a transcript.text.done event was seen
-	sawEnd       bool // [DONE] was seen AFTER it
+	deltas   []byte // the deltas' text, in order
+	doneText []byte // the done event's text
+	sawDone  bool   // a transcript.text.done event was seen
+	sawEnd   bool   // [DONE] was seen AFTER it
 }
 
 // newTranscriptionStreamScan returns the scan for a relay of endpoint -- nil for every
@@ -202,7 +204,7 @@ func (s *transcriptionStreamScan) setDoneText(text string) {
 		return
 	}
 	n := min(len(text), s.room(0))
-	s.doneText, s.haveDoneText = append(s.doneText[:0], text[:n]...), true
+	s.doneText = append(s.doneText[:0], text[:n]...)
 }
 
 // complete reports whether the stream ended the way a transcription that was
@@ -212,9 +214,15 @@ func (s *transcriptionStreamScan) complete() bool {
 }
 
 // transcript is the transcript the stream carried, as far as the capture keeps one:
-// the done event's text when it had one, else the deltas that arrived.
+// the done event's text when it states one (it restates the whole text, and is the
+// authoritative statement of it), else the deltas that arrived. An EMPTY done text
+// states nothing -- a done event that restates no text must not erase the deltas that
+// did arrive -- so the deltas stand in front of it.
 func (s *transcriptionStreamScan) transcript() []byte {
-	if s.haveDoneText {
+	if s == nil {
+		return nil
+	}
+	if len(s.doneText) > 0 {
 		return s.doneText
 	}
 	return s.deltas
@@ -275,14 +283,14 @@ func setStreamedTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange,
 
 // uploadWavDurationMillis returns the duration of the audio the client uploaded to a
 // transcription: the first non-empty `file` part of the multipart body raw, found with
-// the boundary of contentType, measured by wavDurationMillis. It is false when the
+// the boundary of contentType, measured by wavDurationFromReader. It is false when the
 // body is no readable form, has no such part, or the part is no WAV whose header can be
 // believed.
 //
 // The part is read the way validation read it (a part of mime/multipart's reader whose
-// FormName is "file"; an empty one is no upload), into ONE buffer of the body's size,
-// so the upload is held a second time only for the length of the measurement -- and
-// only for a stream that completed (the caller measures nothing else).
+// FormName is "file"; an empty one is no upload), and measured WHERE IT LIES: the
+// reader walks the chunk headers and counts the rest, so the upload -- up to the
+// transcription cap -- is never copied a second time while raw is already held.
 func uploadWavDurationMillis(raw []byte, contentType string) (int64, bool) {
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
@@ -297,14 +305,15 @@ func uploadWavDurationMillis(raw []byte, contentType string) (int64, bool) {
 		if part.FormName() != "file" {
 			continue
 		}
-		var audio bytes.Buffer
-		audio.Grow(len(raw))
-		if _, err := io.Copy(&audio, part); err != nil {
+		// The first byte says whether the part is empty (and so no upload) without
+		// reading any more of it.
+		var first [1]byte
+		if _, err := io.ReadFull(part, first[:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				continue
+			}
 			return 0, false
 		}
-		if audio.Len() == 0 {
-			continue
-		}
-		return wavDurationMillis(audio.Bytes())
+		return wavDurationFromReader(io.MultiReader(bytes.NewReader(first[:]), part))
 	}
 }

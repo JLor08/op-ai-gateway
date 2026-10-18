@@ -233,3 +233,60 @@ func TestWavDurationMillisAcceptsEverySampleSizeAConsistentHeaderCanCarry(t *tes
 		})
 	}
 }
+
+// The `data` chunk's declared size is the other number the duration rests on, and it
+// is the client's too: a header that declares an empty (or tiny) `data` chunk and puts
+// the real audio AFTER it would measure 0 and bill nothing. So the declared size is
+// checked against what the upload actually holds after the chunk header: bytes that
+// the declaration does not account for, beyond the slack a trailing metadata chunk
+// needs, make the header unbelievable.
+func TestWavDurationMillisRejectsADataChunkSmallerThanTheUploadHoldingAfterIt(t *testing.T) {
+	fmtChunk := wavFmtChunk(t, 16000, 1, 16)
+	pcm := make([]byte, 32000) // 1 s of audio
+	for _, tc := range []struct {
+		name string
+		in   []byte
+	}{
+		{"declares zero, the audio follows", wavFile(t, fmtChunk, wavChunk(t, "data", 0, nil), pcm)},
+		{"declares a few bytes, the audio follows", wavFile(t, fmtChunk, wavChunk(t, "data", 100, make([]byte, 100)), pcm)},
+		{"declares zero, the audio follows as a second data chunk", wavFile(t, fmtChunk, wavChunk(t, "data", 0, nil), wavDataChunk(t, len(pcm)))},
+		{"declares zero, the audio follows wrapped in a foreign chunk", wavFile(t, fmtChunk, wavChunk(t, "data", 0, nil), wavChunk(t, "LIST", uint32(len(pcm)), pcm))},
+		{"one byte more than the slack allows", wavFile(t, fmtChunk, wavChunk(t, "data", 0, nil), make([]byte, wavTrailingSlackBytes+1))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ms, ok := wavDurationMillis(tc.in)
+			if ok || ms != 0 {
+				t.Fatalf("wavDurationMillis = (%d, %v), want (0, false): the declared data size is not believable", ms, ok)
+			}
+		})
+	}
+}
+
+// What follows the audio in a genuine file stays valid: trailing metadata chunks (an
+// ffmpeg LIST/INFO is ~100 bytes) up to the slack, with or without the pad byte an odd
+// `data` size is followed by, and a foreign chunk of any size BEFORE `data`.
+func TestWavDurationMillisAcceptsATrailingChunkAndALargeLeadingOne(t *testing.T) {
+	fmtChunk := wavFmtChunk(t, 16000, 1, 16)
+	list := func(n int) []byte { return wavChunk(t, "LIST", uint32(n), make([]byte, n)) }
+	for _, tc := range []struct {
+		name       string
+		in         []byte
+		wantMillis int64
+	}{
+		{"a small trailing LIST chunk", wavFile(t, fmtChunk, wavDataChunk(t, 32000), list(100)), 1000},
+		{"a trailing chunk of exactly the slack", wavFile(t, fmtChunk, wavDataChunk(t, 32000), list(wavTrailingSlackBytes-wavChunkHeaderLen)), 1000},
+		{"an odd data size and its pad byte", wavFile(t, fmtChunk, wavDataChunk(t, 32001)), 1000},
+		{"an odd data size, its pad byte and a trailing chunk", wavFile(t, fmtChunk, wavDataChunk(t, 32001), list(100)), 1000},
+		{"an odd data size, its pad byte and a trailing chunk of exactly the slack", wavFile(t, fmtChunk, wavDataChunk(t, 32001), list(wavTrailingSlackBytes-wavChunkHeaderLen)), 1000},
+		{"an odd data size whose pad byte was left off", wavFile(t, fmtChunk, wavChunk(t, "data", 32001, make([]byte, 32001))[:wavChunkHeaderLen+32001]), 1000},
+		{"a 1 MiB leading chunk before data", wavFile(t, fmtChunk, list(1<<20), wavDataChunk(t, 32000)), 1000},
+		{"a leading chunk of odd length", wavFile(t, fmtChunk, wavChunk(t, "LIST", 5, []byte("INFOx")), wavDataChunk(t, 32000)), 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ms, ok := wavDurationMillis(tc.in)
+			if !ok || ms != tc.wantMillis {
+				t.Fatalf("wavDurationMillis = (%d, %v), want (%d, true)", ms, ok, tc.wantMillis)
+			}
+		})
+	}
+}

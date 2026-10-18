@@ -3,12 +3,23 @@
 
 package gateway
 
-import "encoding/binary"
+import (
+	"bytes"
+	"encoding/binary"
+	"io"
+)
 
 const (
 	wavRIFFHeaderLen  = 12 // "RIFF" + uint32 size + "WAVE"
 	wavChunkHeaderLen = 8  // 4-byte chunk id + uint32 little-endian size
 	wavFmtMinLen      = 16 // the fixed PCM part of the `fmt ` chunk
+
+	// wavTrailingSlackBytes is how many bytes may follow the audio in a `data` chunk's
+	// own extent without being accounted for by its declared size: the trailing
+	// metadata chunks of a genuine file (an ffmpeg LIST/INFO is ~100 bytes, a broadcast
+	// WAV's bext/iXML a few KiB). Anything past it is not metadata but audio the
+	// declaration hid.
+	wavTrailingSlackBytes = 16 << 10
 )
 
 // Offsets of the fixed PCM fields within the body of a `fmt ` chunk (the 2-byte
@@ -27,48 +38,89 @@ const (
 // true. It returns (0, false) when b is not a structurally sound RIFF/WAVE file:
 // a missing or truncated chunk, a chunk that declares more bytes than b holds, a
 // `fmt ` chunk after `data` or too short to carry a byte rate, a zero byte rate,
-// or a `fmt ` chunk whose fields contradict each other (see wavConsistentByteRate).
-// A streamed transcription response carries no audio_duration_ms, so the billable
-// duration is derived from the uploaded WAV instead.
+// a `fmt ` chunk whose fields contradict each other (see wavConsistentByteRate), or
+// a `data` chunk that declares less than the file holds after it (see
+// wavDurationFromReader). A streamed transcription response carries no
+// audio_duration_ms, so the billable duration is derived from the uploaded WAV
+// instead.
 //
 // (0, true) is a real answer: a clip shorter than a millisecond, or an empty `data`
-// chunk, measures zero. Only ok says whether the header could be believed.
+// chunk with nothing after it, measures zero. Only ok says whether the header could
+// be believed.
 func wavDurationMillis(b []byte) (int64, bool) {
-	if len(b) < wavRIFFHeaderLen || string(b[0:4]) != "RIFF" || string(b[8:12]) != "WAVE" {
+	return wavDurationFromReader(bytes.NewReader(b))
+}
+
+// wavDurationFromReader is wavDurationMillis over a stream, so an upload held in a
+// multipart body is measured where it lies, without a second copy of it: only the
+// chunk headers and the `fmt ` chunk are read for their content, and every other byte
+// -- a foreign chunk of any size, the audio itself -- is passed over and counted.
+//
+// The count is what makes the declared `data` size believable. That size is written
+// by the CLIENT, which pays by the second: a header that declares an empty (or tiny)
+// `data` chunk and puts the real audio after it would measure 0 and bill nothing, the
+// same forgery as an inflated byte rate. So the bytes that really follow the `data`
+// chunk header are compared with the declared size: fewer is a truncated file, and
+// more than wavTrailingSlackBytes beyond the declaration (and its pad byte) is audio
+// the declaration hid, not the trailing metadata chunk a genuine file may carry. The
+// slack bounds what a forger can still get billed as nothing to that many bytes of
+// audio per request.
+func wavDurationFromReader(r io.Reader) (int64, bool) {
+	var riff [wavRIFFHeaderLen]byte
+	if _, err := io.ReadFull(r, riff[:]); err != nil || string(riff[0:4]) != "RIFF" || string(riff[8:12]) != "WAVE" {
 		return 0, false
 	}
 
 	var byteRate uint32
-	for pos := wavRIFFHeaderLen; pos+wavChunkHeaderLen <= len(b); {
-		id := string(b[pos : pos+4])
-		size := binary.LittleEndian.Uint32(b[pos+4 : pos+wavChunkHeaderLen])
-		body := pos + wavChunkHeaderLen
-		if uint64(size) > uint64(len(b)-body) {
+	for {
+		var header [wavChunkHeaderLen]byte
+		if _, err := io.ReadFull(r, header[:]); err != nil {
 			return 0, false
 		}
+		id := string(header[0:4])
+		size := binary.LittleEndian.Uint32(header[4:])
 
+		consumed := uint64(0) // bytes of the chunk body already read
 		switch id {
 		case "fmt ":
 			if size < wavFmtMinLen {
 				return 0, false
 			}
-			rate, ok := wavConsistentByteRate(b[body : body+wavFmtMinLen])
+			var fields [wavFmtMinLen]byte
+			if _, err := io.ReadFull(r, fields[:]); err != nil {
+				return 0, false
+			}
+			rate, ok := wavConsistentByteRate(fields[:])
 			if !ok {
 				return 0, false
 			}
-			byteRate = rate
+			byteRate, consumed = rate, wavFmtMinLen
 		case "data":
 			if byteRate == 0 {
+				return 0, false
+			}
+			held, err := io.Copy(io.Discard, r)
+			if err != nil || uint64(size) > uint64(held) {
+				return 0, false
+			}
+			unexplained := uint64(held) - uint64(size)
+			if size&1 == 1 && unexplained > 0 {
+				unexplained-- // the pad byte an odd-length chunk is followed by
+			}
+			if unexplained > wavTrailingSlackBytes {
 				return 0, false
 			}
 			// size < 2^32 and 1000 < 2^10, so the product fits easily in a uint64.
 			return int64(uint64(size) * 1000 / uint64(byteRate)), true
 		}
 
-		// Chunks are word-aligned: an odd-length body is followed by one pad byte.
-		pos = body + int(size) + int(size&1)
+		// Pass over the rest of the chunk. Chunks are word-aligned: an odd-length body
+		// is followed by one pad byte.
+		skip := uint64(size) - consumed + uint64(size&1)
+		if n, err := io.CopyN(io.Discard, r, int64(skip)); err != nil || uint64(n) != skip {
+			return 0, false
+		}
 	}
-	return 0, false
 }
 
 // wavConsistentByteRate returns the byte rate of a `fmt ` chunk (f is its first

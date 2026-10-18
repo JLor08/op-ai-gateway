@@ -185,7 +185,7 @@ func TestTranscriptionStreamRelayPassesSSEThrough(t *testing.T) {
 		t.Fatalf("upstream model = %q, want the mapped %q", got, transcriptionUpstreamModel)
 	}
 
-	ev := lastUsageEvent(t, srv)
+	ev := onlyUsageEvent(t, srv)
 	if ev.Status != "success" || ev.HTTPStatus != http.StatusOK || ev.ContentType != "text/event-stream" {
 		t.Fatalf("usage row = %q/%d/%q, want success/200/text/event-stream", ev.Status, ev.HTTPStatus, ev.ContentType)
 	}
@@ -671,6 +671,19 @@ func streamingTranscriptionPartsOf(model string, audio []byte) []editPart {
 	}
 }
 
+// onlyUsageEvent returns the usage row of a server that has recorded exactly one: a
+// transcription is one row, so a second record (a retry that kept its own row, a
+// double record at the end of a relay) fails the test instead of hiding behind the
+// last event.
+func onlyUsageEvent(t *testing.T, srv *Server) usage.Event {
+	t.Helper()
+	events := srv.Usage.All()
+	if len(events) != 1 {
+		t.Fatalf("usage rows = %d (%+v), want exactly 1", len(events), events)
+	}
+	return events[0]
+}
+
 // transcriptionFrameDelta and transcriptionFrameDone build the event frames audio.cpp streams, for a transcript the
 // test chooses.
 func transcriptionFrameDelta(text string) string {
@@ -721,7 +734,7 @@ func TestTranscriptionStreamBillsFromWavHeader(t *testing.T) {
 			if want := transcriptionFrameDelta("hello ") + transcriptionFrameDelta("there") + transcriptionFrameDone("hello there") + transcriptionSSEEnd; rec.Code != http.StatusOK || rec.Body.String() != want {
 				t.Fatalf("response = %d %q, want the upstream's stream, frame for frame", rec.Code, rec.Body.String())
 			}
-			ev := lastUsageEvent(t, srv)
+			ev := onlyUsageEvent(t, srv)
 			if ev.Status != "success" || !ev.Stream {
 				t.Fatalf("usage row = %q stream=%v, want a streamed success", ev.Status, ev.Stream)
 			}
@@ -783,7 +796,7 @@ func TestTranscriptionStreamLoudZeroOnIncompleteStream(t *testing.T) {
 			if rec.Code != http.StatusOK || rec.Body.String() != tc.wantBody {
 				t.Fatalf("response = %d %q, want 200 and the frames the upstream sent, %q", rec.Code, rec.Body.String(), tc.wantBody)
 			}
-			ev := lastUsageEvent(t, srv)
+			ev := onlyUsageEvent(t, srv)
 			if ev.Status != tc.wantStatus {
 				t.Fatalf("usage row status = %q, want %q", ev.Status, tc.wantStatus)
 			}
@@ -803,11 +816,13 @@ func TestTranscriptionStreamLoudZeroOnIncompleteStream(t *testing.T) {
 
 // A clean stream whose upload cannot be measured is a loud zero too: the upload is no
 // WAV (webm bytes), or its header contradicts itself (an inflated byte rate would bill
-// a long clip as a short one), or the `data` chunk is longer than what was uploaded.
+// a long clip as a short one), the `data` chunk is longer than what was uploaded, or it
+// declares less than the upload holds after it (the audio hidden behind an empty chunk).
 // The transcript still reaches the client.
 func TestTranscriptionStreamLoudZeroOnAnUploadWithNoBillableDuration(t *testing.T) {
 	inflated := wavFile(t, wavFmtChunkWith(t, 1, 16000, 3200000, 2, 16), wavDataChunk(t, 32000)) // 1 s of audio claiming 10 ms
 	truncated := wavFile(t, wavFmtChunk(t, 16000, 1, 16), wavChunk(t, "data", 64000, make([]byte, 100)))
+	declaresNothing := wavFile(t, wavFmtChunk(t, 16000, 1, 16), wavChunk(t, "data", 0, nil), make([]byte, 32000)) // 1 s of audio declared as none
 	for _, tc := range []struct {
 		name  string
 		audio []byte
@@ -817,6 +832,7 @@ func TestTranscriptionStreamLoudZeroOnAnUploadWithNoBillableDuration(t *testing.
 		{"the fixture bytes of the other tests", transcriptionTestAudio},
 		{"an inflated byte rate", inflated},
 		{"a data chunk longer than the upload", truncated},
+		{"a data chunk declaring zero with the audio after it", declaresNothing},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf, restore := withCapturedSlog(t)
@@ -829,7 +845,7 @@ func TestTranscriptionStreamLoudZeroOnAnUploadWithNoBillableDuration(t *testing.
 			if want := transcriptionFrameDelta("hello") + transcriptionFrameDone("hello") + transcriptionSSEEnd; rec.Code != http.StatusOK || rec.Body.String() != want {
 				t.Fatalf("response = %d %q, want the upstream's stream", rec.Code, rec.Body.String())
 			}
-			ev := lastUsageEvent(t, srv)
+			ev := onlyUsageEvent(t, srv)
 			if ev.Status != "success" || ev.BillingQuantity != 0 {
 				t.Fatalf("usage row = %q billing %v, want a success that billed 0", ev.Status, ev.BillingQuantity)
 			}
@@ -855,7 +871,7 @@ func TestTranscriptionStreamBillsASubMillisecondClipAsZeroWithoutAnError(t *test
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if ev := lastUsageEvent(t, srv); ev.Status != "success" || ev.BillingQuantity != 0 {
+	if ev := onlyUsageEvent(t, srv); ev.Status != "success" || ev.BillingQuantity != 0 {
 		t.Fatalf("usage row = %q billing %v, want a success billed 0", ev.Status, ev.BillingQuantity)
 	}
 	if errs := errorLogs(buf); len(errs) != 0 {
@@ -925,7 +941,8 @@ func TestTranscriptionStreamCaptureKeepsThePartialTranscriptOfAnIncompleteStream
 
 // The done event is the authoritative text: it is what the capture stores when it
 // differs from the deltas (a model that revises what it said), and the only source
-// when the stream carried no deltas at all.
+// when the stream carried no deltas at all. An EMPTY done text states nothing, though,
+// and does not erase the deltas that did arrive.
 func TestTranscriptionStreamCapturePrefersTheDoneText(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -933,6 +950,7 @@ func TestTranscriptionStreamCapturePrefersTheDoneText(t *testing.T) {
 	}{
 		{"the done event revises the deltas", []string{transcriptionFrameDelta("hello thar"), transcriptionFrameDone("hello there"), transcriptionSSEEnd}},
 		{"no deltas at all", []string{transcriptionFrameDone("hello there"), transcriptionSSEEnd}},
+		{"an empty done text does not erase the deltas", []string{transcriptionFrameDelta("hello "), transcriptionFrameDelta("there"), transcriptionFrameDone(""), transcriptionSSEEnd}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			up, _ := newSSETranscriptionUpstream(t, tc.frames...)
@@ -980,7 +998,7 @@ func TestTranscriptionStreamCaptureClipsATranscriptPastTheCap(t *testing.T) {
 	if env.RespBody != whole.String()[:1024] || !env.Truncated {
 		t.Fatalf("response body is %d bytes, Truncated = %v, want the first 1024 bytes of the transcript and Truncated", len(env.RespBody), env.Truncated)
 	}
-	if ev := lastUsageEvent(t, srv); ev.BillingQuantity != 0.5 {
+	if ev := onlyUsageEvent(t, srv); ev.BillingQuantity != 0.5 {
 		t.Fatalf("BillingQuantity = %v, want 0.5: a transcript past the capture cap does not stop the stream completing", ev.BillingQuantity)
 	}
 }
@@ -1040,7 +1058,7 @@ func TestTranscriptionStreamCompletesWhenFramesAreSplitAcrossWrites(t *testing.T
 	if want := strings.Join(pieces, ""); rec.Code != http.StatusOK || rec.Body.String() != want {
 		t.Fatalf("response = %d %q, want the upstream's stream unchanged", rec.Code, rec.Body.String())
 	}
-	if ev := lastUsageEvent(t, srv); ev.BillingQuantity != 0.5 {
+	if ev := onlyUsageEvent(t, srv); ev.BillingQuantity != 0.5 {
 		t.Fatalf("BillingQuantity = %v, want 0.5: the stream completed", ev.BillingQuantity)
 	}
 	saved, ok := cs.last()
@@ -1193,6 +1211,9 @@ func TestTranscriptionStreamScanIsNilSafe(t *testing.T) {
 	if scan.complete() {
 		t.Fatal("a nil scan completed")
 	}
+	if got := scan.transcript(); len(got) != 0 {
+		t.Fatalf("a nil scan's transcript = %q, want none", got)
+	}
 	in := &captureInput{RespBody: []byte("kept")}
 	scan.stampCapture(in)
 	if in.Endpoint != endpointChat || string(in.RespBody) != "kept" {
@@ -1255,5 +1276,50 @@ func TestUploadWavDurationMillis(t *testing.T) {
 	}
 	if ms, ok := uploadWavDurationMillis(body[:len(body)/2], ct); ok || ms != 0 {
 		t.Errorf("a form cut short: uploadWavDurationMillis = (%d, %v), want (0, false)", ms, ok)
+	}
+}
+
+// The done event's text is the transcript when it states one; an empty one (a done
+// event that restates nothing) is no statement, and the deltas stand -- but with no
+// deltas either, the transcript is simply empty.
+func TestTranscriptionStreamScanTranscriptSource(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stream string
+		want   string
+	}{
+		{"the done text over the deltas", transcriptionFrameDelta("hello thar") + transcriptionFrameDone("hello there"), "hello there"},
+		{"the done text alone", transcriptionFrameDone("hello there"), "hello there"},
+		{"an empty done text keeps the deltas", transcriptionFrameDelta("hello ") + transcriptionFrameDelta("there") + transcriptionFrameDone(""), "hello there"},
+		{"a done event with no text keeps the deltas", transcriptionFrameDelta("hello") + "data: {\"type\":\"transcript.text.done\"}\n\n", "hello"},
+		{"an empty done text and no deltas", transcriptionFrameDone(""), ""},
+		{"the deltas of a stream that never finished", transcriptionFrameDelta("hello ") + transcriptionFrameDelta("there"), "hello there"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := string(scanOf(newTestTranscriptionScan(), tc.stream, 0).transcript()); got != tc.want {
+				t.Fatalf("transcript = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The copier relays and scans a streamed transcription with no capture tee at all: the
+// capture of that relay is built from the scan, so proxyNative gives the copier no
+// respBuf, and the bytes still reach the client whole and the scan still completes.
+func TestNativeCopierRelaysAndScansAStreamWithoutATee(t *testing.T) {
+	stream := transcriptionFrameDelta("hello ") + transcriptionFrameDelta("there") + transcriptionFrameDone("hello there") + transcriptionSSEEnd
+	rec := httptest.NewRecorder()
+	scan := newTestTranscriptionScan()
+	copier := &nativeCopier{w: rec, flusher: rec, capBytes: 4, transcript: scan}
+
+	if err := copier.run(strings.NewReader(stream)); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if rec.Body.String() != stream || copier.written != int64(len(stream)) {
+		t.Fatalf("client got %q (%d bytes written), want the whole stream", rec.Body.String(), copier.written)
+	}
+	if !scan.complete() || string(scan.transcript()) != "hello there" {
+		t.Fatalf("scan complete = %v, transcript = %q, want a completed stream of %q", scan.complete(), scan.transcript(), "hello there")
 	}
 }
