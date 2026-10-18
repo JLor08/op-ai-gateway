@@ -285,7 +285,12 @@ reports success on a broken corpus is worse than no checker.
   run executor as a 16 kHz mono 16-bit PCM WAV, the same bytes the chat blob
   store holds, the transcript turn next to the user's own clip served from
   the chat blob store, their survival of a reload, the advanced passthrough
-  reaching the form, and the `audio_second` usage row; local-only),
+  reaching the form, and the `audio_second` usage row; plus streaming (ADR-065):
+  against a model the stub lists with `mode=streaming` the run's `stream=true`
+  is relayed and the transcript turn fills in delta by delta (the stub pauses
+  after each delta and the spec reads the turn at every pause), the committed
+  transcript is the done event's text and survives a reload, and the usage row
+  is billed from the converted WAV's header; local-only),
   `e2e:smtp` (local
   mail catcher module in `gateway/e2e/e2e-smtp/mailcatcher`), `e2e:totp`,
   `e2e:transcription` (covers `POST /v1/audio/transcriptions` end to end, the
@@ -293,7 +298,15 @@ reports success on a broken corpus is worse than no checker.
   the portal form, the `asr`/`tts` capability probe, the multipart relay with
   the model rewritten, the capability and `response_format` refusals, and the
   `audio_second` usage row metered from the response body's
-  `timing.audio_duration_ms`; local-only like every suite but `e2e:runtime`),
+  `timing.audio_duration_ms`; plus streaming (ADR-065): the probe writing the
+  `transcription_streaming` verdict from the stub's `/v1/models` `mode`, a
+  `stream=true` request relayed as the upstream's event stream frame by frame
+  (the first frame reaches the client while the stub still holds the stream
+  open) and billed from the uploaded WAV's header, a stale `yes` retried once
+  buffered after the upstream's `500` "requires a model configured with
+  `mode=streaming`", and an offline or verdict-less model answered buffered up
+  front with no `stream` part sent; local-only like every suite but
+  `e2e:runtime`),
   and `e2e:system-admin-mode`. These suites run the gateway in **memory
   mode** — fast, but see the conformance-suite caveat above for what memory
   mode cannot catch. Changes to invite/auth UI or visibility models are

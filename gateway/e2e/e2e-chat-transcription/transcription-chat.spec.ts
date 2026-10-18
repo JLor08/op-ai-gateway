@@ -84,6 +84,18 @@ import { login } from "../e2e/helpers";
 //      with its own transcript.
 //   7. THE BILLING UNIT: each run leaves an audio_second usage row (from the stub's
 //      timing.audio_duration_ms, 2000 ms = 2 s), not a token-metered one.
+//   8. STREAMING (issue #262): the run always asks the gateway for stream=true, and the
+//      gateway decides per model. The models above state no `mode` in the stub's
+//      /v1/models, so they carry no transcription_streaming verdict and are answered
+//      buffered (the scenarios above, whose upstream form never has a stream part, are
+//      that path through the portal). A model the stub lists with mode=streaming gets the
+//      verdict yes, the run's stream=true reaches it, and the transcript turn FILLS IN as
+//      the stub's transcript.text.delta frames arrive: the stub pauses its stream after
+//      each of the first two deltas and the spec looks at the turn at every pause, so a
+//      transcript that only appeared when the run ended could not pass. The committed
+//      transcript is the done event's text (it restates the whole text, with a final
+//      period the deltas lack), survives a reload, and the run's usage row is billed from
+//      the converted WAV's header -- the streamed done event states no audio_duration_ms.
 //
 // Not covered here, and owned by the unit/integration suites instead: the reserved
 // passthrough fields and the invalid-JSON refusal, the run's error codes and their
@@ -113,6 +125,11 @@ const ASR_MODEL = "e2e-chat-transcribe";
 const ASR_UPSTREAM = "whisper_x";
 const UNPROBED_MODEL = "e2e-chat-unprobed";
 const UNPROBED_UPSTREAM = "not_loaded_yet";
+// The streaming model (issue #262): the stub lists it with mode=streaming, so the probe
+// gives it the transcription_streaming verdict yes and the gateway relays the run's
+// stream=true to it.
+const STREAM_MODEL = "e2e-chat-streaming";
+const STREAM_UPSTREAM = "vibevoice_asr_streaming";
 
 // What the stub answers the nth transcription with: the transcript, and the timing
 // block whose audio_duration_ms (milliseconds) is the quantity the gateway bills. Two
@@ -125,6 +142,18 @@ const TRANSCRIPTS = ["Guten Tag, das ist das Transkript.", "Und hier noch ein zw
 // How long the stub holds the FIRST answer, so the pending state is on screen for long
 // enough to be observed without a race.
 const FIRST_ANSWER_DELAY_MS = 1500;
+
+// What the stub streams for stream=true on the streaming model: the increments, and the
+// done event that restates the whole text (with the final period no delta carries, which
+// is what shows the committed transcript is the done event's) and a time to first token,
+// but no audio_duration_ms.
+const STREAM_DELTAS = ["Guten Tag, ", "das ist ein ", "Streaming-Transkript"];
+const STREAM_TEXT = "Guten Tag, das ist ein Streaming-Transkript.";
+const STREAM_TTFT_MS = 120;
+// A held stream is released by itself after this long, so a failing assertion can never
+// leave the stub (and the gateway's relay and the run) waiting for a release that will
+// not come.
+const HOLD_SAFETY_MS = 15000;
 
 const LANGUAGE = "en";
 const PROMPT = "Names: Alba, Jonas.";
@@ -328,8 +357,24 @@ type Stub = {
   calls: StubCall[];
   /** The POST /v1/audio/transcriptions requests among them. */
   transcriptionCalls(): StubCall[];
+  /**
+   * Makes the next `count` streamed answers pause, in turn, right after one of their
+   * delta frames: a hold per pause. `reached` settles once the stub has written that
+   * delta and is waiting; `release()` lets the stream go on. A hold nobody releases
+   * lets go by itself after HOLD_SAFETY_MS.
+   */
+  holdStream(count: number): Hold[];
+  /** Whether a streamed answer is paused at a hold right now. */
+  streamHeld(): boolean;
   close(): Promise<void>;
 };
+
+type Hold = { reached: Promise<void>; release: () => void };
+
+/** One SSE `data:` frame. */
+function sseFrame(payload: unknown): string {
+  return `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`;
+}
 
 /**
  * The audio.cpp stand-in, kept to what the gateway actually talks to and honest
@@ -338,18 +383,64 @@ type Stub = {
  *   GET  /health                   -> 200 (the application's health path)
  *   GET  /v1/models                -> the OpenAI list of LOADED models, each with
  *                                     the `task` audio.cpp states (the capability
- *                                     signal)
+ *                                     signal) and, for the streaming model, the
+ *                                     `mode` ("streaming") the
+ *                                     transcription_streaming verdict is read from
  *   POST /v1/audio/transcriptions  -> a multipart request answered with a JSON
  *                                     {"text","timing"} document, the timing block
  *                                     carrying audio_duration_ms; the nth answer
  *                                     carries the nth transcript and the first is
  *                                     held for FIRST_ANSWER_DELAY_MS; a model it does
  *                                     not serve is answered 500, which is what the
- *                                     real server does for a client error
+ *                                     real server does for a client error. With
+ *                                     stream=true the streaming model answers 200
+ *                                     text/event-stream: a transcript.text.delta per
+ *                                     increment (each its own chunk, paused at the
+ *                                     test's holds), transcript.text.done (the whole
+ *                                     text and timing.ttft_ms, no audio_duration_ms),
+ *                                     then [DONE]; any other model answers 500 "...
+ *                                     requires a model configured with
+ *                                     mode=streaming", as the real server does.
  */
 async function startAudioCppStub(): Promise<Stub> {
   const calls: StubCall[] = [];
   let answered = 0;
+  const pendingHolds: { markReached: () => void; released: Promise<void> }[] = [];
+  let held = 0;
+
+  /** Waits at the next pending hold, if one is armed. */
+  const pauseAtHold = async (): Promise<void> => {
+    const hold = pendingHolds.shift();
+    if (!hold) {
+      return;
+    }
+    held += 1;
+    hold.markReached();
+    let safety: NodeJS.Timeout | undefined;
+    await Promise.race([
+      hold.released,
+      new Promise<void>((resolve) => {
+        safety = setTimeout(resolve, HOLD_SAFETY_MS);
+      })
+    ]);
+    clearTimeout(safety);
+    held -= 1;
+  };
+
+  const streamTranscript = async (res: http.ServerResponse): Promise<void> => {
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+    res.flushHeaders();
+    for (const [i, delta] of STREAM_DELTAS.entries()) {
+      res.write(sseFrame({ type: "transcript.text.delta", delta }));
+      if (i < STREAM_DELTAS.length - 1) {
+        await pauseAtHold();
+      }
+    }
+    res.write(sseFrame({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } }));
+    res.write(sseFrame("[DONE]"));
+    res.end();
+  };
+
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -383,13 +474,31 @@ async function startAudioCppStub(): Promise<Stub> {
       }
       if (method === "GET" && path === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ object: "list", data: [{ id: ASR_UPSTREAM, object: "model", task: "asr" }] }));
+        res.end(
+          JSON.stringify({
+            object: "list",
+            data: [
+              // No mode: this model carries no transcription_streaming verdict.
+              { id: ASR_UPSTREAM, object: "model", task: "asr" },
+              { id: STREAM_UPSTREAM, object: "model", task: "asr", mode: "streaming" }
+            ]
+          })
+        );
         return;
       }
       if (method === "POST" && path === TRANSCRIPTION_PATH) {
-        if (fields.model !== ASR_UPSTREAM) {
+        if (fields.model !== ASR_UPSTREAM && fields.model !== STREAM_UPSTREAM) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: { message: `model not loaded: ${fields.model ?? ""}` } }));
+          return;
+        }
+        if (fields.stream === "true") {
+          if (fields.model !== STREAM_UPSTREAM) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: "streaming transcription requires a model configured with mode=streaming", type: "server_error" } }));
+            return;
+          }
+          void streamTranscript(res);
           return;
         }
         const text = TRANSCRIPTS[Math.min(answered, TRANSCRIPTS.length - 1)];
@@ -410,6 +519,20 @@ async function startAudioCppStub(): Promise<Stub> {
     port: (server.address() as AddressInfo).port,
     calls,
     transcriptionCalls: () => calls.filter((c) => c.method === "POST" && c.path === TRANSCRIPTION_PATH),
+    holdStream: (count) =>
+      Array.from({ length: count }, () => {
+        let markReached!: () => void;
+        let release!: () => void;
+        const reached = new Promise<void>((resolve) => {
+          markReached = resolve;
+        });
+        const released = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        pendingHolds.push({ markReached, released });
+        return { reached, release };
+      }),
+    streamHeld: () => held > 0,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
@@ -425,6 +548,9 @@ let applicationId = "";
 // The WAV the first upstream call received: scenario 5 tells the follow-up clip's upload
 // apart from it.
 let firstUpload: Buffer;
+// The WAV the streaming model's upstream call received (scenario 9 reads the duration its
+// header declares).
+let streamedUpload: Buffer;
 
 test.describe.configure({ mode: "serial" });
 
@@ -491,8 +617,8 @@ const lastUser = () => userTurns().last();
 const composer = () => page.locator("form").filter({ hasText: t.chatTranscriptionInputLabel });
 const sendButton = () => page.getByRole("button", { name: t.send, exact: true });
 
-/** The transcription verdict the gateway holds for each mapping. */
-async function transcriptionVerdicts(): Promise<Record<string, string | null>> {
+/** The verdict of one capability the gateway holds for each mapping (null: no row). */
+async function capabilityVerdicts(capability: string): Promise<Record<string, string | null>> {
   const resp = await page.request.get(`/api/portal/applications/${applicationId}/mappings`);
   expect(resp.ok(), `listing the mappings: ${resp.status()} ${await resp.text()}`).toBe(true);
   const body = (await resp.json()) as {
@@ -500,10 +626,13 @@ async function transcriptionVerdicts(): Promise<Record<string, string | null>> {
   };
   const out: Record<string, string | null> = {};
   for (const mapping of body.data) {
-    out[mapping.gateway_model_name] = mapping.capabilities.find((c) => c.capability === "transcription")?.verdict ?? null;
+    out[mapping.gateway_model_name] = mapping.capabilities.find((c) => c.capability === capability)?.verdict ?? null;
   }
   return out;
 }
+
+const transcriptionVerdicts = () => capabilityVerdicts("transcription");
+const streamingVerdicts = () => capabilityVerdicts("transcription_streaming");
 
 /** The recorded usage rows of the transcription endpoint. */
 type UsageRow = {
@@ -522,6 +651,25 @@ async function transcriptionUsageRows(): Promise<UsageRow[]> {
   const resp = await page.request.get(`/api/portal/usage?req_path=${encodeURIComponent(TRANSCRIPTION_PATH)}&limit=100`);
   expect(resp.ok(), `reading the usage rows: ${resp.status()} ${await resp.text()}`).toBe(true);
   return ((await resp.json()) as { data: UsageRow[] }).data;
+}
+
+/**
+ * Waits for the stub to reach `hold` (it has written a delta and is paused). A run that
+ * never got a stream (the gateway answered buffered, or the request never went out) never
+ * reaches it, and the spec must say so instead of idling out the whole test budget.
+ */
+async function stubReached(hold: Hold, what: string): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      hold.reached,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`the stub never streamed ${what}: the run's stream=true did not reach the streaming model`)), 15000);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Opens a fresh chat (no model picked yet) from the chat view. */
@@ -637,10 +785,13 @@ test("1 — an audio_cpp application created through the portal form is probed, 
   applicationId = app.id;
 
   // One mapping per side of the offering rule: a model the stub lists with task asr
-  // (a transcription yes) and one it does not list (no verdict at all).
+  // (a transcription yes) and one it does not list (no verdict at all), and the model the
+  // stub lists with task asr and mode streaming (a transcription yes and, on top, a
+  // transcription_streaming yes).
   for (const [gateway, upstream] of [
     [ASR_MODEL, ASR_UPSTREAM],
-    [UNPROBED_MODEL, UNPROBED_UPSTREAM]
+    [UNPROBED_MODEL, UNPROBED_UPSTREAM],
+    [STREAM_MODEL, STREAM_UPSTREAM]
   ]) {
     const mapped = await page.request.post(`/api/portal/applications/${applicationId}/mappings`, {
       headers: CSRF,
@@ -654,7 +805,13 @@ test("1 — an audio_cpp application created through the portal form is probed, 
   // cadence takes over.
   await expect
     .poll(transcriptionVerdicts, { timeout: 90000, intervals: [1000] })
-    .toEqual({ [ASR_MODEL]: "yes", [UNPROBED_MODEL]: null });
+    .toEqual({ [ASR_MODEL]: "yes", [UNPROBED_MODEL]: null, [STREAM_MODEL]: "yes" });
+
+  // The same pass states the stream model's mode as the transcription_streaming verdict;
+  // the model whose listing states no mode gets no row (unknown, answered buffered).
+  await expect
+    .poll(streamingVerdicts, { timeout: 30000, intervals: [1000] })
+    .toEqual({ [ASR_MODEL]: null, [UNPROBED_MODEL]: null, [STREAM_MODEL]: "yes" });
 
   // The portal's model listing (what the chat's picker is built from) carries the
   // verdict as its `transcription` flag -- and an asr model is not a speech one.
@@ -665,13 +822,13 @@ test("1 — an audio_cpp application created through the portal form is probed, 
         const data = ((await resp.json()) as { data: { id: string; transcription?: boolean; speech?: boolean }[] }).data;
         return Object.fromEntries(
           data
-            .filter((m) => [ASR_MODEL, UNPROBED_MODEL].includes(m.id))
+            .filter((m) => [ASR_MODEL, UNPROBED_MODEL, STREAM_MODEL].includes(m.id))
             .map((m) => [m.id, { transcription: m.transcription === true, speech: m.speech === true }])
         );
       },
       { timeout: 30000, intervals: [500] }
     )
-    .toMatchObject({ [ASR_MODEL]: { transcription: true, speech: false } });
+    .toMatchObject({ [ASR_MODEL]: { transcription: true, speech: false }, [STREAM_MODEL]: { transcription: true, speech: false } });
 });
 
 // --- Scenario 2 -------------------------------------------------------------
@@ -929,4 +1086,104 @@ test("7 — each transcription run left an audio_second usage row of 2, not a to
       total_tokens: 0
     });
   }
+});
+
+// --- Scenario 8 -------------------------------------------------------------
+
+test("8 — a streaming model's transcript fills in as the deltas arrive, and the committed transcript is the done event's text", async () => {
+  await openNewChat();
+  await page.getByRole("combobox", { name: t.chatModel }).click();
+  await page.getByRole("option", { name: STREAM_MODEL }).click();
+  await expect(page.getByText(t.chatTranscriptionInputLabel)).toBeVisible();
+  await attachClip(FIRST_CLIP);
+  await expect(sendButton()).toBeEnabled();
+
+  const before = stub.transcriptionCalls().length;
+  // The stub pauses its stream after the first and after the second delta until this
+  // test lets it go: at each pause the turn is looked at, with the upstream provably
+  // still mid-stream, so what is on screen can only have come from the deltas so far.
+  const holds = stub.holdStream(2);
+  await sendButton().click();
+
+  // First pause: one delta written. The wait state worded for a transcript is replaced
+  // by that delta's text -- not by the whole transcript -- and the run is not over.
+  await stubReached(holds[0], "its first delta");
+  await expect(lastAssistant()).toContainText(STREAM_DELTAS[0].trim());
+  await expect(lastAssistant()).not.toContainText(STREAM_DELTAS[1].trim());
+  await expect(page.getByText(t.chatTranscriptionRunPending)).toHaveCount(0);
+  expect(stub.streamHeld(), "the first delta is on screen while the upstream is still streaming").toBe(true);
+
+  // Second pause: two deltas written, and the turn has grown to both -- still not the
+  // third, and still before the end of the stream.
+  holds[0].release();
+  await stubReached(holds[1], "its second delta");
+  await expect(lastAssistant()).toContainText((STREAM_DELTAS[0] + STREAM_DELTAS[1]).trim());
+  await expect(lastAssistant()).not.toContainText(STREAM_DELTAS[2]);
+  expect(stub.streamHeld(), "the second delta is on screen while the upstream is still streaming").toBe(true);
+
+  // The stream runs to its end: the committed transcript is the done event's text. Its
+  // final period is in no delta, so seeing it is seeing the restated whole text.
+  holds[1].release();
+  await expect(lastAssistant()).toContainText(STREAM_TEXT);
+  await expect(assistantTurns()).toHaveCount(1);
+  await expect(lastAssistant().getByRole("alert")).toHaveCount(0);
+  await expect(composer().locator("audio")).toHaveCount(0);
+  await expect(sendButton()).toBeDisabled();
+
+  // The user's turn is still the clip, played from the chat blob store.
+  await expect(userTurns()).toHaveCount(1);
+  await expectStoredClip(lastUser().locator("audio"));
+
+  // One upstream call: the run's stream=true reached the model (the gateway relays it on
+  // the verdict), the gateway name rewritten to the application's own id, and the clip
+  // the converted WAV, as for a one-shot run.
+  const calls = stub.transcriptionCalls().slice(before);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].fields).toEqual({ model: STREAM_UPSTREAM, stream: "true" });
+  expect(calls[0].filename).toBe("audio.wav");
+  expect(calls[0].fileType).toBe("audio/wav");
+  expectWav(calls[0].file as Buffer, { hz: FIRST_CLIP.hz, seconds: CLIP_SECONDS });
+  streamedUpload = calls[0].file as Buffer;
+  expect(stub.calls.filter((c) => c.path.startsWith("/v1/chat"))).toHaveLength(0);
+});
+
+// --- Scenario 9 -------------------------------------------------------------
+
+test("9 — the streamed run is billed in audio seconds from the converted WAV's header, and its transcript survives a reload", async () => {
+  // The row is recorded as the response finishes, so poll rather than assume.
+  await expect
+    .poll(async () => (await transcriptionUsageRows()).filter((r) => r.model === STREAM_MODEL).length, { timeout: 30000, intervals: [500] })
+    .toBe(1);
+  const [streamed] = (await transcriptionUsageRows()).filter((r) => r.model === STREAM_MODEL);
+
+  // The stub's done event states no audio_duration_ms, so the quantity is what the
+  // uploaded WAV's own header declares (its data bytes over its byte rate, to the
+  // millisecond, as the gateway reads it) -- the clip is two seconds, so it is also what
+  // the one-shot rows above are billed.
+  const upload = readWav(streamedUpload);
+  const headerSeconds = Math.floor((upload.dataBytes * 1000) / upload.byteRate) / 1000;
+  expect(streamed).toMatchObject({
+    http_status: 200,
+    status: "success",
+    content_type: expect.stringContaining("text/event-stream"),
+    provider_model: STREAM_UPSTREAM,
+    billing_unit: "audio_second",
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0
+  });
+  expect(streamed.billing_quantity).toBeCloseTo(headerSeconds, 3);
+  expect(Math.abs((streamed.billing_quantity ?? 0) - CLIP_SECONDS)).toBeLessThan(0.1);
+
+  // The committed turn is in the chat store, not only on the page that watched it
+  // stream: after a full reload the thread shows the done event's transcript, once, and
+  // its clip plays again.
+  await page.reload();
+  await page.getByRole("link", { name: t.chat }).click();
+  await expect(lastAssistant()).toContainText(STREAM_TEXT);
+  await expect(assistantTurns()).toHaveCount(1);
+  await expect(userTurns()).toHaveCount(1);
+  await expectStoredClip(lastUser().locator("audio"));
+  // Reading it back sent nothing upstream.
+  expect(stub.transcriptionCalls()).toHaveLength(4);
 });

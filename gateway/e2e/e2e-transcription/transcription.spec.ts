@@ -35,6 +35,22 @@ import { login } from "../e2e/helpers";
 //      block of the stub's JSON BODY -- unlike speech, there is no duration
 //      header), not tokens, and the Activity view renders the five token columns
 //      of that row as the not-applicable em dash instead of a measured zero.
+//   5. STREAMING (issue #262): the probe also reads each model's `mode` from the
+//      stub's /v1/models and writes the transcription_streaming verdict from it
+//      (streaming -> yes, offline -> no, no mode -> no row), and that verdict -- not
+//      the client -- decides what a stream=true request is answered with:
+//        - a yes is relayed as the upstream's event stream, UNBUFFERED (the first
+//          frame reaches the client while the stub still holds the stream open),
+//          and billed from the duration in the uploaded WAV's header, because the
+//          streamed done event states no audio_duration_ms (clean completion only);
+//        - a yes that has gone stale (the stub lists mode=streaming but answers
+//          stream=true with the 500 "requires a model configured with
+//          mode=streaming") is retried ONCE buffered: the client gets the one-shot
+//          JSON, never the 500;
+//        - a no (listed offline) and an absent verdict (no mode listed) are answered
+//          buffered up front: the stream part is never sent upstream, so the upstream
+//          is asked exactly once and cannot refuse. A streaming model asked WITHOUT
+//          stream=true is answered one-shot as well.
 
 const t = messages.de;
 
@@ -63,6 +79,20 @@ const TTS_UPSTREAM = "pocket_tts_english_bf16";
 // models, so the stub does not list it and the probe has nothing to say.
 const UNPROBED_MODEL = "e2e-unprobed-model";
 const UNPROBED_UPSTREAM = "not_loaded_yet";
+// The streaming mappings (issue #262). What the stub's /v1/models LISTS for each (the
+// probe's input, hence the verdict) and what it actually DOES with stream=true (the
+// truth) are separate on purpose, so the three states the handler tells apart can each
+// be reached: a model that is listed streaming and is streaming (verdict yes, relayed);
+// one listed offline and offline (verdict no, answered buffered up front); and one listed
+// streaming but, behind the verdict's back, no longer loaded with mode=streaming (verdict
+// yes gone stale: the upstream refuses the stream and the handler retries buffered).
+// The existing ASR_MODEL lists no mode at all, which is the absent-verdict case.
+const STREAM_MODEL = "e2e-asr-streaming";
+const STREAM_UPSTREAM = "vibevoice_asr_streaming";
+const OFFLINE_MODEL = "e2e-asr-offline";
+const OFFLINE_UPSTREAM = "whisper_offline";
+const STALE_MODEL = "e2e-asr-stale";
+const STALE_UPSTREAM = "vibevoice_swapped";
 
 // What the stub answers a transcription with: the transcript, and the timing
 // block whose audio_duration_ms (milliseconds) is the quantity the gateway bills.
@@ -71,14 +101,36 @@ const TRANSCRIPT = "hello from the stub audio.cpp";
 const CLIP_DURATION_MS = 2000;
 const CLIP_SECONDS = 2;
 
+// What the stub streams for stream=true on a model that really is mode=streaming: the
+// increments and the done event that restates the whole text and carries a time to first
+// token -- and NO audio_duration_ms, as the real server's done event has none.
+const STREAM_DELTAS = ["hello ", "from the ", "streaming stub"];
+const STREAM_TEXT = "hello from the streaming stub";
+const STREAM_TTFT_MS = 120;
+// The WAV the streaming requests upload is three seconds long (the header says so), not
+// the stub's CLIP_SECONDS, so the quantity a streamed row bills can only have come from
+// the upload's header.
+const STREAM_CLIP_SECONDS = 3;
+// The sentence audio.cpp's refusal carries when stream=true reaches a model that is not
+// loaded with mode=streaming (HTTP 500, as for every error it answers).
+const STREAM_REFUSAL = "streaming transcription requires a model configured with mode=streaming";
+// A held stream is released by itself after this long, so a failing assertion can never
+// leave the stub (and the gateway's relay) waiting for a release that will not come.
+const HOLD_SAFETY_MS = 15000;
+
 /**
- * A small, valid RIFF/WAVE body (mono, 16 kHz, 16-bit) whose sample bytes are
- * neither valid UTF-8 nor valid JSON, so a relay that decoded, re-encoded or
- * text-handled the upload in any way would corrupt it and the byte comparison
- * below would catch it.
+ * A valid RIFF/WAVE body (mono, 16 kHz, 16-bit) whose sample bytes are neither valid
+ * UTF-8 nor valid JSON, so a relay that decoded, re-encoded or text-handled the upload
+ * in any way would corrupt it and the byte comparison below would catch it. The default
+ * is a handful of bytes (the buffered scenarios never bill from the header); `seconds`
+ * makes a clip whose header really does declare that many seconds of audio.
  */
-function wavClip(): Buffer {
-  const samples = Buffer.from([0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0x01, 0xc3]);
+function wavClip(seconds?: number): Buffer {
+  const pattern = [0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0x01, 0xc3];
+  const samples =
+    seconds === undefined
+      ? Buffer.from(pattern)
+      : Buffer.from(Array.from({ length: seconds * 32000 }, (_, i) => pattern[i % pattern.length]));
   const header = Buffer.alloc(44);
   header.write("RIFF", 0, "ascii");
   header.writeUInt32LE(36 + samples.length, 4);
@@ -97,6 +149,7 @@ function wavClip(): Buffer {
 }
 
 const WAV = wavClip();
+const STREAM_WAV = wavClip(STREAM_CLIP_SECONDS);
 
 /** One part of a multipart/form-data body. */
 type FormPart = { name: string; filename?: string; value: Buffer };
@@ -149,8 +202,42 @@ type Stub = {
   calls: StubCall[];
   /** The POST /v1/audio/transcriptions requests among them. */
   transcriptionCalls(): StubCall[];
+  /**
+   * Makes the next `count` streamed answers pause, in turn, right after one of their
+   * delta frames: a hold per pause. `reached` settles once the stub has written that
+   * delta and is waiting; `release()` lets the stream go on. A hold nobody releases
+   * lets go by itself after HOLD_SAFETY_MS.
+   */
+  holdStream(count: number): Hold[];
+  /** Whether a streamed answer is paused at a hold right now. */
+  streamHeld(): boolean;
   close(): Promise<void>;
 };
+
+type Hold = { reached: Promise<void>; release: () => void };
+
+/** What the stub's /v1/models LISTS for a model, and what POST does with stream=true. */
+type UpstreamModel = {
+  id: string;
+  task: "asr" | "tts";
+  /** The `mode` the listing states, or none (an audio.cpp or agent that states no mode). */
+  listedMode?: "streaming" | "offline";
+  /** Whether stream=true is really honoured: false is answered with the 500 refusal. */
+  streams: boolean;
+};
+
+const UPSTREAM_MODELS: UpstreamModel[] = [
+  { id: ASR_UPSTREAM, task: "asr", streams: false },
+  { id: TTS_UPSTREAM, task: "tts", streams: false },
+  { id: STREAM_UPSTREAM, task: "asr", listedMode: "streaming", streams: true },
+  { id: OFFLINE_UPSTREAM, task: "asr", listedMode: "offline", streams: false },
+  { id: STALE_UPSTREAM, task: "asr", listedMode: "streaming", streams: false }
+];
+
+/** One SSE `data:` frame. */
+function sseFrame(payload: unknown): string {
+  return `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`;
+}
 
 /**
  * The audio.cpp stand-in, kept to what the gateway actually talks to and honest
@@ -159,15 +246,62 @@ type Stub = {
  *   GET  /health                   -> 200 (the application's health path)
  *   GET  /v1/models                -> the OpenAI list of LOADED models, each with
  *                                     the `task` audio.cpp states (the capability
- *                                     signal)
- *   POST /v1/audio/transcriptions  -> a JSON {"text","timing"} document, the
+ *                                     signal) and, for the streaming mappings, the
+ *                                     `mode` ("streaming" | "offline") the
+ *                                     transcription_streaming verdict is read from
+ *   POST /v1/audio/transcriptions  -> by default a JSON {"text","timing"} document, the
  *                                     timing block carrying audio_duration_ms; a
  *                                     model it does not serve is answered 500,
  *                                     which is what the real server does for a
- *                                     client error
+ *                                     client error. With stream=true:
+ *                                       - a model that really streams answers 200
+ *                                         text/event-stream: a transcript.text.delta
+ *                                         per increment, transcript.text.done (the
+ *                                         whole text and timing.ttft_ms, no
+ *                                         audio_duration_ms), then [DONE], each frame
+ *                                         written as its own chunk;
+ *                                       - any other model answers 500 with the error
+ *                                         "... requires a model configured with
+ *                                         mode=streaming", as the real server does.
  */
 async function startAudioCppStub(): Promise<Stub> {
   const calls: StubCall[] = [];
+  const pendingHolds: { markReached: () => void; released: Promise<void> }[] = [];
+  let held = 0;
+
+  /** Waits at the next pending hold, if one is armed. */
+  const pauseAtHold = async (): Promise<void> => {
+    const hold = pendingHolds.shift();
+    if (!hold) {
+      return;
+    }
+    held += 1;
+    hold.markReached();
+    let safety: NodeJS.Timeout | undefined;
+    await Promise.race([
+      hold.released,
+      new Promise<void>((resolve) => {
+        safety = setTimeout(resolve, HOLD_SAFETY_MS);
+      })
+    ]);
+    clearTimeout(safety);
+    held -= 1;
+  };
+
+  const streamTranscript = async (res: http.ServerResponse): Promise<void> => {
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+    res.flushHeaders();
+    for (const [i, delta] of STREAM_DELTAS.entries()) {
+      res.write(sseFrame({ type: "transcript.text.delta", delta }));
+      if (i < STREAM_DELTAS.length - 1) {
+        await pauseAtHold();
+      }
+    }
+    res.write(sseFrame({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } }));
+    res.write(sseFrame("[DONE]"));
+    res.end();
+  };
+
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -194,18 +328,25 @@ async function startAudioCppStub(): Promise<Stub> {
         res.end(
           JSON.stringify({
             object: "list",
-            data: [
-              { id: ASR_UPSTREAM, object: "model", task: "asr" },
-              { id: TTS_UPSTREAM, object: "model", task: "tts" }
-            ]
+            data: UPSTREAM_MODELS.map((m) => ({ id: m.id, object: "model", task: m.task, ...(m.listedMode ? { mode: m.listedMode } : {}) }))
           })
         );
         return;
       }
       if (method === "POST" && path === TRANSCRIPTION_PATH) {
-        if (fields.model !== ASR_UPSTREAM) {
+        const model = UPSTREAM_MODELS.find((m) => m.id === fields.model && m.task === "asr");
+        if (!model) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: { message: `model not loaded: ${fields.model ?? ""}` } }));
+          return;
+        }
+        if (fields.stream === "true") {
+          if (!model.streams) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: { message: STREAM_REFUSAL, type: "server_error" } }));
+            return;
+          }
+          void streamTranscript(res);
           return;
         }
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -221,6 +362,20 @@ async function startAudioCppStub(): Promise<Stub> {
     port: (server.address() as AddressInfo).port,
     calls,
     transcriptionCalls: () => calls.filter((c) => c.method === "POST" && c.path === TRANSCRIPTION_PATH),
+    holdStream: (count) =>
+      Array.from({ length: count }, () => {
+        let markReached!: () => void;
+        let release!: () => void;
+        const reached = new Promise<void>((resolve) => {
+          markReached = resolve;
+        });
+        const released = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        pendingHolds.push({ markReached, released });
+        return { reached, release };
+      }),
+    streamHeld: () => held > 0,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
@@ -262,10 +417,10 @@ function row(name: string): Locator {
   return page.getByRole("row", { name: new RegExp(escapeRegExp(name)) });
 }
 
-/** The transcription verdict the gateway holds for each of the three mappings. */
+/** The verdict of one capability the gateway holds for each mapping (null: no row). */
 type TranscriptionVerdict = { verdict: string; source: string } | null;
 
-async function transcriptionVerdicts(): Promise<Record<string, TranscriptionVerdict>> {
+async function capabilityVerdicts(capability: string): Promise<Record<string, TranscriptionVerdict>> {
   const resp = await page.request.get(`/api/portal/applications/${applicationId}/mappings`);
   expect(resp.ok(), `listing the mappings: ${resp.status()} ${await resp.text()}`).toBe(true);
   const body = (await resp.json()) as {
@@ -273,23 +428,68 @@ async function transcriptionVerdicts(): Promise<Record<string, TranscriptionVerd
   };
   const out: Record<string, TranscriptionVerdict> = {};
   for (const mapping of body.data) {
-    const found = mapping.capabilities.find((c) => c.capability === "transcription");
+    const found = mapping.capabilities.find((c) => c.capability === capability);
     out[mapping.gateway_model_name] = found ? { verdict: found.verdict, source: found.source } : null;
   }
   return out;
 }
+
+const transcriptionVerdicts = () => capabilityVerdicts("transcription");
+const streamingVerdicts = () => capabilityVerdicts("transcription_streaming");
 
 /**
  * One POST /v1/audio/transcriptions with the bearer token: a multipart form of
  * the WAV upload as `file`, the gateway `model`, and any extra text fields. Never
  * throws on a non-2xx: a refusal is an outcome.
  */
-function transcribe(model: string, extra: Record<string, string> = {}): Promise<APIResponse> {
+function transcribe(model: string, extra: Record<string, string> = {}, wav: Buffer = WAV): Promise<APIResponse> {
   return api.post(`${GW}${TRANSCRIPTION_PATH}`, {
     headers: { Authorization: `Bearer ${secret}` },
-    multipart: { file: { name: "clip.wav", mimeType: "audio/wav", buffer: WAV }, model, ...extra },
+    multipart: { file: { name: "clip.wav", mimeType: "audio/wav", buffer: wav }, model, ...extra },
     failOnStatusCode: false
   });
+}
+
+/**
+ * The frames of a text/event-stream body, one `data:` payload at a time, as they
+ * arrive: the generator yields a frame as soon as its blank-line terminator has been
+ * read, so a test can look at the first frame while the stream is still open. A
+ * client that cannot see a frame before the whole body is in (APIRequestContext
+ * buffers it) could not tell a relayed stream from a buffered one.
+ */
+async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    pending += decoder.decode(value, { stream: true });
+    for (let end = pending.indexOf("\n\n"); end >= 0; end = pending.indexOf("\n\n")) {
+      const frame = pending.slice(0, end);
+      pending = pending.slice(end + 2);
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("data:")) {
+          yield line.slice("data:".length).trim();
+        }
+      }
+    }
+  }
+}
+
+/**
+ * A stream=true transcription of `wav`, sent with the global fetch rather than
+ * APIRequestContext so the response body can be read incrementally. Authenticates with
+ * the bearer token like every other call here.
+ */
+function transcribeStreaming(model: string, wav: Buffer): Promise<Response> {
+  const form = new FormData();
+  form.append("file", new Blob([new Uint8Array(wav)], { type: "audio/wav" }), "clip.wav");
+  form.append("model", model);
+  form.append("stream", "true");
+  return fetch(`${GW}${TRANSCRIPTION_PATH}`, { method: "POST", headers: { Authorization: `Bearer ${secret}` }, body: form });
 }
 
 /** The gateway's error code from an OpenAI-shaped `{"error":{"code":...}}` body. */
@@ -368,11 +568,16 @@ test("1 — an audio_cpp application created through the portal form is probed, 
   expect(app).toMatchObject({ type: "audio_cpp", port: stub.port, api_flavors: ["openai_audio"], health_check_path: "/health" });
   applicationId = app.id;
 
-  // Three mappings, one per verdict state the capability gate tells apart.
+  // The mappings: one per verdict state the capability gate tells apart (asr, tts and
+  // never probed), and the three streaming ones (listed streaming, listed offline, and
+  // listed streaming but no longer so upstream).
   for (const [gateway, upstream] of [
     [ASR_MODEL, ASR_UPSTREAM],
     [TTS_MODEL, TTS_UPSTREAM],
-    [UNPROBED_MODEL, UNPROBED_UPSTREAM]
+    [UNPROBED_MODEL, UNPROBED_UPSTREAM],
+    [STREAM_MODEL, STREAM_UPSTREAM],
+    [OFFLINE_MODEL, OFFLINE_UPSTREAM],
+    [STALE_MODEL, STALE_UPSTREAM]
   ]) {
     const mapped = await page.request.post(`/api/portal/applications/${applicationId}/mappings`, {
       headers: CSRF,
@@ -391,7 +596,26 @@ test("1 — an audio_cpp application created through the portal form is probed, 
     .toEqual({
       [ASR_MODEL]: { verdict: "yes", source: "audiocpp_models" },
       [TTS_MODEL]: { verdict: "no", source: "audiocpp_models" },
-      [UNPROBED_MODEL]: null
+      [UNPROBED_MODEL]: null,
+      [STREAM_MODEL]: { verdict: "yes", source: "audiocpp_models" },
+      [OFFLINE_MODEL]: { verdict: "yes", source: "audiocpp_models" },
+      [STALE_MODEL]: { verdict: "yes", source: "audiocpp_models" }
+    });
+
+  // The same pass states each asr model's `mode` as the transcription_streaming
+  // verdict: streaming is a yes, offline a no, and a model whose listing states no
+  // mode (ASR_MODEL), one that is no transcriber (TTS_MODEL) and one never listed
+  // (UNPROBED_MODEL) get no row at all -- unknown is not a no, and unknown is answered
+  // buffered. The stale model's listing still says streaming, so it is a yes.
+  await expect
+    .poll(streamingVerdicts, { timeout: 30000, intervals: [1000] })
+    .toEqual({
+      [ASR_MODEL]: null,
+      [TTS_MODEL]: null,
+      [UNPROBED_MODEL]: null,
+      [STREAM_MODEL]: { verdict: "yes", source: "audiocpp_models" },
+      [OFFLINE_MODEL]: { verdict: "no", source: "audiocpp_models" },
+      [STALE_MODEL]: { verdict: "yes", source: "audiocpp_models" }
     });
 
   // The API token the transcription calls authenticate with.
@@ -534,4 +758,173 @@ test("5 — the Activity view renders the transcription row's five token columns
   const quantityColumn = headers.findIndex((h) => h.startsWith(t.activityColBillingQuantity));
   expect(quantityColumn, `the billing-quantity column in ${JSON.stringify(headers)}`).toBeGreaterThanOrEqual(0);
   await expect(transcriptionRow.getByRole("cell").nth(quantityColumn)).toHaveText(String(CLIP_SECONDS));
+});
+
+// --- Scenario 6 -------------------------------------------------------------
+
+test("6 — a stream=true request to a model whose verdict is streaming yes is relayed as the upstream's event stream, frame by frame, with the stream flag and the upload forwarded", async () => {
+  const before = stub.transcriptionCalls().length;
+  // The stub pauses its stream after the first delta until this test lets it go.
+  const [hold] = stub.holdStream(1);
+
+  const resp = await transcribeStreaming(STREAM_MODEL, STREAM_WAV);
+  expect(resp.status).toBe(200);
+  expect(resp.headers.get("content-type")).toContain("text/event-stream");
+
+  // The first frame reaches the client WHILE the upstream is still holding the rest
+  // back: a relay that buffered the stream (as the one-shot path does, to read its
+  // timing block) would deliver nothing before the stub let go, and the stub is still
+  // paused only if the frame came through it.
+  const frames = sseData(resp.body as ReadableStream<Uint8Array>);
+  const first = await frames.next();
+  expect(first.done, "the stream ended before its first frame").toBe(false);
+  expect(JSON.parse(String(first.value))).toEqual({ type: "transcript.text.delta", delta: STREAM_DELTAS[0] });
+  await hold.reached;
+  expect(stub.streamHeld(), "the first frame was relayed before the upstream finished its stream").toBe(true);
+
+  hold.release();
+  const rest: string[] = [];
+  for await (const frame of frames) {
+    rest.push(frame);
+  }
+  // The rest of the stream, in the upstream's own order and framing: the remaining
+  // deltas, the done event restating the whole text with its time to first token, then
+  // the sentinel. Nothing is added, dropped or translated.
+  expect(rest.map((frame) => (frame === "[DONE]" ? frame : (JSON.parse(frame) as { type: string }).type))).toEqual([
+    "transcript.text.delta",
+    "transcript.text.delta",
+    "transcript.text.done",
+    "[DONE]"
+  ]);
+  expect(rest.slice(0, 2).map((frame) => (JSON.parse(frame) as { delta: string }).delta)).toEqual(STREAM_DELTAS.slice(1));
+  expect(JSON.parse(rest[2])).toEqual({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } });
+
+  // One upstream call: the stream flag reached the model (and nothing else was added to
+  // the form), the gateway model name was rewritten to the application's own id, and
+  // the upload arrived byte for byte.
+  const calls = stub.transcriptionCalls().slice(before);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].fields).toEqual({ model: STREAM_UPSTREAM, stream: "true" });
+  expect(Buffer.compare(calls[0].file as Buffer, STREAM_WAV), "the relayed upload must equal the client's WAV byte for byte").toBe(0);
+});
+
+// --- Scenario 7 -------------------------------------------------------------
+
+test("7 — the streamed call is billed in audio seconds from the uploaded WAV's header, the streamed done event stating none", async () => {
+  // The row is recorded as the response finishes, so poll rather than assume.
+  await expect
+    .poll(async () => (await transcriptionUsageRows()).filter((r) => r.model === STREAM_MODEL).length, { timeout: 30000, intervals: [500] })
+    .toBe(1);
+  const streamed = (await transcriptionUsageRows()).filter((r) => r.model === STREAM_MODEL);
+  expect(streamed).toHaveLength(1);
+
+  // The stub's done event carries ttft_ms and no audio_duration_ms, and its one-shot
+  // answer says CLIP_SECONDS: the quantity here is the three seconds the uploaded
+  // header declares (the stream completed: done, then [DONE]), so it can only have
+  // been read from the upload. The token columns stay zero (tokens do not apply).
+  expect(streamed[0]).toMatchObject({
+    http_status: 200,
+    status: "success",
+    api_flavor: "openai_audio",
+    content_type: expect.stringContaining("text/event-stream"),
+    provider_model: STREAM_UPSTREAM,
+    token_name: TOKEN_NAME,
+    billing_unit: "audio_second",
+    billing_quantity: STREAM_CLIP_SECONDS,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0
+  });
+  expect(STREAM_CLIP_SECONDS).not.toBe(CLIP_SECONDS);
+});
+
+// --- Scenario 8 -------------------------------------------------------------
+
+test("8 — a streaming verdict gone stale is retried once buffered: the upstream's 500 \"requires a model configured with mode=streaming\" never reaches the client, who gets the one-shot JSON", async () => {
+  const before = stub.transcriptionCalls().length;
+
+  // The verdict (yes, from the listing) says the model streams; the stub, which no
+  // longer has it loaded with mode=streaming, refuses the stream with the 500 the real
+  // server answers.
+  const resp = await transcribe(STALE_MODEL, { stream: "true" }, STREAM_WAV);
+  expect(resp.status(), `transcription response: ${await resp.text()}`).toBe(200);
+  expect(resp.headers()["content-type"]).toContain("application/json");
+  expect(await resp.json()).toEqual({ text: TRANSCRIPT, timing: { audio_duration_ms: CLIP_DURATION_MS } });
+
+  // Two upstream calls, in this order: the stream the verdict asked for (refused), then
+  // the same upload and model once more WITHOUT the stream flag.
+  const calls = stub.transcriptionCalls().slice(before);
+  expect(calls).toHaveLength(2);
+  expect(calls[0].fields).toEqual({ model: STALE_UPSTREAM, stream: "true" });
+  expect(calls[1].fields).toEqual({ model: STALE_UPSTREAM });
+  for (const call of calls) {
+    expect(Buffer.compare(call.file as Buffer, STREAM_WAV), "both attempts carry the client's WAV byte for byte").toBe(0);
+  }
+
+  // One usage row for the one request the client made, the answer the client got: a
+  // buffered one, billed like any one-shot transcription from the response's own
+  // timing block (CLIP_SECONDS), not from the three-second upload.
+  await expect
+    .poll(async () => (await transcriptionUsageRows()).filter((r) => r.model === STALE_MODEL).length, { timeout: 30000, intervals: [500] })
+    .toBe(1);
+  const rows = (await transcriptionUsageRows()).filter((r) => r.model === STALE_MODEL);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({
+    http_status: 200,
+    status: "success",
+    content_type: expect.stringContaining("application/json"),
+    provider_model: STALE_UPSTREAM,
+    billing_unit: "audio_second",
+    billing_quantity: CLIP_SECONDS
+  });
+});
+
+// --- Scenario 9 -------------------------------------------------------------
+
+test("9 — a stream=true request to an offline model (verdict no) or one with no streaming verdict is answered buffered up front: one upstream call, no stream flag sent, never an error", async () => {
+  // OFFLINE_MODEL: its listing says mode=offline (a no). ASR_MODEL: its listing states
+  // no mode, so there is no verdict at all (unknown), and unknown is not a yes.
+  for (const [model, upstream] of [
+    [OFFLINE_MODEL, OFFLINE_UPSTREAM],
+    [ASR_MODEL, ASR_UPSTREAM]
+  ]) {
+    const before = stub.transcriptionCalls().length;
+    const resp = await transcribe(model, { stream: "true" });
+    expect(resp.status(), `${model}: ${await resp.text()}`).toBe(200);
+    expect(resp.headers()["content-type"]).toContain("application/json");
+    expect(await resp.json()).toEqual({ text: TRANSCRIPT, timing: { audio_duration_ms: CLIP_DURATION_MS } });
+
+    // Asked ONCE, and without the stream flag: the gateway never asked the upstream for
+    // what it would refuse, so there was no 500 to retry. (The stub would have answered
+    // a stream=true here with that very 500.)
+    const calls = stub.transcriptionCalls().slice(before);
+    expect(calls, `${model}: upstream calls`).toHaveLength(1);
+    expect(calls[0].fields).toEqual({ model: upstream });
+  }
+
+  // A model that streams is also a superset of the one-shot: asked without stream=true
+  // it is answered one-shot JSON, the stream flag absent upstream.
+  const before = stub.transcriptionCalls().length;
+  const oneShot = await transcribe(STREAM_MODEL);
+  expect(oneShot.status(), `one-shot to the streaming model: ${await oneShot.text()}`).toBe(200);
+  expect(oneShot.headers()["content-type"]).toContain("application/json");
+  expect(await oneShot.json()).toEqual({ text: TRANSCRIPT, timing: { audio_duration_ms: CLIP_DURATION_MS } });
+  const calls = stub.transcriptionCalls().slice(before);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].fields).toEqual({ model: STREAM_UPSTREAM });
+
+  // The offline model's row is an ordinary buffered one: success, JSON, the response's
+  // own timing as the quantity.
+  await expect
+    .poll(async () => (await transcriptionUsageRows()).filter((r) => r.model === OFFLINE_MODEL).length, { timeout: 30000, intervals: [500] })
+    .toBe(1);
+  const offline = (await transcriptionUsageRows()).filter((r) => r.model === OFFLINE_MODEL);
+  expect(offline[0]).toMatchObject({
+    http_status: 200,
+    status: "success",
+    content_type: expect.stringContaining("application/json"),
+    provider_model: OFFLINE_UPSTREAM,
+    billing_unit: "audio_second",
+    billing_quantity: CLIP_SECONDS
+  });
 });
