@@ -20,9 +20,9 @@ import (
 
 const (
 	// chatBlobURLPrefix is where a stored chat blob (an image, a speech reply's
-	// WAV, or a transcription turn's input clip) is served from. A content part's image_url.url or
-	// audio_url.url is rewritten to chatBlobURLPrefix + blob id once the bytes
-	// live in chat_blobs.
+	// WAV, or a transcription turn's input clip) is served from. A content part's
+	// image_url.url or audio_url.url is rewritten to chatBlobURLPrefix + blob id
+	// once the bytes live in chat_blobs.
 	chatBlobURLPrefix = "/api/portal/chat-blobs/"
 	// chatBlobIDPrefix starts every blob id; the rest is 32 random hex digits.
 	chatBlobIDPrefix = "blob_"
@@ -91,6 +91,18 @@ func blobPartKindOf(member string) (blobPartKind, bool) {
 		return audioPartKind, true
 	}
 	return 0, false
+}
+
+// String names the family for log lines: "image", "audio", or both joined.
+func (k blobPartKind) String() string {
+	var names []string
+	if k&imagePartKind != 0 {
+		names = append(names, "image")
+	}
+	if k&audioPartKind != 0 {
+		names = append(names, "audio")
+	}
+	return strings.Join(names, "+")
 }
 
 // accepts reports whether a part of this kind may hold a blob of mediaType: the

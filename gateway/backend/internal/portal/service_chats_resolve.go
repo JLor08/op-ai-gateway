@@ -238,7 +238,7 @@ func usableChatBlobs(chatID string, ids []string, occurrences map[string]int, ro
 			continue
 		}
 		if !kind.accepts(row.ContentType) {
-			log.Printf("portal: chat blob %s has a content type that is not sendable as the part that references it; leaving it out of the run history", id)
+			log.Printf("portal: chat blob %s is referenced by an %s part but its content type is not an allow-listed %s type; leaving it out of the resolution", id, kind, kind)
 			continue
 		}
 		usable[id] = row

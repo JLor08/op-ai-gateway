@@ -174,16 +174,27 @@ func TestChatBlobEndpointServesTheOwnersImageHardened(t *testing.T) {
 	}
 }
 
-// Each allow-listed type is served as itself.
+// Each allow-listed type is served as itself: the image types, the speech reply's
+// WAV, and the transcription composer's input formats.
 func TestChatBlobEndpointServesEachAllowListedType(t *testing.T) {
 	e := newChatBlobEnv(t)
 	chatID := e.newChat(t, "usr_a", `{"settings":{},"messages":[]}`)
-	for i, contentType := range []string{"image/png", "image/jpeg", "image/webp", "image/gif", "audio/wav"} {
+	for i, contentType := range []string{
+		"image/png", "image/jpeg", "image/webp", "image/gif",
+		"audio/wav", "audio/webm", "audio/mpeg", "audio/mp4", "audio/ogg",
+	} {
 		id := fmt.Sprintf("blob_type_%d", i)
 		e.putBlob(t, chatID, id, contentType, pngLike(64+i))
 		rec := e.getBlob(e.cookieA, id)
 		if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != contentType {
 			t.Errorf("%s: status %d, Content-Type %q", contentType, rec.Code, rec.Header().Get("Content-Type"))
+		}
+		// Every served type keeps the hardening that makes a same-origin blob url safe.
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", contentType, got)
+		}
+		if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'none'" {
+			t.Errorf("%s: Content-Security-Policy = %q, want default-src 'none'", contentType, got)
 		}
 	}
 }

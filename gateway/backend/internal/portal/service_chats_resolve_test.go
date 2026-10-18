@@ -1079,3 +1079,59 @@ func TestOtherRunKindsNeverResolveAnAudioInputReference(t *testing.T) {
 		})
 	}
 }
+
+// The image-run arm of the same guard. TestOtherRunKindsNeverResolveAnAudioInputReference
+// leaves the clip in an older turn, which resolveImageRunSource never walks whatever
+// family it is given; this is the shape that pins the family: the image thread's LAST
+// user message -- the edit source, the one message that run does resolve -- carries a
+// stored image reference AND a stored audio reference. The edit source is read as
+// images alone: the batched lookup names only the image's id, the clip stays the
+// reference it is, and the clip's bytes (larger than the run bound, which the image
+// is under) are neither fetched nor counted.
+func TestImageRunEditSourceNeverResolvesAnAudioReference(t *testing.T) {
+	ctx := context.Background()
+	e := newResolveEnv(t, true, 1000) // bound 1000 bytes: the image below is 400, the clip 5000
+	chatID := e.emptyChat(t)
+	image, clip := blobTestBytes(400, 12), blobTestBytes(5000, 13)
+
+	// First turn: an edit whose source carries both inline; the commit stores them.
+	if _, _, err := e.svc.PrepareChatRun(ctx, e.owner, chatID, PrepareRunRequest{
+		UserMessage: json.RawMessage(fmt.Sprintf(
+			`[{"type":"text","text":"edit it"},{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}}]`,
+			dataURL("image/png", image), dataURL("audio/webm", clip))),
+		Settings: ChatRunSettings{Model: "m", Kind: chatKindImage},
+	}); err != nil {
+		t.Fatalf("PrepareChatRun: %v", err)
+	}
+	doc := e.stored(t, chatID)
+	imageRefs, audioRefs := storedImageURLs(t, doc), storedMemberURLs(t, doc, "audio_url")
+	if len(imageRefs) != 1 || len(audioRefs) != 1 {
+		t.Fatalf("stored image urls %v, audio urls %v: want one reference of each", imageRefs, audioRefs)
+	}
+	imageID := strings.TrimPrefix(imageRefs[0], gatewayBlobPrefix)
+
+	// Second turn: the last user message names both stored blobs.
+	e.byIDs.calls = nil
+	history, err := e.sendKind(chatID, chatKindImage, json.RawMessage(fmt.Sprintf(
+		`[{"type":"text","text":"again"},{"type":"image_url","image_url":{"url":%q}},{"type":"audio_url","audio_url":{"url":%q}}]`, imageRefs[0], audioRefs[0])))
+	if err != nil {
+		t.Fatalf("PrepareChatRun: %v (the %d clip bytes must not count against the 1000 bound)", err, len(clip))
+	}
+	if len(e.byIDs.calls) != 1 || !slices.Equal(e.byIDs.calls[0].ids, []string{imageID}) {
+		t.Fatalf("calls = %+v, want ONE batch naming only the image %s: the clip must not be fetched", e.byIDs.calls, imageID)
+	}
+	last := history[len(history)-1].Content
+	urls := messageImageURLs(last)
+	if len(urls) != 1 {
+		t.Fatalf("the edit source carries %d image urls, want 1", len(urls))
+	}
+	if mediaType, raw := decodeResolvedURL(t, urls[0]); mediaType != "image/png" || !bytes.Equal(raw, image) {
+		t.Fatalf("the source image resolved to %s with %d bytes, want the %d stored bytes", mediaType, len(raw), len(image))
+	}
+	if got := MessageAudio(last); !slices.Equal(got, audioRefs) {
+		t.Fatalf("the clip in the edit source = %.80v, want its reference %v left alone", got, audioRefs)
+	}
+	if strings.Contains(string(last), "data:audio") {
+		t.Fatalf("the clip was resolved into the edit source: %.200s", last)
+	}
+}
