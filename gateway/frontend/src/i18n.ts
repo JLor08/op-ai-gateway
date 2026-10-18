@@ -329,12 +329,11 @@ const de = {
   chatTranscriptionFormatHint: 'Die Antwort ist immer Text (das Transkript).',
   chatTranscriptionAdvanced: 'Erweitert',
   chatTranscriptionPassthrough: 'Zusätzliche Anfragefelder (JSON)',
-  chatTranscriptionPassthroughHint:
-    'Ein JSON-Objekt mit zusätzlichen Feldern für die Transkriptionsanfrage, zum Beispiel {"key": "value"} oder eine modellspezifische Option; jeder Wert behält seinen JSON-Typ. Die Felder model, file, response_format und stream sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Feldnamen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\\) enthalten. Haben Sie oben „Sprache“, „Hinweis“ oder „Temperatur“ eingestellt, gilt dieser Wert, nicht ein gleichnamiges Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
+  chatTranscriptionPassthroughHint: String.raw`Ein JSON-Objekt mit zusätzlichen Feldern für die Transkriptionsanfrage, zum Beispiel {"key": "value"} oder eine modellspezifische Option; jeder Wert behält seinen JSON-Typ. Die Felder model, file, response_format und stream sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Feldnamen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\) enthalten. Haben Sie oben „Sprache“, „Hinweis“ oder „Temperatur“ eingestellt, gilt dieser Wert, nicht ein gleichnamiges Feld hier. Leer lassen, um nichts Zusätzliches zu senden.`,
   chatTranscriptionPassthroughInvalid:
     'Die erweiterten Felder müssen ein JSON-Objekt sein, zum Beispiel {"key": "value"}. Korrigieren Sie sie oder leeren Sie das Feld, bevor Sie senden.',
   chatTranscriptionPassthroughBadKey: (field: string) =>
-    `Der Feldname ${field} in den erweiterten Feldern ist ungültig: Namen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\\) enthalten. Korrigieren Sie ihn, bevor Sie senden.`,
+    String.raw`Der Feldname ${field} in den erweiterten Feldern ist ungültig: Namen dürfen nicht leer sein und weder Steuerzeichen noch Anführungszeichen (") oder Backslashes (\) enthalten. Korrigieren Sie ihn, bevor Sie senden.`,
   // The mask of an edit (inpainting): an optional PNG, the size of the source
   // image, whose transparent area marks the region to change. Its slot is next to
   // the attach button of an edit and needs the source image first.
@@ -3534,12 +3533,11 @@ const en: PortalMessages = {
   chatTranscriptionFormatHint: 'The reply is always text (the transcript).',
   chatTranscriptionAdvanced: 'Advanced',
   chatTranscriptionPassthrough: 'Extra request fields (JSON)',
-  chatTranscriptionPassthroughHint:
-    'A JSON object of extra fields for the transcription request, for example {"key": "value"} or a model-specific option; each value keeps its JSON type. The fields model, file, response_format and stream are reserved (in any letter case): if one of them appears here, the request is not sent. Field names may not be empty or contain control characters, quotation marks (") or backslashes (\\). If you set "Language", "Prompt" or "Temperature" above, that value wins over a field of the same name here. Leave blank to send nothing extra.',
+  chatTranscriptionPassthroughHint: String.raw`A JSON object of extra fields for the transcription request, for example {"key": "value"} or a model-specific option; each value keeps its JSON type. The fields model, file, response_format and stream are reserved (in any letter case): if one of them appears here, the request is not sent. Field names may not be empty or contain control characters, quotation marks (") or backslashes (\). If you set "Language", "Prompt" or "Temperature" above, that value wins over a field of the same name here. Leave blank to send nothing extra.`,
   chatTranscriptionPassthroughInvalid:
     'The advanced fields must be a JSON object, for example {"key": "value"}. Fix them or clear the field before sending.',
   chatTranscriptionPassthroughBadKey: (field: string) =>
-    `The field name ${field} in the advanced fields is invalid: names may not be empty or contain control characters, quotation marks (") or backslashes (\\). Fix it before sending.`,
+    String.raw`The field name ${field} in the advanced fields is invalid: names may not be empty or contain control characters, quotation marks (") or backslashes (\). Fix it before sending.`,
   chatAttachMask: 'Attach a mask',
   chatAttachMaskTooltip:
     'Attach a mask (a PNG the size of the image): its transparent area marks the region to edit',

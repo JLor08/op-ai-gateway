@@ -23,6 +23,7 @@ import type { Translation } from './shared/types';
 import type { ChatContent } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import { PageTitle } from './shared/PageTitle';
+import { keyedUrls } from './shared/urlKeys';
 import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
 import { TranscriptionComposer } from './TranscriptionComposer';
@@ -1023,11 +1024,11 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               />
               {(c.images.length > 0 || c.mask !== null) && (
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                  {c.images.map((url, index) => (
-                    // Key/remove by index (matching the sent-message renderer):
-                    // attaching the identical file twice must not collapse to one
-                    // key or remove both copies.
-                    <Box sx={{ position: 'relative', width: 72, height: 72 }} key={index}>
+                  {keyedUrls(c.images).map(({ key, url, index }) => (
+                    // Keyed by the image itself, a repeat of it by a copy suffix
+                    // (keyedUrls), and removed by position: attaching the identical
+                    // file twice must not collapse to one key or remove both copies.
+                    <Box sx={{ position: 'relative', width: 72, height: 72 }} key={key}>
                       <Box
                         component="img"
                         src={url}

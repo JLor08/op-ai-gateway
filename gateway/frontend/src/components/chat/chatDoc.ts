@@ -712,10 +712,9 @@ export const TRANSCRIPTION_RESERVED_FIELDS: readonly string[] = [
 ];
 
 // What the transcription passthrough text is: the same classification as the speech one
-// (parseAudioPassthrough), against this run's reserved fields.
-export type TranscriptionPassthroughParse = AudioPassthroughParse;
-
-export function parseTranscriptionPassthrough(raw: string): TranscriptionPassthroughParse {
+// (parseAudioPassthrough, hence the same AudioPassthroughParse), against this run's reserved
+// fields.
+export function parseTranscriptionPassthrough(raw: string): AudioPassthroughParse {
   return parsePassthrough(raw, TRANSCRIPTION_RESERVED_FIELDS, true);
 }
 
@@ -725,7 +724,7 @@ export function parseTranscriptionPassthrough(raw: string): TranscriptionPassthr
 // says it must be a JSON object. Takes only the three keys it reads so chatDoc stays free of the
 // i18n module.
 export function transcriptionPassthroughMessage(
-  parse: TranscriptionPassthroughParse,
+  parse: AudioPassthroughParse,
   t: {
     chatTranscriptionPassthroughInvalid: string;
     chatTranscriptionPassthroughReserved: (field: string) => string;

@@ -189,7 +189,7 @@ func (s *Server) generateTranscriptionTurn(ctx context.Context, owner auth.Token
 	s.setRunLoopbackHeaders(req, owner, run, prep)
 	// After the shared helper, which sets application/json: a multipart type carries
 	// the boundary of the writer that built the body, which only that writer knows.
-	req.Header.Set("Content-Type", contentType)
+	req.Header.Set(contentTypeHeader, contentType)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -218,6 +218,18 @@ func (s *Server) generateTranscriptionTurn(ctx context.Context, owner auth.Token
 		log.Printf("chat run %s: transcription response unreadable: %v", run.ID, err)
 		return nil, "error", transcriptionRunResponseUnreadableMessage
 	}
+	return transcriptionTurnFromResponse(run, resp, payload)
+}
+
+// transcriptionTurnFromResponse turns the endpoint's fully read answer into the
+// turn's outcome (parts, status, terminal message), the same triple
+// generateTranscriptionTurn returns: a non-2xx answer is the upstream's own error
+// code, a 2xx that is not the {"text":...} document is "response unreadable", one
+// that holds no transcript is "no transcript", and anything else is the transcript
+// as one ordinary text part. It is split out of generateTranscriptionTurn, which
+// keeps the request and the read, the way speechPartFrom is split out of
+// generateSpeechTurn.
+func transcriptionTurnFromResponse(run *ChatRun, resp *http.Response, payload []byte) (json.RawMessage, string, string) {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, "error", upstreamErrorCode(payload, resp.Status)
 	}
@@ -229,7 +241,7 @@ func (s *Server) generateTranscriptionTurn(ctx context.Context, owner auth.Token
 	if err := json.Unmarshal(payload, &decoded); err != nil || decoded == nil {
 		// Neither the body nor the error is logged: a body that is nearly the
 		// document may hold the transcript, and the decoder's error can quote it.
-		log.Printf("chat run %s: transcription response is not the {\"text\":...} document (status %s, content type %q, %d bytes)", run.ID, resp.Status, resp.Header.Get("Content-Type"), len(payload))
+		log.Printf("chat run %s: transcription response is not the {\"text\":...} document (status %s, content type %q, %d bytes)", run.ID, resp.Status, resp.Header.Get(contentTypeHeader), len(payload))
 		return nil, "error", transcriptionRunResponseUnreadableMessage
 	}
 	if strings.TrimSpace(decoded.Text) == "" {
@@ -424,7 +436,7 @@ func writeTranscriptionFilePart(mw *multipart.Writer, filename, mediaType string
 	// constants (the filename comes from transcriptionFilenames), so there is nothing
 	// to escape.
 	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, filename))
-	header.Set("Content-Type", mediaType)
+	header.Set(contentTypeHeader, mediaType)
 	part, err := mw.CreatePart(header)
 	if err != nil {
 		return err

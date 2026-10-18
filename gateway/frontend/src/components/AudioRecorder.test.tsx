@@ -63,6 +63,13 @@ function expectMicReleased() {
   for (const track of mic.tracks) expect(track.stop).toHaveBeenCalled();
 }
 
+// Lets the promise continuations a click sets off (the recorder's awaited getUserMedia and its
+// recorder callbacks) run and their state updates land. act() wraps exactly that -- code that is
+// not a Testing Library call -- and not the click itself, which fireEvent already wraps.
+async function flushMicrotasks() {
+  await act(async () => {});
+}
+
 type Mic = ReturnType<typeof makeStream>;
 let mic: Mic;
 let getUserMedia: ReturnType<typeof vi.fn>;
@@ -113,15 +120,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
   // Clicks Record and lets the permission prompt (the awaited getUserMedia) settle.
   async function startRecording() {
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+    await flushMicrotasks();
   }
 
   async function stopRecording() {
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
+    await flushMicrotasks();
   }
 
   describe(`AudioRecorder [${locale}]`, () => {
@@ -278,9 +283,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(record).toBeEnabled();
 
         // ...and the stale error goes the moment they do.
-        await act(async () => {
-          fireEvent.click(record);
-        });
+        fireEvent.click(record);
+        await flushMicrotasks();
         expect(screen.queryByRole('alert')).not.toBeInTheDocument();
         expect(screen.getByRole('button', { name: t.chatRecordStop })).toBeInTheDocument();
       });

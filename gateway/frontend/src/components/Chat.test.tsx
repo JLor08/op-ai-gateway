@@ -343,6 +343,13 @@ async function pickOption(comboLabel: string, optionText: string) {
   fireEvent.click(await screen.findByRole('option', { name: optionText }));
 }
 
+// Lets the promise continuations a click sets off (the recorder's awaited getUserMedia and its
+// recorder callbacks) run and their state updates land. act() wraps exactly that -- code that is
+// not a Testing Library call -- and not the click itself, which fireEvent already wraps.
+async function flushMicrotasks() {
+  await act(async () => {});
+}
+
 beforeEach(() => {
   imageDecodeFails = false;
   imageSizes = new Map();
@@ -1505,12 +1512,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
     // Records a clip through the real recorder and attaches it to the turn.
     async function recordClip() {
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
-      });
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
-      });
+      fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+      await flushMicrotasks();
+      fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
+      await flushMicrotasks();
       fireEvent.click(screen.getByRole('button', { name: t.chatRecordUse }));
     }
 
@@ -1796,9 +1801,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       it('says so when the microphone is denied, and the composer still works', async () => {
         getUserMedia.mockRejectedValueOnce(new DOMException('denied', 'NotAllowedError'));
         await renderTranscriptionThread();
-        await act(async () => {
-          fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
-        });
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
 
         expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordDenied);
         expect(sendButton()).toBeDisabled();
@@ -1810,21 +1814,18 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       it('says so when the browser cannot record at all', async () => {
         Reflect.deleteProperty(navigator, 'mediaDevices');
         await renderTranscriptionThread();
-        await act(async () => {
-          fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
-        });
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
 
         expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordUnsupported);
       });
 
       it('discards a take without attaching anything', async () => {
         await renderTranscriptionThread();
-        await act(async () => {
-          fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
-        });
-        await act(async () => {
-          fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
-        });
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
+        await flushMicrotasks();
         expect(screen.getByLabelText(t.chatRecordPreview)).toBeInTheDocument();
 
         fireEvent.click(screen.getByRole('button', { name: t.chatRecordDiscard }));
@@ -1838,9 +1839,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         renderChat(tokens, [...asrModels, ...models]);
         await waitForChatReady();
         await pickOption(t.chatModel, 'whisper');
-        await act(async () => {
-          fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
-        });
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
+        await flushMicrotasks();
         expect(screen.getByRole('button', { name: t.chatRecordStop })).toBeInTheDocument();
 
         await pickOption(t.chatModel, models[0].display_name);

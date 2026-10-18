@@ -14,6 +14,7 @@ import type { ChatContent, ChatContentPart } from './shared/chatContent';
 import { audioUrlsOf, imageUrlsOf, isMaskPart } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
+import { keyedUrls } from './shared/urlKeys';
 import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
 import { AudioTurn } from './AudioTurn';
@@ -483,8 +484,8 @@ function ChatMessageComponent({
           {/* A transcription turn's input clip: the user's own audio, played from the same
               fetch-once object URL (revoked on unmount) as a speech reply, and offered for
               download. */}
-          {audioUrls.map((url, index) => (
-            <AudioTurn key={index} t={t} url={url} turnId={turnId ?? ''} variant="input" />
+          {keyedUrls(audioUrls).map(({ key, url }) => (
+            <AudioTurn key={key} t={t} url={url} turnId={turnId ?? ''} variant="input" />
           ))}
           {/* No edit on a turn that carries audio: it is a transcription turn, whose clip is
               all the run reads -- editing its (empty) text would change nothing a run uses

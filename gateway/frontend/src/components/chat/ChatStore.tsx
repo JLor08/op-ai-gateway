@@ -110,7 +110,7 @@ export {
   TRANSCRIPTION_AUDIO_TYPES,
   transcriptionPassthroughMessage,
 } from './chatDoc';
-export type { TranscriptionPassthroughParse, TranscriptionSettings } from './chatDoc';
+export type { TranscriptionSettings } from './chatDoc';
 
 // The image-settings presets (and the optionsOr helper that merges a per-model
 // fetched list over them) the composer (Chat.tsx, OUTSIDE components/chat/)
