@@ -964,21 +964,23 @@ the transcript is the user's spoken content, **output-sensitive**, captured like
 response under the opt-in and clipped, like any, at the capture cap
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
-**10. Resolving a transcription writes the token's last-used-model marker, but the
-redirect never takes a transcription candidate.** `relayTranscription` resolves through
+**10. Resolving a transcription writes the token's last-used-model marker, and the
+redirect takes a transcription candidate.** `relayTranscription` resolves through
 `resolveTarget`, so a transcription model becomes the marker a later request's
 unknown-model redirect tries first, and a later **chat** request is not redirected onto
 it (an audio-only model is not in the `openai` offering's `Callable`, the rule §3.6
-gives). The redirect for a **transcription** request, however, asks the `openai_audio`
-offering together with the required capability, and `transcription` has **no portal
-fold** (`hasCapabilityFold`): `ModelOffering.Capable` is empty, so no `LastUsedModel` or
-fallback is ever taken for it and an unknown model name stays an unknown-model refusal.
-That fails closed, and the gate still refuses a model without the verdict, but the
-redirect **convenience** is lost for transcription: a token with the redirect on and a
-transcription-capable `LastUsedModel` or fallback is **not** redirected to it, unlike a
-speech request, whose fold finds such a candidate. It is recorded in [Risks
-§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances) together with
-the absence of a listing flag.
+gives). The redirect for a **transcription** request asks the `openai_audio`
+offering together with the required capability, and `transcription` has its **own portal
+fold** (`hasCapabilityFold` now admits it; `transcriptionFlagsByName`, `speechFlagsByName`'s
+twin): `ModelOffering.Capable` carries every transcription-capable name, so a token with
+the redirect on and a transcription-capable `LastUsedModel` or fallback is redirected to
+it exactly as a speech request is, and the gate still refuses a model without the verdict.
+The fold also backs the `transcription` listing flag (`ModelDTO.Transcription`), which the
+portal chat reads to switch its composer; only the shared Models-view "Available via"
+column stays ungated, on purpose ([Routing & Model Selection
+§2.2](routing-and-model-selection.md#22-callable-existing--and-why-the-listing-is-neither),
+[Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
+[ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)).
 
 ## 4. Session / continuity signals
 
@@ -1808,10 +1810,13 @@ portal's Models view "Available via" column does not read it, so it cannot gate
 `openai_audio` behind a verdict the way it gates `openai_images` behind `image`. The
 request itself is still refused server-side (`routing.model_not_capable`); recorded in
 [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
-**Transcription has neither the fold nor a listing flag**: `transcription` is not in
-`hasCapabilityFold`, so the unknown-model redirect never takes a transcription
-candidate (§3.7) and nothing on the wire advertises the verdict, while the request is
-refused server-side exactly as speech's is.
+**Transcription has the same fold and a listing flag of its own**
+([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)):
+`transcriptionFlagsByName` (`speechFlagsByName`'s twin) is now in `hasCapabilityFold`, so
+the unknown-model redirect takes a transcription candidate (§3.7) and the portal model
+DTO's `transcription` flag (`ModelDTO.Transcription`) advertises the verdict to the chat,
+exactly as `speech`; neither `/v1/models` nor the LM Studio `capabilities` object carries
+it, and the Models-view column stays ungated the same way.
 
 **The portal listing carries `openai_images` and `openai_audio`; `/v1/models`
 deliberately carries neither.** Every listing keeps only the coarse flavors it knows
@@ -1819,9 +1824,10 @@ deliberately carries neither.** Every listing keeps only the coarse flavors it k
 that is served only under `openai_images` reaches the portal's model DTO with
 `flavors: ["openai_images"]` — which is what lets the portal chat offer it
 (§12) — and a speech-only or transcription-only model with `flavors: ["openai_audio"]`,
-which the portal chat offers only when it also carries `speech: true` (its rule needs
-`openai`, or `openai_images` with `image`, or `openai_audio` with `speech`), so a
-transcription-only model is never offered. `/v1/models` keeps
+which the portal chat offers when it carries `speech: true` **or** `transcription: true`
+(its rule needs `openai`, or `openai_images` with `image`, or `openai_audio` with `speech`
+or `transcription`), so a transcription-only model is offered as a transcription turn.
+`/v1/models` keeps
 only the rows that carry `openai`, so the same models are **not** listed there (nor in
 `/api/v1/models`): that listing is what an external OpenAI client fills its *chat*
 picker from, and an images-only or audio-only model offered for chat would fail.
@@ -2914,6 +2920,59 @@ and is a same-origin, cookie-carrying `GET` of the user's own content, but it do
 normalise path segments, so tightening it to the exact blob-id shape is a deferred
 hardening rather than a defect.
 
+**A transcription run is the speech run's inverse against `/v1/audio/transcriptions`
+([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)).**
+`executeTranscriptionRun` (`chat_runs_transcription.go`) shares the reservation, the
+deadline, the loopback header set and the one terminal commit, and nothing of the stream
+consumer. Unlike speech its request is **multipart**: `buildTranscriptionBody` writes the
+last user message's **audio clip** as the single `file` part (a filename by media type,
+mirroring the image edit), `model`, the set `language`/`prompt`/`temperature` as form
+fields and the Advanced passthrough, then POSTs over loopback and **overrides the
+`Content-Type`** with the multipart one as the edit hop does; **no `response_format`** is
+sent, because the endpoint forces JSON (§3.7). The reply is the **ordinary text turn** —
+the transcript becomes one `{"type":"text",…}` part, no new part type and no output blob,
+the inverse of speech's WAV. The run's knobs are a `ChatTranscriptionSettings` (`language`,
+`prompt`, `temperature`, `passthrough`), persisted under `settings.transcription` the way
+`settings.audio` is (`omitempty`, cleared server-side for any non-transcription kind, so a
+text, image or speech chat's stored and wire bytes are unchanged):
+
+- **`language`, `prompt` and `temperature` are the OpenAI transcription options**, each
+  blank-able: a blank field is omitted and the model's own default applies.
+- **Advanced is a JSON passthrough**, merged into the multipart body as form fields.
+  `model`, `file`, `stream` and `response_format` are **reserved**, matched ignoring case: a
+  key that names one ends the run `gateway.chat_run_transcription_reserved_field` and
+  **sends nothing**. The reserved list is copied to the client
+  (`TRANSCRIPTION_RESERVED_FIELDS`), which blocks send and replay exactly as
+  `SPEECH_RESERVED_FIELDS` does. There is **no `response_format` control** — the gateway
+  forces JSON, so a static caption states the reply is text, the twin of speech's "always
+  WAV".
+
+Five terminal codes name the conditions: `gateway.chat_run_transcription_dispatch_failed`
+(the loopback request never completed), `gateway.chat_run_transcription_source_unreadable`
+(the clip could not be turned into bytes), `gateway.chat_run_transcription_response_unreadable`
+(a 2xx body that could not be read), `gateway.chat_run_transcription_no_transcript` (an
+empty or absent `text`: an error, not a blank turn) and
+`gateway.chat_run_transcription_reserved_field`. The endpoint's own refusals reach the run
+through `upstreamErrorCode`, and all are labelled in `format.ts`'s `errorLabelByCode`,
+worded for transcription, **except** `transcription.model_required` and
+`transcription.invalid`, which are left unlabelled on purpose (as `speech.model_required`
+and `images.model_required` are): a run always sends the thread's pinned model, and a
+structurally broken form is not a user-correctable run condition. Both-directions tests pin
+the mapped codes. A deadline is the shared `gateway.chat_run_timeout`.
+
+**The transcription wait and the input clip.** During the run the bubble is
+`TranscriptionPendingTurn`, `AudioPendingTurn`'s twin over the shared `RunPendingTurn`
+(liveness from the run's own status, a server-measured elapsed clock, one static caption,
+no progress figure). The **input** clip shows in the user bubble through the reused
+`AudioTurn`, which fetches the blob once into an object URL (the blob endpoint answers no
+`Range`) and revokes it on unmount. The composer attaches a file **or records** in-browser
+(`MediaRecorder`), releasing the microphone tracks on stop, on a failed start, on a
+recorder error and on unmount (#249's own fix), while send and discard revoke the preview's
+object URL. A transcription thread's first user turn is audio-only, so
+`deriveTitleFromMessages` (the first user message's text) and the backend `deriveChatTitle`
+find nothing; an untitled transcription chat is **titled from its transcript** on
+completion (`titleFromTranscript`), falling back to the localized "Untitled" placeholder.
+
 **The turn is committed as structured content.** `portal.AssistantTurn` carries
 an optional `ContentParts`, written as the message's `content` when it is
 non-empty and ignored otherwise, so a text turn's stored shape stays
@@ -2943,8 +3002,10 @@ inline thread can take its next turn, and the rewritten document and its new
 blobs are written in one store transaction (`SaveChatWithBlobs`), so a refused
 turn leaves nothing behind. It accepts only a standard-padded base64 `data:`
 URL of `image/png`, `image/jpeg`, `image/webp` or `image/gif` in an `image_url` part, or
-of `audio/wav` in an `audio_url` part (each kind takes only its own media family, so
-audio cannot be filed as a picture nor the reverse), within
+of the audio types in an `audio_url` part — `audio/wav` (a speech reply) and a
+transcription clip's input `audio/webm`, `audio/mpeg`, `audio/mp4` or `audio/ogg` (each
+kind takes only its own media family, so audio cannot be filed as a picture nor the
+reverse), within
 `MaxChatBlobBytes` (else `400 images.blob_type_unsupported` /
 `images.blob_too_large`, codes that keep their image wording); a `/chat-blobs/` URL
 arriving in request-supplied
@@ -2961,12 +3022,13 @@ cannot reach a gateway URL, and an adapter drops an image it cannot read without
 an error (the Anthropic image-source conversion returns nil for a URL that is
 neither `data:` nor `http(s)`), so a reference left in the request would make
 the image silently vanish. `PrepareChatRun` therefore resolves the history it
-returns (`resolveChatBlobRefs`) for every **non-image** run: all
-`/chat-blobs/` URLs become `data:<type>;base64,...` URLs of the real bytes
+returns through a **three-way dispatch** on the run's kind. A **text or speech** run takes
+the default `resolveChatBlobRefs`: all
+`/chat-blobs/` **image** URLs become `data:<type>;base64,...` URLs of the real bytes
 through **one** batched, **chat-scoped** `ChatBlobsByIDs` call, so a foreign id
 grafted into the transcript is simply absent and never resolves to another
 user's bytes, and a real remote provider receives real bytes exactly as before.
-Only **image** references are resolved: a speech thread takes this branch too (it
+Only **image** references are resolved here: a speech thread takes this branch too (it
 carries no image of its own), but the walk reads image parts alone, so a stored WAV is
 never fetched, unsealed or counted against `MaxRunHistoryBytes`, and an `image_url`
 reference that names a non-image blob is treated as an image the chat does not hold.
@@ -2976,11 +3038,16 @@ are bounded by `MaxRunHistoryBytes`, counted per occurrence; a run over it is
 refused `400 portal.chat_run_history_too_large` **before** its turn is stored
 (declared sizes are checked first, so a refusal decrypts nothing), so a retry is
 not a duplicate turn. The turn being sent keeps the bytes it was uploaded with
-and needs no round trip, and an image run skips the **history** step (its
+and needs no round trip, and an **image** run skips the history step (its
 executor reads only the last user message, so decrypting the thread's images
-would be wasted and the bound would refuse a thread for bytes never sent). It
+would be wasted and the bound would refuse a thread for bytes never sent): it takes
+`resolveImageRunSource` and
 resolves that one message instead, so an edit's source and mask arrive as bytes
-("An image turn is an EDIT", above).
+("An image turn is an EDIT", above). A **transcription** run is the twin on the audio
+side: it takes `resolveTranscriptionRunSource` ([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)),
+which resolves the last user message's **audio** clip (the resolve walks were generalised
+to a `blobPartKind`) and **refuses** a clip the chat does not hold, exactly as the edit
+refuses a source it does not hold.
 
 **The run's terminal event carries what was committed, and only that.** The
 SSE `snapshot`/`done` events carry a `content_parts` field alongside `content`.

@@ -209,7 +209,7 @@ sequenceDiagram
     GW-->>B: 201 {run id, kind: transcription}
     B->>GW: GET .../runs/{runId}/events (snapshot with elapsed_ms, no deltas)
     GW->>GW: executeTranscriptionRun under transcriptionRunDeadline (10 minutes)
-    GW->>GW: buildTranscriptionBody multipart {file = clip, model, language?, prompt?, temperature?, passthrough}; response_format NOT sent
+    GW->>GW: buildTranscriptionBody multipart {file = clip, model, language?, prompt?, temperature?, passthrough}, response_format NOT sent
     Note over GW: a passthrough key named model, file, stream or response_format ends the run gateway.chat_run_transcription_reserved_field and sends nothing
     GW->>TR: POST /v1/audio/transcriptions over loopback (internal pair, chat-id, run-as), Content-Type overridden to multipart
     TR->>AC: resolve (openai_audio, capability transcription), relay as in 6.1.2
@@ -220,7 +220,7 @@ sequenceDiagram
         GW->>GW: read the body, take text, build ONE text part (no new part type, no output blob)
         GW->>S: commit the turn (the input clip is already a chat blob)
         GW-->>B: SSE done with the transcript as a text turn
-        B->>B: title an untitled chat from the transcript; the input clip plays via a fetched object URL (reused AudioTurn)
+        B->>B: title an untitled chat from the transcript, and play the input clip via a fetched object URL (reused AudioTurn)
     else error
         TR-->>GW: the endpoint's own error, or an empty or unreadable 2xx
         GW-->>B: SSE done, status error with gateway.chat_run_transcription_* or transcription.* code

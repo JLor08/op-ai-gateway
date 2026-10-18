@@ -4154,7 +4154,7 @@ includes the bounds that replace it.
   that exists yet. (Amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
   (c): audio is now the second consumer. `audio/wav` is on the allow-list, an
   `audio_url` part is extracted, and `AudioTurn` renders it, with no new storage layer
-  and no schema change; the resolve walk deliberately stays image-only.) The memory driver keeps a parallel map that is dropped
+  and no schema change; the resolve walk stayed image-only — until [ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn) generalised it to the audio family so a transcription run resolves its own input.) The memory driver keeps a parallel map that is dropped
   with its chat on both `DeleteChat` and the FIFO `evict()`, and whose bytes
   **count against the 64 MiB memory budget** — otherwise the RAM path would be
   unbounded, which is the very problem this decision exists to fix on the other
@@ -4239,7 +4239,7 @@ includes the bounds that replace it.
   in) **and again at read time**, and nothing else is ever echoed as
   `Content-Type`. (Amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
   (c): the list also holds `audio/wav`, which only an `audio_url` part may carry, so the
-  type the endpoint returns is one of five strings.) The body is written whole with a
+  type the endpoint returns is one of five strings — nine since [ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn) added the four transcription input types.) The body is written whole with a
   `Content-Length`; the handler does not go through `http.ServeContent` and answers **no
   `Range` request**, which an `<img>` does not need and an audio player on Safari or
   iOS likely does, so the portal's player plays an object URL it fetched instead of this URL
@@ -5564,7 +5564,7 @@ the same cap, per in-flight request. The costs accepted are named, not hidden
 streaming, no `response_format` but `json`, bounded buffering of the upload **and** the
 response, an unlisted model reading as unknown (an agent-launched child's verdict
 arrives from the agent's probe of its own listing, once per process generation), no
-portal fold (so no redirect candidate and no listing flag), a capture gate that trusts
+portal fold (so no redirect candidate and no listing flag — **reversed by [ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)**, which added both for the portal chat), a capture gate that trusts
 the endpoint, and a captured transcript that is output-sensitive.
 
 **Rejected:** **A fine flavor of its own** (ADR-042's and ADR-061's argument, now three
@@ -5777,7 +5777,8 @@ could have chosen:
   inherited by an alias, `false` for every model when the capability read fails. It is
   not on `/v1/models` or the LM Studio listing. The chat's own filter
   (`chatModels` in `ChatStore.tsx`) admits an `openai_audio` model **only** behind
-  `speech: true`, the polarity `openai_images` has behind `image`, and the effective
+  `speech: true` (since [ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn), also behind `transcription: true`),
+  the polarity `openai_images` has behind `image`, and the effective
   model's flag selects the speech composer for a thread that has no transcript yet.
   **The shared `offeredFlavors` is deliberately untouched.** It also feeds the Models
   view's "Available via" column, and gating `openai_audio` behind a speech verdict there
@@ -5913,8 +5914,10 @@ pieces it joins that no design could have chosen:
 - The browser's `MediaRecorder` produces a container the **browser** chooses, not one the
   operator picks: `audio/webm;codecs=opus` in Chromium, `audio/mp4` in Safari,
   `audio/ogg` in Firefox, with the `codecs` parameter riding on the type string. Whether
-  audio.cpp **decodes** any of webm/mp4/ogg is **not yet verified** against a live ASR
-  model: the ADR-062 probe (v0.9.1, 2026-10-16) used a WAV, and `pocket_tts` is TTS-only.
+  audio.cpp **decodes** any container but WAV is **not yet verified** against a live ASR
+  model — only WAV is confirmed (the issue #69 probe, v0.9.1, 2026-10-16, used a WAV), so
+  `audio/webm`, `audio/mpeg`, `audio/mp4` and `audio/ogg` are all unverified, because the
+  current audio.cpp test server has no ASR model loaded to probe against.
 - audio.cpp bills `audio_second` from the **response body** (`timing.audio_duration_ms`),
   and the **endpoint**, not the chat run, meters it (ADR-062 (e)).
 - A transcription model and a speech model are **distinct verdicts** on the one shared
@@ -5959,8 +5962,10 @@ pieces it joins that no design could have chosen:
   read, while a replay or regenerate carries a `/api/portal/chat-blobs/{id}` reference
   that must be resolved. `PrepareChatRun`'s resolution dispatch becomes **three-way** —
   `image → resolveImageRunSource`, `transcription → resolveTranscriptionRunSource`, else
-  the general `resolveBlobRefs`. The resolve walks (`collectBlobRefIDs`, `usableChatBlobs`,
-  `substituteBlobRefs`, `rewriteBlobParts`) are **generalised to take a `blobPartKind`** so
+  the default `resolveChatBlobRefs` (the image-family wrapper over the generalised
+  `resolveBlobRefs`, taken by a text or speech run). The resolve walks (`collectBlobRefIDs`,
+  `usableChatBlobs`, `substituteBlobRefs`, `rewriteBlobParts`) are **generalised to take a
+  `blobPartKind`** so
   the audio family can be resolved — the change ADR-063 (c) deliberately deferred (it
   recorded "the history resolution stays image-only"), now made and amended there.
 - **(c) The reply is the ordinary text turn; no new output part, and no blob for the
@@ -5991,9 +5996,12 @@ pieces it joins that no design could have chosen:
   `gateway.chat_run_transcription_source_unreadable`; a loopback hop that never completed
   is `gateway.chat_run_transcription_dispatch_failed`; a 2xx whose body cannot be read is
   `gateway.chat_run_transcription_response_unreadable`; and a non-2xx surfaces the
-  endpoint's own `transcription.*` code. Every one of these, and the endpoint's own
-  refusals, has a German and an English label (`errorLabelByCode`), pinned by
-  exhaustiveness tests. The gateway converts nothing: the clip is relayed byte for byte.
+  endpoint's own `transcription.*` code. Every one of these run codes, and the endpoint
+  refusals a run relays, has a German and an English label (`errorLabelByCode`), pinned by
+  exhaustiveness tests — **except** `transcription.model_required` and `transcription.invalid`,
+  left unlabelled on purpose (as `speech.model_required` and `images.model_required` are): a
+  run always sends the thread's pinned model, and a structurally broken form is not a
+  user-correctable run condition. The gateway converts nothing: the clip is relayed byte for byte.
 - **(e) The blob allow-list's audio family widens to the input formats, and the family
   split holds.** `chatBlobMediaTypes`, ADR-056 (e)'s stored-XSS control, gains
   `audio/webm`, `audio/mpeg`, `audio/mp4` and `audio/ogg` beside `audio/wav`.
@@ -6002,10 +6010,16 @@ pieces it joins that no design could have chosen:
   image type is still refused by an audio part (the separation ADR-063 (c) established).
   These are **input** formats — what a client may upload for a run to read — listed for
   the composer that produces them, the other direction from a generated image or a speech
-  WAV. The composer **normalises** a recorder's `audio/webm;codecs=opus` to the bare
-  `audio/webm` before the part is built (`chatDoc.ts`), because `decodeDataURL` /
-  `extractChatBlobs` match the exact allow-listed string and a `codecs` parameter would be
-  refused. There is **no schema change**: the store is payload-type-agnostic (bytes plus a
+  WAV. The composer **canonicalises** a clip's type to one of these exact strings before the
+  part is built (`chatDoc.ts`), because `decodeDataURL` / `extractChatBlobs` match the
+  allow-list exactly: it strips the `;codecs=…` parameter (a recorder reports
+  `audio/webm;codecs=opus`), maps the platform spellings through an alias table
+  (`audio/x-wav`/`audio/wave` → `audio/wav`, `audio/mp3`/`audio/mpeg3` → `audio/mpeg`,
+  `audio/x-m4a`/`audio/m4a` → `audio/mp4`, `application/ogg` → `audio/ogg`, `video/webm` →
+  `audio/webm`, …), and falls back to the file extension when the type is empty or
+  `application/octet-stream`; a clip in no accepted format is refused in the composer
+  ("unsupported audio format") rather than sent to be refused after the turn commits. There
+  is **no schema change**: the store is payload-type-agnostic (bytes plus a
   content type), so the migration, the cascade, the sealing and the memory budget are
   exactly what they were.
 - **(f) The transcription portal fold is new, and it amends ADR-062 (b).** The Models
@@ -6043,16 +6057,19 @@ pieces it joins that no design could have chosen:
 - **(h) The composer records or attaches audio, and the input clip plays through a fetched
   object URL.** A transcription thread's composer replaces the text prompt with an audio
   input control: a **file-attach** button (reuse `handleFiles`, audio accept) **and** a
-  **record** button (`MediaRecorder`; the mic permission is requested on record and the
-  track is **released on every exit path** — stop, send, discard, error, unmount — so the
-  browser's recording indicator never lingers, the defect ADR-056's branch had to fix once
-  already). The attached or recorded clip shows in the user bubble as an audio player: the
+  **record** button (`MediaRecorder`; the mic permission is requested on record). The
+  microphone **tracks are released** (`stopTracks`) at stop (the recorder's `onstop`
+  finish), on a failed start, on a recorder error and on unmount, so the browser's recording
+  indicator never lingers — the care issue #249 took after its own early defect of leaving
+  the mic held when the recorder could not start (fixed in commit `ce79188`); **send and
+  discard** operate on an already-stopped recorder and only revoke the preview's object URL.
+  The attached or recorded clip shows in the user bubble as an audio player: the
   ADR-063 (d) `AudioTurn` is **reused for the input**, fetching the blob once into an
   object URL (the blob endpoint answers no `Range` request, ADR-056 (e)) and **revoking it
   on unmount**. The attach mode of a transcription thread is otherwise `none` (it takes no
   image). Client-side WAV conversion is **deferred**: the broad recorder set is relayed
-  byte for byte, and **only if** a live probe shows audio.cpp rejects the recorder's native
-  container (webm/mp4/ogg) is a client-side conversion to WAV the way forward — settled by
+  byte for byte, and **only if** a live probe shows audio.cpp rejects a native container is
+  a client-side conversion to WAV the way forward — settled by
   the probe, not by guessing ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **(i) The wait is `TranscriptionPendingTurn`, and an untitled transcription chat is
   titled from its transcript.** The run is one buffered zero-delta call (like image and
@@ -6071,12 +6088,17 @@ pieces it joins that no design could have chosen:
 is one buffered request with no progress to show, so the wait is the elapsed clock and an
 honest "no intermediate news"; the first ASR call after a model load can take long enough
 to matter inside the `transcriptionRunDeadline` 10-minute bound (`runDeadlineFor`, a
-variable of its own so the three bounded kinds can move independently). The executor holds
+variable of its own so the three bounded kinds can move independently). One clip is bounded
+at **20 MiB** (the client's `MAX_AUDIO_BYTES` and the store's `MaxChatBlobBytes`, both the
+composer's own upload limit, as a speech WAV is); the executor holds
 the clip whole in memory for the multipart body, and the browser holds one object URL per
 input clip it has rendered until it unmounts, as a speech reply's player does. Stored
 clips are retained for the chat's lifetime like every blob, with no prune (ADR-056). The
 gateway never converts or re-encodes: it relays the recorder's container as recorded, and
-whether audio.cpp decodes it against a live ASR model is an **open item** recorded in
+**whether audio.cpp decodes any container but WAV is not yet verified** — only WAV is
+confirmed (the issue #69 probe used a WAV), so `audio/webm`, `audio/mpeg`, `audio/mp4` and
+`audio/ogg` are all unverified, because the current audio.cpp test server has no ASR model
+loaded; an **open item** recorded in
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances). Nothing else
 moved: no change to `handleOpenAITranscription` or the relay, no schema change, no
 migration, no new auth leg (the loopback pair ADR-062 (j) already admits gains its first
