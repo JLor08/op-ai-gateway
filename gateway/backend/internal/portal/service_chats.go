@@ -530,12 +530,14 @@ type ChatAudioSettings struct {
 // default rather than being handed an inert zero. Only the OpenAI-shaped
 // first-class knobs live here; everything else -- the OpenAI "timestamp
 // granularities" and any native audio.cpp knob -- rides Passthrough. The
-// transcription request is multipart, so the run forwards the set fields as
-// form fields next to the audio file and merges Passthrough into the same form
-// (the gateway relays the body to audio.cpp unchanged), refusing the keys that
-// would override the form the run itself owns (model/file/stream/
-// response_format). The gateway always asks for JSON and the answer is rendered
-// as text, so there is no response_format knob.
+// transcription request is multipart, so buildTranscriptionBody
+// (chat_runs_transcription.go) forwards the set fields as form fields next to
+// the audio file and merges Passthrough into the same form (the gateway relays
+// the body to audio.cpp unchanged), refusing the keys that would override the
+// form the run itself owns (model/file/response_format/stream). A raw-JSON
+// passthrough value is written as its natural form text: a string as itself, any
+// other value as its compact JSON. The gateway always asks for JSON and the
+// answer is rendered as text, so there is no response_format knob.
 type ChatTranscriptionSettings struct {
 	// Language is the ISO-639-1 code of the spoken language (e.g. "de"); "" leaves
 	// the model to detect it.

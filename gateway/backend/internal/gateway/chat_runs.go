@@ -544,12 +544,14 @@ func compactHex(n int) string {
 // force multiple checkpoint ticks within a run.
 var runCheckpointInterval = 3 * time.Second
 
-// chatRunKindImage and chatRunKindSpeech are the two kinds a run can have besides
-// text ("") -- the values portal.ChatRunSettings.Kind pins to the thread. Named
-// here because the gateway branches on them in more than one place.
+// chatRunKindImage, chatRunKindSpeech and chatRunKindTranscription are the three
+// kinds a run can have besides text ("") -- the values portal.ChatRunSettings.Kind
+// pins to the thread. Named here because the gateway branches on them in more than
+// one place.
 const (
-	chatRunKindImage  = "image"
-	chatRunKindSpeech = "speech"
+	chatRunKindImage         = "image"
+	chatRunKindSpeech        = "speech"
+	chatRunKindTranscription = "transcription"
 )
 
 // imageRunDeadline bounds an IMAGE run end to end. It exists because such a run
@@ -567,23 +569,33 @@ var imageRunDeadline = 10 * time.Minute
 // a test can shrink one without touching the other.
 var speechRunDeadline = 10 * time.Minute
 
+// transcriptionRunDeadline bounds a TRANSCRIPTION run end to end, for the reason
+// imageRunDeadline and speechRunDeadline bound theirs: it too is one buffered request
+// that emits nothing between dispatch and its finished transcript, so "this finishes
+// or fails within N minutes" is the only honest thing the UI can promise about the
+// wait. Same value, its own var, so the kinds' promises can move independently and a
+// test can shrink one without touching the others.
+var transcriptionRunDeadline = 10 * time.Minute
+
 // runDeadlineFor returns the end-to-end bound for a run of this kind, and false
 // when the kind is UNBOUNDED.
 //
-// Only image and speech runs are bounded: both are a single buffered request with
-// no incremental output. A text run streams deltas, so the user can see for
-// themselves that it is alive and the honesty argument above simply does not apply
-// to it -- while a ceiling would newly kill long generations from a slow local
+// Only image, speech and transcription runs are bounded: each is a single buffered
+// request with no incremental output. A text run streams deltas, so the user can see
+// for themselves that it is alive and the honesty argument above simply does not
+// apply to it -- while a ceiling would newly kill long generations from a slow local
 // model that complete today. Extending the bound to text would therefore be a
 // behaviour change to an existing, overwhelmingly common path, and it needs its
-// own decision rather than arriving as a side effect of the image or speech
-// features. Do not "simplify" this back into one global deadline.
+// own decision rather than arriving as a side effect of the image, speech or
+// transcription features. Do not "simplify" this back into one global deadline.
 func runDeadlineFor(kind string) (time.Duration, bool) {
 	switch kind {
 	case chatRunKindImage:
 		return imageRunDeadline, true
 	case chatRunKindSpeech:
 		return speechRunDeadline, true
+	case chatRunKindTranscription:
+		return transcriptionRunDeadline, true
 	}
 	return 0, false
 }
@@ -796,6 +808,13 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 		s.executeAudioRun(ctx, owner, run, prep)
 		return
 	}
+	// The transcription kind is speech's mirror image: one buffered request to a
+	// different gateway endpoint -- multipart in, JSON out -- and no deltas. See
+	// chat_runs_transcription.go.
+	if prep.Settings.Kind == chatRunKindTranscription {
+		s.executeTranscriptionRun(ctx, owner, run, prep)
+		return
+	}
 
 	body, err := buildChatCompletionsBody(prep)
 	if err != nil {
@@ -865,12 +884,13 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 // so an image request is tagged as a chat session exactly like a chat one even
 // though the images endpoints have no session signal of their own.
 //
-// Content-Type is application/json here, which every hop but one sends. The
-// image EDIT hop is multipart, and a multipart type carries the boundary of the
-// writer that built the body, so only its caller can state it: generateImageTurn
-// overrides this one header after calling this (chat_runs_images.go). Nothing
-// else in the set varies with the endpoint, which is why there is no variant of
-// this function for it.
+// Content-Type is application/json here, which every hop but two sends. The
+// image EDIT hop and the transcription hop are multipart, and a multipart type
+// carries the boundary of the writer that built the body, so only their callers
+// can state it: generateImageTurn and generateTranscriptionTurn override this one
+// header after calling this (chat_runs_images.go, chat_runs_transcription.go).
+// Nothing else in the set varies with the endpoint, which is why there is no
+// variant of this function for it.
 //
 // The chat's (self-healed, see portal.Service.PrepareChatRun) per-run server
 // override rides as the same two headers the gateway's own applyServerOverride
