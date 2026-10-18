@@ -11,7 +11,6 @@ import {
   IMAGE_SCHEDULERS,
   MASK_PURPOSE,
   TRANSCRIPTION_AUDIO_ACCEPT,
-  TRANSCRIPTION_AUDIO_TYPES,
   TRANSCRIPTION_RESERVED_FIELDS,
   attachModeOf,
   audioDataUrl,
@@ -20,7 +19,6 @@ import {
   audioSettingsFrom,
   audioTurnContent,
   bareAudioMediaType,
-  canonicalAudioMediaType,
   deriveTitleFromTranscript,
   historyHasImage,
   imageSetting,
@@ -1068,22 +1066,16 @@ describe('what an attachment means on a transcription thread', () => {
 
 // The INPUT clip of a transcription turn is an audio_url part of the USER message: the same
 // part type a speech turn's reply uses, told apart by the role it sits in. The backend's
-// DecodeAudioDataURL refuses a data url whose media type carries a parameter, and the
-// browser's recorder produces audio/webm;codecs=opus, so the data url the composer builds
-// (audioDataUrl) must carry the bare type.
+// DecodeAudioDataURL refuses a data url whose media type carries a parameter, so the data url the
+// composer builds (audioDataUrl) must carry the bare type. (The composer's clip is always the
+// audio/wav it converted the upload to; see audioAttach.)
 describe('the audio input part of a transcription turn', () => {
-  it('names the allow-listed input formats, in step with the backend chat-blob allow-list', () => {
-    expect([...TRANSCRIPTION_AUDIO_TYPES]).toEqual([
-      'audio/wav',
-      'audio/webm',
-      'audio/mpeg',
-      'audio/mp4',
-      'audio/ogg',
-    ]);
-    // The picker's accept list carries the types (and, for a dialog that has no MIME type
-    // to go by, the extensions).
-    for (const type of TRANSCRIPTION_AUDIO_TYPES) {
-      expect(TRANSCRIPTION_AUDIO_ACCEPT.split(',')).toContain(type);
+  // The conversion to WAV happens in the browser, so the picker offers any audio, not a list.
+  it('offers any audio to the picker, and the extensions a dialog matches without a MIME type', () => {
+    const accepted = TRANSCRIPTION_AUDIO_ACCEPT.split(',');
+    expect(accepted).toContain('audio/*');
+    for (const extension of ['.wav', '.webm', '.mp3', '.m4a', '.ogg', '.flac']) {
+      expect(accepted).toContain(extension);
     }
   });
 
@@ -1169,91 +1161,6 @@ describe('titling a transcription chat from its transcript', () => {
         assistant('second', 'a2'),
       ]),
     ).toBe('second');
-  });
-});
-
-// A browser reports a clip's type in whatever spelling its platform uses, and the backend's
-// allow-list is exact: a clip leaves the composer under one of the five canonical types or not
-// at all.
-describe('the canonical media type of a clip', () => {
-  it.each([
-    // Already canonical.
-    ['audio/wav', 'audio/wav'],
-    ['audio/webm', 'audio/webm'],
-    ['audio/mpeg', 'audio/mpeg'],
-    ['audio/mp4', 'audio/mp4'],
-    ['audio/ogg', 'audio/ogg'],
-    // The aliases a platform reports for them.
-    ['audio/x-wav', 'audio/wav'],
-    ['audio/wave', 'audio/wav'],
-    ['audio/vnd.wave', 'audio/wav'],
-    ['audio/mp3', 'audio/mpeg'],
-    ['audio/x-mp3', 'audio/mpeg'],
-    ['audio/mpeg3', 'audio/mpeg'],
-    ['audio/x-m4a', 'audio/mp4'],
-    ['audio/m4a', 'audio/mp4'],
-    ['application/ogg', 'audio/ogg'],
-    ['audio/x-ogg', 'audio/ogg'],
-    // Chrome reports a .webm file as video/webm whatever it holds.
-    ['video/webm', 'audio/webm'],
-    // A recorder's parameter is dropped, and case and space do not matter.
-    ['audio/webm;codecs=opus', 'audio/webm'],
-    ['audio/ogg; codecs=opus', 'audio/ogg'],
-    ['  Audio/X-WAV ', 'audio/wav'],
-    ['audio/mp4;codecs="mp4a.40.2"', 'audio/mp4'],
-  ])('maps %s to %s', (reported, canonical) => {
-    expect(canonicalAudioMediaType(reported)).toBe(canonical);
-  });
-
-  it('refuses a type outside the allow-list, whatever the file is called', () => {
-    for (const type of ['audio/flac', 'audio/aac', 'text/plain', 'image/png', 'video/mp4']) {
-      expect(canonicalAudioMediaType(type), type).toBeUndefined();
-      expect(canonicalAudioMediaType(type, 'clip.wav'), type).toBeUndefined();
-    }
-  });
-
-  // FileReader and some file dialogs give no type for a format they do not know.
-  it('reads an empty or generic type from the file extension instead', () => {
-    for (const type of ['', 'application/octet-stream', ' Application/Octet-Stream ']) {
-      expect(canonicalAudioMediaType(type, 'memo.wav'), type).toBe('audio/wav');
-      expect(canonicalAudioMediaType(type, 'memo.WEBM'), type).toBe('audio/webm');
-      expect(canonicalAudioMediaType(type, 'my.voice.memo.mp3'), type).toBe('audio/mpeg');
-      expect(canonicalAudioMediaType(type, 'memo.m4a'), type).toBe('audio/mp4');
-      expect(canonicalAudioMediaType(type, 'memo.ogg'), type).toBe('audio/ogg');
-    }
-  });
-
-  it('refuses an unknown type with no usable extension', () => {
-    expect(canonicalAudioMediaType('')).toBeUndefined();
-    expect(canonicalAudioMediaType('', 'memo')).toBeUndefined();
-    expect(canonicalAudioMediaType('', 'memo.txt')).toBeUndefined();
-    expect(canonicalAudioMediaType('application/octet-stream', 'memo.flac')).toBeUndefined();
-    // An extension is no key into the table's own prototype.
-    expect(canonicalAudioMediaType('', 'memo.constructor')).toBeUndefined();
-    expect(canonicalAudioMediaType('', 'memo.__proto__')).toBeUndefined();
-  });
-
-  it('never invents a type: every answer is one of the five the backend takes', () => {
-    for (const type of [
-      'audio/x-wav',
-      'audio/mp3',
-      'audio/x-m4a',
-      'application/ogg',
-      'video/webm',
-    ]) {
-      expect(TRANSCRIPTION_AUDIO_TYPES).toContain(canonicalAudioMediaType(type));
-    }
-  });
-
-  // The data url the composer builds aliases too, so no path that reaches it can put a
-  // non-canonical type on the wire.
-  it('is what the data url is written under: audio/x-wav is sent as audio/wav', () => {
-    expect(audioDataUrl('audio/x-wav', 'UklGRg==')).toBe('data:audio/wav;base64,UklGRg==');
-    expect(audioDataUrl('audio/mp3', 'AAAA')).toBe('data:audio/mpeg;base64,AAAA');
-    expect(audioDataUrl('audio/x-m4a', 'AAAA')).toBe('data:audio/mp4;base64,AAAA');
-    expect(audioDataUrl('audio/x-wav;codecs=pcm', 'AAAA')).toBe('data:audio/wav;base64,AAAA');
-    // A type with no alias is only made bare, as before (the backend then decides).
-    expect(audioDataUrl('audio/flac', 'AAAA')).toBe('data:audio/flac;base64,AAAA');
   });
 });
 

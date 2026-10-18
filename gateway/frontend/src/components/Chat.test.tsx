@@ -15,6 +15,7 @@ import {
   IMAGE_SIZE_OPTIONS,
 } from './chat/ChatStore';
 import { ToastProvider } from './shared/ToastProvider';
+import { AudioDecodeError, audioBlobToWav } from './shared/audioToWav';
 import { messages, type Locale } from '../i18n';
 import type {
   ActiveChatRun,
@@ -31,6 +32,14 @@ import type {
 // through the real upload pipeline (prepareImageDataUrl) into the sent message.
 vi.mock('heic-to', () => ({
   heicTo: vi.fn(async () => new Blob(['jpeg-bytes'], { type: 'image/jpeg' })),
+}));
+
+// jsdom has no WebAudio, so the browser-side conversion of a clip to WAV (audioToWav.test.ts's
+// subject) is a stand-in here: it "converts" by prefixing the bytes, so a part's payload says
+// whether the CONVERTED clip (not the upload, merely relabelled) is what the turn carries.
+vi.mock('./shared/audioToWav', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./shared/audioToWav')>()),
+  audioBlobToWav: vi.fn(async (blob: Blob) => new Blob(['WAV:', blob], { type: 'audio/wav' })),
 }));
 
 // Captured before any spy is installed, so a mocked createElement can build a
@@ -1510,6 +1519,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     const wavFile = (type = 'audio/x-wav', name = 'memo.wav') =>
       new File(['RIFFwave-bytes'], name, { type });
 
+    // The data url of a clip the converter stand-in (see the vi.mock above) made of an upload
+    // that held `text`: always audio/wav, the converted bytes.
+    const wavUrl = (text: string) => `data:audio/wav;base64,${btoa(`WAV:${text}`)}`;
+    const toWav = vi.mocked(audioBlobToWav);
+    beforeEach(() => toWav.mockClear());
+
     // Records a clip through the real recorder and attaches it to the turn.
     async function recordClip() {
       fireEvent.click(screen.getByRole('button', { name: t.chatRecordStart }));
@@ -1545,15 +1560,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(document.getElementById('chat-message')).toBeNull();
       });
 
-      it('offers an attach button for the allow-listed audio types and a record button', async () => {
+      it('offers an attach button for any audio and a record button', async () => {
         await renderTranscriptionThread();
 
         const input = screen.getByLabelText(t.chatAttachAudio);
         expect(input).toHaveAttribute('type', 'file');
+        // Any audio the browser can decode: it is converted to WAV before it is attached.
         const accepted = (input.getAttribute('accept') ?? '').split(',');
-        for (const type of ['audio/wav', 'audio/webm', 'audio/mpeg', 'audio/mp4', 'audio/ogg']) {
-          expect(accepted).toContain(type);
-        }
+        expect(accepted).toContain('audio/*');
         // One clip is the turn.
         expect(input).not.toHaveAttribute('multiple');
         expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeEnabled();
@@ -1664,60 +1678,97 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
 
     describe('attaching a file', () => {
-      it('sends an audio/x-wav file as an audio/wav part', async () => {
+      it('sends a wav file as an audio/wav part', async () => {
         await renderTranscriptionThread();
         attachAudio(wavFile('audio/x-wav'));
         await waitFor(() => expect(sendButton()).toBeEnabled());
         fireEvent.click(sendButton());
 
         await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-        // The whole turn: the clip alone, under the canonical type, the bytes as they were.
+        // The whole turn: the clip alone, as the converter made it (a wav is converted too, to
+        // the 16 kHz mono the server reads), under audio/wav.
         expect(startedBody().user_message).toEqual([
-          {
-            type: 'audio_url',
-            audio_url: { url: `data:audio/wav;base64,${btoa('RIFFwave-bytes')}` },
-          },
+          { type: 'audio_url', audio_url: { url: wavUrl('RIFFwave-bytes') } },
         ]);
         expect(startedBody().settings.kind).toBe('transcription');
       });
 
+      // The server reads WAV only, so whatever the browser can decode is converted to one
+      // (audioToWav) BEFORE it is attached: the player, the part and the stored turn all carry the
+      // wav, never the upload's own format.
       it.each([
-        ['audio/mp3', 'take.mp3', 'audio/mpeg'],
-        ['audio/x-m4a', 'take.m4a', 'audio/mp4'],
-        ['audio/ogg;codecs=opus', 'take.ogg', 'audio/ogg'],
-        ['video/webm', 'take.webm', 'audio/webm'],
-        // No type at all (a file dialog that does not know the format): the extension decides.
-        ['', 'take.MP3', 'audio/mpeg'],
-        ['application/octet-stream', 'take.m4a', 'audio/mp4'],
-      ])('sends a %s file called %s as %s', async (type, name, canonical) => {
+        ['audio/mp3', 'take.mp3'],
+        ['audio/x-m4a', 'take.m4a'],
+        ['audio/ogg;codecs=opus', 'take.ogg'],
+        ['video/webm', 'take.webm'],
+        ['audio/flac', 'take.flac'],
+        // No type at all (a file dialog that does not know the format): the decoder decides.
+        ['', 'take.MP3'],
+        ['application/octet-stream', 'take.m4a'],
+      ])('converts a %s file called %s to an audio/wav part', async (type, name) => {
         await renderTranscriptionThread();
-        attachAudio(new File(['bytes'], name, { type }));
+        const upload = new File(['bytes'], name, { type });
+        attachAudio(upload);
         await waitFor(() => expect(sendButton()).toBeEnabled());
+        expect(toWav).toHaveBeenCalledWith(upload);
+        // The preview plays the wav that will be sent.
+        expect(screen.getByLabelText(t.chatAttachedAudio).getAttribute('src')).toBe(
+          wavUrl('bytes'),
+        );
         fireEvent.click(sendButton());
 
         await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
         expect(startedBody().user_message).toEqual([
-          { type: 'audio_url', audio_url: { url: `data:${canonical};base64,${btoa('bytes')}` } },
+          { type: 'audio_url', audio_url: { url: wavUrl('bytes') } },
         ]);
       });
 
       it.each([
         ['an image', new File(['x'], 'cat.png', { type: 'image/png' })],
         ['a text file', new File(['x'], 'notes.txt', { type: 'text/plain' })],
-        [
-          'a format the backend does not take',
-          new File(['x'], 'song.flac', { type: 'audio/flac' }),
-        ],
-        ['an unknown type with no usable extension', new File(['x'], 'memo', { type: '' })],
-        [
-          'a generic type with an unknown extension',
-          new File(['x'], 'memo.bin', { type: 'application/octet-stream' }),
-        ],
+        ['a pdf', new File(['x'], 'paper.pdf', { type: 'application/pdf' })],
       ])('refuses %s with the unsupported-format message', async (_name, file) => {
         await renderTranscriptionThread();
         attachAudio(file);
 
         expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorType);
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+        expect(toWav).not.toHaveBeenCalled();
+      });
+
+      it('says so when the browser cannot decode the audio, and attaches nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        await renderTranscriptionThread();
+        attachAudio(new File(['x'], 'broken.mp3', { type: 'audio/mpeg' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorDecode);
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('says so, and keeps the clip it had, when the next one cannot be decoded', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'keep.wav'));
+        await screen.findByText('keep.wav');
+
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        attachAudio(new File(['x'], 'broken.mp3', { type: 'audio/mpeg' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorDecode);
+        expect(screen.getByText('keep.wav')).toBeInTheDocument();
+        expect(sendButton()).toBeEnabled();
+      });
+
+      it('refuses audio whose WAV would be over the 20 MB the backend stores', async () => {
+        // A small compressed upload that decodes to a long clip: the converted size counts.
+        const long = new Blob(['x'], { type: 'audio/wav' });
+        Object.defineProperty(long, 'size', { value: 20 * 1024 * 1024 + 1 });
+        toWav.mockResolvedValueOnce(long);
+        await renderTranscriptionThread();
+        attachAudio(new File(['small'], 'long.mp3', { type: 'audio/mpeg' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorSize);
         expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
         expect(sendButton()).toBeDisabled();
       });
@@ -1773,7 +1824,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
 
     describe('recording', () => {
-      it('sends a recorded audio/webm;codecs=opus clip as a bare audio/webm part', async () => {
+      it('converts a recorded audio/webm;codecs=opus clip to an audio/wav part', async () => {
         await renderTranscriptionThread();
         await recordClip();
 
@@ -1783,11 +1834,25 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         fireEvent.click(sendButton());
 
         await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
-        const url = `data:audio/webm;base64,${btoa('voice-bytes')}`;
-        expect(startedBody().user_message).toEqual([{ type: 'audio_url', audio_url: { url } }]);
-        // No codec parameter anywhere in what goes out.
-        expect(JSON.stringify(startedBody().user_message)).not.toContain('codecs');
+        // The recorder's own format never leaves the browser: the take was converted to WAV when
+        // it was used (the bytes are the converter's, not the recorder's).
+        expect(toWav).toHaveBeenCalledTimes(1);
+        expect(startedBody().user_message).toEqual([
+          { type: 'audio_url', audio_url: { url: wavUrl('voice-bytes') } },
+        ]);
+        expect(JSON.stringify(startedBody().user_message)).not.toContain('webm');
         expect(startedBody().settings.kind).toBe('transcription');
+      });
+
+      it('says so when the take cannot be converted, and attaches nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('unsupported'));
+        await renderTranscriptionThread();
+        await recordClip();
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorDecode);
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioRecordingLabel)).not.toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
       });
 
       it('releases the microphone once the take is stopped', async () => {

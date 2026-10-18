@@ -289,12 +289,15 @@ const de = {
   chatRemoveAudio: 'Audio entfernen',
   chatAudioRecordingLabel: 'Aufnahme',
   // Why a clip could not be attached (the picker's `accept` is only a hint, so the type is
-  // checked again): its format, its size (the backend stores up to 20 MB per clip), an empty
-  // file, or anything else.
+  // checked again): a file that is not audio, its size (the backend stores up to 20 MB per
+  // clip, counted on the WAV the browser converts it to), an empty file, audio the browser
+  // cannot decode, or anything else.
   chatAudioError: 'Audio konnte nicht angehängt werden.',
-  chatAudioErrorType: 'Nicht unterstütztes Audioformat. Erlaubt sind WAV, MP3, M4A, OGG und WEBM.',
+  chatAudioErrorType:
+    'Nicht unterstützter Dateityp. Hängen Sie eine Audiodatei an, zum Beispiel WAV, MP3, M4A, OGG oder WEBM.',
   chatAudioErrorSize: 'Audio ist zu groß (max. 20 MB).',
   chatAudioErrorEmpty: 'Die Audiodatei ist leer.',
+  chatAudioErrorDecode: 'Diese Audiodatei konnte nicht verarbeitet werden.',
   // The in-browser recorder: the controls (record, stop, use or discard the take), the clock
   // and the preview player, the wait for the microphone permission, and why a recording could
   // not be made (permission refused, a browser without recording, anything else).
@@ -3507,9 +3510,11 @@ const en: PortalMessages = {
   chatRemoveAudio: 'Remove audio',
   chatAudioRecordingLabel: 'Recording',
   chatAudioError: 'Could not attach the audio.',
-  chatAudioErrorType: 'Unsupported audio format. Use WAV, MP3, M4A, OGG or WEBM.',
+  chatAudioErrorType:
+    'Unsupported file type. Attach an audio file, for example WAV, MP3, M4A, OGG or WEBM.',
   chatAudioErrorSize: 'Audio is too large (max 20 MB).',
   chatAudioErrorEmpty: 'The audio file is empty.',
+  chatAudioErrorDecode: 'This audio file could not be processed.',
   chatRecordStart: 'Start recording',
   chatRecordStop: 'Stop recording',
   chatRecordUse: 'Use recording',

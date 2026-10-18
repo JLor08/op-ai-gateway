@@ -14,6 +14,7 @@ import {
   type ChatStore,
 } from './ChatStore';
 import { ToastProvider } from '../shared/ToastProvider';
+import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
 import { PortalApiError } from '../../api/transport';
 import { messages, type Locale } from '../../i18n';
 import type {
@@ -23,6 +24,14 @@ import type {
   PortalToken,
   ServerModelOption,
 } from '../../api';
+
+// jsdom has no WebAudio, so the browser-side conversion of a clip to WAV (audioToWav.test.ts's
+// subject) is a stand-in here: it "converts" by prefixing the bytes, so a part's payload says
+// whether the CONVERTED clip (not the upload, merely relabelled) is what the turn carries.
+vi.mock('../shared/audioToWav', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../shared/audioToWav')>()),
+  audioBlobToWav: vi.fn(async (blob: Blob) => new Blob(['WAV:', blob], { type: 'audio/wav' })),
+}));
 
 const models: ModelOption[] = [
   { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
@@ -4082,7 +4091,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await attachClip();
       fireEvent.click(screen.getByRole('button', { name: 'send' }));
     };
-    const clipUrl = `data:audio/wav;base64,${btoa('RIFFclip')}`;
+    // The data url of a clip the converter stand-in (see the vi.mock above) made of an upload
+    // that held `text`: always audio/wav, the converted bytes.
+    const wavUrl = (text: string) => `data:audio/wav;base64,${btoa(`WAV:${text}`)}`;
+    const clipUrl = wavUrl('RIFFclip');
+    const toWav = vi.mocked(audioBlobToWav);
+    beforeEach(() => toWav.mockClear());
 
     it('offers a transcription-capable audio model, and only that one of the audio models', async () => {
       const shape = (
@@ -4360,7 +4374,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await sendClip();
 
         await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
-        // The turn IS the clip: one audio_url part under the canonical type, no text part.
+        // The turn IS the clip: one audio_url part, as audio/wav, no text part.
         expect(bodyOf().user_message).toEqual([{ type: 'audio_url', audio_url: { url: clipUrl } }]);
         expect(startSettings().kind).toBe('transcription');
         expect(screen.getByTestId('count').textContent).toBe('1');
@@ -4370,48 +4384,87 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
       });
 
-      it('takes the clip of a recording through the same path, as a bare audio/webm', async () => {
+      it('takes the clip of a recording through the same path, converted to audio/wav', async () => {
         renderProvider([], { models: transcriptionModels });
         await waitForReady();
         fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
         fireEvent.click(screen.getByRole('button', { name: 'attach-recording' }));
         await waitFor(() => expect(screen.getByTestId('composer-audio').textContent).not.toBe(''));
 
-        // A recording has no file name; the composer labels it itself.
+        // A recording has no file name; the composer labels it itself. The recorder's own
+        // audio/webm;codecs=opus is what the converter was given, and not what is attached.
         expect(screen.getByTestId('composer-audio-name').textContent).toBe('');
-        expect(screen.getByTestId('composer-audio').textContent).toBe(
-          `data:audio/webm;base64,${btoa('recorded')}`,
-        );
+        expect(toWav.mock.calls[0][0].type).toBe('audio/webm;codecs=opus');
+        expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('recorded'));
         fireEvent.click(screen.getByRole('button', { name: 'send' }));
         await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
         expect(bodyOf().user_message).toEqual([
-          { type: 'audio_url', audio_url: { url: `data:audio/webm;base64,${btoa('recorded')}` } },
+          { type: 'audio_url', audio_url: { url: wavUrl('recorded') } },
         ]);
       });
 
-      it('names a picked file by its own name', async () => {
+      it('refuses a recording the browser cannot convert, attaching nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('unsupported'));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        fireEvent.click(screen.getByRole('button', { name: 'attach-recording' }));
+
+        expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+      });
+
+      it('names a picked file by its own name, and attaches it as the audio/wav it was converted to', async () => {
         renderProvider([], { models: transcriptionModels });
         await waitForReady();
         fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
         await attachClip(new File(['x'], 'standup.m4a', { type: 'audio/x-m4a' }));
 
         expect(screen.getByTestId('composer-audio-name').textContent).toBe('standup.m4a');
-        expect(screen.getByTestId('composer-audio').textContent).toBe(
-          `data:audio/mp4;base64,${btoa('x')}`,
-        );
+        expect(screen.getByTestId('composer-audio').textContent).toBe(wavUrl('x'));
       });
 
       // The payload is whatever follows the LAST comma of the reader's data url: base64 has none,
-      // but a media-type parameter may.
-      it('reads the payload of a clip whose reported type contains a comma', async () => {
+      // but a media-type parameter may. (The converted blob is audio/wav, so a stand-in that
+      // reports a parameterised type is what reaches the reader here.)
+      it('reads the payload of a converted clip whose reported type contains a comma', async () => {
+        toWav.mockResolvedValueOnce(new Blob(['pcm'], { type: 'audio/wav;note=a,b' }));
         renderProvider([], { models: transcriptionModels });
         await waitForReady();
         fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
-        await attachClip(new File(['x'], 'clip.wav', { type: 'audio/wav;note=a,b' }));
+        await attachClip(new File(['x'], 'clip.wav', { type: 'audio/wav' }));
 
         expect(screen.getByTestId('composer-audio').textContent).toBe(
-          `data:audio/wav;base64,${btoa('x')}`,
+          `data:audio/wav;base64,${btoa('pcm')}`,
         );
+      });
+
+      // Not audio the decoder can read: said, and nothing attached.
+      it('refuses a file the browser cannot decode, attaching nothing', async () => {
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+          target: { files: [new File(['x'], 'broken.mp3', { type: 'audio/mpeg' })] },
+        });
+
+        expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
+        expect(screen.getByTestId('composer-audio').textContent).toBe('');
+      });
+
+      it('keeps the clip it had when the next one cannot be decoded', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip();
+        toWav.mockRejectedValueOnce(new AudioDecodeError('corrupt'));
+        fireEvent.change(screen.getByLabelText('probe-audio-file'), {
+          target: { files: [new File(['x'], 'broken.mp3', { type: 'audio/mpeg' })] },
+        });
+
+        expect(await screen.findByText(t.chatAudioErrorDecode)).toBeTruthy();
+        expect(screen.getByTestId('composer-audio').textContent).toBe(clipUrl);
       });
 
       it('removes the clip, and sending then has nothing to send', async () => {

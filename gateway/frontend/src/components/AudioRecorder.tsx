@@ -65,8 +65,10 @@ type Phase = 'idle' | 'requesting' | 'recording' | 'recorded';
 // The in-browser recorder of the transcription composer: ask for the microphone, record with a
 // visible clock, stop, hear the take, then use it or discard it. "Use" hands the recording to the
 // composer as a Blob typed as the browser's recorder reports it (audio/webm;codecs=opus in
-// Chromium, audio/mp4 in Safari, audio/ogg in Firefox): normalizing that to the bare canonical
-// type is the composer's job, the same for any clip. Nothing is attached until the user says so.
+// Chromium, audio/mp4 in Safari, audio/ogg in Firefox): converting that to the WAV the
+// transcription server reads is the composer's job (audioAttach), the same for any clip, so the
+// take is previewed here as it was recorded and attached as the WAV. Nothing is attached until
+// the user says so.
 //
 // The microphone is a resource that must never be left held: the stream's tracks are stopped the
 // moment a take ends, fails or is abandoned, and when the component goes away -- mid-recording, or

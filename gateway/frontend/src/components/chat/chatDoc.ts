@@ -801,105 +801,40 @@ export function transcriptionSettingsFrom(
   };
 }
 
-// The audio formats a transcription turn's clip may be in: the allow-list of the backend's
-// chat-blob store (chatBlobMediaTypes in service_chats_blobs.go -- keep the two in step),
-// which is what the composer's attach and record produce (audio/webm and audio/ogg from the
-// browser's recorder, audio/mp4 from Safari's, audio/mpeg and audio/wav from an attached
-// file). A clip of any other type would be refused when the run commits the turn. Lower
-// case: compared against a file's reported MIME type.
-export const TRANSCRIPTION_AUDIO_TYPES: readonly string[] = [
-  'audio/wav',
-  'audio/webm',
-  'audio/mpeg',
-  'audio/mp4',
-  'audio/ogg',
-];
-
-// The picker's `accept` list: the types, plus the extensions a file dialog matches when it
-// has no MIME type to go by (IMAGE_EDIT_SOURCE_ACCEPT's twin).
+// The picker's `accept` list: any audio, plus the extensions a file dialog matches when it has no
+// MIME type to go by (IMAGE_EDIT_SOURCE_ACCEPT's twin). A clip is converted to WAV in the browser
+// before it is attached (shared/audioToWav), so whatever the browser can decode is welcome, not a
+// fixed list of formats; the extensions keep a file the platform does not type as audio/* (an
+// audio-only .webm is video/webm in Chrome, an .opus or .flac may have no type at all) from being
+// greyed out in the dialog.
 export const TRANSCRIPTION_AUDIO_ACCEPT = [
-  ...TRANSCRIPTION_AUDIO_TYPES,
+  'audio/*',
   '.wav',
   '.webm',
   '.mp3',
   '.m4a',
   '.ogg',
+  '.oga',
+  '.opus',
+  '.flac',
+  '.aac',
 ].join(',');
 
 // The bare media type of a clip: its `type/subtype` without parameters, lower-cased and
 // trimmed, which is the only spelling the backend takes (DecodeAudioDataURL refuses a data
-// url whose type carries a parameter, and the allow-list is exact). The browser's recorder
-// reports audio/webm;codecs=opus, so a clip's type has to pass through here before it
-// becomes a data url.
+// url whose type carries a parameter). A browser reports a recording or a picked file with
+// whatever its platform says (audio/webm;codecs=opus, audio/x-m4a, application/ogg ...), so a
+// type is read through here before it is judged or becomes a data url.
 export function bareAudioMediaType(mediaType: string): string {
   return mediaType.split(';', 1)[0].trim().toLowerCase();
 }
 
-// The spellings a platform reports for the five canonical types, mapped to them (keys are bare
-// types). The backend's allow-list is exact, so a clip typed audio/x-wav would be refused when
-// the run commits the turn; here it is relabelled before it is sent. What each one is:
-//   wav  -- audio/x-wav (Windows, older Chrome), audio/wave, audio/vnd.wave;
-//   mpeg -- audio/mp3 (Windows and some Linux dialogs), audio/x-mp3, audio/mpeg3;
-//   mp4  -- audio/x-m4a and audio/m4a (macOS and Safari report an .m4a so);
-//   ogg  -- application/ogg (Firefox and Windows report a .ogg/.oga so), audio/x-ogg;
-//   webm -- video/webm: Chrome types EVERY .webm file so, an audio-only recording included, and
-//           the accept list offers .webm, so a picked audio .webm must not be refused for it.
-// Only the type's name changes; the bytes are relayed untouched, as ever.
-const AUDIO_TYPE_ALIASES: ReadonlyMap<string, string> = new Map([
-  ['audio/x-wav', 'audio/wav'],
-  ['audio/wave', 'audio/wav'],
-  ['audio/vnd.wave', 'audio/wav'],
-  ['audio/mp3', 'audio/mpeg'],
-  ['audio/x-mp3', 'audio/mpeg'],
-  ['audio/mpeg3', 'audio/mpeg'],
-  ['audio/x-m4a', 'audio/mp4'],
-  ['audio/m4a', 'audio/mp4'],
-  ['application/ogg', 'audio/ogg'],
-  ['audio/x-ogg', 'audio/ogg'],
-  ['video/webm', 'audio/webm'],
-]);
-
-// What a file extension says about a clip whose type the platform did not give (an empty type,
-// or the generic application/octet-stream a FileReader or a file dialog falls back to for a
-// format it does not know): the extensions the picker's accept list offers. Lower case, no dot.
-const AUDIO_EXTENSION_TYPES: ReadonlyMap<string, string> = new Map([
-  ['wav', 'audio/wav'],
-  ['webm', 'audio/webm'],
-  ['mp3', 'audio/mpeg'],
-  ['m4a', 'audio/mp4'],
-  ['ogg', 'audio/ogg'],
-]);
-
-// The bare type with its alias applied, or the bare type itself when it has none.
-function aliasedAudioMediaType(mediaType: string): string {
-  const bare = bareAudioMediaType(mediaType);
-  return AUDIO_TYPE_ALIASES.get(bare) ?? bare;
-}
-
-// The canonical media type of a clip a browser or a file reported as `mediaType` (and, for a file,
-// named `fileName`): one of TRANSCRIPTION_AUDIO_TYPES, or undefined when the clip is in no format
-// the backend takes -- which the composer says ("unsupported audio format") instead of sending a
-// clip that would be refused after the turn is committed.
-//
-// The type is trusted when it says anything: parameters dropped, an alias mapped, and a type
-// outside the allow-list refused whatever the file is called (a .wav that reports text/plain is
-// not audio the composer can vouch for). Only an EMPTY or generic type is read from the file's
-// extension, the one situation where the name is all there is.
-export function canonicalAudioMediaType(mediaType: string, fileName = ''): string | undefined {
-  const bare = bareAudioMediaType(mediaType);
-  if (bare === '' || bare === 'application/octet-stream') {
-    const dot = fileName.lastIndexOf('.');
-    return dot < 0 ? undefined : AUDIO_EXTENSION_TYPES.get(fileName.slice(dot + 1).toLowerCase());
-  }
-  const canonical = AUDIO_TYPE_ALIASES.get(bare) ?? bare;
-  return TRANSCRIPTION_AUDIO_TYPES.includes(canonical) ? canonical : undefined;
-}
-
-// The inline data url of a clip: `data:<type>;base64,<bytes>`, the type reduced to its bare,
-// canonical spelling (bareAudioMediaType and the alias table), which is what the backend reads.
-// `base64` is the clip's bytes, standard-alphabet base64 without the data-url prefix.
+// The inline data url of a clip: `data:<type>;base64,<bytes>`, the type reduced to its bare
+// spelling (bareAudioMediaType), which is what the backend reads. `base64` is the clip's bytes,
+// standard-alphabet base64 without the data-url prefix. The composer's clip is always the WAV it
+// converted the upload to (audioAttach passes audio/wav), whatever the upload was.
 export function audioDataUrl(mediaType: string, base64: string): string {
-  return `data:${aliasedAudioMediaType(mediaType)};base64,${base64}`;
+  return `data:${bareAudioMediaType(mediaType)};base64,${base64}`;
 }
 
 // The content of the user turn a transcription composer sends: the clip alone, as one audio_url

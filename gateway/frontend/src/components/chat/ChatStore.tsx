@@ -100,14 +100,13 @@ export { audioPassthroughMessage, parseAudioPassthrough } from './chatDoc';
 export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
 
 // The transcription composer's twin of the above (its own reserved fields and message), and
-// what its audio input needs: the allow-listed clip formats for the attach picker and the bare
-// media-type helper. (The clip itself is built inside the store, by handleFiles / attachRecording,
-// which strip a recorder's media-type parameter and map a platform's alias to the canonical type.)
+// what its audio input needs: the attach picker's `accept` list and the bare media-type helper.
+// (The clip itself is built inside the store, by handleFiles / attachRecording, which convert
+// whatever audio the browser can decode to a 16 kHz mono WAV before it is attached.)
 export {
   bareAudioMediaType,
   parseTranscriptionPassthrough,
   TRANSCRIPTION_AUDIO_ACCEPT,
-  TRANSCRIPTION_AUDIO_TYPES,
   transcriptionPassthroughMessage,
 } from './chatDoc';
 export type { TranscriptionSettings } from './chatDoc';
@@ -356,8 +355,8 @@ function attachErrorText(err: unknown, t: Translation): string {
   return t.chatImageError;
 }
 
-// The user-facing sentence for a refused audio clip: its format, its size, an empty file --
-// or anything else, which is generic.
+// The user-facing sentence for a refused audio clip: its format, its size, an empty file, audio
+// the browser could not decode to WAV -- or anything else, which is generic.
 function audioAttachErrorText(err: unknown, t: Translation): string {
   if (err instanceof AudioAttachError) {
     switch (err.reason) {
@@ -367,6 +366,8 @@ function audioAttachErrorText(err: unknown, t: Translation): string {
         return t.chatAudioErrorSize;
       case 'empty':
         return t.chatAudioErrorEmpty;
+      case 'decode':
+        return t.chatAudioErrorDecode;
       default:
         // "read" (or any future reason) -> generic
         return t.chatAudioError;
@@ -1807,8 +1808,9 @@ export function ChatStoreProvider({
 
   // Vet and attach one audio clip (a picked file, or a recording with no name) as the
   // transcription turn's clip, replacing the one it had; a refused clip leaves that one as it
-  // was and says why. It lands only while the thread is still a transcription one: the picker
-  // may have been left behind by a model switch while the file was being read.
+  // was and says why. The clip is converted to WAV first (prepareAudioClip), which takes a moment
+  // for a long one. It lands only while the thread is still a transcription one: the picker may
+  // have been left behind by a model switch while the file was being converted.
   async function attachAudioClip(file: Blob, name: string) {
     try {
       const clip = await prepareAudioClip(file, name);

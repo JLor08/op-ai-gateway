@@ -16,7 +16,8 @@ import { TRANSCRIPTION_AUDIO_ACCEPT, useChatStore } from './chat/ChatStore';
 // which stays closed until there is one.
 //
 // A clip is attached by the store (handleFiles / attachRecording): both ways go through the same
-// format and size checks, and a clip leaves under its canonical media type. This view only offers
+// checks and the same conversion, in the browser, to the WAV the transcription server reads, so
+// the clip shown here (and played by its preview) is always an audio/wav. This view only offers
 // the controls and shows the result.
 export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
   const c = useChatStore();
@@ -88,8 +89,9 @@ export function TranscriptionComposer({ t }: Readonly<{ t: Translation }>) {
           />
           {/* A label-wrapped file input, the same shape as the image attach of the text
             composer: the input is named by the button's text, and a disabled one (a run is in
-            flight) is not clickable. `accept` is only a hint, which a file dialog's "all files"
-            ignores, so the store checks the type again. One clip is the turn, so no `multiple`. */}
+            flight) is not clickable. `accept` offers any audio (the browser converts it to WAV),
+            and is only a hint, which a file dialog's "all files" ignores, so the store checks the
+            file again. One clip is the turn, so no `multiple`. */}
           <Button
             component="label"
             variant="outlined"
