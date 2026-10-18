@@ -82,7 +82,10 @@ import (
 // images (or as editable, for an edit); for speech it is judged by
 // speechFlagsByName, the rule behind ModelDTO.Speech, so the openai_audio
 // flavor is offered ONLY behind a (speech, yes) verdict and a name is a
-// candidate exactly when the portal lists it as speech-capable. With no required capability Capable is
+// candidate exactly when the portal lists it as speech-capable; transcription
+// is judged the same way by its twin transcriptionFlagsByName
+// (ModelDTO.Transcription, the (transcription, yes) verdict). With no required
+// capability Capable is
 // Callable itself. A required capability that has no fold makes Capable empty:
 // nothing is known to carry it, so nothing is a candidate. The requested-name
 // question never asks Capable: a callable name without the capability is the
@@ -314,28 +317,27 @@ func (s *Service) ModelOfferingFor(ctx context.Context, token auth.Token, flavor
 // the listing folds over for this token (Models() reads visibleMappingViews),
 // with the listing's own rules: for a model name, the listing's own fold for
 // that capability (imageFlagsByName for "image", imageEditFlagsByName for
-// "image_edit", speechFlagsByName for "speech"), and groupCapabilityFlags over the group overlay for a group
+// "image_edit", speechFlagsByName for "speech", transcriptionFlagsByName for
+// "transcription"), and groupCapabilityFlags over the group overlay for a group
 // name -- so Capable and the listing's ModelDTO flags are one rule, not two.
 // idx is the caller's runtime-spec index and must cover views; capableNames
 // makes no spec read of its own.
 //
-// "image", "image_edit" and "speech" are the capabilities with a fold here;
-// any other makes the result empty (fail-closed), alone or beside one that has
-// a fold. "transcription" (/v1/audio/transcriptions) is a required capability
-// WITHOUT a fold, deliberately: a transcription request's unknown-model redirect
-// finds no candidate and the portal listing carries no transcription flag, while
-// the gate still refuses a model without the verdict. A fold that is
-// speechFlagsByName's twin is the way back. "image_edit" is DERIVED
-// (routing.ImpliedImageEdit), which is why it is handled here at all: with no
-// fold for it, an edit request for an unknown model found Capable empty and
-// the preflight redirect, which needs a capable candidate, was dead for edits
-// -- a bare 404 instead of the redirect. "speech" (/v1/audio/speech) is folded
-// by speechFlagsByName, the one place the openai_audio flavor meets the
-// (speech, yes) verdict: it is what offers the flavor ONLY behind that verdict,
-// so a model that was never probed, or probed "no", stays callable for the
-// flavor and is never a redirect candidate. A request requiring more than one
-// folded capability gets the intersection. An error is a failed capability
-// read, which the caller turns into the all-or-nothing empty offering.
+// "image", "image_edit", "speech" and "transcription" are the capabilities with
+// a fold here; any other makes the result empty (fail-closed), alone or beside
+// one that has a fold. "image_edit" is DERIVED (routing.ImpliedImageEdit), which
+// is why it is handled here at all: with no fold for it, an edit request for an
+// unknown model found Capable empty and the preflight redirect, which needs a
+// capable candidate, was dead for edits -- a bare 404 instead of the redirect.
+// "speech" (/v1/audio/speech) is folded by speechFlagsByName and "transcription"
+// (/v1/audio/transcriptions) by its twin transcriptionFlagsByName, the places the
+// openai_audio flavor meets the (speech, yes) and (transcription, yes) verdicts:
+// each offers the flavor ONLY behind its own verdict, so a model that was never
+// probed, or probed "no", stays callable for the flavor and is never a redirect
+// candidate, and a speech verdict never makes a transcription candidate (nor the
+// reverse). A request requiring more than one folded capability gets the
+// intersection. An error is a failed capability read, which the caller turns
+// into the all-or-nothing empty offering.
 func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}, views []mappingView, idx runtimeSpecIndex, overlay groupOverlayInputs, required []string) (map[string]struct{}, error) {
 	if len(required) == 0 {
 		return callable, nil
@@ -381,12 +383,11 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 }
 
 // hasCapabilityFold reports whether capability is one capableNames can fold:
-// the closed set of capabilities that have a fold, image, image_edit and
-// speech (a request also requires "transcription", which has none). Keep it in
-// step with capabilityFlagsByName.
+// the closed set of capabilities that have a fold: image, image_edit, speech and
+// transcription. Keep it in step with capabilityFlagsByName.
 func hasCapabilityFold(capability string) bool {
 	switch capability {
-	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech:
+	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech, routing.CapabilityTranscription:
 		return true
 	}
 	return false
@@ -410,6 +411,8 @@ func capabilityFlagsByName(capability string, views []mappingView, capsByMapping
 		return imageEditFlagsByName(views, capsByMapping, idx)
 	case routing.CapabilitySpeech:
 		return speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
+	case routing.CapabilityTranscription:
+		return transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
 	default:
 		return map[string]bool{}
 	}
