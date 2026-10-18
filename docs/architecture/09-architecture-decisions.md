@@ -322,7 +322,13 @@ gateway's list alone. `capability_source_sdcpp` (issue #154) says the gateway's
 capability ingest accepts the `sdcpp_capabilities` source, and the agent reads
 it before it sends that source at all, because a gateway without the name
 would void every such capability pass. `capability_source_audiocpp` (issue #255) is the
-same shape for the `audiocpp_models` source and an agent-launched audio.cpp child. The
+same shape for the `audiocpp_models` source and an agent-launched audio.cpp child. It is
+also why streaming transcription (issue #262,
+[ADR-065](#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript))
+needed **no new flag**: the agent's `mode`-derived `transcription_streaming` verdict rides
+this same already-declared source, so adding it was a **PATCH** bump (0.9.1 → 0.9.2), not a
+new `agent.Features` entry — a verdict whose absence already means the correct buffered
+behaviour, the "the flag gates the FALLBACK" pattern above. The
 agent declares nothing back: the gateway is the side that must accept the source,
 nothing on the gateway waits on the agent, and an agent-side name would therefore gate
 nothing — so a flag on one list only is not a half-finished negotiation, it is the
@@ -5466,6 +5472,13 @@ chosen:
   is logged once at `Error`, because the pair has no "unknown" and the gap is made
   loud, not repaired (ADR-041). The log line carries the body's **size** only: the
   body is the transcript, which is the user's content.
+  **Amended by [ADR-065](#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript):
+  a STREAMED call bills from the WAV header instead.** A streamed response carries no
+  `timing.audio_duration_ms` (audio.cpp's `transcript.text.done` has only `ttft_ms`), so
+  issue #262 bills a streamed call from the **uploaded WAV header** (the `data` chunk bytes
+  over the byte-rate), set only on a clean `transcript.text.done` + `[DONE]` completion and
+  a loud zero otherwise, with a forged-header consistency guard. The **non-streaming path is
+  unchanged** — still the response `timing.audio_duration_ms` the paragraph above records.
 - **(f) The relay buffers the response up to the body cap, writes it verbatim, and an
   over-cap response is a 502.** `timing` is trailing, so the duration is unknown until
   the body has been read to its end, and the gateway must not have sent a byte by then,
@@ -5501,6 +5514,15 @@ chosen:
   400 `transcription.stream_unsupported`, because the relay's buffering and billing
   contract is one complete JSON response; `stream: false` and an absent or empty `stream`
   and `stream_format` are accepted.
+  **Amended by [ADR-065](#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript):
+  `stream=true` is now RELAYED for a streaming model.** Issue #262 lifted the `stream=true`
+  refusal: when the mapped model's `transcription_streaming` verdict is `yes` (the model is
+  `mode=streaming`) the gateway relays audio.cpp's SSE unbuffered. A stale `yes` that draws
+  the `500 "requires a model configured with mode=streaming"` is retried **once as a
+  buffered one-shot** (with `stream` dropped), not re-streamed, and an absent/`no` verdict
+  buffers from the start. The refusal code `transcription.stream_unsupported` now fires
+  **only** for a non-boolean `stream` or any `stream_format`; `stream: false`, absent and
+  empty keep the buffered one-shot above. The paragraph records the as-landed ADR-062 state.
 - **(h) Capture stores the form and the transcript, and the binary predicate is
   endpoint-gated.** The multipart **request** is captured by the edit's path as a JSON
   summary: the text fields kept, the `file` part `redacted`. The **response** is the JSON
@@ -6152,6 +6174,18 @@ migration, no new auth leg (the loopback pair ADR-062 (j) already admits gains i
 portal caller), and **no ServerAgent version bump** (no agent change). The portal side is
 gateway and frontend only.
 
+**Amended by [ADR-065](#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript):
+the transcription run can now STREAM, and #262 does bump the agent.** Issue #262
+(ADR-065) gives `executeTranscriptionRun` a streaming branch: against a `mode=streaming`
+model the run POSTs `stream=true` over loopback and renders the transcript
+**incrementally** from `transcript.text.delta` events, reusing the text run's delta/
+checkpoint plumbing, so the "one buffered zero-delta call" of (i) is no longer the only
+shape — `TranscriptionPendingTurn` now shows only until the first delta, and the run keeps
+its full deadline until then. The run still handles a buffered answer (the gateway decides
+stream-vs-buffered), and the ordinary-text-turn reply of (c) is unchanged. Unlike #249,
+#262 **does** bump the ServerAgent (0.9.1 → 0.9.2, a PATCH on #258's wire) so an
+agent-launched child can report the `transcription_streaming` verdict.
+
 **Rejected:** **Reusing `ChatAudioSettings` for the knobs** (speech's `voice`/`speed` are
 disjoint from a transcription's `language`/`prompt`/`temperature`; a shared carrier would
 hold fields neither kind uses and muddle the pin/clear). **A `response_format` control**
@@ -6185,5 +6219,191 @@ the non-chosen mode is simply unreachable for that one model, a later enhancemen
 [§13.1](cross-cutting/security-auth-rbac.md#131-chat-binary-payloads-a-sealed-store-ownership-on-read-a-hardened-serving-url),
 [Data Model](reference/data-model.md#portal-chat),
 [HTTP API Surface](reference/api-surface.md#tokens-chats-usage),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-065 — Streaming transcription: the gateway relays the SSE for a streaming model, gated by a transcription_streaming verdict with a retry-buffered-on-500 safety-net, bills the streamed call from the WAV header, and the portal chat run streams the transcript
+**Context:** transcription — the `/v1/audio/transcriptions` endpoint
+([ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint),
+issue #69) and the portal transcription run
+([ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn),
+issue #249) — was built as **one buffered call**: the gateway refused `stream`
+(ADR-062 (g), `transcription.stream_unsupported`) and answered one complete `{text,
+timing}` document, and the portal run showed a zero-delta wait. A live probe against a
+local audio.cpp `audiocpp_server` (2026-10-18) settled what ADR-062 had no reason to
+examine: audio.cpp **does** stream transcription — the same `POST
+/v1/audio/transcriptions` with `stream=true`, requiring a model **loaded with
+`mode=streaming`** (an offline model answers `500 "requires a model configured with
+mode=streaming"`). The wire format is OpenAI-style SSE: `transcript.text.delta`
+(incremental) → `transcript.text.done` (the full `text` plus `timing.ttft_ms`) → `[DONE]`.
+A `mode=streaming` model also serves the non-streaming one-shot, a superset. Issue #262
+lifts the refusal so the gateway relays streaming transcription and the portal renders the
+transcript as it arrives. Four facts about the backend shaped every choice below, none of
+them a design's to pick:
+
+- Streaming needs `mode=streaming`; `mode` (`offline` | `streaming`) is a field of
+  audio.cpp's own `GET /v1/models`, beside the `task` ADR-062 (c) already reads, but was
+  not captured.
+- The streamed `transcript.text.done` event carries **no `audio_duration_ms`** (two
+  probes; only `ttft_ms`), so a streamed call has **no response-side billable duration** —
+  the one input ADR-062 (e) billed from is simply absent on the stream.
+- The runtime is reached **agent-mediated (per run-spec)**: the audio.cpp process runs
+  statically (models managed in its own UI), but the gateway's visibility is the run-spec,
+  so reading `mode` for an agent-launched child needs the ServerAgent to report it.
+- `mode` can go stale: a model is swapped or unloaded in audio.cpp's UI without an agent
+  (or health-loop) restart, so a verdict that said `streaming` can be wrong at the moment
+  of the call.
+
+**Decision — six choices, taken together, every one a reversal scoped to the streaming
+case and leaving the buffered path byte-identical.**
+
+- **(a) The `stream` refusal is lifted for `stream=true`, and the gateway relays the SSE
+  unbuffered.** `validateTranscriptionRequest` no longer refuses a `true` `stream`; when
+  the gateway streams it sends `stream=true` upstream and relays the event stream
+  **chunked, byte for byte**, the one success in the transcription relay that does **not**
+  go read-decide-write (ADR-062 (f)). What **stays refused** with 400
+  `transcription.stream_unsupported` is a **non-boolean `stream`** (a typo is a client
+  error, not a silent buffered fallback) and **any `stream_format`** (audio.cpp emits its
+  own SSE shape and the gateway translates nothing — the tight mirror of ADR-062 (g)'s
+  `response_format` rule). `stream: false`, an absent or empty `stream`, and no
+  `stream_format` keep the buffered one-shot of ADR-062 exactly.
+- **(b) The stream-vs-buffered decision is taken up front from a per-mapping
+  `transcription_streaming` verdict, with retry-buffered-on-500 as the safety-net.** The
+  runtime's per-model `mode` is captured as a **capability verdict** in the project's
+  existing per-mapping vocabulary — `transcription_streaming`: **yes** = the model is
+  `mode=streaming`, **no** = offline, **absent** = unknown (and it is written **only for an
+  ASR model**, the one axis on which streaming is a question; it rides the same
+  `audiocpp_models` source and `/v1/models` read as the `transcription`/`speech` verdicts,
+  (f)). The handler reads it keyed on the resolved route (`MappingCapabilities(ctx,
+  target.RouteID)`, not a new `routing.Target` field): **yes** and the client asked
+  `stream=true` → stream the SSE; **no / absent / a read error** → the buffered one-shot
+  (drop `stream`, return the complete JSON). The decision is **off-by-default-feeling**: an
+  unprobed, offline or not-yet-reported model simply buffers as before, and a client that
+  asked `stream=true` against one gets a valid buffered answer, never an error.
+  **Safety-net:** when the gateway streamed on a `yes` that had gone stale and the upstream
+  answers `500 "requires a model configured with mode=streaming"`, it **re-sends the same
+  request once with `stream` dropped** and returns the one-shot JSON. The upload is already
+  buffered whole in memory (ADR-062 (d)), so the retry re-sends the same bytes and nothing
+  of the failed stream has been written to the client yet; any **other** upstream error
+  surfaces as ADR-062 (i) already relays it. So the verdict is a pure optimisation of the
+  up-front choice: without it, or with it stale, the client still gets a correct answer and
+  the route self-heals at the next probe.
+- **(c) A streamed call bills `audio_second` from the uploaded WAV header, on a clean
+  completion only, loud-zero otherwise, with a forged-header guard.** A streamed response
+  has no `audio_duration_ms` (Context), so the one input ADR-062 (e) billed from is gone.
+  The handler already holds the upload whole (ADR-062 (d)); it parses the **WAV header**
+  (the `data` chunk's byte count over the format's byte-rate = duration — plain RIFF/WAVE
+  header math, no codec; the upload is a WAV because audio.cpp refuses a non-WAV one, which
+  then never completes, #249/#259) and
+  sets `audio_second = duration / 1000` **only on a clean stream completion** — the
+  terminal `transcript.text.done` **and** `[DONE]` both seen. A stream that ends without
+  both while the relay otherwise ended `success` (an error-status cut is already an error
+  row), and an upload that is not a parseable PCM WAV, records a **loud zero**: `0`, logged
+  once at `Error`, because the `(unit, quantity)` pair has no "unknown" and the gap is made
+  loud, not repaired ([ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)).
+  A **forged-header guard** bounds under-billing from both directions: the uploaded bytes
+  must not exceed the header's declared `data` size by more than about 16 KiB — real audio
+  **hidden behind a small or zero `data` chunk** (which would under-report the duration) is
+  rejected to a loud zero — and the `fmt` chunk must be self-consistent
+  (`byteRate == sampleRate * blockAlign`, `blockAlign == channels * ceil(bits/8)`), which
+  blocks an **inflated byte-rate** that would shrink the computed duration. The residual a
+  real file can carry is that trailing slack (about 16 KiB, ≈ 0.5 s at 16 kHz mono 16-bit,
+  longer at a lower byte rate), and a consistently forged header is self-defeating because
+  audio.cpp would then mis-transcribe the clip it describes. This reverses ADR-062 (e)
+  **for the streaming case only**, and only to the WAV-header duration (exact for PCM WAV,
+  not an arbitrary-container decode); the **non-streaming path is unchanged**, still billing
+  from the response `timing.audio_duration_ms`.
+- **(d) A streamed response is captured as its assembled transcript, endpoint-stamped.**
+  The buffered capture stores the JSON transcript (ADR-062 (h)); a streamed call captures
+  the transcript **assembled from the deltas** as the output body, under the same opt-in,
+  the same capture cap and the same sealing at rest, with the multipart request captured as
+  today (the `file` part redacted). The capture's `Endpoint` **must be stamped as the
+  transcription endpoint**, because the event-stream body would otherwise be caught by the
+  binary-speech capture backstop (`isBinarySpeechResponse`, keyed on the shared
+  `openai_audio` flavor and a 2xx status) and stored as a redacted binary stub rather than
+  the text it is — the same stamp ADR-062 (h) added for the buffered transcript, now
+  carried on the streaming path too.
+- **(e) The portal transcription run streams the transcript.** `executeTranscriptionRun`
+  gains a streaming branch: it POSTs `stream=true` over the loopback and consumes the SSE
+  with a **transcription-specific consumer** (`transcript.text.delta` → accumulate and
+  publish a run delta/checkpoint; `transcript.text.done`/`[DONE]` → the terminal commit of
+  the full text), reusing the **text run's** reservation / deadline / delta / checkpoint
+  plumbing rather than the chat-completions SSE parser, and **not** the zero-delta image/
+  speech path. The reply is still the ordinary text turn (ADR-064 (c)); it just fills
+  incrementally, with `TranscriptionPendingTurn` shown until the first delta. Because the
+  run requests streaming but the gateway (b) may still deliver buffered, the branch also
+  handles a non-streamed answer. The run keeps its **full deadline until the first delta**
+  — a `mode=streaming` model's cold start / time-to-first-token can exceed a short idle
+  watchdog — and the usual idle/checkpoint cadence applies once deltas flow; the gateway's
+  own streamed relay has a matching **first-byte deadline grace** ((f), [Risks
+  §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **(f) The ServerAgent reports the verdict as a PATCH bump, no new `agent.Features`
+  flag, no migration.** For a **direct** (static) `audio_cpp` application the gateway's
+  health loop decodes `mode` from `/v1/models` and writes the `transcription_streaming`
+  row itself; no agent is involved. For an **agent-launched** child the ServerAgent decodes
+  `mode` in its audio collector and emits the verdict — and this rides PR #258's **existing
+  one-sided gateway-declared flag `capability_source_audiocpp`** and the `audiocpp_models`
+  source as **one new capability name**, so it needs **no new `agent.Features` entry**,
+  which makes it a **PATCH** bump (0.9.1 → 0.9.2), not MINOR
+  ([ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions):
+  a flag earns its place only when the consumer must interpret the *absence* of a message,
+  and here an absent verdict already means "buffered", which is correct). There is **no
+  migration**: `model_mapping_capabilities` is an open vocabulary (ADR-062 (c)), so the new
+  name is just another row. An older agent that omits the verdict leaves it **absent** →
+  the buffered-plus-retry path of (b), a graceful degrade with no hard version dependency.
+  The agent caches verdicts once per process generation, so a UI mode-change without a
+  restart goes **stale** — which is exactly the case (b)'s retry-on-500 exists to cover.
+  The gateway relaxes its agent-ingest allowlist to admit the name on the agent path only;
+  `(transcription_streaming, no)` is reserved against a manual write and against a probe
+  being outranked by a stale manual override, as the other audio verdicts are.
+
+**Consequence:** streaming transcription is a staged, backward-compatible addition, not a
+new code path. The relay, the WAV-header billing, the capture and the retry-buffered-on-500
+safety-net (stage 1) stand on their own and are live-verifiable through the API, because a
+model that is not `mode=streaming` draws the mismatch 500 and is retried buffered. The
+up-front `transcription_streaming` verdict (stages 2 and 3 — the direct-app `mode` read and
+the agent report) is then pure optimisation of the decision: a `yes` streams (the retry
+covering a rare stale `yes`), and an **absent** verdict buffers and self-heals once the model
+is probed, so no steady-state request streams against a model not known to support it. Stage
+4 (the portal streaming run) is the UX. The non-streaming one-shot path is byte-identical
+when `stream` is absent or the model is offline, and #259's client-side WAV conversion is
+untouched. The accepted nuances are named, not hidden: a stream the upstream closes cleanly
+but **without the terminal `[DONE]`** bills a loud zero that reads in the usage UI as a
+`success` of quantity 0 beside an Error log; the first-byte grace lets a cold
+`mode=streaming` model take its warm-up; and the forged-header residual is the trailing
+slack a real WAV can hide (about 0.5 s at 16 kHz mono 16-bit) ([Risks
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+**Rejected:** **Translating `stream_format`** (audio.cpp emits its own SSE; the project
+proxies natively shaped backends and does not translate, ADR-062). **Buffering the streamed
+response to read a `timing`** (there is none on the stream, and buffering defeats
+streaming). **Billing a streamed call from the request by decoding the container** (the
+upload is WAV, so the header math is exact and needs no codec; a general decode is the
+thing ADR-062 rejected). **Billing on a partial stream** (a stream that ends without
+`transcript.text.done` + `[DONE]` is a loud zero; a partial transcript is not a billable
+measurement). **A new `agent.Features` flag for the verdict** (an absent verdict already
+means the correct buffered behaviour, so the name would gate nothing — ADR-025). **A new
+per-model struct or a migration** (the per-mapping capability vocabulary is open; `mode`
+is one more verdict name). **A new `routing.Target` field for the verdict** (a keyed
+`MappingCapabilities` read in the handler is enough, and error/absent already falls to
+buffered). **A hard version dependency on agent 0.9.2** (an older agent degrades to
+buffered and self-heals once upgraded). **A second audio code path** (the transcription
+handler and the text run's streaming machinery are reused with a `stream` branch).
+→ [API Compatibility & Inference
+§3.7](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions),
+[§7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Routing & Model Selection
+§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[Telemetry, Usage Analytics & Observability
+§8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[Security, Authentication & Authorization
+§14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers),
+[Agent-Managed Model Runtime
+§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[Runtime View
+§6.1.2](06-runtime-view.md#612-transcription-relay-post-v1audiotranscriptions),
+[HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Glossary](12-glossary.md),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

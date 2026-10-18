@@ -55,8 +55,8 @@ import (
 // capability_source_audiocpp is the same shape, for the audiocpp_models source
 // and an audio.cpp child: one-sided, this gateway's statement of what its
 // ingest accepts (rowSource, runtimeSampleCapabilityRows), read by the agent as
-// a precondition before it reports a child's speech and transcription verdicts
-// under that source. It is a separate name rather than a reuse of the sdcpp one
+// a precondition before it reports a child's speech, transcription and
+// transcription_streaming verdicts under that source. It is a separate name rather than a reuse of the sdcpp one
 // because the two acceptances are independent facts: a gateway build can accept
 // one source and not the other, and the agent must not send a source its
 // gateway would drop.
@@ -69,9 +69,12 @@ var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runti
 const capabilitySourceSdcppFeature = "capability_source_sdcpp"
 
 // capabilitySourceAudioCppFeature says this gateway's capability ingest accepts
-// the audiocpp_models source from an agent (rowSource), for the speech and
-// transcription rows only. The agent sends that source only when this name is
-// declared (its gatewayFeatureCapabilitySourceAudioCpp).
+// the audiocpp_models source from an agent (rowSource), for the speech,
+// transcription and transcription_streaming rows only. The agent sends that
+// source only when this name is declared (its
+// gatewayFeatureCapabilitySourceAudioCpp). The streaming verdict rides this
+// same declaration rather than a flag of its own: an agent that does not send
+// it states nothing about it, which the gateway reads as unknown.
 const capabilitySourceAudioCppFeature = "capability_source_audiocpp"
 
 // RuntimeUpstreamPropsFeature is the agent-declared capability naming the

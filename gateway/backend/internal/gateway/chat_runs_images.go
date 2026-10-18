@@ -314,10 +314,12 @@ func (s *Server) generateImageTurn(ctx context.Context, owner auth.Token, run *C
 // message), reporting false when the context is still live and the caller's
 // own error is the real one. A DEADLINE IS NOT A CANCEL: a cancel carries the
 // empty message the UI reads as "the user pressed Stop", and a run its own
-// deadline ended must not claim that.
+// deadline ended must not claim that. The deadline is read off the context's CAUSE,
+// which is context.DeadlineExceeded for a WithTimeout context and for one a run
+// cancelled itself with that cause (the transcription run's, which it can lift).
 func runContextOutcome(ctx context.Context) (status, errMsg string, ended bool) {
 	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(context.Cause(ctx), context.DeadlineExceeded):
 		return "error", runTimedOutMessage, true
 	case ctx.Err() != nil:
 		return "canceled", "", true

@@ -34,41 +34,60 @@ const audioCppLiveListing = `{"object":"list","data":[
 // declarations differ by a byte. The declaration is self-contained on purpose
 // (plain "yes"/"no" literals, every body inline) so that it can be compared.
 var audioCppModelCases = []struct {
-	name              string
-	body              string
-	model             string
-	wantSpeech        string // "yes" | "no" | ""
-	wantTranscription string // "yes" | "no" | ""
+	name                       string
+	body                       string
+	model                      string
+	wantSpeech                 string // "yes" | "no" | ""
+	wantTranscription          string // "yes" | "no" | ""
+	wantTranscriptionStreaming string // "yes" | "no" | ""
 }{
-	{"real v0.9.1 entry, task tts", `{"object":"list","data":[{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}]}`, "pocket_tts_english_bf16", "yes", "no"},
-	{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", "yes", "no"},
-	{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", "yes", "no"},
-	{"task asr transcribes and does not speak", `{"data":[{"id":"m","task":"asr"}]}`, "m", "no", "yes"},
-	{"an asr model the server lists as not loaded is still a yes", `{"data":[{"id":"m","task":"asr","loaded":false}]}`, "m", "no", "yes"},
-	{"a music task is a no on both axes", `{"data":[{"id":"m","task":"music"}]}`, "m", "no", "no"},
-	{"an unknown task is a no on both axes", `{"data":[{"id":"m","task":"some-future-task"}]}`, "m", "no", "no"},
-	{"model absent from the listing", `{"data":[{"id":"other","task":"tts"}]}`, "m", "", ""},
-	{"empty data", `{"object":"list","data":[]}`, "m", "", ""},
-	{"data absent", `{"object":"list"}`, "m", "", ""},
-	{"data null", `{"data":null}`, "m", "", ""},
-	{"the entry is picked out by id among several", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"},{"id":"c","task":"asr"}]}`, "b", "yes", "no"},
-	{"the sibling's task does not leak", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"}]}`, "a", "no", "yes"},
-	{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","task":"tts"}]}`, "pocket_tts", "", ""},
-	{"id match is case-sensitive", `{"data":[{"id":"M","task":"tts"}]}`, "m", "", ""},
-	{"a task padded with whitespace still maps", `{"data":[{"id":"m","task":" tts "}]}`, "m", "yes", "no"},
-	{"task match ignores case", `{"data":[{"id":"m","task":"TTS"}]}`, "m", "yes", "no"},
-	{"task match ignores case and padding for clone", `{"data":[{"id":"m","task":" Clone "}]}`, "m", "yes", "no"},
-	{"a differently-cased asr task is still a transcription yes", `{"data":[{"id":"m","task":"ASR"}]}`, "m", "no", "yes"},
-	{"an asr task padded with whitespace still maps", `{"data":[{"id":"m","task":" asr "}]}`, "m", "no", "yes"},
-	{"a named entry without a task says nothing", `{"data":[{"id":"m"}]}`, "m", "", ""},
-	{"a named entry with an empty task says nothing", `{"data":[{"id":"m","task":""}]}`, "m", "", ""},
-	{"a named entry with a blank task says nothing", `{"data":[{"id":"m","task":"  "}]}`, "m", "", ""},
-	{"an empty model id never matches", `{"data":[{"id":"","task":"tts"}]}`, "", "", ""},
-	{"unknown and extra fields are ignored", `{"object":"list","x":1,"data":[{"id":"m","task":"tts","loaded":false,"extra":{"k":[1,2]}}]}`, "m", "yes", "no"},
-	{"data of the wrong type", `{"data":"m"}`, "m", "", ""},
-	{"a task of the wrong type", `{"data":[{"id":"m","task":1}]}`, "m", "", ""},
-	{"not JSON", `<html>502</html>`, "m", "", ""},
-	{"empty body", ``, "m", "", ""},
+	{"real v0.9.1 entry, task tts", `{"object":"list","data":[{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}]}`, "pocket_tts_english_bf16", "yes", "no", ""},
+	{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", "yes", "no", ""},
+	{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", "yes", "no", ""},
+	{"task asr transcribes and does not speak", `{"data":[{"id":"m","task":"asr"}]}`, "m", "no", "yes", ""},
+	{"an asr model the server lists as not loaded is still a yes", `{"data":[{"id":"m","task":"asr","loaded":false}]}`, "m", "no", "yes", ""},
+	{"a music task is a no on both axes", `{"data":[{"id":"m","task":"music"}]}`, "m", "no", "no", ""},
+	{"an unknown task is a no on both axes", `{"data":[{"id":"m","task":"some-future-task"}]}`, "m", "no", "no", ""},
+	{"model absent from the listing", `{"data":[{"id":"other","task":"tts"}]}`, "m", "", "", ""},
+	{"empty data", `{"object":"list","data":[]}`, "m", "", "", ""},
+	{"data absent", `{"object":"list"}`, "m", "", "", ""},
+	{"data null", `{"data":null}`, "m", "", "", ""},
+	{"the entry is picked out by id among several", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"},{"id":"c","task":"asr"}]}`, "b", "yes", "no", ""},
+	{"the sibling's task does not leak", `{"data":[{"id":"a","task":"asr"},{"id":"b","task":"tts"}]}`, "a", "no", "yes", ""},
+	{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","task":"tts"}]}`, "pocket_tts", "", "", ""},
+	{"id match is case-sensitive", `{"data":[{"id":"M","task":"tts"}]}`, "m", "", "", ""},
+	{"a task padded with whitespace still maps", `{"data":[{"id":"m","task":" tts "}]}`, "m", "yes", "no", ""},
+	{"task match ignores case", `{"data":[{"id":"m","task":"TTS"}]}`, "m", "yes", "no", ""},
+	{"task match ignores case and padding for clone", `{"data":[{"id":"m","task":" Clone "}]}`, "m", "yes", "no", ""},
+	{"a differently-cased asr task is still a transcription yes", `{"data":[{"id":"m","task":"ASR"}]}`, "m", "no", "yes", ""},
+	{"an asr task padded with whitespace still maps", `{"data":[{"id":"m","task":" asr "}]}`, "m", "no", "yes", ""},
+	{"a named entry without a task says nothing", `{"data":[{"id":"m"}]}`, "m", "", "", ""},
+	{"a named entry with an empty task says nothing", `{"data":[{"id":"m","task":""}]}`, "m", "", "", ""},
+	{"a named entry with a blank task says nothing", `{"data":[{"id":"m","task":"  "}]}`, "m", "", "", ""},
+	{"an empty model id never matches", `{"data":[{"id":"","task":"tts"}]}`, "", "", "", ""},
+	{"unknown and extra fields are ignored", `{"object":"list","x":1,"data":[{"id":"m","task":"tts","loaded":false,"extra":{"k":[1,2]}}]}`, "m", "yes", "no", ""},
+	{"data of the wrong type", `{"data":"m"}`, "m", "", "", ""},
+	{"a task of the wrong type", `{"data":[{"id":"m","task":1}]}`, "m", "", "", ""},
+	{"not JSON", `<html>502</html>`, "m", "", "", ""},
+	{"empty body", ``, "m", "", "", ""},
+	{"mode streaming is a transcription streaming yes", `{"data":[{"id":"m","task":"asr","mode":"streaming"}]}`, "m", "no", "yes", "yes"},
+	{"mode offline is a transcription streaming no", `{"data":[{"id":"m","task":"asr","mode":"offline"}]}`, "m", "no", "yes", "no"},
+	{"a streaming model the server lists as not loaded is still a yes", `{"data":[{"id":"m","task":"asr","mode":"streaming","loaded":false}]}`, "m", "no", "yes", "yes"},
+	{"mode match ignores case and padding for streaming", `{"data":[{"id":"a","task":"asr","mode":" Streaming "},{"id":"b","task":"asr","mode":"OFFLINE"}]}`, "a", "no", "yes", "yes"},
+	{"mode match ignores case and padding for offline", `{"data":[{"id":"a","task":"asr","mode":" Streaming "},{"id":"b","task":"asr","mode":"OFFLINE"}]}`, "b", "no", "yes", "no"},
+	{"an empty mode says nothing about streaming", `{"data":[{"id":"m","task":"asr","mode":""}]}`, "m", "no", "yes", ""},
+	{"a blank mode says nothing about streaming", `{"data":[{"id":"m","task":"asr","mode":"  "}]}`, "m", "no", "yes", ""},
+	{"a null mode says nothing about streaming", `{"data":[{"id":"m","task":"asr","mode":null}]}`, "m", "no", "yes", ""},
+	{"an unknown mode says nothing about streaming", `{"data":[{"id":"m","task":"asr","mode":"realtime"}]}`, "m", "no", "yes", ""},
+	{"a mode of the wrong type says nothing and leaves the task verdicts alone", `{"data":[{"id":"m","task":"asr","mode":1}]}`, "m", "no", "yes", ""},
+	{"the sibling's mode does not leak", `{"data":[{"id":"a","task":"asr","mode":"streaming"},{"id":"b","task":"asr","mode":"offline"}]}`, "b", "no", "yes", "no"},
+	{"a tts model gets no streaming verdict whatever its mode", `{"data":[{"id":"m","task":"tts","mode":"streaming"}]}`, "m", "yes", "no", ""},
+	{"a clone model gets no streaming verdict whatever its mode", `{"data":[{"id":"m","task":"clone","mode":"streaming"}]}`, "m", "yes", "no", ""},
+	{"a music model gets no streaming verdict whatever its mode", `{"data":[{"id":"m","task":"music","mode":"streaming"}]}`, "m", "no", "no", ""},
+	{"an offline non-asr model gets no streaming verdict either", `{"data":[{"id":"m","task":"music","mode":"offline"}]}`, "m", "no", "no", ""},
+	{"an entry with no task gets no streaming verdict whatever its mode", `{"data":[{"id":"m","mode":"streaming"}]}`, "m", "", "", ""},
+	{"an asr task is matched ignoring case and padding for the streaming verdict too", `{"data":[{"id":"m","task":" ASR ","mode":"streaming"}]}`, "m", "no", "yes", "yes"},
+	{"a mode on a model the listing does not name says nothing", `{"data":[{"id":"other","task":"asr","mode":"streaming"}]}`, "m", "", "", ""},
 }
 
 // TestParseAudioCppModels pins the mapping rule: the loaded entry's own task is
@@ -80,11 +99,58 @@ func TestParseAudioCppModels(t *testing.T) {
 	for _, tc := range audioCppModelCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := parseAudioCppModels([]byte(tc.body), tc.model)
-			want := AudioCppVerdicts{Speech: tc.wantSpeech, Transcription: tc.wantTranscription}
+			want := AudioCppVerdicts{Speech: tc.wantSpeech, Transcription: tc.wantTranscription, TranscriptionStreaming: tc.wantTranscriptionStreaming}
 			if got != want {
 				t.Fatalf("parseAudioCppModels = %+v, want %+v", got, want)
 			}
 		})
+	}
+}
+
+// TestParseAudioCppModelsMode pins what the shared table cannot say in a row: how
+// the mode axis and the task axes meet. The transcription streaming verdict is
+// stated for an ASR model ONLY -- the capability is transcription-specific, so a
+// model that does not transcribe (tts, clone, music, no task) gets no verdict on it
+// whatever its mode, not even a "no" -- and for an ASR model the entry's mode alone
+// decides it ("streaming" is a yes, "offline" a no, anything else no answer). The
+// mode never moves the speech or transcription verdict the task decides, so a
+// listing whose mode field is odd, or an audio.cpp that adds modes, cannot switch a
+// route off.
+func TestParseAudioCppModelsMode(t *testing.T) {
+	type taskCase struct {
+		verdicts [2]string // speech, transcription
+		isASR    bool
+	}
+	tasks := map[string]taskCase{
+		"asr":   {[2]string{routing.CapabilityNo, routing.CapabilityYes}, true},
+		"ASR":   {[2]string{routing.CapabilityNo, routing.CapabilityYes}, true},
+		"tts":   {[2]string{routing.CapabilityYes, routing.CapabilityNo}, false},
+		"clone": {[2]string{routing.CapabilityYes, routing.CapabilityNo}, false},
+		"music": {[2]string{routing.CapabilityNo, routing.CapabilityNo}, false},
+		"":      {[2]string{"", ""}, false},
+	}
+	modes := []struct{ field, want string }{
+		{``, ""},
+		{`,"mode":"streaming"`, routing.CapabilityYes},
+		{`,"mode":"offline"`, routing.CapabilityNo},
+		{`,"mode":""`, ""},
+		{`,"mode":"realtime"`, ""},
+		{`,"mode":null`, ""},
+		{`,"mode":["streaming"]`, ""},
+	}
+	for task, tc := range tasks {
+		for _, m := range modes {
+			body := `{"data":[{"id":"m","task":"` + task + `"` + m.field + `}]}`
+			wantStreaming := ""
+			if tc.isASR {
+				wantStreaming = m.want
+			}
+			got := parseAudioCppModels([]byte(body), "m")
+			want := AudioCppVerdicts{Speech: tc.verdicts[0], Transcription: tc.verdicts[1], TranscriptionStreaming: wantStreaming}
+			if got != want {
+				t.Errorf("parseAudioCppModels(%s) = %+v, want %+v", body, got, want)
+			}
+		}
 	}
 }
 
@@ -143,7 +209,7 @@ func TestProbeAudioCppModels(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}); got != want {
-			t.Fatalf("got %+v, want %+v", got, want)
+			t.Fatalf("got %+v, want %+v (the live entry is a tts model: mode offline, but no transcription streaming verdict)", got, want)
 		}
 		if method != http.MethodGet || path != "/v1/models" {
 			t.Fatalf("request = %s %s, want GET /v1/models", method, path)
@@ -160,6 +226,21 @@ func TestProbeAudioCppModels(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 		if want := (AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes}); got != want {
+			t.Fatalf("got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("a streaming asr model yields a transcription streaming yes from the same listing", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"data":[{"id":"vibevoice_asr_streaming_7b_bf16","family":"vibevoice_asr","task":"asr","mode":"streaming","loaded":true}]}`))
+		}))
+		defer srv.Close()
+		got, err := probe(t, srv, context.Background(), "vibevoice_asr_streaming_7b_bf16")
+		if err != nil {
+			t.Fatalf("error = %v", err)
+		}
+		want := AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: routing.CapabilityYes}
+		if got != want {
 			t.Fatalf("got %+v, want %+v", got, want)
 		}
 	})

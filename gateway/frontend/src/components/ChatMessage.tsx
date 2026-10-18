@@ -152,12 +152,14 @@ function ChatMessageComponent({
     if (streaming && kind === 'speech' && audioUrl === undefined) {
       return <AudioPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }
-    // A transcription run is the same shape of wait -- one finished transcript at the end,
-    // no incremental events (the run is asked for no stream) -- but its answer is TEXT, so
-    // without this the ordinary text-pending branch below would claim the turn: "Denkt ...
-    // 0 Zeichen" and a cursor for a run that is not reasoning and emits nothing to count.
-    // `text.length === 0` is the `no answer yet` guard that keeps it from replacing an
-    // arriving transcript, as images / audioUrl do for the kinds above.
+    // A transcription run is the same shape of wait until its FIRST text -- a one-shot
+    // model answers one finished transcript at the end, a streaming one emits nothing
+    // before its first delta -- but its answer is TEXT, so without this the ordinary
+    // text-pending branch below would claim the turn: "Denkt ... 0 Zeichen" and a cursor
+    // for a run that is not reasoning and emits nothing to count. `text.length === 0` is
+    // the `no answer yet` guard that keeps it from replacing an arriving transcript (a
+    // streaming model's first delta, a one-shot model's whole text), as images /
+    // audioUrl do for the kinds above.
     if (streaming && kind === 'transcription' && text.length === 0) {
       return <TranscriptionPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }

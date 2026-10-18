@@ -34,13 +34,14 @@ func (s *Server) benchmarkStreamIdle() time.Duration {
 	return benchmarkDefaultStreamIdle
 }
 
-// coldStartBudget is how long a benchmark stream may wait for its first data
-// event: the larger of the application's timeout_ms (target.Timeout) and the
-// idle budget. For a stock application (30 s against 120 s) it equals idle,
-// so watchBenchmarkStream arms no first-data timer and SSE comments count for
-// nothing. A server_agent or stable_diffusion_cpp application (600 s by
-// default) gets that long to start a cold child, as long as the upstream
-// keeps the connection alive.
+// coldStartBudget is how long a stream may wait for its first data: the larger of
+// the application's timeout_ms (target.Timeout) and the idle budget. It is a
+// benchmark stream's first-data budget and, for the same reason, the first-byte
+// budget of a streamed transcription relay (streamFirstByteBudget). For a stock
+// application (30 s against 120 s) it equals idle, so watchBenchmarkStream arms no
+// first-data timer and SSE comments count for nothing. A server_agent or
+// stable_diffusion_cpp application (600 s by default) gets that long to start a
+// cold child, as long as the upstream keeps the connection alive.
 func coldStartBudget(target routing.Target, idle time.Duration) time.Duration {
 	return max(target.Timeout, idle)
 }

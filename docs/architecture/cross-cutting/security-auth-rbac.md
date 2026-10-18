@@ -1205,6 +1205,19 @@ rule above: the model, language and prompt fields are kept, the `file` part is
 `redacted`, and the captured request is the client's form
 ([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 
+**A STREAMED transcription is captured the same way, from the assembled transcript.** When
+the gateway relays audio.cpp's SSE instead of a buffered JSON body (a `mode=streaming` model,
+[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)),
+the captured response body is the transcript **assembled from the `transcript.text.delta`
+events**, not the raw event stream, stored as an ordinary text body under the opt-in,
+**capped and sealed** exactly like the buffered transcript, and the multipart request is
+captured as above (the `file` part redacted). The endpoint stamp still matters, and more
+so: an `event-stream` body would otherwise be caught by the `isBinarySpeechResponse`
+backstop (the shared `openai_audio` flavor and a 2xx status) and stored as a redacted binary
+stub rather than the text it is, so `captureInput.Endpoint` is stamped on the streaming
+success relay as well. The same operator caution holds — with capture on, the transcript
+(the user's spoken content) is stored as readable text, even though the audio never is.
+
 The resulting envelope is gzip-compressed, then — following the scheme in
 [§13](#13-secrets-at-rest) — sealed with the capture cipher when one is
 configured (`KeyVersion` 1), or stored as plain gzip bytes when running the

@@ -1428,6 +1428,27 @@ const (
 	// (usage.BillingUnitAudioSecond is "audio_second"): the capability names what
 	// a model can do, the unit names what a served request is metered in.
 	CapabilityTranscription = "transcription"
+
+	// CapabilityTranscriptionStreaming means the model can answer a STREAMED
+	// transcription: POST /v1/audio/transcriptions with stream=true. It refines
+	// CapabilityTranscription rather than standing beside it, and it is the one
+	// name here that does not gate a route: no request declares it required, so a
+	// model without it is still a transcription candidate. What reads it is the
+	// transcription handler, which relays stream=true as a stream only on a yes and
+	// answers the buffered one-shot for a no and for no row at all -- the absence
+	// is "unknown", and the handler's retry-buffered fallback covers a yes that
+	// has gone stale.
+	//
+	// It is DERIVED from audio.cpp's /v1/models, the per-model mode field of the same
+	// listing the speech and transcription verdicts come from
+	// (CapabilitySourceAudioCppModels), and for an ASR model only: mode "streaming" is
+	// a yes, "offline" a no, anything else no row. The name is the transcriber's, so a
+	// model that does not transcribe (tts, clone, music) carries no row on it, not even
+	// a no.
+	//
+	// Like CapabilityTranscription the string does not coincide with the billable
+	// unit (usage.BillingUnitAudioSecond).
+	CapabilityTranscriptionStreaming = "transcription_streaming"
 )
 
 // Capability verdicts.
@@ -1532,18 +1553,17 @@ const (
 // the gateway's health loop, for an audio_cpp application (audioCppCapabilityRows
 // in cmd/gateway), and the agent's own read of the /v1/models of an audio.cpp
 // child it launched, which the gateway's agent ingest accepts under this source
-// for the speech and transcription rows only (and only when the gateway declares
-// the capability_source_audiocpp feature).
+// for the speech, transcription and transcription_streaming rows only (and only
+// when the gateway declares the capability_source_audiocpp feature).
 //
 // It is the sdcpp_capabilities source's twin in the one respect that matters:
-// it is entitled to establish a "no" as well as a "yes", for each of its two
-// rows. The listing states each model's task, so a model it names with a task
+// it is entitled to establish a "no" as well as a "yes", for each of its rows. The listing states each model's task, so a model it names with a task
 // that does not serve a capability is a real CapabilityNo for that capability,
 // not an absence (a tts or clone model is (speech, yes) with (transcription,
 // no), an asr model the reverse, any other task no for both) -- while a model
 // the listing does not name at all is still no verdict, because a missing entry
-// says nothing about that model. It writes the speech and transcription rows,
-// and no other.
+// says nothing about that model. It writes the speech, transcription and
+// transcription_streaming rows, and no other.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"

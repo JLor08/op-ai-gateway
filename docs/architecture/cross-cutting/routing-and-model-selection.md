@@ -926,6 +926,33 @@ gate excludes on, and it has the same writers as `speech`, **from the same listi
   of the probe. The name is deliberately **not** in `reservedAgentCapabilityNames`: the
   agent reports it (issue #255), and an agent-reported `no` is legitimate.
 
+**Who writes the `transcription_streaming` verdict.** This is not a gate capability — no
+endpoint requires it — but a per-mapping verdict in the same vocabulary that decides, up
+front, whether the gateway streams a transcription or buffers it
+([ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
+issue #262). It is read from audio.cpp's `/v1/models` **`mode`** field (beside the `task`
+the two audio verdicts read), by the **same two producers** and under the same ranking,
+type gate and open-vocabulary storage as `transcription`:
+
+- **`audiocpp_models`** writes it from `mode`, **only for an ASR model** (the one axis on
+  which streaming is a question): an entry whose `task` is `asr` and whose `mode` is
+  `streaming` writes `(transcription_streaming, yes)`, an `asr` entry that is `offline`
+  writes `(transcription_streaming, no)`, and a non-ASR task, an absent `mode`, an unnamed
+  model, an unreachable server or an unreadable body writes **nothing** (absent = unknown =
+  the gateway buffers). The gateway's health loop decodes `mode` for a **static**
+  `audio_cpp` application, and the **agent** (0.9.2) decodes it for an agent-launched child
+  and reports it under this same source, riding the already-declared
+  `capability_source_audiocpp` feature with **no new feature flag** — a PATCH bump on
+  issue #258's wire (the speech block above, [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)).
+  The agent caches once per process generation, so a `mode` change made in audio.cpp's UI
+  without a restart goes stale; the relay's retry-buffered-on-500 safety-net covers that.
+- **`manual`**, the operator's `transcription_streaming: yes`. `(transcription_streaming,
+  no)` is **reserved** in `reservedManualVerdicts` on the same terms as `(transcription,
+  no)`: an absent row already means "buffer", so a manual `no` would needlessly outrank the
+  `mode` probe entitled to establish streaming, forever. `(transcription_streaming, yes)`
+  stays writable, and the name is **not** in `reservedAgentCapabilityNames`, because the
+  agent reports it.
+
 A transcription request avoids the vendor-account path for speech's reason: the
 capability list. `vendorAccountRoutingEligible` has no `openai_audio` twin of its images
 exclusion and declines a capability-carrying request, so the handler always sets

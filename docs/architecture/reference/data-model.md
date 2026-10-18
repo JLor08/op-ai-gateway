@@ -710,7 +710,11 @@ plausible-looking validation rule would break the normal case:
   `speculation_observed`, `image`, `speech` (the verdict `POST /v1/audio/speech`
   is gated on, distinct from `audio`, which means a model *accepts* audio),
   `transcription` (the verdict `POST /v1/audio/transcriptions` is gated on,
-  distinct from both `audio` and `speech`) and
+  distinct from both `audio` and `speech`), `transcription_streaming` (**not** a gate
+  capability — no endpoint requires it; it decides up front whether the gateway streams or
+  buffers a transcription, from the model's `mode` and for ASR models only,
+  [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript))
+  and
   `image_edit` are the names the code itself reasons
   about — `image_edit` is **derived** from `image` at the gate and its only
   stored row is an operator's `no` opt-out, [ADR-057](../09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)
@@ -797,20 +801,24 @@ plausible-looking validation rule would break the normal case:
   last read it (up to about 30 s old), and the
   ingest's acceptance does not depend on the feature), and `audiocpp_models` (a
   `GET` of an agent-launched `audio_cpp` child's own `/v1/models`, since #255,
-  accepted for the `speech` and `transcription` rows only; the agent reports it
+  accepted for the `speech`, `transcription` and `transcription_streaming` rows only (the
+  last added by agent 0.9.2 on this same source with no new feature flag, #262); the agent
+  reports it
   only while the gateway declares the agent feature `capability_source_audiocpp`,
   on the same terms as the sdcpp one). The gateway's own
   passes write `llama_cpp_props` too, and, for an **external** `stable_diffusion_cpp`
   application, `sdcpp_capabilities` directly — the only source that answers
   `image` in both directions, whichever of its two producers wrote it — and, for a
   static `audio_cpp` application, `audiocpp_models` directly (a `GET` of its
-  `/v1/models`, the only source of the `speech` and `transcription` rows and one
-  that answers both in both directions, from the one `task` of the listed model,
+  `/v1/models`, the only source of the `speech`, `transcription` and
+  `transcription_streaming` rows — the first two in both directions from the one `task` of
+  the listed model, the third from its `mode` (`streaming`/`offline`, ASR models only) —
   whichever of its two producers wrote it; a vocabulary addition only, with no
   schema change), plus one probe-ranked source no agent may report:
   `llama_cpp_timings` (read off a completion it relayed). The audio rows:
   [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
-  [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint).
+  [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint),
+  [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript).
   The probing agent REPORTS which of its four
   produced a verdict set rather than the gateway inferring it, and the
   ingest boundary accepts exactly those four from an agent — a sample

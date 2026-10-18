@@ -600,14 +600,22 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
 	// activity for `idle`), a buffered completion uses a total timeout. Both cancel
 	// the upstream request context.
+	//
+	// A stream's watchdog is armed from the request, so what it allows BEFORE the
+	// first byte is its first-byte budget -- idle itself, except for a transcription
+	// (see streamFirstByteBudget); every byte of the body re-arms it to idle (the
+	// copier's writeChunk).
 	idle := s.streamIdleTimeout
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	var idledOut atomic.Bool
 	var watchdog *time.Timer
+	// The instant a total timeout counts from, whether it is armed here or -- for a
+	// stream answered with a plain document -- once that answer is seen.
+	deadlineBase := time.Now()
 	switch {
 	case rel.pfReq.Stream && idle > 0:
-		watchdog = time.AfterFunc(idle, func() { idledOut.Store(true); cancel() })
+		watchdog = time.AfterFunc(streamFirstByteBudget(rel, idle), func() { idledOut.Store(true); cancel() })
 		defer watchdog.Stop()
 	case !rel.pfReq.Stream && rel.target.Timeout > 0:
 		var tcancel context.CancelFunc
@@ -657,6 +665,35 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	}
 	defer resp.Body.Close()
 
+	// A STREAMED transcription (bufferedRetry is set only for one) that the upstream
+	// refuses because the mapped model is not in streaming mode is sent once more,
+	// buffered: the request that was just refused is replaced by its one-shot twin and
+	// run through this whole function again, so the retry gets everything a plain
+	// transcription gets -- the total timeout instead of the idle watchdog, the buffered
+	// relay, the billing from the response's timing block, one usage row. The refused
+	// attempt records nothing and writes nothing (the client has not been sent a byte)
+	// and its resources are released first. bufferedRetry is not set on the retry, so
+	// there is exactly one. Any other answer, and a twin that cannot be built, falls
+	// through to the relays below with the upstream's own answer.
+	if rel.bufferedRetry != nil && peekStreamingRefusal(resp) {
+		body, contentType, buildErr := rel.bufferedRetry()
+		if buildErr == nil {
+			slog.Debug("transcription upstream refused to stream; retrying buffered", "path", r.URL.Path, "model", rel.pfReq.Model, "server", serverName)
+			resp.Body.Close()
+			if watchdog != nil {
+				watchdog.Stop()
+			}
+			cancel()
+			s.Active.Remove(id)
+			rel.pfReq.Stream = false
+			rel.bufferedRetry = nil
+			rel.upstreamBody, rel.contentType = body, contentType
+			s.proxyNative(w, r, rel)
+			return
+		}
+		slog.Error("transcription upstream refused to stream and the buffered retry could not be built; relaying the refusal", "path", r.URL.Path, "model", rel.pfReq.Model, "server", serverName, "err", buildErr)
+	}
+
 	// A non-2xx from the IMAGES upstream (sd-server) needs its error shape
 	// normalised into an OpenAI-compatible object before the client sees it --
 	// see normalizeImagesUpstreamError's own doc comment for why the type/code
@@ -688,20 +725,36 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	}
 
 	// The TRANSCRIPTION upstream (audio.cpp) shares the openai_audio flavor with speech,
-	// so both of its response-side paths are keyed on the endpoint, never the flavor
+	// so its response-side paths are keyed on the endpoint, never the flavor
 	// (needsSpeechErrorRelay above is carved the other way for the same reason). A non-2xx is
 	// normalised like speech's -- a transcription-specific code, see
-	// normalizeTranscriptionUpstreamError. A 2xx is the one response in this relay that
-	// cannot stream: the billable duration is the TRAILING timing block of a JSON body,
-	// so the whole body is read, bounded, before a byte is written, and then written
-	// verbatim -- see relayTranscriptionResponse. Both return, so no transcription ever
-	// reaches the speech-shaped streaming copier below (and its speech-only
-	// Content-Length forwarding and metering-header capture).
+	// normalizeTranscriptionUpstreamError. A one-shot 2xx cannot stream: the billable
+	// duration is the TRAILING timing block of a JSON body, so the whole body is read,
+	// bounded, before a byte is written, and then written verbatim -- see
+	// relayTranscriptionResponse. Both return. The one 2xx that is NOT buffered is the
+	// event stream a streamed request was answered with (isStreamedTranscription): it
+	// falls through to the copier below, which relays it frame by frame, flushed as it
+	// arrives, like any other stream. (Speech's Content-Length forwarding and
+	// metering-header capture stay speech's: see speechRelay.)
 	if needsTranscriptionErrorRelay(rel.endpoint, resp.StatusCode) {
 		s.relayTranscriptionUpstreamError(w, r, ex, resp)
 		return
 	}
-	if rel.endpoint == endpointTranscription {
+	if rel.endpoint == endpointTranscription && !isStreamedTranscription(rel.endpoint, rel.pfReq.Stream, resp.Header) {
+		// A stream request that was answered with a plain document is no stream, and
+		// the idle watchdog armed for it above must not run on a buffered read. It is
+		// a buffered read all the same, so it gets what every buffered request has: the
+		// total timeout. That was never armed for it -- the stream case above armed the
+		// watchdog in its place -- and with the watchdog stopped nothing would bound a
+		// body the upstream never finishes. It counts from the same instant the total
+		// timeout of a request made as a one-shot one does.
+		if watchdog != nil {
+			watchdog.Stop()
+		}
+		if rel.pfReq.Stream && rel.target.Timeout > 0 {
+			total := time.AfterFunc(max(rel.target.Timeout-time.Since(deadlineBase), 0), cancel)
+			defer total.Stop()
+		}
 		s.relayTranscriptionResponse(w, r, ex, resp)
 		return
 	}
@@ -776,13 +829,15 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// left chunked.
 	//
 	// Speech only: every other flavor keeps relaying chunked, exactly as before. (A
-	// transcription shares the openai_audio flavor this test reads, but never gets
-	// here: its 2xx is buffered and written by relayTranscriptionResponse above.)
+	// transcription shares the openai_audio flavor this test reads; speechRelay
+	// carves it out, and the only transcription that gets here is a stream, which has
+	// no length to declare.)
 	// provider.ProxyResponse carries no ContentLength field, so the declared
 	// length is read off the header; Go's client drops that header both for a
 	// chunked response and for one it decompressed itself, so a value that
 	// survives is the length of the bytes the copier will write.
-	if rel.pfReq.APIFlavor == apiFlavorSpeech {
+	speechRelay := rel.pfReq.APIFlavor == apiFlavorSpeech && rel.endpoint != endpointTranscription
+	if speechRelay {
 		if n, ok := declaredContentLength(resp.Header); ok {
 			w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
 		}
@@ -818,7 +873,19 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	imgCounter := newImagesDataCounter(rel.pfReq.APIFlavor)
 	var respBuf bytes.Buffer
 	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress, rel.target.VendorAccountID != "")
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: &respBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter}
+	// The transcription endpoint is the one openai_audio endpoint that streams a
+	// 2xx through here, and the only one with a scan of its own: it reads the event
+	// stream for the completion that bills it and the transcript that is captured
+	// (transcriptionStreamScan). Nil, and so inert, for every other relay.
+	transcriptScan := s.newTranscriptionStreamScan(rel.endpoint, capturing)
+	// That relay's capture is built from the scan (stampCapture below), which keeps the
+	// transcript itself, so it gets no tee of the event framing: respBuf stays empty
+	// and the copier is handed none.
+	teeBuf := &respBuf
+	if transcriptScan != nil {
+		teeBuf = nil
+	}
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan}
 	copyErr := copier.run(resp.Body)
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, rel.pfReq, serverName, idledOut.Load(), copyErr, start)
@@ -835,6 +902,11 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// resp.Header is passed alongside the exchange -- see
 	// setSpeechBillingQuantity (speech_handler.go).
 	setSpeechBillingQuantity(&meta, ex, resp.Header, status)
+	// The transcription measure, for the one transcription that gets this far: a
+	// streamed one, which states no duration -- it is read off the upload's WAV
+	// header, and only for a stream that completed. See
+	// setStreamedTranscriptionBillingQuantity.
+	setStreamedTranscriptionBillingQuantity(&meta, ex, r.Header.Get(contentTypeHeader), transcriptScan, status)
 	// The capture is told how many bytes were actually relayed, and (speech only)
 	// which metering headers the upstream sent: an audio body is not stored (see
 	// captureResponseBody), so these are all of it a capture keeps, and neither can
@@ -843,9 +915,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	capIn := buildCaptureInput(capturing, rel.token.UserID, rel.token.Secret, r, rel.raw, w.Header(), respBuf.Bytes(), resp.StatusCode, rel.pfReq.APIFlavor)
 	if capIn != nil {
 		capIn.RespBytes = copier.written
-		if rel.pfReq.APIFlavor == apiFlavorSpeech {
+		if speechRelay {
 			capIn.RespMetering = speechMeteringHeaders(resp.Header)
 		}
+		// A streamed transcription is captured as its transcript (respBuf is empty for
+		// it, see teeBuf), not as the event framing nor as speech's redacted audio
+		// summary.
+		transcriptScan.stampCapture(capIn)
 	}
 	// resp.Header is the UPSTREAM provider response headers (the native-passthrough
 	// path holds them directly), threaded in for the best-effort vendor rate-limit
@@ -915,6 +991,12 @@ type nativeRelay struct {
 	endpoint     sessionEndpoint
 	contentType  string
 	upstreamBody []byte
+	// bufferedRetry is set only on the relay of a STREAMED transcription
+	// (pfReq.Stream): it builds the body and Content-Type of the one-shot request
+	// proxyNative sends instead when the upstream refuses to stream
+	// (peekStreamingRefusal). Nil on every other relay, and on the retry
+	// itself, which is what keeps it to one.
+	bufferedRetry func() (body []byte, contentType string, err error)
 }
 
 // nativeExchange is the request-scoped state proxyNative COMPUTES once and then
@@ -945,25 +1027,47 @@ type nativeExchange struct {
 	capturing  bool
 }
 
+// streamFirstByteBudget is how long a stream may stay silent before its FIRST byte:
+// the idle timeout, which then governs every gap after it (nativeCopier.writeChunk
+// re-arms the watchdog to idle on each chunk). A streamed transcription is the one
+// stream that gets more -- the larger of the application's own timeout (what a one-shot
+// request of it is allowed end to end) and the idle timeout, coldStartBudget -- because
+// its first frame is its time to first token: a streaming model's cold start, or a model
+// still loading, can run far past an idle timeout sized for a stream that is already
+// flowing, and cutting it would turn a slow start into a failed transcription.
+func streamFirstByteBudget(rel nativeRelay, idle time.Duration) time.Duration {
+	if rel.endpoint == endpointTranscription {
+		return coldStartBudget(rel.target, idle)
+	}
+	return idle
+}
+
 // nativeCopier bundles everything proxyNative's body-copy needs: the client
 // writer (+ flusher/write-deadline controller), the idle watchdog to re-arm on
 // activity, the bounded tee buffer feeding capture, the usage scanner fed
-// independently of that buffer's cap (see usageScanner), and — for images
+// independently of that buffer's cap (see usageScanner), for images
 // only — the imgCounter fed the same way (see imagesDataCounter,
-// images_handler.go). Both scanner and imgCounter are nil-safe: a
-// nativeCopier built without one — several tests here do, when they only care
-// about the copy mechanics, and every non-images flavor never builds an
-// imgCounter at all — simply skips that scan.
+// images_handler.go) — and for a streamed transcription only its event-stream
+// scan (see transcriptionStreamScan). Scanner, imgCounter and transcript are
+// nil-safe: a nativeCopier built without one — several tests here do, when they
+// only care about the copy mechanics, and every non-images flavor never builds
+// an imgCounter at all — simply skips that scan.
 type nativeCopier struct {
-	w          http.ResponseWriter
-	rc         *http.ResponseController
-	flusher    http.Flusher
-	watchdog   *time.Timer
-	idle       time.Duration
+	w        http.ResponseWriter
+	rc       *http.ResponseController
+	flusher  http.Flusher
+	watchdog *time.Timer
+	idle     time.Duration
+	// respBuf is nil for a relay whose capture is not built from the raw bytes (a
+	// streamed transcription's is the scan's transcript): nothing is teed then.
 	respBuf    *bytes.Buffer
 	capBytes   int
 	scanner    *usageScanner
 	imgCounter *imagesDataCounter
+	// transcript is the scan of a streamed transcription's event stream (nil for every
+	// other relay, like the two above). It is fed after each chunk has reached the
+	// client, so it never delays a frame.
+	transcript *transcriptionStreamScan
 	// written counts every body byte the client's writer took, past the capture
 	// cap too (respBuf stops growing there), so a capture that does not store the
 	// body can still say how large it was.
@@ -978,7 +1082,10 @@ type nativeCopier struct {
 // final frame — which, for a buffered non-streaming response, normally never
 // gets its own trailing newline — is still scanned; see usageScanner.finish.
 func (c *nativeCopier) run(body io.Reader) error {
-	defer func() { c.scanner.finish(time.Now()) }()
+	defer func() {
+		c.scanner.finish(time.Now())
+		c.transcript.finish()
+	}()
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := body.Read(buf)
@@ -1018,7 +1125,8 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 	}
 	c.scanner.feed(chunk, time.Now())
 	c.imgCounter.feed(chunk)
-	if c.respBuf.Len() <= c.capBytes {
+	c.transcript.feed(chunk)
+	if c.respBuf != nil && c.respBuf.Len() <= c.capBytes {
 		c.respBuf.Write(chunk)
 	}
 	return nil

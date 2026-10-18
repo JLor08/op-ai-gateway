@@ -130,6 +130,20 @@ transcript**, which is output-sensitive. See [Compatibility & Inference
 §3.7](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions) and
 [ADR-062](09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint).
 
+**Streaming variant.** When the client sends `stream=true` and the mapped model's
+`transcription_streaming` verdict is `yes` (the model is `mode=streaming`), the relay takes
+a different shape: it sends `stream=true` upstream and **relays audio.cpp's SSE unbuffered**
+(`transcript.text.delta` → `transcript.text.done` → `[DONE]`) instead of the read-decide-write
+of the diagram above, bills `audio_second` from the **uploaded WAV header** on a clean
+completion (there is no response `audio_duration_ms` to read), and stamps the transcription
+endpoint on the capture so the assembled transcript is stored as text. A verdict that is
+`no`, absent or unreadable serves the buffered one-shot of the diagram, and a stale `yes`
+that draws a `500 "requires a model configured with mode=streaming"` is **retried buffered
+once** — the upload is already in memory and nothing of the stream has reached the client.
+A cold `mode=streaming` model is given a first-byte deadline grace before the idle watchdog
+takes over ([ADR-065](09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
+[Compatibility & Inference §3.7 item 11](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions)).
+
 ### 6.1.3 Portal speech chat turn (through loopback to a chat blob)
 
 A speech turn in the portal chat is the one place the speech relay of §6.1.1 is called
@@ -238,8 +252,14 @@ billing, capture and routing run under the **run-as token**; the clip is a user-
 [ADR-057](09-architecture-decisions.md#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)),
 not a client-supplied multipart body; and the transcript is committed as the **ordinary
 text turn**, with no output part and no output blob — the inverse of the speech turn, whose
-WAV becomes an `audio_url` blob. The wait is `TranscriptionPendingTurn` (one buffered
-zero-delta call). See [Compatibility & Inference
+WAV becomes an `audio_url` blob. **Against a `mode=streaming` model the run streams**: the
+executor POSTs `stream=true` over the loopback, renders the transcript **incrementally**
+from `transcript.text.delta` events (reusing the text run's delta/checkpoint plumbing), and
+`TranscriptionPendingTurn` shows only until the first delta, the run keeping its full
+deadline until then; against an offline or unprobed model the gateway serves it buffered and
+the run is the one zero-delta call ADR-064 described
+([ADR-065](09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
+issue #262). See [Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) and
 [ADR-064](09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn).
 

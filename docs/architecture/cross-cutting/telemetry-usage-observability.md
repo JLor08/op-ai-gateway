@@ -841,6 +841,30 @@ genuinely empty recording). The body's **content is deliberately not logged**: i
 transcript, which is the user's spoken content. Only the one numeric field is decoded; the
 text is skipped, not copied ([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 
+**A STREAMED transcription bills `audio_second` from the UPLOADED WAV header instead, on a
+clean completion only.** When the gateway relays audio.cpp's SSE (a `mode=streaming` model,
+[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
+issue #262) there is no response `timing.audio_duration_ms` to read — the streamed
+`transcript.text.done` carries only `ttft_ms` — so the quantity comes from the **uploaded
+WAV header**: the `data` chunk's byte count over the format's byte-rate gives the duration,
+and `audio_second = duration / 1000`. The unit is unchanged (endpoint identity, token
+counts and both rates zero), and the rule is the same **loud-zero** rule, tightened to a
+clean completion: the quantity is set **only** when the stream ended with both the terminal
+`transcript.text.done` **and** `[DONE]` seen, and a stream that ends without both while the
+relay otherwise ended `success` (an error-status cut is already an error row) — or an upload
+that is not a parseable PCM WAV — records `0` and is logged once at `Error`. A
+**forged-header guard** bounds under-billing from both directions: the uploaded bytes may not
+exceed the header's declared `data` size by more than about 16 KiB — audio **hidden behind a
+small or zero `data` chunk**, which would under-report the duration, is a loud zero — and the
+`fmt` chunk must be self-consistent (`byteRate == sampleRate * blockAlign`, `blockAlign ==
+channels * ceil(bits/8)`), so an **inflated byte-rate** cannot shrink the computed duration.
+The residual a real WAV can hide is that trailing slack (about 16 KiB, ≈ 0.5 s at 16 kHz
+mono 16-bit, longer at a lower byte rate), and a consistently forged header is self-defeating
+because audio.cpp would then mis-transcribe the clip the header describes. The WAV-header
+math is exact for a PCM WAV, and the upload is one because audio.cpp refuses a non-WAV one,
+which then never completes; the **non-streaming path is unchanged**, still billing from the
+response body above.
+
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
 the response, because a zero `provider.Response` on a failed request would

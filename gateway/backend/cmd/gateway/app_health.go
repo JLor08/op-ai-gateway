@@ -590,33 +590,52 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 }
 
 // audioCppCapabilityRows projects what one audio.cpp /v1/models listing says
-// about ONE model onto the store's row shape: up to two rows, a
-// routing.CapabilitySpeech row and a routing.CapabilityTranscription row, each
-// attributed to routing.CapabilitySourceAudioCppModels and stamped at, and each
-// written only when the listing answered yes or no for THAT capability. No
-// answer is the absence of a row -- "unknown" is exactly as in
-// sdcppCapabilityRows -- so one unanswered axis never suppresses the other.
-// Pure: no I/O.
+// about ONE model onto the store's row shape: up to three rows, a
+// routing.CapabilitySpeech row, a routing.CapabilityTranscription row and a
+// routing.CapabilityTranscriptionStreaming row, each attributed to
+// routing.CapabilitySourceAudioCppModels and stamped at, and each written only
+// when the listing answered yes or no for THAT capability (the streaming row has a
+// second condition, below). No answer is the
+// absence of a row -- "unknown" is exactly as in sdcppCapabilityRows -- so one
+// unanswered axis never suppresses another. Pure: no I/O.
 //
 // The empty verdict is the case this guards. provider.AudioCppVerdicts answers
 // "" for everything the listing does not say -- the model is not in it
-// (the server does not name it in /v1/models), the listing is empty or unreadable, or
-// the entry carries no task -- and none of those is a statement that the model
-// cannot speak or cannot transcribe. A written "no" can switch a model's route
-// off, so an unknown verdict must never become one.
+// (the server does not name it in /v1/models), the listing is empty or unreadable, the
+// entry carries no task, or (streaming) its mode is absent or not one this code knows, or
+// the model is no transcriber -- and none
+// of those is a statement that the model cannot speak, cannot transcribe or cannot
+// stream. A written "no" can switch a model's route off (speech, transcription) or
+// pin it to the buffered answer (transcription streaming), so an unknown verdict must
+// never become one.
 //
 // A "no" is a real verdict where it IS stated: the listing names the
 // model's task, so a model present with a task that does not serve the
 // capability (an asr model for speech, a tts model for transcription, a music
-// model for both) is authoritatively not that kind of model, which is what
-// entitles this source, like sdcpp's, to establish its capability's no.
+// model for both) is authoritatively not that kind of model, and an asr model it
+// lists with mode offline is authoritatively not a streaming one, which is what
+// entitles this source, like sdcpp's, to establish its capabilities' no.
+//
+// The streaming row is the one the transcription handler reads
+// (transcription_handler.go) to choose between relaying stream=true and the
+// buffered one-shot; it gates no route (routing.CapabilityTranscriptionStreaming).
+// It refines the transcription capability, so it is written only for a model whose
+// transcription verdict is yes: a model that does not transcribe (tts, clone, music,
+// one the listing gives no task) carries no row on it, not even a "no", whatever
+// its streaming verdict says. The parser already states no streaming verdict for such
+// a model; this is the same rule held at the row boundary, so a verdict assembled
+// elsewhere cannot put a transcription chip on a model that cannot transcribe.
 func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing.CapabilityRow {
 	var rows []routing.CapabilityRow
 	for _, axis := range []struct{ capability, verdict string }{
 		{routing.CapabilitySpeech, v.Speech},
 		{routing.CapabilityTranscription, v.Transcription},
+		{routing.CapabilityTranscriptionStreaming, v.TranscriptionStreaming},
 	} {
 		if axis.verdict != routing.CapabilityYes && axis.verdict != routing.CapabilityNo {
+			continue
+		}
+		if axis.capability == routing.CapabilityTranscriptionStreaming && v.Transcription != routing.CapabilityYes {
 			continue
 		}
 		rows = append(rows, routing.CapabilityRow{
@@ -721,10 +740,10 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // probeAudioCppModels is the audio_cpp branch of the probe pass for ONE
 // application of type routing.ProviderAudioCpp, a static, operator-run audio.cpp
 // server: for each of its active mappings it reads audio.cpp's own /v1/models
-// listing, derives the speech and transcription verdicts that listing states
-// for the mapping's model, and writes them (audioCppCapabilityRows through
-// writeCapabilityRows, so the precedence and change-detection guards hold
-// exactly as for the other probe sources).
+// listing, derives the speech, transcription and transcription-streaming
+// verdicts that listing states for the mapping's model, and writes them
+// (audioCppCapabilityRows through writeCapabilityRows, so the precedence and
+// change-detection guards hold exactly as for the other probe sources).
 //
 // THE GATE is the application's type, applied by the caller exactly as for the
 // sdcpp pass: every mapping of such an application is an audio.cpp model, so

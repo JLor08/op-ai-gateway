@@ -22,8 +22,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByText(t.chatTranscriptionNoIntermediateNews)).toBeInTheDocument();
     });
 
-    // The run emits no incremental event, so there is nothing to put a number or a bar on, and
-    // no text yet for a character counter to count.
+    // Before the first text the run has emitted no incremental event (a streaming model's first
+    // delta replaces this turn, a one-shot model's answer ends the run), so there is nothing to
+    // put a number or a bar on, and no text yet for a character counter to count.
     it('shows no progress figure, no reasoning summary and no player', () => {
       const { container } = render(
         <TranscriptionPendingTurn t={t} elapsedMs={3_000} roleLabel={t.assistantRole} />,

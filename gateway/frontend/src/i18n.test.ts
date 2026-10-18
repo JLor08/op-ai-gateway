@@ -3250,6 +3250,19 @@ describe('transcription capability i18n key', () => {
     expect(messages.de.capabilityTranscription).toBe('Transkription');
     expect(messages.en.capabilityTranscription).toBe('Transcription');
   });
+
+  // "transcription_streaming" refines "transcription" (the model streams its transcript), so
+  // its chip must read as that refinement, distinct from the plain Transcription chip beside it.
+  it('labels the transcription_streaming chip in de and en, distinct from Transcription', () => {
+    expect(messages.de.capabilityTranscriptionStreaming).toBe('Streaming-Transkription');
+    expect(messages.en.capabilityTranscriptionStreaming).toBe('Streaming transcription');
+    expect(messages.de.capabilityTranscriptionStreaming).not.toBe(
+      messages.de.capabilityTranscription,
+    );
+    expect(messages.en.capabilityTranscriptionStreaming).not.toBe(
+      messages.en.capabilityTranscription,
+    );
+  });
 });
 
 describe('speech capability i18n key', () => {
@@ -3478,6 +3491,24 @@ describe('portal chat transcription render i18n keys', () => {
       expect(messages.en[k].length, k).toBeGreaterThan(0);
       expect(messages.de[k], `${k} is the English text copied into de`).not.toBe(messages.en[k]);
     }
+  });
+
+  // The pending turn is shown from Send until the FIRST text arrives, and that moment is the
+  // transcript's end for a one-shot model but only its start for a streaming one (audio.cpp
+  // mode=streaming fills the turn in delta by delta). The sentence must be true on both paths,
+  // so it may not promise a finished-or-nothing transcript ("fertig oder gar nicht" / "finished
+  // or not at all") -- a streaming model refutes that one delta later.
+  it('words the no-news sentence so it holds for a streaming and a one-shot transcript', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const sentence = messages[locale].chatTranscriptionNoIntermediateNews;
+      expect(sentence).not.toMatch(/fertig oder gar nicht|finished or not at all/i);
+    }
+    expect(messages.de.chatTranscriptionNoIntermediateNews).toMatch(
+      /sobald das Modell Text liefert/,
+    );
+    expect(messages.en.chatTranscriptionNoIntermediateNews).toMatch(
+      /as soon as the model delivers text/,
+    );
   });
 
   // The wait is for a TRANSCRIPT: it must not read as the audio or image wait (a transcription
@@ -3832,10 +3863,25 @@ describe('portal chat transcription error i18n keys', () => {
   });
 
   // transcription.stream_unsupported is reachable from the portal only through a
-  // stream_format passthrough key, so the sentence names the field to remove.
+  // stream_format passthrough key, so the sentence names the field to remove. The gateway
+  // streams transcription for a streaming model, so the refusal is about the stream VALUE
+  // (it must be a boolean) and stream_format, and must not claim that transcription cannot
+  // stream or always answers the complete transcript.
   it('names the stream_format field in the streaming refusal', () => {
     expect(messages.de.errorTranscriptionStreamUnsupported).toContain('stream_format');
     expect(messages.en.errorTranscriptionStreamUnsupported).toContain('stream_format');
+  });
+
+  it('does not claim that transcription cannot stream', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const sentence = messages[locale].errorTranscriptionStreamUnsupported;
+      expect(sentence).not.toMatch(/kein Streaming|does not support streaming/i);
+      expect(sentence).not.toMatch(
+        /immer das vollständige Transkript|always the complete transcript/i,
+      );
+      expect(sentence).toContain('stream');
+      expect(sentence).toMatch(/Boolean|boolean/);
+    }
   });
 
   // The endpoint answers JSON only; the format refusal states the one that works.

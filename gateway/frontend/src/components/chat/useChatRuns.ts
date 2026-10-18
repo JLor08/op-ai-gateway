@@ -96,11 +96,16 @@ type SnapshotPayload = {
 };
 type DeltaPayload = { reasoning?: string; content?: string };
 
-// The content a snapshot/done event says the turn HAS. The two shapes are not
-// alternatives the client may choose between: `content_parts` is what the
-// transcript holds for a structured (image) turn, `content` is the streamed
-// text for every other one, and exactly one of them is ever non-empty. An
-// empty array is treated as absent so it can never shadow the text buffer.
+// The content a snapshot/done event says the turn HAS. `content_parts` is what
+// the transcript holds for a structured turn (an image, or a transcription's
+// committed text part); `content` is the streamed text buffer. For an image run
+// only `content_parts` is non-empty and for a plain text run only `content`
+// is. A STREAMED transcription's done event carries BOTH: `content` is the text
+// its deltas built and `content_parts` the transcript the backend committed --
+// the two normally say the same thing, and when they differ the committed parts
+// win, since they are what the transcript holds and the post-`done` refetch will
+// show. An empty array is treated as absent so it can never shadow the text
+// buffer.
 function contentOf(payload: SnapshotPayload): ChatContent {
   const parts = payload.content_parts;
   if (Array.isArray(parts) && parts.length > 0) return parts;

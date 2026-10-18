@@ -253,7 +253,19 @@ import (
 // gateway side waits on the agent. The same reasoning made 0.7.3 -> 0.7.4
 // (#154, the sdcpp_capabilities source) and 0.8.1 -> 0.8.2 (the image
 // options on that gate) a PATCH.
-const Version = "0.9.1"
+//
+// 0.9.1 -> 0.9.2 is the single bump for the streaming-transcription branch
+// (issue #262): the same audio_cpp probe of /v1/models now also reads the
+// listed model's "mode" and, for an asr model, reports it as the
+// "transcription_streaming" verdict ("yes" for streaming, "no" for offline,
+// nothing for any other mode), so the gateway can answer a stream=true
+// transcription up front -- streamed or buffered -- instead of discovering a
+// refusal from the child. It rides the same sample.CapabilitySourceAudioCppModels
+// source, gated on the same gateway-declared "capability_source_audiocpp", and
+// is cached with the other verdicts of the same document. PATCH, and the rule
+// decides it: agent.Features gains NO entry, and no wire shape changes (an
+// open-vocabulary verdict name on an existing source).
+const Version = "0.9.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1620,8 +1632,9 @@ func (a *Agent) clock() time.Time {
 //     collector.AudioCppModelsPath ("/v1/models"), audio.cpp's only
 //     capability signal: each listed model carries a task, and the entry for
 //     st.Model answers the speech and transcription capabilities as "yes" or
-//     "no" and nothing else; its LiveProgress is ALWAYS "", because audio.cpp
-//     has no timings surface.
+//     "no" and, for an asr model, the transcription_streaming capability from
+//     its mode, and nothing else; its LiveProgress is ALWAYS "", because
+//     audio.cpp has no timings surface.
 //   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
 //     GETs collector.LiveProgressProbePath ("/props").
 //
@@ -1860,12 +1873,13 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into
-// RuntimeSample.Capabilities' wire pointer type: each of the seven named
-// fields (vision, video, audio, tools, image, speech, transcription) becomes
-// one CapabilityVerdict entry keyed by its name, every Extra name becomes a
-// "yes" entry (a reported extra capability is a positive assertion), and an
-// empty ("" -- undetermined) field is skipped entirely rather than carried as
-// an entry, mirroring the store's row-absence-means-unknown model.
+// RuntimeSample.Capabilities' wire pointer type: each of the eight named
+// fields (vision, video, audio, tools, image, speech, transcription,
+// transcription_streaming) becomes one CapabilityVerdict entry keyed by its
+// name, every Extra name becomes a "yes" entry (a reported extra capability is
+// a positive assertion), and an empty ("" -- undetermined) field is skipped
+// entirely rather than carried as an entry, mirroring the store's
+// row-absence-means-unknown model.
 //
 // source is the caller's answer to "which probe produced this document" (a
 // sample.CapabilitySource* constant), carried onto the wrapper so the
@@ -1879,7 +1893,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // side the ingest folds this list into capability rows and keeps the FIRST
 // entry for a given name, dropping every later one -- so a name that appears
 // both as a structured field and in Extra resolves to the STRUCTURED answer.
-// The seven named fields therefore go first and Extra after; swapping the two
+// The eight named fields therefore go first and Extra after; swapping the two
 // blocks silently hands the open list the last word.
 //
 // Always returns a non-nil pointer whose Verdicts is itself non-nil (though
@@ -1889,7 +1903,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // uncached, undetermined probe -- see sample.RuntimeSample.Capabilities' own
 // doc comment for why that distinction is load-bearing.
 func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabilities {
-	verdicts := make([]sample.CapabilityVerdict, 0, 7+len(c.Extra))
+	verdicts := make([]sample.CapabilityVerdict, 0, 8+len(c.Extra))
 	if c.Vision != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "vision", Verdict: c.Vision})
 	}
@@ -1910,6 +1924,15 @@ func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabil
 	}
 	if c.Transcription != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "transcription", Verdict: c.Transcription})
+	}
+	// transcription_streaming refines transcription, so it is stated only
+	// beside a transcription "yes": a model that does not transcribe has no
+	// answer on it, not even a "no" (the gateway holds the same rule when it
+	// folds a direct audio_cpp app's verdicts into rows). The audio.cpp probe
+	// already sets it for an asr model alone; this keeps the emission itself
+	// from putting the name on any other.
+	if c.TranscriptionStreaming != "" && c.Transcription == "yes" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "transcription_streaming", Verdict: c.TranscriptionStreaming})
 	}
 	for _, name := range c.Extra {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: name, Verdict: "yes"})

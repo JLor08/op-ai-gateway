@@ -32,6 +32,16 @@ const (
 	audioCppTaskASR   = "asr"
 )
 
+// audio.cpp mode values. The listing's mode names how the model is LOADED:
+// "streaming" is a model that serves a streamed transcription (stream=true), and
+// "offline" one that answers only a one-shot request and refuses stream=true.
+// Any other value is no statement this code can act on. The mode is read for an
+// ASR model only (parseAudioCppModels): it says how a TRANSCRIBER streams.
+const (
+	audioCppModeStreaming = "streaming"
+	audioCppModeOffline   = "offline"
+)
+
 // AudioCppVerdicts is what one audio.cpp /v1/models listing says about ONE
 // model, one verdict per capability the listing can answer.
 //
@@ -47,20 +57,34 @@ const (
 // only that the server does not name the model), the listing is empty, it
 // cannot be read, or the named entry carries no task. See routing.CapabilitySourceAudioCppModels.
 //
-// The verdict is the capability axis and is decided from the task alone. Whether
-// the model is loaded RIGHT NOW is the health axis: an asr model the server
+// TranscriptionStreaming is the third axis, a refinement of Transcription: it says
+// whether a TRANSCRIBER can answer a stream=true transcription, which is what the
+// gateway's transcription handler decides stream-versus-buffered on. It is stated
+// for an asr model ONLY, from its mode: routing.CapabilityYes for mode "streaming",
+// routing.CapabilityNo for mode "offline", and "" for everything else -- no mode, an
+// empty or unknown one, one of the wrong type, no entry for the model at all, and
+// every model that is not an asr one (tts, clone, music, an entry with no task),
+// whatever its mode. A model that does not transcribe has no answer on a
+// transcription capability, not even a "no". The mode never sets or clears the
+// task's verdicts (Speech, Transcription): an odd mode costs only this axis.
+//
+// The verdict is the capability axis and is decided from the task (Speech,
+// Transcription) and, for an asr model, the mode (TranscriptionStreaming) alone.
+// Whether the model is loaded RIGHT NOW is the health axis: an asr model the server
 // lists as unloaded still carries task "asr", and stays a transcription "yes".
 type AudioCppVerdicts struct {
-	Speech        string
-	Transcription string
+	Speech                 string
+	Transcription          string
+	TranscriptionStreaming string
 }
 
 // AudioCppModelsProber is an optional provider capability: it GETs
-// target.Endpoint + /v1/models and derives the speech and transcription
-// verdicts the listing states for modelID. A transport failure or a non-2xx
-// status is an error and carries no verdict, so the caller writes nothing. A 2xx
-// body that does not name the model, or cannot be read, is NOT an error, only
-// empty verdicts -- the caller writes nothing for an empty verdict either.
+// target.Endpoint + /v1/models and derives the speech, transcription and
+// transcription streaming verdicts the listing states for modelID. A transport
+// failure or a non-2xx status is an error and carries no verdict, so the caller
+// writes nothing. A 2xx body that does not name the model, or cannot be read, is
+// NOT an error, only empty verdicts -- the caller writes nothing for an empty
+// verdict either.
 //
 // It is a client method, like ProbeSdcppCapabilities, and not a free function,
 // because the request must ride the client's own *http.Client: cmd/gateway
@@ -109,14 +133,21 @@ func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target ro
 	return parseAudioCppModels(body, modelID), nil
 }
 
-// audioCppModelsDoc is the part of the listing this code reads: each entry's id
-// and task. The rest of an entry (object, owned_by, family, mode, loaded, path)
+// audioCppModelsDoc is the part of the listing this code reads: each entry's id,
+// task and mode. The rest of an entry (object, owned_by, family, loaded, path)
 // answers no capability question and is left undecoded, so an unknown or added
 // field never breaks the read.
+//
+// Mode is held raw and decoded on its own (audioCppStreamingVerdict), and only for
+// an asr entry: a mode of
+// a type this code does not expect must cost only the streaming verdict, never
+// the speech and transcription verdicts the task decides, and a typed string
+// field would fail the whole document's decode on one odd mode.
 type audioCppModelsDoc struct {
 	Data []struct {
-		ID   string `json:"id"`
-		Task string `json:"task"`
+		ID   string          `json:"id"`
+		Task string          `json:"task"`
+		Mode json.RawMessage `json:"mode"`
 	} `json:"data"`
 }
 
@@ -137,12 +168,29 @@ type audioCppModelsDoc struct {
 //     is not a statement, and a "no" can switch the model's route off)
 //   - no entry for modelID, an empty data list, or an unreadable body -> both ""
 //
-// Only id and task are read: loaded (and family, mode, path) is deliberately
+// The streaming verdict is decided beside those, for an ASR model only, from the
+// entry's mode:
+//   - the entry whose id is modelID, with task "asr" and mode "streaming" ->
+//     streaming "yes"
+//   - the entry whose id is modelID, with task "asr" and mode "offline" ->
+//     streaming "no"
+//   - the entry whose id is modelID, with task "asr" and no mode, an empty, blank
+//     or unknown one, or one that is not a string -> streaming ""
+//   - the entry whose id is modelID, with any other task (tts, clone, music, an
+//     unknown one) or none -> streaming "", WHATEVER its mode: "transcription
+//     streaming" is the transcriber's capability, so a model that does not
+//     transcribe is no "no" on it either
+//   - no entry for modelID, an empty data list, or an unreadable body -> streaming ""
+//
+// A mode of an unexpected type leaves the task's verdicts alone: it costs only the
+// streaming verdict.
+//
+// Only id, task and mode are read: loaded (and family, path) is deliberately
 // not decoded. Whether a model is loaded is the health axis, not the capability
 // axis, so the server listing an asr model with loaded:false does not turn its
 // transcription "yes" into anything else.
 //
-// The id match is exact. The task match ignores case and surrounding
+// The id match is exact. The task and mode matches ignore case and surrounding
 // whitespace: a "TTS" or "ASR" the server might one day emit must not fall to
 // the "no" default, which is a bidirectional verdict that switches a route off.
 // The first entry that carries the id answers.
@@ -167,16 +215,41 @@ func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 		if entry.ID != modelID {
 			continue
 		}
+		var v AudioCppVerdicts
 		switch strings.ToLower(strings.TrimSpace(entry.Task)) {
 		case "":
-			return AudioCppVerdicts{}
 		case audioCppTaskTTS, audioCppTaskClone:
-			return AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}
+			v.Speech, v.Transcription = routing.CapabilityYes, routing.CapabilityNo
 		case audioCppTaskASR:
-			return AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes}
+			v.Speech, v.Transcription = routing.CapabilityNo, routing.CapabilityYes
+			v.TranscriptionStreaming = audioCppStreamingVerdict(entry.Mode)
 		default:
-			return AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityNo}
+			v.Speech, v.Transcription = routing.CapabilityNo, routing.CapabilityNo
 		}
+		return v
 	}
 	return AudioCppVerdicts{}
+}
+
+// audioCppStreamingVerdict maps one ASR entry's raw mode onto the transcription
+// streaming verdict (the caller asks it for an asr entry only):
+// "streaming" is routing.CapabilityYes and "offline"
+// routing.CapabilityNo, matched ignoring case and surrounding whitespace, and
+// everything else is "". Everything else covers an absent field, a null, an empty
+// or blank string, a mode this code does not know (a "no" is only ever the
+// server's own word for a model that cannot stream, never a guess), and a value
+// that is not a string at all.
+func audioCppStreamingVerdict(raw json.RawMessage) string {
+	var mode string
+	if err := json.Unmarshal(raw, &mode); err != nil {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case audioCppModeStreaming:
+		return routing.CapabilityYes
+	case audioCppModeOffline:
+		return routing.CapabilityNo
+	default:
+		return ""
+	}
 }

@@ -461,7 +461,14 @@ type Capabilities struct {
 	// both "".
 	Speech        string
 	Transcription string
-	Extra         []string
+	// TranscriptionStreaming is whether the model streams its transcript
+	// ("yes"/"no"/""), refining Transcription: a transcription "yes" model
+	// that streams answers a stream=true request incrementally, one that does
+	// not answers it in one piece. Only the audio.cpp probe sets it, from the
+	// "mode" its /v1/models entry states, and only for a model whose task is
+	// asr, so it is never set beside a Transcription of "no" or "".
+	TranscriptionStreaming string
+	Extra                  []string
 }
 
 // detectCapabilities is the capability detector for a llama.cpp /props

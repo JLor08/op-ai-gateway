@@ -423,11 +423,14 @@ const de = {
   chatAudioLoadError: 'Audio konnte nicht geladen werden.',
   // The wait of a running transcription (speech-to-text) turn, the transcript twin of the
   // audio wait above: it words the WAIT (the request may still be queued or waiting on a model
-  // load), and the sentence says no intermediate news is coming -- the transcript is one
-  // finished document, with nothing to count meanwhile.
+  // load), and the sentence says no intermediate news is coming BEFORE the first text -- there
+  // is nothing to count meanwhile. It is shown only until text arrives, and that is true on both
+  // paths: a one-shot model answers the whole transcript at once, a streaming one starts filling
+  // the turn in with its first delta, so the sentence promises neither "finished" nor "all at
+  // once".
   chatTranscriptionRunPending: 'Warte auf Transkript',
   chatTranscriptionNoIntermediateNews:
-    'Keine Zwischenmeldungen – das Transkript erscheint fertig oder gar nicht.',
+    'Keine Zwischenmeldungen – das Transkript erscheint, sobald das Modell Text liefert.',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -1490,6 +1493,9 @@ const de = {
   capabilityTools: 'Tools',
   capabilityImage: 'Bilderzeugung',
   capabilityTranscription: 'Transkription',
+  // Refines "Transkription": the model delivers the transcript incrementally
+  // (audio.cpp mode=streaming) instead of as one document at the end.
+  capabilityTranscriptionStreaming: 'Streaming-Transkription',
   capabilitySpeech: 'Sprachsynthese',
   // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
   // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
@@ -1790,10 +1796,12 @@ const de = {
     'Für die Transkription wird eine Audiodatei benötigt. Bitte hängen Sie Audio an oder nehmen Sie welches auf.',
   errorTranscriptionResponseFormatUnsupported:
     'Nicht unterstütztes Antwortformat für die Transkription. Unterstützt wird nur JSON.',
-  // Vom Portal nur über ein stream_format-Feld in den erweiterten Feldern erreichbar
-  // (stream selbst ist reserviert und wird vorher abgelehnt).
+  // Der Code gilt nur noch für ein stream, das kein Boolean ist, und für jedes
+  // stream_format; stream=true selbst ist für ein Streaming-Modell gültig. Vom Portal nur
+  // über ein stream_format-Feld in den erweiterten Feldern erreichbar (stream selbst ist
+  // reserviert und wird vorher abgelehnt).
   errorTranscriptionStreamUnsupported:
-    'Die Transkription unterstützt kein Streaming; die Antwort ist immer das vollständige Transkript. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
+    'Ungültige Streaming-Angabe für die Transkription: stream muss ein Boolean sein, und stream_format wird nicht unterstützt (ein gestreamtes Transkript wird im eigenen Ereignisformat des Modells ausgeliefert). Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
   // Das Ziel ist ein Agent, der multipart_proxy nicht gemeldet hat (älter als 0.9.0,
   // oder seit einem Neustart des Gateways noch nicht gemeldet).
   errorTranscriptionUnavailable:
@@ -3594,7 +3602,7 @@ const en: PortalMessages = {
   chatAudioLoadError: 'Could not load the audio.',
   chatTranscriptionRunPending: 'Waiting for transcript',
   chatTranscriptionNoIntermediateNews:
-    'No intermediate updates – the transcript arrives finished or not at all.',
+    'No intermediate updates – the transcript appears as soon as the model delivers text.',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',
@@ -4587,6 +4595,9 @@ const en: PortalMessages = {
   capabilityTools: 'Tools',
   capabilityImage: 'Image generation',
   capabilityTranscription: 'Transcription',
+  // Refines "Transcription": the model delivers the transcript incrementally
+  // (audio.cpp mode=streaming) instead of as one document at the end.
+  capabilityTranscriptionStreaming: 'Streaming transcription',
   capabilitySpeech: 'Speech synthesis',
   // The chip for the operator's EXCEPTION (image editing = No), not for a
   // capability: image editing is derived from image generation, so it has
@@ -4853,10 +4864,12 @@ const en: PortalMessages = {
     'Transcription needs an audio file. Please attach audio or record some.',
   errorTranscriptionResponseFormatUnsupported:
     'Unsupported response format for transcription. Only JSON is supported.',
-  // Reachable from the portal only through a stream_format field in the advanced
-  // fields (stream itself is reserved and refused earlier).
+  // The code now covers only a stream that is not a boolean and any stream_format;
+  // stream=true itself is valid for a streaming model. Reachable from the portal only
+  // through a stream_format field in the advanced fields (stream itself is reserved and
+  // refused earlier).
   errorTranscriptionStreamUnsupported:
-    'Transcription does not support streaming; the response is always the complete transcript. If present, remove the stream_format field from the advanced fields.',
+    "Invalid streaming option for transcription: stream must be a boolean, and stream_format is not supported (a streamed transcript is relayed in the model's own event format). If present, remove the stream_format field from the advanced fields.",
   // The target is an agent that has not declared multipart_proxy (older than 0.9.0, or
   // not reported since the gateway restarted).
   errorTranscriptionUnavailable:
