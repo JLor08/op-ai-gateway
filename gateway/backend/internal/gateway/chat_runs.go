@@ -1009,16 +1009,120 @@ func (s *Server) startRunCheckpoints(owner auth.Token, run *ChatRun) (stop func(
 	}
 }
 
+// runStreamTimings holds what the live and the final rates of a text run are measured
+// from: when the run's stream began to be consumed, when its first visible content and
+// its first reasoning arrived (zero until they do), and the completion-token count of
+// the terminal usage chunk.
+type runStreamTimings struct {
+	start          time.Time
+	firstContentAt time.Time
+	reasoningStart time.Time
+	outputTokens   int
+}
+
+// observeDelta handles one delta event of a text run's stream: it stamps the first
+// reasoning and the first content (the latter is the turn's time to first token, and
+// the reasoning time up to it), publishes the delta into the run, and refreshes the
+// live chars/s once there is visible content to measure.
+func (t *runStreamTimings) observeDelta(run *ChatRun, ev sseDeltaEvent) {
+	if ev.Reasoning != "" && t.reasoningStart.IsZero() {
+		t.reasoningStart = time.Now()
+	}
+	if ev.Content != "" && t.firstContentAt.IsZero() {
+		t.firstContentAt = time.Now()
+		m := run.currentMetrics()
+		m.TTFTMs = time.Since(t.start).Milliseconds()
+		if !t.reasoningStart.IsZero() {
+			m.ReasoningMs = t.firstContentAt.Sub(t.reasoningStart).Milliseconds()
+		}
+		run.setMetrics(m)
+	}
+	run.publish(ev)
+	if !t.firstContentAt.IsZero() {
+		_, content := run.buffered()
+		// chars/s, live: RUNES (not len's bytes), floored (issue #56).
+		if r := flooredRate(utf8.RuneCountInString(content), time.Since(t.firstContentAt)); r > 0 {
+			m := run.currentMetrics()
+			m.CharsPerSecond = r
+			run.setMetrics(m)
+		}
+	}
+}
+
+// recordFinalRates writes the run's final rates (issue #56) once its stream has ended.
+// It must be called after the checkpoint goroutine has stopped, so that this is the
+// last metrics write. Both rates are floored, but over DIFFERENT windows, because
+// their numerators cover different spans:
+//   - chars/s: the visible answer's runes over the CONTENT window
+//     (firstContentAt -> now). `content` excludes reasoning text, so its
+//     window must too, or the rate understates the answer's real speed.
+//   - tokens/s: the upstream's completion_tokens over the FULL GENERATION
+//     window (first token of any kind -> now). completion_tokens includes
+//     reasoning tokens (see internal/inference/types.go), so anchoring on
+//     firstContentAt would divide a reasoning-inclusive count by a
+//     reasoning-excluding window and inflate the rate several-fold on
+//     reasoning turns. reasoningStart is the first reasoning delta.
+//
+// A run that never produced content has no window and records no rate.
+func (t *runStreamTimings) recordFinalRates(run *ChatRun) {
+	if t.firstContentAt.IsZero() {
+		return
+	}
+	now := time.Now()
+	_, content := run.buffered()
+	m := run.currentMetrics()
+	m.CharsPerSecond = flooredRate(utf8.RuneCountInString(content), now.Sub(t.firstContentAt))
+	genStart := t.firstContentAt
+	if !t.reasoningStart.IsZero() && t.reasoningStart.Before(t.firstContentAt) {
+		genStart = t.reasoningStart
+	}
+	m.TokensPerSecond = flooredRate(t.outputTokens, now.Sub(genStart))
+	run.setMetrics(m)
+}
+
+// runStreamReadFailure maps the read error that cut a text run's stream short to the
+// run's terminal (status, message): a deadline is the run's own timeout, a cancel is
+// the user's Stop (the empty message the UI reads as such), and anything else is the
+// read error itself.
+func runStreamReadFailure(ctx context.Context, err error) (status, errMsg string) {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// The other half of the same conflation: once the upstream has
+		// answered 200 the deadline lands here, as a read error on a
+		// cancelled request, rather than on the Do above.
+		//
+		// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image and
+		// speech kinds are bounded (runDeadlineFor) and neither ever enters
+		// consumeRunStream -- they have no stream to consume -- while the
+		// reservation's context is a plain WithCancel over
+		// context.Background(), so no deadline reaches a text run from
+		// the HTTP request either. Bounding the text kind, or adding a
+		// future streaming kind that is bounded, makes this live again,
+		// and on that day the conflation it exists to prevent would
+		// otherwise return silently: a user who pressed nothing, told
+		// they pressed Stop.
+		//
+		// No test can drive it THROUGH consumeRunStream without first
+		// making the branch reachable, so the mapping is pinned on this
+		// function itself (TestRunStreamReadFailure). Do not delete
+		// this as dead weight. The live equivalent is the body-read
+		// branch in chat_runs_images.go, pinned by
+		// TestRunDeadlineMidResponseIsNotACancelEither.
+		return "error", runTimedOutMessage
+	case ctx.Err() != nil:
+		return "canceled", ""
+	default:
+		return "error", err.Error()
+	}
+}
+
 // consumeRunStream reads the loopback SSE, publishing deltas, computing metrics,
 // checkpointing every runCheckpointInterval, and committing on terminal.
 func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *ChatRun, resp *http.Response) {
 	stopCheckpoints := s.startRunCheckpoints(owner, run)
 	defer stopCheckpoints()
 
-	start := time.Now()
-	var firstContentAt time.Time
-	var reasoningStart time.Time
-	var outputTokens int
+	timings := runStreamTimings{start: time.Now()}
 	status, errMsg := "completed", ""
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -1032,64 +1136,15 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 			status, errMsg = "error", ev.ErrMsg
 			goto finish
 		case sseDelta:
-			if ev.Reasoning != "" && reasoningStart.IsZero() {
-				reasoningStart = time.Now()
-			}
-			if ev.Content != "" && firstContentAt.IsZero() {
-				firstContentAt = time.Now()
-				m := run.currentMetrics()
-				m.TTFTMs = time.Since(start).Milliseconds()
-				if !reasoningStart.IsZero() {
-					m.ReasoningMs = firstContentAt.Sub(reasoningStart).Milliseconds()
-				}
-				run.setMetrics(m)
-			}
-			run.publish(ev)
-			if !firstContentAt.IsZero() {
-				_, content := run.buffered()
-				// chars/s, live: RUNES (not len's bytes), floored (issue #56).
-				if r := flooredRate(utf8.RuneCountInString(content), time.Since(firstContentAt)); r > 0 {
-					m := run.currentMetrics()
-					m.CharsPerSecond = r
-					run.setMetrics(m)
-				}
-			}
+			timings.observeDelta(run, ev)
 		case sseUsage:
 			// The terminal usage chunk's exact completion-token count, used for
 			// the real tokens/sec computed at finish (issue #56).
-			outputTokens = ev.OutputTokens
+			timings.outputTokens = ev.OutputTokens
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		switch {
-		case errors.Is(ctx.Err(), context.DeadlineExceeded):
-			// The other half of the same conflation: once the upstream has
-			// answered 200 the deadline lands here, as a read error on a
-			// cancelled request, rather than on the Do above.
-			//
-			// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image and
-			// speech kinds are bounded (runDeadlineFor) and neither ever enters
-			// consumeRunStream -- they have no stream to consume -- while the
-			// reservation's context is a plain WithCancel over
-			// context.Background(), so no deadline reaches a text run from
-			// the HTTP request either. Bounding the text kind, or adding a
-			// future streaming kind that is bounded, makes this live again,
-			// and on that day the conflation it exists to prevent would
-			// otherwise return silently: a user who pressed nothing, told
-			// they pressed Stop.
-			//
-			// It therefore has NO test, and that is a consequence of the
-			// unreachability rather than a gap -- one cannot be written
-			// without first making the branch reachable. So: do not delete
-			// this as dead weight, and do not "fix" the missing coverage. The
-			// live equivalent is the body-read branch in chat_runs_images.go,
-			// pinned by TestRunDeadlineMidResponseIsNotACancelEither.
-			status, errMsg = "error", runTimedOutMessage
-		case ctx.Err() != nil:
-			status, errMsg = "canceled", ""
-		default:
-			status, errMsg = "error", err.Error()
-		}
+		status, errMsg = runStreamReadFailure(ctx, err)
 	}
 finish:
 	// Stop the checkpoint goroutine AND wait for any in-flight
@@ -1098,29 +1153,8 @@ finish:
 	// startRunCheckpoints).
 	stopCheckpoints()
 	// Final rates (issue #56), computed after the checkpoint goroutine has
-	// stopped so this is the last metrics write. Both are floored, but over
-	// DIFFERENT windows, because their numerators cover different spans:
-	//   - chars/s: the visible answer's runes over the CONTENT window
-	//     (firstContentAt -> now). `content` excludes reasoning text, so its
-	//     window must too, or the rate understates the answer's real speed.
-	//   - tokens/s: the upstream's completion_tokens over the FULL GENERATION
-	//     window (first token of any kind -> now). completion_tokens includes
-	//     reasoning tokens (see internal/inference/types.go), so anchoring on
-	//     firstContentAt would divide a reasoning-inclusive count by a
-	//     reasoning-excluding window and inflate the rate several-fold on
-	//     reasoning turns. reasoningStart is the first reasoning delta.
-	if !firstContentAt.IsZero() {
-		now := time.Now()
-		_, content := run.buffered()
-		m := run.currentMetrics()
-		m.CharsPerSecond = flooredRate(utf8.RuneCountInString(content), now.Sub(firstContentAt))
-		genStart := firstContentAt
-		if !reasoningStart.IsZero() && reasoningStart.Before(firstContentAt) {
-			genStart = reasoningStart
-		}
-		m.TokensPerSecond = flooredRate(outputTokens, now.Sub(genStart))
-		run.setMetrics(m)
-	}
+	// stopped so this is the last metrics write.
+	timings.recordFinalRates(run)
 	s.finishRun(context.Background(), owner, run, status, errMsg)
 }
 

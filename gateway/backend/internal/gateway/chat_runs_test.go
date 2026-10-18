@@ -845,10 +845,10 @@ func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
 // the same branch exists, but it cannot pin THAT branch: it is currently
 // UNREACHABLE -- only the image kind is bounded and an image run never enters
 // consumeRunStream -- so pointing this test at it would be pinning nothing.
-// The branch is kept and annotated where it lives (chat_runs.go, the
-// DeadlineExceeded case), for the day the text kind is bounded; its lack of a
-// test is a consequence of that unreachability rather than a gap, and one
-// cannot be written without first making it reachable.
+// The branch is kept and annotated where it lives (chat_runs.go,
+// runStreamReadFailure's DeadlineExceeded case), for the day the text kind is
+// bounded; no run can be made to reach it through the stream today, so its
+// mapping is pinned on that function itself (TestRunStreamReadFailure).
 //
 // The upstream below sends the first body chunk (which the gateway's copier
 // flushes straight through, so the run's Do returns) and then stalls, putting
@@ -874,6 +874,42 @@ func TestRunDeadlineMidResponseIsNotACancelEither(t *testing.T) {
 	defer unsub()
 	if snap.Err != runTimedOutMessage {
 		t.Fatalf("error = %q, want the timeout code %q", snap.Err, runTimedOutMessage)
+	}
+}
+
+// TestRunStreamReadFailure pins how a text run's stream read error is turned into
+// the run's terminal state. Nothing can make consumeRunStream reach the deadline
+// case today (see runStreamReadFailure), so the mapping is pinned on the function: a
+// deadline is the run's timeout and never a cancel (an empty message is what a user
+// cancel looks like), a cancel stays a cancel, and a read error on a live context is
+// the error itself.
+func TestRunStreamReadFailure(t *testing.T) {
+	readErr := errors.New("connection reset")
+
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	<-expired.Done()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cases := []struct {
+		name       string
+		ctx        context.Context
+		wantStatus string
+		wantMsg    string
+	}{
+		{"deadline is the timeout, not a cancel", expired, "error", runTimedOutMessage},
+		{"cancel is a cancel with no message", canceled, "canceled", ""},
+		{"read error on a live context is the error", context.Background(), "error", readErr.Error()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, msg := runStreamReadFailure(tc.ctx, readErr)
+			if status != tc.wantStatus || msg != tc.wantMsg {
+				t.Fatalf("runStreamReadFailure = (%q, %q), want (%q, %q)", status, msg, tc.wantStatus, tc.wantMsg)
+			}
+		})
 	}
 }
 

@@ -83,44 +83,69 @@ func wavDurationFromReader(r io.Reader) (int64, bool) {
 		consumed := uint64(0) // bytes of the chunk body already read
 		switch id {
 		case "fmt ":
-			if size < wavFmtMinLen {
-				return 0, false
-			}
-			var fields [wavFmtMinLen]byte
-			if _, err := io.ReadFull(r, fields[:]); err != nil {
-				return 0, false
-			}
-			rate, ok := wavConsistentByteRate(fields[:])
+			rate, ok := wavReadFmtByteRate(r, size)
 			if !ok {
 				return 0, false
 			}
 			byteRate, consumed = rate, wavFmtMinLen
 		case "data":
-			if byteRate == 0 {
-				return 0, false
-			}
-			held, err := io.Copy(io.Discard, r)
-			if err != nil || uint64(size) > uint64(held) {
-				return 0, false
-			}
-			unexplained := uint64(held) - uint64(size)
-			if size&1 == 1 && unexplained > 0 {
-				unexplained-- // the pad byte an odd-length chunk is followed by
-			}
-			if unexplained > wavTrailingSlackBytes {
-				return 0, false
-			}
-			// size < 2^32 and 1000 < 2^10, so the product fits easily in a uint64.
-			return int64(uint64(size) * 1000 / uint64(byteRate)), true
+			return wavDataDurationMillis(r, size, byteRate)
 		}
 
-		// Pass over the rest of the chunk. Chunks are word-aligned: an odd-length body
-		// is followed by one pad byte.
-		skip := uint64(size) - consumed + uint64(size&1)
-		if n, err := io.CopyN(io.Discard, r, int64(skip)); err != nil || uint64(n) != skip {
+		if !wavSkipChunkRest(r, size, consumed) {
 			return 0, false
 		}
 	}
+}
+
+// wavReadFmtByteRate reads the fixed PCM part of a `fmt ` chunk whose declared body
+// size is size, and returns its byte rate when the chunk is long enough to carry the
+// fields, they can be read, and they agree with each other (wavConsistentByteRate).
+// It leaves the reader wavFmtMinLen bytes into the chunk body.
+func wavReadFmtByteRate(r io.Reader, size uint32) (uint32, bool) {
+	if size < wavFmtMinLen {
+		return 0, false
+	}
+	var fields [wavFmtMinLen]byte
+	if _, err := io.ReadFull(r, fields[:]); err != nil {
+		return 0, false
+	}
+	return wavConsistentByteRate(fields[:])
+}
+
+// wavDataDurationMillis measures a `data` chunk whose header the reader has just
+// consumed: size is the body length the header declares and byteRate the one the
+// preceding `fmt ` chunk gave (zero when there was none, which is not measurable). It
+// reads the stream to its end -- everything after the chunk header is passed over and
+// counted -- and believes the declared size only as far as wavDurationFromReader's
+// count allows: the stream holds at least that many bytes, and no more than the pad
+// byte and wavTrailingSlackBytes beyond it.
+func wavDataDurationMillis(r io.Reader, size uint32, byteRate uint32) (int64, bool) {
+	if byteRate == 0 {
+		return 0, false
+	}
+	held, err := io.Copy(io.Discard, r)
+	if err != nil || uint64(size) > uint64(held) {
+		return 0, false
+	}
+	unexplained := uint64(held) - uint64(size)
+	if size&1 == 1 && unexplained > 0 {
+		unexplained-- // the pad byte an odd-length chunk is followed by
+	}
+	if unexplained > wavTrailingSlackBytes {
+		return 0, false
+	}
+	// size < 2^32 and 1000 < 2^10, so the product fits easily in a uint64.
+	return int64(uint64(size) * 1000 / uint64(byteRate)), true
+}
+
+// wavSkipChunkRest passes over the rest of a chunk whose body is size bytes long and
+// of which consumed bytes have already been read, and reports whether the stream held
+// them all. Chunks are word-aligned: an odd-length body is followed by one pad byte.
+func wavSkipChunkRest(r io.Reader, size uint32, consumed uint64) bool {
+	skip := uint64(size) - consumed + uint64(size&1)
+	n, err := io.CopyN(io.Discard, r, int64(skip))
+	return err == nil && uint64(n) == skip
 }
 
 // wavConsistentByteRate returns the byte rate of a `fmt ` chunk (f is its first

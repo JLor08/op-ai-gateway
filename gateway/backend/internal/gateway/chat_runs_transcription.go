@@ -336,11 +336,32 @@ func parseTranscriptionSSELine(line string) (transcriptionEvent, transcriptionLi
 // The checkpoints are stopped, and joined, before this returns: the commit that follows
 // must be the last writer to the transcript.
 func (s *Server) consumeTranscriptionStream(ctx context.Context, owner auth.Token, run *ChatRun, resp *http.Response, dispatchedAt time.Time, liftDeadline func()) (json.RawMessage, string, string) {
-	stopCheckpoints := func() { /* nothing started yet: there is no turn to checkpoint before the first delta */ }
-	var sawDelta, sawDone bool
-	var doneText string
+	doneText, sawDone, readErr := s.readTranscriptionEvents(owner, run, resp.Body, dispatchedAt, liftDeadline)
 
-	scanner := bufio.NewScanner(resp.Body)
+	if !sawDone {
+		// A deadline or a cancel lands here as a read error on the cancelled request,
+		// and reporting either as a broken stream -- or a deadline as a cancel -- would
+		// tell the user the upstream failed when it was they, or the clock, that ended it.
+		if status, msg, ended := runContextOutcome(ctx); ended {
+			return nil, status, msg
+		}
+		// Neither the frames nor the decoder's error are logged: they hold the transcript.
+		log.Printf("chat run %s: the transcription stream ended before its done event (read error: %t)", run.ID, readErr != nil)
+		return nil, "error", transcriptionRunResponseUnreadableMessage
+	}
+	return transcriptionTurnFromStreamText(run, doneText)
+}
+
+// readTranscriptionEvents reads a streamed transcription's event stream to its end,
+// publishing every delta into the run and starting its checkpoints at the first one
+// (see consumeTranscriptionStream for what each frame means). It returns the text the
+// done frame stated ("" when it stated none), whether a done frame was seen at all, and
+// the scanner's read error. The checkpoints are stopped, and joined, before it returns.
+func (s *Server) readTranscriptionEvents(owner auth.Token, run *ChatRun, body io.Reader, dispatchedAt time.Time, liftDeadline func()) (doneText string, sawDone bool, readErr error) {
+	stopCheckpoints := func() { /* nothing started yet: there is no turn to checkpoint before the first delta */ }
+	var sawDelta bool
+
+	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		ev, kind := parseTranscriptionSSELine(scanner.Text())
@@ -367,19 +388,15 @@ func (s *Server) consumeTranscriptionStream(ctx context.Context, owner auth.Toke
 		}
 	}
 	stopCheckpoints()
+	return doneText, sawDone, scanner.Err()
+}
 
-	if !sawDone {
-		// A deadline or a cancel lands here as a read error on the cancelled request,
-		// and reporting either as a broken stream -- or a deadline as a cancel -- would
-		// tell the user the upstream failed when it was they, or the clock, that ended it.
-		if status, msg, ended := runContextOutcome(ctx); ended {
-			return nil, status, msg
-		}
-		// Neither the frames nor the decoder's error are logged: they hold the transcript.
-		log.Printf("chat run %s: the transcription stream ended before its done event (read error: %t)", run.ID, scanner.Err() != nil)
-		return nil, "error", transcriptionRunResponseUnreadableMessage
-	}
-
+// transcriptionTurnFromStreamText turns the text of a stream that ended WITH a done
+// frame into the turn's outcome (parts, status, terminal message): the done frame's
+// text when it stated one, else the deltas the run buffered; "no transcript" when
+// neither holds any; otherwise the transcript as one ordinary text part, the shape the
+// one-shot answer is committed in.
+func transcriptionTurnFromStreamText(run *ChatRun, doneText string) (json.RawMessage, string, string) {
 	text := doneText
 	if strings.TrimSpace(text) == "" {
 		_, text = run.buffered() // the done frame restated nothing: the deltas are the text

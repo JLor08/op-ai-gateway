@@ -626,36 +626,21 @@ func rebuildTranscriptionBody(raw []byte, boundary, model string, stream streamE
 // part, and every other part -- its headers and its bytes -- as the client sent it.
 func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, model string, stream streamEdit) error {
 	name := part.FormName()
-	if name == "stream" {
-		switch stream {
-		case streamDrop:
-			return nil
-		case streamSetTrue:
-			if err := mw.WriteField("stream", "true"); err != nil {
-				return fmt.Errorf("write stream field: %w", err)
-			}
-			return nil
-		}
-	}
-	if model != "" && name == "model" {
-		if err := mw.WriteField("model", model); err != nil {
-			return fmt.Errorf("write model field: %w", err)
-		}
-		return nil
+	if handled, err := writeEditedTranscriptionField(mw, name, model, stream); handled {
+		return err
 	}
 	// The first byte of a `file` part says whether it is empty, without reading a
 	// large upload into a second buffer. A part that breaks off before it is an error.
 	var first []byte
 	if name == "file" {
-		var peek [1]byte
-		n, err := io.ReadFull(part, peek[:])
-		if errors.Is(err, io.EOF) {
+		peeked, empty, err := peekTranscriptionFileByte(part)
+		if err != nil {
+			return err
+		}
+		if empty {
 			return nil
 		}
-		if err != nil {
-			return fmt.Errorf("read part %q: %w", name, err)
-		}
-		first = peek[:n]
+		first = peeked
 	}
 	pw, err := mw.CreatePart(part.Header)
 	if err != nil {
@@ -668,6 +653,51 @@ func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, m
 		return fmt.Errorf("copy part %q: %w", name, err)
 	}
 	return nil
+}
+
+// writeEditedTranscriptionField writes the part named name in place of the client's
+// when the rebuild edits it, and reports whether it did: the `stream` part is dropped
+// (nothing is written) or restated as the literal true, as stream says, and the model
+// field is written with model for its value when that is set. handled is false for
+// every other part, which the caller copies as the client sent it; whenever err is not
+// nil, handled is true.
+func writeEditedTranscriptionField(mw *multipart.Writer, name, model string, stream streamEdit) (handled bool, err error) {
+	if name == "stream" {
+		switch stream {
+		case streamDrop:
+			return true, nil
+		case streamSetTrue:
+			return true, writeTranscriptionField(mw, "stream", "true")
+		}
+	}
+	if model != "" && name == "model" {
+		return true, writeTranscriptionField(mw, "model", model)
+	}
+	return false, nil
+}
+
+// writeTranscriptionField writes one plain form field into the rebuilt body.
+func writeTranscriptionField(mw *multipart.Writer, name, value string) error {
+	if err := mw.WriteField(name, value); err != nil {
+		return fmt.Errorf("write %s field: %w", name, err)
+	}
+	return nil
+}
+
+// peekTranscriptionFileByte reads the first byte of a `file` part, which the caller
+// writes back in front of the rest. empty is true when the part has no bytes at all (an
+// empty part is dropped from the rebuilt body); a part that breaks off before its first
+// byte is an error.
+func peekTranscriptionFileByte(part *multipart.Part) (first []byte, empty bool, err error) {
+	var peek [1]byte
+	n, err := io.ReadFull(part, peek[:])
+	if errors.Is(err, io.EOF) {
+		return nil, true, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read part %q: %w", part.FormName(), err)
+	}
+	return peek[:n], false, nil
 }
 
 // relayTranscription resolves the routing target for an already-gated transcription
