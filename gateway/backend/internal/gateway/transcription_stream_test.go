@@ -7,8 +7,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -193,10 +195,10 @@ func TestTranscriptionStreamRelayPassesSSEThrough(t *testing.T) {
 	if ev.ProviderPath != "/v1/audio/transcriptions" || ev.BillingUnit != usage.BillingUnitAudioSecond {
 		t.Fatalf("usage row = %q in %q, want /v1/audio/transcriptions in audio_second", ev.ProviderPath, ev.BillingUnit)
 	}
-	// Interim: a streamed body carries no duration, so it bills a loud zero until the
-	// duration is taken from the upload's WAV header (a later task replaces this).
+	// The upload of this fixture is no WAV, so there is no duration to bill: the loud
+	// zero. (The billing from a WAV upload is TestTranscriptionStreamBillsFromWavHeader's.)
 	if ev.BillingQuantity != 0 {
-		t.Fatalf("BillingQuantity = %v, want the interim loud zero", ev.BillingQuantity)
+		t.Fatalf("BillingQuantity = %v, want the loud zero of an upload that is no WAV", ev.BillingQuantity)
 	}
 }
 
@@ -434,7 +436,7 @@ func TestTranscriptionStreamFormatStillRefused(t *testing.T) {
 // The refusal is told from a server that is really failing by its sentence, in a 500
 // and nowhere else; and looking for it must not cost the body: whatever was read comes
 // back out in front of the rest.
-func TestRefusedStreamingTranscription(t *testing.T) {
+func TestPeekStreamingRefusal(t *testing.T) {
 	long := `{"error":{"message":"` + strings.Repeat("x", transcriptionRefusalPeekBytes+10) + `"}}`
 	for _, tc := range []struct {
 		name   string
@@ -453,8 +455,8 @@ func TestRefusedStreamingTranscription(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := &provider.ProxyResponse{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}
 
-			if got := refusedStreamingTranscription(resp); got != tc.want {
-				t.Fatalf("refusedStreamingTranscription = %v, want %v", got, tc.want)
+			if got := peekStreamingRefusal(resp); got != tc.want {
+				t.Fatalf("peekStreamingRefusal = %v, want %v", got, tc.want)
 			}
 			rest, err := io.ReadAll(resp.Body)
 			if err != nil || string(rest) != tc.body {
@@ -638,5 +640,620 @@ func TestIsStreamedTranscription(t *testing.T) {
 				t.Fatalf("isStreamedTranscription = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- Billing and capture of a streamed transcription ------------------------
+
+// newSSETranscriptionUpstream starts an audio.cpp stub that answers every call with an
+// event stream made of frames, written and flushed one at a time, and then ends the
+// body cleanly.
+func newSSETranscriptionUpstream(t *testing.T, frames ...string) (*httptest.Server, <-chan transcriptionUpstreamCall) {
+	t.Helper()
+	return newScriptedTranscriptionUpstream(t, func(_ int, w http.ResponseWriter, _ transcriptionUpstreamCall) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for _, frame := range frames {
+			_, _ = io.WriteString(w, frame)
+			flusher.Flush()
+		}
+	})
+}
+
+// streamingTranscriptionPartsOf is a valid streamed transcription request for model
+// whose upload is audio.
+func streamingTranscriptionPartsOf(model string, audio []byte) []editPart {
+	return []editPart{
+		{name: "model", body: []byte(model)},
+		{name: "file", filename: "clip.wav", contentType: "audio/wav", body: audio},
+		{name: "stream", body: []byte("true")},
+	}
+}
+
+// transcriptionFrameDelta and transcriptionFrameDone build the event frames audio.cpp streams, for a transcript the
+// test chooses.
+func transcriptionFrameDelta(text string) string {
+	return "data: {\"type\":\"transcript.text.delta\",\"delta\":" + jsonString(text) + "}\n\n"
+}
+
+func transcriptionFrameDone(text string) string {
+	return "data: {\"type\":\"transcript.text.done\",\"text\":" + jsonString(text) + ",\"timing\":{\"ttft_ms\":12}}\n\n"
+}
+
+func jsonString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err) // a string always marshals
+	}
+	return string(b)
+}
+
+// A streamed transcription that ends cleanly -- transcript.text.done, then [DONE] --
+// is billed from the duration of the WAV that was UPLOADED (the stream states none):
+// the `data` chunk over the header's byte rate, in audio_second, on the one usage row.
+// Neither the model name rewrite (the first case) nor an empty `file` part beside the
+// upload (the third) changes which bytes are read.
+func TestTranscriptionStreamBillsFromWavHeader(t *testing.T) {
+	half := buildPCMWav(t, 16000, 1, 16, 16000)           // 0.5 s
+	twoAndAQuarter := buildPCMWav(t, 16000, 1, 16, 72000) // 2.25 s
+	for _, tc := range []struct {
+		name  string
+		model string
+		parts func(model string, audio []byte) []editPart
+		audio []byte
+		want  float64
+	}{
+		{"half a second, model rewritten", transcriptionGatewayModel, streamingTranscriptionPartsOf, half, 0.5},
+		{"two and a quarter seconds, form already carries the mapped name", "asr-same", streamingTranscriptionPartsOf, twoAndAQuarter, 2.25},
+		{"an empty file part in front of the upload", transcriptionGatewayModel, func(model string, audio []byte) []editPart {
+			return append([]editPart{{name: "file", filename: "empty.wav", contentType: "audio/wav"}}, streamingTranscriptionPartsOf(model, audio)...)
+		}, half, 0.5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			up, _ := newSSETranscriptionUpstream(t, transcriptionFrameDelta("hello "), transcriptionFrameDelta("there"), transcriptionFrameDone("hello there"), transcriptionSSEEnd)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionParts(t, srv, tc.parts(tc.model, tc.audio))
+
+			if want := transcriptionFrameDelta("hello ") + transcriptionFrameDelta("there") + transcriptionFrameDone("hello there") + transcriptionSSEEnd; rec.Code != http.StatusOK || rec.Body.String() != want {
+				t.Fatalf("response = %d %q, want the upstream's stream, frame for frame", rec.Code, rec.Body.String())
+			}
+			ev := lastUsageEvent(t, srv)
+			if ev.Status != "success" || !ev.Stream {
+				t.Fatalf("usage row = %q stream=%v, want a streamed success", ev.Status, ev.Stream)
+			}
+			if math.Abs(ev.BillingQuantity-tc.want) > 1e-9 {
+				t.Fatalf("BillingQuantity = %v, want %v audio seconds from the WAV header", ev.BillingQuantity, tc.want)
+			}
+			requireSpeechNonTokenRow(t, ev)
+			if errs := errorLogs(buf); len(errs) != 0 {
+				t.Fatalf("a streamed transcription billed from its WAV logged at Error: %+v", errs)
+			}
+		})
+	}
+}
+
+// Everything short of a clean completion bills nothing -- and says so at Error
+// (ADR-041), once -- while the client still receives every frame the upstream sent:
+// the done event alone, [DONE] alone, [DONE] ahead of the done event, no terminal
+// event at all, and a connection torn down mid-stream.
+func TestTranscriptionStreamLoudZeroOnIncompleteStream(t *testing.T) {
+	wav := buildPCMWav(t, 16000, 1, 16, 16000)
+	for _, tc := range []struct {
+		name string
+		// answer writes the upstream's (incomplete) stream.
+		answer func(w http.ResponseWriter)
+		// wantStatus is the usage row's status: a body that ends cleanly is a success
+		// that billed nothing, one that broke off is a failed relay.
+		wantStatus string
+		wantBody   string
+	}{
+		{"deltas and then nothing", func(w http.ResponseWriter) { _, _ = io.WriteString(w, transcriptionFrameDelta("hello")) }, "success", transcriptionFrameDelta("hello")},
+		{"the done event without [DONE]", func(w http.ResponseWriter) {
+			_, _ = io.WriteString(w, transcriptionFrameDelta("hello")+transcriptionFrameDone("hello"))
+		}, "success", transcriptionFrameDelta("hello") + transcriptionFrameDone("hello")},
+		{"[DONE] without the done event", func(w http.ResponseWriter) {
+			_, _ = io.WriteString(w, transcriptionFrameDelta("hello")+transcriptionSSEEnd)
+		}, "success", transcriptionFrameDelta("hello") + transcriptionSSEEnd},
+		{"[DONE] ahead of the done event", func(w http.ResponseWriter) {
+			_, _ = io.WriteString(w, transcriptionFrameDelta("hello")+transcriptionSSEEnd+transcriptionFrameDone("hello"))
+		}, "success", transcriptionFrameDelta("hello") + transcriptionSSEEnd + transcriptionFrameDone("hello")},
+		{"an empty stream", func(http.ResponseWriter) {}, "success", ""},
+		{"a connection torn down mid-stream", func(w http.ResponseWriter) {
+			_, _ = io.WriteString(w, transcriptionFrameDelta("hello"))
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		}, "error", transcriptionFrameDelta("hello")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			up, _ := newScriptedTranscriptionUpstream(t, func(_ int, w http.ResponseWriter, _ transcriptionUpstreamCall) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				tc.answer(w)
+			})
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, wav))
+
+			if rec.Code != http.StatusOK || rec.Body.String() != tc.wantBody {
+				t.Fatalf("response = %d %q, want 200 and the frames the upstream sent, %q", rec.Code, rec.Body.String(), tc.wantBody)
+			}
+			ev := lastUsageEvent(t, srv)
+			if ev.Status != tc.wantStatus {
+				t.Fatalf("usage row status = %q, want %q", ev.Status, tc.wantStatus)
+			}
+			if ev.BillingQuantity != 0 {
+				t.Fatalf("BillingQuantity = %v, want 0: a stream that did not complete cleanly bills nothing", ev.BillingQuantity)
+			}
+			requireSpeechNonTokenRow(t, ev)
+			if tc.wantStatus == "success" {
+				errs := errorLogs(buf)
+				if len(errs) != 1 || !strings.Contains(errs[0].Msg, "streamed transcription") || !strings.Contains(errs[0].Msg, "without") {
+					t.Fatalf("Error logs = %+v, want exactly one saying the stream ended without its terminal events", errs)
+				}
+			}
+		})
+	}
+}
+
+// A clean stream whose upload cannot be measured is a loud zero too: the upload is no
+// WAV (webm bytes), or its header contradicts itself (an inflated byte rate would bill
+// a long clip as a short one), or the `data` chunk is longer than what was uploaded.
+// The transcript still reaches the client.
+func TestTranscriptionStreamLoudZeroOnAnUploadWithNoBillableDuration(t *testing.T) {
+	inflated := wavFile(t, wavFmtChunkWith(t, 1, 16000, 3200000, 2, 16), wavDataChunk(t, 32000)) // 1 s of audio claiming 10 ms
+	truncated := wavFile(t, wavFmtChunk(t, 16000, 1, 16), wavChunk(t, "data", 64000, make([]byte, 100)))
+	for _, tc := range []struct {
+		name  string
+		audio []byte
+	}{
+		{"webm bytes", []byte("\x1a\x45\xdf\xa3webm-not-a-wav")},
+		{"RIFF that is not WAVE", []byte("RIFF\x00\x00\x00\x00WEBMjunk")},
+		{"the fixture bytes of the other tests", transcriptionTestAudio},
+		{"an inflated byte rate", inflated},
+		{"a data chunk longer than the upload", truncated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			up, _ := newSSETranscriptionUpstream(t, transcriptionFrameDelta("hello"), transcriptionFrameDone("hello"), transcriptionSSEEnd)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, tc.audio))
+
+			if want := transcriptionFrameDelta("hello") + transcriptionFrameDone("hello") + transcriptionSSEEnd; rec.Code != http.StatusOK || rec.Body.String() != want {
+				t.Fatalf("response = %d %q, want the upstream's stream", rec.Code, rec.Body.String())
+			}
+			ev := lastUsageEvent(t, srv)
+			if ev.Status != "success" || ev.BillingQuantity != 0 {
+				t.Fatalf("usage row = %q billing %v, want a success that billed 0", ev.Status, ev.BillingQuantity)
+			}
+			requireSpeechNonTokenRow(t, ev)
+			errs := errorLogs(buf)
+			if len(errs) != 1 || !strings.Contains(errs[0].Msg, "streamed transcription") || !strings.Contains(errs[0].Msg, "WAV") {
+				t.Fatalf("Error logs = %+v, want exactly one saying the upload's duration could not be read from a WAV header", errs)
+			}
+		})
+	}
+}
+
+// A clip shorter than a millisecond is a real measurement of zero, not a failure to
+// measure: billed 0 and logged nowhere at Error.
+func TestTranscriptionStreamBillsASubMillisecondClipAsZeroWithoutAnError(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	t.Cleanup(restore)
+	up, _ := newSSETranscriptionUpstream(t, transcriptionFrameDelta("hi"), transcriptionFrameDone("hi"), transcriptionSSEEnd)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, buildPCMWav(t, 16000, 1, 16, 16))) // 0.5 ms
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ev := lastUsageEvent(t, srv); ev.Status != "success" || ev.BillingQuantity != 0 {
+		t.Fatalf("usage row = %q billing %v, want a success billed 0", ev.Status, ev.BillingQuantity)
+	}
+	if errs := errorLogs(buf); len(errs) != 0 {
+		t.Fatalf("a measured zero logged at Error: %+v", errs)
+	}
+}
+
+// The capture of a streamed transcription is the TRANSCRIPT the stream carried, not
+// the redacted summary a speech response gets (the stream shares speech's openai_audio
+// flavor, so the capture's endpoint stamp is what tells them apart): the deltas
+// assembled, equal to the done event's own text, and stored whole.
+func TestTranscriptionStreamCaptureAssemblesTranscript(t *testing.T) {
+	up, _ := newSSETranscriptionUpstream(t, transcriptionFrameDelta("hello "), transcriptionFrameDelta("there, "), transcriptionFrameDelta("world"), transcriptionFrameDone("hello there, world"), transcriptionSSEEnd)
+	srv, cs := newTranscriptionCaptureServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, buildPCMWav(t, 16000, 1, 16, 16000)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	saved, ok := cs.last()
+	if !ok {
+		t.Fatal("no capture saved")
+	}
+	if saved.APIFlavor != apiFlavorSpeech || saved.HTTPStatus != http.StatusOK {
+		t.Fatalf("capture row = %q/%d, want %s/200", saved.APIFlavor, saved.HTTPStatus, apiFlavorSpeech)
+	}
+	env := decryptCapture(t, saved.Blob)
+	if env.RespBody != "hello there, world" {
+		t.Fatalf("response body = %q, want the assembled transcript (the deltas joined, which is the done event's text)", env.RespBody)
+	}
+	if decodeCapturedBinaryBodyIsSummary(env.RespBody) {
+		t.Fatalf("response body = %q is the redacted binary summary", env.RespBody)
+	}
+	if env.Truncated {
+		t.Fatal("Truncated = true, want false: the transcript is far below the cap")
+	}
+	if got := env.RespHeaders["Content-Type"]; len(got) != 1 || got[0] != "text/event-stream" {
+		t.Fatalf("response headers = %v, want the Content-Type the client was sent", env.RespHeaders)
+	}
+	// The request is captured as a transcription's always is: fields kept, audio redacted.
+	if p := capturedPartByName(t, decodeCapturedMultipart(t, env.ReqBody), "file"); !p.Redacted {
+		t.Fatalf("file part = %+v, want the audio redacted", p)
+	}
+}
+
+// A stream that breaks off keeps the transcript it had delivered: the capture holds
+// the deltas assembled so far (the done event, which would have restated the whole
+// text, never came).
+func TestTranscriptionStreamCaptureKeepsThePartialTranscriptOfAnIncompleteStream(t *testing.T) {
+	up, _ := newSSETranscriptionUpstream(t, transcriptionFrameDelta("hello "), transcriptionFrameDelta("there"))
+	srv, cs := newTranscriptionCaptureServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, buildPCMWav(t, 16000, 1, 16, 16000)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	saved, ok := cs.last()
+	if !ok {
+		t.Fatal("no capture saved")
+	}
+	if env := decryptCapture(t, saved.Blob); env.RespBody != "hello there" {
+		t.Fatalf("response body = %q, want the partial transcript the deltas carried", env.RespBody)
+	}
+}
+
+// The done event is the authoritative text: it is what the capture stores when it
+// differs from the deltas (a model that revises what it said), and the only source
+// when the stream carried no deltas at all.
+func TestTranscriptionStreamCapturePrefersTheDoneText(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		frames []string
+	}{
+		{"the done event revises the deltas", []string{transcriptionFrameDelta("hello thar"), transcriptionFrameDone("hello there"), transcriptionSSEEnd}},
+		{"no deltas at all", []string{transcriptionFrameDone("hello there"), transcriptionSSEEnd}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, _ := newSSETranscriptionUpstream(t, tc.frames...)
+			srv, cs := newTranscriptionCaptureServer(t, up.URL)
+
+			postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, buildPCMWav(t, 16000, 1, 16, 16000)))
+
+			saved, ok := cs.last()
+			if !ok {
+				t.Fatal("no capture saved")
+			}
+			if env := decryptCapture(t, saved.Blob); env.RespBody != "hello there" {
+				t.Fatalf("response body = %q, want the done event's text", env.RespBody)
+			}
+		})
+	}
+}
+
+// The capture cap bounds what a capture keeps and never what the relay delivers: a
+// transcript past it is clipped to the cap and marked truncated, while the client
+// still gets every frame -- and the stream still completes, so it is billed.
+func TestTranscriptionStreamCaptureClipsATranscriptPastTheCap(t *testing.T) {
+	var frames []string
+	var whole strings.Builder
+	for i := 0; i < 64; i++ {
+		piece := strings.Repeat("x", 64) // 4096 bytes of transcript in all
+		whole.WriteString(piece)
+		frames = append(frames, transcriptionFrameDelta(piece))
+	}
+	frames = append(frames, transcriptionFrameDone(whole.String()), transcriptionSSEEnd)
+	up, _ := newSSETranscriptionUpstream(t, frames...)
+	srv, cs := newTranscriptionCaptureServer(t, up.URL)
+	srv.captureMaxBytes = 1024
+
+	rec := postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, buildPCMWav(t, 16000, 1, 16, 16000)))
+
+	if want := strings.Join(frames, ""); rec.Code != http.StatusOK || rec.Body.String() != want {
+		t.Fatalf("client got %d bytes, want the whole %d-byte stream", rec.Body.Len(), len(want))
+	}
+	saved, ok := cs.last()
+	if !ok {
+		t.Fatal("no capture saved")
+	}
+	env := decryptCapture(t, saved.Blob)
+	if env.RespBody != whole.String()[:1024] || !env.Truncated {
+		t.Fatalf("response body is %d bytes, Truncated = %v, want the first 1024 bytes of the transcript and Truncated", len(env.RespBody), env.Truncated)
+	}
+	if ev := lastUsageEvent(t, srv); ev.BillingQuantity != 0.5 {
+		t.Fatalf("BillingQuantity = %v, want 0.5: a transcript past the capture cap does not stop the stream completing", ev.BillingQuantity)
+	}
+}
+
+// The mode-mismatch refusal is retried EXACTLY once. A stub that refuses every call --
+// the retry included -- must see two calls and no more: the retry is a plain
+// transcription, so its refusal is the upstream's error like any other and is relayed.
+// (Were the retry still marked as a stream -- rel.bufferedRetry not cleared before the
+// relay re-enters itself -- every refusal would start another retry, without end.)
+func TestTranscriptionStreamRetriesTheRefusalExactlyOnce(t *testing.T) {
+	up, calls := newScriptedTranscriptionUpstream(t, func(n int, w http.ResponseWriter, _ transcriptionUpstreamCall) {
+		w.Header().Set("Content-Type", "application/json")
+		if n > 2 {
+			// Only a relay that keeps retrying gets here. Answering it differently ends its
+			// loop, so that breaking the guard FAILS this test instead of hanging it.
+			_, _ = io.WriteString(w, transcriptionOKBody)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, transcriptionModeMismatchBody)
+	})
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, streamingTranscriptionParts(transcriptionGatewayModel))
+
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), transcriptionStreamingRefusal) {
+		t.Fatalf("response = %d %s, want the upstream's refusal relayed as its 500", rec.Code, rec.Body.String())
+	}
+	all := drainTranscriptionUpstreamCalls(calls)
+	if len(all) != 2 {
+		t.Fatalf("upstream calls = %d, want exactly 2 (the streamed attempt and its one buffered retry)", len(all))
+	}
+	if _, ok := formFieldOf(t, all[1].body, all[1].contentType, "stream"); ok {
+		t.Fatal("the retry still carries a stream field, want it dropped")
+	}
+	events := srv.Usage.All()
+	if len(events) != 1 || events[0].Status != "error" || events[0].HTTPStatus != http.StatusInternalServerError {
+		t.Fatalf("usage rows = %+v, want one error row at the upstream's 500", events)
+	}
+}
+
+// Frames are not aligned with the upstream's writes: a frame -- the done event and the
+// [DONE] sentinel included -- split across several writes still completes the stream.
+func TestTranscriptionStreamCompletesWhenFramesAreSplitAcrossWrites(t *testing.T) {
+	done := transcriptionFrameDone("hello there")
+	pieces := []string{
+		transcriptionFrameDelta("hello there")[:20],
+		transcriptionFrameDelta("hello there")[20:] + done[:30],
+		done[30:] + "data: [DO",
+		"NE]\n\n",
+	}
+	up, _ := newSSETranscriptionUpstream(t, pieces...)
+	srv, cs := newTranscriptionCaptureServer(t, up.URL)
+
+	rec := postTranscriptionParts(t, srv, streamingTranscriptionPartsOf(transcriptionGatewayModel, buildPCMWav(t, 16000, 1, 16, 16000)))
+
+	if want := strings.Join(pieces, ""); rec.Code != http.StatusOK || rec.Body.String() != want {
+		t.Fatalf("response = %d %q, want the upstream's stream unchanged", rec.Code, rec.Body.String())
+	}
+	if ev := lastUsageEvent(t, srv); ev.BillingQuantity != 0.5 {
+		t.Fatalf("BillingQuantity = %v, want 0.5: the stream completed", ev.BillingQuantity)
+	}
+	saved, ok := cs.last()
+	if !ok {
+		t.Fatal("no capture saved")
+	}
+	if env := decryptCapture(t, saved.Blob); env.RespBody != "hello there" {
+		t.Fatalf("response body = %q, want the transcript", env.RespBody)
+	}
+}
+
+// scanOf feeds stream to a scan in chunks of size bytes (the whole stream at once for
+// size 0), finishes it, and returns it.
+func scanOf(scan *transcriptionStreamScan, stream string, size int) *transcriptionStreamScan {
+	if size <= 0 {
+		size = len(stream)
+	}
+	for rest := []byte(stream); len(rest) > 0; {
+		n := min(size, len(rest))
+		scan.feed(rest[:n])
+		rest = rest[n:]
+	}
+	scan.finish()
+	return scan
+}
+
+func newTestTranscriptionScan() *transcriptionStreamScan {
+	return &transcriptionStreamScan{maxLine: 1 << 20, keepText: true, textCap: 1 << 20}
+}
+
+// What the scan concludes does not depend on how the stream was cut into chunks, or on
+// the line endings it uses.
+func TestTranscriptionStreamScanReadsAStreamWhateverItsChunking(t *testing.T) {
+	stream := transcriptionFrameDelta("héllo ") + ": a comment\n" + "event: transcript\n" + transcriptionFrameDelta("wörld") + transcriptionFrameDone("héllo wörld") + transcriptionSSEEnd
+	for name, text := range map[string]string{
+		"LF":   stream,
+		"CRLF": strings.ReplaceAll(stream, "\n", "\r\n"),
+	} {
+		for _, size := range []int{0, 1, 2, 3, 7, 64} {
+			scan := scanOf(newTestTranscriptionScan(), text, size)
+			if !scan.complete() {
+				t.Fatalf("%s in chunks of %d: complete = false, want true", name, size)
+			}
+			if got := string(scan.transcript()); got != "héllo wörld" {
+				t.Fatalf("%s in chunks of %d: transcript = %q, want %q", name, size, got, "héllo wörld")
+			}
+		}
+	}
+}
+
+// Only the terminal events in their order complete a stream, and anything that is not
+// one is ignored rather than mistaken for one.
+func TestTranscriptionStreamScanCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stream   string
+		complete bool
+	}{
+		{"done then [DONE]", transcriptionFrameDone("x") + transcriptionSSEEnd, true},
+		{"[DONE] as the last line, with no newline", transcriptionFrameDone("x") + "data: [DONE]", true},
+		{"[DONE] without a space after the colon", transcriptionFrameDone("x") + "data:[DONE]\n\n", true},
+		{"the done event only", transcriptionFrameDone("x"), false},
+		{"[DONE] only", transcriptionSSEEnd, false},
+		{"[DONE] ahead of the done event", transcriptionSSEEnd + transcriptionFrameDone("x"), false},
+		{"nothing", "", false},
+		{"the done event cut mid-frame", transcriptionFrameDone("x")[:40], false},
+		{"a done event that is not JSON", "data: {\"type\":\"transcript.text.done\"\n\n" + transcriptionSSEEnd, false},
+		{"the event type named in a delta's text, not in its type", transcriptionFrameDelta(`transcript.text.done`) + transcriptionSSEEnd, false},
+		{"another event type", "data: {\"type\":\"transcript.text.segment\",\"text\":\"x\"}\n\n" + transcriptionSSEEnd, false},
+		{"the done event as a comment", ": " + transcriptionFrameDone("x") + transcriptionSSEEnd, false},
+		{"[DONE] carried in a field that is not data", transcriptionFrameDone("x") + "event: [DONE]\n\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, size := range []int{0, 1} {
+				if got := scanOf(newTestTranscriptionScan(), tc.stream, size).complete(); got != tc.complete {
+					t.Fatalf("complete = %v (chunks of %d), want %v", got, size, tc.complete)
+				}
+			}
+		})
+	}
+}
+
+// The transcript the scan keeps is bounded by the cap -- one byte past it, so a
+// clipped transcript can be told from one that fits exactly -- and is not kept at all
+// when nothing is captured; completion is tracked either way.
+func TestTranscriptionStreamScanBoundsTheTranscript(t *testing.T) {
+	stream := transcriptionFrameDelta("0123456789") + transcriptionFrameDelta("abcdefghij") + transcriptionFrameDone("0123456789abcdefghij") + transcriptionSSEEnd
+
+	t.Run("clipped to the cap plus one byte", func(t *testing.T) {
+		scan := scanOf(&transcriptionStreamScan{maxLine: 1 << 20, keepText: true, textCap: 12}, stream, 0)
+		if got := string(scan.transcript()); got != "0123456789abc" {
+			t.Fatalf("transcript = %q, want the first 13 bytes of the done text", got)
+		}
+	})
+	t.Run("deltas are clipped the same way", func(t *testing.T) {
+		scan := scanOf(&transcriptionStreamScan{maxLine: 1 << 20, keepText: true, textCap: 12}, transcriptionFrameDelta("0123456789")+transcriptionFrameDelta("abcdefghij"), 0)
+		if got := string(scan.transcript()); got != "0123456789abc" {
+			t.Fatalf("transcript = %q, want the first 13 bytes of the deltas", got)
+		}
+	})
+	t.Run("a transcript that fits the cap exactly is whole", func(t *testing.T) {
+		scan := scanOf(&transcriptionStreamScan{maxLine: 1 << 20, keepText: true, textCap: 20}, stream, 0)
+		if got := string(scan.transcript()); got != "0123456789abcdefghij" {
+			t.Fatalf("transcript = %q, want the whole text", got)
+		}
+	})
+	t.Run("nothing kept when nothing is captured", func(t *testing.T) {
+		scan := scanOf(&transcriptionStreamScan{maxLine: 1 << 20}, stream, 0)
+		if len(scan.transcript()) != 0 || !scan.complete() {
+			t.Fatalf("transcript = %q, complete = %v, want no transcript and a completed stream", scan.transcript(), scan.complete())
+		}
+	})
+}
+
+// A line that has to be carried across chunks and outgrows maxLine is given up whole --
+// its start, and its rest however many chunks that spans -- and the lines after it are
+// read as if it had not been there. (A line that arrives inside one chunk is held by
+// nobody: the bound is on what the scan carries, and a chunk is the copier's own read
+// buffer.)
+func TestTranscriptionStreamScanDropsALineBeyondItsBoundAndRecovers(t *testing.T) {
+	long := transcriptionFrameDelta(strings.Repeat("x", 300)) // one line, far past 100 bytes
+	newScan := func() *transcriptionStreamScan {
+		return &transcriptionStreamScan{maxLine: 100, keepText: true, textCap: 1 << 20}
+	}
+	for _, size := range []int{1, 50, 150} {
+		scan := scanOf(newScan(), long+transcriptionFrameDelta("kept"), size)
+		if got := string(scan.transcript()); got != "kept" {
+			t.Fatalf("chunks of %d: transcript = %q, want only the line after the dropped one", size, got)
+		}
+		if cap(scan.carry) > 100 {
+			t.Fatalf("chunks of %d: carry holds %d bytes, want it bounded by the line limit", size, cap(scan.carry))
+		}
+		if scan := scanOf(newScan(), long+transcriptionFrameDone("kept")+transcriptionSSEEnd, size); !scan.complete() {
+			t.Fatalf("chunks of %d: complete = false, want true: the lines after the dropped one still count", size)
+		}
+	}
+	// A done frame that is itself past the bound is lost: billing fails closed.
+	scan := scanOf(newScan(), transcriptionFrameDone(strings.Repeat("x", 300))+transcriptionSSEEnd, 50)
+	if scan.complete() {
+		t.Fatal("a done frame past the line bound completed the stream, want it dropped (a loud zero, never a guess)")
+	}
+}
+
+// A relay that is not a streamed transcription carries no scan, and none of its
+// methods may trip on that.
+func TestTranscriptionStreamScanIsNilSafe(t *testing.T) {
+	var scan *transcriptionStreamScan
+	scan.feed([]byte(transcriptionFrameDone("x") + transcriptionSSEEnd))
+	scan.finish()
+	if scan.complete() {
+		t.Fatal("a nil scan completed")
+	}
+	in := &captureInput{RespBody: []byte("kept")}
+	scan.stampCapture(in)
+	if in.Endpoint != endpointChat || string(in.RespBody) != "kept" {
+		t.Fatalf("a nil scan changed the capture: %+v", in)
+	}
+	scanOf(newTestTranscriptionScan(), "x", 0).stampCapture(nil)
+}
+
+// Only the transcription endpoint gets a scan.
+func TestNewTranscriptionStreamScanIsForTheTranscriptionEndpointOnly(t *testing.T) {
+	srv := &Server{captureMaxBytes: 100}
+	for endpoint, want := range map[sessionEndpoint]bool{endpointTranscription: true, endpointSpeech: false, endpointChat: false} {
+		if got := srv.newTranscriptionStreamScan(endpoint, true) != nil; got != want {
+			t.Errorf("scan for endpoint %v present = %v, want %v", endpoint, got, want)
+		}
+	}
+	scan := srv.newTranscriptionStreamScan(endpointTranscription, true)
+	if !scan.keepText || scan.textCap != 100 || scan.maxLine != int(defaultMaxAudioTranscriptionBodyBytes) {
+		t.Fatalf("scan = %+v, want it keeping up to the capture cap, with the transcription cap as its line bound", scan)
+	}
+	if srv.newTranscriptionStreamScan(endpointTranscription, false).keepText {
+		t.Fatal("a scan of a request that is not captured keeps the transcript")
+	}
+}
+
+// The upload's duration is read from the right part of the form, however the form is
+// laid out, and from nothing that is not a form.
+func TestUploadWavDurationMillis(t *testing.T) {
+	wav := buildPCMWav(t, 16000, 1, 16, 32000) // 1 s
+	other := buildPCMWav(t, 16000, 1, 16, 64000)
+	form := func(parts ...editPart) ([]byte, string) { return buildEditMultipart(t, parts) }
+
+	for _, tc := range []struct {
+		name   string
+		parts  []editPart
+		wantMs int64
+		wantOK bool
+	}{
+		{"the file part", []editPart{{name: "model", body: []byte("m")}, {name: "file", filename: "a.wav", body: wav}}, 1000, true},
+		{"the file part first", []editPart{{name: "file", filename: "a.wav", body: wav}, {name: "model", body: []byte("m")}}, 1000, true},
+		{"an empty file part is no upload", []editPart{{name: "file", filename: "e.wav"}, {name: "file", filename: "a.wav", body: wav}}, 1000, true},
+		{"a WAV in another field is not the upload", []editPart{{name: "file[]", filename: "o.wav", body: other}, {name: "prompt", body: other}, {name: "file", filename: "a.wav", body: wav}}, 1000, true},
+		{"no file part", []editPart{{name: "model", body: []byte("m")}, {name: "file[]", filename: "o.wav", body: other}}, 0, false},
+		{"only an empty file part", []editPart{{name: "file", filename: "e.wav"}}, 0, false},
+		{"a file that is no WAV", []editPart{{name: "file", filename: "a.webm", body: []byte("not a wav")}}, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, ct := form(tc.parts...)
+			ms, ok := uploadWavDurationMillis(body, ct)
+			if ms != tc.wantMs || ok != tc.wantOK {
+				t.Fatalf("uploadWavDurationMillis = (%d, %v), want (%d, %v)", ms, ok, tc.wantMs, tc.wantOK)
+			}
+		})
+	}
+	body, ct := form(editPart{name: "file", filename: "a.wav", body: wav})
+	for name, badCT := range map[string]string{"no content type": "", "not multipart": "application/json", "no boundary": "multipart/form-data", "a boundary that is not the body's": strings.Replace(ct, "boundary=", "boundary=x", 1)} {
+		if ms, ok := uploadWavDurationMillis(body, badCT); ok || ms != 0 {
+			t.Errorf("%s: uploadWavDurationMillis = (%d, %v), want (0, false)", name, ms, ok)
+		}
+	}
+	if ms, ok := uploadWavDurationMillis(body[:len(body)/2], ct); ok || ms != 0 {
+		t.Errorf("a form cut short: uploadWavDurationMillis = (%d, %v), want (0, false)", ms, ok)
 	}
 }

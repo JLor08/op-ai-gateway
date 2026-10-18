@@ -35,16 +35,25 @@ func wavChunk(t *testing.T, id string, declaredSize uint32, body []byte) []byte 
 	return buf.Bytes()
 }
 
-// wavFmtChunk builds a canonical 16-byte PCM `fmt ` chunk.
+// wavFmtChunk builds a canonical 16-byte PCM `fmt ` chunk: a header that agrees with
+// itself (block align = channels x bytes per sample, byte rate = sample rate x block
+// align).
 func wavFmtChunk(t *testing.T, sampleRate uint32, channels, bits uint16) []byte {
 	t.Helper()
 	blockAlign := channels * bits / 8
+	return wavFmtChunkWith(t, channels, sampleRate, sampleRate*uint32(blockAlign), blockAlign, bits)
+}
+
+// wavFmtChunkWith builds a 16-byte PCM `fmt ` chunk from every field as given, so a
+// test can write a header that contradicts itself.
+func wavFmtChunkWith(t *testing.T, channels uint16, sampleRate, byteRate uint32, blockAlign, bits uint16) []byte {
+	t.Helper()
 	var body bytes.Buffer
 	wavPut(t, &body,
 		uint16(1), // audio format: PCM
 		channels,
 		sampleRate,
-		sampleRate*uint32(blockAlign), // byte rate
+		byteRate,
 		blockAlign,
 		bits,
 	)
@@ -140,6 +149,9 @@ func TestWavDurationMillisRejectsNonWav(t *testing.T) {
 		{"data before fmt", wavFile(t, wavDataChunk(t, 100), validFmt)},
 		{"fmt chunk too short", wavFile(t, shortFmt, wavDataChunk(t, 100))},
 		{"zero byte rate", wavFile(t, zeroRateFmt, wavDataChunk(t, 100))},
+		{"zero channels", wavFile(t, wavFmtChunkWith(t, 0, 16000, 0, 0, 16), wavDataChunk(t, 100))},
+		{"zero sample rate", wavFile(t, wavFmtChunkWith(t, 1, 0, 32000, 2, 16), wavDataChunk(t, 100))},
+		{"zero bits per sample", wavFile(t, wavFmtChunkWith(t, 1, 16000, 32000, 2, 0), wavDataChunk(t, 100))},
 		{"data size exceeds buffer", wavFile(t, validFmt, wavChunk(t, "data", 1000, make([]byte, 100)))},
 		{"data size 4 GiB, no body", wavFile(t, validFmt, wavChunk(t, "data", math.MaxUint32, nil))},
 		{"foreign chunk size exceeds buffer", wavFile(t, validFmt, wavChunk(t, "LIST", math.MaxUint32, nil), wavDataChunk(t, 100))},
@@ -164,5 +176,60 @@ func TestWavDurationMillisHandlesChunkOrderAndPadding(t *testing.T) {
 	}
 	if ms != 1000 {
 		t.Fatalf("wavDurationMillis = %d ms, want 1000 ms", ms)
+	}
+}
+
+// The byte rate is the divisor of the duration and is written by the CLIENT, so a
+// header that inflates it would bill a long clip as a short one. Only a header that
+// agrees with itself is believed: block align must be channels x bytes per sample
+// and the byte rate sample rate x block align. Each case below changes ONE field of
+// a 16 kHz mono 16-bit header (32000 bytes per second, 2 per frame) and so makes the
+// header contradict itself.
+func TestWavDurationMillisRejectsAHeaderThatContradictsItself(t *testing.T) {
+	data := wavDataChunk(t, 32000)
+	for _, tc := range []struct {
+		name string
+		fmt  []byte
+	}{
+		{"byte rate inflated 100x", wavFmtChunkWith(t, 1, 16000, 3200000, 2, 16)},
+		{"byte rate halved", wavFmtChunkWith(t, 1, 16000, 16000, 2, 16)},
+		{"byte rate off by one", wavFmtChunkWith(t, 1, 16000, 32001, 2, 16)},
+		{"block align inflated with a byte rate that follows it", wavFmtChunkWith(t, 1, 16000, 3200000, 200, 16)},
+		{"block align not channels x sample size", wavFmtChunkWith(t, 2, 16000, 32000, 2, 16)},
+		{"sample rate inflated, byte rate kept", wavFmtChunkWith(t, 1, 1600000, 32000, 2, 16)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ms, ok := wavDurationMillis(wavFile(t, tc.fmt, data))
+			if ok || ms != 0 {
+				t.Fatalf("wavDurationMillis = (%d, %v), want (0, false): the header is not believable", ms, ok)
+			}
+		})
+	}
+}
+
+// Samples that do not fill whole bytes are stored in whole-byte containers, so the
+// consistency check rounds the sample size UP: a 12-bit mono header (2-byte frames)
+// is as sound as a 16-bit one, and 8-, 24- and 32-bit headers are believed too.
+func TestWavDurationMillisAcceptsEverySampleSizeAConsistentHeaderCanCarry(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		sampleRate     uint32
+		channels, bits uint16
+		blockAlign     uint16
+		dataBytes      int
+		wantMillis     int64
+	}{
+		{"8-bit mono", 8000, 1, 8, 1, 8000, 1000},
+		{"12-bit mono in 2-byte containers", 16000, 1, 12, 2, 32000, 1000},
+		{"24-bit stereo", 48000, 2, 24, 6, 288000, 1000},
+		{"32-bit mono", 16000, 1, 32, 4, 64000, 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fmtChunk := wavFmtChunkWith(t, tc.channels, tc.sampleRate, tc.sampleRate*uint32(tc.blockAlign), tc.blockAlign, tc.bits)
+			ms, ok := wavDurationMillis(wavFile(t, fmtChunk, wavDataChunk(t, tc.dataBytes)))
+			if !ok || ms != tc.wantMillis {
+				t.Fatalf("wavDurationMillis = (%d, %v), want (%d, true)", ms, ok, tc.wantMillis)
+			}
+		})
 	}
 }

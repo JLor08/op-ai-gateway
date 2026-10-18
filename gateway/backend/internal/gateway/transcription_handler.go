@@ -671,16 +671,18 @@ func writeRebuiltTranscriptionPart(mw *multipart.Writer, part *multipart.Part, m
 // A form that asks for a stream (form.wantsStream) is relayed as one: the relay is
 // marked a stream (nativeRelay.pfReq.Stream) and carries bufferedRetry, the builder of
 // the request proxyNative sends once more, buffered, when the upstream refuses to
-// stream (refusedStreamingTranscription). Whether the mapped model can stream is not
+// stream (peekStreamingRefusal). Whether the mapped model can stream is not
 // consulted here: every streamed request is sent as asked, and the retry is what a
 // model that cannot stream is answered with.
 //
 // proxyNative then finishes the exchange through this file's response side, keyed on
 // the endpoint (the openai_audio flavor is speech's too): a non-2xx answer is
 // normalised (relayTranscriptionUpstreamError); a 2xx event stream of a streamed
-// request is relayed unbuffered by the native copier (isStreamedTranscription,
-// setStreamedTranscriptionBillingQuantity); any other 2xx one is buffered, metered
-// from the timing block of its body and written verbatim (relayTranscriptionResponse).
+// request is relayed unbuffered by the native copier (isStreamedTranscription), read on
+// its way by transcriptionStreamScan, billed from the upload's WAV header once the
+// stream completed (setStreamedTranscriptionBillingQuantity) and captured as its
+// transcript; any other 2xx one is buffered, metered from the timing block of its body
+// and written verbatim (relayTranscriptionResponse).
 func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, form transcriptionForm, raw []byte) {
 	start := time.Now()
 	target, ok := s.resolveTranscriptionTarget(w, r, &token, req, raw, start)
@@ -754,7 +756,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 }
 
 // bufferedTranscriptionBody builds the request that is sent INSTEAD of a streamed one
-// the upstream refused (see refusedStreamingTranscription): the client's form, still
+// the upstream refused (see peekStreamingRefusal): the client's form, still
 // held whole in memory, rebuilt with the `stream` part dropped and, as for the first
 // attempt, the mapped model name and no empty `file` part. It is built only when the
 // retry happens, so the common streamed call never holds a second copy of the upload.
@@ -793,15 +795,15 @@ type replayedBody struct {
 	io.Closer
 }
 
-// refusedStreamingTranscription reports whether resp is the upstream's refusal to
+// peekStreamingRefusal reports whether resp is the upstream's refusal to
 // stream a transcription: HTTP 500 whose body names transcriptionStreamingRefusal.
 // Any other status, and any other 500, is false -- those are the upstream's errors and
 // reach the client as they always did.
 //
-// It reads the head of the body to look, and puts what it read back: resp.Body is
-// replaced by a body that still yields every byte, so an error that is not the refusal
-// reaches relayTranscriptionUpstreamError whole.
-func refusedStreamingTranscription(resp *provider.ProxyResponse) bool {
+// It is a peek, not a pure predicate: it reads the head of the body to look, and puts
+// what it read back -- resp.Body is replaced by a body that still yields every byte, so
+// an error that is not the refusal reaches relayTranscriptionUpstreamError whole.
+func peekStreamingRefusal(resp *provider.ProxyResponse) bool {
 	if resp.StatusCode != http.StatusInternalServerError {
 		return false
 	}
@@ -885,21 +887,6 @@ func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []
 		return
 	}
 	meta.BillingQuantity = seconds
-}
-
-// setStreamedTranscriptionBillingQuantity is the interim billing of a STREAMED
-// transcription: a loud zero. The event stream states no duration (its done event
-// carries a time to first token, not audio_duration_ms), so the quantity of a finished
-// stream is left at 0 and said so at Error, exactly as setTranscriptionBillingQuantity
-// says a one-shot body without one (ADR-041) -- never a silent bare zero. Like it, it
-// does nothing for another endpoint or a relay that did not finish cleanly.
-//
-// TODO(Task 3): bill from WAV header
-func setStreamedTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, status string) {
-	if ex.endpoint != endpointTranscription || status != "success" {
-		return
-	}
-	slog.Error("streamed transcription relayed with no billable duration: billed zero until it is read from the upload", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName)
 }
 
 // transcriptionUpstreamErrorType and transcriptionUpstreamErrorCode are the GATEWAY's

@@ -37,9 +37,10 @@ type captureInput struct {
 	// Endpoint is the client endpoint the exchange arrived on, for the one decision
 	// the flavor cannot make: speech and transcription share the openai_audio flavor,
 	// and the first answers with one binary WAV while the second answers with JSON
-	// (isBinarySpeechResponse). relayTranscriptionResponse -- the one 2xx producer that
-	// shares speech's flavor -- stamps it; every other producer leaves it zero
-	// (endpointChat), which nothing reads. That is why the one reader carves
+	// (isBinarySpeechResponse). The two 2xx producers that share speech's flavor
+	// stamp it: relayTranscriptionResponse for a one-shot transcript, and
+	// transcriptionStreamScan.stampCapture for a streamed one. Every other producer
+	// leaves it zero (endpointChat), which nothing reads. That is why the one reader carves
 	// transcription out of speech instead of requiring endpointSpeech: a speech
 	// capture built without an endpoint is still a speech capture, and the way that
 	// can go wrong is a binary body kept redacted, not a WAV run through json.Marshal.
