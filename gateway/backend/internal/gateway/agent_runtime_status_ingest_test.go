@@ -2386,8 +2386,121 @@ func TestIngestLandsTheAudioCppProbesSpeechAndTranscriptionVerdicts(t *testing.T
 	}
 }
 
+// warnRecordsFrom returns every WARN record in recs, so a test can assert that
+// a pass logged NOTHING at the level a real gateway runs at rather than only
+// that one particular message is missing.
+func warnRecordsFrom(recs []logbuffer.Record) []logbuffer.Record {
+	var out []logbuffer.Record
+	for _, r := range recs {
+		if r.Level == "WARN" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestAgentIngestAdmitsTranscriptionStreaming pins that the transcription_streaming
+// verdict an agent derives from an audio.cpp ASR child's /v1/models "mode"
+// reaches model_mapping_capabilities under the audiocpp_models source, so the
+// transcription handler can decide stream-vs-buffered up front for an
+// agent-mediated app the way it already does for a direct one.
+//
+// BOTH directions land, like speech and transcription: the listing's mode
+// "streaming" is a yes and "offline" a real no, and the no is what makes the
+// handler answer the buffered one-shot instead of probing a refusal. A refusal
+// that kept only the "yes" would drop the no row here and fail the second case.
+// The write carries exactly the transcription row beside it, so the streaming
+// row is neither dropped nor does it displace one.
+func TestAgentIngestAdmitsTranscriptionStreaming(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, streaming string
+	}{
+		{"a streaming asr model lands transcription_streaming yes", "rspec_audiocpp_stream_yes", routing.CapabilityYes},
+		{"an offline asr model lands transcription_streaming no", "rspec_audiocpp_stream_no", routing.CapabilityNo},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"speech","verdict":"no"},{"name":"transcription","verdict":"yes"},`+
+					`{"name":"transcription_streaming","verdict":"`+tc.streaming+`"}],"source":"audiocpp_models"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 1 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the three audio rows together)", got)
+			}
+			if sent := counting.lastSent(); len(sent) != 3 {
+				t.Fatalf("the write carried %+v, want exactly the speech, transcription and transcription_streaming rows", sent)
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityTranscription, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilityTranscriptionStreaming, tc.streaming, routing.CapabilitySourceAudioCppModels)
+		})
+	}
+}
+
+// TestAgentIngestNoWarnForKnownOrAbsentCapability pins that neither shape of
+// the verdict is an anomaly worth a log line. The agent derives
+// transcription_streaming for an asr model only, and only from a mode it
+// recognises, so an agent that states nothing about it (a model with no mode,
+// a tts model, an agent build that predates the verdict) simply sends no entry:
+// that is no row and no Warn. And an agent that DOES send it is sending a name
+// this ingest knows, so the audio.cpp allowlist's refusal Warn -- which fires
+// on every sample a build sends -- must stay silent for it.
+//
+// Asserted at the level a real gateway runs at (info), against ALL warnings
+// rather than one message, so a differently-worded refusal could not satisfy it.
+func TestAgentIngestNoWarnForKnownOrAbsentCapability(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, verdicts string
+		wantStreaming        string // "" = no row expected
+		wantRows             int
+	}{
+		{
+			name: "an absent verdict writes no streaming row and logs nothing", spec: "rspec_audiocpp_nostream",
+			verdicts: `{"name":"speech","verdict":"no"},{"name":"transcription","verdict":"yes"}`,
+			wantRows: 2,
+		},
+		{
+			name: "a known verdict logs nothing", spec: "rspec_audiocpp_knownstream",
+			verdicts:      `{"name":"speech","verdict":"no"},{"name":"transcription","verdict":"yes"},{"name":"transcription_streaming","verdict":"yes"}`,
+			wantStreaming: routing.CapabilityYes, wantRows: 3,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := withCapturedSlogAtTheDefaultLevel(t)
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec, `{"verdicts":[`+tc.verdicts+`],"source":"audiocpp_models"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if sent := counting.lastSent(); len(sent) != tc.wantRows {
+				t.Fatalf("the write carried %+v, want %d rows", sent, tc.wantRows)
+			}
+			row, ok := capabilityRow(t, srv, "map_"+tc.spec, routing.CapabilityTranscriptionStreaming)
+			switch {
+			case tc.wantStreaming == "" && ok:
+				t.Fatalf("a transcription_streaming row exists (%+v), want none -- an absent verdict is unknown, never a no", row)
+			case tc.wantStreaming != "" && (!ok || row.Verdict != tc.wantStreaming):
+				t.Fatalf("transcription_streaming row = %+v (present=%v), want verdict %q", row, ok, tc.wantStreaming)
+			}
+			if warns := warnRecordsFrom(buf.Snapshot()); len(warns) != 0 {
+				t.Fatalf("pass logged WARN records %+v, want none -- the verdict is a known name and its absence is no anomaly", warns)
+			}
+		})
+	}
+}
+
 // TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist pins the rule that
-// confines audiocpp_models to the two capabilities its document answers.
+// confines audiocpp_models to the three capabilities its document answers.
 // audio.cpp's /v1/models states each model's task, from which the agent derives
 // the speech and transcription verdicts and nothing else, so a row under this
 // source for any other capability is a false provenance -- the argument that
@@ -2437,7 +2550,7 @@ func TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist(t *testing.T) {
 	}
 
 	recs := buf.Snapshot()
-	rec, ok := audioCppWarnRecord(recs, "other than speech or transcription to the audio.cpp probe")
+	rec, ok := audioCppWarnRecord(recs, "other than speech, transcription or transcription_streaming to the audio.cpp probe")
 	if !ok {
 		t.Fatalf("no WARN record about the dropped foreign rows at the gateway's own default level (info); records = %+v", recs)
 	}
@@ -2469,7 +2582,7 @@ func TestIngestDropsAVisionVerdictFromTheAudioCppProbeAlone(t *testing.T) {
 	if row, ok := capabilityRow(t, srv, "map_rspec_audiocpp_vision", routing.CapabilityVision); ok {
 		t.Fatalf("a vision row exists (%+v), want none", row)
 	}
-	if _, ok := audioCppWarnRecord(buf.Snapshot(), "other than speech or transcription to the audio.cpp probe"); !ok {
+	if _, ok := audioCppWarnRecord(buf.Snapshot(), "other than speech, transcription or transcription_streaming to the audio.cpp probe"); !ok {
 		t.Fatalf("no WARN record about the dropped vision row at the gateway's own default level (info)")
 	}
 }
@@ -2555,14 +2668,14 @@ func TestIngestAudioCppVerdictDoesNotOverwriteAManualVerdict(t *testing.T) {
 }
 
 // TestAudioCppRowsAreNotReservedAgentCapabilityNames pins the premise the audio
-// source's acceptance rests on: neither "speech" nor "transcription" is a
-// reserved agent capability name, so the reserved-name gate in
+// source's acceptance rests on: none of "speech", "transcription" and
+// "transcription_streaming" is a reserved agent capability name, so the reserved-name gate in
 // runtimeSampleCapabilityRows lets both through. The reserved set holds the
 // names whose OWN producers this codebase defined (mtp, live_progress,
 // speculation_observed, image_edit); a synthesis or transcription verdict is
 // reported on the open list like any other.
 func TestAudioCppRowsAreNotReservedAgentCapabilityNames(t *testing.T) {
-	for _, name := range []string{routing.CapabilitySpeech, routing.CapabilityTranscription} {
+	for _, name := range []string{routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityTranscriptionStreaming} {
 		if reservedAgentCapabilityNames[name] {
 			t.Errorf("%q is a reserved agent capability name, want it open so the audiocpp_models source can report it", name)
 		}

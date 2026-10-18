@@ -1553,18 +1553,17 @@ const (
 // the gateway's health loop, for an audio_cpp application (audioCppCapabilityRows
 // in cmd/gateway), and the agent's own read of the /v1/models of an audio.cpp
 // child it launched, which the gateway's agent ingest accepts under this source
-// for the speech and transcription rows only (and only when the gateway declares
-// the capability_source_audiocpp feature).
+// for the speech, transcription and transcription_streaming rows only (and only
+// when the gateway declares the capability_source_audiocpp feature).
 //
 // It is the sdcpp_capabilities source's twin in the one respect that matters:
-// it is entitled to establish a "no" as well as a "yes", for each of its two
-// rows. The listing states each model's task, so a model it names with a task
+// it is entitled to establish a "no" as well as a "yes", for each of its rows. The listing states each model's task, so a model it names with a task
 // that does not serve a capability is a real CapabilityNo for that capability,
 // not an absence (a tts or clone model is (speech, yes) with (transcription,
 // no), an asr model the reverse, any other task no for both) -- while a model
 // the listing does not name at all is still no verdict, because a missing entry
-// says nothing about that model. It writes the speech and transcription rows,
-// and no other.
+// says nothing about that model. It writes the speech, transcription and
+// transcription_streaming rows, and no other.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"
