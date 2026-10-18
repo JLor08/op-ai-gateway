@@ -54,21 +54,6 @@ function webAudio(): {
   return { Context, Offline };
 }
 
-// The bytes of a blob. A FileReader rather than Blob.arrayBuffer(), which older browsers lack and
-// which jsdom does not implement. A failed read is no decode failure, so it is a plain Error.
-function readAsArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const { result } = reader;
-      if (result === null || typeof result === 'string') reject(new Error('read failed'));
-      else resolve(result);
-    };
-    reader.onerror = () => reject(new Error('read failed'));
-    reader.readAsArrayBuffer(blob);
-  });
-}
-
 // Decodes the bytes of a clip with whatever codecs the browser has. The buffer comes back at the
 // context's own sample rate and with the clip's own channels. Nothing in it (no channel, no
 // frame) is as undecodable as bytes the browser refused: a render of zero frames is an error.
@@ -148,12 +133,13 @@ function encodeWav(samples: Float32Array): Blob {
 
 // Converts an audio clip -- any format the browser can decode, whatever its type says -- to a mono
 // 16 kHz 16-bit PCM WAV blob of type audio/wav. Throws an AudioDecodeError for audio the browser
-// cannot turn into one (or has no WebAudio for), and a plain Error if the blob cannot be read.
+// cannot turn into one (or has no WebAudio for). A blob that cannot be read at all is no decode
+// failure: whatever Blob#arrayBuffer() rejects with comes through as it is.
 // The audio context that decoded the clip is closed whatever happens: a page may hold only a few
 // of them, and each pins audio resources until it is.
 export async function audioBlobToWav(input: Blob): Promise<Blob> {
   const { Context, Offline } = webAudio();
-  const bytes = await readAsArrayBuffer(input);
+  const bytes = await input.arrayBuffer();
   const context = new Context();
   try {
     const decoded = await decode(context, bytes);

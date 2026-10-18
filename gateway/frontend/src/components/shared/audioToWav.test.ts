@@ -76,14 +76,26 @@ const bufferOf = (sampleRate: number, ...channels: number[][]) =>
     channels.map((samples) => Float32Array.from(samples)),
   );
 
-// The bytes of a blob (a FileReader: this jsdom's Blob has no arrayBuffer()).
-function bytesOf(blob: Blob): Promise<Uint8Array> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
-    reader.onerror = () => reject(new Error('read failed'));
-    reader.readAsArrayBuffer(blob);
+// jsdom's Blob has no arrayBuffer() (every browser has), which the converter reads the upload
+// with. Fill it in, from a FileReader, only where it is missing.
+if (typeof Blob.prototype.arrayBuffer !== 'function') {
+  Object.defineProperty(Blob.prototype, 'arrayBuffer', {
+    configurable: true,
+    writable: true,
+    value(this: Blob): Promise<ArrayBuffer> {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as ArrayBuffer);
+        reader.onerror = () => reject(new Error('read failed'));
+        reader.readAsArrayBuffer(this);
+      });
+    },
   });
+}
+
+// The bytes of a blob.
+async function bytesOf(blob: Blob): Promise<Uint8Array> {
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 const ascii = (bytes: Uint8Array, from: number, to: number) =>
@@ -137,7 +149,7 @@ describe('audioBlobToWav', () => {
     expect(view.getUint16(34, true)).toBe(16); // bits per sample
     expect(ascii(bytes, 36, 40)).toBe('data');
     expect(view.getUint32(40, true)).toBe(dataBytes);
-    expect(bytes.length).toBe(44 + dataBytes);
+    expect(bytes).toHaveLength(44 + dataBytes);
   });
 
   it('encodes the rendered samples as little-endian int16, clamped to [-1, 1]', async () => {
@@ -183,7 +195,7 @@ describe('audioBlobToWav', () => {
 
     await audioBlobToWav(upload());
 
-    expect(webAudio.offline[0].length).toBe(37);
+    expect(webAudio.offline[0]).toHaveLength(37);
   });
 
   it('closes the decoding context, which holds audio resources', async () => {
@@ -213,6 +225,15 @@ describe('audioBlobToWav', () => {
     expect(wav.type).toBe('audio/wav');
     expect(webAudio.contexts).toHaveLength(1);
     expect(webAudio.offline).toHaveLength(1);
+  });
+
+  it('lets a blob that cannot be read through as it is: no decode failure, no context opened', async () => {
+    const failure = new DOMException('The blob cannot be read', 'NotReadableError');
+    const blob = upload();
+    vi.spyOn(blob, 'arrayBuffer').mockRejectedValue(failure);
+
+    await expect(audioBlobToWav(blob)).rejects.toBe(failure);
+    expect(webAudio.contexts).toHaveLength(0);
   });
 
   describe('refusing what cannot be converted, as an AudioDecodeError', () => {

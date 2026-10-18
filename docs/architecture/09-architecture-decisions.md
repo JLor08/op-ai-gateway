@@ -6019,12 +6019,16 @@ pieces it joins that no design could have chosen:
   as safe as the narrow one (it is an exact-match allow-list of audio types, checked on
   write and again on read), and is harmless forward compatibility — the server's own
   refusal says MP3 support is planned, and a composer that relays more than WAV later then
-  needs no backend change. What the composer **no longer does** is relabel a clip: the
-  per-format media-type aliasing it needed to hit the exact allow-list (stripping
-  `;codecs=…`, mapping `audio/x-m4a`, `application/ogg`, `video/webm` and the other
-  platform spellings, an extension fallback for an empty type) is **removed**, because
-  every clip is converted and then labelled with the one fixed type `audio/wav`, an exact
-  member of the list, whatever the upload was. There is **no schema change**: the
+  needs no backend change. What the composer **no longer does** is relabel a clip to a
+  canonical type: the per-format alias and extension tables it needed to hit the exact
+  allow-list (`canonicalAudioMediaType`, the `TRANSCRIPTION_AUDIO_TYPES` list, the mapping of
+  `audio/x-m4a`, `application/ogg`, `video/webm` and the other platform spellings, an
+  extension fallback for an empty type) are **removed**, because every clip is converted and
+  then labelled with the one fixed type `audio/wav`, an exact member of the list, whatever
+  the upload was. What **survives** is parameter stripping: `bareAudioMediaType` still
+  reduces a type to its bare `type/subtype` (dropping a `;codecs=…` parameter, which the
+  backend refuses in a data url), in the pre-decode type gate (`mayBeAudio` in
+  `audioAttach.ts`) and inside `audioDataUrl`. There is **no schema change**: the
   migration, the cascade, the sealing and the memory budget are exactly what they were.
 - **(f) The transcription portal fold is new, and it amends ADR-062 (b).** The Models
   listing carries a **`transcription` flag** on `ModelDTO` (`/api/portal/models`, always
@@ -6090,7 +6094,8 @@ pieces it joins that no design could have chosen:
   **and again on the WAV**, since 16 kHz mono 16-bit is 32 KB a second and a small
   compressed upload can come out far larger. The attach picker's `accept` is `audio/*`
   plus extension fallbacks for platforms that do not type an audio file as `audio/*`. The
-  conversion's own costs — decode memory, no progress indicator, the double resample, old
+  conversion's own costs — decode memory, no progress indicator, the two-stage resample
+  (`decodeAudioData` to the context's own rate, then the offline context to 16 kHz), old
   Safari — are accepted in
   [Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 - **(i) The wait is `TranscriptionPendingTurn`, and an untitled transcription chat is
@@ -6114,19 +6119,23 @@ variable of its own so the three bounded kinds can move independently). One clip
 at **20 MiB** by default: the composer rejects a larger file at the client's
 `MAX_AUDIO_BYTES` (20 MiB), and the store refuses a larger blob at `MaxChatBlobBytes`
 (`OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES`, default 20 MiB, operator-configurable), the same
-store limit a speech WAV is held to; the executor holds
-the clip whole in memory for the multipart body, and the browser holds one object URL per
-input clip it has rendered until it unmounts, as a speech reply's player does. Stored
-clips are retained for the chat's lifetime like every blob, with no prune (ADR-056). The
-**gateway still never converts or re-encodes**: the conversion that audio.cpp's WAV-only
+store limit a speech WAV is held to. The cap applies to both the upload and the WAV the
+composer produces from it, and at 16 kHz mono 16-bit (about 32 KB a second) a 20 MiB WAV
+is about 10.9 minutes of audio, which is the longest clip the composer can attach. The
+executor holds the clip whole in memory for the multipart body, and the browser holds one
+object URL per input clip it has rendered until it unmounts, as a speech reply's player
+does. Stored clips are retained for the chat's lifetime like every blob, with no prune
+(ADR-056). The **gateway still never converts or re-encodes**: the conversion that audio.cpp's WAV-only
 input requires happens in the **browser**, so the stored clip and the upstream `file`
 part are the same WAV, relayed byte for byte, and in-browser recording and any attached
 format the browser can decode work end to end (the `e2e:chat-transcription` suite drives
 a real WebM/Opus recording, a WebM file and an MP3 file through the real WebAudio
 conversion and asserts that the upstream receives a 16 kHz mono 16-bit PCM WAV). The price
 is paid in the user's browser: the clip is decoded in memory before it is sent, there is no
-"converting" indicator for a long file, and the resample is applied to audio a compressed
-codec already shaped; each is a stated acceptance in
+"converting" indicator for a long file, and the audio is resampled twice
+(`decodeAudioData` first brings it to the `AudioContext`'s device-dependent rate, then
+the offline context to 16 kHz), each stage of an implementation-defined quality; each is
+a stated acceptance in
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances). Nothing else
 moved: no change to `handleOpenAITranscription` or the relay, no schema change, no
 migration, no new auth leg (the loopback pair ADR-062 (j) already admits gains its first
