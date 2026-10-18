@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import { expect, request as apiRequest, test, type APIRequestContext, type APIResponse, type Locator, type Page } from "@playwright/test";
 import { messages } from "../../frontend/src/i18n";
 import { login } from "../e2e/helpers";
+import { createStreamHolds, sseFrame, type Hold } from "../e2e/stream-stub";
 
 // POST /v1/audio/transcriptions, proven across a real process boundary. The
 // gateway under test is the REAL binary (memory mode); the audio.cpp it relays to
@@ -111,12 +112,12 @@ const STREAM_TTFT_MS = 120;
 // the stub's CLIP_SECONDS, so the quantity a streamed row bills can only have come from
 // the upload's header.
 const STREAM_CLIP_SECONDS = 3;
+if (STREAM_CLIP_SECONDS === CLIP_SECONDS) {
+  throw new Error("STREAM_CLIP_SECONDS must differ from CLIP_SECONDS, or a streamed row's quantity could not tell the upload's header from the stub's timing block");
+}
 // The sentence audio.cpp's refusal carries when stream=true reaches a model that is not
 // loaded with mode=streaming (HTTP 500, as for every error it answers).
 const STREAM_REFUSAL = "streaming transcription requires a model configured with mode=streaming";
-// A held stream is released by itself after this long, so a failing assertion can never
-// leave the stub (and the gateway's relay) waiting for a release that will not come.
-const HOLD_SAFETY_MS = 15000;
 
 /**
  * A valid RIFF/WAVE body (mono, 16 kHz, 16-bit) whose sample bytes are neither valid
@@ -206,15 +207,13 @@ type Stub = {
    * Makes the next `count` streamed answers pause, in turn, right after one of their
    * delta frames: a hold per pause. `reached` settles once the stub has written that
    * delta and is waiting; `release()` lets the stream go on. A hold nobody releases
-   * lets go by itself after HOLD_SAFETY_MS.
+   * lets go by itself (see HOLD_SAFETY_MS in ../e2e/stream-stub).
    */
   holdStream(count: number): Hold[];
   /** Whether a streamed answer is paused at a hold right now. */
   streamHeld(): boolean;
   close(): Promise<void>;
 };
-
-type Hold = { reached: Promise<void>; release: () => void };
 
 /** What the stub's /v1/models LISTS for a model, and what POST does with stream=true. */
 type UpstreamModel = {
@@ -234,10 +233,18 @@ const UPSTREAM_MODELS: UpstreamModel[] = [
   { id: STALE_UPSTREAM, task: "asr", listedMode: "streaming", streams: false }
 ];
 
-/** One SSE `data:` frame. */
-function sseFrame(payload: unknown): string {
-  return `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`;
-}
+/**
+ * The frames the stub writes for a transcript that really streams, in order, exactly as
+ * they go on the wire: one transcript.text.delta per increment, the done event that
+ * restates the whole text and carries a time to first token (and NO audio_duration_ms, as
+ * the real server's done event has none), then the [DONE] sentinel. The one source the
+ * stub writes from and the relay test compares the client's bytes to.
+ */
+const STREAM_FRAMES = [
+  ...STREAM_DELTAS.map((delta) => sseFrame({ type: "transcript.text.delta", delta })),
+  sseFrame({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } }),
+  sseFrame("[DONE]")
+];
 
 /**
  * The audio.cpp stand-in, kept to what the gateway actually talks to and honest
@@ -266,39 +273,18 @@ function sseFrame(payload: unknown): string {
  */
 async function startAudioCppStub(): Promise<Stub> {
   const calls: StubCall[] = [];
-  const pendingHolds: { markReached: () => void; released: Promise<void> }[] = [];
-  let held = 0;
-
-  /** Waits at the next pending hold, if one is armed. */
-  const pauseAtHold = async (): Promise<void> => {
-    const hold = pendingHolds.shift();
-    if (!hold) {
-      return;
-    }
-    held += 1;
-    hold.markReached();
-    let safety: NodeJS.Timeout | undefined;
-    await Promise.race([
-      hold.released,
-      new Promise<void>((resolve) => {
-        safety = setTimeout(resolve, HOLD_SAFETY_MS);
-      })
-    ]);
-    clearTimeout(safety);
-    held -= 1;
-  };
+  const holds = createStreamHolds();
 
   const streamTranscript = async (res: http.ServerResponse): Promise<void> => {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
     res.flushHeaders();
-    for (const [i, delta] of STREAM_DELTAS.entries()) {
-      res.write(sseFrame({ type: "transcript.text.delta", delta }));
+    for (const [i, frame] of STREAM_FRAMES.entries()) {
+      res.write(frame);
+      // A pause after each delta but the last: the done event follows it at once.
       if (i < STREAM_DELTAS.length - 1) {
-        await pauseAtHold();
+        await holds.pause();
       }
     }
-    res.write(sseFrame({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } }));
-    res.write(sseFrame("[DONE]"));
     res.end();
   };
 
@@ -362,20 +348,8 @@ async function startAudioCppStub(): Promise<Stub> {
     port: (server.address() as AddressInfo).port,
     calls,
     transcriptionCalls: () => calls.filter((c) => c.method === "POST" && c.path === TRANSCRIPTION_PATH),
-    holdStream: (count) =>
-      Array.from({ length: count }, () => {
-        let markReached!: () => void;
-        let release!: () => void;
-        const reached = new Promise<void>((resolve) => {
-          markReached = resolve;
-        });
-        const released = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        pendingHolds.push({ markReached, released });
-        return { reached, release };
-      }),
-    streamHeld: () => held > 0,
+    holdStream: (count) => holds.arm(count),
+    streamHeld: () => holds.held(),
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
@@ -451,32 +425,44 @@ function transcribe(model: string, extra: Record<string, string> = {}, wav: Buff
 }
 
 /**
- * The frames of a text/event-stream body, one `data:` payload at a time, as they
- * arrive: the generator yields a frame as soon as its blank-line terminator has been
- * read, so a test can look at the first frame while the stream is still open. A
- * client that cannot see a frame before the whole body is in (APIRequestContext
- * buffers it) could not tell a relayed stream from a buffered one.
+ * A text/event-stream body read as it arrives. `frames` yields the `data:` payloads one
+ * at a time, each as soon as its blank-line terminator has been read, so a test can look
+ * at the first frame while the stream is still open: a client that cannot see a frame
+ * before the whole body is in (APIRequestContext buffers it) could not tell a relayed
+ * stream from a buffered one. `raw()` is everything the body has carried so far, decoded
+ * and otherwise untouched, for the comparison that is about bytes and not only payloads.
+ * `close()` cancels the body, so a test that fails halfway leaves no stream open.
  */
-async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+function readSSE(body: ReadableStream<Uint8Array>): { frames: AsyncGenerator<string>; raw: () => string; close: () => Promise<void> } {
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  let pending = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    pending += decoder.decode(value, { stream: true });
-    for (let end = pending.indexOf("\n\n"); end >= 0; end = pending.indexOf("\n\n")) {
-      const frame = pending.slice(0, end);
-      pending = pending.slice(end + 2);
-      for (const line of frame.split("\n")) {
-        if (line.startsWith("data:")) {
-          yield line.slice("data:".length).trim();
+  let raw = "";
+  async function* frames(): AsyncGenerator<string> {
+    let pending = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      const text = decoder.decode(value, { stream: true });
+      raw += text;
+      pending += text;
+      for (let end = pending.indexOf("\n\n"); end >= 0; end = pending.indexOf("\n\n")) {
+        const frame = pending.slice(0, end);
+        pending = pending.slice(end + 2);
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("data:")) {
+            yield line.slice("data:".length).trim();
+          }
         }
       }
     }
   }
+  return {
+    frames: frames(),
+    raw: () => raw,
+    close: () => reader.cancel().catch(() => undefined)
+  };
 }
 
 /**
@@ -631,6 +617,7 @@ test("1 — an audio_cpp application created through the portal form is probed, 
 // --- Scenario 2 -------------------------------------------------------------
 
 test("2 — a transcription-capable model is relayed as one multipart POST with the model rewritten and the upload byte-identical", async () => {
+  const before = stub.transcriptionCalls().length;
   const resp = await transcribe(ASR_MODEL, { language: "en" });
   expect(resp.status(), `transcription response: ${await resp.text()}`).toBe(200);
   expect(resp.headers()["content-type"]).toContain("application/json");
@@ -640,7 +627,7 @@ test("2 — a transcription-capable model is relayed as one multipart POST with 
   // Exactly one upstream call, multipart, with the gateway model name rewritten to
   // the application's own model id, every other text field relayed untouched and
   // the audio upload arriving byte for byte.
-  const calls = stub.transcriptionCalls();
+  const calls = stub.transcriptionCalls().slice(before);
   expect(calls).toHaveLength(1);
   expect(calls[0].contentType).toMatch(/^multipart\/form-data;/);
   expect(calls[0].fields).toEqual({ model: ASR_UPSTREAM, language: "en" });
@@ -768,36 +755,52 @@ test("6 — a stream=true request to a model whose verdict is streaming yes is r
   const [hold] = stub.holdStream(1);
 
   const resp = await transcribeStreaming(STREAM_MODEL, STREAM_WAV);
-  expect(resp.status).toBe(200);
-  expect(resp.headers.get("content-type")).toContain("text/event-stream");
-
-  // The first frame reaches the client WHILE the upstream is still holding the rest
-  // back: a relay that buffered the stream (as the one-shot path does, to read its
-  // timing block) would deliver nothing before the stub let go, and the stub is still
-  // paused only if the frame came through it.
-  const frames = sseData(resp.body as ReadableStream<Uint8Array>);
-  const first = await frames.next();
-  expect(first.done, "the stream ended before its first frame").toBe(false);
-  expect(JSON.parse(String(first.value))).toEqual({ type: "transcript.text.delta", delta: STREAM_DELTAS[0] });
-  await hold.reached;
-  expect(stub.streamHeld(), "the first frame was relayed before the upstream finished its stream").toBe(true);
-
-  hold.release();
-  const rest: string[] = [];
-  for await (const frame of frames) {
-    rest.push(frame);
+  if (!resp.body) {
+    throw new Error(`the streamed transcription answered ${resp.status} with no body`);
   }
-  // The rest of the stream, in the upstream's own order and framing: the remaining
-  // deltas, the done event restating the whole text with its time to first token, then
-  // the sentinel. Nothing is added, dropped or translated.
-  expect(rest.map((frame) => (frame === "[DONE]" ? frame : (JSON.parse(frame) as { type: string }).type))).toEqual([
-    "transcript.text.delta",
-    "transcript.text.delta",
-    "transcript.text.done",
-    "[DONE]"
-  ]);
-  expect(rest.slice(0, 2).map((frame) => (JSON.parse(frame) as { delta: string }).delta)).toEqual(STREAM_DELTAS.slice(1));
-  expect(JSON.parse(rest[2])).toEqual({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } });
+  const sse = readSSE(resp.body);
+  try {
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toContain("text/event-stream");
+
+    // The first frame reaches the client WHILE the upstream is still holding the rest
+    // back: a relay that buffered the stream (as the one-shot path does, to read its
+    // timing block) would deliver nothing before the stub let go, and the stub is still
+    // paused only if the frame came through it.
+    const first = await sse.frames.next();
+    expect(first.done, "the stream ended before its first frame").toBe(false);
+    expect(JSON.parse(String(first.value))).toEqual({ type: "transcript.text.delta", delta: STREAM_DELTAS[0] });
+    await hold.reached;
+    expect(stub.streamHeld(), "the first frame was relayed before the upstream finished its stream").toBe(true);
+    // The upstream has written nothing but that frame, so those are all the bytes there are.
+    expect(sse.raw(), "the first frame's bytes, as the upstream wrote them").toBe(STREAM_FRAMES[0]);
+
+    hold.release();
+    const rest: string[] = [];
+    for await (const frame of sse.frames) {
+      rest.push(frame);
+    }
+    // The rest of the stream, in the upstream's own order and framing: the remaining
+    // deltas, the done event restating the whole text with its time to first token, then
+    // the sentinel. Nothing is added, dropped or translated.
+    expect(rest.map((frame) => (frame === "[DONE]" ? frame : (JSON.parse(frame) as { type: string }).type))).toEqual([
+      "transcript.text.delta",
+      "transcript.text.delta",
+      "transcript.text.done",
+      "[DONE]"
+    ]);
+    expect(rest.slice(0, 2).map((frame) => (JSON.parse(frame) as { delta: string }).delta)).toEqual(STREAM_DELTAS.slice(1));
+    expect(JSON.parse(rest[2])).toEqual({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } });
+    // And the bytes themselves: the whole body is the upstream's frames concatenated,
+    // each `data: ...` line and its blank line as written -- the payload checks above
+    // would not notice a relay that re-framed the stream.
+    expect(sse.raw(), "the relayed body must equal the upstream's frames byte for byte").toBe(STREAM_FRAMES.join(""));
+  } finally {
+    // Whatever failed, the stub is let go and the response closed: neither the stub's
+    // hold nor the gateway's relay is left waiting on a client that has stopped looking.
+    hold.release();
+    await sse.close();
+  }
 
   // One upstream call: the stream flag reached the model (and nothing else was added to
   // the form), the gateway model name was rewritten to the application's own id, and
@@ -835,7 +838,6 @@ test("7 — the streamed call is billed in audio seconds from the uploaded WAV's
     output_tokens: 0,
     total_tokens: 0
   });
-  expect(STREAM_CLIP_SECONDS).not.toBe(CLIP_SECONDS);
 });
 
 // --- Scenario 8 -------------------------------------------------------------

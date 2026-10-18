@@ -66,6 +66,20 @@ func newStallingTranscriptionUpstream(t *testing.T, contentType, prefix string, 
 	return up
 }
 
+// setTranscriptionAppTimeout sets the timeout_ms of the application the transcription
+// test servers route to, the budget a streamed transcription's first byte is given.
+func setTranscriptionAppTimeout(t *testing.T, srv *Server, timeoutMS int) {
+	t.Helper()
+	app, err := srv.Routes.ApplicationByID(context.Background(), "app-audio")
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	app.TimeoutMS = timeoutMS
+	if err := srv.Routes.UpdateApplication(context.Background(), app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+}
+
 // A first frame that comes later than the idle timeout is NOT cut: the stub answers the
 // event stream's headers at once and holds the first frame back for 3.5x the idle
 // timeout. The whole stream reaches the client and the call is recorded a success.
@@ -98,6 +112,50 @@ func TestTranscriptionStreamWaitsForAFirstFrameBeyondTheIdleTimeout(t *testing.T
 	ev := onlyUsageEvent(t, srv)
 	if ev.Status != "success" || ev.ErrorCode != "" {
 		t.Fatalf("usage row = %q/%q, want a success: the idle timeout must not fire before the first byte", ev.Status, ev.ErrorCode)
+	}
+}
+
+// The first-byte budget is a budget, not an open-ended grace: an event stream whose
+// headers arrive but whose body never carries a byte is cut once the application's
+// timeout (300ms here, the budget a streamed transcription's first byte is given) is
+// spent, and recorded the way an idle stream is, provider.stream_idle_timeout. It is
+// cut at that budget and not at the idle timeout (100ms), which a stream that has not
+// produced a byte yet is exempt from -- the grace the test above pins -- and it does
+// not hang for as long as the upstream cares to hold the connection (the stub waits 5s).
+func TestTranscriptionStreamWithNoBodyByteIsCutAtTheFirstByteBudget(t *testing.T) {
+	var cutByRelay atomic.Bool
+	up := newStallingTranscriptionUpstream(t, "text/event-stream", "", &cutByRelay)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+	srv.streamIdleTimeout = 100 * time.Millisecond
+	setTranscriptionAppTimeout(t, srv, 300)
+	front := httptest.NewServer(srv)
+	t.Cleanup(front.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	resp := postTranscriptionFront(t, ctx, front, streamingTranscriptionParts(transcriptionGatewayModel))
+	got, _ := io.ReadAll(resp.Body)
+
+	elapsed := time.Since(start)
+	if elapsed < 250*time.Millisecond {
+		t.Fatalf("the stream ended after %v, want it held to the 300ms first-byte budget, not cut at the 100ms idle timeout", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("the stream took %v to end, want it cut at the 300ms first-byte budget", elapsed)
+	}
+	if len(got) != 0 {
+		t.Fatalf("stream = %q, want no bytes: the upstream never sent one", got)
+	}
+	ev := onlyUsageEvent(t, srv)
+	if ev.Status != "error" || ev.ErrorCode != "provider.stream_idle_timeout" {
+		t.Fatalf("usage row = %q/%q, want error/provider.stream_idle_timeout", ev.Status, ev.ErrorCode)
+	}
+	if ev.BillingQuantity != 0 {
+		t.Fatalf("BillingQuantity = %v, want 0: nothing was transcribed", ev.BillingQuantity)
+	}
+	if !cutByRelay.Load() {
+		t.Fatal("the relay did not cancel the upstream request when the first-byte budget ran out")
 	}
 }
 
@@ -142,14 +200,7 @@ func TestTranscriptionStreamAnsweredWithJSONIsBoundedByTheTotalTimeout(t *testin
 	up := newStallingTranscriptionUpstream(t, "application/json", "", &cutByRelay)
 	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
 	srv.streamIdleTimeout = 100 * time.Millisecond
-	app, err := srv.Routes.ApplicationByID(context.Background(), "app-audio")
-	if err != nil {
-		t.Fatalf("ApplicationByID: %v", err)
-	}
-	app.TimeoutMS = 300
-	if err := srv.Routes.UpdateApplication(context.Background(), app); err != nil {
-		t.Fatalf("UpdateApplication: %v", err)
-	}
+	setTranscriptionAppTimeout(t, srv, 300)
 	front := httptest.NewServer(srv)
 	t.Cleanup(front.Close)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

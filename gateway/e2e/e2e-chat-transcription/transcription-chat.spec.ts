@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { messages } from "../../frontend/src/i18n";
 import { login } from "../e2e/helpers";
+import { createStreamHolds, sseFrame, type Hold } from "../e2e/stream-stub";
 
 // A speech-to-text turn in the PORTAL CHAT, proven across a real process boundary.
 // The gateway under test is the REAL binary (memory mode) and the UI is the REAL
@@ -150,10 +151,6 @@ const FIRST_ANSWER_DELAY_MS = 1500;
 const STREAM_DELTAS = ["Guten Tag, ", "das ist ein ", "Streaming-Transkript"];
 const STREAM_TEXT = "Guten Tag, das ist ein Streaming-Transkript.";
 const STREAM_TTFT_MS = 120;
-// A held stream is released by itself after this long, so a failing assertion can never
-// leave the stub (and the gateway's relay and the run) waiting for a release that will
-// not come.
-const HOLD_SAFETY_MS = 15000;
 
 const LANGUAGE = "en";
 const PROMPT = "Names: Alba, Jonas.";
@@ -361,20 +358,13 @@ type Stub = {
    * Makes the next `count` streamed answers pause, in turn, right after one of their
    * delta frames: a hold per pause. `reached` settles once the stub has written that
    * delta and is waiting; `release()` lets the stream go on. A hold nobody releases
-   * lets go by itself after HOLD_SAFETY_MS.
+   * lets go by itself (see HOLD_SAFETY_MS in ../e2e/stream-stub).
    */
   holdStream(count: number): Hold[];
   /** Whether a streamed answer is paused at a hold right now. */
   streamHeld(): boolean;
   close(): Promise<void>;
 };
-
-type Hold = { reached: Promise<void>; release: () => void };
-
-/** One SSE `data:` frame. */
-function sseFrame(payload: unknown): string {
-  return `data: ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n\n`;
-}
 
 /**
  * The audio.cpp stand-in, kept to what the gateway actually talks to and honest
@@ -405,27 +395,7 @@ function sseFrame(payload: unknown): string {
 async function startAudioCppStub(): Promise<Stub> {
   const calls: StubCall[] = [];
   let answered = 0;
-  const pendingHolds: { markReached: () => void; released: Promise<void> }[] = [];
-  let held = 0;
-
-  /** Waits at the next pending hold, if one is armed. */
-  const pauseAtHold = async (): Promise<void> => {
-    const hold = pendingHolds.shift();
-    if (!hold) {
-      return;
-    }
-    held += 1;
-    hold.markReached();
-    let safety: NodeJS.Timeout | undefined;
-    await Promise.race([
-      hold.released,
-      new Promise<void>((resolve) => {
-        safety = setTimeout(resolve, HOLD_SAFETY_MS);
-      })
-    ]);
-    clearTimeout(safety);
-    held -= 1;
-  };
+  const holds = createStreamHolds();
 
   const streamTranscript = async (res: http.ServerResponse): Promise<void> => {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
@@ -433,7 +403,7 @@ async function startAudioCppStub(): Promise<Stub> {
     for (const [i, delta] of STREAM_DELTAS.entries()) {
       res.write(sseFrame({ type: "transcript.text.delta", delta }));
       if (i < STREAM_DELTAS.length - 1) {
-        await pauseAtHold();
+        await holds.pause();
       }
     }
     res.write(sseFrame({ type: "transcript.text.done", text: STREAM_TEXT, timing: { ttft_ms: STREAM_TTFT_MS } }));
@@ -519,20 +489,8 @@ async function startAudioCppStub(): Promise<Stub> {
     port: (server.address() as AddressInfo).port,
     calls,
     transcriptionCalls: () => calls.filter((c) => c.method === "POST" && c.path === TRANSCRIPTION_PATH),
-    holdStream: (count) =>
-      Array.from({ length: count }, () => {
-        let markReached!: () => void;
-        let release!: () => void;
-        const reached = new Promise<void>((resolve) => {
-          markReached = resolve;
-        });
-        const released = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        pendingHolds.push({ markReached, released });
-        return { reached, release };
-      }),
-    streamHeld: () => held > 0,
+    holdStream: (count) => holds.arm(count),
+    streamHeld: () => holds.held(),
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
@@ -878,6 +836,8 @@ test("3 — an attached WebM is converted to a WAV, relayed as one multipart /v1
   // The user's clip comes back from the chat blob store once the turn is committed,
   // fetched same-origin.
   const blobResponse = page.waitForResponse((r) => new URL(r.url()).pathname.startsWith("/api/portal/chat-blobs/"));
+  const before = stub.transcriptionCalls().length;
+  const allBefore = stub.calls.length;
   await sendButton().click();
 
   // The upstream is held for a moment (see FIRST_ANSWER_DELAY_MS): the chat is in its
@@ -924,7 +884,7 @@ test("3 — an attached WebM is converted to a WAV, relayed as one multipart /v1
   // the file part: a WAV (never the attached WebM), under the name and media type of a
   // WAV, byte for byte what the chat store holds -- the gateway relays, it never
   // transcodes.
-  const calls = stub.transcriptionCalls();
+  const calls = stub.transcriptionCalls().slice(before);
   expect(calls).toHaveLength(1);
   expect(calls[0].contentType).toMatch(/^multipart\/form-data;/);
   expect(calls[0].fields).toEqual({ model: ASR_UPSTREAM, language: LANGUAGE, prompt: PROMPT, temperature: String(TEMPERATURE) });
@@ -939,12 +899,18 @@ test("3 — an attached WebM is converted to a WAV, relayed as one multipart /v1
   // The chat went to the transcription endpoint and nowhere else: no chat-completions
   // call, and no POST of any other kind, reached the stub.
   expect(stub.calls.filter((c) => c.path.startsWith("/v1/chat"))).toHaveLength(0);
-  expect(stub.calls.filter((c) => c.method === "POST").map((c) => c.path)).toEqual([TRANSCRIPTION_PATH]);
+  expect(
+    stub.calls
+      .slice(allBefore)
+      .filter((c) => c.method === "POST")
+      .map((c) => c.path)
+  ).toEqual([TRANSCRIPTION_PATH]);
 });
 
 // --- Scenario 4 -------------------------------------------------------------
 
 test("4 — the transcription thread survives a full reload: still a transcription thread, settings restored, the clip plays again from the store, the transcript is still there", async () => {
+  const before = stub.transcriptionCalls().length;
   await page.reload();
   await page.getByRole("link", { name: t.chat }).click();
 
@@ -962,7 +928,7 @@ test("4 — the transcription thread survives a full reload: still a transcripti
   await expect(page.locator("#chat-transcription-prompt")).toHaveValue(PROMPT);
   await expect(page.locator("#chat-transcription-temperature")).toHaveValue(String(TEMPERATURE));
   // Reading the transcript back sent nothing upstream.
-  expect(stub.transcriptionCalls()).toHaveLength(1);
+  expect(stub.transcriptionCalls()).toHaveLength(before);
 });
 
 // --- Scenario 5 -------------------------------------------------------------
@@ -977,6 +943,7 @@ test("5 — a follow-up MP3 is a second upstream call with the new clip's WAV, a
   await expect(sendButton()).toBeDisabled();
   await attachClip(SECOND_CLIP);
   await expect(sendButton()).toBeEnabled();
+  const before = stub.transcriptionCalls().length;
   await sendButton().click();
 
   await expect(assistantTurns()).toHaveCount(2);
@@ -993,14 +960,14 @@ test("5 — a follow-up MP3 is a second upstream call with the new clip's WAV, a
   // the thread's own settings, and the passthrough fields relayed as form text (each
   // value as its literal) -- but not the passthrough "language", which repeats a set
   // setting: the thread's own value wins and the field appears once.
-  const calls = stub.transcriptionCalls();
-  expect(calls).toHaveLength(2);
-  expect(calls[1].filename).toBe("audio.wav");
-  expect(calls[1].fileType).toBe("audio/wav");
-  const upload = calls[1].file as Buffer;
+  const calls = stub.transcriptionCalls().slice(before);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].filename).toBe("audio.wav");
+  expect(calls[0].fileType).toBe("audio/wav");
+  const upload = calls[0].file as Buffer;
   expectWav(upload, { hz: SECOND_CLIP.hz, seconds: CLIP_SECONDS });
   expect(Buffer.compare(upload, firstUpload), "the second upload must be the second clip, not the first again").not.toBe(0);
-  expect(calls[1].fields).toEqual({
+  expect(calls[0].fields).toEqual({
     model: ASR_UPSTREAM,
     language: LANGUAGE,
     prompt: PROMPT,
@@ -1008,7 +975,7 @@ test("5 — a follow-up MP3 is a second upstream call with the new clip's WAV, a
     word_timestamps: "true",
     seed: "7"
   });
-  expect([...calls[1].partNames].sort()).toEqual(["file", "language", "model", "prompt", "seed", "temperature", "word_timestamps"]);
+  expect([...calls[0].partNames].sort()).toEqual(["file", "language", "model", "prompt", "seed", "temperature", "word_timestamps"]);
   expect(stub.calls.filter((c) => c.path.startsWith("/v1/chat"))).toHaveLength(0);
 });
 
@@ -1037,6 +1004,7 @@ test("6 — a clip recorded in the browser is converted like an attached one: th
     const blobPath = new URL(r.url()).pathname;
     return blobPath.startsWith("/api/portal/chat-blobs/") && !known.has(blobPath);
   });
+  const before = stub.transcriptionCalls().length;
   await sendButton().click();
 
   await expect(assistantTurns()).toHaveCount(3);
@@ -1050,14 +1018,14 @@ test("6 — a clip recorded in the browser is converted like an attached one: th
   // under the name and media type of a WAV, not the audio.webm the recorder produced
   // (an EBML/WebM stream starts 1a45dfa3; a WAV starts RIFF) -- carrying the take's
   // tone (at least the second the clock counted), and the thread's settings unchanged.
-  const calls = stub.transcriptionCalls();
-  expect(calls).toHaveLength(3);
-  expect(calls[2].filename).toBe("audio.wav");
-  expect(calls[2].fileType).toBe("audio/wav");
-  const upload = calls[2].file as Buffer;
+  const calls = stub.transcriptionCalls().slice(before);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].filename).toBe("audio.wav");
+  expect(calls[0].fileType).toBe("audio/wav");
+  const upload = calls[0].file as Buffer;
   expect(upload.subarray(0, 4).toString("ascii"), "the upload is a WAV, not the recorder's WebM").toBe("RIFF");
   expectWav(upload, { hz: MICROPHONE_HZ, minSeconds: 0.75 });
-  expect(calls[2].fields).toMatchObject({ model: ASR_UPSTREAM, language: LANGUAGE, prompt: PROMPT, temperature: String(TEMPERATURE) });
+  expect(calls[0].fields).toMatchObject({ model: ASR_UPSTREAM, language: LANGUAGE, prompt: PROMPT, temperature: String(TEMPERATURE) });
 
   // What the chat store holds of the clip is what the upstream received.
   const blob = await blobResponse;
@@ -1178,6 +1146,7 @@ test("9 — the streamed run is billed in audio seconds from the converted WAV's
   // The committed turn is in the chat store, not only on the page that watched it
   // stream: after a full reload the thread shows the done event's transcript, once, and
   // its clip plays again.
+  const before = stub.transcriptionCalls().length;
   await page.reload();
   await page.getByRole("link", { name: t.chat }).click();
   await expect(lastAssistant()).toContainText(STREAM_TEXT);
@@ -1185,5 +1154,5 @@ test("9 — the streamed run is billed in audio seconds from the converted WAV's
   await expect(userTurns()).toHaveCount(1);
   await expectStoredClip(lastUser().locator("audio"));
   // Reading it back sent nothing upstream.
-  expect(stub.transcriptionCalls()).toHaveLength(4);
+  expect(stub.transcriptionCalls()).toHaveLength(before);
 });

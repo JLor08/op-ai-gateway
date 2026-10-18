@@ -843,8 +843,10 @@ func TestRunDeadlineIsDistinguishableFromACancel(t *testing.T) {
 //
 // This test was originally aimed at consumeRunStream's scanner error, where
 // the same branch exists, but it cannot pin THAT branch: it is currently
-// UNREACHABLE -- only the image kind is bounded and an image run never enters
-// consumeRunStream -- so pointing this test at it would be pinning nothing.
+// UNREACHABLE -- only the image, speech and transcription kinds are bounded and
+// none of them enters consumeRunStream (image and speech have no stream, and a
+// transcription run reads its stream through consumeTranscriptionStream) -- so
+// pointing this test at it would be pinning nothing.
 // The branch is kept and annotated where it lives (chat_runs.go,
 // runStreamReadFailure's DeadlineExceeded case), for the day the text kind is
 // bounded; no run can be made to reach it through the stream today, so its
@@ -1094,19 +1096,23 @@ func TestTextRunIsNotBoundedByTheImageDeadline(t *testing.T) {
 	}
 }
 
-// TestRunDeadlineForOnlyBoundsImageAndSpeechRuns states the rule directly, so a
-// future change that folds the kinds back into one global deadline fails here
-// with the reason attached rather than only in a timing-dependent test.
-func TestRunDeadlineForOnlyBoundsImageAndSpeechRuns(t *testing.T) {
+// TestRunDeadlineForOnlyBoundsImageSpeechAndTranscriptionRuns states the rule
+// directly, so a future change that folds the kinds back into one global
+// deadline fails here with the reason attached rather than only in a
+// timing-dependent test.
+func TestRunDeadlineForOnlyBoundsImageSpeechAndTranscriptionRuns(t *testing.T) {
 	if d, bounded := runDeadlineFor(chatRunKindImage); !bounded || d != imageRunDeadline {
 		t.Fatalf("image run: got (%v, %v), want (%v, true)", d, bounded, imageRunDeadline)
 	}
 	if d, bounded := runDeadlineFor(chatRunKindSpeech); !bounded || d != speechRunDeadline {
 		t.Fatalf("speech run: got (%v, %v), want (%v, true)", d, bounded, speechRunDeadline)
 	}
+	if d, bounded := runDeadlineFor(chatRunKindTranscription); !bounded || d != transcriptionRunDeadline {
+		t.Fatalf("transcription run: got (%v, %v), want (%v, true)", d, bounded, transcriptionRunDeadline)
+	}
 	for _, kind := range []string{"", "text", "unknown"} {
 		if d, bounded := runDeadlineFor(kind); bounded || d != 0 {
-			t.Fatalf("kind %q: got (%v, %v), want (0, false) -- only image and speech runs are bounded", kind, d, bounded)
+			t.Fatalf("kind %q: got (%v, %v), want (0, false) -- only image, speech and transcription runs are bounded", kind, d, bounded)
 		}
 	}
 }

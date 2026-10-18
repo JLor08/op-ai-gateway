@@ -598,10 +598,11 @@ var transcriptionRunDeadline = 10 * time.Minute
 // whose output arrives at the end -- or, for a transcription, whose first delta does.
 // A text run streams deltas, so the user can see for themselves that it is alive and
 // the honesty argument above simply does not apply to it -- while a ceiling would
-// newly kill long generations from a slow local model that complete today. Extending the bound to text would therefore be a
-// behaviour change to an existing, overwhelmingly common path, and it needs its
-// own decision rather than arriving as a side effect of the image, speech or
-// transcription features. Do not "simplify" this back into one global deadline.
+// newly kill long generations from a slow local model that complete today.
+// Extending the bound to text would therefore be a behaviour change to an existing,
+// overwhelmingly common path, and it needs its own decision rather than arriving as
+// a side effect of the image, speech or transcription features. Do not "simplify"
+// this back into one global deadline.
 func runDeadlineFor(kind string) (time.Duration, bool) {
 	switch kind {
 	case chatRunKindImage:
@@ -1091,9 +1092,12 @@ func runStreamReadFailure(ctx context.Context, err error) (status, errMsg string
 		// answered 200 the deadline lands here, as a read error on a
 		// cancelled request, rather than on the Do above.
 		//
-		// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image and
-		// speech kinds are bounded (runDeadlineFor) and neither ever enters
-		// consumeRunStream -- they have no stream to consume -- while the
+		// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image,
+		// speech and transcription kinds are bounded (runDeadlineFor) and none
+		// of them ever enters consumeRunStream: image and speech have no
+		// stream to consume, and a transcription run reads its event stream
+		// through consumeTranscriptionStream, which maps an ended context
+		// itself (runContextOutcome) instead of calling this. The
 		// reservation's context is a plain WithCancel over
 		// context.Background(), so no deadline reaches a text run from
 		// the HTTP request either. Bounding the text kind, or adding a

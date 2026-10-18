@@ -858,6 +858,9 @@ exceed the header's declared `data` size by more than about 16 KiB — audio **h
 small or zero `data` chunk**, which would under-report the duration, is a loud zero — and the
 `fmt` chunk must be self-consistent (`byteRate == sampleRate * blockAlign`, `blockAlign ==
 channels * ceil(bits/8)`), so an **inflated byte-rate** cannot shrink the computed duration.
+A `data` size that declares **more** than the upload holds (a truncated file, or an
+oversized declaration) is no measurement either: it returns `(0, false)` and is a loud zero,
+not a normal bill of the declared duration.
 The residual a real WAV can hide is that trailing slack (about 16 KiB, ≈ 0.5 s at 16 kHz
 mono 16-bit, longer at a lower byte rate), and a consistently forged header is self-defeating
 because audio.cpp would then mis-transcribe the clip the header describes. The WAV-header

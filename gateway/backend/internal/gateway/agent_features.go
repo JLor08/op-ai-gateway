@@ -56,10 +56,10 @@ import (
 // and an audio.cpp child: one-sided, this gateway's statement of what its
 // ingest accepts (rowSource, runtimeSampleCapabilityRows), read by the agent as
 // a precondition before it reports a child's speech, transcription and
-// transcription_streaming verdicts under that source. It is a separate name rather than a reuse of the sdcpp one
-// because the two acceptances are independent facts: a gateway build can accept
-// one source and not the other, and the agent must not send a source its
-// gateway would drop.
+// transcription_streaming verdicts under that source. It is a separate name
+// rather than a reuse of the sdcpp one because the two acceptances are
+// independent facts: a gateway build can accept one source and not the other,
+// and the agent must not send a source its gateway would drop.
 var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature}
 
 // capabilitySourceSdcppFeature says this gateway's capability ingest accepts

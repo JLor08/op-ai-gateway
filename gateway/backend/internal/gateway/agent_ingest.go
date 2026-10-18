@@ -1434,9 +1434,10 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 			// on every path, so no honest agent sends this; the boundary
 			// refuses it anyway because a caller can.
 			//
-			// Only the live-progress row goes; the speech and transcription
-			// verdicts below are what that listing answers, so they still ride
-			// the pass. Warn for the same reason as the lines above.
+			// Only the live-progress row goes; the speech, transcription and
+			// transcription_streaming verdicts below are what that listing
+			// answers, so they still ride the pass. Warn for the same reason
+			// as the lines above.
 			slog.Warn("runtime capability sample attributes a live-progress verdict to the audio.cpp probe, dropping that row",
 				"spec_id", rt.SpecID, "verdict", verdict, "source", source)
 		default:

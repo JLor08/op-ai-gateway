@@ -2782,7 +2782,8 @@ func TestCapabilitiesSampleEmitsImageBetweenNamedFieldsAndExtra(t *testing.T) {
 }
 
 // TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra pins where the
-// two audio.cpp verdicts land on the wire: after the five other named fields
+// audio.cpp verdicts (speech, transcription and, for a transcriber,
+// transcription_streaming) land on the wire: after the five other named fields
 // and before every Extra entry, in both directions, and not at all when
 // undetermined. As for image, the position is the load-bearing part: the
 // gateway keeps the FIRST entry for a name, so a "speech" that also appears in

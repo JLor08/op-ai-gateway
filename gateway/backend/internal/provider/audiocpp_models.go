@@ -16,8 +16,8 @@ import (
 // audiocppModelsPath is audio.cpp's OpenAI-shaped model listing. It is fixed by
 // the server, not configured per application, and it is the ONLY place audio.cpp
 // states what a model can do: there is no separate capability document like
-// sd-server's /sdcpp/v1/capabilities, so the capability signal is the task
-// field of each listed model.
+// sd-server's /sdcpp/v1/capabilities, so the capability signal is the task and
+// mode fields of each listed model.
 const audiocppModelsPath = "/v1/models"
 
 // audio.cpp task values. The listing's task names what the listed model DOES:
@@ -25,7 +25,8 @@ const audiocppModelsPath = "/v1/models"
 // voice, so both are a speech "yes"; "asr" transcribes speech to text, so it is
 // a transcription "yes". Every other task (the music tasks, ...) is a model that
 // does neither. One task answers BOTH capabilities at once: a model is never
-// both a synthesiser and a transcriber.
+// both a synthesiser and a transcriber. (The transcription_streaming verdict is
+// not a task answer: it is read from the mode field below.)
 const (
 	audioCppTaskTTS   = "tts"
 	audioCppTaskClone = "clone"
@@ -55,7 +56,8 @@ const (
 // it (the listing was first taken to name LOADED models only, but audio.cpp
 // v0.9.1 also names an unloaded one with loaded:false, so a missing entry says
 // only that the server does not name the model), the listing is empty, it
-// cannot be read, or the named entry carries no task. See routing.CapabilitySourceAudioCppModels.
+// cannot be read, or the named entry carries no task. See
+// routing.CapabilitySourceAudioCppModels.
 //
 // TranscriptionStreaming is the third axis, a refinement of Transcription: it says
 // whether a TRANSCRIBER can answer a stream=true transcription, which is what the
@@ -138,11 +140,11 @@ func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target ro
 // answers no capability question and is left undecoded, so an unknown or added
 // field never breaks the read.
 //
-// Mode is held raw and decoded on its own (audioCppStreamingVerdict), and only for
-// an asr entry: a mode of
-// a type this code does not expect must cost only the streaming verdict, never
-// the speech and transcription verdicts the task decides, and a typed string
-// field would fail the whole document's decode on one odd mode.
+// Mode is held raw and decoded on its own (audioCppStreamingVerdict), and only
+// for an asr entry: a mode of a type this code does not expect must cost only
+// the streaming verdict, never the speech and transcription verdicts the task
+// decides, and a typed string field would fail the whole document's decode on
+// one odd mode.
 type audioCppModelsDoc struct {
 	Data []struct {
 		ID   string          `json:"id"`
@@ -151,11 +153,11 @@ type audioCppModelsDoc struct {
 	} `json:"data"`
 }
 
-// parseAudioCppModels derives the speech and transcription verdicts for modelID
-// from a /v1/models body. It is TOLERANT, unlike the strict sdcpp document
-// parser: a body that is not the listing, or an entry of the wrong shape, yields
-// the empty verdict rather than an error, so a probe never breaks over an
-// unexpected shape.
+// parseAudioCppModels derives the speech, transcription and
+// transcription_streaming verdicts for modelID from a /v1/models body. It is
+// TOLERANT, unlike the strict sdcpp document parser: a body that is not the
+// listing, or an entry of the wrong shape, yields the empty verdict rather than
+// an error, so a probe never breaks over an unexpected shape.
 //
 // The rule, with the loaded entry's task authoritative:
 //   - the entry whose id is modelID, with task "tts" or "clone" ->
