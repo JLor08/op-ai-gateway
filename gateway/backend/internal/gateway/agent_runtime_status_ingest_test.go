@@ -2536,7 +2536,7 @@ func TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist(t *testing.T) {
 	}
 	sent := counting.lastSent()
 	if len(sent) != 2 {
-		t.Fatalf("the write carried %+v, want exactly the speech and transcription rows -- the audio.cpp listing answers those two and nothing else", sent)
+		t.Fatalf("the write carried %+v, want exactly the speech and transcription rows -- the foreign vision and tools rows must not ride along", sent)
 	}
 	for _, row := range sent {
 		if row.Capability != routing.CapabilitySpeech && row.Capability != routing.CapabilityTranscription {

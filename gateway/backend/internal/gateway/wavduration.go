@@ -47,8 +47,8 @@ const (
 // chunk with nothing after it, measures zero. Only ok says whether the header could
 // be believed.
 //
-// It takes a stream so an upload held in a multipart body is measured where it lies,
-// without a second copy of it: only the chunk headers and the `fmt ` chunk are read
+// The input is a stream so that an upload held in a multipart body is measured where
+// it lies, without a second copy of it: only the chunk headers and the `fmt ` chunk are read
 // for their content, and every other byte -- a foreign chunk of any size, the audio
 // itself -- is passed over and counted. The tests measure an in-memory file through
 // the wavDurationMillis helper of wavduration_test.go.

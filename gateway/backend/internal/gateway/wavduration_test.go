@@ -348,11 +348,11 @@ func TestWavDurationMillisPassesOverTheTailOfALongerFmtChunk(t *testing.T) {
 }
 
 // A second `fmt ` chunk before `data` replaces the first: the walk keeps no first-wins
-// rule, so the byte rate in force is the last one read before `data`. That is the
-// stricter reading of a file the format does not define, because every `fmt ` read
-// must still agree with itself: a later chunk that contradicts itself voids the file
-// even though the first one was sound, so a header cannot hide an inflated rate
-// behind a sound decoy (or the reverse).
+// rule, so the byte rate in force is the last one read before `data`. The format does
+// not define such a file; what the walk guarantees is that every `fmt ` chunk it reads
+// must agree with itself, so a later chunk that contradicts itself voids the file even
+// though the first one was sound. (A later chunk that is consistent but forged still
+// wins -- the residual wavConsistentByteRate documents.)
 func TestWavDurationMillisTakesTheLastFmtChunkBeforeData(t *testing.T) {
 	data := wavDataChunk(t, 16000)
 	t.Run("the later fmt chunk wins", func(t *testing.T) {

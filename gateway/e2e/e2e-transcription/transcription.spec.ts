@@ -111,7 +111,7 @@ const STREAM_TTFT_MS = 120;
 // The WAV the streaming requests upload is three seconds long (the header says so), not
 // the stub's CLIP_SECONDS, so the quantity a streamed row bills can only have come from
 // the upload's header.
-const STREAM_CLIP_SECONDS = 3;
+const STREAM_CLIP_SECONDS: number = 3;
 if (STREAM_CLIP_SECONDS === CLIP_SECONDS) {
   throw new Error("STREAM_CLIP_SECONDS must differ from CLIP_SECONDS, or a streamed row's quantity could not tell the upload's header from the stub's timing block");
 }
@@ -442,6 +442,7 @@ function readSSE(body: ReadableStream<Uint8Array>): { frames: AsyncGenerator<str
     for (;;) {
       const { done, value } = await reader.read();
       if (done) {
+        raw += decoder.decode();
         break;
       }
       const text = decoder.decode(value, { stream: true });

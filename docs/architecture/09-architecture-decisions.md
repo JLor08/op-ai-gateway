@@ -6363,13 +6363,13 @@ case and leaving the buffered path byte-identical.**
 **Consequence:** streaming transcription is a staged, backward-compatible addition, not a
 new code path. The relay, the WAV-header billing, the capture and the retry-buffered-on-500
 safety-net (stage 1) stand on their own and are live-verifiable through the API: the handler
-streams only on a `yes`, so the mismatch 500 can only follow one — written by the probe, or
-manually — for a model that is not `mode=streaming`, and is then retried buffered; a model
-with no verdict is not streamed at all and never draws it. The
-up-front `transcription_streaming` verdict (stages 2 and 3 — the direct-app `mode` read and
-the agent report) is then pure optimisation of the decision: a `yes` streams (the retry
-covering a rare stale `yes`), and an **absent** verdict buffers and self-heals once the model
-is probed, so no steady-state request streams against a model not known to support it. Stage
+streams only on a `yes`, so the mismatch 500 can only follow one — a manual one while only
+stage 1 exists, the probe's once stages 2 and 3 land — for a model that is not
+`mode=streaming`, and is then retried buffered; a model with no verdict is not streamed at
+all and never draws it. The up-front `transcription_streaming` verdict (stages 2 and 3 — the
+direct-app `mode` read and the agent report) is then what takes the decision up front, and
+nothing breaks without it or with it stale: a `yes` streams (the retry covering a rare stale
+`yes`), and an **absent** verdict buffers and self-heals once the model is probed, so no steady-state request streams against a model not known to support it. Stage
 4 (the portal streaming run) is the UX. The non-streaming one-shot path is byte-identical
 when `stream` is absent or the model is offline, and #259's client-side WAV conversion is
 untouched. The accepted nuances are named, not hidden: a stream the upstream closes cleanly

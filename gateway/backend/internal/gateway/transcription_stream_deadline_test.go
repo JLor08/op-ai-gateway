@@ -80,6 +80,24 @@ func setTranscriptionAppTimeout(t *testing.T, srv *Server, timeoutMS int) {
 	}
 }
 
+// requireUpstreamCut waits for the stub to report that the relay cancelled its request
+// (cut, set by newStallingTranscriptionUpstream). The flag is set from the stub's own
+// goroutine once its server notices the closed connection, and the relay's handler
+// returns -- ending the client's body -- as soon as its timer fires, so the client can
+// get to the end of the body first: reading the flag once is a race, and the poll is
+// what makes it deterministic. why completes "the relay did not cancel the upstream
+// request ..." in the failure.
+func requireUpstreamCut(t *testing.T, cut *atomic.Bool, why string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cut.Load() {
+		if time.Now().After(deadline) {
+			t.Fatalf("the relay did not cancel the upstream request %s", why)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // A first frame that comes later than the idle timeout is NOT cut: the stub answers the
 // event stream's headers at once and holds the first frame back for 3.5x the idle
 // timeout. The whole stream reaches the client and the call is recorded a success.
@@ -154,9 +172,7 @@ func TestTranscriptionStreamWithNoBodyByteIsCutAtTheFirstByteBudget(t *testing.T
 	if ev.BillingQuantity != 0 {
 		t.Fatalf("BillingQuantity = %v, want 0: nothing was transcribed", ev.BillingQuantity)
 	}
-	if !cutByRelay.Load() {
-		t.Fatal("the relay did not cancel the upstream request when the first-byte budget ran out")
-	}
+	requireUpstreamCut(t, &cutByRelay, "when the first-byte budget ran out")
 }
 
 // The grace ends at the first byte: once a frame has arrived, silence longer than the
@@ -185,9 +201,7 @@ func TestTranscriptionStreamIdleTimeoutAppliesAfterTheFirstFrame(t *testing.T) {
 	if ev.Status != "error" || ev.ErrorCode != "provider.stream_idle_timeout" {
 		t.Fatalf("usage row = %q/%q, want error/provider.stream_idle_timeout", ev.Status, ev.ErrorCode)
 	}
-	if !cutByRelay.Load() {
-		t.Fatal("the relay did not cancel the upstream request when the stream went idle")
-	}
+	requireUpstreamCut(t, &cutByRelay, "when the stream went idle")
 }
 
 // A stream request the upstream answers with a plain JSON document is relayed buffered,
@@ -216,9 +230,7 @@ func TestTranscriptionStreamAnsweredWithJSONIsBoundedByTheTotalTimeout(t *testin
 	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "transcription.upstream_error") {
 		t.Fatalf("response = %d %s, want the relay's 502 transcription.upstream_error for a body that never finished", resp.StatusCode, body)
 	}
-	if !cutByRelay.Load() {
-		t.Fatal("the relay did not cancel the upstream request at its total timeout")
-	}
+	requireUpstreamCut(t, &cutByRelay, "at its total timeout")
 }
 
 // A client may spell a boolean stream any way strconv.ParseBool reads, and the relay
