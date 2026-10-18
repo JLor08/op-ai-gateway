@@ -19,6 +19,8 @@ class FakeMediaRecorder {
   ];
   // Set to make the constructor throw (an unsupported configuration).
   static constructError: Error | null = null;
+  // Set to make start() throw (the device ended between the grant and the start).
+  static startError: Error | null = null;
 
   state: 'inactive' | 'recording' = 'inactive';
   mimeType = 'audio/webm;codecs=opus';
@@ -37,6 +39,7 @@ class FakeMediaRecorder {
 
   start() {
     this.startCalls += 1;
+    if (FakeMediaRecorder.startError) throw FakeMediaRecorder.startError;
     this.state = 'recording';
   }
 
@@ -48,11 +51,16 @@ class FakeMediaRecorder {
   }
 }
 
-// A microphone stream: one track whose stop() is the "microphone released" signal.
+// A microphone stream: two tracks (a device may hand over more than one), whose stop()s are the
+// "microphone released" signal. Releasing means stopping EVERY track, not just the first.
 function makeStream() {
-  const track = { stop: vi.fn() };
-  const stream = { getTracks: () => [track] } as unknown as MediaStream;
-  return { stream, track };
+  const tracks = [{ stop: vi.fn() }, { stop: vi.fn() }];
+  const stream = { getTracks: () => tracks } as unknown as MediaStream;
+  return { stream, tracks };
+}
+
+function expectMicReleased() {
+  for (const track of mic.tracks) expect(track.stop).toHaveBeenCalled();
 }
 
 type Mic = ReturnType<typeof makeStream>;
@@ -71,6 +79,7 @@ function installMediaStack() {
   });
   FakeMediaRecorder.instances = [];
   FakeMediaRecorder.constructError = null;
+  FakeMediaRecorder.startError = null;
   FakeMediaRecorder.chunks = () => [new Blob(['voice-bytes'], { type: 'audio/webm;codecs=opus' })];
   vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
   urlSeq = 0;
@@ -183,7 +192,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
       expect(FakeMediaRecorder.instances[0].stopCalls).toBe(1);
       // The browser's "recording" indicator goes out with the track.
-      expect(mic.track.stop).toHaveBeenCalled();
+      expectMicReleased();
       // The clock is gone, a player is there and plays an object URL of the recording.
       expect(screen.queryByRole('timer')).not.toBeInTheDocument();
       const preview = screen.getByLabelText(t.chatRecordPreview);
@@ -316,8 +325,30 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await startRecording();
 
         expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordFailed);
-        expect(mic.track.stop).toHaveBeenCalled();
+        expectMicReleased();
         expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeEnabled();
+      });
+
+      // The same failure class as a recorder that cannot be built: the device ended between the
+      // grant and the start. It must not leave the microphone live or the Record button stuck.
+      it('releases the microphone and re-enables Record when the recorder cannot start', async () => {
+        FakeMediaRecorder.startError = new DOMException('device ended', 'InvalidStateError');
+        const { onRecorded } = renderRecorder();
+        await startRecording();
+
+        expect(FakeMediaRecorder.instances[0].startCalls).toBe(1);
+        expectMicReleased();
+        expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordFailed);
+        expect(screen.queryByText(t.chatRecordRequesting)).not.toBeInTheDocument();
+        expect(screen.queryByRole('timer')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeEnabled();
+        expect(onRecorded).not.toHaveBeenCalled();
+
+        // And it can be tried again once the device is back.
+        FakeMediaRecorder.startError = null;
+        await startRecording();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.chatRecordStop })).toBeInTheDocument();
       });
 
       it('fails a recording that captured nothing, and releases everything', async () => {
@@ -329,7 +360,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordFailed);
         expect(onRecorded).not.toHaveBeenCalled();
         expect(createObjectURL).not.toHaveBeenCalled();
-        expect(mic.track.stop).toHaveBeenCalled();
+        expectMicReleased();
         expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeEnabled();
       });
 
@@ -342,7 +373,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         });
 
         expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordFailed);
-        expect(mic.track.stop).toHaveBeenCalled();
+        expectMicReleased();
         expect(screen.queryByRole('timer')).not.toBeInTheDocument();
         expect(onRecorded).not.toHaveBeenCalled();
       });
@@ -355,7 +386,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         unmount();
 
-        expect(mic.track.stop).toHaveBeenCalled();
+        expectMicReleased();
         expect(onRecorded).not.toHaveBeenCalled();
         // The recorder's late `stop` event finds nobody to tell and makes no preview.
         expect(createObjectURL).not.toHaveBeenCalled();
@@ -396,7 +427,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await act(async () => allow(mic.stream));
 
         // Nobody is there to record: the late grant is let go at once, not held open.
-        expect(mic.track.stop).toHaveBeenCalled();
+        expectMicReleased();
         expect(FakeMediaRecorder.instances).toHaveLength(0);
       });
     });

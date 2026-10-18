@@ -181,11 +181,22 @@ export function AudioRecorder({
   }
 
   // Starts a recorder on a granted microphone stream and the clock that follows it. A recorder
-  // that cannot be built (a configuration the browser does not support) releases the stream again.
+  // that cannot be built (a configuration the browser does not support) or cannot start (the device
+  // ended between the grant and the start: InvalidStateError, NotSupportedError) is the same
+  // failure: the stream is released again and the recorder is back to idle with an error, so the
+  // microphone is not left live and Record is not left disabled. The recorder is only recorded in
+  // the refs once it has started, so nothing of a failed one is left for the cleanup to find.
   function beginRecording(stream: MediaStream) {
     let recorder: MediaRecorder;
     try {
       recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunksRef.current.push(event.data);
+      };
+      recorder.onstop = () => finish(recorder);
+      recorder.onerror = fail;
+      recorder.start();
     } catch {
       stopTracks(stream);
       setError(t.chatRecordFailed);
@@ -194,13 +205,6 @@ export function AudioRecorder({
     }
     streamRef.current = stream;
     recorderRef.current = recorder;
-    chunksRef.current = [];
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunksRef.current.push(event.data);
-    };
-    recorder.onstop = () => finish(recorder);
-    recorder.onerror = fail;
-    recorder.start();
     startedAtRef.current = Date.now();
     setElapsedMs(0);
     clockRef.current = setInterval(

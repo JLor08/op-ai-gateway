@@ -4401,6 +4401,19 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         );
       });
 
+      // The payload is whatever follows the LAST comma of the reader's data url: base64 has none,
+      // but a media-type parameter may.
+      it('reads the payload of a clip whose reported type contains a comma', async () => {
+        renderProvider([], { models: transcriptionModels });
+        await waitForReady();
+        fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+        await attachClip(new File(['x'], 'clip.wav', { type: 'audio/wav;note=a,b' }));
+
+        expect(screen.getByTestId('composer-audio').textContent).toBe(
+          `data:audio/wav;base64,${btoa('x')}`,
+        );
+      });
+
       it('removes the clip, and sending then has nothing to send', async () => {
         renderProvider([], { models: transcriptionModels });
         await waitForReady();

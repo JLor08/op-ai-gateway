@@ -41,7 +41,9 @@ function readAsBase64(blob: Blob): Promise<string> {
     const reader = new FileReader();
     reader.onload = () => {
       const { result } = reader;
-      const comma = typeof result === 'string' ? result.indexOf(',') : -1;
+      // The LAST comma: base64 never contains one, but a media-type parameter in the header
+      // (a blob typed `audio/x-foo;a=b,c`) may, and slicing at the first would keep part of it.
+      const comma = typeof result === 'string' ? result.lastIndexOf(',') : -1;
       if (typeof result === 'string' && comma >= 0) resolve(result.slice(comma + 1));
       else reject(new AudioAttachError('read'));
     };

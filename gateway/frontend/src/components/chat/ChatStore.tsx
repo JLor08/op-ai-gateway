@@ -100,14 +100,11 @@ export { audioPassthroughMessage, parseAudioPassthrough } from './chatDoc';
 export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
 
 // The transcription composer's twin of the above (its own reserved fields and message), and
-// what its audio input needs: the allow-listed clip formats for the attach picker, and the
-// constructors of the user-turn audio part, which strip a recorder's media-type parameter
-// (audio/webm;codecs=opus) and map a platform's alias (audio/x-wav) to the canonical type
-// before the clip becomes a data url the backend accepts.
+// what its audio input needs: the allow-listed clip formats for the attach picker and the bare
+// media-type helper. (The clip itself is built inside the store, by handleFiles / attachRecording,
+// which strip a recorder's media-type parameter and map a platform's alias to the canonical type.)
 export {
-  audioInputPart,
   bareAudioMediaType,
-  normalizeAudioDataUrl,
   parseTranscriptionPassthrough,
   TRANSCRIPTION_AUDIO_ACCEPT,
   TRANSCRIPTION_AUDIO_TYPES,

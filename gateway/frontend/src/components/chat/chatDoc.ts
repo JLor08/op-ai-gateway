@@ -903,35 +903,11 @@ export function audioDataUrl(mediaType: string, base64: string): string {
   return `data:${aliasedAudioMediaType(mediaType)};base64,${base64}`;
 }
 
-// The user-turn part carrying a transcription turn's clip: an `audio_url` part holding the
-// audio as an inline `data:<type>;base64,...` url (the image attach's `image_url` part has the
-// same shape), which the run's commit moves into the chat's blob store, leaving a
-// /api/portal/chat-blobs/{id} reference in the transcript. The type is normalized
-// (audioDataUrl), so a recorder's audio/webm;codecs=opus becomes audio/webm and a file's
-// audio/x-wav audio/wav.
-export function audioInputPart(mediaType: string, base64: string): ChatContentPart {
-  return { type: 'audio_url', audio_url: { url: audioDataUrl(mediaType, base64) } };
-}
-
 // The content of the user turn a transcription composer sends: the clip alone, as one audio_url
 // part (`url` is the clip's data url, see audioDataUrl). There is no text part: the turn IS the
 // audio, and nothing else of it is read.
 export function audioTurnContent(url: string): ChatContent {
   return [{ type: 'audio_url', audio_url: { url } }];
-}
-
-// audioInputPart's counterpart for a clip that already is a data url -- what a FileReader
-// makes of a recording (`data:audio/webm;codecs=opus;base64,...`): the same url with its type
-// reduced to the bare one and the payload left exactly as it is. Anything that is not an
-// inline base64 data url (a stored /api/portal/chat-blobs/{id} reference, say) is returned
-// untouched: there is nothing to normalize, and a reference must never be rewritten.
-export function normalizeAudioDataUrl(url: string): string {
-  if (!url.toLowerCase().startsWith('data:')) return url;
-  const comma = url.indexOf(',');
-  if (comma < 0) return url;
-  const header = url.slice('data:'.length, comma).split(';');
-  if (header.at(-1)?.trim().toLowerCase() !== 'base64') return url;
-  return `data:${aliasedAudioMediaType(header[0])};base64,${url.slice(comma + 1)}`;
 }
 
 // Coerce an opaque `content` blob into a well-formed active-chat document,

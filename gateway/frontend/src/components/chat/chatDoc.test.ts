@@ -14,7 +14,7 @@ import {
   TRANSCRIPTION_AUDIO_TYPES,
   TRANSCRIPTION_RESERVED_FIELDS,
   attachModeOf,
-  audioInputPart,
+  audioDataUrl,
   audioPassthroughMessage,
   audioSetting,
   audioSettingsFrom,
@@ -32,7 +32,6 @@ import {
   lastUserHasImage,
   maskPart,
   metricsOf,
-  normalizeAudioDataUrl,
   normalizeDoc,
   optionsOr,
   parseAudioPassthrough,
@@ -1062,8 +1061,8 @@ describe('what an attachment means on a transcription thread', () => {
 // The INPUT clip of a transcription turn is an audio_url part of the USER message: the same
 // part type a speech turn's reply uses, told apart by the role it sits in. The backend's
 // DecodeAudioDataURL refuses a data url whose media type carries a parameter, and the
-// browser's recorder produces audio/webm;codecs=opus, so the constructor must hand over the
-// bare type.
+// browser's recorder produces audio/webm;codecs=opus, so the data url the composer builds
+// (audioDataUrl) must carry the bare type.
 describe('the audio input part of a transcription turn', () => {
   it('names the allow-listed input formats, in step with the backend chat-blob allow-list', () => {
     expect([...TRANSCRIPTION_AUDIO_TYPES]).toEqual([
@@ -1080,26 +1079,14 @@ describe('the audio input part of a transcription turn', () => {
     }
   });
 
-  it('builds an audio_url part from a clip, as an inline data url', () => {
-    expect(audioInputPart('audio/wav', 'UklGRg==')).toEqual({
-      type: 'audio_url',
-      audio_url: { url: 'data:audio/wav;base64,UklGRg==' },
-    });
+  it('builds the inline data url of a clip', () => {
+    expect(audioDataUrl('audio/wav', 'UklGRg==')).toBe('data:audio/wav;base64,UklGRg==');
   });
 
   it('strips a media-type parameter: audio/webm;codecs=opus becomes audio/webm', () => {
-    expect(audioInputPart('audio/webm;codecs=opus', 'AAAA')).toEqual({
-      type: 'audio_url',
-      audio_url: { url: 'data:audio/webm;base64,AAAA' },
-    });
-    expect(audioInputPart('audio/ogg; codecs=opus', 'AAAA')).toEqual({
-      type: 'audio_url',
-      audio_url: { url: 'data:audio/ogg;base64,AAAA' },
-    });
-    expect(audioInputPart('audio/mp4;codecs="mp4a.40.2"', 'AAAA')).toEqual({
-      type: 'audio_url',
-      audio_url: { url: 'data:audio/mp4;base64,AAAA' },
-    });
+    expect(audioDataUrl('audio/webm;codecs=opus', 'AAAA')).toBe('data:audio/webm;base64,AAAA');
+    expect(audioDataUrl('audio/ogg; codecs=opus', 'AAAA')).toBe('data:audio/ogg;base64,AAAA');
+    expect(audioDataUrl('audio/mp4;codecs="mp4a.40.2"', 'AAAA')).toBe('data:audio/mp4;base64,AAAA');
   });
 
   it('normalizes case and surrounding space of the type, like the backend reads it', () => {
@@ -1109,31 +1096,11 @@ describe('the audio input part of a transcription turn', () => {
     expect(bareAudioMediaType('')).toBe('');
   });
 
-  it('rewrites the data url a FileReader makes of a recording the same way', () => {
-    expect(normalizeAudioDataUrl('data:audio/webm;codecs=opus;base64,AAAA')).toBe(
-      'data:audio/webm;base64,AAAA',
-    );
-    expect(normalizeAudioDataUrl('data:audio/ogg;codecs=opus;base64,AAAA')).toBe(
-      'data:audio/ogg;base64,AAAA',
-    );
-    // Already bare: untouched.
-    expect(normalizeAudioDataUrl('data:audio/wav;base64,UklGRg==')).toBe(
-      'data:audio/wav;base64,UklGRg==',
-    );
-    // A payload that happens to contain the separators is left exactly as it is.
-    expect(normalizeAudioDataUrl('data:audio/webm;codecs=opus;base64,AA;codecs=BB==')).toBe(
-      'data:audio/webm;base64,AA;codecs=BB==',
-    );
-    // Not an inline data url (a stored reference): returned as it is, never rewritten.
-    const ref = '/api/portal/chat-blobs/blob_abc';
-    expect(normalizeAudioDataUrl(ref)).toBe(ref);
-  });
-
   it('reads back through audioUrlsOf, and is never mistaken for an image', () => {
-    const part = audioInputPart('audio/webm;codecs=opus', 'AAAA');
-    expect(audioUrlsOf([part])).toEqual(['data:audio/webm;base64,AAAA']);
-    expect(imageUrlsOf([part])).toEqual([]);
-    const message: ChatUiMessage = { id: 'u', role: 'user', content: [part] };
+    const content = audioTurnContent(audioDataUrl('audio/webm;codecs=opus', 'AAAA'));
+    expect(audioUrlsOf(content)).toEqual(['data:audio/webm;base64,AAAA']);
+    expect(imageUrlsOf(content)).toEqual([]);
+    const message: ChatUiMessage = { id: 'u', role: 'user', content };
     // An audio input is no image: the replay guards that look for one stay quiet.
     expect(historyHasImage([message])).toBe(false);
     expect(lastUserHasImage([message])).toBe(false);
@@ -1146,7 +1113,7 @@ describe('titling a transcription chat from its transcript', () => {
   const user: ChatUiMessage = {
     id: 'u1',
     role: 'user',
-    content: [audioInputPart('audio/webm', 'AAAA')],
+    content: audioTurnContent(audioDataUrl('audio/webm', 'AAAA')),
   };
   const assistant = (content: ChatUiMessage['content'], id = 'a1'): ChatUiMessage => ({
     id,
@@ -1270,28 +1237,15 @@ describe('the canonical media type of a clip', () => {
     }
   });
 
-  // The part builders alias too, so no path that reaches them can put a non-canonical type
-  // on the wire.
-  it('is what the part builders write: audio/x-wav is sent as audio/wav', () => {
-    expect(audioInputPart('audio/x-wav', 'UklGRg==')).toEqual({
-      type: 'audio_url',
-      audio_url: { url: 'data:audio/wav;base64,UklGRg==' },
-    });
-    expect(audioInputPart('audio/mp3', 'AAAA')).toEqual({
-      type: 'audio_url',
-      audio_url: { url: 'data:audio/mpeg;base64,AAAA' },
-    });
-    expect(normalizeAudioDataUrl('data:audio/x-m4a;base64,AAAA')).toBe(
-      'data:audio/mp4;base64,AAAA',
-    );
-    expect(normalizeAudioDataUrl('data:audio/x-wav;codecs=pcm;base64,AAAA')).toBe(
-      'data:audio/wav;base64,AAAA',
-    );
+  // The data url the composer builds aliases too, so no path that reaches it can put a
+  // non-canonical type on the wire.
+  it('is what the data url is written under: audio/x-wav is sent as audio/wav', () => {
+    expect(audioDataUrl('audio/x-wav', 'UklGRg==')).toBe('data:audio/wav;base64,UklGRg==');
+    expect(audioDataUrl('audio/mp3', 'AAAA')).toBe('data:audio/mpeg;base64,AAAA');
+    expect(audioDataUrl('audio/x-m4a', 'AAAA')).toBe('data:audio/mp4;base64,AAAA');
+    expect(audioDataUrl('audio/x-wav;codecs=pcm', 'AAAA')).toBe('data:audio/wav;base64,AAAA');
     // A type with no alias is only made bare, as before (the backend then decides).
-    expect(audioInputPart('audio/flac', 'AAAA')).toEqual({
-      type: 'audio_url',
-      audio_url: { url: 'data:audio/flac;base64,AAAA' },
-    });
+    expect(audioDataUrl('audio/flac', 'AAAA')).toBe('data:audio/flac;base64,AAAA');
   });
 });
 
