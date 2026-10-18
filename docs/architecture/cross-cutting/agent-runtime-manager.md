@@ -827,11 +827,15 @@ cached earlier is withheld. The agent reads the child directly because the agent
 aggregate `/v1/models` carries no `task`; that is also why the gateway's own health loop,
 whose audio.cpp pass reads the same document from a **static** `audio_cpp` *application*,
 deliberately leaves a `server_agent` application alone. The gateway's ingest accepts the
-source for the `speech` and `transcription` rows only, at the probe rank, so an
+source for the `speech`, `transcription` and `transcription_streaming` rows only, at the
+probe rank, so an
 operator's manual verdict still outranks it and remains the override, and the fallback
 for an agent before 0.9.1 and for a model the listing does not name (the `transcription`
-name was deliberately left off the ingest's reserved agent names so that this source
-could report it). The kind's agent-side launch shape (arguments, ensure route, VRAM
+and `transcription_streaming` names were deliberately left off the ingest's reserved agent
+names so that this source could report them; `transcription_streaming` — the model's
+`mode`, `yes` for `mode=streaming` and only for an ASR model — was added by the agent at
+0.9.2 on this same source with no new feature flag, issue #262,
+[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)). The kind's agent-side launch shape (arguments, ensure route, VRAM
 measurement) has no worked example here. **Serving transcription needed no agent
 change:** an agent-launched child is sent the upload through the router's existing
 multipart branch (§4.2), which peeks the model from the form whatever the path and
@@ -2786,7 +2790,9 @@ fallback to choose — so an agent-side name would gate nothing, and
 
 `capability_source_audiocpp` (issue #255) is the second flag of that shape, and the two
 are independent facts, not one: it states that the gateway's capability ingest accepts the
-`audiocpp_models` source, for the `speech` and `transcription` rows only. The agent reads
+`audiocpp_models` source, for the `speech`, `transcription` and `transcription_streaming`
+rows only (the last added on this same source by agent 0.9.2 with no new flag, issue #262,
+[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)). The agent reads
 it before it probes an `audio_cpp` child's `/v1/models` and before it sends a verdict
 cached from one, with the same 30 s memo and the same rule that while the name is missing
 nothing is probed or cached for that child. Declaring one name opens nothing for the
@@ -2920,6 +2926,17 @@ gained a fourth capability probe (`/v1/models` for an `audio_cpp` child) and a f
 PATCH, and what a flag is FOR agrees: the gateway is the side that must accept the source,
 so the agent waits on the gateway's name and nothing on the gateway waits on the agent.
 The bump is one for the whole branch, made when the agent change landed.
+
+**`0.9.1` → `0.9.2` (issue #262, streaming transcription) is PATCH, on the same
+precedent.** The agent's `audio_cpp` collector now decodes the per-model `mode` field of
+`/v1/models` (beside the `task` it already read) and emits **one more verdict name on the
+existing `audiocpp_models` source**, `transcription_streaming` (`yes` for `mode=streaming`,
+and only for an ASR model), under the already-declared `capability_source_audiocpp`.
+`agent.Features` gained nothing — an absent verdict already means the gateway buffers, so a
+flag would gate nothing (§7, [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)) — so the rule makes it PATCH, and
+the `Version` pin test moves to `0.9.2`. An older agent that omits the verdict degrades
+cleanly to the gateway's buffered path, which is why there is no hard version dependency
+([ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/

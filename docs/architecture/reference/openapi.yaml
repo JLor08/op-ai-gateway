@@ -310,13 +310,21 @@ paths:
         `transcription.unavailable`. The only accepted `response_format` is
         `json` or absent: `verbose_json`, `text`, `srt`, `vtt` and every other
         value is refused with 400 `transcription.response_format_unsupported`.
-        Streaming is not served (`stream` on, or any `stream_format`, is refused
-        with 400 `transcription.stream_unsupported`). The 200 response is
-        audio.cpp's `application/json` document, written through verbatim with
-        its `timing` extension: the gateway buffers the whole body, up to the
-        upload cap, to read the trailing `timing.audio_duration_ms`, so a 2xx
-        response over that bound, or one that breaks off mid-read, is 502
-        `transcription.upstream_error` with nothing written. A non-2xx upstream
+        `stream: true` against a mapping whose `transcription_streaming`
+        capability verdict is `yes` (the model is `mode=streaming`) is served:
+        the gateway relays audio.cpp's own OpenAI-style SSE unbuffered
+        (`Content-Type: text/event-stream`; `transcript.text.delta` ->
+        `transcript.text.done` -> `[DONE]`). Against an offline, unprobed or
+        not-yet-reported model the same `stream: true` is served buffered (the
+        complete JSON, never an error), and a stale-`yes` `500` is retried
+        buffered once. Only a non-boolean `stream`, or any `stream_format`, is
+        refused with 400 `transcription.stream_unsupported`. The buffered 200
+        response is audio.cpp's `application/json` document, written through
+        verbatim with its `timing` extension: the gateway buffers the whole
+        body, up to the upload cap, to read the trailing
+        `timing.audio_duration_ms`, so a 2xx response over that bound, or one
+        that breaks off mid-read, is 502 `transcription.upstream_error` with
+        nothing written. A non-2xx upstream
         answer keeps the upstream's status and is normalised to the OpenAI
         error shape: an OpenAI error object passes through unchanged, a
         plain-string `error` is wrapped with `type: upstream_error` and `code:
@@ -326,8 +334,10 @@ paths:
         `request.body_too_large`); a body bound for an agent-launched model is
         checked against the agent's own 32 MiB after the gateway has prepared
         it, with the same refusal. Metered in seconds of audio
-        (`billing_unit: audio_second`, read from the response body's
-        `timing.audio_duration_ms`, not a header), not in tokens. Beyond those
+        (`billing_unit: audio_second`), not in tokens: a buffered call reads the
+        duration from the response body's `timing.audio_duration_ms` (not a
+        header); a streamed call, which carries no such field, reads it from the
+        uploaded WAV header and bills only on a clean completion. Beyond those
         it answers the same statuses as every other inference path (429/402
         from the principal limiter, 503 from the capacity queue or no healthy
         host), which this path-level spec does not enumerate. Alias:
@@ -2975,10 +2985,12 @@ components:
                   `transcription.response_format_unsupported`.
               stream:
                 type: boolean
-                enum: [false]
                 description: >
-                  Streaming is not served. `false` or absent is accepted; `true`
-                  is 400 `transcription.stream_unsupported`.
+                  `true` is served as an unbuffered SSE relay when the model is
+                  `mode=streaming` (the `transcription_streaming` verdict is
+                  `yes`), and served buffered otherwise; `false` or absent takes
+                  the buffered one-shot. A non-boolean value is 400
+                  `transcription.stream_unsupported`.
               stream_format:
                 type: string
                 description: >
@@ -3004,10 +3016,15 @@ components:
           schema: { type: string, format: binary }
     Transcription:
       description: >
-        audio.cpp's transcription document, written through verbatim:
-        `{"text": "...", "timing": {"wall_ms": ..., "audio_duration_ms": ...,
-        "rtf": ...}}`. `timing` is an audio.cpp extension that the gateway keeps
-        (OpenAI clients ignore unknown fields) and reads for the usage row.
+        The buffered 200 is audio.cpp's transcription document, written through
+        verbatim: `{"text": "...", "timing": {"wall_ms": ...,
+        "audio_duration_ms": ..., "rtf": ...}}`. `timing` is an audio.cpp
+        extension that the gateway keeps (OpenAI clients ignore unknown fields)
+        and reads for the usage row. A STREAMED 200 (a `mode=streaming` model
+        asked with `stream: true`) is instead `text/event-stream`: audio.cpp's
+        own SSE, `transcript.text.delta` (incremental) -> `transcript.text.done`
+        (the full `text` plus `timing.ttft_ms`, no `audio_duration_ms`) ->
+        `[DONE]`, relayed unbuffered and billed from the uploaded WAV header.
       content:
         application/json:
           schema:
@@ -3027,6 +3044,12 @@ components:
                   wall_ms: { type: number }
                   audio_duration_ms: { type: number }
                   rtf: { type: number }
+        text/event-stream:
+          schema:
+            type: string
+            description: >
+              The streamed case: audio.cpp's SSE frames `transcript.text.delta`
+              -> `transcript.text.done` -> `[DONE]`, relayed byte for byte.
     BadRequest:
       description: >
         Invalid request payload — the Error envelope carries the stable
