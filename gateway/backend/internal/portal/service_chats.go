@@ -599,7 +599,9 @@ func (d chatDoc) marshal() (json.RawMessage, error) {
 // (resolveChatBlobRefs); an image run's history is returned as stored, except
 // that the source image of its turn -- the image its last user message carries,
 // which makes the turn an edit -- is resolved to a data url too, or the run is
-// refused (resolveImageRunSource). Owner-scoped.
+// refused (resolveImageRunSource); a transcription run's likewise, except that
+// the source is the audio clip its last user message carries
+// (resolveTranscriptionRunSource). Owner-scoped.
 func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID string, req PrepareRunRequest) ([]ChatAPIMessage, ChatRunSettings, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {
@@ -767,14 +769,25 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// or whose images cannot be read, stores nothing, so retrying it is not a
 	// duplicate turn.
 	//
+	// A transcription run is the audio twin of that: its input is the clip its
+	// last user message carries, so it resolves that one message's audio and no
+	// other (resolveTranscriptionRunSource), and refuses a clip the chat does not
+	// hold. It reads audio parts and nothing else; every other run reads image
+	// parts and nothing else, so a stored clip in a text, image or speech thread's
+	// history is left as the reference it is.
+	//
 	// A speech run takes the text branch on purpose: its input is the last user
 	// message's text and its history carries no image to resolve beyond what a
 	// text thread's would, so it needs no special source resolution of its own.
-	if req.Settings.Kind != chatKindImage {
-		if history, err = s.resolveChatBlobRefs(ctx, chatID, history); err != nil {
-			return nil, ChatRunSettings{}, err
-		}
-	} else if history, err = s.resolveImageRunSource(ctx, chatID, history); err != nil {
+	switch req.Settings.Kind {
+	case chatKindImage:
+		history, err = s.resolveImageRunSource(ctx, chatID, history)
+	case chatKindTranscription:
+		history, err = s.resolveTranscriptionRunSource(ctx, chatID, history)
+	default:
+		history, err = s.resolveChatBlobRefs(ctx, chatID, history)
+	}
+	if err != nil {
 		return nil, ChatRunSettings{}, err
 	}
 	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
@@ -935,6 +948,31 @@ func isMaskPart(raw json.RawMessage) bool {
 		mask = json.Unmarshal(member.val, &purpose) == nil && purpose == ImagePurposeMask
 	}
 	return mask
+}
+
+// MessageAudio is the url of every audio part of a message content, in order: what
+// a transcription-run executor sends as the clip to transcribe (an array content;
+// a plain string has none). It is MessageImages' audio twin and exported for the
+// same reason as MessageText, and it reads through rewriteBlobPart with the audio
+// kind -- the one definition of an audio part the extraction at a run commit and
+// the resolution of a transcription run's source already share -- so the executor
+// and the resolution cannot disagree about what counts as a clip (an object whose
+// audio_url is an object with a string url, members matched without regard to
+// case). An audio part has no mask, nor any other tag, so only the urls are
+// returned.
+func MessageAudio(content json.RawMessage) []string {
+	parts, ok := parseJSONArray(content)
+	if !ok {
+		return nil
+	}
+	var urls []string
+	for _, raw := range parts {
+		_, _, _ = rewriteBlobPart(raw, audioPartKind, func(_ blobPartKind, url string) (string, json.RawMessage, error) {
+			urls = append(urls, url)
+			return url, nil, nil
+		})
+	}
+	return urls
 }
 
 // AssistantTurn is the generated assistant message a run persists.

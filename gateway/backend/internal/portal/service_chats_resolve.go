@@ -64,7 +64,7 @@ var unavailableImagePart = json.RawMessage(`{"type":"text","text":"` + unavailab
 // history is not modified; a history with no reference comes back as it is, with
 // no store call.
 func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, error) {
-	out, unavailable, err := s.resolveBlobRefs(ctx, chatID, history)
+	out, unavailable, err := s.resolveBlobRefs(ctx, chatID, history, imagePartKind)
 	if err != nil {
 		return nil, err
 	}
@@ -74,12 +74,22 @@ func (s *Service) resolveChatBlobRefs(ctx context.Context, chatID string, histor
 	return out, nil
 }
 
-// resolveBlobRefs is resolveChatBlobRefs, also reporting how many references had
-// no stored image for the chat (each is now an unavailableImagePart). The caller
-// decides what an absent image means for its run: a text run goes on without it,
-// an edit cannot (see resolveImageRunSource).
-func (s *Service) resolveBlobRefs(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, int, error) {
-	ids, occurrences, err := collectBlobRefIDs(history)
+// resolveBlobRefs is resolveChatBlobRefs for the parts of one family, kind, also
+// reporting how many references had no stored blob for the chat (each is now an
+// unavailableImagePart). The caller decides what an absent blob means for its run:
+// a text run goes on without an absent image, an edit cannot (see
+// resolveImageRunSource), and neither can a transcription without its clip (see
+// resolveTranscriptionRunSource) -- which matters because the placeholder is worded
+// for an image, so an audio resolution must refuse on a non-zero count rather than
+// hand its history on.
+//
+// kind is the whole of what is read: the walk lists, fetches and substitutes only
+// the parts of that family (a text, image or speech run's history is an
+// imagePartKind resolution, so a stored audio reference of the same history is
+// never fetched, unsealed or counted), and a stored row is usable only if its type
+// is one the family accepts.
+func (s *Service) resolveBlobRefs(ctx context.Context, chatID string, history []ChatAPIMessage, kind blobPartKind) ([]ChatAPIMessage, int, error) {
+	ids, occurrences, err := collectBlobRefIDs(history, kind)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -92,7 +102,7 @@ func (s *Service) resolveBlobRefs(ctx context.Context, chatID string, history []
 		return nil, 0, err
 	}
 	limit := int64(s.maxRunHistoryBytes)
-	usable, err := usableChatBlobs(chatID, ids, occurrences, rows, limit)
+	usable, err := usableChatBlobs(chatID, ids, occurrences, rows, limit, kind)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -100,7 +110,7 @@ func (s *Service) resolveBlobRefs(ctx context.Context, chatID string, history []
 	if err != nil {
 		return nil, 0, err
 	}
-	return substituteBlobRefs(history, urls)
+	return substituteBlobRefs(history, urls, kind)
 }
 
 // resolveImageRunSource gives an image run the source image of its turn. An image
@@ -128,6 +138,46 @@ func (s *Service) resolveBlobRefs(ctx context.Context, chatID string, history []
 //
 // history is not modified. A history with no user message comes back as it is.
 func (s *Service) resolveImageRunSource(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, error) {
+	return s.resolveLastUserSource(ctx, chatID, history, imagePartKind, "the image to edit has no stored image for this chat")
+}
+
+// resolveTranscriptionRunSource is resolveImageRunSource's audio twin: it gives a
+// transcription run the clip of its turn. A transcription thread's turn is a run
+// over the audio its last user message carries: the executor sends that clip's
+// bytes to /v1/audio/transcriptions. It reads nothing else of the history (the
+// thread's older clips and transcripts are never sent anywhere), so only the LAST
+// user message is resolved, with the very resolution an image edit's source gets,
+// read as audio parts (audioPartKind) instead of images: the clips are fetched
+// scoped to chatID (an id that is another chat's, another user's or never stored is
+// simply absent), a row that is not an allow-listed audio type is not a clip, the
+// declared and the unsealed sizes are bounded, and the stored document is not
+// touched. A message with no stored reference (a fresh attachment or recording
+// arrives inline, a plain prompt carries no audio) costs no store call.
+//
+// The tolerance is the edit's, not the text run's: a clip this chat does not hold
+// refuses the run with ErrChatBlobNotOwned. A transcription cannot proceed without
+// its source -- and the image placeholder the shared walk would put in an absent
+// clip's place is no input to transcribe -- so the run stops before anything is
+// stored (the error a foreign blob in a new turn or an edited_history already gets
+// at the commit, extractChatBlobs, here also covering the one message that check
+// never sees: a stored transcript's own last message), and a retry is not a
+// duplicate turn.
+//
+// The other kinds of run never come here: a text, image or speech run resolves
+// images only, so a stored clip in such a thread's history is left as a reference.
+//
+// history is not modified. A history with no user message comes back as it is.
+func (s *Service) resolveTranscriptionRunSource(ctx context.Context, chatID string, history []ChatAPIMessage) ([]ChatAPIMessage, error) {
+	return s.resolveLastUserSource(ctx, chatID, history, audioPartKind, "the audio to transcribe has no stored clip for this chat")
+}
+
+// resolveLastUserSource is the one resolution of a run's source: the blobs of
+// family kind that the LAST user message of history references are resolved to
+// data: urls, every other message is left as it is, and a reference the chat holds
+// no usable blob for refuses the run with ErrChatBlobNotOwned (absent says, in the
+// log line, what was missing). resolveImageRunSource and
+// resolveTranscriptionRunSource are this for the image and the audio family.
+func (s *Service) resolveLastUserSource(ctx context.Context, chatID string, history []ChatAPIMessage, kind blobPartKind, absent string) ([]ChatAPIMessage, error) {
 	last := -1
 	for i := len(history) - 1; i >= 0; i-- {
 		if history[i].Role == "user" {
@@ -138,12 +188,12 @@ func (s *Service) resolveImageRunSource(ctx context.Context, chatID string, hist
 	if last < 0 {
 		return history, nil
 	}
-	resolved, unavailable, err := s.resolveBlobRefs(ctx, chatID, history[last:last+1])
+	resolved, unavailable, err := s.resolveBlobRefs(ctx, chatID, history[last:last+1], kind)
 	if err != nil {
 		return nil, err
 	}
 	if unavailable > 0 {
-		log.Printf("portal: chat %s: the image to edit has no stored image for this chat; refusing the run", chatID)
+		log.Printf("portal: chat %s: %s; refusing the run", chatID, absent)
 		return nil, ErrChatBlobNotOwned
 	}
 	out := slices.Clone(history)
@@ -151,12 +201,13 @@ func (s *Service) resolveImageRunSource(ctx context.Context, chatID string, hist
 	return out, nil
 }
 
-// collectBlobRefIDs lists the distinct blob ids the history references, in the
-// order first seen, and how many times each occurs. The history is only read.
-func collectBlobRefIDs(history []ChatAPIMessage) ([]string, map[string]int, error) {
+// collectBlobRefIDs lists the distinct blob ids the history references from parts
+// of family kind, in the order first seen, and how many times each occurs. The
+// history is only read.
+func collectBlobRefIDs(history []ChatAPIMessage, kind blobPartKind) ([]string, map[string]int, error) {
 	var ids []string
 	occurrences := map[string]int{}
-	count := func(url string) (string, json.RawMessage, error) {
+	count := func(_ blobPartKind, url string) (string, json.RawMessage, error) {
 		if id, ok := blobRefID(url); ok {
 			if occurrences[id] == 0 {
 				ids = append(ids, id)
@@ -166,7 +217,7 @@ func collectBlobRefIDs(history []ChatAPIMessage) ([]string, map[string]int, erro
 		return url, nil, nil
 	}
 	for _, m := range history {
-		if _, _, err := rewriteImageParts(m.Content, count); err != nil {
+		if _, _, err := rewriteBlobParts(m.Content, kind, count); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -174,10 +225,11 @@ func collectBlobRefIDs(history []ChatAPIMessage) ([]string, map[string]int, erro
 }
 
 // usableChatBlobs keeps, of the rows the store returned for ids, those this run
-// may send: a row of another chat or of a type outside the allow-list is left
-// out like an absent one. It bounds the declared sizes -- byte_len per
-// occurrence -- by limit, so a refusal costs no decryption.
-func usableChatBlobs(chatID string, ids []string, occurrences map[string]int, rows map[string]store.ChatBlob, limit int64) (map[string]store.ChatBlob, error) {
+// may send: a row of another chat or of a type the family kind does not accept
+// (outside the allow-list, or of the other family) is left out like an absent
+// one. It bounds the declared sizes -- byte_len per occurrence -- by limit, so a
+// refusal costs no decryption.
+func usableChatBlobs(chatID string, ids []string, occurrences map[string]int, rows map[string]store.ChatBlob, limit int64, kind blobPartKind) (map[string]store.ChatBlob, error) {
 	usable := make(map[string]store.ChatBlob, len(rows))
 	var declared int64
 	for _, id := range ids {
@@ -185,8 +237,8 @@ func usableChatBlobs(chatID string, ids []string, occurrences map[string]int, ro
 		if !ok || row.ChatID != chatID {
 			continue
 		}
-		if !imagePartKind.accepts(row.ContentType) {
-			log.Printf("portal: chat blob %s has a content type that is not a sendable image; leaving it out of the run history", id)
+		if !kind.accepts(row.ContentType) {
+			log.Printf("portal: chat blob %s has a content type that is not sendable as the part that references it; leaving it out of the run history", id)
 			continue
 		}
 		usable[id] = row
@@ -224,15 +276,15 @@ func (s *Service) blobDataURLs(ids []string, occurrences map[string]int, usable 
 	return urls, nil
 }
 
-// substituteBlobRefs returns a copy of history in which every stored-image url
-// is replaced by its entry in urls, or -- when it has none -- the whole part by
-// unavailableImagePart. It also returns how many parts were replaced that way.
-// history is not modified.
-func substituteBlobRefs(history []ChatAPIMessage, urls map[string]string) ([]ChatAPIMessage, int, error) {
+// substituteBlobRefs returns a copy of history in which every stored-blob url of
+// a part of family kind is replaced by its entry in urls, or -- when it has none --
+// the whole part by unavailableImagePart. It also returns how many parts were
+// replaced that way. history is not modified.
+func substituteBlobRefs(history []ChatAPIMessage, urls map[string]string, kind blobPartKind) ([]ChatAPIMessage, int, error) {
 	out := make([]ChatAPIMessage, len(history))
 	copy(out, history)
 	unavailable := 0
-	resolve := func(url string) (string, json.RawMessage, error) {
+	resolve := func(_ blobPartKind, url string) (string, json.RawMessage, error) {
 		id, ok := blobRefID(url)
 		if !ok {
 			return url, nil, nil
@@ -244,7 +296,7 @@ func substituteBlobRefs(history []ChatAPIMessage, urls map[string]string) ([]Cha
 		return url, unavailableImagePart, nil
 	}
 	for i, m := range history {
-		content, changed, err := rewriteImageParts(m.Content, resolve)
+		content, changed, err := rewriteBlobParts(m.Content, kind, resolve)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -255,7 +307,7 @@ func substituteBlobRefs(history []ChatAPIMessage, urls map[string]string) ([]Cha
 	return out, unavailable, nil
 }
 
-// blobRefID is the blob id of a stored-image url, and whether url is one.
+// blobRefID is the blob id of a stored-blob url, and whether url is one.
 func blobRefID(url string) (string, bool) {
 	return strings.CutPrefix(url, chatBlobURLPrefix)
 }

@@ -226,12 +226,13 @@ func TestChatBlobEndpointServesASpeechReplyHardened(t *testing.T) {
 }
 
 // A row whose type is not an allow-listed type is never served, even to its
-// owner: the store-time allow-list is not the only line of defense. Only audio/wav
-// is listed of the audio types, so the other spellings of it are refused too.
+// owner: the store-time allow-list is not the only line of defense. Only the
+// listed audio types are served (wav, and the transcription input formats), so an
+// unlisted subtype and the other spellings of a listed one are refused too.
 func TestChatBlobEndpointNeverServesAnUnlistedType(t *testing.T) {
 	e := newChatBlobEnv(t)
 	chatID := e.newChat(t, "usr_a", `{"settings":{},"messages":[]}`)
-	for i, contentType := range []string{"text/html", "image/svg+xml", "application/javascript", "image/png; charset=utf-8", "audio/mpeg", "audio/x-wav", "audio/wav; codecs=1"} {
+	for i, contentType := range []string{"text/html", "image/svg+xml", "application/javascript", "image/png; charset=utf-8", "audio/flac", "audio/x-wav", "audio/wav; codecs=1", "audio/webm; codecs=opus"} {
 		id := fmt.Sprintf("blob_bad_%d", i)
 		e.putBlob(t, chatID, id, contentType, []byte(`<html><script>alert(document.cookie)</script></html>`))
 		rec := e.getBlob(e.cookieA, id)

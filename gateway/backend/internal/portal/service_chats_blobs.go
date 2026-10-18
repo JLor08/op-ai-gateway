@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	// chatBlobURLPrefix is where a stored chat blob (an image, or a speech
-	// reply's WAV) is served from. A content part's image_url.url or
+	// chatBlobURLPrefix is where a stored chat blob (an image, a speech reply's
+	// WAV, or a transcription turn's input clip) is served from. A content part's image_url.url or
 	// audio_url.url is rewritten to chatBlobURLPrefix + blob id once the bytes
 	// live in chat_blobs.
 	chatBlobURLPrefix = "/api/portal/chat-blobs/"
@@ -35,8 +35,14 @@ const (
 // image/svg+xml. Extend it deliberately, per consumer.
 //
 // It holds two families, and a part only ever takes its own (blobPartKind.accepts):
-// the image types an image_url part may carry, and audio/wav, the one type an
-// audio_url part (a speech chat turn's reply) may carry.
+// the image types an image_url part may carry, and the audio types an audio_url
+// part may carry -- audio/wav, a speech chat turn's reply, and the INPUT formats of
+// a transcription chat turn's clip, the ones the composer's attach and record
+// produce (audio/webm and audio/ogg from the browser's recorder, audio/mp4 from
+// Safari's, audio/mpeg and audio/wav from an attached file). The family split
+// holds because accepts asks for the "audio/" prefix AND the allow-list: a widened
+// audio type joins the audio family only, an image part still cannot take it, and
+// an image type is still refused by an audio part.
 //
 // It must stay in sync with the pipelines' output formats: a generated
 // image is committed as "image/" + the upstream's output_format (see
@@ -46,13 +52,20 @@ const (
 // refuses a type missing from this set, losing the image or the audio. Every
 // format a pipeline can emit has to be listed here;
 // TestChatBlobAllowListCoversTheGeneratedImageFormats pins the image formats it
-// emits today (png, jpeg, webp).
+// emits today (png, jpeg, webp). The input formats are the other direction: what
+// a client may upload for a run to read, so they are listed for the composer that
+// produces them, not for a pipeline's output.
 var chatBlobMediaTypes = map[string]struct{}{
 	"image/png":  {},
 	"image/jpeg": {},
 	"image/webp": {},
 	"image/gif":  {},
 	"audio/wav":  {},
+	// The transcription composer's input formats (see above).
+	"audio/webm": {},
+	"audio/mpeg": {},
+	"audio/mp4":  {},
+	"audio/ogg":  {},
 }
 
 // blobPartKind is the family of a content part that references a stored blob:
@@ -110,7 +123,8 @@ func (k blobPartKind) accepts(mediaType string) bool {
 //
 //   - a data: url must be exactly data:<allow-listed type of the part's own
 //     family>;base64,<standard padded base64>: an image type for an image part,
-//     audio/wav for an audio part. The decoded bytes are stored (sealed when a
+//     an audio type (audio/wav, or a transcription clip's webm/mpeg/mp4/ogg) for
+//     an audio part. The decoded bytes are stored (sealed when a
 //     cipher is configured), so what is stored is what was uploaded, byte for
 //     byte, and anything that cannot be decoded losslessly -- another alphabet,
 //     missing padding, a charset parameter -- is refused rather than guessed at.
@@ -281,8 +295,8 @@ func isDataURL(url string) bool {
 
 // DecodeImageDataURL parses data:<type>;base64,<payload> and returns the media
 // type (canonical lower case) and the decoded bytes. Only that exact form is
-// accepted: a type outside the allow-list or outside the image family (audio/wav
-// is on the allow-list, but is not an image), a parameter (charset=...), a
+// accepted: a type outside the allow-list or outside the image family (the audio
+// types are on the allow-list, but are not images), a parameter (charset=...), a
 // payload that is not base64, an empty payload, or base64 that is not the
 // standard padded alphabet (the url-safe alphabet, missing padding) is
 // ErrChatBlobTypeUnsupported -- all of them are "not an image this store can
@@ -297,9 +311,30 @@ func isDataURL(url string) bool {
 // upload (or a resolved reference, see resolveImageRunSource) as an edit's source
 // image both parse through it, so the executor cannot accept a spelling the store
 // refused, and a url it cannot read is never sent anywhere. An audio part's url
-// goes through the same parse with its own family (decodeDataURL).
+// goes through the same parse with its own family (DecodeAudioDataURL).
 func DecodeImageDataURL(url string) (string, []byte, error) {
 	return decodeDataURL(url, imagePartKind)
+}
+
+// DecodeAudioDataURL is DecodeImageDataURL's audio twin: it parses
+// data:<type>;base64,<payload> and returns the media type (canonical lower case)
+// and the decoded bytes, under exactly the same rules, with the audio family in
+// place of the image one: the type must be on the allow-list AND an audio type
+// (audio/wav, audio/webm, audio/mpeg, audio/mp4, audio/ogg), so an image type is
+// refused here as an audio type is by DecodeImageDataURL. A parameter (a recorder's
+// audio/webm;codecs=opus included), a payload that is not base64, an empty payload,
+// or base64 that is not the standard padded alphabet is ErrChatBlobTypeUnsupported:
+// "not a clip this store can hold and give back unchanged".
+//
+// It is exported, and has no size bound of its own (decodeInlineBlob adds the
+// per-blob cap), because it is the ONE definition of what an inline audio url is:
+// the run commit that stores an attached or recorded clip and the transcription
+// executor that sends the clip (an inline upload, or a resolved reference, see
+// resolveTranscriptionRunSource) as the audio file of the request both parse
+// through it, so the executor cannot accept a spelling the store refused, and a
+// url it cannot read is never sent anywhere.
+func DecodeAudioDataURL(url string) (string, []byte, error) {
+	return decodeDataURL(url, audioPartKind)
 }
 
 // decodeDataURL is DecodeImageDataURL for a part of any kind: the one parse of
@@ -342,8 +377,9 @@ func (s *Service) decodeInlineBlob(url string, kind blobPartKind) (string, []byt
 }
 
 // sealChatBlob returns the key version and the bytes to store for a blob: the
-// bytes sealed with the capture cipher (nonce||AEAD, no gzip -- images are
-// already compressed, and a WAV is stored as the upstream produced it) when one is configured, else the plain bytes with key
+// bytes sealed with the capture cipher (nonce||AEAD, no gzip -- images and the
+// compressed audio formats are already compressed, and a WAV is stored as the
+// upstream produced it) when one is configured, else the plain bytes with key
 // version 0, which only the volatile RAM store ever holds (the same
 // arrangement as the sealed chat document, see sealChat).
 func (s *Service) sealChatBlob(raw []byte) (int, []byte) {
@@ -442,7 +478,9 @@ func (s *Service) openChatBlob(row store.ChatBlob) ([]byte, error) {
 type imageURLVisitor func(url string) (out string, replacement json.RawMessage, err error)
 
 // mediaURLVisitor is imageURLVisitor told which kind of part the url belongs to,
-// for the one walk that visits more than images (the extraction at a run commit).
+// for the walks that read more than images (the extraction at a run commit) or a
+// family of their own choosing (the resolution of a run's history or source, which
+// ignores the kind it is told: the walk was asked for exactly one).
 type mediaURLVisitor func(kind blobPartKind, url string) (out string, replacement json.RawMessage, err error)
 
 // imageOnly adapts an imageURLVisitor to the generalised walk.
@@ -452,33 +490,32 @@ func imageOnly(visit imageURLVisitor) mediaURLVisitor {
 	}
 }
 
-// rewriteImageParts walks one message's content: when it is an array, every
-// part that is an image part -- an object whose image_url is an object with a
-// string url -- goes through visit. Every other shape is not an image part and
-// is left as it is, as is a content that is not an array (a plain string). An
-// audio part is NOT an image part: the resolution of a run's history reads the
-// images of a thread and nothing else, so a stored speech reply is neither
-// fetched nor counted against the run's size bound.
-//
-// It is the ONE definition of what an image url is, shared by the extraction at
-// a run commit (through rewriteBlobParts, which adds the audio kind) and the
-// resolution of a run's history, so the two cannot disagree about a spelling:
-// members are matched without regard to case (the readers of this document
-// decode into tagged structs, which encoding/json matches that way), and a part
-// that changes is rebuilt along the changed path only, members in their original
-// order, every other value byte for byte. The returned bool is whether anything
-// changed; when it is false the input comes back as it was.
-func rewriteImageParts(content json.RawMessage, visit imageURLVisitor) (json.RawMessage, bool, error) {
-	return rewriteBlobParts(content, imagePartKind, imageOnly(visit))
-}
-
-// rewriteImagePart is rewriteImageParts for one part.
+// rewriteImagePart is rewriteBlobPart for the image family alone, with a visitor
+// that is told nothing of the kind: what MessageImages reads an image part's url
+// through.
 func rewriteImagePart(raw json.RawMessage, visit imageURLVisitor) (json.RawMessage, bool, error) {
 	return rewriteBlobPart(raw, imagePartKind, imageOnly(visit))
 }
 
-// rewriteBlobParts is rewriteImageParts for the kinds of part in kinds: every part
-// of one of those kinds goes through visit, told which it is.
+// rewriteBlobParts walks one message's content: when it is an array, every part
+// of one of the kinds in kinds -- an object whose image_url (or audio_url) is an
+// object with a string url -- goes through visit, told which kind it is. Every
+// other shape is not such a part and is left as it is, as is a content that is not
+// an array (a plain string). A walk asks for the family it means to read, and only
+// that one: the resolution of a text, image or speech run's history reads the
+// images of a thread (imagePartKind) and nothing else, so a stored speech reply or
+// a stored transcription clip is neither fetched nor counted against the run's size
+// bound, and a transcription run's source is read as audio (audioPartKind) alone.
+//
+// It is the ONE definition of what a blob url is, shared by the extraction at a run
+// commit (both kinds), the resolution of a run's history (the image kind) or source
+// (the audio kind for a transcription run), and the readers MessageImages and
+// MessageAudio, so none of them can disagree about a spelling: members are matched
+// without regard to case (the readers of this document decode into tagged structs,
+// which encoding/json matches that way), and a part that changes is rebuilt along
+// the changed path only, members in their original order, every other value byte
+// for byte. The returned bool is whether anything changed; when it is false the
+// input comes back as it was.
 func rewriteBlobParts(content json.RawMessage, kinds blobPartKind, visit mediaURLVisitor) (json.RawMessage, bool, error) {
 	parts, ok := parseJSONArray(content)
 	if !ok {
