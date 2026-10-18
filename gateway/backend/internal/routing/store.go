@@ -1441,9 +1441,10 @@ const (
 	//
 	// It is DERIVED from audio.cpp's /v1/models, the per-model mode field of the same
 	// listing the speech and transcription verdicts come from
-	// (CapabilitySourceAudioCppModels): mode "streaming" is a yes, "offline" a no,
-	// anything else no row. Unlike those two it is read from the mode and not the
-	// task, so it needs no asr model behind it to be stated.
+	// (CapabilitySourceAudioCppModels), and for an ASR model only: mode "streaming" is
+	// a yes, "offline" a no, anything else no row. The name is the transcriber's, so a
+	// model that does not transcribe (tts, clone, music) carries no row on it, not even
+	// a no.
 	//
 	// Like CapabilityTranscription the string does not coincide with the billable
 	// unit (usage.BillingUnitAudioSecond).

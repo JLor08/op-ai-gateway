@@ -41,7 +41,7 @@ var audioCppModelCases = []struct {
 	wantTranscription          string // "yes" | "no" | ""
 	wantTranscriptionStreaming string // "yes" | "no" | ""
 }{
-	{"real v0.9.1 entry, task tts", `{"object":"list","data":[{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}]}`, "pocket_tts_english_bf16", "yes", "no", "no"},
+	{"real v0.9.1 entry, task tts", `{"object":"list","data":[{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}]}`, "pocket_tts_english_bf16", "yes", "no", ""},
 	{"task tts", `{"data":[{"id":"m","task":"tts"}]}`, "m", "yes", "no", ""},
 	{"task clone also produces speech", `{"data":[{"id":"m","task":"clone"}]}`, "m", "yes", "no", ""},
 	{"task asr transcribes and does not speak", `{"data":[{"id":"m","task":"asr"}]}`, "m", "no", "yes", ""},
@@ -81,8 +81,12 @@ var audioCppModelCases = []struct {
 	{"an unknown mode says nothing about streaming", `{"data":[{"id":"m","task":"asr","mode":"realtime"}]}`, "m", "no", "yes", ""},
 	{"a mode of the wrong type says nothing and leaves the task verdicts alone", `{"data":[{"id":"m","task":"asr","mode":1}]}`, "m", "no", "yes", ""},
 	{"the sibling's mode does not leak", `{"data":[{"id":"a","task":"asr","mode":"streaming"},{"id":"b","task":"asr","mode":"offline"}]}`, "b", "no", "yes", "no"},
-	{"mode answers on its own, whatever the task", `{"data":[{"id":"m","task":"tts","mode":"streaming"}]}`, "m", "yes", "no", "yes"},
-	{"mode answers on its own, even for an entry with no task", `{"data":[{"id":"m","mode":"streaming"}]}`, "m", "", "", "yes"},
+	{"a tts model gets no streaming verdict whatever its mode", `{"data":[{"id":"m","task":"tts","mode":"streaming"}]}`, "m", "yes", "no", ""},
+	{"a clone model gets no streaming verdict whatever its mode", `{"data":[{"id":"m","task":"clone","mode":"streaming"}]}`, "m", "yes", "no", ""},
+	{"a music model gets no streaming verdict whatever its mode", `{"data":[{"id":"m","task":"music","mode":"streaming"}]}`, "m", "no", "no", ""},
+	{"an offline non-asr model gets no streaming verdict either", `{"data":[{"id":"m","task":"music","mode":"offline"}]}`, "m", "no", "no", ""},
+	{"an entry with no task gets no streaming verdict whatever its mode", `{"data":[{"id":"m","mode":"streaming"}]}`, "m", "", "", ""},
+	{"an asr task is matched ignoring case and padding for the streaming verdict too", `{"data":[{"id":"m","task":" ASR ","mode":"streaming"}]}`, "m", "no", "yes", "yes"},
 	{"a mode on a model the listing does not name says nothing", `{"data":[{"id":"other","task":"asr","mode":"streaming"}]}`, "m", "", "", ""},
 }
 
@@ -103,18 +107,27 @@ func TestParseAudioCppModels(t *testing.T) {
 	}
 }
 
-// TestParseAudioCppModelsMode pins the one thing the shared table cannot say in a
-// row: the mode axis is INDEPENDENT of the task axes. The entry's mode alone decides
-// the transcription streaming verdict ("streaming" is a yes, "offline" a no, anything
-// else no answer), and it never moves the speech or transcription verdict the task
-// decides -- so a listing whose mode field is odd, or an audio.cpp that adds modes,
-// cannot switch a route off.
+// TestParseAudioCppModelsMode pins what the shared table cannot say in a row: how
+// the mode axis and the task axes meet. The transcription streaming verdict is
+// stated for an ASR model ONLY -- the capability is transcription-specific, so a
+// model that does not transcribe (tts, clone, music, no task) gets no verdict on it
+// whatever its mode, not even a "no" -- and for an ASR model the entry's mode alone
+// decides it ("streaming" is a yes, "offline" a no, anything else no answer). The
+// mode never moves the speech or transcription verdict the task decides, so a
+// listing whose mode field is odd, or an audio.cpp that adds modes, cannot switch a
+// route off.
 func TestParseAudioCppModelsMode(t *testing.T) {
-	taskVerdicts := map[string][2]string{
-		"asr":   {routing.CapabilityNo, routing.CapabilityYes},
-		"tts":   {routing.CapabilityYes, routing.CapabilityNo},
-		"music": {routing.CapabilityNo, routing.CapabilityNo},
-		"":      {"", ""},
+	type taskCase struct {
+		verdicts [2]string // speech, transcription
+		isASR    bool
+	}
+	tasks := map[string]taskCase{
+		"asr":   {[2]string{routing.CapabilityNo, routing.CapabilityYes}, true},
+		"ASR":   {[2]string{routing.CapabilityNo, routing.CapabilityYes}, true},
+		"tts":   {[2]string{routing.CapabilityYes, routing.CapabilityNo}, false},
+		"clone": {[2]string{routing.CapabilityYes, routing.CapabilityNo}, false},
+		"music": {[2]string{routing.CapabilityNo, routing.CapabilityNo}, false},
+		"":      {[2]string{"", ""}, false},
 	}
 	modes := []struct{ field, want string }{
 		{``, ""},
@@ -125,11 +138,15 @@ func TestParseAudioCppModelsMode(t *testing.T) {
 		{`,"mode":null`, ""},
 		{`,"mode":["streaming"]`, ""},
 	}
-	for task, verdicts := range taskVerdicts {
+	for task, tc := range tasks {
 		for _, m := range modes {
 			body := `{"data":[{"id":"m","task":"` + task + `"` + m.field + `}]}`
+			wantStreaming := ""
+			if tc.isASR {
+				wantStreaming = m.want
+			}
 			got := parseAudioCppModels([]byte(body), "m")
-			want := AudioCppVerdicts{Speech: verdicts[0], Transcription: verdicts[1], TranscriptionStreaming: m.want}
+			want := AudioCppVerdicts{Speech: tc.verdicts[0], Transcription: tc.verdicts[1], TranscriptionStreaming: wantStreaming}
 			if got != want {
 				t.Errorf("parseAudioCppModels(%s) = %+v, want %+v", body, got, want)
 			}
@@ -191,8 +208,8 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, TranscriptionStreaming: routing.CapabilityNo}); got != want {
-			t.Fatalf("got %+v, want %+v (the live entry is mode offline)", got, want)
+		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}); got != want {
+			t.Fatalf("got %+v, want %+v (the live entry is a tts model: mode offline, but no transcription streaming verdict)", got, want)
 		}
 		if method != http.MethodGet || path != "/v1/models" {
 			t.Fatalf("request = %s %s, want GET /v1/models", method, path)
@@ -322,7 +339,7 @@ func TestMultiplexerDispatchesAudioCppModelsToOpenAICompatibleClient(t *testing.
 	if err != nil {
 		t.Fatalf("ProbeAudioCppModels(audio_cpp) returned %v", err)
 	}
-	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, TranscriptionStreaming: routing.CapabilityNo}); got != want {
+	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 	if len(paths) != 1 || paths[0] != "/v1/models" {
