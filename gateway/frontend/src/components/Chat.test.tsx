@@ -1916,6 +1916,170 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // A clip is converted to WAV in the browser before it is attached, which takes a moment for a
+    // long one: the composer says so while it runs, and holds everything that could stack another
+    // attach on it or send before it lands. The converter stand-in answers at once, so these
+    // tests hold a conversion open by hand and finish it themselves.
+    describe('converting a clip', () => {
+      const deferConversion = () => {
+        let resolve!: (wav: Blob) => void;
+        let reject!: (err: unknown) => void;
+        const pending = new Promise<Blob>((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        toWav.mockImplementationOnce(() => pending);
+        return {
+          finish: (text: string) => resolve(new Blob(['WAV:', text], { type: 'audio/wav' })),
+          fail: (err: unknown) => reject(err),
+        };
+      };
+      const composer = () => screen.getByRole('group', { name: t.chatTranscriptionInputLabel });
+      const indicator = () => within(composer()).queryByRole('status');
+      const attachButton = () => screen.getByRole('button', { name: t.chatAttachAudio });
+      const recordButton = () => screen.getByRole('button', { name: t.chatRecordStart });
+
+      it('shows no indicator while nothing is being converted', async () => {
+        await renderTranscriptionThread();
+
+        expect(indicator()).toBeNull();
+        expect(screen.queryByText(t.chatTranscriptionConverting)).not.toBeInTheDocument();
+      });
+
+      it('shows an indicator, and holds attach, record and Send, while a file is converted', async () => {
+        const conversion = deferConversion();
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'long.wav'));
+
+        // A spinner with its label, announced as a status.
+        expect(await within(composer()).findByRole('status')).toHaveTextContent(
+          t.chatTranscriptionConverting,
+        );
+        expect(within(composer()).getByRole('progressbar', { hidden: true })).toBeInTheDocument();
+        expect(attachButton()).toHaveAttribute('aria-disabled', 'true');
+        expect(recordButton()).toBeDisabled();
+        expect(sendButton()).toBeDisabled();
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+
+        conversion.finish('long');
+
+        // Back to the normal state, with the clip attached and Send open.
+        await waitFor(() => expect(indicator()).toBeNull());
+        expect(screen.queryByText(t.chatTranscriptionConverting)).not.toBeInTheDocument();
+        expect(screen.getByText('long.wav')).toBeInTheDocument();
+        expect(attachButton()).not.toHaveAttribute('aria-disabled', 'true');
+        expect(recordButton()).toBeEnabled();
+        expect(sendButton()).toBeEnabled();
+      });
+
+      it('holds Send while a clip is converted even though one is already attached', async () => {
+        await renderTranscriptionThread();
+        attachAudio(wavFile('audio/wav', 'first.wav'));
+        await screen.findByText('first.wav');
+        expect(sendButton()).toBeEnabled();
+
+        const conversion = deferConversion();
+        attachAudio(wavFile('audio/wav', 'second.wav'));
+
+        // The clip it had stays in view, but nothing may be sent (or stacked) until the new one
+        // lands: Send would otherwise transcribe the clip that is being replaced.
+        expect(await within(composer()).findByRole('status')).toBeInTheDocument();
+        expect(screen.getByText('first.wav')).toBeInTheDocument();
+        expect(sendButton()).toBeDisabled();
+        expect(attachButton()).toHaveAttribute('aria-disabled', 'true');
+
+        conversion.finish('second');
+
+        await screen.findByText('second.wav');
+        expect(screen.queryByText('first.wav')).not.toBeInTheDocument();
+        expect(indicator()).toBeNull();
+        expect(sendButton()).toBeEnabled();
+      });
+
+      it('shows the indicator while a recording is converted, and holds the record controls', async () => {
+        const conversion = deferConversion();
+        await renderTranscriptionThread();
+        await recordClip();
+
+        expect(await within(composer()).findByRole('status')).toHaveTextContent(
+          t.chatTranscriptionConverting,
+        );
+        expect(recordButton()).toBeDisabled();
+        expect(attachButton()).toHaveAttribute('aria-disabled', 'true');
+        expect(sendButton()).toBeDisabled();
+
+        conversion.finish('voice-bytes');
+
+        expect(await screen.findByText(t.chatAudioRecordingLabel)).toBeInTheDocument();
+        expect(indicator()).toBeNull();
+        expect(recordButton()).toBeEnabled();
+        expect(sendButton()).toBeEnabled();
+      });
+
+      it('holds "Use recording" of a take that is waiting while a file is converted', async () => {
+        await renderTranscriptionThread();
+        fireEvent.click(recordButton());
+        await flushMicrotasks();
+        fireEvent.click(screen.getByRole('button', { name: t.chatRecordStop }));
+        await flushMicrotasks();
+        expect(screen.getByRole('button', { name: t.chatRecordUse })).toBeEnabled();
+
+        const conversion = deferConversion();
+        attachAudio(wavFile('audio/wav', 'file.wav'));
+
+        // The take cannot be used (it would stack a second attach), but it can still be thrown away.
+        expect(await within(composer()).findByRole('status')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.chatRecordUse })).toBeDisabled();
+        expect(screen.getByRole('button', { name: t.chatRecordDiscard })).toBeEnabled();
+
+        conversion.finish('file');
+
+        await screen.findByText('file.wav');
+        expect(screen.getByRole('button', { name: t.chatRecordUse })).toBeEnabled();
+      });
+
+      it('goes back to the normal state, with the error shown, when the conversion fails', async () => {
+        const conversion = deferConversion();
+        await renderTranscriptionThread();
+        attachAudio(new File(['x'], 'broken.mp3', { type: 'audio/mpeg' }));
+        expect(await within(composer()).findByRole('status')).toBeInTheDocument();
+
+        conversion.fail(new AudioDecodeError('corrupt'));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent(t.chatAudioErrorDecode);
+        expect(indicator()).toBeNull();
+        expect(attachButton()).not.toHaveAttribute('aria-disabled', 'true');
+        expect(recordButton()).toBeEnabled();
+        expect(screen.queryByLabelText(t.chatAttachedAudio)).not.toBeInTheDocument();
+        // No clip, so Send stays closed -- for that reason, not for the conversion.
+        expect(sendButton()).toBeDisabled();
+      });
+
+      it('does not say that a clip is missing while the one just attached is converted', async () => {
+        const conversion = deferConversion();
+        await renderTranscriptionThread();
+        attachAudio(wavFile());
+        expect(await within(composer()).findByRole('status')).toBeInTheDocument();
+
+        // The indicator says what is going on; the "attach audio first" hint would contradict it.
+        fireEvent.mouseOver(sendButton().parentElement as HTMLElement);
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        });
+        expect(screen.queryByRole('tooltip')).toBeNull();
+
+        conversion.finish('RIFFwave-bytes');
+        await waitFor(() => expect(sendButton()).toBeEnabled());
+      });
+
+      it('does not offer the indicator on a thread that takes text', async () => {
+        renderChat();
+        await waitForChatReady();
+
+        expect(screen.queryByText(t.chatTranscriptionConverting)).not.toBeInTheDocument();
+      });
+    });
+
     describe('the settings panel', () => {
       it('shows language, prompt, temperature and an Advanced section', async () => {
         await renderTranscriptionThread();

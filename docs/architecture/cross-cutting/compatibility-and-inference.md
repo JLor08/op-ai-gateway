@@ -2986,7 +2986,11 @@ are all `audio/wav` and the same bytes. The composer's own gate is only "plainly
 is refused" (an image, text, a PDF) before decoding; audio the browser cannot decode, a
 browser without WebAudio and an empty clip are refused as such with nothing attached; and
 the 20 MiB ceiling is checked on the upload and again on the WAV (16 kHz mono 16-bit is
-32 KB a second, so a small compressed upload can come out far larger). The gateway
+32 KB a second, so a small compressed upload can come out far larger). While a clip is
+converting, `ChatStore.audioConverting` is true and the composer shows an indeterminate
+"Converting audio…" indicator and holds its attach, record and Send controls; attaches are
+numbered, and only the newest one lands (a conversion superseded by a later attach, or
+abandoned by removing or sending the clip, is discarded). The gateway
 transcodes nothing; the conversion's accepted costs are in [Risks
 §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances). A transcription thread's first user turn is audio-only, so
 `deriveTitleFromMessages` (the first user message's text) and the backend `deriveChatTitle`

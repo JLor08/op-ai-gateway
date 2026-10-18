@@ -81,8 +81,8 @@ export function AudioRecorder({
   onRecorded,
 }: Readonly<{
   t: Translation;
-  // True while a run is in flight: nothing new may be started or used then. A take already in
-  // progress can still be stopped or discarded.
+  // True while a run is in flight or a clip is being converted: nothing new may be started or
+  // used then. A take already in progress can still be stopped or discarded.
   disabled?: boolean;
   onRecorded: (blob: Blob) => void;
 }>) {

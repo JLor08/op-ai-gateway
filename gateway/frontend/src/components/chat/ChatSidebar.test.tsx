@@ -24,6 +24,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     input: '',
     images: [],
     audio: null,
+    audioConverting: false,
     model: '',
     systemPrompt: '',
     temperature: 1,

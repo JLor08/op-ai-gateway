@@ -155,6 +155,11 @@ export type ChatStore = {
   // nothing else. `url` is the inline data url the turn will carry, already under its canonical
   // media type (what the preview plays too); `name` is the file's, '' for a recording.
   audio: AudioClip | null;
+  // True while an attached clip is being converted to WAV (attachAudioClip): from the pick or the
+  // recording's "use" until its clip lands or the attach fails. A long clip takes a moment, and
+  // the composer shows that and holds its attach, record and Send controls meanwhile. It is
+  // false again as soon as the clip is removed or sent, which abandons the attach in flight.
+  audioConverting: boolean;
   model: string;
   systemPrompt: string;
   temperature: number;
@@ -471,6 +476,18 @@ export function ChatStoreProvider({
   const [images, setImages] = useState<string[]>([]);
   // The transcription composer's clip (see ChatStore.audio).
   const [audio, setAudio] = useState<AudioClip | null>(null);
+  // Whether the NEWEST attach's conversion is in flight (see ChatStore.audioConverting), and the
+  // number of the newest attach: every attachAudioClip takes the next one, and a conversion that
+  // finds it is no longer the newest on finishing is superseded and discarded. A clip that is
+  // removed or sent takes a number too (abandonAudioAttach), which voids the attach in flight.
+  const [audioConverting, setAudioConverting] = useState(false);
+  const audioAttachSeqRef = useRef(0);
+  // Voids the audio attach in flight, if any (the conversion carries on, but its result no longer
+  // counts): the clip it was to land was removed or sent. Nothing is converting from then on.
+  const abandonAudioAttach = useCallback(() => {
+    audioAttachSeqRef.current += 1;
+    setAudioConverting(false);
+  }, []);
   const [mask, setMask] = useState<string | null>(null);
   const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   const [selectedTokenId, setSelectedTokenId] = useState<string>(DEFAULTS.run_as_token_id);
@@ -1564,6 +1581,9 @@ export function ChatStoreProvider({
     setImages([]);
     setMask(null);
     setAudio(null);
+    // A clip still being converted was meant to replace the one just sent: it must not turn up
+    // in the composer afterwards, as if it had been attached to the next turn.
+    abandonAudioAttach();
 
     try {
       const res = await apiRef.current.startChatRun(chatId, {
@@ -1809,19 +1829,35 @@ export function ChatStoreProvider({
   // Vet and attach one audio clip (a picked file, or a recording with no name) as the
   // transcription turn's clip, replacing the one it had; a refused clip leaves that one as it
   // was and says why. The clip is converted to WAV first (prepareAudioClip), which takes a moment
-  // for a long one. It lands only while the thread is still a transcription one: the picker may
-  // have been left behind by a model switch while the file was being converted.
+  // for a long one: audioConverting says so meanwhile. It lands only while the thread is still a
+  // transcription one: the picker may have been left behind by a model switch while the file was
+  // being converted.
+  //
+  // The conversions may overlap and finish in any order (a long clip, then a short one), so each
+  // attach takes the next number and only the NEWEST one counts: a conversion that finishes
+  // after another attach started, or after the clip was removed or sent (abandonAudioAttach), is
+  // superseded -- its clip is not set, and neither is its refusal said, nor does it end the
+  // converting state that now belongs to the attach that superseded it.
   async function attachAudioClip(file: Blob, name: string) {
+    const seq = ++audioAttachSeqRef.current;
+    setAudioConverting(true);
     try {
       const clip = await prepareAudioClip(file, name);
-      if (chatKindRef.current === 'transcription') setAudio(clip);
+      if (seq === audioAttachSeqRef.current && chatKindRef.current === 'transcription') {
+        setAudio(clip);
+      }
     } catch (err) {
-      showError(audioAttachErrorText(err, t));
+      if (seq === audioAttachSeqRef.current) showError(audioAttachErrorText(err, t));
+    } finally {
+      if (seq === audioAttachSeqRef.current) setAudioConverting(false);
     }
   }
 
   const attachRecording = (blob: Blob) => attachAudioClip(blob, '');
-  const removeAudio = useCallback(() => setAudio(null), []);
+  const removeAudio = useCallback(() => {
+    setAudio(null);
+    abandonAudioAttach();
+  }, [abandonAudioAttach]);
 
   async function handleFiles(fileList: FileList | null) {
     if (!fileList || fileList.length === 0) return;
@@ -1911,6 +1947,7 @@ export function ChatStoreProvider({
     input,
     images,
     audio,
+    audioConverting,
     model,
     systemPrompt,
     temperature,
