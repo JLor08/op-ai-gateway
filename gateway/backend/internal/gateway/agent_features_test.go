@@ -100,7 +100,7 @@ func TestAgentFeaturesDeclaresTheSdcppCapabilitySource(t *testing.T) {
 // the literal the agent matches, read off the served body, so a renamed
 // constant or a dropped list entry both fail here, where the agent would
 // otherwise just go quiet and an agent-launched audio.cpp child would keep
-// reading as "unknown" for speech and transcription.
+// reading as "unknown" for speech, transcription and transcription_streaming.
 func TestAgentFeaturesDeclaresTheAudioCppCapabilitySource(t *testing.T) {
 	srv := NewTestServer()
 	seedTestAgentToken(t, srv, "agt_features", "mock-host-qwen", "features-secret")

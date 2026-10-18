@@ -598,10 +598,11 @@ var transcriptionRunDeadline = 10 * time.Minute
 // whose output arrives at the end -- or, for a transcription, whose first delta does.
 // A text run streams deltas, so the user can see for themselves that it is alive and
 // the honesty argument above simply does not apply to it -- while a ceiling would
-// newly kill long generations from a slow local model that complete today. Extending the bound to text would therefore be a
-// behaviour change to an existing, overwhelmingly common path, and it needs its
-// own decision rather than arriving as a side effect of the image, speech or
-// transcription features. Do not "simplify" this back into one global deadline.
+// newly kill long generations from a slow local model that complete today.
+// Extending the bound to text would therefore be a behaviour change to an existing,
+// overwhelmingly common path, and it needs its own decision rather than arriving as
+// a side effect of the image, speech or transcription features. Do not "simplify"
+// this back into one global deadline.
 func runDeadlineFor(kind string) (time.Duration, bool) {
 	switch kind {
 	case chatRunKindImage:
@@ -666,7 +667,7 @@ const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
 // roughly two orders of magnitude of headroom over the legitimate worst case
 // and cannot plausibly fire for a write that is merely slow. In the other
 // direction it is 20x shorter than the image and speech runs' own 10-minute
-// deadlines (imageRunDeadline, speechRunDeadline) and equal to
+// deadlines (imageRunDeadline, speechRunDeadline, transcriptionRunDeadline) and equal to
 // runEvictionDelay, the grace a terminal run already spends in the registry --
 // so a wedged commit resolves inside a window the product already asks a user
 // to wait, rather than the unbounded one that needs a restart.
@@ -1091,9 +1092,12 @@ func runStreamReadFailure(ctx context.Context, err error) (status, errMsg string
 		// answered 200 the deadline lands here, as a read error on a
 		// cancelled request, rather than on the Do above.
 		//
-		// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image and
-		// speech kinds are bounded (runDeadlineFor) and neither ever enters
-		// consumeRunStream -- they have no stream to consume -- while the
+		// CURRENTLY UNREACHABLE, AND DELIBERATELY KEPT. Only the image,
+		// speech and transcription kinds are bounded (runDeadlineFor) and none
+		// of them ever enters consumeRunStream: image and speech have no
+		// stream to consume, and a transcription run reads its event stream
+		// through consumeTranscriptionStream, which maps an ended context
+		// itself (runContextOutcome) instead of calling this. The
 		// reservation's context is a plain WithCancel over
 		// context.Background(), so no deadline reaches a text run from
 		// the HTTP request either. Bounding the text kind, or adding a
@@ -1173,10 +1177,10 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 
 // finishRunWithParts is finishRun for a run whose output is NOT the streamed
 // text buffer: an image run commits its generated image(s), and a speech run
-// its one audio part, as the turn's structured content instead
+// its one audio part, and a transcription run its transcript as one text part, as the turn's structured content instead
 // (portal.AssistantTurn.ContentParts, which is written as the message's
 // `content` when it is non-empty). parts is nil for every text run and on every
-// failing image or speech run, which is byte-for-byte the
+// failing image, speech or transcription run, which is byte-for-byte the
 // behaviour finishRun had before this parameter existed.
 //
 // The parts also ride on the run's TERMINAL EVENT, but only once the commit
@@ -1192,8 +1196,8 @@ func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *
 	// The commit must outlive the deadline that ended the run: this is called
 	// with the run's OWN ctx on every failing path (the two
 	// request-construction failures, the Do failure and the non-200 on the
-	// text path; all of them on the image and speech paths, which each have a
-	// single terminal call site), so on a timeout the ctx is ALREADY expired
+	// text path; all of them on the image, speech and transcription paths, which
+	// each have a single terminal call site), so on a timeout the ctx is ALREADY expired
 	// and the commit below would be cancelled before it wrote -- losing the turn
 	// instead of recording why it ended. Same idiom as
 	// benchmark_vram_runner.go:236.

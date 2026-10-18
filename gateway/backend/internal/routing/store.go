@@ -1543,7 +1543,8 @@ const (
 //
 // CapabilitySourceAudioCppModels names the fifth probe-rank source: audio.cpp's
 // own model listing, GET /v1/models, from whose per-model task field the
-// CapabilitySpeech and CapabilityTranscription verdicts are derived. It is named
+// CapabilitySpeech and CapabilityTranscription verdicts are derived, and from
+// whose mode field the CapabilityTranscriptionStreaming verdict is. It is named
 // for the document it read, like the sources above, and ranks 1 through
 // capabilitySourceRank's DEFAULT branch for the same reason: never able to
 // overwrite manual (3) or vision_benchmark (2), always able to repair its own
@@ -1557,13 +1558,17 @@ const (
 // when the gateway declares the capability_source_audiocpp feature).
 //
 // It is the sdcpp_capabilities source's twin in the one respect that matters:
-// it is entitled to establish a "no" as well as a "yes", for each of its rows. The listing states each model's task, so a model it names with a task
-// that does not serve a capability is a real CapabilityNo for that capability,
-// not an absence (a tts or clone model is (speech, yes) with (transcription,
-// no), an asr model the reverse, any other task no for both) -- while a model
-// the listing does not name at all is still no verdict, because a missing entry
-// says nothing about that model. It writes the speech, transcription and
-// transcription_streaming rows, and no other.
+// it is entitled to establish a "no" as well as a "yes", for each of its rows.
+// The listing states each model's task, so a model it names with a task that
+// does not serve a capability is a real CapabilityNo for that capability, not
+// an absence (a tts or clone model is (speech, yes) with (transcription, no),
+// an asr model the reverse, any other task no for both) -- while a model the
+// listing does not name at all is still no verdict, because a missing entry
+// says nothing about that model. The streaming row is the transcriber's own,
+// so it exists for an asr model only (mode "streaming" a yes, "offline" a
+// no, any other mode no row) and a model of any other task carries none, not
+// even a no. It writes the speech, transcription and transcription_streaming
+// rows, and no other.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"

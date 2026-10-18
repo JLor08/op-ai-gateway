@@ -1217,10 +1217,11 @@ func TestTranscriptionRunHandlesBufferedAnswer(t *testing.T) {
 
 // A streaming model's first delta can be a long time coming (a cold start, a model
 // still loading), and the run waits for it: nothing is published, the run stays
-// running and shows nothing, however long the stream stays silent before it. The stand-in (which plays the gateway's own endpoint, so no
-// relay watchdog is involved) answers the headers at once and holds the first delta back
-// for 300ms behind nothing but heartbeat comments. What is pinned is the run's side of
-// it: silence before the first delta does not cancel or fail the run, nothing is
+// running and shows nothing, however long the stream stays silent before it. The
+// stand-in (which plays the gateway's own endpoint, so no relay watchdog is
+// involved) answers the headers at once and holds the first delta back for 300ms
+// behind nothing but heartbeat comments. What is pinned is the run's side of it:
+// silence before the first delta does not cancel or fail the run, nothing is
 // published meanwhile, and the wait is measured as the turn's time to first token.
 func TestTranscriptionRunWaitsForASlowFirstDelta(t *testing.T) {
 	first := make(chan struct{})
@@ -1403,6 +1404,34 @@ func TestTranscriptionRunStreamCutBeforeDoneIsAnError(t *testing.T) {
 	}
 	if len(snap.ContentParts) != 0 {
 		t.Fatalf("a cut stream commits no finished transcript, got %s", snap.ContentParts)
+	}
+	stored := storedChatContent(t, srv, owner, chatID)
+	if !strings.Contains(stored, `"content":"the start of a sentence"`) || !strings.Contains(stored, `"status":"error"`) || strings.Contains(stored, `"status":"pending"`) {
+		t.Fatalf("the turn must be a finished error turn that keeps the published text: %s", stored)
+	}
+}
+
+// A bare [DONE] is not a done event. The sentinel only says the stream has ended; the
+// transcript's end is the transcript.text.done event, which alone states the whole text,
+// so a stream of deltas followed by [DONE] and no done event is read as a stream that
+// ended before its done event -- the same unreadable-response error and the same error
+// turn that keeps the published text as a cut stream gets -- and not as a completed
+// transcript assembled from the deltas. (The relay reads it the same way and bills it
+// as a loud zero: TestTranscriptionStreamLoudZeroOnIncompleteStream.) A run that took
+// the sentinel for a completion would commit a text nothing had vouched for as whole.
+func TestTranscriptionRunBareDoneSentinelWithoutADoneEventIsAnError(t *testing.T) {
+	loopback, _ := newStreamingRunLoopback(t, func(s streamingStub) {
+		s.emit(transcriptDeltaFrame("the start of "), transcriptDeltaFrame("a sentence"), transcriptStreamEnd)
+	})
+	srv, owner, chatID, _ := newSpeechRunTestServer(t, loopback.URL)
+	srv.selfBaseURL = loopback.URL
+
+	run, snap := speechRunOutcome(t, srv, owner, chatID, transcriptionRunPrep(t, "audio/wav", speechTestWAV()))
+	if snap.Status != "error" || runError(t, run) != transcriptionRunResponseUnreadableMessage {
+		t.Fatalf("status = %q, error = %q; want error %q -- [DONE] without a done event is no completion", snap.Status, runError(t, run), transcriptionRunResponseUnreadableMessage)
+	}
+	if len(snap.ContentParts) != 0 {
+		t.Fatalf("a stream without its done event commits no finished transcript, got %s", snap.ContentParts)
 	}
 	stored := storedChatContent(t, srv, owner, chatID)
 	if !strings.Contains(stored, `"content":"the start of a sentence"`) || !strings.Contains(stored, `"status":"error"`) || strings.Contains(stored, `"status":"pending"`) {

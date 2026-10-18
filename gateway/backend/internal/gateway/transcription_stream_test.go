@@ -797,8 +797,8 @@ func onlyUsageEvent(t *testing.T, srv *Server) usage.Event {
 	return events[0]
 }
 
-// transcriptionFrameDelta and transcriptionFrameDone build the event frames audio.cpp streams, for a transcript the
-// test chooses.
+// transcriptionFrameDelta and transcriptionFrameDone build the event frames
+// audio.cpp streams, for a transcript the test chooses.
 func transcriptionFrameDelta(text string) string {
 	return "data: {\"type\":\"transcript.text.delta\",\"delta\":" + jsonString(text) + "}\n\n"
 }

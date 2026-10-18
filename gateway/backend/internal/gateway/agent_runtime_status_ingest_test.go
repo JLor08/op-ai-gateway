@@ -2333,9 +2333,11 @@ func audioCppWarnRecord(recs []logbuffer.Record, substr string) (logbuffer.Recor
 
 // TestIngestLandsTheAudioCppProbesSpeechAndTranscriptionVerdicts pins the
 // audiocpp_models source as one this ingest ACCEPTS: an agent that read an
-// agent-launched audio.cpp child's /v1/models listing reports the speech and
-// transcription verdicts under that source, and both rows land on the spec's
-// mapping stamped with it.
+// agent-launched audio.cpp child's /v1/models listing reports the task-derived
+// speech and transcription verdicts under that source, and both rows land on
+// the spec's mapping stamped with it. The mode-derived transcription_streaming
+// verdict rides the same source and is pinned by
+// TestAgentIngestAdmitsTranscriptionStreaming.
 //
 // Both NAMES and both DIRECTIONS, which is what sets this source apart from
 // sdcpp_capabilities' single image row. The listing states a model's one task,
@@ -2501,15 +2503,17 @@ func TestAgentIngestNoWarnForKnownOrAbsentCapability(t *testing.T) {
 
 // TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist pins the rule that
 // confines audiocpp_models to the three capabilities its document answers.
-// audio.cpp's /v1/models states each model's task, from which the agent derives
-// the speech and transcription verdicts and nothing else, so a row under this
-// source for any other capability is a false provenance -- the argument that
-// confines sdcpp_capabilities to image, applied to a document that answers two
-// rows instead of one.
+// audio.cpp's /v1/models states each model's task and mode, from which the
+// agent derives the speech, transcription and transcription_streaming verdicts
+// and nothing else, so a row under this source for any other capability is a
+// false provenance -- the argument that confines sdcpp_capabilities to image,
+// applied to a document that answers three rows instead of one.
 //
 // Only the foreign rows go, in both directions (vision "yes" and tools "no"
 // alike), while the speech and transcription verdicts in the same document still
-// land. Unfalsifiable the way the sdcpp sibling is: the mapping already holds
+// land (the streaming one is covered by
+// TestAgentIngestAdmitsTranscriptionStreamingBesideAForeignRow). Unfalsifiable
+// the way the sdcpp sibling is: the mapping already holds
 // vision "no" from the OTHER probe at EQUAL rank, which a leaked "yes" would
 // flip, and the two audio rows prove the write path ran. The drop is visible at
 // the level a real gateway runs at, and the record names what was dropped.
@@ -2532,7 +2536,7 @@ func TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist(t *testing.T) {
 	}
 	sent := counting.lastSent()
 	if len(sent) != 2 {
-		t.Fatalf("the write carried %+v, want exactly the speech and transcription rows -- the audio.cpp listing answers those two and nothing else", sent)
+		t.Fatalf("the write carried %+v, want exactly the speech and transcription rows -- the foreign vision and tools rows must not ride along", sent)
 	}
 	for _, row := range sent {
 		if row.Capability != routing.CapabilitySpeech && row.Capability != routing.CapabilityTranscription {
@@ -2559,6 +2563,56 @@ func TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist(t *testing.T) {
 	}
 	if got, _ := rec.Attrs["spec_id"].(string); got != "rspec_audiocpp_foreign" {
 		t.Fatalf("WARN record spec_id attr = %q, want rspec_audiocpp_foreign", got)
+	}
+}
+
+// TestAgentIngestAdmitsTranscriptionStreamingBesideAForeignRow pins the mixed
+// payload: a report carrying an admitted transcription_streaming row together
+// with a capability the audio.cpp listing cannot answer. The allowlist
+// (audioCppProbeCapabilities) must judge each row on its own name, so the
+// streaming verdict is stored while the foreign one is refused -- not both
+// dropped because the payload as a whole was suspect, and not both kept because
+// one name in it was known.
+//
+// The Warn names ONLY the foreign capability. A record that also listed
+// transcription_streaming would tell an operator the verdict was refused when
+// it was stored. The vision row the mapping already holds from the OTHER probe
+// at EQUAL rank is what a leaked "yes" would flip, so the drop is observable
+// and not merely unwritten.
+func TestAgentIngestAdmitsTranscriptionStreamingBesideAForeignRow(t *testing.T) {
+	const specID = "rspec_audiocpp_stream_foreign"
+	buf := withCapturedSlogAtTheDefaultLevel(t)
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, specID, false)
+	seedCapabilityRow(t, srv, "map_"+specID, routing.CapabilityVision,
+		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+	counting := countingRowStore(srv)
+
+	req, raw := ingestReq(t, capabilitiesBody(specID,
+		`{"verdicts":[{"name":"transcription_streaming","verdict":"yes"},{"name":"vision","verdict":"yes"}],`+
+			`"source":"audiocpp_models"}`))
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := counting.upsertCalls.Load(); got != 1 {
+		t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the admitted streaming row)", got)
+	}
+	sent := counting.lastSent()
+	if len(sent) != 1 || sent[0].Capability != routing.CapabilityTranscriptionStreaming {
+		t.Fatalf("the write carried %+v, want exactly the transcription_streaming row", sent)
+	}
+	assertCapabilityRow(t, srv, "map_"+specID, routing.CapabilityTranscriptionStreaming,
+		routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	assertCapabilityRow(t, srv, "map_"+specID, routing.CapabilityVision,
+		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
+
+	recs := buf.Snapshot()
+	rec, ok := audioCppWarnRecord(recs, "other than speech, transcription or transcription_streaming to the audio.cpp probe")
+	if !ok {
+		t.Fatalf("no WARN record about the dropped foreign row at the gateway's own default level (info); records = %+v", recs)
+	}
+	if got, _ := rec.Attrs["capabilities"].([]string); !reflect.DeepEqual(got, []string{routing.CapabilityVision}) {
+		t.Fatalf("WARN record capabilities attr = %#v, want [vision] only -- the admitted streaming row must not be named as dropped", rec.Attrs["capabilities"])
 	}
 }
 

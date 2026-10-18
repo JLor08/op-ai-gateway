@@ -4,7 +4,6 @@
 package gateway
 
 import (
-	"bytes"
 	"encoding/binary"
 	"io"
 )
@@ -33,28 +32,26 @@ const (
 	wavBitsOffset       = 14
 )
 
-// wavDurationMillis returns the audio duration of a PCM WAV file in milliseconds,
-// computed from the container header alone (data chunk bytes / byte rate), and
-// true. It returns (0, false) when b is not a structurally sound RIFF/WAVE file:
-// a missing or truncated chunk, a chunk that declares more bytes than b holds, a
-// `fmt ` chunk after `data` or too short to carry a byte rate, a zero byte rate,
-// a `fmt ` chunk whose fields contradict each other (see wavConsistentByteRate), or
-// a `data` chunk that declares less than the file holds after it (see
-// wavDurationFromReader). A streamed transcription response carries no
+// wavDurationFromReader returns the audio duration of a PCM WAV stream in
+// milliseconds, computed from the container header alone (data chunk bytes / byte
+// rate), and true. It returns (0, false) when the stream is not a structurally sound
+// RIFF/WAVE file: a missing or truncated chunk, a chunk that declares more bytes than
+// the stream holds, a `fmt ` chunk after `data` or too short to carry a byte rate, a
+// zero byte rate, a `fmt ` chunk whose fields contradict each other (see
+// wavConsistentByteRate), or a `data` chunk that declares less than the stream holds
+// after it (see below). A streamed transcription response carries no
 // audio_duration_ms, so the billable duration is derived from the uploaded WAV
 // instead.
 //
 // (0, true) is a real answer: a clip shorter than a millisecond, or an empty `data`
 // chunk with nothing after it, measures zero. Only ok says whether the header could
 // be believed.
-func wavDurationMillis(b []byte) (int64, bool) {
-	return wavDurationFromReader(bytes.NewReader(b))
-}
-
-// wavDurationFromReader is wavDurationMillis over a stream, so an upload held in a
-// multipart body is measured where it lies, without a second copy of it: only the
-// chunk headers and the `fmt ` chunk are read for their content, and every other byte
-// -- a foreign chunk of any size, the audio itself -- is passed over and counted.
+//
+// The input is a stream so that an upload held in a multipart body is measured where
+// it lies, without a second copy of it: only the chunk headers and the `fmt ` chunk are read
+// for their content, and every other byte -- a foreign chunk of any size, the audio
+// itself -- is passed over and counted. The tests measure an in-memory file through
+// the wavDurationMillis helper of wavduration_test.go.
 //
 // The count is what makes the declared `data` size believable. That size is written
 // by the CLIENT, which pays by the second: a header that declares an empty (or tiny)

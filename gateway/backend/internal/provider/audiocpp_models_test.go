@@ -17,8 +17,9 @@ import (
 // audioCppLiveListing is the shape audio.cpp v0.9.1 really answers on
 // GET /v1/models, probed live: an OpenAI-style list whose entries add family,
 // task, mode, loaded and path. It may also name an unloaded model, with
-// loaded:false; this prober never reads loaded. The task field is the capability
-// signal this prober reads.
+// loaded:false; this prober never reads loaded. The task field is the signal
+// for the speech and transcription verdicts and, for an asr model, the mode
+// field is the signal for transcription_streaming.
 const audioCppLiveListing = `{"object":"list","data":[
   {"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}
 ]}`
@@ -91,10 +92,13 @@ var audioCppModelCases = []struct {
 }
 
 // TestParseAudioCppModels pins the mapping rule: the loaded entry's own task is
-// authoritative, for BOTH capability axes at once. A synthesis task (tts, clone)
+// authoritative, for BOTH task axes at once. A synthesis task (tts, clone)
 // is a speech "yes" and a transcription "no"; asr is a transcription "yes" and
 // a speech "no"; any other task is a "no" on both; and a model the listing does
 // not name -- or a listing this code cannot read -- is no verdict on either.
+// The third axis, transcription_streaming, is read from the mode of an asr entry
+// only and is no verdict for any other task (see the streaming rows of the
+// table).
 func TestParseAudioCppModels(t *testing.T) {
 	for _, tc := range audioCppModelCases {
 		t.Run(tc.name, func(t *testing.T) {

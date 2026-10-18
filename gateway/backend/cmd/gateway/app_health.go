@@ -752,8 +752,8 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // whose runtime spec is of kind audio_cpp, is NOT probed here: the agent
 // router's /v1/models carries no task, so it could state no verdict. That gap
 // is closed agent-side, not here: the agent reads the child's own /v1/models
-// and reports the speech and transcription verdicts under the same
-// audiocpp_models source, which the gateway's agent ingest accepts, so this
+// and reports the speech, transcription and transcription_streaming verdicts
+// under the same audiocpp_models source, which the gateway's agent ingest accepts, so this
 // loop deliberately leaves an agent-launched child alone.)
 //
 // The model id handed to the prober is the mapping's AppModelName, the name the
@@ -1311,8 +1311,8 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 
 		// audio.cpp capability pass: for every active audio_cpp application,
 		// read the server's own /v1/models listing for each of its active
-		// mappings and write the speech and transcription verdicts that
-		// listing states for that model (probeAudioCppModels). A separate
+		// mappings and write the speech, transcription and transcription_streaming
+		// verdicts that listing states for that model (probeAudioCppModels). A separate
 		// branch from the context probe for the same reason as the sdcpp one:
 		// audio_cpp has no context probe path, and the listing is not a
 		// ModelInfo. It shares that branch's cadence (the application's

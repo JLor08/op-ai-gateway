@@ -99,6 +99,14 @@ func buildPCMWavWithLeadingChunk(t *testing.T, sampleRate uint32, channels, bits
 	)
 }
 
+// wavDurationMillis measures a WAV held in memory: wavDurationFromReader, the
+// production entry point (it reads the upload where it lies in the multipart
+// body), over a byte slice. It lives here because only these tests hold their
+// files as slices.
+func wavDurationMillis(b []byte) (int64, bool) {
+	return wavDurationFromReader(bytes.NewReader(b))
+}
+
 func TestWavDurationMillis(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -281,6 +289,9 @@ func TestWavDurationMillisAcceptsATrailingChunkAndALargeLeadingOne(t *testing.T)
 		{"an odd data size whose pad byte was left off", wavFile(t, fmtChunk, wavChunk(t, "data", 32001, make([]byte, 32001))[:wavChunkHeaderLen+32001]), 1000},
 		{"a 1 MiB leading chunk before data", wavFile(t, fmtChunk, list(1<<20), wavDataChunk(t, 32000)), 1000},
 		{"a leading chunk of odd length", wavFile(t, fmtChunk, wavChunk(t, "LIST", 5, []byte("INFOx")), wavDataChunk(t, 32000)), 1000},
+		// 8 kHz would measure 2000 ms, so a result of 1000 shows the trailing `fmt ` was
+		// never read: the byte rate is the one that stood before `data`.
+		{"a trailing fmt chunk that disagrees with the first is never read", wavFile(t, fmtChunk, wavDataChunk(t, 32000), wavFmtChunk(t, 8000, 1, 16)), 1000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ms, ok := wavDurationMillis(tc.in)
@@ -289,4 +300,73 @@ func TestWavDurationMillisAcceptsATrailingChunkAndALargeLeadingOne(t *testing.T)
 			}
 		})
 	}
+}
+
+// A `fmt ` chunk is allowed to be longer than its fixed 16-byte PCM part: an 18-byte
+// one carries the cbSize field, and WAVE_FORMAT_EXTENSIBLE (what many encoders write
+// for anything beyond 16-bit stereo) is 40 bytes. Only the fixed part is read, so the
+// rest must be passed over -- and an odd-length one followed by its pad byte -- to land
+// on the next chunk header. A parser that stopped reading the chunk at 16 bytes would
+// take the extension for a chunk header and lose the `data` chunk.
+func TestWavDurationMillisPassesOverTheTailOfALongerFmtChunk(t *testing.T) {
+	fixed := func(tag uint16) *bytes.Buffer {
+		var body bytes.Buffer
+		wavPut(t, &body, tag, uint16(1), uint32(16000), uint32(32000), uint16(2), uint16(16))
+		return &body
+	}
+	withTail := func(tag uint16, tail ...any) []byte {
+		body := fixed(tag)
+		wavPut(t, body, tail...)
+		return wavChunk(t, "fmt ", uint32(body.Len()), body.Bytes())
+	}
+	extensible := withTail(0xFFFE,
+		uint16(22), // cbSize
+		uint16(16), // valid bits per sample
+		uint32(4),  // channel mask: front centre
+		// KSDATAFORMAT_SUBTYPE_PCM, the sub-format GUID
+		[]byte{0x01, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71},
+	)
+	if got := len(extensible) - wavChunkHeaderLen; got != 40 {
+		t.Fatalf("the extensible fmt body is %d bytes, want 40 -- the test no longer builds the chunk it names", got)
+	}
+	data := wavDataChunk(t, 32000)
+	for _, tc := range []struct {
+		name string
+		fmt  []byte
+	}{
+		{"18 bytes: with a cbSize of zero", withTail(1, uint16(0))},
+		{"40 bytes: WAVE_FORMAT_EXTENSIBLE", extensible},
+		{"odd length: 17 bytes and its pad byte", withTail(1, uint8(0))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ms, ok := wavDurationMillis(wavFile(t, tc.fmt, data))
+			if !ok || ms != 1000 {
+				t.Fatalf("wavDurationMillis = (%d, %v), want (1000, true)", ms, ok)
+			}
+		})
+	}
+}
+
+// A second `fmt ` chunk before `data` replaces the first: the walk keeps no first-wins
+// rule, so the byte rate in force is the last one read before `data`. The format does
+// not define such a file; what the walk guarantees is that every `fmt ` chunk it reads
+// must agree with itself, so a later chunk that contradicts itself voids the file even
+// though the first one was sound. (A later chunk that is consistent but forged still
+// wins -- the residual wavConsistentByteRate documents.)
+func TestWavDurationMillisTakesTheLastFmtChunkBeforeData(t *testing.T) {
+	data := wavDataChunk(t, 16000)
+	t.Run("the later fmt chunk wins", func(t *testing.T) {
+		// 16 kHz would measure 500 ms, 8 kHz 1000 ms.
+		ms, ok := wavDurationMillis(wavFile(t, wavFmtChunk(t, 16000, 1, 16), wavFmtChunk(t, 8000, 1, 16), data))
+		if !ok || ms != 1000 {
+			t.Fatalf("wavDurationMillis = (%d, %v), want (1000, true): the later fmt chunk's byte rate", ms, ok)
+		}
+	})
+	t.Run("a later fmt chunk that contradicts itself voids a sound first one", func(t *testing.T) {
+		forged := wavFmtChunkWith(t, 1, 16000, 3200000, 2, 16)
+		ms, ok := wavDurationMillis(wavFile(t, wavFmtChunk(t, 16000, 1, 16), forged, data))
+		if ok || ms != 0 {
+			t.Fatalf("wavDurationMillis = (%d, %v), want (0, false)", ms, ok)
+		}
+	})
 }

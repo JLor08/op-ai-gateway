@@ -874,7 +874,9 @@ document, from two producers
   **not probed** by the health loop, because the agent router's `/v1/models` carries no
   `task` and so could state no verdict. The agent covers that case itself, below.
 - **`audiocpp_models`, reported by the agent** (issue #255, agent 0.9.1) answers the same
-  two rows for an **agent-launched** `audio_cpp` child. The agent GETs the child's **own**
+  rows for an **agent-launched** `audio_cpp` child (the `speech` and `transcription` pair
+  decided here, and the mode-derived `transcription_streaming` verdict of agent 0.9.2,
+  described below). The agent GETs the child's **own**
   `/v1/models` over its loopback connection (`collector.ProbeAudioCppVerdicts`; the
   router's aggregate listing carries no `task`, the child's does), decides both verdicts
   from the entry whose `id` is the spec's model with a deliberate duplicate of the
@@ -885,8 +887,8 @@ document, from two producers
   type but not this source would otherwise drop the capability rows of every such sample,
   with a warning. While the gateway does not declare it, the agent probes and caches
   nothing for that child and withholds a verdict it cached earlier, so a gateway upgrade
-  takes effect without a child restart. The ingest accepts the source for the `speech`
-  and `transcription` rows only, at probe rank 1, so a manual verdict (rank 3) still
+  takes effect without a child restart. The ingest accepts the source for the `speech`,
+  `transcription` and `transcription_streaming` rows only, at probe rank 1, so a manual verdict (rank 3) still
   outranks it. Unlike the health loop, which asks again every tick, the agent asks
   **once per process generation**: a listing that does not name the model is a conclusive
   answer there, cached with the child's pid, so such a child reads as unknown until it
@@ -910,8 +912,9 @@ gate excludes on, and it has the same writers as `speech`, **from the same listi
   **and** `(transcription, no)`; any other non-empty task writes both `no`; and an absent
   task, an unnamed model, an unreachable server, a non-2xx status or an unreadable body
   writes **nothing**, because none of those says a model cannot transcribe and a `no` can
-  switch a route off. `audioCppCapabilityRows` projects the two verdicts into at most two
-  rows, each only when stated, so an unanswered axis never suppresses the other. The
+  switch a route off. `audioCppCapabilityRows` projects the verdicts into at most three
+  rows (the third, `transcription_streaming`, is described below), each only when stated,
+  so an unanswered axis never suppresses the other. The
   task match ignores case and surrounding whitespace, so an `ASR` the server might one day
   emit does not fall to the `no` default. The same ranking, the same type gate (a
   `server_agent` mapping with an `audio_cpp` spec is **not probed** by the health loop)
