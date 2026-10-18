@@ -159,6 +159,12 @@ type runEvent struct {
 	// served the terminal state as a `snapshot` and never sees a `done`, needs
 	// it just as much.
 	//
+	// One kind fills BOTH: a streamed transcription's deltas are the text buffer
+	// as they arrive, and its commit then carries the transcript as parts (the
+	// shape its one-shot answer is committed in). The two say the same text, and
+	// the client takes the parts when there are any (contentOf), so the done
+	// frame's restatement of the transcript replaces what the deltas built.
+	//
 	// STRICTLY WHAT WAS COMMITTED: finishRunWithParts clears it when
 	// CommitAssistant fails, so a turn the store refused (portal.chat_too_large
 	// above all) is not rendered as though it had been saved. json.RawMessage,
@@ -569,22 +575,30 @@ var imageRunDeadline = 10 * time.Minute
 // a test can shrink one without touching the other.
 var speechRunDeadline = 10 * time.Minute
 
-// transcriptionRunDeadline bounds a TRANSCRIPTION run end to end, for the reason
-// imageRunDeadline and speechRunDeadline bound theirs: it too is one buffered request
-// that emits nothing between dispatch and its finished transcript, so "this finishes
-// or fails within N minutes" is the only honest thing the UI can promise about the
-// wait. Same value, its own var, so the kinds' promises can move independently and a
-// test can shrink one without touching the others.
+// transcriptionRunDeadline bounds a TRANSCRIPTION run, for the reason imageRunDeadline
+// and speechRunDeadline bound theirs: until it has something to show, a run emits
+// NOTHING between dispatch and its finished transcript, so "this finishes or fails
+// within N minutes" is the only honest thing the UI can promise about the wait. Same
+// value, its own var, so the kinds' promises can move independently and a test can
+// shrink one without touching the others.
+//
+// Unlike the other two it is the budget of the WAIT, not of the whole run: the
+// gateway answers a streaming model with an event stream, and the moment the first
+// transcript delta arrives the stream shows for itself that it is alive -- the text
+// run's argument for being unbounded -- so the run lifts the bound there, and from then
+// on it is the gateway relay's idle timeout that ends a stream gone silent. A
+// one-shot answer never has a first delta, so it keeps the bound to its end. See
+// executeTranscriptionRun, which arms and lifts it.
 var transcriptionRunDeadline = 10 * time.Minute
 
 // runDeadlineFor returns the end-to-end bound for a run of this kind, and false
 // when the kind is UNBOUNDED.
 //
-// Only image, speech and transcription runs are bounded: each is a single buffered
-// request with no incremental output. A text run streams deltas, so the user can see
-// for themselves that it is alive and the honesty argument above simply does not
-// apply to it -- while a ceiling would newly kill long generations from a slow local
-// model that complete today. Extending the bound to text would therefore be a
+// Only image, speech and transcription runs are bounded: each is a single request
+// whose output arrives at the end -- or, for a transcription, whose first delta does.
+// A text run streams deltas, so the user can see for themselves that it is alive and
+// the honesty argument above simply does not apply to it -- while a ceiling would
+// newly kill long generations from a slow local model that complete today. Extending the bound to text would therefore be a
 // behaviour change to an existing, overwhelmingly common path, and it needs its
 // own decision rather than arriving as a side effect of the image, speech or
 // transcription features. Do not "simplify" this back into one global deadline.
@@ -628,15 +642,16 @@ const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
 // Stop answers OK and does nothing (the cancel cannot reach a context
 // stripped of cancellation), and sending, saving and renaming that chat are
 // 409 until the gateway restarts. A hung CHECKPOINT does exactly the same,
-// one step earlier and more insidiously: consumeRunStream's `finish:` label
-// joins the checkpoint goroutine (wg.Wait) BEFORE calling the terminal step,
-// so the commit and its bound are never even entered. Bounding only the
+// one step earlier and more insidiously: the stop function startRunCheckpoints
+// returns joins the checkpoint goroutine (wg.Wait) BEFORE its caller reaches the
+// terminal step, so the commit and its bound are never even entered. Bounding only the
 // commit would leave the wedge fully reachable and the claim below false.
 //
 // THE BOUND APPLIES TO TEXT RUNS TOO -- and text is in fact the EXPOSED kind
 // here, not the protected one. finishRunWithParts is the one terminal step
-// every kind shares, but only the text executor checkpoints: executeImageRun
-// and executeAudioRun each make a single buffered request and have no periodic
+// every kind shares, but only the executors that stream text checkpoint (the text
+// run, and a transcription run whose answer is a stream): executeImageRun and
+// executeAudioRun each make a single buffered request and have no periodic
 // write at all. So a hung store write reaches a text run by two routes and an
 // image or speech run by one.
 // Either way, a commit or checkpoint that has not returned in 30 s is already
@@ -786,7 +801,11 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	// context keeps cancellation intact -- Stop still cancels the parent, which
 	// cancels this -- and the deferred cancel releases the timer on every
 	// terminal path, including the ordinary success one.
-	if d, bounded := runDeadlineFor(prep.Settings.Kind); bounded {
+	//
+	// The transcription kind is bounded too (runDeadlineFor), but not here: its
+	// deadline is only the budget for the wait for the first delta of a stream, so its
+	// executor arms it itself and lifts it there (executeTranscriptionRun).
+	if d, bounded := runDeadlineFor(prep.Settings.Kind); bounded && prep.Settings.Kind != chatRunKindTranscription {
 		var cancelDeadline context.CancelFunc
 		ctx, cancelDeadline = context.WithTimeout(ctx, d)
 		defer cancelDeadline()
@@ -808,9 +827,10 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 		s.executeAudioRun(ctx, owner, run, prep)
 		return
 	}
-	// The transcription kind is speech's mirror image: one buffered request to a
-	// different gateway endpoint -- multipart in, JSON out -- and no deltas. See
-	// chat_runs_transcription.go.
+	// The transcription kind is speech's mirror image: one request to a different
+	// gateway endpoint -- multipart in, a transcript out -- answered either with one JSON
+	// document or, for a model that streams, with an event stream of transcript deltas
+	// that the run fills the turn in from. See chat_runs_transcription.go.
 	if prep.Settings.Kind == chatRunKindTranscription {
 		s.executeTranscriptionRun(ctx, owner, run, prep)
 		return
@@ -922,11 +942,20 @@ func (s *Server) setRunLoopbackHeaders(req *http.Request, owner auth.Token, run 
 	}
 }
 
-// consumeRunStream reads the loopback SSE, publishing deltas, computing metrics,
-// checkpointing every runCheckpointInterval, and committing on terminal.
-func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *ChatRun, resp *http.Response) {
+// startRunCheckpoints starts the run's periodic pending-checkpoint write -- every
+// runCheckpointInterval the text buffered so far is stored as the chat's trailing
+// pending turn -- and returns the function that stops it. The stop function signals the
+// writer AND waits for any in-flight CheckpointAssistant write to complete, so the
+// caller's terminal commit is deterministically the last writer to the transcript.
+// Without that join, a checkpoint's read-modify-write could land after the commit and
+// leave the trailing assistant message stuck at "pending". It is safe to call more than
+// once.
+//
+// Shared by every executor that streams text into the run's buffer: consumeRunStream
+// (the chat-completions parser) and consumeTranscriptionStream (the transcription
+// parser) differ in what they read, not in how the progress is persisted.
+func (s *Server) startRunCheckpoints(owner auth.Token, run *ChatRun) (stop func()) {
 	ticker := time.NewTicker(runCheckpointInterval)
-	defer ticker.Stop()
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -941,15 +970,15 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 				m := run.currentMetrics()
 				// BOUNDED by the same chatRunCommitTimeout the terminal
 				// commit uses, and for the same reason -- this write can
-				// strand a run just as thoroughly. `finish:` below joins this
-				// goroutine (wg.Wait) BEFORE it reaches finishRunWithParts,
-				// so a checkpoint that never returns means the terminal
-				// commit is never even entered and its bound cannot help:
-				// the run stays `running`, its per-chat slot stays held, and
-				// Stop is powerless because context.Background() is nobody's
-				// to cancel. That made the hang a TEXT-run hazard
-				// specifically -- executeImageRun has no checkpoint at all --
-				// which is the opposite of where the risk looks like it
+				// strand a run just as thoroughly. The stop function joins this
+				// goroutine (wg.Wait) BEFORE its caller reaches
+				// finishRunWithParts, so a checkpoint that never returns means
+				// the terminal commit is never even entered and its bound
+				// cannot help: the run stays `running`, its per-chat slot stays
+				// held, and Stop is powerless because context.Background() is
+				// nobody's to cancel. That made the hang a hazard of the runs
+				// that stream text -- executeImageRun has no checkpoint at all
+				// -- which is the opposite of where the risk looks like it
 				// should be, and it is why "the bound makes a hung store
 				// write terminal rather than permanent" is only true with
 				// this call bounded too.
@@ -970,6 +999,21 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 			}
 		}
 	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			ticker.Stop()
+			close(done)
+			wg.Wait()
+		})
+	}
+}
+
+// consumeRunStream reads the loopback SSE, publishing deltas, computing metrics,
+// checkpointing every runCheckpointInterval, and committing on terminal.
+func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *ChatRun, resp *http.Response) {
+	stopCheckpoints := s.startRunCheckpoints(owner, run)
+	defer stopCheckpoints()
 
 	start := time.Now()
 	var firstContentAt time.Time
@@ -1048,13 +1092,11 @@ func (s *Server) consumeRunStream(ctx context.Context, owner auth.Token, run *Ch
 		}
 	}
 finish:
-	// Signal the checkpoint goroutine to stop AND wait for any in-flight
+	// Stop the checkpoint goroutine AND wait for any in-flight
 	// CheckpointAssistant("pending") write to complete before committing, so
-	// CommitAssistant is deterministically the last writer to the transcript.
-	// Without this join, a checkpoint's read-modify-write could land after the
-	// commit and leave the trailing assistant message stuck at "pending".
-	close(done)
-	wg.Wait()
+	// CommitAssistant is deterministically the last writer to the transcript (see
+	// startRunCheckpoints).
+	stopCheckpoints()
 	// Final rates (issue #56), computed after the checkpoint goroutine has
 	// stopped so this is the last metrics write. Both are floored, but over
 	// DIFFERENT windows, because their numerators cover different spans:

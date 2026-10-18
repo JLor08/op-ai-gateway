@@ -22,6 +22,31 @@ const (
 	sseDoneSentinel         = "[DONE]"
 )
 
+// transcriptionEvent is one JSON frame of that stream, as far as either reader of it --
+// the relay's scan below and the portal run's consumer (chat_runs_transcription.go) --
+// needs it: its type, the increment a delta carries and the whole text a done event
+// restates. Text is a pointer so a done event that states no text is told from one that
+// states an empty one.
+type transcriptionEvent struct {
+	Type  string  `json:"type"`
+	Delta string  `json:"delta"`
+	Text  *string `json:"text"`
+}
+
+// decodeTranscriptionEvent decodes the payload of a `data:` line as a JSON event. It
+// reports false for a payload that is not one (a sentinel, a comment's remains, a
+// document of another shape), which both readers ignore.
+func decodeTranscriptionEvent(payload []byte) (transcriptionEvent, bool) {
+	if len(payload) == 0 || payload[0] != '{' {
+		return transcriptionEvent{}, false
+	}
+	var event transcriptionEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return transcriptionEvent{}, false
+	}
+	return event, true
+}
+
 // transcriptionStreamScan is the SSE-aware tee a streamed transcription is relayed
 // through. nativeCopier feeds it every chunk AFTER that chunk has been written to the
 // client and flushed, so it only ever looks: it never holds a byte back, and the stream
@@ -163,15 +188,8 @@ func (s *transcriptionStreamScan) scanLine(line []byte) {
 		s.sawEnd = s.sawEnd || s.sawDone
 		return
 	}
-	if len(payload) == 0 || payload[0] != '{' {
-		return
-	}
-	var event struct {
-		Type  string  `json:"type"`
-		Delta string  `json:"delta"`
-		Text  *string `json:"text"`
-	}
-	if err := json.Unmarshal(payload, &event); err != nil {
+	event, ok := decodeTranscriptionEvent(payload)
+	if !ok {
 		return
 	}
 	switch event.Type {
