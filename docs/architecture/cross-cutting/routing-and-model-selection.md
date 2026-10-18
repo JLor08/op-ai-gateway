@@ -405,8 +405,9 @@ never named. So an images request for an unknown name is served by an
 image-capable fallback, and answers 404 `routing.no_model_route` for its own
 name when neither candidate carries `image` (an edit: `image_edit`, which an
 operator's opt-out removes from a model that still generates; a speech request:
-`speech`, by the same rule; a **transcription** request: no candidate at all, since
-`transcription` has no fold, §2.2, so it answers for its own name). Step 4 judges the
+`speech`, by the same rule; a **transcription** request: `transcription`, by the same
+rule — its own fold since [ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn),
+§2.2). Step 4 judges the
 **effective**
 name steps 1–3 produced, so an override that already resolves to a usable
 model ends the chain there. The catch-all has no requested name of its own —
@@ -670,15 +671,16 @@ composer), so the two cannot disagree; neither `/v1/models` nor the LM Studio
 `capabilities` object carries it. The flavor cannot answer this by itself:
 `Callable` for `openai_images` holds every model whose route declares the
 flavor — its application and, for an agent-launched model with a spec, the
-spec too — whatever its verdict. A required capability with no fold
-leaves `Capable` empty, so nothing is a candidate. **`transcription` is that case, on
-purpose:** `hasCapabilityFold` admits `image`, `image_edit` and `speech` only, so for a
-transcription request the unknown-model redirect finds no candidate (the chain of §2.1
-ends at step 5 and the request fails as it would without the redirect), and no portal
-listing carries a transcription flag. The gate is not affected: a model without a
-`(transcription, yes)` verdict is still refused by §2.3. A fold that is
-`speechFlagsByName`'s twin is the way back, recorded in [Risks
-§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances). The listing is neither a subset nor a superset of
+spec too — whatever its verdict. **`transcription` has its own fold too**
+(`transcriptionFlagsByName`, `speechFlagsByName`'s twin), added by
+[ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn):
+`hasCapabilityFold` admits `image`, `image_edit`, `speech` **and** `transcription`, so a
+transcription request's unknown-model redirect takes a transcription-capable
+`LastUsedModel` or fallback (`ModelOffering.Capable`), and the portal listing carries a
+`transcription` flag (`ModelDTO.Transcription`). A required capability with **no** fold
+would leave `Capable` empty, so nothing would be a candidate for it — the invariant holds,
+but no required capability lacks a fold today. The gate is unaffected either way: a model
+without a `(transcription, yes)` verdict is still refused by §2.3. The listing is neither a subset nor a superset of
 `Callable`: it loses the suppressed names and gains the token's own aliases (its
 manual override aliases and its generated Claude aliases,
 [§2.4](#24-generated-claude-model-aliases)), which are rewritten before routing

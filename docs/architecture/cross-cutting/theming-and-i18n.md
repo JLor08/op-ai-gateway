@@ -302,6 +302,16 @@ maps to its own speech-worded sentence with a different German and English text,
 an image label, which would tell a speech user about an image
 ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).
 
+**The transcription codes join them.** The five codes of a transcription chat run
+(`gateway.chat_run_transcription_dispatch_failed`, `gateway.chat_run_transcription_source_unreadable`,
+`gateway.chat_run_transcription_response_unreadable`, `gateway.chat_run_transcription_no_transcript`
+and `gateway.chat_run_transcription_reserved_field`) are in the chat-run list, and the
+`transcription.*` refusals of `POST /v1/audio/transcriptions` that a run relays are in the
+endpoint list, pinned in both directions like the `speech.*` set. Each maps to its own
+transcription-worded sentence with a different German and English text, never to a speech or
+image label
+([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)).
+
 ## See also
 
 - [Security, Authentication & Authorization](security-auth-rbac.md) — the session/CSRF model that the theme endpoints deliberately sit outside of (they are public and pre-auth by design).
