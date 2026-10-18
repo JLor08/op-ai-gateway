@@ -4,6 +4,7 @@
 import * as fs from "node:fs";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
+import { fileURLToPath } from "node:url";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { messages } from "../../frontend/src/i18n";
 import { login } from "../e2e/helpers";
@@ -20,18 +21,37 @@ import { login } from "../e2e/helpers";
 // renders is read back out of the chat store.
 //
 // The clip gets into the composer both ways the portal offers: ATTACHED from a file
-// (scenarios 3 and 5, WAV clips this spec makes) and RECORDED in the browser
-// (scenario 6). A microphone is the one thing no suite can rely on -- headless
-// Chromium has no capture device, and its fake one does not even answer getUserMedia
-// on every host -- so the spec replaces only the capture SOURCE (see
-// installSyntheticMicrophone): the portal's recorder, the browser's REAL MediaRecorder
-// and its real audio/webm (Opus) encoding are all untouched. The recorder's state
-// machine and error paths are unit-tested (AudioRecorder.test.tsx); what is
-// cross-process -- the clip's bytes on the wire and in the store -- is what the two
-// ways are compared on here.
+// (scenarios 3 and 5, tiny NON-WAV fixtures: a WebM/Opus and an MP3 tone, both stereo
+// and not at 16 kHz) and RECORDED in the browser (scenario 6). A microphone is the one
+// thing no suite can rely on -- headless Chromium has no capture device, and its fake
+// one does not even answer getUserMedia on every host -- so the spec replaces only the
+// capture SOURCE (see installSyntheticMicrophone): the portal's recorder, the browser's
+// REAL MediaRecorder and its real audio/webm (Opus) encoding are all untouched. The
+// recorder's state machine and error paths are unit-tested (AudioRecorder.test.tsx);
+// what is cross-process -- the clip's bytes on the wire and in the store -- is what the
+// two ways are compared on here.
+//
+// The audio.cpp server reads WAV ONLY (a live probe: webm, ogg, m4a and mp3 uploads are
+// refused with a 400), so the composer converts EVERY clip, attached or recorded, to a
+// 16 kHz mono 16-bit PCM WAV in the browser before it enters the turn
+// (shared/audioToWav.ts). Chromium has real WebAudio, so that conversion runs for real
+// here: the fixtures and the recording are decoded, down-mixed, resampled and
+// re-encoded by the portal's own code, and what the suite asserts is what then crosses
+// the process boundary -- a WAV, whatever went in. (jsdom has no WebAudio, so the
+// Vitest suites drive the encoder through fakes; this suite is where it meets a real
+// decoder.) The gateway itself never transcodes: it relays the stored WAV as it is.
+//
+// The fixtures are 2 s tones, generated once and committed (fixtures/), with
+//
+//   ffmpeg -f lavfi -i sine=frequency=440:duration=2:sample_rate=48000 -ac 2 \
+//     -map_metadata -1 -fflags +bitexact -flags:a +bitexact -c:a libopus -b:a 24k tone-440hz.webm
+//   ffmpeg -f lavfi -i sine=frequency=880:duration=2:sample_rate=44100 -ac 2 \
+//     -map_metadata -1 -fflags +bitexact -flags:a +bitexact -c:a libmp3lame -b:a 24k \
+//     -write_xing 0 -id3v2_version 0 tone-880hz.mp3
 //
 // What the in-process suites cannot reach (the Go run-executor tests stub the HTTP
-// hop, the Vitest suites stub fetch and the audio element), and this suite owns:
+// hop, the Vitest suites stub fetch, the audio element and WebAudio), and this suite
+// owns:
 //
 //   1. OFFERING: the model the probe marks transcription-capable is in the chat's
 //      picker and a model the probe has no verdict for (an unprobed one) is not, and
@@ -41,32 +61,35 @@ import { login } from "../e2e/helpers";
 //   2. THE WIRE: one send makes exactly one upstream multipart POST to
 //      /v1/audio/transcriptions, with the gateway model name rewritten to the
 //      application's own model id, the thread's language, prompt and temperature
-//      carried as form fields, and the clip arriving as the `file` part BYTE FOR BYTE
-//      (named by its media type); the stub never sees a chat-completions call.
+//      carried as form fields, and the clip arriving as the `file` part -- a WAV (the
+//      attached WebM converted: RIFF/WAVE, PCM, mono, 16 kHz, 16 bit, the tone still
+//      at its pitch) named audio.wav, never the WebM that was attached; the stub never
+//      sees a chat-completions call.
 //   3. THE ANSWER: a pending state while the upstream is still working, then the
 //      transcript as a plain text turn, next to the user's own clip, which plays from
-//      the chat blob store (byte for byte the attached WAV, as audio/wav, which the
-//      browser really decodes) and downloads as the same bytes; the untitled chat is
-//      named after its transcript.
+//      the chat blob store (byte for byte the WAV the upstream received, as audio/wav,
+//      which the browser really decodes) and downloads as the same bytes; the untitled
+//      chat is named after its transcript.
 //   4. PERSISTENCE: after a full reload the thread is still a transcription thread,
 //      its settings are restored, the clip plays again from the store and the
 //      transcript is still there -- and reading it back sent nothing upstream.
-//   5. THE FOLLOW-UP: a second clip is a second upstream call with the NEW clip's
-//      bytes (an earlier turn's clip is never re-sent), and the advanced JSON
-//      passthrough reaches the form next to the thread's own settings, a passthrough
-//      key that repeats a set setting not being sent twice.
-//   6. THE RECORDING: a clip recorded in the browser is relayed like an attached one --
-//      the recorder's audio/webm reaches the upstream as the file part (named
-//      audio.webm, byte for byte what the chat blob store holds) and is answered with
-//      its own transcript.
+//   5. THE FOLLOW-UP: a second clip (an MP3, another format and another pitch) is a
+//      second upstream call with the NEW clip's WAV (an earlier turn's clip is never
+//      re-sent), and the advanced JSON passthrough reaches the form next to the
+//      thread's own settings, a passthrough key that repeats a set setting not being
+//      sent twice.
+//   6. THE RECORDING: a clip recorded in the browser is converted like an attached
+//      one -- the recorder's audio/webm never reaches the wire: the upstream gets a WAV
+//      (named audio.wav, byte for byte what the chat blob store holds) and answers it
+//      with its own transcript.
 //   7. THE BILLING UNIT: each run leaves an audio_second usage row (from the stub's
 //      timing.audio_duration_ms, 2000 ms = 2 s), not a token-metered one.
 //
 // Not covered here, and owned by the unit/integration suites instead: the reserved
 // passthrough fields and the invalid-JSON refusal, the run's error codes and their
-// labels (including "no transcript" for silence), the format and size refusals of the
-// attach, the recorder's permission-denied / unsupported / failed paths, and the
-// object-URL revoke on unmount -- none of those is a cross-process property.
+// labels (including "no transcript" for silence), the refusals of the attach (not audio,
+// undecodable, too large), the recorder's permission-denied / unsupported / failed paths,
+// and the object-URL revoke on unmount -- none of those is a cross-process property.
 
 const t = messages.de;
 
@@ -93,9 +116,9 @@ const UNPROBED_UPSTREAM = "not_loaded_yet";
 
 // What the stub answers the nth transcription with: the transcript, and the timing
 // block whose audio_duration_ms (milliseconds) is the quantity the gateway bills. Two
-// seconds, and the WAV clips below really are this long, so the number the stub
-// reports, the bytes and the duration the browser decodes all agree. Every transcript
-// is shorter than the 40 characters the chat title is cut at.
+// seconds, and the fixture clips below really are this long, so the number the stub
+// reports, the converted WAV and the duration the browser decodes all agree. Every
+// transcript is shorter than the 40 characters the chat title is cut at.
 const CLIP_SECONDS = 2;
 const CLIP_DURATION_MS = CLIP_SECONDS * 1000;
 const TRANSCRIPTS = ["Guten Tag, das ist das Transkript.", "Und hier noch ein zweiter Satz.", "Dies stammt aus einer Aufnahme."];
@@ -111,40 +134,136 @@ const TEMPERATURE = 0.2;
 // sent a second time -- the real endpoint refuses a repeated field).
 const PASSTHROUGH = { word_timestamps: true, seed: 7, language: "fr" };
 
-/**
- * A valid RIFF/WAVE body (mono, 16 kHz, 16-bit PCM): CLIP_SECONDS of a tone at `hz`.
- * The sample bytes are neither valid UTF-8 nor valid JSON, so a hop that decoded,
- * re-encoded or text-handled the clip in any way would corrupt it and the byte
- * comparisons below would catch it; it is long enough for a media element to decode
- * and report a duration for; and a different pitch makes a different clip, so which
- * of two clips reached the upstream is observable.
- */
-function wavClip(hz: number): Buffer {
-  const sampleRate = 16000;
-  const count = sampleRate * CLIP_SECONDS;
-  const samples = Buffer.alloc(count * 2);
-  for (let i = 0; i < count; i += 1) {
-    samples.writeInt16LE(Math.round(Math.sin((2 * Math.PI * hz * i) / sampleRate) * 12000), i * 2);
-  }
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0, "ascii");
-  header.writeUInt32LE(36 + samples.length, 4);
-  header.write("WAVE", 8, "ascii");
-  header.write("fmt ", 12, "ascii");
-  header.writeUInt32LE(16, 16); // fmt chunk size
-  header.writeUInt16LE(1, 20); // PCM
-  header.writeUInt16LE(1, 22); // mono
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * 2, 28); // byte rate
-  header.writeUInt16LE(2, 32); // block align
-  header.writeUInt16LE(16, 34); // bits per sample
-  header.write("data", 36, "ascii");
-  header.writeUInt32LE(samples.length, 40);
-  return Buffer.concat([header, samples]);
+// The clips the spec attaches: NON-WAV audio, so the composer's conversion is what
+// makes the upload a WAV. Each is a CLIP_SECONDS tone, stereo and not at 16 kHz (48 kHz
+// Opus, 44.1 kHz MP3), so the down-mix and the resample are exercised too; a different
+// pitch and container make a different clip, so which of two reached the upstream is
+// observable from the bytes AND from the tone in them.
+type Fixture = { name: string; mimeType: string; hz: number; bytes: Buffer };
+
+function fixture(name: string, mimeType: string, hz: number): Fixture {
+  return { name, mimeType, hz, bytes: fs.readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url))) };
 }
 
-const FIRST_WAV = wavClip(440);
-const SECOND_WAV = wavClip(880);
+const FIRST_CLIP = fixture("tone-440hz.webm", "audio/webm", 440);
+const SECOND_CLIP = fixture("tone-880hz.mp3", "audio/mpeg", 880);
+// The pitch of the synthetic microphone (installSyntheticMicrophone).
+const MICROPHONE_HZ = 440;
+
+// What the composer converts every clip to (shared/audioToWav.ts) and the audio.cpp
+// server reads: a canonical 44-byte RIFF/WAVE header, then 16-bit PCM, mono, 16 kHz.
+const WAV_SAMPLE_RATE = 16000;
+const WAV_HEADER_BYTES = 44;
+
+type WavFacts = {
+  riff: string;
+  riffSize: number;
+  wave: string;
+  fmt: string;
+  fmtSize: number;
+  formatTag: number;
+  channels: number;
+  sampleRate: number;
+  byteRate: number;
+  blockAlign: number;
+  bitsPerSample: number;
+  data: string;
+  dataBytes: number;
+  /** The length of the clip, from the samples. */
+  seconds: number;
+  /** The largest sample, as a fraction of full scale: 0 is silence. */
+  peak: number;
+  /** The pitch of the tone, from the zero crossings of the audible stretch. */
+  hz: number;
+};
+
+/**
+ * Reads a WAV the way a strict consumer would: the header fields exactly where the
+ * canonical 44-byte layout puts them, and, from the 16-bit samples, the length, the
+ * loudest sample and the pitch. The pitch is the number of sign changes between the
+ * first and the last audible sample (|sample| over a threshold, so a recording's quiet
+ * lead-in and tail do not count) over twice their duration: a decode, down-mix and
+ * resample that went wrong would change it, which makes it a check that the audio
+ * survived the conversion and not just that a header was written.
+ */
+function readWav(wav: Buffer): WavFacts {
+  const samples = Math.max(0, (wav.length - WAV_HEADER_BYTES) >> 1);
+  const at = (i: number) => wav.readInt16LE(WAV_HEADER_BYTES + i * 2);
+  let peak = 0;
+  let first = -1;
+  let last = -1;
+  const audible = 500;
+  for (let i = 0; i < samples; i += 1) {
+    const magnitude = Math.abs(at(i));
+    peak = Math.max(peak, magnitude);
+    if (magnitude > audible) {
+      first = first < 0 ? i : first;
+      last = i;
+    }
+  }
+  let crossings = 0;
+  for (let i = first + 1; first >= 0 && i <= last; i += 1) {
+    if ((at(i - 1) < 0) !== (at(i) < 0)) {
+      crossings += 1;
+    }
+  }
+  const audibleSeconds = (last - first) / WAV_SAMPLE_RATE;
+  return {
+    riff: wav.toString("ascii", 0, 4),
+    riffSize: wav.readUInt32LE(4),
+    wave: wav.toString("ascii", 8, 12),
+    fmt: wav.toString("ascii", 12, 16),
+    fmtSize: wav.readUInt32LE(16),
+    formatTag: wav.readUInt16LE(20),
+    channels: wav.readUInt16LE(22),
+    sampleRate: wav.readUInt32LE(24),
+    byteRate: wav.readUInt32LE(28),
+    blockAlign: wav.readUInt16LE(32),
+    bitsPerSample: wav.readUInt16LE(34),
+    data: wav.toString("ascii", 36, 40),
+    dataBytes: wav.readUInt32LE(40),
+    seconds: samples / WAV_SAMPLE_RATE,
+    peak: peak / 0x8000,
+    hz: audibleSeconds > 0 ? crossings / 2 / audibleSeconds : 0
+  };
+}
+
+/**
+ * `upload` is a WAV of the kind the audio.cpp server reads -- RIFF/WAVE, a `fmt `
+ * chunk that declares PCM, mono, 16000 Hz, 16 bit, and a data chunk that is exactly
+ * the rest of the file -- carrying an audible tone at `hz` that lasts `seconds` (or,
+ * for a recording whose length is not fixed, at least `minSeconds`).
+ */
+function expectWav(upload: Buffer, expected: { hz: number; seconds?: number; minSeconds?: number }): void {
+  const wav = readWav(upload);
+  expect(wav).toMatchObject({
+    riff: "RIFF",
+    riffSize: upload.length - 8,
+    wave: "WAVE",
+    fmt: "fmt ",
+    fmtSize: 16,
+    formatTag: 1, // PCM
+    channels: 1,
+    sampleRate: WAV_SAMPLE_RATE,
+    byteRate: WAV_SAMPLE_RATE * 2,
+    blockAlign: 2,
+    bitsPerSample: 16,
+    data: "data",
+    dataBytes: upload.length - WAV_HEADER_BYTES
+  });
+  expect(wav.peak, "the WAV is not silence").toBeGreaterThan(0.05);
+  expect(Math.abs(wav.hz - expected.hz), `the tone survived the conversion at its pitch (${wav.hz} Hz, not ${expected.hz} Hz)`).toBeLessThan(
+    expected.hz * 0.03
+  );
+  if (expected.seconds !== undefined) {
+    // Within a tenth of a second: an MP3's decoder delay and padding (about 40 ms here)
+    // are part of what the browser decodes.
+    expect(Math.abs(wav.seconds - expected.seconds), `the WAV is as long as the clip (${wav.seconds} s, not ${expected.seconds} s)`).toBeLessThan(0.1);
+  }
+  if (expected.minSeconds !== undefined) {
+    expect(wav.seconds, "the WAV holds the recording").toBeGreaterThanOrEqual(expected.minSeconds);
+  }
+}
 
 /** One part of a multipart/form-data body. */
 type FormPart = { name: string; filename?: string; contentType?: string; value: Buffer };
@@ -303,6 +422,9 @@ let page: Page;
 let stub: Stub;
 let serverId = "";
 let applicationId = "";
+// The WAV the first upstream call received: scenario 5 tells the follow-up clip's upload
+// apart from it.
+let firstUpload: Buffer;
 
 test.describe.configure({ mode: "serial" });
 
@@ -328,9 +450,19 @@ async function installSyntheticMicrophone(target: Page): Promise<void> {
   });
 }
 
+// The address of every chat blob the page has fetched so far (scenario 6 finds the one
+// it is waiting for by its not being among them).
+const fetchedBlobPaths = new Set<string>();
+
 test.beforeAll(async ({ browser }) => {
   stub = await startAudioCppStub();
   page = await browser.newPage();
+  page.on("response", (response) => {
+    const blobPath = new URL(response.url()).pathname;
+    if (blobPath.startsWith("/api/portal/chat-blobs/")) {
+      fetchedBlobPaths.add(blobPath);
+    }
+  });
   await installSyntheticMicrophone(page);
 });
 
@@ -409,10 +541,14 @@ async function openSettings(): Promise<void> {
 
 /**
  * Attaches `clip` through the composer's attach control (the file input the button
- * wraps), and returns once the composer shows it: a player for the waiting clip.
+ * wraps), and returns once the composer shows it: a player for the waiting clip. What
+ * the player holds is the CONVERTED clip -- an inline audio/wav data url, never the
+ * WebM or MP3 that was picked -- which is what the user hears before sending and what
+ * is then stored and sent.
  */
-async function attachClip(clip: Buffer, name: string): Promise<void> {
-  await composer().getByLabel(t.chatAttachAudio, { exact: true }).setInputFiles({ name, mimeType: "audio/wav", buffer: clip });
+async function attachClip(clip: Fixture): Promise<void> {
+  await composer().getByLabel(t.chatAttachAudio, { exact: true }).setInputFiles({ name: clip.name, mimeType: clip.mimeType, buffer: clip.bytes });
+  await expect(composer().locator("audio")).toHaveAttribute("src", /^data:audio\/wav;base64,/);
   await expectPlayableClip(composer().locator("audio"));
 }
 
@@ -431,9 +567,8 @@ async function expectDecodedClip(player: Locator, seconds: number | null = CLIP_
         }),
       { timeout: 15000, intervals: [250] }
     )
-    // A recording's WebM has no duration header (the browser reports Infinity until the
-    // file is played to its end), so its length is not asserted: the clip is decoded
-    // when the metadata loaded without a media error.
+    // A recording's length is whatever the take lasted, so it is not asserted exactly:
+    // the clip is decoded when the metadata loaded without a media error.
     .toMatchObject({ error: null, ready: true, ...(seconds === null ? {} : { seconds: expect.closeTo(seconds, 1) }) });
 }
 
@@ -574,13 +709,13 @@ test("2 — the chat offers the asr model and not the unprobed one, and picking 
 
 // --- Scenario 3 -------------------------------------------------------------
 
-test("3 — an attached clip is relayed as one multipart /v1/audio/transcriptions request and renders as a transcript turn next to its playable, downloadable clip", async () => {
+test("3 — an attached WebM is converted to a WAV, relayed as one multipart /v1/audio/transcriptions request, and renders as a transcript turn next to its playable, downloadable clip", async () => {
   await openSettings();
   await page.locator("#chat-transcription-language").fill(LANGUAGE);
   await page.locator("#chat-transcription-prompt").fill(PROMPT);
   await page.locator("#chat-transcription-temperature").fill(String(TEMPERATURE));
 
-  await attachClip(FIRST_WAV, "first-clip.wav");
+  await attachClip(FIRST_CLIP);
   await expect(sendButton()).toBeEnabled();
 
   // The user's clip comes back from the chat blob store once the turn is committed,
@@ -603,14 +738,16 @@ test("3 — an attached clip is relayed as one multipart /v1/audio/transcription
   await expect(composer().locator("audio")).toHaveCount(0);
   await expect(sendButton()).toBeDisabled();
 
-  // The user's turn is the clip: a player that plays the stored bytes -- byte for byte
-  // the attached WAV, served as audio/wav out of the owner-scoped blob endpoint.
+  // The user's turn is the clip: a player that plays the stored bytes -- the converted
+  // WAV, served as audio/wav out of the owner-scoped blob endpoint.
   await expect(userTurns()).toHaveCount(1);
   await expectStoredClip(lastUser().locator("audio"));
   const blob = await blobResponse;
   expect(blob.status()).toBe(200);
   expect(blob.headers()["content-type"]).toMatch(/^audio\/wav/);
-  expect(Buffer.compare(await blob.body(), FIRST_WAV), "the stored blob must equal the attached WAV byte for byte").toBe(0);
+  const stored = await blob.body();
+  expectWav(stored, { hz: FIRST_CLIP.hz, seconds: CLIP_SECONDS });
+  expect(Buffer.compare(stored, FIRST_CLIP.bytes), "what is stored is the converted WAV, not the attached WebM").not.toBe(0);
 
   // The download saves the same bytes, named as the user's own input, not as audio the
   // gateway generated.
@@ -619,7 +756,7 @@ test("3 — an attached clip is relayed as one multipart /v1/audio/transcription
     lastUser().getByRole("button", { name: t.chatDownloadAudio, exact: true }).click()
   ]);
   expect(download.suggestedFilename()).toMatch(/^input-audio-[A-Za-z0-9._-]+\.wav$/);
-  expect(Buffer.compare(fs.readFileSync(await download.path()), FIRST_WAV), "the downloaded file must equal the attached WAV byte for byte").toBe(0);
+  expect(Buffer.compare(fs.readFileSync(await download.path()), stored), "the downloaded file must equal the stored WAV byte for byte").toBe(0);
 
   // The untitled chat is named after its transcript.
   await expect(page.getByLabel(t.chatSidebarLabel)).toContainText(TRANSCRIPTS[0]);
@@ -627,14 +764,21 @@ test("3 — an attached clip is relayed as one multipart /v1/audio/transcription
   // Exactly one upstream transcription call: multipart, the gateway model name
   // rewritten to the application's own model id, the thread's settings as form fields
   // (temperature in its plain decimal form) and nothing else, and the clip arriving as
-  // the file part byte for byte under the name of its media type.
+  // the file part: a WAV (never the attached WebM), under the name and media type of a
+  // WAV, byte for byte what the chat store holds -- the gateway relays, it never
+  // transcodes.
   const calls = stub.transcriptionCalls();
   expect(calls).toHaveLength(1);
   expect(calls[0].contentType).toMatch(/^multipart\/form-data;/);
   expect(calls[0].fields).toEqual({ model: ASR_UPSTREAM, language: LANGUAGE, prompt: PROMPT, temperature: String(TEMPERATURE) });
   expect(calls[0].filename).toBe("audio.wav");
+  expect(calls[0].fileType).toBe("audio/wav");
   expect(calls[0].file, "the upstream received a file part").toBeDefined();
-  expect(Buffer.compare(calls[0].file as Buffer, FIRST_WAV), "the relayed upload must equal the attached WAV byte for byte").toBe(0);
+  const upload = calls[0].file as Buffer;
+  expect(upload.subarray(0, 4).toString("hex"), "the attached clip is a WebM (EBML) stream, the upload is not").not.toBe("1a45dfa3");
+  expectWav(upload, { hz: FIRST_CLIP.hz, seconds: CLIP_SECONDS });
+  expect(Buffer.compare(upload, stored), "the relayed upload must equal the stored WAV byte for byte").toBe(0);
+  firstUpload = upload;
   // The chat went to the transcription endpoint and nowhere else: no chat-completions
   // call, and no POST of any other kind, reached the stub.
   expect(stub.calls.filter((c) => c.path.startsWith("/v1/chat"))).toHaveLength(0);
@@ -666,7 +810,7 @@ test("4 — the transcription thread survives a full reload: still a transcripti
 
 // --- Scenario 5 -------------------------------------------------------------
 
-test("5 — a follow-up clip is a second upstream call with the new clip's bytes, and the advanced passthrough reaches the form next to the thread's own settings", async () => {
+test("5 — a follow-up MP3 is a second upstream call with the new clip's WAV, and the advanced passthrough reaches the form next to the thread's own settings", async () => {
   await openSettings();
   await page.getByRole("button", { name: t.chatTranscriptionAdvanced, exact: true }).click();
   await page.locator("#chat-transcription-passthrough").fill(JSON.stringify(PASSTHROUGH));
@@ -674,7 +818,7 @@ test("5 — a follow-up clip is a second upstream call with the new clip's bytes
   // A transcription turn IS its clip: with the first one sent, Send is closed again
   // until another is attached.
   await expect(sendButton()).toBeDisabled();
-  await attachClip(SECOND_WAV, "second-clip.wav");
+  await attachClip(SECOND_CLIP);
   await expect(sendButton()).toBeEnabled();
   await sendButton().click();
 
@@ -688,13 +832,17 @@ test("5 — a follow-up clip is a second upstream call with the new clip's bytes
   await expect(page.locator('[data-role="assistant"]').getByRole("alert")).toHaveCount(0);
 
   // The second upstream call: the NEW clip only (an earlier turn's clip is never
-  // re-sent), the thread's own settings, and the passthrough fields relayed as form
-  // text (each value as its literal) -- but not the passthrough "language", which
-  // repeats a set setting: the thread's own value wins and the field appears once.
+  // re-sent) -- the MP3 converted to a WAV like the first clip was, at its own pitch --
+  // the thread's own settings, and the passthrough fields relayed as form text (each
+  // value as its literal) -- but not the passthrough "language", which repeats a set
+  // setting: the thread's own value wins and the field appears once.
   const calls = stub.transcriptionCalls();
   expect(calls).toHaveLength(2);
   expect(calls[1].filename).toBe("audio.wav");
-  expect(Buffer.compare(calls[1].file as Buffer, SECOND_WAV), "the second upload must be the second clip, byte for byte").toBe(0);
+  expect(calls[1].fileType).toBe("audio/wav");
+  const upload = calls[1].file as Buffer;
+  expectWav(upload, { hz: SECOND_CLIP.hz, seconds: CLIP_SECONDS });
+  expect(Buffer.compare(upload, firstUpload), "the second upload must be the second clip, not the first again").not.toBe(0);
   expect(calls[1].fields).toEqual({
     model: ASR_UPSTREAM,
     language: LANGUAGE,
@@ -707,9 +855,9 @@ test("5 — a follow-up clip is a second upstream call with the new clip's bytes
   expect(stub.calls.filter((c) => c.path.startsWith("/v1/chat"))).toHaveLength(0);
 });
 
-// --- Scenario 6 -------------------------------------------------------------
+// --- Scenario 6 ---------------------------------------------------------------
 
-test("6 — a clip recorded in the browser is relayed like an attached one: the recorder's WebM reaches the upstream and the chat store byte for byte", async () => {
+test("6 — a clip recorded in the browser is converted like an attached one: the recorder's WebM never reaches the wire, a WAV reaches the upstream and the chat store", async () => {
   // The REAL recorder, on the synthetic microphone: start, let the clock reach one
   // second so the take holds audio, stop, and use the take.
   await composer().getByRole("button", { name: t.chatRecordStart, exact: true }).click();
@@ -719,15 +867,19 @@ test("6 — a clip recorded in the browser is relayed like an attached one: the 
   await composer().getByRole("button", { name: t.chatRecordUse, exact: true }).click();
 
   // The take is the composer's clip, shown under the name a recording gets (it has no
-  // file name), and Send is open.
+  // file name), and Send is open. What the composer holds of it is the converted WAV:
+  // the recorder made an audio/webm (Opus), and that is not what is kept.
   await expect(composer().getByText(t.chatAudioRecordingLabel, { exact: true })).toBeVisible();
-  await expect(composer().locator("audio")).toHaveAttribute("src", /^data:audio\/webm;base64,/);
+  await expect(composer().locator("audio")).toHaveAttribute("src", /^data:audio\/wav;base64,/);
   await expect(sendButton()).toBeEnabled();
 
-  // The stored copy of the recording is the third blob the chat serves, as audio/webm.
-  const blobResponse = page.waitForResponse(
-    (r) => new URL(r.url()).pathname.startsWith("/api/portal/chat-blobs/") && (r.headers()["content-type"] ?? "").startsWith("audio/webm")
-  );
+  // The stored copy of the recording is the third blob the chat serves. Every clip is a
+  // WAV now, so the new blob is told apart from the two already fetched by its address.
+  const known = new Set(fetchedBlobPaths);
+  const blobResponse = page.waitForResponse((r) => {
+    const blobPath = new URL(r.url()).pathname;
+    return blobPath.startsWith("/api/portal/chat-blobs/") && !known.has(blobPath);
+  });
   await sendButton().click();
 
   await expect(assistantTurns()).toHaveCount(3);
@@ -737,22 +889,23 @@ test("6 — a clip recorded in the browser is relayed like an attached one: the 
   await expect(composer().locator("audio")).toHaveCount(0);
   await expectStoredClip(lastUser().locator("audio"), null);
 
-  // The third upstream call: the recorder's own bytes -- an EBML/WebM stream -- as the
-  // file part under the name and media type of the canonical audio/webm (the recorder
-  // reports audio/webm;codecs=opus; the codec parameter never reaches the wire), and
-  // the thread's settings unchanged.
+  // The third upstream call: a WAV made from the recorder's own audio -- the file part
+  // under the name and media type of a WAV, not the audio.webm the recorder produced
+  // (an EBML/WebM stream starts 1a45dfa3; a WAV starts RIFF) -- carrying the take's
+  // tone (at least the second the clock counted), and the thread's settings unchanged.
   const calls = stub.transcriptionCalls();
   expect(calls).toHaveLength(3);
-  expect(calls[2].filename).toBe("audio.webm");
-  expect(calls[2].fileType).toBe("audio/webm");
+  expect(calls[2].filename).toBe("audio.wav");
+  expect(calls[2].fileType).toBe("audio/wav");
   const upload = calls[2].file as Buffer;
-  expect(upload.length, "the recording holds audio").toBeGreaterThan(1000);
-  expect(upload.subarray(0, 4).toString("hex"), "the upload is a WebM (EBML) stream").toBe("1a45dfa3");
+  expect(upload.subarray(0, 4).toString("ascii"), "the upload is a WAV, not the recorder's WebM").toBe("RIFF");
+  expectWav(upload, { hz: MICROPHONE_HZ, minSeconds: 0.75 });
   expect(calls[2].fields).toMatchObject({ model: ASR_UPSTREAM, language: LANGUAGE, prompt: PROMPT, temperature: String(TEMPERATURE) });
 
   // What the chat store holds of the clip is what the upstream received.
   const blob = await blobResponse;
   expect(blob.status()).toBe(200);
+  expect(blob.headers()["content-type"]).toMatch(/^audio\/wav/);
   expect(Buffer.compare(await blob.body(), upload), "the stored recording must equal the relayed upload byte for byte").toBe(0);
 });
 
