@@ -655,7 +655,8 @@ describe('errorLabelByCode (whole-map invariants)', () => {
    * whatever code comes back, as `speech.response_format_unsupported` is for speech.
    * `transcription.stream_unsupported` IS reachable from the portal, through a
    * `stream_format` passthrough key (the one streaming-related field the run does not
-   * reserve).
+   * reserve). The gateway emits it only for a non-boolean `stream` and for any
+   * `stream_format`; `stream: true` itself is valid for a streaming model.
    */
   const transcriptionWireCodes = [
     'transcription.file_required',

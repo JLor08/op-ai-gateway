@@ -1796,10 +1796,12 @@ const de = {
     'Für die Transkription wird eine Audiodatei benötigt. Bitte hängen Sie Audio an oder nehmen Sie welches auf.',
   errorTranscriptionResponseFormatUnsupported:
     'Nicht unterstütztes Antwortformat für die Transkription. Unterstützt wird nur JSON.',
-  // Vom Portal nur über ein stream_format-Feld in den erweiterten Feldern erreichbar
-  // (stream selbst ist reserviert und wird vorher abgelehnt).
+  // Der Code gilt nur noch für ein stream, das kein Boolean ist, und für jedes
+  // stream_format; stream=true selbst ist für ein Streaming-Modell gültig. Vom Portal nur
+  // über ein stream_format-Feld in den erweiterten Feldern erreichbar (stream selbst ist
+  // reserviert und wird vorher abgelehnt).
   errorTranscriptionStreamUnsupported:
-    'Die Transkription unterstützt kein Streaming; die Antwort ist immer das vollständige Transkript. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
+    'Ungültige Streaming-Angabe für die Transkription: stream muss ein Boolean sein, und stream_format wird nicht unterstützt (ein gestreamtes Transkript wird im eigenen Ereignisformat des Modells ausgeliefert). Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
   // Das Ziel ist ein Agent, der multipart_proxy nicht gemeldet hat (älter als 0.9.0,
   // oder seit einem Neustart des Gateways noch nicht gemeldet).
   errorTranscriptionUnavailable:
@@ -4862,10 +4864,12 @@ const en: PortalMessages = {
     'Transcription needs an audio file. Please attach audio or record some.',
   errorTranscriptionResponseFormatUnsupported:
     'Unsupported response format for transcription. Only JSON is supported.',
-  // Reachable from the portal only through a stream_format field in the advanced
-  // fields (stream itself is reserved and refused earlier).
+  // The code now covers only a stream that is not a boolean and any stream_format;
+  // stream=true itself is valid for a streaming model. Reachable from the portal only
+  // through a stream_format field in the advanced fields (stream itself is reserved and
+  // refused earlier).
   errorTranscriptionStreamUnsupported:
-    'Transcription does not support streaming; the response is always the complete transcript. If present, remove the stream_format field from the advanced fields.',
+    "Invalid streaming option for transcription: stream must be a boolean, and stream_format is not supported (a streamed transcript is relayed in the model's own event format). If present, remove the stream_format field from the advanced fields.",
   // The target is an agent that has not declared multipart_proxy (older than 0.9.0, or
   // not reported since the gateway restarted).
   errorTranscriptionUnavailable:

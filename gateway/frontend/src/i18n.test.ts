@@ -3863,10 +3863,25 @@ describe('portal chat transcription error i18n keys', () => {
   });
 
   // transcription.stream_unsupported is reachable from the portal only through a
-  // stream_format passthrough key, so the sentence names the field to remove.
+  // stream_format passthrough key, so the sentence names the field to remove. The gateway
+  // streams transcription for a streaming model, so the refusal is about the stream VALUE
+  // (it must be a boolean) and stream_format, and must not claim that transcription cannot
+  // stream or always answers the complete transcript.
   it('names the stream_format field in the streaming refusal', () => {
     expect(messages.de.errorTranscriptionStreamUnsupported).toContain('stream_format');
     expect(messages.en.errorTranscriptionStreamUnsupported).toContain('stream_format');
+  });
+
+  it('does not claim that transcription cannot stream', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      const sentence = messages[locale].errorTranscriptionStreamUnsupported;
+      expect(sentence).not.toMatch(/kein Streaming|does not support streaming/i);
+      expect(sentence).not.toMatch(
+        /immer das vollständige Transkript|always the complete transcript/i,
+      );
+      expect(sentence).toContain('stream');
+      expect(sentence).toMatch(/Boolean|boolean/);
+    }
   });
 
   // The endpoint answers JSON only; the format refusal states the one that works.
