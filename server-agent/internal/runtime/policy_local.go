@@ -857,6 +857,16 @@ type expandedSpec struct {
 	envFromSpec []bool
 }
 
+// deviceBackendByToken maps each llama.cpp --device placeholder token to the
+// backend prefix deviceList uses. One table so resolveNonSecretToken handles
+// the three exact-match siblings (${CUDA_DEVICES}/${VULKAN_DEVICES}/
+// ${METAL_DEVICES}) in a single branch with one shared empty-list guard.
+var deviceBackendByToken = map[string]string{
+	"CUDA_DEVICES":   "CUDA",
+	"VULKAN_DEVICES": "Vulkan",
+	"METAL_DEVICES":  "MTL",
+}
+
 // resolveNonSecretToken resolves inner -- the text between "${" and "}" -- when
 // it is one of the exact-match, NON-secret placeholders: ${PORT}, ${MODEL},
 // ${HOST_GPU_IDS}, ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} and
@@ -897,24 +907,13 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 	// The three llama.cpp --device placeholders, exact-match siblings of
 	// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
 	// Same empty-list refusal, on the same reasoning (an empty --device
-	// list selects NO device, not every device).
-	if inner == "CUDA_DEVICES" {
+	// list selects NO device, not every device). One table-driven branch
+	// for the three, so the shared guard and message live once.
+	if backend, ok := deviceBackendByToken[inner]; ok {
 		if gpuIDs == "" {
-			return "", true, fmt.Errorf("${CUDA_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+			return "", true, fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device", inner)
 		}
-		return deviceList(spec, "CUDA"), true, nil
-	}
-	if inner == "VULKAN_DEVICES" {
-		if gpuIDs == "" {
-			return "", true, fmt.Errorf("${VULKAN_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-		}
-		return deviceList(spec, "Vulkan"), true, nil
-	}
-	if inner == "METAL_DEVICES" {
-		if gpuIDs == "" {
-			return "", true, fmt.Errorf("${METAL_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-		}
-		return deviceList(spec, "MTL"), true, nil
+		return deviceList(spec, backend), true, nil
 	}
 
 	// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and

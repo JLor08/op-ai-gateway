@@ -1091,8 +1091,7 @@ const de = {
   runtimeSpecConfigFileAdd: 'Datei hinzufügen',
   runtimeSpecConfigFileRemove: 'Datei entfernen',
   runtimeSpecConfigFileNameBlank: 'Der Dateiname fehlt.',
-  runtimeSpecConfigFileNameInvalid:
-    'Der Name muss ein einzelner Dateiname sein: keine Pfadtrenner (/ \\), kein „.“ oder „..“, kein Doppelpunkt, keine Steuerzeichen.',
+  runtimeSpecConfigFileNameInvalid: String.raw`Der Name muss ein einzelner Dateiname sein: keine Pfadtrenner (/ \), kein „.“ oder „..“, kein Doppelpunkt, keine Steuerzeichen.`,
   runtimeSpecConfigFileNameDuplicate:
     'Dateinamen müssen eindeutig sein; Groß- und Kleinschreibung wird nicht unterschieden.',
   runtimeSpecConfigFileTooLarge: 'Die Datei ist größer als 64 KiB.',
@@ -4248,8 +4247,7 @@ const en: PortalMessages = {
   runtimeSpecConfigFileAdd: 'Add file',
   runtimeSpecConfigFileRemove: 'Remove file',
   runtimeSpecConfigFileNameBlank: 'The file name is missing.',
-  runtimeSpecConfigFileNameInvalid:
-    'The name must be a single file name: no path separators (/ \\), no "." or "..", no colon, no control characters.',
+  runtimeSpecConfigFileNameInvalid: String.raw`The name must be a single file name: no path separators (/ \), no "." or "..", no colon, no control characters.`,
   runtimeSpecConfigFileNameDuplicate:
     'File names must be unique; upper and lower case are not told apart.',
   runtimeSpecConfigFileTooLarge: 'The file is larger than 64 KiB.',

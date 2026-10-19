@@ -33,7 +33,7 @@ const utf8 = new TextEncoder();
 // unicode.IsControl: the C0 range, DEL and the C1 range.
 function hasControlCharacter(text: string): boolean {
   for (let i = 0; i < text.length; i += 1) {
-    const code = text.charCodeAt(i);
+    const code = text.codePointAt(i) ?? 0;
     if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
   }
   return false;
