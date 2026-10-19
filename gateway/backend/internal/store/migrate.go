@@ -4163,10 +4163,11 @@ func migration92Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 }
 
 // migration93Up adds agent_runtime_specs.config_files (#257), the opaque JSON
-// array of {name, content} objects the agent writes into the launched child's
-// working directory before it starts the process. The store never parses it:
-// the portal validates and canonicalises it at write time and the agent decodes
-// it at launch -- the same contract as args and env.
+// array of {name, content} objects the agent writes into its own per-spec
+// config directory (<config_files_dir>/<spec-id>/, never the spec's work_dir)
+// before it starts the process. The store never parses it: the portal validates
+// and canonicalises it at write time and the agent decodes it at launch -- the
+// same contract as args and env.
 //
 // The column is `text not null` with an empty-string default: text is ADR-005's
 // wide type for a string value (an unbounded text column on both dialects, not

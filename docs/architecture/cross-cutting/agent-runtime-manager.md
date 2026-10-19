@@ -110,7 +110,7 @@ A live translate stream gets no such credit ([Risks & Technical Debt
 ## 3. Authority: the gateway specifies, the AI server permits
 
 The full launch specification — binary, argv, environment, working directory,
-listen port, health path, timeouts — lives in the gateway database and is
+config files, listen port, health path, timeouts — lives in the gateway database and is
 maintained in the portal. What may actually execute is decided **only** on the
 AI server, by the agent's own local configuration. The rule is: *the server
 operator decides what may run at all; the gateway decides when and how.*
@@ -254,7 +254,9 @@ placeholder-derived value by recorded provenance instead
 ([§14.7](#147-the-resolved-command-what-actually-ran)).
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
-Exactly eight placeholders are resolved, in both `args` and `env` values:
+Exactly nine placeholders are resolved, in both `args` and `env` values — all but
+the two secret-bearing ones, `${AGENT_ENV:NAME}` and `${API_TOKEN}`, also in a
+spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)):
 
 - `${PORT}` — an exact match substitutes the child's listen port.
 - `${MODEL}` — an exact match substitutes the spec's **`upstream_model`**: the
@@ -310,6 +312,17 @@ Exactly eight placeholders are resolved, in both `args` and `env` values:
   with multi-device Metal support — the portal shows a hint when the placeholder
   is used against a non-macOS agent, since stock llama.cpp Metal builds expose
   one device.
+- `${CONFIG_DIR}` — an exact match substitutes the **absolute per-spec directory
+  the agent writes the spec's config files into**,
+  `<config_files_dir>/<spec-id>` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child), issue #257):
+  `["--config", "${CONFIG_DIR}/server.json"]`. It is a plain path the agent
+  chose, **not a secret**: it records no secret span, and the reported launch
+  command ([§14.7](#147-the-resolved-command-what-actually-ran)) shows the
+  resolved path. It resolves in `args`, `env` **and** config-file content, so a
+  multi-file config can name a sibling by absolute path. It resolves whether or
+  not the spec carries any files, because it is only a path — the directory
+  exists once a launch has written something into it — and it has no
+  empty-value refusal, since the base directory has a non-empty default.
 - `${AGENT_ENV:NAME}` — resolved from the agent's own process environment. A
   **missing variable is a hard error naming the variable**, never a silent empty
   substitution.
@@ -364,7 +377,9 @@ same reason (`${GPU_IDS_FILE}`, `${HOST_GPU_IDS_JSON}`), with the same accepted
 cost: `${GPU_IDS}` — the shorter name this token deliberately does *not* use —
 reaches the child as literal text. `CUDA_DEVICES`, `VULKAN_DEVICES` and
 `METAL_DEVICES` are exact-match only for the identical reason and carry the
-identical accepted cost.
+identical accepted cost, and so is `CONFIG_DIR` (`${CONFIG_DIR_X}` is a plausible
+pass-through token): a typo such as `${CONFIG_DIRECTORY}` reaches the child as
+literal text.
 
 `${MODEL}` and `${HOST_GPU_IDS}` need **no feature flag**
 ([ADR-025](../09-architecture-decisions.md) negotiation), and that was checked
@@ -386,6 +401,9 @@ later, behind the `gpu_selection` flag ([§7](#7-feature-negotiation)), precisel
 *because* already-deployed agents that support `runtime_manager` but predate
 them genuinely exist in the field — the "no such agent can exist" premise
 above is what makes `${MODEL}`/`${HOST_GPU_IDS}` the exception, not the rule.
+`${CONFIG_DIR}` is in the same position and ships behind the
+`runtime_config_files` flag ([§7](#7-feature-negotiation)): an agent that
+predates it passes the token through as literal text.
 
 Four properties of that one pass are load-bearing, and each has a wrong
 implementation that shipped once:
@@ -469,7 +487,12 @@ transient would send it into crash backoff instead of surfacing it as the
 configuration error it is. Expansion is also **dry-run with port 0 before any
 resource is acquired**, so a permanently broken spec fails without grabbing an
 ephemeral port; the port value only substitutes a decimal string, so the dry run
-is faithful.
+is faithful. The config-file half of a launch joins the same dry run
+([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)): a secret or malformed placeholder in a file's content, an
+OS-unsafe file name or a spec id that would escape the base directory is the
+same class of operator error, found at port 0 before a port is acquired or a
+byte is written, and it is `not_permitted` too. Only a genuine filesystem
+failure while writing is a start failure.
 
 #### The runtime-spec API token: a deliberate, one-off exception to "no secret enters the gateway"
 
@@ -1225,6 +1248,115 @@ fact about this runtime is, and why:
 The facts above about `sd-server` itself were checked against
 `leejet/stable-diffusion.cpp` at commit `cc515a0` (`master`, 2026-09-16); a
 later `sd-server` release could in principle change any of them.
+
+### 3.5 Config files the agent writes before it launches the child
+
+A launch specification can carry **zero or more config files**, each a
+`{name, content}` pair of plain text (issue #257,
+[ADR-066](../09-architecture-decisions.md#adr-066--agent-provisioned-config-files-one-child-per-spec-a-0n-config-files-facet-written-to-an-agent-owned-directory-a-config_dir-placeholder-and-non-secret-content-only)). The agent writes them into an agent-owned directory
+**before it execs the child**, and the spec's `args` or `env` point the server at
+them with `${CONFIG_DIR}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)).
+
+It exists because a launch specification could otherwise express only a command
+line. A server that reads the models it serves from a config file — audio.cpp's
+`server.json`, an array of `{id, path, task, mode}` — had that file made by hand
+on every host, outside the run-spec workflow, and the id in it drifted from the
+`upstream_model` the gateway rewrites a request to: audio.cpp then answers
+`unknown model id: <name>`, which surfaces as an HTTP 500. With the id written
+as `${MODEL}` in the file's content, the drift is impossible by construction.
+**One child still serves one spec**: each spec provisions its own files, port and
+GPU, and a shared server assembled from several specs was rejected because it
+would make lifecycle, admission and GPU accounting server-scoped (ADR-066).
+
+The facet is general, not audio.cpp-specific, and holds up to **16 files per
+spec**, so a server that needs a per-model or per-voice file as well is covered
+without a second mechanism. A spec with none (`config_files: []`, the default of
+every spec that predates the facet) behaves byte-for-byte as before: the base
+directory is not even required.
+
+**Where the files go.** `<config_files_dir>/<spec-id>/<name>`, under an
+agent-owned base directory the operator sets on the agent
+(`config_files_dir`, [§15](#15-configuration-reference); default
+`server-agent-config-files` beside the binary). It is **never the spec's
+`work_dir`**: that is operator-chosen and may be a read-only mount or the
+binary's own directory, so the one place the agent can be sure to write is a
+directory it owns. The per-spec subdirectory, keyed by spec id, is what makes
+uniqueness structural — two specs that both name their file `server.json` land in
+different directories and can never overwrite each other. The gateway supplies a
+file's relative name and content and **never where on the host it is written**,
+exactly as it never supplies the binary allowlist.
+
+Each file is written **on every launch** (an idempotent overwrite) **after** the
+listen port is chosen and the placeholders are resolved, and **before** the
+`exec`, so `${PORT}` in a file is the real port of that generation. The write is
+atomic — a temp file created inside the target directory, `chmod 0600`, renamed
+into place, the same helper the runtime-config cache uses (§8.1) — so a child, or
+a crash mid-write, sees the old file or the new one and never a torn one. The
+per-spec directory is created `0755` if needed. The whole spec's files are
+validated and expanded **before the first byte is written**, so a bad second file
+cannot leave a half-provisioned directory behind. A change to a spec's
+`config_files` is **launch-affecting** ([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)):
+the child reads its files at startup, so a content edit relaunches it.
+
+**What a file's content may contain.** Placeholders are expanded in content by
+a small expander over the **same resolver** the `args`/`env` pass uses
+(`resolveNonSecretToken`), restricted to the **non-secret** tokens: `${PORT}`,
+`${MODEL}`, `${HOST_GPU_IDS}`, `${CUDA_DEVICES}`, `${VULKAN_DEVICES}`,
+`${METAL_DEVICES}` and `${CONFIG_DIR}`, each meaning exactly what it means on the
+command line. `${API_TOKEN}` and any `${AGENT_ENV…}` spelling are **hard
+errors** in content, as is a `PORT`-prefixed near-miss; every other `${…}`
+passes through literally, so a server's own templating survives. The expander is
+deliberately not `expandSpec`: that function *resolves* the two secret
+placeholders and records secret spans so the reported command can mask them,
+neither of which means anything for a file that lands on disk and is never
+reported. A written file outlives the process and sits where other local users
+and backups can read it, so a decrypted secret is never put there; secrets keep
+travelling through `env`/`args`, where the reported command masks them. Errors
+name the offending token, never a value. The gateway refuses the two secret
+placeholders at submit time as well.
+
+**Names, counts and sizes.** The gateway's runtime-spec PUT refuses a list
+that breaks any rule with 400 `runtime_spec.config_files_invalid` (the message
+names the file and the rule, never its content, which can hold the very secret
+that tripped the check): at most 16 files; each name a single file name (no
+separator of either OS, no `:` volume or stream marker, not blank or `.`/`..`, no
+control character); names unique **case-insensitively**; each content at most
+64 KiB; no secret placeholder. The agent does not trust that it ran, and layers
+two checks of its own:
+
+- `ParseConfig` applies the **gateway's name rule, no stricter and no laxer**, to
+  every spec. It is the single parser for gateway- and file-mode documents, so a
+  stricter rule would fail a document the gateway already stored and take the
+  whole runtime configuration down. A bad or repeated name is therefore a **hard
+  parse error for the document**, like a duplicate spec id (§8.1), reported as
+  the closed code `invalid_config_file_name` (§8.3); only a hand-written
+  file-mode `runtime.json` can reach it.
+- The **write boundary** adds the platform strictness that one spec should fail
+  alone rather than the document: a trailing dot or space (Windows strips them,
+  aliasing another name), a Windows reserved device name (`CON`, `NUL`, `COM1`…,
+  with or without an extension), and an invisible Unicode format character (a
+  bidirectional override can make a name read as another extension). It applies
+  on every GOOS, because the document may be authored on one OS and run on
+  another. It also requires the spec's directory to lie **strictly inside** the
+  base — a file-mode spec id such as `../evil` would otherwise resolve beside or
+  above it — compared lexically on purpose, like the work-directory check.
+
+**Failure classification.** The faults a retry can never fix — a secret or
+malformed placeholder, an unsafe name, a spec id that escapes the base, a spec
+that has files on an agent with no `config_files_dir` — are found by
+`planSpecConfigFiles`, which joins the pre-port dry run (§3.2, port 0, because the
+port only ever substitutes `${PORT}`) and reports `not_permitted`, rate-limited
+like a bad `args` placeholder. The filesystem writes that follow are the only
+step that can fail for an environmental reason (an unwritable directory, a full
+disk, a failed rename), and that is `start_failed` with crash backoff, with a
+message naming the file or directory — never `not_permitted`, which would claim
+the configuration can never work (§6).
+
+**Negotiation and visibility.** Writing the file is an observable agent
+behavior, so the agent declares `runtime_config_files` (`Since: "0.10.0"`, [§7](#7-feature-negotiation)).
+The agent gates nothing on it; the portal reads it to warn that a connected
+agent older than `0.10.0` would ignore the facet (§11.5). The file-mode upward
+report masks a config file's content like an `env` value (§8.3).
 
 ## 4. One router port per AI server
 
@@ -2391,7 +2523,7 @@ up. So:
 |---|---|
 | Spec removed from the document | **Applied immediately** — the spec drains. |
 | `admin_state` set to `force_stopped` | **Applied immediately** — a running child drains. |
-| A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
+| A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `config_files` — the files the agent writes before the exec and the child reads at startup, so a content edit relaunches — `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
 | A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, startup/health timeouts, the reported runtime `type`, the client-facing model name, **or a GPU row's `vram_mb`** — the admission demand, not a launch input) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` binds at the next start, per the not-retroactive rule below). |
 | Lowered per-GPU VRAM budget | **Not retroactive.** Binds at the next start. |
 | Removed co-residency pair | **Not retroactive.** Binds at the next start. |
@@ -2435,10 +2567,10 @@ strings.
 | `running` | Loaded and serving. The only state counted as loaded. |
 | `draining` | No new requests routed; in-flight finishing before SIGTERM. |
 | `backoff` | Crash-loop wait. |
-| `start_failed` | Never became healthy. |
+| `start_failed` | Never became healthy — or never launched: the exec failed, or a config file could not be written to disk ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). |
 | `crashed` | Died while running. |
 | `pending_vram_unknown` | Cannot start because its VRAM demand is unknown and the GPU is occupied (§5.3). |
-| `not_permitted` | Agent-local policy or placeholder expansion refused it, or its own demand exceeds a GPU budget outright. A configuration error. |
+| `not_permitted` | Agent-local policy or placeholder expansion refused it — including a config file whose name or content can never be written (§3.5) — or its own demand exceeds a GPU budget outright. A configuration error. |
 
 A state transition rings the manager's buffered(1) `Transitions()` doorbell,
 which makes the agent take an immediate coalesced telemetry sample instead of
@@ -2559,10 +2691,11 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Six
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Seven
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
-`runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`); two,
+`runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
+`runtime_config_files`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
@@ -2590,8 +2723,9 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_upstream_props` ([§4.1](#41-control-routes),
 [§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `Since: "0.7.0"`,
 `runtime_ensure` ([§4.1](#41-control-routes),
-[§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`, and
-`multipart_proxy` ([§4.2](#42-model-routing)), `Since: "0.9.0"`
+[§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`,
+`multipart_proxy` ([§4.2](#42-model-routing)), `Since: "0.9.0"`, and
+`runtime_config_files` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)), `Since: "0.10.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -2753,6 +2887,25 @@ older gateway simply never receives a multipart request. The name is on the
 agent's list alone and spelled identically on both sides, because the agent
 module imports nothing from the gateway. `server-agent`'s `Version` moved
 `0.8.2` → `0.9.0` for this entry, MINOR per the same rule.
+
+`runtime_config_files` (issue #257) has the `gpu_selection` shape: declared for the
+**portal's** benefit, not gated by the agent. The agent always honors the
+`config_files` it receives and resolves `${CONFIG_DIR}`, whatever the gateway
+declares back ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). What the flag lets the portal do is warn *before* the
+fact. An agent that predates it ignores the unknown `config_files` field,
+launches the child with the file missing and passes `${CONFIG_DIR}` through as
+literal text, and no probe can tell that apart from a spec that never asked for
+a file, so the name is the only signal there is. The portal reads
+`agent_features` and, **only once the operator has at least one config file in
+the form** and the agent's features have been read, shows a non-blocking
+"agent too old" warning naming the reported version
+([§11.5](#115-what-each-remaining-tab-shows)); it never blocks Save and does not
+fire for a `${CONFIG_DIR}` placed in `args` with no files. **Nothing on the
+gateway reads this flag**, and it gates nothing there: unlike `runtime_ensure`
+and `multipart_proxy` there is no route the gateway would otherwise send to an
+agent that cannot serve it, because the document carrying `config_files` is the
+one every agent already polls. `server-agent`'s `Version` moved `0.9.2` →
+`0.10.0` for this entry, MINOR per the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -2934,9 +3087,20 @@ existing `audiocpp_models` source**, `transcription_streaming` (`yes` for `mode=
 and only for an ASR model), under the already-declared `capability_source_audiocpp`.
 `agent.Features` gained nothing — an absent verdict already means the gateway buffers, so a
 flag would gate nothing (§7, [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)) — so the rule makes it PATCH, and
-the `Version` pin test moves to `0.9.2`. An older agent that omits the verdict degrades
+the `Version` pin test moved to `0.9.2` (and has since moved on, below). An older agent that omits the verdict degrades
 cleanly to the gateway's buffered path, which is why there is no hard version dependency
 ([ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)).
+
+**`0.9.2` → `0.10.0` (issue #257, agent config files) is MINOR, the plain case
+again.** `agent.Features` gained `runtime_config_files` for the `config_files`
+facet and the `${CONFIG_DIR}` placeholder ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)), and the portal waits on
+that name before it stops warning (§7). The bump is **one for the whole branch**
+— the agent's write step, the placeholder, the `config_files_dir` setting and the
+file-mode content redaction all ship in it, however many commits that spans —
+and the `Version` assertion moved to `TestFeaturesDeclareRuntimeConfigFiles`,
+beside the newest feature (`multipart_proxy`'s test keeps its own presence and
+`Since` check, and its `Since` stays `"0.9.0"`)
+([ADR-066](../09-architecture-decisions.md#adr-066--agent-provisioned-config-files-one-child-per-spec-a-0n-config-files-facet-written-to-an-agent-owned-directory-a-config_dir-placeholder-and-non-secret-content-only)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -3130,7 +3294,12 @@ Parsing rules are deliberately asymmetric, and a later "be consistent" refactor
 would flatten them in one direction or the other: **unknown top-level fields are
 tolerated** (forward compatibility with a newer gateway); **a duplicate spec id
 is a hard error**, because silently keeping one of the two would launch the wrong
-process for whichever mapping lost; **a `coresident` pair naming an absent spec
+process for whichever mapping lost; **a `config_files` name that is not one plain
+file name, or repeats another in the same spec, is a hard error too**
+(`invalid_config_file_name`, [§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child) — reachable only from a hand-written
+file-mode document, since the gateway refuses the same lists at submit time, and
+deliberately the gateway's rule and no stricter, so a name the gateway stored can
+never take the whole document down); **a `coresident` pair naming an absent spec
 id is dropped silently** with the rest of the document left usable, because that
 is reachable from an ordinary stale or racy read on the gateway side rather than
 a defect worth failing the whole configuration over. Every collection-shaped
@@ -3194,7 +3363,8 @@ isolated" capability is the only thing that would ever serve it.
 
 A file-mode agent reports its **effective** configuration upward — WS frame
 `runtime_report`, or `POST /api/agent/v1/runtime-report` — carrying the config
-with **env values masked, keys visible**, plus `runtime_source`, the load
+with **env values and config-file content masked, keys and file names visible**,
+plus `runtime_source`, the load
 timestamp and any parse error. It is sent on four triggers: at driver start, on
 a detected file change, on every WS reconnect (the transport re-sends its cached
 report, mirroring the system report), and — for the POST transport, which has no
@@ -3231,7 +3401,8 @@ carries no `api_token` field at all, so even an unmasked value arriving on
 the wire would be dropped by the unmarshal before it reached storage — but
 the agent-side mask is what keeps that from being the *only* protection.
 
-`api_token` is the **only** `AgentRuntimeSpecDTO` field the mirror omits;
+`api_token` and `config_files` are the **only** `AgentRuntimeSpecDTO` fields the
+mirror omits;
 every other non-secret field must be present on `agentRuntimeReportSpec`, or
 the same unmarshal-then-remarshal that drops the token silently drops it too.
 That is not hypothetical: `visible_devices_mode`, `type`, and the probe paths
@@ -3239,6 +3410,22 @@ were each lost this way, so a spec genuinely running in args mode was shown as
 `env` in the report view (issue #64). A round-trip test
 (`TestIngestRuntimeReportPreservesMirrorFields`) pins the non-secret fields
 through the sanitizer and asserts the token still does not survive.
+
+The same pass covers a spec's **config files** (issue #257, [§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). Every
+file keeps its `name` and has its `content` replaced with the identical `•••`
+mask, in a fresh slice per spec and as `[]` rather than `null` when there are
+none. A hand-written file-mode config file can hold a literal secret — an inline
+key in the YAML or JSON the model server reads — and `config_files` rides this
+same upward report, so its content is treated exactly like an `env` value;
+*which* files a spec provisions is a useful diagnostic, what is in them never
+crosses the wire. The masking is scoped to the **report**: the write step itself
+is unchanged in file mode, and the files are written for the child, unmasked,
+exactly as in gateway mode. The gateway's side of this is defence in depth, as
+for `api_token`: its ingest mirror (`agentRuntimeReportSpec`) carries **no
+`config_files` field**, so the unmarshal-then-remarshal drops the whole facet,
+names included, before anything is stored — which also means the portal's
+read-only file-mode view does not show a spec's config files. The agent-side
+mask is what keeps that from being the only protection.
 
 > **Limitation — `args` are not masked *in this report*.** The report's wire
 > contract scopes redaction to `env` values, and `args` are deliberately outside
@@ -3296,7 +3483,8 @@ agent-chosen prose can never be allowed through (see
 | Code | Meaning |
 |---|---|
 | `json_syntax` | The file is not valid JSON, in any of the ways `encoding/json` reports. |
-| `duplicate_spec_id` | Two entries in the file share a spec id — the one parse failure that is not a syntax error. |
+| `duplicate_spec_id` | Two entries in the file share a spec id — a structural failure, not a syntax error. |
+| `invalid_config_file_name` | A spec's `config_files` carries a name that is not one plain file name (path separator, `.`/`..`, drive or stream marker, control character, blank), or repeats another name in the same spec, compared case-insensitively ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). Structural and fatal to the whole document, like a duplicate spec id. |
 | `file_missing` | Nothing exists at the configured path. |
 | `read_failed` | Something is there, but the agent could not stat or read it — permissions, a non-directory path component, an I/O error. |
 | *(empty)* | **No failure.** The field is `omitempty`, so a healthy agent sends nothing here. |
@@ -3325,7 +3513,7 @@ failure therefore discards the agent's mtime memory, so the next successful
 stat cannot take the unchanged shortcut past the re-parse that clears the code.
 
 The agent additionally owns an `unclassified` floor which nothing currently
-produces; it is a defensive value, not a fifth meaning, and the gateway
+produces; it is a defensive value, not a sixth meaning, and the gateway
 degrades it like any other unknown code.
 
 It is a **three-sided contract with no compiler on any seam**, so adding a code
@@ -4863,6 +5051,28 @@ the mirror are load-bearing: it covers `args` as well as `env`, and it classifie
 by **prefix**, not substring, in both directions (a substring test on `PORT`
 wrongly rejects `${TRANSPORT}`; an `includes('${AGENT_ENV:OP_AGENT_')` test
 wrongly accepts the near-misses the agent refuses).
+
+**Config files** ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)) are a repeatable editor of `{file name, content}`
+rows beside `args` and `env`: a monospace multi-line field per file, an Add button
+that stops at the 16-file cap, and inline feedback on the offending field while the
+operator types — a name that is blank, not a single plain file name or repeated
+(case-insensitively), content over 64 KiB, or content naming `${API_TOKEN}` or
+`${AGENT_ENV:`. Like the placeholder mirror above, those checks restate what the
+gateway's spec PUT enforces (`validateRuntimeSpecConfigFiles`, 400
+`runtime_spec.config_files_invalid`) rule for rule and are early feedback, not a
+second contract. The reason to have them is the **create** path: the mapping is
+written before its spec, so a bad list caught only by the gateway would leave a
+spec-less mapping behind. The form therefore refuses at submit, on the first
+problem, and names the file — never its content, which can hold the very secret
+that tripped the check. The stricter agent-side name rules (a trailing dot or
+space, Windows device names, invisible Unicode format characters) are
+deliberately not mirrored, for the reason the gateway does not mirror them either.
+The list is part of the **full-document** PUT, so the form binds it from the loaded
+spec and always sends it, `[]` included: an absent `config_files` clears the stored
+set, and that is also why the Start/Stop/Clear override body spreads it through
+unchanged. Once at least one file is configured and the agent's features have
+been read, an agent that has not declared `runtime_config_files` draws a
+non-blocking warning with its reported version ([§7](#7-feature-negotiation)).
 
 A per-application warnings endpoint returns opaque string codes and today emits
 four. All are pure derivations with no store write, reloaded after every spec
@@ -7028,6 +7238,18 @@ operator meets first:
   until the process exits. And work-directory containment is **lexical**: a symlink
   inside an allowed directory can point outside it — the binary allowlist, not
   the directory check, is the boundary.
+- **Config files are written, never garbage-collected, and never hold a secret**
+  ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). A file dropped from a spec's `config_files`, and the whole
+  `<spec-id>/` directory of a removed spec, stay on disk until an operator deletes
+  them: the write is overwrite-on-launch only. A secret cannot be placed in a file
+  at all (`${API_TOKEN}` and `${AGENT_ENV:…}` are refused in content, by the
+  gateway at submit time and again by the agent), so a server that can take a
+  credential only from a file cannot be fully provisioned this way. Containment
+  of the per-spec directory is **lexical**, like the work-directory check: a
+  symlink an operator planted under their own `config_files_dir` is theirs to
+  explain. And an agent older than `0.10.0` silently ignores the facet (the portal
+  warns, §7), so a spec whose `args` reference `${CONFIG_DIR}` launches against a
+  missing file.
 - **The feature ships no metrics** of its own beyond the telemetry sample and the
   status stream.
 - **A key-protected vLLM child gets no context size in a benchmark**
@@ -7313,8 +7535,8 @@ outcome this feature exists to eliminate. See
 Attached to each generation's **start marker**, inline in the output and
 collapsed by default, the portal shows the command the agent **actually
 executed**. An operator debugging a spec that will not start is otherwise
-looking at a template: `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}` and
-`${AGENT_ENV:NAME}` are all resolved at launch (§3.2), the binary came from the
+looking at a template: `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`, `${CONFIG_DIR}`
+and `${AGENT_ENV:NAME}` are all resolved at launch (§3.2), the binary came from the
 agent-local allowlist (§3.1), and the working directory may not be what they
 assume. The gap between what was typed and what ran is where the bug tends to
 be. Binary, argv, working directory and the **complete** effective environment
@@ -7401,14 +7623,17 @@ print, so the alert says so and carries the guidance that follows: secrets go in
 
 And, equally deliberately, what is **not** masked, because masking it would cost
 the feature its whole reason for existing while protecting nothing: the resolved
-`${PORT}`/`${MODEL}`/`${HOST_GPU_IDS}`, the agent-provided base environment, the
+`${PORT}`/`${MODEL}`/`${HOST_GPU_IDS}`/`${CONFIG_DIR}` (a path the agent chose,
+which records no secret span), the agent-provided base environment, the
 GPU visibility variable a `set_visible_devices` spec receives ("the variable was
 actually set, to *these* cards" is among the most useful things this can say),
 and literal text from the spec — binary, args, `work_dir`, env keys in both
 modes, env values in gateway mode. In gateway mode that text is in the gateway's
 own database and the portal's spec editor renders it back to the same admins; in
 file mode the report already sends binary/args/`work_dir`/env keys verbatim. Either
-way, showing it exports nothing the gateway does not already hold.
+way, showing it exports nothing the gateway does not already hold. A spec's config-file
+**content** is no part of the command at all: it is written to disk (§3.5) and
+never reported here.
 
 The mask **is** the placeholder rather than a row of bullets, and that does two
 jobs: it is unmistakably not a value (so the block cannot be misread as leaking
@@ -7483,6 +7708,7 @@ registers, over the authoritative table in
 | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. |
 | `runtime_allow_binary_dirs` / `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (**no flag form**) | `false` | Auto-allow each allowed binary's parent directory as a `work_dir` subtree (§3.1.2). On while `runtime_allowed_dirs` is empty flips work-dir handling permissive→restrictive. |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
+| `config_files_dir` / `OP_AGENT_CONFIG_FILES_DIR` | `server-agent-config-files` next to the binary | Base directory the agent writes spec config files under, one `<spec-id>/` subdirectory each; `${CONFIG_DIR}` resolves to it ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). A relative config-file value resolves beside that file. **The gateway never supplies it.** |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
 | `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
 | `runtime_log_buffer_total_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` (**no flag form**) | 16 MiB | Ceiling on that retention across all specs. |

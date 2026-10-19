@@ -333,6 +333,14 @@ agent declares nothing back: the gateway is the side that must accept the source
 nothing on the gateway waits on the agent, and an agent-side name would therefore gate
 nothing — so a flag on one list only is not a half-finished negotiation, it is the
 name placed on the side whose fact it is.
+
+`runtime_config_files` (issue #257,
+[ADR-066](#adr-066--agent-provisioned-config-files-one-child-per-spec-a-0n-config-files-facet-written-to-an-agent-owned-directory-a-config_dir-placeholder-and-non-secret-content-only))
+is the portal-informational shape on the agent's list alone: the agent always
+honors the config files it receives and gates nothing on the flag, while the
+portal reads it to warn that a connected agent older than `0.10.0` would launch the
+child without the file — a fact no probe can tell apart from a spec that never asked
+for one.
 → [Agent-Managed Model Runtime §7](cross-cutting/agent-runtime-manager.md).
 
 ## ADR-026 — Gateway→agent control is desired state, not commands
@@ -610,7 +618,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -666,7 +674,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -835,7 +843,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1020,7 +1028,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1235,7 +1243,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-92-migrations),
+[§4](reference/data-model.md#4-migration-history-93-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1461,7 +1469,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-92-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-93-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1586,7 +1594,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-92-migrations),
+[§4](reference/data-model.md#4-migration-history-93-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3549,7 +3557,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-92-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-93-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3773,7 +3781,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-92-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-93-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4787,7 +4795,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4913,7 +4921,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-92-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5056,7 +5064,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-92-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-93-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -6420,3 +6428,154 @@ handler and the text run's streaming machinery are reused with a `stream` branch
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-066 — Agent-provisioned config files: one child per spec, a 0..N config-files facet written to an agent-owned directory, a `${CONFIG_DIR}` placeholder, and non-secret content only
+**Context:** a managed child's launch specification could express only a
+**command line** — `binary`, `args`, `env`, `work_dir` — and the only file the
+agent ever wrote was its own runtime-config cache, never a config file *for* the
+process it launched. A server that cannot be driven entirely by argv therefore
+could not be managed end to end from the run-spec form. **audio.cpp** is the
+concrete case
+([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
+[ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)):
+it reads the models it serves from a JSON config (`server.json`, an array of
+`{id, path, task, mode}`) that the operator had to create **by hand on the host**,
+outside the gateway, and pass as a fixed `--config` argument. Two problems
+followed. **Operability:** the portal could not provision the file, so audio.cpp
+was not manageable end to end. **Drift:** the model id in that hand-made file is
+decoupled from the spec's `upstream_model` — the application-side name the
+gateway rewrites a request to on the native relay those two ADRs describe — and a
+mismatch is audio.cpp's `unknown model id: <name>`, surfaced as HTTP 500. Issue
+#257.
+
+**Decision — eight choices, taken together.**
+
+- **(a) One child per spec (Variant A); a shared server (Variant B) is rejected.**
+  Each spec provisions its own config file(s), its own port and its own GPU, which
+  reuses the one-child-per-spec runtime, port and GPU accounting unchanged. Variant
+  B — one audio.cpp serving several models from a single `server.json` assembled
+  from several specs by a reconciler — is more efficient but breaks the
+  one-child-per-spec assumption (lifecycle, admission, GPU accounting, idle and stop
+  would all become server-scoped) and needs a conflict-free many-specs-to-one-file
+  reconciler. Running N processes (more memory and VRAM, repeated loading, N health
+  checks) is the accepted cost.
+- **(b) A general `config_files` facet: 0..N `{name, content}` files per spec.** It
+  is not audio.cpp-specific, so the per-model or per-voice file another server needs
+  (PocketTTS's `--voice-ref`) is covered without a second pass. It is stored as
+  `agent_runtime_specs.config_files`, an opaque JSON `text` column added by
+  **migration 93** (append-only, `text not null default ''`, `''` = none, so every
+  existing spec is unchanged; the portal validates it, the agent decodes it, the
+  store never parses it —
+  [ADR-004](#adr-004--three-store-drivers-behind-one-dialect-seam),
+  [ADR-005](#adr-005--postgresql-needs-wide-column-types)), carried to the agent as
+  `specs[].config_files` of the runtime-config document and edited in the portal's
+  launch-spec form. Names are single file names, unique case-insensitively; at most
+  16 files of at most 64 KiB per spec.
+- **(c) The agent writes the files into an agent-owned, configurable directory —
+  never `work_dir` — under a per-spec subdirectory.** `work_dir` is
+  operator-chosen and may not be writable (the binary's own directory, a read-only
+  mount), so writing there would turn "can this spec start" into a question about a
+  directory the agent does not own. The agent instead writes to
+  `<config_files_dir>/<spec-id>/<name>`. `config_files_dir` is a new agent setting
+  on the usual triple source — flag `-config-files-dir`, env
+  `OP_AGENT_CONFIG_FILES_DIR`, config key `config_files_dir`, default
+  `server-agent-config-files` beside the binary, a relative file value resolved
+  beside the config file — and it is **operator-only, like the allowlists**: the
+  gateway names a file's relative name and content, never where on the host it
+  lands ([ADR-024](#adr-024--managed-runtime-the-gateway-specifies-the-launch-the-ai-server-permits-it)).
+  The per-spec subdirectory makes uniqueness structural: two specs that both name
+  their file `server.json` cannot overwrite each other. Each file is written
+  atomically (a temp file inside the target directory, `0600`, renamed into place),
+  **on every launch, after the port is chosen and before the exec**.
+- **(d) `${CONFIG_DIR}` is a first-class placeholder that resolves to the
+  directory.** It becomes `<config_files_dir>/<spec-id>` in `args`, `env` **and**
+  file content, so an operator writes `--config ${CONFIG_DIR}/server.json` and a
+  multi-file config can name a sibling by absolute path. A per-file form such as
+  `${CONFIG:server.json}` was rejected as redundant: the operator already names the
+  file in the editor and joins it in `args`. It is exact-match only, a plain path
+  rather than a secret, and so is never masked in the reported command.
+- **(e) Content expands the non-secret tokens only; the two secret tokens are
+  refused.** A file's content runs through a small content expander over the
+  **same resolver** `args`/`env` use — `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`,
+  `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` and `${CONFIG_DIR}` — so
+  the audio.cpp `id` derives from `${MODEL}` and the listen port from `${PORT}`,
+  which removes the drift **by construction**. `${API_TOKEN}` and `${AGENT_ENV:…}`
+  are **hard errors** in content, enforced by the gateway at submit time and again
+  by the agent: a written file outlives the process and sits where other local
+  users and backups can read it, so a decrypted secret is never placed there
+  ([ADR-027](#adr-027--model-secrets-never-enter-the-gateway),
+  [ADR-035](#adr-035--the-gateway-owns-the-runtime-spec-upstream-token)). This is
+  also why the content expander is deliberately **not** `expandSpec`, which
+  resolves the two secret tokens and records spans to mask them in the reported
+  command — meaningless for a file that is never reported.
+- **(f) A failure split: deterministic faults are `not_permitted`, filesystem I/O
+  is `start_failed`.** A secret or malformed placeholder in content, an unsafe file
+  name, or a spec id that would escape the base directory can never succeed on
+  retry, so it is found by the **pre-port dry run** — the same one a bad `args`
+  placeholder already goes through, port 0, because the port only substitutes
+  `${PORT}` — and takes the rate-limited `not_permitted` path before a port is
+  acquired or a byte is written. A genuine write failure (an unwritable directory, a
+  full disk, a failed rename) is an environmental launch failure, not a policy
+  denial: it takes `start_failed` with crash backoff and a message naming the file
+  or directory, never `not_permitted`.
+- **(g) A feature flag and one version bump.** Writing a config file is a new
+  observable agent behavior, so it goes through feature negotiation
+  ([ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)):
+  the agent declares `runtime_config_files` (`Since: "0.10.0"`) and ServerAgent moves
+  `0.9.2` → `0.10.0`, MINOR because `agent.Features` gained an entry — **one bump for
+  the whole branch**. The flag has the `gpu_selection` shape: **declared for the
+  portal's benefit**, gating nothing on the agent (which always honors the files it
+  receives) and nothing on the gateway. An older agent ignores the unknown field and
+  launches the child with the file missing, which no probe can tell apart from a spec
+  that never asked for one, so the portal warns — non-blocking — when a spec has
+  files and the connected agent has not declared the name.
+- **(h) File-mode report content redaction.** In file mode the agent's upward
+  report already masks every spec's `env` **values**, because a hand-written
+  `runtime.json` may carry a literal secret the gateway must never receive.
+  `config_files` rides the same report and is equally secret-bearing, so each file
+  keeps its `name` and has its `content` masked the same way. The **write step is
+  unchanged** in file mode — the files are written, unmasked, for the child exactly
+  as in gateway mode. The gateway's ingest mirror of a spec carries no
+  `config_files` field, so the facet never reaches storage either.
+
+**Consequence:** the whole audio.cpp lifecycle can be driven from the gateway, and
+the `unknown model id` drift that came from a hand-maintained id is gone as a
+*cause* (the 500 handler itself is unchanged). A spec with no config files is
+byte-for-byte unchanged, so nothing about existing deployments moves. A change to a
+spec's `config_files` is launch-affecting, so a content edit relaunches the child.
+The accepted nuances are named, not hidden. **Nothing garbage-collects the
+directory**: a file dropped from a spec, and a removed spec's whole `<spec-id>/`
+directory, stay on disk (overwrite-on-launch only). **Secrets cannot be placed in a
+file**, so a server that can take a credential only from a file cannot be fully
+provisioned this way. The per-spec directory's containment is **lexical**, like the
+work-directory check. A malformed or repeated name is a hard parse error for the
+whole file-mode document (`invalid_config_file_name`, a new closed `parse_error`
+code on the three-sided contract), and `ParseConfig` applies the gateway's name rule
+and **no stricter**, because it is the single parser for both modes and a stricter
+rule would drop a document the gateway already accepted; the platform strictness (a
+trailing dot or space, Windows device names, invisible Unicode format characters) is
+applied at the write boundary instead, where it fails one spec rather than the
+document.
+
+**Rejected:** **A shared server assembled from several specs** (Variant B, (a)).
+**Writing into `work_dir`** (it may not be writable, and two specs could share it).
+**A per-file placeholder `${CONFIG:<name>}`** (redundant beside the directory form).
+**Expanding `${API_TOKEN}` or `${AGENT_ENV:…}` inside a file**, even at `0600`
+(a decrypted secret at rest on disk, outliving the process). **Reusing `expandSpec`
+for content** (it resolves and masks secrets, neither of which applies to a written
+file). **Taking a write failure down the `not_permitted` path**, or a deterministic
+fault down the backoff path (the first claims a configuration can never work when
+the disk is merely full; the second hammers the filesystem over a spec that cannot
+succeed). **A gateway-side gate on the flag** (the document that carries
+`config_files` is the one every agent already polls, so there is no route to
+withhold). **Garbage-collecting a removed spec's directory** (deferred;
+overwrite-on-launch is enough for the current need).
+→ [Agent-Managed Model Runtime
+§3.5](cross-cutting/agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[§8.3](cross-cutting/agent-runtime-manager.md#83-the-upward-report-and-what-it-redacts),
+[Configuration & Environment Variables](reference/config-env.md),
+[HTTP API Surface](reference/api-surface.md),
+[Data Model §4](reference/data-model.md#runtime-spec-config-files),
+[Security, Authentication & Authorization
+§8.2](cross-cutting/security-auth-rbac.md#82-free-form-text-from-an-agent-is-redacted-safe-by-default).

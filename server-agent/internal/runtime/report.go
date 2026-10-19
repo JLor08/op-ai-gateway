@@ -70,15 +70,17 @@ type Report struct {
 	Config      json.RawMessage `json:"config"`
 }
 
-// BuildReport redacts every env value out of cfg, marshals the result as the
-// report's config object, and returns the fully marshaled Report ready to
-// hand to Client.PostRuntimeReport or WSSender.PostRuntimeReport verbatim.
+// BuildReport redacts every env value, every spec's api_token and (#257) the
+// content of every spec's config files out of cfg (redactConfigEnv), marshals
+// the result as the report's config object, and returns the fully marshaled
+// Report ready to hand to Client.PostRuntimeReport or
+// WSSender.PostRuntimeReport verbatim.
 // source and parseErr are round-tripped unchanged. parseErr is a
 // ParseErrorCode from that type's CLOSED SET, not free text -- the type is
 // what makes "free of embedded secrets" a compile-time property here rather
 // than a promise the loader is trusted to keep (the C2 fix; the gateway
 // still allow-lists the value on ingest as defense in depth). This
-// function's own job remains the env map.
+// function's own job remains the secret-bearing spec fields named above.
 func BuildReport(cfg Config, source string, parseErr ParseErrorCode, at time.Time) ([]byte, error) {
 	cfgRaw, err := json.Marshal(redactConfigEnv(cfg))
 	if err != nil {

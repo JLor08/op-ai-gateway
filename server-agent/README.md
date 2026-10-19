@@ -281,15 +281,19 @@ explicit count of the missing bytes at the point they were lost.
 
 #### Placeholders in `args` and `env` values
 
-Four, resolved by the agent at launch time in **both** `args` and `env`
-values. Everything else shaped like `${…}` is passed through byte-for-byte, so
-a model server's own templating still works.
+Resolved by the agent at launch time in **both** `args` and `env`
+values (the table lists the ones an operator reaches for first; the device-list
+placeholders `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` and
+`${API_TOKEN}` are described in the architecture documentation). Everything else
+shaped like `${…}` is passed through byte-for-byte, so a model server's own
+templating still works.
 
 | Placeholder | Becomes | If it cannot be resolved |
 |---|---|---|
 | `${PORT}` | the port the agent assigned this process | — |
 | `${MODEL}` | the spec's `upstream_model` — the **application-side** model name (the mapping's *app model name*), i.e. what the model server itself calls the model | hard error if `upstream_model` is empty |
 | `${HOST_GPU_IDS}` | the spec's own GPU indices **as this host numbers them**, ascending and comma-separated (`2,5`) | hard error if the spec declares no GPUs |
+| `${CONFIG_DIR}` | the absolute per-spec directory the agent writes the spec's config files into, `<config_files_dir>/<spec-id>` — see [Config files](#config-files-for-a-managed-process) | — (a plain path; always resolves) |
 | `${AGENT_ENV:NAME}` | `NAME` from the **agent's own** process environment | hard error naming the variable; never a silent empty value |
 
 `${MODEL}` is the one to reach for when a command line has to repeat the model
@@ -314,7 +318,37 @@ the exact forms (`${PORTX}`, `${port}`, `${AGENT_ENV:}`). `${MODEL}` and
 `${MODELS_DIR}`, `${MODEL_ID}` and `${GPU_IDS_FILE}` are plausible things to
 pass through, so only the exact spellings are substituted — the cost being that
 `${MDOEL}`, `${model}` or the shorter `${GPU_IDS}` reaches the child as literal
-text instead of erroring.
+text instead of erroring. `${CONFIG_DIR}` follows the same exact-match rule, so
+`${CONFIG_DIR_X}` is passed through.
+
+#### Config files for a managed process
+
+A spec can carry up to 16 **config files**, each a name and some text, for a model
+server that cannot be driven by its command line alone (audio.cpp reads the models
+it serves from a JSON file, for example). The portal's launch-spec form edits them;
+the agent writes them **before it starts the process** to
+`<config_files_dir>/<spec-id>/<name>` — an agent-owned directory you choose with
+`config_files_dir` (see the settings table above), never the spec's `work_dir`,
+which may not be writable — and the spec's `args` point the server at them:
+`["--config", "${CONFIG_DIR}/server.json"]`. Each file is rewritten on every
+launch, atomically, with mode `0600`.
+
+A file's content may use `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`, the three
+`*_DEVICES` lists and `${CONFIG_DIR}`, so a model id written as `${MODEL}` always
+matches the spec. **It may never use `${API_TOKEN}` or `${AGENT_ENV:…}`**: a secret
+is not written to disk, and the spec is refused (gateway) or reported
+`not_permitted` (agent) if one appears. A name that is not one plain file name (a
+path separator, `..`) is refused by the gateway and, in a hand-written file-mode
+document, fails the whole document load (`invalid_config_file_name`); a name only
+this host would mangle — a Windows device name such as `NUL`, a trailing dot — makes
+that one spec `not_permitted`. Only a real filesystem failure (an unwritable
+directory, a full disk) is a start failure that backs off and retries. Nothing deletes a file you later drop from a
+spec, nor a removed spec's directory; clear those by hand. An agent older than
+`0.10.0` ignores config files altogether (the portal warns).
+
+In **file mode** the agent's upward report masks every file's content (the name
+stays visible), the same way it masks `env` values; the files themselves are still
+written for the child.
 
 #### `set_visible_devices`: pinning a model to its GPUs
 
@@ -424,11 +458,13 @@ it:
 Set `runtime_source: "file"` plus `runtime_config: <path>` to own the launch
 specs locally instead of in the portal. The file uses the identical JSON schema
 the gateway serves; the agent reports the effective document upward with every
-env **value** redacted (keys stay visible) and the portal renders it read-only,
+env **value** and every config file's **content** redacted (keys and file names
+stay visible) and the portal renders it read-only,
 including hiding start/stop — whoever owns the config owns the operations.
 
 > **Never write a secret's value into a spec — reference it as
-> `${AGENT_ENV:NAME}`.** The upward report masks `env` values only; `args` are
+> `${AGENT_ENV:NAME}`.** The upward report masks `env` values, config-file
+> content and a spec's `api_token`; `args` are
 > reported **verbatim**, so a literal secret in an argument reaches the gateway
 > in plaintext and is shown to portal admins. A **placeholder** is safe in
 > either field: the report never expands it, and the launch command the log

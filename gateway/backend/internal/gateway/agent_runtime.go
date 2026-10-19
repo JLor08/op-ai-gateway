@@ -356,10 +356,13 @@ type agentRuntimeReportSpecGPU struct {
 	VRAMMB int `json:"vram_mb"`
 }
 
-// agentRuntimeReportSpec mirrors AgentRuntimeSpecDTO, minus its one secret
-// field (api_token -- see the gap in the struct body). Env is the ONLY
-// secret-carrying field this schema keeps (design spec §4.6: "env values are
-// referential"), so its values are the sole redaction target in
+// agentRuntimeReportSpec mirrors AgentRuntimeSpecDTO, minus two fields that can
+// carry a secret: api_token (see the gap in the struct body) and config_files
+// (#257; likewise not modelled, so the sanitizer's re-parse drops the whole
+// facet, names included -- a file-mode config file's content can hold a literal
+// secret, and the agent masks it before it sends the report as well). Env is
+// the ONLY secret-carrying field this schema keeps (design spec §4.6: "env
+// values are referential"), so its values are the sole redaction target in
 // sanitizeRuntimeReportConfig. Every OTHER non-secret DTO field must appear
 // here, or the sanitizer's re-parse silently drops it from the stored report
 // (issue #64: visible_devices_mode, type and the probe paths were each lost

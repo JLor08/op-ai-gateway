@@ -451,13 +451,23 @@ redaction *test* correspondingly lives agent-side — a gateway-side test would
 assert on values that arrive already masked, looking like coverage while proving
 nothing.)
 
+The same agent-side mask covers each spec's **config-file content** (issue #257,
+[the runtime chapter §3.5](agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child)):
+a hand-written file-mode config file can hold a literal secret, so every file
+keeps its name and has its content replaced with the `•••` mask, exactly as an
+`env` value is. The gateway's ingest mirror of a spec carries no `config_files`
+field at all, so the facet — names included — is dropped by the re-parse before
+anything is stored. In gateway mode, by contrast, the content is operator text
+stored and shipped in the clear, which is why the secret placeholders (`${API_TOKEN}`, `${AGENT_ENV:…}`) are refused in it at submit time
+and again by the agent, and why a written file never carries a secret.
+
 `parse_error` is the second, non-obvious leak path into that table, and it needs
 its own rule: **a configuration-loader error routinely quotes the offending
 line**, so an unparsed secret-bearing line could reach the report even though
 `env` values are masked. The rule is an **allow-list over a closed set of
 codes**: the field may only ever be one of the classification codes the agent's
-wire contract defines (`json_syntax`, `duplicate_spec_id`, `file_missing`,
-`read_failed` — see
+wire contract defines (`json_syntax`, `duplicate_spec_id`,
+`invalid_config_file_name`, `file_missing`, `read_failed` — see
 [the runtime chapter](agent-runtime-manager.md)), anything else is replaced by
 a fixed generic constant, and an **empty** value stays empty, because "this
 agent reported no parse failure" is not a redaction case at all. Free text has
