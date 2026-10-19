@@ -117,6 +117,12 @@ func wavReadFmtByteRate(r io.Reader, size uint32) (uint32, bool) {
 // counted -- and believes the declared size only as far as wavDurationFromReader's
 // count allows: the stream holds at least that many bytes, and no more than the pad
 // byte and wavTrailingSlackBytes beyond it.
+//
+// A declaration that overruns the stream (a truncated file, or the 0xFFFFFFFF a
+// streaming WAV writer emits) is a loud zero, not a bill of the bytes held. That is no
+// under-bill because audio.cpp refuses such an upload ("failed to read WAV data chunk",
+// verified live against v0.9.1, buffered and stream=true alike): it is never transcribed.
+// A future audio.cpp that decodes it would make the zero an under-bill; re-check on upgrade.
 func wavDataDurationMillis(r io.Reader, size uint32, byteRate uint32) (int64, bool) {
 	if byteRate == 0 {
 		return 0, false
