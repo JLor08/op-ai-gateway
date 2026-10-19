@@ -6312,10 +6312,11 @@ case and leaving the buffered path byte-identical.**
   **loud zero** — never a normal bill of the declared duration. That zero is no under-bill,
   because audio.cpp refuses such an upload outright: probed live against audio.cpp v0.9.1,
   a truncated file, a `data` size declared 1 MiB too large and `0xFFFFFFFF` all fail with
-  HTTP 500 `failed to read WAV data chunk`, in a buffered and a `stream=true` request
-  alike (the oversized files fail the same way on an offline-mode model, so the read
-  precedes the streaming-mode check), so the call never completes and no clip is
-  transcribed for the zero. A future audio.cpp that decodes a short `data` chunk would turn
+  HTTP 500 `failed to read WAV data chunk`, in a buffered request and in a `stream=true`
+  request to a `mode=streaming` model alike (the same JSON error arrives before any SSE
+  starts, and on an offline-mode model the oversized files fail on that read before the
+  streaming-mode check, so it is a shared front end), so the call never completes and no
+  clip is transcribed for the zero. A future audio.cpp that decodes a short `data` chunk would turn
   it into an under-bill, answered by billing from the bytes the upload holds. The residual a
   real file can carry is that trailing slack (about 16 KiB, ≈ 0.5 s at 16 kHz mono 16-bit,
   longer at a lower byte rate), and a consistently forged header is self-defeating because

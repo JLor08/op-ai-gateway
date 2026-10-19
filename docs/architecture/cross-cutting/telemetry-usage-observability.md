@@ -863,8 +863,8 @@ oversized declaration) is no measurement either: it returns `(0, false)` and is 
 not a normal bill of the declared duration. That zero is no under-bill, because audio.cpp
 refuses such an upload: probed live against audio.cpp v0.9.1, a truncated file, a `data`
 size declared 1 MiB too large and `0xFFFFFFFF` all fail with HTTP 500 `failed to read WAV
-data chunk`, in a buffered and a `stream=true` request alike, so the call never completes
-and no clip is transcribed for the zero (a future audio.cpp that decodes a short `data`
+data chunk`, in a buffered request and in a `stream=true` request to a `mode=streaming`
+model alike, so the call never completes and no clip is transcribed for the zero (a future audio.cpp that decodes a short `data`
 chunk would make it one, and is answered by billing from the bytes the upload holds).
 The residual a real WAV can hide is that trailing slack (about 16 KiB, ≈ 0.5 s at 16 kHz
 mono 16-bit, longer at a lower byte rate), and a consistently forged header is self-defeating
