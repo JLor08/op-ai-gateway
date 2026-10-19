@@ -81,6 +81,17 @@ func (s *Server) handleAgentRuntimeConfig(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Only a file-mode agent ever stores a server_runtime_reports row; an agent
+	// reaching this gateway-config endpoint is, by definition, no longer in file
+	// mode, so any stored report is stale and must stop surfacing as current
+	// (issue #260). Clear it once -- the read keeps the steady-state poll
+	// write-free after the first clear.
+	if _, hasReport, rerr := s.Routes.ServerRuntimeReportByServer(r.Context(), serverID); rerr == nil && hasReport {
+		if derr := s.Routes.DeleteServerRuntimeReport(r.Context(), serverID); derr != nil {
+			slog.Warn("could not clear stale file-mode runtime report", "server_id", serverID, "err", derr)
+		}
+	}
+
 	etag := `"` + dto.ETag + `"`
 	w.Header().Set("ETag", etag)
 	if etagMatches(r.Header.Get("If-None-Match"), dto.ETag) {

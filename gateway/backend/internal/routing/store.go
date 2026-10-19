@@ -2467,6 +2467,13 @@ type RuntimeStore interface {
 	// serverID; ok is false when no report has ever been stored for that
 	// server (not an error) — mirrors ServerHardwareByServer.
 	ServerRuntimeReportByServer(ctx context.Context, serverID string) (ServerRuntimeReport, bool, error)
+	// DeleteServerRuntimeReport removes serverID's stored runtime report, if
+	// any. Idempotent: deleting when no report is stored is not an error. Only
+	// a file-mode agent ever stores one, so the gateway clears it once the agent
+	// is known to run in gateway mode (it fetches its gateway runtime config),
+	// which would otherwise leave the last file-mode report showing as current
+	// forever (issue #260).
+	DeleteServerRuntimeReport(ctx context.Context, serverID string) error
 }
 
 // VendorAccountStore is per-user external-vendor-account CRUD. Credentials ride

@@ -63,6 +63,37 @@ func agentRuntimeConfigRequest(secret, ifNoneMatch string) *http.Request {
 	return req
 }
 
+// TestAgentRuntimeConfigClearsStaleFileModeReport pins the #260 fix: a stored
+// file-mode runtime report is cleared once the agent fetches its gateway runtime
+// config. A file-mode agent never calls that endpoint, so an agent reaching it is
+// by definition no longer in file mode and the stored report is stale --
+// GET .../runtime/report must stop returning it.
+func TestAgentRuntimeConfigClearsStaleFileModeReport(t *testing.T) {
+	fake := &fakePortalAgentRuntimeConfig{dto: sampleAgentRuntimeConfigDTO()}
+	srv := agentRuntimeConfigTestServer(t, fake)
+	collected := time.Date(2026, 7, 10, 11, 0, 0, 0, time.UTC)
+	if err := srv.Routes.UpsertServerRuntimeReport(context.Background(), routing.ServerRuntimeReport{
+		ServerID:    "mock-host-qwen",
+		CollectedAt: collected,
+		ReportJSON:  `{"source":"file","parse_error":"file_missing"}`,
+		UpdatedAt:   collected,
+	}); err != nil {
+		t.Fatalf("seed report: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, agentRuntimeConfigRequest("runtime-secret", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("runtime-config status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+
+	if _, ok, err := srv.Routes.ServerRuntimeReportByServer(context.Background(), "mock-host-qwen"); err != nil {
+		t.Fatalf("read report: %v", err)
+	} else if ok {
+		t.Fatalf("stale file-mode runtime report still present after the agent fetched its gateway runtime config")
+	}
+}
+
 // sampleAgentRuntimeConfigDTO is a representative populated document,
 // matching the agent-runtime-manager design spec §11 sample exactly (one
 // two-GPU vllm spec, one budget pair, one coresidency pair).
