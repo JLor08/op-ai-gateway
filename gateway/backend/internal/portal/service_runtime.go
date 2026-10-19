@@ -2352,6 +2352,15 @@ type AgentRuntimeSpecDTO struct {
 	// ollama's metrics path). Never the raw stored override alone.
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
+	// ConfigFiles are the operator-supplied files the agent writes into the
+	// spec's per-spec directory before it launches the child (#257; the
+	// agent-side runtime.Spec pairs this exact json tag). Always non-nil, so a
+	// spec with none ships "config_files":[] and never null. Content is
+	// operator text that validateRuntimeSpecConfigFiles already vetted at
+	// submit time (no secret placeholders), and like Env it may carry
+	// ${PORT}/${MODEL}-style placeholders the agent resolves locally --
+	// passed through here untouched.
+	ConfigFiles []ConfigFileDTO `json:"config_files"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -2599,7 +2608,7 @@ func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Applica
 // agentRuntimeSpecDTO builds one AgentRuntimeSpecDTO from a stored (already
 // confirmed enabled) spec, its owning mapping (for Model/UpstreamModel), and
 // its GPU rows. Mirrors runtimeSpecDTO's opaque-JSON handling: a corrupt
-// stored Args/Env is a store-data problem, not a client-input one, but still
+// stored Args/Env/ConfigFiles is a store-data problem, not a client-input one, but still
 // surfaces as the matching domain sentinel rather than a raw JSON error.
 //
 // VRAM_LOCKED IS THE OPERATOR'S ESCAPE FROM THE MEASUREMENT RATCHET, and the
@@ -2643,6 +2652,10 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 	if env == nil {
 		env = map[string]string{}
 	}
+	configFiles, err := decodeRuntimeSpecConfigFiles(spec.ConfigFiles)
+	if err != nil {
+		return AgentRuntimeSpecDTO{}, err
+	}
 	gpuDTOs := make([]AgentRuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
 		// Measured wins -- unless the operator locked the spec's VRAM, in
@@ -2673,6 +2686,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		SetVisibleDevices:           spec.SetVisibleDevices,
 		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 		AdminState:                  spec.AdminState,
+		ConfigFiles:                 configFiles,
 	}, nil
 }
 

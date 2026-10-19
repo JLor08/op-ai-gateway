@@ -3712,3 +3712,100 @@ func TestPutRuntimeSpecResponsesLiveTimingsRefusalRunsAfterThePreExistingValidat
 		}
 	}
 }
+
+// TestAgentRuntimeSpecDTOCarriesConfigFiles pins that the agent-wire DTO
+// carries the stored config_files (#257): the opaque JSON column unmarshals
+// onto AgentRuntimeSpecDTO.ConfigFiles verbatim (placeholders such as ${MODEL}
+// are the agent's to resolve, never rewritten here), an empty stored value --
+// every row written before the column existed -- yields a non-nil empty slice
+// so the wire carries "config_files":[] and never null, and a corrupt stored
+// value surfaces as the domain sentinel rather than a raw JSON error.
+func TestAgentRuntimeSpecDTOCarriesConfigFiles(t *testing.T) {
+	mapping := routing.ModelMapping{GatewayModelName: "qwen", AppModelName: "qwen-upstream"}
+	build := func(stored string) (AgentRuntimeSpecDTO, error) {
+		return agentRuntimeSpecDTO(routing.RuntimeSpec{
+			ID:          "rspec_x",
+			Binary:      "/usr/bin/x",
+			Args:        "[]",
+			Env:         "{}",
+			ConfigFiles: stored,
+		}, mapping, nil)
+	}
+
+	t.Run("stored files appear on the DTO", func(t *testing.T) {
+		dto, err := build(`[{"name":"server.json","content":"id ${MODEL}"},{"name":"b.yaml","content":"x: 1"}]`)
+		if err != nil {
+			t.Fatalf("agentRuntimeSpecDTO: %v", err)
+		}
+		want := []ConfigFileDTO{
+			{Name: "server.json", Content: "id ${MODEL}"},
+			{Name: "b.yaml", Content: "x: 1"},
+		}
+		if !slices.Equal(dto.ConfigFiles, want) {
+			t.Fatalf("ConfigFiles = %#v, want %#v", dto.ConfigFiles, want)
+		}
+	})
+
+	t.Run("empty stored value yields a non-nil empty slice", func(t *testing.T) {
+		dto, err := build("")
+		if err != nil {
+			t.Fatalf("agentRuntimeSpecDTO: %v", err)
+		}
+		if dto.ConfigFiles == nil || len(dto.ConfigFiles) != 0 {
+			t.Fatalf("ConfigFiles = %#v, want a non-nil empty slice", dto.ConfigFiles)
+		}
+		raw, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatalf("marshal dto: %v", err)
+		}
+		if !strings.Contains(string(raw), `"config_files":[]`) {
+			t.Fatalf("wire body = %s, want an explicit \"config_files\":[]", raw)
+		}
+	})
+
+	t.Run("literal null stored value yields a non-nil empty slice", func(t *testing.T) {
+		dto, err := build("null")
+		if err != nil {
+			t.Fatalf("agentRuntimeSpecDTO: %v", err)
+		}
+		if dto.ConfigFiles == nil || len(dto.ConfigFiles) != 0 {
+			t.Fatalf("ConfigFiles = %#v, want a non-nil empty slice", dto.ConfigFiles)
+		}
+	})
+
+	t.Run("corrupt stored value is the domain sentinel", func(t *testing.T) {
+		if _, err := build("{not json"); !errors.Is(err, ErrRuntimeSpecConfigFilesInvalid) {
+			t.Fatalf("err = %v, want ErrRuntimeSpecConfigFilesInvalid", err)
+		}
+	})
+
+	t.Run("reaches the runtime-config document the agent fetches", func(t *testing.T) {
+		now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+		ctx := context.Background()
+		svc, routeStore := newServerTestService(t, now)
+		server := createTestServer(t, svc, "S", "s.example.test")
+		app := seedServerAgentApplication(t, routeStore, server.ID, now)
+		m, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen-upstream"})
+		if err != nil {
+			t.Fatalf("CreateMapping: %v", err)
+		}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), m.ID, PutRuntimeSpecRequest{
+			Enabled:     true,
+			Binary:      "/usr/local/bin/llama-server",
+			ConfigFiles: []ConfigFileDTO{{Name: "server.json", Content: "id ${MODEL}"}},
+		}); err != nil {
+			t.Fatalf("PutRuntimeSpec: %v", err)
+		}
+		cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+		if err != nil {
+			t.Fatalf("AgentRuntimeConfig: %v", err)
+		}
+		if len(cfg.Specs) != 1 {
+			t.Fatalf("specs = %#v, want 1", cfg.Specs)
+		}
+		want := []ConfigFileDTO{{Name: "server.json", Content: "id ${MODEL}"}}
+		if !slices.Equal(cfg.Specs[0].ConfigFiles, want) {
+			t.Fatalf("agent wire ConfigFiles = %#v, want %#v", cfg.Specs[0].ConfigFiles, want)
+		}
+	})
+}
