@@ -2853,6 +2853,15 @@ func (m *MemoryStore) ServerRuntimeReportByServer(_ context.Context, serverID st
 	return report, ok, nil
 }
 
+// DeleteServerRuntimeReport removes serverID's stored runtime report, if any.
+// Idempotent: deleting when none is stored is not an error (issue #260).
+func (m *MemoryStore) DeleteServerRuntimeReport(_ context.Context, serverID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.runtimeReports, serverID)
+	return nil
+}
+
 // --- VendorAccountStore: per-user external AI vendor accounts (migration 82) ---
 
 // CreateVendorAccount stores a new account; a duplicate id is ErrConflict,

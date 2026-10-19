@@ -429,6 +429,15 @@ func (s *SQLiteStore) ServerRuntimeReportByServer(ctx context.Context, serverID 
 	return report, true, nil
 }
 
+// DeleteServerRuntimeReport removes serverID's stored runtime report, if any.
+// Idempotent: a delete that matches no row is not an error (issue #260).
+func (s *SQLiteStore) DeleteServerRuntimeReport(ctx context.Context, serverID string) error {
+	if _, err := s.exec(ctx, `delete from server_runtime_reports where server_id = ?`, serverID); err != nil {
+		return fmt.Errorf("delete server runtime report: %w", err)
+	}
+	return nil
+}
+
 func scanServerRuntimeReport(row rowScanner) (routing.ServerRuntimeReport, error) {
 	var report routing.ServerRuntimeReport
 	err := row.Scan(&report.ServerID, &report.CollectedAt, &report.ReportJSON, &report.UpdatedAt)

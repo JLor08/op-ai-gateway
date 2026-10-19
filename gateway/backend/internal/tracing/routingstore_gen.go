@@ -1816,6 +1816,18 @@ func (_d *RoutingStoreWithTracing) UpsertServerRuntimeReport(ctx context.Context
 	return _d.Store.UpsertServerRuntimeReport(ctx, report)
 }
 
+func (_d *RoutingStoreWithTracing) DeleteServerRuntimeReport(ctx context.Context, serverID string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteServerRuntimeReport")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteServerRuntimeReport(ctx, serverID)
+}
+
 func (_d *RoutingStoreWithTracing) UpsertTelemetry(ctx context.Context, telemetry _sourceRouting.ServerTelemetry) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpsertTelemetry")
 	defer span.End()

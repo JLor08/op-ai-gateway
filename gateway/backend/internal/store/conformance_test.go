@@ -3176,6 +3176,23 @@ func TestConformanceServerRuntimeReports(t *testing.T) {
 			t.Fatalf("after overwrite = %#v ok=%v err=%v", got, ok, err)
 		}
 
+		// Delete removes the row; the next read is absent again (issue #260: the
+		// gateway clears a stale file-mode report once the agent runs in gateway
+		// mode). Delete is idempotent -- deleting the now-absent row, and an
+		// unknown server's row, are both no-ops, not errors (no FK on delete).
+		if err := s.DeleteServerRuntimeReport(ctx, "rr1"); err != nil {
+			t.Fatalf("DeleteServerRuntimeReport: %v", err)
+		}
+		if _, ok, err := s.ServerRuntimeReportByServer(ctx, "rr1"); err != nil || ok {
+			t.Fatalf("after delete = ok=%v err=%v, want ok=false", ok, err)
+		}
+		if err := s.DeleteServerRuntimeReport(ctx, "rr1"); err != nil {
+			t.Fatalf("DeleteServerRuntimeReport(idempotent): %v", err)
+		}
+		if err := s.DeleteServerRuntimeReport(ctx, "nope"); err != nil {
+			t.Fatalf("DeleteServerRuntimeReport(unknown server): %v", err)
+		}
+
 		// Missing server -> ErrNotFound (FK violation classified).
 		orphan := routing.ServerRuntimeReport{ServerID: "nope", CollectedAt: now, ReportJSON: "{}", UpdatedAt: now}
 		if err := s.UpsertServerRuntimeReport(ctx, orphan); err != ErrNotFound {

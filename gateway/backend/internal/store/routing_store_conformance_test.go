@@ -1871,6 +1871,23 @@ func TestRoutingStoreServerRuntimeReports(t *testing.T) {
 			t.Fatalf("after overwrite: ok=%v err=%v got=%#v", ok, err, got)
 		}
 
+		// Delete removes the row; the next read is absent again (issue #260: the
+		// gateway clears a stale file-mode report once the agent runs in gateway
+		// mode). Delete is idempotent -- the now-absent row and an unknown
+		// server's row both delete without error (no FK on delete).
+		if err := s.DeleteServerRuntimeReport(ctx, "srv_rr"); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if _, ok, err := s.ServerRuntimeReportByServer(ctx, "srv_rr"); err != nil || ok {
+			t.Fatalf("after delete: ok=%v err=%v, want ok=false", ok, err)
+		}
+		if err := s.DeleteServerRuntimeReport(ctx, "srv_rr"); err != nil {
+			t.Fatalf("delete idempotent: %v", err)
+		}
+		if err := s.DeleteServerRuntimeReport(ctx, "srv_missing"); err != nil {
+			t.Fatalf("delete unknown server: %v", err)
+		}
+
 		// Unknown server -> ErrNotFound.
 		orphan := routing.ServerRuntimeReport{ServerID: "srv_missing", CollectedAt: now, ReportJSON: "{}", UpdatedAt: now}
 		if err := s.UpsertServerRuntimeReport(ctx, orphan); err != ErrNotFound {
