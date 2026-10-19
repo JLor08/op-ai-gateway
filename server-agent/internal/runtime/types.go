@@ -203,9 +203,7 @@ const (
 	// same spec, compared case-insensitively. Structural and fatal to the
 	// whole document, like a duplicate spec id: the gateway enforces the same
 	// rules at submit time, so only a hand-authored file-mode runtime.json can
-	// reach it. NOTE this code is agent-side only so far -- the gateway's
-	// allow-list and the portal's label map do not know it yet and degrade it
-	// to the generic message (see the three-sided rule above).
+	// reach it.
 	ParseErrorInvalidConfigFileName ParseErrorCode = "invalid_config_file_name"
 	// ParseErrorFileMissing: nothing exists at the configured path. The
 	// file never got parsed, so this is not a parse failure at all -- it

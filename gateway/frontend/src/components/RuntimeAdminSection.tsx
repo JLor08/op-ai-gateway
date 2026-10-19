@@ -74,6 +74,7 @@ import {
   type RuntimeSpecFlavorValues,
 } from './shared/runtimeSpecTypeFlavors';
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
+import { CONFIG_FILES_MAX, configFileIssues, type ConfigFileIssue } from './shared/configFiles';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
 import { ListTable, listTableLabels, type ListColumn } from './shared/ListTable';
@@ -174,6 +175,26 @@ type GpuRow = {
   vramMeasuredMb: number;
 };
 
+// One row of the spec form's config-file editor (#257). `rowKey` is the same
+// render-only identity as GpuRow's (mid-list removal must not shift one row's
+// DOM state onto its neighbour) and never reaches the wire: buildSpecBody
+// sends {name, content} only.
+type ConfigFileRow = {
+  rowKey: string;
+  name: string;
+  content: string;
+};
+
+// The sentence each config-file problem is shown as, inline on the offending
+// field while typing and (the first one) as the refusal at submit.
+const configFileIssueLabel: Record<ConfigFileIssue, MessageKey> = {
+  name_blank: 'runtimeSpecConfigFileNameBlank',
+  name_invalid: 'runtimeSpecConfigFileNameInvalid',
+  name_duplicate: 'runtimeSpecConfigFileNameDuplicate',
+  content_too_large: 'runtimeSpecConfigFileTooLarge',
+  content_secret: 'runtimeSpecConfigFileSecretPlaceholder',
+};
+
 // The warning codes RuntimeWarnings emits today (see
 // gateway/backend/internal/portal/service_runtime.go); an unmapped future
 // code falls back to its raw wire value rather than a misleading label.
@@ -235,6 +256,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     type: '',
     metrics_path: '',
     context_probe_path: '',
+    config_files: [],
     effective_type: '',
     resolved_metrics_path: '',
     resolved_context_probe_path: '',
@@ -244,20 +266,26 @@ function emptySpec(mappingId: string): RuntimeSpec {
 // The file-mode `parse_error` codes, mapped to the sentence the operator
 // reads. The field carries a CODE from a closed set and NEVER free text: the
 // agent classifies its own load failure (`json_syntax`, `duplicate_spec_id`,
-// `file_missing`, `read_failed`, plus an `unclassified` floor) and the gateway
-// allow-lists the four real codes, degrading anything else to its own generic
-// constant. That contract is THREE-SIDED and no compiler checks either seam --
-// adding a code means the agent's set, the gateway's allow-list, and this map
-// plus its two i18n keys.
+// `invalid_config_file_name`, `file_missing`, `read_failed`, plus an
+// `unclassified` floor) and the gateway allow-lists the five real codes,
+// degrading anything else to its own generic constant. That contract is
+// THREE-SIDED and no compiler checks either seam -- adding a code means the
+// agent's set, the gateway's allow-list, and this map plus its two i18n keys.
 //
-// The last two are named for parsing only because the WIRE FIELD is: the agent
-// raises them before any parsing happens, for a runtime.json that is not there
-// or cannot be read. They exist because the agent used to report neither, so a
-// file-mode server with a missing file rendered exactly like one with no specs
-// configured -- the empty state and the absent state, told apart nowhere.
+// `invalid_config_file_name` (#257) is a structural failure inside the
+// document: a spec's `config_files` carries a name that is not one plain file
+// name, or two names that collide case-insensitively.
+//
+// `file_missing` and `read_failed` are named for parsing only because the WIRE
+// FIELD is: the agent raises them before any parsing happens, for a
+// runtime.json that is not there or cannot be read. They exist because the
+// agent used to report neither, so a file-mode server with a missing file
+// rendered exactly like one with no specs configured -- the empty state and
+// the absent state, told apart nowhere.
 const runtimeParseErrorReasonByCode: Record<string, MessageKey> = {
   json_syntax: 'runtimeParseErrorJsonSyntax',
   duplicate_spec_id: 'runtimeParseErrorDuplicateSpecId',
+  invalid_config_file_name: 'runtimeParseErrorInvalidConfigFileName',
   file_missing: 'runtimeParseErrorFileMissing',
   read_failed: 'runtimeParseErrorReadFailed',
 };
@@ -563,7 +591,9 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // so an override click never round-trips them back as if they were
   // writable. type/metrics_path/context_probe_path (the writable trio) DO
   // belong in `rest`: an override must preserve them unchanged, exactly like
-  // every other field this full-document PUT carries verbatim.
+  // every other field this full-document PUT carries verbatim. So does
+  // config_files (#257): the PUT treats an absent list as "none", so dropping
+  // it here would delete the operator's files on a Start/Stop/Clear click.
   //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
@@ -2440,6 +2470,11 @@ export function RuntimeAdminSection({
   const [specType, setSpecType] = useState<RuntimeSpec['type']>('');
   const [metricsPath, setMetricsPath] = useState('');
   const [contextProbePath, setContextProbePath] = useState('');
+  // The spec's config files (#257), bound from the LOADED spec on Edit and sent
+  // back by buildSpecBody. The PUT is a full document and an absent
+  // `config_files` clears the stored set, so this state is what keeps a save of
+  // an unrelated field from deleting files that were set through the API.
+  const [configFiles, setConfigFiles] = useState<ConfigFileRow[]>([]);
   // undefined = "no opinion", and the request field is optional so this form
   // can say it. It genuinely has to: with Type on "Auto" the effective kind
   // is detected from the binary's basename, and that detection is Go-only --
@@ -2543,6 +2578,7 @@ export function RuntimeAdminSection({
     setSpecLiveTimings(undefined);
     setMetricsPath('');
     setContextProbePath('');
+    setConfigFiles([]);
     setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType(null);
   }
@@ -2598,6 +2634,15 @@ export function RuntimeAdminSection({
     setSpecFirstWrite(!spec.configured);
     setMetricsPath(spec.metrics_path);
     setContextProbePath(spec.context_probe_path);
+    // Optional on the type, always present on the wire; a document from before
+    // the field existed is "no files".
+    setConfigFiles(
+      (spec.config_files ?? []).map((f) => ({
+        rowKey: makeRowKey(),
+        name: f.name,
+        content: f.content,
+      })),
+    );
     setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType({
       type: spec.type,
@@ -2710,6 +2755,33 @@ export function RuntimeAdminSection({
   // where the backend's own refusal would land.
   function updateGpuRow(idx: number, patch: Partial<Pick<GpuRow, 'index' | 'vramEstimateMb'>>) {
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+
+  function addConfigFile() {
+    setConfigFiles((rows) =>
+      rows.length >= CONFIG_FILES_MAX
+        ? rows
+        : [...rows, { rowKey: makeRowKey(), name: '', content: '' }],
+    );
+  }
+  function removeConfigFile(idx: number) {
+    setConfigFiles((rows) => rows.filter((_, i) => i !== idx));
+  }
+  function updateConfigFile(idx: number, patch: Partial<Pick<ConfigFileRow, 'name' | 'content'>>) {
+    setConfigFiles((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+  // The early refusal at submit (create AND edit): the gateway rejects the same
+  // lists with a 400, and on a CREATE the mapping is written before its spec,
+  // so a bad name caught only there would leave a spec-less mapping behind.
+  // Names the offending file, never its content -- that can hold the secret
+  // that tripped the check.
+  function configFilesError(): string | undefined {
+    const issues = configFileIssues(configFiles);
+    const idx = issues.findIndex((issue) => issue !== null);
+    if (idx < 0) return undefined;
+    const issue = issues[idx]!;
+    const label = configFiles[idx].name.trim() === '' ? `#${idx + 1}` : configFiles[idx].name;
+    return `${t.runtimeSpecConfigFiles} (${label}): ${t[configFileIssueLabel[issue]]}`;
   }
 
   // Reorder the GPU rows by rowKey (moveColumn works on a string[] of ids;
@@ -2974,6 +3046,10 @@ export function RuntimeAdminSection({
       type: specType,
       metrics_path: metricsPath.trim(),
       context_probe_path: contextProbePath.trim(),
+      // Always sent, [] included: absent clears the stored set on the backend,
+      // and this is the one place that decides what the full document says.
+      // Plain {name, content} -- the row key is a render identity only.
+      config_files: configFiles.map(({ name, content }) => ({ name, content })),
     };
   }
 
@@ -3035,6 +3111,11 @@ export function RuntimeAdminSection({
     const placeholderError = validatePlaceholders([...args, ...Object.values(parsedEnv.env)], t);
     if (placeholderError) {
       showError(placeholderError);
+      return;
+    }
+    const configFilesProblem = configFilesError();
+    if (configFilesProblem) {
+      showError(configFilesProblem);
       return;
     }
     const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
@@ -3126,6 +3207,11 @@ export function RuntimeAdminSection({
     const placeholderError = validatePlaceholders([...args, ...Object.values(parsedEnv.env)], t);
     if (placeholderError) {
       showError(placeholderError);
+      return;
+    }
+    const configFilesProblem = configFilesError();
+    if (configFilesProblem) {
+      showError(configFilesProblem);
       return;
     }
     const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
@@ -4070,6 +4156,15 @@ export function RuntimeAdminSection({
     // agentVersion are the report-derived values (:1703-1704); the host OS comes
     // from the hardware report already fetched (:1394-1396) — NOT a new DTO field.
     const agentHasGpuSelection = agentFeatures.includes('gpu_selection');
+    // The config-files editor's live feedback and its agent-capability hint
+    // (#257). Advisory like the GPU hints: an old agent still accepts the
+    // spec, it just never writes the files -- and ${CONFIG_DIR} stays literal
+    // -- so the warning is shown only once the operator actually has files
+    // configured, never as standing noise on every spec. `reportReady` keeps it
+    // from guessing about an agent whose features have not been read yet.
+    const configFileRowIssues = configFileIssues(configFiles);
+    const showAgentNoConfigFiles =
+      configFiles.length > 0 && reportReady && !agentFeatures.includes('runtime_config_files');
     const gpuOrderIsCustom = gpuRows.some((r, i, all) => i > 0 && r.index < all[i - 1].index);
     const argsHaveMetalDevices = parseArgsText(argsText).some((a) =>
       a.includes('${METAL_DEVICES}'),
@@ -4367,6 +4462,86 @@ export function RuntimeAdminSection({
               minRows={3}
               helperText={t.runtimeSpecEnvHint}
             />
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <Typography variant="subtitle2" component="h3">
+                {t.runtimeSpecConfigFiles}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                {t.runtimeSpecConfigFilesHint}
+              </Typography>
+              {showAgentNoConfigFiles && (
+                <Alert severity="warning">
+                  {`${t.runtimeSpecAgentNoConfigFiles} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+                </Alert>
+              )}
+              {configFiles.map((row, idx) => {
+                const issue = configFileRowIssues[idx];
+                // A blank name is refused at submit but not painted red while
+                // the row is still new and empty.
+                const nameIssue =
+                  issue === 'name_invalid' || issue === 'name_duplicate' ? issue : null;
+                const contentIssue =
+                  issue === 'content_too_large' || issue === 'content_secret' ? issue : null;
+                return (
+                  <Box
+                    key={row.rowKey}
+                    sx={{
+                      display: 'grid',
+                      gap: 1,
+                      p: 1.5,
+                      border: 1,
+                      borderColor: 'divider',
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'flex-start' }}>
+                      <Field
+                        id={`runtime-spec-config-file-name-${idx}`}
+                        label={t.runtimeSpecConfigFileName}
+                        value={row.name}
+                        onChange={(e) => updateConfigFile(idx, { name: e.target.value })}
+                        placeholder={t.runtimeSpecConfigFileNamePlaceholder}
+                        error={nameIssue !== null}
+                        helperText={nameIssue ? t[configFileIssueLabel[nameIssue]] : undefined}
+                        inputProps={{ spellCheck: false }}
+                      />
+                      <Button
+                        type="button"
+                        size="small"
+                        color="secondary"
+                        sx={{ flexShrink: 0, mt: 0.5 }}
+                        onClick={() => removeConfigFile(idx)}
+                      >
+                        {t.runtimeSpecConfigFileRemove}
+                      </Button>
+                    </Box>
+                    <Field
+                      id={`runtime-spec-config-file-content-${idx}`}
+                      label={t.runtimeSpecConfigFileContent}
+                      value={row.content}
+                      onChange={(e) => updateConfigFile(idx, { content: e.target.value })}
+                      multiline
+                      minRows={4}
+                      error={contentIssue !== null}
+                      helperText={contentIssue ? t[configFileIssueLabel[contentIssue]] : undefined}
+                      inputProps={{ spellCheck: false }}
+                      sx={{ '& textarea': { fontFamily: 'monospace' } }}
+                    />
+                  </Box>
+                );
+              })}
+              <Box>
+                <Button
+                  type="button"
+                  variant="outlined"
+                  size="small"
+                  disabled={configFiles.length >= CONFIG_FILES_MAX}
+                  onClick={addConfigFile}
+                >
+                  {t.runtimeSpecConfigFileAdd}
+                </Button>
+              </Box>
+            </Box>
             <Field
               id="runtime-spec-work-dir"
               label={t.runtimeSpecWorkDir}

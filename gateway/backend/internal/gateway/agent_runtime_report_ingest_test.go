@@ -189,6 +189,16 @@ func TestIngestRuntimeReportParseErrorRedactionShapes(t *testing.T) {
 			wantStored: `"parse_error":"read_failed"`,
 		},
 		{
+			// #257: a hand-authored file-mode runtime.json whose config_files
+			// carries a bad or repeated name. The agent's closed set has the
+			// code (runtime.ParseErrorInvalidConfigFileName); degraded to the
+			// generic constant, the operator would lose exactly the diagnosis
+			// the code exists to deliver.
+			name:       "invalid_config_file_name code kept",
+			parseError: "invalid_config_file_name",
+			wantStored: `"parse_error":"invalid_config_file_name"`,
+		},
+		{
 			// The whole reason for the closed set: the previous rule kept
 			// this, and it was the only non-generic value ANY real parse
 			// failure could produce.

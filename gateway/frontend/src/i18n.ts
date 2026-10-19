@@ -1082,6 +1082,24 @@ const de = {
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
   runtimeSpecPlaceholderInvalid:
     'Ungültiger Platzhalter (gemeint ist vermutlich ${PORT} oder ${AGENT_ENV:NAME})',
+  runtimeSpecConfigFiles: 'Konfigurationsdateien',
+  runtimeSpecConfigFilesHint:
+    'Der Agent schreibt diese Dateien vor jedem Start in ein eigenes Verzeichnis dieser Spezifikation; ${CONFIG_DIR} liefert den Pfad dazu (in Argumenten, Umgebung und Dateiinhalt). ${PORT} und ${MODEL} werden auch im Inhalt ersetzt. Keine Secrets eintragen – die Dateien liegen unverschlüsselt auf dem Zielsystem; ${API_TOKEN} und ${AGENT_ENV:NAME} sind hier nicht erlaubt. Höchstens 16 Dateien zu je 64 KiB.',
+  runtimeSpecConfigFileName: 'Dateiname',
+  runtimeSpecConfigFileNamePlaceholder: 'z. B. models.ini',
+  runtimeSpecConfigFileContent: 'Inhalt',
+  runtimeSpecConfigFileAdd: 'Datei hinzufügen',
+  runtimeSpecConfigFileRemove: 'Datei entfernen',
+  runtimeSpecConfigFileNameBlank: 'Der Dateiname fehlt.',
+  runtimeSpecConfigFileNameInvalid:
+    'Der Name muss ein einzelner Dateiname sein: keine Pfadtrenner (/ \\), kein „.“ oder „..“, kein Doppelpunkt, keine Steuerzeichen.',
+  runtimeSpecConfigFileNameDuplicate:
+    'Dateinamen müssen eindeutig sein; Groß- und Kleinschreibung wird nicht unterschieden.',
+  runtimeSpecConfigFileTooLarge: 'Die Datei ist größer als 64 KiB.',
+  runtimeSpecConfigFileSecretPlaceholder:
+    'Der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten – die Datei wird unverschlüsselt geschrieben. Secrets über Umgebung oder Argumente übergeben.',
+  runtimeSpecAgentNoConfigFiles:
+    'Der verbundene Agent meldet „runtime_config_files“ nicht (benötigt Version 0.10.0 oder neuer): Er schreibt diese Dateien nicht, und ${CONFIG_DIR} wird nicht ersetzt.',
   runtimeSpecArgsHint:
     'Ein Argument pro Zeile – Leerzeichen trennen hier nichts. Ein Schalter und sein Wert sind zwei Zeilen; ein Pfad mit Leerzeichen bleibt eine. Den Port nicht fest eintragen: Bei Listen-Port 0 vergibt ihn der Agent, ${PORT} setzt ihn ein.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
@@ -1188,6 +1206,8 @@ const de = {
   runtimeParseError: 'Der Agent konnte seine lokale Konfigurationsdatei nicht laden.',
   runtimeParseErrorJsonSyntax: 'Die Datei ist kein gültiges JSON.',
   runtimeParseErrorDuplicateSpecId: 'Zwei Einträge in der Datei haben dieselbe Spec-ID.',
+  runtimeParseErrorInvalidConfigFileName:
+    'Ein Eintrag enthält in „config_files“ einen ungültigen oder doppelten Namen – nötig ist je Spezifikation ein eindeutiger, einzelner Dateiname ohne Pfad.',
   runtimeParseErrorFileMissing: 'Am konfigurierten Pfad liegt keine Datei.',
   runtimeParseErrorReadFailed:
     'Die Datei ist vorhanden, ließ sich aber nicht lesen — Eigentümer und Berechtigungen prüfen.',
@@ -1653,6 +1673,8 @@ const de = {
     'Die Startvorgabe deklariert eine GPU, die dieser Server nicht meldet. Eine Karte, die der Lauf nicht sehen kann, hält niemals still: er könnte kein Ergebnis liefern. Die Meldung nennt den Index; korrigieren Sie die GPU-Zeilen der Startvorgabe.',
   errorRuntimeSpecServerBenchmarking:
     'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
+  errorRuntimeSpecConfigFilesInvalid:
+    'Ungültige Konfigurationsdateien: Jeder Name muss ein einzelner, eindeutiger Dateiname sein (keine Pfadtrenner, „.“ oder „..“, Doppelpunkt, Steuerzeichen), höchstens 16 Dateien zu je 64 KiB, und der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the
@@ -4217,6 +4239,24 @@ const en: PortalMessages = {
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
   runtimeSpecPlaceholderInvalid:
     'Invalid placeholder (likely meant to be ${PORT} or ${AGENT_ENV:NAME})',
+  runtimeSpecConfigFiles: 'Config files',
+  runtimeSpecConfigFilesHint:
+    'Before every start the agent writes these files into a directory of its own for this spec; ${CONFIG_DIR} gives the path to it (in args, env and file content). ${PORT} and ${MODEL} are replaced in the content too. Do not put secrets in — the files sit unencrypted on the target machine; ${API_TOKEN} and ${AGENT_ENV:NAME} are not allowed here. At most 16 files of 64 KiB each.',
+  runtimeSpecConfigFileName: 'File name',
+  runtimeSpecConfigFileNamePlaceholder: 'e.g. models.ini',
+  runtimeSpecConfigFileContent: 'Content',
+  runtimeSpecConfigFileAdd: 'Add file',
+  runtimeSpecConfigFileRemove: 'Remove file',
+  runtimeSpecConfigFileNameBlank: 'The file name is missing.',
+  runtimeSpecConfigFileNameInvalid:
+    'The name must be a single file name: no path separators (/ \\), no "." or "..", no colon, no control characters.',
+  runtimeSpecConfigFileNameDuplicate:
+    'File names must be unique; upper and lower case are not told apart.',
+  runtimeSpecConfigFileTooLarge: 'The file is larger than 64 KiB.',
+  runtimeSpecConfigFileSecretPlaceholder:
+    'The content must not contain ${API_TOKEN} or ${AGENT_ENV:…} — the file is written unencrypted. Pass secrets through env or args.',
+  runtimeSpecAgentNoConfigFiles:
+    'The connected agent does not report "runtime_config_files" (needs version 0.10.0 or newer): it does not write these files, and ${CONFIG_DIR} is not expanded.',
   runtimeSpecArgsHint:
     'One argument per line — spaces separate nothing here. A flag and its value are two lines; a path containing spaces stays one. Do not hard-code the port: with listen port 0 the agent assigns it and ${PORT} fills it in.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
@@ -4319,6 +4359,8 @@ const en: PortalMessages = {
   runtimeParseError: 'The agent could not load its local configuration file.',
   runtimeParseErrorJsonSyntax: 'The file is not valid JSON.',
   runtimeParseErrorDuplicateSpecId: 'Two entries in the file share the same spec id.',
+  runtimeParseErrorInvalidConfigFileName:
+    'An entry has an invalid or repeated name in "config_files" — each spec needs unique, single file names without a path.',
   runtimeParseErrorFileMissing: 'There is no file at the configured path.',
   runtimeParseErrorReadFailed:
     'The file is there but could not be read — check its ownership and permissions.',
@@ -4737,6 +4779,8 @@ const en: PortalMessages = {
     "The launch spec declares a GPU this server does not report. A card the run cannot see never holds still, so the run could reach no result. The message names the index; correct the spec's GPU rows.",
   errorRuntimeSpecServerBenchmarking:
     'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — would contaminate its measurement. Wait for the run to finish, or cancel it.',
+  errorRuntimeSpecConfigFilesInvalid:
+    'Invalid config files: every name must be a single, unique file name (no path separators, "." or "..", colon, control characters), at most 16 files of 64 KiB each, and the content must not contain ${API_TOKEN} or ${AGENT_ENV:…}.',
   // Portal chat image generation (task 8): the chat run lifecycle's own
   // codes, the mapping capability-form refusal, and the four images.* codes
   // now reachable from a chat run. See format.ts's errorLabelByCode for the

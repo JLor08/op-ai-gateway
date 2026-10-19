@@ -24,6 +24,18 @@ export interface RuntimeSpecGPU {
   vram_measured_mb: number;
 }
 
+// One operator-supplied config file the agent writes into the spec's per-spec
+// directory before it launches the child (#257). `name` is a single plain file
+// name (no path separators, ".."/".", drive or stream marker, control
+// characters; unique per spec, compared case-insensitively); `content` is
+// plain text that may carry the non-secret placeholders (${PORT}, ${MODEL},
+// ${CONFIG_DIR}, ...) and never ${API_TOKEN} or ${AGENT_ENV:...}. Mirrors the
+// Go ConfigFileDTO (portal/service_runtime.go).
+export interface ConfigFile {
+  name: string;
+  content: string;
+}
+
 // A mapping's agent-managed launch spec (GET/PUT/DELETE
 // /api/portal/mappings/{id}/runtime-spec). `configured: false` means the
 // mapping has no spec row yet -- the only signal for "not configured". The
@@ -122,6 +134,13 @@ export interface RuntimeSpec {
   // `resolved_context_probe_path` below for what they actually resolve to.
   metrics_path: string;
   context_probe_path: string;
+  // The files the agent writes before it launches the child (#257). The GET
+  // always carries the array ([] when there are none) but the field is
+  // optional here: a PUT that omits it clears the stored set, exactly like
+  // every other field of this full-document upsert, so a caller building a
+  // body from a loaded spec must carry it through (the form binds it to state;
+  // specBodyWithAdminState spreads it in `rest`).
+  config_files?: ConfigFile[];
   // effective_type / resolved_metrics_path / resolved_context_probe_path are
   // READ-ONLY echoes of the backend's auto-detection + per-type defaulting
   // (routing.EffectiveRuntimeSpecType / routing.DeriveProbePaths): what the

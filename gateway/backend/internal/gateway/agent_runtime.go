@@ -279,6 +279,11 @@ const runtimeReportParseErrorGeneric = "config parse error"
 // Not listed here (including the agent's own defensive "unclassified") means
 // the value degrades to runtimeReportParseErrorGeneric.
 //
+// invalid_config_file_name (#257) is a structural failure in the document: a
+// spec's config_files carries a name that is not one plain file name, or two
+// names that collide case-insensitively. The gateway enforces the same rules
+// at submit time, so only a hand-authored file-mode runtime.json reaches it.
+//
 // The last two are not parse failures at all: the agent raises them BEFORE
 // parsing, for a runtime.json that is not there or cannot be read. They ride
 // this field because its subject is "why the local file was not adopted", and
@@ -286,10 +291,11 @@ const runtimeReportParseErrorGeneric = "config parse error"
 // nothing, which rendered a missing file and a server with no specs
 // identically.
 var runtimeReportParseErrorCodes = map[string]bool{
-	"json_syntax":       true,
-	"duplicate_spec_id": true,
-	"file_missing":      true,
-	"read_failed":       true,
+	"json_syntax":              true,
+	"duplicate_spec_id":        true,
+	"invalid_config_file_name": true,
+	"file_missing":             true,
+	"read_failed":              true,
 }
 
 // redactRuntimeReportParseError keeps a file-mode report's parse_error only

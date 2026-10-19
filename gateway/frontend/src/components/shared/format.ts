@@ -109,6 +109,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // A launch-spec write refused because a benchmark run is holding that
   // server: one override click mid-run is what contaminates its measurement.
   'runtime_spec.server_benchmarking': 'errorRuntimeSpecServerBenchmarking',
+  // #257: a config_files list the service refused (portalRuntimeSpecErrRows,
+  // gateway/portal_runtime_endpoints.go). The 400's own message names the
+  // file and the rule, but a mapped code renders THIS label instead of it, so
+  // the label states every rule rather than one.
+  'runtime_spec.config_files_invalid': 'errorRuntimeSpecConfigFilesInvalid',
   'limit.validation_failed': 'errorLimitValidationFailed',
   'limit.user_not_found': 'errorLimitUserNotFound',
   'group.not_found': 'errorGroupNotFound',
