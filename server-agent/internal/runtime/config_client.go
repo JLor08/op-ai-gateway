@@ -74,7 +74,13 @@ func sameETag(a, b string) bool {
 	return a != "" && a == b
 }
 
-// writeCacheFile atomically (over)writes path with data: a temp file created
+// writeCacheFile is writeFileAtomic behind a package-level var, like
+// certinstall.writeTempFile, so a test can inject a failure without touching
+// real filesystem permissions (fragile across OSes, and meaningless when a test
+// runs as root).
+var writeCacheFile = writeFileAtomic
+
+// writeFileAtomic atomically (over)writes path with data: a temp file created
 // DIRECTLY INSIDE the target directory (never os.CreateTemp(""), which
 // resolves through $TMPDIR and can land on a different filesystem -- the
 // certinstall.writeTempFile precedent this copies), dot-prefixed so a
@@ -84,10 +90,10 @@ func sameETag(a, b string) bool {
 // world-readable material either), then renamed into place. A failure at
 // any point leaves whatever was previously at path untouched.
 //
-// A package-level var, like certinstall.writeTempFile, so a test can inject
-// a failure without touching real filesystem permissions (fragile across
-// OSes, and meaningless when a test runs as root).
-var writeCacheFile = func(path string, data []byte) error {
+// The runtime-config cache and the config files a spec provisions (#257,
+// writeSpecConfigFiles) share it: both are non-secret files the agent owns and
+// both need the same all-or-nothing replacement.
+func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err

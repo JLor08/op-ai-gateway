@@ -857,6 +857,82 @@ type expandedSpec struct {
 	envFromSpec []bool
 }
 
+// resolveNonSecretToken resolves inner -- the text between "${" and "}" -- when
+// it is one of the exact-match, NON-secret placeholders: ${PORT}, ${MODEL},
+// ${HOST_GPU_IDS}, ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} and
+// ${CONFIG_DIR}. handled reports whether inner was one of them; err is non-nil
+// only when handled (the token exists but cannot be resolved for this spec).
+// gpuIDs is hostGPUIDs(spec), hoisted by the caller so it is computed once per
+// expansion rather than once per match.
+//
+// This is the ONE copy of that resolution. expandSpec (Args/Env) and
+// expandConfigFileContent (config_files content, #257) both call it, so the two
+// surfaces cannot drift apart on what ${MODEL} or ${CONFIG_DIR} means. The
+// secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are deliberately NOT here:
+// expandSpec resolves and masks them, expandConfigFileContent refuses them.
+func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string) (value string, handled bool, err error) {
+	if inner == "PORT" {
+		return strconv.Itoa(port), true, nil
+	}
+
+	// EXACT match only -- ${MODEL...} anything is NOT a near-miss.
+	// See ExpandPlaceholders' doc comment for why the ${PORT} prefix rule
+	// deliberately does not extend here.
+	if inner == "MODEL" {
+		if spec.UpstreamModel == "" {
+			return "", true, fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
+		}
+		return spec.UpstreamModel, true, nil
+	}
+
+	// EXACT match only, same reasoning as ${MODEL} above. HOST, not
+	// child, indices -- the name says so because the digits do not.
+	if inner == "HOST_GPU_IDS" {
+		if gpuIDs == "" {
+			return "", true, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
+		}
+		return gpuIDs, true, nil
+	}
+
+	// The three llama.cpp --device placeholders, exact-match siblings of
+	// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
+	// Same empty-list refusal, on the same reasoning (an empty --device
+	// list selects NO device, not every device).
+	if inner == "CUDA_DEVICES" {
+		if gpuIDs == "" {
+			return "", true, fmt.Errorf("${CUDA_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+		}
+		return deviceList(spec, "CUDA"), true, nil
+	}
+	if inner == "VULKAN_DEVICES" {
+		if gpuIDs == "" {
+			return "", true, fmt.Errorf("${VULKAN_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+		}
+		return deviceList(spec, "Vulkan"), true, nil
+	}
+	if inner == "METAL_DEVICES" {
+		if gpuIDs == "" {
+			return "", true, fmt.Errorf("${METAL_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
+		}
+		return deviceList(spec, "MTL"), true, nil
+	}
+
+	// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and
+	// friends are plausible pass-through tokens. The per-spec directory
+	// the agent provisions this spec's config_files into (#257):
+	// <config_files_dir>/<spec.ID>. NOT a secret -- it is an agent-chosen
+	// path the operator needs to read in the reported command -- so it
+	// records no secretSpan and is never masked, exactly like ${PORT}
+	// and ${MODEL}. No empty-value refusal: configFilesDir has a
+	// non-empty default at runtime, and spec.ID is the spec's identity,
+	// so the join is never a hole in a path.
+	if inner == "CONFIG_DIR" {
+		return filepath.Join(configFilesDir, spec.ID), true, nil
+	}
+
+	return "", false, nil
+}
+
 // expandSpec is ExpandPlaceholders' worker. Everything in ExpandPlaceholders'
 // doc comment describes this function; the exported wrapper exists only
 // because most callers want nothing but the argv and environment.
@@ -885,69 +961,11 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 			match := s[m[0]:m[1]]
 			inner := match[2 : len(match)-1] // strip "${" and "}"
 
-			if inner == "PORT" {
-				b.WriteString(strconv.Itoa(port))
-				continue
-			}
-
-			// EXACT match only -- ${MODEL...} anything is NOT a near-miss.
-			// See the doc comment above for why the ${PORT} prefix rule
-			// deliberately does not extend here.
-			if inner == "MODEL" {
-				if spec.UpstreamModel == "" {
-					return "", nil, fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
+			if v, handled, resolveErr := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir); handled {
+				if resolveErr != nil {
+					return "", nil, resolveErr
 				}
-				b.WriteString(spec.UpstreamModel)
-				continue
-			}
-
-			// EXACT match only, same reasoning as ${MODEL} above. HOST, not
-			// child, indices -- the name says so because the digits do not.
-			if inner == "HOST_GPU_IDS" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
-				}
-				b.WriteString(gpuIDs)
-				continue
-			}
-
-			// The three llama.cpp --device placeholders, exact-match siblings of
-			// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
-			// Same empty-list refusal, on the same reasoning (an empty --device
-			// list selects NO device, not every device).
-			if inner == "CUDA_DEVICES" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${CUDA_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-				}
-				b.WriteString(deviceList(spec, "CUDA"))
-				continue
-			}
-			if inner == "VULKAN_DEVICES" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${VULKAN_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-				}
-				b.WriteString(deviceList(spec, "Vulkan"))
-				continue
-			}
-			if inner == "METAL_DEVICES" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${METAL_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-				}
-				b.WriteString(deviceList(spec, "MTL"))
-				continue
-			}
-
-			// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and
-			// friends are plausible pass-through tokens. The per-spec directory
-			// the agent provisions this spec's config_files into (#257):
-			// <config_files_dir>/<spec.ID>. NOT a secret -- it is an agent-chosen
-			// path the operator needs to read in the reported command -- so it
-			// records no secretSpan and is never masked, exactly like ${PORT}
-			// and ${MODEL}. No empty-value refusal: configFilesDir has a
-			// non-empty default at runtime, and spec.ID is the spec's identity,
-			// so the join is never a hole in a path.
-			if inner == "CONFIG_DIR" {
-				b.WriteString(filepath.Join(configFilesDir, spec.ID))
+				b.WriteString(v)
 				continue
 			}
 

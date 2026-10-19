@@ -39,6 +39,8 @@ func main() {
 	envLog := flag.String("env-log", "", "if set, write what this process ACTUALLY received for -env-name, as \"set:<value>\" or \"unset\" -- the only way to observe a child's own environment from the parent's test, and it deliberately distinguishes an absent variable from one set to the empty string")
 	envName := flag.String("env-name", "", "the environment variable -env-log reports")
 	cwdLog := flag.String("cwd-log", "", "if set, write this process's ACTUAL working directory (os.Getwd) -- the only way to observe from the parent's test where the manager launched the child, which is what proves R2's empty-work_dir default (cmd.Dir = the binary's own directory)")
+	readFile := flag.String("read-file", "", "if set (with -read-log), read this file at startup and record what it held -- the only way to observe from the parent's test that a file the manager provisions (config_files) already existed, with its final content, when the child started")
+	readLog := flag.String("read-log", "", "where -read-file records its result: \"content:<bytes>\" when the file was readable, \"missing\" when it was not")
 	requestLog := flag.String("request-log", "", "if set, append one line \"<METHOD> <PATH>\" per HTTP request this process receives, before answering it -- proves from the child's side which requests reached it, independent of the router's and the manager's own bookkeeping")
 	ignoreSigterm := flag.Bool("ignore-sigterm", false, "ignore SIGTERM, so the manager's kill-grace escalation to SIGKILL is what actually ends this process -- gives a test a real, controllable window in which a signalled-but-still-live child keeps answering /health")
 	healthGate := flag.String("health-gate", "", "if set, /health answers 503 until this file exists (and -health-delay has passed) -- lets a test hold a child in starting for exactly as long as it needs, and end the load at a moment it chooses, instead of guessing a delay")
@@ -90,6 +92,20 @@ func main() {
 		}
 		if err := os.WriteFile(*cwdLog, []byte(wd), 0o644); err != nil {
 			log.Fatalf("stubchild: write cwd log: %v", err)
+		}
+	}
+
+	// What the -read-file path held at the moment this process started. The
+	// manager writes config_files BEFORE exec, so a child that finds the file
+	// complete here proves the ordering; "missing" distinguishes "never written"
+	// from "written empty".
+	if *readFile != "" && *readLog != "" {
+		record := "missing"
+		if data, err := os.ReadFile(*readFile); err == nil {
+			record = "content:" + string(data)
+		}
+		if err := os.WriteFile(*readLog, []byte(record), 0o644); err != nil {
+			log.Fatalf("stubchild: write read log: %v", err)
 		}
 	}
 

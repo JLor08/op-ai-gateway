@@ -1040,7 +1040,9 @@ func (o *owner) applyConfig(cfg Config) {
 // zeroed, and whatever remains -- the fields ExpandPlaceholders + startProcess
 // bake into the process (binary, args, env, work_dir, the GPU index set, the
 // visible-devices toggle and mode, listen port, the ${API_TOKEN} material,
-// and upstream_model via a ${MODEL} placeholder) -- is compared with
+// upstream_model via a ${MODEL} placeholder, and config_files -- the files
+// startProcess writes before exec and the child reads at startup, so a content
+// edit must relaunch) -- is compared with
 // reflect.DeepEqual. Anchoring on the metadata set is deliberate: a NEW Spec
 // field therefore defaults to launch-affecting until it is added here, so a
 // forgotten classification over-relaunches (harmless -- a graceful drain and
@@ -1747,10 +1749,11 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	}
 }
 
-// startProcess resolves the listen port, expands placeholders, execs the
-// child (never blocking the owner loop beyond the exec.Cmd.Start() call
-// itself), and hands off health-waiting and exit-waiting to their own
-// goroutines.
+// startProcess resolves the listen port, expands placeholders, writes the
+// spec's config files, execs the child (never blocking the owner loop beyond
+// the exec.Cmd.Start() call itself and the few small, size-bounded config-file
+// writes just before it), and hands off health-waiting and exit-waiting to
+// their own goroutines.
 func (o *owner) startProcess(st *specState) {
 	spec := st.spec
 
@@ -1765,6 +1768,17 @@ func (o *owner) startProcess(st *specState) {
 	// placeholder port is a faithful pre-check; the real port is
 	// substituted in the second call below once one is available.
 	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+		o.setNotPermitted(st, err.Error())
+		return
+	}
+	// The config_files half of the same dry run (#257): a secret or malformed
+	// placeholder in a file's content, an OS-unsafe file name, or a spec ID that
+	// would escape config_files_dir can never succeed on retry, so it is
+	// reported exactly like a bad Args placeholder -- not_permitted,
+	// rate-limited -- and before a port is acquired or anything is written. The
+	// checks are port-independent for the same reason the one above is. Only the
+	// filesystem writes, further down, are start failures.
+	if _, err := planSpecConfigFiles(spec, 0, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
@@ -1790,6 +1804,22 @@ func (o *owner) startProcess(st *specState) {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
+
+	// Provision the spec's config files BEFORE anything is exec'd: the child
+	// reads them at startup, so they must already exist, complete, with the real
+	// ${PORT} in them. Everything deterministic was settled by the dry run above,
+	// so an error here is a genuine filesystem failure (unwritable directory,
+	// full disk, failed rename) -- a start failure that backs off and retries,
+	// the same shape as the ephemeral-port failure above, and NOT a
+	// not_permitted verdict, which would claim the config can never work.
+	if err := writeSpecConfigFiles(spec, port, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
+		o.setState(st, StateStartFailed)
+		o.recordFailure(st, err.Error(), 0, "")
+		o.failPending(st, ErrStartFailed)
+		o.enterBackoff(st) // I2 fix: rate-limit / retry a persistently failing start, same as any other start_failed
+		return
+	}
+
 	args, env := ex.args, ex.env
 	// The reportable form of this exact launch, built from the SAME expansion
 	// (never a second one that could disagree with it) and masked here, at the
