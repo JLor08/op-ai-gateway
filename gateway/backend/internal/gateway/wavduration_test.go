@@ -160,6 +160,9 @@ func TestWavDurationMillisRejectsNonWav(t *testing.T) {
 		{"zero channels", wavFile(t, wavFmtChunkWith(t, 0, 16000, 0, 0, 16), wavDataChunk(t, 100))},
 		{"zero sample rate", wavFile(t, wavFmtChunkWith(t, 1, 0, 32000, 2, 16), wavDataChunk(t, 100))},
 		{"zero bits per sample", wavFile(t, wavFmtChunkWith(t, 1, 16000, 32000, 2, 0), wavDataChunk(t, 100))},
+		// An overrunning declaration is a loud zero, not a bill of the bytes held: audio.cpp
+		// refuses such a file (v0.9.1: HTTP 500 "failed to read WAV data chunk"), so no clip
+		// is transcribed for the zero. If that ever changes, bill min(declared, held) instead.
 		{"data size exceeds buffer", wavFile(t, validFmt, wavChunk(t, "data", 1000, make([]byte, 100)))},
 		{"data size 4 GiB, no body", wavFile(t, validFmt, wavChunk(t, "data", math.MaxUint32, nil))},
 		{"foreign chunk size exceeds buffer", wavFile(t, validFmt, wavChunk(t, "LIST", math.MaxUint32, nil), wavDataChunk(t, 100))},
