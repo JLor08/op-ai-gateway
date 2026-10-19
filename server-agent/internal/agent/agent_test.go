@@ -2783,9 +2783,9 @@ func TestCapabilitiesSampleEmitsImageBetweenNamedFieldsAndExtra(t *testing.T) {
 
 // TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra pins where the
 // audio.cpp verdicts (speech, transcription and, for a transcriber,
-// transcription_streaming) land on the wire: after the five other named fields
-// and before every Extra entry, in both directions, and not at all when
-// undetermined. As for image, the position is the load-bearing part: the
+// transcription_streaming, and for a synthesiser, speech_clone) land on the
+// wire: after the five other named fields and before every Extra entry, in both
+// directions, and not at all when undetermined. As for image, the position is the load-bearing part: the
 // gateway keeps the FIRST entry for a name, so a "speech" that also appears in
 // Extra (Extra can only say "yes") must lose to the structured field.
 func TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra(t *testing.T) {
@@ -2876,6 +2876,50 @@ func TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra(t *testing.T) 
 		{
 			name: "a streaming verdict with no transcription verdict is not carried",
 			caps: collector.Capabilities{TranscriptionStreaming: "yes"},
+			want: []sample.CapabilityVerdict{},
+		},
+		{
+			name: "speech_clone follows speech and transcription and precedes Extra",
+			caps: collector.Capabilities{
+				Speech: "yes", Transcription: "no", SpeechClone: "yes", Extra: []string{"thinking"},
+			},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "transcription", Verdict: "no"},
+				{Name: "speech_clone", Verdict: "yes"},
+				{Name: "thinking", Verdict: "yes"},
+			},
+		},
+		{
+			name: "a speech_clone no is carried, ahead of an Extra entry of the same name",
+			caps: collector.Capabilities{
+				Speech: "yes", SpeechClone: "no", Extra: []string{"speech_clone"},
+			},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "speech_clone", Verdict: "no"},
+				{Name: "speech_clone", Verdict: "yes"},
+			},
+		},
+		{
+			name: "an undetermined speech_clone verdict is omitted",
+			caps: collector.Capabilities{Speech: "yes", Transcription: "no"},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "transcription", Verdict: "no"},
+			},
+		},
+		{
+			name: "a speech_clone verdict beside a speech no is not carried",
+			caps: collector.Capabilities{Speech: "no", Transcription: "yes", SpeechClone: "yes"},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "no"},
+				{Name: "transcription", Verdict: "yes"},
+			},
+		},
+		{
+			name: "a speech_clone verdict with no speech verdict is not carried",
+			caps: collector.Capabilities{SpeechClone: "no"},
 			want: []sample.CapabilityVerdict{},
 		},
 	}
@@ -3898,6 +3942,21 @@ func audioCppCaps(speech, transcription string) *sample.Capabilities {
 	}
 }
 
+// audioCppTTSCaps is the capability set a plain-synthesiser audio_cpp child
+// reports: the speech and transcription verdicts, then the speech_clone "no"
+// the task "tts" states beside a speech "yes", under the literal source the
+// gateway matches.
+func audioCppTTSCaps() *sample.Capabilities {
+	return &sample.Capabilities{
+		Verdicts: []sample.CapabilityVerdict{
+			{Name: "speech", Verdict: "yes"},
+			{Name: "transcription", Verdict: "no"},
+			{Name: "speech_clone", Verdict: "no"},
+		},
+		Source: "audiocpp_models",
+	}
+}
+
 // TestProbeRuntimeChildPropsAudioCppReadsItsModelListing is the wiring proof
 // for audio.cpp: when the gateway declares capability_source_audiocpp, an
 // audio_cpp child is asked exactly one thing, GET /v1/models, and never
@@ -3920,7 +3979,7 @@ func TestProbeRuntimeChildPropsAudioCppReadsItsModelListing(t *testing.T) {
 	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("child requests = %v, want exactly %v (the model listing, and no /props)", got, want)
 	}
-	if want := audioCppCaps("yes", "no"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+	if want := audioCppTTSCaps(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
 		t.Fatalf("Capabilities = %+v, want %+v", rs.Capabilities, want)
 	}
 	if rs.LiveProgressSupport != "" {
@@ -3934,7 +3993,7 @@ func TestProbeRuntimeChildPropsAudioCppReadsItsModelListing(t *testing.T) {
 	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("child requests after a same-pid call = %v, want still %v (a conclusive answer is cached)", got, want)
 	}
-	if want := audioCppCaps("yes", "no"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+	if want := audioCppTTSCaps(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
 		t.Errorf("Capabilities (cache hit) = %+v, want %+v", rs.Capabilities, want)
 	}
 	if n := features.fetches(); n != 1 {
@@ -3990,12 +4049,12 @@ func TestProbeRuntimeChildPropsAudioCppReportsTranscriptionStreaming(t *testing.
 		{
 			"a tts child in streaming mode",
 			`{"data":[{"id":"kokoro-82m","task":"tts","mode":"streaming"}]}`,
-			audioCppCaps("yes", "no"),
+			audioCppTTSCaps(),
 		},
 		{
 			"a tts child in offline mode, as audio.cpp v0.9.1 lists it",
 			`{"data":[{"id":"kokoro-82m","task":"tts","mode":"offline"}]}`,
-			audioCppCaps("yes", "no"),
+			audioCppTTSCaps(),
 		},
 	}
 	for _, tc := range cases {
@@ -4023,6 +4082,61 @@ func TestProbeRuntimeChildPropsAudioCppReportsTranscriptionStreaming(t *testing.
 			}
 			if again.Capabilities == nil || !reflect.DeepEqual(*again.Capabilities, *tc.want) {
 				t.Errorf("Capabilities (cache hit) = %+v, want %+v", again.Capabilities, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppReportsSpeechClone is the wiring proof for
+// the speech_clone verdict on the EXISTING audio.cpp source: the task the
+// child's own listing states for the spec's model comes out as a speech_clone
+// verdict after the speech and transcription ones ("clone" a yes, "tts" a
+// no), with no second child request and no new gateway feature. An asr model, or
+// one whose listing states no task, gets no such verdict: speech_clone refines
+// a speech "yes", so a model that does not synthesise has no answer on it, not
+// even a "no".
+func TestProbeRuntimeChildPropsAudioCppReportsSpeechClone(t *testing.T) {
+	listing := func(task string) string {
+		return `{"object":"list","data":[{"id":"whisper-small","task":"asr"},{"id":"kokoro-82m","task":"` + task + `"}]}`
+	}
+	cloneCaps := func(speechClone string) *sample.Capabilities {
+		return &sample.Capabilities{
+			Verdicts: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "transcription", Verdict: "no"},
+				{Name: "speech_clone", Verdict: speechClone},
+			},
+			Source: "audiocpp_models",
+		}
+	}
+	cases := []struct {
+		name string
+		doc  string
+		want *sample.Capabilities
+	}{
+		{"a clone child reports speech_clone yes", listing("clone"), cloneCaps("yes")},
+		{"a tts child reports speech_clone no", listing("tts"), cloneCaps("no")},
+		{"an asr child reports no speech_clone verdict", audioCppASRDoc, audioCppCaps("no", "yes")},
+		{
+			"a child whose listing states no task reports nothing at all",
+			`{"data":[{"id":"kokoro-82m"}]}`,
+			&sample.Capabilities{Verdicts: []sample.CapabilityVerdict{}, Source: "audiocpp_models"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newProbeChild(t, map[string]string{audioCppModelsRoute: tc.doc})
+			features := &fakeGatewayFeatures{names: []string{"capability_source_audiocpp"}}
+			a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+			st, base := audioCppStatus(t, child, 7240)
+
+			var rs sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+			if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("child requests = %v, want exactly %v (one listing read answers every verdict)", got, want)
+			}
+			if rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *tc.want) {
+				t.Errorf("Capabilities = %+v, want %+v", rs.Capabilities, tc.want)
 			}
 		})
 	}
@@ -4105,7 +4219,7 @@ func TestProbeRuntimeChildPropsAudioCppWaitsForTheGatewayFeature(t *testing.T) {
 			if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
 				t.Fatalf("child requests after the gateway declares the feature = %v, want %v (an upgrade is picked up without a child restart)", got, want)
 			}
-			if want := audioCppCaps("yes", "no"); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
+			if want := audioCppTTSCaps(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *want) {
 				t.Errorf("Capabilities after the upgrade = %+v, want %+v", rs.Capabilities, want)
 			}
 		})
@@ -4156,8 +4270,8 @@ func TestProbeRuntimeChildPropsAudioCppWithholdsACachedVerdictOnRollback(t *test
 		return rs
 	}
 
-	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *audioCppCaps("yes", "no")) {
-		t.Fatalf("Capabilities while declared = %+v, want %+v", rs.Capabilities, audioCppCaps("yes", "no"))
+	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *audioCppTTSCaps()) {
+		t.Fatalf("Capabilities while declared = %+v, want %+v", rs.Capabilities, audioCppTTSCaps())
 	}
 
 	features.set([]string{"runtime_manager", "capability_source_sdcpp"}, nil)
@@ -4173,8 +4287,8 @@ func TestProbeRuntimeChildPropsAudioCppWithholdsACachedVerdictOnRollback(t *test
 
 	features.set([]string{"capability_source_audiocpp"}, nil)
 	clk.advance(gatewayFeatureRecheckInterval)
-	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *audioCppCaps("yes", "no")) {
-		t.Fatalf("Capabilities after the source is declared again = %+v, want %+v", rs.Capabilities, audioCppCaps("yes", "no"))
+	if rs := probe(); rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *audioCppTTSCaps()) {
+		t.Fatalf("Capabilities after the source is declared again = %+v, want %+v", rs.Capabilities, audioCppTTSCaps())
 	}
 	if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
 		t.Errorf("child requests = %v, want %v (the kept entry answers; the child is not asked again)", got, want)
