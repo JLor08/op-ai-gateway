@@ -1321,8 +1321,10 @@ names the file and the rule, never its content, which can hold the very secret
 that tripped the check): at most 16 files; each name a single file name (no
 separator of either OS, no `:` volume or stream marker, not blank or `.`/`..`, no
 control character); names unique **case-insensitively**; each content at most
-64 KiB; no secret placeholder. The agent does not trust that it ran, and layers
-two checks of its own:
+64 KiB; no secret placeholder. Count and size are the gateway's alone: the agent
+does not re-check them (`ParseConfig` never counts files or measures content). The
+agent does not trust that the name rule ran, and layers two checks of its own, which
+cover **names** and path **containment** only:
 
 - `ParseConfig` applies the **gateway's name rule, no stricter and no laxer**, to
   every spec. It is the single parser for gateway- and file-mode documents, so a
@@ -5055,9 +5057,11 @@ wrongly accepts the near-misses the agent refuses).
 **Config files** ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)) are a repeatable editor of `{file name, content}`
 rows beside `args` and `env`: a monospace multi-line field per file, an Add button
 that stops at the 16-file cap, and inline feedback on the offending field while the
-operator types — a name that is blank, not a single plain file name or repeated
+operator types — a name that is not a single plain file name or repeated
 (case-insensitively), content over 64 KiB, or content naming `${API_TOKEN}` or
-`${AGENT_ENV:`. Like the placeholder mirror above, those checks restate what the
+`${AGENT_ENV:`. A **blank** name is the one exception: it is refused at submit, not
+painted as an error while a freshly added row is still empty. Like the placeholder
+mirror above, those checks restate what the
 gateway's spec PUT enforces (`validateRuntimeSpecConfigFiles`, 400
 `runtime_spec.config_files_invalid`) rule for rule and are early feedback, not a
 second contract. The reason to have them is the **create** path: the mapping is

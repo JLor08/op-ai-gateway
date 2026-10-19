@@ -72,7 +72,7 @@ Domain and technical terms used throughout this documentation.
 | **VRAM budget** | A per-`(server, GPU index)` megabyte ceiling that admission sums declared and measured demand against. An *absent* row and a row of `0` both mean unconstrained — "no budget for this GPU" is expressible either way, and admission skips the GPU identically. |
 | **Feature flag (agent capability)** | A named capability, e.g. `runtime_manager`, that gateway and agent each declare; a feature is active only where both lists intersect. Versions are never compared ([ADR-025](09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)). |
 | **Admin state** | The persisted desired-state override on a managed model: `''` (none), `force_running`, or `force_stopped`. There is no restart command — a restart is a sequence over these states. |
-| **File mode** | An agent whose managed-runtime configuration comes from a local file instead of the gateway. It reports its effective configuration upward with environment values masked, and the portal becomes read-only for that server. |
+| **File mode** | An agent whose managed-runtime configuration comes from a local file instead of the gateway. It reports its effective configuration upward with environment values, the API token and config-file content masked, and the portal becomes read-only for that server. |
 | **Dialect seam** | The abstraction that keeps SQLite and PostgreSQL on one query set (`internal/store/dialect.go`). |
 | **Migration** | A forward-only, versioned schema change applied transactionally on startup. |
 | **Store driver** | One of `memory`, `sqlite`, `postgres`. |

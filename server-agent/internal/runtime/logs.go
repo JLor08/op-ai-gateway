@@ -58,9 +58,8 @@ import (
 // was, until then, dropped immediately after exec.Command consumed it. The
 // masked command is a typed FIELD ON THE GENERATION'S OPENING MARKER, so it
 // travels with the boundary that already carries the pid and needs no
-// attribution rule of its
-// own -- see ResolvedCommand for why that placement, and what it costs when a
-// marker is evicted.
+// attribution rule of its own -- see ResolvedCommand for why that placement,
+// and what it costs when a marker is evicted.
 
 const (
 	// DefaultLogBufferBytes is the per-spec retention default: 1 MiB.

@@ -435,7 +435,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   is mapping-scoped, so a client fans out one GET per mapping.
   `configured: false` is the *only* signal for "this mapping has no spec row
   yet". The document is then synthesized: `id` is absent and `mapping_id` is
-  set; the spec's own fields are zero values (`gpus`/`args`/`env`/`api_flavors`
+  set; the spec's own fields are zero values (`gpus`/`args`/`env`/`api_flavors`/`config_files`
   non-nil but empty, `responses_mode`/`messages_mode` `""`), except
   `visible_devices_mode` (`env`) and `api_token_mode`/`api_token_header_source`
   (`app`), which carry their defaults; `app_api_token_set`/`app_api_token_header`
@@ -591,7 +591,7 @@ sentinel is a breaking API change that must be applied in both places):
 | Code | Status |
 |---|---|
 | `runtime_spec.not_found` | 404 |
-| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid` | 400 |
+| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
 | `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
