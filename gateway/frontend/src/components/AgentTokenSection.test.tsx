@@ -378,6 +378,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(cfg.runtime_allowed_binaries).toEqual([]);
       expect(cfg.runtime_allowed_dirs).toEqual([]);
       expect(cfg.runtime_cache).toBe('');
+      // The operator-only base directory for agent-provisioned runtime-spec
+      // config files: empty means the agent's built-in default beside its binary.
+      expect(cfg.config_files_dir).toBe('');
       // The two empty-value semantics are opposite, and the comments — not the
       // values, which a generated template cannot guess — are what carry that.
       expect(raw).toContain('EMPTY (the default) MEANS NOTHING MAY START');

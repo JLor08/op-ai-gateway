@@ -1165,6 +1165,57 @@ func TestRuntimeCachePathPrecedence(t *testing.T) {
 	}
 }
 
+// TestConfigFilesDirResolution proves flag > env > file > the next-to-binary
+// default for ConfigFilesDir -- the base directory under which the agent
+// writes the config files an agent-managed runtime spec asks for -- and that a
+// relative value is anchored beside the selected config file (the
+// RuntimeCachePath / CAFile precedent) rather than the agent's process working
+// directory, which for a service is typically "/".
+func TestConfigFilesDirResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	// default: server-agent-config-files next to the (stubbed) binary.
+	orig := executable
+	t.Cleanup(func() { executable = orig })
+	binDir := t.TempDir()
+	executable = func() (string, error) { return filepath.Join(binDir, "server-agent"), nil }
+	wantDefault := filepath.Join(binDir, "server-agent-config-files")
+	if cfg, err := Load(base, noenv); err != nil || cfg.ConfigFilesDir != wantDefault {
+		t.Fatalf("default ConfigFilesDir = %q (err %v), want %q", cfg.ConfigFilesDir, err, wantDefault)
+	}
+
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","config_files_dir":"/from-file/config-files"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.ConfigFilesDir != "/from-file/config-files" {
+		t.Fatalf("file ConfigFilesDir = %q (err %v), want /from-file/config-files", cfg.ConfigFilesDir, err)
+	}
+	env := func(k string) string {
+		if k == "OP_AGENT_CONFIG_FILES_DIR" {
+			return "/from-env/config-files"
+		}
+		return ""
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.ConfigFilesDir != "/from-env/config-files" {
+		t.Fatalf("env ConfigFilesDir = %q (err %v), want /from-env/config-files (env > file)", cfg.ConfigFilesDir, err)
+	}
+	args := append([]string{"-config", path}, "-config-files-dir=/from-flag/config-files")
+	if cfg, err := Load(args, env); err != nil || cfg.ConfigFilesDir != "/from-flag/config-files" {
+		t.Fatalf("flag ConfigFilesDir = %q (err %v), want /from-flag/config-files (flag > env > file)", cfg.ConfigFilesDir, err)
+	}
+
+	// A relative file value is anchored beside the selected config file.
+	cfgDir := t.TempDir()
+	relPath := filepath.Join(cfgDir, "selected-agent.json")
+	body := `{"gateway_url":"https://gw.example","token":"x","config_files_dir":"managed/config-files"}`
+	if err := os.WriteFile(relPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	wantRel := filepath.Join(cfgDir, "managed", "config-files")
+	if cfg, err := Load([]string{"-config", relPath}, noenv); err != nil || cfg.ConfigFilesDir != wantRel {
+		t.Fatalf("relative ConfigFilesDir = %q (err %v), want %q (resolved beside the config file)", cfg.ConfigFilesDir, err, wantRel)
+	}
+}
+
 // TestRuntimeRouterBindHostPrecedence proves flag > env > file > empty
 // (the "let main.go derive a default" sentinel) for RuntimeRouterBindHost
 // (docs/architecture/cross-cutting/agent-runtime-manager.md §4.6): unlike
@@ -1364,7 +1415,9 @@ func TestGeneratedAgentConfigLoadsToDocumentedDefaults(t *testing.T) {
 	//   - runtime_source "gateway" and cert_proxy_routes_mode "fallback" are
 	//     the values Load() defaults an empty string to anyway;
 	//   - runtime_cache "" still resolves to the next-to-the-binary default,
-	//     NOT to the empty string, which would disable the disk cache.
+	//     NOT to the empty string, which would disable the disk cache;
+	//   - config_files_dir "" likewise resolves to the next-to-the-binary
+	//     default directory, not to the empty string.
 	if cfg.RuntimeSource != RuntimeSourceGateway {
 		t.Errorf("RuntimeSource = %q, want %q", cfg.RuntimeSource, RuntimeSourceGateway)
 	}
@@ -1382,6 +1435,9 @@ func TestGeneratedAgentConfigLoadsToDocumentedDefaults(t *testing.T) {
 	}
 	if base := filepath.Base(cfg.RuntimeCachePath); base != defaultRuntimeCacheName {
 		t.Errorf("RuntimeCachePath = %q, want a path ending in %q (an empty runtime_cache must still get the built-in default)", cfg.RuntimeCachePath, defaultRuntimeCacheName)
+	}
+	if base := filepath.Base(cfg.ConfigFilesDir); base != defaultConfigFilesDirName {
+		t.Errorf("ConfigFilesDir = %q, want a path ending in %q (an empty config_files_dir must still get the built-in default)", cfg.ConfigFilesDir, defaultConfigFilesDirName)
 	}
 	if len(cfg.CertProxyRoutes) != 0 {
 		t.Errorf("CertProxyRoutes = %v, want empty", cfg.CertProxyRoutes)

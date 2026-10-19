@@ -162,6 +162,15 @@ type ManagerOptions struct {
 	// false, is the gateway-sourced case, where the gateway already holds
 	// every literal in the document.
 	SpecsFromLocalFile bool
+	// ConfigFilesDir is the agent-owned, writable base directory under which
+	// the config files a spec's config_files facet asks for are written, one
+	// per-spec subdirectory (<ConfigFilesDir>/<spec-id>/<name>). It is
+	// OPERATOR configuration from the agent's own local config (the
+	// config_files_dir setting) -- the gateway names a file's relative name and
+	// content, never where on the host it lands. Fixed for the process
+	// lifetime, like the other options here. Empty (every test that does not
+	// exercise config files) means no base directory was configured.
+	ConfigFilesDir string
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -222,6 +231,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		getenv:             getenv,
 		gpuVendor:          opts.GPUVendor,
 		specsFromLocalFile: opts.SpecsFromLocalFile,
+		configFilesDir:     opts.ConfigFilesDir,
 		specs:              make(map[string]*specState),
 		allowedPairs:       map[[2]string]bool{},
 		logs:               m.logs,
@@ -800,6 +810,10 @@ type owner struct {
 	// use is the masking rule for the reported launch command; see the option's
 	// own doc.
 	specsFromLocalFile bool
+	// configFilesDir is ManagerOptions.ConfigFilesDir -- the base directory
+	// the owner writes a spec's config files under. Fixed for the process
+	// lifetime, so a plain field like gpuVendor above.
+	configFilesDir string
 	// logs is m.logs, held here so the owner can open a generation's writer
 	// and prune the retention of specs a new config removed. Carries its own
 	// mutex; nothing about it is owner-goroutine-confined.

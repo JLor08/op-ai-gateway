@@ -109,6 +109,12 @@ const (
 // defaultConfigName precedent).
 const defaultRuntimeCacheName = "server-agent-runtime.cache.json"
 
+// defaultConfigFilesDirName is the directory looked for next to the binary
+// when ConfigFilesDir is not otherwise configured (the defaultRuntimeCacheName
+// precedent). It is the base under which the agent writes the config files an
+// agent-managed runtime spec asks for.
+const defaultConfigFilesDirName = "server-agent-config-files"
+
 // Config holds the resolved agent settings. The server identity is derived from
 // the token by the gateway, so there is no hostname field.
 type Config struct {
@@ -212,6 +218,14 @@ type Config struct {
 	// file (the CAFile/CACacheFile precedent) rather than the agent's
 	// process working directory, which for a service is typically "/".
 	RuntimeCachePath string
+	// ConfigFilesDir is the base directory under which the agent writes the
+	// config files an agent-managed runtime spec's config_files facet asks
+	// for. Defaults to defaultConfigFilesDirName next to the binary. Like
+	// RuntimeCachePath, a relative value from the config file is anchored
+	// beside that config file rather than the agent's process working
+	// directory. Operator-owned: it comes ONLY from this local config, never
+	// from the gateway.
+	ConfigFilesDir string
 	// RuntimeRouterBindHost is the operator-controlled bind address for the
 	// agent-managed model runtime's router port
 	// (docs/architecture/cross-cutting/agent-runtime-manager.md §4.6): an
@@ -308,6 +322,7 @@ type fileConfig struct {
 	// the reflection parity test and resolveBool's env>file precedence.
 	RuntimeAllowBinaryDirs *bool  `json:"runtime_allow_binary_dirs"`
 	RuntimeCachePath       string `json:"runtime_cache"`
+	ConfigFilesDir         string `json:"config_files_dir"`
 	RuntimeRouterBindHost  string `json:"runtime_router_bind"`
 
 	RuntimeLogBufferBytes      int `json:"runtime_log_buffer_bytes"`
@@ -351,6 +366,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	runtimeSource := fs.String("runtime-source", "", "agent-managed model runtime spec source: gateway|file (env OP_AGENT_RUNTIME_SOURCE / config runtime_source)")
 	runtimeConfigPath := fs.String("runtime-config", "", "path to a local runtime-config JSON file; required when runtime-source=file (env OP_AGENT_RUNTIME_CONFIG / config runtime_config)")
 	runtimeCachePath := fs.String("runtime-cache", "", "path to the runtime process-state cache file (default: "+defaultRuntimeCacheName+" next to the binary; env OP_AGENT_RUNTIME_CACHE / config runtime_cache)")
+	configFilesDir := fs.String("config-files-dir", "", "base directory the agent writes runtime-spec config files under (default: "+defaultConfigFilesDirName+" next to the binary; env OP_AGENT_CONFIG_FILES_DIR / config config_files_dir)")
 	runtimeRouterBindHost := fs.String("runtime-router-bind", "", "bind host for the agent-managed model runtime's router port; empty = derive from the mesh identity, else all interfaces (env OP_AGENT_RUNTIME_ROUTER_BIND / config runtime_router_bind)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -428,6 +444,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
 		RuntimeAllowBinaryDirs: resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
 		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
+		ConfigFilesDir:         strings.TrimSpace(resolveStr("config-files-dir", *configFilesDir, "OP_AGENT_CONFIG_FILES_DIR", file.ConfigFilesDir)),
 		RuntimeRouterBindHost:  strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
 
 		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
@@ -448,10 +465,14 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if cfg.RuntimeCachePath == "" {
 		cfg.RuntimeCachePath = defaultRuntimeCachePath()
 	}
+	if cfg.ConfigFilesDir == "" {
+		cfg.ConfigFilesDir = defaultConfigFilesDir()
+	}
 	cfg.CAFile = resolvePathAgainstConfig(cfg.CAFile, path)
 	cfg.CACacheFile = resolvePathAgainstConfig(cfg.CACacheFile, path)
 	cfg.RuntimeConfigPath = resolvePathAgainstConfig(cfg.RuntimeConfigPath, path)
 	cfg.RuntimeCachePath = resolvePathAgainstConfig(cfg.RuntimeCachePath, path)
+	cfg.ConfigFilesDir = resolvePathAgainstConfig(cfg.ConfigFilesDir, path)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -505,6 +526,16 @@ func defaultRuntimeCachePath() string {
 		return defaultRuntimeCacheName
 	}
 	return filepath.Join(filepath.Dir(exe), defaultRuntimeCacheName)
+}
+
+// defaultConfigFilesDir is server-agent-config-files in the binary's own
+// directory (the defaultRuntimeCachePath precedent).
+func defaultConfigFilesDir() string {
+	exe, err := executable()
+	if err != nil {
+		return defaultConfigFilesDirName
+	}
+	return filepath.Join(filepath.Dir(exe), defaultConfigFilesDirName)
 }
 
 // resolvePathAgainstConfig makes a relative path independent of the process

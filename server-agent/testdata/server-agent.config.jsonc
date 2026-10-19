@@ -134,6 +134,15 @@
   // value is resolved beside this config file.
   "runtime_cache": "",
 
+  // Base directory the agent writes the config files a model's runtime spec
+  // asks for, one subdirectory per spec. This value comes ONLY from this local
+  // file: the gateway supplies a file's relative name and content, never where
+  // on this host it is written. Point it at a directory of your choosing to
+  // keep these files out of the agent's own directory. Empty (the default)
+  // means "server-agent-config-files" next to the agent binary; a relative
+  // value is resolved beside this config file.
+  "config_files_dir": "",
+
   // Bind host for the agent-managed model runtime's router port -- the port the
   // gateway sends inference requests to for a server_agent application. This
   // value comes ONLY from this local file: the gateway supplies the router's
