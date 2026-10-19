@@ -127,6 +127,62 @@ func TestRedactConfigEnvRedactsAPIToken(t *testing.T) {
 	}
 }
 
+// TestRedactConfigEnvMasksConfigFileContent is the security guard for #257's
+// file-mode half: a hand-written file-mode spec can carry a config file whose
+// CONTENT holds a literal secret (an inline api key in a YAML/JSON the model
+// server reads), and Spec.ConfigFiles rides the same upward report as Env, so
+// redactConfigEnv must mask every file's Content while keeping its Name (a
+// useful diagnostic). It greps the MARSHALED bytes for the literal, proves the
+// no-mutation contract, and proves a nil ConfigFiles on a hand-built Config
+// normalizes to [] (never `config_files:null`), like Args and GPUs.
+func TestRedactConfigEnvMasksConfigFileContent(t *testing.T) {
+	const secret = "sk-literal-config-secret"
+	cfg := Config{
+		Specs: []Spec{
+			{ID: "with-files", ConfigFiles: []ConfigFile{
+				{Name: "server.yaml", Content: "api_key: " + secret + "\nport: ${PORT}\n"},
+				{Name: "empty.json", Content: ""},
+			}},
+			{ID: "no-files"}, // nil ConfigFiles must marshal as []
+		},
+	}
+
+	redacted := redactConfigEnv(cfg)
+
+	raw, err := json.Marshal(redacted)
+	if err != nil {
+		t.Fatalf("marshal redacted config: %v", err)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("config file content leaked into the marshaled config: %s", raw)
+	}
+	if strings.Contains(string(raw), `"config_files":null`) {
+		t.Fatalf("nil ConfigFiles marshaled as null, want []: %s", raw)
+	}
+
+	got := redacted.Specs[0].ConfigFiles
+	if len(got) != 2 {
+		t.Fatalf("spec[0] ConfigFiles len = %d, want 2", len(got))
+	}
+	for i, wantName := range []string{"server.yaml", "empty.json"} {
+		if got[i].Name != wantName {
+			t.Errorf("ConfigFiles[%d].Name = %q, want %q (names are kept)", i, got[i].Name, wantName)
+		}
+		if got[i].Content != envRedactedMask {
+			t.Errorf("ConfigFiles[%d].Content = %q, want the mask %q", i, got[i].Content, envRedactedMask)
+		}
+	}
+	if nf := redacted.Specs[1].ConfigFiles; nf == nil || len(nf) != 0 {
+		t.Errorf("spec[1] ConfigFiles = %#v, want a non-nil empty slice", nf)
+	}
+
+	// No-mutation contract: the caller's cfg still holds the original content
+	// (the redacted slice must be a fresh one, not an alias of the caller's).
+	if cfg.Specs[0].ConfigFiles[0].Content != "api_key: "+secret+"\nport: ${PORT}\n" {
+		t.Errorf("redactConfigEnv mutated the caller's ConfigFiles content: %q", cfg.Specs[0].ConfigFiles[0].Content)
+	}
+}
+
 // TestBuildReportParseErrorRoundTrips proves the parse_error CODE (and a
 // non-file source) survive BuildReport unchanged. The parameter is a
 // ParseErrorCode, not free text, so "round-trips" is all this function is

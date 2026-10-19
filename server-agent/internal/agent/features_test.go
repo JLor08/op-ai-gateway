@@ -301,6 +301,34 @@ func TestFeaturesDeclareMultipartProxy(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "multipart_proxy") {
 		t.Fatal("FeatureNames() does not carry multipart_proxy, so it never reaches the gateway in capabilities.features")
 	}
+	// The Version assertion moved to TestFeaturesDeclareRuntimeConfigFiles,
+	// beside the newest feature (see the bump-rule note there).
+}
+
+// TestFeaturesDeclareRuntimeConfigFiles pins the config-file provisioning
+// capability: a launch spec's config_files facet (#257) is written by this
+// agent before the model process starts, and the GATEWAY/PORTAL warns when the
+// connected agent predates it -- an older agent ignores the unknown field and
+// launches the child with the file missing -- so a rename here silently
+// disables that warning. The agent itself always honors what it receives; the
+// flag exists for the gateway's benefit. The gateway spells the same string in
+// its own constant; this module cannot import it.
+func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_config_files" {
+			found = true
+			if f.Since != "0.10.0" {
+				t.Fatalf("runtime_config_files Since = %q, want 0.10.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_config_files")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_config_files") {
+		t.Fatal("FeatureNames() does not carry runtime_config_files, so it never reaches the gateway in capabilities.features")
+	}
 	// The version assertion lives here, beside the newest feature, and it
 	// is the forcing function for the repository's bump rule: a change that
 	// moves Version has to come THROUGH this test and state which rule it
@@ -308,16 +336,15 @@ func TestFeaturesDeclareMultipartProxy(t *testing.T) {
 	// runtime_ensure; 0.8.1 and 0.8.2 were PATCH because they gained nothing
 	// (0.8.2 added the image_options telemetry field, gated on the
 	// gateway-declared capability_source_sdcpp, which is not an agent.Features
-	// entry); 0.9.0 is MINOR because agent.Features gained multipart_proxy;
-	// 0.9.1 is PATCH because it gained nothing (it probes an audio_cpp child's
-	// /v1/models for speech/transcription, gated on the gateway-declared
+	// entry); 0.9.0 was MINOR because agent.Features gained multipart_proxy;
+	// 0.9.1 and 0.9.2 were PATCH because they gained nothing (they probe an
+	// audio_cpp child's /v1/models, gated on the gateway-declared
 	// capability_source_audiocpp, which is not an agent.Features entry
-	// either); 0.9.2 is PATCH for the same reason (it adds the
-	// transcription_streaming verdict to that same audio_cpp probe, read from
-	// the child's /v1/models mode, on the same source). A Since records the
-	// version a feature shipped in, so runtime_ensure's stays 0.8.0 and
-	// multipart_proxy's stays 0.9.0.
-	if Version != "0.9.2" {
-		t.Fatalf("Version = %q, want 0.9.2 (agent.Features gained nothing since multipart_proxy at 0.9.0, so the bump is PATCH)", Version)
+	// either); 0.10.0 is MINOR because agent.Features gained
+	// runtime_config_files. A Since records the version a feature shipped in,
+	// so runtime_ensure's stays 0.8.0, multipart_proxy's stays 0.9.0 and
+	// runtime_config_files' is 0.10.0.
+	if Version != "0.10.0" {
+		t.Fatalf("Version = %q, want 0.10.0 (agent.Features gained runtime_config_files, so the bump is MINOR)", Version)
 	}
 }
