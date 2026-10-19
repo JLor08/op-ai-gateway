@@ -125,6 +125,7 @@ var migrations = []migration{
 	{version: 90, name: "user_group_managers_can_manage_vendor_accounts", up: migration90Up},
 	{version: 91, name: "vendor_account_admin_groups", up: migration91Up},
 	{version: 92, name: "resource_group_vendor_accounts", up: migration92Up},
+	{version: 93, name: "runtime_spec_config_files", up: migration93Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4159,4 +4160,29 @@ func migration92Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration93Up adds agent_runtime_specs.config_files (#257), the opaque JSON
+// array of {name, content} objects the agent writes into its own per-spec
+// config directory (<config_files_dir>/<spec-id>/, never the spec's work_dir)
+// before it starts the process. The store never parses it: the portal validates
+// and canonicalises it at write time and the agent decodes it at launch -- the
+// same contract as args and env.
+//
+// The column is `text not null` with an empty-string default: text is ADR-005's
+// wide type for a string value (an unbounded text column on both dialects, not
+// a sized one), and the empty default is the whole of the upgrade story: every
+// existing spec reads back "" = no config files, so no running deployment's
+// launch behaviour changes. The default is the empty string rather than the
+// typed empty array / object migration65Up gave args and env because "" is what
+// RuntimeSpec.ConfigFiles holds for "none" everywhere else (memory store,
+// portal DTO), so a row never needs translating between two spellings of
+// "empty".
+//
+// Append-only: it does NOT touch baselineCreateStatements, FROZEN as of v60, nor
+// migration65Up's create-table for agent_runtime_specs; a fresh install gets the
+// column by replaying this duplicate-tolerant migration. addColumnIfMissing
+// keeps it re-runnable on both dialects.
+func migration93Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "config_files text not null default ''")
 }

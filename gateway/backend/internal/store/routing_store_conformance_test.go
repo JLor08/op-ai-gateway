@@ -1294,7 +1294,14 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			ID: "rspec_rt2", MappingID: "map_rt2", Enabled: true,
 			Binary: "/usr/bin/llama-server", Args: `["--port","${PORT}"]`,
 			Env: `{"HF_TOKEN":"${AGENT_ENV:HF_TOKEN}"}`, WorkDir: "/srv/models",
-			HealthPath: "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
+			// config_files is an opaque JSON array the store never parses
+			// (the Args/Env contract). The seed is non-empty and carries a
+			// `${...}` placeholder, quotes and a space, so a store that
+			// trimmed, re-encoded or dropped the value shows as a mismatch --
+			// and only a non-empty seed makes an UNWIRED column visible, since
+			// it would otherwise read back the DDL default "".
+			ConfigFiles: `[{"name":"server.json","content":"id ${MODEL}"}]`,
+			HealthPath:  "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
 			IdleTimeoutSeconds: 900, AdmissionWaitTimeoutSeconds: 30, Pinned: true,
 			AdminState: "force_running", VRAMLocked: true, SetVisibleDevices: true,
 			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
@@ -1343,6 +1350,9 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("read back: ok=%v err=%v", ok, err)
 		}
+		if got.ConfigFiles != spec.ConfigFiles {
+			t.Fatalf("config_files round-trip mismatch: got %q, want %q", got.ConfigFiles, spec.ConfigFiles)
+		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
 			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
 			got.AdminState != "force_running" || !got.CreatedAt.Equal(now) {
@@ -1365,11 +1375,19 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		if gotByID.Binary != spec.Binary || gotByID.MappingID != "map_rt2" {
 			t.Fatalf("RuntimeSpecByID mismatch: %+v", gotByID)
 		}
+		if gotByID.ConfigFiles != spec.ConfigFiles {
+			t.Fatalf("RuntimeSpecByID lost config_files: got %q, want %q", gotByID.ConfigFiles, spec.ConfigFiles)
+		}
 		if _, ok, err := s.RuntimeSpecByID(ctx, "rspec_rt2_missing"); err != nil || ok {
 			t.Fatalf("RuntimeSpecByID absent: ok=%v err=%v", ok, err)
 		}
 
 		spec.Binary = "/usr/bin/vllm"
+		// A different config_files value on the overwrite: the SQL upsert's
+		// `do update set` list is hand-maintained apart from its insert
+		// columns, so a config_files column named only in the insert would
+		// persist on the first save and be silently ignored by this one.
+		spec.ConfigFiles = `[{"name":"server.json","content":"id ${MODEL} v2"},{"name":"b.conf","content":"x"}]`
 		spec.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
 			t.Fatalf("upsert overwrite: %v", err)
@@ -1377,6 +1395,9 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		got, _, _ = s.RuntimeSpecByMapping(ctx, "map_rt2")
 		if got.Binary != "/usr/bin/vllm" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("overwrite must keep created_at, got %+v", got)
+		}
+		if got.ConfigFiles != spec.ConfigFiles {
+			t.Fatalf("overwrite lost the new config_files (the do-update list omits the column): got %q, want %q", got.ConfigFiles, spec.ConfigFiles)
 		}
 
 		// The same spec saved again with responses_live_timings_enabled
@@ -1454,6 +1475,10 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		// responses_live_timings_enabled while agreeing on every OTHER
 		// integer boolean, for the list-read assertion below.
 		second.ResponsesLiveTimingsEnabled = false
+		// ... and with NO config files, so the list read below can tell a
+		// column read from the DDL default: rspec_aaa must read back "" while
+		// rspec_rt2 reads back its JSON.
+		second.ConfigFiles = ""
 		if err := s.UpsertRuntimeSpec(ctx, second); err != nil {
 			t.Fatalf("upsert second spec: %v", err)
 		}
@@ -1477,6 +1502,10 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		if specs[0].ResponsesLiveTimingsEnabled || !specs[1].ResponsesLiveTimingsEnabled {
 			t.Fatalf("the s.-qualified column list (runtimeSpecColsPrefixed) disagrees with runtimeSpecCols: rspec_aaa stored responses_live_timings_enabled=false and rspec_rt2 stored true, the list read returned %v/%v",
 				specs[0].ResponsesLiveTimingsEnabled, specs[1].ResponsesLiveTimingsEnabled)
+		}
+		if specs[0].ConfigFiles != "" || specs[1].ConfigFiles != spec.ConfigFiles {
+			t.Fatalf("the list read (runtimeSpecColsPrefixed) lost or crossed config_files: rspec_aaa stored \"\" and rspec_rt2 stored %q, the list read returned %q/%q",
+				spec.ConfigFiles, specs[0].ConfigFiles, specs[1].ConfigFiles)
 		}
 		if !specs[0].SetVisibleDevices || !specs[1].SetVisibleDevices {
 			t.Fatalf("the list read lost set_visible_devices, which both rows stored as true: it is transposed with responses_live_timings_enabled in runtimeSpecColsPrefixed: %+v", specs)

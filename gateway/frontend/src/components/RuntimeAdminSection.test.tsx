@@ -2642,6 +2642,11 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     type: spec.type,
     metrics_path: spec.metrics_path,
     context_probe_path: spec.context_probe_path,
+    // #257: replayed verbatim like every other writable field (it rides the
+    // rest-spread). Present only when the loaded spec carries the field: a
+    // spec stored through a FORM save carries `[]`, one from an older fixture
+    // carries nothing, and the override must restate exactly what it read.
+    ...(spec.config_files !== undefined ? { config_files: spec.config_files } : {}),
   };
 }
 
@@ -4247,6 +4252,25 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorDuplicateSpecId}`),
     ).toBeInTheDocument();
     expect(screen.queryByText('duplicate_spec_id', { exact: false })).not.toBeInTheDocument();
+  });
+
+  // #257: the agent's code for a hand-authored runtime.json whose config_files
+  // carries a bad or repeated name. The gateway's allow-list relays it
+  // (runtimeReportParseErrorCodes) and this map must translate it: a code the
+  // map does not know degrades to "the reason was not reported", which drops
+  // exactly the diagnosis the code exists to deliver.
+  it('maps the invalid_config_file_name code to its own sentence', async () => {
+    renderFileMode(fileConfig, { parse_error: 'invalid_config_file_name' });
+    expect(
+      await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorInvalidConfigFileName}`),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText('invalid_config_file_name', { exact: false }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(t.runtimeParseErrorUnknown, { exact: false }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText('File-Alpha')).not.toBeInTheDocument();
   });
 
   // A1: the two ACCESS codes. They are the reason this whole mechanism was
@@ -9350,5 +9374,448 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, 
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #257: a spec's config files. The editor is a repeatable {name, content}
+// list; the form's PUT is a FULL document, so the load -> save round trip of
+// files set through the API (which this form may never have touched) is the
+// property that matters most here.
+// ---------------------------------------------------------------------------
+// Timeout raised from the 5000ms default: these tests drive many click-by-click
+// renders of this large form (each config-file row is two MUI text fields), which
+// can outrun 5s on a loaded/degraded CI runner even though they pass comfortably
+// otherwise. The behaviour under test is unchanged; only the deadline is relaxed.
+describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, () => {
+  const filesOnTheServer = [
+    { name: 'models.ini', content: '[a]\nmodel = /models/a.gguf\nport = ${PORT}\n' },
+    { name: 'Chat.Template.jinja', content: '{{ messages }}\n' },
+  ];
+
+  async function openEditFor(spec: Partial<RuntimeSpec>, extra: { report?: RuntimeReport } = {}) {
+    const rendered = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          ...spec,
+        }),
+      },
+      ...extra,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return rendered;
+  }
+
+  async function openCreateAndFillBase() {
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+  }
+
+  // The agent-feature warning is gated on the report GET having settled, so a
+  // "stays quiet" assertion made before that is vacuous. A macrotask turn runs
+  // after every pending microtask, which is what the fake report resolves on.
+  async function settleReport() {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  function nameFields() {
+    return screen.queryAllByLabelText(t.runtimeSpecConfigFileName) as HTMLInputElement[];
+  }
+  function contentFields() {
+    return screen.queryAllByLabelText(t.runtimeSpecConfigFileContent) as HTMLTextAreaElement[];
+  }
+  function addFile(name: string, content: string) {
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd }));
+    const names = nameFields();
+    const contents = contentFields();
+    fireEvent.change(names[names.length - 1], { target: { value: name } });
+    fireEvent.change(contents[contents.length - 1], { target: { value: content } });
+  }
+
+  it('starts with no rows and adds an empty name + content pair per click', async () => {
+    renderSection();
+    await openCreateAndFillBase();
+    expect(screen.getByText(t.runtimeSpecConfigFiles)).toBeInTheDocument();
+    expect(nameFields()).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd }));
+    expect(nameFields()).toHaveLength(1);
+    expect(contentFields()).toHaveLength(1);
+    expect(nameFields()[0]).toHaveValue('');
+    expect(contentFields()[0]).toHaveValue('');
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd }));
+    expect(nameFields()).toHaveLength(2);
+  });
+
+  it('binds name and (multi-line) content per row', async () => {
+    renderSection();
+    await openCreateAndFillBase();
+    addFile('a.ini', 'line one\nline two');
+    addFile('b.ini', 'other');
+
+    expect(nameFields().map((f) => f.value)).toEqual(['a.ini', 'b.ini']);
+    expect(contentFields().map((f) => f.value)).toEqual(['line one\nline two', 'other']);
+    // Multi-line, not a single-line input.
+    expect(contentFields()[0].tagName).toBe('TEXTAREA');
+  });
+
+  it('removes exactly the clicked row and keeps the others in order', async () => {
+    renderSection();
+    await openCreateAndFillBase();
+    addFile('first.ini', '1');
+    addFile('second.ini', '2');
+    addFile('third.ini', '3');
+
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecConfigFileRemove })[1]);
+
+    expect(nameFields().map((f) => f.value)).toEqual(['first.ini', 'third.ini']);
+    expect(contentFields().map((f) => f.value)).toEqual(['1', '3']);
+  });
+
+  it('stops offering Add at the gateway limit of 16 files', async () => {
+    // Seeded through a loaded spec: sixteen click-by-click renders of this
+    // whole form (each row is two MUI text fields) outrun the test timeout.
+    await openEditFor({
+      config_files: Array.from({ length: 15 }, (_, i) => ({ name: `f${i}.ini`, content: '' })),
+    });
+    expect(nameFields()).toHaveLength(15);
+    expect(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd }));
+    expect(nameFields()).toHaveLength(16);
+    expect(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd })).toBeDisabled();
+
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecConfigFileRemove })[0]);
+    expect(nameFields()).toHaveLength(15);
+    expect(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd })).toBeEnabled();
+  });
+
+  describe('buildSpecBody', () => {
+    it('sends config_files as plain {name, content} pairs in row order', async () => {
+      const { putSpecs } = renderSection();
+      await openCreateAndFillBase();
+      addFile('b.ini', 'second alphabetically, first typed');
+      addFile('a.ini', 'x');
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      // toEqual on the whole array: any form-only field (the row key) leaking
+      // onto the wire fails here.
+      expect(putSpecs[0].body.config_files).toEqual([
+        { name: 'b.ini', content: 'second alphabetically, first typed' },
+        { name: 'a.ini', content: 'x' },
+      ]);
+    });
+
+    it('sends an explicit empty list on an untouched create', async () => {
+      const { putSpecs } = renderSection();
+      await openCreateAndFillBase();
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual([]);
+    });
+  });
+
+  // THE CARRIED-OVER HAZARD (Task 1): PUT is a full document, and absent
+  // `config_files` means "none" to the backend. A form that did not bind the
+  // loaded files would silently clear every file set through the API the
+  // first time anyone saved an unrelated field.
+  describe('round trip of a loaded spec (full-document PUT)', () => {
+    it('shows the stored files as rows when the edit form opens', async () => {
+      await openEditFor({ config_files: filesOnTheServer });
+      expect(nameFields().map((f) => f.value)).toEqual(['models.ini', 'Chat.Template.jinja']);
+      expect(contentFields().map((f) => f.value)).toEqual(filesOnTheServer.map((f) => f.content));
+    });
+
+    it('an UNTOUCHED load -> save preserves the stored config files byte for byte', async () => {
+      const { putSpecs } = await openEditFor({ config_files: filesOnTheServer });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual(filesOnTheServer);
+    });
+
+    it('preserves them across an edit of an UNRELATED field', async () => {
+      const { putSpecs, storedSpecs } = await openEditFor({ config_files: filesOnTheServer });
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecWorkDir), {
+        target: { value: '/srv/work' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.work_dir).toBe('/srv/work');
+      expect(putSpecs[0].body.config_files).toEqual(filesOnTheServer);
+      expect(storedSpecs.map_1.config_files).toEqual(filesOnTheServer);
+    });
+
+    it('does not carry one spec files into the next form that opens', async () => {
+      // The state is per form session: opening a spec with no files after one
+      // with files must not resurrect the first one's rows.
+      const { putSpecs } = renderSection({
+        mappings: [
+          makeMapping({ id: 'map_1', gateway_model_name: 'gw-1' }),
+          makeMapping({ id: 'map_2', gateway_model_name: 'gw-2', app_model_name: 'app-2' }),
+        ],
+        specsByMappingId: {
+          map_1: makeSpec({
+            configured: true,
+            id: 'spec_1',
+            mapping_id: 'map_1',
+            binary: '/usr/bin/a',
+            config_files: filesOnTheServer,
+          }),
+          map_2: makeSpec({
+            configured: true,
+            id: 'spec_2',
+            mapping_id: 'map_2',
+            binary: '/usr/bin/b',
+            config_files: [],
+          }),
+        },
+      });
+      await screen.findByText('gw-1');
+      const editButtons = await screen.findAllByRole('button', { name: t.runtimeSpecEditAction });
+      fireEvent.click(editButtons[0]);
+      await waitFor(() => expect(nameFields()).toHaveLength(2));
+      fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+
+      const again = await screen.findAllByRole('button', { name: t.runtimeSpecEditAction });
+      fireEvent.click(again[1]);
+      await waitFor(() =>
+        expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveValue('/usr/bin/b'),
+      );
+      expect(nameFields()).toHaveLength(0);
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual([]);
+    });
+
+    it('a Create opened after an Edit starts with no rows', async () => {
+      renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: {
+          map_1: makeSpec({
+            configured: true,
+            id: 'spec_1',
+            mapping_id: 'map_1',
+            binary: '/usr/bin/a',
+            config_files: filesOnTheServer,
+          }),
+        },
+      });
+      await screen.findByText('gw-model');
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+      await waitFor(() => expect(nameFields()).toHaveLength(2));
+      fireEvent.click(screen.getByRole('button', { name: t.cancel }));
+
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+      await screen.findByLabelText(t.runtimeSpecBinary);
+      expect(nameFields()).toHaveLength(0);
+    });
+
+    it('a spec loaded without the field (older document) saves as an empty list', async () => {
+      const { putSpecs } = await openEditFor({ config_files: undefined });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual([]);
+    });
+
+    it('sends the edited list after a row is removed and another changed', async () => {
+      const { putSpecs } = await openEditFor({ config_files: filesOnTheServer });
+      fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecConfigFileRemove })[1]);
+      fireEvent.change(contentFields()[0], { target: { value: 'port = 9000\n' } });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual([
+        { name: 'models.ini', content: 'port = 9000\n' },
+      ]);
+    });
+
+    it('removing the last row saves an empty list, which clears the stored files', async () => {
+      const { putSpecs } = await openEditFor({ config_files: [filesOnTheServer[0]] });
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileRemove }));
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual([]);
+    });
+
+    it('an admin override PUT replays the loaded files too', async () => {
+      const spec = fullSpec({ config_files: filesOnTheServer });
+      const { putSpecs, stream } = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: spec },
+        statusRows: [makeStatus({ spec_id: 'spec_1' })],
+      });
+      stream.setStatus('open');
+      await openStatusTab();
+
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeForceStop }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual(filesOnTheServer);
+      expect(putSpecs[0].body).toEqual(expectedBody(spec, 'force_stopped'));
+    });
+  });
+
+  describe('client-side validation (mirrors the gateway, before any write)', () => {
+    async function expectRefused(message: string) {
+      expect(await screen.findAllByText(message, { exact: false })).not.toHaveLength(0);
+    }
+
+    it('refuses a path in a name, and creates no mapping', async () => {
+      const { created, putSpecs } = renderSection();
+      await openCreateAndFillBase();
+      addFile('../etc/passwd', 'x');
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+      await expectRefused(t.runtimeSpecConfigFileNameInvalid);
+      // The mapping is written BEFORE its spec: a refusal must come first, or a
+      // bad name leaves a spec-less mapping behind.
+      expect(created).toHaveLength(0);
+      expect(putSpecs).toHaveLength(0);
+    });
+
+    it('refuses a blank name', async () => {
+      const { created } = renderSection();
+      await openCreateAndFillBase();
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd }));
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+      await expectRefused(t.runtimeSpecConfigFileNameBlank);
+      expect(created).toHaveLength(0);
+    });
+
+    it('refuses a repeated name, case-insensitively', async () => {
+      const { created } = renderSection();
+      await openCreateAndFillBase();
+      addFile('Models.ini', '1');
+      addFile('models.INI', '2');
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+      await expectRefused(t.runtimeSpecConfigFileNameDuplicate);
+      expect(created).toHaveLength(0);
+    });
+
+    it.each(['token=${API_TOKEN}', 'key=${AGENT_ENV:HF_TOKEN}'])(
+      'refuses the secret placeholder in %j',
+      async (content) => {
+        const { created, putSpecs } = renderSection();
+        await openCreateAndFillBase();
+        addFile('secrets.ini', content);
+        fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+        await expectRefused(t.runtimeSpecConfigFileSecretPlaceholder);
+        expect(created).toHaveLength(0);
+        expect(putSpecs).toHaveLength(0);
+      },
+    );
+
+    it('refuses on an EDIT too, before the mapping PATCH', async () => {
+      const { fakeApi, putSpecs } = await openEditFor({ config_files: filesOnTheServer });
+      fireEvent.change(nameFields()[0], { target: { value: 'a/b' } });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+
+      await expectRefused(t.runtimeSpecConfigFileNameInvalid);
+      expect(fakeApi.updateMapping).not.toHaveBeenCalled();
+      expect(putSpecs).toHaveLength(0);
+    });
+
+    it('marks the offending name field as invalid while typing', async () => {
+      renderSection();
+      await openCreateAndFillBase();
+      addFile('ok.ini', '');
+      addFile('bad/name', '');
+      expect(nameFields()[0]).toHaveAttribute('aria-invalid', 'false');
+      expect(nameFields()[1]).toHaveAttribute('aria-invalid', 'true');
+      expect(screen.getByText(t.runtimeSpecConfigFileNameInvalid)).toBeInTheDocument();
+    });
+
+    it('a clean list is not refused', async () => {
+      const { putSpecs } = renderSection();
+      await openCreateAndFillBase();
+      addFile('models.ini', 'port = ${PORT}\ndir = ${CONFIG_DIR}\nmodel = ${MODEL}\n');
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+    });
+  });
+
+  describe('agent feature warning (runtime_config_files)', () => {
+    const withFiles = { config_files: [filesOnTheServer[0]] };
+
+    it('warns, naming the agent version, when the agent does not declare runtime_config_files', async () => {
+      await openEditFor(withFiles, {
+        report: makeReport({ agent_version: '0.9.2', agent_features: ['runtime_manager'] }),
+      });
+      const warning = await screen.findByText(t.runtimeSpecAgentNoConfigFiles, { exact: false });
+      expect(warning).toHaveTextContent('0.9.2');
+    });
+
+    it('stays quiet when the agent declares runtime_config_files', async () => {
+      await openEditFor(withFiles, {
+        report: makeReport({
+          agent_version: '0.10.0',
+          agent_features: ['runtime_manager', 'runtime_config_files'],
+        }),
+      });
+      await screen.findByLabelText(t.runtimeSpecConfigFileName);
+      await settleReport();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoConfigFiles, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('stays quiet for a spec without config files, even on an old agent', async () => {
+      await openEditFor(
+        { config_files: [] },
+        { report: makeReport({ agent_version: '0.9.2', agent_features: ['runtime_manager'] }) },
+      );
+      await settleReport();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoConfigFiles, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('appears as soon as a file row is added on an old agent', async () => {
+      renderSection({
+        report: makeReport({ agent_version: '0.9.2', agent_features: ['runtime_manager'] }),
+      });
+      await openCreateAndFillBase();
+      await settleReport();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoConfigFiles, { exact: false }),
+      ).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd }));
+      expect(
+        await screen.findByText(t.runtimeSpecAgentNoConfigFiles, { exact: false }),
+      ).toBeInTheDocument();
+    });
+
+    it('is advisory: it never blocks the save', async () => {
+      const { putSpecs } = await openEditFor(withFiles, {
+        report: makeReport({ agent_version: '0.9.2', agent_features: [] }),
+      });
+      await screen.findByText(t.runtimeSpecAgentNoConfigFiles, { exact: false });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.config_files).toEqual(withFiles.config_files);
+    });
   });
 });

@@ -2733,8 +2733,10 @@ paths:
       tags: [agent]
       summary: Ingest a file-mode agent's effective runtime configuration
       description: >
-        Env values are already masked agent-side; the gateway re-masks
-        structurally as defence in depth. An empty or unparseable config
+        Env values, a literal api_token and config-file content are already
+        masked agent-side; the gateway re-masks structurally as defence in
+        depth (its ingest type carries neither api_token nor config_files,
+        so both are dropped on arrival). An empty or unparseable config
         degrades rather than rejecting the report. Answers
         {"accepted":true,"server_id":"..."}.
       security: [{ agentToken: [] }]

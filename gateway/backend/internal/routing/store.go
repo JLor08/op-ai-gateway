@@ -2238,7 +2238,12 @@ type RuntimeSpec struct {
 	// Env is an opaque JSON object string; values are ${AGENT_ENV:NAME}
 	// placeholders resolved by the agent from its own environment — never
 	// secrets at rest here.
-	Env                         string
+	Env string
+	// ConfigFiles is an opaque JSON array string of {name, content} objects
+	// (the Args/Env pattern, "" = none): the files the agent writes before it
+	// launches the child. Content is plain text, never a secret -- the portal
+	// refuses the secret placeholders at write time.
+	ConfigFiles                 string
 	WorkDir                     string
 	ListenPort                  int // 0 = agent picks a free loopback port
 	HealthPath                  string

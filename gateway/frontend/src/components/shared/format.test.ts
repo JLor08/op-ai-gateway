@@ -131,6 +131,29 @@ describe('formatPortalError', () => {
     expect(formatPortalError(err, messages.en)).toBe(`${code}: ${messages.en[key]}`);
   });
 
+  // #257: the gateway's refusal of a runtime spec's config_files (a bad or
+  // repeated name, too many or too large files, a secret placeholder in the
+  // content). The server's own message names the file, but a mapped code
+  // renders the label INSTEAD -- so the label has to carry the rules itself --
+  // and an unmapped one would show raw English in a localized portal.
+  it('labels runtime_spec.config_files_invalid with its own label, in both locales', () => {
+    const err = new PortalApiError(
+      400,
+      'runtime_spec.config_files_invalid',
+      'config file name "../x" must be a single file name',
+    );
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale].errorRuntimeSpecConfigFilesInvalid;
+      expect(label.length).toBeGreaterThan(0);
+      expect(formatPortalError(err, messages[locale])).toBe(
+        `runtime_spec.config_files_invalid: ${label}`,
+      );
+    }
+    expect(messages.de.errorRuntimeSpecConfigFilesInvalid).not.toBe(
+      messages.en.errorRuntimeSpecConfigFilesInvalid,
+    );
+  });
+
   // The refusals the vendor model discovery adds: a malformed model prefix, a
   // stored credential the models refresh cannot open, the models and the usage
   // refresh's own 500s and a malformed Codex client_version. Each renders its localized label, never the

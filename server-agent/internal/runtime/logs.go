@@ -54,12 +54,12 @@ import (
 // AND WHAT THIS FILE GAINED SINCE: the RESOLVED LAUNCH COMMAND (command.go).
 // Output alone answers "what did it print", not "what did it print THIS
 // from" -- and every interesting value in a spec (${PORT}, ${MODEL},
-// ${HOST_GPU_IDS}, ${AGENT_ENV:NAME}) is resolved at launch and was, until
-// then, dropped immediately after exec.Command consumed it. The masked command
-// is a typed FIELD ON THE GENERATION'S OPENING MARKER, so it travels with the
-// boundary that already carries the pid and needs no attribution rule of its
-// own -- see ResolvedCommand for why that placement, and what it costs when a
-// marker is evicted.
+// ${HOST_GPU_IDS}, ${CONFIG_DIR}, ${AGENT_ENV:NAME}) is resolved at launch and
+// was, until then, dropped immediately after exec.Command consumed it. The
+// masked command is a typed FIELD ON THE GENERATION'S OPENING MARKER, so it
+// travels with the boundary that already carries the pid and needs no
+// attribution rule of its own -- see ResolvedCommand for why that placement,
+// and what it costs when a marker is evicted.
 
 const (
 	// DefaultLogBufferBytes is the per-spec retention default: 1 MiB.

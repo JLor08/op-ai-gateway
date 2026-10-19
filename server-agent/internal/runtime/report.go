@@ -19,7 +19,10 @@
 // first place.
 //
 // SCOPE, stated exactly, because the obvious stronger reading is wrong: the
-// contract covers env VALUES. It does NOT cover `args`, which are reported
+// contract covers env VALUES, a spec's api_token and (#257) the CONTENT of
+// each of a spec's config files -- a hand-written file-mode config file can
+// hold a literal secret, so its content is masked and only its name survives.
+// It does NOT cover `args`, which are reported
 // verbatim even though ${AGENT_ENV:NAME} placeholders are expanded in them
 // too -- so a secret placed in an argument reaches the gateway in plaintext.
 // That was reviewed and upheld as spec-correct, and the operator guidance
@@ -67,15 +70,17 @@ type Report struct {
 	Config      json.RawMessage `json:"config"`
 }
 
-// BuildReport redacts every env value out of cfg, marshals the result as the
-// report's config object, and returns the fully marshaled Report ready to
-// hand to Client.PostRuntimeReport or WSSender.PostRuntimeReport verbatim.
+// BuildReport redacts every env value, every spec's api_token and (#257) the
+// content of every spec's config files out of cfg (redactConfigEnv), marshals
+// the result as the report's config object, and returns the fully marshaled
+// Report ready to hand to Client.PostRuntimeReport or
+// WSSender.PostRuntimeReport verbatim.
 // source and parseErr are round-tripped unchanged. parseErr is a
 // ParseErrorCode from that type's CLOSED SET, not free text -- the type is
 // what makes "free of embedded secrets" a compile-time property here rather
 // than a promise the loader is trusted to keep (the C2 fix; the gateway
 // still allow-lists the value on ingest as defense in depth). This
-// function's own job remains the env map.
+// function's own job remains the secret-bearing spec fields named above.
 func BuildReport(cfg Config, source string, parseErr ParseErrorCode, at time.Time) ([]byte, error) {
 	cfgRaw, err := json.Marshal(redactConfigEnv(cfg))
 	if err != nil {
@@ -96,15 +101,18 @@ func BuildReport(cfg Config, source string, parseErr ParseErrorCode, at time.Tim
 // redactConfigEnv returns a copy of cfg in which every spec's Env map has
 // every VALUE replaced by envRedactedMask -- keys survive untouched -- and
 // every spec's non-empty APIToken is likewise replaced by envRedactedMask (an
-// empty token stays "" so absence remains distinguishable on the wire; I4). It
-// never mutates cfg's own slices/maps (a fresh Specs slice and a fresh Env
-// map per spec) nor cfg's own APIToken values (specs[i] is a struct copy and
-// APIToken is a value field), and it re-applies ParseConfig's own nil->empty-collection
-// normalization to every collection-shaped field: BuildReport can be called
-// with a Config that never went through ParseConfig (e.g. a zero-value
-// Config on a parse-error report), and the wire contract requires
-// specs/gpu_budgets/coresident/args/gpus/env to always be non-nil arrays and
-// objects, never JSON null.
+// empty token stays "" so absence remains distinguishable on the wire; I4).
+// Every spec's config files keep their Name but have their Content replaced by
+// envRedactedMask (#257): a hand-written file-mode file can hold a literal
+// secret. It never mutates cfg's own slices/maps (a fresh Specs slice, a fresh
+// Env map and a fresh ConfigFiles slice per spec) nor cfg's own APIToken
+// values (specs[i] is a struct copy and APIToken is a value field), and it
+// re-applies ParseConfig's own nil->empty-collection normalization to every
+// collection-shaped field: BuildReport can be called with a Config that never
+// went through ParseConfig (e.g. a zero-value Config on a parse-error report),
+// and the wire contract requires
+// specs/gpu_budgets/coresident/args/gpus/env/config_files to always be non-nil
+// arrays and objects, never JSON null.
 func redactConfigEnv(cfg Config) Config {
 	if cfg.GPUBudgets == nil {
 		cfg.GPUBudgets = []GPUBudget{}
@@ -121,6 +129,18 @@ func redactConfigEnv(cfg Config) Config {
 		if specs[i].GPUs == nil {
 			specs[i].GPUs = []SpecGPU{}
 		}
+		// A hand-written file-mode config file's CONTENT can hold a literal
+		// secret (an inline key in the YAML/JSON the model server reads), and
+		// Spec.ConfigFiles rides this same upward report. Mask every Content and
+		// keep the Name: which files a spec provisions is a useful diagnostic,
+		// what is in them never crosses the wire. Build a FRESH slice (the copy
+		// above is shallow, so writing through specs[i].ConfigFiles would mutate
+		// the caller's backing array), and normalize nil to [] like Args/GPUs.
+		files := make([]ConfigFile, len(specs[i].ConfigFiles))
+		for j, f := range specs[i].ConfigFiles {
+			files[j] = ConfigFile{Name: f.Name, Content: envRedactedMask}
+		}
+		specs[i].ConfigFiles = files
 		masked := make(map[string]string, len(specs[i].Env))
 		for k := range specs[i].Env {
 			masked[k] = envRedactedMask

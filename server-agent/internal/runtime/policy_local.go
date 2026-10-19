@@ -564,9 +564,9 @@ func allowedDirBase(entry string) string {
 // substitution happens, never after.
 var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 
-// ExpandPlaceholders resolves every ${PORT}, ${MODEL}, ${HOST_GPU_IDS} and
-// ${AGENT_ENV:NAME} occurrence in spec.Args and spec.Env values, and builds
-// the exact environment the child process will receive.
+// ExpandPlaceholders resolves every ${PORT}, ${MODEL}, ${HOST_GPU_IDS},
+// ${CONFIG_DIR} and ${AGENT_ENV:NAME} occurrence in spec.Args and spec.Env
+// values, and builds the exact environment the child process will receive.
 //
 // ${PORT} becomes the decimal port chosen for this process. ${MODEL} becomes
 // spec.UpstreamModel, the application-side model name (see the ${MODEL}
@@ -779,8 +779,19 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // byte-identical environment to the one it received before this option existed
 // (TestExpandPlaceholdersVisibleDevicesOffIsUnchanged).
 //
+// ${CONFIG_DIR} is the FIFTH token (#257), exact match only for the same reason
+// as ${MODEL}. It resolves to filepath.Join(configFilesDir, spec.ID): the
+// per-spec directory the agent writes spec.ConfigFiles into, so a spec can
+// point its model server at them (["--models-preset", "${CONFIG_DIR}/models.ini"])
+// without hard-coding an agent-side path that differs per host. configFilesDir
+// is the agent's config_files_dir setting, passed in rather than read from
+// package state so this function stays a pure function of its arguments. It is
+// a plain, NON-secret value: no secretSpan is recorded and the reported
+// command shows the resolved path.
+//
 // Arbitrary OTHER "${...}" text -- a model server's own templating syntax --
-// still passes through untouched; this function owns only these four tokens.
+// still passes through untouched; this function owns only these five tokens
+// (plus ${API_TOKEN} and the ${*_DEVICES} family documented where they resolve).
 // Provenance is recorded, not reconstructed. expandSpec below returns, beside
 // the argv and environment the child actually receives, the exact byte spans
 // of each result string that came from an ${AGENT_ENV:NAME} substitution --
@@ -788,8 +799,8 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // that performed the substitution. command.go turns that into the masked,
 // reportable ResolvedCommand; see its doc for why span-level provenance is
 // the only honest basis for masking a resolved command.
-func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string) (args []string, env []string, err error) {
-	ex, err := expandSpec(spec, port, vendor, getenv)
+func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
+	ex, err := expandSpec(spec, port, vendor, getenv, configFilesDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -846,6 +857,81 @@ type expandedSpec struct {
 	envFromSpec []bool
 }
 
+// deviceBackendByToken maps each llama.cpp --device placeholder token to the
+// backend prefix deviceList uses. One table so resolveNonSecretToken handles
+// the three exact-match siblings (${CUDA_DEVICES}/${VULKAN_DEVICES}/
+// ${METAL_DEVICES}) in a single branch with one shared empty-list guard.
+var deviceBackendByToken = map[string]string{
+	"CUDA_DEVICES":   "CUDA",
+	"VULKAN_DEVICES": "Vulkan",
+	"METAL_DEVICES":  "MTL",
+}
+
+// resolveNonSecretToken resolves inner -- the text between "${" and "}" -- when
+// it is one of the exact-match, NON-secret placeholders: ${PORT}, ${MODEL},
+// ${HOST_GPU_IDS}, ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} and
+// ${CONFIG_DIR}. handled reports whether inner was one of them; err is non-nil
+// only when handled (the token exists but cannot be resolved for this spec).
+// gpuIDs is hostGPUIDs(spec), hoisted by the caller so it is computed once per
+// expansion rather than once per match.
+//
+// This is the ONE copy of that resolution. expandSpec (Args/Env) and
+// expandConfigFileContent (config_files content, #257) both call it, so the two
+// surfaces cannot drift apart on what ${MODEL} or ${CONFIG_DIR} means. The
+// secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are deliberately NOT here:
+// expandSpec resolves and masks them, expandConfigFileContent refuses them.
+func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string) (value string, handled bool, err error) {
+	if inner == "PORT" {
+		return strconv.Itoa(port), true, nil
+	}
+
+	// EXACT match only -- ${MODEL...} anything is NOT a near-miss.
+	// See ExpandPlaceholders' doc comment for why the ${PORT} prefix rule
+	// deliberately does not extend here.
+	if inner == "MODEL" {
+		if spec.UpstreamModel == "" {
+			return "", true, fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
+		}
+		return spec.UpstreamModel, true, nil
+	}
+
+	// EXACT match only, same reasoning as ${MODEL} above. HOST, not
+	// child, indices -- the name says so because the digits do not.
+	if inner == "HOST_GPU_IDS" {
+		if gpuIDs == "" {
+			return "", true, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
+		}
+		return gpuIDs, true, nil
+	}
+
+	// The three llama.cpp --device placeholders, exact-match siblings of
+	// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
+	// Same empty-list refusal, on the same reasoning (an empty --device
+	// list selects NO device, not every device). One table-driven branch
+	// for the three, so the shared guard and message live once.
+	if backend, ok := deviceBackendByToken[inner]; ok {
+		if gpuIDs == "" {
+			return "", true, fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device", inner)
+		}
+		return deviceList(spec, backend), true, nil
+	}
+
+	// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and
+	// friends are plausible pass-through tokens. The per-spec directory
+	// the agent provisions this spec's config_files into (#257):
+	// <config_files_dir>/<spec.ID>. NOT a secret -- it is an agent-chosen
+	// path the operator needs to read in the reported command -- so it
+	// records no secretSpan and is never masked, exactly like ${PORT}
+	// and ${MODEL}. No empty-value refusal: configFilesDir has a
+	// non-empty default at runtime, and spec.ID is the spec's identity,
+	// so the join is never a hole in a path.
+	if inner == "CONFIG_DIR" {
+		return filepath.Join(configFilesDir, spec.ID), true, nil
+	}
+
+	return "", false, nil
+}
+
 // expandSpec is ExpandPlaceholders' worker. Everything in ExpandPlaceholders'
 // doc comment describes this function; the exported wrapper exists only
 // because most callers want nothing but the argv and environment.
@@ -857,7 +943,7 @@ type expandedSpec struct {
 // observable; it changes no classification and no error. A failing match
 // returns immediately rather than setting a first-error and walking on, which
 // yields the identical error because the walk was, and is, left to right.
-func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string) (expandedSpec, error) {
+func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
 	gpuIDs := hostGPUIDs(spec)
 
 	expand := func(s string) (string, []secretSpan, error) {
@@ -874,55 +960,11 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 			match := s[m[0]:m[1]]
 			inner := match[2 : len(match)-1] // strip "${" and "}"
 
-			if inner == "PORT" {
-				b.WriteString(strconv.Itoa(port))
-				continue
-			}
-
-			// EXACT match only -- ${MODEL...} anything is NOT a near-miss.
-			// See the doc comment above for why the ${PORT} prefix rule
-			// deliberately does not extend here.
-			if inner == "MODEL" {
-				if spec.UpstreamModel == "" {
-					return "", nil, fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
+			if v, handled, resolveErr := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir); handled {
+				if resolveErr != nil {
+					return "", nil, resolveErr
 				}
-				b.WriteString(spec.UpstreamModel)
-				continue
-			}
-
-			// EXACT match only, same reasoning as ${MODEL} above. HOST, not
-			// child, indices -- the name says so because the digits do not.
-			if inner == "HOST_GPU_IDS" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
-				}
-				b.WriteString(gpuIDs)
-				continue
-			}
-
-			// The three llama.cpp --device placeholders, exact-match siblings of
-			// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
-			// Same empty-list refusal, on the same reasoning (an empty --device
-			// list selects NO device, not every device).
-			if inner == "CUDA_DEVICES" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${CUDA_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-				}
-				b.WriteString(deviceList(spec, "CUDA"))
-				continue
-			}
-			if inner == "VULKAN_DEVICES" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${VULKAN_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-				}
-				b.WriteString(deviceList(spec, "Vulkan"))
-				continue
-			}
-			if inner == "METAL_DEVICES" {
-				if gpuIDs == "" {
-					return "", nil, fmt.Errorf("${METAL_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
-				}
-				b.WriteString(deviceList(spec, "MTL"))
+				b.WriteString(v)
 				continue
 			}
 

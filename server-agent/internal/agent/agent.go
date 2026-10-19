@@ -265,7 +265,21 @@ import (
 // is cached with the other verdicts of the same document. PATCH, and the rule
 // decides it: agent.Features gains NO entry, and no wire shape changes (an
 // open-vocabulary verdict name on an existing source).
-const Version = "0.9.2"
+//
+// 0.9.2 -> 0.10.0 is the single bump for the agent-config-files branch (issue
+// #257): a runtime launch spec gains a config_files facet -- named,
+// placeholder-expanded text files the agent writes into an agent-owned
+// directory before it execs the model process -- plus a ${CONFIG_DIR}
+// placeholder in args and env that resolves to that directory, and a
+// file-mode upward report now masks each config file's content (keeping its
+// name) the way it already masks env values. MINOR, and the rule decides it:
+// agent.Features gains "runtime_config_files", the name the gateway/portal
+// checks to warn that a connected agent predates the facet (an older agent
+// ignores the unknown field and launches the child without the file, which
+// cannot be told apart by trying). The agent itself gates nothing on it. The
+// same reasoning made 0.7.4 -> 0.8.0 (runtime_ensure) and 0.8.2 -> 0.9.0
+// (multipart_proxy) a MINOR.
+const Version = "0.10.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

@@ -195,6 +195,21 @@ var Features = []Feature{
 	// Since is 0.9.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
 	{Name: "multipart_proxy", Since: "0.9.0"},
+	// runtime_config_files: this agent's runtime manager writes a launch
+	// spec's config_files (#257) -- named, placeholder-expanded text files --
+	// into an agent-owned directory before it execs the model process, and
+	// resolves ${CONFIG_DIR} in the spec's args and env to that directory.
+	// Unlike runtime_upstream_props, runtime_ensure and multipart_proxy, this
+	// flag gates nothing on the agent: the agent always honors the config_files
+	// it receives. It is declared for the GATEWAY/PORTAL's benefit -- the portal
+	// warns when the connected agent predates it, because an older agent
+	// ignores the unknown config_files field and launches the child with the
+	// file missing, which no probe of the agent can tell apart from a spec that
+	// never asked for one.
+	//
+	// Since is 0.10.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block).
+	{Name: "runtime_config_files", Since: "0.10.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

@@ -435,7 +435,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   is mapping-scoped, so a client fans out one GET per mapping.
   `configured: false` is the *only* signal for "this mapping has no spec row
   yet". The document is then synthesized: `id` is absent and `mapping_id` is
-  set; the spec's own fields are zero values (`gpus`/`args`/`env`/`api_flavors`
+  set; the spec's own fields are zero values (`gpus`/`args`/`env`/`api_flavors`/`config_files`
   non-nil but empty, `responses_mode`/`messages_mode` `""`), except
   `visible_devices_mode` (`env`) and `api_token_mode`/`api_token_header_source`
   (`app`), which carry their defaults; `app_api_token_set`/`app_api_token_header`
@@ -591,7 +591,7 @@ sentinel is a breaking API change that must be applied in both places):
 | Code | Status |
 |---|---|
 | `runtime_spec.not_found` | 404 |
-| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid` | 400 |
+| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
 | `runtime_coresidency.pair_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
@@ -687,6 +687,23 @@ mutation like every other spec validation rule. See [Agent-Managed Model
 Runtime
 §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation).
 
+`RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `config_files`, an array of
+`{name, content}` objects (issue #257, [ADR-066](../09-architecture-decisions.md#adr-066--agent-provisioned-config-files-one-child-per-spec-a-0n-config-files-facet-written-to-an-agent-owned-directory-a-config_dir-placeholder-and-non-secret-content-only)): up to 16 plain-text files the
+agent writes into its own per-spec directory before it launches the child, which
+the spec's `args`/`env` reach through the `${CONFIG_DIR}` placeholder
+([Agent-Managed Model Runtime §3.5](../cross-cutting/agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child)). The **GET** response always carries the
+array (`[]` for none, never `null`). The PUT is a full document like every other
+field, so an **absent** `config_files` clears the stored set — a client that
+builds a body from a loaded spec must carry it through. `content` may use the
+non-secret placeholders (`${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`, the three
+`*_DEVICES` lists, `${CONFIG_DIR}`) and never `${API_TOKEN}` or `${AGENT_ENV:…}`.
+`runtime_spec.config_files_invalid` (400) rejects a list with more than 16 files; a
+`name` that is not a single file name (separator of either OS, `:`, `.`/`..`,
+blank, control character) or repeats another case-insensitively; a `content` over
+64 KiB; or a content naming one of the two secret placeholders. Its message names
+the file and the rule, **never the content**, and the check runs before any
+mutation like every other spec validation rule.
+
 `RuntimeSpecDTO` additionally carries the runtime-spec **API token** fields —
 see [agent-runtime-manager.md](../cross-cutting/agent-runtime-manager.md#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)
 for the four modes and the security posture, and
@@ -737,7 +754,7 @@ ever lands — `Rotate` follows the identical gate.
 
 **Env values are never validated** —
 that is load-bearing, since validating them would break the `${AGENT_ENV:NAME}`,
-`${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}` and `${CUDA_DEVICES}`/
+`${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`, `${CONFIG_DIR}` and `${CUDA_DEVICES}`/
 `${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholder mechanism, and it means an env key naming an
 agent-reserved base variable (`PATH`, `HOME`, `USERPROFILE`, `LOCALAPPDATA`,
 `SYSTEMROOT`, `WINDIR`) and `${AGENT_ENV:OP_AGENT_*}` references are *accepted
@@ -1211,7 +1228,7 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 | `/api/agent/v1/proxy-routes` | GET | Fetch the gateway-provided TLS proxy route topology (cert mode `proxy`) |
 | `/api/agent/v1/features` | GET | The **gateway's** declared feature list, ETag-conditional — the gateway→agent half of capability negotiation |
 | `/api/agent/v1/runtime-config` | GET | The desired agent-managed runtime state for the caller's own server, ETag-conditional |
-| `/api/agent/v1/runtime-report` | POST | Ingest a file-mode agent's *effective* runtime configuration (env values already masked agent-side) |
+| `/api/agent/v1/runtime-report` | POST | Ingest a file-mode agent's *effective* runtime configuration (env values and config-file content already masked agent-side) |
 | `/api/agent/v1/download/{...}` | GET | Agent distribution: download a ServerAgent release binary/manifest/config (fetched by operators or scripts; the agent does not update itself) |
 
 ### 5.1 The two managed-runtime GETs
@@ -1256,6 +1273,9 @@ independent implementations must agree on:
 - top-level `router_listen`, `max_processes`, `gpu_budgets[{index, budget_mb}]`,
   `specs[]`, `coresident[[specIdA, specIdB]]`, `etag`;
 - each spec carries `id`, `model`, `upstream_model`, `binary`, `args[]`, `env{}`,
+  `config_files[{name, content}]` (always an array, `[]` for none, never `null`;
+  `content` still carries any `${PORT}`/`${MODEL}`/`${CONFIG_DIR}`-style
+  placeholder, which the agent resolves locally — [§3.5](../cross-cutting/agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child)),
   `work_dir`, `gpus[{index, vram_mb}]`, `listen_port`, `health_path`,
   `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
   `admission_wait_timeout_seconds`, `pinned`, `set_visible_devices`,
@@ -1330,8 +1350,10 @@ mapping is a house convention that is easy to get wrong:
 Both paths run through one ingest whose sanitisation is **structural, not a
 string scan**: the `config` blob is re-parsed into a fully typed gateway-side
 mirror of the runtime-config schema and re-marshalled, so any field the agent
-sent that the struct does not model is silently dropped, and every `env` value
-across every spec is overwritten with a fixed mask before anything is stored.
+sent that the struct does not model is silently dropped — a spec's `config_files`
+and `api_token` among them: the mirror models neither, so the files'
+names and content never reach storage — and every `env` value across every spec
+is overwritten with a fixed mask before anything is stored.
 `source` and `parse_error` are clamped, and an empty or unparseable `config`
 degrades to `"{}"` rather than rejecting the report — which is what makes a
 broken local file diagnosable. Adding a `json.RawMessage` field here for

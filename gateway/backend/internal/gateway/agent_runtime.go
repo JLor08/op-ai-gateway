@@ -279,6 +279,11 @@ const runtimeReportParseErrorGeneric = "config parse error"
 // Not listed here (including the agent's own defensive "unclassified") means
 // the value degrades to runtimeReportParseErrorGeneric.
 //
+// invalid_config_file_name (#257) is a structural failure in the document: a
+// spec's config_files carries a name that is not one plain file name, or two
+// names that collide case-insensitively. The gateway enforces the same rules
+// at submit time, so only a hand-authored file-mode runtime.json reaches it.
+//
 // The last two are not parse failures at all: the agent raises them BEFORE
 // parsing, for a runtime.json that is not there or cannot be read. They ride
 // this field because its subject is "why the local file was not adopted", and
@@ -286,10 +291,11 @@ const runtimeReportParseErrorGeneric = "config parse error"
 // nothing, which rendered a missing file and a server with no specs
 // identically.
 var runtimeReportParseErrorCodes = map[string]bool{
-	"json_syntax":       true,
-	"duplicate_spec_id": true,
-	"file_missing":      true,
-	"read_failed":       true,
+	"json_syntax":              true,
+	"duplicate_spec_id":        true,
+	"invalid_config_file_name": true,
+	"file_missing":             true,
+	"read_failed":              true,
 }
 
 // redactRuntimeReportParseError keeps a file-mode report's parse_error only
@@ -350,10 +356,13 @@ type agentRuntimeReportSpecGPU struct {
 	VRAMMB int `json:"vram_mb"`
 }
 
-// agentRuntimeReportSpec mirrors AgentRuntimeSpecDTO, minus its one secret
-// field (api_token -- see the gap in the struct body). Env is the ONLY
-// secret-carrying field this schema keeps (design spec §4.6: "env values are
-// referential"), so its values are the sole redaction target in
+// agentRuntimeReportSpec mirrors AgentRuntimeSpecDTO, minus two fields that can
+// carry a secret: api_token (see the gap in the struct body) and config_files
+// (#257; likewise not modelled, so the sanitizer's re-parse drops the whole
+// facet, names included -- a file-mode config file's content can hold a literal
+// secret, and the agent masks it before it sends the report as well). Env is
+// the ONLY secret-carrying field this schema keeps (design spec §4.6: "env
+// values are referential"), so its values are the sole redaction target in
 // sanitizeRuntimeReportConfig. Every OTHER non-secret DTO field must appear
 // here, or the sanitizer's re-parse silently drops it from the stored report
 // (issue #64: visible_devices_mode, type and the probe paths were each lost
