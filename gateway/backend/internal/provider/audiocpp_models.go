@@ -26,7 +26,9 @@ const audiocppModelsPath = "/v1/models"
 // a transcription "yes". Every other task (the music tasks, ...) is a model that
 // does neither. One task answers BOTH capabilities at once: a model is never
 // both a synthesiser and a transcriber. (The transcription_streaming verdict is
-// not a task answer: it is read from the mode field below.)
+// not a task answer: it is read from the mode field below. The speech_clone
+// verdict is a task answer, and the only one that tells "tts" from "clone": see
+// AudioCppVerdicts.SpeechClone.)
 const (
 	audioCppTaskTTS   = "tts"
 	audioCppTaskClone = "clone"
@@ -70,19 +72,34 @@ const (
 // transcription capability, not even a "no". The mode never sets or clears the
 // task's verdicts (Speech, Transcription): an odd mode costs only this axis.
 //
+// SpeechClone is the fourth axis, a refinement of Speech: it says whether a speech
+// model synthesises only IN A REFERENCE VOICE, which a text-only caller (the
+// portal chat's speech picker) cannot supply. It is stated for the two speech
+// tasks ONLY, from the task alone: routing.CapabilityNo for task "tts" and
+// routing.CapabilityYes for task "clone". It is "" for everything else -- an asr
+// model, any other task (music, an unknown one), an entry with no task, no entry
+// for the model at all, an empty listing, an unreadable body -- because a model
+// that does not synthesise speech has no answer on a speech refinement, not even
+// a "no". It is set exactly when Speech is "yes", and the mode never moves it: it
+// refines Speech, it never replaces it (a clone model is still a Speech "yes", so
+// it stays a /v1/audio/speech candidate), and it gates no route.
+//
 // The verdict is the capability axis and is decided from the task (Speech,
-// Transcription) and, for an asr model, the mode (TranscriptionStreaming) alone.
-// Whether the model is loaded RIGHT NOW is the health axis: an asr model the server
-// lists as unloaded still carries task "asr", and stays a transcription "yes".
+// Transcription, SpeechClone) and, for an asr model, the mode
+// (TranscriptionStreaming) alone. Whether the model is loaded RIGHT NOW is the
+// health axis: an asr model the server lists as unloaded still carries task
+// "asr", and stays a transcription "yes".
 type AudioCppVerdicts struct {
 	Speech                 string
 	Transcription          string
 	TranscriptionStreaming string
+	SpeechClone            string
 }
 
 // AudioCppModelsProber is an optional provider capability: it GETs
-// target.Endpoint + /v1/models and derives the speech, transcription and
-// transcription streaming verdicts the listing states for modelID. A transport
+// target.Endpoint + /v1/models and derives the speech, transcription,
+// transcription streaming and speech clone verdicts the listing states for
+// modelID. A transport
 // failure or a non-2xx status is an error and carries no verdict, so the caller
 // writes nothing. A 2xx body that does not name the model, or cannot be read, is
 // NOT an error, only empty verdicts -- the caller writes nothing for an empty
@@ -153,8 +170,9 @@ type audioCppModelsDoc struct {
 	} `json:"data"`
 }
 
-// parseAudioCppModels derives the speech, transcription and
-// transcription_streaming verdicts for modelID from a /v1/models body. It is
+// parseAudioCppModels derives the speech, transcription,
+// transcription_streaming and speech_clone verdicts for modelID from a /v1/models
+// body. It is
 // TOLERANT, unlike the strict sdcpp document parser: a body that is not the
 // listing, or an entry of the wrong shape, yields the empty verdict rather than
 // an error, so a probe never breaks over an unexpected shape.
@@ -186,6 +204,16 @@ type audioCppModelsDoc struct {
 //
 // A mode of an unexpected type leaves the task's verdicts alone: it costs only the
 // streaming verdict.
+//
+// The speech_clone verdict is decided beside those, for the two speech tasks only,
+// from the entry's task alone:
+//   - the entry whose id is modelID, with task "tts" -> speech_clone "no"
+//   - the entry whose id is modelID, with task "clone" -> speech_clone "yes"
+//   - the entry whose id is modelID, with any other task (asr, music, an unknown
+//     one) or none -> speech_clone "", WHATEVER its mode: "speech clone" refines
+//     speech, so a model that does not synthesise speech is no "no" on it either
+//   - no entry for modelID, an empty data list, or an unreadable body ->
+//     speech_clone ""
 //
 // Only id, task and mode are read: loaded (and family, path) is deliberately
 // not decoded. Whether a model is loaded is the health axis, not the capability
@@ -220,8 +248,12 @@ func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 		var v AudioCppVerdicts
 		switch strings.ToLower(strings.TrimSpace(entry.Task)) {
 		case "":
-		case audioCppTaskTTS, audioCppTaskClone:
+		case audioCppTaskTTS:
 			v.Speech, v.Transcription = routing.CapabilityYes, routing.CapabilityNo
+			v.SpeechClone = routing.CapabilityNo
+		case audioCppTaskClone:
+			v.Speech, v.Transcription = routing.CapabilityYes, routing.CapabilityNo
+			v.SpeechClone = routing.CapabilityYes
 		case audioCppTaskASR:
 			v.Speech, v.Transcription = routing.CapabilityNo, routing.CapabilityYes
 			v.TranscriptionStreaming = audioCppStreamingVerdict(entry.Mode)

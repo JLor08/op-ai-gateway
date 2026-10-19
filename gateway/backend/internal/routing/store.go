@@ -1449,6 +1449,29 @@ const (
 	// Like CapabilityTranscription the string does not coincide with the billable
 	// unit (usage.BillingUnitAudioSecond).
 	CapabilityTranscriptionStreaming = "transcription_streaming"
+
+	// CapabilitySpeechClone means the model synthesises speech only IN A REFERENCE
+	// VOICE: audio.cpp's task "clone", whose synthesis needs a sample of the voice to
+	// copy, which a text-only caller (the portal chat's speech picker above all) has
+	// no way to supply. It refines CapabilitySpeech rather than standing beside it,
+	// and like CapabilityTranscriptionStreaming it is a name that does not gate a
+	// route: no request declares it required, so a clone model is still a speech
+	// candidate for POST /v1/audio/speech and a model without the row is still
+	// routed. What reads it is the portal's model listing, which folds it into a
+	// per-model flag the chat speech picker uses to leave a clone model out on a
+	// yes, and treats a no and no row at all alike -- the absence is "unknown",
+	// never "needs a voice".
+	//
+	// It is DERIVED from audio.cpp's /v1/models, the per-model task field of the same
+	// listing the speech and transcription verdicts come from
+	// (CapabilitySourceAudioCppModels): task "tts" is a no and task "clone" a yes. Any
+	// other task, none, or a model the listing does not name carries no row on it: a
+	// model that does not synthesise speech has no answer on a speech refinement, not
+	// even a no.
+	//
+	// Like CapabilitySpeech the string does not coincide with the billable unit
+	// (usage.BillingUnitAudioSecond).
+	CapabilitySpeechClone = "speech_clone"
 )
 
 // Capability verdicts.
@@ -1543,19 +1566,20 @@ const (
 //
 // CapabilitySourceAudioCppModels names the fifth probe-rank source: audio.cpp's
 // own model listing, GET /v1/models, from whose per-model task field the
-// CapabilitySpeech and CapabilityTranscription verdicts are derived, and from
-// whose mode field the CapabilityTranscriptionStreaming verdict is. It is named
-// for the document it read, like the sources above, and ranks 1 through
-// capabilitySourceRank's DEFAULT branch for the same reason: never able to
-// overwrite manual (3) or vision_benchmark (2), always able to repair its own
-// drift (1 vs 1).
+// CapabilitySpeech, CapabilityTranscription and CapabilitySpeechClone verdicts are
+// derived, and from whose mode field the CapabilityTranscriptionStreaming
+// verdict is. It is named for the document it read, like the sources above, and
+// ranks 1 through capabilitySourceRank's DEFAULT branch for the same reason:
+// never able to overwrite manual (3) or vision_benchmark (2), always able to
+// repair its own drift (1 vs 1).
 //
 // It has two producers, each reading that listing from where it can reach it:
 // the gateway's health loop, for an audio_cpp application (audioCppCapabilityRows
 // in cmd/gateway), and the agent's own read of the /v1/models of an audio.cpp
 // child it launched, which the gateway's agent ingest accepts under this source
-// for the speech, transcription and transcription_streaming rows only (and only
-// when the gateway declares the capability_source_audiocpp feature).
+// for the speech, transcription, transcription_streaming and speech_clone rows
+// only (and only when the gateway declares the capability_source_audiocpp
+// feature).
 //
 // It is the sdcpp_capabilities source's twin in the one respect that matters:
 // it is entitled to establish a "no" as well as a "yes", for each of its rows.
@@ -1567,8 +1591,10 @@ const (
 // says nothing about that model. The streaming row is the transcriber's own,
 // so it exists for an asr model only (mode "streaming" a yes, "offline" a
 // no, any other mode no row) and a model of any other task carries none, not
-// even a no. It writes the speech, transcription and transcription_streaming
-// rows, and no other.
+// even a no. The speech_clone row is the speech synthesiser's own, so it exists
+// for a tts model (a no) and a clone model (a yes) only, and a model of any other
+// task carries none, not even a no. It writes the speech, transcription,
+// transcription_streaming and speech_clone rows, and no other.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"

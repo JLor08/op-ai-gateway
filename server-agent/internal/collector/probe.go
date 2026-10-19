@@ -468,7 +468,16 @@ type Capabilities struct {
 	// "mode" its /v1/models entry states, and only for a model whose task is
 	// asr, so it is never set beside a Transcription of "no" or "".
 	TranscriptionStreaming string
-	Extra                  []string
+	// SpeechClone is whether a speech model synthesises ONLY in a reference
+	// voice ("yes"/"no"/""), refining Speech: a speech "yes" model that is
+	// "yes" here needs a sample of the voice to copy, which a text-only caller
+	// cannot supply, while one that is "no" speaks without one. Only the
+	// audio.cpp probe sets it, from the "task" its /v1/models entry states
+	// ("tts" is a no, "clone" a yes), and only for a model whose task is one of
+	// those two, so it is never set beside a Speech of "no" or "". It gates no
+	// route: it only describes the model.
+	SpeechClone string
+	Extra       []string
 }
 
 // detectCapabilities is the capability detector for a llama.cpp /props
