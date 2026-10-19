@@ -590,12 +590,12 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 }
 
 // audioCppCapabilityRows projects what one audio.cpp /v1/models listing says
-// about ONE model onto the store's row shape: up to three rows, a
-// routing.CapabilitySpeech row, a routing.CapabilityTranscription row and a
-// routing.CapabilityTranscriptionStreaming row, each attributed to
-// routing.CapabilitySourceAudioCppModels and stamped at, and each written only
-// when the listing answered yes or no for THAT capability (the streaming row has a
-// second condition, below). No answer is the
+// about ONE model onto the store's row shape: up to four rows, a
+// routing.CapabilitySpeech row, a routing.CapabilityTranscription row, a
+// routing.CapabilityTranscriptionStreaming row and a routing.CapabilitySpeechClone
+// row, each attributed to routing.CapabilitySourceAudioCppModels and stamped at, and
+// each written only when the listing answered yes or no for THAT capability (the
+// streaming and clone rows have a second condition, below). No answer is the
 // absence of a row -- "unknown" is exactly as in sdcppCapabilityRows -- so one
 // unanswered axis never suppresses another. Pure: no I/O.
 //
@@ -625,17 +625,31 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // its streaming verdict says. The parser already states no streaming verdict for such
 // a model; this is the same rule held at the row boundary, so a verdict assembled
 // elsewhere cannot put a transcription chip on a model that cannot transcribe.
+//
+// The clone row is the twin of the streaming row, one capability over: it says whether
+// a speech model synthesises only in a reference voice (a clone model, yes) or from
+// text alone (a plain tts model, no), the distinction the portal chat's speech picker
+// needs to keep a model it cannot drive out of the list (routing.CapabilitySpeechClone);
+// it gates no route either. It refines the speech capability, so it is written only for
+// a model whose speech verdict is yes: a model that does not synthesise speech (asr,
+// music, one the listing gives no task) carries no row on it, not even a "no", whatever
+// its clone verdict says. Same rule at the row boundary: a verdict assembled elsewhere
+// cannot put a clone chip on a model that cannot speak.
 func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing.CapabilityRow {
 	var rows []routing.CapabilityRow
 	for _, axis := range []struct{ capability, verdict string }{
 		{routing.CapabilitySpeech, v.Speech},
 		{routing.CapabilityTranscription, v.Transcription},
 		{routing.CapabilityTranscriptionStreaming, v.TranscriptionStreaming},
+		{routing.CapabilitySpeechClone, v.SpeechClone},
 	} {
 		if axis.verdict != routing.CapabilityYes && axis.verdict != routing.CapabilityNo {
 			continue
 		}
 		if axis.capability == routing.CapabilityTranscriptionStreaming && v.Transcription != routing.CapabilityYes {
+			continue
+		}
+		if axis.capability == routing.CapabilitySpeechClone && v.Speech != routing.CapabilityYes {
 			continue
 		}
 		rows = append(rows, routing.CapabilityRow{
