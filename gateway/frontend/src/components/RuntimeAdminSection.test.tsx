@@ -9383,7 +9383,11 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, 
 // files set through the API (which this form may never have touched) is the
 // property that matters most here.
 // ---------------------------------------------------------------------------
-describe('RuntimeAdminSection config files editor (#257)', () => {
+// Timeout raised from the 5000ms default: these tests drive many click-by-click
+// renders of this large form (each config-file row is two MUI text fields), which
+// can outrun 5s on a loaded/degraded CI runner even though they pass comfortably
+// otherwise. The behaviour under test is unchanged; only the deadline is relaxed.
+describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, () => {
   const filesOnTheServer = [
     { name: 'models.ini', content: '[a]\nmodel = /models/a.gguf\nport = ${PORT}\n' },
     { name: 'Chat.Template.jinja', content: '{{ messages }}\n' },
