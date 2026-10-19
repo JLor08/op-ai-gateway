@@ -131,6 +131,7 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				Binary:                      "/opt/bin-" + idx,
 				Args:                        `["--arg-` + idx + `"]`,
 				Env:                         `{"KEY_` + idx + `":"${AGENT_ENV:V}"}`,
+				ConfigFiles:                 `[{"name":"f-` + idx + `.json","content":"c-` + idx + ` ${MODEL}"}]`,
 				WorkDir:                     "/work-" + idx,
 				ListenPort:                  19000 + i,
 				HealthPath:                  "/health-" + idx,
@@ -247,7 +248,7 @@ func TestAgentRuntimeSpecsSchemaColumnsAllCovered(t *testing.T) {
 			seeded: []string{
 				"admin_state", "admission_wait_timeout_seconds", "api_flavors", "api_token",
 				"api_token_header", "api_token_header_source", "api_token_mode", "args", "binary_path",
-				"context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
+				"config_files", "context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
 				"id", "idle_timeout_seconds", "listen_port", "mapping_id", "messages_mode",
 				"metrics_path", "responses_mode", "startup_timeout_seconds", "type", "updated_at",
 				"visible_devices_mode", "work_dir",
