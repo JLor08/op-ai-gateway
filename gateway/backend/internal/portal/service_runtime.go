@@ -14,10 +14,12 @@ import (
 	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // CodeRuntimeSpecNotFound is ErrRuntimeSpecNotFound's API error code,
@@ -149,6 +151,14 @@ var (
 	// supplied -- typed, or named by the binary it is detected from. There is
 	// no spec shape whose refusal rests on state the request left alone.
 	ErrRuntimeSpecResponsesLiveTimingsUnsupported = errors.New("runtime_spec.responses_live_timings_unsupported")
+	// ErrRuntimeSpecConfigFilesInvalid rejects a config_files list that breaks
+	// any of validateRuntimeSpecConfigFiles' rules: a name that is not a single
+	// path segment, a repeated name, more than runtimeSpecConfigFilesMax files,
+	// a file over runtimeSpecConfigFileMaxBytes, or content carrying a secret
+	// placeholder (${API_TOKEN} / ${AGENT_ENV:...}). HTTP 400, and the message
+	// names the offending file and rule -- never its content, which can hold
+	// the very secret that tripped the check.
+	ErrRuntimeSpecConfigFilesInvalid = errors.New("runtime_spec.config_files_invalid")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -224,6 +234,22 @@ func runtimeSpecHealthPathDefault(t routing.RuntimeSpecType) string {
 // placeholders the agent resolves at launch time — never validated or
 // rewritten here; see the RuntimeSpecDTO.Env doc below).
 var runtimeSpecEnvKeyPattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
+
+const (
+	// runtimeSpecConfigFilesMax and runtimeSpecConfigFileMaxBytes bound a
+	// spec's config files (#257). They keep the opaque config_files column and
+	// the runtime-config document the agent polls small: 16 files of at most
+	// 64 KiB each is a megabyte at the very worst, far above any real model
+	// server config.
+	runtimeSpecConfigFilesMax     = 16
+	runtimeSpecConfigFileMaxBytes = 64 << 10
+)
+
+// runtimeSpecConfigFileSecretPlaceholders are the two placeholders that
+// resolve to a secret at launch time: the per-spec API token and an agent
+// environment variable. Config files are written to disk in the clear, so
+// neither may appear in their content (see validateRuntimeSpecConfigFiles).
+var runtimeSpecConfigFileSecretPlaceholders = []string{"${API_TOKEN}", "${AGENT_ENV:"}
 
 // --- binary absoluteness: the gateway-side mirror of the agent's check -----
 //
@@ -408,8 +434,8 @@ type RuntimeSpecDTO struct {
 	// Configured is false when the mapping has no runtime spec row yet — the
 	// only signal GetRuntimeSpec ever uses for "not configured". The document
 	// is then synthesized: ID is absent and MappingID is set; the spec's own
-	// fields are zero values (GPUs/Args/Env/APIFlavors non-nil but empty, both
-	// endpoint modes ""), except VisibleDevicesMode ("env") and
+	// fields are zero values (GPUs/Args/Env/APIFlavors/ConfigFiles non-nil but
+	// empty, both endpoint modes ""), except VisibleDevicesMode ("env") and
 	// APITokenMode/APITokenHeaderSource ("app"), which carry their defaults;
 	// AppAPITokenSet/AppAPITokenHeader echo the parent application; and the
 	// resolved echoes are computed from that empty spec: EffectiveType is
@@ -477,6 +503,12 @@ type RuntimeSpecDTO struct {
 	// means "use the type's default"); see routing.RuntimeSpec.
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
+	// ConfigFiles are the stored config files (#257), always non-nil on the
+	// wire ([] when there are none). Carried on the read-back so a loaded
+	// document spread through putRequestFromDTO keeps them: a benchmark
+	// admin-state write is a full-document upsert and would otherwise clear the
+	// operator's files.
+	ConfigFiles []ConfigFileDTO `json:"config_files"`
 	// EffectiveType / ResolvedMetricsPath / ResolvedContextProbePath are
 	// READ-ONLY echoes of routing.EffectiveRuntimeSpecType +
 	// routing.DeriveProbePaths -- what the agent will actually use once Type/
@@ -487,6 +519,16 @@ type RuntimeSpecDTO struct {
 	EffectiveType            string `json:"effective_type"`
 	ResolvedMetricsPath      string `json:"resolved_metrics_path"`
 	ResolvedContextProbePath string `json:"resolved_context_probe_path"`
+}
+
+// ConfigFileDTO is one operator-supplied config file of a runtime spec: a
+// single-segment file name and its content. The agent writes the files into an
+// agent-owned directory before it launches the child (#257). The content is
+// stored and shipped in the clear, which is why validateRuntimeSpecConfigFiles
+// refuses the secret placeholders in it.
+type ConfigFileDTO struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -557,6 +599,11 @@ type PutRuntimeSpecRequest struct {
 	Type             string `json:"type"`
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
+	// ConfigFiles are the files the agent writes before it launches the child
+	// (#257). Like every other field of this full-document request, absent
+	// means none: a PUT that omits them clears the stored set. Validated by
+	// validateRuntimeSpecConfigFiles.
+	ConfigFiles []ConfigFileDTO `json:"config_files,omitempty"`
 }
 
 // GetRuntimeSpec returns mappingID's runtime spec, or Configured:false when
@@ -589,6 +636,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			Args:                     []string{},
 			Env:                      map[string]string{},
 			GPUs:                     []RuntimeSpecGPUDTO{},
+			ConfigFiles:              []ConfigFileDTO{},
 			APIFlavors:               []string{},
 			VisibleDevicesMode:       string(routing.VisibleDevicesModeEnv),
 			APITokenMode:             string(routing.RuntimeAPITokenModeApp),
@@ -755,6 +803,7 @@ type runtimeSpecFields struct {
 	visibleMode        routing.VisibleDevicesMode
 	args               string // JSON
 	env                string // JSON
+	configFiles        string // JSON array of ConfigFileDTO; "" when there are none
 	healthPath         string
 	healthTimeout      int
 	startupTimeout     int
@@ -823,10 +872,16 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	// 400 where it used to report runtime_spec.metrics_path_invalid,
 	// runtime_spec.endpoint_mode_invalid or runtime_spec.flavor_invalid.
 	//
-	// Exactly one REQUEST-REFUSING rejection is left after it on the write
-	// path: capture.SealSecret's keyless-store failure (capture.ErrKeyRequired
-	// -> 400 runtime_spec.api_token_key_required), returned from either token
-	// branch of runtimeSpecAPIToken that seals, "random" or "set". It is
+	// The config_files validation (validateRuntimeSpecConfigFiles, #257) also
+	// runs after it, below the args/env encoding, for the same reason: it is
+	// newer than every check above, so it cannot rewrite the answer to a body
+	// that was already invalid for a shipped reason.
+	//
+	// Apart from that one, exactly one REQUEST-REFUSING rejection is left
+	// after it on the write path: capture.SealSecret's keyless-store failure
+	// (capture.ErrKeyRequired -> 400 runtime_spec.api_token_key_required),
+	// returned from either token branch of runtimeSpecAPIToken that seals,
+	// "random" or "set". It is
 	// write-path preparation rather than a request validation, and it is also
 	// the ONE place the two surfaces order things differently -- recorded here
 	// rather than smoothed over: CreateApplication and UpdateApplication both
@@ -881,6 +936,10 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 		return runtimeSpecFields{}, ErrRuntimeSpecEnvInvalid
 	}
 	f.args, f.env = string(argsJSON), string(envJSON)
+	f.configFiles, err = validateRuntimeSpecConfigFiles(req.ConfigFiles)
+	if err != nil {
+		return runtimeSpecFields{}, err
+	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
 	if f.healthPath == "" {
 		f.healthPath = runtimeSpecHealthPathDefault(effectiveSpecKind)
@@ -1089,6 +1148,7 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		Binary:                      f.binary,
 		Args:                        f.args,
 		Env:                         f.env,
+		ConfigFiles:                 f.configFiles,
 		WorkDir:                     strings.TrimSpace(req.WorkDir),
 		ListenPort:                  req.ListenPort,
 		HealthPath:                  f.healthPath,
@@ -1451,6 +1511,104 @@ func validateRuntimeSpecAPIToken(req PutRuntimeSpecRequest) error {
 	return nil
 }
 
+// validateRuntimeSpecConfigFiles validates a spec's config files (#257) and
+// returns the opaque JSON column value for them: "" for an empty or nil list
+// (the same "nothing" encoding an empty Args gets), else the marshalled list in
+// request order. Every refusal wraps ErrRuntimeSpecConfigFilesInvalid and names
+// the file and the rule it broke; it never quotes content.
+//
+// The rules, all checked before anything is stored:
+//   - at most runtimeSpecConfigFilesMax files;
+//   - each name is a single path segment (configFileNameIsSingleSegment);
+//   - names are unique, compared case-insensitively;
+//   - each content is at most runtimeSpecConfigFileMaxBytes bytes;
+//   - no content carries a secret placeholder: the agent writes these files in
+//     the clear (0600, but still a plain file next to the model), so a
+//     ${API_TOKEN} or ${AGENT_ENV:NAME} in one would put a secret at rest on
+//     disk. Secrets reach the child through Env/Args, never through a file.
+//
+// The agent re-checks the names itself before writing -- the gateway is not
+// the authority over the agent's filesystem, this is the early-feedback layer.
+func validateRuntimeSpecConfigFiles(files []ConfigFileDTO) (string, error) {
+	if len(files) == 0 {
+		return "", nil
+	}
+	if len(files) > runtimeSpecConfigFilesMax {
+		return "", fmt.Errorf("%w: at most %d config files are allowed, got %d",
+			ErrRuntimeSpecConfigFilesInvalid, runtimeSpecConfigFilesMax, len(files))
+	}
+	seen := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		if !configFileNameIsSingleSegment(f.Name) {
+			return "", fmt.Errorf("%w: config file name %q must be a single file name (no path separators, \"..\", drive or stream marker, or control characters)",
+				ErrRuntimeSpecConfigFilesInvalid, f.Name)
+		}
+		key := strings.ToLower(f.Name)
+		if _, dup := seen[key]; dup {
+			return "", fmt.Errorf("%w: duplicate config file name %q (names are compared case-insensitively)",
+				ErrRuntimeSpecConfigFilesInvalid, f.Name)
+		}
+		seen[key] = struct{}{}
+		if len(f.Content) > runtimeSpecConfigFileMaxBytes {
+			return "", fmt.Errorf("%w: config file %q is larger than %d bytes",
+				ErrRuntimeSpecConfigFilesInvalid, f.Name, runtimeSpecConfigFileMaxBytes)
+		}
+		for _, placeholder := range runtimeSpecConfigFileSecretPlaceholders {
+			if strings.Contains(f.Content, placeholder) {
+				return "", fmt.Errorf("%w: config file %q must not contain the secret placeholder %s -- files are written in the clear, pass secrets through env or args instead",
+					ErrRuntimeSpecConfigFilesInvalid, f.Name, placeholder)
+			}
+		}
+	}
+	encoded, err := json.Marshal(files)
+	if err != nil {
+		// Unreachable for a slice of two-string structs, but never swallow it.
+		return "", fmt.Errorf("%w: %w", ErrRuntimeSpecConfigFilesInvalid, err)
+	}
+	return string(encoded), nil
+}
+
+// configFileNameIsSingleSegment reports whether name is one plain file name the
+// agent can safely join under its config directory: non-blank, no path
+// separator of either OS, not "." or "..", no volume or alternate-data-stream
+// marker (":"), and no control character.
+//
+// The separators and the colon are rejected explicitly rather than left to
+// filepath.Base: Base is per-GOOS, the gateway is OS-agnostic, and the agent
+// that writes the file may run on Windows while this check runs on Linux
+// (the same reasoning as runtimeSpecBinaryIsAbsolute). filepath.Base is kept
+// as an extra guard, so a form the explicit rules missed still has to survive
+// the local OS's own idea of a base name.
+func configFileNameIsSingleSegment(name string) bool {
+	if strings.TrimSpace(name) == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\:`) || strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return false
+	}
+	return filepath.Base(name) == name && !filepath.IsAbs(name)
+}
+
+// decodeRuntimeSpecConfigFiles is the inverse of validateRuntimeSpecConfigFiles'
+// encoding: the stored column back to a list, always non-nil. "" is the stored
+// form of "no files" -- every row written before #257 has it -- so unlike Args
+// and Env it is not an error. Anything else that fails to parse is a corrupt
+// stored row, not a client-input problem, and surfaces as the domain sentinel
+// rather than a raw JSON error (the Args/Env convention in runtimeSpecDTO).
+func decodeRuntimeSpecConfigFiles(stored string) ([]ConfigFileDTO, error) {
+	files := []ConfigFileDTO{}
+	if stored == "" {
+		return files, nil
+	}
+	if err := json.Unmarshal([]byte(stored), &files); err != nil {
+		return nil, ErrRuntimeSpecConfigFilesInvalid
+	}
+	if files == nil {
+		files = []ConfigFileDTO{}
+	}
+	return files, nil
+}
+
 // validateRuntimeSpecGPUs rejects a negative GPU index, a negative VRAM
 // estimate, or a GPU index repeated across entries — all ErrRuntimeSpecGPUInvalid,
 // checked BEFORE any store call (the store's own duplicate-index guard
@@ -1491,6 +1649,10 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 	}
 	if env == nil {
 		env = map[string]string{}
+	}
+	configFiles, err := decodeRuntimeSpecConfigFiles(spec.ConfigFiles)
+	if err != nil {
+		return RuntimeSpecDTO{}, err
 	}
 	gpuDTOs := make([]RuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
@@ -1536,6 +1698,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		Type:                        spec.Type,
 		MetricsPath:                 spec.MetricsPath,
 		ContextProbePath:            spec.ContextProbePath,
+		ConfigFiles:                 configFiles,
 		EffectiveType:               string(effectiveType),
 		ResolvedMetricsPath:         resolvedMetrics,
 		ResolvedContextProbePath:    resolvedContext,

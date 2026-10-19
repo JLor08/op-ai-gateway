@@ -48,6 +48,10 @@ func benchmarkSpecFixture(t *testing.T) (*Service, func() []string, string, Runt
 		APIFlavors:    []string{routing.APIFlavorOpenAI},
 		ResponsesMode: string(routing.EndpointModeDisabled),
 		MessagesMode:  string(routing.EndpointModeTranslate),
+		// Config files too (#257): the benchmark writers spread this loaded
+		// document back through PutRuntimeSpec, which treats an absent
+		// config_files as "clear them".
+		ConfigFiles: []ConfigFileDTO{{Name: "server.json", Content: `{"threads":8}`}},
 	})
 	if err != nil {
 		t.Fatalf("PutRuntimeSpec: %v", err)
@@ -156,6 +160,7 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		SetVisibleDevices:           true,
 		VisibleDevicesMode:          string(routing.VisibleDevicesModeArgs),
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 3, VRAMEstimateMB: 12000, VRAMMeasuredMB: 11500}},
+		ConfigFiles:                 []ConfigFileDTO{{Name: "server.json", Content: `{"threads":8}`}},
 		APIFlavors:                  []string{routing.APIFlavorOpenAI},
 		ResponsesMode:               string(routing.EndpointModeDisabled),
 		MessagesMode:                string(routing.EndpointModeTranslate),
@@ -190,6 +195,7 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
+		ConfigFiles:                 dto.ConfigFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,

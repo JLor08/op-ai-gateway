@@ -50,6 +50,7 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
+		ConfigFiles:                 dto.ConfigFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,

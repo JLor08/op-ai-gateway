@@ -160,6 +160,31 @@ func TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400(t *testing.T) {
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400 pins the WIRE
+// contract of portal.ErrRuntimeSpecConfigFilesInvalid (#257): 400 with its own
+// code, a message that names the offending file and rule, and no echo of the
+// file's content. Without a row in portalRuntimeSpecErrRows the sentinel would
+// fall through to the 500 fallback, as the tests above describe.
+func TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","config_files":[{"name":"server.json","content":"{\"key\":\"${API_TOKEN}\"}"}]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.config_files_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.config_files_invalid", code)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "server.json") || !strings.Contains(got, "secret placeholder") {
+		t.Fatalf("body = %s, want a message naming the file and the secret-placeholder rule", got)
+	}
+	if strings.Contains(rec.Body.String(), `{\"key\"`) {
+		t.Fatalf("body = %s echoes the file content", rec.Body.String())
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutAcceptsAudioCppAndOpenAIAudio pins the
 // wire side of the audio.cpp configuration: an explicit audio_cpp type with the
 // openai_audio flavor is saved and echoed (200, neither runtime_spec.type_invalid
