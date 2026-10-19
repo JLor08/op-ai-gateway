@@ -564,9 +564,9 @@ func allowedDirBase(entry string) string {
 // substitution happens, never after.
 var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 
-// ExpandPlaceholders resolves every ${PORT}, ${MODEL}, ${HOST_GPU_IDS} and
-// ${AGENT_ENV:NAME} occurrence in spec.Args and spec.Env values, and builds
-// the exact environment the child process will receive.
+// ExpandPlaceholders resolves every ${PORT}, ${MODEL}, ${HOST_GPU_IDS},
+// ${CONFIG_DIR} and ${AGENT_ENV:NAME} occurrence in spec.Args and spec.Env
+// values, and builds the exact environment the child process will receive.
 //
 // ${PORT} becomes the decimal port chosen for this process. ${MODEL} becomes
 // spec.UpstreamModel, the application-side model name (see the ${MODEL}
@@ -779,8 +779,19 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // byte-identical environment to the one it received before this option existed
 // (TestExpandPlaceholdersVisibleDevicesOffIsUnchanged).
 //
+// ${CONFIG_DIR} is the FIFTH token (#257), exact match only for the same reason
+// as ${MODEL}. It resolves to filepath.Join(configFilesDir, spec.ID): the
+// per-spec directory the agent writes spec.ConfigFiles into, so a spec can
+// point its model server at them (["--models-preset", "${CONFIG_DIR}/models.ini"])
+// without hard-coding an agent-side path that differs per host. configFilesDir
+// is the agent's config_files_dir setting, passed in rather than read from
+// package state so this function stays a pure function of its arguments. It is
+// a plain, NON-secret value: no secretSpan is recorded and the reported
+// command shows the resolved path.
+//
 // Arbitrary OTHER "${...}" text -- a model server's own templating syntax --
-// still passes through untouched; this function owns only these four tokens.
+// still passes through untouched; this function owns only these five tokens
+// (plus ${API_TOKEN} and the ${*_DEVICES} family documented where they resolve).
 // Provenance is recorded, not reconstructed. expandSpec below returns, beside
 // the argv and environment the child actually receives, the exact byte spans
 // of each result string that came from an ${AGENT_ENV:NAME} substitution --
@@ -788,8 +799,8 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // that performed the substitution. command.go turns that into the masked,
 // reportable ResolvedCommand; see its doc for why span-level provenance is
 // the only honest basis for masking a resolved command.
-func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string) (args []string, env []string, err error) {
-	ex, err := expandSpec(spec, port, vendor, getenv)
+func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
+	ex, err := expandSpec(spec, port, vendor, getenv, configFilesDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -857,7 +868,7 @@ type expandedSpec struct {
 // observable; it changes no classification and no error. A failing match
 // returns immediately rather than setting a first-error and walking on, which
 // yields the identical error because the walk was, and is, left to right.
-func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string) (expandedSpec, error) {
+func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
 	gpuIDs := hostGPUIDs(spec)
 
 	expand := func(s string) (string, []secretSpan, error) {
@@ -923,6 +934,20 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, getenv func(string) strin
 					return "", nil, fmt.Errorf("${METAL_DEVICES} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device")
 				}
 				b.WriteString(deviceList(spec, "MTL"))
+				continue
+			}
+
+			// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and
+			// friends are plausible pass-through tokens. The per-spec directory
+			// the agent provisions this spec's config_files into (#257):
+			// <config_files_dir>/<spec.ID>. NOT a secret -- it is an agent-chosen
+			// path the operator needs to read in the reported command -- so it
+			// records no secretSpan and is never masked, exactly like ${PORT}
+			// and ${MODEL}. No empty-value refusal: configFilesDir has a
+			// non-empty default at runtime, and spec.ID is the spec's identity,
+			// so the join is never a hole in a path.
+			if inner == "CONFIG_DIR" {
+				b.WriteString(filepath.Join(configFilesDir, spec.ID))
 				continue
 			}
 

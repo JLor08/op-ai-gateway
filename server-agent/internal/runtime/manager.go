@@ -1764,7 +1764,7 @@ func (o *owner) startProcess(st *specState) {
 	// substitutes a decimal string for ${PORT}), so this dry run with a
 	// placeholder port is a faithful pre-check; the real port is
 	// substituted in the second call below once one is available.
-	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.getenv); err != nil {
+	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.getenv, o.configFilesDir); err != nil {
 		o.setNotPermitted(st, err.Error())
 		return
 	}
@@ -1782,7 +1782,7 @@ func (o *owner) startProcess(st *specState) {
 		port = p
 	}
 
-	ex, err := expandSpec(spec, port, o.gpuVendor, o.getenv)
+	ex, err := expandSpec(spec, port, o.gpuVendor, o.getenv, o.configFilesDir)
 	if err != nil {
 		// Already validated above (that dry run used port 0); reaching
 		// here would mean ExpandPlaceholders' result depends on the port
