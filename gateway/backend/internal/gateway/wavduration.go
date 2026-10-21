@@ -63,19 +63,16 @@ const (
 // slack bounds what a forger can still get billed as nothing to that many bytes of
 // audio per request.
 func wavDurationFromReader(r io.Reader) (int64, bool) {
-	var riff [wavRIFFHeaderLen]byte
-	if _, err := io.ReadFull(r, riff[:]); err != nil || string(riff[0:4]) != "RIFF" || string(riff[8:12]) != "WAVE" {
+	if !wavReadRIFFHeader(r) {
 		return 0, false
 	}
 
 	var byteRate uint32
 	for {
-		var header [wavChunkHeaderLen]byte
-		if _, err := io.ReadFull(r, header[:]); err != nil {
+		id, size, ok := wavReadChunkHeader(r)
+		if !ok {
 			return 0, false
 		}
-		id := string(header[0:4])
-		size := binary.LittleEndian.Uint32(header[4:])
 
 		consumed := uint64(0) // bytes of the chunk body already read
 		switch id {
@@ -93,6 +90,53 @@ func wavDurationFromReader(r io.Reader) (int64, bool) {
 			return 0, false
 		}
 	}
+}
+
+// wavByteRateFromReader returns the byte rate (sample rate x channels x bytes per
+// sample) of a PCM WAV stream, read from its `fmt ` chunk, and true. It returns
+// (0, false) for a stream that is not RIFF/WAVE and for a `fmt ` chunk that is
+// truncated, too short to carry a byte rate or not consistent with itself (see
+// wavConsistentByteRate), and for a stream whose `data` chunk comes before any `fmt `
+// chunk (wavDurationFromReader does not believe one that follows `data` either).
+//
+// It stops at the `fmt ` chunk: the audio is never read, so a response can be
+// measured from its first bytes, and any chunk ahead of `fmt ` is passed over. The
+// rate is the PCM FORMAT's constant, the divisor that turns PCM bytes into seconds
+// (a streamed speech response is billed as pcmBytes / byteRate), not a throughput.
+func wavByteRateFromReader(r io.Reader) (uint32, bool) {
+	if !wavReadRIFFHeader(r) {
+		return 0, false
+	}
+	for {
+		id, size, ok := wavReadChunkHeader(r)
+		if !ok || id == "data" {
+			return 0, false
+		}
+		if id == "fmt " {
+			return wavReadFmtByteRate(r, size)
+		}
+		if !wavSkipChunkRest(r, size, 0) {
+			return 0, false
+		}
+	}
+}
+
+// wavReadRIFFHeader consumes the 12-byte RIFF container header and reports whether
+// it declares a WAVE file.
+func wavReadRIFFHeader(r io.Reader) bool {
+	var riff [wavRIFFHeaderLen]byte
+	_, err := io.ReadFull(r, riff[:])
+	return err == nil && string(riff[0:4]) == "RIFF" && string(riff[8:12]) == "WAVE"
+}
+
+// wavReadChunkHeader consumes one chunk header and returns the chunk's id and the
+// size of its body, and false when the stream ends inside the header.
+func wavReadChunkHeader(r io.Reader) (id string, size uint32, ok bool) {
+	var header [wavChunkHeaderLen]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return "", 0, false
+	}
+	return string(header[0:4]), binary.LittleEndian.Uint32(header[4:]), true
 }
 
 // wavReadFmtByteRate reads the fixed PCM part of a `fmt ` chunk whose declared body

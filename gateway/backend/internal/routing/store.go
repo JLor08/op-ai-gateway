@@ -1383,6 +1383,15 @@ type ModelMappingCacheRow struct {
 // after the model is unloaded.
 const ModelMappingCacheVoices = "voices"
 
+// ModelMappingCacheOutputByteRate is the cache type of a mapping's speech output
+// byte rate: ScopeKey "", Payload the PCM format rate as a decimal integer of bytes
+// per second (sample rate x channels x bytes per sample, 88200 for a 44.1 kHz mono
+// 16-bit model). It is the constant that turns the PCM bytes of a streamed speech
+// response into audio seconds, read from the `fmt` chunk of a non-stream WAV answer
+// (wavByteRateFromReader) and cached because a streamed response carries no header
+// to read it from. It is not a throughput.
+const ModelMappingCacheOutputByteRate = "output_byte_rate"
+
 // ValidateModelMappingCacheRow rejects a row that cannot be a meaningful cache
 // entry: one without a cache type (nothing could ever read it back by type).
 // Both UpsertModelMappingCache implementations call this exact function, so the

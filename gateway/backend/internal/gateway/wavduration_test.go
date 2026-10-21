@@ -107,6 +107,66 @@ func wavDurationMillis(b []byte) (int64, bool) {
 	return wavDurationFromReader(bytes.NewReader(b))
 }
 
+// wavByteRate reads the byte rate of a WAV held in memory: wavByteRateFromReader, the
+// production entry point, over a byte slice (the twin of wavDurationMillis).
+func wavByteRate(b []byte) (uint32, bool) {
+	return wavByteRateFromReader(bytes.NewReader(b))
+}
+
+// The byte rate is the PCM FORMAT rate (sample rate x channels x bytes per sample),
+// read from the `fmt ` chunk alone: the audio after it is never needed, so the
+// fixtures below are as often header-only as complete files.
+func TestWavByteRateFromReader(t *testing.T) {
+	list := wavChunk(t, "LIST", 5, []byte("INFOx"))
+	for _, tc := range []struct {
+		name string
+		in   []byte
+		want uint32
+	}{
+		{"44.1kHz mono 16-bit", buildPCMWav(t, 44100, 1, 16, 4410), 88200},
+		{"24kHz mono 16-bit", buildPCMWav(t, 24000, 1, 16, 2400), 48000},
+		{"44.1kHz stereo 16-bit", buildPCMWav(t, 44100, 2, 16, 4410), 176400},
+		{"empty data chunk", buildPCMWav(t, 44100, 1, 16, 0), 88200},
+		{"fmt only, the body never follows", wavFile(t, wavFmtChunk(t, 44100, 1, 16)), 88200},
+		{"a foreign chunk before fmt is passed over, odd length and pad byte included", wavFile(t, list, wavFmtChunk(t, 24000, 1, 16), wavDataChunk(t, 100)), 48000},
+		{"a foreign chunk between fmt and data is never reached", buildPCMWavWithLeadingChunk(t, 24000, 1, 16, 100), 48000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rate, ok := wavByteRate(tc.in)
+			if !ok || rate != tc.want {
+				t.Fatalf("wavByteRate = (%d, %v), want (%d, true)", rate, ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestWavByteRateFromReaderRejectsWhatIsNotAnAgreeingWav(t *testing.T) {
+	validFmt := wavFmtChunk(t, 44100, 1, 16)
+	for _, tc := range []struct {
+		name string
+		in   []byte
+	}{
+		{"nil", nil},
+		{"not a wav", []byte("not a wav")},
+		{"riff but webm", []byte("RIFF\x00\x00\x00\x00WEBM")},
+		{"header only, no chunks", []byte("RIFF\x04\x00\x00\x00WAVE")},
+		{"fmt chunk truncated mid-body", buildPCMWav(t, 44100, 1, 16, 100)[:wavRIFFHeaderLen+wavChunkHeaderLen+wavFmtMinLen-1]},
+		{"fmt chunk too short to carry a byte rate", wavFile(t, wavChunk(t, "fmt ", 8, make([]byte, 8)), wavDataChunk(t, 100))},
+		{"data before fmt", wavFile(t, wavDataChunk(t, 100), validFmt)},
+		{"no fmt chunk", wavFile(t, wavChunk(t, "LIST", 5, []byte("INFOx")))},
+		{"byte rate inflated 100x", wavFile(t, wavFmtChunkWith(t, 1, 44100, 8820000, 2, 16), wavDataChunk(t, 100))},
+		{"byte rate zero", wavFile(t, wavFmtChunkWith(t, 1, 44100, 0, 2, 16), wavDataChunk(t, 100))},
+		{"block align not channels x sample size", wavFile(t, wavFmtChunkWith(t, 2, 44100, 88200, 2, 16), wavDataChunk(t, 100))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rate, ok := wavByteRate(tc.in)
+			if ok || rate != 0 {
+				t.Fatalf("wavByteRate = (%d, %v), want (0, false)", rate, ok)
+			}
+		})
+	}
+}
+
 func TestWavDurationMillis(t *testing.T) {
 	for _, tc := range []struct {
 		name           string

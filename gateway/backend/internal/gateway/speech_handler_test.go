@@ -1063,3 +1063,77 @@ func TestSpeechMeteringHeaders(t *testing.T) {
 		t.Error("a nil header must yield nil")
 	}
 }
+
+// cachedOutputByteRate reads the PCM format rate a mapping's speech benchmark
+// cached (cache type output_byte_rate, scope ""). Anything but a positive integer
+// that fits a uint32 reads as "not known", because the caller divides by it.
+func TestCachedOutputByteRate(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	const mappingID = "route_mock_qwen" // seeded by seedGatewayTestRoutes
+	newServer := func(t *testing.T) (*Server, *routing.MemoryStore) {
+		t.Helper()
+		routes := routing.NewMemoryStore()
+		seedGatewayTestRoutes(routes, now)
+		return &Server{Routes: routes}, routes
+	}
+	put := func(t *testing.T, routes *routing.MemoryStore, scopeKey, payload string) {
+		t.Helper()
+		row := routing.ModelMappingCacheRow{MappingID: mappingID, CacheType: routing.ModelMappingCacheOutputByteRate, ScopeKey: scopeKey, Payload: payload, UpdatedAt: now}
+		if err := routes.UpsertModelMappingCache(ctx, row); err != nil {
+			t.Fatalf("UpsertModelMappingCache: %v", err)
+		}
+	}
+
+	t.Run("a cached rate reads back", func(t *testing.T) {
+		s, routes := newServer(t)
+		put(t, routes, "", "88200")
+		if rate, ok := s.cachedOutputByteRate(ctx, mappingID); !ok || rate != 88200 {
+			t.Fatalf("cachedOutputByteRate = (%d, %v), want (88200, true)", rate, ok)
+		}
+	})
+	t.Run("the cache type is the output_byte_rate string", func(t *testing.T) {
+		if routing.ModelMappingCacheOutputByteRate != "output_byte_rate" {
+			t.Fatalf("ModelMappingCacheOutputByteRate = %q, want %q", routing.ModelMappingCacheOutputByteRate, "output_byte_rate")
+		}
+	})
+	t.Run("an unseen mapping and one with no row read as unknown", func(t *testing.T) {
+		s, _ := newServer(t)
+		for _, id := range []string{mappingID, "no-such-mapping", ""} {
+			if rate, ok := s.cachedOutputByteRate(ctx, id); ok || rate != 0 {
+				t.Errorf("cachedOutputByteRate(%q) = (%d, %v), want (0, false)", id, rate, ok)
+			}
+		}
+	})
+	t.Run("another cache type is not the rate", func(t *testing.T) {
+		s, routes := newServer(t)
+		row := routing.ModelMappingCacheRow{MappingID: mappingID, CacheType: routing.ModelMappingCacheVoices, Payload: "88200", UpdatedAt: now}
+		if err := routes.UpsertModelMappingCache(ctx, row); err != nil {
+			t.Fatalf("UpsertModelMappingCache: %v", err)
+		}
+		if rate, ok := s.cachedOutputByteRate(ctx, mappingID); ok || rate != 0 {
+			t.Fatalf("cachedOutputByteRate = (%d, %v), want (0, false)", rate, ok)
+		}
+	})
+	t.Run("only the scope-empty row is the rate", func(t *testing.T) {
+		s, routes := newServer(t)
+		put(t, routes, "some-scope", "88200")
+		if rate, ok := s.cachedOutputByteRate(ctx, mappingID); ok || rate != 0 {
+			t.Fatalf("cachedOutputByteRate = (%d, %v), want (0, false)", rate, ok)
+		}
+	})
+	t.Run("a payload that is not a usable rate reads as unknown", func(t *testing.T) {
+		for _, payload := range []string{"", "  ", "abc", "88200.5", "-1", "0", "4294967296", `{"rate":88200}`} {
+			s, routes := newServer(t)
+			put(t, routes, "", payload)
+			if rate, ok := s.cachedOutputByteRate(ctx, mappingID); ok || rate != 0 {
+				t.Errorf("payload %q: cachedOutputByteRate = (%d, %v), want (0, false)", payload, rate, ok)
+			}
+		}
+	})
+	t.Run("a server without a route store reads as unknown", func(t *testing.T) {
+		if rate, ok := (&Server{}).cachedOutputByteRate(ctx, mappingID); ok || rate != 0 {
+			t.Fatalf("cachedOutputByteRate = (%d, %v), want (0, false)", rate, ok)
+		}
+	})
+}

@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -390,6 +391,36 @@ func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.
 		return
 	}
 	meta.BillingQuantity = seconds
+}
+
+// cachedOutputByteRate returns the PCM byte rate cached for the mapping routeID
+// (routing.ModelMappingCacheOutputByteRate, the scope-"" row) and true. It returns
+// (0, false) when the rate is not known: no route store, no such row, a payload that
+// is not a positive integer fitting a uint32 (the caller divides by it, so a zero is
+// no rate), or a store failure (logged at Warn). Every unknown reads the same
+// because the caller has one fallback for all of them -- bill the streamed bytes
+// themselves -- and a billing path has no business failing a response over a missing
+// optimization.
+func (s *Server) cachedOutputByteRate(ctx context.Context, routeID string) (uint32, bool) {
+	if s.Routes == nil || routeID == "" {
+		return 0, false
+	}
+	rows, err := s.Routes.ModelMappingCache(ctx, routeID, routing.ModelMappingCacheOutputByteRate)
+	if err != nil {
+		slog.Warn("output byte rate cache read failed; the streamed speech call falls back to bytes", "mapping_id", routeID, "err", err)
+		return 0, false
+	}
+	for _, row := range rows {
+		if row.ScopeKey != "" {
+			continue
+		}
+		rate, err := strconv.ParseUint(strings.TrimSpace(row.Payload), 10, 32)
+		if err != nil || rate == 0 {
+			return 0, false // ParseUint returns its range maximum with an error: never hand that out as a rate
+		}
+		return uint32(rate), true
+	}
+	return 0, false
 }
 
 // speechMeteringHeaderPrefix is the lower-cased prefix of the headers audio.cpp
