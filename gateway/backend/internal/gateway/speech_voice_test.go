@@ -255,31 +255,29 @@ func TestSpeechRoutesAChosenVoiceToTheServerThatHasIt(t *testing.T) {
 	})
 }
 
-// FAIL-OPEN, the existing-client guarantee: when a candidate's voice status is UNKNOWN --
-// a gateway with nothing cached yet -- a named voice (a known name or free text) routes
-// exactly as a request with no voice does, so a bearer client that always sent its own
-// voice name is neither refused nor re-routed (unknown is not absent). A voice a FULLY
-// voice-cached fleet is known to lack is a different case, see
-// TestSpeechUnknownVoiceOnAFullyCachedFleetIsRefused.
+// FAIL-OPEN, the existing-client guarantee: a voice the gateway does not know (free text,
+// a name no cached list holds) and a gateway with nothing cached at all route exactly as a
+// request with no voice does, so a bearer client that always sent its own voice name is
+// not refused and not re-routed.
 func TestSpeechFreeTextVoiceIsUnaffected(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		model string
-		voice string
+		name        string
+		cacheVoices bool
+		model       string
+		voice       string
 	}{
-		{"a known voice name, nothing cached yet (model)", "tts-voice", "bella"},
-		{"a known voice name, nothing cached yet (group)", "tts-group", "bella"},
-		{"a free-text voice, nothing cached yet (model)", "tts-voice", "my-own-voice"},
-		{"a free-text voice, nothing cached yet (group)", "tts-group", "my-own-voice"},
+		{"an unknown voice on a model", true, "tts-voice", "my-own-voice"},
+		{"an unknown voice on a group", true, "tts-group", "my-own-voice"},
+		{"a known voice name, nothing cached yet (model)", false, "tts-voice", "bella"},
+		{"a known voice name, nothing cached yet (group)", false, "tts-group", "bella"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Two fresh worlds, one request each: consecutive requests in ONE world are not
 			// comparable, because the gateway's swap protection steers the second away from the
-			// server the first just used. Nothing is cached, so every candidate is of unknown
-			// voice status and nothing narrows.
-			want := newSpeechVoiceWorld(t, false)
+			// server the first just used.
+			want := newSpeechVoiceWorld(t, tc.cacheVoices)
 			wantServer := want.servedBy(t, want.speak(t, tc.model, "")) // today's choice with no voice at all
-			w := newSpeechVoiceWorld(t, false)
+			w := newSpeechVoiceWorld(t, tc.cacheVoices)
 			if got := w.servedBy(t, w.speak(t, tc.model, tc.voice)); got != wantServer {
 				t.Fatalf("voice %q served by %q, want %q (the same server as with no voice)", tc.voice, got, wantServer)
 			}
@@ -287,38 +285,11 @@ func TestSpeechFreeTextVoiceIsUnaffected(t *testing.T) {
 	}
 }
 
-// On a FULLY voice-cached fleet a voice no candidate lists is KNOWN-ABSENT everywhere, so
-// it is refused rather than relayed to an upstream already known to reject it. The model
-// path answers 503 routing.voice_unavailable (the pool narrowed to empty); the group path
-// answers 404 routing.no_model_route, because the group threading reads a member whose every
-// candidate the voice excludes as having no mapping (by design, unchanged here). No upstream
-// is called either way.
-func TestSpeechUnknownVoiceOnAFullyCachedFleetIsRefused(t *testing.T) {
-	for _, tc := range []struct {
-		model, wantCode string
-		wantStatus      int
-	}{
-		{"tts-voice", "routing.voice_unavailable", http.StatusServiceUnavailable},
-		{"tts-group", "routing.no_model_route", http.StatusNotFound},
-	} {
-		t.Run(tc.model, func(t *testing.T) {
-			w := newSpeechVoiceWorld(t, true)
-			rec := w.speak(t, tc.model, "my-own-voice")
-			if rec.Code != tc.wantStatus {
-				t.Fatalf("status = %d, want %d; body = %s", rec.Code, tc.wantStatus, rec.Body.String())
-			}
-			requireErrorCode(t, rec.Body.String(), tc.wantCode)
-			requireNoSpeechUpstreamCall(t, w.callsA)
-			requireNoSpeechUpstreamCall(t, w.callsB)
-		})
-	}
-}
-
 // The voice's servers are all unusable: a dedicated 503 routing.voice_unavailable, in the
 // body AND on the usage row, where the generic routing.no_healthy_host would otherwise be
 // -- and no upstream is called. The controls show the refusal is about this voice only:
-// the healthy server's own voice (narrowed to it), and no voice at all, are still served by
-// the same world.
+// the healthy server's voice, and a voice nobody is known to offer (not narrowed, so not
+// refused), are still served by the same world.
 func TestSpeechVoiceOnADownServerIsRefusedAsVoiceUnavailable(t *testing.T) {
 	// One request per world (see TestSpeechFreeTextVoiceIsUnaffected for why), with
 	// server b, the only one that offers bella, unhealthy.
@@ -352,7 +323,7 @@ func TestSpeechVoiceOnADownServerIsRefusedAsVoiceUnavailable(t *testing.T) {
 				t.Fatalf("row = status %d/%q/%q flavor %q, want 503/error/routing.voice_unavailable/%s", got.HTTPStatus, got.Status, got.ErrorCode, got.APIFlavor, apiFlavorSpeech)
 			}
 
-			for _, voice := range []string{"alba", ""} {
+			for _, voice := range []string{"alba", "my-own-voice", ""} {
 				w := downB(t)
 				if got := w.servedBy(t, w.speak(t, model, voice)); got != "a" {
 					t.Fatalf("voice %q served by %q, want the healthy server a", voice, got)

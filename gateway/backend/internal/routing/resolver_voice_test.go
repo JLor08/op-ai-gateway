@@ -162,20 +162,21 @@ func TestVoiceStandardUncachedSiblingStaysEligible(t *testing.T) {
 	})
 }
 
-// FAIL-OPEN on UNKNOWN: when NO candidate is known to lack the voice -- nothing cached
-// anywhere, or a mix of a voice-listing candidate and an uncached (unknown) sibling -- the
-// voice narrows nothing and the request routes exactly as it does without a voice (an
-// existing bearer client that sends a free-text voice to a fleet not yet voice-cached
-// keeps working; the upstream stays the authority on the name). It is silent at the
-// default log level too.
+// FAIL-OPEN: a voice no candidate is KNOWN to offer -- never cached (all unknown), or cached
+// on every candidate but listed by none (all known-absent: nothing is known to offer it,
+// cached-empty included) -- does not filter, so the request routes as it does with no voice
+// at all (existing bearer clients that send a free-text voice keep working, and the upstream
+// stays the authority). Silent at the default log level. (An undecodable row is a separate
+// case: it stays eligible, see TestVoiceStandardUndecodableRowStaysEligible.)
 func TestVoiceStandardUnknownVoiceDoesNotFilter(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		voicesA, voicesB []string
 		ask              string
 	}{
-		{name: "nothing cached anywhere", ask: "bella"},
-		{name: "a voice one lists while the sibling is uncached", voicesA: []string{"bella"}, ask: "bella"},
+		{name: "a voice nothing lists (all known-absent)", voicesA: []string{"alba"}, voicesB: []string{"bella"}, ask: "nobody-has-this"},
+		{name: "nothing cached anywhere (all unknown)", ask: "bella"},
+		{name: "cached, and empty everywhere", voicesA: []string{}, voicesB: []string{}, ask: "bella"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureSlog(t)
@@ -187,33 +188,6 @@ func TestVoiceStandardUnknownVoiceDoesNotFilter(t *testing.T) {
 			}
 			if out := logs.String(); out != "" {
 				t.Fatalf("log = %q, want nothing at the default level", out)
-			}
-		})
-	}
-}
-
-// KNOWN-ABSENT everywhere is NOT fail-open: when every candidate has a cached voices row
-// and none lists the voice (a cached-empty "[]" list included), the gateway KNOWS no
-// server offers it, so the pool narrows to empty and the request is voice_unavailable --
-// it is not routed to a server already known to reject it. Both servers are healthy here;
-// the voice alone empties the pool.
-func TestVoiceStandardKnownAbsentEverywhereIsVoiceUnavailable(t *testing.T) {
-	for _, tc := range []struct {
-		name             string
-		voicesA, voicesB []string
-		ask              string
-	}{
-		{name: "both list other voices", voicesA: []string{"alba"}, voicesB: []string{"bella"}, ask: "nobody-has-this"},
-		{name: "both cached empty", voicesA: []string{}, voicesB: []string{}, ask: "bella"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			r := NewResolver(voiceModelStore(t, tc.voicesA, tc.voicesB), voiceClock(), nil)
-			_, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", tc.ask))
-			if !errors.Is(err, ErrVoiceUnavailable) {
-				t.Fatalf("err = %v, want ErrVoiceUnavailable (every candidate is known to lack %q)", err, tc.ask)
-			}
-			if errors.Is(err, ErrNoHealthyHost) || errors.Is(err, ErrNoModelRoute) {
-				t.Fatalf("err = %v also matches a generic routing sentinel", err)
 			}
 		})
 	}
@@ -251,32 +225,29 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 
 // A voice cached on a mapping whose model is NOT a plain tts one any more (it became a
 // clone model after the cache was written) is not a known voice: the same read-side
-// verdict gate the voices endpoint applies. bella is cached only on map_b, so once map_b
-// is a clone the sole tts candidate (map_a, cached ["alba"]) is KNOWN to lack bella and
-// the request is voice_unavailable; were the stale clone row honored, bella would instead
-// be forced onto srv_b.
+// verdict gate the voices endpoint applies. map_b would be the only match, so were the
+// stale row honored the request would be forced onto srv_b.
 func TestVoiceStandardIgnoresAVoiceCachedOnANonTTSMapping(t *testing.T) {
 	mem := voiceModelStore(t, []string{"alba"}, []string{"bella"})
 	if err := mem.UpsertMappingCapabilities(context.Background(), "map_b", []CapabilityRow{{Capability: CapabilitySpeechClone, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: voiceNow}}); err != nil {
 		t.Fatalf("flip map_b to a clone model: %v", err)
 	}
 	r := NewResolver(mem, voiceClock(), nil)
-	if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella")); !errors.Is(err, ErrVoiceUnavailable) {
-		t.Fatalf("err = %v, want ErrVoiceUnavailable: bella is only cached on a clone mapping, so no tts candidate lists it", err)
+	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_a" {
+		t.Fatalf("server = %q, want srv_a: bella is only cached on a mapping that is a clone model now, so it is unknown", got.ServerID)
 	}
 }
 
 // The voice only exists on a server the principal is not provisioned for: it is not a
-// candidate at all, so the filter sees only the reachable pool. srv_a is reachable and
-// KNOWN to lack bella, so the request is voice_unavailable (the unprovisioned server's
-// bella is never considered). Once that server is provisioned too the pool narrows to it.
+// candidate at all, so nothing in the REACHABLE pool lists the voice and the request is
+// not narrowed (and not refused) -- the filter sees the pool dispatch sees.
 func TestVoiceStandardOnlyConsidersWhatTheCallerMayReach(t *testing.T) {
 	r := NewResolver(voiceModelStore(t, []string{"alba"}, []string{"bella"}), voiceClock(), nil)
 	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true}})
-	if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella")); !errors.Is(err, ErrVoiceUnavailable) {
-		t.Fatalf("err = %v, want ErrVoiceUnavailable (only srv_a is reachable and it is known to lack bella)", err)
+	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_a" {
+		t.Fatalf("server = %q, want srv_a (bella lives only on an unprovisioned server, so it is unknown here)", got.ServerID)
 	}
-	// And the provisioned pool narrows to the voice's server once it is reachable.
+	// And the provisioned pool still narrows when the voice is in it.
 	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true, "srv_b": true}})
 	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
 		t.Fatalf("server = %q, want srv_b once the voice's server is provisioned", got.ServerID)
@@ -319,6 +290,11 @@ func TestVoiceStandardVoiceOnADownServerIsVoiceUnavailable(t *testing.T) {
 			}
 			if got := resolveVoice(t, r, voiceReq("tts", "")); got.ServerID != "srv_a" {
 				t.Fatalf("control: no voice served by %q, want srv_a", got.ServerID)
+			}
+			// A voice nothing lists is not narrowed, so it is served by the healthy server
+			// exactly as it would be without a voice: it never meets the sentinel.
+			if got := resolveVoice(t, r, voiceReq("tts", "nobody-has-this")); got.ServerID != "srv_a" {
+				t.Fatalf("control: unknown voice served by %q, want srv_a", got.ServerID)
 			}
 		})
 	}
@@ -593,6 +569,7 @@ func TestVoiceGroupPrePassNarrowsAcrossMembers(t *testing.T) {
 		{"no voice keeps the priority order", "", "srv_a"},
 		{"a voice only the second member has", "bella", "srv_b"},
 		{"a voice only the first member has", "alba", "srv_a"},
+		{"a voice no member has is not narrowed", "nobody-has-this", "srv_a"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := resolveVoice(t, r, voiceReq("tts-group", tc.voice)); got.ServerID != tc.wantServer {
@@ -637,21 +614,13 @@ func TestVoiceGroupUncachedSiblingStaysEligible(t *testing.T) {
 }
 
 // The voice only exists behind a server the principal is not provisioned for: not in the
-// reachable pool. The one reachable member (coder-a) is known to lack bella, so no
-// reachable member offers the voice and the group has no route for it (ErrNoModelRoute --
-// the group path reads a member whose every candidate the voice excludes as memberNoMapping,
-// NOT as a real-but-gated member, so the standard path's ErrVoiceUnavailable does not apply
-// here). Once the voice's member is provisioned the group narrows to it.
+// reachable pool, so the group is not narrowed (and not refused).
 func TestVoiceGroupOnlyConsidersWhatTheCallerMayReach(t *testing.T) {
 	r := NewResolver(voiceGroupStore(t, []string{"alba"}, []string{"bella"}), voiceClock(), nil)
 	r.SetGroupResolver(voiceGroup(GroupPolicy{FailoverMode: "sticky"}))
 	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true}})
-	if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts-group", "bella")); !errors.Is(err, ErrNoModelRoute) {
-		t.Fatalf("err = %v, want ErrNoModelRoute (bella is behind an unprovisioned member)", err)
-	}
-	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true, "srv_b": true}})
-	if got := resolveVoice(t, r, voiceReq("tts-group", "bella")); got.ServerID != "srv_b" {
-		t.Fatalf("server = %q, want srv_b once the voice's member is provisioned", got.ServerID)
+	if got := resolveVoice(t, r, voiceReq("tts-group", "bella")); got.ServerID != "srv_a" {
+		t.Fatalf("server = %q, want srv_a (bella is behind an unprovisioned server)", got.ServerID)
 	}
 }
 
@@ -811,6 +780,10 @@ func TestVoiceGroupFailureMapping(t *testing.T) {
 		_, err := r.Resolve(ctx, voicePrincipal, voiceReq("tts-group", "bella"))
 		if !errors.Is(err, ErrVoiceUnavailable) || errors.Is(err, ErrNoHealthyHost) {
 			t.Fatalf("err = %v, want ErrVoiceUnavailable", err)
+		}
+		// An unknown voice is not narrowed: served by the healthy member, as today.
+		if got := resolveVoice(t, r, voiceReq("tts-group", "nobody-has-this")); got.ServerID != "srv_a" {
+			t.Fatalf("control: unknown voice served by %q, want srv_a", got.ServerID)
 		}
 	})
 	t.Run("the voice's only member is busy", func(t *testing.T) {

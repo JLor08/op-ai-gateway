@@ -6806,7 +6806,10 @@ gave.
   (or an undecodable one). Routing **excludes only the known-absent candidates**;
   known-present and unknown ones stay eligible (fail open), so a healthy same-model
   sibling that was never voice-cached keeps serving as a failover/load target. **When no
-  candidate is known-absent, nothing is filtered.** The single-model path applies it after the
+  candidate is known-absent, nothing is filtered; and when EVERY candidate is known-absent
+  the filter also stands aside** (nothing is known to offer the voice, so the request routes
+  unfiltered and the upstream decides) — only a MIX, at least one known-absent alongside at
+  least one eligible candidate, actually restricts routing. The single-model path applies it after the
   capability gate and before the admission parameters. A **group** needs a **pre-pass**,
   not a per-member rule (`groupVoiceScope`): `eligibleCandidates` sees one member at a
   time, so a rule "restrict this member if one of *its* candidates lists the voice"
@@ -6823,14 +6826,15 @@ gave.
   taken for a voiced single-model request (the pin was chosen without the voice and would
   bypass it; no such pin can exist today, so this keeps the contract rather than changing
   a path), while a group's pin passes through the voice-restricted `selectMember`. When the
-  voice **narrowed** the pool (excluded at least one *known-absent* candidate) and every
-  remaining eligible candidate is unusable, the answer is
-  **`routing.ErrVoiceUnavailable`** → **HTTP 503 `routing.voice_unavailable`** instead
-  of the generic `routing.no_healthy_host`: the generic code says the model has no host,
-  which is false when other servers of the model are healthy and are known only to lack the
-  voice. It fires **exactly then** — which includes the case where every candidate is
-  known-absent, so the eligible set is empty — and **never** for a voice no candidate is
-  known to lack (all unknown/uncached stay eligible, fail open). The two reads the
+  voice **narrowed** the pool (excluded at least one *known-absent* candidate while an
+  eligible candidate remained) and every remaining eligible candidate is unusable, the
+  answer is **`routing.ErrVoiceUnavailable`** → **HTTP 503 `routing.voice_unavailable`**
+  instead of the generic `routing.no_healthy_host`: the generic code says the model has no
+  host, which is false when other servers of the model are healthy and are known only to
+  lack the voice. It fires **exactly then** — and **never** for a voice no candidate is
+  known to lack (all known-present or unknown), **nor** for one no candidate is known to
+  offer (every candidate known-absent, or every candidate of unknown status): those route
+  unfiltered, fail open, and the upstream decides. The two reads the
   pre-pass makes fail **differently, on purpose**: an unreadable **voices cache** fails
   **open** (logged at Warn, routed as if no voice were named — the cache exists only for
   this preference), while a failing capability **verdict** read is **returned**, like the
@@ -6855,10 +6859,11 @@ that carries this change (and for up to five minutes after a transient first-fet
 the back-off), and a server on an agent older than 0.11.0 never has one; both read as
 **unknown voice status** (not "absent") and stay eligible fail-open. A list is an **offer,
 never a constraint**: the cache holds only what the health loop saw, so the field stays
-free text, and a voice on a server of unknown/uncached status still reaches the upstream,
-which answers **500** (not 400) through the ordinary `normalizeSpeechUpstreamError`. The
-gateway answers **503 `routing.voice_unavailable`** without calling the upstream only when
-every reachable candidate is *known* — from its cached list — to lack the voice.
+free text, and a voice no cached list is known to offer — a free-text name, or one every
+candidate is known-absent for — still reaches the upstream, which answers **500** (not 400)
+through the ordinary `normalizeSpeechUpstreamError`. The filter only steers AWAY FROM
+servers known to lack the voice while a known-present or unknown one remains; it never
+refuses a request no server is known to be able to serve.
 **Voices are names only**, because that is all audio.cpp
 states; richer display (language, gender) would need a new `cache_type` or a new payload
 shape. **A single audio.cpp server holding TWO tts models loaded at once is unverified**:

@@ -56,18 +56,17 @@ func hasVoicesRow(rows []ModelMappingCacheRow) bool {
 // voiceScope is the outcome of ONE request's voice pre-pass (voiceScopeFor): the set of
 // candidate mappings the requested voice is restricted to. A nil *voiceScope is "no
 // restriction" and is what every method treats as the identity, so a request that named
-// no voice, or one no candidate is KNOWN to lack, threads a nil through the resolver and
-// changes nothing.
+// no voice, one no candidate is KNOWN to lack, or one NO candidate is known to offer (every
+// candidate known-absent -- fail open), threads a nil through the resolver and changes nothing.
 //
 // A non-nil scope exists only when the voice EXCLUDED at least one candidate KNOWN (from
-// its cached voices row) to not list it (FAIL-OPEN on unknown, see voiceScopeFor). Its
-// allowed set may then be empty -- exactly when EVERY candidate is known to lack the
-// voice, which is the correct ErrVoiceUnavailable case.
+// its cached voices row) to not list it AND at least one eligible candidate remained
+// (FAIL-OPEN on unknown, see voiceScopeFor): allowed is then never empty.
 type voiceScope struct {
 	// allowed is the ids of the pool's mappings eligible to serve the voice: those whose
 	// cached voice list names it, PLUS those whose voice status is UNKNOWN (no cached row,
-	// or an unreadable one) and so stay eligible fail-open (unknown != absent). It is empty
-	// only when every candidate is known to lack the voice.
+	// or an unreadable one) and so stay eligible fail-open (unknown != absent). It is never
+	// empty: when every candidate is known-absent the pre-pass returns a nil scope instead.
 	allowed map[string]struct{}
 	// narrowed reports that the voice EXCLUDED at least one candidate KNOWN (from its cached
 	// voices row) to not list it, which is what makes a later "no usable host" the voice's
@@ -114,11 +113,13 @@ func (v *voiceScope) refine(err error) error {
 // them), or a row that cannot be decoded -- stays eligible: unknown is NOT absent, so a
 // healthy same-model sibling keeps serving as a failover/load target and the upstream
 // stays the authority on a voice it was never told about. Only a KNOWN-ABSENT candidate
-// narrows anything; otherwise -- no voice named, an empty pool, every candidate
-// known-present or of unknown status -- it returns nil and the request routes exactly as
-// it would without a voice. voice_unavailable therefore arises only when the voice
-// narrowed the pool and none of the eligible hosts is usable -- which includes the case
-// where EVERY candidate is known-absent, leaving the eligible set empty.
+// narrows anything, and only while an eligible candidate remains; otherwise -- no voice
+// named, an empty pool, every candidate known-present or of unknown status, OR every
+// candidate known-absent (nothing is known to offer the voice, so it routes unfiltered and
+// the upstream decides) -- it returns nil and the request routes exactly as it would
+// without a voice. voice_unavailable therefore arises only when the voice narrowed the pool
+// (some known-absent) with an eligible candidate left, and none of those eligible hosts is
+// usable.
 //
 // A candidate is known-present when the voice is in its mapping's cached list (exact
 // match: the name is relayed to the upstream byte for byte, so a near miss is a different
@@ -201,16 +202,24 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 		// or null list included). This is the ONLY thing that narrows the pool.
 		knownAbsent++
 	}
+	if len(allowed) == 0 {
+		// Every candidate is KNOWN-absent: no cached list offers the voice. FAIL OPEN --
+		// route unfiltered and let the upstream be the authority (it may accept a free-text
+		// name; if not it rejects it with a 500, the accepted free-text risk), rather than
+		// 503 a request the upstream might still serve.
+		slog.Debug("voice filter: no candidate lists the voice, routing unfiltered", "voice", voice, "candidates", len(ids))
+		return nil, nil
+	}
 	if knownAbsent == 0 {
 		// Nothing is KNOWN to lack the voice (every candidate lists it or is of unknown
 		// status), so the voice restricts nothing: route exactly as without a voice.
 		slog.Debug("voice filter: no candidate is known to lack the voice, routing unfiltered", "voice", voice, "candidates", len(ids))
 		return nil, nil
 	}
-	// At least one candidate is KNOWN-ABSENT, so the voice narrows the pool to the eligible
-	// set (known-present + unknown + corrupt). allowed MAY be empty -- exactly when EVERY
-	// candidate is known-absent -- which is the correct ErrVoiceUnavailable case: restrict
-	// empties the pool and refine maps the resulting ErrNoHealthyHost to ErrVoiceUnavailable.
+	// At least one candidate is KNOWN-ABSENT and at least one eligible candidate remains
+	// (known-present or of unknown status), so the voice narrows the pool to the eligible
+	// set. allowed is never empty here; ErrVoiceUnavailable arises only when every one of
+	// those eligible hosts is unusable (refine maps the resulting ErrNoHealthyHost).
 	slog.Debug("voice filter: excluding candidates known to lack the voice", "voice", voice, "allowed", len(allowed), "known_absent", knownAbsent, "candidates", len(ids))
 	return &voiceScope{allowed: allowed, narrowed: true}, nil
 }
