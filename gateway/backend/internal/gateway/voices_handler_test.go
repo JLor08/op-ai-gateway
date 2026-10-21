@@ -204,6 +204,9 @@ func newVoicesWorld(t *testing.T) *voicesWorld {
 		{"grp_locked_member", "grp-of-locked", []string{"tts-locked"}},
 		{"grp_locked", "grp-locked", []string{"tts-one"}},
 		{"grp_restricted", "grp-restricted", []string{"tts-one", "tts-restricted"}},
+		// A visible group whose members include a hidden and a locked model: both are
+		// still full members of it.
+		{"grp_open", "grp-open", []string{"tts-one", "tts-hidden", "tts-locked"}},
 	} {
 		if err := routes.CreateModelGroup(ctx, routing.ModelGroup{ID: g.id, GatewayModelName: g.name, DisplayName: g.name, Status: routing.ServerStatusActive, FailoverMode: "sticky", CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateModelGroup %s: %v", g.name, err)

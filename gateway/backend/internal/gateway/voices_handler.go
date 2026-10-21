@@ -22,6 +22,12 @@ import (
 // answers a missing ?name=).
 const audioVoicesModelRequired = "model.name_required"
 
+// audioVoicesFailed is the code of the 500 both voices routes answer a store
+// failure with (handleAudioVoices and handlePortalModelVoices). It is API surface
+// too, and the one answer that is never "no voices": a client can tell "none"
+// from "could not look".
+const audioVoicesFailed = "model.voices_failed"
+
 // audioVoicesResponse is the body of GET /v1/audio/voices: the model name as the
 // client asked for it and the voice names a speech request to that model may name
 // in its "voice" field. Voices is never nil, so an empty answer encodes as [].
@@ -87,7 +93,7 @@ func (s *Server) handleAudioVoices(w http.ResponseWriter, r *http.Request) {
 		voices, err = s.voicesForModel(r.Context(), token, effective)
 		if err != nil {
 			slog.Error("audio voices lookup failed", "model", model, "err", err)
-			writeJSON(w, http.StatusInternalServerError, apierror.Response("model.voices_failed", "model voices failed", ""))
+			writeJSON(w, http.StatusInternalServerError, apierror.Response(audioVoicesFailed, "model voices failed", ""))
 			return
 		}
 	}

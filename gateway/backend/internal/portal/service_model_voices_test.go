@@ -199,10 +199,12 @@ func TestModelVoicesMappingIDsExpandsAGroupToItsMembers(t *testing.T) {
 	requireVoiceMappingIDs(t, svc, nonAdmin, "tts-inner", "map-srv-3")
 }
 
-// Visibility applies to a group at two levels, as the portal's own group listing
-// applies it: the group's own hidden/locked setting suppresses the whole group for
-// a non-admin, and a hidden or locked MEMBER is left out of an otherwise visible
-// group. An admin bypasses both.
+// The hidden/locked gate applies to the name that was ASKED ABOUT: a group's own
+// hidden/locked setting suppresses the whole group for a non-admin, but a member's
+// own setting does not narrow a visible group. A hidden or locked model is still a
+// full member of it ("locked" means reachable through a group, not directly), so a
+// non-admin gets the member's mapping THROUGH the group while the model's own name
+// stays suppressed. An admin bypasses the gate.
 func TestModelVoicesMappingIDsGroupVisibility(t *testing.T) {
 	svc, rs := newModelServersTestService(t, voiceNow, fakeLoadedModels{})
 	audio := routing.APIFlavorOpenAIAudio
@@ -216,7 +218,9 @@ func TestModelVoicesMappingIDsGroupVisibility(t *testing.T) {
 	setVoiceVisibility(t, rs, voiceNow, "grp-closed", "locked")
 	nonAdmin := auth.Token{UserID: "usr_plain_voice", Scopes: []string{"gateway:use"}}
 
-	requireVoiceMappingIDs(t, svc, nonAdmin, "grp-open", "map-srv-shown")
+	requireVoiceMappingIDs(t, svc, nonAdmin, "grp-open", "map-srv-hidden", "map-srv-locked", "map-srv-shown")
+	requireVoiceMappingIDs(t, svc, nonAdmin, "tts-hidden")
+	requireVoiceMappingIDs(t, svc, nonAdmin, "tts-locked")
 	requireVoiceMappingIDs(t, svc, nonAdmin, "grp-closed")
 
 	requireVoiceMappingIDs(t, svc, adminToken(), "grp-open", "map-srv-hidden", "map-srv-locked", "map-srv-shown")

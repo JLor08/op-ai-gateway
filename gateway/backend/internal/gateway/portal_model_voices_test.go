@@ -108,7 +108,6 @@ func TestPortalModelVoicesEveryNothingToShowCaseIsAnEmpty200(t *testing.T) {
 		"a hidden model":                 {voicesOtherSecret, "tts-hidden"},
 		"a locked model":                 {voicesOtherSecret, "tts-locked"},
 		"a locked group":                 {voicesOtherSecret, "grp-locked"},
-		"a group of one locked model":    {voicesOtherSecret, "grp-of-locked"},
 		"restricted to another user":     {voicesDevSecret, "tts-restricted"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -121,10 +120,10 @@ func TestPortalModelVoicesEveryNothingToShowCaseIsAnEmpty200(t *testing.T) {
 }
 
 // THE portal gate, where it differs from the public endpoint's: a hidden or
-// locked model is invisible to a non-admin here even though the public endpoint
-// offers a hidden model (still directly requestable) and a locked one through its
-// group. An admin bypasses the portal suppression, as it bypasses it everywhere
-// else in the portal.
+// locked model asked for BY NAME is invisible to a non-admin here even though the
+// public endpoint offers a hidden model (still directly requestable). An admin
+// bypasses the portal suppression, as it bypasses it everywhere else in the
+// portal.
 func TestPortalModelVoicesHidesHiddenAndLockedModelsFromANonAdmin(t *testing.T) {
 	w := newVoicesWorld(t)
 
@@ -139,21 +138,30 @@ func TestPortalModelVoicesHidesHiddenAndLockedModelsFromANonAdmin(t *testing.T) 
 	requireVoices(t, w.voicesFor(t, voicesOtherSecret, "tts-hidden"), []string{"hidden-voice"})
 }
 
-// A locked or hidden MEMBER is left out of an otherwise visible group for a
-// non-admin, as the portal's group server listing leaves it out, and a locked
-// group is suppressed whole. An admin sees through both.
+// The hidden/locked gate applies to the name that was ASKED ABOUT, and a member's
+// own visibility does not narrow a visible group: a hidden or locked model is
+// still a full member of it ("locked" means reachable through a group, not
+// directly), so a non-admin gets its voices THROUGH the group, which is the main
+// locked-via-group setup, while the model's own name stays suppressed. A locked
+// group is suppressed whole under its own name. An admin bypasses the gate.
 func TestPortalModelVoicesGroupVisibility(t *testing.T) {
 	w := newVoicesWorld(t)
 
-	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "grp-of-locked"), nil)
+	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "grp-of-locked"), []string{"locked-voice"})
+	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "grp-open"), []string{"hidden-voice", "locked-voice", "one-a", "shared"})
+	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "tts-locked"), nil)
+	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "tts-hidden"), nil)
 	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "grp-locked"), nil)
+
 	requireVoices(t, w.portalVoices(t, voicesDevSecret, "grp-of-locked"), []string{"locked-voice"})
+	requireVoices(t, w.portalVoices(t, voicesDevSecret, "grp-open"), []string{"hidden-voice", "locked-voice", "one-a", "shared"})
 	requireVoices(t, w.portalVoices(t, voicesDevSecret, "grp-locked"), []string{"one-a", "shared"})
 }
 
 // Resource-group provisioning applies: a server restricted to another user's
 // group is invisible (the same empty 200 as an unknown name) and visible to the
-// provisioned user, and a group is cut member by member.
+// provisioned user, and a group is cut member by member (provisioning, not a
+// member's own visibility, is what bounds a group's members).
 func TestPortalModelVoicesFollowsProvisioning(t *testing.T) {
 	w := newVoicesWorld(t)
 

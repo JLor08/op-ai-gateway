@@ -38,14 +38,17 @@ import (
 //     (activeMappingViews).
 //
 // A group name expands to its leaf members, nested subgroups flattened by their
-// own traversal (routing.FlattenGroup), and the ids are those of ALL the visible
-// members: the voices a group can offer are the UNION of what its members offer.
-// Visibility applies at both levels, as the portal's group server listing
-// (handlePortalModelGroupServers, which asks ModelServers per member) applies
-// it: the group's own hidden/locked setting suppresses the whole group for a
-// non-admin, and a hidden or locked MEMBER is left out of an otherwise visible
-// group, since the portal does not show that model's servers either. An inactive
-// group is not resolvable and offers nothing.
+// own traversal (routing.FlattenGroup), and the ids are those of ALL the members'
+// mappings that survive provisioning: the voices a group can offer are the UNION
+// of what its members offer. The hidden/locked gate applies to the name that was
+// ASKED ABOUT only, the group's own name included (the first bullet above): a
+// member's own visibility does NOT narrow a visible group, because a hidden or
+// locked model is still a full member of it (modelGroupOverlay), and "locked"
+// means reachable through a group but not directly. Leaving a locked member out
+// would empty the picker for the main locked-via-group setup, and no access
+// boundary is crossed by listing it: a group dispatch may route to the member,
+// and provisioning still filters its servers. An inactive group is not
+// resolvable and offers nothing.
 //
 // The ids are deduped and sorted. An unknown or blank name, or one with no
 // visible speech mapping, is an empty non-nil slice and not an error.
@@ -58,7 +61,7 @@ func (s *Service) ModelVoiceMappingIDs(ctx context.Context, principal auth.Token
 	if suppressed {
 		return ids, nil
 	}
-	names, err := s.voiceModelNames(ctx, principal, gatewayModelName)
+	names, err := s.voiceModelNames(ctx, gatewayModelName)
 	if err != nil {
 		return nil, err
 	}
@@ -90,13 +93,14 @@ func (s *Service) ModelVoiceMappingIDs(ctx context.Context, principal auth.Token
 
 // voiceModelNames returns the gateway model names whose mappings may offer
 // voices for gatewayModelName: the name itself when it is a model, or, when it
-// names a model group, the leaf members of that group that principal may see (a
-// hidden or locked member of a visible group is dropped for a non-admin, exactly
-// as ModelServers drops it, member by member, in the portal's group listing).
+// names a model group, ALL of that group's leaf members, in flatten order. No
+// member is filtered by its own hidden/locked setting (a hidden or locked model is
+// still a full member of a group, see ModelVoiceMappingIDs).
 //
-// gatewayModelName's own visibility is NOT checked here: the caller has already
-// done it for the name it was asked about, group or model.
-func (s *Service) voiceModelNames(ctx context.Context, principal auth.Token, gatewayModelName string) ([]string, error) {
+// Visibility is NOT checked here at all: the caller has already checked the name
+// it was asked about, group or model, and provisioning is applied to the mappings
+// afterwards.
+func (s *Service) voiceModelNames(ctx context.Context, gatewayModelName string) ([]string, error) {
 	groups, err := s.routes.ModelGroups(ctx)
 	if err != nil {
 		return nil, err
@@ -112,16 +116,5 @@ func (s *Service) voiceModelNames(ctx context.Context, principal auth.Token, gat
 	if err != nil {
 		return nil, err
 	}
-	members := routing.FlattenGroup(gatewayModelName, graph)
-	names := make([]string, 0, len(members))
-	for _, member := range members {
-		memberSuppressed, err := s.modelServersSuppressed(ctx, principal, member)
-		if err != nil {
-			return nil, err
-		}
-		if !memberSuppressed {
-			names = append(names, member)
-		}
-	}
-	return names, nil
+	return routing.FlattenGroup(gatewayModelName, graph), nil
 }

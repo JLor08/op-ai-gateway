@@ -603,10 +603,13 @@ func (s *Server) cachedImageOptions(views []portal.ImageOptionMapping) []provide
 //
 // Visibility is the PORTAL's, decided BEFORE the cache is read:
 // Portal.ModelVoiceMappingIDs returns only the mappings this principal may see in
-// the portal (hidden/locked suppression for a non-admin, resource-group
-// provisioning, group expansion), NOT the routing-consistent set the public
-// endpoint serves, so a hidden or locked model has no mappings, reads no cache
-// and answers {"voices":[]} exactly like an unknown one. Every "nothing to show"
+// the portal (hidden/locked suppression of the requested name for a non-admin,
+// group expansion, resource-group provisioning), NOT the routing-consistent set
+// the public endpoint serves, so a hidden or locked model asked for by name has no
+// mappings, reads no cache and answers {"voices":[]} exactly like an unknown one.
+// A group's members are NOT filtered by their own visibility (a hidden or locked
+// model is still a full member of a group), so a locked model's voices are
+// offered through its group. Every "nothing to show"
 // case -- an unknown, hidden, locked, restricted, non-speech, clone or not-yet-
 // cached model -- is that same 200, so the answer cannot be used to probe which
 // models exist. A store failure is the only 500 and is never read as an empty
@@ -627,7 +630,7 @@ func (s *Server) handlePortalModelVoices(w http.ResponseWriter, r *http.Request)
 	voices, err := s.portalVoicesForModel(r.Context(), token, name)
 	if err != nil {
 		slog.Error("portal model voices lookup failed", "model", name, "err", err)
-		writeJSON(w, http.StatusInternalServerError, apierror.Response("model.voices_failed", "model voices failed", ""))
+		writeJSON(w, http.StatusInternalServerError, apierror.Response(audioVoicesFailed, "model voices failed", ""))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string][]string{"voices": voices})
