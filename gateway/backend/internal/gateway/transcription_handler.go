@@ -833,6 +833,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		// and the usage row; the preflight request is not, so the gate and the resolve
 		// above judged the same request a plain transcription would be.
 		rel.pfReq.Stream = true
+		rel.streamRefusal = transcriptionStreamingRefusal
 		rel.bufferedRetry = func() ([]byte, string, error) {
 			return bufferedTranscriptionBody(target, raw, form.boundary, model)
 		}
@@ -868,27 +869,33 @@ func bufferedTranscriptionBody(target routing.Target, raw []byte, boundary, mode
 // stream-versus-buffered decision; peekStreamingRefusal and the buffered retry remain
 // the net under a yes that has gone stale.
 //
-// Everything but a yes is false: a no, no row at all (the verdict is "unknown" until a
-// probe states the model's mode, and the answer for unknown is the buffered one-shot,
-// which every model serves), a route that is no mapping (a vendor account's route id
-// names none), no route store, and a read that fails. A failed read is logged at
-// Warn: it is a store error and not an expected outcome, and it silently changes what
+// Everything but a yes is false (see mappingStreamingVerdictIsYes): a no, no row at all
+// (the verdict is "unknown" until a probe states the model's mode, and the answer for
+// unknown is the buffered one-shot, which every model serves), a route that is no mapping
+// (a vendor account's route id names none), no route store, and a read that fails.
+func (s *Server) mappingStreamsTranscription(ctx context.Context, routeID string) bool {
+	return s.mappingStreamingVerdictIsYes(ctx, routeID, routing.CapabilityTranscriptionStreaming, "transcription streaming verdict could not be read; answering buffered")
+}
+
+// mappingStreamingVerdictIsYes is the read both audio endpoints' stream-versus-buffered
+// decisions share: whether the route's stored verdict for capability (one of the
+// streaming capabilities) is yes. A failed read is false and is logged at Warn with
+// failure: it is a store error and not an expected outcome, and it silently changes what
 // the client was answered with.
 //
 // The verdict is read per request with a keyed MappingCapabilities, not carried on the
-// routing.Target: the resolver builds a target for every inference shape and this is
-// the one reader.
-func (s *Server) mappingStreamsTranscription(ctx context.Context, routeID string) bool {
+// routing.Target: the resolver builds a target for every inference shape and the two
+// audio relays are the only readers.
+func (s *Server) mappingStreamingVerdictIsYes(ctx context.Context, routeID, capability, failure string) bool {
 	if s.Routes == nil || routeID == "" {
 		return false
 	}
 	rows, err := s.Routes.MappingCapabilities(ctx, routeID)
 	if err != nil {
-		slog.Warn("transcription streaming verdict could not be read; answering buffered",
-			"route_id", routeID, "capability", routing.CapabilityTranscriptionStreaming, "err", err)
+		slog.Warn(failure, "route_id", routeID, "capability", capability, "err", err)
 		return false
 	}
-	return routing.CapabilityRowsByName(rows)[routing.CapabilityTranscriptionStreaming].Verdict == routing.CapabilityYes
+	return routing.CapabilityRowsByName(rows)[capability].Verdict == routing.CapabilityYes
 }
 
 // transcriptionStreamingRefusal is the sentence audio.cpp's error carries when
@@ -897,10 +904,10 @@ func (s *Server) mappingStreamsTranscription(ctx context.Context, routeID string
 // status alone -- is what tells this refusal from a server that is really failing.
 const transcriptionStreamingRefusal = "requires a model configured with mode=streaming"
 
-// transcriptionRefusalPeekBytes bounds how much of a 500 body is read looking for
-// transcriptionStreamingRefusal: audio.cpp puts the sentence in a one-line error
-// object, so the head of the body is where it is.
-const transcriptionRefusalPeekBytes = 64 << 10
+// streamingRefusalPeekBytes bounds how much of a 500 body is read looking for a
+// streaming refusal's sentence: audio.cpp puts the sentence in a one-line error object,
+// so the head of the body is where it is.
+const streamingRefusalPeekBytes = 64 << 10
 
 // replayedBody is a response body some of whose bytes have already been read: the
 // reader yields them again in front of the rest, and Close closes the original.
@@ -909,21 +916,23 @@ type replayedBody struct {
 	io.Closer
 }
 
-// peekStreamingRefusal reports whether resp is the upstream's refusal to
-// stream a transcription: HTTP 500 whose body names transcriptionStreamingRefusal.
-// Any other status, and any other 500, is false -- those are the upstream's errors and
-// reach the client as they always did.
+// peekStreamingRefusal reports whether resp is the upstream's refusal to stream an
+// audio request: HTTP 500 whose body names sentence, the one the relay was built for
+// (transcriptionStreamingRefusal or speechStreamingRefusal -- audio.cpp words them
+// differently, and the speech one ends in the transcription's words, so a relay peeks
+// for its own). Any other status, any other 500 and an empty sentence are false -- those
+// are the upstream's errors and reach the client as they always did.
 //
 // It is a peek, not a pure predicate: it reads the head of the body to look, and puts
 // what it read back -- resp.Body is replaced by a body that still yields every byte, so
-// an error that is not the refusal reaches relayTranscriptionUpstreamError whole.
-func peekStreamingRefusal(resp *provider.ProxyResponse) bool {
-	if resp.StatusCode != http.StatusInternalServerError {
+// an error that is not the refusal reaches the endpoint's own error relay whole.
+func peekStreamingRefusal(resp *provider.ProxyResponse, sentence string) bool {
+	if sentence == "" || resp.StatusCode != http.StatusInternalServerError {
 		return false
 	}
-	head, err := io.ReadAll(io.LimitReader(resp.Body, transcriptionRefusalPeekBytes))
+	head, err := io.ReadAll(io.LimitReader(resp.Body, streamingRefusalPeekBytes))
 	resp.Body = replayedBody{Reader: io.MultiReader(bytes.NewReader(head), resp.Body), Closer: resp.Body}
-	return err == nil && bytes.Contains(head, []byte(transcriptionStreamingRefusal))
+	return err == nil && bytes.Contains(head, []byte(sentence))
 }
 
 // isStreamedTranscription reports whether a transcription's 2xx answer is relayed as

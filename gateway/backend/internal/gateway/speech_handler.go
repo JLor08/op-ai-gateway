@@ -40,10 +40,13 @@ const (
 	speechModelRequired = "speech.model_required"
 	speechInputRequired = "speech.input_required"
 	// speechResponseFormatUnsupported is the code for a response_format this relay
-	// cannot honor -- every value but "wav"; see validateSpeechRequest.
+	// cannot honor -- every value but "wav", or "pcm" on a stream; see
+	// validateSpeechRequest.
 	speechResponseFormatUnsupported = "speech.response_format_unsupported"
-	// speechStreamUnsupported is the code for a request asking for a streamed
-	// response, which v1 does not produce; see validateSpeechRequest.
+	// speechStreamUnsupported is the code for a request whose stream fields the relay
+	// cannot honor: a stream that is no boolean, a stream_format on a request that is
+	// no stream or outside the two audio.cpp emits, or a stream asking for wav; see
+	// validateSpeechRequest.
 	speechStreamUnsupported = "speech.stream_unsupported"
 )
 
@@ -161,30 +164,44 @@ func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 // error such as a missing input or an unknown model with HTTP 500, which the
 // gateway would otherwise hand on as a server failure. Every other field (voice,
 // instructions, speed, ...) is the client's own business and reaches the
-// upstream unexamined, with three exceptions.
+// upstream unexamined, with three exceptions: response_format, stream and
+// stream_format, which decide what KIND of response the relay has to carry.
 //
-// response_format decision: only "wav" (or an absent value) is accepted, and
-// EVERY other value -- mp3, opus, flac, aac and pcm, but also json and b64_json
-// -- is refused with speechResponseFormatUnsupported. v1 relays a purely binary
-// audio/wav body: audio.cpp answers an unsupported value such as mp3 with raw
-// WAV labelled audio/wav (a client asking for mp3 would be handed WAV without
-// being told), and json/b64_json are not OpenAI speech formats at all and,
-// unlike the wav response, carry none of the metering headers the usage row's
-// billing quantity is read from -- relayed, they would be billed as zero
-// seconds. A 400 the client can act on beats both silent outcomes.
+// stream decision: `stream` must be a JSON boolean (or absent or null); anything
+// else is refused with speechStreamUnsupported. `stream: true` is admitted -- whether
+// the call is then relayed as a stream or answered as a one-shot WAV is the relay's
+// decision (relaySpeech), made from the mapped model's speech_streaming verdict.
+// `stream: false` and an absent stream describe what the endpoint always did.
 //
-// stream decision: `stream: true` and ANY stream_format (sse or audio) are
-// refused with speechStreamUnsupported. The relay's buffering and billing
-// contract is that of a single complete audio response, and relaying a streaming
-// request would hand the client a shape the gateway has not been built, metered
-// or tested for. `stream: false`, an absent stream and a null stream_format
-// describe what the endpoint already does and are accepted.
+// response_format decision, which depends on whether the request streams:
+//
+//   - A request that does NOT stream accepts only "wav" (or an absent value); EVERY other
+//     value -- mp3, opus, flac, aac and pcm, but also json and b64_json -- is refused with
+//     speechResponseFormatUnsupported. The relay of a one-shot request is a purely binary
+//     audio/wav body: audio.cpp answers an unsupported value such as mp3 with raw WAV
+//     labelled audio/wav (a client asking for mp3 would be handed WAV without being told),
+//     and json/b64_json are not OpenAI speech formats at all and, unlike the wav response,
+//     carry none of the metering headers the usage row's billing quantity is read from --
+//     relayed, they would be billed as zero seconds. A 400 the client can act on beats both
+//     silent outcomes.
+//   - A request that streams accepts "pcm" (or an absent value) -- the only format
+//     audio.cpp's streaming mode serves. "wav" is refused with speechStreamUnsupported,
+//     because audio.cpp answers a wav stream with a 500 ("streaming speech currently
+//     supports response_format=pcm") and the gateway says so itself before relaying it;
+//     every other value is refused with speechResponseFormatUnsupported as above.
+//
+// stream_format ("sse", the default shape, or "audio", headerless raw PCM) is meaningful
+// only to a stream: on one it is relayed as the client wrote it -- the gateway translates
+// no event shape into another -- and any other value, or a stream_format on a request
+// that is not a stream, is refused with speechStreamUnsupported. A null stream_format is
+// absent.
 //
 // response_format, stream and stream_format are decoded as json.RawMessage and
 // then type-checked, for the reason validateImagesRequest gives: a typed decode
 // would discard the type error and leave the field at its zero value, walking a
 // non-string response_format such as ["mp3"] or 123 past the check. A JSON null
-// is an absent value throughout.
+// is an absent value throughout. The checks run in the order response_format, stream,
+// stream_format, so a request wrong in two ways is told about the first.
 //
 // The result is the concrete *inference.Error, nil for a valid request. Callers
 // compare it to nil as returned and only then hand it on as an error, which
@@ -203,28 +220,61 @@ func validateSpeechRequest(raw []byte, model string) *inference.Error {
 	if strings.TrimSpace(body.Input) == "" {
 		return &inference.Error{Code: speechInputRequired, Message: "input is required and must be a non-empty string"}
 	}
+	// Whether the request streams is read first because the response_format rule depends
+	// on it, but a stream that is no boolean is only reported after response_format.
+	var stream bool
+	streamErr := false
+	if len(body.Stream) > 0 {
+		streamErr = json.Unmarshal(body.Stream, &stream) != nil
+		stream = stream && !streamErr
+	}
 	if len(body.ResponseFormat) > 0 {
-		var format string
-		if err := json.Unmarshal(body.ResponseFormat, &format); err != nil {
-			return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format must be the string \"wav\"; got %s", body.ResponseFormat)}
-		}
-		if format != "" && format != "wav" {
-			return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only \"wav\" is", format)}
+		if err := validateSpeechResponseFormat(body.ResponseFormat, stream); err != nil {
+			return err
 		}
 	}
-	if len(body.Stream) > 0 {
-		var stream bool
-		if err := json.Unmarshal(body.Stream, &stream); err != nil {
-			return &inference.Error{Code: speechStreamUnsupported, Message: fmt.Sprintf("stream must be the boolean false or absent; got %s", body.Stream)}
-		}
-		if stream {
-			return &inference.Error{Code: speechStreamUnsupported, Message: "stream is not supported on this endpoint; it always returns a single complete audio/wav response"}
-		}
+	if streamErr {
+		return &inference.Error{Code: speechStreamUnsupported, Message: fmt.Sprintf("stream must be a boolean or absent; got %s", body.Stream)}
 	}
 	if len(body.StreamFormat) > 0 && string(body.StreamFormat) != "null" {
-		return &inference.Error{Code: speechStreamUnsupported, Message: "stream_format is not supported on this endpoint; it always returns a single complete audio/wav response"}
+		if !stream {
+			return &inference.Error{Code: speechStreamUnsupported, Message: "stream_format applies only to a streamed request; set stream to true or leave stream_format out"}
+		}
+		var format string
+		if err := json.Unmarshal(body.StreamFormat, &format); err != nil || (format != speechStreamFormatSSE && format != speechStreamFormatAudio) {
+			return &inference.Error{Code: speechStreamUnsupported, Message: fmt.Sprintf("stream_format must be \"sse\" or \"audio\"; got %s", body.StreamFormat)}
+		}
 	}
 	return nil
+}
+
+// The two values of a streamed speech request's stream_format that audio.cpp serves:
+// an event stream (its default) and headerless raw PCM.
+const (
+	speechStreamFormatSSE   = "sse"
+	speechStreamFormatAudio = "audio"
+)
+
+// validateSpeechResponseFormat applies validateSpeechRequest's response_format rule to a
+// present value: "wav" or absent for a request that does not stream, "pcm" or absent
+// for one that does (and "wav" on a stream is the stream's own refusal).
+func validateSpeechResponseFormat(rawFormat json.RawMessage, stream bool) *inference.Error {
+	want := "wav"
+	if stream {
+		want = "pcm"
+	}
+	var format string
+	if err := json.Unmarshal(rawFormat, &format); err != nil {
+		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format must be the string %q; got %s", want, rawFormat)}
+	}
+	switch {
+	case format == "" || format == want:
+		return nil
+	case stream && format == "wav":
+		return &inference.Error{Code: speechStreamUnsupported, Message: "a streamed response is headerless PCM; response_format must be \"pcm\" (or absent) when stream is true"}
+	default:
+		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only %q is", format, want)}
+	}
 }
 
 // recordSpeechRoutingFailure writes the client-facing error response for a
@@ -306,20 +356,126 @@ func (s *Server) resolveSpeechTarget(w http.ResponseWriter, r *http.Request, tok
 //
 // proxyNative streams the upstream body to the client chunk by chunk and relays
 // the upstream Content-Type verbatim, which is what carries an audio/wav body.
+//
+// A request that asks for a stream (`stream: true`; validateSpeechRequest has checked it
+// is a boolean) is relayed as one only when the mapped route is KNOWN to stream: its
+// speech_streaming verdict is yes (mappingStreamsSpeech). Then the relay is marked a
+// stream (nativeRelay.pfReq.Stream) and carries bufferedRetry, the builder of the request
+// proxyNative sends once more, buffered, when the upstream refuses to stream
+// (nativeRelay.streamRefusal) -- the net for a yes that has gone stale, a model swapped to
+// offline mode behind the verdict's back. Any other answer (a no, no verdict at all, one
+// that cannot be read) decides up front that the request is answered buffered: the body
+// is sent without the stream-only fields (speechBufferedBody), so the upstream is never
+// asked for what it would refuse and the client's answer, a one-shot WAV, costs one
+// upstream call. The preflight request is not marked a stream, so the gate and the
+// resolve judged the same request a one-shot call would be.
+//
+// proxyNative then finishes the exchange: a 2xx event stream (or raw PCM) of a streamed
+// request is relayed unbuffered by the native copier, read on its way by
+// speechStreamScan, billed on its completion (setStreamedSpeechBillingQuantity) and
+// captured as the redacted audio summary every speech response gets; any other 2xx one
+// is the one-shot WAV, billed from its duration header (setSpeechBillingQuantity).
 func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte) {
 	start := time.Now()
 	target, ok := s.resolveSpeechTarget(w, r, &token, req, raw, start)
 	if !ok {
 		return
 	}
-	s.proxyNative(w, r, nativeRelay{
+	rel := nativeRelay{
 		token:    token,
 		target:   target,
 		path:     upstreamPath(target, apiFlavorSpeech, endpointSpeech),
 		raw:      raw,
 		pfReq:    req,
 		endpoint: endpointSpeech,
-	})
+	}
+	if _, wantsStream := sniffRoutingModel(raw); wantsStream {
+		if s.mappingStreamsSpeech(r.Context(), target.RouteID) {
+			rel.pfReq.Stream = true
+			rel.streamRefusal = speechStreamingRefusal
+			rel.bufferedRetry = func() ([]byte, string, error) {
+				body, err := speechBufferedBody(raw)
+				return body, jsonContentType, err
+			}
+		} else {
+			slog.Debug("speech asked to stream but the route is not known to: answering buffered",
+				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+				"route_id", target.RouteID, "capability", routing.CapabilitySpeechStreaming)
+			body, err := speechBufferedBody(raw)
+			if err != nil {
+				// Not expected for a body validateSpeechRequest accepted: it found an input in
+				// it, which only a JSON object has. Were it to happen it is answered as a failed
+				// relay (and recorded) rather than sending the upstream a stream request it would
+				// refuse.
+				slog.Error("speech: building the buffered body failed",
+					"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
+				s.recordSpeechRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("build buffered speech body: %w", err))
+				return
+			}
+			rel.upstreamBody = body
+		}
+	}
+	s.proxyNative(w, r, rel)
+}
+
+// speechStreamingRefusal is the sentence audio.cpp's error carries when stream=true
+// reaches a speech model that is not loaded with mode=streaming (an offline model). It
+// answers HTTP 500, as it does for every error, so the sentence -- not the status alone
+// -- is what tells this refusal from a server that is really failing. It is speech's own:
+// a transcription's refusal says "transcription streaming ..." (transcriptionStreamingRefusal,
+// whose words this one happens to end in).
+const speechStreamingRefusal = "speech streaming requires a model configured with mode=streaming"
+
+// speechStreamOnlyFields are the request fields of a speech body that only a stream has a
+// meaning for: stream itself, stream_format (sse or audio) and response_format, which on
+// a stream is pcm and on a one-shot request is wav. The buffered twin of a streamed
+// request leaves them all out, so audio.cpp answers it with the one-shot WAV it always
+// has: a pcm response_format kept on it would ask for a shape the buffered relay's
+// billing (a WAV's duration header) does not carry.
+var speechStreamOnlyFields = []string{"stream", "stream_format", "response_format"}
+
+// speechBufferedBody builds the body of the one-shot request answered INSTEAD of a
+// streamed one -- either decided up front, when the route is not known to stream, or
+// sent as the retry when the upstream refused to (nativeRelay.bufferedRetry): the
+// client's JSON without speechStreamOnlyFields, every other field as it was written
+// (values are kept as raw JSON, so a number keeps its full precision). Names are matched
+// without regard to case, as encoding/json matched them when the request was validated,
+// so a "Stream" the validation read as a stream is dropped too. The model name is not
+// touched here: proxyNative rewrites it to the mapped one, as for any speech body.
+//
+// It is an error only for a body that is no JSON object, which validateSpeechRequest
+// has already ruled out.
+func speechBufferedBody(raw []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("speech body is not valid JSON: %w", err)
+	}
+	if fields == nil {
+		return nil, errors.New("speech body is not a JSON object")
+	}
+	for name := range fields {
+		for _, streamOnly := range speechStreamOnlyFields {
+			if strings.EqualFold(name, streamOnly) {
+				delete(fields, name)
+				break
+			}
+		}
+	}
+	return json.Marshal(fields)
+}
+
+// mappingStreamsSpeech reports whether the mapped route is known to answer a streamed
+// synthesis: its stored speech_streaming verdict, keyed by the route (target.RouteID,
+// the mapping id), is yes. It is the up-front half of the stream-versus-buffered
+// decision, mappingStreamsTranscription's twin; the upstream's refusal and the buffered
+// retry remain the net under a yes that has gone stale.
+//
+// Everything but a yes is false (see mappingStreamingVerdictIsYes): a no, no row at all
+// (the verdict is "unknown" until a probe states the model's mode, and the answer for
+// unknown is the one-shot WAV, which every model serves), a route that is no mapping, no
+// route store, and a read that fails.
+func (s *Server) mappingStreamsSpeech(ctx context.Context, routeID string) bool {
+	return s.mappingStreamingVerdictIsYes(ctx, routeID, routing.CapabilitySpeechStreaming, "speech streaming verdict could not be read; answering buffered")
 }
 
 // speechDurationHeader is the response header audio.cpp reports a synthesized
@@ -536,10 +692,10 @@ func normalizeSpeechUpstreamError(body []byte, status int) ([]byte, bool) {
 // needs everything proxyNative's own terminal step does (see nativeExchange).
 //
 // The whole body is read before anything is written, unlike the copier's
-// byte-as-it-arrives design: normalising needs all of it, and a speech request
-// never streams (validateSpeechRequest refuses stream), so an error is one small
-// payload. The read is bounded by s.captureMaxBytes, the cap the copier's capture
-// buffer already uses; an error body has no reason to exceed it.
+// byte-as-it-arrives design: normalising needs all of it, and an error is one small
+// payload -- a streamed request's too: a non-2xx status is the answer INSTEAD of a
+// stream, not a part of one. The read is bounded by s.captureMaxBytes, the cap the
+// copier's capture buffer already uses; an error body has no reason to exceed it.
 func (s *Server) relaySpeechUpstreamError(w http.ResponseWriter, r *http.Request, ex nativeExchange, resp *provider.ProxyResponse) {
 	upstreamBody, readErr := io.ReadAll(io.LimitReader(resp.Body, int64(s.captureMaxBytes)))
 	errorCode := fmt.Sprintf("upstream.%d", resp.StatusCode)

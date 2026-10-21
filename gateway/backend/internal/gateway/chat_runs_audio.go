@@ -105,13 +105,17 @@ const (
 
 // speechReservedFields are the request fields a thread's passthrough may not set.
 // model and input are the run's own (the thread's pinned model and the user's
-// text); stream and response_format are the two the endpoint's contract -- one
-// complete audio/wav body -- depends on, and it refuses a streamed request or any
-// format but wav anyway (validateSpeechRequest). Rejecting them here turns what
-// would be an opaque upstream refusal, or worse an override of the run's own
+// text); stream and response_format are the two the run's contract -- one buffered,
+// complete audio/wav body, which it commits as the assistant turn -- depends on: a
+// stream is relayed as an event stream or raw PCM, and a pcm format is only valid
+// beside one, so neither answers with a body the run can commit as a WAV. The
+// endpoint itself refuses any format but wav on a request that does not stream
+// (validateSpeechRequest), but admits a stream. Rejecting them here turns what would
+// be an opaque answer the run cannot use, or worse an override of the run's own
 // value, into a refusal that names its cause.
 //
-// stream_format is deliberately not listed: the endpoint already refuses any
+// stream_format is deliberately not listed: it is valid only beside a stream, which
+// the run never sends (stream is reserved above), so the endpoint already refuses any
 // non-null one with speech.stream_unsupported, which the run surfaces as that code.
 var speechReservedFields = []string{"model", "input", "stream", "response_format"}
 
