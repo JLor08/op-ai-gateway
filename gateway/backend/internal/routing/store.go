@@ -1349,6 +1349,45 @@ type CapabilityRow struct {
 	CheckedAt  time.Time
 }
 
+// ModelMappingCacheRow is one cached payload about a mapping's model, the unit
+// the model_mapping_cache table stores (migration 94, #251). It is a GENERAL
+// per-mapping cache: the first consumer is the TTS voice list (CacheType
+// "voices", ScopeKey "", one row per mapping), and a later consumer adds a new
+// CacheType rather than a new table.
+//
+// The key is (MappingID, CacheType, ScopeKey). ScopeKey is "" for a payload
+// that is simply "the mapping's X"; a consumer whose payload varies by some
+// other axis (a locale, say) names that axis in it. Payload is opaque to the
+// store -- each consumer owns its encoding (the voices cache stores JSON) -- and
+// may be empty, which is a legitimate value: "fetched, and there is nothing to
+// offer". UpdatedAt is the caller's clock reading of the write, kept so a
+// reader can tell how stale a payload is; the store never stamps it.
+//
+// The cached facts are about the model the mapping pointed at when they were
+// written, so the rows are dropped when ModelMapping.AppModelName changes (see
+// MappingStore.UpdateMapping / UpdateMappingEditable) and cascade away with the
+// mapping itself.
+type ModelMappingCacheRow struct {
+	MappingID string
+	CacheType string
+	ScopeKey  string
+	Payload   string
+	UpdatedAt time.Time
+}
+
+// ValidateModelMappingCacheRow rejects a row that cannot be a meaningful cache
+// entry: one without a cache type (nothing could ever read it back by type).
+// Both UpsertModelMappingCache implementations call this exact function, so the
+// drivers cannot diverge on what counts as a valid row. A missing mapping is
+// not checked here -- that is the foreign key's job on the SQL drivers and a
+// hand-rolled existence check on MemoryStore.
+func ValidateModelMappingCacheRow(r ModelMappingCacheRow) error {
+	if r.CacheType == "" {
+		return fmt.Errorf("model mapping cache row: cache type must not be empty")
+	}
+	return nil
+}
+
 // Capability names. The vocabulary is deliberately OPEN -- an upstream may
 // report capabilities this codebase has never heard of (Ollama passes
 // manifest-declared names through verbatim), and those are stored and
@@ -1889,6 +1928,13 @@ func (m MappingMetricsMask) Any() bool {
 
 type MappingStore interface {
 	CreateMapping(ctx context.Context, mapping ModelMapping) error
+	// UpdateMapping, like UpdateMappingEditable below, is one of the two
+	// writers of app_model_name, and both drop the mapping's model_mapping_cache
+	// rows (DeleteModelMappingCache) in the same atomic step when the stored
+	// app_model_name differs from the incoming one: a cached payload describes
+	// the model the mapping pointed at when it was written. A same-name update
+	// leaves the cache alone, and an update the store refuses (missing mapping,
+	// unknown application, name conflict) does not delete it either.
 	UpdateMapping(ctx context.Context, mapping ModelMapping) error
 	// UpdateMappingEditable writes a mapping's operator-editable columns
 	// (application_id, gateway_model_name, app_model_name, status,
@@ -1896,7 +1942,9 @@ type MappingStore interface {
 	// caller supplies in metrics — plus metrics_source/metrics_updated_at when
 	// metrics.Any(). Every unsupplied metric column is left exactly as stored,
 	// so a portal edit that carries a stale metric value can no longer revert a
-	// concurrently probed one (issue #65). ErrNotFound on a missing row.
+	// concurrently probed one (issue #65). ErrNotFound on a missing row. It
+	// invalidates the mapping's cache rows on an app_model_name change exactly
+	// as UpdateMapping above documents.
 	UpdateMappingEditable(ctx context.Context, mapping ModelMapping, metrics MappingMetricsMask) error
 	// UpdateMappingContextProbe sets a mapping's context_size + provenance from a
 	// context probe, atomically and ONLY when metrics_locked is false (a no-op,
@@ -1999,6 +2047,35 @@ type MappingStore interface {
 	// row is how "not determined" is expressed -- the state the pre-78 bool
 	// columns could not represent.
 	DeleteMappingCapability(ctx context.Context, mappingID, capability string) error
+	// UpsertModelMappingCache writes one cache row (migration 94, #251),
+	// replacing any row for the same (mapping, cache type, scope key) in place.
+	// The row is validated (ValidateModelMappingCacheRow) before anything is
+	// written. An unknown MappingID is NOT a benign no-op: model_mapping_cache.
+	// mapping_id carries a real `references model_mappings(id) on delete
+	// cascade`, so the write fails with ErrNotFound on every driver (the SQL
+	// drivers classify the foreign-key violation, MemoryStore does a hand-rolled
+	// existence check) -- the same no-fabricated-orphan convention as
+	// UpsertMappingCapabilities, whose doc carries the argument. In practice
+	// this is reachable only via a TOCTOU (the mapping deleted between a
+	// caller's resolve step and this write). The caller supplies UpdatedAt; the
+	// store does not stamp it.
+	UpsertModelMappingCache(ctx context.Context, row ModelMappingCacheRow) error
+	// ModelMappingCache lists one mapping's cache rows of one cache type,
+	// ordered by scope key. A mapping with no such rows yields an empty
+	// (non-nil) slice -- nothing cached is simply nothing cached, not an error.
+	ModelMappingCache(ctx context.Context, mappingID, cacheType string) ([]ModelMappingCacheRow, error)
+	// ModelMappingCacheForMappings is the BULK reader for one cache type: one
+	// query per chunk of ids instead of one per mapping, keyed by mapping id,
+	// each mapping's rows ordered by scope key. A mapping with no rows
+	// contributes NO key. Repeated ids are read once. The listing endpoints are
+	// the intended caller (every mapping of a listing at once), which is the
+	// same reason MappingCapabilitiesForMappings exists.
+	ModelMappingCacheForMappings(ctx context.Context, mappingIDs []string, cacheType string) (map[string][]ModelMappingCacheRow, error)
+	// DeleteModelMappingCache removes every cache row of one mapping, whatever
+	// its cache type. Deleting where there is nothing is a benign no-op. This is
+	// the explicit form of what UpdateMapping/UpdateMappingEditable do on an
+	// app_model_name change and what the FK cascade does when the mapping goes.
+	DeleteModelMappingCache(ctx context.Context, mappingID string) error
 	MappingByID(ctx context.Context, id string) (ModelMapping, error)
 	MappingsByApplication(ctx context.Context, applicationID string) ([]ModelMapping, error)
 	MappingsByServer(ctx context.Context, serverID string) ([]ModelMapping, error)

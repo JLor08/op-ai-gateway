@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/routing"
 	"path/filepath"
 	"reflect"
@@ -2226,4 +2227,332 @@ func TestCapabilityRankCaseMatchesGoRank(t *testing.T) {
 			}
 		}
 	})
+}
+
+// --- Model mapping cache rows (model_mapping_cache, #251) -------------------
+
+// seedModelCacheMappings creates one server, one application and one mapping
+// per id (AppModelName "<id>-upstream"), the FK parents every
+// model_mapping_cache row needs. It goes through routing.Store only, so the
+// same fixture serves the memory, sqlite and postgres legs.
+func seedModelCacheMappings(t *testing.T, s routing.Store, now time.Time, ids ...string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.CreateAIServer(ctx, routing.AIServer{
+		ID: "srv_mc", Name: "MC", Domain: "srv-mc.local", Provider: routing.ProviderOllama,
+		Endpoint: "http://srv-mc.local:11434", Status: routing.ServerStatusActive,
+		HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := s.CreateApplication(ctx, routing.Application{
+		ID: "app_mc", ServerID: "srv_mc", Type: "ollama", Port: 11434, Scheme: "http",
+		APIFlavors: []string{routing.APIFlavorOpenAI}, Priority: 1, Weight: 1,
+		TimeoutMS: 30000, AffinityTTLSeconds: 300, Status: routing.ServerStatusActive,
+		HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+	for _, id := range ids {
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: id, ApplicationID: "app_mc", GatewayModelName: id + "-model",
+			AppModelName: id + "-upstream", Status: routing.ServerStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping %s: %v", id, err)
+		}
+	}
+}
+
+// sameModelMappingCacheRow compares two cache rows field by field, comparing
+// the timestamp with Equal (a driver may hand back a different Location).
+func sameModelMappingCacheRow(a, b routing.ModelMappingCacheRow) bool {
+	return a.MappingID == b.MappingID && a.CacheType == b.CacheType &&
+		a.ScopeKey == b.ScopeKey && a.Payload == b.Payload && a.UpdatedAt.Equal(b.UpdatedAt)
+}
+
+// TestModelMappingCacheRows proves the general per-mapping cache on every
+// driver: rows round-trip with their payload and timestamp, two rows of one
+// mapping are told apart by (cache_type, scope_key), a read is filtered by
+// cache_type, a second write for the same key REPLACES rather than
+// duplicating, the bulk reader returns exactly the requested parents (and
+// invents no key for a mapping without rows), delete-by-mapping clears every
+// cache type of that mapping and nothing else, and deleting the MAPPING takes
+// its rows with it (the FK cascade on the SQL drivers, hand-rolled on memory).
+func TestModelMappingCacheRows(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+		seedModelCacheMappings(t, s, now, "m1", "m2", "m3")
+
+		m1Default := routing.ModelMappingCacheRow{MappingID: "m1", CacheType: "voices", ScopeKey: "", Payload: `{"voices":["alloy","echo"]}`, UpdatedAt: now}
+		m1Scoped := routing.ModelMappingCacheRow{MappingID: "m1", CacheType: "voices", ScopeKey: "de", Payload: `{"voices":["hans"]}`, UpdatedAt: now}
+		m1Other := routing.ModelMappingCacheRow{MappingID: "m1", CacheType: "other", ScopeKey: "", Payload: `{"x":1}`, UpdatedAt: now}
+		m2Default := routing.ModelMappingCacheRow{MappingID: "m2", CacheType: "voices", ScopeKey: "", Payload: `{"voices":["nova"]}`, UpdatedAt: now}
+		for _, row := range []routing.ModelMappingCacheRow{m1Default, m1Scoped, m1Other, m2Default} {
+			if err := s.UpsertModelMappingCache(ctx, row); err != nil {
+				t.Fatalf("upsert %+v: %v", row, err)
+			}
+		}
+
+		// Single read: filtered by cache_type, ordered by scope_key.
+		got, err := s.ModelMappingCache(ctx, "m1", "voices")
+		if err != nil {
+			t.Fatalf("read m1 voices: %v", err)
+		}
+		want := []routing.ModelMappingCacheRow{m1Default, m1Scoped}
+		if len(got) != len(want) {
+			t.Fatalf("m1 voices = %+v, want %+v", got, want)
+		}
+		for i := range want {
+			if !sameModelMappingCacheRow(got[i], want[i]) {
+				t.Fatalf("m1 voices row %d = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+		if other, err := s.ModelMappingCache(ctx, "m1", "other"); err != nil || len(other) != 1 || other[0].Payload != `{"x":1}` {
+			t.Fatalf("m1 other = %+v err=%v, want the one other-typed row", other, err)
+		}
+		// No rows is an empty, non-nil slice -- never an error.
+		if none, err := s.ModelMappingCache(ctx, "m3", "voices"); err != nil || none == nil || len(none) != 0 {
+			t.Fatalf("m3 voices = %#v err=%v, want an empty non-nil slice", none, err)
+		}
+		if none, err := s.ModelMappingCache(ctx, "does-not-exist", "voices"); err != nil || len(none) != 0 {
+			t.Fatalf("unknown mapping read = %#v err=%v, want empty", none, err)
+		}
+
+		// Bulk read: m1 carries TWO voices rows so a reader that keeps only the
+		// last row scanned per mapping cannot pass; m3 and the unknown id must
+		// contribute no key at all.
+		batch, err := s.ModelMappingCacheForMappings(ctx, []string{"m1", "m2", "m3", "nope"}, "voices")
+		if err != nil {
+			t.Fatalf("bulk read: %v", err)
+		}
+		if len(batch) != 2 {
+			t.Fatalf("bulk keys = %v, want exactly m1 and m2", batch)
+		}
+		if _, present := batch["m3"]; present {
+			t.Fatal("bulk reader invented a key for a mapping without rows")
+		}
+		if _, present := batch["nope"]; present {
+			t.Fatal("bulk reader invented a key for an unknown mapping")
+		}
+		if len(batch["m1"]) != len(got) {
+			t.Fatalf("bulk m1 = %+v, single = %+v", batch["m1"], got)
+		}
+		for i := range got {
+			if !sameModelMappingCacheRow(batch["m1"][i], got[i]) {
+				t.Fatalf("bulk and single reader disagree at row %d: bulk=%+v single=%+v", i, batch["m1"], got)
+			}
+		}
+		if len(batch["m2"]) != 1 || batch["m2"][0].Payload != m2Default.Payload {
+			t.Fatalf("bulk m2 = %+v", batch["m2"])
+		}
+		// A repeated id must not duplicate rows (two drivers, one answer).
+		dup, err := s.ModelMappingCacheForMappings(ctx, []string{"m1", "m1"}, "voices")
+		if err != nil || len(dup["m1"]) != 2 {
+			t.Fatalf("bulk with a repeated id = %+v err=%v, want m1's 2 rows once", dup, err)
+		}
+		if empty, err := s.ModelMappingCacheForMappings(ctx, nil, "voices"); err != nil || len(empty) != 0 {
+			t.Fatalf("empty bulk: err=%v map=%+v", err, empty)
+		}
+
+		// Upsert replaces in place: same key, new payload + timestamp, no
+		// duplicate row, and the sibling rows are untouched.
+		later := now.Add(time.Hour)
+		if err := s.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+			MappingID: "m1", CacheType: "voices", ScopeKey: "", Payload: `{"voices":["alloy"]}`, UpdatedAt: later,
+		}); err != nil {
+			t.Fatalf("overwrite: %v", err)
+		}
+		got, err = s.ModelMappingCache(ctx, "m1", "voices")
+		if err != nil {
+			t.Fatalf("read after overwrite: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("overwrite duplicated or dropped a row: %+v", got)
+		}
+		if got[0].ScopeKey != "" || got[0].Payload != `{"voices":["alloy"]}` || !got[0].UpdatedAt.Equal(later) {
+			t.Fatalf("overwrite did not replace the default-scope row: %+v", got[0])
+		}
+		if got[1].Payload != m1Scoped.Payload || !got[1].UpdatedAt.Equal(now) {
+			t.Fatalf("overwrite disturbed the sibling scoped row: %+v", got[1])
+		}
+
+		// An empty payload is a legitimate value ("fetched, nothing to offer").
+		if err := s.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+			MappingID: "m3", CacheType: "voices", Payload: "", UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("upsert empty payload: %v", err)
+		}
+		if got, err := s.ModelMappingCache(ctx, "m3", "voices"); err != nil || len(got) != 1 || got[0].Payload != "" {
+			t.Fatalf("empty payload read back = %+v err=%v", got, err)
+		}
+		if err := s.DeleteModelMappingCache(ctx, "m3"); err != nil {
+			t.Fatalf("delete m3: %v", err)
+		}
+
+		// Delete-by-mapping clears every cache type of that mapping and only
+		// that mapping; deleting where nothing exists is a benign no-op.
+		if err := s.DeleteModelMappingCache(ctx, "m1"); err != nil {
+			t.Fatalf("delete m1: %v", err)
+		}
+		for _, cacheType := range []string{"voices", "other"} {
+			if left, err := s.ModelMappingCache(ctx, "m1", cacheType); err != nil || len(left) != 0 {
+				t.Fatalf("m1 %s after delete = %+v err=%v, want none", cacheType, left, err)
+			}
+		}
+		if kept, err := s.ModelMappingCache(ctx, "m2", "voices"); err != nil || len(kept) != 1 {
+			t.Fatalf("m2 voices after deleting m1 = %+v err=%v, want untouched", kept, err)
+		}
+		for _, absent := range []string{"m1", "m3", "does-not-exist"} {
+			if err := s.DeleteModelMappingCache(ctx, absent); err != nil {
+				t.Fatalf("delete(%q) of an absent set must be a no-op: %v", absent, err)
+			}
+		}
+
+		// FK cascade: deleting the MAPPING takes its cache rows with it.
+		if err := s.DeleteMapping(ctx, "m2"); err != nil {
+			t.Fatalf("delete mapping m2: %v", err)
+		}
+		if left, err := s.ModelMappingCache(ctx, "m2", "voices"); err != nil || len(left) != 0 {
+			t.Fatalf("m2 cache after the mapping was deleted = %+v err=%v, want none (cascade)", left, err)
+		}
+		if left, err := s.ModelMappingCacheForMappings(ctx, []string{"m2"}, "voices"); err != nil || len(left) != 0 {
+			t.Fatalf("bulk m2 after the mapping was deleted = %+v err=%v, want none (cascade)", left, err)
+		}
+	})
+}
+
+// TestModelMappingCacheRejectsBadWrites pins the two write refusals every
+// driver shares: a row whose mapping does not exist fails (a real FK on the
+// SQL drivers, a hand-rolled ErrNotFound on memory -- the same convention
+// UpsertMappingCapabilities documents) and leaves no orphan behind, and a
+// row without a cache type is rejected before anything is written.
+func TestModelMappingCacheRejectsBadWrites(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+		seedModelCacheMappings(t, s, now, "m1")
+
+		if err := s.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+			MappingID: "does-not-exist", CacheType: "voices", Payload: "{}", UpdatedAt: now,
+		}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("upsert for a missing mapping = %v, want ErrNotFound on every driver (FK violation reclassified on SQL, existence check on memory)", err)
+		}
+		if left, err := s.ModelMappingCache(ctx, "does-not-exist", "voices"); err != nil || len(left) != 0 {
+			t.Fatalf("rows for the missing mapping = %+v err=%v, want none (no orphan)", left, err)
+		}
+
+		if err := s.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+			MappingID: "m1", CacheType: "", Payload: "{}", UpdatedAt: now,
+		}); err == nil {
+			t.Fatal("upsert with an empty cache type succeeded, want a validation failure")
+		}
+		if left, err := s.ModelMappingCache(ctx, "m1", ""); err != nil || len(left) != 0 {
+			t.Fatalf("rows for the empty cache type = %+v err=%v, want none", left, err)
+		}
+	})
+}
+
+// TestModelMappingCacheInvalidatedWhenAppModelNameChanges pins the
+// invalidation hook: a cached payload is about the model the mapping pointed
+// at when it was written (a voice list belongs to one model), so persisting a
+// mapping whose AppModelName CHANGED must drop that mapping's cache rows --
+// through BOTH writers that persist app_model_name (UpdateMapping and
+// UpdateMappingEditable) -- while a same-name update (a status flip, a metric
+// edit) and every other mapping's rows stay. The rename is atomic with the
+// cache delete: a rename the store refuses leaves the rows alone.
+func TestModelMappingCacheInvalidatedWhenAppModelNameChanges(t *testing.T) {
+	type writer struct {
+		name  string
+		write func(ctx context.Context, s routing.Store, mapping routing.ModelMapping) error
+	}
+	writers := []writer{
+		{"UpdateMapping", func(ctx context.Context, s routing.Store, mapping routing.ModelMapping) error {
+			return s.UpdateMapping(ctx, mapping)
+		}},
+		{"UpdateMappingEditable", func(ctx context.Context, s routing.Store, mapping routing.ModelMapping) error {
+			return s.UpdateMappingEditable(ctx, mapping, routing.MappingMetricsMask{})
+		}},
+	}
+	for _, w := range writers {
+		t.Run(w.name, func(t *testing.T) {
+			forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+				ctx := context.Background()
+				now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+				seedModelCacheMappings(t, s, now, "m1", "m2")
+				for _, id := range []string{"m1", "m2"} {
+					if err := s.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+						MappingID: id, CacheType: "voices", Payload: `{"voices":["` + id + `"]}`, UpdatedAt: now,
+					}); err != nil {
+						t.Fatalf("seed cache %s: %v", id, err)
+					}
+				}
+				rowsOf := func(id string) int {
+					t.Helper()
+					rows, err := s.ModelMappingCache(ctx, id, "voices")
+					if err != nil {
+						t.Fatalf("read cache %s: %v", id, err)
+					}
+					return len(rows)
+				}
+				m1, err := s.MappingByID(ctx, "m1")
+				if err != nil {
+					t.Fatalf("load m1: %v", err)
+				}
+
+				// Same AppModelName (a status flip): the cache stays.
+				same := m1
+				same.Status = routing.ServerStatusDisabled
+				same.UpdatedAt = now.Add(time.Minute)
+				if err := w.write(ctx, s, same); err != nil {
+					t.Fatalf("same-name update: %v", err)
+				}
+				if n := rowsOf("m1"); n != 1 {
+					t.Fatalf("a same-AppModelName update left %d cache rows for m1, want 1 (must not invalidate)", n)
+				}
+
+				// A rename the store refuses (unknown application -> FK
+				// violation / ErrNotFound) is not a rename: the cache stays.
+				refused := m1
+				refused.AppModelName = "renamed-but-refused"
+				refused.ApplicationID = "app_that_does_not_exist"
+				if err := w.write(ctx, s, refused); err == nil {
+					t.Fatal("a rename onto an unknown application succeeded, want a failure")
+				}
+				if n := rowsOf("m1"); n != 1 {
+					t.Fatalf("a REFUSED rename left %d cache rows for m1, want 1 (delete must be atomic with the update)", n)
+				}
+
+				// A real rename: m1's rows go, m2's stay.
+				renamed := m1
+				renamed.AppModelName = "m1-renamed-upstream"
+				renamed.UpdatedAt = now.Add(2 * time.Minute)
+				if err := w.write(ctx, s, renamed); err != nil {
+					t.Fatalf("rename update: %v", err)
+				}
+				if n := rowsOf("m1"); n != 0 {
+					t.Fatalf("a changed AppModelName left %d cache rows for m1, want 0 (stale voices of the old model)", n)
+				}
+				if n := rowsOf("m2"); n != 1 {
+					t.Fatalf("m1's rename touched m2's cache: %d rows, want 1", n)
+				}
+
+				// Rows written after the rename belong to the new model and
+				// survive the next same-name update.
+				if err := s.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+					MappingID: "m1", CacheType: "voices", Payload: `{"voices":["fresh"]}`, UpdatedAt: now.Add(3 * time.Minute),
+				}); err != nil {
+					t.Fatalf("write after rename: %v", err)
+				}
+				renamed.UpdatedAt = now.Add(4 * time.Minute)
+				if err := w.write(ctx, s, renamed); err != nil {
+					t.Fatalf("second same-name update: %v", err)
+				}
+				if n := rowsOf("m1"); n != 1 {
+					t.Fatalf("a same-name update after the rename left %d cache rows for m1, want 1", n)
+				}
+			})
+		})
+	}
 }
