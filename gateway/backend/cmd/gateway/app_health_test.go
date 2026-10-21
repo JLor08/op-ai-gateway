@@ -5132,3 +5132,545 @@ func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T)
 		t.Fatalf("the upstream was asked for /v1/audio/voices %d times (paths %v), want 1: only the loaded tts model's", voiceRequests, paths)
 	}
 }
+
+// agentVoicesRunner builds a runner over ONE server_agent application ("a1" on
+// http://s1.local:8001) whose agent declares `features`, with the given
+// mappings, each of them a fully ELIGIBLE agent-launched audio.cpp child for the
+// agent-child voices pass (#251): a runtime spec of kind audio_cpp, the agent's
+// own plain-tts verdicts (speech yes, speech_clone no) and its model loaded.
+// The app has an app-level credential, so a pass that fell back to it instead of
+// the spec's is visible. A test breaks exactly one gate on the returned parts and
+// runs a cycle: that is what keeps each case's reason for not fetching
+// unambiguous.
+func agentVoicesRunner(t *testing.T, features []string, mappings ...routing.ModelMapping) (*appHealthRunner, *fakeHealthStore, *audioCppFakeProber, *gateway.LoadedModelRegistry) {
+	t.Helper()
+	shrinkRetryGap(t)
+	app := serverAgentApp("a1", "s1", 8001)
+	app.APIToken = "plain:app-tok"
+	app.APITokenHeader = "X-App-Key"
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{"a1": mappings}
+	loaded := gateway.NewLoadedModelRegistry()
+	models := make([]string, 0, len(mappings))
+	for _, mp := range mappings {
+		st.runtimeSpecs = append(st.runtimeSpecs, routing.RuntimeSpec{MappingID: mp.ID, Enabled: true, Type: string(routing.RuntimeSpecTypeAudioCpp)})
+		st.seedCapability(mp.ID, routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+		st.seedCapability(mp.ID, routing.CapabilitySpeechClone, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+		models = append(models, mp.AppModelName)
+	}
+	loaded.SetGatewayProbe("a1", models)
+	prober := newAudioCppFakeProber()
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil), loaded: loaded,
+		agents:   fakeAgentBundle{features: map[string][]string{"s1": features}},
+		settings: st, probeTimeout: time.Second, now: time.Now,
+	}
+	return runner, st, prober, loaded
+}
+
+// agentVoicesFlag is the agent's declared feature set that makes the voices
+// route reachable: the one flag the pass is gated on.
+var agentVoicesFlag = []string{gateway.RuntimeVoicesFeature}
+
+// TestRunAppHealthOnceVoicesAgentFetchesThroughTheRouterAndWrites is the pass's
+// whole job (#251): a RUNNING agent-launched audio.cpp child that is a plain tts
+// model, on a server whose agent declared runtime_voices, has its voices fetched
+// through the agent router's GET /upstream/<model>/v1/audio/voices and written,
+// normalized, to the mapping's cache row.
+//
+// The lister is aimed at <router base>/upstream/<model> -- the target's Endpoint,
+// to which the lister appends /v1/audio/voices -- with the application's
+// server_agent provider, the probe timeout, and the mapping's upstream model
+// name. The router is the only way to reach the child (it listens on a loopback
+// port the gateway cannot dial), and the route is Status-only, so a cold child
+// answers 404 instead of being started.
+func TestRunAppHealthOnceVoicesAgentFetchesThroughTheRouterAndWrites(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "pocket_tts"))
+	prober.acVoices["pocket_tts"] = voiceList("demo_2_man", "demo_1_man", "demo_2_man")
+	at := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return at }
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.voicesAsked(), []string{"pocket_tts"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("voices listing asked about %v, want %v", got, want)
+	}
+	target := prober.acVoicesTargets[0]
+	if target.Provider != routing.ProviderServerAgent || target.Endpoint != "http://s1.local:8001/upstream/pocket_tts" || target.Timeout != time.Second {
+		t.Fatalf("voices target = %+v, want {Provider:server_agent Endpoint:http://s1.local:8001/upstream/pocket_tts Timeout:1s}", target)
+	}
+	row, ok := st.voicesRowOf("m1")
+	if !ok {
+		t.Fatal("m1 has no voices row, want one")
+	}
+	want := routing.ModelMappingCacheRow{
+		MappingID: "m1", CacheType: "voices", ScopeKey: "",
+		Payload: `["demo_1_man","demo_2_man"]`, UpdatedAt: at,
+	}
+	if row != want {
+		t.Fatalf("voices row = %+v, want %+v", row, want)
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentEscapesTheModelInTheRouterPath: the model name
+// is a PATH segment of the router URL, so it is escaped segment by segment (a
+// slash-bearing name stays a multi-segment path), exactly as the context probe
+// expands {model}.
+func TestRunAppHealthOnceVoicesAgentEscapesTheModelInTheRouterPath(t *testing.T) {
+	runner, _, prober, _ := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "org/my model"))
+	prober.acVoices["org/my model"] = voiceList("a")
+
+	runCapabilityCycle(runner)
+
+	if len(prober.acVoicesTargets) != 1 {
+		t.Fatalf("voices listing called %d times, want 1", len(prober.acVoicesTargets))
+	}
+	if got, want := prober.acVoicesTargets[0].Endpoint, "http://s1.local:8001/upstream/org/my%20model"; got != want {
+		t.Fatalf("voices endpoint = %q, want %q", got, want)
+	}
+	if got, want := prober.voicesAsked(), []string{"org/my model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("voices listing asked about %v, want %v (the raw upstream model name)", got, want)
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentWithoutTheFlagNeverFetches is the fail-closed
+// gate: an agent with no positive evidence of the voices route is NEVER asked,
+// because an older router answers 404 runtime.model_not_managed for it -- the
+// very answer it gives an unmanaged model -- so asking could not tell the two
+// apart and would only add a silent no-op GET per child per tick. "No evidence"
+// is an agent that declared other features only, one that declared none, a
+// server with no agent registry entry at all, and no registry bundle. The
+// control case, with the flag, proves the setup is otherwise fetch-capable.
+func TestRunAppHealthOnceVoicesAgentWithoutTheFlagNeverFetches(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		agents   agentRegistryBundle
+		wantAsks int
+	}{
+		{"control: the flag is declared", fakeAgentBundle{features: map[string][]string{"s1": agentVoicesFlag}}, 1},
+		{"only another feature is declared", fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}, 0},
+		{"no feature is declared", fakeAgentBundle{features: map[string][]string{"s1": {}}}, 0},
+		{"the server has no agent entry", fakeAgentBundle{features: map[string][]string{}}, 0},
+		{"the flag is declared by another server's agent", fakeAgentBundle{features: map[string][]string{"s2": agentVoicesFlag}}, 0},
+		{"no registry bundle", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober, _ := agentVoicesRunner(t, nil, audioCppMapping("m1", "pocket_tts"))
+			runner.agents = tc.agents
+			prober.acVoices["pocket_tts"] = voiceList("a")
+
+			runCapabilityCycle(runner)
+
+			if got := len(prober.voicesAsked()); got != tc.wantAsks {
+				t.Fatalf("voices listing asked %d times, want %d", got, tc.wantAsks)
+			}
+			if tc.wantAsks == 0 {
+				if row, ok := st.voicesRowOf("m1"); ok {
+					t.Fatalf("m1 has a voices row %+v, want none", row)
+				}
+				if n := st.cacheWriteCount(); n != 0 {
+					t.Fatalf("cache written %d times, want 0", n)
+				}
+			} else {
+				st.assertVoicesPayload(t, "m1", `["a"]`)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentGate pins WHICH mappings are asked, one gate
+// broken per case against a fully eligible child (the control). The route is
+// Status-only, so a request for a model that is not running would only 404 --
+// and a gateway that fetched on a guess is how a cold child would get asked at
+// all -- hence loaded is strict, and only a plain tts audio.cpp child has voices
+// to offer: (speech, yes) and NOT (speech_clone, yes), from the verdicts the
+// agent reports for the child. An UNKNOWN clone verdict (no row) does not block:
+// only an affirmative clone does, the same rule as the static server's pass.
+func TestRunAppHealthOnceVoicesAgentGate(t *testing.T) {
+	deleteCap := func(st *fakeHealthStore, capability string) { delete(st.caps["m1"], capability) }
+	for _, tc := range []struct {
+		name      string
+		breakGate func(st *fakeHealthStore, loaded *gateway.LoadedModelRegistry)
+		want      bool
+	}{
+		{"control: a running plain tts audio.cpp child", func(*fakeHealthStore, *gateway.LoadedModelRegistry) {}, true},
+		{"the clone verdict is unknown", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			deleteCap(st, routing.CapabilitySpeechClone)
+		}, true},
+		{"the spec names no type but an audio.cpp binary", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			st.runtimeSpecs[0].Type, st.runtimeSpecs[0].Binary = "", "/opt/audio.cpp/audiocpp_server"
+		}, true},
+		{"nothing is loaded", func(_ *fakeHealthStore, loaded *gateway.LoadedModelRegistry) { loaded.SetGatewayProbe("a1", nil) }, false},
+		{"another model is loaded", func(_ *fakeHealthStore, loaded *gateway.LoadedModelRegistry) {
+			loaded.SetGatewayProbe("a1", []string{"some_other_model"})
+		}, false},
+		{"the speech verdict is no", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			st.seedCapability("m1", routing.CapabilitySpeech, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+		}, false},
+		{"the speech verdict is unknown", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) { deleteCap(st, routing.CapabilitySpeech) }, false},
+		{"the model is a clone model", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+		}, false},
+		{"the spec is a llama.cpp one", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			st.runtimeSpecs[0].Type = string(routing.RuntimeSpecTypeLlamaCpp)
+		}, false},
+		{"the spec names no type and an unrelated binary", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			st.runtimeSpecs[0].Type, st.runtimeSpecs[0].Binary = "", "/usr/local/bin/my-server"
+		}, false},
+		{"the mapping has no runtime spec", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) { st.runtimeSpecs = nil }, false},
+		{"the mapping is not active", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			st.mappings["a1"][0].Status = routing.ServerStatusDisabled
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober, loaded := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "pocket_tts"))
+			prober.acVoices["pocket_tts"] = voiceList("a")
+			tc.breakGate(st, loaded)
+
+			runCapabilityCycle(runner)
+
+			asked := prober.voicesAsked()
+			if tc.want {
+				if !reflect.DeepEqual(asked, []string{"pocket_tts"}) {
+					t.Fatalf("voices listing asked about %v, want [pocket_tts]", asked)
+				}
+				st.assertVoicesPayload(t, "m1", `["a"]`)
+				return
+			}
+			if len(asked) != 0 {
+				t.Fatalf("voices listing asked about %v, want no request", asked)
+			}
+			if row, ok := st.voicesRowOf("m1"); ok {
+				t.Fatalf("m1 has a voices row %+v, want none", row)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentOnlyAsksTheLoadedMapping: two audio.cpp
+// children of one application, one running and one cold. The cold one is never
+// asked -- the router would not start it, but asking is still a wasted request
+// that could one day be a start -- and gets no row; the running one is.
+func TestRunAppHealthOnceVoicesAgentOnlyAsksTheLoadedMapping(t *testing.T) {
+	runner, st, prober, loaded := agentVoicesRunner(t, agentVoicesFlag,
+		audioCppMapping("m1", "tts_running"), audioCppMapping("m2", "tts_cold"))
+	loaded.SetGatewayProbe("a1", []string{"tts_running"})
+	prober.acVoices["tts_running"], prober.acVoices["tts_cold"] = voiceList("r"), voiceList("c")
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.voicesAsked(), []string{"tts_running"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("voices listing asked about %v, want %v", got, want)
+	}
+	st.assertVoicesPayload(t, "m1", `["r"]`)
+	if row, ok := st.voicesRowOf("m2"); ok {
+		t.Fatalf("the cold child's mapping has a voices row %+v, want none", row)
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentCredentialsComeFromTheSpec: each mapping's
+// fetch carries the credential SpecUpstreamAuth resolves for ITS spec (issue
+// #58), opened from its sealed form, because the router forwards whatever the
+// request carries to the child verbatim and a child protected by its own api key
+// would otherwise answer 401. The app's own token is the fallback only for a
+// spec in "app" mode (and the zero value); "off" sends nothing at all.
+func TestRunAppHealthOnceVoicesAgentCredentialsComeFromTheSpec(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag,
+		audioCppMapping("m-set", "tts_set"), audioCppMapping("m-custom", "tts_custom"),
+		audioCppMapping("m-off", "tts_off"), audioCppMapping("m-app", "tts_app"))
+	for i := range st.runtimeSpecs {
+		switch st.runtimeSpecs[i].MappingID {
+		case "m-set":
+			st.runtimeSpecs[i].APITokenMode, st.runtimeSpecs[i].APIToken = "set", "plain:set-tok"
+		case "m-custom":
+			st.runtimeSpecs[i].APITokenMode, st.runtimeSpecs[i].APIToken = "set", "plain:custom-tok"
+			st.runtimeSpecs[i].APITokenHeaderSource, st.runtimeSpecs[i].APITokenHeader = "custom", "X-Spec-Key"
+		case "m-off":
+			st.runtimeSpecs[i].APITokenMode = "off"
+		}
+	}
+	for _, model := range []string{"tts_set", "tts_custom", "tts_off", "tts_app"} {
+		prober.acVoices[model] = voiceList("v")
+	}
+
+	runCapabilityCycle(runner)
+
+	prober.acMu.Lock()
+	got := map[string]provider.UpstreamAuth{}
+	for i, model := range prober.acVoicesModels {
+		got[model] = prober.acVoicesAuth[i]
+	}
+	prober.acMu.Unlock()
+	want := map[string]provider.UpstreamAuth{
+		"tts_set":    {Header: "X-App-Key", Token: "set-tok"},
+		"tts_custom": {Header: "X-Spec-Key", Token: "custom-tok"},
+		"tts_off":    {},
+		"tts_app":    {Header: "X-App-Key", Token: "app-tok"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("voices credentials per model = %+v, want %+v", got, want)
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentColdChildKeepsTheRowAndBacksOff: the route
+// answers 404 runtime.model_not_running for a child that stopped between the
+// agent's loaded report and this GET (an idle unload, a crash). That says nothing
+// about the model's voices, so it is a FAILED listing: the row on file -- the last
+// known good, which the picker offers while the model is unloaded -- survives,
+// and a back-off opens so the pass does not ask again every tick. Once the window
+// has elapsed it asks again; a success is written and clears it. The fake hands
+// voices back beside the error, so only the error guard stands between them and
+// the row.
+func TestRunAppHealthOnceVoicesAgentColdChildKeepsTheRowAndBacksOff(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "pocket_tts"))
+	current := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return current }
+	prober.acVoices["pocket_tts"] = voiceList("would_overwrite")
+	prober.acVoicesErr["pocket_tts"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+	st.seedVoicesCache("m1", `["old_a","old_b"]`)
+	asked := func() int { return len(prober.voicesAsked()) }
+
+	runCapabilityCycle(runner)
+	if n := asked(); n != 1 {
+		t.Fatalf("asked %d times after the first tick, want 1", n)
+	}
+	if !runner.voicesBackoff.active("m1", current) {
+		t.Fatal("no back-off is open after a failed listing")
+	}
+	st.assertVoicesPayload(t, "m1", `["old_a","old_b"]`)
+
+	current = current.Add(audioCppVoicesBackoff / 2)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 1 {
+		t.Fatalf("asked %d times inside the back-off, want still 1", n)
+	}
+
+	current = current.Add(audioCppVoicesBackoff)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 2 {
+		t.Fatalf("asked %d times after the back-off elapsed, want 2", n)
+	}
+	if n := st.cacheWriteCount(); n != 0 {
+		t.Fatalf("cache written %d times while every listing failed, want 0", n)
+	}
+	st.assertVoicesPayload(t, "m1", `["old_a","old_b"]`)
+
+	// The child answers again: the success is written over the old row and
+	// clears the back-off, so the next tick asks without waiting.
+	delete(prober.acVoicesErr, "pocket_tts")
+	current = current.Add(audioCppVoicesBackoff + time.Second)
+	runCapabilityCycle(runner)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 4 {
+		t.Fatalf("asked %d times after the child recovered, want 4 (a success clears the back-off)", n)
+	}
+	st.assertVoicesPayload(t, "m1", `["would_overwrite"]`)
+}
+
+// TestRunAppHealthOnceVoicesAgentUnloadClearsTheBackoff: a child that leaves the
+// loaded set while a back-off is open starts clean on its next load, so a reload
+// (a new child, possibly a newer audio.cpp that does serve the listing) is asked
+// at once instead of waiting out the window of the child before it.
+func TestRunAppHealthOnceVoicesAgentUnloadClearsTheBackoff(t *testing.T) {
+	runner, _, prober, loaded := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "pocket_tts"))
+	prober.acVoicesErr["pocket_tts"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+
+	runCapabilityCycle(runner) // fails, opens a back-off
+	runCapabilityCycle(runner) // inside it: not asked
+	if n := len(prober.voicesAsked()); n != 1 {
+		t.Fatalf("asked %d times, want 1", n)
+	}
+
+	loaded.SetGatewayProbe("a1", nil)
+	runCapabilityCycle(runner) // unloaded: never asked, back-off cleared
+	loaded.SetGatewayProbe("a1", []string{"pocket_tts"})
+	runCapabilityCycle(runner)
+	if n := len(prober.voicesAsked()); n != 2 {
+		t.Fatalf("asked %d times after an unload and reload, want 2 (the reload retries inside the old back-off window)", n)
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentWritePolicy: the same write policy as the
+// static server's pass -- a SUCCESSFUL listing is written, a genuine empty one
+// included ("the model has no voices" is a fact the picker should know), once:
+// a steady child costs a read per tick and no write.
+func TestRunAppHealthOnceVoicesAgentWritePolicy(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "pocket_tts"))
+	prober.acVoices["pocket_tts"] = []provider.Voice{} // a genuine empty, nil error
+	st.seedVoicesCache("m1", `["old"]`)
+
+	runCapabilityCycle(runner)
+	runCapabilityCycle(runner)
+
+	st.assertVoicesPayload(t, "m1", `[]`)
+	if n := st.cacheWriteCount(); n != 1 {
+		t.Fatalf("cache written %d times over two empty listings, want 1", n)
+	}
+	if n := len(prober.voicesAsked()); n != 2 {
+		t.Fatalf("voices listing asked %d times over two ticks, want 2 (asked every tick, only the write is skipped)", n)
+	}
+
+	prober.acVoices["pocket_tts"] = voiceList("b", "a", "b")
+	runCapabilityCycle(runner)
+	st.assertVoicesPayload(t, "m1", `["a","b"]`)
+}
+
+// TestRunAppHealthOnceVoicesAgentFailsClosedOnStoreReadErrors: the pass cannot
+// tell what kind of child a mapping is without its runtime spec, nor whether it
+// is a plain tts one without its capability rows, so a failed read of either is
+// "not known to be eligible": nothing is asked.
+func TestRunAppHealthOnceVoicesAgentFailsClosedOnStoreReadErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   func(*fakeHealthStore)
+		wantLog string // "" = the failure is only debug-logged
+	}{
+		{"the runtime specs cannot be read", func(st *fakeHealthStore) { st.specsErr = true }, "runtime specs for app a1 failed"},
+		{"the capability rows cannot be read", func(st *fakeHealthStore) { st.capsReadErr = true }, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "pocket_tts"))
+			prober.acVoices["pocket_tts"] = voiceList("a")
+			tc.setup(st)
+			var buf bytes.Buffer
+			log.SetOutput(&buf)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+			runCapabilityCycle(runner)
+
+			if asked := prober.voicesAsked(); len(asked) != 0 {
+				t.Fatalf("voices listing asked about %v, want no request", asked)
+			}
+			if n := st.cacheWriteCount(); n != 0 {
+				t.Fatalf("cache written %d times, want 0", n)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Fatalf("log output = %q, want it to contain %q", buf.String(), tc.wantLog)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentStoreWriteFailureIsBestEffort: a cache write
+// that fails is logged and the pass carries on to the next mapping.
+func TestRunAppHealthOnceVoicesAgentStoreWriteFailureIsBestEffort(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag,
+		audioCppMapping("m1", "tts_a"), audioCppMapping("m2", "tts_b"))
+	prober.acVoices["tts_a"], prober.acVoices["tts_b"] = voiceList("a"), voiceList("b")
+	st.cacheWriteErr = true
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	runCapabilityCycle(runner)
+
+	if n := len(prober.voicesAsked()); n != 2 {
+		t.Fatalf("voices listing asked %d times, want 2 (one failing write must not stop the next mapping)", n)
+	}
+	if !strings.Contains(buf.String(), "voices") {
+		t.Fatalf("log output = %q, want the failure logged", buf.String())
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentWithoutAListerIsSkipped: a prober that cannot
+// list voices skips the pass silently.
+func TestRunAppHealthOnceVoicesAgentWithoutAListerIsSkipped(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "pocket_tts"))
+	runner.prober = &audioCppModelsOnlyProber{fakeProber: prober.fakeProber, inner: prober}
+
+	runCapabilityCycle(runner)
+
+	if n := st.cacheWriteCount(); n != 0 {
+		t.Fatalf("cache written %d times, want 0", n)
+	}
+}
+
+// TestRunAppHealthOnceVoicesAgentOnTheWire runs the pass through the REAL client
+// chain -- the Multiplexer's server_agent client against an httptest server
+// standing in for the agent router -- which the fake-lister tests above cannot
+// see: the router URL the pass builds, the credential reaching the wire, and the
+// route being a plain GET that is never anything else. Two children of one
+// application: one answers its voices, one is cold and answers the router's
+// 404, which keeps its stored row and opens its back-off. The router is
+// asserted to have seen exactly the two voices GETs: no request that could start
+// a child, no /props, no /running.
+func TestRunAppHealthOnceVoicesAgentOnTheWire(t *testing.T) {
+	shrinkRetryGap(t)
+	type seenReq struct{ method, path, authorization, apiKey string }
+	var mu sync.Mutex
+	var seen []seenReq
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, seenReq{r.Method, r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("X-Api-Key")})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/upstream/tts_warm/v1/audio/voices":
+			_, _ = w.Write([]byte(`{"voices":["demo_2_man","demo_1_man"]}`))
+		case "/upstream/tts_cold/v1/audio/voices":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"runtime.model_not_running","message":"model is not running"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer router.Close()
+	u, err := url.Parse(router.URL)
+	if err != nil {
+		t.Fatalf("parse router url: %v", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("parse router port: %v", err)
+	}
+
+	app := serverAgentApp("a1", "s1", port)
+	app.HealthCheckMode = routing.HealthCheckModeAlwaysReachable // the only requests the router sees are the voices ones
+	app.APIToken = "plain:app-tok-must-not-be-used"
+	st := &fakeHealthStore{
+		servers: []routing.AIServer{{ID: "s1", Domain: u.Hostname(), Provider: routing.ProviderServerAgent, Status: routing.ServerStatusActive}},
+		apps:    map[string][]routing.Application{"s1": {app}},
+		mappings: map[string][]routing.ModelMapping{"a1": {
+			audioCppMapping("m-warm", "tts_warm"), audioCppMapping("m-cold", "tts_cold"),
+		}},
+		runtimeSpecs: []routing.RuntimeSpec{
+			{MappingID: "m-warm", Type: "audio_cpp", APITokenMode: "set", APIToken: "plain:tok-warm"},
+			{MappingID: "m-cold", Type: "audio_cpp", APITokenMode: "set", APIToken: "plain:tok-cold", APITokenHeaderSource: "custom", APITokenHeader: "X-Api-Key"},
+		},
+	}
+	for _, id := range []string{"m-warm", "m-cold"} {
+		st.seedCapability(id, routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+		st.seedCapability(id, routing.CapabilitySpeechClone, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+	}
+	st.seedVoicesCache("m-cold", `["last_known_good"]`)
+	loaded := gateway.NewLoadedModelRegistry()
+	loaded.SetGatewayProbe("a1", []string{"tts_warm", "tts_cold"})
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	runner := &appHealthRunner{
+		store: st, prober: providerClients(0, false, nil), registry: gateway.NewAppHealthRegistry(nil), loaded: loaded,
+		agents:   fakeAgentBundle{features: map[string][]string{"s1": agentVoicesFlag}},
+		settings: st, probeTimeout: time.Second, now: func() time.Time { return now },
+	}
+
+	runCapabilityCycle(runner)
+
+	mu.Lock()
+	got := append([]seenReq(nil), seen...)
+	mu.Unlock()
+	sort.Slice(got, func(i, j int) bool { return got[i].path < got[j].path })
+	want := []seenReq{
+		{http.MethodGet, "/upstream/tts_cold/v1/audio/voices", "", "tok-cold"},
+		{http.MethodGet, "/upstream/tts_warm/v1/audio/voices", "Bearer tok-warm", ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("router saw %+v, want exactly %+v", got, want)
+	}
+	st.assertVoicesPayload(t, "m-warm", `["demo_1_man","demo_2_man"]`)
+	st.assertVoicesPayload(t, "m-cold", `["last_known_good"]`)
+	if n := st.cacheWriteCount(); n != 1 {
+		t.Fatalf("cache written %d times, want 1 (the warm child only)", n)
+	}
+	if !runner.voicesBackoff.active("m-cold", now) || runner.voicesBackoff.active("m-warm", now) {
+		t.Fatalf("back-off cold=%v warm=%v, want cold=true warm=false", runner.voicesBackoff.active("m-cold", now), runner.voicesBackoff.active("m-warm", now))
+	}
+}

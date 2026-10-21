@@ -26,6 +26,13 @@ const (
 	// runtime.model_not_running. An operator-set ContextProbePath always wins
 	// over this default.
 	AgentRouterContextProbePath = "/upstream/{model}/props"
+	// AgentRouterUpstreamPath is the {model}-template base of the router's
+	// per-model passthrough routes (AgentRouterContextProbePath is this plus
+	// /props). A caller that hands a provider client the base as the target's
+	// Endpoint lets the client append the route's own path: the voices pass
+	// aims the audio.cpp voices lister at it, and the lister appends
+	// /v1/audio/voices (#251).
+	AgentRouterUpstreamPath = "/upstream/{model}"
 )
 
 // EffectiveLoadedModelsProbe resolves the loaded-models path and format a
