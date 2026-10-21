@@ -83,6 +83,11 @@ func TestMappingCapabilityVerdictReservedPairsAreRefused(t *testing.T) {
 			want: ErrMappingCapabilityReserved,
 		},
 		{
+			name: "a manual no on speech_streaming -- would permanently veto its probe",
+			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilitySpeechStreaming: routing.CapabilityNo}},
+			want: ErrMappingCapabilityReserved,
+		},
+		{
 			name: "a manual no on speech_clone -- would permanently force-offer a clone model the chat cannot drive",
 			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilitySpeechClone: routing.CapabilityNo}},
 			want: ErrMappingCapabilityReserved,

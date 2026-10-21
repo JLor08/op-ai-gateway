@@ -2502,6 +2502,78 @@ func TestAgentIngestAdmitsSpeechClone(t *testing.T) {
 	}
 }
 
+// TestAudioCppProbeCapabilitiesAllowsSpeechStreaming pins the ingest allowlist
+// for the speech twin of transcription_streaming: speech_streaming is a name the
+// audiocpp_models source may report (audioCppProbeCapabilities), spelled as the
+// literal the agent sends, and it is NOT a reserved agent capability name -- the
+// agent legitimately reports it, so reserving it would drop every honest row.
+func TestAudioCppProbeCapabilitiesAllowsSpeechStreaming(t *testing.T) {
+	if routing.CapabilitySpeechStreaming != "speech_streaming" {
+		t.Fatalf("routing.CapabilitySpeechStreaming = %q, want the literal speech_streaming the agent sends", routing.CapabilitySpeechStreaming)
+	}
+	if !audioCppProbeCapabilities[routing.CapabilitySpeechStreaming] {
+		t.Errorf("audioCppProbeCapabilities does not admit %q, want it admitted for the audiocpp_models source", routing.CapabilitySpeechStreaming)
+	}
+	if reservedAgentCapabilityNames[routing.CapabilitySpeechStreaming] {
+		t.Errorf("%q is a reserved agent capability name, want it open: the agent reports it", routing.CapabilitySpeechStreaming)
+	}
+}
+
+// TestAgentIngestAdmitsSpeechStreaming pins that the speech_streaming verdict an
+// agent derives from an audio.cpp tts or clon child's /v1/models "mode" reaches
+// model_mapping_capabilities under the audiocpp_models source, so the speech
+// handler can decide stream-vs-buffered up front for an agent-mediated app the way
+// it does for a direct one. It is the speech twin of
+// TestAgentIngestAdmitsTranscriptionStreaming.
+//
+// BOTH directions land: mode "streaming" is a yes and "offline" a real no, and the
+// no is what lets the handler answer the buffered one-shot instead of probing a
+// refusal. The write carries the speech, transcription and speech_clone rows beside
+// it (so the streaming row neither displaces one nor is dropped), and the pass
+// logs nothing at the level a real gateway runs at: the name is a known one, so
+// the allowlist's refusal Warn, which would repeat on every sample, must stay silent.
+func TestAgentIngestAdmitsSpeechStreaming(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, spec, streaming string
+	}{
+		{"a streaming tts model lands speech_streaming yes", "rspec_audiocpp_speech_stream_yes", routing.CapabilityYes},
+		{"an offline tts model lands speech_streaming no", "rspec_audiocpp_speech_stream_no", routing.CapabilityNo},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := withCapturedSlogAtTheDefaultLevel(t)
+			srv := NewTestServer()
+			seedRuntimeIngestSpec(t, srv, tc.spec, false)
+			mappingID := "map_" + tc.spec
+			counting := countingRowStore(srv)
+
+			req, raw := ingestReq(t, capabilitiesBody(tc.spec,
+				`{"verdicts":[{"name":"speech","verdict":"yes"},{"name":"transcription","verdict":"no"},`+
+					`{"name":"speech_clone","verdict":"no"},{"name":"speech_streaming","verdict":"`+tc.streaming+`"}],"source":"audiocpp_models"}`))
+			if err := srv.ingestTelemetrySample(ctx, "mock-host-qwen", req, raw); err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if got := counting.upsertCalls.Load(); got != 1 {
+				t.Fatalf("UpsertMappingCapabilities calls = %d, want exactly 1 (the four audio rows together)", got)
+			}
+			sent := counting.lastSent()
+			if len(sent) != 4 {
+				t.Fatalf("the write carried %+v, want exactly the speech, transcription, speech_clone and speech_streaming rows", sent)
+			}
+			for _, row := range sent {
+				if row.Source != routing.CapabilitySourceAudioCppModels {
+					t.Fatalf("sent row %+v carries source %q, want audiocpp_models", row, row.Source)
+				}
+			}
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+			assertCapabilityRow(t, srv, mappingID, routing.CapabilitySpeechStreaming, tc.streaming, routing.CapabilitySourceAudioCppModels)
+			if warns := warnRecordsFrom(buf.Snapshot()); len(warns) != 0 {
+				t.Fatalf("pass logged WARN records %+v, want none -- speech_streaming is a name the audio.cpp allowlist knows", warns)
+			}
+		})
+	}
+}
+
 // TestIngestRefusesSpeechCloneFromTheSdcppProbe pins the other half of the
 // attribution rule: speech_clone is the audio.cpp listing's to state and no other
 // probe's. A row for it under sdcpp_capabilities, whose document answers image
@@ -2649,7 +2721,7 @@ func TestIngestDropsRowsOutsideTheAudioCppProbesAllowlist(t *testing.T) {
 	}
 
 	recs := buf.Snapshot()
-	rec, ok := audioCppWarnRecord(recs, "other than speech, transcription, transcription_streaming or speech_clone to the audio.cpp probe")
+	rec, ok := audioCppWarnRecord(recs, "other than speech, transcription, transcription_streaming, speech_clone or speech_streaming to the audio.cpp probe")
 	if !ok {
 		t.Fatalf("no WARN record about the dropped foreign rows at the gateway's own default level (info); records = %+v", recs)
 	}
@@ -2702,7 +2774,7 @@ func TestAgentIngestAdmitsTranscriptionStreamingBesideAForeignRow(t *testing.T) 
 		routing.CapabilityNo, routing.CapabilitySourceLlamaCppProps)
 
 	recs := buf.Snapshot()
-	rec, ok := audioCppWarnRecord(recs, "other than speech, transcription, transcription_streaming or speech_clone to the audio.cpp probe")
+	rec, ok := audioCppWarnRecord(recs, "other than speech, transcription, transcription_streaming, speech_clone or speech_streaming to the audio.cpp probe")
 	if !ok {
 		t.Fatalf("no WARN record about the dropped foreign row at the gateway's own default level (info); records = %+v", recs)
 	}
@@ -2731,7 +2803,7 @@ func TestIngestDropsAVisionVerdictFromTheAudioCppProbeAlone(t *testing.T) {
 	if row, ok := capabilityRow(t, srv, "map_rspec_audiocpp_vision", routing.CapabilityVision); ok {
 		t.Fatalf("a vision row exists (%+v), want none", row)
 	}
-	if _, ok := audioCppWarnRecord(buf.Snapshot(), "other than speech, transcription, transcription_streaming or speech_clone to the audio.cpp probe"); !ok {
+	if _, ok := audioCppWarnRecord(buf.Snapshot(), "other than speech, transcription, transcription_streaming, speech_clone or speech_streaming to the audio.cpp probe"); !ok {
 		t.Fatalf("no WARN record about the dropped vision row at the gateway's own default level (info)")
 	}
 }
@@ -2818,13 +2890,13 @@ func TestIngestAudioCppVerdictDoesNotOverwriteAManualVerdict(t *testing.T) {
 
 // TestAudioCppRowsAreNotReservedAgentCapabilityNames pins the premise the audio
 // source's acceptance rests on: none of "speech", "transcription",
-// "transcription_streaming" and "speech_clone" is a reserved agent capability
+// "transcription_streaming", "speech_clone" and "speech_streaming" is a reserved agent capability
 // name, so the reserved-name gate in runtimeSampleCapabilityRows lets them through. The reserved set holds the
 // names whose OWN producers this codebase defined (mtp, live_progress,
 // speculation_observed, image_edit); a synthesis or transcription verdict is
 // reported on the open list like any other.
 func TestAudioCppRowsAreNotReservedAgentCapabilityNames(t *testing.T) {
-	for _, name := range []string{routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityTranscriptionStreaming, routing.CapabilitySpeechClone} {
+	for _, name := range []string{routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityTranscriptionStreaming, routing.CapabilitySpeechClone, routing.CapabilitySpeechStreaming} {
 		if reservedAgentCapabilityNames[name] {
 			t.Errorf("%q is a reserved agent capability name, want it open so the audiocpp_models source can report it", name)
 		}

@@ -610,12 +610,13 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 }
 
 // audioCppCapabilityRows projects what one audio.cpp /v1/models listing says
-// about ONE model onto the store's row shape: up to four rows, a
+// about ONE model onto the store's row shape: up to five rows, a
 // routing.CapabilitySpeech row, a routing.CapabilityTranscription row, a
-// routing.CapabilityTranscriptionStreaming row and a routing.CapabilitySpeechClone
-// row, each attributed to routing.CapabilitySourceAudioCppModels and stamped at, and
-// each written only when the listing answered yes or no for THAT capability (the
-// streaming and clone rows have a second condition, below). No answer is the
+// routing.CapabilityTranscriptionStreaming row, a routing.CapabilitySpeechClone
+// row and a routing.CapabilitySpeechStreaming row, each attributed to
+// routing.CapabilitySourceAudioCppModels and stamped at, and each written only when
+// the listing answered yes or no for THAT capability (the streaming and clone rows
+// have a second condition, below). No answer is the
 // absence of a row -- "unknown" is exactly as in sdcppCapabilityRows -- so one
 // unanswered axis never suppresses another. Pure: no I/O.
 //
@@ -623,11 +624,12 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // "" for everything the listing does not say -- the model is not in it
 // (the server does not name it in /v1/models), the listing is empty or unreadable, the
 // entry carries no task, (streaming) its mode is absent or not one this code knows, or
-// the model is no transcriber, or (clone) the model is no speech model -- and none
-// of those is a statement that the model cannot speak, cannot transcribe, cannot
-// stream or is not a clone. A written "no" can switch a model's route off (speech,
-// transcription), pin it to the buffered answer (transcription streaming), or mark it a
-// plain non-clone synthesiser (speech_clone), so an unknown verdict must never become one.
+// the model is no transcriber (transcription streaming) or no synthesiser (speech
+// streaming), or (clone) the model is no speech model -- and none of those is a
+// statement that the model cannot speak, cannot transcribe, cannot stream or is not a
+// clone. A written "no" can switch a model's route off (speech, transcription), pin it
+// to the buffered answer (transcription or speech streaming), or mark it a plain
+// non-clone synthesiser (speech_clone), so an unknown verdict must never become one.
 //
 // A "no" is a real verdict where it IS stated: the listing names the
 // model's task, so a model present with a task that does not serve the
@@ -655,6 +657,15 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // music, one the listing gives no task) carries no row on it, not even a "no", whatever
 // its clone verdict says. Same rule at the row boundary: a verdict assembled elsewhere
 // cannot put a clone chip on a model that cannot speak.
+//
+// The speech_streaming row is the streaming row's twin on the synthesiser's side
+// (routing.CapabilitySpeechStreaming): the one the speech handler reads to choose
+// between relaying stream=true and the buffered one-shot, gating no route. It refines
+// the speech capability, so it is written only for a model whose speech verdict is
+// yes: a model that does not synthesise speech (asr, music, one the listing gives no
+// task) carries no row on it, not even a "no", whatever its verdict says. The parser
+// already states no such verdict for such a model; this is the same rule held at the
+// row boundary.
 func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing.CapabilityRow {
 	var rows []routing.CapabilityRow
 	for _, axis := range []struct{ capability, verdict string }{
@@ -662,6 +673,7 @@ func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing
 		{routing.CapabilityTranscription, v.Transcription},
 		{routing.CapabilityTranscriptionStreaming, v.TranscriptionStreaming},
 		{routing.CapabilitySpeechClone, v.SpeechClone},
+		{routing.CapabilitySpeechStreaming, v.SpeechStreaming},
 	} {
 		if axis.verdict != routing.CapabilityYes && axis.verdict != routing.CapabilityNo {
 			continue
@@ -670,6 +682,9 @@ func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing
 			continue
 		}
 		if axis.capability == routing.CapabilitySpeechClone && v.Speech != routing.CapabilityYes {
+			continue
+		}
+		if axis.capability == routing.CapabilitySpeechStreaming && v.Speech != routing.CapabilityYes {
 			continue
 		}
 		rows = append(rows, routing.CapabilityRow{
@@ -786,8 +801,9 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // whose runtime spec is of kind audio_cpp, is NOT probed here: the agent
 // router's /v1/models carries no task, so it could state no verdict. That gap
 // is closed agent-side, not here: the agent reads the child's own /v1/models
-// and reports the speech, transcription, transcription_streaming and speech_clone verdicts
-// under the same audiocpp_models source, which the gateway's agent ingest accepts, so this
+// and reports the speech, transcription, transcription_streaming, speech_clone and
+// speech_streaming verdicts under the same audiocpp_models source, which the gateway's
+// agent ingest accepts, so this
 // loop deliberately leaves an agent-launched child alone. Its voices are the one thing
 // this loop does fetch for it, in a pass of their own: probeAgentVoices.)
 //
@@ -1660,8 +1676,8 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 
 		// audio.cpp capability pass: for every active audio_cpp application,
 		// read the server's own /v1/models listing for each of its active
-		// mappings and write the speech, transcription, transcription_streaming and
-		// speech_clone verdicts that listing states for that model, and, for a
+		// mappings and write the speech, transcription, transcription_streaming,
+		// speech_clone and speech_streaming verdicts that listing states for that model, and, for a
 		// model it states loaded and plain tts, cache its voices (probeAudioCppModels). A separate
 		// branch from the context probe for the same reason as the sdcpp one:
 		// audio_cpp has no context probe path, and the listing is not a

@@ -1528,6 +1528,28 @@ const (
 	// Like CapabilitySpeech the string does not coincide with the billable unit
 	// (usage.BillingUnitAudioSecond).
 	CapabilitySpeechClone = "speech_clone"
+
+	// CapabilitySpeechStreaming means the model can answer a STREAMED speech
+	// synthesis: POST /v1/audio/speech with stream=true. It is the speech twin of
+	// CapabilityTranscriptionStreaming and refines CapabilitySpeech the way that
+	// one refines CapabilityTranscription: it does not gate a route (no request
+	// declares it required, so a model without it is still a speech candidate), and
+	// what reads it is the speech handler, which relays stream=true as a stream
+	// only on a yes and answers the buffered one-shot for a no and for no row at
+	// all -- the absence is "unknown", and the handler's retry-buffered fallback
+	// covers a yes that has gone stale.
+	//
+	// It is DERIVED from audio.cpp's /v1/models, the per-model mode field of the same
+	// listing the speech and transcription verdicts come from
+	// (CapabilitySourceAudioCppModels), and for a SPEECH model only (task "tts" or
+	// "clon"): mode "streaming" is a yes, "offline" a no, anything else no row. The
+	// name is the synthesiser's, so a model that does not synthesise speech (asr,
+	// music) carries no row on it, not even a no -- and an asr model's mode is the
+	// CapabilityTranscriptionStreaming verdict, never this one.
+	//
+	// Like CapabilitySpeech the string does not coincide with the billable unit
+	// (usage.BillingUnitAudioSecond).
+	CapabilitySpeechStreaming = "speech_streaming"
 )
 
 // Capability verdicts.
@@ -1623,8 +1645,8 @@ const (
 // CapabilitySourceAudioCppModels names the fifth probe-rank source: audio.cpp's
 // own model listing, GET /v1/models, from whose per-model task field the
 // CapabilitySpeech, CapabilityTranscription and CapabilitySpeechClone verdicts are
-// derived, and from whose mode field the CapabilityTranscriptionStreaming
-// verdict is. It is named for the document it read, like the sources above, and
+// derived, and from whose mode field the CapabilityTranscriptionStreaming and
+// CapabilitySpeechStreaming verdicts are. It is named for the document it read, like the sources above, and
 // ranks 1 through capabilitySourceRank's DEFAULT branch for the same reason:
 // never able to overwrite manual (3) or vision_benchmark (2), always able to
 // repair its own drift (1 vs 1).
@@ -1633,9 +1655,9 @@ const (
 // the gateway's health loop, for an audio_cpp application (audioCppCapabilityRows
 // in cmd/gateway), and the agent's own read of the /v1/models of an audio.cpp
 // child it launched, which the gateway's agent ingest accepts under this source
-// for the speech, transcription, transcription_streaming and speech_clone rows
-// only (and only when the gateway declares the capability_source_audiocpp
-// feature).
+// for the speech, transcription, transcription_streaming, speech_clone and
+// speech_streaming rows only (and only when the gateway declares the
+// capability_source_audiocpp feature).
 //
 // It is the sdcpp_capabilities source's twin in the one respect that matters:
 // it is entitled to establish a "no" as well as a "yes", for each of its rows.
@@ -1649,8 +1671,12 @@ const (
 // no, any other mode no row) and a model of any other task carries none, not
 // even a no. The speech_clone row is the speech synthesiser's own, so it exists
 // for a tts model (a no) and a clone model (a yes) only, and a model of any other
-// task carries none, not even a no. It writes the speech, transcription,
-// transcription_streaming and speech_clone rows, and no other.
+// task carries none, not even a no. The speech_streaming row is the speech
+// synthesiser's twin of the streaming row, so it exists for a tts or clone model
+// only (mode "streaming" a yes, "offline" a no, any other mode no row) and a model
+// of any other task carries none, not even a no. It writes the speech,
+// transcription, transcription_streaming, speech_clone and speech_streaming
+// rows, and no other.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"

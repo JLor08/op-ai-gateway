@@ -376,11 +376,14 @@ func TestFeaturesDeclareRuntimeVoices(t *testing.T) {
 	// verdict, then the "clone" -> "clon" task-string correction, both read from
 	// the child's /v1/models task on the same gateway-declared
 	// capability_source_audiocpp source, which is not an agent.Features entry);
-	// 0.11.0 is MINOR because agent.Features gained runtime_voices. A Since
-	// records the version a feature shipped in, so runtime_ensure's stays 0.8.0,
-	// multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0 and
-	// runtime_voices' is 0.11.0.
-	if Version != "0.11.0" {
-		t.Fatalf("Version = %q, want 0.11.0 (agent.Features gained runtime_voices, so the bump is MINOR)", Version)
+	// 0.11.0 is MINOR because agent.Features gained runtime_voices; 0.11.1 is
+	// PATCH (the speech_streaming verdict, read from the audio_cpp child's
+	// /v1/models mode on the same gateway-declared capability_source_audiocpp
+	// source, which is not an agent.Features entry: an absent verdict already
+	// means the correct default, buffered). A Since records the version a feature
+	// shipped in, so runtime_ensure's stays 0.8.0, multipart_proxy's stays 0.9.0,
+	// runtime_config_files' stays 0.10.0 and runtime_voices' stays 0.11.0.
+	if Version != "0.11.1" {
+		t.Fatalf("Version = %q, want 0.11.1 (the speech_streaming verdict is an open-vocabulary name on an existing source, and agent.Features gained nothing, so the bump is PATCH)", Version)
 	}
 }

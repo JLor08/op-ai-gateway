@@ -3937,6 +3937,43 @@ func TestAudioCppCapabilityRows(t *testing.T) {
 			},
 		},
 		{
+			name: "a streaming tts model: speech_streaming yes beside speech yes and speech_clone no",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+				row(routing.CapabilitySpeechClone, routing.CapabilityNo),
+				row(routing.CapabilitySpeechStreaming, routing.CapabilityYes),
+			},
+		},
+		{
+			name: "an offline clone model: speech_streaming no is a real verdict",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes, SpeechStreaming: routing.CapabilityNo},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+				row(routing.CapabilitySpeechClone, routing.CapabilityYes),
+				row(routing.CapabilitySpeechStreaming, routing.CapabilityNo),
+			},
+		},
+		{
+			name: "a speech_streaming verdict on a model that is not a speech model builds no speech_streaming row (asr)",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechStreaming: routing.CapabilityYes},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityNo),
+				row(routing.CapabilityTranscription, routing.CapabilityYes),
+			},
+		},
+		{name: "a speech_streaming verdict with no speech verdict builds no row", v: provider.AudioCppVerdicts{SpeechStreaming: routing.CapabilityYes}, want: nil},
+		{
+			name: "a speech_streaming verdict that is not yes or no builds no row",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechStreaming: "maybe"},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+			},
+		},
+		{
 			name: "a transcription_streaming verdict that is not yes or no builds no row",
 			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: "maybe"},
 			want: []routing.CapabilityRow{
@@ -3960,6 +3997,46 @@ func TestAudioCppCapabilityRows(t *testing.T) {
 			v:    provider.AudioCppVerdicts{Speech: "", Transcription: routing.CapabilityNo},
 			want: []routing.CapabilityRow{row(routing.CapabilityTranscription, routing.CapabilityNo)},
 		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := audioCppCapabilityRows(tc.v, at)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("audioCppCapabilityRows(%+v) = %+v, want %+v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAudioCppCapabilityRowsEmitSpeechStreaming pins the speech twin of the
+// streaming axis on its own: a speech model's streaming verdict becomes a
+// speech_streaming row, under the same source and stamp as the speech and
+// transcription rows. yes and no are both real answers (the mode names how the
+// model is loaded); no verdict at all -- the mode was absent, unknown or
+// unreadable -- is no row, and never a written no, because the speech handler
+// reads an absent row as "buffered" and a written no as a statement the model
+// cannot stream.
+//
+// The row is the speech capability's refinement, so it is emitted only beside a
+// speech yes: a model that is not a speech model (asr, music, one the listing
+// gives no task) gets NO row on it, not even a no, whatever the verdict says.
+func TestAudioCppCapabilityRowsEmitSpeechStreaming(t *testing.T) {
+	at := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	rowOf := func(capability, verdict string) routing.CapabilityRow {
+		return routing.CapabilityRow{Capability: capability, Verdict: verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}
+	}
+	speechRows := []routing.CapabilityRow{rowOf("speech", routing.CapabilityYes), rowOf("transcription", routing.CapabilityNo)}
+	for _, tc := range []struct {
+		name string
+		v    provider.AudioCppVerdicts
+		want []routing.CapabilityRow
+	}{
+		{"a tts model in streaming mode", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes}, append(append([]routing.CapabilityRow{}, speechRows...), rowOf("speech_streaming", routing.CapabilityYes))},
+		{"a tts model in offline mode", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo}, append(append([]routing.CapabilityRow{}, speechRows...), rowOf("speech_streaming", routing.CapabilityNo))},
+		{"a tts model whose mode is not stated", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}, speechRows},
+		{"an asr model with a speech_streaming verdict", provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechStreaming: routing.CapabilityYes}, []routing.CapabilityRow{
+			rowOf("speech", routing.CapabilityNo), rowOf("transcription", routing.CapabilityYes),
+		}},
+		{"a speech_streaming verdict beside no speech verdict", provider.AudioCppVerdicts{SpeechStreaming: routing.CapabilityYes}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := audioCppCapabilityRows(tc.v, at)
@@ -4243,6 +4320,42 @@ func TestRunAppHealthOnceAudioCppWritesTranscriptionStreamingVerdict(t *testing.
 		t.Fatalf("m5 (a tts model) has a transcription_streaming row %+v, want none: the capability is the transcriber's", row)
 	}
 	st.assertCapability(t, "m5", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+}
+
+// TestRunAppHealthOnceAudioCppWritesSpeechStreamingVerdict is the speech twin of
+// the transcription_streaming one: the same /v1/models read also states each
+// speech model's mode, and the probe pass stores it as the per-mapping
+// speech_streaming row the speech handler decides stream-versus-buffered on --
+// yes for a streaming model, no for an offline one. A model that does not
+// synthesise speech gets no such row. A model whose listing states no mode writes
+// no row AND leaves the verdict already on file alone: an unknown mode must not
+// turn a stored yes into a buffered answer.
+func TestRunAppHealthOnceAudioCppWritesSpeechStreamingVerdict(t *testing.T) {
+	runner, st, _ := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{
+			"vibevoice_tts":     {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes},
+			"pocket_tts":        {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo},
+			"no_mode":           {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo},
+			"stale_mode":        {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo},
+			"asr_with_tts_mode": {Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechStreaming: routing.CapabilityYes},
+		},
+		audioCppMapping("m1", "vibevoice_tts"), audioCppMapping("m2", "pocket_tts"),
+		audioCppMapping("m3", "no_mode"), audioCppMapping("m4", "stale_mode"), audioCppMapping("m5", "asr_with_tts_mode"))
+	st.seedCapability("m4", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+
+	runCapabilityCycle(runner)
+
+	st.assertCapability(t, "m1", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	st.assertCapability(t, "m2", routing.CapabilitySpeechStreaming, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+	if row, ok := st.capabilityOf("m3", routing.CapabilitySpeechStreaming); ok {
+		t.Fatalf("m3 has a speech_streaming row %+v, want none: its listing stated no mode", row)
+	}
+	st.assertCapability(t, "m4", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	// A model that does not synthesise speech gets no speech_streaming row, whatever a verdict says.
+	if row, ok := st.capabilityOf("m5", routing.CapabilitySpeechStreaming); ok {
+		t.Fatalf("m5 (an asr model) has a speech_streaming row %+v, want none: the capability is the synthesiser's", row)
+	}
+	st.assertCapability(t, "m5", routing.CapabilityTranscription, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
 }
 
 // TestRunAppHealthOnceAudioCppNeverReadsRuntimeSpecs pins that the gate is the

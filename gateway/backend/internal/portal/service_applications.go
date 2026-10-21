@@ -355,6 +355,18 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// override of that probe and the enablement path for a model whose mode the
 	// listing does not state, or one whose agent predates the verdict.
 	routing.CapabilityTranscriptionStreaming: {routing.CapabilityNo: true},
+	// routing.CapabilitySpeechStreaming + CapabilityNo is reserved on the same
+	// terms as (transcription_streaming, no), its transcriber-side twin: an absent
+	// row already answers a streamed speech request with the buffered one-shot, so
+	// "cannot stream" costs the operator nothing to leave unsaid, while a manual no
+	// is rank 3 and would outrank forever the writer entitled to establish it -- a
+	// read of audio.cpp's own /v1/models listing (routing.CapabilitySourceAudioCppModels),
+	// whose per-model mode ("offline" or "streaming") is authoritative for a speech
+	// model it names. A stale manual no would otherwise keep a model that streams
+	// buffered, with nothing to show why. (speech_streaming, yes) stays writable: it
+	// is the operator's override of that probe and the enablement path for a model
+	// whose mode the listing does not state, or one whose agent predates the verdict.
+	routing.CapabilitySpeechStreaming: {routing.CapabilityNo: true},
 	// routing.CapabilitySpeechClone + CapabilityNo is reserved on the same terms as
 	// the audio.cpp axes above. An absent speech_clone row already reads as "not a
 	// clone model" (speechCloneFlagsByName folds false, so the chat picker offers
