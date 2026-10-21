@@ -380,6 +380,40 @@ func (m *Multiplexer) dispatchProbeAudioCppModels(ctx context.Context, target ro
 	return AudioCppVerdicts{}, ErrUnavailable
 }
 
+var _ AudioCppVoicesLister = (*Multiplexer)(nil)
+
+// ListVoices routes the audio.cpp /v1/audio/voices listing to the provider's
+// client (like ProbeAudioCppModels), falling back to the fallback client. A
+// provider whose client does not implement AudioCppVoicesLister yields
+// (nil, ErrUnavailable): an error is what tells the caller there are no voices to
+// store, and an empty list with a nil error would read as a successful listing
+// that found none.
+func (m *Multiplexer) ListVoices(ctx context.Context, target routing.Target, model string) ([]Voice, error) {
+	ctx, span := tracing.Start(ctx, "provider.ListVoices")
+	defer span.End()
+	res, err := m.dispatchListVoices(ctx, target, model)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return res, err
+}
+
+func (m *Multiplexer) dispatchListVoices(ctx context.Context, target routing.Target, model string) ([]Voice, error) {
+	if m == nil {
+		return nil, ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if l, ok := client.(AudioCppVoicesLister); ok {
+			return l.ListVoices(ctx, target, model)
+		}
+	}
+	if l, ok := m.fallback.(AudioCppVoicesLister); ok {
+		return l.ListVoices(ctx, target, model)
+	}
+	return nil, ErrUnavailable
+}
+
 var _ SdcppImageOptionsProber = (*Multiplexer)(nil)
 
 // ProbeSdcppImageOptions routes the stable-diffusion.cpp image-options probe to
