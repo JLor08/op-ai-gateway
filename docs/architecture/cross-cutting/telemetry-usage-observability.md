@@ -900,10 +900,12 @@ request is never mislabelled, and only the success path chooses between the two 
 partial count: a stream cut short delivered some audio and bills none, and the two shapes that
 would read as a success that billed nothing (a stream that ended without a completion the gateway
 can count, and one that completed with no audio) are logged once at `Error`, the loud-zero rule
-of this section. The rate is read on a context that survives the request, so a client that
-disconnects right after a complete stream is not billed in bytes for the timing of its hang-up. A
-client that disconnects **before** the stream ends is a `provider.client_disconnected` error row of
-`(audio_second, 0)`. `audio_bytes` is **unpriceable in Tier 3**: the modeled tier's guard returns
+of this section. A client that disconnects **at or before the stream's termination**, including
+right after the final frame, is a `provider.client_disconnected` error row of `(audio_second, 0)`:
+the relay decides the status as soon as the copy returns, and a non-`success` row never reads the
+rate or bills a quantity (a billed success after a disconnect effectively cannot occur). The rate
+read of a `success` row uses a context stripped of cancellation purely defensively, to cover the
+window after that status decision. `audio_bytes` is **unpriceable in Tier 3**: the modeled tier's guard returns
 the terminal `unpriceable` provenance for any non-token unit (§8.4.4), and a coefficient applies
 only on an exact unit match, so no modeled watt-hour figure exists until one declares
 `audio_bytes` (the token-blind measured and estimated tiers still apply on a host that has power

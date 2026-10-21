@@ -1489,7 +1489,7 @@ vocabulary is deliberately small and open only at the code level —
 `internal/usage/billing.go`. Two named units, not three: `"character"` belongs
 to an external price list rather than to this system, and audio.cpp's own
 metering signal is a *duration*, so speech and transcription share one unit.
-(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a fourth non-token unit, `BillingUnitAudioBytes`
+(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a third non-token unit, `BillingUnitAudioBytes`
 (`"audio_bytes"`), joined the vocabulary for a streamed speech response whose duration
 cannot yet be derived; see the amendment after the Rejected list.)
 
@@ -7154,10 +7154,16 @@ case and leaves the buffered path and every non-streaming metering byte-identica
   carrying no audio) are logged once at `Error`, ADR-041's loud-zero rule; a row that is
   already an error row carries its cause in its own code and is not logged again. **The
   quantity is never a partial count**: a stream cut short delivered some audio and bills
-  none, which is also what ADR-065 (c) decided for a partial transcript. The rate is read
-  on a context that survives the request (`context.WithoutCancel`), because a client that
-  hangs up right after a complete stream is still a stream to bill and a cancelled store
-  read would otherwise drop it to bytes for no reason but the timing of its disconnect.
+  none, which is also what ADR-065 (c) decided for a partial transcript. **A client
+  disconnect seen when the stream terminates is an error row, whatever it cut off**: the
+  relay decides the status as soon as the copy returns (`nativeTerminalStatus`:
+  `r.Context().Err() != nil` is `provider.client_disconnected`), and the setter returns
+  before it reads the rate for any status but `success`, so a hang-up mid-stream **or right
+  after the final frame** is `(audio_second, 0)` with that code, never a billed stream. The
+  rate is nevertheless read on a context stripped of cancellation (`context.WithoutCancel`);
+  that is **defensive**, covering only the window after the status decision (a request
+  context cancelled between that decision and the store read), so a cancelled read cannot
+  drop a stream the relay had already judged a success to bytes.
   - *Amends [ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar): a new unit, and a success-path measurement-unit
     refinement with failure rows uniform.* `usage.BillingUnitAudioBytes = "audio_bytes"`
     joins the code-level vocabulary (`ValidBillingUnit` accepts it); its quantity is the
