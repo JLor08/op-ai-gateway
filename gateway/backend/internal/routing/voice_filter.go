@@ -106,9 +106,14 @@ func (v *voiceScope) refine(err error) error {
 // per-member decision cannot narrow a group, because a member without the voice would
 // still be eligible when the walk reached it.
 //
-// A store failure is returned, never read as "no voice is known" (that would hide an
-// outage behind a request quietly routed to a server that may lack the voice). Exactly
-// two bulk reads, and none at all for a request that names no voice.
+// The two reads fail differently, on purpose. A failure of the VOICES CACHE read fails
+// open: the cache is the one input that exists only for this preference, so when it
+// cannot be read there is simply no voice information, which is exactly the "nothing
+// lists the voice" case (nil, routed as without a voice; logged at Warn so the outage
+// is not silent). A failure of the capability VERDICT read is returned: it reads the
+// very rows filterCapable has just read and refuses on, so the posture stays that of
+// the capability gate it belongs to. Exactly two bulk reads, and none at all for a
+// request that names no voice.
 func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []MappingCandidate) (*voiceScope, error) {
 	if voice == "" || len(pool) == 0 {
 		return nil, nil
@@ -136,7 +141,9 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 	}
 	cached, err := r.store.ModelMappingCacheForMappings(ctx, tts, ModelMappingCacheVoices)
 	if err != nil {
-		return nil, fmt.Errorf("voice filter: read the voices cache: %w", err)
+		// FAIL OPEN, see above: no cache, no voice information, no restriction.
+		slog.Warn("voice filter: voices cache could not be read, routing unfiltered", "voice", voice, "candidates", len(ids), "err", err)
+		return nil, nil
 	}
 	allowed := make(map[string]struct{}, len(tts))
 	for _, id := range tts {

@@ -312,33 +312,115 @@ func (s *voiceCacheStore) ModelMappingCacheForMappings(ctx context.Context, ids 
 	return s.resolverStore.ModelMappingCacheForMappings(ctx, ids, cacheType)
 }
 
-// A STORE failure is not a content case: it is returned, never read as "no voice is
-// known" and quietly routed (which would hide an outage behind a wrong-server answer).
-// The fail-open rule covers what the cache SAYS, not whether it could be read.
-func TestVoiceStoreFailureIsReturnedNotFailedOpen(t *testing.T) {
+// FAIL-OPEN on the voices CACHE read: the cache exists only for this preference, so when
+// it cannot be read there is no voice information, which is the "nothing lists the voice"
+// case -- the request routes as it would without a voice instead of failing. The read IS
+// attempted (cacheReads == 1), so this is the error being absorbed and not the read being
+// skipped, and the outage is not silent (a Warn).
+func TestVoiceCacheReadFailureFailsOpen(t *testing.T) {
 	boom := errors.New("cache store down")
-	t.Run("standard", func(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		model  string
+		newMem func(t *testing.T) *MemoryStore
+		setup  func(r *Resolver)
+	}{
+		{"standard", "tts", func(t *testing.T) *MemoryStore { return voiceModelStore(t, []string{"alba"}, []string{"bella"}) }, func(*Resolver) {}},
+		{"group", "tts-group", func(t *testing.T) *MemoryStore { return voiceGroupStore(t, []string{"alba"}, []string{"bella"}) }, func(r *Resolver) { r.SetGroupResolver(voiceGroup(GroupPolicy{FailoverMode: "sticky"})) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureSlog(t)
+			// Today's choice, from a healthy store, with no voice at all.
+			control := NewResolver(tc.newMem(t), voiceClock(), nil)
+			tc.setup(control)
+			want := resolveVoice(t, control, voiceReq(tc.model, ""))
+
+			broken := &voiceCacheStore{resolverStore: tc.newMem(t), failCache: boom}
+			r := NewResolver(broken, voiceClock(), nil)
+			tc.setup(r)
+			// bella is only listed by srv_b; were the filter applied the answer would be srv_b.
+			got, err := r.Resolve(context.Background(), voicePrincipal, voiceReq(tc.model, "bella"))
+			if err != nil {
+				t.Fatalf("err = %v, want the request routed as without a voice", err)
+			}
+			if got.ServerID != want.ServerID || got.RouteID != want.RouteID {
+				t.Fatalf("target = %+v, want today's %+v", got, want)
+			}
+			if broken.cacheReads != 1 {
+				t.Fatalf("cache reads = %d, want the one failing read attempted", broken.cacheReads)
+			}
+			if out := logs.String(); !strings.Contains(out, "voices cache could not be read") || !strings.Contains(out, "cache store down") {
+				t.Fatalf("log = %q, want a warning naming the failed cache read", out)
+			}
+		})
+	}
+
+	// Not narrowed means not refused: with srv_b (the only server that would list bella)
+	// down, the broken cache must not turn into voice_unavailable either -- it is served by
+	// the healthy server, as without a voice.
+	t.Run("never voice_unavailable", func(t *testing.T) {
+		captureSlog(t)
 		store := &voiceCacheStore{resolverStore: voiceModelStore(t, []string{"alba"}, []string{"bella"}), failCache: boom}
+		r := NewResolver(store, voiceClock(), fakeReachability{unreachable: map[string]bool{"app_b": true}})
+		if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_a" {
+			t.Fatalf("server = %q, want srv_a", got.ServerID)
+		}
+	})
+}
+
+// The capability VERDICT read is the other half of the filter and keeps the capability
+// gate's posture: it reads the rows filterCapable has just read and refuses on, so its
+// failure is returned, not absorbed. voiceVerdictStore lets filterCapable's own reads
+// through and fails the filter's.
+func TestVoiceVerdictReadFailureIsReturned(t *testing.T) {
+	boom := errors.New("verdict store down")
+	t.Run("standard", func(t *testing.T) {
+		store := &voiceVerdictStore{resolverStore: voiceModelStore(t, []string{"alba"}, []string{"bella"}), okCalls: 1, err: boom} // filterCapable reads once
 		r := NewResolver(store, voiceClock(), nil)
 		if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella")); !errors.Is(err, boom) {
 			t.Fatalf("err = %v, want the store's error", err)
 		}
-		// With no voice there is nothing to read, so the same broken cache is irrelevant.
-		if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "")); err != nil {
-			t.Fatalf("no voice: err = %v, want served", err)
+		if store.calls != 2 {
+			t.Fatalf("verdict reads = %d, want 2 (filterCapable's, then the voice filter's failing one)", store.calls)
 		}
 	})
 	t.Run("group", func(t *testing.T) {
-		store := &voiceCacheStore{resolverStore: voiceGroupStore(t, []string{"alba"}, []string{"bella"}), failCache: boom}
+		store := &voiceVerdictStore{resolverStore: voiceGroupStore(t, []string{"alba"}, []string{"bella"}), okCalls: 2, err: boom} // one filterCapable read per member
 		r := NewResolver(store, voiceClock(), nil)
 		r.SetGroupResolver(voiceGroup(GroupPolicy{FailoverMode: "sticky"}))
 		if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts-group", "bella")); !errors.Is(err, boom) {
 			t.Fatalf("err = %v, want the store's error", err)
 		}
-		if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts-group", "")); err != nil {
-			t.Fatalf("no voice: err = %v, want served", err)
+		if store.calls != 3 {
+			t.Fatalf("verdict reads = %d, want 3 (one per member, then the voice filter's failing one)", store.calls)
 		}
 	})
+	// A request without a voice never makes the filter's read, so the same store is fine.
+	t.Run("no voice", func(t *testing.T) {
+		store := &voiceVerdictStore{resolverStore: voiceModelStore(t, []string{"alba"}, []string{"bella"}), okCalls: 1, err: boom}
+		r := NewResolver(store, voiceClock(), nil)
+		resolveVoice(t, r, voiceReq("tts", ""))
+		if store.calls != 1 {
+			t.Fatalf("verdict reads = %d, want only filterCapable's", store.calls)
+		}
+	})
+}
+
+// voiceVerdictStore passes the first okCalls capability-verdict reads through and fails
+// every later one.
+type voiceVerdictStore struct {
+	resolverStore
+	okCalls int
+	calls   int
+	err     error
+}
+
+func (s *voiceVerdictStore) MappingCapabilitiesForMappings(ctx context.Context, ids []string) (map[string][]CapabilityRow, error) {
+	s.calls++
+	if s.calls > s.okCalls {
+		return nil, s.err
+	}
+	return s.resolverStore.MappingCapabilitiesForMappings(ctx, ids)
 }
 
 // Capacity: the admission queue waits on the voice's servers only, because the pool is
