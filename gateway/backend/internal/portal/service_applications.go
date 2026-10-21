@@ -355,6 +355,20 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// override of that probe and the enablement path for a model whose mode the
 	// listing does not state, or one whose agent predates the verdict.
 	routing.CapabilityTranscriptionStreaming: {routing.CapabilityNo: true},
+	// routing.CapabilitySpeechClone + CapabilityNo is reserved on the same terms as
+	// the audio.cpp axes above. An absent speech_clone row already reads as "not a
+	// clone model" (speechCloneFlagsByName folds false, so the chat picker offers
+	// it), so "is not a clone model" costs the operator nothing to leave unsaid,
+	// while a manual no is rank 3 and would outrank forever the writer entitled to
+	// establish the fact -- a read of audio.cpp's own /v1/models listing
+	// (routing.CapabilitySourceAudioCppModels), whose per-model task ("clone") is
+	// authoritative for a model it names. A stale manual no would permanently
+	// FORCE-OFFER a genuine clone model into the chat speech picker, where every
+	// send fails for want of a reference voice -- exactly the broken affordance #252
+	// removes. (speech_clone, yes) stays writable: it is the operator's override to
+	// hide a clone model the listing has not classified, or a non-audio.cpp speech
+	// model they know needs a reference voice.
+	routing.CapabilitySpeechClone: {routing.CapabilityNo: true},
 	// routing.CapabilityImageEdit is deliberately ABSENT: see the doc comment above.
 }
 

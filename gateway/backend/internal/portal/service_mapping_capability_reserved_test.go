@@ -83,6 +83,11 @@ func TestMappingCapabilityVerdictReservedPairsAreRefused(t *testing.T) {
 			want: ErrMappingCapabilityReserved,
 		},
 		{
+			name: "a manual no on speech_clone -- would permanently force-offer a clone model the chat cannot drive",
+			req:  UpdateMappingRequest{CapabilityVerdicts: map[string]string{routing.CapabilitySpeechClone: routing.CapabilityNo}},
+			want: ErrMappingCapabilityReserved,
+		},
+		{
 			// The name is trimmed BEFORE the reservation is consulted, or the
 			// refusal would be one space away from being bypassed.
 			name: "a padded reserved pair is still reserved",
@@ -202,8 +207,9 @@ func TestMappingCapabilityVerdictOpenVocabularySurvivesTheReservation(t *testing
 
 	if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
 		CapabilityVerdicts: map[string]string{
-			routing.CapabilityMTP: routing.CapabilityYes,
-			"structured_outputs":  routing.CapabilityNo,
+			routing.CapabilityMTP:         routing.CapabilityYes,
+			"structured_outputs":          routing.CapabilityNo,
+			routing.CapabilitySpeechClone: routing.CapabilityYes,
 		},
 	}); err != nil {
 		t.Fatalf("UpdateMapping (unreserved names): %v", err)
@@ -215,6 +221,12 @@ func TestMappingCapabilityVerdictOpenVocabularySurvivesTheReservation(t *testing
 	}
 	if rows["structured_outputs"].Verdict != routing.CapabilityNo {
 		t.Fatalf("structured_outputs row = %+v, want manual no -- the vocabulary stays open", rows["structured_outputs"])
+	}
+	// Only (speech_clone, no) is reserved; a manual (speech_clone, yes) stays
+	// writable -- the operator's override to hide a clone model the probe has not
+	// classified.
+	if rows[routing.CapabilitySpeechClone].Verdict != routing.CapabilityYes {
+		t.Fatalf("speech_clone row = %+v, want manual yes -- only the no direction is reserved", rows[routing.CapabilitySpeechClone])
 	}
 }
 
