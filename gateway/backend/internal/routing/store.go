@@ -1375,6 +1375,14 @@ type ModelMappingCacheRow struct {
 	UpdatedAt time.Time
 }
 
+// ModelMappingCacheVoices is the cache type of a mapping's TTS voice list
+// (#251): ScopeKey "", Payload a JSON array of voice names -- deduplicated and
+// sorted, the exact strings the model's speech request takes in its "voice"
+// field. The health loop writes it while the mapping's model is observed loaded
+// (and only then), and the voice picker reads it, so the names stay on offer
+// after the model is unloaded.
+const ModelMappingCacheVoices = "voices"
+
 // ValidateModelMappingCacheRow rejects a row that cannot be a meaningful cache
 // entry: one without a cache type (nothing could ever read it back by type).
 // Both UpsertModelMappingCache implementations call this exact function, so the

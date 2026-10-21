@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"op-ai-gateway/internal/capture"
@@ -13,6 +15,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +31,11 @@ var (
 	appHealthRetryGap = 2 * time.Second
 	// appHealthProbeConcurrency bounds concurrent probes within one server.
 	appHealthProbeConcurrency = 8
+	// audioCppVoicesBackoff is how long a mapping whose voices listing failed is
+	// left alone before the audio.cpp pass asks again (see voicesBackoff). A
+	// server that does not serve the listing then costs one small GET per loaded
+	// tts mapping per backoff window instead of one per health tick.
+	audioCppVoicesBackoff = 5 * time.Minute
 )
 
 // healthStore is the store surface the app-health loop needs. *store.SQLiteStore
@@ -53,6 +61,12 @@ type healthStore interface {
 	// precedence rule of its own -- this caller does, via
 	// routing.WritableCapabilityRows.
 	UpsertMappingCapabilities(ctx context.Context, mappingID string, rows []routing.CapabilityRow) error
+	// ModelMappingCache and UpsertModelMappingCache are the voices cache's read
+	// and write (#251): writeVoicesCache reads the row on file to detect a
+	// change and writes only when the normalized payload differs. See
+	// routing.MappingStore for the contract of both.
+	ModelMappingCache(ctx context.Context, mappingID, cacheType string) ([]routing.ModelMappingCacheRow, error)
+	UpsertModelMappingCache(ctx context.Context, row routing.ModelMappingCacheRow) error
 	InsertServerAvailabilitySample(ctx context.Context, sample routing.ServerAvailabilitySample) error
 	// RuntimeSpecsByApplication lists the runtime specs joined to the app's
 	// mappings (RuntimeSpec.MappingID keys back to the mapping). The {model}
@@ -247,6 +261,11 @@ type appHealthRunner struct {
 	// Server). Nil is valid and means nobody consumes them: the options probe
 	// is then not made at all.
 	imageOptionsRegistry *gateway.AppImageOptionsRegistry
+	// voicesBackoff remembers which mappings' voices listing failed lately, so
+	// a static audio.cpp server without the listing is not asked every tick
+	// (cacheAudioCppVoices). Its zero value is ready; the runner is used by
+	// pointer, never copied.
+	voicesBackoff voicesBackoff
 }
 
 // cycleCfg is the once-per-cycle settings snapshot read via
@@ -786,6 +805,14 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // audioCppCapabilityRows. Unlike probeSdcppCapabilities there is no unlanded
 // signal to hand back: the mappings are read from the store, not discovered by
 // the probe, so there is no mapping a verdict could be waiting for.
+//
+// The same listing read also says whether the model is LOADED right now, and
+// that drives a second, voices step per mapping (cacheAudioCppVoices, #251): a
+// loaded plain tts model has its voices listed and cached on the mapping, which
+// is the only moment audio.cpp can say them (it answers for the model it has
+// loaded). The step runs after the capability write, on the same verdict, and
+// only through the prober's optional voices listing; its failures never touch
+// the verdicts above.
 func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.AudioCppModelsProber) {
 	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
 	if err != nil {
@@ -800,6 +827,9 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 	// Attach the app's per-app upstream credential to the probe (fail-open).
 	token, _ := capture.OpenSecret(r.cipher, app.APIToken)
 	pctx := provider.WithUpstreamAuth(ctx, app.APITokenHeader, token)
+	// The same prober lists voices when it can (the Multiplexer does); one that
+	// cannot just skips the voices step.
+	lister, _ := prober.(provider.AudioCppVoicesLister)
 	for _, mp := range mappings {
 		if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
 			continue
@@ -818,7 +848,185 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 			continue
 		}
 		r.writeCapabilityRows(ctx, mp, audioCppCapabilityRows(v, r.now()))
+		r.cacheAudioCppVoices(pctx, lister, target, mp, v)
 	}
+}
+
+// audioCppVoicesWanted reports whether the voices of the model this probe
+// observed are worth asking for: the listing states it LOADED right now, and it
+// is a plain tts model -- (speech, yes) and NOT (speech_clone, yes), #252's
+// verdict, taken from the same listing read.
+//
+// Loaded is strict because audio.cpp answers /v1/audio/voices for the model it
+// has loaded and ignores which one is asked for, so asking while the mapping's
+// model is not the loaded one would attribute another model's voices to it. A
+// clone model is left out because it is driven by a reference recording, not by
+// a named voice, so it has no voice picker to feed; a model that does not
+// synthesise speech (asr, music, an unstated task) has no voices at all.
+//
+// The fresh verdict is the gate and not the stored capability rows: this pass
+// is the one writing them, so it reads its own tick's answer without a store
+// read, and an operator's manual override of a row only narrows what the voice
+// picker offers (it re-checks the stored verdict on read), never what is cached.
+func audioCppVoicesWanted(v provider.AudioCppVerdicts) bool {
+	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechClone != routing.CapabilityYes
+}
+
+// voicesBackoff is the cross-tick memory of which mappings' voices listing
+// failed lately, so that a server that does not serve the listing (an older
+// audio.cpp, a proxy without the route) is not asked once per loaded tts mapping
+// per health tick for as long as the model stays loaded. A failure opens a
+// window of audioCppVoicesBackoff for THAT mapping; a success, or the model
+// leaving the loaded-tts set (an unload, a reload, a task change), clears it, so
+// a reload retries at once.
+//
+// The audio.cpp pass runs one goroutine per application, so the memory is
+// mutex-guarded. It is keyed by mapping id and bounded by the mappings that ever
+// failed: an expired entry is swept whenever a new one is opened. The zero value
+// is ready to use, which is how the tests build their runners.
+type voicesBackoff struct {
+	mu    sync.Mutex
+	until map[string]time.Time
+}
+
+// active reports whether mappingID is inside a back-off window at now.
+func (b *voicesBackoff) active(mappingID string, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	until, ok := b.until[mappingID]
+	return ok && now.Before(until)
+}
+
+// start opens a window for mappingID ending at until, dropping every entry
+// whose window has already ended.
+func (b *voicesBackoff) start(mappingID string, now, until time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.until == nil {
+		b.until = make(map[string]time.Time)
+	}
+	for id, end := range b.until {
+		if !now.Before(end) {
+			delete(b.until, id)
+		}
+	}
+	b.until[mappingID] = until
+}
+
+// clear ends mappingID's window, if it has one.
+func (b *voicesBackoff) clear(mappingID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.until, mappingID)
+}
+
+// cacheAudioCppVoices is the voices step of probeAudioCppModels for ONE mapping,
+// run with the verdict that mapping's /v1/models probe just returned: when the
+// model is observed loaded and is a plain tts one (audioCppVoicesWanted), it
+// asks the server's voice listing and stores the names with writeVoicesCache.
+//
+// The write policy, which is what keeps the cache trustworthy:
+//   - a listing that SUCCEEDS is written, a genuine empty one included -- "the
+//     model has no voices" is a fact worth caching -- through writeVoicesCache,
+//     which writes only on a change, so a steady server costs no write per tick;
+//   - a listing that FAILS (transport, non-2xx, an undecodable body) writes
+//     nothing: the row already on file is the last known good, and a failed read
+//     says nothing about the voices. It also opens a back-off for the mapping
+//     (voicesBackoff);
+//   - a mapping whose model is not observed loaded is never asked, so a row is
+//     only ever written from the model the server answered for.
+//
+// A nil lister (a prober that cannot list voices) skips the step. Best-effort:
+// every failure is logged and the pass carries on.
+func (r *appHealthRunner) cacheAudioCppVoices(ctx context.Context, lister provider.AudioCppVoicesLister, target routing.Target, mp routing.ModelMapping, v provider.AudioCppVerdicts) {
+	if lister == nil {
+		return
+	}
+	if !audioCppVoicesWanted(v) {
+		r.voicesBackoff.clear(mp.ID)
+		return
+	}
+	now := r.now()
+	if r.voicesBackoff.active(mp.ID, now) {
+		return
+	}
+	voices, err := lister.ListVoices(ctx, target, mp.AppModelName)
+	if err != nil {
+		r.voicesBackoff.start(mp.ID, now, now.Add(audioCppVoicesBackoff))
+		slog.Debug("app health: audio.cpp voices listing failed", "mapping_id", mp.ID, "model", mp.AppModelName, "error", err)
+		return
+	}
+	r.voicesBackoff.clear(mp.ID)
+	if _, err := r.writeVoicesCache(ctx, mp.ID, voices); err != nil {
+		log.Printf("app health: voices cache write for mapping %s failed: %v", mp.ID, err)
+	}
+}
+
+// writeVoicesCache is the one writer of a mapping's voices cache row (#251),
+// shared by every pass that learns a model's voices (the static audio.cpp pass
+// here, the agent-child pass beside it). It stores the voices as a NORMALIZED
+// payload and writes only when that differs from the row on file, so a pass that
+// runs every health tick costs a store read, not a write, while nothing changes.
+//
+// Normalized means: the names deduplicated and sorted bytewise, blank ones
+// dropped, each other name kept verbatim (the server matches a voice name
+// exactly, so no trimming or case folding), encoded as a JSON array -- "[]" for
+// no voices, never "null". The compare is on that canonical text, so a server
+// that merely re-orders or repeats its names does not flap the row, and a row
+// written in some other layout is rewritten once to the canonical one.
+//
+// An empty voices slice is a real value and is written like any other: the caller
+// passes it only after a SUCCESSFUL listing, which is what makes "fetched, and
+// the model has none" different from "never asked" (no row). A FAILED listing
+// must never reach this function -- see cacheAudioCppVoices -- or it would erase
+// the last known good.
+//
+// changed reports whether a row was written. A read or write failure is returned
+// as an error with changed=false; the caller logs it and carries on.
+func (r *appHealthRunner) writeVoicesCache(ctx context.Context, mappingID string, voices []provider.Voice) (changed bool, err error) {
+	payload, err := voicesCachePayload(voices)
+	if err != nil {
+		return false, err
+	}
+	rows, err := r.store.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheVoices)
+	if err != nil {
+		return false, fmt.Errorf("read the voices cache: %w", err)
+	}
+	for _, row := range rows {
+		if row.ScopeKey == "" && row.Payload == payload {
+			return false, nil
+		}
+	}
+	if err := r.store.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+		MappingID: mappingID, CacheType: routing.ModelMappingCacheVoices, ScopeKey: "",
+		Payload: payload, UpdatedAt: r.now(),
+	}); err != nil {
+		return false, fmt.Errorf("write the voices cache: %w", err)
+	}
+	return true, nil
+}
+
+// voicesCachePayload is the canonical stored form of a voice list: see
+// writeVoicesCache.
+func voicesCachePayload(voices []provider.Voice) (string, error) {
+	names := make([]string, 0, len(voices))
+	seen := make(map[string]struct{}, len(voices))
+	for _, v := range voices {
+		if strings.TrimSpace(v.Name) == "" {
+			continue
+		}
+		if _, dup := seen[v.Name]; dup {
+			continue
+		}
+		seen[v.Name] = struct{}{}
+		names = append(names, v.Name)
+	}
+	slices.Sort(names)
+	payload, err := json.Marshal(names)
+	if err != nil {
+		return "", fmt.Errorf("encode the voices payload: %w", err)
+	}
+	return string(payload), nil
 }
 
 // cacheSdcppImageOptions reads the image options of one external
@@ -1326,7 +1534,8 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		// audio.cpp capability pass: for every active audio_cpp application,
 		// read the server's own /v1/models listing for each of its active
 		// mappings and write the speech, transcription, transcription_streaming and
-		// speech_clone verdicts that listing states for that model (probeAudioCppModels). A separate
+		// speech_clone verdicts that listing states for that model, and, for a
+		// model it states loaded and plain tts, cache its voices (probeAudioCppModels). A separate
 		// branch from the context probe for the same reason as the sdcpp one:
 		// audio_cpp has no context probe path, and the listing is not a
 		// ModelInfo. It shares that branch's cadence (the application's

@@ -17,9 +17,10 @@ import (
 // audioCppLiveListing is the shape audio.cpp v0.9.1 really answers on
 // GET /v1/models, probed live: an OpenAI-style list whose entries add family,
 // task, mode, loaded and path. It may also name an unloaded model, with
-// loaded:false; this prober never reads loaded. The task field is the signal
-// for the speech, transcription and speech_clone verdicts and, for an asr
-// model, the mode field is the signal for transcription_streaming.
+// loaded:false. The task field is the signal for the speech, transcription and
+// speech_clone verdicts and, for an asr model, the mode field is the signal for
+// transcription_streaming; loaded is the health axis the prober also reports
+// (AudioCppVerdicts.Loaded), which no verdict depends on.
 const audioCppLiveListing = `{"object":"list","data":[
   {"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/models/pocket_tts_english_bf16.gguf"}
 ]}`
@@ -167,6 +168,70 @@ func TestParseAudioCppModelsMode(t *testing.T) {
 	}
 }
 
+// TestParseAudioCppLoaded pins the health axis the prober reports beside the
+// verdicts: whether the listing states THIS model as currently loaded. Only a
+// boolean true on the named entry is "loaded"; everything the listing does not
+// say (no entry, no field, a null, a field of the wrong type, a body that is not
+// the listing) is "not loaded", because the voices cache is written only for a
+// model observed loaded, and an unreadable statement must never read as one.
+//
+// It is deliberately a SEPARATE table from audioCppModelCases: that one is the
+// capability rule, duplicated verbatim in the agent's module, and loaded is not
+// part of it.
+func TestParseAudioCppLoaded(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  string
+		model string
+		want  bool
+	}{
+		{"loaded true", `{"data":[{"id":"m","task":"tts","loaded":true}]}`, "m", true},
+		{"loaded false", `{"data":[{"id":"m","task":"tts","loaded":false}]}`, "m", false},
+		{"loaded absent", `{"data":[{"id":"m","task":"tts"}]}`, "m", false},
+		{"loaded null", `{"data":[{"id":"m","task":"tts","loaded":null}]}`, "m", false},
+		{"loaded as the string true is not a boolean", `{"data":[{"id":"m","task":"tts","loaded":"true"}]}`, "m", false},
+		{"loaded as the number 1 is not a boolean", `{"data":[{"id":"m","task":"tts","loaded":1}]}`, "m", false},
+		{"loaded on an entry with no task still counts", `{"data":[{"id":"m","loaded":true}]}`, "m", true},
+		{"the real v0.9.1 entry", audioCppLiveListing, "pocket_tts_english_bf16", true},
+		{"the entry is picked out by id", `{"data":[{"id":"a","loaded":false},{"id":"b","loaded":true},{"id":"c","loaded":false}]}`, "b", true},
+		{"a loaded sibling does not leak", `{"data":[{"id":"a","loaded":true},{"id":"b","loaded":false}]}`, "b", false},
+		{"model absent from the listing", `{"data":[{"id":"other","loaded":true}]}`, "m", false},
+		{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","loaded":true}]}`, "pocket_tts", false},
+		{"id match is case-sensitive", `{"data":[{"id":"M","loaded":true}]}`, "m", false},
+		{"an empty model id never matches", `{"data":[{"id":"","loaded":true}]}`, "", false},
+		{"empty data", `{"data":[]}`, "m", false},
+		{"data null", `{"data":null}`, "m", false},
+		{"data of the wrong type", `{"data":"m"}`, "m", false},
+		{"not JSON", `<html>502</html>`, "m", false},
+		{"empty body", ``, "m", false},
+		{"the first entry carrying the id answers", `{"data":[{"id":"m","loaded":false},{"id":"m","loaded":true}]}`, "m", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseAudioCppLoaded([]byte(tc.body), tc.model); got != tc.want {
+				t.Fatalf("parseAudioCppLoaded = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeAudioCppModelsOddLoadedCostsOnlyLoaded: a loaded field of a type this
+// code does not expect must cost only Loaded, never the verdicts the task
+// decides (the mode precedent), because a capability "no" or "yes" must not
+// hang on an unrelated health field.
+func TestProbeAudioCppModelsOddLoadedCostsOnlyLoaded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","task":"tts","loaded":"yes"}]}`))
+	}))
+	defer srv.Close()
+	got, err := NewOpenAICompatibleClient(srv.Client()).ProbeAudioCppModels(context.Background(), routing.Target{Endpoint: srv.URL}, "m")
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo}); got != want {
+		t.Fatalf("got %+v, want %+v (an odd loaded type must not cost the task verdicts)", got, want)
+	}
+}
+
 // agentAudioCppCasesPath is the agent's copy of audioCppModelCases, relative to
 // this package's directory, where go test runs it. Both Go modules live in one
 // repository, and CI checks the whole repository out before it tests this
@@ -221,8 +286,8 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo}); got != want {
-			t.Fatalf("got %+v, want %+v (the live entry is a tts model: speech_clone no, mode offline, but no transcription streaming verdict)", got, want)
+		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, Loaded: true}); got != want {
+			t.Fatalf("got %+v, want %+v (the live entry is a loaded tts model: speech_clone no, mode offline, but no transcription streaming verdict)", got, want)
 		}
 		if method != http.MethodGet || path != "/v1/models" {
 			t.Fatalf("request = %s %s, want GET /v1/models", method, path)
@@ -238,7 +303,7 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		if want := (AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes}); got != want {
+		if want := (AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, Loaded: true}); got != want {
 			t.Fatalf("got %+v, want %+v", got, want)
 		}
 	})
@@ -252,7 +317,7 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		want := AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: routing.CapabilityYes}
+		want := AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: routing.CapabilityYes, Loaded: true}
 		if got != want {
 			t.Fatalf("got %+v, want %+v", got, want)
 		}
@@ -267,9 +332,24 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		want := AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes}
+		want := AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes, Loaded: true}
 		if got != want {
 			t.Fatalf("got %+v, want %+v (a clone model is still a speech yes: speech_clone refines speech, it never replaces it)", got, want)
+		}
+	})
+
+	t.Run("an unloaded entry still states its verdicts and is not Loaded", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"data":[{"id":"pocket_tts_english_bf16","task":"tts","loaded":false}]}`))
+		}))
+		defer srv.Close()
+		got, err := probe(t, srv, context.Background(), "pocket_tts_english_bf16")
+		if err != nil {
+			t.Fatalf("error = %v", err)
+		}
+		want := AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo}
+		if got != want {
+			t.Fatalf("got %+v, want %+v (loaded is the health axis: an unloaded model keeps its capability verdicts and is simply not Loaded)", got, want)
 		}
 	})
 
@@ -367,7 +447,7 @@ func TestMultiplexerDispatchesAudioCppModelsToOpenAICompatibleClient(t *testing.
 	if err != nil {
 		t.Fatalf("ProbeAudioCppModels(audio_cpp) returned %v", err)
 	}
-	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo}); got != want {
+	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, Loaded: true}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 	if len(paths) != 1 || paths[0] != "/v1/models" {

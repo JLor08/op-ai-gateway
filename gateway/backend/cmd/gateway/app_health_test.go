@@ -54,7 +54,19 @@ type fakeHealthStore struct {
 	// (exercising the fallback-to-app-token degrade path).
 	runtimeSpecs []routing.RuntimeSpec
 	specsErr     bool
+	// cache is the model_mapping_cache table (#251), keyed by mapping id then
+	// by (cache type, scope key); cacheWrites counts UpsertModelMappingCache
+	// calls (the no-write-amplification spy), and cacheReadErr / cacheWriteErr
+	// make the corresponding call fail.
+	cache         map[string]map[modelMappingCacheKey]routing.ModelMappingCacheRow
+	cacheWrites   int
+	cacheReadErr  bool
+	cacheWriteErr bool
 }
+
+// modelMappingCacheKey is the (cache type, scope key) half of the cache table's
+// primary key; the mapping id is the outer map's key.
+type modelMappingCacheKey struct{ cacheType, scopeKey string }
 
 func (f *fakeHealthStore) AIServers(context.Context) ([]routing.AIServer, error) {
 	return f.servers, nil
@@ -211,6 +223,100 @@ func (f *fakeHealthStore) assertCapability(t *testing.T, mappingID, capability, 
 	}
 	if row.Verdict != wantVerdict || row.Source != wantSource {
 		t.Fatalf("%s %q row = %s/%s, want %s/%s", mappingID, capability, row.Verdict, row.Source, wantVerdict, wantSource)
+	}
+}
+
+// ModelMappingCache mirrors the store contract: one mapping's cache rows of one
+// cache type ordered by scope key, and an EMPTY (non-nil) slice for a mapping
+// with none. cacheReadErr makes it fail instead.
+func (f *fakeHealthStore) ModelMappingCache(_ context.Context, mappingID, cacheType string) ([]routing.ModelMappingCacheRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cacheReadErr {
+		return nil, fmt.Errorf("model mapping cache: boom")
+	}
+	out := []routing.ModelMappingCacheRow{}
+	for key, row := range f.cache[mappingID] {
+		if key.cacheType == cacheType {
+			out = append(out, row)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ScopeKey < out[j].ScopeKey })
+	return out, nil
+}
+
+// UpsertModelMappingCache mirrors the store contract: the row is validated
+// (routing.ValidateModelMappingCacheRow) before anything is written, and it
+// REPLACES any row for the same (mapping, cache type, scope key). Every call is
+// counted, a failing one included, so cacheWriteCount is a spy on what the loop
+// ATTEMPTED.
+func (f *fakeHealthStore) UpsertModelMappingCache(_ context.Context, row routing.ModelMappingCacheRow) error {
+	if err := routing.ValidateModelMappingCacheRow(row); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cacheWrites++
+	if f.cacheWriteErr {
+		return fmt.Errorf("model mapping cache: boom")
+	}
+	if f.cache == nil {
+		f.cache = map[string]map[modelMappingCacheKey]routing.ModelMappingCacheRow{}
+	}
+	if f.cache[row.MappingID] == nil {
+		f.cache[row.MappingID] = map[modelMappingCacheKey]routing.ModelMappingCacheRow{}
+	}
+	f.cache[row.MappingID][modelMappingCacheKey{row.CacheType, row.ScopeKey}] = row
+	return nil
+}
+
+// cacheWriteCount returns how many times UpsertModelMappingCache was called --
+// the spy the change-detection assertions turn on: a loop that correctly skips
+// an unchanged payload and one that rewrites it reach the same stored state, so
+// only the count tells them apart.
+func (f *fakeHealthStore) cacheWriteCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cacheWrites
+}
+
+// seedVoicesCache puts a voices row on file, standing in for an earlier write.
+// Its UpdatedAt is an hour old so a test can tell a rewrite from the original.
+func (f *fakeHealthStore) seedVoicesCache(mappingID, payload string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cache == nil {
+		f.cache = map[string]map[modelMappingCacheKey]routing.ModelMappingCacheRow{}
+	}
+	if f.cache[mappingID] == nil {
+		f.cache[mappingID] = map[modelMappingCacheKey]routing.ModelMappingCacheRow{}
+	}
+	f.cache[mappingID][modelMappingCacheKey{routing.ModelMappingCacheVoices, ""}] = routing.ModelMappingCacheRow{
+		MappingID: mappingID, CacheType: routing.ModelMappingCacheVoices, Payload: payload,
+		UpdatedAt: time.Now().UTC().Add(-time.Hour),
+	}
+}
+
+// voicesRowOf reads one mapping's stored voices row back. ok is false when the
+// mapping has NO such row, which is how "never fetched" differs from "fetched
+// and empty" (a row whose payload is "[]").
+func (f *fakeHealthStore) voicesRowOf(mappingID string) (routing.ModelMappingCacheRow, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.cache[mappingID][modelMappingCacheKey{routing.ModelMappingCacheVoices, ""}]
+	return row, ok
+}
+
+// assertVoicesPayload fails unless mappingID has a voices row holding exactly
+// this payload.
+func (f *fakeHealthStore) assertVoicesPayload(t *testing.T, mappingID, wantPayload string) {
+	t.Helper()
+	row, ok := f.voicesRowOf(mappingID)
+	if !ok {
+		t.Fatalf("%s has NO voices row, want payload %s", mappingID, wantPayload)
+	}
+	if row.Payload != wantPayload {
+		t.Fatalf("%s voices payload = %s, want %s", mappingID, row.Payload, wantPayload)
 	}
 }
 
@@ -3963,16 +4069,47 @@ type audioCppFakeProber struct {
 	acTargets []routing.Target
 	acModels  []string
 	acAuth    []provider.UpstreamAuth
+	// acVoices / acVoicesErr answer ListVoices per MODEL ID, the voices twin of
+	// acVerdicts / acErr: a model with an error STILL returns its voices beside
+	// it, so a branch that ignored the error would write them. acVoicesModels /
+	// acVoicesTargets / acVoicesAuth record every ListVoices call, in order.
+	acVoices        map[string][]provider.Voice
+	acVoicesErr     map[string]error
+	acVoicesModels  []string
+	acVoicesTargets []routing.Target
+	acVoicesAuth    []provider.UpstreamAuth
 }
 
-var _ provider.AudioCppModelsProber = (*audioCppFakeProber)(nil)
+var (
+	_ provider.AudioCppModelsProber = (*audioCppFakeProber)(nil)
+	_ provider.AudioCppVoicesLister = (*audioCppFakeProber)(nil)
+)
 
 func newAudioCppFakeProber() *audioCppFakeProber {
 	return &audioCppFakeProber{
-		fakeProber: newFakeProber(),
-		acVerdicts: map[string]provider.AudioCppVerdicts{},
-		acErr:      map[string]error{},
+		fakeProber:  newFakeProber(),
+		acVerdicts:  map[string]provider.AudioCppVerdicts{},
+		acErr:       map[string]error{},
+		acVoices:    map[string][]provider.Voice{},
+		acVoicesErr: map[string]error{},
 	}
+}
+
+func (f *audioCppFakeProber) ListVoices(ctx context.Context, target routing.Target, model string) ([]provider.Voice, error) {
+	f.acMu.Lock()
+	defer f.acMu.Unlock()
+	f.acVoicesTargets = append(f.acVoicesTargets, target)
+	f.acVoicesModels = append(f.acVoicesModels, model)
+	a, _ := provider.UpstreamAuthFrom(ctx)
+	f.acVoicesAuth = append(f.acVoicesAuth, a)
+	return f.acVoices[model], f.acVoicesErr[model]
+}
+
+// voicesAsked returns a copy of every model id ListVoices was asked about.
+func (f *audioCppFakeProber) voicesAsked() []string {
+	f.acMu.Lock()
+	defer f.acMu.Unlock()
+	return append([]string(nil), f.acVoicesModels...)
 }
 
 func (f *audioCppFakeProber) ProbeAudioCppModels(ctx context.Context, target routing.Target, modelID string) (provider.AudioCppVerdicts, error) {
@@ -4355,6 +4492,484 @@ func TestRunAppHealthOnceAudioCppAuthRejectedLogsAndNeverWrites(t *testing.T) {
 	}
 }
 
+// audioCppLoadedTTS is the verdict of a plain text-to-speech model the listing
+// states as loaded RIGHT NOW: the one shape whose voices the audio.cpp pass
+// fetches and caches (#251).
+func audioCppLoadedTTS() provider.AudioCppVerdicts {
+	return provider.AudioCppVerdicts{
+		Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo,
+		SpeechClone: routing.CapabilityNo, Loaded: true,
+	}
+}
+
+// voiceList builds the lister's answer for the given names, in the given order.
+func voiceList(names ...string) []provider.Voice {
+	out := make([]provider.Voice, 0, len(names))
+	for _, n := range names {
+		out = append(out, provider.Voice{Name: n})
+	}
+	return out
+}
+
+// TestRunAppHealthOnceAudioCppCachesVoicesOfALoadedTTSModel is the branch's
+// whole job for the voice picker (#251): the audio.cpp pass observes a mapping's
+// model LOADED and tts, asks the server's voice listing, and stores the names on
+// the mapping as a NORMALIZED cache row (deduplicated, sorted -- the server's
+// order is cosmetic), so the picker can offer them even after the model is
+// unloaded.
+//
+// The listing is asked with the mapping's AppModelName, the server's own target
+// and the application's credential, exactly like the /v1/models probe beside it.
+func TestRunAppHealthOnceAudioCppCachesVoicesOfALoadedTTSModel(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": audioCppLoadedTTS()},
+		audioCppMapping("m1", "pocket_tts"))
+	prober.acVoices["pocket_tts"] = voiceList("demo_2_man", "demo_1_man", "demo_2_man")
+	at := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return at }
+	app := st.apps["s1"][0]
+	app.APIToken = "plain:app-tok"
+	app.APITokenHeader = "X-App-Key"
+	st.apps["s1"][0] = app
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.voicesAsked(), []string{"pocket_tts"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("voices listing asked about %v, want %v (the mapping's AppModelName, once)", got, want)
+	}
+	row, ok := st.voicesRowOf("m1")
+	if !ok {
+		t.Fatal("m1 has no voices row, want one")
+	}
+	want := routing.ModelMappingCacheRow{
+		MappingID: "m1", CacheType: "voices", ScopeKey: "",
+		Payload: `["demo_1_man","demo_2_man"]`, UpdatedAt: at,
+	}
+	if row != want {
+		t.Fatalf("voices row = %+v, want %+v", row, want)
+	}
+	prober.acMu.Lock()
+	defer prober.acMu.Unlock()
+	if len(prober.acVoicesTargets) != 1 {
+		t.Fatalf("voices listing called %d times, want 1", len(prober.acVoicesTargets))
+	}
+	if target := prober.acVoicesTargets[0]; target.Provider != routing.ProviderAudioCpp || target.Endpoint != "http://s1.local:8001" || target.Timeout != time.Second {
+		t.Fatalf("voices target = %+v, want {Provider:audio_cpp Endpoint:http://s1.local:8001 Timeout:1s}", target)
+	}
+	// UpstreamAuth carries an ExtraHeaders map and is not comparable with ==.
+	if a := prober.acVoicesAuth[0]; a.Header != "X-App-Key" || a.Token != "app-tok" {
+		t.Fatalf("voices credential = {Header:%q Token:%q}, want {Header:X-App-Key Token:app-tok}", a.Header, a.Token)
+	}
+}
+
+// TestRunAppHealthOnceAudioCppVoicesWriteIsChangeDetected: the pass runs every
+// health tick, so a steady server must cost the cache no write. The listing is
+// still asked each tick (that is how a change is noticed); only an unchanged
+// NORMALIZED payload suppresses the write, so a server that merely re-orders or
+// repeats its names does not flap the row, and a real change does write.
+func TestRunAppHealthOnceAudioCppVoicesWriteIsChangeDetected(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": audioCppLoadedTTS()},
+		audioCppMapping("m1", "pocket_tts"))
+	prober.acVoices["pocket_tts"] = voiceList("b", "a")
+
+	runCapabilityCycle(runner)
+	if n := st.cacheWriteCount(); n != 1 {
+		t.Fatalf("cache writes after the first tick = %d, want 1", n)
+	}
+	st.assertVoicesPayload(t, "m1", `["a","b"]`)
+
+	runCapabilityCycle(runner)
+	if n := st.cacheWriteCount(); n != 1 {
+		t.Fatalf("cache writes after an identical second tick = %d, want still 1 (change detection)", n)
+	}
+
+	prober.acVoices["pocket_tts"] = voiceList("a", "b", "a")
+	runCapabilityCycle(runner)
+	if n := st.cacheWriteCount(); n != 1 {
+		t.Fatalf("cache writes after a re-ordered, repeated listing = %d, want still 1 (the payload is normalized before the compare)", n)
+	}
+
+	prober.acVoices["pocket_tts"] = voiceList("a", "b", "c")
+	runCapabilityCycle(runner)
+	if n := st.cacheWriteCount(); n != 2 {
+		t.Fatalf("cache writes after a changed listing = %d, want 2", n)
+	}
+	st.assertVoicesPayload(t, "m1", `["a","b","c"]`)
+
+	if got := len(prober.voicesAsked()); got != 4 {
+		t.Fatalf("voices listing asked %d times over four ticks, want 4 (it is asked every tick; only the write is skipped)", got)
+	}
+}
+
+// TestRunAppHealthOnceAudioCppVoicesGate pins WHICH mappings are asked: only a
+// model the listing states as LOADED right now (the server answers for the
+// model it has loaded, so asking for any other would attribute another model's
+// voices to this one) and only a plain tts one -- (speech, yes) and NOT
+// (speech_clone, yes), #252's verdict -- because a clone model takes a reference
+// recording, not a named voice. Everything else is never fetched and never
+// written, however the rest of the verdict reads.
+func TestRunAppHealthOnceAudioCppVoicesGate(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	for _, tc := range []struct {
+		name      string
+		v         provider.AudioCppVerdicts
+		wantFetch bool
+	}{
+		{"a loaded tts model", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: no, Loaded: true}, true},
+		{"a loaded speech model whose clone verdict is unknown", provider.AudioCppVerdicts{Speech: yes, Transcription: no, Loaded: true}, true},
+		{"a tts model that is not loaded", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: no}, false},
+		{"a loaded clone model", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: yes, Loaded: true}, false},
+		{"a loaded asr model", provider.AudioCppVerdicts{Speech: no, Transcription: yes, Loaded: true}, false},
+		{"a loaded model that is no speech and no transcription model", provider.AudioCppVerdicts{Speech: no, Transcription: no, Loaded: true}, false},
+		{"a loaded model whose task the listing does not state", provider.AudioCppVerdicts{Loaded: true}, false},
+		{"a model the listing does not name", provider.AudioCppVerdicts{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober := audioCppProbeRunner(t,
+				map[string]provider.AudioCppVerdicts{"pocket_tts": tc.v},
+				audioCppMapping("m1", "pocket_tts"))
+			prober.acVoices["pocket_tts"] = voiceList("a")
+
+			runCapabilityCycle(runner)
+
+			asked := prober.voicesAsked()
+			if tc.wantFetch {
+				if want := []string{"pocket_tts"}; !reflect.DeepEqual(asked, want) {
+					t.Fatalf("voices listing asked about %v, want %v", asked, want)
+				}
+				st.assertVoicesPayload(t, "m1", `["a"]`)
+				return
+			}
+			if len(asked) != 0 {
+				t.Fatalf("voices listing asked about %v, want no request", asked)
+			}
+			if row, ok := st.voicesRowOf("m1"); ok {
+				t.Fatalf("m1 has a voices row %+v, want none", row)
+			}
+			if n := st.cacheWriteCount(); n != 0 {
+				t.Fatalf("cache written %d times, want 0", n)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceAudioCppVoicesAreAttributedToTheLoadedMappingOnly: one
+// server, several mappings, one loaded tts model. The listing answers for that
+// model alone, so the voices belong to ITS mapping and to no other -- not to an
+// unloaded sibling, not to a loaded clone model beside it.
+func TestRunAppHealthOnceAudioCppVoicesAreAttributedToTheLoadedMappingOnly(t *testing.T) {
+	cloneLoaded := provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes, Loaded: true}
+	idleTTS := audioCppLoadedTTS()
+	idleTTS.Loaded = false
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{
+			"tts_loaded": audioCppLoadedTTS(), "tts_idle": idleTTS, "clone_loaded": cloneLoaded,
+		},
+		audioCppMapping("m1", "tts_loaded"), audioCppMapping("m2", "tts_idle"), audioCppMapping("m3", "clone_loaded"))
+	for _, model := range []string{"tts_loaded", "tts_idle", "clone_loaded"} {
+		prober.acVoices[model] = voiceList("v_" + model)
+	}
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.voicesAsked(), []string{"tts_loaded"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("voices listing asked about %v, want %v", got, want)
+	}
+	st.assertVoicesPayload(t, "m1", `["v_tts_loaded"]`)
+	for _, id := range []string{"m2", "m3"} {
+		if row, ok := st.voicesRowOf(id); ok {
+			t.Fatalf("%s has a voices row %+v, want none", id, row)
+		}
+	}
+}
+
+// TestRunAppHealthOnceAudioCppVoicesFetchErrorKeepsTheRow is last-known-good: a
+// failed listing (unreachable, non-2xx, an undecodable body) says nothing about
+// the model's voices, so it writes nothing and the row on file survives. The
+// fake hands voices back beside the error, so only the error guard stands
+// between them and the row.
+func TestRunAppHealthOnceAudioCppVoicesFetchErrorKeepsTheRow(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": audioCppLoadedTTS()},
+		audioCppMapping("m1", "pocket_tts"))
+	prober.acVoices["pocket_tts"] = voiceList("would_overwrite")
+	prober.acVoicesErr["pocket_tts"] = fmt.Errorf("%w: status 503", provider.ErrUnavailable)
+	st.seedVoicesCache("m1", `["old_a","old_b"]`)
+
+	runCapabilityCycle(runner)
+
+	if n := len(prober.voicesAsked()); n != 1 {
+		t.Fatalf("voices listing asked %d times, want 1 (the fetch must have run for this to mean anything)", n)
+	}
+	if n := st.cacheWriteCount(); n != 0 {
+		t.Fatalf("cache written %d times after a failed listing, want 0", n)
+	}
+	st.assertVoicesPayload(t, "m1", `["old_a","old_b"]`)
+}
+
+// TestRunAppHealthOnceAudioCppVoicesGenuineEmptyListingIsWritten: a listing that
+// SUCCEEDS with no voices is the truth for a model that has none, so it is
+// written -- over an earlier non-empty row, and as the first row for a mapping
+// with none (an absent row means "never asked", which "fetched, nothing to
+// offer" is not). The empty payload is itself change-detected.
+func TestRunAppHealthOnceAudioCppVoicesGenuineEmptyListingIsWritten(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed string // "" = no row on file
+	}{
+		{"as the first row", ""},
+		{"over an earlier non-empty row", `["old"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober := audioCppProbeRunner(t,
+				map[string]provider.AudioCppVerdicts{"pocket_tts": audioCppLoadedTTS()},
+				audioCppMapping("m1", "pocket_tts"))
+			prober.acVoices["pocket_tts"] = []provider.Voice{} // a genuine empty, nil error
+			if tc.seed != "" {
+				st.seedVoicesCache("m1", tc.seed)
+			}
+
+			runCapabilityCycle(runner)
+
+			st.assertVoicesPayload(t, "m1", `[]`)
+			if n := st.cacheWriteCount(); n != 1 {
+				t.Fatalf("cache written %d times, want 1", n)
+			}
+
+			runCapabilityCycle(runner)
+			if n := st.cacheWriteCount(); n != 1 {
+				t.Fatalf("cache written %d times after a second empty listing, want still 1", n)
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceAudioCppVoicesBackOffAfterAnError: a server that does not
+// serve the listing (an older audio.cpp, a proxy without the route) must not be
+// asked once per mapping per tick for as long as the model stays loaded. A
+// failed listing starts a back-off for THAT mapping: within it the listing is
+// not asked; once it has elapsed the next tick asks again, and a success (or the
+// model leaving the loaded set) clears it, so a reload retries at once.
+func TestRunAppHealthOnceAudioCppVoicesBackOffAfterAnError(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": audioCppLoadedTTS()},
+		audioCppMapping("m1", "pocket_tts"))
+	current := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return current }
+	prober.acVoicesErr["pocket_tts"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+	asked := func() int { return len(prober.voicesAsked()) }
+
+	runCapabilityCycle(runner)
+	if n := asked(); n != 1 {
+		t.Fatalf("asked %d times after the first tick, want 1", n)
+	}
+
+	current = current.Add(audioCppVoicesBackoff / 2)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 1 {
+		t.Fatalf("asked %d times inside the back-off, want still 1", n)
+	}
+
+	current = current.Add(audioCppVoicesBackoff)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 2 {
+		t.Fatalf("asked %d times after the back-off elapsed, want 2", n)
+	}
+	if n := st.cacheWriteCount(); n != 0 {
+		t.Fatalf("cache written %d times while every listing failed, want 0", n)
+	}
+
+	// The server starts answering: the success is written and clears the
+	// back-off, so the following ticks ask again without waiting.
+	delete(prober.acVoicesErr, "pocket_tts")
+	prober.acVoices["pocket_tts"] = voiceList("a")
+	current = current.Add(audioCppVoicesBackoff + time.Second)
+	runCapabilityCycle(runner)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 4 {
+		t.Fatalf("asked %d times after the server recovered, want 4 (a success clears the back-off)", n)
+	}
+	st.assertVoicesPayload(t, "m1", `["a"]`)
+
+	// An unload clears a fresh back-off too: the reload is asked at once.
+	prober.acVoicesErr["pocket_tts"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+	runCapabilityCycle(runner) // fails, starts a back-off
+	before := asked()
+	unloaded := audioCppLoadedTTS()
+	unloaded.Loaded = false
+	prober.acMu.Lock()
+	prober.acVerdicts["pocket_tts"] = unloaded
+	prober.acMu.Unlock()
+	runCapabilityCycle(runner)
+	prober.acMu.Lock()
+	prober.acVerdicts["pocket_tts"] = audioCppLoadedTTS()
+	prober.acMu.Unlock()
+	runCapabilityCycle(runner)
+	if n := asked(); n != before+1 {
+		t.Fatalf("asked %d times after an unload and reload, want %d (the reload retries inside the old back-off window)", n, before+1)
+	}
+}
+
+// audioCppModelsOnlyProber is a prober that reads /v1/models but implements no
+// voices listing -- every provider client but the OpenAI-compatible one.
+type audioCppModelsOnlyProber struct {
+	*fakeProber
+	inner *audioCppFakeProber
+}
+
+func (p *audioCppModelsOnlyProber) ProbeAudioCppModels(ctx context.Context, target routing.Target, modelID string) (provider.AudioCppVerdicts, error) {
+	return p.inner.ProbeAudioCppModels(ctx, target, modelID)
+}
+
+// TestRunAppHealthOnceAudioCppVoicesWithoutAListerStillWritesVerdicts: a prober
+// that cannot list voices skips the voices step, silently, and the capability
+// verdicts the same pass derives are unaffected.
+func TestRunAppHealthOnceAudioCppVoicesWithoutAListerStillWritesVerdicts(t *testing.T) {
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"pocket_tts": audioCppLoadedTTS()},
+		audioCppMapping("m1", "pocket_tts"))
+	runner.prober = &audioCppModelsOnlyProber{fakeProber: prober.fakeProber, inner: prober}
+
+	runCapabilityCycle(runner)
+
+	st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	if row, ok := st.voicesRowOf("m1"); ok {
+		t.Fatalf("m1 has a voices row %+v, want none: nothing could list voices", row)
+	}
+	if n := st.cacheWriteCount(); n != 0 {
+		t.Fatalf("cache written %d times, want 0", n)
+	}
+}
+
+// TestRunAppHealthOnceAudioCppVoicesStoreFailuresAreBestEffort: the voices cache
+// is a convenience on the side of the health loop, so a cache read or write that
+// fails is logged and the pass carries on -- the capability verdicts and the
+// next mapping are unaffected.
+func TestRunAppHealthOnceAudioCppVoicesStoreFailuresAreBestEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*fakeHealthStore)
+	}{
+		{"a failing cache read", func(st *fakeHealthStore) { st.cacheReadErr = true }},
+		{"a failing cache write", func(st *fakeHealthStore) { st.cacheWriteErr = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober := audioCppProbeRunner(t,
+				map[string]provider.AudioCppVerdicts{"tts_a": audioCppLoadedTTS(), "tts_b": audioCppLoadedTTS()},
+				audioCppMapping("m1", "tts_a"), audioCppMapping("m2", "tts_b"))
+			prober.acVoices["tts_a"], prober.acVoices["tts_b"] = voiceList("a"), voiceList("b")
+			tc.setup(st)
+			var buf bytes.Buffer
+			log.SetOutput(&buf)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+			runCapabilityCycle(runner)
+
+			if n := len(prober.voicesAsked()); n != 2 {
+				t.Fatalf("voices listing asked %d times, want 2 (one failing mapping must not stop the next)", n)
+			}
+			st.assertCapability(t, "m1", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+			if !strings.Contains(buf.String(), "voices") {
+				t.Fatalf("log output = %q, want the failure logged", buf.String())
+			}
+		})
+	}
+}
+
+// TestWriteVoicesCache pins the shared writer (the audio.cpp pass here, the
+// agent-child pass later): it stores a NORMALIZED payload -- names deduplicated
+// and sorted bytewise, blanks dropped, the rest verbatim because the match
+// against the server is exact -- as a JSON array, reports whether it wrote, and
+// writes only when the normalized payload differs from the row on file.
+func TestWriteVoicesCache(t *testing.T) {
+	at := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	newRunner := func() (*appHealthRunner, *fakeHealthStore) {
+		st := newHealthTestStore()
+		return &appHealthRunner{store: st, now: func() time.Time { return at }}, st
+	}
+
+	t.Run("normalizes: dedupe, sort, drop blanks, keep names verbatim", func(t *testing.T) {
+		r, st := newRunner()
+		changed, err := r.writeVoicesCache(context.Background(), "m1", voiceList("b", "A", "a", "b", "", "  ", ` q"x `))
+		if err != nil || !changed {
+			t.Fatalf("writeVoicesCache = (%v, %v), want (true, nil)", changed, err)
+		}
+		// Bytewise order: "A" < "a" < "b", and the padded, quoted name stays as is.
+		st.assertVoicesPayload(t, "m1", `[" q\"x ","A","a","b"]`)
+		row, _ := st.voicesRowOf("m1")
+		if row.CacheType != "voices" || row.ScopeKey != "" || !row.UpdatedAt.Equal(at) {
+			t.Fatalf("row = %+v, want cache type voices, empty scope key, UpdatedAt %v", row, at)
+		}
+	})
+
+	t.Run("an unchanged payload writes nothing and reports changed=false", func(t *testing.T) {
+		r, st := newRunner()
+		if _, err := r.writeVoicesCache(context.Background(), "m1", voiceList("a", "b")); err != nil {
+			t.Fatal(err)
+		}
+		changed, err := r.writeVoicesCache(context.Background(), "m1", voiceList("b", "a", "b"))
+		if err != nil || changed {
+			t.Fatalf("writeVoicesCache = (%v, %v), want (false, nil)", changed, err)
+		}
+		if n := st.cacheWriteCount(); n != 1 {
+			t.Fatalf("cache written %d times, want 1", n)
+		}
+	})
+
+	t.Run("a different payload replaces the row", func(t *testing.T) {
+		r, st := newRunner()
+		st.seedVoicesCache("m1", `["a"]`)
+		changed, err := r.writeVoicesCache(context.Background(), "m1", voiceList("a", "b"))
+		if err != nil || !changed {
+			t.Fatalf("writeVoicesCache = (%v, %v), want (true, nil)", changed, err)
+		}
+		st.assertVoicesPayload(t, "m1", `["a","b"]`)
+	})
+
+	t.Run("no voices at all is the empty array, never null", func(t *testing.T) {
+		for name, in := range map[string][]provider.Voice{"nil": nil, "empty": {}, "only blanks": voiceList("", " ")} {
+			r, st := newRunner()
+			changed, err := r.writeVoicesCache(context.Background(), "m1", in)
+			if err != nil || !changed {
+				t.Fatalf("%s: writeVoicesCache = (%v, %v), want (true, nil)", name, changed, err)
+			}
+			st.assertVoicesPayload(t, "m1", `[]`)
+		}
+	})
+
+	t.Run("a legacy or foreign payload for the same voices is rewritten once to the canonical form", func(t *testing.T) {
+		r, st := newRunner()
+		st.seedVoicesCache("m1", `[ "a", "b" ]`)
+		changed, err := r.writeVoicesCache(context.Background(), "m1", voiceList("a", "b"))
+		if err != nil || !changed {
+			t.Fatalf("writeVoicesCache = (%v, %v), want (true, nil)", changed, err)
+		}
+		st.assertVoicesPayload(t, "m1", `["a","b"]`)
+	})
+
+	t.Run("a cache read failure is an error and writes nothing", func(t *testing.T) {
+		r, st := newRunner()
+		st.cacheReadErr = true
+		changed, err := r.writeVoicesCache(context.Background(), "m1", voiceList("a"))
+		if err == nil || changed {
+			t.Fatalf("writeVoicesCache = (%v, %v), want (false, error)", changed, err)
+		}
+		if n := st.cacheWriteCount(); n != 0 {
+			t.Fatalf("cache written %d times after a failed read, want 0", n)
+		}
+	})
+
+	t.Run("a cache write failure is an error and not a change", func(t *testing.T) {
+		r, st := newRunner()
+		st.cacheWriteErr = true
+		changed, err := r.writeVoicesCache(context.Background(), "m1", voiceList("a"))
+		if err == nil || changed {
+			t.Fatalf("writeVoicesCache = (%v, %v), want (false, error)", changed, err)
+		}
+	})
+}
+
 // TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts drives the audio.cpp branch
 // through the REAL production chain -- providerClients' Multiplexer, its
 // OpenAI-compatible client, a MemoryStore -- against an httptest server serving
@@ -4366,6 +4981,13 @@ func TestRunAppHealthOnceAudioCppAuthRejectedLogsAndNeverWrites(t *testing.T) {
 // does, would leave every audio mapping without a verdict and every fake test
 // green. The application is a static audio_cpp one with no runtime spec, the
 // deployment the type exists for.
+//
+// The same chain carries the voices cache (#251): the one LOADED tts model's
+// voices come from the server's /v1/audio/voices and land, normalized, on its
+// mapping's model_mapping_cache row -- and on no other mapping's: the loaded asr
+// model and the model the listing does not name are never asked. The unloaded
+// entry of the real listing shape (loaded:false) is part of the fixture, so a
+// pass that ignored `loaded` would ask for its voices and fail the path check.
 func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T) {
 	shrinkRetryGap(t)
 	var paths []string
@@ -4374,14 +4996,21 @@ func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T)
 		mu.Lock()
 		paths = append(paths, r.URL.Path)
 		mu.Unlock()
-		if r.URL.Path != "/v1/models" {
+		switch r.URL.Path {
+		case "/v1/models":
+		case "/v1/audio/voices":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"voices":["demo_2_man","demo_1_man","demo_2_man"]}`))
+			return
+		default:
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"object":"list","data":[` +
 			`{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/m/pocket"},` +
-			`{"id":"whisper_small","object":"model","owned_by":"engine","family":"whisper","task":"asr","mode":"offline","loaded":true,"path":"/m/whisper"}]}`))
+			`{"id":"whisper_small","object":"model","owned_by":"engine","family":"whisper","task":"asr","mode":"offline","loaded":true,"path":"/m/whisper"},` +
+			`{"id":"idle_tts","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":false,"path":"/m/idle"}]}`))
 	}))
 	defer upstream.Close()
 	u, err := url.Parse(upstream.URL)
@@ -4417,6 +5046,7 @@ func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T)
 		{ID: "m1", ApplicationID: "a1", GatewayModelName: "tts", AppModelName: "pocket_tts_english_bf16", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now},
 		{ID: "m2", ApplicationID: "a1", GatewayModelName: "asr", AppModelName: "whisper_small", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now},
 		{ID: "m3", ApplicationID: "a1", GatewayModelName: "idle", AppModelName: "not_loaded", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now},
+		{ID: "m4", ApplicationID: "a1", GatewayModelName: "tts-idle", AppModelName: "idle_tts", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now},
 	} {
 		if err := store.CreateMapping(ctx, m); err != nil {
 			t.Fatalf("create mapping %s: %v", m.ID, err)
@@ -4460,14 +5090,45 @@ func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T)
 	if row, ok := transcription("m3"); ok {
 		t.Fatalf("m3 transcription row = %+v, want none -- a model absent from the listing is unknown, never a no", row)
 	}
+	// The voices of the one loaded tts model are cached on ITS mapping,
+	// normalized (sorted, deduplicated); no other mapping has a row.
+	voicesPayload := func(mappingID string) (string, bool) {
+		rows, err := store.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheVoices)
+		if err != nil {
+			t.Fatalf("model mapping cache %s: %v", mappingID, err)
+		}
+		if len(rows) == 0 {
+			return "", false
+		}
+		if len(rows) != 1 || rows[0].ScopeKey != "" || !rows[0].UpdatedAt.Equal(now) {
+			t.Fatalf("%s voices rows = %+v, want exactly one with an empty scope key stamped %v", mappingID, rows, now)
+		}
+		return rows[0].Payload, true
+	}
+	if payload, ok := voicesPayload("m1"); !ok || payload != `["demo_1_man","demo_2_man"]` {
+		t.Fatalf("m1 voices payload = %q (present=%v), want [\"demo_1_man\",\"demo_2_man\"]", payload, ok)
+	}
+	for _, id := range []string{"m2", "m3", "m4"} {
+		if payload, ok := voicesPayload(id); ok {
+			t.Fatalf("%s has a voices row %q, want none -- only the loaded tts model's mapping is cached", id, payload)
+		}
+	}
 	mu.Lock()
 	defer mu.Unlock()
+	voiceRequests := 0
 	for _, p := range paths {
-		if p != "/v1/models" {
-			t.Fatalf("upstream paths = %v, want only /v1/models", paths)
+		switch p {
+		case "/v1/models":
+		case "/v1/audio/voices":
+			voiceRequests++
+		default:
+			t.Fatalf("upstream paths = %v, want only /v1/models and /v1/audio/voices", paths)
 		}
 	}
 	if len(paths) == 0 {
 		t.Fatal("the upstream was never asked for /v1/models")
+	}
+	if voiceRequests != 1 {
+		t.Fatalf("the upstream was asked for /v1/audio/voices %d times (paths %v), want 1: only the loaded tts model's", voiceRequests, paths)
 	}
 }
