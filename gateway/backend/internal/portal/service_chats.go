@@ -508,8 +508,9 @@ type ChatImageSettings struct {
 // itself owns (model/input/stream/response_format). The response is always WAV
 // (the gateway serves only wav), so there is no format knob.
 type ChatAudioSettings struct {
-	// Voice is the free-text voice name; "" leaves the model's default voice.
-	// audio.cpp voices are not discovered, so it is whatever the user types.
+	// Voice is the voice name; "" leaves the model's default voice. The composer
+	// offers the voices the gateway has cached for the model in a combobox that
+	// still takes free text, so it is whatever the user picked or typed.
 	Voice string `json:"voice,omitempty"`
 	// Speed is the speaking-rate multiplier, passed through as given (the
 	// model's own range applies). A POINTER so an explicit value stays

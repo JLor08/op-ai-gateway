@@ -496,7 +496,7 @@ export function imageSettingsFrom(image: ChatImageSettings | undefined): ImageSe
 // blank sentinel that audioSetting() below omits from the wire, so the model keeps its
 // own default (its default voice is shown as a placeholder, never written).
 export type AudioSettings = {
-  voice: string; // free text; "" = the model's default voice
+  voice: string; // picked or typed (combobox); "" = the model's default voice
   // The speaking-rate multiplier as a BLANK-ABLE string ("" = the model's own default),
   // parsed to a number on the wire by audioSetting(); a blank or unparseable one is
   // omitted. Not clamped: the model's own range applies.

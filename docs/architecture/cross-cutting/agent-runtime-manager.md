@@ -2939,12 +2939,14 @@ has the `runtime_upstream_props` shape, not the `runtime_config_files` one: **th
 gates real behavior on it, fail-closed, and that gate is the flag's purpose.** It says the
 router serves `GET /upstream/{model}/v1/audio/voices` (§4.1), and the gateway's agent-child
 voices pass reads it off the agent's sample (`hasAgentFeature(…,
-gateway.RuntimeVoicesFeature)`, `AgentFeatures.Has`) before it asks anything. An agent that
-predates the route has no such control route, so the GET falls through to model routing
-and answers `404 runtime.model_not_managed` — the same status and code an unmanaged model
-gets, so a probe could not tell an old agent from an unknown model, and would only add a
-silent no-op request each tick for as long as the model stayed loaded. A server on such an
-agent (or one that has not reported since a gateway restart) simply has no cached voices,
+gateway.RuntimeVoicesFeature)`, `AgentFeatures.Has`) before it asks anything. An older
+router never serves the voices route and answers a 404 — `runtime.upstream_endpoint_not_allowed`
+from 0.7.0 on (it already has the `/upstream/` route and refuses a suffix other than `/props`),
+`runtime.model_not_managed` before 0.7.0 (no `/upstream` route at all, so the GET falls
+through to model routing). Either way the read cannot succeed, so the gateway sends it only
+to an agent that declared `runtime_voices`; a read sent to an older one would only add a
+silent no-op request each tick for as long as the model stayed loaded. A server on
+an agent without the flag (or one that has not reported since a gateway restart) simply has no cached voices,
 which the portal's picker handles fail-open (plain free text). The name is on the agent's
 list alone, spelled identically on both sides because the agent module imports nothing from
 the gateway (`gateway.RuntimeVoicesFeature` is exported for the health loop in

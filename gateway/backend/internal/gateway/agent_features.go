@@ -95,12 +95,12 @@ const RuntimeUpstreamPropsFeature = "runtime_upstream_props"
 // on the agent's list only, not on gatewayAgentFeatures. The health loop's
 // agent-child voices pass fetches through that route only from an agent with
 // positive evidence the route exists (AgentFeatures.Has) -- fail-closed, the
-// RuntimeUpstreamPropsFeature precedent -- because an older router answers 404
-// runtime.model_not_managed for every such read, the same status and code it
-// gives an unmanaged model, so trying the route cannot tell an old agent from
-// an unknown model and would only add silent no-op traffic each tick. It is
-// exported, like RuntimeUpstreamPropsFeature, for that loop in cmd/gateway,
-// which checks it too (hasAgentFeature).
+// RuntimeUpstreamPropsFeature precedent -- because an older router never serves
+// the route and answers a 404 (runtime.upstream_endpoint_not_allowed from 0.7.0
+// on, runtime.model_not_managed before 0.7.0), so the read cannot succeed there
+// and would only add silent no-op traffic each tick. It is exported, like
+// RuntimeUpstreamPropsFeature, for that loop in cmd/gateway, which checks it too
+// (hasAgentFeature).
 //
 // The agent module cannot import this package, so the agent names the
 // identical string in its own registry

@@ -1000,8 +1000,9 @@ func (r *appHealthRunner) fetchAndCacheVoices(ctx context.Context, lister provid
 //     applies the same rule at read time, so writer and reader cannot disagree).
 //
 // The caller has already required the agent's runtime_voices declaration: it is
-// fail-closed, because an older router answers an unmanaged model's 404 for the
-// route too and the two cannot be told apart. A runtime-spec or capability read
+// fail-closed, because an older router never serves the route and answers a 404
+// (runtime.upstream_endpoint_not_allowed from 0.7.0 on, runtime.model_not_managed
+// before 0.7.0), so the read cannot succeed there. A runtime-spec or capability read
 // that FAILS leaves the mapping unasked for this tick for the same reason: what
 // the child is cannot be told.
 //
@@ -1699,11 +1700,11 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		// effective interval and wg+sem.
 		//
 		// FAIL-CLOSED on the agent's runtime_voices declaration
-		// (gateway.RuntimeVoicesFeature): an older router answers 404
-		// runtime.model_not_managed for the route, the same status and
-		// code it gives an unmanaged model, so without positive evidence
-		// of the route a probe could not tell an old agent from an
-		// unknown model and would only add silent no-op traffic. The
+		// (gateway.RuntimeVoicesFeature): an older router never serves the
+		// route and answers a 404 (runtime.upstream_endpoint_not_allowed
+		// from 0.7.0 on, runtime.model_not_managed before 0.7.0), so
+		// without positive evidence of the route a probe could not succeed
+		// and would only add silent no-op traffic. The
 		// route itself is Status-only and never starts a cold child, and
 		// the pass additionally asks only models the agent reports
 		// loaded (probeAgentVoices).

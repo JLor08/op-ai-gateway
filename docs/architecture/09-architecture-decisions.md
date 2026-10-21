@@ -6735,10 +6735,11 @@ gave.
   `0.10.2` → `0.11.0` (MINOR, `agent.Features` gained an entry; **one bump for the whole
   branch**), and the gateway names it `gateway.RuntimeVoicesFeature`. The gateway's
   agent-child pass checks it **fail-closed**, the `runtime_upstream_props` shape: an
-  older router answers an unmanaged model's 404 `runtime.model_not_managed` for the
-  route too, so an old agent cannot be told from an unknown model and is simply never
-  asked, and a server on such an agent has no cached voices, which the picker handles
-  fail-open.
+  older router never serves the voices route and answers a 404 —
+  `runtime.upstream_endpoint_not_allowed` from 0.7.0 on, `runtime.model_not_managed`
+  before 0.7.0 — so the read cannot succeed there, and the gateway sends it only to an
+  agent that declared `runtime_voices`. A server on an agent without the flag has no
+  cached voices, which the picker handles fail-open.
 - **(c) Population is change-detected fetch-on-load, strict about which model it
   attributes to.** The gateway has no "just became loaded" event, so the health loop
   does the restart-surviving thing the capability writers do

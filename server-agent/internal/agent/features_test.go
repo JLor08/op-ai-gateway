@@ -337,9 +337,10 @@ func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
 // agent's runtime router serves GET /upstream/{model}/v1/audio/voices (#251), a
 // Status-only passthrough to a RUNNING audio.cpp child's voice listing, and the
 // GATEWAY fetches a child's voices only from an agent that declares this exact
-// name, fail-closed -- an older router answers 404 runtime.model_not_managed
-// for every such read, which cannot be told apart from an unmanaged model -- so
-// a rename here silently stops every agent child's voices from being cached.
+// name, fail-closed -- an older router never serves the route and answers a 404
+// (runtime.upstream_endpoint_not_allowed from 0.7.0 on, runtime.model_not_managed
+// before 0.7.0) for every such read -- so a rename here silently stops every
+// agent child's voices from being cached.
 // The gateway spells the same string in its own constant
 // (RuntimeVoicesFeature, gateway/backend/internal/gateway/agent_features.go);
 // this module cannot import it.

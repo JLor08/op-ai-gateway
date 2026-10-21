@@ -145,7 +145,8 @@ var Features = []Feature{
 	// runtime_upstream_props: this agent's runtime router serves
 	// GET /upstream/{model}/props -- the GET-only, allowlisted passthrough to
 	// a RUNNING managed child's /props (issue #58; it never starts a child,
-	// and the allowlist is exactly /props). Unlike most entries above, the
+	// and the allowlist was exactly /props when this flag shipped; it is two
+	// endpoints since runtime_voices below). Unlike most entries above, the
 	// GATEWAY gates real behavior on this flag, fail-closed (the
 	// PushRuntimeConfig precedent): its app-health {model} probe pass only
 	// sends /upstream/{model}/props probes at an agent with positive
@@ -218,9 +219,11 @@ var Features = []Feature{
 	// this flag gates nothing on the agent -- the route is simply there or not
 	// -- but it is declared for the GATEWAY's benefit: its health loop fetches an
 	// agent child's voices only from an agent with positive evidence the route
-	// exists, fail-closed, because an older router answers 404
-	// runtime.model_not_managed for every such read, forever, and a read that
-	// cannot succeed is exactly the traffic a capability gate exists to prevent.
+	// exists, fail-closed, because an older router never serves the route and
+	// answers a 404 (runtime.upstream_endpoint_not_allowed from 0.7.0 on,
+	// runtime.model_not_managed before 0.7.0) for every such read, forever, and a
+	// read that cannot succeed is exactly the traffic a capability gate exists to
+	// prevent.
 	//
 	// Since is 0.11.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
