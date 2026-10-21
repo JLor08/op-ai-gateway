@@ -1883,7 +1883,7 @@ it, and the Models-view column stays ungated the same way.
 
 **A `speech_clone` refinement hides a voice-clone model from the chat picker.** The one
 audio.cpp task that decides `speech` and `transcription` also decides a third row,
-`speech_clone` (`clone` → yes, `tts` → no, nothing for a non-speech model), written by
+`speech_clone` (`clon` → yes, `tts` → no, nothing for a non-speech model), written by
 both producers of the `audiocpp_models` source and folded into the portal DTO's
 `speech_clone` flag (`ModelDTO.SpeechClone`, `speechCloneFlagsByName`). Unlike the folds
 above it is the fail-OPEN INVERSE — an OR across a model's mappings and a group's offerable
@@ -2588,7 +2588,7 @@ speech-capable model puts an empty thread into the speech composer
 (`prospectiveKind`), and a model that is both image- and speech-capable is an image
 model, image having been the kind first. A **clone**-task model is the one speech model
 the picker leaves OUT: it carries a `speech_clone: true` flag (`ModelDTO.SpeechClone`,
-from the audio.cpp task's `clone` verdict, §9), and the speech filter admits a model only
+from the audio.cpp task's `clon` verdict, §9), and the speech filter admits a model only
 when `speech: true` **and not** `speech_clone: true`, because a clone model needs a
 reference voice this text-only composer cannot supply, so every send would fail upstream
 (the audio counterpart of the picker-offers-what-send-fails problem). It is still

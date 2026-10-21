@@ -2453,7 +2453,7 @@ func TestAgentIngestAdmitsTranscriptionStreaming(t *testing.T) {
 // of speech, on the open list, admitted by the one allowlist
 // (audioCppProbeCapabilities).
 //
-// BOTH directions land: the task "clone" is a yes and the task "tts" a real no,
+// BOTH directions land: the task "clon" is a yes and the task "tts" a real no,
 // and the no is what lets the picker tell "speaks without a reference" from "not
 // known". A refusal that kept only the "yes" would drop the no row here and fail
 // the second case. The write carries the speech and transcription rows beside it

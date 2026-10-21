@@ -361,7 +361,7 @@ var reservedManualVerdicts = map[string]map[string]bool{
 	// it), so "is not a clone model" costs the operator nothing to leave unsaid,
 	// while a manual no is rank 3 and would outrank forever the writer entitled to
 	// establish the fact -- a read of audio.cpp's own /v1/models listing
-	// (routing.CapabilitySourceAudioCppModels), whose per-model task ("clone") is
+	// (routing.CapabilitySourceAudioCppModels), whose per-model task ("clon") is
 	// authoritative for a model it names. A stale manual no would permanently
 	// FORCE-OFFER a genuine clone model into the chat speech picker, where every
 	// send fails for want of a reference voice -- exactly the broken affordance #252

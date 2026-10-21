@@ -16,15 +16,17 @@ import (
 // is the task field of each listed model and, for an asr model, its mode.
 const AudioCppModelsPath = "/v1/models"
 
-// audio.cpp task values. The listing's task names what the listed model DOES:
-// "tts" synthesises speech from text and "clone" synthesises it in a reference
-// voice, so both are a speech "yes"; "asr" transcribes speech to text, so it is
-// a transcription "yes". Every other task (the music tasks, ...) is a model
-// that does neither. The speech_clone verdict is a task answer too, and the only
-// one that tells "tts" from "clone".
+// audio.cpp task values, spelled as the server emits them in /v1/models. The
+// listing's task names what the listed model DOES: "tts" synthesises speech from
+// text and "clon" (audio.cpp's spelling of voice cloning -- NOT "clone"; the
+// server rejects "clone" and reports "clon", verified against v0.9.1) synthesises
+// it in a reference voice, so both are a speech "yes"; "asr" transcribes speech to
+// text, so it is a transcription "yes". Every other task (the music tasks, ...) is
+// a model that does neither. The speech_clone verdict is a task answer too, and the
+// only one that tells "tts" from "clon".
 const (
 	audioCppTaskTTS   = "tts"
-	audioCppTaskClone = "clone"
+	audioCppTaskClone = "clon"
 	audioCppTaskASR   = "asr"
 )
 
@@ -68,7 +70,7 @@ type audioCppModelsDoc struct {
 // It is
 // TOLERANT: a body that is not the listing, or an entry of the wrong shape,
 // yields no verdict rather than an error. The rule:
-//   - the entry whose id is model, with task "tts" or "clone" ->
+//   - the entry whose id is model, with task "tts" or "clon" ->
 //     speech "yes", transcription "no"
 //   - the entry whose id is model, with task "asr" ->
 //     speech "no", transcription "yes"
@@ -85,7 +87,7 @@ type audioCppModelsDoc struct {
 //     streaming "no"
 //   - the entry whose id is model, with task "asr" and no mode, an empty, blank
 //     or unknown one, or one that is not a string -> streaming ""
-//   - the entry whose id is model, with any other task (tts, clone, music, an
+//   - the entry whose id is model, with any other task (tts, clon, music, an
 //     unknown one) or none -> streaming "", WHATEVER its mode: "transcription
 //     streaming" is the transcriber's capability, so a model that does not
 //     transcribe is no "no" on it either
@@ -100,7 +102,7 @@ type audioCppModelsDoc struct {
 // model synthesises only in a reference voice (which a text-only caller cannot
 // supply), and gates no route:
 //   - the entry whose id is model, with task "tts" -> speech_clone "no"
-//   - the entry whose id is model, with task "clone" -> speech_clone "yes"
+//   - the entry whose id is model, with task "clon" -> speech_clone "yes"
 //   - the entry whose id is model, with any other task (asr, music, an unknown
 //     one) or none -> speech_clone "", WHATEVER its mode: "speech clone" refines
 //     speech, so a model that does not synthesise speech is no "no" on it either

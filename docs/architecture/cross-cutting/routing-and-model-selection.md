@@ -854,7 +854,7 @@ document, from two producers
   The listing names each model's `task`, so the verdict is **per mapping**,
   keyed on the mapping's application-side model name (`AppModelName`, matched exactly
   against the entry's `id`; one small `GET` per active named mapping per cadence
-  tick): `tts` or `clone` writes `(speech, yes)`; the model present with any other
+  tick): `tts` or `clon` writes `(speech, yes)`; the model present with any other
   non-empty task (`asr`, a music task) writes a real `(speech, no)` (the transcription
   half is below); and the model
   **absent** from the listing, an empty task, an unreachable server, a non-2xx status
@@ -908,7 +908,7 @@ gate excludes on, and it has the same writers as `speech`, **from the same listi
 
 - **`audiocpp_models`** decides both rows from the one `task` of the entry whose `id`
   equals the mapping's application-side model name, in both directions: `asr` writes
-  `(transcription, yes)` **and** `(speech, no)`; `tts` or `clone` writes `(speech, yes)`
+  `(transcription, yes)` **and** `(speech, no)`; `tts` or `clon` writes `(speech, yes)`
   **and** `(transcription, no)`; any other non-empty task writes both `no`; and an absent
   task, an unnamed model, an unreachable server, a non-2xx status or an unreadable body
   writes **nothing**, because none of those says a model cannot transcribe and a `no` can
@@ -965,7 +965,7 @@ issue #252). It is read from audio.cpp's `/v1/models` **`task`** field — the s
 and open-vocabulary storage as `speech`:
 
 - **`audiocpp_models`** writes it from `task`, **only for a speech model** (the one axis on
-  which clone-vs-plain is a question): a `clone` entry writes `(speech_clone, yes)`, a `tts`
+  which clone-vs-plain is a question): a `clon` entry writes `(speech_clone, yes)`, a `tts`
   entry writes `(speech_clone, no)`, and a non-speech task (`asr`, music), an absent task, an
   unnamed model, an unreachable server or an unreadable body writes **nothing** (absent =
   unknown = the picker still offers it, fail-open). The gateway's health loop decodes it for

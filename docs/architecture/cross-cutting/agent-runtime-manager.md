@@ -840,7 +840,7 @@ an `audio_cpp` child's probe GETs the child's **own** `/v1/models` over loopback
 (`collector.ProbeAudioCppVerdicts`, path `collector.AudioCppModelsPath`), because that
 listing is the only place audio.cpp states what a model does. The entry whose `id` is the
 spec's model carries a `task`, and one parser decides both verdicts from it: `tts` or
-`clone` is `(speech, yes)` with `(transcription, no)`, `asr` the reverse, any other
+`clon` is `(speech, yes)` with `(transcription, no)`, `asr` the reverse, any other
 non-empty task `no` for both, and an unlisted model or a taskless entry no verdict. The
 verdicts ride the sample under the source `audiocpp_models`, and the agent sends them
 **only while the gateway declares `capability_source_audiocpp`**, a name on the
@@ -859,7 +859,7 @@ for an agent before 0.9.1 and for a model the listing does not name (the `transc
 names so that this source could report them; `transcription_streaming` — the model's
 `mode`, `yes` for `mode=streaming` and only for an ASR model — was added by the agent at
 0.9.2 on this same source with no new feature flag, issue #262,
-[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript); `speech_clone` — the model's `task`, `yes` for `clone` and only for a speech model, which the portal chat picker excludes — was added the same way at 0.10.1, issue #252,
+[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript); `speech_clone` — the model's `task`, `yes` for `clon` and only for a speech model, which the portal chat picker excludes — was added the same way at 0.10.1, issue #252,
 [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)). The kind's agent-side launch shape (arguments, ensure route, VRAM
 measurement) has no worked example here. **Serving transcription needed no agent
 change:** an agent-launched child is sent the upload through the router's existing
@@ -3111,7 +3111,7 @@ beside the newest feature (`multipart_proxy`'s test keeps its own presence and
 **`0.10.0` → `0.10.1` (issue #252, clone-model chat exclusion) is PATCH, on the same
 precedent.** The agent's `audio_cpp` collector emits **one more verdict name on the existing
 `audiocpp_models` source**, `speech_clone`, derived from the per-model `task` it already reads
-(`yes` for `clone`, `no` for `tts`, and only for a speech model), under the already-declared
+(`yes` for `clon`, `no` for `tts`, and only for a speech model), under the already-declared
 `capability_source_audiocpp`. `agent.Features` gained nothing — the verdict refines the chat
 picker, gates no route, and an absent one is fail-open (the model stays offered), so a flag
 would gate nothing — so the rule makes it PATCH, and the `Version` pin moves to `0.10.1`.
@@ -3120,6 +3120,16 @@ Like the audio bumps before it, there is **no feature flag gating the verdict**,
 with a Warn on each sample (it is not on that older gateway's `audioCppProbeCapabilities`):
 the same mixed-fleet fact as the earlier audio verdicts, so the operator rule is "upgrade the gateway first"
 ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).
+
+**`0.10.1` → `0.10.2` (issue #272 prerequisite, the clon-task spelling fix) is PATCH.**
+The collector matched the task string `clone`, but audio.cpp spells it `clon` (its load API
+rejects `clone` and `/v1/models` reports `clon`, verified against v0.9.1), so a clon child
+fell to the "any other task" branch and was reported `(speech, no)` — refused everywhere —
+and its `speech_clone` verdict never fired. Correcting the string to `clon` changes what the
+agent reports for a clon child, which the gateway observes, so the rule makes it a PATCH:
+`agent.Features` gains nothing and the wire shape is unchanged (the same open-vocabulary
+verdict on the same source, only the task string it keys on is corrected). The `Version`
+pin moves to `0.10.2` ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only) (d) correction note).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -3831,7 +3841,7 @@ mirror). Three different cadences share the one collect cycle:
     loopback listing and never the router's**. audio.cpp is not known to serve a
     `/props` document either, and its listing is the only place it states what a model does: the entry whose
     `id` is `st.Model` carries a `task`, and one parser decides both verdicts from it
-    (`tts` or `clone` is `(speech, yes)` with `(transcription, no)`, `asr` the
+    (`tts` or `clon` is `(speech, yes)` with `(transcription, no)`, `asr` the
     reverse, any other non-empty task `no` for both, an unlisted model or a taskless
     entry no verdict). The verdict is per **model**, so, like Ollama's and unlike
     `/props` and sd-server's, this probe takes the model. Its `LiveProgressSupport` is always `""` as well,

@@ -20,18 +20,20 @@ import (
 // mode fields of each listed model.
 const audiocppModelsPath = "/v1/models"
 
-// audio.cpp task values. The listing's task names what the listed model DOES:
-// "tts" synthesises speech from text and "clone" synthesises it in a reference
-// voice, so both are a speech "yes"; "asr" transcribes speech to text, so it is
-// a transcription "yes". Every other task (the music tasks, ...) is a model that
-// does neither. One task answers BOTH capabilities at once: a model is never
-// both a synthesiser and a transcriber. (The transcription_streaming verdict is
-// not a task answer: it is read from the mode field below. The speech_clone
-// verdict is a task answer, and the only one that tells "tts" from "clone": see
-// AudioCppVerdicts.SpeechClone.)
+// audio.cpp task values, spelled as the server emits them in /v1/models. The
+// listing's task names what the listed model DOES: "tts" synthesises speech from
+// text and "clon" (audio.cpp's spelling of voice cloning -- NOT "clone"; the
+// server's load API rejects "clone" and the /v1/models listing reports "clon",
+// verified against v0.9.1) synthesises it in a reference voice, so both are a
+// speech "yes"; "asr" transcribes speech to text, so it is a transcription "yes".
+// Every other task (the music tasks, ...) is a model that does neither. One task
+// answers BOTH capabilities at once: a model is never both a synthesiser and a
+// transcriber. (The transcription_streaming verdict is not a task answer: it is
+// read from the mode field below. The speech_clone verdict is a task answer, and
+// the only one that tells "tts" from "clon": see AudioCppVerdicts.SpeechClone.)
 const (
 	audioCppTaskTTS   = "tts"
-	audioCppTaskClone = "clone"
+	audioCppTaskClone = "clon"
 	audioCppTaskASR   = "asr"
 )
 
@@ -67,7 +69,7 @@ const (
 // for an asr model ONLY, from its mode: routing.CapabilityYes for mode "streaming",
 // routing.CapabilityNo for mode "offline", and "" for everything else -- no mode, an
 // empty or unknown one, one of the wrong type, no entry for the model at all, and
-// every model that is not an asr one (tts, clone, music, an entry with no task),
+// every model that is not an asr one (tts, clon, music, an entry with no task),
 // whatever its mode. A model that does not transcribe has no answer on a
 // transcription capability, not even a "no". The mode never sets or clears the
 // task's verdicts (Speech, Transcription): an odd mode costs only this axis.
@@ -76,7 +78,7 @@ const (
 // model synthesises only IN A REFERENCE VOICE, which a text-only caller (the
 // portal chat's speech picker) cannot supply. It is stated for the two speech
 // tasks ONLY, from the task alone: routing.CapabilityNo for task "tts" and
-// routing.CapabilityYes for task "clone". It is "" for everything else -- an asr
+// routing.CapabilityYes for task "clon". It is "" for everything else -- an asr
 // model, any other task (music, an unknown one), an entry with no task, no entry
 // for the model at all, an empty listing, an unreadable body -- because a model
 // that does not synthesise speech has no answer on a speech refinement, not even
@@ -178,7 +180,7 @@ type audioCppModelsDoc struct {
 // an error, so a probe never breaks over an unexpected shape.
 //
 // The rule, with the loaded entry's task authoritative:
-//   - the entry whose id is modelID, with task "tts" or "clone" ->
+//   - the entry whose id is modelID, with task "tts" or "clon" ->
 //     speech "yes", transcription "no"
 //   - the entry whose id is modelID, with task "asr" ->
 //     speech "no", transcription "yes"
@@ -196,7 +198,7 @@ type audioCppModelsDoc struct {
 //     streaming "no"
 //   - the entry whose id is modelID, with task "asr" and no mode, an empty, blank
 //     or unknown one, or one that is not a string -> streaming ""
-//   - the entry whose id is modelID, with any other task (tts, clone, music, an
+//   - the entry whose id is modelID, with any other task (tts, clon, music, an
 //     unknown one) or none -> streaming "", WHATEVER its mode: "transcription
 //     streaming" is the transcriber's capability, so a model that does not
 //     transcribe is no "no" on it either
@@ -208,7 +210,7 @@ type audioCppModelsDoc struct {
 // The speech_clone verdict is decided beside those, for the two speech tasks only,
 // from the entry's task alone:
 //   - the entry whose id is modelID, with task "tts" -> speech_clone "no"
-//   - the entry whose id is modelID, with task "clone" -> speech_clone "yes"
+//   - the entry whose id is modelID, with task "clon" -> speech_clone "yes"
 //   - the entry whose id is modelID, with any other task (asr, music, an unknown
 //     one) or none -> speech_clone "", WHATEVER its mode: "speech clone" refines
 //     speech, so a model that does not synthesise speech is no "no" on it either
