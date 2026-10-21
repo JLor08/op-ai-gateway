@@ -2176,6 +2176,17 @@ func (r *Resolver) groupVoiceScope(ctx context.Context, g groupResolve) (*voiceS
 	return r.voiceScopeFor(ctx, g.req.RequiredVoice, pool)
 }
 
+// groupWalk carries the two things threaded unchanged through ONE group resolution
+// attempt: the policy (which the relaxation ladder rewrites between attempts) and the voice
+// pre-pass scope (which it must NOT). Keeping voice a sibling field here, never a
+// GroupPolicy field, preserves the invariant that the ladder can relax the policy but never
+// the voice. It is built from a groupResolve at each call site (groupWalk{policy: g.policy,
+// voice: g.voice}), so the voice is only ever copied, never recomputed between attempts.
+type groupWalk struct {
+	policy GroupPolicy
+	voice  *voiceScope
+}
+
 // eligibleCandidates resolves one group member's candidates and applies every
 // eligibility filter the group's policy imposes: the store read, the provisioning gate,
 // the request's voice restriction (nil for none), the speed floor, then the loaded-only
@@ -2202,7 +2213,7 @@ func (r *Resolver) groupVoiceScope(ctx context.Context, g groupResolve) (*voiceS
 // The two policy filters themselves live in filterBySpeedFloor and filterLoaded; both are
 // no-ops for a group that did not opt in, so an opted-out group costs exactly what it did
 // before those settings existed.
-func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, required []string, voice *voiceScope, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
+func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, required []string, gw groupWalk) (cands []MappingCandidate, live bool, err error) {
 	cands, err = r.memberPool(ctx, token, name, apiFlavor, fineFlavor, required)
 	if err != nil {
 		return nil, false, err
@@ -2211,18 +2222,18 @@ func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, nam
 	// groupVoiceScope before any member was visited: this member keeps only the
 	// candidates whose mapping is in that set. Applied with the capability gate, BEFORE
 	// live is taken, for the same reason: a member whose every mapping the voice excludes
-	// reads as memberNoMapping, not as a real-but-gated member. It is deliberately not a
-	// GroupPolicy field, so the relaxation ladder (which only ever rewrites the policy)
-	// cannot relax it.
-	cands = voice.restrict(cands)
+	// reads as memberNoMapping, not as a real-but-gated member. It is a sibling of policy in
+	// groupWalk, never a GroupPolicy field, so the relaxation ladder (which only ever
+	// rewrites the policy) cannot relax it.
+	cands = gw.voice.restrict(cands)
 	if len(cands) == 0 {
 		return nil, false, nil
 	}
-	cands, err = r.filterBySpeedFloor(ctx, cands, name, policy.MinTokensPerSecond)
+	cands, err = r.filterBySpeedFloor(ctx, cands, name, gw.policy.MinTokensPerSecond)
 	if err != nil {
 		return nil, true, err
 	}
-	return r.filterLoaded(cands, policy.LoadedOnly), true, nil
+	return r.filterLoaded(cands, gw.policy.LoadedOnly), true, nil
 }
 
 // filterBySpeedFloor drops the candidates whose effective generation speed falls short of
@@ -2278,8 +2289,8 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 //
 // Eligibility (and the memberNoMapping/memberUnavailable distinction it drives) lives in
 // eligibleCandidates; this function only turns that outcome into a status and selects.
-func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, voice *voiceScope, now time.Time, policy GroupPolicy) (MappingCandidate, memberStatus, []string, int, error) {
-	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, req.RequiredCapabilities, voice, policy)
+func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, gw groupWalk) (MappingCandidate, memberStatus, []string, int, error) {
+	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, req.RequiredCapabilities, gw)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
 	}
@@ -2317,14 +2328,14 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // Cost: this reads EVERY member's mappings (and their telemetry) on every request, where a
 // priority-ordered walk stops at the first available member. That is the price of the
 // ordering, and only groups that opt into it pay it.
-func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, required []string, voice *voiceScope, policy GroupPolicy) ([]GroupMember, error) {
+func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, required []string, gw groupWalk) ([]GroupMember, error) {
 	speed := make(map[string]float64, len(members))
 	for _, m := range members {
 		if _, done := speed[m.MemberGatewayName]; done {
 			continue // a duplicated member name is scored once
 		}
 		best := 0.0
-		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, required, voice, policy)
+		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, required, gw)
 		if err != nil {
 			return nil, err
 		}
@@ -2379,12 +2390,12 @@ func (r *Resolver) speedMarginMet(ctx context.Context, best, pinned MappingCandi
 // counts; a member with no mapping does not). anyLive lets resolveGroup pick
 // ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g). A hard
 // store/selection error is propagated.
-func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, voice *voiceScope, now time.Time, policy GroupPolicy) (string, MappingCandidate, []string, int, bool, error) {
+func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, gw groupWalk) (string, MappingCandidate, []string, int, bool, error) {
 	var atCap []string
 	queueTimeoutSecs := 0
 	anyLive := false
 	for _, m := range members {
-		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, voice, now, policy)
+		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, gw)
 		if err != nil {
 			return "", MappingCandidate{}, nil, 0, false, err
 		}
@@ -2578,7 +2589,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
 	// the candidates it can actually use.
 	if g.policy.MemberOrder == MemberOrderSpeed {
-		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, g.voice, g.policy)
+		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, groupWalk{policy: g.policy, voice: g.voice})
 		if err != nil {
 			return Target{}, err
 		}
@@ -2611,7 +2622,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	var deadline time.Time
 	deadlineSet := false
 	for {
-		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.voice, g.now, g.policy)
+		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
 		if err != nil {
 			return Target{}, err
 		}
@@ -2664,7 +2675,7 @@ func (r *Resolver) pinnedMember(ctx context.Context, g groupResolve) (string, Ma
 	if pinned == "" {
 		return "", MappingCandidate{}, nil
 	}
-	pinSel, pinStatus, _, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.voice, g.now, g.policy)
+	pinSel, pinStatus, _, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}
@@ -2698,7 +2709,7 @@ func (r *Resolver) climbTarget(ctx context.Context, g groupResolve, pinned strin
 	// Is a better-ranked member available? The pin is memberOK, so firstAvailable stops
 	// at-or-before it in the effective order → best index <= pin index (the memberIndex
 	// guard below is belt-and-suspenders for that invariant).
-	best, bestSel, _, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.voice, g.now, g.policy)
+	best, bestSel, _, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, groupWalk{policy: g.policy, voice: g.voice})
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}

@@ -1038,24 +1038,8 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 		loadedSet[name] = struct{}{}
 	}
 	for _, mp := range mappings {
-		if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
-			continue
-		}
-		spec, ok := specByMapping[mp.ID]
-		if !ok || routing.EffectiveRuntimeSpecType(spec) != routing.RuntimeSpecTypeAudioCpp {
-			continue
-		}
-		if _, loaded := loadedSet[mp.AppModelName]; !loaded {
-			r.voicesBackoff.clear(mp.ID)
-			continue
-		}
-		rows, err := r.store.MappingCapabilities(ctx, mp.ID)
-		if err != nil {
-			slog.Debug("app health: capabilities for the agent voices pass failed", "mapping_id", mp.ID, "error", err)
-			continue
-		}
-		if !routing.CapabilityRowsPlainTTS(rows) {
-			r.voicesBackoff.clear(mp.ID)
+		spec, ask := r.agentVoiceProbeSpec(ctx, mp, specByMapping, loadedSet)
+		if !ask {
 			continue
 		}
 		specToken, header := routing.SpecUpstreamAuth(spec, app)
@@ -1067,6 +1051,41 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 		}
 		r.fetchAndCacheVoices(provider.WithUpstreamAuth(ctx, header, token), lister, target, mp)
 	}
+}
+
+// agentVoiceProbeSpec decides whether probeAgentVoices should ask ONE mapping for its voices
+// this tick and, if so, returns the audio.cpp runtime spec to probe it with (ask == true).
+// The guard chain is strict because the agent router answers 404 for a child that is not
+// running, so a wrong guess is a wasted request or voices attributed to the wrong thing: the
+// mapping must be active with an app model name, carry an audio.cpp runtime spec, be in the
+// loaded set, and have stored verdicts that make it a plain tts model.
+//
+// A mapping that has left the loaded set or the plain-tts set has its back-off cleared, so a
+// later reload is asked at once. A runtime-spec miss or a capability read that FAILS leaves
+// the mapping unasked this tick without clearing a back-off: what the child is cannot be
+// told, the same reason the caller requires the agent's runtime_voices declaration.
+func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.ModelMapping, specByMapping map[string]routing.RuntimeSpec, loadedSet map[string]struct{}) (routing.RuntimeSpec, bool) {
+	if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
+		return routing.RuntimeSpec{}, false
+	}
+	spec, ok := specByMapping[mp.ID]
+	if !ok || routing.EffectiveRuntimeSpecType(spec) != routing.RuntimeSpecTypeAudioCpp {
+		return routing.RuntimeSpec{}, false
+	}
+	if _, loaded := loadedSet[mp.AppModelName]; !loaded {
+		r.voicesBackoff.clear(mp.ID)
+		return routing.RuntimeSpec{}, false
+	}
+	rows, err := r.store.MappingCapabilities(ctx, mp.ID)
+	if err != nil {
+		slog.Debug("app health: capabilities for the agent voices pass failed", "mapping_id", mp.ID, "error", err)
+		return routing.RuntimeSpec{}, false
+	}
+	if !routing.CapabilityRowsPlainTTS(rows) {
+		r.voicesBackoff.clear(mp.ID)
+		return routing.RuntimeSpec{}, false
+	}
+	return spec, true
 }
 
 // writeVoicesCache is the one writer of a mapping's voices cache row (#251),

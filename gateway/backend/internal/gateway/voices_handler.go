@@ -161,15 +161,7 @@ func (s *Server) cachedVoicesForMappings(ctx context.Context, mappingIDs []strin
 	if s.Routes == nil {
 		return voices, nil
 	}
-	ids := make([]string, 0, len(mappingIDs))
-	seenID := make(map[string]struct{}, len(mappingIDs))
-	for _, id := range mappingIDs {
-		if _, dup := seenID[id]; dup || id == "" {
-			continue
-		}
-		seenID[id] = struct{}{}
-		ids = append(ids, id)
-	}
+	ids := dedupeNonEmpty(mappingIDs)
 	if len(ids) == 0 {
 		return voices, nil
 	}
@@ -190,6 +182,30 @@ func (s *Server) cachedVoicesForMappings(ctx context.Context, mappingIDs []strin
 	if err != nil {
 		return nil, fmt.Errorf("read the voices cache: %w", err)
 	}
+	voices = unionVoiceNames(voices, tts, cached)
+	slices.Sort(voices)
+	return voices, nil
+}
+
+// dedupeNonEmpty returns ids distinct and non-empty, in first-seen order.
+func dedupeNonEmpty(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup || id == "" {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// unionVoiceNames adds the voice names cached for each tts mapping to voices, deduped and
+// skipping blanks, returning the extended slice. A voices row whose payload does not decode
+// costs only its own mapping (logged at Warn, since the writer cannot produce one), so a
+// single bad row never blanks the union.
+func unionVoiceNames(voices, tts []string, cached map[string][]routing.ModelMappingCacheRow) []string {
 	seenName := map[string]struct{}{}
 	for _, id := range tts {
 		// routing.VoiceNamesFromCacheRows is the one reader of the cache's encoding, shared
@@ -207,6 +223,5 @@ func (s *Server) cachedVoicesForMappings(ctx context.Context, mappingIDs []strin
 			voices = append(voices, name)
 		}
 	}
-	slices.Sort(voices)
-	return voices, nil
+	return voices
 }

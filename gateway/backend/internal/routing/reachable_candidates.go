@@ -48,18 +48,9 @@ func (r *Resolver) ReachableCandidates(ctx context.Context, principal auth.Token
 	if r == nil || r.store == nil {
 		return nil, nil
 	}
-	names := []string{modelName}
-	if r.groups != nil {
-		members, _, isGroup := r.groups.Group(modelName)
-		if !r.groups.DirectAllowed(modelName) {
-			return nil, nil
-		}
-		if isGroup {
-			names = names[:0]
-			for _, m := range members {
-				names = append(names, m.MemberGatewayName)
-			}
-		}
+	names, ok := r.reachableNames(modelName)
+	if !ok {
+		return nil, nil
 	}
 	flavor := NormalizeAPIFlavor(apiFlavor)
 	var out []MappingCandidate
@@ -73,12 +64,44 @@ func (r *Resolver) ReachableCandidates(ctx context.Context, principal auth.Token
 		if err != nil {
 			return nil, err
 		}
-		for _, c := range cands {
-			if !seen[c.Mapping.ID] {
-				seen[c.Mapping.ID] = true
-				out = append(out, c)
-			}
-		}
+		out = appendNewCandidates(out, cands, seen)
 	}
 	return out, nil
+}
+
+// reachableNames is the set of model names ReachableCandidates pools over: the name itself,
+// or -- for a group name -- its flattened members, with a name that is both a group and a
+// model read as the group (as resolveStandard does). ok is false ONLY for a locked name
+// that is not DirectAllowed (reachable through no DIRECT request), which the caller reports
+// as "reaches nothing"; a plain model name, and a group with no groups wiring, are (just
+// the name itself, true).
+func (r *Resolver) reachableNames(modelName string) (names []string, ok bool) {
+	names = []string{modelName}
+	if r.groups == nil {
+		return names, true
+	}
+	members, _, isGroup := r.groups.Group(modelName)
+	if !r.groups.DirectAllowed(modelName) {
+		return nil, false
+	}
+	if isGroup {
+		names = names[:0]
+		for _, m := range members {
+			names = append(names, m.MemberGatewayName)
+		}
+	}
+	return names, true
+}
+
+// appendNewCandidates appends the candidates whose mapping id is not already in seen to out,
+// marking each appended id seen, and returns the extended slice. It is how
+// ReachableCandidates returns a mapping reachable through several members exactly once.
+func appendNewCandidates(out, cands []MappingCandidate, seen map[string]bool) []MappingCandidate {
+	for _, c := range cands {
+		if !seen[c.Mapping.ID] {
+			seen[c.Mapping.ID] = true
+			out = append(out, c)
+		}
+	}
+	return out
 }

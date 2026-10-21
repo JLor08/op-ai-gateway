@@ -146,24 +146,12 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 	if voice == "" || len(pool) == 0 {
 		return nil, nil
 	}
-	ids := make([]string, 0, len(pool))
-	seen := make(map[string]struct{}, len(pool))
-	for _, c := range pool {
-		if _, dup := seen[c.Mapping.ID]; !dup {
-			seen[c.Mapping.ID] = struct{}{}
-			ids = append(ids, c.Mapping.ID)
-		}
-	}
+	ids := candidateMappingIDs(pool)
 	verdicts, err := r.store.MappingCapabilitiesForMappings(ctx, ids)
 	if err != nil {
 		return nil, fmt.Errorf("voice filter: read capability verdicts: %w", err)
 	}
-	tts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if CapabilityRowsPlainTTS(verdicts[id]) {
-			tts = append(tts, id)
-		}
-	}
+	tts := plainTTSMappingIDs(ids, verdicts)
 	if len(tts) == 0 {
 		return nil, nil
 	}
@@ -176,30 +164,13 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 	allowed := make(map[string]struct{}, len(tts))
 	knownAbsent := 0
 	for _, id := range tts {
-		rows := cached[id]
-		if !hasVoicesRow(rows) {
-			// UNKNOWN voice status: this mapping has no voices row, so nothing is known about
-			// what it offers. Unknown is NOT absent -- keep it eligible (fail open) and leave
-			// the upstream the authority on the name. A healthy, never-voice-cached sibling of
-			// the same model therefore stays a failover/load target.
+		if voiceListsEligible(cached[id], voice, id) {
 			allowed[id] = struct{}{}
 			continue
 		}
-		names, err := VoiceNamesFromCacheRows(rows)
-		if err != nil {
-			// CORRUPT: an undecodable row is treated as UNKNOWN voice status and kept eligible
-			// (fail open; the writer cannot produce one, so the outage is logged at Warn).
-			slog.Warn("voice filter: voices cache row is undecodable, treated as unknown voice status, kept eligible", "mapping_id", id, "err", err)
-			allowed[id] = struct{}{}
-			continue
-		}
-		if slices.Contains(names, voice) {
-			// KNOWN-PRESENT: the mapping's cached list names the voice.
-			allowed[id] = struct{}{}
-			continue
-		}
-		// KNOWN-ABSENT: the row exists and decodes but does not list the voice (a cached-empty
-		// or null list included). This is the ONLY thing that narrows the pool.
+		// KNOWN-ABSENT (the only ineligible outcome): the row exists and decodes but does not
+		// list the voice (a cached-empty or null list included). This is the ONLY thing that
+		// narrows the pool.
 		knownAbsent++
 	}
 	if len(allowed) == 0 {
@@ -222,4 +193,64 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 	// those eligible hosts is unusable (refine maps the resulting ErrNoHealthyHost).
 	slog.Debug("voice filter: excluding candidates known to lack the voice", "voice", voice, "allowed", len(allowed), "known_absent", knownAbsent, "candidates", len(ids))
 	return &voiceScope{allowed: allowed, narrowed: true}, nil
+}
+
+// candidateMappingIDs is the pool's distinct mapping ids in first-seen order: the ids
+// voiceScopeFor reads the capability and voices caches for, each at most once.
+func candidateMappingIDs(pool []MappingCandidate) []string {
+	ids := make([]string, 0, len(pool))
+	seen := make(map[string]struct{}, len(pool))
+	for _, c := range pool {
+		if _, dup := seen[c.Mapping.ID]; !dup {
+			seen[c.Mapping.ID] = struct{}{}
+			ids = append(ids, c.Mapping.ID)
+		}
+	}
+	return ids
+}
+
+// plainTTSMappingIDs keeps the ids whose CURRENT stored verdicts make them a plain tts
+// model (CapabilityRowsPlainTTS), the verdict gate the voices endpoint also applies at read
+// time, so a cached list that outlived a tts -> clone (or tts -> non-speech) flip is not
+// treated as a known voice here either.
+func plainTTSMappingIDs(ids []string, verdicts map[string][]CapabilityRow) []string {
+	tts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if CapabilityRowsPlainTTS(verdicts[id]) {
+			tts = append(tts, id)
+		}
+	}
+	return tts
+}
+
+// voiceListsEligible classifies ONE plain-tts mapping against the requested voice from its
+// cached voices rows, reporting whether it stays eligible to serve the voice. The caller
+// treats an ineligible mapping as the sole narrowing state, KNOWN-ABSENT.
+//
+// FAIL-OPEN on UNKNOWN: a mapping with no voices row (never voice-cached) or an undecodable
+// one has unknown voice status, which is NOT absent, so it is kept eligible and the upstream
+// stays the authority on a name it was never told about. A KNOWN-PRESENT mapping (its cached
+// list names the voice, exact match -- the name is relayed byte for byte) is eligible too.
+// Only a KNOWN-ABSENT mapping -- row present and decodable, voice not in it -- is ineligible.
+func voiceListsEligible(rows []ModelMappingCacheRow, voice, id string) bool {
+	if !hasVoicesRow(rows) {
+		// UNKNOWN voice status: this mapping has no voices row, so nothing is known about
+		// what it offers. Unknown is NOT absent -- keep it eligible (fail open) and leave
+		// the upstream the authority on the name. A healthy, never-voice-cached sibling of
+		// the same model therefore stays a failover/load target.
+		return true
+	}
+	names, err := VoiceNamesFromCacheRows(rows)
+	if err != nil {
+		// CORRUPT: an undecodable row is treated as UNKNOWN voice status and kept eligible
+		// (fail open; the writer cannot produce one, so the outage is logged at Warn).
+		slog.Warn("voice filter: voices cache row is undecodable, treated as unknown voice status, kept eligible", "mapping_id", id, "err", err)
+		return true
+	}
+	if slices.Contains(names, voice) {
+		// KNOWN-PRESENT: the mapping's cached list names the voice.
+		return true
+	}
+	// KNOWN-ABSENT: the row exists and decodes but does not list the voice.
+	return false
 }
