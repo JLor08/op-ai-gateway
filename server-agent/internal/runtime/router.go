@@ -23,7 +23,10 @@
 //     via Status() only -- NEVER EnsureRunning, a probe must not start or
 //     keep alive a child -- and relayed byte-verbatim so the gateway's
 //     evidence rule reads the child's own document. The allowlist is
-//     exactly /props; widening it is #49-2/#55 business.
+//     /props plus GET /upstream/{model}/v1/audio/voices (issue #251, the
+//     "runtime_voices" feature: an audio.cpp child's voice listing, same
+//     Status-only never-start shape, outbound path /v1/audio/voices with
+//     no query); widening it further is #49-2/#55 business.
 //   - POST /ensure/{model} -- start a managed child without forwarding a
 //     request to it: model from the PATH (everything after "/ensure/", so
 //     ids containing "/" work), EnsureRunning under the request context,
@@ -324,7 +327,7 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case isGet && r.URL.Path == "/v1/models":
 		rt.serveModels(w, r)
 	case isGet && strings.HasPrefix(r.URL.Path, "/upstream/"):
-		rt.serveUpstreamProps(w, r)
+		rt.serveUpstream(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, ensurePathPrefix):
 		rt.serveEnsure(w, r)
 	default:
@@ -393,16 +396,41 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, modelsResponse{Object: "list", Data: data})
 }
 
-// upstreamPropsSuffix is the one child endpoint the /upstream passthrough
-// allowlists -- both the inbound suffix match and the outbound path.
-const upstreamPropsSuffix = "/props"
+// upstreamPropsSuffix and upstreamVoicesSuffix are the child endpoints the
+// /upstream passthrough allowlists -- both the inbound suffix match and the
+// outbound path.
+const (
+	upstreamPropsSuffix  = "/props"
+	upstreamVoicesSuffix = "/v1/audio/voices"
+)
 
-// serveUpstreamProps handles GET /upstream/{model}/props (issue #58): the
-// llama-swap-style upstream passthrough, restricted to a GET of exactly
-// /props on a RUNNING child. The gateway probes an api-key-protected child's
-// live-progress capability through it, attaching the spec's token -- which
-// this handler, like the proxy paths, forwards verbatim (Authorization and
-// custom token headers are not hop-by-hop).
+// upstreamEndpoint is one allowlisted child endpoint of the /upstream
+// passthrough.
+type upstreamEndpoint struct {
+	// path is both the inbound suffix after the model and the outbound path on
+	// the child.
+	path string
+	// forwardQuery relays the inbound query string to the child. /props keeps
+	// it (llama.cpp reads e.g. ?model=); the voices read drops it, because
+	// audio.cpp ignores ?model= (it lists the voices of the model it has
+	// loaded), so the request's model only selects the child.
+	forwardQuery bool
+}
+
+var upstreamEndpoints = []upstreamEndpoint{
+	{path: upstreamPropsSuffix, forwardQuery: true},
+	{path: upstreamVoicesSuffix, forwardQuery: false},
+}
+
+// serveUpstream handles GET /upstream/{model}/props (issue #58) and GET
+// /upstream/{model}/v1/audio/voices (issue #251): the llama-swap-style
+// upstream passthrough, restricted to a GET of exactly one allowlisted
+// endpoint on a RUNNING child. The gateway probes an api-key-protected
+// child's live-progress capability (/props) and an audio.cpp child's voice
+// listing (/v1/audio/voices, the "runtime_voices" feature) through it,
+// attaching the spec's token -- which this handler, like the proxy paths,
+// forwards verbatim (Authorization and custom token headers are not
+// hop-by-hop).
 //
 // Deliberate properties, each one a guardrail from the issue:
 //   - Status() only, never EnsureRunning: llama-swap's own /upstream route
@@ -412,22 +440,30 @@ const upstreamPropsSuffix = "/props"
 //   - Prefix/suffix decomposition, not segment matching: upstream model ids
 //     are only TrimSpace-validated and may contain "/" (HF-style
 //     "org/model"); everything between "/upstream/" and the trailing
-//     "/props" is the model. provider.ExpandModelPath on the gateway side
-//     keeps "/" literal, so the two ends agree.
-//   - The outbound path is EXACTLY /props -- never the inbound path -- and
-//     the response is relayed unmodified: the evidence rule's
-//     "role":"router" gate must see the child's own document.
+//     allowlisted suffix is the model. provider.ExpandModelPath on the
+//     gateway side keeps "/" literal, so the two ends agree.
+//   - The outbound path is EXACTLY the allowlisted suffix -- never the
+//     inbound path -- and the response is relayed unmodified: the evidence
+//     rule's "role":"router" gate must see the child's own document, and a
+//     voice listing must reach the gateway's parser as the child wrote it.
 //   - Managed-but-cold gets its own sentinel (runtime.model_not_running):
 //     §4.3's error codes are never collapsed, and "no spec" vs "not
 //     running right now" are different diagnoses.
-func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
+func (rt *router) serveUpstream(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/upstream/")
-	if !strings.HasSuffix(rest, upstreamPropsSuffix) {
-		writeError(w, http.StatusNotFound, "runtime.upstream_endpoint_not_allowed",
-			"only /props may be requested through /upstream/{model}")
-		return
+	for _, ep := range upstreamEndpoints {
+		if model, ok := strings.CutSuffix(rest, ep.path); ok {
+			rt.relayToRunningChild(w, r, model, ep)
+			return
+		}
 	}
-	model := strings.TrimSuffix(rest, upstreamPropsSuffix)
+	writeError(w, http.StatusNotFound, "runtime.upstream_endpoint_not_allowed",
+		"only /props and /v1/audio/voices may be requested through /upstream/{model}")
+}
+
+// relayToRunningChild is the Status-only relay behind serveUpstream: resolve
+// model to a RUNNING child's port and GET ep.path on it, never starting one.
+func (rt *router) relayToRunningChild(w http.ResponseWriter, r *http.Request, model string, ep upstreamEndpoint) {
 	if model == "" || rt.m == nil {
 		writeError(w, http.StatusNotFound, codeModelNotManaged,
 			"no active launch spec for this model")
@@ -457,8 +493,8 @@ func (rt *router) serveUpstreamProps(w http.ResponseWriter, r *http.Request) {
 			"model is managed but not running; this probe never starts a child")
 		return
 	}
-	target := "http://127.0.0.1:" + strconv.Itoa(port) + upstreamPropsSuffix
-	if r.URL.RawQuery != "" {
+	target := "http://127.0.0.1:" + strconv.Itoa(port) + ep.path
+	if ep.forwardQuery && r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)

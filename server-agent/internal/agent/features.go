@@ -210,6 +210,21 @@ var Features = []Feature{
 	// Since is 0.10.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
 	{Name: "runtime_config_files", Since: "0.10.0"},
+	// runtime_voices: this agent's runtime router serves
+	// GET /upstream/{model}/v1/audio/voices -- a Status-only passthrough to a
+	// RUNNING audio.cpp child's voice listing (issue #251; it never starts a
+	// child, and the outbound path is exactly /v1/audio/voices, relayed
+	// byte-verbatim with the spec's token forwarded). Like runtime_upstream_props,
+	// this flag gates nothing on the agent -- the route is simply there or not
+	// -- but it is declared for the GATEWAY's benefit: its health loop fetches an
+	// agent child's voices only from an agent with positive evidence the route
+	// exists, fail-closed, because an older router answers 404
+	// runtime.model_not_managed for every such read, forever, and a read that
+	// cannot succeed is exactly the traffic a capability gate exists to prevent.
+	//
+	// Since is 0.11.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block).
+	{Name: "runtime_voices", Since: "0.11.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

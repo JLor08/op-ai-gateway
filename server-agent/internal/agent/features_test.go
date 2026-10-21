@@ -329,6 +329,36 @@ func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_config_files") {
 		t.Fatal("FeatureNames() does not carry runtime_config_files, so it never reaches the gateway in capabilities.features")
 	}
+	// The Version assertion moved to TestFeaturesDeclareRuntimeVoices, beside
+	// the newest feature (see the bump-rule note there).
+}
+
+// TestFeaturesDeclareRuntimeVoices pins the voices-route capability: this
+// agent's runtime router serves GET /upstream/{model}/v1/audio/voices (#251), a
+// Status-only passthrough to a RUNNING audio.cpp child's voice listing, and the
+// GATEWAY fetches a child's voices only from an agent that declares this exact
+// name, fail-closed -- an older router answers 404 runtime.model_not_managed
+// for every such read, which cannot be told apart from an unmanaged model -- so
+// a rename here silently stops every agent child's voices from being cached.
+// The gateway spells the same string in its own constant
+// (runtimeVoicesFeature, gateway/backend/internal/gateway/agent_features.go);
+// this module cannot import it.
+func TestFeaturesDeclareRuntimeVoices(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_voices" {
+			found = true
+			if f.Since != "0.11.0" {
+				t.Fatalf("runtime_voices Since = %q, want 0.11.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_voices")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_voices") {
+		t.Fatal("FeatureNames() does not carry runtime_voices, so it never reaches the gateway in capabilities.features")
+	}
 	// The version assertion lives here, beside the newest feature, and it
 	// is the forcing function for the repository's bump rule: a change that
 	// moves Version has to come THROUGH this test and state which rule it
@@ -341,15 +371,15 @@ func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
 	// audio_cpp child's /v1/models, gated on the gateway-declared
 	// capability_source_audiocpp, which is not an agent.Features entry
 	// either); 0.10.0 was MINOR because agent.Features gained
-	// runtime_config_files; 0.10.1 is PATCH (it added the speech_clone verdict to
-	// that same audio_cpp probe) and 0.10.2 is PATCH too (it corrects the clone
-	// task string from "clone" to "clon", audio.cpp's real spelling, changing what
-	// the agent reports for a clon child) -- both read from the child's /v1/models
-	// task on the same gateway-declared capability_source_audiocpp source, which is
-	// not an agent.Features entry. A Since records the version a feature shipped in,
-	// so runtime_ensure's stays 0.8.0, multipart_proxy's stays 0.9.0 and
-	// runtime_config_files' is 0.10.0.
-	if Version != "0.10.2" {
-		t.Fatalf("Version = %q, want 0.10.2 (agent.Features gained nothing since runtime_config_files at 0.10.0, so the bump is PATCH)", Version)
+	// runtime_config_files; 0.10.1 and 0.10.2 were PATCH (the speech_clone
+	// verdict, then the "clone" -> "clon" task-string correction, both read from
+	// the child's /v1/models task on the same gateway-declared
+	// capability_source_audiocpp source, which is not an agent.Features entry);
+	// 0.11.0 is MINOR because agent.Features gained runtime_voices. A Since
+	// records the version a feature shipped in, so runtime_ensure's stays 0.8.0,
+	// multipart_proxy's stays 0.9.0, runtime_config_files' stays 0.10.0 and
+	// runtime_voices' is 0.11.0.
+	if Version != "0.11.0" {
+		t.Fatalf("Version = %q, want 0.11.0 (agent.Features gained runtime_voices, so the bump is MINOR)", Version)
 	}
 }

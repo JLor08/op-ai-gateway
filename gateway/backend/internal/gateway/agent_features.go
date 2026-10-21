@@ -89,6 +89,26 @@ const capabilitySourceAudioCppFeature = "capability_source_audiocpp"
 // checks it too.
 const RuntimeUpstreamPropsFeature = "runtime_upstream_props"
 
+// RuntimeVoicesFeature is the agent-declared capability naming the runtime
+// router's GET /upstream/{model}/v1/audio/voices passthrough: a Status-only,
+// never-start read of a RUNNING audio.cpp child's voice listing (#251). It is
+// on the agent's list only, not on gatewayAgentFeatures. The health loop's
+// agent-child voices pass fetches through that route only from an agent with
+// positive evidence the route exists (AgentFeatures.Has) -- fail-closed, the
+// RuntimeUpstreamPropsFeature precedent -- because an older router answers 404
+// runtime.model_not_managed for every such read, the same status and code it
+// gives an unmanaged model, so trying the route cannot tell an old agent from
+// an unknown model and would only add silent no-op traffic each tick. It is
+// exported, like RuntimeUpstreamPropsFeature, for that loop in cmd/gateway,
+// which checks it too (hasAgentFeature).
+//
+// The agent module cannot import this package, so the agent names the
+// identical string in its own registry
+// (server-agent/internal/agent/features.go) -- the same arrangement as
+// runtimeEnsureFeature. The two spellings must stay equal;
+// TestRuntimeVoicesFeatureIsAgentDeclaredOnly pins this side.
+const RuntimeVoicesFeature = "runtime_voices"
+
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
 // route an image EDIT (POST /v1/images/edits, which is multipart) or an audio

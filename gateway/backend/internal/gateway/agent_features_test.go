@@ -172,6 +172,29 @@ func TestRuntimeUpstreamPropsFeatureIsAgentDeclaredOnly(t *testing.T) {
 	}
 }
 
+// TestRuntimeVoicesFeatureIsAgentDeclaredOnly pins the literal the agent
+// declares for its router's voices passthrough (its features.go; the agent
+// module cannot import this one), and that the name stays off the gateway's own
+// list: it states a fact about the agent's router alone, and the health loop
+// only reads it off the agent's declared set (AgentFeatures.Has, fail-closed)
+// before it fetches an agent child's voices.
+func TestRuntimeVoicesFeatureIsAgentDeclaredOnly(t *testing.T) {
+	if RuntimeVoicesFeature != "runtime_voices" {
+		t.Fatalf("RuntimeVoicesFeature = %q, want the agent's literal %q", RuntimeVoicesFeature, "runtime_voices")
+	}
+	if slices.Contains(gatewayAgentFeatures, RuntimeVoicesFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeVoicesFeature)
+	}
+	srv := NewTestServer()
+	if srv.AgentFeatures.Has("voices-host", RuntimeVoicesFeature) {
+		t.Fatalf("a server that declared nothing must not read as having %q (fail-closed)", RuntimeVoicesFeature)
+	}
+	srv.AgentFeatures.Set("voices-host", []string{RuntimeVoicesFeature})
+	if !srv.AgentFeatures.Has("voices-host", RuntimeVoicesFeature) {
+		t.Fatalf("a server that declared %q must read as having it", RuntimeVoicesFeature)
+	}
+}
+
 // TestMultipartProxyFeatureName pins the literal an agent that serves multipart
 // image edits declares in its own registry (server-agent/internal/agent/
 // features.go; the agent module cannot import this one), and that the name
