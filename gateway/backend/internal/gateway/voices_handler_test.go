@@ -543,6 +543,30 @@ func TestAudioVoicesAuth(t *testing.T) {
 			t.Fatalf("status = %d, want 401; body = %s", rec.Code, rec.Body.String())
 		}
 	})
+	// THE BOUNDARY: a browser session cookie must NOT reach this endpoint. The
+	// voices a browser shows come from the session-cookie portal route. A real
+	// Account and a real login back it, and the control line proves the cookie IS a
+	// working session (a cookie route accepts it), so the 401 is auth refusing it
+	// and not a cookie that never meant anything.
+	t.Run("a real session cookie is refused", func(t *testing.T) {
+		srv, dir := newChatTestServer(t)
+		seedLoginUser(t, dir, "usr_voices_cookie", "voices-cookie@example.test", "password-1", "user")
+		cookie := loginCookie(t, srv, "voices-cookie@example.test", "password-1")
+
+		if control := chatRequest(t, srv, cookie, http.MethodGet, "/api/portal/chats", ""); control.Code != http.StatusOK {
+			t.Fatalf("control: GET /api/portal/chats with the cookie = %d, want 200 (a working session); body = %s", control.Code, control.Body.String())
+		}
+		for _, path := range []string{"/v1/audio/voices", "/openai/v1/audio/voices"} {
+			req := httptest.NewRequest(http.MethodGet, path+"?model=tts-union", nil)
+			req.AddCookie(cookie)
+			req.Header.Set(csrfHeaderName, "1")
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("%s with a session cookie: status = %d, want 401; body = %s", path, rec.Code, rec.Body.String())
+			}
+		}
+	})
 	t.Run("only GET", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v1/audio/voices?model=tts-union", nil)
 		req.Header.Set("Authorization", "Bearer "+voicesDevSecret)
@@ -552,6 +576,102 @@ func TestAudioVoicesAuth(t *testing.T) {
 			t.Fatalf("status = %d, want 405; body = %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// addToken registers a bearer token directly in the world's token store, for the
+// tests that need a token carrying its own model rules (a service allowlist, an
+// override), which the seeded user tokens do not have.
+func (w *voicesWorld) addToken(t *testing.T, secret string, tok auth.Token) {
+	t.Helper()
+	ts, ok := w.srv.Tokens.(*auth.TokenStore)
+	if !ok {
+		t.Fatalf("srv.Tokens is %T, want *auth.TokenStore", w.srv.Tokens)
+	}
+	if tok.Scopes == nil {
+		tok.Scopes = []string{scopeGatewayUse}
+	}
+	tok.Active = true
+	ts.AddPlainToken(tok, secret)
+}
+
+// serviceVoicesToken is a service token (llm:invoke only) with the given model
+// allowlist, the one kind of token whose allowlist dispatch enforces.
+func serviceVoicesToken(id string, allowed ...string) auth.Token {
+	return auth.Token{ID: "tok_" + id, Kind: "service", ServiceID: "svc_" + id, ServiceName: id, Scopes: []string{scopeLLMInvoke}, AllowedModels: allowed}
+}
+
+// A service token's model allowlist is a gate dispatch applies BEFORE routing
+// (speech answers 403 model.not_allowed), so the voices endpoint must not be a way
+// round it: for a model the token may not use the answer is the same empty 200 as
+// for an unknown one, never the model's voices and never a distinguishing status.
+// The allowlist is checked against the name asked about, exactly: a member of an
+// allowed group is not itself allowed.
+func TestAudioVoicesAppliesTheTokensModelAllowlist(t *testing.T) {
+	w := newVoicesWorld(t)
+	w.addToken(t, "svc-restricted", serviceVoicesToken("restricted", "tts-one", "tts-group"))
+	w.addToken(t, "svc-open", serviceVoicesToken("open"))
+
+	for _, tc := range []struct {
+		name   string
+		secret string
+		model  string
+		want   []string
+	}{
+		{"a model outside the allowlist", "svc-restricted", "tts-union", nil},
+		{"an allowed model", "svc-restricted", "tts-one", []string{"one-a", "shared"}},
+		{"an allowed group", "svc-restricted", "tts-group", []string{"one-a", "shared", "two-b"}},
+		{"a member of an allowed group is not itself allowed", "svc-restricted", "tts-two", nil},
+		{"an empty allowlist allows every model", "svc-open", "tts-union", []string{"alba", "bella", "cora"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireVoices(t, w.voicesFor(t, tc.secret, tc.model), tc.want)
+		})
+	}
+
+	// Parity with dispatch, so the test pins the rule it claims to mirror: the same
+	// token is refused 403 by the speech endpoint for the same model.
+	rec := postSpeechWithHeaders(t, w.srv, "/v1/audio/speech", `{"model":"tts-union","input":"hi"}`, map[string]string{"Authorization": "Bearer svc-restricted"})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("speech for a model outside the allowlist: status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A token's model override rewrites the requested name before dispatch looks it
+// up, so the voices are those of the EFFECTIVE model while the response keeps the
+// name the client asked for. The service allowlist is then checked against the
+// effective name, as inferencePreflight does, not against the requested one.
+func TestAudioVoicesAppliesTheTokensModelOverride(t *testing.T) {
+	w := newVoicesWorld(t)
+	rule := func(from, to string) map[string]auth.ModelOverrideRule {
+		return map[string]auth.ModelOverrideRule{from: {To: to}}
+	}
+	w.addToken(t, "usr-rule", auth.Token{ID: "tok_rule", UserID: "usr_dev", ModelOverrideRules: rule("voice-alias", "tts-union")})
+	w.addToken(t, "usr-catchall", auth.Token{ID: "tok_catchall", UserID: "usr_dev", ModelOverride: "tts-one"})
+	svcRule := serviceVoicesToken("svc_rule", "tts-union")
+	svcRule.ModelOverrideRules = rule("voice-alias", "tts-union")
+	w.addToken(t, "svc-rule", svcRule)
+	svcBlocked := serviceVoicesToken("svc_blocked", "tts-one")
+	svcBlocked.ModelOverrideRules = map[string]auth.ModelOverrideRule{"voice-alias": {To: "tts-union"}, "tts-one": {To: "tts-union"}}
+	w.addToken(t, "svc-blocked", svcBlocked)
+
+	for _, tc := range []struct {
+		name   string
+		secret string
+		model  string
+		want   []string
+	}{
+		{"a rule rewrites the requested name", "usr-rule", "voice-alias", []string{"alba", "bella", "cora"}},
+		{"a name with no rule is looked up as asked", "usr-rule", "tts-one", []string{"one-a", "shared"}},
+		{"a catch-all override forces every name", "usr-catchall", "tts-union", []string{"one-a", "shared"}},
+		{"the allowlist is checked against the effective name", "svc-rule", "voice-alias", []string{"alba", "bella", "cora"}},
+		{"an effective name outside the allowlist is empty", "svc-blocked", "voice-alias", nil},
+		{"an allowed requested name is gated on what it is rewritten to", "svc-blocked", "tts-one", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// voicesFor asserts the response echoes tc.model, the requested name.
+			requireVoices(t, w.voicesFor(t, tc.secret, tc.model), tc.want)
+		})
+	}
 }
 
 // voicesForModel is the shared core Task 8's portal route reuses: it takes the

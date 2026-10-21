@@ -42,15 +42,18 @@ type audioVoicesResponse struct {
 // DELIBERATELY not the browser session cookie (authenticateInternalOrBearer).
 // A browser reaches voices through the session-cookie portal route instead.
 // run-as is not applied: it only swaps the loopback principal for another token
-// OF THE SAME USER, and a voice list depends on the user, never on the token.
+// OF THE SAME USER, and what a user may route to (provisioning) never depends on
+// which of their tokens asks. The token's OWN model rules do, and are applied
+// below, as dispatch applies them: the model override first, then a service
+// token's model allowlist against the effective name.
 //
 // Status codes are the no-leak ones: a missing or blank model is 400
 // model.name_required, because it is a client bug that an empty list would hide,
 // and EVERY other "nothing to show" case -- an unknown name, a model the token
-// cannot route to, a non-speech or clone model, one with nothing cached yet --
-// is the same 200 with "voices":[], so the answer cannot be used to probe which
-// models exist or which servers a token is kept away from. A store failure is the
-// only 500, and it is never read as an empty answer.
+// cannot route to or is not allowed to use, a non-speech or clone model, one with
+// nothing cached yet -- is the same 200 with "voices":[], so the answer cannot be
+// used to probe which models exist or which servers a token is kept away from. A
+// store failure is the only 500, and it is never read as an empty answer.
 //
 // Voices are deliberately not part of /v1/models: a model list stays one cheap
 // read and a voice list is per-model detail a client asks for on demand.
@@ -69,11 +72,24 @@ func (s *Server) handleAudioVoices(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, apierror.Response(audioVoicesModelRequired, "model is required", ""))
 		return
 	}
-	voices, err := s.voicesForModel(r.Context(), token, model)
-	if err != nil {
-		slog.Error("audio voices lookup failed", "model", model, "err", err)
-		writeJSON(w, http.StatusInternalServerError, apierror.Response("model.voices_failed", "model voices failed", ""))
-		return
+	// The two TOKEN-level gates dispatch applies before it resolves anything
+	// (inferencePreflight): the token's own model override rewrites the requested
+	// name, and a service token's allowlist is then checked against the EFFECTIVE
+	// name. Skipping them would make this endpoint an existence oracle for a
+	// restricted token, which gets a 403 from speech for the same model. A refusal
+	// here is deliberately NOT a 403: it is the same empty 200 every other
+	// "nothing to show" case gives, so the answer says nothing about the model.
+	// The request's own name is what the response echoes either way.
+	effective := resolveModelOverride(r.Context(), token, model, s.Portal)
+	voices := []string{}
+	if modelAllowed(token, effective) {
+		var err error
+		voices, err = s.voicesForModel(r.Context(), token, effective)
+		if err != nil {
+			slog.Error("audio voices lookup failed", "model", model, "err", err)
+			writeJSON(w, http.StatusInternalServerError, apierror.Response("model.voices_failed", "model voices failed", ""))
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, audioVoicesResponse{Model: model, Voices: voices})
 }
@@ -87,9 +103,12 @@ func (s *Server) handleAudioVoices(w http.ResponseWriter, r *http.Request) {
 // model the token cannot dispatch to nor hides one it can:
 // routing.Resolver.ReachableCandidates (the group expansion, the locked/direct
 // rule and resource-group provisioning, dispatch's own code) over the speech
-// flavor, then the CURRENT tts verdict (cachedVoicesForMappings).
+// flavor, then the CURRENT tts verdict (cachedVoicesForMappings). It does NOT
+// apply the token's own model rules (override, service allowlist): those rewrite
+// or refuse the NAME a request carries, so they belong to the caller that holds
+// the request (handleAudioVoices), which hands this the effective name.
 //
-// This is the endpoint's whole answer, split from handleAudioVoices so another
+// This is the endpoint's answer for that name, split from handleAudioVoices so another
 // route can reuse the union under a DIFFERENT visibility rule: the portal voices
 // route (a session-cookie caller that must not see what the portal hides or
 // locks) decides which mappings its principal may see itself and hands exactly
