@@ -42,6 +42,16 @@ const (
 	codeBenchmarkAudioOnly = "benchmark.audio_only"
 	msgBenchmarkAudioOnly  = "this model, or every model in the run's scope, serves audio only, so no chat prompt is sent"
 
+	// codeBenchmarkSpeechUnavailable: the SPEECH benchmark (?mode=speech) has no
+	// target in the run's scope. It is the speech benchmark's own refusal, the twin of
+	// the two above for the one mode that inverts their audio-only rule: it runs on
+	// plain text-to-speech mappings, so what it refuses is a scope with none -- a
+	// mapping that does not synthesize speech, or a voice-cloning model that cannot
+	// without a reference voice (speechBenchmarkSkip). An application- or server-scope
+	// run answers it too when every mapping in its scope is skipped.
+	codeBenchmarkSpeechUnavailable = "benchmark.speech_unavailable"
+	msgBenchmarkSpeechUnavailable  = "this model, or every model in the run's scope, cannot be benchmarked for speech: it does not synthesize speech, or it clones a voice and needs a reference"
+
 	// codeBenchmarkAgentEnsureUnsupported: an images-only agent child loads
 	// only through the agent's ensure route, and the server's agent has not
 	// declared runtime_ensure. That is an older agent, or one that has not
@@ -63,6 +73,7 @@ const (
 var (
 	errBenchmarkImagesOnly             = errors.New(codeBenchmarkImagesOnly)
 	errBenchmarkAudioOnly              = errors.New(codeBenchmarkAudioOnly)
+	errBenchmarkSpeechUnavailable      = errors.New(codeBenchmarkSpeechUnavailable)
 	errBenchmarkAgentEnsureUnsupported = errors.New(codeBenchmarkAgentEnsureUnsupported)
 	errBenchmarkSpecForceStopped       = errors.New(codeBenchmarkSpecForceStopped)
 )
@@ -94,6 +105,17 @@ const benchmarkSkippedImagesOnly = "images_only"
 // benchmarkSkippedAudioOnly is benchmarkSkippedImagesOnly for a mapping that
 // serves only audio (speech or transcription).
 const benchmarkSkippedAudioOnly = "audio_only"
+
+// The two values of BenchmarkResult.Skipped a speech run (?mode=speech) records,
+// for a mapping an application- or server-scope run did not measure
+// (partitionSpeechBenchmarkViews): benchmarkSkippedNotSpeech when it does not
+// synthesize speech (a chat model, a transcriber, an unprobed model), and
+// benchmarkSkippedSpeechClone when it is a voice-cloning model, whose synthesis
+// needs a reference voice the benchmark does not have.
+const (
+	benchmarkSkippedNotSpeech   = "not_speech"
+	benchmarkSkippedSpeechClone = "speech_clone"
+)
 
 // benchmarkSpecUnreadable prefixes the error an application- or server-scope
 // run records for a mapping whose runtime spec could not be read.
@@ -254,6 +276,26 @@ func (s *Server) partitionBenchmarkViews(ctx context.Context, views []portal.Ben
 		}
 	}
 	return p
+}
+
+// partitionBenchmarkViewsFor is the split a run of mode makes: the speech
+// benchmark's own (partitionSpeechBenchmarkViews), where audio is what runs, and for
+// every other mode partitionBenchmarkViews, where audio is what is refused.
+func (s *Server) partitionBenchmarkViewsFor(ctx context.Context, views []portal.BenchmarkTargetView, mode string) benchmarkViewPartition {
+	if mode == benchmarkModeSpeech {
+		return s.partitionSpeechBenchmarkViews(ctx, views)
+	}
+	return s.partitionBenchmarkViews(ctx, views)
+}
+
+// refuseNothingRunnableFor answers a partition with no runnable view the way the
+// run's mode does: refuseNothingRunnableSpeech for the speech benchmark,
+// refuseNothingRunnable for every other mode.
+func (p benchmarkViewPartition) refuseNothingRunnableFor(w http.ResponseWriter, mode string) bool {
+	if mode == benchmarkModeSpeech {
+		return p.refuseNothingRunnableSpeech(w)
+	}
+	return p.refuseNothingRunnable(w)
 }
 
 // refuseNothingRunnable answers a partition with no runnable view, and

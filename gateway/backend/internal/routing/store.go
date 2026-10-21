@@ -617,6 +617,28 @@ type BenchmarkRun struct {
 	// number to their own field themselves (see the agent-runtime-manager
 	// cross-cutting doc's ownership split).
 	VRAMJSON string
+	// TTFTMS, WallMS and RTF are the audio perf metrics of a kind=="speech" row
+	// (migration 95, #263), and are zero for every other kind and for a speech run
+	// that failed or measured none of them: zero is "not measured", and the SQL
+	// driver stores it as NULL (the columns are nullable), so a real measurement
+	// is never confused with an absent one. A measurement is never exactly zero
+	// -- the speech benchmark rounds a sub-millisecond time up to 1 -- so the two
+	// readings cannot collide.
+	//
+	//   - TTFTMS is the time from sending the synthesis request to the first byte
+	//     of the response, in milliseconds. The speech benchmark's request does not
+	//     stream, and audio.cpp answers a non-stream call only once the whole clip
+	//     is synthesized, so this is close to the synthesis time itself, not the
+	//     time to the first audio of a streamed call.
+	//   - WallMS is the synthesis wall time in milliseconds: audio.cpp's own
+	//     X-AudioCPP-Wall-Ms when it reported one, else the benchmark's measured
+	//     elapsed time.
+	//   - RTF is the real-time factor, wall time over the length of audio produced
+	//     (below 1 is faster than real time): audio.cpp's own X-AudioCPP-RTF when it
+	//     reported one, else WallMS over the WAV's duration.
+	TTFTMS int64
+	WallMS int64
+	RTF    float64
 }
 
 // CapacityLevel is one concurrency level measured during a capacity ramp. Every

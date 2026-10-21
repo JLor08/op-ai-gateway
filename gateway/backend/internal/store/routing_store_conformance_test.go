@@ -2098,6 +2098,75 @@ func TestRoutingStoreBenchmarkRunVRAMJSON(t *testing.T) {
 	})
 }
 
+// TestRoutingStoreBenchmarkRunSpeechMetrics is the MEMORY-vs-SQL half of the
+// migration-v95 audio perf-metric contract (#263): a kind=="speech" row
+// round-trips its time to first byte, wall time and real-time factor through
+// routing.Store on every backend, and a run that measured none reads back with
+// all three zero ("not measured"). The SQL driver stores a zero as NULL, so the
+// pair also pins that a NULL column scans as zero rather than failing the read.
+func TestRoutingStoreBenchmarkRunSpeechMetrics(t *testing.T) {
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+
+		if err := s.CreateAIServer(ctx, routing.AIServer{
+			ID: "srv_sp", Name: "Speech", Domain: "speech.example.test", Provider: routing.ProviderAudioCpp,
+			Endpoint: "http://speech.example.test:8080", Status: routing.ServerStatusActive, HealthStatus: routing.HealthUnknown,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create server: %v", err)
+		}
+		if err := s.CreateApplication(ctx, routing.Application{
+			ID: "app_sp", ServerID: "srv_sp", Type: routing.ProviderAudioCpp, Port: 8080, Scheme: "http",
+			APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Status: routing.ServerStatusActive,
+			HealthCheckMode: routing.HealthCheckModeAlwaysReachable, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create application: %v", err)
+		}
+		if err := s.CreateMapping(ctx, routing.ModelMapping{
+			ID: "map_sp", ApplicationID: "app_sp", GatewayModelName: "sp-tts",
+			AppModelName: "sp-upstream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create mapping: %v", err)
+		}
+
+		if err := s.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
+			MappingID: "map_sp", ServerID: "srv_sp", CreatedAt: now.Add(2 * time.Minute),
+			Kind: "speech", TTFTMS: 910, WallMS: 1500, RTF: 0.375,
+		}); err != nil {
+			t.Fatalf("insert speech run: %v", err)
+		}
+		if err := s.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
+			MappingID: "map_sp", ServerID: "srv_sp", CreatedAt: now.Add(time.Minute),
+			Kind: "speech", Error: "upstream answered HTTP 500",
+		}); err != nil {
+			t.Fatalf("insert failed speech run: %v", err)
+		}
+		if err := s.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
+			MappingID: "map_sp", ServerID: "srv_sp", CreatedAt: now, GenTokensPerSecond: 12,
+		}); err != nil {
+			t.Fatalf("insert speed run: %v", err)
+		}
+
+		runs, err := s.BenchmarkRunsByMapping(ctx, "map_sp", 50)
+		if err != nil {
+			t.Fatalf("BenchmarkRunsByMapping: %v", err)
+		}
+		if len(runs) != 3 {
+			t.Fatalf("expected 3 runs, got %d (%+v)", len(runs), runs)
+		}
+		if r := runs[0]; r.Kind != "speech" || r.TTFTMS != 910 || r.WallMS != 1500 || r.RTF != 0.375 {
+			t.Errorf("measured speech run = %+v, want ttft 910, wall 1500, rtf 0.375", r)
+		}
+		if r := runs[1]; r.Kind != "speech" || r.Error == "" || r.TTFTMS != 0 || r.WallMS != 0 || r.RTF != 0 {
+			t.Errorf("failed speech run = %+v, want its error and zero metrics", r)
+		}
+		if r := runs[2]; r.Kind != "speed" || r.TTFTMS != 0 || r.WallMS != 0 || r.RTF != 0 {
+			t.Errorf("speed run = %+v, want kind=speed with zero audio metrics", r)
+		}
+	})
+}
+
 // upsertPrecedenceFixture creates a server/app/mapping and returns the mapping id.
 func upsertPrecedenceFixture(t *testing.T, ctx context.Context, s routing.Store, now time.Time) string {
 	t.Helper()

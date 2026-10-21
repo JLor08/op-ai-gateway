@@ -713,7 +713,7 @@ func TestBenchmarkModeSpeedUnchanged(t *testing.T) {
 	}
 
 	// Empty mode -> "speed"; explicit modes pass through.
-	for in, want := range map[string]string{"": "speed", "speed": "speed", "capacity": "capacity", "both": "both", "vision": "vision"} {
+	for in, want := range map[string]string{"": "speed", "speed": "speed", "capacity": "capacity", "both": "both", "vision": "vision", "speech": "speech"} {
 		rec2 := httptest.NewRecorder()
 		q := ""
 		if in != "" {

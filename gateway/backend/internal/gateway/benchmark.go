@@ -87,9 +87,22 @@ type BenchmarkResult struct {
 	// Skipped names why an application- or server-scope run did not measure
 	// this mapping, from a closed set: "images_only"
 	// (benchmarkSkippedImagesOnly) or "audio_only"
-	// (benchmarkSkippedAudioOnly). A skipped result carries no metrics and
-	// no error, and no history row is written for it.
+	// (benchmarkSkippedAudioOnly) for a chat-prompt run, and "not_speech"
+	// (benchmarkSkippedNotSpeech) or "speech_clone"
+	// (benchmarkSkippedSpeechClone) for a speech run. A skipped result carries
+	// no metrics and no error, and no history row is written for it.
 	Skipped string `json:"skipped,omitempty"`
+	// The speech benchmark's figures (a speech run; omitted on every other mode
+	// and on a speech result that failed). OutputByteRate is the mapping's output
+	// byte rate, bytes of PCM per second of audio, read from the WAV the run
+	// synthesized and cached as routing.ModelMappingCacheOutputByteRate.
+	// TTFTMS, WallMS and RTF are the audio perf metrics
+	// routing.BenchmarkRun.TTFTMS documents, the same figures the run's
+	// kind=="speech" history row carries.
+	OutputByteRate uint32  `json:"output_byte_rate,omitempty"`
+	TTFTMS         int64   `json:"ttft_ms,omitempty"`
+	WallMS         int64   `json:"wall_ms,omitempty"`
+	RTF            float64 `json:"rtf,omitempty"`
 }
 
 type benchmarkRun struct {

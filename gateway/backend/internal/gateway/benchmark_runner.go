@@ -848,7 +848,11 @@ func (s *Server) measureMapping(ctx context.Context, tgt benchmarkTarget) (Bench
 // the mapping's `vision` capability row, sourced vision_benchmark, subject to the same
 // precedence rank every capability writer obeys -- routing.WritableCapabilityRows -- so
 // it never overwrites an operator's CapabilitySourceManual verdict; always appends a
-// kind=="vision" history row regardless — success or inconclusive). An empty mode is
+// kind=="vision" history row regardless — success or inconclusive), or "speech" (the
+// audio benchmark: synthesizes one clip per plain text-to-speech target, caches the
+// output byte rate read from the answer's WAV header as the mapping's
+// routing.ModelMappingCacheOutputByteRate row, and appends a kind=="speech" history
+// row with the audio perf metrics -- see benchmark_speech.go). An empty mode is
 // treated as "speed".
 //
 // A manual speed or both run's server_agent targets (mayPreStop) share one override
@@ -887,15 +891,18 @@ func (s *Server) runBenchmark(ctx context.Context, run *benchmarkRun, serverID s
 			res, speedErr = s.measureBothTarget(ctx, tgt, run, serverID)
 		case "vision":
 			res = s.runVisionTarget(ctx, tgt)
+		case benchmarkModeSpeech:
+			res = s.runSpeechTarget(ctx, tgt)
 		default: // "speed" (and empty)
 			res = s.measureSpeedTarget(ctx, tgt)
 			speedErr = res.Error
 		}
 		// Append a speed-history row (success AND failure — speedErr is set on a measure
-		// failure). Best-effort: a history-write error never fails the run. A capacity-only
-		// or vision-only run measures no speed metrics, so it writes no speed-history row
-		// (the capacity history curve is written inside measureCapacityTarget).
-		if mode != "capacity" && mode != "vision" {
+		// failure). Best-effort: a history-write error never fails the run. A capacity-only,
+		// vision-only or speech-only run measures no speed metrics, so it writes no speed-history
+		// row (the capacity history curve is written inside measureCapacityTarget, the vision and
+		// speech rows inside runVisionTarget and runSpeechTarget).
+		if mode != "capacity" && mode != "vision" && mode != benchmarkModeSpeech {
 			_ = s.Routes.InsertBenchmarkRun(ctx, routing.BenchmarkRun{
 				MappingID:             tgt.mapping.ID,
 				ServerID:              tgt.server.ID,

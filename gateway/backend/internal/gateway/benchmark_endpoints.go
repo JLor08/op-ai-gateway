@@ -54,13 +54,19 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 // background. It responds 202 with the initial status; 409 if a run is already
 // in flight on the server OR the server still has in-flight requests; otherwise
 // an error status via writeBenchmarkError. scope is "mapping"|"application"|"server";
-// mode is "speed"|"capacity"|"both"|"vision" (already validated by parseBenchmarkMode).
+// mode is "speed"|"capacity"|"both"|"vision"|"speech" (already validated by
+// parseBenchmarkMode).
 //
-// Every mode sends each target a chat prompt, so before the reservation the
+// Every mode but speech sends each target a chat prompt, so before the reservation the
 // scope's views are partitioned (partitionBenchmarkViews): a view that serves
 // only images or only audio (speech, transcription) is skipped, and one whose runtime spec cannot be
 // read is not measured either, because the answer is unknown and is not
-// guessed at. A scope with no runnable view reserves nothing and answers 409
+// guessed at. The speech benchmark inverts the audio half of that split
+// (partitionSpeechBenchmarkViews): it synthesizes a clip on each plain
+// text-to-speech mapping, the audio-only ones included, and skips every
+// mapping that does not synthesize speech or that clones a voice; a scope with
+// no such mapping answers 409 benchmark.speech_unavailable
+// (refuseNothingRunnableSpeech). Nothing else about the starter differs. A scope with no runnable view reserves nothing and answers 409
 // benchmark.images_only when every view serves only images (or images and
 // audio), 409 benchmark.audio_only when every view serves only audio, else
 // 500 benchmark.request_failed (refuseNothingRunnable); a mapping scope's
@@ -85,8 +91,8 @@ func (s *Server) startBenchmark(w http.ResponseWriter, r *http.Request, token au
 	if s.refuseBusyServer(w, server.ID) {
 		return
 	}
-	part := s.partitionBenchmarkViews(r.Context(), views)
-	if part.refuseNothingRunnable(w) {
+	part := s.partitionBenchmarkViewsFor(r.Context(), views, mode)
+	if part.refuseNothingRunnableFor(w, mode) {
 		return
 	}
 	// The run outlives the HTTP request (the client only triggers it), so it runs
@@ -318,13 +324,13 @@ func writeVRAMProbeError(w http.ResponseWriter, err error) {
 
 // parseBenchmarkMode reads + validates the optional ?mode query param for a
 // benchmark trigger. Empty defaults to "speed" (byte-identical to the pre-mode
-// behavior); "speed"|"capacity"|"both"|"vision" pass through; anything else writes
-// an HTTP 400 and returns ok=false so the caller aborts.
+// behavior); "speed"|"capacity"|"both"|"vision"|"speech" pass through; anything else
+// writes an HTTP 400 and returns ok=false so the caller aborts.
 func parseBenchmarkMode(w http.ResponseWriter, r *http.Request) (string, bool) {
 	switch mode := r.URL.Query().Get("mode"); mode {
 	case "":
 		return "speed", true
-	case "speed", "capacity", "both", "vision":
+	case "speed", "capacity", "both", "vision", benchmarkModeSpeech:
 		return mode, true
 	default:
 		writeJSON(w, http.StatusBadRequest, apierror.Response("benchmark.mode_invalid", "unknown benchmark mode", ""))
@@ -343,6 +349,7 @@ var benchmarkErrRows = []errRow{
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: "benchmark.not_found", msg: "not found"},
 	{err: errBenchmarkImagesOnly, status: http.StatusConflict, code: codeBenchmarkImagesOnly, msg: msgBenchmarkImagesOnly},
 	{err: errBenchmarkAudioOnly, status: http.StatusConflict, code: codeBenchmarkAudioOnly, msg: msgBenchmarkAudioOnly},
+	{err: errBenchmarkSpeechUnavailable, status: http.StatusConflict, code: codeBenchmarkSpeechUnavailable, msg: msgBenchmarkSpeechUnavailable},
 	{err: errBenchmarkAgentEnsureUnsupported, status: http.StatusConflict, code: codeBenchmarkAgentEnsureUnsupported, msg: msgBenchmarkAgentEnsureUnsupported},
 	{err: errBenchmarkSpecForceStopped, status: http.StatusConflict, code: codeBenchmarkSpecForceStopped, msg: msgBenchmarkSpecForceStopped},
 }
