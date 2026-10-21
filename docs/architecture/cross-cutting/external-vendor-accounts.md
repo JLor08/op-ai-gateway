@@ -2595,7 +2595,7 @@ deliberate, named choice**, because `all: true` never covers a shared account (Â
 
 The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 (column, a JSON string on `api_tokens`, migration 85;
-[Data Model](../reference/data-model.md#4-migration-history-94-migrations)):
+[Data Model](../reference/data-model.md#4-migration-history-95-migrations)):
 
 ```json
 { "all": false,

@@ -62,7 +62,7 @@ sequenceDiagram
 
     C->>GW: POST /v1/audio/speech {model, input, voice} (Bearer token)
     GW->>GW: authenticate (bearer or loopback, never a session)
-    GW->>GW: validate: model + input; response_format wav only; no stream
+    GW->>GW: validate: model + input; response_format wav (pcm when streaming); stream boolean
     Note over GW: 400 speech.* here, before any admission, not recorded
     GW->>R: resolve(model, openai_audio, required capability speech)
     R-->>GW: candidate with speech: yes, or 404 no_model_route / model_not_capable
@@ -84,6 +84,23 @@ from the server's `/v1/models` `task`; the flavor is the application's own
 summary of the audio, never the WAV bytes. See [Compatibility & Inference
 §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech) and
 [ADR-061](09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only).
+
+**Streaming variant** ([ADR-068](09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issues #253 and #263). When the client sends
+`stream=true` (with `response_format` `pcm` or absent) and the mapped model's
+`speech_streaming` verdict is `yes` (the model is `mode=streaming`), the relay sends
+`stream=true` upstream and **relays audio.cpp's stream unbuffered**: the SSE
+`speech.audio.delta` (base64 PCM) → `speech.audio.done` → `[DONE]`, or raw PCM for
+`stream_format=audio`, with **no `Content-Length`** (a stream has none). The stream states no
+duration and no sample rate, so the relay **counts the PCM it relays** after each chunk has
+been written, and on a clean completion bills `audio_second` = bytes ÷ the mapping's cached
+output byte rate, or `audio_bytes` = the byte count while no rate is cached; anything else
+(an error, a cut or a disconnected stream) is an `audio_second` row of quantity 0. The capture
+stays the redacted summary, with the endpoint stamped speech. A verdict that is `no`, absent or
+unreadable serves the buffered one-shot of the diagram (the body is sent without the stream
+fields, so the client gets `audio/wav` whatever it asked), and a stale `yes` that draws a `500
+"speech streaming requires a model configured with mode=streaming"` is **retried buffered
+once**, nothing of the stream having reached the client. The byte rate is learned by the speech
+benchmark (§6.5), which the health loop starts for a loaded streaming-capable mapping.
 
 ### 6.1.2 Transcription relay (`POST /v1/audio/transcriptions`)
 
@@ -150,8 +167,9 @@ A speech turn in the portal chat is the one place the speech relay of §6.1.1 is
 by the gateway itself. The browser never calls `/v1/audio/speech`: it starts a **run**
 like any chat turn, and the run executor calls the endpoint over loopback, stores the
 WAV it gets back as a chat blob and lets the browser fetch that blob for playback.
-Like an image turn, it emits no incremental event between dispatch and the finished
-reply, so the browser shows a wait state fed by a server-measured clock.
+A **buffered** speech turn, like an image turn, emits no incremental event between dispatch
+and the finished reply, so the browser shows a wait state fed by a server-measured clock; a
+**streaming** turn (below the diagram) plays the audio as it arrives.
 
 ```mermaid
 sequenceDiagram
@@ -168,7 +186,7 @@ sequenceDiagram
     B->>GW: GET .../runs/{runId}/events (snapshot with elapsed_ms, no deltas)
     GW->>GW: executeAudioRun under speechRunDeadline (10 minutes)
     GW->>GW: buildSpeechBody {model, input = last user text, voice, speed, passthrough}
-    Note over GW: a passthrough key named model, input, stream or response_format ends the run gateway.chat_run_speech_reserved_field and sends nothing
+    Note over GW: a passthrough key named model, input, stream, stream_format or response_format ends the run gateway.chat_run_speech_reserved_field and sends nothing
     GW->>SP: POST /v1/audio/speech over loopback (internal pair, chat-id, run-as)
     SP->>AC: resolve (openai_audio, capability speech), relay as in 6.1.1
     alt 2xx WAV
@@ -186,6 +204,20 @@ sequenceDiagram
         GW-->>B: SSE done, status error with gateway.chat_run_* or speech.* code
     end
 ```
+
+**Streaming branch** ([ADR-068](09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issues #253 and #263). When the gateway can stream the
+model (every mapping the model could route to is `speech_streaming: yes` with a cached output
+byte rate, all agreeing, and the thread has not opted out; the composer asks
+`GET /api/portal/model-speech-streaming` and the run re-evaluates the same gate), the executor
+sends `stream=true` with `stream_format=sse` instead, arming `speechRunDeadline` only until the
+first chunk of audio. Each `speech.audio.delta` reaches the browser as an **`audio`** run event
+(`{seq, rate, data}`: base64 PCM, a sequence number and the sample rate) that the browser
+schedules gaplessly on one shared `AudioContext`, and is buffered nowhere on the server. The
+executor keeps the PCM, and on a stream that ended with `speech.audio.done` and `[DONE]` it wraps
+it in a canonical WAV header at the cached rate and commits the **same one `audio_url` part** as
+the buffered turn, so the rest of the diagram (the blob, the SSE `done`, `AudioTurn`) is
+unchanged; a cut stream commits nothing. Live playback is abandoned for the run at the first
+gap in the sequence, which is harmless because the committed WAV is complete.
 
 What differs from the speech relay of §6.1.1: the caller is the executor and the
 credential the internal loopback pair (never a session cookie, [Security
@@ -352,6 +384,20 @@ sequenceDiagram
     R-->>SSE: live progress
     Note over R: metrics feed candidate scoring —<br/>hybrid swap-protection avoids thrashing
 ```
+
+**Speech benchmark** ([ADR-068](09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issue #263). `POST …/benchmark?mode=speech`, and the
+app-health loop on its own for a loaded, streaming-capable, plain text-to-speech mapping that
+has no cached **output byte rate** (or one measured under another loaded model), is the one
+benchmark that runs on audio mappings and sends no chat prompt. After taking the server's
+reservation, and giving it back if the server has live requests, it synthesizes one short
+**non-stream** clip **directly** to the mapping's upstream through the provider's native relay
+(not through the gateway's own loopback, which the reservation would exclude and which has no
+principal for a scheduled run), reads the byte rate from the WAV `fmt` chunk, caches it (only
+from a mono 16-bit PCM WAV) in `model_mapping_cache` beside the model identity it was measured
+under, and appends a `kind=speech` history row with `ttft_ms` (roughly synthesis plus any model
+cold start, since the request does not stream), `wall_ms` and `rtf`. A clone model is skipped.
+The health loop retires a rate and re-runs the benchmark when the loaded model behind the
+mapping changes, and leaves a mapping whose run produced no rate alone for five minutes.
 
 ## 6.6 Mesh certificate issuance & HTTPS auto-switch
 

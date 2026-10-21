@@ -694,13 +694,14 @@ that discards its type error would leave a non-string `response_format` such as
 `["mp3"]` at its zero value and walk it past the very check below. A JSON `null` is an
 absent value throughout.
 
-**2. `response_format` accepts only `wav` or an absent value; everything else is 400
-`speech.response_format_unsupported`.**
+**2. For a request that does not stream, `response_format` accepts only `wav` or an absent
+value; everything else is 400 `speech.response_format_unsupported`** (a streamed request
+asks `pcm` or nothing, item 3).
 
 | `response_format` sent | The gateway | Why |
 |---|---|---|
 | absent, `null`, `""` or `"wav"` | relays | audio.cpp answers a real `audio/wav` body with `Content-Length` and the metering headers |
-| `mp3`, `opus`, `flac`, `aac`, `pcm` | 400 | audio.cpp does not produce them: it answers **raw WAV, still labelled `audio/wav`**, so a client that asked for `mp3` would be handed WAV without being told |
+| `mp3`, `opus`, `flac`, `aac`, `pcm` (without a stream) | 400 | audio.cpp does not produce them: it answers **raw WAV, still labelled `audio/wav`**, so a client that asked for `mp3` would be handed WAV without being told |
 | `json`, `b64_json` | 400 | not OpenAI speech formats, and audio.cpp's JSON answer (base64 WAV) carries **none** of the metering headers, so a relayed one would be billed as zero seconds on every success |
 | a non-string value | 400 | the same refusal, with the received value in the message |
 
@@ -713,14 +714,37 @@ is neither wrong nor silent. Lifting the restriction for `json` and `b64_json` l
 means decoding the clip's RIFF header for its duration, because the upstream's header
 is absent on those responses.
 
-**3. Streaming is deferred and refused: `stream: true` and any `stream_format`
-(`sse` or `audio`) are 400 `speech.stream_unsupported`.** The relay's buffering and
-billing contract is that of one complete audio response, and relaying a stream request
-would hand the client a shape the gateway was not built, metered or tested for.
-`stream: false`, an absent `stream` and a null or absent `stream_format` describe what
-the endpoint already does and are accepted; a non-boolean `stream` is refused with the
-same code. audio.cpp itself refuses a stream request to a model not configured with
-`mode=streaming` (with a 500), so the refusal also keeps that failure off the client.
+**3. Streaming is served for a `mode=streaming` model: the stream is headerless PCM, and the
+gateway meters it by counting the bytes it relays**
+([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issues #253 and #263; it lifts ADR-061 (e)'s refusal). `stream: true`
+is admitted, and whether it is *relayed as a stream* is decided up front from the resolved
+route's **`speech_streaming`** verdict (`mappingStreamsSpeech`, a keyed `MappingCapabilities`
+read in the handler, `transcription_streaming`'s twin, [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)
+(b)). The verdict is `yes` for a `mode=streaming` `tts` or `clon` model, `no` for `offline`
+and absent when unprobed; the gateway's health loop writes it for a static `audio_cpp`
+application and the ServerAgent (0.11.1) for an agent-launched child ([Routing & Model
+Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)). A **`yes`** relays
+audio.cpp's own stream; a **`no`, an absent verdict or a failed read** answers the buffered
+one-shot WAV instead: the body is sent without `stream`, `stream_format` and `response_format`
+(`speechBufferedBody`), one upstream call, so a client that asked for a stream and `pcm` from a
+route that does not stream is handed `audio/wav`, never an error. audio.cpp streams only as
+PCM, so the request surface of a streamed request is:
+
+| Field | On a request with `stream: true` |
+|---|---|
+| `stream` | a JSON boolean; a non-boolean value is 400 `speech.stream_unsupported` |
+| `response_format` | `pcm` or absent; **`wav` is 400 `speech.stream_unsupported`** (audio.cpp 500s a wav stream, so the gateway refuses it up front), any other value 400 `speech.response_format_unsupported` |
+| `stream_format` | `sse` (audio.cpp's default) or `audio`, relayed as written with nothing translated; any other value, and a `stream_format` on a request that does not stream, is 400 `speech.stream_unsupported`; `null` is absent |
+
+The streamed answer is `text/event-stream` — `speech.audio.delta` frames (base64 PCM in
+`audio`, signed 16-bit little-endian mono, **headerless: no sample rate and no duration on the
+wire**) → `speech.audio.done` (only `timing.ttft_ms`) → `[DONE]` — or, for
+`stream_format=audio`, raw `application/octet-stream` PCM. Either is relayed chunked and byte
+for byte through the native copier (§7). If the gateway streamed on a **stale** `yes` and
+audio.cpp answers `500 "speech streaming requires a model configured with mode=streaming"`,
+the request is **re-sent once buffered** (nothing of the failed stream was written, and the
+refused attempt records nothing), ADR-065 (b)'s safety net with the speech endpoint's own
+sentence; any other upstream error is relayed as item 5 says.
 
 **4. The relay is binary, sized and unbuffered.** `proxyNative` relays the upstream
 `Content-Type` verbatim and streams the body through the shared copier, 32 KiB at a
@@ -734,11 +758,16 @@ auto-decompressed response, so a surviving value is exactly the length the copie
 writes. And the **usage scanner is nil** (`newUsageScanner` answers nil for
 `apiFlavorSpeech`, as for images): a binary body has no chat usage in it, and scanning
 it would split the audio on newlines and retain it per in-flight request to find that
-out. Because `Stream` is never set, the request takes `proxyNative`'s buffered-deadline
+out. A **one-shot** request never sets `Stream`, so it takes `proxyNative`'s buffered-deadline
 branch: the application's `timeout_ms` is the one **total** deadline, with no idle
 watchdog (§7), and a long synthesis can occupy the whole of it. The `audio_cpp`
 application type defaults it to 600000 ms; an application of any other type that serves
-speech has the stock 30000 and needs it raised by hand (§7.1).
+speech has the stock 30000 and needs it raised by hand (§7.1). A **streamed** answer differs
+in three ways (item 3): the request sets `Stream`, so the idle watchdog governs once audio
+flows, with a first-byte grace (§7); **no `Content-Length` is set** (a chunked stream has none;
+a stream request answered with a plain `audio/wav` keeps the forwarded length); and the copier
+tees nothing for capture (the capture of a streamed response is the redacted summary of
+item 6, built from the byte count the copier keeps).
 
 **5. A non-2xx upstream response is normalised, and the classification is the
 gateway's own where the upstream gave none.** `relaySpeechUpstreamError` (behind
@@ -758,14 +787,26 @@ audio.cpp's 500 for a client error is done up front by the validation in step 1,
 here. A refused or failed request is one `error`-status usage row billed as
 `audio_second` with quantity `0`, since no clip was produced.
 
-**6. A speech request bills in seconds and its capture holds metadata.** The usage row
-carries `billing_unit = audio_second` and a quantity read from the upstream's
+**6. A speech request bills in seconds (a streamed call, before its byte rate is known, in
+bytes) and its capture holds metadata.** The usage row of a one-shot call carries
+`billing_unit = audio_second` and a quantity read from the upstream's
 `X-AudioCPP-Audio-Duration-Ms` header ([Telemetry
 §8.4.1](telemetry-usage-observability.md#841-the-usage-event)). The upstream's
-`X-AudioCPP-*` metering headers are **not** forwarded to the client. A payload capture
+`X-AudioCPP-*` metering headers are **not** forwarded to the client. A **streamed** call has no
+such header, so the relay **counts the PCM it relays** (`speechStreamScan`: the decoded
+`speech.audio.delta` payloads, or the raw body bytes) and, **on a clean completion only**
+(`speech.audio.done` then `[DONE]`, or a raw body the upstream closed cleanly), bills
+`audio_second` = bytes ÷ the mapping's cached **output byte rate** (item 10) — the same number
+audio.cpp's own header would have stated — or, while no rate is cached, `audio_bytes` = the byte
+count. Every other outcome (an error status, a copy error, an idle timeout, a client that went
+away, a stream that ended without its terminal events or with a count that could not be made
+whole, a stream with no audio) is `(audio_second, 0)`: the quantity is never a partial count.
+`audio_bytes` is unpriceable in Tier 3 until a coefficient declares that unit. A payload capture
 stores the request JSON as usual, since it carries the `input` text the opt-in exists
-for, and stores a **metadata summary instead of the WAV bytes** (content type, size,
-the metering headers), gated on the response's own `Content-Type`
+for, and stores a **metadata summary instead of the audio bytes** (content type, size,
+the metering headers), gated on the response's own `Content-Type`; a streamed response is
+`text/event-stream` or `application/octet-stream` and is still that redacted summary, because
+the capture's endpoint is stamped speech
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
 **7. Resolving a speech request writes the token's last-used-model marker, and the
@@ -844,10 +885,39 @@ The portal chat's speech composer reads the cache through the portal route (§12
 **9. The portal chat is a caller of this endpoint.** A chat thread of kind `speech`
 reaches `POST /v1/audio/speech` through the run executor, over the internal loopback pair
 with the run-as header, which is the leg this endpoint admits instead of a session
-cookie. The endpoint, its validation, its relay and its billing are unchanged; the chat
-takes the whole WAV, stores it as a chat blob and plays it back
+cookie. The endpoint, its validation, its relay and its billing are the public endpoint's
+own; the chat takes the whole WAV (a buffered run) or the assembled stream (item 3), stores it
+as a chat blob and plays it back
 ([§12](#12-in-portal-chat-playground),
-[ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).
+[ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs),
+[ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)).
+
+**10. The output byte rate is learned by the speech benchmark, never assumed.** A stream states
+no sample rate, so the constant that turns its bytes into seconds (the PCM **format** rate,
+`sampleRate × channels × bytesPerSample`, 88200 B/s for a 44.1 kHz mono 16-bit model — not a
+throughput) is observed once per mapping. The speech benchmark (`POST …/benchmark?mode=speech`,
+[HTTP API Surface](../reference/api-surface.md#1-inference--compatibility-endpoints))
+synthesizes one short non-stream clip **directly** through the provider's native relay on a
+plain text-to-speech mapping (not through the gateway's own loopback: the run holds the
+server's reservation, which excludes the server from routing, a scheduled or health-loop run
+has no principal, and the relay forwards none of audio.cpp's `X-AudioCPP-*` headers), reads the
+byte rate from the WAV `fmt` chunk and caches it in the generic per-mapping cache
+(`output_byte_rate`, a plain decimal; [Data
+Model](../reference/data-model.md#the-per-mapping-cache-table)). Only a **mono, 16-bit integer
+PCM** WAV is cached, because a byte rate alone cannot say what format it belongs to and a
+stream is played and stored as exactly that, so `sampleRate = byteRate ÷ 2` wherever a rate
+exists; a non-conforming model stays on `audio_bytes` and plays buffered. The design assumes
+the **streamed rate equals the buffered WAV's** (verified for the probed model, and required
+for any client to play headerless PCM). The rate is a property of the **model**, so a companion
+row (`output_byte_rate_model`) records the loaded-model identity it was measured under, and the
+health loop retires the rate and re-runs the benchmark when the identity changes. The health
+loop starts the benchmark for a loaded, plain-TTS mapping whose `speech_streaming` verdict is
+`yes` and that has no usable rate (an agent-launched child only while it is running, so a cold
+child is never started); a run that was started leaves the mapping alone for five minutes. A
+clone model is skipped (its synthesis needs a server-side reference WAV) and bills
+`audio_bytes`. The run also records a `kind=speech` history row with `ttft_ms`, `wall_ms` and
+`rtf` (migration 95): `ttft_ms` is the time to the first byte of a **non-stream** answer, so it
+is roughly synthesis plus any model cold start, not a streamed time to first audio.
 
 ### 3.7 OpenAI audio transcriptions
 
@@ -1497,9 +1567,16 @@ of that split: each pins `Stream` to `false`, so it always takes the buffered
 branch and is bounded by `target.Timeout` alone, with no idle watchdog at all. Because a diffusion
 request can legitimately occupy that whole budget without emitting anything,
 the application's `timeout_ms` is the only thing standing between a working
-long generation and a cancelled one — see §3.4. `/v1/audio/speech` is on that side
-too: it never sets `Stream` (a stream request is refused up front), so a long
-synthesis is bounded by the application's `timeout_ms` alone (§3.6). A **buffered**
+long generation and a cancelled one — see §3.4. A **one-shot** `/v1/audio/speech` is on that
+side too: it never sets `Stream`, so a long synthesis is bounded by the application's
+`timeout_ms` alone (§3.6). A **streamed** speech call (a `mode=streaming` model asked with
+`stream: true`, §3.6 item 3, [ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)) takes the streaming side exactly as a
+streaming transcription does: it sets `Stream`, so the idle watchdog governs once audio
+flows, behind the same **first-byte grace** (the larger of `timeout_ms` and the idle timeout,
+so a cold `mode=streaming` model's time to first audio is not cut short), and the relay
+forwards no `Content-Length`. Its copier hands each chunk to a byte-counting scan only
+**after** the chunk was written and flushed, so the stream is as unbuffered as without it;
+what the scan counts is what the call is billed on (§3.6 item 6). A **buffered**
 `/v1/audio/transcriptions` is on that side too, its `timeout_ms` covering the buffered read
 of the response body and the first call after a model load, which pays the model's warm-up
 (§3.7). A **streaming** transcription, by contrast, sets `Stream` and takes the streaming
@@ -2802,7 +2879,9 @@ A **streaming** transcription run is the exception on the transcription side:
 `transcriptionRunDeadline` bounds only the wait **until the first delta** (the cold
 `mode=streaming` warm-up), and once deltas flow the deadline is **lifted** and the relay's
 idle watchdog bounds liveness instead, exactly as a text run's visible-liveness makes it
-unbounded.
+unbounded. A **streaming speech** run is the same on the speech side
+([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): its executor arms `speechRunDeadline` itself and lifts it at the first
+chunk of audio), while a buffered speech run is bounded to its end as before.
 The deadline is applied in `executeRun`, the first point at which the kind is
 known, as a child of the reservation's context — so Stop still cancels it — and
 it is released on every terminal path, the ordinary success one included.
@@ -2844,8 +2923,9 @@ happened, so a cancel must not erase it either.
 above.** The text executor checkpoints, and so does the transcription executor **when it
 streams** (its streaming branch reuses the text run's delta/checkpoint plumbing,
 [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript));
-`executeImageRun`, `executeAudioRun` and a **buffered** `executeTranscriptionRun` each make
-one buffered request and have no periodic write —
+`executeImageRun`, `executeAudioRun` (a streaming speech run too: its audio events never enter
+the text buffer, so it has no checkpoint) and a **buffered** `executeTranscriptionRun` each make
+one request and have no periodic write —
 so a hung store reaches a text run (and a streaming transcription run) by two routes and an
 image, speech or buffered transcription run by one. Both bounds applying to text is
 therefore required rather than merely tolerated; a kilobyte text write that
@@ -3027,8 +3107,8 @@ shared header set's `Content-Type` as the edit hop does. `buildSpeechBody` sends
 (the thread's pinned model), `input` (the **last user message's text**) and, when set,
 `voice` and `speed`, plus the thread's advanced passthrough, and **no `response_format`**:
 the endpoint answers WAV when it is absent and refuses every other value (§3.6), so there
-is no format knob and the reply is always WAV. The run's knobs are a
-`ChatAudioSettings` (`voice`, `speed`, `passthrough`), persisted under `settings.audio` the
+is no format knob and the reply is always WAV (a streamed synthesis is assembled into one, below). The run's knobs are a
+`ChatAudioSettings` (`voice`, `speed`, `stream`, `passthrough`), persisted under `settings.audio` the
 way `kind` and `image` are (`omitempty`, and cleared server-side for any non-speech kind,
 so a text or image chat's stored and wire bytes are unchanged; a speech thread always
 emits the key, `{}` when empty):
@@ -3059,12 +3139,13 @@ emits the key, `{}` when empty):
 - **Advanced is a JSON passthrough.** One text box takes a JSON object whose keys are
   merged into the body verbatim as top-level fields (the OpenAI `instructions` field and
   audio.cpp's native knobs; each value keeps the JSON type the user wrote). `model`,
-  `input`, `stream` and `response_format` are **reserved**, matched ignoring case: a key
-  that names one ends the run `gateway.chat_run_speech_reserved_field` and **sends
+  `input`, `stream`, `stream_format` and `response_format` are **reserved**, matched ignoring
+  case: a key that names one ends the run `gateway.chat_run_speech_reserved_field` and **sends
   nothing**, since dropping the key and sending the rest would answer a request the user
-  did not make. `stream_format` is not reserved (the endpoint already refuses it, §3.6),
-  and a `voice` or `speed` passthrough key yields to the same field when the first-class
-  control is set. The composer refuses, on send and on replay, text that is not a JSON
+  did not make. (`stream_format` joined the list with streaming: the run states `stream` and
+  `stream_format` itself when it streams and omits both when it does not, and a passthrough
+  `stream_format=audio` would answer raw PCM in a shape the run does not parse.) A `voice` or
+  `speed` passthrough key yields to the same field when the first-class control is set. The composer refuses, on send and on replay, text that is not a JSON
   object (it would otherwise be omitted from the request in silence) and an object that
   names a reserved key (so a turn is not committed only to fail): the reserved list is
   copied to the client (`SPEECH_RESERVED_FIELDS`, matched ignoring case), the Advanced
@@ -3091,7 +3172,7 @@ is: a run always sends the thread's pinned model. Both-directions tests pin the 
 run codes and the speech endpoint codes, so a code added to the map without being named
 there fails. A deadline is the shared `gateway.chat_run_timeout`, never a cancel.
 
-**The speech wait and the audio answer.** During the run the bubble is
+**The speech wait and the audio answer.** During a buffered run (a streaming one is below) the bubble is
 `AudioPendingTurn`, the image wait's twin over a shared `RunPendingTurn`: liveness from the
 run's own status, a server-measured elapsed clock and one sentence saying no intermediate
 news is coming, with no progress figure, since the endpoint reports none. The finished turn
@@ -3112,6 +3193,57 @@ fetch guard `isFetchableUrl` is the same literal-prefix check the image download
 and is a same-origin, cookie-carrying `GET` of the user's own content, but it does not
 normalise path segments, so tightening it to the exact blob-id shape is a deferred
 hardening rather than a defect.
+
+**A speech run streams its audio when the gateway can stream the model
+([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)).** `executeAudioRun` keeps the buffered run above and gains
+a streaming branch, the transcription run's shape (below) on the output side: it POSTs `stream=true`
+with `stream_format=sse` (and no `response_format`) to the gateway's own `/v1/audio/speech` over
+the same loopback, so the relay and its metering are the public endpoint's (§3.6 items 3 and 6),
+reads the SSE (`consumeSpeechStream`), and commits **the same single `audio_url` part** the
+buffered run commits, a WAV assembled from the PCM (the canonical 44-byte header written with the
+cached rate) that `chat_blobs` stores as ever. It reuses the run's reservation, first-delta
+deadline (armed by the executor itself and **lifted at the first chunk of audio**, after which
+the relay's idle watchdog bounds liveness), TTFT metric and one terminal commit. It commits only
+a stream that ended with `speech.audio.done` then `[DONE]` and some audio: a stream cut short
+commits nothing (`gateway.chat_run_speech_response_unreadable`, or the run's own timeout or
+cancel when its context ended), and an empty one is `gateway.chat_run_no_audio`. The branch
+also handles a one-shot WAV answer, since the gateway answers a stream request buffered when its
+verdict has gone stale.
+
+- **The gate: stream only where the PCM is playable.** The composer asks `GET
+  /api/portal/model-speech-streaming?name=<model>` (`api.modelSpeechStreaming`, fail-closed: any
+  answer but a boolean `true` with a whole sample rate is "no streaming") and shows its "stream"
+  checkbox only on a `yes`. The gate is open only when **every** mapping a speech request for the
+  model could be routed to (the portal-visible plain-TTS ones, the voice picker's set) has a
+  `speech_streaming` verdict of `yes` **and** a usable cached output byte rate, and they agree
+  on it, the sample rate being half the byte rate (the cache holds only a mono 16-bit PCM rate,
+  §3.6 item 10). A route is chosen per request after the gate is asked, so a model with two
+  mappings streams only if it makes no difference which serves it. The run evaluates the gate
+  **again server-side** (`speechRunStreamRate`, for the model the request will route for, the
+  run-as token's override applied) and never takes the client's word: the toggle is a choice,
+  not an authority. Anything else is the buffered run, so the portal never plays PCM at an
+  unknown rate and never needs the `audio_bytes` path.
+- **On by default, opt-out.** `settings.audio.stream` is a pointer: absent means the default,
+  which streams where the gate allows, and only an explicit `false` is persisted, so an existing
+  thread's stored settings stay byte-identical. The client mirrors this (`audioSetting` writes
+  `stream` only when it is off).
+- **Progressive playback.** Each `speech.audio.delta` is published to the run's subscribers as a
+  new SSE event, **`audio`** (`{"audio": {"seq", "rate", "data"}}`: the chunk's base64 PCM
+  exactly as the stream carried it, numbered, with the sample rate), and **buffered nowhere**: not
+  in the run's text buffer, so never in a checkpoint, and not replayed by a `snapshot` (a late
+  subscriber is served the committed turn). `speechPlayback.ts` decodes each chunk and schedules
+  it on one shared `AudioContext` clock as an `AudioBufferSourceNode` started where the previous
+  one ends, which is gapless without an AudioWorklet. It plays only an **unbroken** stream from
+  chunk 0 at one rate, because the run's fan-out drops events for a subscriber whose buffer is
+  full (harmless for text, an audible gap for audio): the first irregularity, a context that is
+  not running (a tab that re-adopted the run without a gesture, whose queue would otherwise
+  play stale), or a format it cannot play abandons live playback for that run, and the
+  committed WAV, which is complete whatever a subscriber missed, is rendered by `AudioTurn` like
+  a buffered reply. While audio is playing live the pending bubble says so
+  (`AudioPendingTurn`'s `live` state) instead of "no intermediate news".
+- **The Models view and the benchmark.** A `speech_streaming` capability chip (shown on a `yes`
+  only) sits beside the speech chips in the Models view, and the benchmark section renders the
+  speech mode's results (§3.6 item 10) with the first-byte time named as including a cold start.
 
 **A transcription run is the speech run's inverse against `/v1/audio/transcriptions`
 ([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)).**
@@ -3367,8 +3499,8 @@ Every inference error response uses the gateway-wide envelope
 | `request.body_too_large` | 413 | an edit body over `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, a transcription body over `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, or either one over the agent router's 32 MiB once the gateway has prepared it (§10) |
 | `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) — an edit relays it the same way |
 | `speech.model_required` / `speech.input_required` | 400 | the speech body failed `validateSpeechRequest` (§3.6): no `model`, or no non-empty string `input` |
-| `speech.response_format_unsupported` | 400 | a `response_format` other than `wav` or absent — `mp3`, `opus`, `flac`, `aac`, `pcm`, `json`, `b64_json` and any non-string value (§3.6) |
-| `speech.stream_unsupported` | 400 | a speech request asking for a streamed response: `stream: true`, a non-boolean `stream`, or any `stream_format` (§3.6) |
+| `speech.response_format_unsupported` | 400 | on a request that does not stream, a `response_format` other than `wav` or absent — `mp3`, `opus`, `flac`, `aac`, `pcm`, `json`, `b64_json` and any non-string value; on a streamed request, one other than `pcm` or absent (§3.6) |
+| `speech.stream_unsupported` | 400 | a speech request whose stream fields the relay cannot honor: a non-boolean `stream`, a `stream_format` other than `sse` or `audio` or one on a request that does not stream, or `response_format=wav` beside `stream: true` (audio.cpp serves streaming only as `pcm`) (§3.6) |
 | `speech.upstream_error` | the upstream's own status | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"`; an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged (§3.6) |
 | `transcription.model_required` / `transcription.file_required` | 400 | the transcription form failed `validateTranscriptionRequest` (§3.7): no `model`, or no non-empty part named `file` |
 | `transcription.invalid` | 400 | a structurally broken form (§3.7): not `multipart/form-data` or no boundary (a JSON body included), a truncated or malformed part, a field over 1 MiB, a repeated single-use field, a body that could not be read — or **more than one** non-empty `file` part |
