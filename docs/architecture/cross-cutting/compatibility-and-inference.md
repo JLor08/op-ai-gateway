@@ -1881,15 +1881,30 @@ DTO's `transcription` flag (`ModelDTO.Transcription`) advertises the verdict to 
 exactly as `speech`; neither `/v1/models` nor the LM Studio `capabilities` object carries
 it, and the Models-view column stays ungated the same way.
 
+**A `speech_clone` refinement hides a voice-clone model from the chat picker.** The one
+audio.cpp task that decides `speech` and `transcription` also decides a third row,
+`speech_clone` (`clone` → yes, `tts` → no, nothing for a non-speech model), written by
+both producers of the `audiocpp_models` source and folded into the portal DTO's
+`speech_clone` flag (`ModelDTO.SpeechClone`, `speechCloneFlagsByName`). Unlike the folds
+above it is the fail-OPEN INVERSE — an OR across a model's mappings and a group's offerable
+members — because it answers "should the picker HIDE this?": a voice-clone model needs a
+reference voice a text-only speech composer cannot supply, so the chat excludes it (§12),
+while `speech` stays `true` so the direct `/v1/audio/speech` endpoint still serves it to a
+bearer client that can. It gates no route, no request requires it, and it is absent from
+`/v1/models` and the LM Studio listing, like `speech` and `transcription`
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (h), issue #252).
+
 **The portal listing carries `openai_images` and `openai_audio`; `/v1/models`
 deliberately carries neither.** Every listing keeps only the coarse flavors it knows
 (`knownAPIFlavors`: `anthropic`, `openai`, `openai_audio`, `openai_images`), so a model
 that is served only under `openai_images` reaches the portal's model DTO with
 `flavors: ["openai_images"]` — which is what lets the portal chat offer it
 (§12) — and a speech-only or transcription-only model with `flavors: ["openai_audio"]`,
-which the portal chat offers when it carries `speech: true` **or** `transcription: true`
-(its rule needs `openai`, or `openai_images` with `image`, or `openai_audio` with `speech`
-or `transcription`), so a transcription-only model is offered as a transcription turn.
+which the portal chat offers when it carries `speech: true` (and not `speech_clone: true`,
+§12) **or** `transcription: true`
+(its rule needs `openai`, or `openai_images` with `image`, or `openai_audio` with a
+non-clone `speech` or with `transcription`), so a transcription-only model is offered as a
+transcription turn.
 `/v1/models` keeps
 only the rows that carry `openai`, so the same models are **not** listed there (nor in
 `/api/v1/models`): that listing is what an external OpenAI client fills its *chat*
@@ -2571,10 +2586,15 @@ transcription-only model carries no `speech` flag, so the speech filter leaves i
 but the transcription filter admits it (next paragraph). A
 speech-capable model puts an empty thread into the speech composer
 (`prospectiveKind`), and a model that is both image- and speech-capable is an image
-model, image having been the kind first. A clone-task model carries the verdict too, since
-the verdict cannot tell it from a `tts` one, so it is offered, and used text-only it has
-no reference voice and may answer an upstream error
-([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (e), (h)).
+model, image having been the kind first. A **clone**-task model is the one speech model
+the picker leaves OUT: it carries a `speech_clone: true` flag (`ModelDTO.SpeechClone`,
+from the audio.cpp task's `clone` verdict, §9), and the speech filter admits a model only
+when `speech: true` **and not** `speech_clone: true`, because a clone model needs a
+reference voice this text-only composer cannot supply, so every send would fail upstream
+(the audio counterpart of the picker-offers-what-send-fails problem). It is still
+`speech: true`, so the direct `/v1/audio/speech` endpoint serves it for a bearer client
+that can supply the voice; only the chat affordance is withheld
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (e), (h), issue #252).
 
 **The picker also offers a transcription model, by the twin rule.** `chatModels` keeps a
 model whose offered flavors include `openai_audio` **and** whose `transcription` flag is

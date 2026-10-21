@@ -713,7 +713,13 @@ plausible-looking validation rule would break the normal case:
   distinct from both `audio` and `speech`), `transcription_streaming` (**not** a gate
   capability — no endpoint requires it; it decides up front whether the gateway streams or
   buffers a transcription, from the model's `mode` and for ASR models only,
-  [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript))
+  [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)),
+  `speech_clone` (also **not** a gate capability — it refines `speech` the way
+  `transcription_streaming` refines `transcription`, from the audio.cpp task
+  (`clone` → yes, `tts` → no) and for speech models only; the portal chat picker
+  reads it to EXCLUDE a voice-clone model, which a text-only composer cannot give
+  a reference voice, while the direct `/v1/audio/speech` endpoint still serves it,
+  [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (h), issue #252)
   and
   `image_edit` are the names the code itself reasons
   about — `image_edit` is **derived** from `image` at the gate and its only
