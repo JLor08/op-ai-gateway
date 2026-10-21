@@ -2945,10 +2945,10 @@ from 0.7.0 on (it already has the `/upstream/` route and refuses a suffix other 
 `runtime.model_not_managed` before 0.7.0 (no `/upstream` route at all, so the GET falls
 through to model routing). Either way the read cannot succeed, so the gateway sends it only
 to an agent that declared `runtime_voices`; a read sent to an older one would only add a
-silent no-op request each tick for as long as the model stayed loaded. A server on
-an agent without the flag (or one that has not reported since a gateway restart) simply has no cached voices,
-which the portal's picker handles fail-open (plain free text). The name is on the agent's
-list alone, spelled identically on both sides because the agent module imports nothing from
+silent no-op request each tick for as long as the model stayed loaded. A server on an
+agent without the flag (or one that has not reported since a gateway restart) simply has
+no cached voices, which the portal's picker handles fail-open (plain free text). The
+name is on the agent's list alone, spelled identically on both sides because the agent module imports nothing from
 the gateway (`gateway.RuntimeVoicesFeature` is exported for the health loop in
 `cmd/gateway`, the way `RuntimeUpstreamPropsFeature` is). `server-agent`'s `Version` moved
 `0.10.2` → `0.11.0` for this entry, MINOR per the same rule.

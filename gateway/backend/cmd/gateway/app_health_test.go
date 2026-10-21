@@ -5235,9 +5235,10 @@ func TestRunAppHealthOnceVoicesAgentEscapesTheModelInTheRouterPath(t *testing.T)
 
 // TestRunAppHealthOnceVoicesAgentWithoutTheFlagNeverFetches is the fail-closed
 // gate: an agent with no positive evidence of the voices route is NEVER asked,
-// because an older router answers 404 runtime.model_not_managed for it -- the
-// very answer it gives an unmanaged model -- so asking could not tell the two
-// apart and would only add a silent no-op GET per child per tick. "No evidence"
+// because an older router never serves the route and answers a 404
+// (runtime.upstream_endpoint_not_allowed from 0.7.0 on, runtime.model_not_managed
+// before 0.7.0), so asking could not succeed and would only add a silent no-op
+// GET per child per tick. "No evidence"
 // is an agent that declared other features only, one that declared none, a
 // server with no agent registry entry at all, and no registry bundle. The
 // control case, with the flag, proves the setup is otherwise fetch-capable.
