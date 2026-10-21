@@ -263,6 +263,15 @@ type ServerDeps struct {
 	// it at its own construction. Server never stores or reads this field. nil is
 	// correct for any Server built without cmd/gateway.
 	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
+	// SetSpeechRateTrigger is the same wiring conduit for the app-health loop: it
+	// binds the trigger the loop starts the speech rate benchmark with (#263). The
+	// loop is built together with the portal Service, before this Server exists, so
+	// its handle on the Server's TriggerSpeechRateBenchmark is empty until
+	// cmd/gateway's buildGatewayServer calls this ONCE with the just-built Server's
+	// method as the argument. Until then the loop's trigger answers false (nothing
+	// started) and the loop asks again on its next tick. Server never stores or reads
+	// this field. nil is correct for any Server built without cmd/gateway.
+	SetSpeechRateTrigger func(SpeechRateTrigger)
 	// OnAgentReactivated, when set, is invoked with the server id when that server's
 	// ServerAgent transitions inactive->active (see AgentPresenceRegistry.
 	// ReportReactivated), computed against the server's EFFECTIVE presence window.

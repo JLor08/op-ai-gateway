@@ -570,11 +570,7 @@ func (s *Server) cachedOutputByteRate(ctx context.Context, routeID string) (uint
 		if row.ScopeKey != "" {
 			continue
 		}
-		rate, err := strconv.ParseUint(strings.TrimSpace(row.Payload), 10, 32)
-		if err != nil || rate == 0 {
-			return 0, false // ParseUint returns its range maximum with an error: never hand that out as a rate
-		}
-		return uint32(rate), true
+		return routing.ParseOutputByteRate(row.Payload) // the one definition of a usable rate, shared with the health loop's gate
 	}
 	return 0, false
 }

@@ -100,6 +100,13 @@ type benchmarkTarget struct {
 	// attaches it to each server_agent target with mayPreStop; it is nil on
 	// every other target.
 	overrides *benchmarkOverrides
+	// rateIdentity is the loaded-model identity the app-health loop observed when it
+	// started a speech rate benchmark for this target (TriggerSpeechRateBenchmark):
+	// the string runSpeechTarget records beside the output byte rate it caches, so a
+	// later change of the model behind the mapping is told from "the rate is
+	// current". Empty on every other target -- a manual speech run knows none -- and
+	// then no identity is recorded.
+	rateIdentity string
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the

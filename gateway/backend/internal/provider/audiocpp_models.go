@@ -117,6 +117,18 @@ const (
 // be asked about. It decides no verdict and no verdict decides it: it is set by
 // the probe (fetchAudioCppModels), not by parseAudioCppModels, whose table is the
 // capability rule shared verbatim with the agent's copy.
+//
+// Path is the identity axis, set the same way as Loaded and for the same reason (the
+// one listing states it, and it is no part of the shared capability rule): the model
+// file the listing states for the model's id, verbatim, or "" for everything it does not
+// say -- no entry, no field, a null, a blank or non-string value, an unreadable body. A
+// rate measured on a model is a property of THAT model (the streamed speech billing
+// reads the output byte rate cached from a benchmark), and the model behind one id can
+// change under it (the server restarted with another file, the id re-pointed), which no
+// rename of the mapping signals; the health loop compares this string tick to tick to
+// notice. It decides no verdict and no verdict decides it, and an entry the server
+// lists as unloaded states its path too, so it is read whether or not the model is
+// loaded.
 type AudioCppVerdicts struct {
 	Speech                 string
 	Transcription          string
@@ -124,6 +136,7 @@ type AudioCppVerdicts struct {
 	SpeechClone            string
 	SpeechStreaming        string
 	Loaded                 bool
+	Path                   string
 }
 
 // AudioCppModelsProber is an optional provider capability: it GETs
@@ -179,32 +192,35 @@ func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target ro
 	if err != nil {
 		return AudioCppVerdicts{}, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	// The verdicts and the loaded flag are two reads of the one body: the
-	// verdicts are the capability rule, pinned by the table the agent's copy
-	// shares, and loaded is the health axis beside them (see AudioCppVerdicts).
-	// The listing is one small document per probe, so decoding it twice costs
-	// nothing worth coupling the two.
+	// The verdicts, the loaded flag and the path are three reads of the one body:
+	// the verdicts are the capability rule, pinned by the table the agent's copy
+	// shares, and loaded and the path are the health and identity axes beside them
+	// (see AudioCppVerdicts). The listing is one small document per probe, so
+	// decoding it three times costs nothing worth coupling them.
 	v := parseAudioCppModels(body, modelID)
 	v.Loaded = parseAudioCppLoaded(body, modelID)
+	v.Path = parseAudioCppPath(body, modelID)
 	return v, nil
 }
 
 // audioCppModelsDoc is the part of the listing this code reads: each entry's id,
-// task, mode and loaded. The rest of an entry (object, owned_by, family, path)
+// task, mode, loaded and path. The rest of an entry (object, owned_by, family)
 // answers no question this code asks and is left undecoded, so an unknown or
 // added field never breaks the read.
 //
-// Mode and Loaded are held raw and decoded on their own (audioCppStreamingVerdict,
-// audioCppLoadedFlag): a mode or a loaded of a type this code does not expect
-// must cost only the streaming verdicts or only the loaded flag, never the
-// speech and transcription verdicts the task decides, and a typed field would
-// fail the whole document's decode on one odd value.
+// Mode, Loaded and Path are held raw and decoded on their own
+// (audioCppStreamingVerdict, audioCppLoadedFlag, audioCppPathString): a mode, a
+// loaded or a path of a type this code does not expect must cost only the
+// streaming verdicts, only the loaded flag or only the path, never the speech and
+// transcription verdicts the task decides, and a typed field would fail the whole
+// document's decode on one odd value.
 type audioCppModelsDoc struct {
 	Data []struct {
 		ID     string          `json:"id"`
 		Task   string          `json:"task"`
 		Mode   json.RawMessage `json:"mode"`
 		Loaded json.RawMessage `json:"loaded"`
+		Path   json.RawMessage `json:"path"`
 	} `json:"data"`
 }
 
@@ -360,6 +376,44 @@ func audioCppLoadedFlag(raw json.RawMessage) bool {
 		return false
 	}
 	return loaded
+}
+
+// parseAudioCppPath returns the model file a /v1/models body states for modelID: the
+// first entry whose id is modelID, with a path that is a non-blank string, kept
+// verbatim. Like parseAudioCppLoaded it is tolerant -- it never fails -- and every
+// statement it cannot read is "": no entry for modelID, an empty modelID, an entry
+// without a path or with a null, a number or an object there, a blank string, an empty
+// data list, a body that is not the listing. The id match is exact, as in
+// parseAudioCppModels, so the two always speak of the same entry.
+//
+// The path is the identity axis (see AudioCppVerdicts.Path): it decides no capability
+// verdict, and an entry the server lists as unloaded states it too.
+func parseAudioCppPath(body []byte, modelID string) string {
+	if modelID == "" {
+		return ""
+	}
+	var doc audioCppModelsDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return ""
+	}
+	for _, entry := range doc.Data {
+		if entry.ID != modelID {
+			continue
+		}
+		return audioCppPathString(entry.Path)
+	}
+	return ""
+}
+
+// audioCppPathString maps one entry's raw path onto its string: the JSON string
+// itself, verbatim, unless it is blank. An absent field, a null and a value that is
+// not a string at all are "" -- an identity is never guessed.
+func audioCppPathString(raw json.RawMessage) string {
+	var path string
+	if err := json.Unmarshal(raw, &path); err != nil || strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return path
 }
 
 // audioCppStreamingVerdict maps one entry's raw mode onto a streaming verdict:

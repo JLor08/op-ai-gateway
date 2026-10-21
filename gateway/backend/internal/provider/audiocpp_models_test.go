@@ -276,6 +276,66 @@ func TestParseAudioCppLoaded(t *testing.T) {
 	}
 }
 
+// TestParseAudioCppPath pins the identity axis the prober reports beside the verdicts:
+// the model file the listing states for THIS id. The health loop compares it tick to
+// tick to notice that the model behind one name changed, so it must be the entry's own
+// string, verbatim, and everything the listing does not say (no entry, no field, a
+// null, a field of the wrong type, a blank path, a body that is not the listing) is
+// the empty string -- "no statement", never a guessed identity.
+//
+// Like the loaded flag it is a SEPARATE table from audioCppModelCases: it is not part
+// of the capability rule the agent's copy shares.
+func TestParseAudioCppPath(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  string
+		model string
+		want  string
+	}{
+		{"the path of the named entry", `{"data":[{"id":"m","task":"tts","path":"/models/a.gguf"}]}`, "m", "/models/a.gguf"},
+		{"the real v0.9.1 entry", audioCppLiveListing, "pocket_tts_english_bf16", "/models/pocket_tts_english_bf16.gguf"},
+		{"an unloaded entry states its path too", `{"data":[{"id":"m","loaded":false,"path":"/models/a.gguf"}]}`, "m", "/models/a.gguf"},
+		{"the entry is picked out by id", `{"data":[{"id":"a","path":"/a"},{"id":"b","path":"/b"},{"id":"c","path":"/c"}]}`, "b", "/b"},
+		{"a sibling's path does not leak", `{"data":[{"id":"a","path":"/a"},{"id":"b"}]}`, "b", ""},
+		{"the path is kept verbatim", `{"data":[{"id":"m","path":" /Models/A b.gguf "}]}`, "m", " /Models/A b.gguf "},
+		{"path absent", `{"data":[{"id":"m","task":"tts"}]}`, "m", ""},
+		{"path null", `{"data":[{"id":"m","path":null}]}`, "m", ""},
+		{"path blank", `{"data":[{"id":"m","path":"   "}]}`, "m", ""},
+		{"path as a number is not a path", `{"data":[{"id":"m","path":7}]}`, "m", ""},
+		{"path as an object is not a path", `{"data":[{"id":"m","path":{"p":"/a"}}]}`, "m", ""},
+		{"model absent from the listing", `{"data":[{"id":"other","path":"/o"}]}`, "m", ""},
+		{"id match is exact, not a prefix", `{"data":[{"id":"pocket_tts_english_bf16","path":"/p"}]}`, "pocket_tts", ""},
+		{"an empty model id never matches", `{"data":[{"id":"","path":"/p"}]}`, "", ""},
+		{"empty data", `{"data":[]}`, "m", ""},
+		{"not JSON", `<html>502</html>`, "m", ""},
+		{"empty body", ``, "m", ""},
+		{"the first entry carrying the id answers", `{"data":[{"id":"m"},{"id":"m","path":"/second"}]}`, "m", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseAudioCppPath([]byte(tc.body), tc.model); got != tc.want {
+				t.Fatalf("parseAudioCppPath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeAudioCppModelsOddPathCostsOnlyPath: a path of a type this code does not
+// expect must cost only Path, never the verdicts the task decides or the loaded flag.
+func TestProbeAudioCppModelsOddPathCostsOnlyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","task":"tts","mode":"streaming","loaded":true,"path":["/a"]}]}`))
+	}))
+	defer srv.Close()
+	got, err := NewOpenAICompatibleClient(srv.Client()).ProbeAudioCppModels(context.Background(), routing.Target{Endpoint: srv.URL}, "m")
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	want := AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes, Loaded: true}
+	if got != want {
+		t.Fatalf("got %+v, want %+v (an odd path type must not cost the verdicts or the loaded flag)", got, want)
+	}
+}
+
 // TestProbeAudioCppModelsOddLoadedCostsOnlyLoaded: a loaded field of a type this
 // code does not expect must cost only Loaded, never the verdicts the task
 // decides (the mode precedent), because a capability "no" or "yes" must not
@@ -348,8 +408,8 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if err != nil {
 			t.Fatalf("error = %v", err)
 		}
-		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo, Loaded: true}); got != want {
-			t.Fatalf("got %+v, want %+v (the live entry is a loaded tts model: speech_clone no, mode offline so speech_streaming no, but no transcription streaming verdict)", got, want)
+		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo, Loaded: true, Path: "/models/pocket_tts_english_bf16.gguf"}); got != want {
+			t.Fatalf("got %+v, want %+v (the live entry is a loaded tts model: speech_clone no, mode offline so speech_streaming no, but no transcription streaming verdict; its path is the identity axis)", got, want)
 		}
 		if method != http.MethodGet || path != "/v1/models" {
 			t.Fatalf("request = %s %s, want GET /v1/models", method, path)
@@ -524,7 +584,7 @@ func TestMultiplexerDispatchesAudioCppModelsToOpenAICompatibleClient(t *testing.
 	if err != nil {
 		t.Fatalf("ProbeAudioCppModels(audio_cpp) returned %v", err)
 	}
-	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo, Loaded: true}); got != want {
+	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo, Loaded: true, Path: "/models/pocket_tts_english_bf16.gguf"}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
 	if len(paths) != 1 || paths[0] != "/v1/models" {

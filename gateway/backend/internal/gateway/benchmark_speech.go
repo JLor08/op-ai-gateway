@@ -223,6 +223,9 @@ func (s *Server) runSpeechTarget(ctx context.Context, tgt benchmarkTarget) Bench
 	if err == nil {
 		err = s.cacheOutputByteRate(ctx, tgt.mapping.ID, m.byteRate)
 	}
+	if err == nil {
+		s.recordRateIdentity(ctx, tgt)
+	}
 	row := routing.BenchmarkRun{
 		MappingID: tgt.mapping.ID,
 		ServerID:  tgt.server.ID,
@@ -240,6 +243,32 @@ func (s *Server) runSpeechTarget(ctx context.Context, tgt benchmarkTarget) Bench
 		slog.Warn("speech benchmark: history row write failed", "mapping_id", tgt.mapping.ID, "err", herr)
 	}
 	return res
+}
+
+// recordRateIdentity stores the loaded-model identity the rate just cached was measured
+// under, as the mapping's routing.ModelMappingCacheOutputByteRateModel row (scope "").
+// It runs only after the rate itself was written -- so a crash between the two leaves a
+// rate with no identity, which the health loop adopts, and never an identity vouching
+// for a rate that was not written -- and only for a target that carries one: a manual
+// run (no identity known) writes nothing and leaves a stored identity as it was.
+//
+// It is best-effort. The rate is already cached and valid, so a failed identity write is
+// logged and is not the run's failure: the health loop sees a rate with no matching
+// identity on its next tick and settles it (adopts the observed identity, or re-derives
+// the rate when the model really changed).
+func (s *Server) recordRateIdentity(ctx context.Context, tgt benchmarkTarget) {
+	if tgt.rateIdentity == "" {
+		return
+	}
+	err := s.Routes.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+		MappingID: tgt.mapping.ID,
+		CacheType: routing.ModelMappingCacheOutputByteRateModel,
+		Payload:   tgt.rateIdentity,
+		UpdatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		slog.Warn("speech benchmark: the rate's model identity could not be recorded; the health loop settles it on its next tick", "mapping_id", tgt.mapping.ID, "err", err)
+	}
 }
 
 // cacheOutputByteRate stores a mapping's output byte rate as its
