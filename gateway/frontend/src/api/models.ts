@@ -696,6 +696,17 @@ export function modelsApi(fetcher: Fetcher) {
         fetcher,
         `/api/portal/model-image-options?name=${encodeURIComponent(name)}`,
       ).then((r) => r.data),
+    // The voice names the gateway has cached for a speech model (the deduped union
+    // across everything the name resolves to), for the chat's voice picker. Global
+    // (gateway:use); name is a query param like modelServers. An empty list means
+    // "none known" -- no cache yet, an unknown or not-visible name, a non-speech model
+    // -- and is never an error; a malformed answer reads as empty too, so the picker
+    // degrades to plain free text instead of breaking the settings panel.
+    modelVoices: (name: string) =>
+      request<{ voices?: string[] }>(
+        fetcher,
+        `/api/portal/model-voices?name=${encodeURIComponent(name)}`,
+      ).then((r) => r.voices ?? []),
     // Every (model, server) a model GROUP can serve (its flattened members), with a
     // live rank across the whole group's candidate list. Global (gateway:use); no
     // SSE — the group-detail view polls this like the model-detail Prio column.

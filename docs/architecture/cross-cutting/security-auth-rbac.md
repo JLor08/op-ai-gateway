@@ -12,23 +12,26 @@ different trust boundary:
 |---|---|---|---|
 | Portal session | The browser SPA | `op_ai_gateway_session` cookie + `X-OP-CSRF` header on unsafe methods | `internal/gateway/auth.go` (`authenticateWeb`) |
 | Bearer API token | External OpenAI/Anthropic-compatible clients, Codex, Claude Code, service integrations | `Authorization: Bearer <secret>` | `internal/auth.TokenStore`, `internal/gateway/server.go` (`authenticate`) |
-| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech` and `/v1/audio/transcriptions` only) |
+| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions` and `/v1/audio/voices` only) |
 | Agent token | The `op-ai-server-agent` reporting/proxy process on each AI server | `Authorization: Bearer <agent-secret>` against a separate token universe | `internal/gateway/agent_auth.go` |
 
 `/v1/chat/completions` (and its `/openai/v1/` alias) is the one inference
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
 token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`,
-`/v1/images/edits`, `/v1/audio/speech` and `/v1/audio/transcriptions` (and their
-`/openai/v1/` aliases) accept
+`/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions` and
+`/v1/audio/voices` (and their `/openai/v1/` aliases) accept
 **either** the internal trusted-loopback pair **or** a bearer token, but never a portal
 session cookie: they are reachable by the gateway's own background executor over
 loopback, never by a logged-in browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
-`internal/gateway/auth_internal_or_bearer.go`; speech is the third user of that leg and
-transcription the fourth. The portal chat's `speech` run kind calls `/v1/audio/speech`
+`internal/gateway/auth_internal_or_bearer.go`; speech is the third user of that leg,
+transcription the fourth and the cache-backed voices listing the fifth: a browser reads
+the same cache through the session-cookie `GET /api/portal/model-voices` instead,
+[ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter).
+The portal chat's `speech` run kind calls `/v1/audio/speech`
 over the loopback pair ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)),
 and the `transcription` run kind calls `/v1/audio/transcriptions` over it the same way
 ([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)),
-so each audio endpoint now has a portal loopback caller,
+so each of those two audio endpoints now has a portal loopback caller (the voices listing has none),
 [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
 [ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)). Every remaining inference
 endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
@@ -357,7 +360,7 @@ flowchart TD
     P -- no/invalid bearer --> X2
     P -- pass --> L
 
-    D -- "/v1/images/generations, /v1/images/edits,\n/v1/audio/speech, /v1/audio/transcriptions\n(/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
+    D -- "/v1/images/generations, /v1/images/edits,\n/v1/audio/speech, /v1/audio/transcriptions,\n/v1/audio/voices (/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
     R -- yes --> S["Loopback principal\n(session-shaped, never elevated)"]
     R -- no --> T{"Authorization: Bearer present?"}
     T -- yes --> U["Bearer principal\n(TokenStore.LookupBearer)"]
@@ -371,8 +374,8 @@ flowchart TD
     Q -- pass --> L
 ```
 
-Note that `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech` and
-`/v1/audio/transcriptions` resolve their principal through `authenticateInternalOrBearer` (`auth_internal_or_bearer.go`)
+Note that `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`,
+`/v1/audio/transcriptions` and `/v1/audio/voices` resolve their principal through `authenticateInternalOrBearer` (`auth_internal_or_bearer.go`)
 rather than through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
 duplicated: both entry points call the same `loopbackPrincipal`
 (`internal/gateway/auth.go`), so the constant-time secret comparison and its

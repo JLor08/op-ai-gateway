@@ -126,6 +126,7 @@ var migrations = []migration{
 	{version: 91, name: "vendor_account_admin_groups", up: migration91Up},
 	{version: 92, name: "resource_group_vendor_accounts", up: migration92Up},
 	{version: 93, name: "runtime_spec_config_files", up: migration93Up},
+	{version: 94, name: "model_mapping_cache", up: migration94Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4185,4 +4186,51 @@ func migration92Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // keeps it re-runnable on both dialects.
 func migration93Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "config_files text not null default ''")
+}
+
+// migration94Up creates model_mapping_cache (#251) -- a GENERAL per-mapping
+// cache of facts the gateway learned about a mapping's model, whose first
+// consumer is the TTS voice list (cache_type "voices", an empty scope_key, one
+// row per mapping). A later consumer adds a cache_type value, not a table.
+//
+// The key is (mapping_id, cache_type, scope_key); scope_key is the empty string
+// for a payload that is simply "the mapping's X", so the key columns are all
+// `not null` (a NULL in a primary-key column would be a distinct key on SQLite
+// and rejected on Postgres). mapping_id is a real foreign key that cascades, so
+// deleting a mapping drops its cached payloads on both SQL drivers -- the same
+// shape as model_mapping_capabilities (migration 78) -- and the store layer
+// additionally drops the rows when a mapping's app_model_name changes.
+//
+// payload is `text`, ADR-005's wide type for a string value (an unbounded text
+// column on both dialects, never a sized one): the cached JSON can outgrow any
+// fixed width as a model's voice list grows. It defaults to the empty string,
+// which is a legitimate payload ("fetched, nothing to offer"), so a row never
+// needs NULL. updated_at is dl.timestampType() (timestamptz on Postgres), the
+// same substitution migration78Up makes for checked_at.
+//
+// Append-only: it does NOT touch baselineCreateStatements, FROZEN as of v60, so
+// the table lives only here -- the discipline migration78Up, migration82Up and
+// migration87Up follow. Both statements are if-not-exists so the step is
+// replayable on both dialects. The explicit mapping_id index follows the
+// sibling child tables' convention (idx_chat_blobs_chat) and names the access
+// path every reader and the delete-by-mapping use; the primary key's leading
+// column would serve it too, so the index is cheap redundancy, not a need.
+func migration94Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	stmts := []string{
+		`create table if not exists model_mapping_cache (
+			mapping_id text not null references model_mappings(id) on delete cascade,
+			cache_type text not null,
+			scope_key text not null default '',
+			payload text not null default '',
+			updated_at ` + dl.timestampType() + ` not null,
+			primary key (mapping_id, cache_type, scope_key)
+		)`,
+		`create index if not exists idx_model_mapping_cache_mapping on model_mapping_cache(mapping_id)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -302,7 +302,20 @@ import (
 // the rule makes it a PATCH: agent.Features gains NO entry and no wire shape changes
 // (the same open-vocabulary verdict on the same source, only the task string it keys
 // on is corrected).
-const Version = "0.10.2"
+//
+// 0.10.2 -> 0.11.0 is the single bump for the voices-model-cache branch (issue
+// #251): the runtime router gains GET /upstream/{model}/v1/audio/voices, a
+// Status-only, never-start passthrough to a running audio.cpp child's voice
+// listing, so the gateway can cache the voices an agent-launched TTS model offers
+// (the gateway talks to the router, never to the child). MINOR, and the rule
+// decides it: agent.Features gains "runtime_voices", the name the gateway checks,
+// fail-closed, before it fetches a child's voices -- an older router never
+// serves the route and answers a 404 (runtime.upstream_endpoint_not_allowed from
+// 0.7.0 on, runtime.model_not_managed before 0.7.0), so the read cannot succeed
+// there. The agent itself gates nothing on it. The same
+// reasoning made 0.7.0 (runtime_upstream_props), 0.8.0 (runtime_ensure), 0.9.0
+// (multipart_proxy) and 0.10.0 (runtime_config_files) a MINOR.
+const Version = "0.11.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

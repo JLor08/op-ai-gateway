@@ -224,8 +224,44 @@ func (s *SQLiteStore) CreateMapping(ctx context.Context, mapping routing.ModelMa
 	return nil
 }
 
+// updateMappingRow runs one `update model_mappings` statement (query/args, the
+// caller's own column list) for UpdateMapping and UpdateMappingEditable -- the
+// two writers of app_model_name -- together with the cache invalidation they
+// owe it: the mapping's model_mapping_cache rows are dropped when the incoming
+// app_model_name differs from the stored one. Both run in ONE transaction,
+// delete first (so the stored name it compares against is still the old one),
+// which makes the pair atomic: an update the database refuses (unknown
+// application, name conflict, missing mapping) rolls the delete back, so only a
+// rename that actually landed invalidates anything. label prefixes the wrapped
+// error ("update mapping", "update mapping editable"), as each writer's own
+// message did before the transaction was introduced.
+func (s *SQLiteStore) updateMappingRow(ctx context.Context, mapping routing.ModelMapping, label, query string, args ...any) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin %s: %w", label, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := s.deleteModelMappingCacheIfRenamed(ctx, tx, mapping.ID, mapping.AppModelName); err != nil {
+		return err
+	}
+	result, err := s.execOn(ctx, tx, query, args...)
+	if err != nil {
+		if s.dl.isForeignKeyViolation(err) {
+			return ErrNotFound
+		}
+		if s.dl.isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	if err := requireAffected(result); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMapping) error {
-	result, err := s.exec(ctx, `
+	return s.updateMappingRow(ctx, mapping, "update mapping", `
 		update model_mappings
 		set application_id = ?, gateway_model_name = ?, app_model_name = ?,
 			status = ?, gen_tokens_per_second = ?, prompt_tokens_per_second = ?,
@@ -252,16 +288,6 @@ func (s *SQLiteStore) UpdateMapping(ctx context.Context, mapping routing.ModelMa
 		mapping.UpdatedAt,
 		mapping.ID,
 	)
-	if err != nil {
-		if s.dl.isForeignKeyViolation(err) {
-			return ErrNotFound
-		}
-		if s.dl.isUniqueViolation(err) {
-			return ErrConflict
-		}
-		return fmt.Errorf("update mapping: %w", err)
-	}
-	return requireAffected(result)
 }
 
 // ptrWhen returns &v when cond, else nil -- the "supply this value or leave it
@@ -281,7 +307,8 @@ func ptrWhen[T any](cond bool, v T) *T {
 // metric is supplied; otherwise they too keep the probe's provenance. Unlike
 // the narrow probe writers there is NO metrics_locked guard: the operator owns
 // these columns (a manual value on a locked mapping is exactly what the supplied
-// metrics express).
+// metrics express). Like UpdateMapping it drops the mapping's cache rows when
+// app_model_name changes -- see updateMappingRow.
 func (s *SQLiteStore) UpdateMappingEditable(ctx context.Context, mapping routing.ModelMapping, metrics routing.MappingMetricsMask) error {
 	// A per-column COALESCE(?, col): a NULL arg keeps the stored value, a
 	// non-NULL one writes it. Passing a nil pointer for an unsupplied metric is
@@ -295,7 +322,7 @@ func (s *SQLiteStore) UpdateMappingEditable(ctx context.Context, mapping routing
 		src = &mapping.MetricsSource
 		srcAt = mapping.MetricsUpdatedAt
 	}
-	result, err := s.exec(ctx, `
+	return s.updateMappingRow(ctx, mapping, "update mapping editable", `
 		update model_mappings
 		set application_id = ?, gateway_model_name = ?, app_model_name = ?, status = ?,
 			metrics_locked = ?, updated_at = ?,
@@ -327,16 +354,6 @@ func (s *SQLiteStore) UpdateMappingEditable(ctx context.Context, mapping routing
 		src, srcAt,
 		mapping.ID,
 	)
-	if err != nil {
-		if s.dl.isForeignKeyViolation(err) {
-			return ErrNotFound
-		}
-		if s.dl.isUniqueViolation(err) {
-			return ErrConflict
-		}
-		return fmt.Errorf("update mapping editable: %w", err)
-	}
-	return requireAffected(result)
 }
 
 // UpdateMappingContextProbe sets a mapping's context_size + provenance from a

@@ -966,6 +966,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, routing.ErrNoHealthyHost) {
 		message = "no healthy host for requested model"
 	}
+	if errors.Is(err, routing.ErrVoiceUnavailable) {
+		message = "no usable server offers the requested voice right now"
+	}
 	if errors.Is(err, routing.ErrAdmissionQueueTimeout) {
 		message = "capacity queue timed out"
 	}
@@ -1049,7 +1052,10 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, errTranscriptionTooLarge) {
 		return http.StatusRequestEntityTooLarge
 	}
-	if errors.Is(err, routing.ErrNoHealthyHost) {
+	// ErrVoiceUnavailable is ErrNoHealthyHost's narrower twin (the servers that offer
+	// the requested voice are all down or busy), so it is the same 503: a retry, or
+	// the voice's servers coming back, is what cures it.
+	if errors.Is(err, routing.ErrNoHealthyHost) || errors.Is(err, routing.ErrVoiceUnavailable) {
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusBadGateway
@@ -1071,6 +1077,8 @@ func completionErrorCode(err error) string {
 		return codeRequestBodyTooLarge
 	case errors.Is(err, routing.ErrNoHealthyHost):
 		return routing.ErrNoHealthyHost.Error()
+	case errors.Is(err, routing.ErrVoiceUnavailable):
+		return routing.ErrVoiceUnavailable.Error()
 	case errors.Is(err, routing.ErrAdmissionQueueTimeout):
 		return routing.ErrAdmissionQueueTimeout.Error()
 	case errors.Is(err, routing.ErrAdmissionQueueFull):

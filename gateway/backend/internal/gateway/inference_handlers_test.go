@@ -310,7 +310,7 @@ func TestPreflightRedirectsACapabilityCarryingRequestOnlyToACapableCandidate(t *
 // forgot it would both skip the gate and become routable to a vendor model of
 // the same name.
 func TestSpeechInferenceShapeIsTheSpeechEndpointsIdentity(t *testing.T) {
-	shape := speechInferenceShape("tts-voice")
+	shape := speechInferenceShape("tts-voice", "")
 	if shape.apiFlavor != "openai_audio" {
 		t.Fatalf("apiFlavor = %q, want exactly openai_audio", shape.apiFlavor)
 	}
@@ -323,6 +323,9 @@ func TestSpeechInferenceShapeIsTheSpeechEndpointsIdentity(t *testing.T) {
 	if !reflect.DeepEqual(shape.requiredCapabilities, []string{routing.CapabilitySpeech}) {
 		t.Fatalf("requiredCapabilities = %v, want [%s]", shape.requiredCapabilities, routing.CapabilitySpeech)
 	}
+	if shape.requiredVoice != "" {
+		t.Fatalf("requiredVoice = %q, want none for a request that names no voice", shape.requiredVoice)
+	}
 }
 
 // TestPreflightRedirectsASpeechRequestOnlyToACapableCandidate is the images
@@ -333,7 +336,7 @@ func TestPreflightRedirectsASpeechRequestOnlyToACapableCandidate(t *testing.T) {
 	fp := &fakeOfferingPortal{off: offeringWithIncapable([]string{"voice-model"}, []string{"text-model"})}
 	s := &Server{Portal: fp}
 	token := auth.Token{UnknownModelRedirect: true, LastUsedModel: "text-model", UnknownModelFallback: "voice-model"}
-	pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil, speechInferenceShape("totally-unknown"))
+	pf, handled := s.inferencePreflight(httptest.NewRecorder(), newInferenceRequest(t), token, nil, speechInferenceShape("totally-unknown", ""))
 	if handled {
 		t.Fatal("preflight refused the request")
 	}

@@ -258,11 +258,14 @@ const de = {
   chatSpeechNoImageInput:
     'Dieses Modell spricht Text; eine Sprachsynthese nimmt keine Bilder als Eingabe entgegen.',
   // The speech-thread settings panel, shown in place of the text-chat controls. The
-  // voice is free text (audio.cpp does not list its voices) with the model's own
-  // default as placeholder, never written; a blank speed leaves the model's rate. The
-  // output is always WAV, so there is no format control, only the static hint.
+  // voice is a combobox over the voices the gateway has cached for the model, and
+  // still free text (the hint says so, and only shows while there is a list), with the
+  // model's own default as placeholder, never written; a blank speed leaves the
+  // model's rate. The output is always WAV, so there is no format control, only the
+  // static hint.
   chatSpeechVoice: 'Stimme',
   chatSpeechVoiceDefault: 'Standard (Modell)',
+  chatSpeechVoiceHint: 'Eine Stimme aus der Liste wählen oder einen Namen eintippen',
   chatSpeechSpeed: 'Geschwindigkeit',
   chatSpeechFormatHint: 'Das Audio wird immer als WAV zurückgegeben.',
   // The collapsible "Advanced" section: extra request fields as a JSON object (the
@@ -3526,6 +3529,7 @@ const en: PortalMessages = {
     'This model speaks text; speech synthesis does not accept images as input.',
   chatSpeechVoice: 'Voice',
   chatSpeechVoiceDefault: 'Default (model)',
+  chatSpeechVoiceHint: 'Pick a voice from the list or type a name',
   chatSpeechSpeed: 'Speed',
   chatSpeechFormatHint: 'The audio is always returned as WAV.',
   chatSpeechAdvanced: 'Advanced',

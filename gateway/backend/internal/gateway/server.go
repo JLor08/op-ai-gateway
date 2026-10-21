@@ -459,8 +459,8 @@ type Server struct {
 	// (auth.go); its two callers are authenticateWeb (auth.go, for
 	// /v1/chat/completions and every Portal/Admin/System route) and
 	// authenticateInternalOrBearer (auth_internal_or_bearer.go, for
-	// /v1/images/generations, /v1/images/edits, /v1/audio/speech and
-	// /v1/audio/transcriptions only), which
+	// /v1/images/generations, /v1/images/edits, /v1/audio/speech,
+	// /v1/audio/transcriptions and /v1/audio/voices only), which
 	// differ in what they fall back to and in nothing else. internalAuthSecret
 	// empty disables the branch entirely (fail-closed) for both, because the
 	// check is the same code.
@@ -1338,6 +1338,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/audio/speech", s.handleOpenAISpeech)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions", s.handleOpenAITranscription)
+	s.mux.HandleFunc("/openai/v1/audio/voices", s.handleAudioVoices)
+	s.mux.HandleFunc("/v1/audio/voices", s.handleAudioVoices)
 	s.mux.HandleFunc("/openai/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("/openai/api/v1/models", s.handleLMStudioV1Models)
@@ -1377,6 +1379,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/model-servers", s.handlePortalModelServers)
 	s.mux.HandleFunc("/api/portal/model-servers/events", s.handlePortalModelServersEvents)
 	s.mux.HandleFunc("/api/portal/model-image-options", s.handlePortalModelImageOptions)
+	s.mux.HandleFunc("/api/portal/model-voices", s.handlePortalModelVoices)
 	s.mux.HandleFunc("/api/portal/model-group-servers", s.handlePortalModelGroupServers)
 	s.mux.HandleFunc("/api/portal/servers", s.handlePortalServers)
 	s.mux.HandleFunc("/api/portal/servers/", s.handlePortalServerItem)

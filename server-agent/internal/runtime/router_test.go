@@ -1452,8 +1452,9 @@ func TestRouterUpstreamPropsUnknownModelAndNilManager(t *testing.T) {
 	}
 }
 
-// TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints: /props is the entire
-// allowlist. A running child must see ZERO traffic for a refused path.
+// TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints: /props and
+// /v1/audio/voices are the entire allowlist (the two entries of
+// upstreamEndpoints). A running child must see ZERO traffic for any other path.
 func TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints(t *testing.T) {
 	var hits atomic.Int32
 	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1481,16 +1482,16 @@ func TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints(t *testing.T) {
 
 // TestRouterUpstreamPropsNonGETFallsThroughToBodyDispatch: the M9 contract --
 // the new case is isGet-guarded, so a POST at the same path lands in
-// serveProxy's body-dispatch path, NOT serveUpstreamProps. A body-less POST
+// serveProxy's body-dispatch path, NOT serveUpstream. A body-less POST
 // can't tell the two apart (serveProxy's own empty-model 404 and
-// serveUpstreamProps' allowlist refusal are indistinguishable against an
+// serveUpstream's allowlist refusal are indistinguishable against an
 // empty-statuses fake), so this drives a named model through a RUNNING
 // status entry: a POST with body {"model":"m"} must reach servePlainProxy
 // and call EnsureRunning (asserted via the fake's counter) -- something
-// serveUpstreamProps never does -- and must NEVER reach the running child
+// serveUpstream never does -- and must NEVER reach the running child
 // directly (asserted via the child's own hit counter), which is what would
 // happen if the isGet guard were missing and the request fell into
-// serveUpstreamProps instead.
+// serveUpstream instead.
 func TestRouterUpstreamPropsNonGETFallsThroughToBodyDispatch(t *testing.T) {
 	var hits atomic.Int32
 	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1511,10 +1512,10 @@ func TestRouterUpstreamPropsNonGETFallsThroughToBodyDispatch(t *testing.T) {
 		t.Fatalf("code = %q, want runtime.model_not_managed (statusManager.EnsureRunning's own sentinel -- proof of fall-through)", code)
 	}
 	if n := m.ensures.Load(); n != 1 {
-		t.Fatalf("EnsureRunning called %d times, want 1 -- the POST must drive servePlainProxy's EnsureRunning call, which serveUpstreamProps never makes", n)
+		t.Fatalf("EnsureRunning called %d times, want 1 -- the POST must drive servePlainProxy's EnsureRunning call, which serveUpstream never makes", n)
 	}
 	if got := hits.Load(); got != 0 {
-		t.Fatalf("child hits = %d, want 0 -- a POST must never reach the running child directly through serveUpstreamProps", got)
+		t.Fatalf("child hits = %d, want 0 -- a POST must never reach the running child directly through serveUpstream", got)
 	}
 }
 
@@ -1597,4 +1598,186 @@ func TestRouterUpstreamPropsRunningEntryWinsAmongDuplicates(t *testing.T) {
 			t.Fatalf("second child hits = %d, want 0 -- the first running entry must win outright, never the second", got)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// GET /upstream/{model}/v1/audio/voices (issue #251): the second endpoint on
+// the allowlisted, never-starting /upstream passthrough, behind the
+// runtime_voices feature flag.
+// ---------------------------------------------------------------------------
+
+// TestServeVoicesRelaysWhenRunning: a RUNNING audio.cpp child's voice listing
+// comes back through the router byte-verbatim. The child sees the path EXACTLY
+// /v1/audio/voices (never the inbound /upstream path) and NO query: audio.cpp
+// ignores ?model= (it answers for the model it has loaded), so the model in the
+// request only picks the child. The per-spec token headers are forwarded, the
+// model id carries a slash (HF style), and EnsureRunning is never called.
+func TestServeVoicesRelaysWhenRunning(t *testing.T) {
+	const body = `{"voices":["demo_1_man","demo_3_woman"]}`
+	var hits atomic.Int32
+	var gotMethod, gotPath, gotQuery, gotAuth, gotKey string
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.RawQuery
+		gotAuth, gotKey = r.Header.Get("Authorization"), r.Header.Get("X-Api-Key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer child.Close()
+
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "org/tts", State: StateRunning, Port: childPort(t, child.URL)}}}
+	rt := newRouter(m)
+
+	req := httptest.NewRequest(http.MethodGet, "/upstream/org/tts/v1/audio/voices?model=ignored", nil)
+	req.Header.Set("Authorization", "Bearer spec-tok")
+	req.Header.Set("X-Api-Key", "raw-tok")
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("child hits = %d, want 1", got)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v1/audio/voices" {
+		t.Fatalf("child saw %s %q, want GET exactly /v1/audio/voices (the inbound /upstream path must never be forwarded)", gotMethod, gotPath)
+	}
+	if gotQuery != "" {
+		t.Fatalf("child saw query %q, want none (audio.cpp ignores ?model=; the request's model only selects the child)", gotQuery)
+	}
+	if gotAuth != "Bearer spec-tok" || gotKey != "raw-tok" {
+		t.Fatalf("credentials not forwarded verbatim: Authorization=%q X-Api-Key=%q", gotAuth, gotKey)
+	}
+	if rec.Body.String() != body {
+		t.Fatalf("body not relayed verbatim: %q", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want the child's application/json", ct)
+	}
+	if n := m.ensures.Load(); n != 0 {
+		t.Fatalf("EnsureRunning called %d times, want 0 (a voices read must never start a child)", n)
+	}
+}
+
+// TestServeVoicesColdChild404: a managed child that is not running answers 404
+// runtime.model_not_running with ZERO hits on its port, and EnsureRunning is
+// never called -- the voices read must never start a cold child (the same
+// guardrail as /props). The "starting with a live port" case pins the
+// State==StateRunning half of the guard: snapshotStatus fills Port for every
+// state where a process exists, so a port check alone would forward to it.
+func TestServeVoicesColdChild404(t *testing.T) {
+	var hits atomic.Int32
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer child.Close()
+	livePort := childPort(t, child.URL)
+
+	for _, tc := range []struct {
+		name string
+		st   Status
+	}{
+		{"stopped", Status{SpecID: "s1", Model: "tts", State: StateStopped}},
+		{"starting with a live port", Status{SpecID: "s1", Model: "tts", State: StateStarting, Port: livePort}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &statusManager{statuses: []Status{tc.st}}
+			rt := newRouter(m)
+			rec := httptest.NewRecorder()
+			rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/tts/v1/audio/voices", nil))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
+			}
+			if code := decodeErrorCode(t, rec); code != "runtime.model_not_running" {
+				t.Fatalf("code = %q, want runtime.model_not_running", code)
+			}
+			if n := m.ensures.Load(); n != 0 {
+				t.Fatalf("EnsureRunning called %d times, want 0 (a voices read must never start a child)", n)
+			}
+		})
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("child hits = %d, want 0 (a cold child must see no traffic)", got)
+	}
+}
+
+// TestServeVoicesColdModelNeverStartsRealManager: the same never-start
+// guarantee against the REAL manager -- the managed-but-cold spec is still
+// StateStopped after the read (the TestRouterUpstreamPropsColdModelNeverStarts
+// pattern: assert on the manager, not just the response).
+func TestServeVoicesColdModelNeverStartsRealManager(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.Apply(Config{Specs: []Spec{baseSpec("s1", "cold-tts")}}) // neither Pinned nor force_running: stays cold
+
+	rec := httptest.NewRecorder()
+	NewRouter(m).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/upstream/cold-tts/v1/audio/voices", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if code := decodeErrorCode(t, rec); code != "runtime.model_not_running" {
+		t.Fatalf("code = %q, want runtime.model_not_running", code)
+	}
+	for _, st := range m.Status() {
+		if st.State != StateStopped {
+			t.Fatalf("spec %s is %q after the voices read, want %q -- the read started a child", st.SpecID, st.State, StateStopped)
+		}
+	}
+}
+
+// TestServeVoicesUnknownModelAndNilManager: no spec, a nil manager, or an
+// empty model answers 404 runtime.model_not_managed -- "no spec" and "not
+// running" stay different diagnoses.
+func TestServeVoicesUnknownModelAndNilManager(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		m    managerPort
+		path string
+	}{
+		{"unknown model", &statusManager{}, "/upstream/nope/v1/audio/voices"},
+		{"nil manager", nil, "/upstream/nope/v1/audio/voices"},
+		{"empty model", &statusManager{}, "/upstream//v1/audio/voices"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			newRouter(tc.m).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", rec.Code)
+			}
+			if code := decodeErrorCode(t, rec); code != codeModelNotManaged {
+				t.Fatalf("code = %q, want %s", code, codeModelNotManaged)
+			}
+		})
+	}
+}
+
+// TestServeVoicesNonGETFallsThroughToBodyDispatch: the M9 contract holds for
+// the voices endpoint too -- a POST at the same path is not the voices read, it
+// lands in serveProxy's body dispatch (EnsureRunning is its tell) and never
+// reaches the running child directly.
+func TestServeVoicesNonGETFallsThroughToBodyDispatch(t *testing.T) {
+	var hits atomic.Int32
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer child.Close()
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "m", State: StateRunning, Port: childPort(t, child.URL)}}}
+	rt := newRouter(m)
+
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/upstream/m/v1/audio/voices", strings.NewReader(`{"model":"m"}`)))
+
+	if n := m.ensures.Load(); n != 1 {
+		t.Fatalf("EnsureRunning called %d times, want 1 -- the POST must drive servePlainProxy, which the voices read never does", n)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("child hits = %d, want 0 -- a POST must never reach the running child through the voices read", got)
+	}
 }

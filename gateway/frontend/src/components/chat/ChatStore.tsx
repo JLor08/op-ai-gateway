@@ -127,6 +127,11 @@ export {
   optionsOr,
 } from './chatDoc';
 
+// "No voices to offer": one shared empty list, so resetting the picker's voices on every
+// model change is a no-op render (React bails out on an identical state value) instead of
+// a fresh array each time.
+const NO_VOICES: readonly string[] = [];
+
 // The per-message actions the transcript's rows are handed (handlersFor): the user
 // turn's edit, the assistant turn's regenerate, and -- on a generated image -- the
 // refine that makes it the source of the next edit.
@@ -243,6 +248,13 @@ export type ChatStore = {
   // ("unknown"), so the composer's dropdowns merge it over their static
   // Phase 1b-i superset (optionsOr) rather than trusting it to be complete.
   modelImageOptions: ImageModelOptions | null;
+  // The voice names the gateway has cached for the effective model, fetched on demand
+  // while that model SYNTHESIZES speech (api.modelVoices), for the speech composer's
+  // voice picker. Empty whenever there is nothing to offer: not a speech model, the
+  // fetch is in flight, it failed, or the model has no cached voices. The picker is
+  // then plain free text -- a list is only ever an offer, never a constraint, since
+  // the cache holds just the voices the health loop has seen.
+  modelVoices: readonly string[];
   // The THREAD's kind: "" (text), "image", "speech" or "transcription". Pinned by the backend
   // at the thread's first send and authoritative from then on; while the thread is
   // still empty it follows the picked model, because that is what the next
@@ -425,6 +437,7 @@ export function ChatStoreProvider({
     | 'createChat'
     | 'deleteChat'
     | 'modelImageOptions'
+    | 'modelVoices'
     | 'saveChat'
     | 'saveChatKeepalive'
     | 'serverModels'
@@ -502,6 +515,9 @@ export function ChatStoreProvider({
   // The effective image model's per-model sd-server options (see api.modelImageOptions),
   // used to narrow the composer's image dropdowns. null while there is none.
   const [modelImageOptions, setModelImageOptions] = useState<ImageModelOptions | null>(null);
+  // The effective speech model's cached voice names (see api.modelVoices), offered by the
+  // speech composer's voice picker. Empty while there are none.
+  const [modelVoices, setModelVoices] = useState<readonly string[]>(NO_VOICES);
 
   // The caller's manageable servers (undefined prop -> []): drives whether the
   // server-override picker renders at all and its option list.
@@ -1245,6 +1261,32 @@ export function ChatStoreProvider({
     };
   }, [modelImageCapable, effectiveModel]);
 
+  // Load the effective SPEECH model's cached voices so the speech composer's voice
+  // picker can offer them. The image-options effect above, for voices: cleared up
+  // front (a voice belongs to ONE model, so the previous model's must not stay on
+  // offer while the next fetch is in flight -- it would be sent and refused), a
+  // latest-wins guard against a slow stale response, and a non-speech (or no) model
+  // clears without a fetch. FAIL-OPEN: a failed fetch and an empty answer are the same
+  // empty list, which leaves the voice field the free-text field it always was.
+  // Keyed on the picked model, not the thread's kind, like the image options: the
+  // composer only renders the picker for a speech thread.
+  useEffect(() => {
+    setModelVoices(NO_VOICES);
+    if (!modelSpeechCapable || effectiveModel === '') return;
+    let cancelled = false;
+    void apiRef.current
+      .modelVoices(effectiveModel)
+      .then((voices) => {
+        if (!cancelled) setModelVoices(voices);
+      })
+      .catch(() => {
+        if (!cancelled) setModelVoices(NO_VOICES);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelSpeechCapable, effectiveModel]);
+
   // The run/SSE engine's subscribe/finishRun/adoptCanonicalTranscript/
   // ensureAssistant/writeAssistant/updateChatMessages/markRunning now live in
   // useChatRuns.ts (FA-2); `runs` above exposes the narrow interface this
@@ -1986,6 +2028,7 @@ export function ChatStoreProvider({
     modelTranscriptionCapable,
     attachMode,
     modelImageOptions,
+    modelVoices,
     chatKind,
     imageSettings,
     setImageSettings,

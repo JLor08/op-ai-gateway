@@ -364,6 +364,18 @@ func (_d *RoutingStoreWithTracing) DeleteModelGroup(ctx context.Context, id stri
 	return _d.Store.DeleteModelGroup(ctx, id)
 }
 
+func (_d *RoutingStoreWithTracing) DeleteModelMappingCache(ctx context.Context, mappingID string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteModelMappingCache")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteModelMappingCache(ctx, mappingID)
+}
+
 func (_d *RoutingStoreWithTracing) DeletePrincipalLimits(ctx context.Context, principalType string, principalID string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.DeletePrincipalLimits")
 	defer span.End()
@@ -398,6 +410,18 @@ func (_d *RoutingStoreWithTracing) DeleteRuntimeSpec(ctx context.Context, id str
 		}
 	}()
 	return _d.Store.DeleteRuntimeSpec(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) DeleteServerRuntimeReport(ctx context.Context, serverID string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteServerRuntimeReport")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteServerRuntimeReport(ctx, serverID)
 }
 
 func (_d *RoutingStoreWithTracing) DeleteService(ctx context.Context, id string) (err error) {
@@ -566,6 +590,30 @@ func (_d *RoutingStoreWithTracing) ModelGroups(ctx context.Context) (ma1 []_sour
 		}
 	}()
 	return _d.Store.ModelGroups(ctx)
+}
+
+func (_d *RoutingStoreWithTracing) ModelMappingCache(ctx context.Context, mappingID string, cacheType string) (ma1 []_sourceRouting.ModelMappingCacheRow, err error) {
+	ctx, span := Start(ctx, "routing.Store.ModelMappingCache")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ModelMappingCache(ctx, mappingID, cacheType)
+}
+
+func (_d *RoutingStoreWithTracing) ModelMappingCacheForMappings(ctx context.Context, mappingIDs []string, cacheType string) (m1 map[string][]_sourceRouting.ModelMappingCacheRow, err error) {
+	ctx, span := Start(ctx, "routing.Store.ModelMappingCacheForMappings")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ModelMappingCacheForMappings(ctx, mappingIDs, cacheType)
 }
 
 func (_d *RoutingStoreWithTracing) ModelSettingByName(ctx context.Context, name string) (m1 _sourceRouting.ModelSetting, b1 bool, err error) {
@@ -1768,6 +1816,18 @@ func (_d *RoutingStoreWithTracing) UpsertMappingCapabilities(ctx context.Context
 	return _d.Store.UpsertMappingCapabilities(ctx, mappingID, rows)
 }
 
+func (_d *RoutingStoreWithTracing) UpsertModelMappingCache(ctx context.Context, row _sourceRouting.ModelMappingCacheRow) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpsertModelMappingCache")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpsertModelMappingCache(ctx, row)
+}
+
 func (_d *RoutingStoreWithTracing) UpsertModelSetting(ctx context.Context, setting _sourceRouting.ModelSetting) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpsertModelSetting")
 	defer span.End()
@@ -1814,18 +1874,6 @@ func (_d *RoutingStoreWithTracing) UpsertServerRuntimeReport(ctx context.Context
 		}
 	}()
 	return _d.Store.UpsertServerRuntimeReport(ctx, report)
-}
-
-func (_d *RoutingStoreWithTracing) DeleteServerRuntimeReport(ctx context.Context, serverID string) (err error) {
-	ctx, span := Start(ctx, "routing.Store.DeleteServerRuntimeReport")
-	defer span.End()
-	defer func() {
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-		}
-	}()
-	return _d.Store.DeleteServerRuntimeReport(ctx, serverID)
 }
 
 func (_d *RoutingStoreWithTracing) UpsertTelemetry(ctx context.Context, telemetry _sourceRouting.ServerTelemetry) (err error) {

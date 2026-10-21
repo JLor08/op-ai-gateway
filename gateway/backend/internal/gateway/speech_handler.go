@@ -61,13 +61,39 @@ const (
 //     because it carries a capability list, while a vendor account's model match
 //     reads the model name and never the flavor. A handler that dropped the list
 //     would skip the gate AND become routable to a vendor model of the same name.
-func speechInferenceShape(model string) inferenceShape {
+//   - requiredVoice is the voice the body names (sniffSpeechVoice), "" for none. It is
+//     a routing PREFERENCE that fails open -- see inference.Request.RequiredVoice -- so
+//     unlike the capability list it never refuses a request on its own.
+func speechInferenceShape(model, voice string) inferenceShape {
 	return inferenceShape{
 		apiFlavor:            apiFlavorSpeech,
 		endpoint:             endpointSpeech,
 		model:                model,
 		requiredCapabilities: []string{routing.CapabilitySpeech},
+		requiredVoice:        voice,
 	}
+}
+
+// sniffSpeechVoice extracts the TTS voice a speech request names, tolerantly and
+// exactly as the client sent it: the sibling of sniffRoutingModel for the one other
+// field that steers routing (#251). Anything that is not a non-blank JSON string --
+// an absent field, null, a number, an OpenAI-style custom-voice object, a body that is
+// not JSON at all -- is "" (no voice named), which is the fail-open answer: the request
+// then routes exactly as it did before voices were routable. The name is NOT trimmed:
+// the body is relayed to the upstream byte for byte, so " alba" is a different voice
+// from "alba", and the filter matches what the upstream will be asked for.
+func sniffSpeechVoice(raw []byte) string {
+	var probe struct {
+		Voice json.RawMessage `json:"voice"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return ""
+	}
+	var voice string
+	if json.Unmarshal(probe.Voice, &voice) != nil || strings.TrimSpace(voice) == "" {
+		return ""
+	}
+	return voice
 }
 
 // handleOpenAISpeech serves POST /v1/audio/speech (and its /openai/v1/audio/speech
@@ -119,7 +145,7 @@ func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	pf, handled := s.inferencePreflight(w, r, token, raw, speechInferenceShape(model))
+	pf, handled := s.inferencePreflight(w, r, token, raw, speechInferenceShape(model, sniffSpeechVoice(raw)))
 	if handled {
 		return
 	}
@@ -223,8 +249,10 @@ func (s *Server) recordSpeechRoutingFailure(w http.ResponseWriter, r *http.Reque
 	code := completionErrorCode(err)
 	// Warn for an admission-queue rejection, mirroring tryProxyNative's own
 	// severity split for the same error pair; Debug for every other routing
-	// failure (no route, no healthy host, not capable), which is the ordinary,
-	// expected shape of the gate doing its job.
+	// failure (no route, no healthy host, not capable, and routing.voice_unavailable
+	// -- the requested voice's servers are all down or busy, answered 503 with its
+	// own code by completionHTTPStatus / completionErrorCode), which is the
+	// ordinary, expected shape of the gate doing its job.
 	if errors.Is(err, routing.ErrAdmissionQueueTimeout) || errors.Is(err, routing.ErrAdmissionQueueFull) {
 		slog.Warn("speech request admission rejected", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status)
 	} else {

@@ -55,6 +55,36 @@ describe('portal api', () => {
     expect(result).toEqual(options);
   });
 
+  it("fetches a speech model's cached voices by name and unwraps voices", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ voices: ['af_heart', 'bf_emma'] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    // A gateway model name may hold '/', so it travels URL-encoded in ?name=.
+    const result = await api.modelVoices('org/tts one');
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/model-voices?name=org%2Ftts%20one', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(result).toEqual(['af_heart', 'bf_emma']);
+  });
+
+  it('reads a voices answer without a list as no voices (the picker stays free text)', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(createPortalApi(fetcher).modelVoices('kokoro')).resolves.toEqual([]);
+  });
+
   it('carries the backend-folded image_edit flag on a model option, independent of image', async () => {
     // ModelDTO.image_edit is derived and folded in the backend (image:yes and no
     // operator opt-out, ANDed across a model's mappings), so the client never

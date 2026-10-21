@@ -144,6 +144,15 @@ type MemoryStore struct {
 	// assignment is a full copy (mirrors certificates above). Deleting a
 	// mapping cascades its whole entry (see deleteMappingLocked).
 	mappingCapabilities map[string]map[string]CapabilityRow
+	// mappingCache mirrors model_mapping_cache (migration 94, #251): mappingID
+	// -> (cache type, scope key) -> its ModelMappingCacheRow. The composite is
+	// the inner map KEY, so an upsert is a natural replacement (the SQL side's
+	// on-conflict-do-update). Unordered on write; reads sort by ScopeKey,
+	// mirroring the SQL `order by scope_key`. ModelMappingCacheRow has no
+	// slice/pointer fields, so a plain value-map assignment is a full copy.
+	// Deleting a mapping cascades its whole entry (see deleteMappingLocked), and
+	// a changed AppModelName drops it (see invalidateMappingCacheOnRenameLocked).
+	mappingCache map[string]map[modelMappingCacheKey]ModelMappingCacheRow
 	// vendorAccounts mirrors the vendor_accounts table (per-user external AI
 	// vendor accounts, migration 82), keyed by account id. Credentials are
 	// stored sealed, exactly as the SQL drivers hold them.
@@ -201,6 +210,7 @@ func NewMemoryStore() *MemoryStore {
 		gpuBudgets:               map[string][]ServerGPUBudget{},
 		runtimeReports:           map[string]ServerRuntimeReport{},
 		mappingCapabilities:      map[string]map[string]CapabilityRow{},
+		mappingCache:             map[string]map[modelMappingCacheKey]ModelMappingCacheRow{},
 		vendorAccounts:           map[string]VendorAccount{},
 		vendorAccountModels:      map[string][]VendorAccountModel{},
 		vendorAccountUsage:       map[string]VendorAccountUsage{},
@@ -994,7 +1004,8 @@ func (m *MemoryStore) deleteMappingsForApplicationLocked(applicationID string) {
 // deleteMappingLocked removes one mapping plus everything the SQL FK graph
 // cascades from `model_mappings`: its benchmark runs
 // (model_mapping_benchmarks.mapping_id), its capability rows
-// (model_mapping_capabilities.mapping_id), its runtime spec
+// (model_mapping_capabilities.mapping_id), its cache rows
+// (model_mapping_cache.mapping_id), its runtime spec
 // (agent_runtime_specs.mapping_id) and that spec's per-GPU rows
 // (agent_runtime_spec_gpus.spec_id, a second hop), and any co-residency pair
 // naming it on EITHER side (agent_coresidency_rules.mapping_a_id /
@@ -1005,6 +1016,7 @@ func (m *MemoryStore) deleteMappingLocked(mappingID string) {
 	delete(m.mappings, mappingID)
 	delete(m.benchmarks, mappingID)
 	delete(m.mappingCapabilities, mappingID)
+	delete(m.mappingCache, mappingID)
 	for specID, spec := range m.runtimeSpecs {
 		if spec.MappingID == mappingID {
 			delete(m.runtimeSpecs, specID)
@@ -1041,14 +1053,28 @@ func (m *MemoryStore) CreateMapping(_ context.Context, mapping ModelMapping) err
 func (m *MemoryStore) UpdateMapping(_ context.Context, mapping ModelMapping) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.mappings[mapping.ID]; !ok {
+	stored, ok := m.mappings[mapping.ID]
+	if !ok {
 		return storeerr.ErrNotFound
 	}
 	if _, ok := m.applications[mapping.ApplicationID]; !ok {
 		return storeerr.ErrNotFound
 	}
+	m.invalidateMappingCacheOnRenameLocked(stored, mapping.AppModelName)
 	m.mappings[mapping.ID] = mapping
 	return nil
+}
+
+// invalidateMappingCacheOnRenameLocked drops a mapping's cache rows when the
+// incoming app_model_name differs from the stored one, mirroring the SQL
+// writers' same-transaction delete (see SQLStore.deleteMappingCacheIfRenamed).
+// It runs only after every refusal check has passed, so a rejected update
+// invalidates nothing -- the in-memory equivalent of the SQL rollback. Callers
+// must hold m.mu for writing.
+func (m *MemoryStore) invalidateMappingCacheOnRenameLocked(stored ModelMapping, incomingAppModelName string) {
+	if stored.AppModelName != incomingAppModelName {
+		delete(m.mappingCache, stored.ID)
+	}
 }
 
 // UpdateMappingEditable mirrors the SQLite CASE-per-column writer: it starts
@@ -1065,6 +1091,7 @@ func (m *MemoryStore) UpdateMappingEditable(_ context.Context, mapping ModelMapp
 	if _, ok := m.applications[mapping.ApplicationID]; !ok {
 		return storeerr.ErrNotFound
 	}
+	m.invalidateMappingCacheOnRenameLocked(existing, mapping.AppModelName)
 	existing.ApplicationID = mapping.ApplicationID
 	existing.GatewayModelName = mapping.GatewayModelName
 	existing.AppModelName = mapping.AppModelName
@@ -1238,6 +1265,87 @@ func (m *MemoryStore) DeleteMappingCapability(_ context.Context, mappingID, capa
 	if len(byCapability) == 0 {
 		delete(m.mappingCapabilities, mappingID)
 	}
+	return nil
+}
+
+// modelMappingCacheKey is the part of model_mapping_cache's composite primary
+// key that follows the mapping id: MemoryStore keys the inner map by it so an
+// upsert replaces in place, exactly as the SQL on-conflict-do-update does.
+type modelMappingCacheKey struct {
+	cacheType string
+	scopeKey  string
+}
+
+// UpsertModelMappingCache writes one cache row, replacing any row for the same
+// (mapping, cache type, scope key). It validates the row first
+// (ValidateModelMappingCacheRow, the same check the SQL drivers make) and then
+// requires the mapping to exist -- a hand-rolled FK existence check mirroring
+// UpsertMappingCapabilities, because the SQL drivers reject an orphan row with
+// a real foreign-key violation and silently fabricating one here would be a
+// driver divergence.
+func (m *MemoryStore) UpsertModelMappingCache(_ context.Context, row ModelMappingCacheRow) error {
+	if err := ValidateModelMappingCacheRow(row); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.mappings[row.MappingID]; !ok {
+		return storeerr.ErrNotFound
+	}
+	byKey := m.mappingCache[row.MappingID]
+	if byKey == nil {
+		byKey = map[modelMappingCacheKey]ModelMappingCacheRow{}
+		m.mappingCache[row.MappingID] = byKey
+	}
+	byKey[modelMappingCacheKey{cacheType: row.CacheType, scopeKey: row.ScopeKey}] = row
+	return nil
+}
+
+// ModelMappingCache lists one mapping's cache rows of one cache type ordered
+// by scope key (mirroring the SQL `order by scope_key`; the map is unordered
+// on write). A mapping with no such rows yields an empty, non-nil slice.
+func (m *MemoryStore) ModelMappingCache(_ context.Context, mappingID, cacheType string) ([]ModelMappingCacheRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.modelMappingCacheLocked(mappingID, cacheType), nil
+}
+
+// modelMappingCacheLocked is ModelMappingCache's body, so the bulk reader can
+// reuse it under one lock. Callers must hold m.mu.
+func (m *MemoryStore) modelMappingCacheLocked(mappingID, cacheType string) []ModelMappingCacheRow {
+	stored := m.mappingCache[mappingID]
+	out := make([]ModelMappingCacheRow, 0, len(stored))
+	for key, row := range stored {
+		if key.cacheType == cacheType {
+			out = append(out, row)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ScopeKey < out[j].ScopeKey })
+	return out
+}
+
+// ModelMappingCacheForMappings mirrors the SQL bulk reader: a mapping with no
+// rows of the type contributes NO key (not an empty slice), and a repeated id
+// is read once because the result is assigned per id.
+func (m *MemoryStore) ModelMappingCacheForMappings(_ context.Context, mappingIDs []string, cacheType string) (map[string][]ModelMappingCacheRow, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string][]ModelMappingCacheRow, len(mappingIDs))
+	for _, id := range mappingIDs {
+		if rows := m.modelMappingCacheLocked(id, cacheType); len(rows) > 0 {
+			out[id] = rows
+		}
+	}
+	return out, nil
+}
+
+// DeleteModelMappingCache removes every cache row of one mapping. Deleting
+// where there is nothing is a benign no-op, mirroring the SQL delete's 0 rows
+// affected.
+func (m *MemoryStore) DeleteModelMappingCache(_ context.Context, mappingID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.mappingCache, mappingID)
 	return nil
 }
 

@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 93 migrations in order, same as
+- **Only-pending.** A fresh install runs all 94 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -602,6 +602,35 @@ on the target), and `model_settings` and `model_group_members` (both keyed on th
 gateway model **name**, not a mapping id). The consequence worth knowing:
 **principal limits do not cascade with their principal**, in either driver.
 "Completing" the memory cascade here would be a divergence *from* SQL.
+
+**The per-mapping cache (`model_mapping_cache`, migration 94, issue #251) is
+implemented on all three drivers and holds the same three guarantees by hand in
+the memory twin**
+([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter),
+[Data Model](../reference/data-model.md#the-per-mapping-cache-table)). The SQL
+drivers share one implementation (`internal/store/sqlite_model_cache.go`): a
+single-mapping reader, a bulk reader that chunks its bound parameters at 1000 per
+query and deduplicates the ids first (so an id repeated across two chunks cannot
+append a mapping's rows twice where `MemoryStore` returns them once), and an
+`insert … on conflict(mapping_id, cache_type, scope_key) do update` upsert. The
+three guarantees: (1) **the orphan-parent refusal** — the SQL foreign key is real,
+the violation is reclassified to `ErrNotFound`, and `MemoryStore.UpsertModelMappingCache`
+hand-rolls the same existence check, so a caller that lost a race with a mapping
+delete sees the identical error on every driver; (2) **the delete cascade** — `ON
+DELETE CASCADE` on the SQL side, and `deleteMappingLocked` dropping the mapping's
+cache map by hand (the cascade's mapping hop), so a delete-then-recreate under the
+same id never inherits the old mapping's cached voices; (3) **the rename
+invalidation** — when a mapping's `AppModelName` changes, its cache rows are dropped
+(the cached facts are about the old model). On SQL this lives **in the store, in the
+same transaction as the update**, in the one `updateMappingRow` helper both
+`UpdateMapping` and `UpdateMappingEditable` run through: the delete goes first (so
+the stored name it compares against is still the old one, a comparison the database
+does with an `exists`, not a separate read), and an update the database then refuses
+(unknown application, a name conflict, a missing mapping) rolls the delete back, so
+only a rename that actually landed invalidates anything and a save that did not
+change the name drops nothing. `MemoryStore` mirrors it in both update methods. A
+caller never has to remember to invalidate, which is why the health loop's writer
+needs no rename awareness of its own.
 
 One nuance to the general note that FK violations are invisible in the memory
 driver: **for the runtime tables they are not.** The memory store hand-rolls the

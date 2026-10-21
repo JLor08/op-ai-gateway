@@ -342,7 +342,8 @@ flowchart TD
     LoadCands --> FilterProv["filterProvisioned\n(resource-group gate)"]
     FilterProv --> FilterCap["filterCapable\n(required-capability gate,\nsee §2.3)"]
     FilterCap -->|"emptied, and the request\nrequired a capability"| ErrCap["404: ErrModelNotCapable"]
-    FilterCap --> Select["selectCandidate (see §3)"]
+    FilterCap --> Voice["voice filter (speech only,\nfail-open, see §2.5)"]
+    Voice --> Select["selectCandidate (see §3)"]
     Select -->|all candidates at\neffective cap| Queue["AdmissionController.WaitForSlot\n(see §6)"]
     Queue -->|slot signalled / recheck tick| Select
     Queue -->|timeout / full / ctx done| ErrQueue["503: ErrAdmissionQueueTimeout\n/ ErrAdmissionQueueFull"]
@@ -375,6 +376,11 @@ does not carry a `yes` verdict for every capability the **endpoint** requires.
 It is a no-op for a request that requires none — which is every chat,
 Responses and Messages request — and §2.3 is entirely about the one case where
 it is not.
+
+A speech request that names a `voice` then passes through the **voice filter** (§2.5),
+which, unlike the capability gate, **fails open**: it narrows the pool to the candidates
+whose cached voice list offers the voice when at least one does, and leaves the pool alone
+otherwise. It is a no-op for every request that names no voice.
 
 ### 2.1 Per-token model resolution
 
@@ -798,7 +804,8 @@ why).
     §3.4](compatibility-and-inference.md#34-openai-images-generations)).
   - An **agent-launched** child is a `server_agent` mapping behind the
     agent's router, which the health loop cannot reach — the router passes
-    only `/props` through per model. Instead the agent itself reads the
+    only `/props` (and an audio.cpp child's voices, since 0.11.0) through per
+    model. Instead the agent itself reads the
     identical document over its own loopback connection to the child
     (`collector.ProbeSdcppVerdicts`, issue #154) and reports the verdict up
     the telemetry channel under this same source name, but only while the
@@ -1255,6 +1262,108 @@ delivers Claude Code's effort as `chat_template_kwargs.reasoning_effort`
 ([API Compatibility & Inference
 §9.2](compatibility-and-inference.md#92-claude-code-reasoning-effort-compatibility)).
 
+### 2.5 The voice filter (speech only, fail-open)
+
+A speech request that names a `voice` is steered toward a server that has it
+([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter),
+issue #251). It is a **preference, not a gate**, and that is the whole design: the
+opposite of the capability gate (§2.3), which **fails closed**. The voice is carried
+on its own field, `inference.Request.RequiredVoice`, not as a capability name,
+precisely so that it cannot inherit that posture: a request whose voice the gateway has
+never heard of, a mapping whose cache was never filled, or a cache that cannot be read
+must all route exactly as they did before voices were routable. The speech handler
+sniffs the field from the raw body (`sniffSpeechVoice`: a non-blank JSON string, exactly
+as sent and **not trimmed**, because the body reaches the upstream byte for byte and
+`" alba"` is a different voice from `"alba"`; anything else, an object-valued `voice`
+included, is "no voice named"), and every other endpoint leaves it empty.
+
+**The rule** (`voiceScopeFor`, `internal/routing/voice_filter.go`) — **unknown is not
+absent**: each candidate is classified from its cached voices row. A candidate is
+*known-present* when the voice is in its cached list, *known-absent* when it has a cached
+list that does **not** contain it (a cached-empty list included), and of **unknown** voice
+status when it has **no** cached voices row at all (or an undecodable one). The filter
+**excludes only the known-absent candidates**; known-present and unknown ones stay
+selectable (fail open), so a healthy same-model sibling that was never voice-cached keeps
+serving. **When no candidate is known-absent — and also when EVERY candidate is
+known-absent — nothing is filtered** and the request is routed as without a voice (in the
+all-known-absent case nothing is known to offer the voice, so the upstream, not the gateway,
+decides; only a MIX of a known-absent candidate and an eligible one restricts routing).
+"In its cached list" means an **exact** match in the mapping's
+cached voices (`model_mapping_cache`, type `voices`) **and** the mapping is a plain
+tts model *now* (`routing.CapabilityRowsPlainTTS`: `(speech, yes)` and not
+`(speech_clone, yes)`, the same rule the voices endpoint applies at read time, so a list
+that outlived a flip to a clone model is not a known voice either). **Presence of the
+scope-`""` row** — not a non-empty decoded list — is what separates *known* from
+*unknown*, because an empty or null payload decodes the same as no row at all. For a single model
+the filter runs in `resolveStandard` on the pool the capability gate left, **after** the
+two empty-pool sentinels (so `ErrNoModelRoute` and `ErrModelNotCapable` are untouched)
+and **before** the admission parameters (so a request queues on the voice's servers, not
+on servers it cannot use). A request that names no voice reads nothing and is
+byte-identical to before.
+
+**Groups need a pre-pass, computed once over the flattened pool** (`groupVoiceScope`).
+`eligibleCandidates` and `selectMember` see one member's candidates at a time, so a
+per-member rule ("restrict this member if one of *its* candidates lists the voice")
+leaves a member without the voice fully eligible, and priority or speed order can then
+pick it ahead of the member that has it: such a filter never narrows a group. Instead,
+before any member is visited, `resolveGroup` flattens the group (each distinct member's
+`memberPool`, the one definition of "could serve this request" that the walk and the
+speed ordering share: store read, provisioning, endpoint-mode refinement, capability
+gate) and asks `voiceScopeFor` over the whole set, which answers both halves at once: "is
+any candidate **anywhere in the group** known-absent for the voice" (the narrowing switch)
+and the allowed mapping set (known-present **plus** unknown). The result is threaded through
+`eligibleCandidates`, `selectMember`, `orderMembersBySpeed`, `firstAvailable` and
+`climbTarget` (and so the pin check). A group's offered voices are therefore the **union**
+across its member mappings (what the voices endpoints list for it), and a chosen voice
+drops only the members known-absent for it (keeping known-present and unknown ones) before
+the ordinary group dispatch scores them.
+
+**The voice scope is carried OUTSIDE `GroupPolicy`, so the relaxation ladder cannot
+relax it.** The ladder (§5) only ever rewrites the policy: it drops `loaded_only`, then
+the speed floor, when nothing satisfies them. Those are preferences that give way. A voice
+the group is *known* to offer on some members is a requirement, and serving it from a
+member without it would be a wrong answer, not a degraded one, so it lives on
+`groupResolve.voice`, set once and read by every attempt.
+
+**Two exemptions.** A **server override** (`resolveServerOverride`) names one server, so
+there is nothing for the voice to choose between and it does not veto the override. A
+**sticky pin** is not taken for a voiced single-model request (`resolveStandard` skips
+`resolveAffinity` when `RequiredVoice` is set, because the pin was chosen without regard to
+the voice and following it would bypass the filter; no such pin can exist today, since
+both pin writers are guarded on the capability list and a speech request always carries
+one, so this changes no path that is reachable now and keeps the contract should the guard
+ever be lifted). A **group's** pin goes through the voice-restricted `selectMember`, so it
+can only hold a member the voice allows.
+
+**`ErrVoiceUnavailable` (503 `routing.voice_unavailable`) fires exactly when the voice
+narrowed the pool and no remaining eligible host is usable.** `voiceScope.narrowed` records
+that the voice excluded at least one candidate **known** (from its cached row) to lack it
+**while at least one eligible candidate (known-present or unknown) remained**; a candidate
+of unknown/uncached status never narrows, and an all-known-absent request produces no scope
+at all (fail open), so it cannot reach this error. When the walk then ends in
+`ErrNoHealthyHost` (unreachable, unhealthy or busy), `refine` turns it into
+`ErrVoiceUnavailable`. The generic code says the model has no host, which is false
+when other servers of the same model are healthy and are known only to lack the voice, and
+a client that cannot tell the two apart can act on neither (retry shortly versus choose
+another voice). Every other error, and the same error for a voice that narrowed nothing —
+no candidate is known to lack it, or **every** candidate is known-absent (routed unfiltered,
+the upstream decides) — passes through untouched. Both resolution paths use it: the standard
+path at its no-healthy-host exit, and the group path on the last attempt of the ladder.
+
+**The cache read and the verdict read fail differently, on purpose.** The pre-pass makes
+exactly two bulk reads, and none at all for a request that names no voice. An unreadable
+**voices cache** (`ModelMappingCacheForMappings`) **fails open**: it logs a Warn and
+returns no scope, so the request routes as if no voice were named. The cache exists only
+for this preference, so when it cannot be read there is simply no voice information, which
+is the "every candidate is of unknown status" case (nothing narrows), and a cache-table
+hiccup must not turn an otherwise-working speech request into a failure. A failing
+capability **verdict** read (`MappingCapabilitiesForMappings`) is **returned**, like the
+capability gate it belongs to: it reads the very rows `filterCapable` has just read and
+refused on, so the posture stays that of the gate. An undecodable cache row is a third,
+local case: that mapping is treated as **unknown** voice status and **kept eligible**
+(Warn, "treated as unknown voice status, kept eligible"), and the rest of the pool is
+unaffected.
+
 ## 3. Candidate scoring
 
 `selectCandidate` (`internal/routing/resolver.go`) narrows the candidate pool
@@ -1521,8 +1630,11 @@ of resolving a single mapping.
   3. neither applied — reached only when `min_speed_fallback=ignore`.
 
   The loaded-only filter is always dropped before the speed floor, and a
-  filter already dropped never reappears in a later attempt. Three
-  consequences follow directly from this design:
+  filter already dropped never reappears in a later attempt. **A requested
+  speech voice is the one restriction the ladder does not relax**: it is decided
+  once over the flattened group before the first attempt and carried outside the
+  policy the ladder rewrites (§2.5). Three consequences follow directly from this
+  design:
   - The floor reads the *load-aware* effective speed, so a member can drop
     below it purely because it is currently busy — nothing about the member
     itself needs to change.
@@ -1779,6 +1891,7 @@ caller may see, for a dashboard-style overview without subscribing per server.
 |---|---|---|
 | `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what two dispatch checks answer after resolution for a `server_agent` mapping's spec: the images, speech and transcription relays when the spec excludes `openai_images` (`openai_audio` for speech and transcription), and the text translate dispatch when the spec is images-only or audio-only ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Neither post-resolve refusal is advertised, except on a name that mixes a refused mapping with a served one (issue #145), or while its application's spec read fails: the listings and `Callable` take the spec's flavors by the same rule, and for a token with the unknown-model redirect on, a request whose effective model fails the flavor half for the request's flavor is redirected before it gets here whenever its LastUsedModel or fallback is usable (§2.1, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)) |
 | `ErrNoHealthyHost` | **503** | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
+| `ErrVoiceUnavailable` | **503** (`routing.voice_unavailable`) | a speech request's `voice` is one that at least one candidate is **known** (from its cached voice list) to lack while an eligible candidate (one that lists it, or of unknown/uncached status) remained, so the voice narrowed the pool to the eligible ones and none of those is usable; answered **instead of** `ErrNoHealthyHost` and only then (§2.5). A voice no candidate is known to lack, or one **every** candidate is known-absent for (fail open), never produces it |
 | `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate; for speech, no `speech: yes`, and for transcription no `transcription: yes` (a model the listing does not name reads as unknown) |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |

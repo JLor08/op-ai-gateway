@@ -209,7 +209,23 @@ type Request struct {
 	// (routing.Store already has MappingCapabilitiesForMappings). See ADR-042
 	// and ADR-044.
 	RequiredCapabilities []string `json:"-"`
-	Model                string   `json:"model"`
+	// RequiredVoice is the TTS voice name the client asked for (the speech
+	// request's "voice" field, exactly as sent), or "" when it named none. It is
+	// routing input for /v1/audio/speech only, set by that handler from the raw
+	// body and nil-equivalent ("") on every other endpoint (#251).
+	//
+	// It is a PREFERENCE, never a gate: when at least one candidate mapping's
+	// cached voice list (the voices model_mapping_cache) names the voice, routing
+	// is restricted to the candidates that do, and when none does -- a free-text
+	// or unknown voice, a mapping whose list was never cached -- routing is left
+	// exactly as it is without a voice. That is the opposite of
+	// RequiredCapabilities, which fails closed (an unknown verdict refuses), and
+	// the reason this is a field of its own rather than a capability name: an
+	// existing bearer client that sends a voice the gateway has never heard of
+	// must keep working as it always did, and the upstream remains the authority
+	// on whether it accepts the name. See routing.Resolver (voiceScope).
+	RequiredVoice string `json:"-"`
+	Model         string `json:"model"`
 	// RequestedModel is the model name exactly as the client sent it, before
 	// any token model override rewrote Model. Recorded on the usage event so
 	// the activity list can show the pre-override name (issue #7).

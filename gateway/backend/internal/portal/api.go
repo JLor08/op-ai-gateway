@@ -130,6 +130,7 @@ type API interface {
 	ModelImageOptionViews(context.Context, auth.Token, string) ([]ImageOptionMapping, error)
 	ModelOfferingFor(context.Context, auth.Token, string, []string) ModelOffering
 	ModelServers(context.Context, auth.Token, string) ([]ModelServerDTO, error)
+	ModelVoiceMappingIDs(context.Context, auth.Token, string) ([]string, error)
 	Models(context.Context, auth.Token) ModelsResponse
 	ModelsForFlavor(context.Context, auth.Token, string) []string
 	MyProjects(context.Context, auth.Token) ([]ProjectRefDTO, error)

@@ -618,7 +618,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -674,7 +674,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -843,7 +843,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -889,6 +889,16 @@ end but a typed, logged operator misconfiguration
 token"). Widening the allowlist beyond `/props` — `/slots` for #49-2,
 router-mode passthrough for #55 — is deliberately left to those issues; this
 decision adds exactly the one route #58 needed.
+
+**Amended by [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)
+(a second allowlisted endpoint, issue #251).** "An allowlist of exactly `/props`" is now an
+allowlist of exactly **two** endpoints: `GET /upstream/{model}/v1/audio/voices` joined it,
+for an audio.cpp child's voice listing, behind its own agent feature (`runtime_voices`, agent
+0.11.0) and its own ADR, as this decision said a widening would need to be. Every guardrail
+above carries over unchanged (GET-only, `Status()`-only and never-start, the path
+decomposition, the gateway's fail-closed gate on the declared feature); what became
+per-endpoint is whether the inbound query is forwarded (`forwardQuery`: kept for `/props`,
+dropped for voices, because audio.cpp ignores `?model=`).
 → [Agent-Managed Model Runtime
 §4.1](cross-cutting/agent-runtime-manager.md#41-control-routes),
 [§4.3](cross-cutting/agent-runtime-manager.md#43-stable-error-codes),
@@ -1028,7 +1038,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1243,7 +1253,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-93-migrations),
+[§4](reference/data-model.md#4-migration-history-94-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1469,7 +1479,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-93-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-94-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1594,7 +1604,7 @@ so the int4/float4 class cannot recur on a brand-new column.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-93-migrations),
+[§4](reference/data-model.md#4-migration-history-94-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -2370,7 +2380,8 @@ for, and it now has two producers.** The gateway's health loop reads an
 **external** application's `/sdcpp/v1/capabilities` directly; an
 **agent-launched** child's own agent reads the identical document behind the
 agent's router — which the health loop cannot reach, since the router passes
-only `/props` through per model — and reports the verdict up the telemetry
+only `/props` through per model (an audio.cpp child's voices, from 0.11.0, are
+the one other endpoint, [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)) — and reports the verdict up the telemetry
 channel under the same source name, but only while the gateway declares the
 agent feature `capability_source_sdcpp` (issue #154). Either way
 `supported_modes` is exhaustive, so it is the only source that answers
@@ -3557,7 +3568,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-93-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-94-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3781,7 +3792,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-93-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-94-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4124,6 +4135,17 @@ same request would succeed or be ignored depending on routing); fail-closed
 semantics for an empty field (an unread model would get an empty dropdown); and
 pre-filling the reported defaults (turns every untouched knob into a sent
 override).
+
+**Amended by [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)
+(the first persistent per-mapping cache).** The decision above stands for image options:
+they stay in the two volatile caches, nothing about them is stored, and no migration was
+added for them. The title's "never stored" is a statement about image options, not a
+gateway-wide rule. Image options can be re-read from the capabilities document at any
+time, which is what makes losing them on a restart cheap. A TTS voice list cannot: audio.cpp
+states it only for the model it has **loaded**, so a picker that must work while the model is
+unloaded needs the names kept, and the gateway now has a persistent per-mapping cache
+(`model_mapping_cache`, migration 94) for exactly that kind of fact. The reasoning that kept
+the options out of `model_mapping_capabilities` applies unchanged to the voices.
 → [API Compatibility & Inference §3.4](cross-cutting/compatibility-and-inference.md#34-openai-images-generations),
 [§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings),
@@ -4795,7 +4817,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4921,7 +4943,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-93-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5064,7 +5086,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-93-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-94-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -5268,6 +5290,11 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   portal chat's speech run is now a caller of it, amended by [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)),
   with the same run-as block copied in. The voices listing is an audio.cpp and llama-swap
   convention, not an OpenAI endpoint, so clients learn voice names out of band.
+  **(Amended by [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter),
+  issue #251: the gateway still does not PROXY the upstream's listing, but it now serves
+  `GET /v1/audio/voices` itself, as a read of a persistent per-mapping cache filled while
+  the model is loaded, on the same bearer-or-loopback leg, so a client can learn voice
+  names from the gateway.)**
 
 **Consequence:** speech has the images day-one cost, in a milder form. A deployment with
 no `openai_audio` application serves no speech: a route without the flavor answers 404
@@ -5301,7 +5328,8 @@ capture** (a corrupted, clipped fragment that bloats every capture). **Gating th
 writer on `server_agent` plus a spec kind** (it never opens for a static server, and the
 agent router's listing states no `task`). **Normalising an already-OpenAI-shaped error**
 (it would overwrite the upstream's attested type with the gateway's). **Proxying the
-voices listing** (not an OpenAI endpoint).
+voices listing** (not an OpenAI endpoint; ADR-067 later added a cache-backed endpoint
+instead of a proxy).
 
 **Amended by [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)
 (transcription, the third endpoint on the gate).** Speech's `openai_audio` flavor and `audio_cpp`
@@ -5326,8 +5354,18 @@ validation and its relay did not change. The Models listing now carries a `speec
 (`ModelDTO.Speech`, from the fold the unknown-model redirect already read), which the
 chat's picker reads; the Models view's "Available via" column still does not, so the
 Consequence's sentence about it stands. (j)'s decision not to proxy
-`GET /v1/audio/voices` also stands, and it is why the chat's `voice` field is free
-text.
+`GET /v1/audio/voices` also stood at that point, and it was why the chat's `voice` field
+was free text.
+
+**Amended by [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)
+(voices are served from a persistent cache; issue #251).** Both halves of that last sentence
+are superseded. The gateway now answers `GET /v1/audio/voices` itself (and the portal has its
+own session-cookie `GET /api/portal/model-voices`), reading the names the health loop cached
+while the model was loaded rather than proxying the upstream, and the chat's `voice` field is
+a discoverable combobox over them that still accepts free text. The upstream's behavior is
+unchanged and is what shaped this: it lists voices only for its loaded model, so a name list
+has to be kept, and an unknown voice still answers HTTP 500, which the endpoint relays like
+any other speech error.
 
 → [API Compatibility & Inference §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
@@ -5668,7 +5706,10 @@ could have chosen:
   OpenAI endpoint), and the agent router has no voices route. audio.cpp also has no
   capabilities endpoint (the analogue of `/sdcpp/v1/capabilities` answers 404), so its
   native knobs (a kokoro model's `seed`, `language`, `phonemes`, ...) cannot be learned
-  at runtime either.
+  at runtime either. (**The voice half is superseded by
+  [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)**:
+  voice names are now cached while the model is loaded and served by the gateway, and the
+  agent router has a voices route. The native-knobs half stands.)
 - The blob-serving endpoint answers **no `Range` request**: it writes the decrypted
   body with a `Content-Length` and does not go through `http.ServeContent`
   ([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
@@ -5829,21 +5870,34 @@ could have chosen:
   shared function keeps answering what it did. An agent-managed `audio_cpp` model appears in the chat once its
   agent has reported a `(speech, yes)` verdict from the child's own listing (ADR-061 (d),
   agent 0.9.1) or an operator has set `speech: yes` by hand.
-- **(f) `voice` is free text, and there is no voices dropdown.** The settings panel
-  carries a free-text `voice` field whose placeholder hints that the model's own default
+- **(f) `voice` was free text with no voices dropdown; it is now a combobox. (AMENDED by
+  [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter),
+  issue #251 — see the amendment below.)** The settings panel
+  carries a `voice` field whose placeholder hints that the model's own default
   applies and is **never written** (blank leaves the model on its default voice, the
   rule the image defaults follow), and a `speed` number field (placeholder `1.0`, passed
   through as given: the model's own range applies and the composer does not clamp
   it). There is no `response_format` control, only a static caption that the reply is
   always WAV (the endpoint's WAV-only surface, ADR-061 (e)), and no image attach (the
-  attach mode of a speech thread is `none`). The reason there is no dropdown is a chain
-  of two reversals: discovering voices needs the gateway to proxy
-  `/v1/audio/voices`, which ADR-061 (j) refused on purpose, **and** the agent router to
-  grow a voices route, which would likely be an agent change with its own feature flag
-  and version bump. Each is a decision of its own, so a discoverable voice list is a deferred
-  enhancement with its own ADR, and the free-text field is the approved first step. No
-  `/api/portal/model-audio-options` endpoint exists for the same reason: there is nothing
-  to put in it.
+  attach mode of a speech thread is `none`). As first shipped the field was plain free
+  text and there was no dropdown, by a chain of two reversals: discovering voices needed
+  the gateway to proxy `/v1/audio/voices`, which ADR-061 (j) refused on purpose, **and**
+  the agent router to grow a voices route, which would likely be an agent change with its
+  own feature flag and version bump. Each was a decision of its own, so a discoverable voice
+  list was deferred to its own ADR, and the free-text field was the approved first step. No
+  `/api/portal/model-audio-options` endpoint exists: the voice list has its own route (below)
+  and the other speech knobs have nothing to put in one.
+
+  **Amendment (issue #251, ADR-067):** both reversals were taken. The gateway now serves
+  the cached voices and the agent router has the `runtime_voices` route, so the field is a
+  **combobox**: a dropdown of the voices cached for the picked model that **also accepts
+  free text** (`SpeechVoiceField.tsx`, an MUI `Autocomplete` in `freeSolo` mode), still bound
+  to the existing `voice` field of `ChatAudioSettings` (the field audio.cpp consumes, so
+  nothing on the run path changed). The names come from the session-cookie
+  `GET /api/portal/model-voices?name=`, fetched on pick and cleared on every model change,
+  and the field is the plain free-text field again whenever there is no list (none cached,
+  an unknown or not-visible model, a failed fetch): a list is an offer, never a
+  constraint. The model's-default placeholder and the never-write-a-blank rule are unchanged.
 - **(g) The Advanced section is a JSON passthrough, guarded against the fields the run
   owns.** A collapsible "Advanced" holds one text box for a **JSON object**; every key is
   merged into the request body as a top-level field, verbatim (`map[string]json.RawMessage`,
@@ -5911,9 +5965,10 @@ side is gateway and frontend only.
 **Rejected:** **A mode toggle or a "speak" button** (ADR-043's argument, the composer
 could then offer what the gate refuses). **Widening the shared `offeredFlavors`** (it
 would regress the Models view for every audio row without a speech verdict; the chat's
-stricter rule belongs in the chat). **A voices dropdown now** (it needs the gateway to
-proxy a listing ADR-061 (j) refused and an agent route that does not exist), and **a
-`/api/portal/model-audio-options` endpoint** (nothing to serve). **Reusing `image_url`
+stricter rule belongs in the chat). **A voices dropdown now** (it needed the gateway to
+proxy a listing ADR-061 (j) refused and an agent route that did not exist — **reversed by
+issue #251 (choice (f) amendment, ADR-067): both now exist and the dropdown is the
+combobox**), and **a `/api/portal/model-audio-options` endpoint** (nothing to serve). **Reusing `image_url`
 for the WAV** (every consumer would read audio as a picture). **A clone-model filter**
 (the verdict does not distinguish the task — **reversed by issue #252 (choice (h)
 amendment): the `speech_clone` refinement now distinguishes it, so the filter exists**). **Playing the blob URL directly** (no
@@ -6608,3 +6663,261 @@ overwrite-on-launch is enough for the current need).
 [Data Model §4](reference/data-model.md#runtime-spec-config-files),
 [Security, Authentication & Authorization
 §8.2](cross-cutting/security-auth-rbac.md#82-free-form-text-from-an-agent-is-redacted-safe-by-default).
+
+## ADR-067 — A persistent per-mapping cache, first used for TTS voices: fetched while the model is loaded, change-detected, and read by a picker and a fail-open routing filter
+**Context:** the portal chat's speech composer took `voice` as free text because the
+gateway did not proxy `GET /v1/audio/voices`
+([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
+(j)) and the agent router had no voices route
+([ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(f)), so a dropdown had nothing to be filled from. Issue #251 asked for the
+discoverable picker, and the obstacle behind it is a property of the upstream, which
+was **live-verified** against an audio.cpp v0.9.1 server before anything was built:
+`GET /v1/audio/voices` answers a flat `{"voices": ["demo_1_man", ...]}` (names only: no
+id, language or gender objects) for **whichever model that server has loaded right
+now**, and it **ignores a `?model=` query** (the same answer for no parameter, a valid
+id and a bogus one); `GET /v1/models` carries `loaded: true|false` per model; a listed
+name is consumed by the **existing speech `voice` field** (honored and validated
+against the model's cached voice references, an exact match on what is a directory
+name; `voice_id` is ignored), and an **unknown voice answers HTTP 500**, not 400; a
+request with no voice gets a default one. So voices exist only while a model is
+loaded, and a picker that must work while it is **unloaded**, or after a gateway
+restart, needs the names to be kept. That rules out
+[ADR-055](#adr-055--per-model-sd-server-image-options-are-read-live-on-pick-from-two-volatile-caches-and-never-stored)'s
+answer: an `sd-server`'s options can be re-read from its capabilities document at any
+time, so a volatile cache re-warms; a voice list can only be read during a window the
+gateway does not control, so losing it costs the picker. It also rules out
+`model_mapping_capabilities`
+([ADR-039](#adr-039--per-model-capabilities-are-child-rows-with-ranked-provenance-and-the-eleven-columns-are-dropped)),
+which holds one kind of fact (a ranked `yes`/`no` verdict) for the same reason ADR-055
+gave.
+
+**Decision — six choices, taken together.**
+
+- **(a) A general, persistent per-mapping cache: the first.** A new table
+  `model_mapping_cache` (**migration 94**, append-only) holds `(mapping_id,
+  cache_type, scope_key, payload, updated_at)`, primary key `(mapping_id, cache_type,
+  scope_key)`, `mapping_id` a real foreign key `on delete cascade`, `payload` a
+  `text` column of opaque consumer-owned JSON (`''` is a legitimate payload: "fetched,
+  nothing to offer"), `updated_at` the writer's clock. It is general on purpose: a later
+  per-mapping discovered fact adds a `cache_type`, not a table
+  ([ADR-004](#adr-004--three-store-drivers-behind-one-dialect-seam),
+  [ADR-005](#adr-005--postgresql-needs-wide-column-types)). Voices are the first type:
+  `cache_type = "voices"` (`routing.ModelMappingCacheVoices`), `scope_key = ""` (one row
+  per mapping; the column is there for a later sub-mapping axis), the payload a JSON
+  array of voice **names** in canonical form (deduplicated, sorted bytewise, blank
+  names dropped, every other name kept verbatim because the upstream matches exactly,
+  `[]` and never `null` for none). The unit is `routing.ModelMappingCacheRow`; all three
+  drivers implement it (memory with a hand-rolled foreign-key existence check). The rows
+  are **invalidated when the mapping's `AppModelName` changes** — in the store, in the
+  same transaction as `UpdateMapping`/`UpdateMappingEditable`, so a rename the database
+  refuses rolls the delete back — and they cascade away with the mapping. The cached
+  names are facts about the model the mapping pointed at when they were written.
+- **(b) Voices become reachable by two paths.** A gateway provider capability,
+  `provider.AudioCppVoicesLister` (`(*OpenAICompatibleClient).ListVoices`, dispatched by
+  the `Multiplexer` under a tracing span), reaches a **static** `audio_cpp` server
+  directly; it never sends `?model=` (the upstream ignores it) and it **distinguishes a
+  genuine empty listing (success, an empty non-nil slice) from a failure** (transport, a
+  non-2xx, an undecodable body, all `ErrUnavailable`), which is what lets the writer
+  below tell "no voices" from "could not ask". For an **agent-launched** child, which
+  listens on a loopback port of the agent's host, the agent's router grows
+  `GET /upstream/{model}/v1/audio/voices`: the second endpoint on the `/upstream`
+  allowlist beside `/props`
+  ([ADR-037](#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)),
+  **Status-only and never-start** (a cold child answers 404
+  `runtime.model_not_running`, never a boot), outbound path exactly `/v1/audio/voices`,
+  relayed verbatim, the spec's token forwarded as for `/props`. The allowlist is now a
+  table of two endpoints with a **per-endpoint `forwardQuery`**: `/props` keeps the
+  inbound query (llama.cpp reads `?model=`), the voices read drops it. The route is a new
+  observable agent behavior, so it goes through feature negotiation
+  ([ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)):
+  the agent declares `runtime_voices` (`Since: "0.11.0"`), ServerAgent moves
+  `0.10.2` → `0.11.0` (MINOR, `agent.Features` gained an entry; **one bump for the whole
+  branch**), and the gateway names it `gateway.RuntimeVoicesFeature`. The gateway's
+  agent-child pass checks it **fail-closed**, the `runtime_upstream_props` shape: an
+  older router never serves the voices route and answers a 404 —
+  `runtime.upstream_endpoint_not_allowed` from 0.7.0 on, `runtime.model_not_managed`
+  before 0.7.0 — so the read cannot succeed there, and the gateway sends it only to an
+  agent that declared `runtime_voices`. A server on an agent without the flag has no
+  cached voices, which the picker handles fail-open.
+- **(c) Population is change-detected fetch-on-load, strict about which model it
+  attributes to.** The gateway has no "just became loaded" event, so the health loop
+  does the restart-surviving thing the capability writers do
+  (`writeCapabilityRows`): on each pass, **while the mapping's model is observed
+  loaded**, it asks for the voices and **writes only when the canonical payload differs
+  from the stored one**, so a steady server costs a read per tick, never a write. The
+  write is for the mapping's **currently loaded model only**, because audio.cpp answers
+  for "the loaded model" whatever was asked; asking while another model is loaded would
+  attribute that model's voices here. Two producers share one fetch-and-write step
+  (`fetchAndCacheVoices`): the static `audio_cpp` pass (`probeAudioCppModels`, which now
+  also decodes `loaded` from the same `/v1/models` read) and the agent-child pass
+  (`probeAgentVoices`, gated on the agent's loaded-model report, the spec kind `audio_cpp`
+  and the `runtime_voices` flag, with the per-mapping `SpecUpstreamAuth` credential and
+  the target `<router>/upstream/<model>`). **The write policy:** a lister **success**,
+  a genuine empty one included, is written when changed; a lister **error**, and a cold
+  child's 404, writes nothing and keeps the row (last known good), and opens a 5-minute
+  per-mapping back-off (`audioCppVoicesBackoff`, cleared by a success or by the model
+  leaving the loaded set) so a server without the listing is not asked every tick. **Only
+  a plain tts model is asked**: `(speech, yes)` and **not** `(speech_clone, yes)`
+  ([ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+  (h), #252): the static pass reads that off the very listing it just fetched, the
+  agent pass off the stored rows through `routing.CapabilityRowsPlainTTS`, the one rule
+  the read side applies too. A clone model is driven by a reference recording and has no
+  named voices; a non-speech model has none at all.
+- **(d) Two read endpoints over one union core.** `GET /v1/audio/voices?model=<gateway
+  model name>` (alias `/openai/v1/audio/voices`; `handleAudioVoices`) is the public one:
+  **bearer or the internal loopback pair, never the session cookie**, scope `gateway:use`
+  or `llm:invoke`, the speech endpoints' own auth leg
+  ([ADR-006](#adr-006--two-auth-modes-chat-completions-also-session-reachable)). It
+  **reads the cache and nothing else** — no model is loaded, no upstream is asked — and
+  answers `{"model": "<as asked>", "voices": [...]}`, the union across everything the name
+  resolves to, a group name expanded to its members. `?model=` selects which cache rows to
+  read; the upstream's own parameter is moot. Its visibility gate is
+  **routing-consistent** (`Resolver.ReachableCandidates`: the group expansion, the
+  locked/direct rule, resource-group provisioning), preceded by the token's own model
+  override and a service token's allowlist, and followed by the **current** plain-tts
+  verdict at read time (a row that outlived a flip to `speech_clone` or `speech: no` offers
+  nothing). Every "nothing to show" case — an unknown name, a model the token cannot
+  route to or may not use, a non-speech or clone model, nothing cached yet — is the same
+  **200 with an empty `voices`** (no-leak: the answer cannot probe which models exist); a
+  missing or blank `model` is **400 `model.name_required`**, and a store failure is
+  **500 `model.voices_failed`**, never read as empty. A browser cannot use that endpoint,
+  so the picker has its own **session-cookie** route, `GET /api/portal/model-voices?name=`
+  (`handlePortalModelVoices`, `requireWebScope(gateway:use)`, a `name` query parameter like
+  `model-image-options`), under the **portal's** visibility rule
+  (`Portal.ModelVoiceMappingIDs`). **The rule, precisely:** hidden/locked suppression
+  (`modelServersSuppressed`, a non-admin only) applies to the **requested name only**,
+  the group's own name included; the **members of a group are filtered by provisioning
+  alone**, so a locked member's voices are listed through its group (a hidden or locked
+  model is still a full member of a group, and `locked` means "reachable through a group,
+  not directly"). Both routes share one core, `cachedVoicesForMappings` (the current
+  verdict gate, the cache read, a Warn-and-skip for an undecodable row, dedupe, sort), and
+  differ only in who may see which mapping. Voices stay out of `/v1/models`.
+- **(e) A chosen voice routes to a server that has it — and the filter is fail-open.** The
+  speech handler **sniffs `voice`** from the raw body (`sniffSpeechVoice`: a non-blank JSON
+  string, exactly as sent and not trimmed, else none) into a dedicated
+  `inference.Request.RequiredVoice` field, deliberately **not** a capability token: a
+  capability fails closed, and an existing bearer client sending a voice the gateway never
+  heard of, or hitting a cache that was never filled, must keep working as it always did.
+  The rule — **unknown is not absent**: a candidate is *known-present* when its cached
+  list contains the voice (an exact match, on a mapping that is a plain tts model now),
+  *known-absent* when it has a cached list that does **not** contain it (a cached-empty
+  list included), and of **unknown** voice status when it has no cached voices row at all
+  (or an undecodable one). Routing **excludes only the known-absent candidates**;
+  known-present and unknown ones stay eligible (fail open), so a healthy same-model
+  sibling that was never voice-cached keeps serving as a failover/load target. **When no
+  candidate is known-absent, nothing is filtered; and when EVERY candidate is known-absent
+  the filter also stands aside** (nothing is known to offer the voice, so the request routes
+  unfiltered and the upstream decides) — only a MIX, at least one known-absent alongside at
+  least one eligible candidate, actually restricts routing. The single-model path applies it after the
+  capability gate and before the admission parameters. A **group** needs a **pre-pass**,
+  not a per-member rule (`groupVoiceScope`): `eligibleCandidates` sees one member at a
+  time, so a rule "restrict this member if one of *its* candidates lists the voice"
+  leaves a voice-less member fully eligible and priority or speed order can then pick it
+  ahead of the member that has the voice — the group is never narrowed. The pre-pass is
+  computed **once over the flattened group** (`memberPool`, the same provisioning,
+  endpoint-mode and capability filters the walk uses, so it cannot count a candidate the
+  walk would not see) and carried **outside `GroupPolicy`** (`groupResolve.voice`), which
+  is the one thing the relaxation ladder rewrites, so a relaxed attempt can drop
+  `loaded_only` and the speed floor but **never relaxes the voice**; it is threaded into
+  `eligibleCandidates`, `selectMember`, `orderMembersBySpeed`, `firstAvailable` and
+  `climbTarget`. Two exemptions: a **server override** names one server, so there is
+  nothing to choose between and the voice does not veto it, and a **sticky pin** is not
+  taken for a voiced single-model request (the pin was chosen without the voice and would
+  bypass it; no such pin can exist today, so this keeps the contract rather than changing
+  a path), while a group's pin passes through the voice-restricted `selectMember`. When the
+  voice **narrowed** the pool (excluded at least one *known-absent* candidate while an
+  eligible candidate remained) and every remaining eligible candidate is unusable, the
+  answer is **`routing.ErrVoiceUnavailable`** → **HTTP 503 `routing.voice_unavailable`**
+  instead of the generic `routing.no_healthy_host`: the generic code says the model has no
+  host, which is false when other servers of the model are healthy and are known only to
+  lack the voice. It fires **exactly then** — and **never** for a voice no candidate is
+  known to lack (all known-present or unknown), **nor** for one no candidate is known to
+  offer (every candidate known-absent, or every candidate of unknown status): those route
+  unfiltered, fail open, and the upstream decides. The two reads the
+  pre-pass makes fail **differently, on purpose**: an unreadable **voices cache** fails
+  **open** (logged at Warn, routed as if no voice were named — the cache exists only for
+  this preference), while a failing capability **verdict** read is **returned**, like the
+  capability gate it belongs to.
+- **(f) The portal field becomes a combobox bound to the existing `voice` field.**
+  `SpeechVoiceField.tsx` (a free-text-capable MUI `Autocomplete`) offers the cached
+  names and still accepts any typed name. It is keyed on the **existing** `voice` string
+  (the live probe shows no other field consumes a listed name, so `ChatAudioSettings` is
+  unchanged and there is no backend change on the run path). The list comes from
+  `api.modelVoices` and a `ChatStore` effect shaped like the image-options one: cleared
+  first on every model change (a voice belongs to one model), a latest-wins guard against a
+  slow stale response, **fail-open** (a failed fetch and an empty answer are the same empty
+  list, which leaves the plain free-text field it was before). A saved voice the list omits
+  stays shown, a blank is "the model's default" and is never written, and the helper hint
+  appears only while there is a list; the label, hint and placeholder are German and
+  English together.
+
+**Consequence:** a speech model's voices stay on offer while it is unloaded and across a
+gateway restart, and a chosen voice reaches a server that has it. The costs are named.
+**A mapping has no row until its model has been observed loaded once** under a gateway
+that carries this change (and for up to five minutes after a transient first-fetch failure,
+the back-off), and a server on an agent older than 0.11.0 never has one; both read as
+**unknown voice status** (not "absent") and stay eligible fail-open. A list is an **offer,
+never a constraint**: the cache holds only what the health loop saw, so the field stays
+free text, and a voice no cached list is known to offer — a free-text name, or one every
+candidate is known-absent for — still reaches the upstream, which answers **500** (not 400)
+through the ordinary `normalizeSpeechUpstreamError`. The filter only steers AWAY FROM
+servers known to lack the voice while a known-present or unknown one remains; it never
+refuses a request no server is known to be able to serve.
+**Voices are names only**, because that is all audio.cpp
+states; richer display (language, gender) would need a new `cache_type` or a new payload
+shape. **A single audio.cpp server holding TWO tts models loaded at once is unverified**:
+`/v1/audio/voices` ignores `?model=` and answers for "the loaded model", so two loaded tts
+mappings on one server could cache the same voices. The **same root cause** also appears as
+a **cross-GET / hot-swap window**: the loaded-model check and the `ListVoices` fetch are
+two unsynchronized GETs, so a static multi-model server that swaps its loaded model between
+them can have its voices misattributed. Both are harmless on the documented
+single-model-loaded deployment, the agent-child path is immune, and the attribution
+self-heals on the next tick (the upstream validates the name, so the worst case is a 500,
+not silent wrong audio). The common offline-mode case, where
+one model is loaded at a time, is correct, and no code guard was built; the follow-up is a
+live check with two models
+([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). A verdict
+flip needs no delete, because the read-side verdict gate hides a stale row and the next
+load's tts-gated write stops refreshing it.
+
+**Amends:** [ADR-055](#adr-055--per-model-sd-server-image-options-are-read-live-on-pick-from-two-volatile-caches-and-never-stored)
+(image options remain volatile and unstored; what changes is that "cache, don't store" is
+no longer the only pattern, because a fact obtainable only while the model is loaded must
+persist),
+[ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
+(j) (`GET /v1/audio/voices` now exists, as a read of the cache and not a proxy of the
+upstream),
+[ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(f) (the voice field is a combobox, not free text with no dropdown) and
+[ADR-037](#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)
+(the `/upstream` allowlist holds two endpoints, not exactly `/props`).
+
+**Rejected:** **A volatile cache like ADR-055's** (empty whenever the model is unloaded and
+after every restart, which is the whole use case). **Extending `model_mapping_capabilities`**
+(a ranked yes/no verdict, not a name list). **Proxying the listing live** (nothing to ask
+while unloaded, and for an agent-launched child it would have to start a cold one, which a
+listing must never do). **A fail-closed voice filter, or a `voice:<name>` capability
+token** (it would break existing free-text bearer clients and an empty or fresh cache).
+**A per-member group filter** (it never narrows a group, above). **Relaxing the voice on
+the ladder** (serving it from a member without it would be the wrong answer, not a degraded
+one). **The browser reading the public endpoint** (it refuses the session cookie, and the
+internal pair is blanked at the edge), hence the portal route. **Fetching on a "became
+loaded" event** (the gateway has none; the change-detected tick is restart-surviving).
+**Writing for a model the mapping does not currently point at, or from an unloaded one**
+(it would attribute another model's voices to this mapping). **A code guard for two tts
+models loaded at once** (unverifiable on the available server; the limitation is recorded
+instead).
+→ [API Compatibility & Inference
+§3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Routing & Model Selection
+§2.5](cross-cutting/routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open),
+[Agent-Managed Model Runtime
+§4.1](cross-cutting/agent-runtime-manager.md#41-control-routes),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[Persistence](cross-cutting/persistence.md),
+[Data Model](reference/data-model.md#the-per-mapping-cache-table),
+[HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

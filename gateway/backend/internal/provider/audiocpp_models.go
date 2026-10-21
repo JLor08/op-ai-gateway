@@ -86,26 +86,37 @@ const (
 // refines Speech, it never replaces it (a clone model is still a Speech "yes", so
 // it stays a /v1/audio/speech candidate), and it gates no route.
 //
-// The verdict is the capability axis and is decided from the task (Speech,
-// Transcription, SpeechClone) and, for an asr model, the mode
+// The four verdicts are the capability axis and are decided from the task
+// (Speech, Transcription, SpeechClone) and, for an asr model, the mode
 // (TranscriptionStreaming) alone. Whether the model is loaded RIGHT NOW is the
 // health axis: an asr model the server lists as unloaded still carries task
 // "asr", and stays a transcription "yes".
+//
+// Loaded is that health axis, carried beside the verdicts because the one
+// listing states both: true only when the listing's entry for the model says
+// loaded:true (a boolean). Everything the listing does not say -- no entry, no
+// field, a null or a non-boolean, an unreadable body -- is false, because the
+// caller acts on it by asking the server for the model's voices, and the server
+// answers for the model it has loaded, so a model not observed loaded must never
+// be asked about. It decides no verdict and no verdict decides it: it is set by
+// the probe (fetchAudioCppModels), not by parseAudioCppModels, whose table is the
+// capability rule shared verbatim with the agent's copy.
 type AudioCppVerdicts struct {
 	Speech                 string
 	Transcription          string
 	TranscriptionStreaming string
 	SpeechClone            string
+	Loaded                 bool
 }
 
 // AudioCppModelsProber is an optional provider capability: it GETs
 // target.Endpoint + /v1/models and derives the speech, transcription,
 // transcription streaming and speech clone verdicts the listing states for
-// modelID. A transport
+// modelID, and whether it states the model as loaded right now. A transport
 // failure or a non-2xx status is an error and carries no verdict, so the caller
 // writes nothing. A 2xx body that does not name the model, or cannot be read, is
-// NOT an error, only empty verdicts -- the caller writes nothing for an empty
-// verdict either.
+// NOT an error, only empty verdicts and Loaded false -- the caller writes
+// nothing for an empty verdict either.
 //
 // It is a client method, like ProbeSdcppCapabilities, and not a free function,
 // because the request must ride the client's own *http.Client: cmd/gateway
@@ -151,24 +162,32 @@ func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target ro
 	if err != nil {
 		return AudioCppVerdicts{}, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	return parseAudioCppModels(body, modelID), nil
+	// The verdicts and the loaded flag are two reads of the one body: the
+	// verdicts are the capability rule, pinned by the table the agent's copy
+	// shares, and loaded is the health axis beside them (see AudioCppVerdicts).
+	// The listing is one small document per probe, so decoding it twice costs
+	// nothing worth coupling the two.
+	v := parseAudioCppModels(body, modelID)
+	v.Loaded = parseAudioCppLoaded(body, modelID)
+	return v, nil
 }
 
 // audioCppModelsDoc is the part of the listing this code reads: each entry's id,
-// task and mode. The rest of an entry (object, owned_by, family, loaded, path)
-// answers no capability question and is left undecoded, so an unknown or added
-// field never breaks the read.
+// task, mode and loaded. The rest of an entry (object, owned_by, family, path)
+// answers no question this code asks and is left undecoded, so an unknown or
+// added field never breaks the read.
 //
-// Mode is held raw and decoded on its own (audioCppStreamingVerdict), and only
-// for an asr entry: a mode of a type this code does not expect must cost only
-// the streaming verdict, never the speech and transcription verdicts the task
-// decides, and a typed string field would fail the whole document's decode on
-// one odd mode.
+// Mode and Loaded are held raw and decoded on their own (audioCppStreamingVerdict,
+// audioCppLoadedFlag): a mode or a loaded of a type this code does not expect
+// must cost only the streaming verdict or only the loaded flag, never the
+// speech and transcription verdicts the task decides, and a typed field would
+// fail the whole document's decode on one odd value.
 type audioCppModelsDoc struct {
 	Data []struct {
-		ID   string          `json:"id"`
-		Task string          `json:"task"`
-		Mode json.RawMessage `json:"mode"`
+		ID     string          `json:"id"`
+		Task   string          `json:"task"`
+		Mode   json.RawMessage `json:"mode"`
+		Loaded json.RawMessage `json:"loaded"`
 	} `json:"data"`
 }
 
@@ -217,10 +236,11 @@ type audioCppModelsDoc struct {
 //   - no entry for modelID, an empty data list, or an unreadable body ->
 //     speech_clone ""
 //
-// Only id, task and mode are read: loaded (and family, path) is deliberately
-// not decoded. Whether a model is loaded is the health axis, not the capability
-// axis, so the server listing an asr model with loaded:false does not turn its
-// transcription "yes" into anything else.
+// Only id, task and mode decide a verdict: loaded (and family, path) never
+// does. Whether a model is loaded is the health axis, not the capability axis, so
+// the server listing an asr model with loaded:false does not turn its
+// transcription "yes" into anything else. The loaded flag is read separately, by
+// parseAudioCppLoaded, and is not part of this rule.
 //
 // The id match is exact. The task and mode matches ignore case and surrounding
 // whitespace: a "TTS" or "ASR" the server might one day emit must not fall to
@@ -265,6 +285,46 @@ func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 		return v
 	}
 	return AudioCppVerdicts{}
+}
+
+// parseAudioCppLoaded reports whether a /v1/models body states modelID as
+// currently loaded: the first entry whose id is modelID, with a loaded field that
+// is the boolean true. Like parseAudioCppModels it is tolerant -- it never
+// fails -- and every statement it cannot read is false: no entry for modelID, an
+// empty modelID, an entry without a loaded field or with a null, a string or a
+// number there, an empty data list, a body that is not the listing. The id match
+// is exact, as in parseAudioCppModels, so the two always speak of the same entry.
+//
+// Loaded is the health axis (see AudioCppVerdicts): it decides no capability
+// verdict, and no verdict decides it, so an asr model the server lists as
+// unloaded keeps its transcription "yes" while this says false.
+func parseAudioCppLoaded(body []byte, modelID string) bool {
+	if modelID == "" {
+		return false
+	}
+	var doc audioCppModelsDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return false
+	}
+	for _, entry := range doc.Data {
+		if entry.ID != modelID {
+			continue
+		}
+		return audioCppLoadedFlag(entry.Loaded)
+	}
+	return false
+}
+
+// audioCppLoadedFlag maps one entry's raw loaded field onto a bool: true only for
+// the JSON boolean true. An absent field, a null, and a value that is not a
+// boolean at all (the string "true", a number) are false -- a loaded model is
+// never guessed.
+func audioCppLoadedFlag(raw json.RawMessage) bool {
+	var loaded bool
+	if err := json.Unmarshal(raw, &loaded); err != nil {
+		return false
+	}
+	return loaded
 }
 
 // audioCppStreamingVerdict maps one ASR entry's raw mode onto the transcription

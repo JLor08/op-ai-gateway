@@ -59,8 +59,9 @@ export type ChatImageSettings = {
 // stay byte-identical. The reply is always WAV (the gateway serves only wav), so there
 // is no format knob. See the backend's portal.ChatAudioSettings.
 export type ChatAudioSettings = {
-  // The free-text voice name (audio.cpp voices are not discovered); omitted = the
-  // model's default voice.
+  // The voice name, picked from the voices the gateway has cached for the model or
+  // typed as free text (the composer's field is a combobox that still takes any name);
+  // omitted = the model's default voice.
   voice?: string;
   // The speaking-rate multiplier, passed through as given (the model's own range
   // applies); omitted = the model's default.

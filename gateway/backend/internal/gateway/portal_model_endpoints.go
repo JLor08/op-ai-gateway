@@ -14,6 +14,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -584,6 +585,67 @@ func (s *Server) cachedImageOptions(views []portal.ImageOptionMapping) []provide
 		}
 	}
 	return collected
+}
+
+// handlePortalModelVoices answers which voices the portal's voice picker may offer
+// for a gateway model (?name=<model>, a group name included): the deduped, sorted
+// UNION of the voices the gateway has cached for the model's visible mappings, as
+// {"voices":[...]}. It is the browser's route to the same cache the public GET
+// /v1/audio/voices reads (handleAudioVoices), and shares its union core
+// (cachedVoicesForMappings): the two differ ONLY in who may see which mapping.
+//
+// Auth is requireWebScope(gateway:use), the portal model endpoints' own: the
+// session cookie a browser holds (the public endpoint deliberately refuses it).
+// The model name is a query parameter for the reason handlePortalModelImageOptions'
+// is (it may contain '/'). Like it, a missing or blank name is a 400
+// model.name_required: an empty name would resolve to nothing and read as "no
+// voices", hiding a client bug behind a normal-looking answer.
+//
+// Visibility is the PORTAL's, decided BEFORE the cache is read:
+// Portal.ModelVoiceMappingIDs returns only the mappings this principal may see in
+// the portal (hidden/locked suppression of the requested name for a non-admin,
+// group expansion, resource-group provisioning), NOT the routing-consistent set
+// the public endpoint serves, so a hidden or locked model asked for by name has no
+// mappings, reads no cache and answers {"voices":[]} exactly like an unknown one.
+// A group's members are NOT filtered by their own visibility (a hidden or locked
+// model is still a full member of a group), so a locked model's voices are
+// offered through its group. Every "nothing to show"
+// case -- an unknown, hidden, locked, restricted, non-speech, clone or not-yet-
+// cached model -- is that same 200, so the answer cannot be used to probe which
+// models exist. A store failure is the only 500 and is never read as an empty
+// answer. Nothing here loads a model or contacts an upstream.
+func (s *Server) handlePortalModelVoices(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
+	if !ok {
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if strings.TrimSpace(name) == "" {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(audioVoicesModelRequired, "model name is required", ""))
+		return
+	}
+	voices, err := s.portalVoicesForModel(r.Context(), token, name)
+	if err != nil {
+		slog.Error("portal model voices lookup failed", "model", name, "err", err)
+		writeJSON(w, http.StatusInternalServerError, apierror.Response(audioVoicesFailed, "model voices failed", ""))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]string{"voices": voices})
+}
+
+// portalVoicesForModel is voicesForModel under the portal's visibility rule: the
+// voices cached for the mappings of modelName that the portal shows token, run
+// through the same union core. It never returns nil, and a store failure is an
+// error, never an empty answer.
+func (s *Server) portalVoicesForModel(ctx context.Context, token auth.Token, modelName string) ([]string, error) {
+	ids, err := s.Portal.ModelVoiceMappingIDs(ctx, token, modelName)
+	if err != nil {
+		return nil, err
+	}
+	return s.cachedVoicesForMappings(ctx, ids)
 }
 
 // handlePortalModelServersEvents streams the model-servers list over SSE: a `snapshot` frame, then
