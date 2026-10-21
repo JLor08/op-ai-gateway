@@ -3724,6 +3724,40 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
     });
 
+    it('excludes a clone-task speech model from the picker, keeping plain tts (#252)', async () => {
+      // speech_clone marks a voice-CLONE model: it keeps speech:true (the direct
+      // endpoint serves it) but a text-only chat composer cannot supply the
+      // reference voice it needs, so the picker drops it. A speech model with no
+      // speech_clone flag is fail-open (offered), and a clone model that ALSO
+      // transcribes is still offered via the transcription half.
+      const audio = (
+        id: string,
+        speech?: boolean,
+        speech_clone?: boolean,
+        transcription?: boolean,
+      ): ModelOption => ({
+        id,
+        display_name: id,
+        flavors: ['openai_audio'],
+        loading_on_count: 0,
+        speech,
+        speech_clone,
+        transcription,
+      });
+      renderProvider([], {
+        models: [
+          audio('tts-plain', true, false),
+          audio('tts-unclassified', true), // no speech_clone row -> fail-open, offered
+          audio('voice-clone', true, true), // clone -> excluded from the speech picker
+          audio('clone-and-asr', true, true, true), // still offered via transcription
+        ],
+      });
+      await waitForReady();
+      expect(screen.getByTestId('model-options').textContent).toBe(
+        'tts-plain,tts-unclassified,clone-and-asr',
+      );
+    });
+
     it('leaves the offered text and image models exactly as they were', async () => {
       // The existing offered-models rule, restated with a speech model alongside:
       // adding the speech admission changed nothing for the others.

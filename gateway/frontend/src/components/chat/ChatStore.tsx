@@ -548,8 +548,14 @@ export function ChatStoreProvider({
         return (
           offered.includes('openai') ||
           offered.includes('openai_images') ||
+          // An openai_audio model is offered behind a speech OR transcription
+          // verdict — except a voice-CLONE speech model (speech_clone), which the
+          // text-only speech composer cannot drive (it needs a reference voice),
+          // so it is excluded from the speech half (#252). A clone model that also
+          // transcribes is still offered via the transcription half.
           (offered.includes('openai_audio') &&
-            (option.speech === true || option.transcription === true))
+            ((option.speech === true && option.speech_clone !== true) ||
+              option.transcription === true))
         );
       }),
     [models],

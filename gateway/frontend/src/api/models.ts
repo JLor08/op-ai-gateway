@@ -505,6 +505,18 @@ export type ModelOption = {
   // false`, which is what keeps every pre-existing non-transcription test
   // meaningful.
   transcription?: boolean;
+  // True when this model is a voice-CLONE speech model (audio.cpp task "clone"):
+  // it REFINES `speech` without changing it. A clone model stays `speech: true`
+  // (the direct /v1/audio/speech endpoint serves it), but the chat picker excludes
+  // it, because a text-only speech composer cannot supply the reference voice a
+  // clone model needs and every send would fail (#252). It is the backend's own
+  // fold (ModelDTO.SpeechClone) — the INVERSE of the `speech` fold, an OR across
+  // mappings/members, fail-open — and the client never recomputes it.
+  //
+  // OPTIONAL and fail-open: a model that omits it (an unknown task, or an agent
+  // too old to report the verdict) derives `speech_clone === false` and stays
+  // offered — only a KNOWN clone model is hidden.
+  speech_clone?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options
