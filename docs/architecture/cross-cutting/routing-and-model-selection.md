@@ -1277,14 +1277,21 @@ as sent and **not trimmed**, because the body reaches the upstream byte for byte
 `" alba"` is a different voice from `"alba"`; anything else, an object-valued `voice`
 included, is "no voice named"), and every other endpoint leaves it empty.
 
-**The rule** (`voiceScopeFor`, `internal/routing/voice_filter.go`): when the voice is
-named and **at least one candidate lists it**, only the candidates that list it are
-selectable; otherwise nothing is filtered and the request is routed as without a voice.
-"Lists it" means the voice is in the mapping's cached voices
-(`model_mapping_cache`, type `voices`, an **exact** match) **and** the mapping is a plain
+**The rule** (`voiceScopeFor`, `internal/routing/voice_filter.go`) — **unknown is not
+absent**: each candidate is classified from its cached voices row. A candidate is
+*known-present* when the voice is in its cached list, *known-absent* when it has a cached
+list that does **not** contain it (a cached-empty list included), and of **unknown** voice
+status when it has **no** cached voices row at all (or an undecodable one). The filter
+**excludes only the known-absent candidates**; known-present and unknown ones stay
+selectable (fail open), so a healthy same-model sibling that was never voice-cached keeps
+serving. **When no candidate is known-absent, nothing is filtered** and the request is
+routed as without a voice. "In its cached list" means an **exact** match in the mapping's
+cached voices (`model_mapping_cache`, type `voices`) **and** the mapping is a plain
 tts model *now* (`routing.CapabilityRowsPlainTTS`: `(speech, yes)` and not
 `(speech_clone, yes)`, the same rule the voices endpoint applies at read time, so a list
-that outlived a flip to a clone model is not a known voice either). For a single model
+that outlived a flip to a clone model is not a known voice either). **Presence of the
+scope-`""` row** — not a non-empty decoded list — is what separates *known* from
+*unknown*, because an empty or null payload decodes the same as no row at all. For a single model
 the filter runs in `resolveStandard` on the pool the capability gate left, **after** the
 two empty-pool sentinels (so `ErrNoModelRoute` and `ErrModelNotCapable` are untouched)
 and **before** the admission parameters (so a request queues on the voice's servers, not
@@ -1299,13 +1306,14 @@ pick it ahead of the member that has it: such a filter never narrows a group. In
 before any member is visited, `resolveGroup` flattens the group (each distinct member's
 `memberPool`, the one definition of "could serve this request" that the walk and the
 speed ordering share: store read, provisioning, endpoint-mode refinement, capability
-gate) and asks `voiceScopeFor` over the whole set, which answers both halves at once: "does
-at least one candidate **anywhere in the group** list the voice" (the fail-open switch)
-and the allowed mapping set. The result is threaded through `eligibleCandidates`,
-`selectMember`, `orderMembersBySpeed`, `firstAvailable` and `climbTarget` (and so the pin
-check). A group's offered voices are therefore the **union** across its member mappings
-(what the voices endpoints list for it), and a chosen voice narrows the allowed members to
-those that have it before the ordinary group dispatch scores them.
+gate) and asks `voiceScopeFor` over the whole set, which answers both halves at once: "is
+any candidate **anywhere in the group** known-absent for the voice" (the narrowing switch)
+and the allowed mapping set (known-present **plus** unknown). The result is threaded through
+`eligibleCandidates`, `selectMember`, `orderMembersBySpeed`, `firstAvailable` and
+`climbTarget` (and so the pin check). A group's offered voices are therefore the **union**
+across its member mappings (what the voices endpoints list for it), and a chosen voice
+drops only the members known-absent for it (keeping known-present and unknown ones) before
+the ordinary group dispatch scores them.
 
 **The voice scope is carried OUTSIDE `GroupPolicy`, so the relaxation ladder cannot
 relax it.** The ladder (§5) only ever rewrites the policy: it drops `loaded_only`, then
@@ -1325,28 +1333,34 @@ ever be lifted). A **group's** pin goes through the voice-restricted `selectMemb
 can only hold a member the voice allows.
 
 **`ErrVoiceUnavailable` (503 `routing.voice_unavailable`) fires exactly when the voice
-narrowed the pool and nothing left is usable.** `voiceScope.narrowed` records that the
-voice excluded at least one candidate of the pool it was computed over; when the walk then
-ends in `ErrNoHealthyHost` (unreachable, unhealthy or busy), `refine` turns it into
-`ErrVoiceUnavailable`. The generic code says the model has no host, which is false when
-other servers of the same model are healthy and merely lack the voice, and a client that
-cannot tell the two apart can act on neither (retry shortly versus choose another voice).
-Every other error, and the same error for a voice that narrowed nothing (every candidate
-lists it), passes through untouched; a voice nothing is known to offer never produces it.
-Both resolution paths use it: the standard path at its no-healthy-host exit, the group
-path on the last attempt of the ladder.
+narrowed the pool and no remaining eligible host is usable.** `voiceScope.narrowed` records
+that the voice excluded at least one candidate **known** (from its cached row) to lack it;
+a candidate of unknown/uncached status never narrows. When the walk then ends in
+`ErrNoHealthyHost` (unreachable, unhealthy or busy), `refine` turns it into
+`ErrVoiceUnavailable` — which **includes** the case where every candidate is known-absent,
+so the eligible set is empty. The generic code says the model has no host, which is false
+when other servers of the same model are healthy and are known only to lack the voice, and
+a client that cannot tell the two apart can act on neither (retry shortly versus choose
+another voice). Every other error, and the same error for a voice that narrowed nothing (no
+candidate is known to lack it), passes through untouched. Both resolution paths use it: the
+standard path at its no-healthy-host exit, and the group path on the last attempt of the
+ladder — where, if the voice excluded **every** member's candidates, the group reads as
+`ErrNoModelRoute` instead (each such member is `memberNoMapping`, not a gated host), which
+`refine` leaves unchanged.
 
 **The cache read and the verdict read fail differently, on purpose.** The pre-pass makes
 exactly two bulk reads, and none at all for a request that names no voice. An unreadable
 **voices cache** (`ModelMappingCacheForMappings`) **fails open**: it logs a Warn and
 returns no scope, so the request routes as if no voice were named. The cache exists only
 for this preference, so when it cannot be read there is simply no voice information, which
-is the "nothing lists the voice" case, and a cache-table hiccup must not turn an
-otherwise-working speech request into a failure. A failing capability **verdict** read
-(`MappingCapabilitiesForMappings`) is **returned**, like the capability gate it belongs
-to: it reads the very rows `filterCapable` has just read and refused on, so the posture
-stays that of the gate. An undecodable cache row is a third, local case: that mapping
-"does not list" the voice (Warn), and the rest of the pool is unaffected.
+is the "every candidate is of unknown status" case (nothing narrows), and a cache-table
+hiccup must not turn an otherwise-working speech request into a failure. A failing
+capability **verdict** read (`MappingCapabilitiesForMappings`) is **returned**, like the
+capability gate it belongs to: it reads the very rows `filterCapable` has just read and
+refused on, so the posture stays that of the gate. An undecodable cache row is a third,
+local case: that mapping is treated as **unknown** voice status and **kept eligible**
+(Warn, "treated as unknown voice status, kept eligible"), and the rest of the pool is
+unaffected.
 
 ## 3. Candidate scoring
 
@@ -1875,7 +1889,7 @@ caller may see, for a dashboard-style overview without subscribing per server.
 |---|---|---|
 | `ErrNoModelRoute` | **404** | no active mapping exists at all for the model/flavor (or the model is a locked group-only name requested directly); also what an **all-chat model group** answers to a capability-carrying request (§2.3), and what two dispatch checks answer after resolution for a `server_agent` mapping's spec: the images, speech and transcription relays when the spec excludes `openai_images` (`openai_audio` for speech and transcription), and the text translate dispatch when the spec is images-only or audio-only ([API Compatibility & Inference §6](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Neither post-resolve refusal is advertised, except on a name that mixes a refused mapping with a served one (issue #145), or while its application's spec read fails: the listings and `Callable` take the spec's flavors by the same rule, and for a token with the unknown-model redirect on, a request whose effective model fails the flavor half for the request's flavor is redirected before it gets here whenever its LastUsedModel or fallback is usable (§2.1, [ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)) |
 | `ErrNoHealthyHost` | **503** | mappings exist but every candidate is gated (unhealthy/unreachable/busy/non-viable) |
-| `ErrVoiceUnavailable` | **503** (`routing.voice_unavailable`) | a speech request's `voice` is offered by some candidate's cached voice list, narrowed the pool to those candidates, and none of them is usable; answered **instead of** `ErrNoHealthyHost` and only then (§2.5). A voice nothing is known to offer never produces it |
+| `ErrVoiceUnavailable` | **503** (`routing.voice_unavailable`) | a speech request's `voice` is one that at least one candidate is **known** (from its cached voice list) to lack, so the voice narrowed the pool to those not known-absent (those that list it, plus any of unknown/uncached status), and none of those is usable — including when every candidate is known-absent, so none is left; answered **instead of** `ErrNoHealthyHost` and only then (§2.5). A voice no candidate is known to lack never produces it |
 | `ErrModelNotCapable` | 404 | candidates existed for the model, but none carries a `yes` verdict for a capability the endpoint requires (§2.3) — for an edit's `image_edit`, one that is not derived: no `image: yes`, or an operator's `image_edit: no` on every candidate; for speech, no `speech: yes`, and for transcription no `transcription: yes` (a model the listing does not name reads as unknown) |
 | `ErrAdmissionQueueTimeout` | 503 | an admission-queued request's deadline elapsed before a slot freed |
 | `ErrAdmissionQueueFull` | 503 | the admission queue was already at `admission_queue_max_depth` |

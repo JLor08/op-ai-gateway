@@ -826,13 +826,16 @@ Runtime §4.1](agent-runtime-manager.md#41-control-routes)).
 - **A requested `voice` steers routing, and fails open** ([Routing & Model Selection
   §2.5](routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open)). The
   handler sniffs the body's `voice` (`sniffSpeechVoice`: a non-blank JSON string, exactly as
-  sent, else none) into `inference.Request.RequiredVoice`. When at least one candidate's
-  cached list contains it, routing is restricted to the candidates that do; otherwise the
-  request routes exactly as it did before voices were routable, so an existing client that
-  sends a free-text or unknown voice is unaffected, and the upstream stays the authority
-  (audio.cpp answers an unknown voice with **HTTP 500**, relayed like any other speech
-  error). If the voice narrowed the candidates and none of those is usable the answer is
-  `503` `routing.voice_unavailable` (§13) instead of the generic no-healthy-host.
+  sent, else none) into `inference.Request.RequiredVoice`. It **excludes only the candidates
+  known (from their cached voices row) to lack the voice**; candidates that list it and
+  candidates of unknown/uncached voice status stay eligible (**unknown is not absent**, fail
+  open), so an existing client that sends a free-text voice, and a healthy same-model server
+  not yet voice-cached, are both unaffected, and the upstream stays the authority (audio.cpp
+  answers an unknown voice with **HTTP 500**, relayed like any other speech error). When no
+  candidate is known-absent the request routes exactly as it did before voices were routable.
+  If the voice narrowed the candidates (at least one known-absent) and no eligible host is
+  usable — including when every candidate is known-absent — the answer is `503`
+  `routing.voice_unavailable` (§13) instead of the generic no-healthy-host.
 
 The portal chat's speech composer reads the cache through the portal route (§12), so its
 `voice` field is a combobox over that list and still takes free text.
@@ -3374,7 +3377,7 @@ Every inference error response uses the gateway-wide envelope
 | `transcription.upstream_error` | the upstream's own status, or **502** | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"` (an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged); **and**, as a 502, a 2xx response that was **over the buffer bound** or broke off mid-read, with nothing of the body written (§3.7) |
 | `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images, speech and transcription relays answer when the resolved agent-launched child's spec excludes `openai_images` (`openai_audio` for speech and transcription), and what the text translate path answers when that child's spec is images-only or audio-only (§6) |
 | `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |
-| `routing.voice_unavailable` | **503** | a speech request named a `voice` that some candidate's cached voice list offers, the voice therefore **narrowed** the candidates to those, and none of them is usable (unreachable, unhealthy or busy) — `routing.no_healthy_host`'s narrower twin, answered instead of it **only** when the voice narrowed the pool; a voice nothing is known to offer never produces it ([Routing & Model Selection §2.5](routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open), §3.6 item 8) |
+| `routing.voice_unavailable` | **503** | a speech request named a `voice` that at least one candidate is **known** (from its cached voice list) to lack, so the voice **narrowed** the candidates to those not known-absent (those that list it, plus any of unknown/uncached status), and none of those is usable (unreachable, unhealthy or busy) — including when every candidate is known-absent, so none is left — `routing.no_healthy_host`'s narrower twin, answered instead of it **only** when the voice narrowed the pool; a voice no candidate is known to lack never produces it ([Routing & Model Selection §2.5](routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open), §3.6 item 8) |
 | `model.name_required` | 400 | `GET /v1/audio/voices` without a non-blank `model`, or `GET /api/portal/model-voices` (and `model-image-options`) without a non-blank `name`: a client bug an empty list would hide (§3.6 item 8) |
 | `model.voices_failed` | 500 | a store failure while reading the voices cache or the visibility it depends on, on either voices route; never read as an empty list (§3.6 item 8) |
 | `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires — for an edit's `image_edit`, one that is not **derived**: no `image: yes`, or an operator's `image_edit: no`; for speech or transcription, no `(speech, yes)` or `(transcription, yes)` verdict, an unprobed model included ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |

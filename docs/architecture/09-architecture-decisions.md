@@ -6799,9 +6799,14 @@ gave.
   `inference.Request.RequiredVoice` field, deliberately **not** a capability token: a
   capability fails closed, and an existing bearer client sending a voice the gateway never
   heard of, or hitting a cache that was never filled, must keep working as it always did.
-  The rule: **when at least one candidate's cached list contains the voice (an exact
-  match, on a mapping that is a plain tts model now), routing is restricted to those
-  candidates; otherwise nothing is filtered.** The single-model path applies it after the
+  The rule — **unknown is not absent**: a candidate is *known-present* when its cached
+  list contains the voice (an exact match, on a mapping that is a plain tts model now),
+  *known-absent* when it has a cached list that does **not** contain it (a cached-empty
+  list included), and of **unknown** voice status when it has no cached voices row at all
+  (or an undecodable one). Routing **excludes only the known-absent candidates**;
+  known-present and unknown ones stay eligible (fail open), so a healthy same-model
+  sibling that was never voice-cached keeps serving as a failover/load target. **When no
+  candidate is known-absent, nothing is filtered.** The single-model path applies it after the
   capability gate and before the admission parameters. A **group** needs a **pre-pass**,
   not a per-member rule (`groupVoiceScope`): `eligibleCandidates` sees one member at a
   time, so a rule "restrict this member if one of *its* candidates lists the voice"
@@ -6818,11 +6823,14 @@ gave.
   taken for a voiced single-model request (the pin was chosen without the voice and would
   bypass it; no such pin can exist today, so this keeps the contract rather than changing
   a path), while a group's pin passes through the voice-restricted `selectMember`. When the
-  voice **narrowed** the pool and every remaining candidate is unusable, the answer is
+  voice **narrowed** the pool (excluded at least one *known-absent* candidate) and every
+  remaining eligible candidate is unusable, the answer is
   **`routing.ErrVoiceUnavailable`** → **HTTP 503 `routing.voice_unavailable`** instead
   of the generic `routing.no_healthy_host`: the generic code says the model has no host,
-  which is false when other servers of the model are healthy and merely lack the voice. It
-  fires **exactly then** and never for a voice nothing is known to offer. The two reads the
+  which is false when other servers of the model are healthy and are known only to lack the
+  voice. It fires **exactly then** — which includes the case where every candidate is
+  known-absent, so the eligible set is empty — and **never** for a voice no candidate is
+  known to lack (all unknown/uncached stay eligible, fail open). The two reads the
   pre-pass makes fail **differently, on purpose**: an unreadable **voices cache** fails
   **open** (logged at Warn, routed as if no voice were named — the cache exists only for
   this preference), while a failing capability **verdict** read is **returned**, like the
@@ -6844,15 +6852,24 @@ gave.
 gateway restart, and a chosen voice reaches a server that has it. The costs are named.
 **A mapping has no row until its model has been observed loaded once** under a gateway
 that carries this change (and for up to five minutes after a transient first-fetch failure,
-the back-off), and a server on an agent older than 0.11.0 never has one; both read as "no
-voices" and degrade to free text. A list is an **offer, never a constraint**: the cache
-holds only what the health loop saw, so the field stays free text, and an unknown voice
-still reaches the upstream, which answers **500** (not 400) through the ordinary
-`normalizeSpeechUpstreamError`. **Voices are names only**, because that is all audio.cpp
+the back-off), and a server on an agent older than 0.11.0 never has one; both read as
+**unknown voice status** (not "absent") and stay eligible fail-open. A list is an **offer,
+never a constraint**: the cache holds only what the health loop saw, so the field stays
+free text, and a voice on a server of unknown/uncached status still reaches the upstream,
+which answers **500** (not 400) through the ordinary `normalizeSpeechUpstreamError`. The
+gateway answers **503 `routing.voice_unavailable`** without calling the upstream only when
+every reachable candidate is *known* — from its cached list — to lack the voice.
+**Voices are names only**, because that is all audio.cpp
 states; richer display (language, gender) would need a new `cache_type` or a new payload
 shape. **A single audio.cpp server holding TWO tts models loaded at once is unverified**:
 `/v1/audio/voices` ignores `?model=` and answers for "the loaded model", so two loaded tts
-mappings on one server could cache the same voices. The common offline-mode case, where
+mappings on one server could cache the same voices. The **same root cause** also appears as
+a **cross-GET / hot-swap window**: the loaded-model check and the `ListVoices` fetch are
+two unsynchronized GETs, so a static multi-model server that swaps its loaded model between
+them can have its voices misattributed. Both are harmless on the documented
+single-model-loaded deployment, the agent-child path is immune, and the attribution
+self-heals on the next tick (the upstream validates the name, so the worst case is a 500,
+not silent wrong audio). The common offline-mode case, where
 one model is loaded at a time, is correct, and no code guard was built; the follow-up is a
 live check with two models
 ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). A verdict

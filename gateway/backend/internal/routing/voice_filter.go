@@ -37,21 +37,42 @@ func VoiceNamesFromCacheRows(rows []ModelMappingCacheRow) ([]string, error) {
 	return nil, nil
 }
 
+// hasVoicesRow reports whether a mapping has the scope-"" voices row the writers keep --
+// the signal that its voice status is KNOWN (the voices were fetched at least once), as
+// opposed to never cached. Row PRESENCE is read directly here, because
+// VoiceNamesFromCacheRows cannot tell "no row at all" (status UNKNOWN -> fail open) from a
+// present row whose payload is blank or a JSON null (fetched, lists nothing -> KNOWN-absent):
+// both of those decode to (nil, nil). A present scope-"" row, whatever it decodes to, means
+// the voices were fetched, so the status is known and the filter may act on it.
+func hasVoicesRow(rows []ModelMappingCacheRow) bool {
+	for _, row := range rows {
+		if row.ScopeKey == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // voiceScope is the outcome of ONE request's voice pre-pass (voiceScopeFor): the set of
 // candidate mappings the requested voice is restricted to. A nil *voiceScope is "no
-// restriction" and is what every method treats as the identity, so a request that
-// named no voice, or a voice nothing is known to offer, threads a nil through the
-// resolver and changes nothing.
+// restriction" and is what every method treats as the identity, so a request that named
+// no voice, or one no candidate is KNOWN to lack, threads a nil through the resolver and
+// changes nothing.
 //
-// A non-nil scope exists only when the pre-pass found at least one candidate that lists
-// the voice (FAIL-OPEN, see voiceScopeFor): allowed is then never empty.
+// A non-nil scope exists only when the voice EXCLUDED at least one candidate KNOWN (from
+// its cached voices row) to not list it (FAIL-OPEN on unknown, see voiceScopeFor). Its
+// allowed set may then be empty -- exactly when EVERY candidate is known to lack the
+// voice, which is the correct ErrVoiceUnavailable case.
 type voiceScope struct {
-	// allowed is the ids of the pool's mappings whose cached voice list names the
-	// requested voice.
+	// allowed is the ids of the pool's mappings eligible to serve the voice: those whose
+	// cached voice list names it, PLUS those whose voice status is UNKNOWN (no cached row,
+	// or an unreadable one) and so stay eligible fail-open (unknown != absent). It is empty
+	// only when every candidate is known to lack the voice.
 	allowed map[string]struct{}
-	// narrowed reports that the voice EXCLUDED at least one candidate of the pool it
-	// was computed over, which is what makes a later "no usable host" the voice's doing
-	// (refine). A voice that every candidate lists restricts nothing.
+	// narrowed reports that the voice EXCLUDED at least one candidate KNOWN (from its cached
+	// voices row) to not list it, which is what makes a later "no usable host" the voice's
+	// doing (refine). A candidate of unknown/uncached voice status never narrows; a voice
+	// every candidate lists or has unknown status restricts nothing.
 	narrowed bool
 }
 
@@ -86,19 +107,25 @@ func (v *voiceScope) refine(err error) error {
 // "could be served by" means exactly what dispatch means), it decides whether the voice
 // restricts that pool and to what.
 //
-// FAIL-OPEN, the whole point: the restriction applies only when at least one candidate
-// in the pool lists the voice. Otherwise -- no voice named, an empty pool, a voice no
-// cached list names (a free-text or unknown voice, a cache never filled, a cached-empty
-// list, an undecodable row) -- it returns nil and the request routes exactly as it
-// would without a voice. An existing bearer client that sends a voice the gateway has
-// never heard of therefore behaves as it always did; the upstream stays the authority
-// on whether it accepts the name.
+// FAIL-OPEN on UNKNOWN, the whole point: the voice restricts the pool only AWAY FROM
+// candidates KNOWN (from their cached voices row) to not list it. A candidate whose voice
+// status is unknown -- no voices row cached yet (a server never observed with its model
+// loaded, an older static audio.cpp with no voices endpoint, an agent too old to report
+// them), or a row that cannot be decoded -- stays eligible: unknown is NOT absent, so a
+// healthy same-model sibling keeps serving as a failover/load target and the upstream
+// stays the authority on a voice it was never told about. Only a KNOWN-ABSENT candidate
+// narrows anything; otherwise -- no voice named, an empty pool, every candidate
+// known-present or of unknown status -- it returns nil and the request routes exactly as
+// it would without a voice. voice_unavailable therefore arises only when the voice
+// narrowed the pool and none of the eligible hosts is usable -- which includes the case
+// where EVERY candidate is known-absent, leaving the eligible set empty.
 //
-// A candidate lists the voice when the voice is in its mapping's cached list (exact
-// match: the name is relayed to the upstream byte for byte, so a near miss is a
-// different voice) AND the mapping is a plain tts model NOW (CapabilityRowsPlainTTS, the
-// verdict gate the voices endpoint applies at read time, so a list that outlived a
-// tts -> clone flip is not a known voice here either).
+// A candidate is known-present when the voice is in its mapping's cached list (exact
+// match: the name is relayed to the upstream byte for byte, so a near miss is a different
+// voice) AND the mapping is a plain tts model NOW (CapabilityRowsPlainTTS, the verdict gate
+// the voices endpoint applies at read time, so a list that outlived a tts -> clone flip is
+// not a known voice here either). A candidate whose cached list does NOT name the voice is
+// known-absent and excluded; one with no cached voices row at all is unknown and kept.
 //
 // The pool is one flat set. For a group the caller passes every member's candidates,
 // which is what lets one answer both "does anything in the group list the voice" (the
@@ -108,9 +135,9 @@ func (v *voiceScope) refine(err error) error {
 //
 // The two reads fail differently, on purpose. A failure of the VOICES CACHE read fails
 // open: the cache is the one input that exists only for this preference, so when it
-// cannot be read there is simply no voice information, which is exactly the "nothing
-// lists the voice" case (nil, routed as without a voice; logged at Warn so the outage
-// is not silent). A failure of the capability VERDICT read is returned: it reads the
+// cannot be read there is simply no voice information, which is exactly the "every
+// candidate is of unknown status" case (nil, routed as without a voice; logged at Warn so
+// the outage is not silent). A failure of the capability VERDICT read is returned: it reads the
 // very rows filterCapable has just read and refuses on, so the posture stays that of
 // the capability gate it belongs to. Exactly two bulk reads, and none at all for a
 // request that names no voice.
@@ -146,22 +173,44 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 		return nil, nil
 	}
 	allowed := make(map[string]struct{}, len(tts))
+	knownAbsent := 0
 	for _, id := range tts {
-		names, err := VoiceNamesFromCacheRows(cached[id])
+		rows := cached[id]
+		if !hasVoicesRow(rows) {
+			// UNKNOWN voice status: this mapping has no voices row, so nothing is known about
+			// what it offers. Unknown is NOT absent -- keep it eligible (fail open) and leave
+			// the upstream the authority on the name. A healthy, never-voice-cached sibling of
+			// the same model therefore stays a failover/load target.
+			allowed[id] = struct{}{}
+			continue
+		}
+		names, err := VoiceNamesFromCacheRows(rows)
 		if err != nil {
-			// Unreadable is "does not list it": a corrupt row must not break routing, and
-			// the writer cannot produce one.
-			slog.Warn("voice filter: voices cache row is undecodable and was skipped", "mapping_id", id, "err", err)
+			// CORRUPT: an undecodable row is treated as UNKNOWN voice status and kept eligible
+			// (fail open; the writer cannot produce one, so the outage is logged at Warn).
+			slog.Warn("voice filter: voices cache row is undecodable, treated as unknown voice status, kept eligible", "mapping_id", id, "err", err)
+			allowed[id] = struct{}{}
 			continue
 		}
 		if slices.Contains(names, voice) {
+			// KNOWN-PRESENT: the mapping's cached list names the voice.
 			allowed[id] = struct{}{}
+			continue
 		}
+		// KNOWN-ABSENT: the row exists and decodes but does not list the voice (a cached-empty
+		// or null list included). This is the ONLY thing that narrows the pool.
+		knownAbsent++
 	}
-	if len(allowed) == 0 {
-		slog.Debug("voice filter: no candidate lists the voice, routing unfiltered", "voice", voice, "candidates", len(ids))
+	if knownAbsent == 0 {
+		// Nothing is KNOWN to lack the voice (every candidate lists it or is of unknown
+		// status), so the voice restricts nothing: route exactly as without a voice.
+		slog.Debug("voice filter: no candidate is known to lack the voice, routing unfiltered", "voice", voice, "candidates", len(ids))
 		return nil, nil
 	}
-	slog.Debug("voice filter: restricting candidates to those that list the voice", "voice", voice, "allowed", len(allowed), "candidates", len(ids))
-	return &voiceScope{allowed: allowed, narrowed: len(allowed) < len(ids)}, nil
+	// At least one candidate is KNOWN-ABSENT, so the voice narrows the pool to the eligible
+	// set (known-present + unknown + corrupt). allowed MAY be empty -- exactly when EVERY
+	// candidate is known-absent -- which is the correct ErrVoiceUnavailable case: restrict
+	// empties the pool and refine maps the resulting ErrNoHealthyHost to ErrVoiceUnavailable.
+	slog.Debug("voice filter: excluding candidates known to lack the voice", "voice", voice, "allowed", len(allowed), "known_absent", knownAbsent, "candidates", len(ids))
+	return &voiceScope{allowed: allowed, narrowed: true}, nil
 }

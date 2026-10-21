@@ -126,46 +126,115 @@ func TestVoiceStandardKeepsEveryCandidateThatHasTheVoice(t *testing.T) {
 	}
 }
 
-// FAIL-OPEN: a voice no candidate lists -- unknown, never cached, cached-empty or an
-// undecodable payload -- does not filter, so the request routes as it does with no
-// voice at all (existing bearer clients that send a free-text voice keep working).
+// THE regression (#251): a healthy sibling of the SAME model whose voices were NEVER
+// cached (an older static audio.cpp with no voices endpoint, an agent too old to report
+// them, or a model never observed loaded during a health tick) has UNKNOWN voice status,
+// not absent. Unknown must stay eligible (fail open), so it remains a failover/load target
+// and a voiced request is not 503'd when a healthy server could serve it. srv_a lists
+// bella; srv_b is plain tts, healthy, and has no voices row at all.
+func TestVoiceStandardUncachedSiblingStaysEligible(t *testing.T) {
+	t.Run("the voice's server is down: the uncached sibling serves it", func(t *testing.T) {
+		r := NewResolver(voiceModelStore(t, []string{"bella"}, nil), voiceClock(), fakeReachability{unreachable: map[string]bool{"app_a": true}})
+		got, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella"))
+		if err != nil {
+			t.Fatalf("err = %v, want the uncached sibling to serve bella (unknown != absent)", err)
+		}
+		if got.ServerID != "srv_b" {
+			t.Fatalf("server = %q, want srv_b", got.ServerID)
+		}
+	})
+	t.Run("the voice's server is busy: the uncached sibling serves it", func(t *testing.T) {
+		r := NewResolver(voiceModelStore(t, []string{"bella"}, nil), voiceClock(), nil)
+		r.SetServerBusyChecker(fakeBusy{busy: map[string]bool{"srv_a": true}})
+		if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
+			t.Fatalf("server = %q, want srv_b (srv_a busy; the uncached sibling stays an eligible failover target)", got.ServerID)
+		}
+	})
+	// The contrast that proves the filter still narrows on KNOWN absence: when the sibling
+	// has a cached row that lists a DIFFERENT voice it is known-absent, so with the voice's
+	// server down the request is voice_unavailable -- the sibling is known not to have it.
+	t.Run("a known-absent sibling does not rescue: voice_unavailable", func(t *testing.T) {
+		r := NewResolver(voiceModelStore(t, []string{"bella"}, []string{"ciao"}), voiceClock(), fakeReachability{unreachable: map[string]bool{"app_a": true}})
+		_, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella"))
+		if !errors.Is(err, ErrVoiceUnavailable) {
+			t.Fatalf("err = %v, want ErrVoiceUnavailable (srv_b is known to lack bella)", err)
+		}
+	})
+}
+
+// FAIL-OPEN on UNKNOWN: when NO candidate is known to lack the voice -- nothing cached
+// anywhere, or a mix of a voice-listing candidate and an uncached (unknown) sibling -- the
+// voice narrows nothing and the request routes exactly as it does without a voice (an
+// existing bearer client that sends a free-text voice to a fleet not yet voice-cached
+// keeps working; the upstream stays the authority on the name). It is silent at the
+// default log level too.
 func TestVoiceStandardUnknownVoiceDoesNotFilter(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		voicesA, voicesB []string
-		corruptB         bool
 		ask              string
 	}{
-		{name: "a voice nothing lists", voicesA: []string{"alba"}, voicesB: []string{"bella"}, ask: "nobody-has-this"},
 		{name: "nothing cached anywhere", ask: "bella"},
-		{name: "cached, and empty everywhere", voicesA: []string{}, voicesB: []string{}, ask: "bella"},
-		// map_b's row is the only one that would list bella, and it cannot be read.
-		{name: "an undecodable cache row", voicesA: []string{"alba"}, voicesB: []string{"bella"}, corruptB: true, ask: "bella"},
+		{name: "a voice one lists while the sibling is uncached", voicesA: []string{"bella"}, ask: "bella"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureSlog(t)
-			mem := voiceModelStore(t, tc.voicesA, tc.voicesB)
-			if tc.corruptB {
-				if err := mem.UpsertModelMappingCache(context.Background(), ModelMappingCacheRow{MappingID: "map_b", CacheType: ModelMappingCacheVoices, Payload: `{not json`, UpdatedAt: voiceNow}); err != nil {
-					t.Fatalf("seed corrupt row: %v", err)
-				}
-			}
-			r := NewResolver(mem, voiceClock(), nil)
+			r := NewResolver(voiceModelStore(t, tc.voicesA, tc.voicesB), voiceClock(), nil)
 			want := resolveVoice(t, r, voiceReq("tts", "")) // today's behavior
 			got := resolveVoice(t, r, voiceReq("tts", tc.ask))
 			if got.ServerID != want.ServerID || got.RouteID != want.RouteID {
 				t.Fatalf("target = %+v, want today's %+v", got, want)
 			}
-			// A row that cannot be read is skipped LOUDLY (the writer cannot produce one, so
-			// somebody should hear about it); every other case is silent at the default level.
-			if tc.corruptB {
-				if out := logs.String(); !strings.Contains(out, "undecodable") || !strings.Contains(out, "mapping_id=map_b") {
-					t.Fatalf("log = %q, want a warning naming the undecodable row of map_b", out)
-				}
-			} else if out := logs.String(); out != "" {
+			if out := logs.String(); out != "" {
 				t.Fatalf("log = %q, want nothing at the default level", out)
 			}
 		})
+	}
+}
+
+// KNOWN-ABSENT everywhere is NOT fail-open: when every candidate has a cached voices row
+// and none lists the voice (a cached-empty "[]" list included), the gateway KNOWS no
+// server offers it, so the pool narrows to empty and the request is voice_unavailable --
+// it is not routed to a server already known to reject it. Both servers are healthy here;
+// the voice alone empties the pool.
+func TestVoiceStandardKnownAbsentEverywhereIsVoiceUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		voicesA, voicesB []string
+		ask              string
+	}{
+		{name: "both list other voices", voicesA: []string{"alba"}, voicesB: []string{"bella"}, ask: "nobody-has-this"},
+		{name: "both cached empty", voicesA: []string{}, voicesB: []string{}, ask: "bella"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewResolver(voiceModelStore(t, tc.voicesA, tc.voicesB), voiceClock(), nil)
+			_, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", tc.ask))
+			if !errors.Is(err, ErrVoiceUnavailable) {
+				t.Fatalf("err = %v, want ErrVoiceUnavailable (every candidate is known to lack %q)", err, tc.ask)
+			}
+			if errors.Is(err, ErrNoHealthyHost) || errors.Is(err, ErrNoModelRoute) {
+				t.Fatalf("err = %v also matches a generic routing sentinel", err)
+			}
+		})
+	}
+}
+
+// An undecodable voices row is treated as UNKNOWN voice status and kept eligible (fail
+// open, logged at Warn): its mapping stays a candidate instead of being dropped. map_a is
+// known-absent for bella and map_b's row is corrupt, so the corrupt-but-eligible map_b is
+// exactly where bella routes -- and the warning names it.
+func TestVoiceStandardUndecodableRowStaysEligible(t *testing.T) {
+	logs := captureSlog(t)
+	mem := voiceModelStore(t, []string{"alba"}, []string{"bella"})
+	if err := mem.UpsertModelMappingCache(context.Background(), ModelMappingCacheRow{MappingID: "map_b", CacheType: ModelMappingCacheVoices, Payload: `{not json`, UpdatedAt: voiceNow}); err != nil {
+		t.Fatalf("seed corrupt row: %v", err)
+	}
+	r := NewResolver(mem, voiceClock(), nil)
+	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
+		t.Fatalf("server = %q, want srv_b (its row is undecodable, so it is kept eligible)", got.ServerID)
+	}
+	if out := logs.String(); !strings.Contains(out, "undecodable") || !strings.Contains(out, "mapping_id=map_b") {
+		t.Fatalf("log = %q, want a warning naming the undecodable row of map_b", out)
 	}
 }
 
@@ -182,29 +251,32 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 
 // A voice cached on a mapping whose model is NOT a plain tts one any more (it became a
 // clone model after the cache was written) is not a known voice: the same read-side
-// verdict gate the voices endpoint applies. map_b would be the only match, so were the
-// stale row honored the request would be forced onto srv_b.
+// verdict gate the voices endpoint applies. bella is cached only on map_b, so once map_b
+// is a clone the sole tts candidate (map_a, cached ["alba"]) is KNOWN to lack bella and
+// the request is voice_unavailable; were the stale clone row honored, bella would instead
+// be forced onto srv_b.
 func TestVoiceStandardIgnoresAVoiceCachedOnANonTTSMapping(t *testing.T) {
 	mem := voiceModelStore(t, []string{"alba"}, []string{"bella"})
 	if err := mem.UpsertMappingCapabilities(context.Background(), "map_b", []CapabilityRow{{Capability: CapabilitySpeechClone, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: voiceNow}}); err != nil {
 		t.Fatalf("flip map_b to a clone model: %v", err)
 	}
 	r := NewResolver(mem, voiceClock(), nil)
-	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_a" {
-		t.Fatalf("server = %q, want srv_a: bella is only cached on a mapping that is a clone model now, so it is unknown", got.ServerID)
+	if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella")); !errors.Is(err, ErrVoiceUnavailable) {
+		t.Fatalf("err = %v, want ErrVoiceUnavailable: bella is only cached on a clone mapping, so no tts candidate lists it", err)
 	}
 }
 
 // The voice only exists on a server the principal is not provisioned for: it is not a
-// candidate at all, so nothing in the REACHABLE pool lists the voice and the request is
-// not narrowed (and not refused) -- the filter sees the pool dispatch sees.
+// candidate at all, so the filter sees only the reachable pool. srv_a is reachable and
+// KNOWN to lack bella, so the request is voice_unavailable (the unprovisioned server's
+// bella is never considered). Once that server is provisioned too the pool narrows to it.
 func TestVoiceStandardOnlyConsidersWhatTheCallerMayReach(t *testing.T) {
 	r := NewResolver(voiceModelStore(t, []string{"alba"}, []string{"bella"}), voiceClock(), nil)
 	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true}})
-	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_a" {
-		t.Fatalf("server = %q, want srv_a (bella lives only on an unprovisioned server, so it is unknown here)", got.ServerID)
+	if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella")); !errors.Is(err, ErrVoiceUnavailable) {
+		t.Fatalf("err = %v, want ErrVoiceUnavailable (only srv_a is reachable and it is known to lack bella)", err)
 	}
-	// And the provisioned pool still narrows when the voice is in it.
+	// And the provisioned pool narrows to the voice's server once it is reachable.
 	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true, "srv_b": true}})
 	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
 		t.Fatalf("server = %q, want srv_b once the voice's server is provisioned", got.ServerID)
@@ -247,11 +319,6 @@ func TestVoiceStandardVoiceOnADownServerIsVoiceUnavailable(t *testing.T) {
 			}
 			if got := resolveVoice(t, r, voiceReq("tts", "")); got.ServerID != "srv_a" {
 				t.Fatalf("control: no voice served by %q, want srv_a", got.ServerID)
-			}
-			// A voice nothing lists is not narrowed, so it is served by the healthy server
-			// exactly as it would be without a voice: it never meets the sentinel.
-			if got := resolveVoice(t, r, voiceReq("tts", "nobody-has-this")); got.ServerID != "srv_a" {
-				t.Fatalf("control: unknown voice served by %q, want srv_a", got.ServerID)
 			}
 		})
 	}
@@ -526,7 +593,6 @@ func TestVoiceGroupPrePassNarrowsAcrossMembers(t *testing.T) {
 		{"no voice keeps the priority order", "", "srv_a"},
 		{"a voice only the second member has", "bella", "srv_b"},
 		{"a voice only the first member has", "alba", "srv_a"},
-		{"a voice no member has is not narrowed", "nobody-has-this", "srv_a"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := resolveVoice(t, r, voiceReq("tts-group", tc.voice)); got.ServerID != tc.wantServer {
@@ -545,14 +611,47 @@ func TestVoiceGroupWithNothingCachedRoutesAsToday(t *testing.T) {
 	}
 }
 
+// The regression (#251) on the group path: a member of UNKNOWN voice status (never
+// cached) stays eligible across the group pre-pass, so it is a live failover target when
+// the voice's member is down. coder-a lists bella; coder-b is healthy but never cached.
+func TestVoiceGroupUncachedSiblingStaysEligible(t *testing.T) {
+	t.Run("the voice's member is down: the uncached member serves it", func(t *testing.T) {
+		r := NewResolver(voiceGroupStore(t, []string{"bella"}, nil), voiceClock(), fakeReachability{unreachable: map[string]bool{"app_a": true}})
+		r.SetGroupResolver(voiceGroup(GroupPolicy{FailoverMode: "sticky"}))
+		got, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts-group", "bella"))
+		if err != nil {
+			t.Fatalf("err = %v, want the uncached member to serve bella (unknown != absent)", err)
+		}
+		if got.ServerID != "srv_b" {
+			t.Fatalf("server = %q, want srv_b", got.ServerID)
+		}
+	})
+	t.Run("a known-absent member does not rescue: voice_unavailable", func(t *testing.T) {
+		r := NewResolver(voiceGroupStore(t, []string{"bella"}, []string{"ciao"}), voiceClock(), fakeReachability{unreachable: map[string]bool{"app_a": true}})
+		r.SetGroupResolver(voiceGroup(GroupPolicy{FailoverMode: "sticky"}))
+		_, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts-group", "bella"))
+		if !errors.Is(err, ErrVoiceUnavailable) {
+			t.Fatalf("err = %v, want ErrVoiceUnavailable (coder-b is known to lack bella)", err)
+		}
+	})
+}
+
 // The voice only exists behind a server the principal is not provisioned for: not in the
-// reachable pool, so the group is not narrowed (and not refused).
+// reachable pool. The one reachable member (coder-a) is known to lack bella, so no
+// reachable member offers the voice and the group has no route for it (ErrNoModelRoute --
+// the group path reads a member whose every candidate the voice excludes as memberNoMapping,
+// NOT as a real-but-gated member, so the standard path's ErrVoiceUnavailable does not apply
+// here). Once the voice's member is provisioned the group narrows to it.
 func TestVoiceGroupOnlyConsidersWhatTheCallerMayReach(t *testing.T) {
 	r := NewResolver(voiceGroupStore(t, []string{"alba"}, []string{"bella"}), voiceClock(), nil)
 	r.SetGroupResolver(voiceGroup(GroupPolicy{FailoverMode: "sticky"}))
 	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true}})
-	if got := resolveVoice(t, r, voiceReq("tts-group", "bella")); got.ServerID != "srv_a" {
-		t.Fatalf("server = %q, want srv_a (bella is behind an unprovisioned server)", got.ServerID)
+	if _, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts-group", "bella")); !errors.Is(err, ErrNoModelRoute) {
+		t.Fatalf("err = %v, want ErrNoModelRoute (bella is behind an unprovisioned member)", err)
+	}
+	r.SetProvisioningGate(fakeGate{allow: map[string]bool{"srv_a": true, "srv_b": true}})
+	if got := resolveVoice(t, r, voiceReq("tts-group", "bella")); got.ServerID != "srv_b" {
+		t.Fatalf("server = %q, want srv_b once the voice's member is provisioned", got.ServerID)
 	}
 }
 
@@ -712,10 +811,6 @@ func TestVoiceGroupFailureMapping(t *testing.T) {
 		_, err := r.Resolve(ctx, voicePrincipal, voiceReq("tts-group", "bella"))
 		if !errors.Is(err, ErrVoiceUnavailable) || errors.Is(err, ErrNoHealthyHost) {
 			t.Fatalf("err = %v, want ErrVoiceUnavailable", err)
-		}
-		// An unknown voice is not narrowed: served by the healthy member, as today.
-		if got := resolveVoice(t, r, voiceReq("tts-group", "nobody-has-this")); got.ServerID != "srv_a" {
-			t.Fatalf("control: unknown voice served by %q, want srv_a", got.ServerID)
 		}
 	})
 	t.Run("the voice's only member is busy", func(t *testing.T) {
