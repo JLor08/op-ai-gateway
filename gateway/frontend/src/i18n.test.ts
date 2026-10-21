@@ -3384,6 +3384,7 @@ describe('portal chat speech i18n keys', () => {
     'chatSpeechNoImageInput',
     'chatSpeechVoice',
     'chatSpeechVoiceDefault',
+    'chatSpeechVoiceHint',
     'chatSpeechSpeed',
     'chatSpeechFormatHint',
     'chatSpeechAdvanced',

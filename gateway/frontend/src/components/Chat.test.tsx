@@ -154,6 +154,10 @@ function makeChatApi() {
     // model GENERATES images: this file's fixtures know none, so every field is
     // omitted (the dropdowns then use the static Phase 1b-i superset).
     modelImageOptions: vi.fn(async (_name: string) => ({}) as ImageModelOptions),
+    // The cached voice names the store fetches whenever the picked model SYNTHESIZES
+    // speech: none by default (the voice field is then plain free text); the voice
+    // picker tests below seed their own.
+    modelVoices: vi.fn(async (_name: string) => [] as string[]),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.
@@ -1083,8 +1087,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   // A text-to-speech model is picked like an image generator: the chat offers it and an
   // empty thread's composer follows it (the store's prospective kind). The input stays
   // text; the settings panel swaps the text-chat controls for the speech ones (a
-  // free-text voice, a speed, and a collapsed Advanced JSON passthrough). The output
-  // is WAV only, so no format control exists.
+  // voice combobox -- the model's cached voices to pick from, any name to type -- a
+  // speed, and a collapsed Advanced JSON passthrough). The output is WAV only, so no
+  // format control exists.
   describe(`Chat: the composer of a speech thread [${locale}]`, () => {
     const speechModels: ModelOption[] = [
       {
@@ -1133,7 +1138,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await renderSpeechThread();
       openSettings();
 
-      expect(screen.getByRole('textbox', { name: t.chatSpeechVoice })).toBeInTheDocument();
+      expect(screen.getByRole('combobox', { name: t.chatSpeechVoice })).toBeInTheDocument();
       expect(screen.getByRole('spinbutton', { name: t.chatSpeechSpeed })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: t.chatSpeechAdvanced })).toBeInTheDocument();
       // A system prompt, temperature and a token cap mean nothing to /v1/audio/speech...
@@ -1181,16 +1186,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expectNoSpeechControls();
     });
 
-    it('offers the voice as free text and the speed as a number, both blank by default', async () => {
+    it('offers the voice as a combobox and the speed as a number, both blank by default', async () => {
       await renderSpeechThread();
       openSettings();
 
-      // Not a dropdown: audio.cpp's voices are not discoverable, so any name may be typed.
-      const voice = screen.getByRole('textbox', { name: t.chatSpeechVoice });
+      // A combobox that also takes free text (a model's voices are only what the
+      // gateway has cached, so any name may still be typed).
+      const voice = screen.getByRole('combobox', { name: t.chatSpeechVoice });
       expect(voice).toHaveValue('');
       // The placeholder says "model default" -- it is a hint, never written.
       expect(voice).toHaveAttribute('placeholder', t.chatSpeechVoiceDefault);
-      expect(screen.queryByRole('combobox', { name: t.chatSpeechVoice })).not.toBeInTheDocument();
 
       const speed = screen.getByRole('spinbutton', { name: t.chatSpeechSpeed });
       expect(speed).toHaveValue(null); // a blank number field: the model keeps its own rate
@@ -1239,7 +1244,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     it('sends the voice, the speed and the parsed passthrough in the started run', async () => {
       await renderSpeechThread();
       openSettings();
-      fireEvent.change(screen.getByRole('textbox', { name: t.chatSpeechVoice }), {
+      fireEvent.change(screen.getByRole('combobox', { name: t.chatSpeechVoice }), {
         target: { value: 'bf_emma' },
       });
       fireEvent.change(screen.getByRole('spinbutton', { name: t.chatSpeechSpeed }), {
@@ -1291,12 +1296,208 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitForChatReady();
       openSettings();
 
-      expect(screen.getByRole('textbox', { name: t.chatSpeechVoice })).toHaveValue('bf_emma');
+      expect(screen.getByRole('combobox', { name: t.chatSpeechVoice })).toHaveValue('bf_emma');
       expect(screen.getByRole('spinbutton', { name: t.chatSpeechSpeed })).toHaveValue(0.8);
       fireEvent.click(screen.getByRole('button', { name: t.chatSpeechAdvanced }));
       expect(screen.getByLabelText(t.chatSpeechPassthrough)).toHaveValue(
         JSON.stringify({ seed: 1 }, null, 2),
       );
+    });
+
+    // The voice field is a combobox over the voices the gateway has cached for the picked
+    // model (api.modelVoices), and it stays FREE TEXT: the cache is only what the health
+    // loop has seen, so a voice it never saw may still be typed. No voices (none cached, or
+    // the lookup failed) is not an error -- the field is then just the free-text field it
+    // was before voices were discoverable.
+    describe('the voice picker', () => {
+      const voices = ['af_heart', 'bf_emma', 'bm_george'];
+
+      // The speech thread with the model's voices fetched (or the fetch refused) and the
+      // settings open; returns the voice combobox. A non-empty list is awaited through the
+      // hint that only a known list shows, so the test never races the fetch.
+      async function renderPicker(fetched: string[] | Error = voices) {
+        if (fetched instanceof Error) chatApi.spies.modelVoices.mockRejectedValue(fetched);
+        else chatApi.spies.modelVoices.mockResolvedValue(fetched);
+        await renderSpeechThread();
+        await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('kokoro'));
+        openSettings();
+        if (Array.isArray(fetched) && fetched.length > 0) {
+          await screen.findByText(t.chatSpeechVoiceHint);
+        } else {
+          await flushMicrotasks();
+        }
+        return screen.getByRole('combobox', { name: t.chatSpeechVoice });
+      }
+
+      const openList = (voice: HTMLElement) => fireEvent.mouseDown(voice);
+      const offered = () => screen.queryAllByRole('option').map((option) => option.textContent);
+
+      async function expectSentVoice(expected: Record<string, unknown>) {
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+        expect(startedSettings().audio).toEqual(expected);
+      }
+
+      it('asks for the voices of the picked speech model', async () => {
+        await renderPicker();
+
+        expect(chatApi.spies.modelVoices).toHaveBeenCalledTimes(1);
+        expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('kokoro');
+      });
+
+      it('lists the fetched voices and tells the user a name may be typed too', async () => {
+        const voice = await renderPicker();
+
+        expect(screen.getByText(t.chatSpeechVoiceHint)).toBeInTheDocument();
+        openList(voice);
+        await screen.findByRole('option', { name: 'af_heart' });
+        expect(offered()).toEqual(voices);
+      });
+
+      it('sends a picked voice in the started run', async () => {
+        const voice = await renderPicker();
+        openList(voice);
+        fireEvent.click(await screen.findByRole('option', { name: 'bf_emma' }));
+
+        expect(voice).toHaveValue('bf_emma');
+        await expectSentVoice({ voice: 'bf_emma' });
+      });
+
+      it('narrows the list to what is typed', async () => {
+        const voice = await renderPicker();
+        openList(voice);
+        await screen.findByRole('option', { name: 'af_heart' });
+
+        fireEvent.change(voice, { target: { value: 'b' } });
+
+        expect(offered()).toEqual(['bf_emma', 'bm_george']);
+      });
+
+      it('accepts a typed voice the list does not hold, and sends it unchanged', async () => {
+        const voice = await renderPicker();
+
+        fireEvent.change(voice, { target: { value: 'my_custom_voice' } });
+        expect(voice).toHaveValue('my_custom_voice');
+        // Nothing matches, and the field offers nothing instead of refusing the name...
+        expect(offered()).toEqual([]);
+        expect(screen.queryByText(/no options/i)).not.toBeInTheDocument();
+        // ...nor does leaving the field drop it.
+        fireEvent.blur(voice);
+        expect(voice).toHaveValue('my_custom_voice');
+
+        await expectSentVoice({ voice: 'my_custom_voice' });
+      });
+
+      it('keeps the typed text on Enter instead of choosing a match', async () => {
+        const voice = await renderPicker();
+        openList(voice);
+        await screen.findByRole('option', { name: 'bf_emma' });
+
+        // "b" matches two voices, yet Enter commits the name the user typed: it is the
+        // name that is kept, and sent.
+        fireEvent.change(voice, { target: { value: 'b' } });
+        fireEvent.keyDown(voice, { key: 'Enter' });
+
+        expect(voice).toHaveValue('b');
+        await expectSentVoice({ voice: 'b' });
+      });
+
+      it('keeps what was typed while the voices were still loading', async () => {
+        let release: (v: string[]) => void = () => {};
+        chatApi.spies.modelVoices.mockImplementation(
+          () =>
+            new Promise<string[]>((resolve) => {
+              release = resolve;
+            }),
+        );
+        await renderSpeechThread();
+        await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('kokoro'));
+        openSettings();
+        const voice = screen.getByRole('combobox', { name: t.chatSpeechVoice });
+
+        // The list is not here yet: the field is free text, and the user types.
+        fireEvent.change(voice, { target: { value: 'my_voice' } });
+        await act(async () => {
+          release(voices);
+        });
+        await screen.findByText(t.chatSpeechVoiceHint);
+
+        // The late list neither overwrites the typed name nor drops it.
+        expect(voice).toHaveValue('my_voice');
+        await expectSentVoice({ voice: 'my_voice' });
+      });
+
+      it('shows the dropdown arrow only while there is a list to open', async () => {
+        // Scoped to the voice field: the model picker has an arrow of its own.
+        const arrowOf = (voice: HTMLElement) =>
+          within(voice.closest('.MuiAutocomplete-root') as HTMLElement).queryByRole('button', {
+            name: 'Open',
+          });
+
+        expect(arrowOf(await renderPicker())).toBeInTheDocument();
+
+        cleanup();
+        chatApi = makeChatApi();
+        expect(arrowOf(await renderPicker([]))).not.toBeInTheDocument();
+      });
+
+      it('sends no voice once the field is cleared again', async () => {
+        const voice = await renderPicker();
+        openList(voice);
+        fireEvent.click(await screen.findByRole('option', { name: 'bf_emma' }));
+
+        fireEvent.change(voice, { target: { value: '' } });
+
+        expect(voice).toHaveValue('');
+        await expectSentVoice({});
+      });
+
+      it('keeps a saved voice the fetched list does not hold, and still sends it', async () => {
+        chatApi.rows.push({
+          id: 'c_speech_saved_voice',
+          title: '',
+          created_at: '2026-07-22T12:00:00Z',
+          updated_at: '2026-07-22T12:00:00Z',
+          content: {
+            settings: { model: 'kokoro', kind: 'speech', audio: { voice: 'retired_voice' } },
+            messages: [],
+          },
+        });
+        chatApi.spies.modelVoices.mockResolvedValue(voices);
+        renderChat(tokens, speechModels);
+        await waitForChatReady();
+        openSettings();
+        await screen.findByText(t.chatSpeechVoiceHint);
+
+        // The pick the list omits stays in the field -- not blanked, not replaced by the
+        // first voice -- while the list still offers everything the model has.
+        const voice = screen.getByRole('combobox', { name: t.chatSpeechVoice });
+        expect(voice).toHaveValue('retired_voice');
+        openList(voice);
+        await screen.findByRole('option', { name: 'af_heart' });
+        expect(offered()).toEqual(voices);
+        expect(voice).toHaveValue('retired_voice');
+
+        fireEvent.keyDown(voice, { key: 'Escape' });
+        await expectSentVoice({ voice: 'retired_voice' });
+      });
+
+      it.each([
+        ['has no cached voices', [] as string[]],
+        ['cannot be asked for them', new Error('voices unavailable')],
+      ])('is the plain free-text field when the model %s', async (_case, fetched) => {
+        const voice = await renderPicker(fetched);
+
+        // Nothing to pick from, and no claim that there is.
+        expect(screen.queryByText(t.chatSpeechVoiceHint)).not.toBeInTheDocument();
+        openList(voice);
+        expect(offered()).toEqual([]);
+        expect(screen.queryByText(/no options/i)).not.toBeInTheDocument();
+
+        fireEvent.change(voice, { target: { value: 'bf_emma' } });
+        expect(voice).toHaveValue('bf_emma');
+        await expectSentVoice({ voice: 'bf_emma' });
+      });
     });
 
     describe('an advanced passthrough that is not a JSON object', () => {

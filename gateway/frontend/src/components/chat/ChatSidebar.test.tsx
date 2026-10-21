@@ -52,6 +52,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     modelTranscriptionCapable: false,
     attachMode: 'vision',
     modelImageOptions: null,
+    modelVoices: [],
     chatKind: '',
     imageSettings: DEFAULT_IMAGE_SETTINGS,
     setImageSettings: vi.fn(),

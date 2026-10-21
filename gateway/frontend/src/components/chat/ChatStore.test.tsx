@@ -164,6 +164,10 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     // model GENERATES images. Defaults to "nothing known" (every field omitted);
     // the image-options tests below override it.
     modelImageOptions: vi.fn(async (_name: string) => ({}) as ImageModelOptions),
+    // The cached voice names of a speech model, fetched whenever the picked model
+    // SYNTHESIZES speech. Defaults to "none known"; the voice-picker tests below
+    // override it.
+    modelVoices: vi.fn(async (_name: string) => [] as string[]),
   };
   return { api: spies, rows, spies };
 }
@@ -243,6 +247,8 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       </button>
       {/* The fetched per-model image options ("null" until/unless one arrives). */}
       <span data-testid="model-image-options">{JSON.stringify(c.modelImageOptions)}</span>
+      {/* The fetched voice names of the picked speech model ("[]" until/unless some arrive). */}
+      <span data-testid="model-voices">{JSON.stringify(c.modelVoices)}</span>
       <span data-testid="model-options">{c.modelOptions.map((o) => o.id).join(',')}</span>
       <span data-testid="override-model">{c.overrideModel}</span>
       <span data-testid="override-locks">{String(c.overrideLocksModel)}</span>
@@ -3656,6 +3662,167 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         releaseTurbo(turboOptions);
       });
       expect(optionsShown()).toBe(JSON.stringify(xlOptions));
+    });
+  });
+
+  // The voice names the speech composer's picker offers. Fetched on demand when the
+  // picked model SYNTHESIZES speech -- the image-options pattern: clear first, latest
+  // wins, and a failure degrades to [] (the picker is then plain free text, the field
+  // as it was before voices were discoverable).
+  describe(`ChatStoreProvider per-model voices [${locale}]`, () => {
+    const voiceModels: ModelOption[] = [
+      {
+        id: 'kokoro',
+        display_name: 'kokoro',
+        flavors: ['openai_audio'],
+        loading_on_count: 0,
+        speech: true,
+      },
+      {
+        id: 'piper',
+        display_name: 'piper',
+        flavors: ['openai_audio'],
+        loading_on_count: 0,
+        speech: true,
+      },
+      { id: 'gpt-oss-20b', display_name: 'gpt-oss-20b', flavors: ['openai'], loading_on_count: 0 },
+    ];
+    const kokoroVoices = ['af_heart', 'bf_emma'];
+    const piperVoices = ['amy'];
+
+    const voicesShown = () => screen.getByTestId('model-voices').textContent;
+
+    it('fetches nothing while the picked model does not synthesize speech', async () => {
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('false');
+      expect(chatApi.spies.modelVoices).not.toHaveBeenCalled();
+      expect(voicesShown()).toBe('[]');
+    });
+
+    it('fetches and exposes the voices of a picked speech model', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue(kokoroVoices);
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+      expect(voicesShown()).toBe('[]');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(kokoroVoices)));
+      expect(chatApi.spies.modelVoices).toHaveBeenCalledTimes(1);
+      expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('kokoro');
+    });
+
+    it('refetches for another speech model and clears when a text model is picked', async () => {
+      chatApi.spies.modelVoices.mockImplementation(async (name: string) =>
+        name === 'kokoro' ? kokoroVoices : piperVoices,
+      );
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(kokoroVoices)));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-piper' }));
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(piperVoices)));
+      expect(chatApi.spies.modelVoices).toHaveBeenLastCalledWith('piper');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+      await waitFor(() => expect(voicesShown()).toBe('[]'));
+      // Going text must clear without another fetch.
+      expect(chatApi.spies.modelVoices).toHaveBeenCalledTimes(2);
+    });
+
+    it('stays empty when the fetch fails (fail-open: free text)', async () => {
+      chatApi.spies.modelVoices.mockRejectedValue(new Error('boom'));
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('kokoro'));
+      expect(voicesShown()).toBe('[]');
+    });
+
+    it('stays empty when the model has no cached voices', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue([]);
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('kokoro'));
+      expect(voicesShown()).toBe('[]');
+    });
+
+    it("drops the previous model's voices when the next fetch fails", async () => {
+      chatApi.spies.modelVoices.mockImplementation(async (name: string) => {
+        if (name === 'kokoro') return kokoroVoices;
+        throw new Error('boom');
+      });
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(kokoroVoices)));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-piper' }));
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('piper'));
+      await waitFor(() => expect(voicesShown()).toBe('[]'));
+    });
+
+    it("does not keep the previous model's voices while the next fetch is in flight", async () => {
+      let releasePiper: (v: string[]) => void = () => {};
+      chatApi.spies.modelVoices.mockImplementation((name: string) =>
+        name === 'kokoro'
+          ? Promise.resolve(kokoroVoices)
+          : new Promise<string[]>((resolve) => {
+              releasePiper = resolve;
+            }),
+      );
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(kokoroVoices)));
+
+      // piper's fetch is pending: kokoro's voices must not linger as if they were
+      // piper's (a voice piper does not have would be offered, and 500 on send).
+      fireEvent.click(screen.getByRole('button', { name: 'pick-piper' }));
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('piper'));
+      expect(voicesShown()).toBe('[]');
+
+      await act(async () => {
+        releasePiper(piperVoices);
+      });
+      expect(voicesShown()).toBe(JSON.stringify(piperVoices));
+    });
+
+    it('ignores a stale response for a previously picked model (latest wins)', async () => {
+      // kokoro's response is held back until after piper's has landed.
+      let releaseKokoro: (v: string[]) => void = () => {};
+      chatApi.spies.modelVoices.mockImplementation((name: string) =>
+        name === 'kokoro'
+          ? new Promise<string[]>((resolve) => {
+              releaseKokoro = resolve;
+            })
+          : Promise.resolve(piperVoices),
+      );
+      renderProvider([], { models: voiceModels });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('kokoro'));
+      fireEvent.click(screen.getByRole('button', { name: 'pick-piper' }));
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(piperVoices)));
+
+      await act(async () => {
+        releaseKokoro(kokoroVoices);
+      });
+      expect(voicesShown()).toBe(JSON.stringify(piperVoices));
     });
   });
 

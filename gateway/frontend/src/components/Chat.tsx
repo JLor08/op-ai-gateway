@@ -26,6 +26,7 @@ import { PageTitle } from './shared/PageTitle';
 import { keyedUrls } from './shared/urlKeys';
 import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
 import { ChatMessage } from './ChatMessage';
+import { SpeechVoiceField } from './SpeechVoiceField';
 import { TranscriptionComposer } from './TranscriptionComposer';
 import {
   IMAGE_EDIT_SOURCE_ACCEPT,
@@ -653,13 +654,15 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   )}
                 </>
               )}
-              {/* Speech-synthesis knobs (/v1/audio/speech). The voice is FREE TEXT:
-                audio.cpp's voices are not discoverable, so the model's own default
-                is only a placeholder, never written. A blank speed leaves the
-                model's rate (placeholder 1.0; not clamped, the model's own range
-                applies). The output is always WAV, so there is no format control,
-                just the static hint. The "Advanced" section holds a JSON object of
-                extra request fields (OpenAI `instructions`, model-native knobs). */}
+              {/* Speech-synthesis knobs (/v1/audio/speech). The voice is a combobox over
+                the voices the gateway has cached for the model (c.modelVoices) that
+                stays FREE TEXT -- the cache is only what was seen, so any name may be
+                typed -- and the model's own default is only a placeholder, never
+                written. A blank speed leaves the model's rate (placeholder 1.0; not
+                clamped, the model's own range applies). The output is always WAV, so
+                there is no format control, just the static hint. The "Advanced"
+                section holds a JSON object of extra request fields (OpenAI
+                `instructions`, model-native knobs). */}
               {isSpeechThread && (
                 <>
                   <Box
@@ -669,19 +672,13 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       gap: 2,
                     }}
                   >
-                    <TextField
+                    <SpeechVoiceField
                       id="chat-speech-voice"
-                      label={t.chatSpeechVoice}
                       value={c.audioSettings.voice}
-                      placeholder={t.chatSpeechVoiceDefault}
-                      onChange={(event) =>
-                        c.setAudioSettings((s) => ({ ...s, voice: event.target.value }))
-                      }
+                      voices={c.modelVoices}
+                      onChange={(voice) => c.setAudioSettings((s) => ({ ...s, voice }))}
                       disabled={c.streaming}
-                      // Pin the label shrunk and the notch open (as the prompt field
-                      // does) so the placeholder -- the model-default hint -- is
-                      // visible instead of hidden behind the resting label.
-                      slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+                      t={t}
                     />
                     <TextField
                       id="chat-speech-speed"
