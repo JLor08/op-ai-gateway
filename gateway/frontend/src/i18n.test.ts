@@ -3271,6 +3271,15 @@ describe('speech capability i18n key', () => {
     expect(messages.en.capabilitySpeech).toBe('Speech synthesis');
   });
 
+  // "speech_streaming" refines "speech" (the model streams its audio as it is generated), so
+  // its chip must read as that refinement, distinct from the plain Speech chip beside it.
+  it('labels the speech_streaming chip in de and en, distinct from Speech', () => {
+    expect(messages.de.capabilitySpeechStreaming).toBe('Streaming-Sprachsynthese');
+    expect(messages.en.capabilitySpeechStreaming).toBe('Streaming speech synthesis');
+    expect(messages.de.capabilitySpeechStreaming).not.toBe(messages.de.capabilitySpeech);
+    expect(messages.en.capabilitySpeechStreaming).not.toBe(messages.en.capabilitySpeech);
+  });
+
   // "speech" is the text-to-speech endpoint, "audio" the input modality.
   it('keeps the speech chip label distinct from the audio modality label', () => {
     expect(messages.de.capabilitySpeech).not.toBe(messages.de.capabilityAudio);

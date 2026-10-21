@@ -1353,6 +1353,19 @@ const de = {
   benchmarkVision: 'Vision',
   benchmarkCapacityRuns: 'Kapazitäts-Messungen',
   benchmarkVisionRuns: 'Vision-Messungen',
+  // The speech (text-to-speech) benchmark's history section. A speech run measures no chat
+  // tokens: its figures are the synthesis time, the real-time factor (synthesis time over
+  // the length of the audio; below 1 is faster than real time) and the time to the first
+  // response byte. That last one INCLUDES any model start -- the benchmark's request does
+  // not stream and an agent-launched model is started behind it -- so its label and note
+  // say so rather than calling it a streamed time to first audio.
+  benchmarkSpeechRuns: 'Sprachsynthese-Messungen',
+  benchmarkSpeechTtft: 'Zeit bis zum ersten Byte (inkl. Modellstart)',
+  benchmarkSpeechWall: 'Synthesezeit',
+  benchmarkSpeechRtf: 'Echtzeitfaktor',
+  benchmarkSpeechByteRate: 'Ausgaberate',
+  benchmarkSpeechTtftNote:
+    'Die Messung streamt nicht: Das Audio kommt erst nach der ganzen Synthese, und ein vom Agenten gestartetes Modell wird hinter der Anfrage geladen. Die Zeit bis zum ersten Byte umfasst daher Synthese und einen etwaigen Modellstart, nicht die Zeit bis zum ersten gestreamten Audio.',
   benchmarkMemoryObserved: 'Speicher beobachtet',
   benchmarkColConcurrency: 'Parallel',
   benchmarkColAggregateTps: 'Gesamt tok/s',
@@ -1383,6 +1396,9 @@ const de = {
     'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
   benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Audio, kein Chat-Prompt gesendet',
+  benchmarkResultSkippedNotSpeech: 'übersprungen – kein Sprachsynthese-Modell, nichts gesendet',
+  benchmarkResultSkippedSpeechClone:
+    'übersprungen – ein Stimmklon-Modell braucht eine Referenzstimme, nichts gesendet',
   benchmarkResultLoadTimeNotMeasured: 'Ladezeit nicht gemessen',
   benchmarkNotMeasured: 'Nicht gemessen',
   // Die VRAM-Messung: ein eigener Lauf mit eigenem Endpunkt, der jedes
@@ -1520,6 +1536,9 @@ const de = {
   capabilityTranscriptionStreaming: 'Streaming-Transkription',
   capabilitySpeech: 'Sprachsynthese',
   capabilitySpeechClone: 'Stimmklon',
+  // Refines "Sprachsynthese": the model delivers its audio as it is generated
+  // (audio.cpp mode=streaming) instead of as one finished WAV at the end.
+  capabilitySpeechStreaming: 'Streaming-Sprachsynthese',
   // Der Chip für die AUSNAHME des Betreibers (Bildbearbeitung = Nein), nicht für
   // eine Fähigkeit: Bildbearbeitung wird aus der Bilderzeugung abgeleitet und
   // hat deshalb nur in dieser einen Richtung etwas anzuzeigen. Siehe
@@ -4504,6 +4523,15 @@ const en: PortalMessages = {
   benchmarkVision: 'Vision',
   benchmarkCapacityRuns: 'Capacity runs',
   benchmarkVisionRuns: 'Vision runs',
+  // See the German block: the speech benchmark's figures, the time to the first byte
+  // including any model start.
+  benchmarkSpeechRuns: 'Speech runs',
+  benchmarkSpeechTtft: 'Time to first byte (incl. model start)',
+  benchmarkSpeechWall: 'Synthesis time',
+  benchmarkSpeechRtf: 'Real-time factor',
+  benchmarkSpeechByteRate: 'Output rate',
+  benchmarkSpeechTtftNote:
+    'The measurement does not stream: the audio arrives only after the whole synthesis, and a model the agent launches is loaded behind the request. The time to the first byte therefore covers the synthesis and any model start, not the time to the first streamed audio.',
   benchmarkMemoryObserved: 'Memory observed',
   benchmarkColConcurrency: 'Parallel',
   benchmarkColAggregateTps: 'Total tok/s',
@@ -4530,6 +4558,9 @@ const en: PortalMessages = {
     'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an audio-only model does not answer, so they are disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
   benchmarkResultSkippedAudioOnly: 'skipped — generates audio only, no chat prompt sent',
+  benchmarkResultSkippedNotSpeech: 'skipped — not a speech synthesis model, nothing sent',
+  benchmarkResultSkippedSpeechClone:
+    'skipped — a voice-clone model needs a reference voice, nothing sent',
   benchmarkResultLoadTimeNotMeasured: 'load time not measured',
   benchmarkNotMeasured: 'Not measured',
   // See the German block for the two rules these texts carry: 0 always means
@@ -4645,6 +4676,9 @@ const en: PortalMessages = {
   capabilityTranscriptionStreaming: 'Streaming transcription',
   capabilitySpeech: 'Speech synthesis',
   capabilitySpeechClone: 'Voice clone',
+  // Refines "Speech synthesis": the model delivers its audio as it is generated
+  // (audio.cpp mode=streaming) instead of as one finished WAV at the end.
+  capabilitySpeechStreaming: 'Streaming speech synthesis',
   // The chip for the operator's EXCEPTION (image editing = No), not for a
   // capability: image editing is derived from image generation, so it has
   // something to show in this one direction only. See capabilityChips in

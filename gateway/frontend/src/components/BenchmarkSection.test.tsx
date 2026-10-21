@@ -531,6 +531,187 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(t.benchmarkCapacityRuns)).not.toBeInTheDocument();
     });
 
+    // A speech (kind=speech) history row measured no chat tokens: its figures are the
+    // synthesis wall time, the real-time factor and the time to the first response byte,
+    // so it gets its own section and never falls into the speed table as four dashes and
+    // a green tick. The time to the first byte is LABELLED as including any model start:
+    // the benchmark's request does not stream and an agent-launched model is started
+    // behind the request, so it is not a streamed time to first audio.
+    it('renders the speech history section with its own metrics, outside the speed table', async () => {
+      const speechRun: BenchmarkRunDTO = {
+        id: 'run_speech_ok',
+        mapping_id: 'map_1',
+        server_id: 'srv_1',
+        created_at: '2026-10-21T12:00:00Z',
+        gen_tokens_per_second: 0,
+        prompt_tokens_per_second: 0,
+        load_time_ms: 0,
+        context_size: 0,
+        error: '',
+        kind: 'speech',
+        ttft_ms: 4210,
+        wall_ms: 1830,
+        rtf: 0.49,
+      };
+      const speechErrorRun: BenchmarkRunDTO = {
+        ...speechRun,
+        id: 'run_speech_err',
+        created_at: '2026-10-21T11:00:00Z',
+        error: 'speech benchmark: the model refused',
+        ttft_ms: undefined,
+        wall_ms: undefined,
+        rtf: undefined,
+      };
+
+      renderSection(
+        { kind: 'server' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [makeMapping({ id: 'map_1' })],
+          runs: [speechRun, speechErrorRun],
+        },
+      );
+
+      await screen.findByText(t.benchmarkSpeechRuns);
+      expect(screen.getByText('4210')).toBeInTheDocument();
+      expect(screen.getByText('1830')).toBeInTheDocument();
+      expect(screen.getByText('0.49')).toBeInTheDocument();
+      expect(screen.getByText('speech benchmark: the model refused')).toBeInTheDocument();
+      // The first-byte column names the cold start it includes, and a note says why.
+      expect(screen.getByText(t.benchmarkSpeechTtft)).toBeInTheDocument();
+      expect(screen.getByText(t.benchmarkSpeechTtftNote)).toBeInTheDocument();
+      // A speech-only history renders no speed table and no tok/s figure at all: the one
+      // date header is the speech table's own, and none of the speed table's columns shows.
+      expect(screen.getAllByText(t.benchmarkRunAt)).toHaveLength(1);
+      expect(screen.queryByText(t.mappingGenTokensPerSecond)).not.toBeInTheDocument();
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
+    it('leaves a measured speech row out of the speed table next to speed runs', async () => {
+      const speedRun: BenchmarkRunDTO = {
+        id: 'run_speed',
+        mapping_id: 'map_1',
+        server_id: 'srv_1',
+        created_at: '2026-10-21T10:00:00Z',
+        gen_tokens_per_second: 77,
+        prompt_tokens_per_second: 300,
+        load_time_ms: 900,
+        context_size: 4096,
+        error: '',
+        kind: 'speed',
+      };
+      const speechRun: BenchmarkRunDTO = {
+        ...speedRun,
+        id: 'run_speech',
+        created_at: '2026-10-21T12:00:00Z',
+        gen_tokens_per_second: 0,
+        prompt_tokens_per_second: 0,
+        load_time_ms: 0,
+        context_size: 0,
+        kind: 'speech',
+        ttft_ms: 500,
+        wall_ms: 400,
+        rtf: 0.2,
+      };
+      renderSection(
+        { kind: 'server' },
+        {
+          apps: [makeApp({ id: 'app_1' })],
+          mappings: [makeMapping({ id: 'map_1' })],
+          runs: [speechRun, speedRun],
+        },
+      );
+
+      await screen.findByText(t.benchmarkSpeechRuns);
+      // Exactly one body row of the speed table: the speed run. The speech row is not a
+      // dash-filled second one.
+      expect(screen.getByText('77')).toBeInTheDocument();
+      const speedTable = screen.getByText(t.mappingGenTokensPerSecond).closest('table');
+      expect(speedTable).not.toBeNull();
+      expect(within(speedTable as HTMLElement).getAllByRole('row')).toHaveLength(2); // header + 1
+      expect(screen.getAllByText(t.benchmarkRunAt)).toHaveLength(2); // one header per table
+    });
+
+    it('renders a speech result by its metrics, never as "0 tok/s"', async () => {
+      const subscribeBenchmark = vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+        onStatus({
+          running: true,
+          server_id: 'srv_1',
+          scope: 'mapping',
+          mode: 'speech',
+          total: 1,
+          done: 1,
+          results: [
+            {
+              mapping_id: 'm1',
+              gateway_model_name: 'tts-gw',
+              gen_tokens_per_second: 0,
+              prompt_tokens_per_second: 0,
+              load_time_ms: 0,
+              output_byte_rate: 88200,
+              ttft_ms: 4210,
+              wall_ms: 1830,
+              rtf: 0.49,
+            },
+          ],
+        });
+        return () => {};
+      }) as unknown as PortalApi['subscribeBenchmark'];
+
+      renderSection({ kind: 'server' }, { subscribeBenchmark });
+
+      const line = await screen.findByText(/^tts-gw: /);
+      expect(line).toHaveTextContent('0.49');
+      expect(line).toHaveTextContent('1830 ms');
+      expect(line).toHaveTextContent('4210 ms');
+      expect(line).toHaveTextContent('88200');
+      // The cold start is named where the first-byte figure is.
+      expect(line).toHaveTextContent(t.benchmarkSpeechTtft);
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
+    it('renders the two speech skips as their own skip lines', async () => {
+      const subscribeBenchmark = vi.fn((_id: string, onStatus: (s: BenchmarkStatus) => void) => {
+        onStatus({
+          running: true,
+          server_id: 'srv_1',
+          scope: 'application',
+          mode: 'speech',
+          total: 2,
+          done: 2,
+          results: [
+            {
+              mapping_id: 'm1',
+              gateway_model_name: 'chat-gw',
+              gen_tokens_per_second: 0,
+              prompt_tokens_per_second: 0,
+              load_time_ms: 0,
+              skipped: 'not_speech',
+            },
+            {
+              mapping_id: 'm2',
+              gateway_model_name: 'clone-gw',
+              gen_tokens_per_second: 0,
+              prompt_tokens_per_second: 0,
+              load_time_ms: 0,
+              skipped: 'speech_clone',
+            },
+          ],
+        });
+        return () => {};
+      }) as unknown as PortalApi['subscribeBenchmark'];
+
+      renderSection({ kind: 'server' }, { subscribeBenchmark });
+
+      expect(
+        await screen.findByText(`chat-gw: ${t.benchmarkResultSkippedNotSpeech}`),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(`clone-gw: ${t.benchmarkResultSkippedSpeechClone}`),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument();
+    });
+
     it('calls onModelsChanged when the poll resolves the run to completion', async () => {
       // subscribeBenchmark delivers a running frame → the poll starts. benchmarkStatus
       // returns running once, then not-running, so the poll resolves and completion

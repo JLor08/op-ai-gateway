@@ -191,6 +191,14 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // portal chat reads the same flag to EXCLUDE a clone model from its picker, since a
   // text-only composer cannot supply the reference voice (#252).
   { capability: 'speech_clone', label: (t) => t.capabilitySpeechClone },
+  // "speech_streaming" refines "speech" the way "transcription_streaming" below refines
+  // "transcription": the model delivers its audio as it is generated (audio.cpp
+  // mode=streaming) rather than as one finished WAV. A probed trait of the endpoint like
+  // the chips around it, so it sits right after "speech" and its clone refinement and shows
+  // only on a `yes` -- an offline model (`no`) and the unknown (no row) render no chip. The
+  // portal chat's speech composer offers streaming playback only for such a model whose
+  // output rate is also known (the speech benchmark's), see ChatStore's speechStreaming.
+  { capability: 'speech_streaming', label: (t) => t.capabilitySpeechStreaming },
   { capability: 'transcription', label: (t) => t.capabilityTranscription },
   // "transcription_streaming" refines "transcription": the model delivers its transcript
   // incrementally (audio.cpp mode=streaming) rather than as one document at the end. It is a

@@ -299,6 +299,23 @@ function VramOutcome({ t, result }: Readonly<{ t: Translation; result: Benchmark
   );
 }
 
+/** Whether a result is a speech benchmark's: it carries the audio figures no other mode
+ * does (all omitted unless measured), and a speech run has no chat-token speed to show. */
+function isSpeechResult(r: BenchmarkResult): boolean {
+  return Boolean(r.rtf || r.wall_ms || r.ttft_ms || r.output_byte_rate);
+}
+
+/** A speech result's figures, each only when measured. The first-byte time is named with
+ * its cold start (see `benchmarkSpeechTtft`): it is not a streamed time to first audio. */
+function speechResultLine(r: BenchmarkResult, t: Translation): string {
+  const parts: string[] = [];
+  if (r.rtf) parts.push(`${t.benchmarkSpeechRtf} ${r.rtf.toFixed(2)}`);
+  if (r.wall_ms) parts.push(`${t.benchmarkSpeechWall} ${r.wall_ms} ms`);
+  if (r.ttft_ms) parts.push(`${t.benchmarkSpeechTtft} ${r.ttft_ms} ms`);
+  if (r.output_byte_rate) parts.push(`${t.benchmarkSpeechByteRate} ${r.output_byte_rate} B/s`);
+  return parts.join(', ');
+}
+
 /** One result line: a skip takes priority (a skipped result's numbers are
  * zeros, not a measurement), then an error, then a vision-capability probe
  * result, then a capacity-ramp result, else the plain speed reading. A load
@@ -307,7 +324,10 @@ function VramOutcome({ t, result }: Readonly<{ t: Translation; result: Benchmark
 function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.skipped === 'images_only') return t.benchmarkResultSkippedImagesOnly;
   if (r.skipped === 'audio_only') return t.benchmarkResultSkippedAudioOnly;
+  if (r.skipped === 'not_speech') return t.benchmarkResultSkippedNotSpeech;
+  if (r.skipped === 'speech_clone') return t.benchmarkResultSkippedSpeechClone;
   if (r.error) return r.error;
+  if (isSpeechResult(r)) return speechResultLine(r, t);
   if (r.vision_capable !== undefined) {
     return `${t.benchmarkVision}: ${r.vision_capable ? '✓' : '✗'}`;
   }
@@ -478,7 +498,60 @@ function FinishedPinNotice({
  * was given its own section.
  */
 function isNonSpeedKind(kind: string): boolean {
-  return kind === 'capacity' || kind === 'vision' || kind === 'vram';
+  return kind === 'capacity' || kind === 'vision' || kind === 'vram' || kind === 'speech';
+}
+
+/**
+ * The speech (text-to-speech) benchmark's history rows. A speech run measures no
+ * chat tokens, so it has its own section instead of a row of dashes in the speed
+ * table: when it ran, the time to the first response byte (NAMED as including any
+ * model start, with a note saying why: the request does not stream, so it is
+ * roughly synthesis plus cold start, never a streamed time to first audio), the
+ * synthesis wall time and the real-time factor, or the error of a run that
+ * measured none of them.
+ */
+function SpeechHistory({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRunDTO[] }>) {
+  const speechRuns = runs.filter((r) => r.kind === 'speech');
+  return (
+    <Box sx={{ mt: 2 }}>
+      <Typography variant="subtitle2" component="h3" sx={{ mb: 0.5 }}>
+        {t.benchmarkSpeechRuns}
+      </Typography>
+      <Typography variant="caption" color="text.secondary" component="p" sx={{ mb: 1 }}>
+        {t.benchmarkSpeechTtftNote}
+      </Typography>
+      <Table size="small">
+        <TableHead>
+          <TableRow>
+            <TableCell>{t.benchmarkRunAt}</TableCell>
+            <TableCell align="right">{t.benchmarkSpeechTtft}</TableCell>
+            <TableCell align="right">{t.benchmarkSpeechWall} (ms)</TableCell>
+            <TableCell align="right">{t.benchmarkSpeechRtf}</TableCell>
+            <TableCell>{t.tableStatus}</TableCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {speechRuns.map((run) => (
+            <TableRow key={run.id}>
+              <TableCell>{new Date(run.created_at).toLocaleString()}</TableCell>
+              <TableCell align="right">{run.ttft_ms || '—'}</TableCell>
+              <TableCell align="right">{run.wall_ms || '—'}</TableCell>
+              <TableCell align="right">{run.rtf ? run.rtf.toFixed(2) : '—'}</TableCell>
+              <TableCell>
+                {run.error ? (
+                  <Typography variant="body2" color="error">
+                    {run.error}
+                  </Typography>
+                ) : (
+                  <CheckCircleIcon fontSize="small" color="success" titleAccess={t.benchmarkDone} />
+                )}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Box>
+  );
 }
 
 /**
@@ -627,6 +700,7 @@ function HistoryTables({ t, runs }: Readonly<{ t: Translation; runs: BenchmarkRu
             ))}
         </Box>
       )}
+      {runs.some((r) => r.kind === 'speech') && <SpeechHistory t={t} runs={runs} />}
       {runs.some((r) => r.kind === 'vision') && (
         <Box sx={{ mt: 2 }}>
           <Typography variant="subtitle2" component="h3" sx={{ mb: 1 }}>
