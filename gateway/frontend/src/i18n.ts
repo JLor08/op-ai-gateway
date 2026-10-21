@@ -239,10 +239,10 @@ const de = {
   chatAudioPassthroughInvalid:
     'Die erweiterten Felder müssen ein JSON-Objekt sein, zum Beispiel {"seed": 1}. Korrigieren Sie sie oder leeren Sie das Feld, bevor Sie senden.',
   // The refusal of a speech turn whose "Advanced" passthrough names a field the run sets
-  // itself (model, input, stream, response_format; matched ignoring case), raised
+  // itself (model, input, stream, stream_format, response_format; matched ignoring case), raised
   // BEFORE anything is sent or stored. Names the field as the user wrote it.
   chatSpeechPassthroughReserved: (field: string) =>
-    `Das Feld „${field}“ in den erweiterten Feldern ist reserviert: Der Lauf setzt model, input, stream und response_format selbst. Entfernen Sie es, bevor Sie senden.`,
+    `Das Feld „${field}“ in den erweiterten Feldern ist reserviert: Der Lauf setzt model, input, stream, stream_format und response_format selbst. Entfernen Sie es, bevor Sie senden.`,
   // The same refusal for a transcription (speech-to-text) turn: its run sets model, file,
   // response_format and stream itself (matched ignoring case). Raised BEFORE anything is sent
   // or stored; names the field as the user wrote it. The not-a-JSON-object case reuses
@@ -268,12 +268,18 @@ const de = {
   chatSpeechVoiceHint: 'Eine Stimme aus der Liste wählen oder einen Namen eintippen',
   chatSpeechSpeed: 'Geschwindigkeit',
   chatSpeechFormatHint: 'Das Audio wird immer als WAV zurückgegeben.',
+  // The streaming toggle of the speech settings (ADR-068), shown ONLY for a model the gateway
+  // says it can stream (it streams and its output rate is known). On by default: the audio
+  // plays while it is generated, and the finished clip then appears as the file it always was.
+  chatSpeechStream: 'Beim Erzeugen abspielen (Streaming)',
+  chatSpeechStreamHint:
+    'Das Modell liefert das Audio schon während der Erzeugung, und es wird sofort abgespielt. Das fertige Audio erscheint danach wie gewohnt als Datei.',
   // The collapsible "Advanced" section: extra request fields as a JSON object (the
   // OpenAI `instructions` field or a model-native option).
   chatSpeechAdvanced: 'Erweitert',
   chatSpeechPassthrough: 'Zusätzliche Anfragefelder (JSON)',
   chatSpeechPassthroughHint:
-    'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream und response_format sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Haben Sie oben „Stimme“ oder „Geschwindigkeit“ eingestellt, gilt dieser Wert, nicht ein voice- oder speed-Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
+    'Ein JSON-Objekt mit zusätzlichen Feldern für die Sprachanfrage, zum Beispiel {"instructions": "Sprich langsam."} oder eine modellspezifische Option wie {"seed": 1}. Die Felder model, input, stream, stream_format und response_format sind reserviert (auch in anderer Groß-/Kleinschreibung): Steht eines davon hier, wird die Anfrage nicht gesendet. Haben Sie oben „Stimme“ oder „Geschwindigkeit“ eingestellt, gilt dieser Wert, nicht ein voice- oder speed-Feld hier. Leer lassen, um nichts Zusätzliches zu senden.',
   // The composer of a transcription (speech-to-text) thread: the audio input replaces the
   // text prompt. The group's label and the hint under it; the refusals of a send with no clip
   // (also the Send button's tooltip) and of a replay whose last user turn has none (a
@@ -418,6 +424,12 @@ const de = {
   chatAudioRunPending: 'Warte auf Audio',
   chatAudioNoIntermediateNews:
     'Keine Zwischenmeldungen – das Audio erscheint fertig oder gar nicht.',
+  // The pending turn of a speech run that PLAYS its audio while it is generated (a streaming
+  // model, ADR-068): instead of the silent wait above, which would be false while the user
+  // is listening. The finished audio still appears in this bubble as the file it always was.
+  chatAudioStreamLive: 'Wird beim Erzeugen abgespielt',
+  chatAudioStreamLiveHint:
+    'Das fertige Audio erscheint hier, sobald die Erzeugung abgeschlossen ist.',
   chatGeneratedAudio: 'Erzeugtes Audio',
   chatDownloadAudio: 'Audio herunterladen',
   // Inline next to the player, in two cases: the download itself failed, or the stored
@@ -1798,15 +1810,16 @@ const de = {
   // nennen, das er selbst besitzt (Groß-/Kleinschreibung egal). Der Text nennt das
   // Steuerelement mit seiner Beschriftung (chatSpeechAdvanced).
   errorChatRunSpeechReservedField:
-    'Die erweiterten Felder dieses Chats enthalten ein reserviertes Feld (model, input, stream oder response_format). Die Anfrage wurde nicht gesendet. Entfernen Sie das Feld unter „Erweitert“, und versuchen Sie es erneut.',
+    'Die erweiterten Felder dieses Chats enthalten ein reserviertes Feld (model, input, stream, stream_format oder response_format). Die Anfrage wurde nicht gesendet. Entfernen Sie das Feld unter „Erweitert“, und versuchen Sie es erneut.',
   errorSpeechInputRequired:
     'Für die Sprachsynthese wird ein Text benötigt. Bitte geben Sie den Text ein, der gesprochen werden soll.',
   errorSpeechResponseFormatUnsupported:
     'Nicht unterstütztes Antwortformat für die Sprachsynthese. Unterstützt wird nur WAV.',
-  // Vom Portal nur über ein stream_format-Feld in den erweiterten Feldern erreichbar
-  // (stream selbst ist reserviert und wird vorher abgelehnt).
+  // Vom Portal aus kaum noch erreichbar: stream und stream_format setzt der Lauf selbst
+  // (beide sind reserviert und werden vorher abgelehnt). Bleibt als Rückfall, falls der
+  // Endpunkt die Streaming-Anfrage dennoch ablehnt.
   errorSpeechStreamUnsupported:
-    'Die Sprachsynthese unterstützt kein Streaming; die Antwort ist immer eine vollständige Audiodatei. Entfernen Sie gegebenenfalls das Feld stream_format aus den erweiterten Feldern.',
+    'Die Sprachsynthese hat die Streaming-Anfrage abgelehnt. Schalten Sie das Streaming für diesen Chat aus, und versuchen Sie es erneut.',
   errorSpeechUpstreamError:
     'Der Sprachsynthese-Server hat einen Fehler gemeldet. Bitte versuchen Sie es erneut.',
   // Transkription im Chat (#249): die Lauf-Codes eines Transkriptions-Laufs
@@ -3538,7 +3551,7 @@ const en: PortalMessages = {
   chatAudioPassthroughInvalid:
     'The advanced fields must be a JSON object, for example {"seed": 1}. Fix them or clear the field before sending.',
   chatSpeechPassthroughReserved: (field: string) =>
-    `The field "${field}" in the advanced fields is reserved: the run sets model, input, stream and response_format itself. Remove it before sending.`,
+    `The field "${field}" in the advanced fields is reserved: the run sets model, input, stream, stream_format and response_format itself. Remove it before sending.`,
   chatTranscriptionPassthroughReserved: (field: string) =>
     `The field "${field}" in the advanced fields is reserved: the run sets model, file, response_format and stream itself. Remove it before sending.`,
   chatSpeechPromptLabel: 'Text to speak',
@@ -3551,10 +3564,14 @@ const en: PortalMessages = {
   chatSpeechVoiceHint: 'Pick a voice from the list or type a name',
   chatSpeechSpeed: 'Speed',
   chatSpeechFormatHint: 'The audio is always returned as WAV.',
+  // See the German block: shown only for a model the gateway can stream.
+  chatSpeechStream: 'Play while generating (streaming)',
+  chatSpeechStreamHint:
+    'The model delivers its audio while it is generated, and it plays at once. The finished audio then appears as a file as usual.',
   chatSpeechAdvanced: 'Advanced',
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:
-    'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream and response_format are reserved (in any letter case): if one of them appears here, the request is not sent. If you set "Voice" or "Speed" above, that value wins over a voice or speed field here. Leave blank to send nothing extra.',
+    'A JSON object of extra fields for the speech request, for example {"instructions": "Speak slowly."} or a model-specific option such as {"seed": 1}. The fields model, input, stream, stream_format and response_format are reserved (in any letter case): if one of them appears here, the request is not sent. If you set "Voice" or "Speed" above, that value wins over a voice or speed field here. Leave blank to send nothing extra.',
   chatTranscriptionInputLabel: 'Audio to transcribe',
   chatTranscriptionOnlyHint:
     'This model turns speech into text. Attach an audio file or record right in the browser; the reply is the transcript as text.',
@@ -3641,6 +3658,9 @@ const en: PortalMessages = {
   chatAudioRunPending: 'Waiting for audio',
   chatAudioNoIntermediateNews:
     'No intermediate updates – the audio arrives finished or not at all.',
+  // See the German block: the pending turn of a speech run that plays while it generates.
+  chatAudioStreamLive: 'Playing while it is generated',
+  chatAudioStreamLiveHint: 'The finished audio appears here once the generation is complete.',
   chatGeneratedAudio: 'Generated audio',
   chatDownloadAudio: 'Download audio',
   chatAudioDownloadError: 'Could not download the audio.',
@@ -4906,15 +4926,16 @@ const en: PortalMessages = {
   // owns (case-insensitive). The text names the control by its label
   // (chatSpeechAdvanced).
   errorChatRunSpeechReservedField:
-    'The advanced fields of this chat contain a reserved field (model, input, stream or response_format). The request was not sent. Remove the field under "Advanced" and try again.',
+    'The advanced fields of this chat contain a reserved field (model, input, stream, stream_format or response_format). The request was not sent. Remove the field under "Advanced" and try again.',
   errorSpeechInputRequired:
     'Speech synthesis needs text to speak. Please enter the text to be spoken.',
   errorSpeechResponseFormatUnsupported:
     'Unsupported response format for speech synthesis. Only WAV is supported.',
-  // Reachable from the portal only through a stream_format field in the advanced
-  // fields (stream itself is reserved and refused earlier).
+  // Hardly reachable from the portal any more: the run sets stream and stream_format itself
+  // (both are reserved and refused earlier). Kept as the fallback should the endpoint refuse
+  // the streaming request after all.
   errorSpeechStreamUnsupported:
-    'Speech synthesis does not support streaming; the response is always one complete audio file. If present, remove the stream_format field from the advanced fields.',
+    'The speech synthesis endpoint refused the streaming request. Turn streaming off for this chat and try again.',
   errorSpeechUpstreamError: 'The speech synthesis server reported an error. Please try again.',
   // Transcription in the chat (#249): the run codes of a transcription run
   // (chat_runs_transcription.go) and the transcription.* codes of

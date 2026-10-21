@@ -509,17 +509,26 @@ export type AudioSettings = {
   // of reserved fields; parseAudioPassthrough() says which, so the composer and send()
   // can name a bad one.
   passthrough: string;
+  // Whether the thread plays a streaming-capable model's audio while it is generated
+  // (ADR-068), the speech composer's "stream" toggle. On by default: the run streams
+  // wherever the gateway's gate allows it (the model streams and its output rate is known)
+  // and the toggle only appears for such a model; it is the user's way to opt a thread out
+  // and get the buffered WAV instead. audioSetting() writes it only when it is OFF, so a
+  // thread that never touched it persists nothing for it.
+  stream: boolean;
 };
 
 export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   voice: '',
   speed: '',
   passthrough: '',
+  stream: true,
 };
 
 // The request fields a thread's passthrough may not set: the run's own (`model` is
-// the thread's pinned model, `input` the user's text) and the two the speech
-// endpoint's one-complete-WAV contract depends on (`stream`, `response_format`).
+// the thread's pinned model, `input` the user's text) and the three its one-complete-WAV
+// turn depends on (`stream` and `stream_format`, which the run states itself when it
+// streams and omits when it does not, and `response_format`).
 // This mirrors speechReservedFields in the backend's chat_runs_audio.go -- keep the
 // two in step. The backend still refuses such a key (gateway.chat_run_speech_reserved_field,
 // matched ignoring case), but only AFTER the turn is committed; this copy lets the
@@ -529,6 +538,7 @@ export const SPEECH_RESERVED_FIELDS: readonly string[] = [
   'model',
   'input',
   'stream',
+  'stream_format',
   'response_format',
 ];
 
@@ -647,6 +657,9 @@ export function audioSetting(
   if (speed !== undefined) audio.speed = speed;
   const passthrough = parseAudioPassthrough(s.passthrough);
   if (passthrough.status === 'ok') audio.passthrough = passthrough.value;
+  // Only the opt-out is written: streaming is the default, so an unset thread persists
+  // nothing and a thread's settings stay byte-identical until the user turns it off.
+  if (!s.stream) audio.stream = false;
   return { audio };
 }
 
@@ -664,6 +677,9 @@ export function audioSettingsFrom(audio: ChatAudioSettings | undefined): AudioSe
     voice: typeof s.voice === 'string' ? s.voice : DEFAULT_AUDIO_SETTINGS.voice,
     speed: imageNumToStr(s.speed),
     passthrough,
+    // Anything but an explicit false is the default (on): a missing or mistyped value must
+    // not silently turn streaming off.
+    stream: s.stream !== false,
   };
 }
 

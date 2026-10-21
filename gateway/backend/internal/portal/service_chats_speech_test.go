@@ -295,3 +295,66 @@ func TestChatAudioSettingsWireShape(t *testing.T) {
 		t.Fatalf("a ChatRunSettings without audio must carry no audio key: %s", zero)
 	}
 }
+
+// The speech-streaming choice (ADR-068): unset stays off the wire so an existing thread's
+// persisted settings are byte-identical, while an explicit false -- the opt-out -- is
+// emitted and survives the round trip (a plain bool with omitempty would lose it).
+func TestChatAudioSettingsSpeechStreamWireShape(t *testing.T) {
+	off, on := false, true
+	if b, _ := json.Marshal(ChatAudioSettings{Voice: "v"}); string(b) != `{"voice":"v"}` {
+		t.Fatalf("an unset stream must be omitted, got %s", b)
+	}
+	b, err := json.Marshal(ChatAudioSettings{Stream: &off})
+	if err != nil || string(b) != `{"stream":false}` {
+		t.Fatalf("an explicit false must be emitted, got %s (%v)", b, err)
+	}
+	if b, _ := json.Marshal(ChatAudioSettings{Stream: &on}); string(b) != `{"stream":true}` {
+		t.Fatalf("an explicit true is emitted too, got %s", b)
+	}
+	var back ChatAudioSettings
+	if err := json.Unmarshal([]byte(`{"stream":false}`), &back); err != nil || back.Stream == nil || *back.Stream {
+		t.Fatalf("unmarshal = %+v (%v), want a set false", back, err)
+	}
+}
+
+// The thread's speech-streaming choice is persisted with its other audio settings and handed
+// to the run, which is what lets the composer's toggle outlive the page; a thread that never
+// touched it stores nothing for it.
+func TestPrepareChatRunKeepsTheSpeechStreamChoice(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	owner := chatToken("usr_a")
+	created, _ := svc.CreateChat(ctx, owner, CreateChatRequest{Content: json.RawMessage(`{"settings":{},"messages":[]}`)})
+
+	off := false
+	_, settings, err := svc.PrepareChatRun(ctx, owner, created.ID, PrepareRunRequest{
+		UserMessage: json.RawMessage(`{"id":"u1","role":"user","content":"read this aloud"}`),
+		Settings:    ChatRunSettings{Model: "kokoro", Kind: chatKindSpeech, Audio: &ChatAudioSettings{Voice: "af_bella", Stream: &off}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Audio == nil || settings.Audio.Stream == nil || *settings.Audio.Stream {
+		t.Fatalf("the choice was not handed to the run: %+v", settings.Audio)
+	}
+	got, _ := svc.GetChat(ctx, owner, created.ID)
+	if !strings.Contains(string(got.Content), `"stream":false`) {
+		t.Fatalf("the choice was not persisted: %s", got.Content)
+	}
+
+	// A later send that leaves it unset stores nothing for it: the default is the absence.
+	_, settings, err = svc.PrepareChatRun(ctx, owner, created.ID, PrepareRunRequest{
+		UserMessage: json.RawMessage(`{"id":"u2","role":"user","content":"again"}`),
+		Settings:    ChatRunSettings{Model: "kokoro", Kind: chatKindSpeech, Audio: &ChatAudioSettings{Voice: "af_bella"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Audio.Stream != nil {
+		t.Fatalf("an unset choice came back as %v", *settings.Audio.Stream)
+	}
+	got, _ = svc.GetChat(ctx, owner, created.ID)
+	if strings.Contains(string(got.Content), `"stream"`) {
+		t.Fatalf("an unset choice was persisted: %s", got.Content)
+	}
+}

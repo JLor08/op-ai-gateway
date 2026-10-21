@@ -1389,6 +1389,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/model-servers/events", s.handlePortalModelServersEvents)
 	s.mux.HandleFunc("/api/portal/model-image-options", s.handlePortalModelImageOptions)
 	s.mux.HandleFunc("/api/portal/model-voices", s.handlePortalModelVoices)
+	s.mux.HandleFunc("/api/portal/model-speech-streaming", s.handlePortalModelSpeechStreaming)
 	s.mux.HandleFunc("/api/portal/model-group-servers", s.handlePortalModelGroupServers)
 	s.mux.HandleFunc("/api/portal/servers", s.handlePortalServers)
 	s.mux.HandleFunc("/api/portal/servers/", s.handlePortalServerItem)

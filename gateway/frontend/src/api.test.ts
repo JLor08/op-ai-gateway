@@ -85,6 +85,48 @@ describe('portal api', () => {
     await expect(createPortalApi(fetcher).modelVoices('kokoro')).resolves.toEqual([]);
   });
 
+  // The speech composer's streaming gate: the model may stream when the gateway says so AND
+  // names the rate to play it at. Anything less is "no streaming" -- a malformed answer must
+  // never open the gate (a stream the client cannot play).
+  it("fetches whether a speech model may stream and unwraps the gate's answer", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ streaming: true, sample_rate: 44100 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    const result = await api.modelSpeechStreaming('org/tts one');
+
+    expect(fetcher).toHaveBeenCalledWith(
+      '/api/portal/model-speech-streaming?name=org%2Ftts%20one',
+      { headers: {}, credentials: 'include' },
+    );
+    expect(result).toEqual({ streaming: true, sampleRate: 44100 });
+  });
+
+  it.each([
+    ['a no', { streaming: false }],
+    ['a yes without a rate', { streaming: true }],
+    ['a yes with a rate that is no rate', { streaming: true, sample_rate: 0 }],
+    ['a yes with a fractional rate', { streaming: true, sample_rate: 44100.5 }],
+    ['a yes that is not the boolean true', { streaming: 'yes', sample_rate: 44100 }],
+    ['an empty answer', {}],
+  ])('reads %s as no streaming', async (_name, body) => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(createPortalApi(fetcher).modelSpeechStreaming('kokoro')).resolves.toEqual({
+      streaming: false,
+      sampleRate: 0,
+    });
+  });
+
   it('carries the backend-folded image_edit flag on a model option, independent of image', async () => {
     // ModelDTO.image_edit is derived and folded in the backend (image:yes and no
     // operator opt-out, ANDed across a model's mappings), so the client never

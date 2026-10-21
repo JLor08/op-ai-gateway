@@ -15,6 +15,7 @@ import {
 } from './ChatStore';
 import { ToastProvider } from '../shared/ToastProvider';
 import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
+import { NO_SPEECH_STREAMING, type SpeechStreamingGate } from '../../api/models';
 import { PortalApiError } from '../../api/transport';
 import { messages, type Locale } from '../../i18n';
 import type {
@@ -31,6 +32,21 @@ import type {
 vi.mock('../shared/audioToWav', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../shared/audioToWav')>()),
   audioBlobToWav: vi.fn(async (blob: Blob) => new Blob(['WAV:', blob], { type: 'audio/wav' })),
+}));
+
+// jsdom has no Web Audio either, so the progressive speech playback (speechPlayback.test.ts's
+// subject) is a recording stand-in here: these tests are about WHEN the store hands audio to
+// it, primes it and silences it, not about sound.
+const playback = vi.hoisted(() => ({
+  prime: vi.fn(),
+  push: vi.fn((..._args: unknown[]) => true),
+  end: vi.fn(),
+  stopAll: vi.fn(),
+  isLive: vi.fn(() => false),
+}));
+vi.mock('./speechPlayback', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./speechPlayback')>()),
+  speechPlayback: playback,
 }));
 
 const models: ModelOption[] = [
@@ -168,6 +184,12 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     // SYNTHESIZES speech. Defaults to "none known"; the voice-picker tests below
     // override it.
     modelVoices: vi.fn(async (_name: string) => [] as string[]),
+    // The speech composer's streaming gate, fetched whenever the picked model
+    // SYNTHESIZES speech. Defaults to "no streaming" (the buffered WAV run); the
+    // speech-streaming tests below override it.
+    modelSpeechStreaming: vi.fn(
+      async (_name: string): Promise<SpeechStreamingGate> => NO_SPEECH_STREAMING,
+    ),
   };
   return { api: spies, rows, spies };
 }
@@ -249,6 +271,13 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="model-image-options">{JSON.stringify(c.modelImageOptions)}</span>
       {/* The fetched voice names of the picked speech model ("[]" until/unless some arrive). */}
       <span data-testid="model-voices">{JSON.stringify(c.modelVoices)}</span>
+      {/* Whether the speech composer may offer streaming (the gate is open), and whether the
+          active chat's run is playing its audio live. */}
+      <span data-testid="speech-streaming">{String(c.speechStreaming)}</span>
+      <span data-testid="run-audio-live">{String(c.runAudioLive)}</span>
+      <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, stream: false }))}>
+        set-audio-stream-off
+      </button>
       <span data-testid="model-options">{c.modelOptions.map((o) => o.id).join(',')}</span>
       <span data-testid="override-model">{c.overrideModel}</span>
       <span data-testid="override-locks">{String(c.overrideLocksModel)}</span>
@@ -274,7 +303,12 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <button
         type="button"
         onClick={() =>
-          c.setAudioSettings({ voice: 'af_heart', speed: '1.25', passthrough: '{"seed":3}' })
+          c.setAudioSettings({
+            voice: 'af_heart',
+            speed: '1.25',
+            passthrough: '{"seed":3}',
+            stream: true,
+          })
         }
       >
         set-audio
@@ -3829,6 +3863,260 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   // A text-to-speech model is picked like an image generator: the chat offers it, the
   // empty thread's composer follows it (prospectiveKind), and the first send pins the
   // thread as "speech". The audio settings ride the run only for that kind.
+  // The portal speech-streaming run (ADR-068): the composer offers streaming only where the
+  // gateway says the model streams AND its rate is known, primes the browser's audio inside
+  // the send gesture, hands the run's `audio` events to the playback, and silences it when
+  // the run ends any way but completing.
+  describe(`ChatStoreProvider speech streaming [${locale}]`, () => {
+    const speechModel = (id: string): ModelOption => ({
+      id,
+      display_name: id,
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    });
+    const kokoro = speechModel('kokoro');
+    const piper = speechModel('piper');
+    const open: SpeechStreamingGate = { streaming: true, sampleRate: 44100 };
+    const speechThread = (audio?: unknown): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: {
+          settings: { model: kokoro.id, kind: 'speech', ...(audio ? { audio } : {}) },
+          messages: [],
+        },
+      },
+    ];
+    const sendText = (text: string) => {
+      fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: text } });
+      fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    };
+    const chunk = (seq: number) => ({ audio: { seq, rate: 44100, data: 'AAAA' } });
+
+    beforeEach(() => {
+      playback.prime.mockClear();
+      playback.end.mockClear();
+      playback.stopAll.mockClear();
+      playback.push.mockReset().mockReturnValue(true);
+    });
+
+    it('asks whether the picked speech model may stream, and offers streaming only on a yes', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechStreaming.mockResolvedValue(open);
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(screen.getByTestId('speech-streaming').textContent).toBe('true'));
+      expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalledWith('kokoro');
+    });
+
+    it('offers no streaming while the gate is closed, and not before the answer arrives', async () => {
+      chatApi = makeChatApi(speechThread());
+      let answer: (g: SpeechStreamingGate) => void = () => {};
+      chatApi.spies.modelSpeechStreaming.mockImplementation(
+        () => new Promise<SpeechStreamingGate>((resolve) => (answer = resolve)),
+      );
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalled());
+      expect(screen.getByTestId('speech-streaming').textContent).toBe('false');
+      await act(async () => answer(NO_SPEECH_STREAMING));
+      expect(screen.getByTestId('speech-streaming').textContent).toBe('false');
+    });
+
+    it('fails closed when the lookup fails', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechStreaming.mockRejectedValue(new Error('boom'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalled());
+      expect(screen.getByTestId('speech-streaming').textContent).toBe('false');
+    });
+
+    it('does not ask for a model that is not a speech model', async () => {
+      renderProvider([], { models });
+      await waitForReady();
+      expect(chatApi.spies.modelSpeechStreaming).not.toHaveBeenCalled();
+      expect(screen.getByTestId('speech-streaming').textContent).toBe('false');
+    });
+
+    it("drops the previous model's answer at once when another model is picked", async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechStreaming.mockImplementation(async (name: string) =>
+        name === 'kokoro' ? open : NO_SPEECH_STREAMING,
+      );
+      renderProvider([], { models: [kokoro, piper] });
+      await waitForReady();
+      await waitFor(() => expect(screen.getByTestId('speech-streaming').textContent).toBe('true'));
+      fireEvent.click(screen.getByRole('button', { name: 'pick-piper' }));
+      await waitFor(() =>
+        expect(chatApi.spies.modelSpeechStreaming).toHaveBeenLastCalledWith('piper'),
+      );
+      expect(screen.getByTestId('speech-streaming').textContent).toBe('false');
+    });
+
+    it('primes the audio inside the send, before the run is requested, when streaming is on and open', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechStreaming.mockResolvedValue(open);
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(screen.getByTestId('speech-streaming').textContent).toBe('true'));
+
+      sendText('hello');
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(playback.prime).toHaveBeenCalledTimes(1);
+      expect(playback.prime.mock.invocationCallOrder[0]).toBeLessThan(
+        chatApi.spies.startChatRun.mock.invocationCallOrder[0],
+      );
+    });
+
+    it.each([
+      ['the gate is closed', undefined, NO_SPEECH_STREAMING],
+      ['the thread turned streaming off', { stream: false }, open],
+    ])('does not prime the audio when %s', async (_name, audio, gate) => {
+      chatApi = makeChatApi(speechThread(audio));
+      chatApi.spies.modelSpeechStreaming.mockResolvedValue(gate);
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalled());
+
+      sendText('hello');
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(playback.prime).not.toHaveBeenCalled();
+    });
+
+    it("seeds the thread's streaming choice from the document and sends it with the run", async () => {
+      chatApi = makeChatApi(speechThread({ voice: 'af_heart', stream: false }));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toMatchObject({
+        stream: false,
+      });
+      sendText('hello');
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      const settings = (
+        chatApi.spies.startChatRun.mock.calls[0][1] as {
+          settings: { audio?: { stream?: boolean } };
+        }
+      ).settings;
+      expect(settings.audio?.stream).toBe(false);
+    });
+
+    it('turning the choice back on is the default again, and is not written', async () => {
+      chatApi = makeChatApi(speechThread({ stream: false }));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'set-audio' })); // stream: true
+      sendText('hello');
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      const settings = (
+        chatApi.spies.startChatRun.mock.calls[0][1] as {
+          settings: { audio?: Record<string, unknown> };
+        }
+      ).settings;
+      expect(settings.audio).not.toHaveProperty('stream');
+    });
+
+    // Starts a speech run and returns its event source, the run subscribed.
+    async function startRun() {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechStreaming.mockResolvedValue(open);
+      const view = renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(screen.getByTestId('speech-streaming').textContent).toBe('true'));
+      sendText('hello');
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      return { es: FakeEventSource.instances[0], ...view };
+    }
+
+    it('hands the run its audio chunks as they arrive and shows it as playing live', async () => {
+      const { es } = await startRun();
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+
+      act(() => {
+        es.emit('snapshot', { reasoning: '', content: '', status: 'running', kind: 'speech' });
+        es.emit('audio', chunk(0));
+        es.emit('audio', chunk(1));
+      });
+
+      expect(playback.push).toHaveBeenCalledTimes(2);
+      expect(playback.push).toHaveBeenNthCalledWith(1, 'c1', 'run_1', chunk(0).audio);
+      expect(playback.push).toHaveBeenNthCalledWith(2, 'c1', 'run_1', chunk(1).audio);
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
+      // The audio never becomes text in the transcript.
+      expect(screen.getByTestId('last').textContent).toBe('');
+    });
+
+    it('does not show the run as live when the playback refuses the stream (a gap)', async () => {
+      playback.push.mockReturnValue(false);
+      const { es } = await startRun();
+      act(() => es.emit('audio', chunk(0)));
+      expect(playback.push).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+    });
+
+    it('ignores an audio event without a chunk', async () => {
+      const { es } = await startRun();
+      act(() => es.emit('audio', {}));
+      expect(playback.push).not.toHaveBeenCalled();
+    });
+
+    it('lets a completed run play out, and shows the finished turn', async () => {
+      const { es } = await startRun();
+      act(() => es.emit('audio', chunk(0)));
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
+
+      act(() =>
+        es.emit('done', {
+          content: '',
+          status: 'completed',
+          kind: 'speech',
+          content_parts: [{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } }],
+        }),
+      );
+      expect(playback.end).toHaveBeenCalledWith('c1', true);
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+      await waitFor(() =>
+        expect(screen.getByTestId('last-parts').textContent).toBe(
+          'audio_url:data:audio/wav;base64,UklG',
+        ),
+      );
+    });
+
+    it.each([
+      ['a Stop', { status: 'canceled', error: '' }],
+      ['an error', { status: 'error', error: 'gateway.chat_run_timeout' }],
+    ])('silences a run that ends in %s', async (_name, terminal) => {
+      const { es } = await startRun();
+      act(() => es.emit('audio', chunk(0)));
+      act(() => es.emit('done', { content: '', kind: 'speech', ...terminal }));
+      expect(playback.end).toHaveBeenCalledWith('c1', false);
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+    });
+
+    it('ends the playback of a run it only learns is over from a terminal snapshot', async () => {
+      const { es } = await startRun();
+      act(() => es.emit('audio', chunk(0)));
+      act(() => es.emit('snapshot', { content: '', status: 'completed', kind: 'speech' }));
+      expect(playback.end).toHaveBeenCalledWith('c1', true);
+    });
+
+    it("silences a chat's audio when the chat is deleted", async () => {
+      const { es } = await startRun();
+      act(() => es.emit('audio', chunk(0)));
+      fireEvent.click(screen.getByRole('button', { name: 'delete-c1' }));
+      await waitFor(() => expect(playback.end).toHaveBeenCalledWith('c1', false));
+    });
+
+    it('silences every chat when the store goes away', async () => {
+      const { unmount } = await startRun();
+      unmount();
+      expect(playback.stopAll).toHaveBeenCalled();
+    });
+  });
+
   describe(`ChatStoreProvider speech-thread kind [${locale}]`, () => {
     // A TTS model: only the openai_audio flavor, with the backend's speech verdict.
     const kokoro: ModelOption = {
@@ -4147,6 +4435,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         voice: 'bf_emma',
         speed: '0.8',
         passthrough: '',
+        stream: true,
       });
 
       // The audio settings are the ONLY thing that changes here, so this also holds

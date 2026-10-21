@@ -27,6 +27,7 @@ import {
   type ChatUiMessage,
   type RunMetricsPayload,
 } from './chatDoc';
+import { speechPlayback, type AudioChunk, type SpeechPlayback } from './speechPlayback';
 
 // A live run subscription for one chat. `es` is the open EventSource (null once
 // terminal / after close). Keyed by chatId in runsRef.
@@ -95,6 +96,11 @@ type SnapshotPayload = {
   content_parts?: ChatContentPart[];
 };
 type DeltaPayload = { reasoning?: string; content?: string };
+// The `audio` event of a STREAMING speech run (the backend's runAudio): one chunk of the PCM
+// the run is generating, numbered and carrying the sample rate to play it at. It is no part
+// of the transcript or of any snapshot -- the finished clip arrives as the done event's
+// content_parts -- so it is only ever handed to the playback (speechPlayback.ts).
+type AudioPayload = { audio?: AudioChunk };
 
 // The content a snapshot/done event says the turn HAS. `content_parts` is what
 // the transcript holds for a structured turn (an image, or a transcription's
@@ -131,6 +137,10 @@ export type ChatRunsApi = {
   // runsRef for RENDERING (sidebar spinner, derived `streaming`); may lag a
   // render behind the ref, so gating logic must use `isRunning` instead.
   runningChatIds: Set<string>;
+  // Chats whose running speech run is playing its audio live right now (a streaming
+  // model's chunks, played as they arrive): the pending turn says so instead of "no
+  // intermediate news". Rendering state only, like runningChatIds.
+  audioLiveChatIds: Set<string>;
   // Synchronous, always-current "is this chat's run live" check (reads the
   // backing ref directly, never stale). Use this for gating (send / edit /
   // save), never `runningChatIds`.
@@ -195,6 +205,10 @@ export function useChatRuns(
   // either already a translated caller-supplied value or a raw wire code
   // this module has no business rendering untranslated.
   tRef: RefObject<Translation>,
+  // The browser's progressive speech playback (a recording stand-in in tests). The run's
+  // `audio` events are handed to it and it is silenced when the run ends any way but
+  // completing, or the chat goes away.
+  playback: SpeechPlayback = speechPlayback,
 ): ChatRunsApi {
   // Per-chat run subscriptions, keyed by chatId. The source of truth for "is
   // this chat running" (runningChatIds mirrors it for rendering). Entries are
@@ -205,6 +219,7 @@ export function useChatRuns(
   // (not in the visible `messages`), so switching to it shows the latest.
   const chatBuffersRef = useRef<Map<string, ChatUiMessage[]>>(new Map());
   const [runningChatIds, setRunningChatIds] = useState<Set<string>>(new Set());
+  const [audioLiveChatIds, setAudioLiveChatIds] = useState<Set<string>>(new Set());
   const onTerminalRef = useRef<RunTerminalHandler | null>(null);
   const onTranscriptStaleRef = useRef<TranscriptStaleHandler | null>(null);
 
@@ -215,6 +230,18 @@ export function useChatRuns(
       if (running === prev.has(chatId)) return prev;
       const next = new Set(prev);
       if (running) next.add(chatId);
+      else next.delete(chatId);
+      return next;
+    });
+  }, []);
+
+  // Add/remove a chat from the audio-live set (the render mirror of "this run is playing its
+  // audio now"; the source of truth is the playback itself).
+  const markAudioLive = useCallback((chatId: string, live: boolean) => {
+    setAudioLiveChatIds((prev) => {
+      if (live === prev.has(chatId)) return prev;
+      const next = new Set(prev);
+      if (live) next.add(chatId);
       else next.delete(chatId);
       return next;
     });
@@ -272,6 +299,10 @@ export function useChatRuns(
   // left by an error/cancel before any output), and refresh tokens/models.
   const finishRun = useCallback(
     (chatId: string, status: ChatRunStatus, error?: string) => {
+      // A completed speech run plays out the audio it has queued (the finished clip is
+      // about to appear beside it); anything else -- a Stop, an error -- goes silent now.
+      playback.end(chatId, status === 'completed');
+      markAudioLive(chatId, false);
       const run = runsRef.current.get(chatId);
       if (run) {
         run.es?.close();
@@ -313,7 +344,7 @@ export function useChatRuns(
       if (error) showErrorRef.current(formatChatRunErrorCode(error, tRef.current));
       void onRefreshRef.current();
     },
-    [updateChatMessages, markRunning, showErrorRef, onRefreshRef, tRef],
+    [updateChatMessages, markRunning, markAudioLive, playback, showErrorRef, onRefreshRef, tRef],
   );
 
   // Review follow-up #A: after a run's `done`, the backend has ALREADY committed
@@ -469,6 +500,15 @@ export function useChatRuns(
             content: (typeof m.content === 'string' ? m.content : '') + (d.content ?? ''),
           }));
         });
+        // A streaming speech run's audio, one chunk per event. Played as it arrives and
+        // never written into the transcript: whether the run is playing live is the
+        // playback's answer (it plays only an unbroken stream, from its first chunk), and
+        // what the turn becomes is the done event's content_parts.
+        es.addEventListener('audio', (e) => {
+          const { audio } = JSON.parse((e as MessageEvent).data) as AudioPayload;
+          if (!audio) return;
+          markAudioLive(chatId, playback.push(chatId, runId, audio));
+        });
         es.addEventListener('done', (e) => {
           const term = JSON.parse((e as MessageEvent).data) as SnapshotPayload;
           ensureAssistant(chatId);
@@ -550,6 +590,8 @@ export function useChatRuns(
       adoptCanonicalTranscript,
       registerRunning,
       markRunning,
+      markAudioLive,
+      playback,
     ],
   );
 
@@ -604,17 +646,22 @@ export function useChatRuns(
       runsRef.current.delete(chatId);
       chatBuffersRef.current.delete(chatId);
       markRunning(chatId, false);
+      // The chat is gone: nothing may keep speaking for it.
+      playback.end(chatId, false);
+      markAudioLive(chatId, false);
       // The chat is gone (deleteChat), so there is no transcript left to be
       // stale about — and leaving a mark behind would outlive its subject and
       // block a future chat that reused the id.
       onTranscriptStaleRef.current?.(chatId, false);
     },
-    [markRunning],
+    [markRunning, markAudioLive, playback],
   );
 
   const closeAll = useCallback(() => {
     for (const run of runsRef.current.values()) run.es?.close();
-  }, []);
+    // The store is going away (provider unmount): no run's audio outlives it.
+    playback.stopAll();
+  }, [playback]);
 
   const onTerminal = useCallback((cb: RunTerminalHandler) => {
     onTerminalRef.current = cb;
@@ -626,6 +673,7 @@ export function useChatRuns(
 
   return {
     runningChatIds,
+    audioLiveChatIds,
     isRunning,
     statusOf,
     runIdIfRunning,

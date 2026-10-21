@@ -365,6 +365,15 @@ func requireNoSpeechRunCall(t *testing.T, calls <-chan speechRunLoopbackCall) {
 // never reached.
 func newSpeechRunTestServer(t *testing.T, upstreamURL string) (*Server, auth.Token, string, portal.ChatStore) {
 	t.Helper()
+	srv, _, owner, chatID, chats := newSpeechRunTestServerWithDirectory(t, upstreamURL)
+	return srv, owner, chatID, chats
+}
+
+// newSpeechRunTestServerWithDirectory is newSpeechRunTestServer with the user directory as
+// well, the only handle on the store AuthorizeRunAsToken reads, for a test that needs a
+// run-as token owned by the chat's user.
+func newSpeechRunTestServerWithDirectory(t *testing.T, upstreamURL string) (*Server, *portal.MemoryDirectory, auth.Token, string, portal.ChatStore) {
+	t.Helper()
 	chats := store.NewMemoryChatStore(0)
 	cipher, err := capture.New(testCaptureKey)
 	if err != nil {
@@ -438,7 +447,7 @@ func newSpeechRunTestServer(t *testing.T, upstreamURL string) (*Server, auth.Tok
 	if err != nil {
 		t.Fatalf("CreateChat: %v", err)
 	}
-	return srv, owner, created.ID, chats
+	return srv, directory, owner, created.ID, chats
 }
 
 // speechRunOutcome starts the run, waits for it to end and returns it with its
