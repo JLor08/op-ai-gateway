@@ -978,19 +978,6 @@ func (r *appHealthRunner) fetchAndCacheVoices(ctx context.Context, lister provid
 	}
 }
 
-// agentVoicesPlainTTS reports whether a mapping's STORED capability rows say its
-// model is a plain tts one: (speech, yes) and NOT (speech_clone, yes) -- the
-// same rule as audioCppVoicesWanted, read from rows instead of a fresh listing
-// because an agent-launched child is not asked for its /v1/models by the
-// gateway: the agent reads it and reports the verdicts (source audiocpp_models).
-// An absent row is unknown, so an unstated speech verdict is not tts, and an
-// unstated clone verdict does not exclude: only an affirmative one does.
-func agentVoicesPlainTTS(rows []routing.CapabilityRow) bool {
-	byName := routing.CapabilityRowsByName(rows)
-	return byName[routing.CapabilitySpeech].Verdict == routing.CapabilityYes &&
-		byName[routing.CapabilitySpeechClone].Verdict != routing.CapabilityYes
-}
-
 // probeAgentVoices is the agent-launched audio.cpp child's voices pass for ONE
 // server_agent application on a server whose agent declared
 // gateway.RuntimeVoicesFeature (#251): the twin of cacheAudioCppVoices for the
@@ -1006,7 +993,11 @@ func agentVoicesPlainTTS(rows []routing.CapabilityRow) bool {
 //     report), so a cold child is never asked, let alone started;
 //   - its runtime spec is of kind audio.cpp (routing.EffectiveRuntimeSpecType),
 //     because the router would forward the GET to any running child;
-//   - its stored verdicts make it a plain tts model (agentVoicesPlainTTS).
+//   - its stored verdicts make it a plain tts model (routing.CapabilityRowsPlainTTS:
+//     the same rule as audioCppVoicesWanted, read from the rows the agent reported
+//     (source audiocpp_models) instead of a fresh listing, because an agent-launched
+//     child is not asked for its /v1/models by the gateway; the voices endpoint
+//     applies the same rule at read time, so writer and reader cannot disagree).
 //
 // The caller has already required the agent's runtime_voices declaration: it is
 // fail-closed, because an older router answers an unmanaged model's 404 for the
@@ -1062,7 +1053,7 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 			slog.Debug("app health: capabilities for the agent voices pass failed", "mapping_id", mp.ID, "error", err)
 			continue
 		}
-		if !agentVoicesPlainTTS(rows) {
+		if !routing.CapabilityRowsPlainTTS(rows) {
 			r.voicesBackoff.clear(mp.ID)
 			continue
 		}

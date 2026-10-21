@@ -1752,6 +1752,24 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 	return out
 }
 
+// CapabilityRowsPlainTTS reports whether a mapping's stored capability rows say
+// its model is a PLAIN text-to-speech one -- (speech, yes) and NOT
+// (speech_clone, yes) -- the models whose voice list is a fixed set of names a
+// speech request can ask for by name (#251). An absent row is unknown, so an
+// unstated speech verdict is not tts, and an unstated or negative clone verdict
+// does not exclude: only an affirmative one does (a clone model synthesises only
+// in a reference voice it is handed, so it has no named voices to offer).
+//
+// It is the ONE definition of that rule for everything that writes or reads the
+// voices cache from stored rows: the agent-launched health pass decides from it
+// whether to ask a child for its voices, and the voices endpoint decides from it,
+// at read time, whether a cached list may still be offered.
+func CapabilityRowsPlainTTS(rows []CapabilityRow) bool {
+	byName := CapabilityRowsByName(rows)
+	return byName[CapabilitySpeech].Verdict == CapabilityYes &&
+		byName[CapabilitySpeechClone].Verdict != CapabilityYes
+}
+
 // WritableCapabilityRows answers the one question every capability writer --
 // a probe, or the vision benchmark -- has to ask -- which of the verdicts I
 // just determined may I actually write, given what is already on file -- and
