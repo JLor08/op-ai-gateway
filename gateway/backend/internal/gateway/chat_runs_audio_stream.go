@@ -136,12 +136,7 @@ func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Toke
 	if err != nil {
 		return 0, false, err
 	}
-	candidates := ids[:0:0]
-	for _, id := range ids {
-		if routing.CapabilityRowsPlainTTS(verdicts[id]) {
-			candidates = append(candidates, id)
-		}
-	}
+	candidates := plainTTSMappingIDs(ids, verdicts)
 	if len(candidates) == 0 {
 		return 0, false, nil
 	}
@@ -149,22 +144,44 @@ func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Toke
 	if err != nil {
 		return 0, false, err
 	}
+	rate, ok := agreedSpeechStreamRate(candidates, verdicts, cached)
+	return rate, ok, nil
+}
+
+// plainTTSMappingIDs keeps, in order, the mappings whose capability rows say plain tts
+// (routing.CapabilityRowsPlainTTS): the only ones a speech request is ever routed to.
+func plainTTSMappingIDs(ids []string, verdicts map[string][]routing.CapabilityRow) []string {
+	candidates := ids[:0:0]
+	for _, id := range ids {
+		if routing.CapabilityRowsPlainTTS(verdicts[id]) {
+			candidates = append(candidates, id)
+		}
+	}
+	return candidates
+}
+
+// agreedSpeechStreamRate folds the candidate mappings into the one sample rate a stream
+// may be played at, and true, only when every one of them has a speech_streaming verdict
+// of yes, a usable cached output byte rate (scopeLessByteRate, speechStreamSampleRate),
+// and the same rate as the others. Any mapping that fails any of the three closes the
+// gate: (0, false). An empty candidate set is a closed gate too.
+func agreedSpeechStreamRate(candidates []string, verdicts map[string][]routing.CapabilityRow, cached map[string][]routing.ModelMappingCacheRow) (int, bool) {
 	sampleRate := 0
 	for _, id := range candidates {
 		if routing.CapabilityRowsByName(verdicts[id])[routing.CapabilitySpeechStreaming].Verdict != routing.CapabilityYes {
-			return 0, false, nil
+			return 0, false
 		}
 		rate, ok := scopeLessByteRate(cached[id])
 		if !ok {
-			return 0, false, nil
+			return 0, false
 		}
 		hz, ok := speechStreamSampleRate(rate)
 		if !ok || (sampleRate != 0 && hz != sampleRate) {
-			return 0, false, nil
+			return 0, false
 		}
 		sampleRate = hz
 	}
-	return sampleRate, sampleRate != 0, nil
+	return sampleRate, sampleRate != 0
 }
 
 // scopeLessByteRate reads the usable output byte rate out of one mapping's cache rows: the
@@ -348,55 +365,83 @@ func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *ht
 // (speechStreamMaxLine): a line past it ends the read (bufio.ErrTooLong), which is the same
 // incomplete stream.
 func readSpeechEvents(run *ChatRun, body io.Reader, sampleRate int, dispatchedAt time.Time, liftDeadline func()) (pcm []byte, complete bool, readErr error) {
-	var (
-		sawDelta, sawDone, sawEnd, lost bool
-		seq                             int
-	)
+	r := &speechEventReader{run: run, sampleRate: sampleRate, dispatchedAt: dispatchedAt, liftDeadline: liftDeadline}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), speechStreamMaxLine)
 	for scanner.Scan() {
-		payload, ok := strings.CutPrefix(strings.TrimSpace(scanner.Text()), "data:")
-		if !ok {
-			continue
-		}
-		payload = strings.TrimSpace(payload)
-		if payload == sseDoneSentinel {
-			sawEnd = sawEnd || sawDone
-			continue
-		}
-		if !strings.HasPrefix(payload, "{") {
-			continue
-		}
-		var ev speechStreamEvent
-		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-			lost = true
-			continue
-		}
-		switch ev.Type {
-		case speechEventDelta:
-			if ev.Audio == "" {
-				continue
-			}
-			chunk, err := base64.StdEncoding.DecodeString(ev.Audio)
-			if err != nil {
-				lost = true
-				continue
-			}
-			if !sawDelta {
-				sawDelta = true
-				liftDeadline()
-				m := run.currentMetrics()
-				m.TTFTMs = time.Since(dispatchedAt).Milliseconds()
-				run.setMetrics(m)
-			}
-			pcm = append(pcm, chunk...)
-			run.publishAudio(runAudio{Seq: seq, Rate: sampleRate, Data: ev.Audio})
-			seq++
-		case speechEventDone:
-			sawDone = true
-		}
+		r.consumeLine(scanner.Text())
 	}
-	return pcm, sawDone && sawEnd && !lost, scanner.Err()
+	return r.pcm, r.sawDone && r.sawEnd && !r.lost, scanner.Err()
+}
+
+// speechEventReader is what reading a streamed synthesis' event stream (readSpeechEvents)
+// accumulates, one line at a time: the decoded PCM, the next audio event's sequence
+// number, and the facts that decide whether the stream completed -- whether a delta has
+// been seen (the first lifts the deadline and stamps the TTFT), a speech.audio.done, a
+// [DONE] that came after it, and whether any frame or delta was lost to a read failure.
+type speechEventReader struct {
+	run          *ChatRun
+	sampleRate   int
+	dispatchedAt time.Time
+	liftDeadline func()
+
+	pcm                             []byte
+	sawDelta, sawDone, sawEnd, lost bool
+	seq                             int
+}
+
+// consumeLine takes one line of the event stream. Only an SSE data line carries
+// anything: [DONE] counts as the end only once speech.audio.done has been seen, a
+// payload that is not a JSON object is ignored, and one that is but cannot be read
+// loses the frame (lost).
+func (r *speechEventReader) consumeLine(line string) {
+	payload, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
+	if !ok {
+		return
+	}
+	payload = strings.TrimSpace(payload)
+	if payload == sseDoneSentinel {
+		r.sawEnd = r.sawEnd || r.sawDone
+		return
+	}
+	if !strings.HasPrefix(payload, "{") {
+		return
+	}
+	var ev speechStreamEvent
+	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+		r.lost = true
+		return
+	}
+	switch ev.Type {
+	case speechEventDelta:
+		r.consumeDelta(ev.Audio)
+	case speechEventDone:
+		r.sawDone = true
+	}
+}
+
+// consumeDelta takes one speech.audio.delta's base64 audio: an empty one is skipped, one
+// that is not base64 is lost, and any other is decoded into the PCM buffer and relayed to
+// the run's subscribers as it came. The first lifts the deadline and stamps the TTFT.
+func (r *speechEventReader) consumeDelta(audio string) {
+	if audio == "" {
+		return
+	}
+	chunk, err := base64.StdEncoding.DecodeString(audio)
+	if err != nil {
+		r.lost = true
+		return
+	}
+	if !r.sawDelta {
+		r.sawDelta = true
+		r.liftDeadline()
+		m := r.run.currentMetrics()
+		m.TTFTMs = time.Since(r.dispatchedAt).Milliseconds()
+		r.run.setMetrics(m)
+	}
+	r.pcm = append(r.pcm, chunk...)
+	r.run.publishAudio(runAudio{Seq: r.seq, Rate: r.sampleRate, Data: audio})
+	r.seq++
 }
 
 // wavHeaderLen is the size of the canonical 44-byte PCM WAV header: RIFF, `fmt ` (16 bytes

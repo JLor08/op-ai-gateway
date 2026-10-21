@@ -215,7 +215,14 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	if streaming && resp.StatusCode >= 200 && resp.StatusCode <= 299 && isSpeechEventStream(resp.Header) {
 		return s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline)
 	}
+	return bufferedSpeechTurn(ctx, run, resp)
+}
 
+// bufferedSpeechTurn is the outcome of a speech run's loopback answer that is not an
+// event stream: the one-shot WAV (or an error answer) read whole, as
+// generateSpeechTurn's result -- the content parts to commit, the run status and the
+// terminal error message.
+func bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *http.Response) (json.RawMessage, string, string) {
 	// Read the WHOLE body: a WAV cannot be played from a prefix of it, and it is
 	// deliberately not bounded by s.captureMaxBytes (1 MiB, which an ordinary clip
 	// exceeds) -- the same call, and the same backstop, as the image path: the chat

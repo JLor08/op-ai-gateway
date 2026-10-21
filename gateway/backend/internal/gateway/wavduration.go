@@ -177,21 +177,31 @@ func wavFmtFieldsFromReader(r io.Reader) ([wavFmtMinLen]byte, bool) {
 			return fields, false
 		}
 		if id == "fmt " {
-			if size < wavFmtMinLen {
-				return fields, false
-			}
-			if _, err := io.ReadFull(r, fields[:]); err != nil {
-				return fields, false
-			}
-			if _, ok := wavConsistentByteRate(fields[:]); !ok {
-				return fields, false
-			}
-			return fields, true
+			return wavReadConsistentFmtFields(r, size)
 		}
 		if !wavSkipChunkRest(r, size, 0) {
 			return fields, false
 		}
 	}
+}
+
+// wavReadConsistentFmtFields reads the first wavFmtMinLen bytes of a `fmt ` chunk whose
+// declared body size is size, and reports true only when the chunk is long enough to
+// carry them, they can be read, and they agree with each other (wavConsistentByteRate).
+// It leaves the reader wavFmtMinLen bytes into the chunk body. It is
+// wavReadFmtByteRate's counterpart for the caller that needs the fields themselves.
+func wavReadConsistentFmtFields(r io.Reader, size uint32) ([wavFmtMinLen]byte, bool) {
+	var fields [wavFmtMinLen]byte
+	if size < wavFmtMinLen {
+		return fields, false
+	}
+	if _, err := io.ReadFull(r, fields[:]); err != nil {
+		return fields, false
+	}
+	if _, ok := wavConsistentByteRate(fields[:]); !ok {
+		return fields, false
+	}
+	return fields, true
 }
 
 // wavReadRIFFHeader consumes the 12-byte RIFF container header and reports whether

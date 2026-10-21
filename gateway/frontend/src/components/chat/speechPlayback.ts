@@ -98,7 +98,10 @@ export function decodeBase64(data: string): Uint8Array | null {
   try {
     const binary = atob(data);
     const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    // codePointAt, not charCodeAt: they differ only on a surrogate PAIR, and atob's output is
+    // a binary string by definition (every code unit 0..255), so no surrogate can occur here
+    // and the two are exactly equivalent. The `?? 0` is for the type only -- `i` is in range.
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.codePointAt(i) ?? 0;
     return bytes;
   } catch {
     return null;

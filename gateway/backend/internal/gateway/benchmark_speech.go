@@ -373,23 +373,12 @@ func (s *Server) measureSpeechTarget(ctx context.Context, tgt benchmarkTarget) (
 	defer resp.Body.Close()
 	ttft := time.Since(start)
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkErrorBytes))
-		return speechMeasurement{}, fmt.Errorf("speech benchmark: the upstream answered HTTP %d: %s", resp.StatusCode, speechBenchmarkErrorText(errBody))
+	if err := checkSpeechBenchmarkResponse(resp); err != nil {
+		return speechMeasurement{}, err
 	}
-	if contentType := resp.Header.Get("Content-Type"); !speechAudioMediaTypeOf(contentType) {
-		return speechMeasurement{}, fmt.Errorf("speech benchmark: the answer is not labelled as WAV (Content-Type %q)", contentType)
-	}
-	audio, err := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkMaxAudioBytes+1))
-	wall := time.Since(start)
+	audio, wall, err := readSpeechBenchmarkAudio(resp.Body, start)
 	if err != nil {
-		return speechMeasurement{}, fmt.Errorf("speech benchmark: the answer could not be read to its end: %w", err)
-	}
-	switch {
-	case len(audio) == 0:
-		return speechMeasurement{}, errors.New("speech benchmark: the answer is empty")
-	case len(audio) > speechBenchmarkMaxAudioBytes:
-		return speechMeasurement{}, fmt.Errorf("speech benchmark: the answer exceeds %d bytes", speechBenchmarkMaxAudioBytes)
+		return speechMeasurement{}, err
 	}
 	format, ok := wavFormatFromReader(bytes.NewReader(audio))
 	if !ok {
@@ -407,12 +396,7 @@ func (s *Server) measureSpeechTarget(ctx context.Context, tgt benchmarkTarget) (
 	}
 	rate := format.ByteRate
 
-	audioSeconds, haveAudio := speechDurationSeconds(resp.Header.Get(speechDurationHeader))
-	if !haveAudio {
-		if ms, ok := wavDurationFromReader(bytes.NewReader(audio)); ok && ms > 0 {
-			audioSeconds, haveAudio = float64(ms)/1000, true
-		}
-	}
+	audioSeconds, haveAudio := speechBenchmarkAudioSeconds(resp.Header, audio)
 	wallSeconds := wall.Seconds()
 	if ms, ok := speechPositiveHeader(resp.Header, speechWallHeader); ok {
 		wallSeconds = ms / 1000
@@ -424,6 +408,52 @@ func (s *Server) measureSpeechTarget(ctx context.Context, tgt benchmarkTarget) (
 		m.rtf = wallSeconds / audioSeconds
 	}
 	return m, nil
+}
+
+// checkSpeechBenchmarkResponse reports why a benchmark synthesis answer cannot be
+// measured: a non-2xx status (with the upstream's error text) or a Content-Type that
+// does not label the body as WAV. It reads the body only to quote an error answer.
+func checkSpeechBenchmarkResponse(resp *provider.ProxyResponse) error {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, speechBenchmarkErrorBytes))
+		return fmt.Errorf("speech benchmark: the upstream answered HTTP %d: %s", resp.StatusCode, speechBenchmarkErrorText(errBody))
+	}
+	if contentType := resp.Header.Get("Content-Type"); !speechAudioMediaTypeOf(contentType) {
+		return fmt.Errorf("speech benchmark: the answer is not labelled as WAV (Content-Type %q)", contentType)
+	}
+	return nil
+}
+
+// readSpeechBenchmarkAudio reads a benchmark answer's body to its end (bounded by
+// speechBenchmarkMaxAudioBytes) and returns it with the elapsed time since start,
+// taken the instant the read returns, before any check of what was read. An unreadable,
+// empty or oversized body is an error.
+func readSpeechBenchmarkAudio(body io.Reader, start time.Time) ([]byte, time.Duration, error) {
+	audio, err := io.ReadAll(io.LimitReader(body, speechBenchmarkMaxAudioBytes+1))
+	wall := time.Since(start)
+	if err != nil {
+		return nil, wall, fmt.Errorf("speech benchmark: the answer could not be read to its end: %w", err)
+	}
+	switch {
+	case len(audio) == 0:
+		return nil, wall, errors.New("speech benchmark: the answer is empty")
+	case len(audio) > speechBenchmarkMaxAudioBytes:
+		return nil, wall, fmt.Errorf("speech benchmark: the answer exceeds %d bytes", speechBenchmarkMaxAudioBytes)
+	}
+	return audio, wall, nil
+}
+
+// speechBenchmarkAudioSeconds is the length of audio a benchmark answer holds: the
+// X-AudioCPP-Audio-Duration-Ms header the billing reads when it is usable, else the
+// WAV's own length (wavDurationFromReader). It reports false when neither can say.
+func speechBenchmarkAudioSeconds(header http.Header, audio []byte) (float64, bool) {
+	if seconds, ok := speechDurationSeconds(header.Get(speechDurationHeader)); ok {
+		return seconds, true
+	}
+	if ms, ok := wavDurationFromReader(bytes.NewReader(audio)); ok && ms > 0 {
+		return float64(ms) / 1000, true
+	}
+	return 0, false
 }
 
 // millisAtLeastOne converts a time in seconds to whole milliseconds, never below 1.

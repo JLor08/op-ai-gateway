@@ -56,7 +56,7 @@ describe('pcm16ToFloat32', () => {
   it('carries the odd byte of a chunk that splits a sample into the next chunk', () => {
     const whole = pcm([1000, -1000, 5]);
     const first = pcm16ToFloat32(new Uint8Array(whole.slice(0, 3)), null);
-    expect(first.samples.length).toBe(1);
+    expect(first.samples).toHaveLength(1);
     expect(first.carry).toBe(whole[2]);
     const second = pcm16ToFloat32(new Uint8Array(whole.slice(3)), first.carry);
     expect(second.carry).toBeNull();
@@ -67,7 +67,7 @@ describe('pcm16ToFloat32', () => {
 
   it('keeps a single carried byte waiting when the next chunk is empty', () => {
     const r = pcm16ToFloat32(new Uint8Array(0), 7);
-    expect(r.samples.length).toBe(0);
+    expect(r.samples).toHaveLength(0);
     expect(r.carry).toBe(7);
   });
 });
