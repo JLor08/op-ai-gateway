@@ -302,6 +302,180 @@ func TestParseConfigRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
+// configFilesDoc marshals a one-spec runtime-config document whose only
+// interesting field is config_files. Marshalling (rather than a raw string
+// literal) keeps the json tags under test: a control character or a backslash
+// in a name must reach ParseConfig exactly as a real gateway document would
+// carry it.
+func configFilesDoc(t *testing.T, files []ConfigFile) []byte {
+	t.Helper()
+	raw, err := json.Marshal(Config{Specs: []Spec{{ID: "a", Binary: "/bin/a", ConfigFiles: files}}})
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	return raw
+}
+
+// TestParseConfigNormalizesConfigFiles pins the config_files wire contract
+// (#257) and the "every collection-shaped field is non-nil" rule for it: an
+// absent key and an explicit null both become an empty, non-nil slice -- so a
+// caller can range over it or re-marshal it without a nil check, and a
+// file-mode report never carries `"config_files":null` -- and a populated list
+// round-trips name and content untouched and in order.
+func TestParseConfigNormalizesConfigFiles(t *testing.T) {
+	t.Run("absent key", func(t *testing.T) {
+		cfg, err := ParseConfig([]byte(`{"specs":[{"id":"a","binary":"/bin/a"}]}`))
+		if err != nil {
+			t.Fatalf("ParseConfig() error = %v", err)
+		}
+		if cfg.Specs[0].ConfigFiles == nil || len(cfg.Specs[0].ConfigFiles) != 0 {
+			t.Fatalf("ConfigFiles = %#v, want a non-nil empty slice", cfg.Specs[0].ConfigFiles)
+		}
+	})
+	t.Run("explicit null", func(t *testing.T) {
+		cfg, err := ParseConfig([]byte(`{"specs":[{"id":"a","binary":"/bin/a","config_files":null}]}`))
+		if err != nil {
+			t.Fatalf("ParseConfig() error = %v", err)
+		}
+		if cfg.Specs[0].ConfigFiles == nil || len(cfg.Specs[0].ConfigFiles) != 0 {
+			t.Fatalf("ConfigFiles = %#v, want a non-nil empty slice", cfg.Specs[0].ConfigFiles)
+		}
+	})
+	t.Run("populated round-trips", func(t *testing.T) {
+		const raw = `{"specs":[{"id":"a","binary":"/bin/a","config_files":[` +
+			`{"name":"chat-template.jinja","content":"{{ messages }}\n"},` +
+			`{"name":"grammar.gbnf","content":""}]}]}`
+		cfg, err := ParseConfig([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseConfig() error = %v", err)
+		}
+		want := []ConfigFile{
+			{Name: "chat-template.jinja", Content: "{{ messages }}\n"},
+			{Name: "grammar.gbnf", Content: ""},
+		}
+		got := cfg.Specs[0].ConfigFiles
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("ConfigFiles = %#v, want %#v", got, want)
+		}
+	})
+	t.Run("re-marshals under config_files", func(t *testing.T) {
+		cfg, err := ParseConfig([]byte(`{"specs":[{"id":"a","binary":"/bin/a"}]}`))
+		if err != nil {
+			t.Fatalf("ParseConfig() error = %v", err)
+		}
+		out, err := json.Marshal(cfg.Specs[0])
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !strings.Contains(string(out), `"config_files":[]`) {
+			t.Fatalf("marshalled spec = %s, want it to carry \"config_files\":[]", out)
+		}
+	})
+	t.Run("same name in two specs is fine", func(t *testing.T) {
+		// Uniqueness is per spec: every spec gets its own directory.
+		const raw = `{"specs":[` +
+			`{"id":"a","binary":"/bin/a","config_files":[{"name":"x.json","content":"1"}]},` +
+			`{"id":"b","binary":"/bin/b","config_files":[{"name":"x.json","content":"2"}]}]}`
+		if _, err := ParseConfig([]byte(raw)); err != nil {
+			t.Fatalf("ParseConfig() error = %v, want the same name across two specs accepted", err)
+		}
+	})
+}
+
+// TestParseConfigAcceptsPlainConfigFileNames is the other half of the filename
+// contract: ParseConfig is the SINGLE parser for gateway-mode and file-mode
+// documents, so a name the gateway accepts at submit time must never fail here
+// -- a gateway-stored config would otherwise tear down the whole runtime
+// document. These are names configFileNameIsSingleSegment (gateway portal)
+// lets through.
+func TestParseConfigAcceptsPlainConfigFileNames(t *testing.T) {
+	for _, name := range []string{
+		"config.json",
+		"chat-template.jinja",
+		"model.yaml",
+		".env",
+		"a.b.c",
+		"with space.txt",
+		"Ünïcode.txt",
+		"UPPER.JSON",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := ParseConfig(configFilesDoc(t, []ConfigFile{{Name: name, Content: "x"}}))
+			if err != nil {
+				t.Fatalf("ParseConfig() error = %v, want %q accepted", err, name)
+			}
+			if got := cfg.Specs[0].ConfigFiles; len(got) != 1 || got[0].Name != name {
+				t.Fatalf("ConfigFiles = %#v", got)
+			}
+		})
+	}
+}
+
+// TestParseConfigRejectsBadConfigFileName pins the agent-side filename guard
+// (#257). A hand-authored file-mode runtime.json never passed the gateway's
+// submit-time validation, so this is the only guard on that path: a name that
+// is not one plain file name would let the agent's later write escape its
+// config directory. The ruleset deliberately MIRRORS the gateway's
+// configFileNameIsSingleSegment (no stricter -- see validConfigFileName) and a
+// violation is a document-level ParseError, like a duplicate spec id.
+func TestParseConfigRejectsBadConfigFileName(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files []ConfigFile
+	}{
+		{"forward slash", []ConfigFile{{Name: "a/b.json"}}},
+		{"leading slash is absolute", []ConfigFile{{Name: "/etc/passwd"}}},
+		{"backslash", []ConfigFile{{Name: `a\b.json`}}},
+		{"windows absolute", []ConfigFile{{Name: `C:\Windows\x.json`}}},
+		{"colon (drive or stream)", []ConfigFile{{Name: "x.json:stream"}}},
+		{"drive letter without separator", []ConfigFile{{Name: "C:x.json"}}},
+		{"dot-dot", []ConfigFile{{Name: ".."}}},
+		{"dot-dot traversal", []ConfigFile{{Name: "../x.json"}}},
+		{"single dot", []ConfigFile{{Name: "."}}},
+		{"empty", []ConfigFile{{Name: ""}}},
+		{"blank", []ConfigFile{{Name: "   "}}},
+		{"NUL control character", []ConfigFile{{Name: "a\x00b.json"}}},
+		{"newline control character", []ConfigFile{{Name: "a\nb.json"}}},
+		{"DEL control character", []ConfigFile{{Name: "a\x7fb.json"}}},
+		{"exact duplicate", []ConfigFile{{Name: "x.json"}, {Name: "x.json"}}},
+		{"case-insensitive duplicate", []ConfigFile{{Name: "App.json"}, {Name: "app.JSON"}}},
+		{"bad name after a good one", []ConfigFile{{Name: "ok.json"}, {Name: "../no.json"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := ParseConfig(configFilesDoc(t, tc.files))
+			if err == nil {
+				t.Fatalf("ParseConfig() accepted config_files %q, want an error", tc.files)
+			}
+			var pe *ParseError
+			if !errors.As(err, &pe) {
+				t.Fatalf("err = %v (%T), want a *ParseError (document-level, classified)", err, err)
+			}
+			if pe.Code != ParseErrorInvalidConfigFileName {
+				t.Fatalf("code = %q, want %q", pe.Code, ParseErrorInvalidConfigFileName)
+			}
+			if len(cfg.Specs) != 0 {
+				t.Fatalf("a rejected document must return the zero Config, got %d specs", len(cfg.Specs))
+			}
+		})
+	}
+}
+
+// TestParseConfigConfigFileErrorNeverQuotesContent keeps the diagnosis local
+// AND content-free: the error names the spec and the offending file name (a
+// name is an identifier, not a secret) but never the file's content.
+func TestParseConfigConfigFileErrorNeverQuotesContent(t *testing.T) {
+	_, err := ParseConfig(configFilesDoc(t, []ConfigFile{{Name: "../x.json", Content: "HF_TOKEN=sk-secret-content"}}))
+	if err == nil {
+		t.Fatal("ParseConfig() accepted a traversal name")
+	}
+	if strings.Contains(err.Error(), "sk-secret-content") {
+		t.Fatalf("error text quotes file content: %v", err)
+	}
+	if !strings.Contains(err.Error(), "../x.json") {
+		t.Fatalf("error text = %v, want it to name the offending file", err)
+	}
+}
+
 // TestConfigAllowedPairsCanonicalizesReversedInput covers the review's
 // Minor fix: Coresident is kept in wire order (whatever order the gateway
 // happened to emit each pair in), while PolicySnapshot.Allowed is
@@ -463,8 +637,8 @@ func TestStatusAndLastErrorJSONTags(t *testing.T) {
 // The table is the exhaustive reachable surface, not a sample. Config, Spec
 // and GPUBudget declare no custom UnmarshalJSON, so a malformed document can
 // only fail in two places: json.Unmarshal (syntax errors and type mismatches,
-// including the whole-document non-object cases) and the duplicate-spec-id
-// check. Both are covered below in several shapes each.
+// including the whole-document non-object cases) and the two structural
+// checks (duplicate spec id, bad config_files name). Each is covered below.
 //
 // It also pins the literal wire VALUES. They are a three-sided contract --
 // this set, the gateway's allow-list (redactRuntimeReportParseError), and the
@@ -480,6 +654,7 @@ func TestParseConfigErrorsAreAllClassified(t *testing.T) {
 	}{
 		{ParseErrorJSONSyntax, "json_syntax"},
 		{ParseErrorDuplicateSpecID, "duplicate_spec_id"},
+		{ParseErrorInvalidConfigFileName, "invalid_config_file_name"},
 		{ParseErrorFileMissing, "file_missing"},
 		{ParseErrorReadFailed, "read_failed"},
 		{ParseErrorUnclassified, "unclassified"},
@@ -490,8 +665,9 @@ func TestParseConfigErrorsAreAllClassified(t *testing.T) {
 		}
 	}
 	closed := map[ParseErrorCode]bool{
-		ParseErrorJSONSyntax:      true,
-		ParseErrorDuplicateSpecID: true,
+		ParseErrorJSONSyntax:            true,
+		ParseErrorDuplicateSpecID:       true,
+		ParseErrorInvalidConfigFileName: true,
 	}
 
 	const dupSpecs = `{"specs":[{"id":"dup","binary":"/bin/a"},{"id":"dup","binary":"/bin/b"}]}`
@@ -512,6 +688,8 @@ func TestParseConfigErrorsAreAllClassified(t *testing.T) {
 		{"coresident pair given numbers", `{"coresident":[[1,2]]}`, ParseErrorJSONSyntax},
 		{"gpu budget index given a string", `{"gpu_budgets":[{"index":"zero"}]}`, ParseErrorJSONSyntax},
 		{"duplicate spec id", dupSpecs, ParseErrorDuplicateSpecID},
+		{"config file name with a path", `{"specs":[{"id":"a","binary":"/bin/a","config_files":[{"name":"../x","content":""}]}]}`, ParseErrorInvalidConfigFileName},
+		{"config file given as a string", `{"specs":[{"id":"a","config_files":"x"}]}`, ParseErrorJSONSyntax},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseConfig([]byte(tc.raw))

@@ -25,7 +25,7 @@ import (
 // reportable command, failing the test on any expansion error.
 func commandFor(t *testing.T, spec Spec, port int, vendor GPUVendor, getenv func(string) string, fromFile bool) ResolvedCommand {
 	t.Helper()
-	ex, err := expandSpec(spec, port, vendor, getenv)
+	ex, err := expandSpec(spec, port, vendor, getenv, "")
 	if err != nil {
 		t.Fatalf("expandSpec: %v", err)
 	}
@@ -423,7 +423,7 @@ func TestExpandSpecKeepsTheChildsRealValues(t *testing.T) {
 		}
 		return ""
 	}
-	args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, getenv)
+	args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestExpandPlaceholdersAPITokenResolvesInAnEnvValue(t *testing.T) {
 		Env:      map[string]string{"VLLM_API_KEY": "${API_TOKEN}"},
 		APIToken: "tok-abc",
 	}
-	_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, func(string) string { return "" })
+	_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -497,7 +497,7 @@ func TestExpandPlaceholdersAPITokenResolvesInAnArgument(t *testing.T) {
 		Args:     []string{"--api-key", "${API_TOKEN}"},
 		APIToken: "tok-abc",
 	}
-	args, _, err := ExpandPlaceholders(spec, 8081, GPUVendorNone, func(string) string { return "" })
+	args, _, err := ExpandPlaceholders(spec, 8081, GPUVendorNone, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -548,7 +548,7 @@ func TestExpandPlaceholdersAPITokenEmptyErrors(t *testing.T) {
 		{Args: []string{"--api-key", "${API_TOKEN}"}},
 		{Env: map[string]string{"VLLM_API_KEY": "${API_TOKEN}"}},
 	} {
-		_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, func(string) string { return "" })
+		_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, func(string) string { return "" }, "")
 		if err == nil {
 			t.Fatalf("ExpandPlaceholders(%+v) with an empty APIToken should refuse, not substitute an empty string", spec)
 		}

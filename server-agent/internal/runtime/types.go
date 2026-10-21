@@ -23,13 +23,31 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
+	"strings"
 	"time"
+	"unicode"
 )
 
 // SpecGPU is one GPU a Spec's process is launched to use.
 type SpecGPU struct {
 	Index  int `json:"index"`
 	VRAMMB int `json:"vram_mb"` // 0 = unknown demand, never a real zero-cost claim
+}
+
+// ConfigFile is one operator-supplied file the agent materialises for a spec
+// before launching its process (#257): a bare file Name and its Content. It is
+// the agent-local pairing of the gateway's ConfigFileDTO -- the json tags are
+// the wire contract and must match it exactly, and the gateway package is not
+// imported (the arch test freezes this package's import graph).
+//
+// ParseConfig guarantees every Name it lets through is one plain file name
+// (validConfigFileName) and unique within its spec; it says nothing about the
+// Content, which the gateway bounds (count and size) and the writer treats as
+// opaque bytes.
+type ConfigFile struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
 }
 
 // Spec is one ENABLED launch spec inside the runtime-config document --
@@ -43,6 +61,7 @@ type Spec struct {
 	Binary                      string            `json:"binary"`
 	Args                        []string          `json:"args"`
 	Env                         map[string]string `json:"env"`
+	ConfigFiles                 []ConfigFile      `json:"config_files"` // #257; non-nil after ParseConfig, names validated there
 	WorkDir                     string            `json:"work_dir"`
 	GPUs                        []SpecGPU         `json:"gpus"`
 	ListenPort                  int               `json:"listen_port"`
@@ -178,6 +197,14 @@ const (
 	// ParseErrorDuplicateSpecID: two specs share an id. Structural, and
 	// deliberately fatal to the whole document -- see ParseConfig.
 	ParseErrorDuplicateSpecID ParseErrorCode = "duplicate_spec_id"
+	// ParseErrorInvalidConfigFileName: a spec's config_files carries a name
+	// that is not one plain file name (path separator, "." / "..", drive or
+	// stream marker, control character, blank) or repeats another name in the
+	// same spec, compared case-insensitively. Structural and fatal to the
+	// whole document, like a duplicate spec id: the gateway enforces the same
+	// rules at submit time, so only a hand-authored file-mode runtime.json can
+	// reach it.
+	ParseErrorInvalidConfigFileName ParseErrorCode = "invalid_config_file_name"
 	// ParseErrorFileMissing: nothing exists at the configured path. The
 	// file never got parsed, so this is not a parse failure at all -- it
 	// rides the same field because the field's real subject is "why the
@@ -261,6 +288,17 @@ func ClassifyParseError(err error) ParseErrorCode {
 //   - a duplicate spec ID is rejected as an error. The gateway is not
 //     supposed to ever emit one; silently keeping one of the two would mean
 //     launching the wrong process for whichever mapping lost.
+//   - a config_files entry whose name is not one plain file name, or that
+//     repeats another name in the same spec (case-insensitively), is rejected
+//     as an error too (ParseErrorInvalidConfigFileName). This is the ONLY
+//     guard on the file-mode path -- a hand-authored runtime.json never went
+//     through the gateway's submit-time validation -- and it applies the same
+//     rules the gateway does (validConfigFileName), no stricter: this is the
+//     single parser for both modes, so a name the gateway stored must never
+//     fail here and take the whole document down. Platform-specific
+//     restrictions (Windows device names, trailing dot or space) belong to the
+//     writer, which fails just the one spec. The file count and size limits are
+//     the gateway's and are not re-checked here.
 //   - a coresident pair naming a spec ID that is not (or no longer) present
 //     in Specs is dropped silently, and the rest of the document -- other
 //     specs, other pairs -- remains usable. This is reachable from an
@@ -268,8 +306,8 @@ func ClassifyParseError(err error) ParseErrorCode {
 //     failing the whole config over.
 //
 // Every collection-shaped field (Specs, GPUBudgets, Coresident, and each
-// Spec's Args/Env/GPUs) is normalized to non-nil, so a caller that ranges
-// over it or re-marshals it (file mode) never has to nil-check first.
+// Spec's Args/Env/GPUs/ConfigFiles) is normalized to non-nil, so a caller that
+// ranges over it or re-marshals it (file mode) never has to nil-check first.
 func ParseConfig(raw []byte) (Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(raw, &cfg); err != nil {
@@ -309,9 +347,68 @@ func ParseConfig(raw []byte) (Config, error) {
 		if cfg.Specs[i].GPUs == nil {
 			cfg.Specs[i].GPUs = []SpecGPU{}
 		}
+		if cfg.Specs[i].ConfigFiles == nil {
+			cfg.Specs[i].ConfigFiles = []ConfigFile{}
+		}
+		if err := checkConfigFileNames(cfg.Specs[i]); err != nil {
+			return Config{}, err
+		}
 	}
 
 	return cfg, nil
+}
+
+// checkConfigFileNames validates spec's config_files names: each one plain
+// file name (validConfigFileName) and unique within the spec, compared
+// case-insensitively (the agent may write to a case-insensitive filesystem, so
+// "App.json" and "app.json" would collide there). The error names the spec and
+// the offending file name -- a name is an identifier -- and never the content.
+// It is local-only detail: the wire carries just the ParseErrorCode.
+func checkConfigFileNames(spec Spec) error {
+	seen := make(map[string]struct{}, len(spec.ConfigFiles))
+	for _, f := range spec.ConfigFiles {
+		if !validConfigFileName(f.Name) {
+			return &ParseError{Code: ParseErrorInvalidConfigFileName, Err: fmt.Errorf(
+				"spec %q: config file name %q must be a single file name (no path separators, \"..\", drive or stream marker, or control characters)",
+				spec.ID, f.Name)}
+		}
+		key := strings.ToLower(f.Name)
+		if _, dup := seen[key]; dup {
+			return &ParseError{Code: ParseErrorInvalidConfigFileName, Err: fmt.Errorf(
+				"spec %q: duplicate config file name %q (names are compared case-insensitively)",
+				spec.ID, f.Name)}
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+// validConfigFileName reports whether name is one plain file name safe to join
+// under a per-spec config directory: non-blank, not "." or "..", no path
+// separator of either OS, no volume or alternate-data-stream marker (":"), and
+// no control character.
+//
+// It is an agent-local copy of the gateway's configFileNameIsSingleSegment
+// (gateway/backend/internal/portal/service_runtime.go) and MUST accept and
+// reject exactly the same names -- not more, not fewer. The gateway applies
+// that ruleset at submit time; ParseConfig is the single parser for gateway-
+// and file-mode documents, so a stricter check here would fail a document the
+// gateway already accepted and drop the whole runtime config, while a laxer one
+// would let a hand-written file-mode name through. Keep the two in lockstep.
+// (Not shared by import: the arch test freezes this package's import graph.)
+//
+// The separators and the colon are rejected explicitly rather than left to
+// filepath.Base: Base is per-GOOS and the document may have been authored for
+// the other OS. filepath.Base is kept as an extra guard, so a form the
+// explicit rules missed still has to survive this OS's own idea of a base name.
+func validConfigFileName(name string) bool {
+	if strings.TrimSpace(name) == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\:`) || strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return false
+	}
+	return filepath.Base(name) == name && !filepath.IsAbs(name)
 }
 
 // AllowedPairs returns c.Coresident as a canonical PairKey set, ready to

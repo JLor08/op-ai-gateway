@@ -65,6 +65,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). A bare entry already permits the directory **and everything beneath it**; a trailing whole-segment wildcard — `/srv/models/*` or `C:\models\*` — is an accepted, exactly-equivalent spelling of that subtree, honoured so a config written that way does what its author expects. It is **not** a glob: a glued `/srv/models*` stays literal (it permits no `/srv/models-evil` sibling), and a bare `*` permits nothing. Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` | — (file/env only) | `runtime_allow_binary_dirs` | `false` | When on, each `runtime_allowed_binaries` entry's **parent directory** is treated as an allowed `work_dir` prefix without listing it in `runtime_allowed_dirs` — convenient when a model's `work_dir` sits beside its binary. Same operator-only provenance as the allowlists. The auto-added dirs use the same subtree containment as explicit entries. **Footgun:** turning it on while `runtime_allowed_dirs` is empty flips `work_dir` from "any is accepted" to "only the binary directories and their subtrees" (a spec with no `work_dir` still runs beside its binary either way). |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
+| `OP_AGENT_CONFIG_FILES_DIR` | `-config-files-dir` | `config_files_dir` | `server-agent-config-files` next to the binary | Base directory under which the agent writes the config files a managed runtime spec asks for, one subdirectory per spec. Operator-only: the gateway supplies a file's relative name and content, never where on this host it is written. Point it at a directory of your choosing to keep these files out of the agent's own directory. A relative config-file value is resolved beside that config file. |
 | `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — that directory is the only thing consulted (`cert_mode` is not, so a `cert_dir` still populated after the mode went back to `off` does derive an address). With no loadable leaf there, **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. **Under `cert_mode: "proxy"` it is the other way round** — that mode makes `cert_dir` mandatory, so the empty default resolves to the leaf's mesh address, never all interfaces and never loopback. **Resolved once at process start**, so a boot before the first certificate install binds all interfaces until the agent restarts. See [Managed model runtime](#managed-model-runtime). |
 | `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` | — (file/env only) | `runtime_log_buffer_bytes` | `1048576` (1 MiB) | How much of each managed model process's stdout+stderr the agent keeps **in memory**, in bytes, so an operator can read it after the fact. The buffer belongs to the **spec**, not the process, so a crashed model's output survives it, and a restart appends after a visible boundary marker rather than wiping the history. Below `65536` is raised to it. Operator-only, like the allowlists: memory on this host is the operator's tradeoff and the gateway can never raise it. **Never written to disk** — this content can include prompt text. |
 | `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` | — (file/env only) | `runtime_log_buffer_total_bytes` | `16777216` (16 MiB) | Ceiling on the **sum** of those buffers across every spec, so a server with twenty specs is not twenty times the per-spec number. The agent keeps at most `total / per-spec` buffers, evicting the least-recently-written one nobody is watching. This is the number to reason about when sizing the agent's memory. |
@@ -78,8 +79,8 @@ looks for **`server-agent.json` next to the binary**; override the path with
 the same setting overrides the file. A missing default file is fine; an explicitly
 requested file that is missing or malformed is a startup error.
 
-Relative `ca_file`, `ca_cache_file`, `runtime_config` and `runtime_cache`
-values are resolved beside the actually selected config file (after
+Relative `ca_file`, `ca_cache_file`, `runtime_config`, `runtime_cache` and
+`config_files_dir` values are resolved beside the actually selected config file (after
 flag/environment/file precedence), not against the process working directory.
 Absolute paths stay unchanged.
 
@@ -280,15 +281,19 @@ explicit count of the missing bytes at the point they were lost.
 
 #### Placeholders in `args` and `env` values
 
-Four, resolved by the agent at launch time in **both** `args` and `env`
-values. Everything else shaped like `${…}` is passed through byte-for-byte, so
-a model server's own templating still works.
+Resolved by the agent at launch time in **both** `args` and `env`
+values (the table lists the ones an operator reaches for first; the device-list
+placeholders `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` and
+`${API_TOKEN}` are described in the architecture documentation). Everything else
+shaped like `${…}` is passed through byte-for-byte, so a model server's own
+templating still works.
 
 | Placeholder | Becomes | If it cannot be resolved |
 |---|---|---|
 | `${PORT}` | the port the agent assigned this process | — |
 | `${MODEL}` | the spec's `upstream_model` — the **application-side** model name (the mapping's *app model name*), i.e. what the model server itself calls the model | hard error if `upstream_model` is empty |
 | `${HOST_GPU_IDS}` | the spec's own GPU indices **as this host numbers them**, ascending and comma-separated (`2,5`) | hard error if the spec declares no GPUs |
+| `${CONFIG_DIR}` | the absolute per-spec directory the agent writes the spec's config files into, `<config_files_dir>/<spec-id>` — see [Config files](#config-files-for-a-managed-process) | — (a plain path; always resolves) |
 | `${AGENT_ENV:NAME}` | `NAME` from the **agent's own** process environment | hard error naming the variable; never a silent empty value |
 
 `${MODEL}` is the one to reach for when a command line has to repeat the model
@@ -313,7 +318,37 @@ the exact forms (`${PORTX}`, `${port}`, `${AGENT_ENV:}`). `${MODEL}` and
 `${MODELS_DIR}`, `${MODEL_ID}` and `${GPU_IDS_FILE}` are plausible things to
 pass through, so only the exact spellings are substituted — the cost being that
 `${MDOEL}`, `${model}` or the shorter `${GPU_IDS}` reaches the child as literal
-text instead of erroring.
+text instead of erroring. `${CONFIG_DIR}` follows the same exact-match rule, so
+`${CONFIG_DIR_X}` is passed through.
+
+#### Config files for a managed process
+
+A spec can carry up to 16 **config files**, each a name and some text, for a model
+server that cannot be driven by its command line alone (audio.cpp reads the models
+it serves from a JSON file, for example). The portal's launch-spec form edits them;
+the agent writes them **before it starts the process** to
+`<config_files_dir>/<spec-id>/<name>` — an agent-owned directory you choose with
+`config_files_dir` (see the settings table above), never the spec's `work_dir`,
+which may not be writable — and the spec's `args` point the server at them:
+`["--config", "${CONFIG_DIR}/server.json"]`. Each file is rewritten on every
+launch, atomically, with mode `0600`.
+
+A file's content may use `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`, the three
+`*_DEVICES` lists and `${CONFIG_DIR}`, so a model id written as `${MODEL}` always
+matches the spec. **It may never use `${API_TOKEN}` or `${AGENT_ENV:…}`**: a secret
+is not written to disk, and the spec is refused (gateway) or reported
+`not_permitted` (agent) if one appears. A name that is not one plain file name (a
+path separator, `..`) is refused by the gateway and, in a hand-written file-mode
+document, fails the whole document load (`invalid_config_file_name`); a name only
+this host would mangle — a Windows device name such as `NUL`, a trailing dot — makes
+that one spec `not_permitted`. Only a real filesystem failure (an unwritable
+directory, a full disk) is a start failure that backs off and retries. Nothing deletes a file you later drop from a
+spec, nor a removed spec's directory; clear those by hand. An agent older than
+`0.10.0` ignores config files altogether (the portal warns).
+
+In **file mode** the agent's upward report masks every file's content (the name
+stays visible), the same way it masks `env` values; the files themselves are still
+written for the child.
 
 #### `set_visible_devices`: pinning a model to its GPUs
 
@@ -423,11 +458,13 @@ it:
 Set `runtime_source: "file"` plus `runtime_config: <path>` to own the launch
 specs locally instead of in the portal. The file uses the identical JSON schema
 the gateway serves; the agent reports the effective document upward with every
-env **value** redacted (keys stay visible) and the portal renders it read-only,
+env **value** and every config file's **content** redacted (keys and file names
+stay visible) and the portal renders it read-only,
 including hiding start/stop — whoever owns the config owns the operations.
 
 > **Never write a secret's value into a spec — reference it as
-> `${AGENT_ENV:NAME}`.** The upward report masks `env` values only; `args` are
+> `${AGENT_ENV:NAME}`.** The upward report masks `env` values, config-file
+> content and a spec's `api_token`; `args` are
 > reported **verbatim**, so a literal secret in an argument reaches the gateway
 > in plaintext and is shown to portal admins. A **placeholder** is safe in
 > either field: the report never expands it, and the launch command the log

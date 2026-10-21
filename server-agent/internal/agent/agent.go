@@ -266,7 +266,21 @@ import (
 // decides it: agent.Features gains NO entry, and no wire shape changes (an
 // open-vocabulary verdict name on an existing source).
 //
-// 0.9.2 -> 0.9.3 is the single bump for the clone-speech-picker branch (issue
+// 0.9.2 -> 0.10.0 is the single bump for the agent-config-files branch (issue
+// #257): a runtime launch spec gains a config_files facet -- named,
+// placeholder-expanded text files the agent writes into an agent-owned
+// directory before it execs the model process -- plus a ${CONFIG_DIR}
+// placeholder in args and env that resolves to that directory, and a
+// file-mode upward report now masks each config file's content (keeping its
+// name) the way it already masks env values. MINOR, and the rule decides it:
+// agent.Features gains "runtime_config_files", the name the gateway/portal
+// checks to warn that a connected agent predates the facet (an older agent
+// ignores the unknown field and launches the child without the file, which
+// cannot be told apart by trying). The agent itself gates nothing on it. The
+// same reasoning made 0.7.4 -> 0.8.0 (runtime_ensure) and 0.8.2 -> 0.9.0
+// (multipart_proxy) a MINOR.
+//
+// 0.10.0 -> 0.10.1 is the single bump for the clone-speech-picker branch (issue
 // #252): the same audio_cpp probe of /v1/models now also reads the listed
 // model's "task" for a speech model and reports it as the "speech_clone"
 // verdict ("yes" for a clone model, which needs a reference voice a text chat
@@ -277,7 +291,7 @@ import (
 // verdicts of the same document. PATCH, and the rule decides it: agent.Features
 // gains NO entry, and no wire shape changes (an open-vocabulary verdict name on
 // an existing source), the reasoning of 0.9.1 -> 0.9.2 above.
-const Version = "0.9.3"
+const Version = "0.10.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

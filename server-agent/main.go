@@ -183,6 +183,10 @@ func main() {
 		// the Source below selects this, read here rather than derived from
 		// the Source object so the two can never disagree.
 		SpecsFromLocalFile: cfg.RuntimeSource == config.RuntimeSourceFile,
+		// Where the config files a spec asks for are written. Operator-owned
+		// like the allowlists: the gateway supplies a file's name and content,
+		// never the directory it lands in.
+		ConfigFilesDir: cfg.ConfigFilesDir,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
@@ -286,6 +290,7 @@ func main() {
 		"system_report_interval", cfg.SystemReportInterval.String(),
 		"runtime_config_path", cfg.RuntimeConfigPath,
 		"runtime_cache_path", cfg.RuntimeCachePath,
+		"config_files_dir", cfg.ConfigFilesDir,
 		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
 		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs),
 		"runtime_allow_binary_dirs", cfg.RuntimeAllowBinaryDirs,

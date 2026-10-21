@@ -969,7 +969,7 @@ and open-vocabulary storage as `speech`:
   entry writes `(speech_clone, no)`, and a non-speech task (`asr`, music), an absent task, an
   unnamed model, an unreachable server or an unreadable body writes **nothing** (absent =
   unknown = the picker still offers it, fail-open). The gateway's health loop decodes it for
-  a **static** `audio_cpp` application, and the **agent** (0.9.3, issue #252) for an
+  a **static** `audio_cpp` application, and the **agent** (0.10.1, issue #252) for an
   agent-launched child, reporting it under this same source with **no new feature flag** — a
   PATCH bump riding the already-declared `capability_source_audiocpp`, the same shape as the
   `transcription_streaming` row above. It is folded into `ModelDTO.SpeechClone` by

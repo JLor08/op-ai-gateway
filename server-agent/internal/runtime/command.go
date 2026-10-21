@@ -11,13 +11,13 @@ import (
 // process was actually launched with, in the form it is safe to report.
 //
 // WHY IT EXISTS. An operator debugging a spec that will not start is looking
-// at a template, not at what ran. ${PORT}, ${MODEL}, ${HOST_GPU_IDS} and
-// ${AGENT_ENV:NAME} are all resolved at launch, the binary came from the
-// agent's own allowlist, the working directory may not be what the operator
-// assumes, and the environment is a hand-built minimal block rather than the
-// agent's own. The gap between "what I typed" and "what ran" is where the bug
-// lives, and nothing used to keep the resolved form: ExpandPlaceholders built
-// it, exec.Command consumed it, and it was dropped.
+// at a template, not at what ran. ${PORT}, ${MODEL}, ${HOST_GPU_IDS},
+// ${CONFIG_DIR} and ${AGENT_ENV:NAME} are all resolved at launch, the binary
+// came from the agent's own allowlist, the working directory may not be what
+// the operator assumes, and the environment is a hand-built minimal block
+// rather than the agent's own. The gap between "what I typed" and "what ran"
+// is where the bug lives, and nothing used to keep the resolved form:
+// ExpandPlaceholders built it, exec.Command consumed it, and it was dropped.
 //
 // WHERE IT LIVES, and why that is not an arbitrary choice. A ResolvedCommand is
 // a typed field on the generation's OPENING MARKER RECORD (logs.go's

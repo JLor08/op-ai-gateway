@@ -107,6 +107,17 @@ var portalRuntimeSpecErrRows = []errRow{
 			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported.Error()+": ")
 		},
 	},
+	// Dynamic message, same shape as the row above: the service wraps the
+	// sentinel with the offending file's name and the rule it broke (never its
+	// content), and the operator needs that to fix the entry.
+	{
+		err:    portal.ErrRuntimeSpecConfigFilesInvalid,
+		status: http.StatusBadRequest,
+		code:   "runtime_spec.config_files_invalid",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecConfigFilesInvalid.Error()+": ")
+		},
+	},
 	{err: portal.ErrRuntimeSpecMetricsPathInvalid, status: http.StatusBadRequest, code: "runtime_spec.metrics_path_invalid", msg: "metrics_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	{err: portal.ErrRuntimeSpecContextProbePathInvalid, status: http.StatusBadRequest, code: "runtime_spec.context_probe_path_invalid", msg: "context_probe_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	// The four per-spec API-token sentinels from validateRuntimeSpecAPIToken
