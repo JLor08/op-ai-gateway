@@ -602,12 +602,12 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // The empty verdict is the case this guards. provider.AudioCppVerdicts answers
 // "" for everything the listing does not say -- the model is not in it
 // (the server does not name it in /v1/models), the listing is empty or unreadable, the
-// entry carries no task, or (streaming) its mode is absent or not one this code knows, or
-// the model is no transcriber -- and none
-// of those is a statement that the model cannot speak, cannot transcribe or cannot
-// stream. A written "no" can switch a model's route off (speech, transcription) or
-// pin it to the buffered answer (transcription streaming), so an unknown verdict must
-// never become one.
+// entry carries no task, (streaming) its mode is absent or not one this code knows, or
+// the model is no transcriber, or (clone) the model is no speech model -- and none
+// of those is a statement that the model cannot speak, cannot transcribe, cannot
+// stream or is not a clone. A written "no" can switch a model's route off (speech,
+// transcription), pin it to the buffered answer (transcription streaming), or mark it a
+// plain non-clone synthesiser (speech_clone), so an unknown verdict must never become one.
 //
 // A "no" is a real verdict where it IS stated: the listing names the
 // model's task, so a model present with a task that does not serve the
@@ -754,8 +754,8 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // probeAudioCppModels is the audio_cpp branch of the probe pass for ONE
 // application of type routing.ProviderAudioCpp, a static, operator-run audio.cpp
 // server: for each of its active mappings it reads audio.cpp's own /v1/models
-// listing, derives the speech, transcription and transcription-streaming
-// verdicts that listing states for the mapping's model, and writes them
+// listing, derives the speech, transcription, transcription-streaming and
+// speech_clone verdicts that listing states for the mapping's model, and writes them
 // (audioCppCapabilityRows through writeCapabilityRows, so the precedence and
 // change-detection guards hold exactly as for the other probe sources).
 //
@@ -766,7 +766,7 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // whose runtime spec is of kind audio_cpp, is NOT probed here: the agent
 // router's /v1/models carries no task, so it could state no verdict. That gap
 // is closed agent-side, not here: the agent reads the child's own /v1/models
-// and reports the speech, transcription and transcription_streaming verdicts
+// and reports the speech, transcription, transcription_streaming and speech_clone verdicts
 // under the same audiocpp_models source, which the gateway's agent ingest accepts, so this
 // loop deliberately leaves an agent-launched child alone.)
 //
@@ -1325,8 +1325,8 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 
 		// audio.cpp capability pass: for every active audio_cpp application,
 		// read the server's own /v1/models listing for each of its active
-		// mappings and write the speech, transcription and transcription_streaming
-		// verdicts that listing states for that model (probeAudioCppModels). A separate
+		// mappings and write the speech, transcription, transcription_streaming and
+		// speech_clone verdicts that listing states for that model (probeAudioCppModels). A separate
 		// branch from the context probe for the same reason as the sdcpp one:
 		// audio_cpp has no context probe path, and the listing is not a
 		// ModelInfo. It shares that branch's cadence (the application's

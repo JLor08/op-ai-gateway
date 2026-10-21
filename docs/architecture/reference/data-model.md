@@ -807,8 +807,9 @@ plausible-looking validation rule would break the normal case:
   last read it (up to about 30 s old), and the
   ingest's acceptance does not depend on the feature), and `audiocpp_models` (a
   `GET` of an agent-launched `audio_cpp` child's own `/v1/models`, since #255,
-  accepted for the `speech`, `transcription` and `transcription_streaming` rows only (the
-  last added by agent 0.9.2 on this same source with no new feature flag, #262); the agent
+  accepted for the `speech`, `transcription`, `transcription_streaming` and `speech_clone`
+  rows only (the last two added on this same source with no new feature flag — streaming by
+  agent 0.9.2, #262, and `speech_clone` by agent 0.9.3, #252); the agent
   reports it
   only while the gateway declares the agent feature `capability_source_audiocpp`,
   on the same terms as the sdcpp one). The gateway's own
@@ -816,9 +817,10 @@ plausible-looking validation rule would break the normal case:
   application, `sdcpp_capabilities` directly — the only source that answers
   `image` in both directions, whichever of its two producers wrote it — and, for a
   static `audio_cpp` application, `audiocpp_models` directly (a `GET` of its
-  `/v1/models`, the only source of the `speech`, `transcription` and
-  `transcription_streaming` rows — the first two in both directions from the one `task` of
-  the listed model, the third from its `mode` (`streaming`/`offline`, ASR models only) —
+  `/v1/models`, the only source of the `speech`, `transcription`,
+  `transcription_streaming` and `speech_clone` rows — the first two in both directions from
+  the one `task` of the listed model, the third from its `mode` (`streaming`/`offline`, ASR
+  models only), the fourth from that same `task` (`clone`/`tts`, speech models only, #252) —
   whichever of its two producers wrote it; a vocabulary addition only, with no
   schema change), plus one probe-ranked source no agent may report:
   `llama_cpp_timings` (read off a completion it relayed). The audio rows:

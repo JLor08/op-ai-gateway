@@ -1155,6 +1155,56 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText('transcription_streaming')).not.toBeInTheDocument();
     });
 
+    it('renders speech_clone as a translated chip after Speech, not a raw standby chip', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              capabilities: [capRow('speech_clone', 'yes'), capRow('speech', 'yes')],
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilitySpeechClone)).toBeInTheDocument();
+      expect(within(cell).queryByText('speech_clone')).not.toBeInTheDocument();
+      expect(within(cell).getByText(t.capabilitySpeechClone)).toHaveAttribute(
+        'data-status',
+        'active',
+      );
+      // Fixed order, whatever order the rows arrive in: Speech, then its clone refinement.
+      const labels = within(cell)
+        .getAllByText((_, el) => el?.getAttribute('data-status') === 'active')
+        .map((el) => el.textContent);
+      expect(labels).toEqual([t.capabilitySpeech, t.capabilitySpeechClone]);
+    });
+
+    it('renders no speech_clone chip for a `no` verdict, and never a raw one', async () => {
+      const rows = makeRows().map((r) =>
+        r.mapping_id === 'map-a'
+          ? {
+              ...r,
+              capabilities: [capRow('speech', 'yes'), capRow('speech_clone', 'no')],
+            }
+          : r,
+      );
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const cell = cellForColumn('GPU-Box-A', t.modelServerColCapabilities);
+      expect(within(cell).getByText(t.capabilitySpeech)).toBeInTheDocument();
+      expect(within(cell).queryByText(t.capabilitySpeechClone)).not.toBeInTheDocument();
+      expect(within(cell).queryByText('speech_clone')).not.toBeInTheDocument();
+    });
+
     // POST /v1/audio/speech is gated on a `speech` verdict. The mirror of the
     // transcription chip above: a `speech: yes` row used to fall into the
     // open-vocabulary bucket and render as a raw lowercase `speech` standby

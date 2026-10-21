@@ -70,7 +70,7 @@ const capabilitySourceSdcppFeature = "capability_source_sdcpp"
 
 // capabilitySourceAudioCppFeature says this gateway's capability ingest accepts
 // the audiocpp_models source from an agent (rowSource), for the speech,
-// transcription and transcription_streaming rows only. The agent sends that
+// transcription, transcription_streaming and speech_clone rows only. The agent sends that
 // source only when this name is declared (its
 // gatewayFeatureCapabilitySourceAudioCpp). The streaming verdict rides this
 // same declaration rather than a flag of its own: an agent that does not send

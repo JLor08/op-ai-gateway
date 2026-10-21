@@ -184,6 +184,13 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // "speculation_observed" below. Both are distinct from "audio" above, which is
   // an input modality (a chat model that accepts audio), not an audio endpoint.
   { capability: 'speech', label: (t) => t.capabilitySpeech },
+  // "speech_clone" refines "speech": the model synthesises in a reference VOICE
+  // (audio.cpp task=clone) rather than from text alone. A probed trait of the
+  // endpoint like the two around it, it sits right after "speech" and shows only on a
+  // `yes` -- the plain tts model (`no`) and the unknown (no row) render no chip. The
+  // portal chat reads the same flag to EXCLUDE a clone model from its picker, since a
+  // text-only composer cannot supply the reference voice (#252).
+  { capability: 'speech_clone', label: (t) => t.capabilitySpeechClone },
   { capability: 'transcription', label: (t) => t.capabilityTranscription },
   // "transcription_streaming" refines "transcription": the model delivers its transcript
   // incrementally (audio.cpp mode=streaming) rather than as one document at the end. It is a
