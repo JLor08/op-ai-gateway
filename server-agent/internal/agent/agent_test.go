@@ -4090,7 +4090,7 @@ func TestProbeRuntimeChildPropsAudioCppReportsTranscriptionStreaming(t *testing.
 // TestProbeRuntimeChildPropsAudioCppReportsSpeechClone is the wiring proof for
 // the speech_clone verdict on the EXISTING audio.cpp source: the task the
 // child's own listing states for the spec's model comes out as a speech_clone
-// verdict after the speech and transcription ones ("clone" a yes, "tts" a
+// verdict after the speech and transcription ones ("clon" a yes, "tts" a
 // no), with no second child request and no new gateway feature. An asr model, or
 // one whose listing states no task, gets no such verdict: speech_clone refines
 // a speech "yes", so a model that does not synthesise has no answer on it, not
@@ -4114,7 +4114,7 @@ func TestProbeRuntimeChildPropsAudioCppReportsSpeechClone(t *testing.T) {
 		doc  string
 		want *sample.Capabilities
 	}{
-		{"a clone child reports speech_clone yes", listing("clone"), cloneCaps("yes")},
+		{"a clone child reports speech_clone yes", listing("clon"), cloneCaps("yes")},
 		{"a tts child reports speech_clone no", listing("tts"), cloneCaps("no")},
 		{"an asr child reports no speech_clone verdict", audioCppASRDoc, audioCppCaps("no", "yes")},
 		{

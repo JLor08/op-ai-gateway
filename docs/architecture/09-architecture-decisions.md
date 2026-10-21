@@ -5084,7 +5084,7 @@ speech decided *differently*, and why. The inputs are facts about the backend,
 audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have chosen:
 
 - Its capability signal is the per-model `task` field of its own `GET /v1/models`
-  (`tts` and `clone` synthesise speech, `asr` transcribes), and that listing names
+  (`tts` and `clon` synthesise speech, `asr` transcribes), and that listing names
   **loaded** models only.
 - It answers `response_format` `wav` or absent with a binary `audio/wav` body, a
   `Content-Length` and metering headers (`X-AudioCPP-Audio-Duration-Ms`,
@@ -5162,8 +5162,13 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   `/v1/models` carries no `task`, so the only server it could reach was one that could
   state no verdict.
 - **(d) The verdict is read from `GET /v1/models`, per mapping, by the gateway's own
-  health loop.** `probeAudioCppModels` finds the entry whose `id` equals the mapping's
-  application-side model name and derives: `task` `tts` or `clone` is `(speech, yes)`;
+  health loop.** *(Spelling correction, issue #272: audio.cpp spells the clone task
+  `clon`, not `clone` — its load API rejects `clone` and `/v1/models` reports `clon`,
+  verified against v0.9.1. The parser originally matched `clone`, so a real clone model
+  fell to the "any other task" branch below and read `(speech, no)` — refused everywhere,
+  and #252's `speech_clone` verdict never fired. Both parser copies and this
+  document now say `clon`.)* `probeAudioCppModels` finds the entry whose `id` equals the mapping's
+  application-side model name and derives: `task` `tts` or `clon` is `(speech, yes)`;
   the model present with any other non-empty task is `(speech, no)`, authoritative
   because the listing states each loaded model's task (the loaded-only reading in this
   paragraph is superseded, see the note at the end of this choice); the model absent, the task
@@ -5173,7 +5178,7 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   or `vision_benchmark` row, always able to repair its own drift), and it writes the
   `speech` row (the `transcription` row joined it in ADR-062 (c), the
   `transcription_streaming` row in ADR-065, and the `speech_clone` row in issue #252 —
-  `clone` → yes, `tts` → no, all derived from the same per-model `task` the `speech`
+  `clon` → yes, `tts` → no, all derived from the same per-model `task` the `speech`
   verdict reads). **A model that is
   not loaded reads as unknown and refuses**
   until the health loop sees it loaded; for an operator-run server the mapped model is
@@ -5424,7 +5429,7 @@ chosen:
 - **(c) One probe, one `task`, both capabilities.** The `audiocpp_models` source and
   `probeAudioCppModels` are unchanged in shape and now decide **two** rows from the one
   `task` they read: `asr` writes `(transcription, yes)` and `(speech, no)`; `tts` and
-  `clone` write `(speech, yes)` and `(transcription, no)`; any other non-empty task
+  `clon` write `(speech, yes)` and `(transcription, no)`; any other non-empty task
   writes both `no`, authoritative because the listing states each model's task; an
   absent task, a model the listing does not name or an unreadable body writes
   **nothing**, because none of those says a model cannot transcribe and a `no` can
@@ -5669,7 +5674,7 @@ could have chosen:
   ([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
   (e), a handler locked down on purpose). Safari and iOS will likely not play audio from
   a URL that cannot be range-read (WebKit's known behaviour, not measured here).
-- The `speech` verdict is the verdict of audio.cpp's `tts` **and** `clone` tasks
+- The `speech` verdict is the verdict of audio.cpp's `tts` **and** `clon` tasks
   (ADR-061 (d)), and a clone model needs a reference voice a text-only chat cannot
   supply.
 
@@ -5865,7 +5870,7 @@ could have chosen:
   caller and the backstop should the two lists ever drift.
 - **(h) Clone-task models are offered and may fail. (RESOLVED by issue #252 — see the
   amendment below.)** The `speech` verdict does not
-  distinguish `tts` from `clone` (ADR-061 (d)) and the model DTO carries no task, so a clone
+  distinguish `tts` from `clon` (ADR-061 (d)) and the model DTO carries no task, so a clone
   model carries the flag and appears in the chat. Used text-only it has no reference
   voice, so it can answer an upstream error, which the run surfaces as the endpoint's
   own code. Excluding clone models would need a new per-mapping fact the verdict does not
@@ -5874,7 +5879,7 @@ could have chosen:
 
   **Amendment (issue #252):** the per-mapping fact now exists. A new NON-ROUTING
   refinement capability `speech_clone` (`routing.CapabilitySpeechClone`, the twin of
-  `transcription_streaming`) is derived from the same audio.cpp task (`clone` → yes,
+  `transcription_streaming`) is derived from the same audio.cpp task (`clon` → yes,
   `tts` → no, nothing for a non-speech model), written by both producers of the
   `audiocpp_models` source (the gateway health loop and the agent, which bumps to 0.10.1,
   a PATCH — `audioCppProbeCapabilities` gains the fourth name), and folded into
@@ -5978,7 +5983,7 @@ pieces it joins that no design could have chosen:
   and the **endpoint**, not the chat run, meters it (ADR-062 (e)).
 - A transcription model and a speech model are **distinct verdicts** on the one shared
   `openai_audio` flavor (ADR-062 (c)): `asr` ⇒ `(transcription, yes)` and `(speech, no)`,
-  `tts`/`clone` ⇒ the reverse. The audio.cpp probe never produces a model that is both; a
+  `tts`/`clon` ⇒ the reverse. The audio.cpp probe never produces a model that is both; a
   model carrying both verdicts can arise only from manual or agent config.
 
 **Decision — nine choices, taken together.**

@@ -722,7 +722,7 @@ plausible-looking validation rule would break the normal case:
   [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)),
   `speech_clone` (also **not** a gate capability — it refines `speech` the way
   `transcription_streaming` refines `transcription`, from the audio.cpp task
-  (`clone` → yes, `tts` → no) and for speech models only; the portal chat picker
+  (`clon` → yes, `tts` → no) and for speech models only; the portal chat picker
   reads it to EXCLUDE a voice-clone model, which a text-only composer cannot give
   a reference voice, while the direct `/v1/audio/speech` endpoint still serves it,
   [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (h), issue #252)
@@ -826,7 +826,7 @@ plausible-looking validation rule would break the normal case:
   `/v1/models`, the only source of the `speech`, `transcription`,
   `transcription_streaming` and `speech_clone` rows — the first two in both directions from
   the one `task` of the listed model, the third from its `mode` (`streaming`/`offline`, ASR
-  models only), the fourth from that same `task` (`clone`/`tts`, speech models only, #252) —
+  models only), the fourth from that same `task` (`clon`/`tts`, speech models only, #252) —
   whichever of its two producers wrote it; a vocabulary addition only, with no
   schema change), plus one probe-ranked source no agent may report:
   `llama_cpp_timings` (read off a completion it relayed). The audio rows:

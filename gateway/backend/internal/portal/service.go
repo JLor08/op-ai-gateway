@@ -1399,7 +1399,7 @@ type ModelDTO struct {
 	// transcription=true, speech=false.
 	Transcription bool `json:"transcription"`
 	// SpeechClone marks a speech model that synthesises in a REFERENCE voice
-	// (audio.cpp task "clone"): it REFINES Speech without changing it. Speech
+	// (audio.cpp task "clon"): it REFINES Speech without changing it. Speech
 	// stays true -- the direct /v1/audio/speech endpoint still serves a clone
 	// model to a bearer client that can supply the reference voice -- while
 	// SpeechClone lets the portal chat picker EXCLUDE it, because a text-only

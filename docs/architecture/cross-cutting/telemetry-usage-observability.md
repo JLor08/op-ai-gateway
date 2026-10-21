@@ -1848,7 +1848,7 @@ The agent's `parseAudioCppModels` (`server-agent/internal/collector/audiocpp.go`
 by `ProbeAudioCppVerdicts`) and the gateway's (`internal/provider/audiocpp_models.go`,
 which reads a static `audio_cpp` application's copy of the same listing) are the same
 kind of deliberate duplicate, each doc comment naming the other. Both read the one entry
-whose `id` is the model and decide **both** verdicts from its `task`: `tts` or `clone`
+whose `id` is the model and decide **both** verdicts from its `task`: `tts` or `clon`
 is `(speech, yes)` with `(transcription, no)`, `asr` the reverse, any other non-empty
 task `no` for both, and an absent task, an unlisted model or an unreadable body no
 verdict; the task match ignores case and surrounding whitespace, and `loaded` is
@@ -2083,7 +2083,7 @@ nobody can make from a count:
   sd-server pass it is not one probe per application), projected by
   `audioCppCapabilityRows` into at most **two** rows, `speech` and `transcription`, each
   with `source = audiocpp_models` and each only when stated. The listing's per-model
-  `task` decides both at once: `tts`/`clone` is `(speech, yes)` and `(transcription,
+  `task` decides both at once: `tts`/`clon` is `(speech, yes)` and `(transcription,
   no)`, `asr` is `(transcription, yes)` and `(speech, no)`, any other non-empty task is
   `no` for both, and a model the listing does not name (it was taken to list **loaded**
   models only; a v0.9.1 probe also saw an unloaded model named, and the prober decodes

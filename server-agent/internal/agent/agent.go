@@ -291,7 +291,18 @@ import (
 // verdicts of the same document. PATCH, and the rule decides it: agent.Features
 // gains NO entry, and no wire shape changes (an open-vocabulary verdict name on
 // an existing source), the reasoning of 0.9.1 -> 0.9.2 above.
-const Version = "0.10.1"
+//
+// 0.10.1 -> 0.10.2 is the single bump for the clon-task spelling fix (issue #272
+// prerequisite): audio.cpp spells the clone task "clon", not "clone" (its load API
+// rejects "clone" and /v1/models reports "clon", verified against v0.9.1), but the
+// collector's parser matched "clone", so a clon child fell to the default branch and
+// was reported (speech, no) -- refused everywhere -- and its speech_clone verdict
+// never fired. Correcting the string to "clon" changes what the agent reports for a
+// clon child (now (speech, yes) + (speech_clone, yes)), which the gateway observes, so
+// the rule makes it a PATCH: agent.Features gains NO entry and no wire shape changes
+// (the same open-vocabulary verdict on the same source, only the task string it keys
+// on is corrected).
+const Version = "0.10.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

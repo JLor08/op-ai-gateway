@@ -341,13 +341,15 @@ func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
 	// audio_cpp child's /v1/models, gated on the gateway-declared
 	// capability_source_audiocpp, which is not an agent.Features entry
 	// either); 0.10.0 was MINOR because agent.Features gained
-	// runtime_config_files; 0.10.1 is PATCH because it gained nothing again (it
-	// adds the speech_clone verdict to that same audio_cpp probe, read from the
-	// child's /v1/models task, on the same gateway-declared
-	// capability_source_audiocpp source, which is not an agent.Features entry). A
-	// Since records the version a feature shipped in, so runtime_ensure's stays
-	// 0.8.0, multipart_proxy's stays 0.9.0 and runtime_config_files' is 0.10.0.
-	if Version != "0.10.1" {
-		t.Fatalf("Version = %q, want 0.10.1 (agent.Features gained nothing since runtime_config_files at 0.10.0, so the bump is PATCH)", Version)
+	// runtime_config_files; 0.10.1 is PATCH (it added the speech_clone verdict to
+	// that same audio_cpp probe) and 0.10.2 is PATCH too (it corrects the clone
+	// task string from "clone" to "clon", audio.cpp's real spelling, changing what
+	// the agent reports for a clon child) -- both read from the child's /v1/models
+	// task on the same gateway-declared capability_source_audiocpp source, which is
+	// not an agent.Features entry. A Since records the version a feature shipped in,
+	// so runtime_ensure's stays 0.8.0, multipart_proxy's stays 0.9.0 and
+	// runtime_config_files' is 0.10.0.
+	if Version != "0.10.2" {
+		t.Fatalf("Version = %q, want 0.10.2 (agent.Features gained nothing since runtime_config_files at 0.10.0, so the bump is PATCH)", Version)
 	}
 }

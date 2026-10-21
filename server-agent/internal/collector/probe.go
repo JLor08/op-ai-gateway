@@ -473,7 +473,7 @@ type Capabilities struct {
 	// "yes" here needs a sample of the voice to copy, which a text-only caller
 	// cannot supply, while one that is "no" speaks without one. Only the
 	// audio.cpp probe sets it, from the "task" its /v1/models entry states
-	// ("tts" is a no, "clone" a yes), and only for a model whose task is one of
+	// ("tts" is a no, "clon" a yes), and only for a model whose task is one of
 	// those two, so it is never set beside a Speech of "no" or "". It gates no
 	// route: it only describes the model.
 	SpeechClone string

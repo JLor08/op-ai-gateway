@@ -1451,7 +1451,7 @@ const (
 	CapabilityTranscriptionStreaming = "transcription_streaming"
 
 	// CapabilitySpeechClone means the model synthesises speech only IN A REFERENCE
-	// VOICE: audio.cpp's task "clone", whose synthesis needs a sample of the voice to
+	// VOICE: audio.cpp's task "clon", whose synthesis needs a sample of the voice to
 	// copy, which a text-only caller (the portal chat's speech picker above all) has
 	// no way to supply. It refines CapabilitySpeech rather than standing beside it,
 	// and like CapabilityTranscriptionStreaming it is a name that does not gate a
@@ -1464,7 +1464,7 @@ const (
 	//
 	// It is DERIVED from audio.cpp's /v1/models, the per-model task field of the same
 	// listing the speech and transcription verdicts come from
-	// (CapabilitySourceAudioCppModels): task "tts" is a no and task "clone" a yes. Any
+	// (CapabilitySourceAudioCppModels): task "tts" is a no and task "clon" a yes. Any
 	// other task, none, or a model the listing does not name carries no row on it: a
 	// model that does not synthesise speech has no answer on a speech refinement, not
 	// even a no.
