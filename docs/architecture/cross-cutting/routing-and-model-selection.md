@@ -888,7 +888,7 @@ document, from two producers
   with a warning. While the gateway does not declare it, the agent probes and caches
   nothing for that child and withholds a verdict it cached earlier, so a gateway upgrade
   takes effect without a child restart. The ingest accepts the source for the `speech`,
-  `transcription` and `transcription_streaming` rows only, at probe rank 1, so a manual verdict (rank 3) still
+  `transcription`, `transcription_streaming` and `speech_clone` rows only, at probe rank 1, so a manual verdict (rank 3) still
   outranks it. Unlike the health loop, which asks again every tick, the agent asks
   **once per process generation**: a listing that does not name the model is a conclusive
   answer there, cached with the child's pid, so such a child reads as unknown until it
@@ -912,9 +912,9 @@ gate excludes on, and it has the same writers as `speech`, **from the same listi
   **and** `(transcription, no)`; any other non-empty task writes both `no`; and an absent
   task, an unnamed model, an unreachable server, a non-2xx status or an unreadable body
   writes **nothing**, because none of those says a model cannot transcribe and a `no` can
-  switch a route off. `audioCppCapabilityRows` projects the verdicts into at most three
-  rows (the third, `transcription_streaming`, is described below), each only when stated,
-  so an unanswered axis never suppresses the other. The
+  switch a route off. `audioCppCapabilityRows` projects the verdicts into at most four
+  rows (the third, `transcription_streaming`, and the fourth, `speech_clone`, are described
+  below), each only when stated, so an unanswered axis never suppresses the other. The
   task match ignores case and surrounding whitespace, so an `ASR` the server might one day
   emit does not fall to the `no` default. The same ranking, the same type gate (a
   `server_agent` mapping with an `audio_cpp` spec is **not probed** by the health loop)
@@ -955,6 +955,33 @@ type gate and open-vocabulary storage as `transcription`:
   `mode` probe entitled to establish streaming, forever. `(transcription_streaming, yes)`
   stays writable, and the name is **not** in `reservedAgentCapabilityNames`, because the
   agent reports it.
+
+**Who writes the `speech_clone` verdict.** Like `transcription_streaming` this is **not** a
+gate capability — no endpoint requires it — but a per-mapping verdict in the same vocabulary
+that lets the portal chat's speech picker EXCLUDE a voice-clone model, which a text-only
+composer cannot give a reference voice ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (h),
+issue #252). It is read from audio.cpp's `/v1/models` **`task`** field — the same field the
+`speech` verdict reads — by the **same two producers** and under the same ranking, type gate
+and open-vocabulary storage as `speech`:
+
+- **`audiocpp_models`** writes it from `task`, **only for a speech model** (the one axis on
+  which clone-vs-plain is a question): a `clone` entry writes `(speech_clone, yes)`, a `tts`
+  entry writes `(speech_clone, no)`, and a non-speech task (`asr`, music), an absent task, an
+  unnamed model, an unreachable server or an unreadable body writes **nothing** (absent =
+  unknown = the picker still offers it, fail-open). The gateway's health loop decodes it for
+  a **static** `audio_cpp` application, and the **agent** (0.10.1, issue #252) for an
+  agent-launched child, reporting it under this same source with **no new feature flag** — a
+  PATCH bump riding the already-declared `capability_source_audiocpp`, the same shape as the
+  `transcription_streaming` row above. It is folded into `ModelDTO.SpeechClone` by
+  `speechCloneFlagsByName`, the fail-open OR inverse of the `speech` fold, but it changes no
+  route: `speech` stays the authority for `/v1/audio/speech` and the unknown-model redirect,
+  so a clone model is still served to a bearer client that can supply a reference voice.
+- **`manual`**, the operator's `speech_clone: yes` — the override to hide a clone model the
+  listing has not classified. `(speech_clone, no)` is **reserved** in `reservedManualVerdicts`
+  on the same terms as `(transcription_streaming, no)`: an absent row already offers the model
+  (fail-open), so a manual `no` would needlessly outrank the `task` probe and permanently
+  force-offer a clone model the chat cannot drive. `(speech_clone, yes)` stays writable, and
+  the name is **not** in `reservedAgentCapabilityNames`, because the agent reports it.
 
 A transcription request avoids the vendor-account path for speech's reason: the
 capability list. `vendorAccountRoutingEligible` has no `openai_audio` twin of its images

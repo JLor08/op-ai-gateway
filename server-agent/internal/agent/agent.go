@@ -279,7 +279,19 @@ import (
 // cannot be told apart by trying). The agent itself gates nothing on it. The
 // same reasoning made 0.7.4 -> 0.8.0 (runtime_ensure) and 0.8.2 -> 0.9.0
 // (multipart_proxy) a MINOR.
-const Version = "0.10.0"
+//
+// 0.10.0 -> 0.10.1 is the single bump for the clone-speech-picker branch (issue
+// #252): the same audio_cpp probe of /v1/models now also reads the listed
+// model's "task" for a speech model and reports it as the "speech_clone"
+// verdict ("yes" for a clone model, which needs a reference voice a text chat
+// cannot supply, "no" for a plain tts one, nothing for any other task), so the
+// portal's chat speech picker can leave out the models it cannot drive. It
+// rides the same sample.CapabilitySourceAudioCppModels source, gated on the same
+// gateway-declared "capability_source_audiocpp", and is cached with the other
+// verdicts of the same document. PATCH, and the rule decides it: agent.Features
+// gains NO entry, and no wire shape changes (an open-vocabulary verdict name on
+// an existing source), the reasoning of 0.9.1 -> 0.9.2 above.
+const Version = "0.10.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1887,9 +1899,9 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into
-// RuntimeSample.Capabilities' wire pointer type: each of the eight named
+// RuntimeSample.Capabilities' wire pointer type: each of the nine named
 // fields (vision, video, audio, tools, image, speech, transcription,
-// transcription_streaming) becomes one CapabilityVerdict entry keyed by its
+// transcription_streaming, speech_clone) becomes one CapabilityVerdict entry keyed by its
 // name, every Extra name becomes a "yes" entry (a reported extra capability is
 // a positive assertion), and an empty ("" -- undetermined) field is skipped
 // entirely rather than carried as an entry, mirroring the store's
@@ -1907,7 +1919,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // side the ingest folds this list into capability rows and keeps the FIRST
 // entry for a given name, dropping every later one -- so a name that appears
 // both as a structured field and in Extra resolves to the STRUCTURED answer.
-// The eight named fields therefore go first and Extra after; swapping the two
+// The nine named fields therefore go first and Extra after; swapping the two
 // blocks silently hands the open list the last word.
 //
 // Always returns a non-nil pointer whose Verdicts is itself non-nil (though
@@ -1917,7 +1929,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // uncached, undetermined probe -- see sample.RuntimeSample.Capabilities' own
 // doc comment for why that distinction is load-bearing.
 func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabilities {
-	verdicts := make([]sample.CapabilityVerdict, 0, 8+len(c.Extra))
+	verdicts := make([]sample.CapabilityVerdict, 0, 9+len(c.Extra))
 	if c.Vision != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "vision", Verdict: c.Vision})
 	}
@@ -1947,6 +1959,14 @@ func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabil
 	// from putting the name on any other.
 	if c.TranscriptionStreaming != "" && c.Transcription == "yes" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "transcription_streaming", Verdict: c.TranscriptionStreaming})
+	}
+	// speech_clone refines speech the same way: it says whether a speech model
+	// synthesises only in a reference voice, so it is stated only beside a
+	// speech "yes". A model that does not synthesise has no answer on it, not
+	// even a "no". The audio.cpp probe already sets it for a tts or clone model
+	// alone; this keeps the emission itself from putting the name on any other.
+	if c.SpeechClone != "" && c.Speech == "yes" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "speech_clone", Verdict: c.SpeechClone})
 	}
 	for _, name := range c.Extra {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: name, Verdict: "yes"})

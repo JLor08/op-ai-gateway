@@ -1398,6 +1398,22 @@ type ModelDTO struct {
 	// a model a transcription candidate -- a pure-ASR model folds
 	// transcription=true, speech=false.
 	Transcription bool `json:"transcription"`
+	// SpeechClone marks a speech model that synthesises in a REFERENCE voice
+	// (audio.cpp task "clone"): it REFINES Speech without changing it. Speech
+	// stays true -- the direct /v1/audio/speech endpoint still serves a clone
+	// model to a bearer client that can supply the reference voice -- while
+	// SpeechClone lets the portal chat picker EXCLUDE it, because a text-only
+	// speech composer has no way to supply that voice and every send would fail
+	// upstream (#252, the audio counterpart of the picker-offers-what-send-fails
+	// problem). Unlike Speech it is the INVERSE of a fail-closed fold: it answers
+	// "should the picker HIDE this?", so it is an OR across a model's mappings
+	// (any clone mapping sets it, since a send could route there) and a group's
+	// offerable members, and it is fail-OPEN -- a speech model whose task is
+	// unknown, or whose agent predates the verdict, is SpeechClone:false and stays
+	// offered. It is speechCloneFlagsByName's result and gates NO route; no request
+	// ever requires it. Independent of Transcription (one audio.cpp task decides
+	// both speech and transcription, so a clone model is transcription:false).
+	SpeechClone bool `json:"speech_clone"`
 	// OriginalModelID is set ONLY on a generated Claude alias row (the token's
 	// claude_model_aliases setting): the real gateway model/group id the
 	// `anthropic-local-<hash>` ID resolves to. DisplayName on such a row is the
@@ -2607,6 +2623,13 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// capability batch and runtime-spec index, so it costs no further
 			// store read either.
 			transcriptionOn := transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
+			// speech_clone is speechCloneFlagsByName, the INVERSE of the speech
+			// fold: it marks a clone-task speech model the chat picker hides (#252),
+			// an OR across the name's mappings, read from the same capability batch
+			// and runtime-spec index as the folds above. It gates NO route -- Speech
+			// stays the authority for /v1/audio/speech and the redirect -- so it has
+			// no ModelOffering.Capable twin.
+			speechCloneOn := speechCloneFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeechClone), idx)
 			// Each model's flavors are the ones dispatch serves it under
 			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
 			// flavorSetsFromViews applies for /v1/models too. Every model keeps
@@ -2751,13 +2774,16 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// are the AND of its offerable members' flags (same fail-closed rule
 				// as a plain model); an EMPTY offerable member set is false
 				// (fail-closed — never claim a capability on a group with nothing to
-				// serve it).
+				// serve it). speech_clone is the one exception: it is the OR
+				// (groupCapabilityFlagsOr), because it HIDES rather than serves (#252),
+				// so one clone member hides the group.
 				// Captured before suppression, mirroring groupOffered/groupContext.
 				groupVision := groupCapabilityFlags(entries, visionOn)
 				groupImage := groupCapabilityFlags(entries, imageOn)
 				groupImageEdit := groupCapabilityFlags(entries, imageEditOn)
 				groupSpeech := groupCapabilityFlags(entries, speechOn)
 				groupTranscription := groupCapabilityFlags(entries, transcriptionOn)
+				groupSpeechClone := groupCapabilityFlagsOr(entries, speechCloneOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2797,6 +2823,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					imageEditOn[e.Name] = groupImageEdit[e.Name]
 					speechOn[e.Name] = groupSpeech[e.Name]
 					transcriptionOn[e.Name] = groupTranscription[e.Name]
+					speechCloneOn[e.Name] = groupSpeechClone[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2873,6 +2900,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if v, ok := transcriptionOn[target]; ok {
 						transcriptionOn[name] = v
 					}
+					if v, ok := speechCloneOn[target]; ok {
+						speechCloneOn[name] = v
+					}
 					if _, ok := isGroup[target]; ok {
 						isGroup[name] = struct{}{}
 					}
@@ -2939,6 +2969,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.ImageEdit = imageEditOn[id]
 				dto.Speech = speechOn[id]
 				dto.Transcription = transcriptionOn[id]
+				dto.SpeechClone = speechCloneOn[id]
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}
@@ -3066,6 +3097,30 @@ func transcriptionFlagsByName(views []mappingView, transcriptionRows map[string]
 	})
 }
 
+// speechCloneFlagsByName is the DELIBERATE INVERSE of speechFlagsByName. The
+// speech, transcription and image folds are fail-closed ANDs that answer "would
+// the endpoint serve EVERY mapping of this name?"; speech_clone answers the
+// opposite question -- "is this a clone-task model the chat picker should HIDE?"
+// (ModelDTO.SpeechClone, #252) -- so it is an OR across the name's mappings and
+// fail-OPEN: true as soon as ANY offering mapping carries a (speech_clone, yes)
+// verdict AND would serve a speech request (viewServesAudio, the same flavor half
+// the speech fold reads), and false for a name whose mappings are all plain tts,
+// never probed on this axis, or not audio-serving. The OR is the safe direction:
+// if any mapping of a name is a clone model, a chat send to that name could route
+// to it and fail, so the whole name is hidden. It does NOT gate a route -- Speech
+// stays the authority for /v1/audio/speech and the unknown-model redirect, and a
+// clone model remains a speech candidate for a bearer client that can supply a
+// reference voice.
+func speechCloneFlagsByName(views []mappingView, speechCloneRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	out := make(map[string]bool)
+	for _, view := range views {
+		name := view.mapping.GatewayModelName
+		clone := speechCloneRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesAudio(view, idx)
+		out[name] = out[name] || clone
+	}
+	return out
+}
+
 // foldMappingFlags is the per-name AND shared by the capability folds: for each
 // gateway model name among views, true only when ok holds for EVERY one of its
 // mappings. A name starts true on its first mapping and is only ever ANDed
@@ -3098,6 +3153,27 @@ func groupCapabilityFlags(entries []groupOverlayEntry, flags map[string]bool) ma
 			}
 		}
 		out[e.Name] = all
+	}
+	return out
+}
+
+// groupCapabilityFlagsOr is groupCapabilityFlags' OR twin, for the speech_clone
+// axis: a group is a clone group when ANY offerable member is one, the inverse of
+// the fail-closed AND the serve-folds use, and false for a group with no offerable
+// member. See speechCloneFlagsByName for why this axis ORs where the others AND
+// (it HIDES rather than serves, so hiding a group because one member is a clone
+// model is the safe direction).
+func groupCapabilityFlagsOr(entries []groupOverlayEntry, flags map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		anyMember := false
+		for _, member := range e.OrderedOfferableMembers {
+			if flags[member] {
+				anyMember = true
+				break
+			}
+		}
+		out[e.Name] = anyMember
 	}
 	return out
 }

@@ -3796,6 +3796,41 @@ func TestAudioCppCapabilityRows(t *testing.T) {
 		},
 		{name: "a streaming verdict with no transcription verdict builds no row", v: provider.AudioCppVerdicts{TranscriptionStreaming: routing.CapabilityYes}, want: nil},
 		{
+			name: "a clone model: speech_clone yes beside speech yes and transcription no",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+				row(routing.CapabilitySpeechClone, routing.CapabilityYes),
+			},
+		},
+		{
+			name: "a plain tts model: speech_clone no is a real verdict",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+				row(routing.CapabilitySpeechClone, routing.CapabilityNo),
+			},
+		},
+		{
+			name: "a speech_clone verdict on a model that is not a speech model builds no speech_clone row (asr)",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechClone: routing.CapabilityYes},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityNo),
+				row(routing.CapabilityTranscription, routing.CapabilityYes),
+			},
+		},
+		{name: "a speech_clone verdict with no speech verdict builds no row", v: provider.AudioCppVerdicts{SpeechClone: routing.CapabilityYes}, want: nil},
+		{
+			name: "a speech_clone verdict that is not yes or no builds no row",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: "maybe"},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+			},
+		},
+		{
 			name: "a transcription_streaming verdict that is not yes or no builds no row",
 			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: "maybe"},
 			want: []routing.CapabilityRow{
@@ -3859,6 +3894,48 @@ func TestAudioCppCapabilityRowsEmitTranscriptionStreaming(t *testing.T) {
 			{Capability: "transcription", Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at},
 		}},
 		{"a streaming verdict beside no transcription verdict", provider.AudioCppVerdicts{TranscriptionStreaming: routing.CapabilityYes}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := audioCppCapabilityRows(tc.v, at)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("audioCppCapabilityRows(%+v) = %+v, want %+v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAudioCppCapabilityRowsEmitSpeechClone pins the fourth axis on its own: a speech
+// model's speech_clone verdict becomes a speech_clone row, under the same source and
+// stamp as the speech and transcription rows. yes (a clone model, which needs a
+// reference voice) and no (a plain tts model) are both real answers; no verdict at
+// all -- no task, an unnamed model, an unreadable listing -- is no row, and never a
+// written no, because the portal reads an absent row as "not known to be a clone
+// model" and a written no as a statement it is a plain synthesiser.
+//
+// The row is the speech capability's refinement, so it is emitted only beside a speech
+// yes: a model that is not a speech model (asr, music, one the listing gives no task)
+// gets NO row on it, not even a no, whatever the verdict says.
+func TestAudioCppCapabilityRowsEmitSpeechClone(t *testing.T) {
+	at := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	speechRow := routing.CapabilityRow{Capability: "speech", Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}
+	transcriptionNoRow := routing.CapabilityRow{Capability: "transcription", Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}
+	cloneRow := func(verdict string) routing.CapabilityRow {
+		return routing.CapabilityRow{Capability: "speech_clone", Verdict: verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}
+	}
+	for _, tc := range []struct {
+		name string
+		v    provider.AudioCppVerdicts
+		want []routing.CapabilityRow
+	}{
+		{"a clone model", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes}, []routing.CapabilityRow{speechRow, transcriptionNoRow, cloneRow(routing.CapabilityYes)}},
+		{"a plain tts model", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo}, []routing.CapabilityRow{speechRow, transcriptionNoRow, cloneRow(routing.CapabilityNo)}},
+		{"a speech model whose task is not stated", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}, []routing.CapabilityRow{speechRow, transcriptionNoRow}},
+		{"an asr model", provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechClone: routing.CapabilityNo}, []routing.CapabilityRow{
+			{Capability: "speech", Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at},
+			{Capability: "transcription", Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at},
+		}},
+		{"a speech_clone verdict beside no speech verdict", provider.AudioCppVerdicts{SpeechClone: routing.CapabilityYes}, nil},
+		{"the empty verdict", provider.AudioCppVerdicts{}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := audioCppCapabilityRows(tc.v, at)

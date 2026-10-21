@@ -243,12 +243,13 @@ type agentRuntimeCapabilitiesSample struct {
 //
 // CapabilitySourceAudioCppModels is claimable on the same footing: the agent's
 // collector probe reads an agent-launched audio.cpp child's /v1/models listing,
-// whose per-model task answers two questions, whether the model synthesises
-// speech and whether it transcribes, and whose mode answers a third for an asr
-// model, whether it streams. The source may speak about those three rows only
-// (speech, transcription and transcription_streaming, each in both directions):
-// runtimeSampleCapabilityRows drops every other row it arrives with, and a
-// live-progress verdict with it.
+// whose per-model task answers three questions, whether the model synthesises
+// speech, whether it transcribes and, for a speech model, whether it needs a
+// reference voice, and whose mode answers a fourth for an asr model, whether it
+// streams. The source may speak about those four rows only (speech,
+// transcription, transcription_streaming and speech_clone, each in both
+// directions): runtimeSampleCapabilityRows drops every other row it arrives
+// with, and a live-progress verdict with it.
 //
 // It lives in this package rather than in routing on purpose: routing owns
 // the store-side RANK, which is about how two sources compare; which sources
@@ -1270,13 +1271,17 @@ var reservedAgentCapabilityNames = map[string]bool{
 // comes from the same entry's mode field and refines transcription: the agent
 // states it for an asr model only (streaming is a yes, offline a no) and sends
 // no entry at all when the mode says nothing, so its absence is "unknown" and
-// never a refusal. It is not a reserved agent capability name
+// never a refusal. speech_clone comes from the task again and refines speech:
+// the agent states it for a tts model (a no) or a clone model (a yes) only, and
+// sends no entry at all for any other task, so its absence is "unknown" too.
+// Neither refinement is a reserved agent capability name
 // (reservedAgentCapabilityNames), for the reason speech and transcription are
 // not: nothing in this codebase reports it through a dedicated field.
 var audioCppProbeCapabilities = map[string]bool{
 	routing.CapabilitySpeech:                 true,
 	routing.CapabilityTranscription:          true,
 	routing.CapabilityTranscriptionStreaming: true,
+	routing.CapabilitySpeechClone:            true,
 }
 
 // runtimeSampleCapabilityRows is everything ONE runtime entry determined
@@ -1320,24 +1325,29 @@ var audioCppProbeCapabilities = map[string]bool{
 //     exactly one question -- whether its supported_modes list img_gen --
 //     so a row under that source for any other capability says something
 //     the document never said.
-//  4. ANY capability other than speech, transcription or
-//     transcription_streaming attributed to audiocpp_models, in either
-//     direction. audio.cpp's /v1/models listing states each model's one task
-//     and mode, from which exactly three questions are answered -- does it
-//     synthesise speech, does it transcribe, does its asr mode stream -- so a
-//     row under that source for any other capability says something the
-//     listing never said. Unlike rule 3 the allowlist has three names
-//     (audioCppProbeCapabilities), and all are kept in both directions: a tts
-//     model is (speech, yes) with (transcription, no), an asr model the
-//     reverse, and an asr model's mode adds (transcription_streaming, yes or
-//     no) when it states one.
+//  4. ANY capability other than speech, transcription,
+//     transcription_streaming or speech_clone attributed to audiocpp_models,
+//     in either direction. audio.cpp's /v1/models listing states each model's
+//     one task and mode, from which exactly four questions are answered --
+//     does it synthesise speech, does it transcribe, does its asr mode stream,
+//     does its speech task need a reference voice -- so a row under that
+//     source for any other capability says something the listing never said.
+//     Unlike rule 3 the allowlist has four names (audioCppProbeCapabilities),
+//     and all are kept in both directions: a tts model is (speech, yes) with
+//     (transcription, no) and (speech_clone, no), a clone model the same with
+//     (speech_clone, yes), an asr model the reverse of the tts shape, and an
+//     asr model's mode adds (transcription_streaming, yes or no) when it
+//     states one. speech_clone is the audio.cpp listing's to state alone: the
+//     same name under any other source falls to that source's own rules
+//     (under sdcpp_capabilities, rule 3 drops it).
 //
 // All are one-line rules for the same reason: an invariant a caller can
 // violate is not an invariant, and this is the boundary where the agent's
 // bytes arrive. None voids the pass -- what the same document CAN answer
 // (/api/show's "yes" verdicts, the sdcpp document's image verdict in either
-// direction, the audio listing's speech, transcription and
-// transcription_streaming verdicts in either direction) still rides it.
+// direction, the audio listing's speech, transcription,
+// transcription_streaming and speech_clone verdicts in either direction) still
+// rides it.
 //
 // A consequence worth stating, because it is a limit on what the tests here
 // can show: the live-progress row can now only ever carry llama_cpp_props,
@@ -1500,24 +1510,27 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 			notImage = append(notImage, row.Capability)
 		case source == routing.CapabilitySourceAudioCppModels && !audioCppProbeCapabilities[row.Capability]:
 			// REFUSED, in either direction: the sdcpp refusal's argument
-			// applied to a listing that answers three questions rather than
+			// applied to a listing that answers four questions rather than
 			// one. audio.cpp's /v1/models states each model's task and mode,
 			// and the agent derives the speech verdict (does the task
-			// synthesise), the transcription verdict (does it transcribe) and,
-			// for an asr model, the transcription_streaming verdict (does its
-			// mode stream) from it. It says nothing about vision, tools or any
-			// other capability, so a row under this source for one of them
-			// could not have come from that listing -- a buggy or hostile
-			// agent's claim, stamped with a provenance that cannot produce it.
+			// synthesise), the transcription verdict (does it transcribe), for
+			// an asr model, the transcription_streaming verdict (does its
+			// mode stream) and, for a tts or clone model, the speech_clone
+			// verdict (does its task need a reference voice) from it. It says
+			// nothing about vision, tools or any other capability, so a row
+			// under this source for one of them could not have come from that
+			// listing -- a buggy or hostile agent's claim, stamped with a
+			// provenance that cannot produce it.
 			//
-			// The three names (audioCppProbeCapabilities) all stay writable
+			// The four names (audioCppProbeCapabilities) all stay writable
 			// in BOTH directions, unlike sdcpp's single image name: the
 			// listing names the model's task, so a model it lists with a task
 			// that does not serve a capability is a real "no" for that
 			// capability (routing.CapabilitySourceAudioCppModels), and an asr
 			// model is exactly (transcription, yes) with (speech, no). A
-			// streaming verdict the agent could not derive is not sent at
-			// all, so it never reaches this refusal and never costs a Warn.
+			// streaming or speech_clone verdict the agent could not derive is
+			// not sent at all, so it never reaches this refusal and never
+			// costs a Warn.
 			notAudio = append(notAudio, row.Capability)
 		default:
 			kept = append(kept, row)
@@ -1548,7 +1561,7 @@ func runtimeSampleCapabilityRows(rt agentRuntimeSample, at time.Time) []routing.
 	if len(notAudio) > 0 {
 		// Warn, same argument again: the drop repeats for every sample this
 		// agent build sends, and the absent rows read as plain "unknown".
-		slog.Warn("runtime capability sample attributes a capability other than speech, transcription or transcription_streaming to the audio.cpp probe, dropping those rows",
+		slog.Warn("runtime capability sample attributes a capability other than speech, transcription, transcription_streaming or speech_clone to the audio.cpp probe, dropping those rows",
 			"spec_id", rt.SpecID, "source", source, "capabilities", notAudio)
 	}
 	return append(rows, kept...)

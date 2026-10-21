@@ -850,15 +850,17 @@ cached earlier is withheld. The agent reads the child directly because the agent
 aggregate `/v1/models` carries no `task`; that is also why the gateway's own health loop,
 whose audio.cpp pass reads the same document from a **static** `audio_cpp` *application*,
 deliberately leaves a `server_agent` application alone. The gateway's ingest accepts the
-source for the `speech`, `transcription` and `transcription_streaming` rows only, at the
+source for the `speech`, `transcription`, `transcription_streaming` and `speech_clone` rows
+only, at the
 probe rank, so an
 operator's manual verdict still outranks it and remains the override, and the fallback
-for an agent before 0.9.1 and for a model the listing does not name (the `transcription`
-and `transcription_streaming` names were deliberately left off the ingest's reserved agent
+for an agent before 0.9.1 and for a model the listing does not name (the `transcription`,
+`transcription_streaming` and `speech_clone` names were deliberately left off the ingest's reserved agent
 names so that this source could report them; `transcription_streaming` — the model's
 `mode`, `yes` for `mode=streaming` and only for an ASR model — was added by the agent at
 0.9.2 on this same source with no new feature flag, issue #262,
-[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)). The kind's agent-side launch shape (arguments, ensure route, VRAM
+[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript); `speech_clone` — the model's `task`, `yes` for `clone` and only for a speech model, which the portal chat picker excludes — was added the same way at 0.10.1, issue #252,
+[ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)). The kind's agent-side launch shape (arguments, ensure route, VRAM
 measurement) has no worked example here. **Serving transcription needed no agent
 change:** an agent-launched child is sent the upload through the router's existing
 multipart branch (§4.2), which peeks the model from the form whatever the path and
@@ -2945,9 +2947,11 @@ fallback to choose — so an agent-side name would gate nothing, and
 
 `capability_source_audiocpp` (issue #255) is the second flag of that shape, and the two
 are independent facts, not one: it states that the gateway's capability ingest accepts the
-`audiocpp_models` source, for the `speech`, `transcription` and `transcription_streaming`
-rows only (the last added on this same source by agent 0.9.2 with no new flag, issue #262,
-[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript)). The agent reads
+`audiocpp_models` source, for the `speech`, `transcription`, `transcription_streaming` and
+`speech_clone`
+rows only (the last two added on this same source with no new flag — streaming by agent 0.9.2, issue #262,
+[ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript), and `speech_clone` by agent 0.10.1, issue #252,
+[ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)). The agent reads
 it before it probes an `audio_cpp` child's `/v1/models` and before it sends a verdict
 cached from one, with the same 30 s memo and the same rule that while the name is missing
 nothing is probed or cached for that child. Declaring one name opens nothing for the
@@ -3103,6 +3107,19 @@ and the `Version` assertion moved to `TestFeaturesDeclareRuntimeConfigFiles`,
 beside the newest feature (`multipart_proxy`'s test keeps its own presence and
 `Since` check, and its `Since` stays `"0.9.0"`)
 ([ADR-066](../09-architecture-decisions.md#adr-066--agent-provisioned-config-files-one-child-per-spec-a-0n-config-files-facet-written-to-an-agent-owned-directory-a-config_dir-placeholder-and-non-secret-content-only)).
+
+**`0.10.0` → `0.10.1` (issue #252, clone-model chat exclusion) is PATCH, on the same
+precedent.** The agent's `audio_cpp` collector emits **one more verdict name on the existing
+`audiocpp_models` source**, `speech_clone`, derived from the per-model `task` it already reads
+(`yes` for `clone`, `no` for `tts`, and only for a speech model), under the already-declared
+`capability_source_audiocpp`. `agent.Features` gained nothing — the verdict refines the chat
+picker, gates no route, and an absent one is fail-open (the model stays offered), so a flag
+would gate nothing — so the rule makes it PATCH, and the `Version` pin moves to `0.10.1`.
+Like the audio bumps before it, there is **no feature flag gating the verdict**, so an
+0.10.1 agent talking to a gateway that predates this change has its `speech_clone` rows dropped
+with a Warn on each sample (it is not on that older gateway's `audioCppProbeCapabilities`):
+the same mixed-fleet fact as the earlier audio verdicts, so the operator rule is "upgrade the gateway first"
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/

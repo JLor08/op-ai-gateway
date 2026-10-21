@@ -328,8 +328,9 @@ const (
 	// CapabilitySourceAudioCppModels is a GET of audio.cpp's /v1/models
 	// (collector.ProbeAudioCppVerdicts), where each listed model's task names
 	// what it does: it answers the speech and transcription capabilities in
-	// both directions, and for an asr model the transcription_streaming one
-	// from its mode, and nothing else. Identical to the gateway's
+	// both directions, for an asr model the transcription_streaming one
+	// from its mode, and for a speech model the speech_clone refinement from the
+	// task (clone -> yes, tts -> no), and nothing else. Identical to the gateway's
 	// routing.CapabilitySourceAudioCppModels.
 	CapabilitySourceAudioCppModels = "audiocpp_models"
 )

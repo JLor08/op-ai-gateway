@@ -5171,7 +5171,10 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   model cannot speak and a `no` can switch a route off. It is a new probe-rank source,
   `audiocpp_models`, ranking 1 with the other probes (never able to outrank a `manual`
   or `vision_benchmark` row, always able to repair its own drift), and it writes the
-  `speech` row only (the `transcription` row joined it in ADR-062 (c)). **A model that is
+  `speech` row (the `transcription` row joined it in ADR-062 (c), the
+  `transcription_streaming` row in ADR-065, and the `speech_clone` row in issue #252 —
+  `clone` → yes, `tts` → no, all derived from the same per-model `task` the `speech`
+  verdict reads). **A model that is
   not loaded reads as unknown and refuses**
   until the health loop sees it loaded; for an operator-run server the mapped model is
   loaded, and `speech: yes` set by hand covers the rest. (*Superseded in part by
@@ -5810,6 +5813,9 @@ could have chosen:
   `speech: true` (since [ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn), also behind `transcription: true`),
   the polarity `openai_images` has behind `image`, and the effective
   model's flag selects the speech composer for a thread that has no transcript yet.
+  Since issue #252 the speech half is `speech: true` **and not**
+  `speech_clone: true`: a voice-clone model is dropped from the picker (choice (h),
+  the refinement that reversed it), while the transcription half is unchanged.
   **The shared `offeredFlavors` is deliberately untouched.** It also feeds the Models
   view's "Available via" column, and gating `openai_audio` behind a speech verdict there
   would drop the flavor from transcription, unprobed and not-yet-reported agent-managed
@@ -5857,13 +5863,30 @@ could have chosen:
   (`SPEECH_RESERVED_FIELDS` in `chatDoc.ts`, matched ignoring case, the inline error
   naming the offending field), and the backend check stays the authority for every other
   caller and the backstop should the two lists ever drift.
-- **(h) Clone-task models are offered and may fail.** The `speech` verdict does not
+- **(h) Clone-task models are offered and may fail. (RESOLVED by issue #252 — see the
+  amendment below.)** The `speech` verdict does not
   distinguish `tts` from `clone` (ADR-061 (d)) and the model DTO carries no task, so a clone
   model carries the flag and appears in the chat. Used text-only it has no reference
   voice, so it can answer an upstream error, which the run surfaces as the endpoint's
   own code. Excluding clone models would need a new per-mapping fact the verdict does not
   hold. Recorded as an accepted limitation
   ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+  **Amendment (issue #252):** the per-mapping fact now exists. A new NON-ROUTING
+  refinement capability `speech_clone` (`routing.CapabilitySpeechClone`, the twin of
+  `transcription_streaming`) is derived from the same audio.cpp task (`clone` → yes,
+  `tts` → no, nothing for a non-speech model), written by both producers of the
+  `audiocpp_models` source (the gateway health loop and the agent, which bumps to 0.10.1,
+  a PATCH — `audioCppProbeCapabilities` gains the fourth name), and folded into
+  `ModelDTO.SpeechClone` (`speechCloneFlagsByName`, the fail-OPEN OR inverse of the speech
+  fold). The chat picker's speech half is now `speech && !speech_clone`, so a clone model
+  is no longer offered. `speech` is unchanged, so the direct `/v1/audio/speech` endpoint
+  still serves a clone model to a bearer client that can supply a reference voice; only
+  the chat affordance is withheld, and `(speech_clone, no)` is reserved as a manual verdict
+  so an operator cannot permanently force-offer a clone model. This REVERSES the "A
+  clone-model filter" rejection below. (Option 2 — a reference-voice attach/record control
+  in the composer — remains out of scope, overlapping the transcription composer's
+  audio-input work.)
 
 **Consequence:** a speech turn has the image turn's costs in a milder form. It is one
 buffered request with no progress to show, so the wait is the elapsed clock and an
@@ -5887,7 +5910,8 @@ stricter rule belongs in the chat). **A voices dropdown now** (it needs the gate
 proxy a listing ADR-061 (j) refused and an agent route that does not exist), and **a
 `/api/portal/model-audio-options` endpoint** (nothing to serve). **Reusing `image_url`
 for the WAV** (every consumer would read audio as a picture). **A clone-model filter**
-(the verdict does not distinguish the task). **Playing the blob URL directly** (no
+(the verdict does not distinguish the task — **reversed by issue #252 (choice (h)
+amendment): the `speech_clone` refinement now distinguishes it, so the filter exists**). **Playing the blob URL directly** (no
 `Range`, so Safari and iOS would likely not play it) and **making the blob handler
 range-capable** (a change to a handler locked down on purpose, for one consumer; an
 object URL costs the player a fetch it makes anyway). **Stating `response_format`**
