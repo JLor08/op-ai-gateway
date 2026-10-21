@@ -1259,6 +1259,18 @@ func (_d *APIWithTracing) ModelServers(ctx context.Context, t1 auth.Token, s1 st
 	return _d.API.ModelServers(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) ModelVoiceMappingIDs(ctx context.Context, t1 auth.Token, s1 string) (sa1 []string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ModelVoiceMappingIDs")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.ModelVoiceMappingIDs(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) Models(ctx context.Context, t1 auth.Token) (m1 ModelsResponse) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.Models")
 	defer span.End()

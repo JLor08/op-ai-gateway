@@ -62,7 +62,10 @@ type voicesWorld struct {
 	srv *Server
 	// deps is what srv was built from, so a test can build a sibling server over
 	// a different routing.Store (a failing one) with everything else the same.
-	deps          ServerDeps
+	deps ServerDeps
+	// directory is the user and token store srv and its portal service share, so a
+	// test can rebuild the portal service over a different routing.Store.
+	directory     *portal.MemoryDirectory
 	routes        *routing.MemoryStore
 	now           time.Time
 	upstreamCalls *atomic.Int64
@@ -110,7 +113,7 @@ func newVoicesWorld(t *testing.T) *voicesWorld {
 	}
 
 	routes := routing.NewMemoryStore()
-	w := &voicesWorld{routes: routes, now: now, upstreamCalls: &calls}
+	w := &voicesWorld{routes: routes, directory: directory, now: now, upstreamCalls: &calls}
 	for _, app := range []struct {
 		name    string
 		flavors []string

@@ -4936,13 +4936,24 @@ func (s *Service) loadGroupOverlayInputs(ctx context.Context) (groupOverlayInput
 	if err != nil {
 		return groupOverlayInputs{}, err
 	}
-	// Build the flatten graph once from ALL groups (active flag preserved
-	// per-group) plus each group's ordered members.
+	graph, err := s.groupFlattenGraph(ctx, groups)
+	if err != nil {
+		return groupOverlayInputs{}, err
+	}
+	return groupOverlayInputs{groups: groups, visByLower: visByLower, graph: graph}, nil
+}
+
+// groupFlattenGraph builds the flatten graph from ALL groups (active flag
+// preserved per-group) plus each group's ordered members, keyed by lowercased,
+// trimmed gateway_model_name: one GroupMembersByGroup read per group. It is the
+// graph routing.FlattenGroup walks, shared by the model-group overlay and the
+// portal voices route's group expansion (ModelVoiceMappingIDs).
+func (s *Service) groupFlattenGraph(ctx context.Context, groups []routing.ModelGroup) (map[string]routing.FlatGroup, error) {
 	graph := make(map[string]routing.FlatGroup, len(groups))
 	for _, g := range groups {
 		ms, err := s.routes.GroupMembersByGroup(ctx, g.ID)
 		if err != nil {
-			return groupOverlayInputs{}, err
+			return nil, err
 		}
 		graph[strings.ToLower(strings.TrimSpace(g.GatewayModelName))] = routing.FlatGroup{
 			Traversal: g.Traversal,
@@ -4950,7 +4961,7 @@ func (s *Service) loadGroupOverlayInputs(ctx context.Context) (groupOverlayInput
 			Active:    g.Status == routing.ServerStatusActive,
 		}
 	}
-	return groupOverlayInputs{groups: groups, visByLower: visByLower, graph: graph}, nil
+	return graph, nil
 }
 
 // buildGroupOverlay is modelGroupOverlay's pure half: it touches no store and
