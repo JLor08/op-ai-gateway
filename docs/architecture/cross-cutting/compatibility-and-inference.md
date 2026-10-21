@@ -686,7 +686,8 @@ non-empty string `input` (`speech.input_required`), and answers those as a gatew
 rather than relaying them, because audio.cpp answers a missing `input` or an unknown
 model with **HTTP 500**, which the gateway would otherwise hand on as a server
 failure. Every other field (`voice`, `instructions`, `speed`, ...) is the client's own
-business and reaches the upstream unexamined, with the exceptions below.
+business and reaches the upstream unexamined, with the exceptions below. (`voice` is
+additionally **read**, never changed, as a routing preference: item 8.)
 `response_format`, `stream` and `stream_format` are type-checked rather than decoded
 straight into Go types, for the reason `validateImagesRequest` gives: a struct decode
 that discards its type error would leave a non-string `response_format` such as
@@ -783,11 +784,58 @@ speech fold (`ModelOffering.Capable`, [Routing & Model Selection
 so a candidate without the verdict is skipped rather than turned into a
 `model_not_capable` about a model the client never named.
 
-**8. `GET /v1/audio/voices` is deliberately not proxied.** The voices listing is an
-audio.cpp and llama-swap convention, not an OpenAI endpoint, and the gateway proxies the
-OpenAI surface. A client learns the voice names its model accepts out of band and sends
-one as `voice`; the gateway passes it through unexamined. The portal chat's speech
-composer follows the same rule, so its `voice` field is free text (§12).
+**8. `GET /v1/audio/voices` is served from a cache, not proxied, and a requested `voice`
+is a fail-open routing preference.** The voices listing is an audio.cpp and llama-swap
+convention, not an OpenAI endpoint, and audio.cpp lists voices only for the model it has
+**loaded** (and ignores a `?model=` query), so the gateway does not proxy it. It reads
+what the health loop cached while the model was loaded: the persistent per-mapping
+`model_mapping_cache` table ([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter),
+[Data Model](../reference/data-model.md#the-per-mapping-cache-table)), filled by a gateway
+lister for a static `audio_cpp` server and through the agent router's voices route for an
+agent-launched child ([Agent-Managed Model
+Runtime §4.1](agent-runtime-manager.md#41-control-routes)).
+
+- **`GET /v1/audio/voices?model=<gateway model name>`** (alias
+  `/openai/v1/audio/voices`; `handleAudioVoices`) takes the speech endpoints' auth: a bearer
+  token with `gateway:use` or `llm:invoke`, **or** the internal loopback pair, never the
+  session cookie. It is a **read of the cache only**: no model is loaded and no upstream is
+  contacted, so a model that is not loaded is answered from what was recorded while it was.
+  The response is `{"model": "<name as asked>", "voices": ["..."]}`, the deduped, sorted
+  union over everything the name resolves to (a group name is expanded to its members).
+  `?model=` picks the cache rows to read; audio.cpp's own parameter is moot. Visibility is
+  **routing-consistent**: the token's model override, then a service token's allowlist,
+  then exactly the mappings a speech dispatch for this token could reach
+  (`Resolver.ReachableCandidates`: the group and locked rule, resource-group provisioning),
+  then only mappings that are a **plain tts model now** (`(speech, yes)` and not
+  `(speech_clone, yes)`, read at request time, so a cached list that outlived a flip to a
+  clone model offers nothing). **No-leak:** every "nothing to show" case (an unknown name,
+  one the token cannot route to or is not allowed, a non-speech or clone model, nothing
+  cached) is the same `200` with `"voices": []`; a missing or blank `model` is `400`
+  `model.name_required`; a store failure is `500` `model.voices_failed`, never an empty
+  answer. Voices are not part of `/v1/models`.
+- **`GET /api/portal/model-voices?name=<gateway model name>`** is the browser's route to the
+  same cache (`handlePortalModelVoices`, session cookie, `gateway:use`; the public endpoint
+  refuses the cookie). It answers `{"voices": [...]}` and applies the **portal's**
+  visibility rule rather than the routing-consistent one. **The gate, precisely:**
+  hidden/locked suppression applies to the **requested name only** (a non-admin asking for a
+  hidden or locked model gets the empty answer, an admin bypasses it), and **the members of
+  a group are filtered by provisioning only**, so a locked member's voices are still listed
+  through its group (a hidden or locked model is a full member of a group). Both routes
+  share one union core, `cachedVoicesForMappings`, and differ only in who may see which
+  mapping.
+- **A requested `voice` steers routing, and fails open** ([Routing & Model Selection
+  §2.5](routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open)). The
+  handler sniffs the body's `voice` (`sniffSpeechVoice`: a non-blank JSON string, exactly as
+  sent, else none) into `inference.Request.RequiredVoice`. When at least one candidate's
+  cached list contains it, routing is restricted to the candidates that do; otherwise the
+  request routes exactly as it did before voices were routable, so an existing client that
+  sends a free-text or unknown voice is unaffected, and the upstream stays the authority
+  (audio.cpp answers an unknown voice with **HTTP 500**, relayed like any other speech
+  error). If the voice narrowed the candidates and none of those is usable the answer is
+  `503` `routing.voice_unavailable` (§13) instead of the generic no-healthy-host.
+
+The portal chat's speech composer reads the cache through the portal route (§12), so its
+`voice` field is a combobox over that list and still takes free text.
 
 **9. The portal chat is a caller of this endpoint.** A chat thread of kind `speech`
 reaches `POST /v1/audio/speech` through the run executor, over the internal loopback pair
@@ -1698,7 +1746,25 @@ bound, from which the gateway's health loop derives the `speech` and `transcript
 verdicts of an `audio_cpp` application ([Routing & Model Selection
 §2.3](routing-and-model-selection.md#23-the-capability-gate)). A transport failure or
 a non-2xx status is an error and states nothing; a 2xx body that does not name the
-model, or cannot be read, is an empty verdict, not an error.
+model, or cannot be read, is an empty verdict, not an error. The same read also states
+whether the model is **loaded** right now (`AudioCppVerdicts.Loaded`, from the listing's
+`loaded` flag, which the verdict decode used to drop), and that gates the voices step
+below.
+
+It also implements the optional **`AudioCppVoicesLister`** capability (`ListVoices`,
+`internal/provider/audiocpp_voices.go`, dispatched by the `Multiplexer` under a tracing
+span): a `GET /v1/audio/voices` through the same transport, credential, 1 MiB bound and
+`target.Timeout`, decoded as audio.cpp's flat `{"voices": [names]}` into name-only
+`Voice` values. It never sends `?model=` (audio.cpp ignores it and lists the model it has
+loaded, so the caller must have observed that model loaded before attributing the result
+to a mapping). Unlike the tolerant models probe it **tells a genuine empty listing from a
+failure**: a valid listing with an empty, absent or null `voices` is a success (an empty,
+non-nil slice, which the health loop stores), whereas a transport failure, a non-2xx
+status, or a body that cannot be read or decoded is `ErrUnavailable` and states nothing, so
+a garbage or HTML 2xx never reads as "the model has no voices". A blank name is dropped
+and every other name is kept verbatim, because the match upstream is exact. Its callers are
+the health loop's two voices passes
+([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)).
 
 The **native Gemini client** (`GeminiClient`) is not an OpenAI-dialect client and
 shares none of that path machinery. It translates the neutral request and response
@@ -2963,11 +3029,27 @@ way `kind` and `image` are (`omitempty`, and cleared server-side for any non-spe
 so a text or image chat's stored and wire bytes are unchanged; a speech thread always
 emits the key, `{}` when empty):
 
-- **`voice` is free text.** Its placeholder says the model's own default applies and is
-  never written, and a blank leaves the model on that default. audio.cpp's voices are not
-  discoverable through the gateway (the voices listing is not proxied, [ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
-  (j), and the agent router has no voices route), so there is no dropdown: a
-  discoverable list is a deferred enhancement with its own decision.
+- **`voice` is a combobox: a dropdown of the voices the gateway has cached for the model
+  that still accepts free text** (`SpeechVoiceField.tsx`, an MUI `Autocomplete` in `freeSolo`
+  mode, outside `chat/` for the architecture test's sake), bound to the existing `voice`
+  field of `ChatAudioSettings` (it is the field audio.cpp consumes, so nothing on the run
+  path or in the settings wire changed). Its placeholder says the model's own default
+  applies and is never written, and a blank leaves the model on that default. When the
+  effective model synthesizes speech, `ChatStore` fetches `GET /api/portal/model-voices`
+  for it (`api.modelVoices`, exposed as `modelVoices`; §3.6 item 8 has the endpoint, the
+  cache behind it and the portal visibility rule), shaped like the image-options fetch
+  above: the list is **cleared first** on every model change (a voice belongs to one model,
+  so the previous model's names are never on offer while the next fetch is in flight), a
+  stale response is discarded (latest pick wins), and the whole thing is **fail-open** — a
+  failed fetch, an empty answer and a model with no cache are the same empty list, which
+  leaves the plain free-text field. A list is an offer, never a constraint (the cache
+  holds only the voices the health loop has seen), so any name may be typed and what is
+  typed is what the run sends; a saved voice the list omits stays shown rather than being
+  blanked, and the helper hint (a voice may be picked or a name typed) appears only while
+  there is a list. An unknown voice still reaches audio.cpp, which answers HTTP 500
+  ([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter),
+  [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+  (f) amendment).
 - **`speed` is passed through as given** (placeholder `1.0`, no clamp: the model's own
   range applies).
 - **Advanced is a JSON passthrough.** One text box takes a JSON object whose keys are
@@ -3292,6 +3374,9 @@ Every inference error response uses the gateway-wide envelope
 | `transcription.upstream_error` | the upstream's own status, or **502** | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"` (an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged); **and**, as a 502, a 2xx response that was **over the buffer bound** or broke off mid-read, with nothing of the body written (§3.7) |
 | `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images, speech and transcription relays answer when the resolved agent-launched child's spec excludes `openai_images` (`openai_audio` for speech and transcription), and what the text translate path answers when that child's spec is images-only or audio-only (§6) |
 | `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |
+| `routing.voice_unavailable` | **503** | a speech request named a `voice` that some candidate's cached voice list offers, the voice therefore **narrowed** the candidates to those, and none of them is usable (unreachable, unhealthy or busy) — `routing.no_healthy_host`'s narrower twin, answered instead of it **only** when the voice narrowed the pool; a voice nothing is known to offer never produces it ([Routing & Model Selection §2.5](routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open), §3.6 item 8) |
+| `model.name_required` | 400 | `GET /v1/audio/voices` without a non-blank `model`, or `GET /api/portal/model-voices` (and `model-image-options`) without a non-blank `name`: a client bug an empty list would hide (§3.6 item 8) |
+| `model.voices_failed` | 500 | a store failure while reading the voices cache or the visibility it depends on, on either voices route; never read as an empty list (§3.6 item 8) |
 | `routing.model_not_capable` | 404 | candidates exist for the model but none carries a `yes` verdict for a capability the endpoint requires — for an edit's `image_edit`, one that is not **derived**: no `image: yes`, or an operator's `image_edit: no`; for speech or transcription, no `(speech, yes)` or `(transcription, yes)` verdict, an unprobed model included ([Routing & Model Selection §2.3](routing-and-model-selection.md#23-the-capability-gate)) |
 | `routing.admission_queue_timeout` / `_full` | 503 | admission queue (see [Routing & Model Selection §6.3](routing-and-model-selection.md)) |
 | `provider.timeout` / `.invalid_response` / `.unavailable` | 502 | upstream call failed or returned something unparseable |
@@ -3322,7 +3407,8 @@ attempted) `routing.Target`, so a request refused *before* `Resolve` leaves no
   upstream is contacted and nothing reaches `recordUsage`.
 - **Recorded**, with `status:"error"` — everything from `Resolve` onward:
   `routing.no_model_route` / `routing.no_healthy_host` /
-  `routing.model_not_capable`, both `routing.admission_queue_*` rejections,
+  `routing.voice_unavailable` / `routing.model_not_capable`, both
+  `routing.admission_queue_*` rejections,
   `responses.endpoint_disabled` / `messages.endpoint_disabled` (only knowable
   after model resolution, and recorded against the resolved target), the native
   relay's `messages.invalid_output_config` (§9.2; its translate-path twin is a

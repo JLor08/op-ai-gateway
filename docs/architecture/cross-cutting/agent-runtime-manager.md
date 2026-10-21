@@ -1223,8 +1223,9 @@ fact about this runtime is, and why:
 - **Its `image` verdict is automatic too, read through the agent rather than
   around it.** The gateway's health loop reaches only an **external**
   `stable_diffusion_cpp` application's `/sdcpp/v1/capabilities` — the agent's
-  router passes only `/props` through per model, so the health loop cannot
-  reach an agent-launched child at all. Instead the agent's own per-type
+  router passes only `/props` (and, since 0.11.0, an audio.cpp child's
+  `/v1/audio/voices`) through per model, so the health loop cannot reach an
+  agent-launched sd-server child's capabilities document at all. Instead the agent's own per-type
   capability probe reads that same document over its loopback connection to
   the child and reports the verdict under the identical `sdcpp_capabilities`
   source (§10; [Routing & Model Selection
@@ -1378,8 +1379,9 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Five fixed GET-only routes and one POST route; any other method on those paths
-falls through to model routing.
+Six fixed GET-only routes and one POST route (the `/upstream` passthrough counts
+once per allowlisted endpoint: `/props` and, since 0.11.0, `/v1/audio/voices`); any
+other method on those paths falls through to model routing.
 
 | Route | Answers | Blocks during a load? |
 |---|---|---|
@@ -1387,6 +1389,7 @@ falls through to model routing.
 | `GET /running` | llama-swap's shape, `{"running":[{"model":"<upstream>","state":"ready"}]}` — **only** specs in state `running`. | Never |
 | `GET /v1/models` | OpenAI's shape, listing **every** managed spec including cold ones. | Never |
 | `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved via `Status()` **only** — a match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one. Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
+| `GET /upstream/{model}/v1/audio/voices` | The second endpoint on the same `/upstream` allowlist (issue #251, the `runtime_voices` feature, `Since: "0.11.0"`): an audio.cpp child's voice listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved via `Status()` **only**, **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Two differences from `/props`: the outbound path is exactly `/v1/audio/voices`, and the **inbound query string is not forwarded** (audio.cpp ignores `?model=` and lists the voices of the model it has loaded, so the request's model only selects the child). | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `POST /ensure/{model}` | Starts the managed child for `model` and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
@@ -1423,12 +1426,31 @@ answers `/upstream/{model}/props` for a cold child with
 
 **`/upstream/{model}/props` is the router's first path-parameter dispatch —
 a new contract BESIDE §4.2's byte-for-byte body dispatch, not a change to
-it.** A `GET` on the path whose suffix is anything other than `/props` is
-refused outright (`runtime.upstream_endpoint_not_allowed`, §4.3): the
-allowlist is exactly one path, never a generic reverse proxy. A non-`GET` on
-the same path falls through to the ordinary model-routed proxy, same as any
-other method on the other control routes above (the existing M9 rule) — there
-is no separate method check inside this handler.
+it.** A `GET` on the path whose suffix is anything other than an allowlisted
+endpoint is refused outright (`runtime.upstream_endpoint_not_allowed`, §4.3): the
+allowlist is a fixed table, never a generic reverse proxy. It held exactly one
+endpoint, `/props`, until issue #251 added a second, `/v1/audio/voices`; each
+table entry carries its own `forwardQuery`, true for `/props` (llama.cpp reads
+e.g. `?model=`) and false for the voices read, which is why the two share one
+`serveUpstream` handler and one Status-only relay (`relayToRunningChild`) and still
+differ in the outbound query. A non-`GET` on the same path falls through to the
+ordinary model-routed proxy, same as any other method on the other control routes
+above (the existing M9 rule) — there is no separate method check inside this
+handler.
+
+**The voices route exists because audio.cpp lists voices only for a model it has
+loaded, and the child listens on a loopback port the gateway cannot reach**
+([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)).
+It is the same Status-only, never-start read as `/props`: asking for the voices of a
+cold child answers `404 runtime.model_not_running`, which the gateway's agent-child
+voices pass (`probeAgentVoices`, in app health) treats as **"no voices this tick"** —
+it keeps the row already cached and backs off for that mapping — and never as a reason
+to boot the child. The pass asks only for a mapping whose model the agent reports
+loaded, whose spec is of kind `audio_cpp` and which is a plain tts model (§7 has the
+flag it is gated on), attaches the mapping's own `routing.SpecUpstreamAuth` credential
+as `/props` does, and reaches the route with the endpoint
+`<router>/upstream/<model>` to which its lister appends `/v1/audio/voices`. The
+response is the child's own `{"voices": [...]}`, relayed unmodified.
 
 **`POST /ensure/{model}` is the one control route that starts a child**, and it
 starts it without forwarding a request
@@ -1527,13 +1549,13 @@ request-id concept.
 | Code | Status | Meaning |
 |---|---|---|
 | `runtime.model_not_managed` | 404 | No active launch spec for this model. |
-| `runtime.model_not_running` | 404 | Managed but not currently running — `/upstream/{model}/props` (§4.1) never starts a child, so a cold match gets this instead of a boot. |
+| `runtime.model_not_running` | 404 | Managed but not currently running — `/upstream/{model}/props` and `/upstream/{model}/v1/audio/voices` (§4.1) never start a child, so a cold match gets this instead of a boot. For the voices read it is the gateway's "no voices this tick", not an error to act on. |
 | `runtime.start_failed` | 502 | The process exited or never became healthy. |
 | `runtime.start_timeout` | 504 | `startup_timeout_seconds` elapsed — kept distinct from `start_failed` because it is a different diagnosis. |
 | `runtime.admission_blocked` | 503 | No slot freed within the wait window. |
 | `runtime.not_permitted` | 502 | Agent-local policy refused the binary, the directory or a placeholder — a configuration error, explicitly **not** transient. |
 | `runtime.request_too_large` | 413 | Body over the router's limit. |
-| `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props` — the passthrough allowlist (§4.1) is exactly one path. |
+| `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props` or `/v1/audio/voices` — the passthrough allowlist (§4.1) is exactly those two endpoints. |
 | `runtime.upstream_gone` | 502 | The child died during the request — **and the fallthrough** for a raw connection failure, a non-2xx the router could not forward, or the manager-closed sentinel. |
 
 Collapsing or renaming any of these destroys the distinction between a
@@ -2695,11 +2717,11 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Seven
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Eight
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
-`runtime_config_files`); two,
+`runtime_config_files`, `runtime_voices`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
@@ -2729,7 +2751,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_ensure` ([§4.1](#41-control-routes),
 [§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`,
 `multipart_proxy` ([§4.2](#42-model-routing)), `Since: "0.9.0"`, and
-`runtime_config_files` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)), `Since: "0.10.0"`
+`runtime_config_files` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)), `Since: "0.10.0"`, and
+`runtime_voices` ([§4.1](#41-control-routes)), `Since: "0.11.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -2910,6 +2933,23 @@ and `multipart_proxy` there is no route the gateway would otherwise send to an
 agent that cannot serve it, because the document carrying `config_files` is the
 one every agent already polls. `server-agent`'s `Version` moved `0.9.2` →
 `0.10.0` for this entry, MINOR per the same rule.
+
+`runtime_voices` (issue #251, [ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter))
+has the `runtime_upstream_props` shape, not the `runtime_config_files` one: **the gateway
+gates real behavior on it, fail-closed, and that gate is the flag's purpose.** It says the
+router serves `GET /upstream/{model}/v1/audio/voices` (§4.1), and the gateway's agent-child
+voices pass reads it off the agent's sample (`hasAgentFeature(…,
+gateway.RuntimeVoicesFeature)`, `AgentFeatures.Has`) before it asks anything. An agent that
+predates the route has no such control route, so the GET falls through to model routing
+and answers `404 runtime.model_not_managed` — the same status and code an unmanaged model
+gets, so a probe could not tell an old agent from an unknown model, and would only add a
+silent no-op request each tick for as long as the model stayed loaded. A server on such an
+agent (or one that has not reported since a gateway restart) simply has no cached voices,
+which the portal's picker handles fail-open (plain free text). The name is on the agent's
+list alone, spelled identically on both sides because the agent module imports nothing from
+the gateway (`gateway.RuntimeVoicesFeature` is exported for the health loop in
+`cmd/gateway`, the way `RuntimeUpstreamPropsFeature` is). `server-agent`'s `Version` moved
+`0.10.2` → `0.11.0` for this entry, MINOR per the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -3130,6 +3170,19 @@ agent reports for a clon child, which the gateway observes, so the rule makes it
 `agent.Features` gains nothing and the wire shape is unchanged (the same open-vocabulary
 verdict on the same source, only the task string it keys on is corrected). The `Version`
 pin moves to `0.10.2` ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only) (d) correction note).
+
+**`0.10.2` → `0.11.0` (issue #251, the audio.cpp voices route) is MINOR, the plain case
+once more.** `agent.Features` gained `runtime_voices` for the router's
+`GET /upstream/{model}/v1/audio/voices` ([§4.1](#41-control-routes)), a new observable
+router behavior that the gateway's agent-child voices pass gates on, fail-closed
+([§7](#7-feature-negotiation)). The bump is **one for the whole branch** — the route, the
+per-endpoint `forwardQuery` allowlist refactor of `/upstream`, and the flag all ship in it —
+and the `Version` assertion moved to the newest feature's test beside
+`TestFeaturesDeclareRuntimeConfigFiles` (that test keeps its own presence and `Since` check,
+and its `Since` stays `"0.10.0"`). Like the audio bumps before it, an older gateway that does
+not know the name simply never asks, and an agent older than 0.11.0 is never asked by a newer
+gateway, so there is no mixed-fleet hazard
+([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -7287,10 +7340,11 @@ operator meets first:
   ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)). The
   agent's loopback probe carries no credential
   ([ADR-037](../09-architecture-decisions.md#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)),
-  and the router's `/upstream` allowlist forwards only `/props`, which vLLM
-  does not serve. Closing it means widening that allowlist to
-  `GET /v1/models`, behind a new agent feature and with its own ADR, because
-  the allowlist is a security boundary. Two shortcuts were rejected: a
+  and the router's `/upstream` allowlist forwards only `/props` (and, since
+  0.11.0, an audio.cpp child's `/v1/audio/voices`), and vLLM serves neither.
+  Closing it means widening that allowlist to `GET /v1/models`, behind a new
+  agent feature and with its own ADR, because the allowlist is a security
+  boundary (the voices read was added that way: its own flag and ADR-067). Two shortcuts were rejected: a
   gateway-side `POST /tokenize` counts as a use of the model and relies on an
   endpoint vLLM leaves unguarded, and parsing `--max-model-len` out of the
   launch args records a guess, not an observation.

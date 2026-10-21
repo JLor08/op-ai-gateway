@@ -341,7 +341,7 @@ func TestFeaturesDeclareRuntimeConfigFiles(t *testing.T) {
 // for every such read, which cannot be told apart from an unmanaged model -- so
 // a rename here silently stops every agent child's voices from being cached.
 // The gateway spells the same string in its own constant
-// (runtimeVoicesFeature, gateway/backend/internal/gateway/agent_features.go);
+// (RuntimeVoicesFeature, gateway/backend/internal/gateway/agent_features.go);
 // this module cannot import it.
 func TestFeaturesDeclareRuntimeVoices(t *testing.T) {
 	found := false

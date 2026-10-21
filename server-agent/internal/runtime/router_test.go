@@ -1452,8 +1452,9 @@ func TestRouterUpstreamPropsUnknownModelAndNilManager(t *testing.T) {
 	}
 }
 
-// TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints: /props is the entire
-// allowlist. A running child must see ZERO traffic for a refused path.
+// TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints: /props and
+// /v1/audio/voices are the entire allowlist (the two entries of
+// upstreamEndpoints). A running child must see ZERO traffic for any other path.
 func TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints(t *testing.T) {
 	var hits atomic.Int32
 	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

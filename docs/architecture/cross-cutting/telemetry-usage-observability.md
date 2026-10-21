@@ -1540,7 +1540,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-93-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-94-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -2041,7 +2041,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-93-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-94-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open
@@ -2086,8 +2086,10 @@ nobody can make from a count:
   `task` decides both at once: `tts`/`clon` is `(speech, yes)` and `(transcription,
   no)`, `asr` is `(transcription, yes)` and `(speech, no)`, any other non-empty task is
   `no` for both, and a model the listing does not name (it was taken to list **loaded**
-  models only; a v0.9.1 probe also saw an unloaded model named, and the prober decodes
-  `task`, never `loaded`), an entry with no task, an unreachable server
+  models only; a v0.9.1 probe also saw an unloaded model named, and the verdicts read
+  `task`, never `loaded`: the prober does decode `loaded` too since issue #251, but it
+  gates only the pass's separate, post-verdict voices step, which caches a loaded plain tts
+  model's voices, [ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter), never a verdict), an entry with no task, an unreachable server
   or an unreadable body writes **no row**, because none of those states that the
   model cannot speak or transcribe. It is written through the same `writeCapabilityRows`, so every
   guard below applies unchanged. The pass reaches a **static** application only: it does

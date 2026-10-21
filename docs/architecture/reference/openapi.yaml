@@ -260,17 +260,34 @@ paths:
         wrapped with `type: upstream_error` and `code: speech.upstream_error`,
         and any other body is relayed as it came. Metered in seconds of audio
         (`billing_unit: audio_second`, read from the upstream's
-        `X-AudioCPP-Audio-Duration-Ms` header), not in tokens. The gateway does
-        not proxy `GET /v1/audio/voices`. Beyond those it answers the same
-        statuses as every other inference path (429/402 from the principal
-        limiter, 503 from the capacity queue or no healthy host), which this
-        path-level spec does not enumerate. Alias: /openai/v1/audio/speech.
+        `X-AudioCPP-Audio-Duration-Ms` header), not in tokens. A requested
+        `voice` is a fail-open routing preference: when at least one candidate
+        mapping's cached voice list (see GET /v1/audio/voices) offers it,
+        routing is restricted to the candidates that do, and otherwise it is
+        unfiltered, so a free-text or unknown voice reaches the upstream as
+        before (audio.cpp answers an unknown voice with HTTP 500). When the
+        voice narrowed the candidates and none of those is usable the answer
+        is 503 `routing.voice_unavailable`, in place of
+        `routing.no_healthy_host` and only then. Beyond those it answers the
+        same statuses as every other inference path (429/402 from the
+        principal limiter, 503 from the capacity queue or no healthy host),
+        which this path-level spec does not enumerate. Alias:
+        /openai/v1/audio/speech.
       security: [{ bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/SpeechRequest' }
       responses:
         '200': { $ref: '#/components/responses/AudioWav' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: >
+            The Error envelope with code `routing.voice_unavailable` when the
+            requested `voice` narrowed the candidates to the servers that offer
+            it and every one of them is unreachable, unhealthy or busy;
+            otherwise `routing.no_healthy_host` or a capacity-queue code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /openai/v1/audio/speech:
     post:
       tags: [inference]
@@ -279,6 +296,72 @@ paths:
       requestBody: { $ref: '#/components/requestBodies/SpeechRequest' }
       responses:
         '200': { $ref: '#/components/responses/AudioWav' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: >
+            The Error envelope with code `routing.voice_unavailable` when the
+            requested `voice` narrowed the candidates to the servers that offer
+            it and every one of them is unreachable, unhealthy or busy;
+            otherwise `routing.no_healthy_host` or a capacity-queue code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/audio/voices:
+    get:
+      tags: [inference]
+      summary: The voice names the gateway has cached for a speech model (a read of the cache, never an upstream call)
+      description: >
+        Scope `gateway:use` or `llm:invoke`: a bearer token OR the internal
+        trusted-loopback header pair (unreachable by any external client, which
+        is why only bearerAuth is modelled below), never a portal session
+        cookie (a browser uses GET /api/portal/model-voices). The `model` query
+        parameter is the gateway model name (a group name is expanded to its
+        members); it selects which cached rows are read, and audio.cpp's own
+        `?model=` is moot (it ignores it and lists the model it has loaded).
+        The answer is the deduplicated, sorted union of the voices cached for
+        the mappings a speech dispatch for this token could reach (the token's
+        model override and a service token's allowlist applied first, then
+        resource-group provisioning and the locked/group-only rule), restricted
+        to mappings that are a plain tts model NOW (`speech` yes and not
+        `speech_clone` yes, read at request time). Nothing is loaded and no
+        upstream is contacted, so the list is available while the model is
+        unloaded. Every "nothing to show" case (an unknown name, a model the
+        token cannot route to or may not use, a non-speech or clone model, one
+        with nothing cached yet) is the same 200 with an empty `voices` list,
+        so the answer cannot be used to probe which models exist. A missing or
+        blank `model` is 400 `model.name_required`; a store failure is 500
+        `model.voices_failed`, never read as an empty list. Voices are not part
+        of /v1/models. Alias: /openai/v1/audio/voices.
+      parameters:
+        - name: model
+          in: query
+          required: true
+          description: The gateway model name (or group name).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/AudioVoices' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500':
+          description: The Error envelope with code `model.voices_failed` (a store failure).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /openai/v1/audio/voices:
+    get:
+      tags: [inference]
+      summary: Alias of /v1/audio/voices
+      parameters:
+        - name: model
+          in: query
+          required: true
+          description: The gateway model name (or group name).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/AudioVoices' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
   /v1/audio/transcriptions:
@@ -1020,6 +1103,55 @@ paths:
                 properties:
                   data: { $ref: '#/components/schemas/ModelImageOptions' }
         '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/model-voices:
+    get:
+      tags: [portal]
+      summary: Voice names cached for a speech model, for the portal voice picker (scope gateway:use)
+      description: >
+        What the portal chat's speech composer may offer in its `voice`
+        combobox for one gateway model: the deduplicated, sorted union of the
+        voices the health loop cached for the model's visible mappings (a group
+        name is expanded to its members). It reads the same persistent cache as
+        GET /v1/audio/voices (which refuses the session cookie a browser holds)
+        through one shared union core, and differs only in the visibility rule,
+        which is the portal's: for a non-admin a requested name that is
+        `hidden` or `locked` answers the empty list (an admin bypasses it), this
+        suppression applying to the REQUESTED name only, and the members of a
+        group are filtered by resource-group provisioning ONLY, never by their
+        own visibility, so a locked member's voices are listed through its
+        group. Only mappings that are a plain tts model now (`speech` yes and
+        not `speech_clone` yes) contribute. Nothing is loaded and no upstream
+        is contacted. Every "nothing to show" case (an unknown, hidden, locked,
+        restricted, non-speech, clone or not-yet-cached model) is the same 200
+        with an empty `voices` list. A missing or empty `name` is 400
+        `model.name_required`; a failed read is 500 `model.voices_failed`, never
+        reported as an empty list. See api-surface.md and
+        compatibility-and-inference.md section 3.6.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: The gateway model name (a query parameter because it may contain `/`).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The cached voices, possibly an empty list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [voices]
+                properties:
+                  voices:
+                    type: array
+                    items: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500':
+          description: The Error envelope with code `model.voices_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/model-group-servers:
     get:
       tags: [portal]
@@ -2924,9 +3056,14 @@ components:
               voice:
                 type: string
                 description: >
-                  The voice name, passed to the upstream as sent. The gateway
-                  does not proxy audio.cpp's `GET /v1/audio/voices`, so voice
-                  names are learned out of band.
+                  The voice name, passed to the upstream as sent. The names a
+                  model accepts are listed by `GET /v1/audio/voices` (the
+                  gateway's cache of audio.cpp's own listing). It is also read,
+                  never changed, as a fail-open routing preference: when some
+                  candidate's cached list offers it, routing is restricted to
+                  the candidates that do, otherwise it is unfiltered, so a
+                  free-text or unknown voice still reaches the upstream, which
+                  answers an unknown voice with HTTP 500.
               response_format:
                 type: string
                 enum: [wav]
@@ -3016,6 +3153,24 @@ components:
       content:
         audio/wav:
           schema: { type: string, format: binary }
+    AudioVoices:
+      description: >
+        The voice names cached for the model, as the deduplicated, sorted union
+        across the mappings the token can reach, or an empty list for every
+        "nothing to show" case. `voices` is never null. Each name is exactly
+        what a speech request's `voice` field takes.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [model, voices]
+            properties:
+              model:
+                type: string
+                description: The model name exactly as the client asked for it.
+              voices:
+                type: array
+                items: { type: string }
     Transcription:
       description: >
         The buffered 200 is audio.cpp's transcription document, written through
