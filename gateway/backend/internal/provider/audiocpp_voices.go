@@ -28,9 +28,12 @@ type Voice struct {
 
 // AudioCppVoicesLister is an optional provider capability: it GETs
 // target.Endpoint + /v1/audio/voices and returns the voice names that endpoint
-// lists. A transport failure or a non-2xx status is an error and carries no
-// voices, so the caller stores nothing. A 2xx body that lists no voices, or
-// cannot be read, is NOT an error, only an empty (non-nil) slice.
+// lists. A valid (possibly empty) voices listing is a success: a server that
+// lists no voices yields an empty, non-nil slice and a nil error, which is a
+// genuine "this model has no voices" the caller may store. A transport error, a
+// non-2xx status, or an unreadable or undecodable body returns ErrUnavailable
+// and no voices, so the caller stores nothing: a garbage, HTML or truncated body
+// must never read as "the model has no voices".
 //
 // audio.cpp answers for the model it currently has LOADED and ignores a ?model=
 // query parameter (live-verified against v0.9.1: the same result for no
@@ -58,8 +61,8 @@ func (c *OpenAICompatibleClient) ListVoices(ctx context.Context, target routing.
 // fetchAudioCppVoices is the GET behind ListVoices. Modelled on
 // fetchAudioCppModels: it honours target.Timeout, attaches the per-application
 // upstream credential, and bounds the body at 1 MiB. A transport failure or a
-// non-2xx status is an ErrUnavailable; decoding is the tolerant
-// parseAudioCppVoices. model is intentionally not put on the wire: see
+// non-2xx status is an ErrUnavailable, and so is a body that cannot be read or
+// decoded (parseAudioCppVoices). model is intentionally not put on the wire: see
 // AudioCppVoicesLister.
 func fetchAudioCppVoices(ctx context.Context, httpClient *http.Client, target routing.Target, _ string) ([]Voice, error) {
 	if target.Timeout > 0 {
@@ -84,7 +87,11 @@ func fetchAudioCppVoices(ctx context.Context, httpClient *http.Client, target ro
 	if err != nil {
 		return nil, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	return parseAudioCppVoices(body), nil
+	voices, err := parseAudioCppVoices(body)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode voices: %v", ErrUnavailable, err)
+	}
+	return voices, nil
 }
 
 // audioCppVoicesDoc is the whole of the listing: one array of voice names.
@@ -93,24 +100,29 @@ type audioCppVoicesDoc struct {
 }
 
 // parseAudioCppVoices decodes a /v1/audio/voices body, {"voices":["a","b"]}, into
-// one Voice per name, in the server's order. It is TOLERANT, like
-// parseAudioCppModels: it never fails and never returns nil. An empty or absent
-// or null voices array, a body that is not JSON, and a voices field (or an entry
-// in it) of the wrong type all yield an empty slice, so a probe never breaks over
-// an unexpected shape. A blank name is dropped: it names no voice directory, and
-// an empty voice on a speech request means "no voice chosen". Other names are
-// kept verbatim -- the match against the server is exact.
-func parseAudioCppVoices(body []byte) []Voice {
-	voices := []Voice{}
+// one Voice per name, in the server's order. Unlike the tolerant
+// parseAudioCppModels, it tells a genuine empty listing from a failure, because
+// the caller stores a genuine empty listing but must skip a failed one:
+//   - a valid listing with an empty, absent or null voices array is a success and
+//     yields an empty, non-nil slice ("the server lists no voices")
+//   - a body that is not JSON (empty, HTML, truncated), a voices field of the
+//     wrong type, or an entry in it of the wrong type is an error and yields no
+//     voices, because it says nothing about which voices the model has
+//
+// A blank name is dropped: it names no voice directory, and an empty voice on a
+// speech request means "no voice chosen". Other names are kept verbatim -- the
+// match against the server is exact.
+func parseAudioCppVoices(body []byte) ([]Voice, error) {
 	var doc audioCppVoicesDoc
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return voices
+		return nil, err
 	}
+	voices := []Voice{}
 	for _, name := range doc.Voices {
 		if strings.TrimSpace(name) == "" {
 			continue
 		}
 		voices = append(voices, Voice{Name: name})
 	}
-	return voices
+	return voices, nil
 }

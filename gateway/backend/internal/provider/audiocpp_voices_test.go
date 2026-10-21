@@ -23,25 +23,43 @@ import (
 const audioCppLiveVoices = `{"voices":["demo_1_man","demo_2_man","demo_3_woman","demo_4_woman"]}`
 
 func TestParseAudioCppVoices(t *testing.T) {
+	// A valid listing -- even one that lists no voices -- is a success; a body
+	// that is not a decodable listing is an error and carries no voices, so a
+	// garbage body can never read as "the model has no voices".
 	cases := []struct {
-		name string
-		body string
-		want []Voice
+		name    string
+		body    string
+		want    []Voice
+		wantErr bool
 	}{
-		{"the live flat name list", audioCppLiveVoices, []Voice{{Name: "demo_1_man"}, {Name: "demo_2_man"}, {Name: "demo_3_woman"}, {Name: "demo_4_woman"}}},
-		{"two names", `{"voices":["a","b"]}`, []Voice{{Name: "a"}, {Name: "b"}}},
-		{"an empty list", `{"voices":[]}`, []Voice{}},
-		{"an absent voices field", `{}`, []Voice{}},
-		{"a null voices field", `{"voices":null}`, []Voice{}},
-		{"an unknown extra field is ignored", `{"model":"m","voices":["a"]}`, []Voice{{Name: "a"}}},
-		{"a blank name is dropped", `{"voices":["a","","  ","b"]}`, []Voice{{Name: "a"}, {Name: "b"}}},
-		{"a body that is not JSON", `<html>not the listing</html>`, []Voice{}},
-		{"a voices field of the wrong type", `{"voices":"demo_1_man"}`, []Voice{}},
-		{"an entry of the wrong type", `{"voices":["a",7,"b"]}`, []Voice{}},
+		{"the live flat name list", audioCppLiveVoices, []Voice{{Name: "demo_1_man"}, {Name: "demo_2_man"}, {Name: "demo_3_woman"}, {Name: "demo_4_woman"}}, false},
+		{"two names", `{"voices":["a","b"]}`, []Voice{{Name: "a"}, {Name: "b"}}, false},
+		{"an empty list", `{"voices":[]}`, []Voice{}, false},
+		{"an absent voices field", `{}`, []Voice{}, false},
+		{"a null voices field", `{"voices":null}`, []Voice{}, false},
+		{"an unknown extra field is ignored", `{"model":"m","voices":["a"]}`, []Voice{{Name: "a"}}, false},
+		{"a blank name is dropped", `{"voices":["a","","  ","b"]}`, []Voice{{Name: "a"}, {Name: "b"}}, false},
+		{"an HTML body", `<html>not the listing</html>`, nil, true},
+		{"an empty body", ``, nil, true},
+		{"a truncated body", `{"voices":["a","b`, nil, true},
+		{"a voices field of the wrong type", `{"voices":"demo_1_man"}`, nil, true},
+		{"an entry of the wrong type", `{"voices":["a",7,"b"]}`, nil, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseAudioCppVoices([]byte(tc.body))
+			got, err := parseAudioCppVoices([]byte(tc.body))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseAudioCppVoices(%s) = %+v, nil; want an error", tc.body, got)
+				}
+				if got != nil {
+					t.Fatalf("parseAudioCppVoices(%s) = %+v with an error; want no voices", tc.body, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAudioCppVoices(%s) error = %v, want nil", tc.body, err)
+			}
 			if got == nil {
 				t.Fatalf("parseAudioCppVoices(%s) = nil, want a non-nil slice", tc.body)
 			}
@@ -59,9 +77,9 @@ func TestListVoices(t *testing.T) {
 	}
 
 	t.Run("lists the names from GET /v1/audio/voices", func(t *testing.T) {
-		var method, path string
+		var method, path, rawQuery string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			method, path = r.Method, r.URL.Path
+			method, path, rawQuery = r.Method, r.URL.Path, r.URL.RawQuery
 			_, _ = w.Write([]byte(audioCppLiveVoices))
 		}))
 		defer srv.Close()
@@ -75,6 +93,25 @@ func TestListVoices(t *testing.T) {
 		}
 		if method != http.MethodGet || path != "/v1/audio/voices" {
 			t.Fatalf("request = %s %s, want GET /v1/audio/voices", method, path)
+		}
+		if rawQuery != "" {
+			t.Fatalf("request query = %q, want none: audio.cpp ignores ?model=, so the model is never sent upstream", rawQuery)
+		}
+	})
+
+	t.Run("a valid empty listing is a success with an empty non-nil slice", func(t *testing.T) {
+		for _, body := range []string{`{"voices":[]}`, `{}`, `{"voices":null}`} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			got, err := list(t, srv, context.Background(), "m")
+			srv.Close()
+			if err != nil {
+				t.Fatalf("body %s: error = %v, want nil -- a genuine empty listing is a success", body, err)
+			}
+			if got == nil || len(got) != 0 {
+				t.Fatalf("body %s: got %#v, want an empty non-nil slice", body, got)
+			}
 		}
 	})
 
@@ -107,17 +144,19 @@ func TestListVoices(t *testing.T) {
 		}
 	})
 
-	t.Run("a 2xx body that is not the listing is an empty list, not an error", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte("<html>not the listing</html>"))
-		}))
-		defer srv.Close()
-		got, err := list(t, srv, context.Background(), "m")
-		if err != nil {
-			t.Fatalf("error = %v, want nil -- the server answered, it just did not list voices", err)
-		}
-		if got == nil || len(got) != 0 {
-			t.Fatalf("got %#v, want an empty non-nil slice", got)
+	t.Run("a 2xx body that is not a decodable listing is an ErrUnavailable and no voices", func(t *testing.T) {
+		for _, body := range []string{"<html>not the listing</html>", `{"voices":["a","b`, `{"voices":"demo_1_man"}`, ``} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			got, err := list(t, srv, context.Background(), "m")
+			srv.Close()
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("body %q: error = %v, want ErrUnavailable -- an undecodable body must not read as \"the model has no voices\"", body, err)
+			}
+			if got != nil {
+				t.Fatalf("body %q: got %+v, want nil", body, got)
+			}
 		}
 	})
 
