@@ -50,6 +50,18 @@ var (
 	// server cannot serve this model", and an override names ONE server, so there is no
 	// second candidate the distinction could steer to.
 	ErrServerOverrideModelUnavailable = errors.New("routing.server_override_model_unavailable")
+	// ErrVoiceUnavailable: a speech request named a voice that the gateway KNOWS some
+	// candidate offers (its cached voice list names it), the voice therefore NARROWED
+	// the candidates to the ones that offer it, and none of those is usable right now
+	// -- unreachable, unhealthy or busy. It is the answer where ErrNoHealthyHost would
+	// otherwise be, and only there: the generic sentinel says "this model has no host",
+	// which is false when other servers of the same model are healthy and merely lack
+	// the voice, and a client that cannot tell the two apart cannot act on either (retry
+	// shortly vs choose another voice). It is NEVER returned for a voice nothing is known
+	// to offer: that request is not narrowed at all and fails, if it fails, as it always
+	// did. Maps to HTTP 503 like ErrNoHealthyHost, since the condition is the voice's
+	// servers being down, which a retry can cure.
+	ErrVoiceUnavailable = errors.New("routing.voice_unavailable")
 )
 
 // errAllAtCapacity is an INTERNAL sentinel from selectCandidate: every candidate is at its
@@ -415,6 +427,12 @@ type resolverStore interface {
 	// guard test in internal/portal, so adding it here costs nothing but this
 	// line.
 	MappingCapabilitiesForMappings(ctx context.Context, mappingIDs []string) (map[string][]CapabilityRow, error)
+	// ModelMappingCacheForMappings is the voice filter's bulk read (#251): the
+	// voices cache (ModelMappingCacheVoices) of every candidate in one query, read
+	// only for a request that names a voice (voiceScopeFor). Like the capability
+	// read above it is already implemented on every driver and decorated by the
+	// generated tracing wrapper, so the narrow interface gains it for free.
+	ModelMappingCacheForMappings(ctx context.Context, mappingIDs []string, cacheType string) (map[string][]ModelMappingCacheRow, error)
 	// VendorAccountsByOwner and VendorAccountModels are the per-user vendor-account
 	// surface resolveVendorAccount reads: the owner's accounts (sorted by id) -- the
 	// OWNER-ONLY fallback routableVendorAccounts uses when no VendorAccountEnumerator
@@ -658,8 +676,8 @@ func (r *Resolver) Resolve(ctx context.Context, token auth.Token, req inference.
 
 // resolveStandard is the self-hosted/shared resolution path: model-group dispatch,
 // route affinity, then fresh candidate selection (ActiveMappingsForModel →
-// filterProvisioned → filterServesEndpoint → filterCapable → selectCandidate →
-// targetFrom). It is everything Resolve did below the server-override short-circuit
+// filterProvisioned → filterServesEndpoint → filterCapable → the fail-open voice filter →
+// selectCandidate → targetFrom). It is everything Resolve did below the server-override short-circuit
 // before the vendor-account branch was layered on top; extracting it verbatim lets
 // Resolve wrap it with the vendor precedence without duplicating any of its
 // ErrNoModelRoute exits. now and apiFlavor are passed in, computed once by Resolve.
@@ -692,7 +710,14 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 			return Target{}, ErrNoModelRoute // a locked group-only model requested directly
 		}
 	}
-	if token.ID != "" {
+	// A request that names a voice does not take a sticky pin: the pin was chosen
+	// without regard to the voice, and following it would bypass the voice filter
+	// below. No such pin can exist today -- both pin writers are guarded on the
+	// capability list, a speech request always carries one, and AffinityKey's coarse
+	// flavor keeps speech keys apart from every text endpoint's -- so this changes
+	// nothing for any request that reaches here now; it keeps the voice contract
+	// intact should that guard ever be lifted.
+	if token.ID != "" && req.RequiredVoice == "" {
 		target, ok, err := r.resolveAffinity(ctx, key, req.APIFlavor, req.RequiredCapabilities, now)
 		if err != nil {
 			return Target{}, err
@@ -757,6 +782,17 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 	if len(candidates) == 0 {
 		return Target{}, ErrNoModelRoute
 	}
+	// The voice filter (#251), fail-open: with a voice named AND at least one candidate
+	// listing it in its cached voices, only the candidates that list it are selectable;
+	// otherwise voice is nil and candidates are untouched. It runs on the pool the
+	// capability gate left, AFTER the two empty-pool sentinels above, so those answers
+	// are exactly what they were, and BEFORE the admission parameters below, so a
+	// request queues on the voice's servers and not on servers it cannot use.
+	voice, err := r.voiceScopeFor(ctx, req.RequiredVoice, candidates)
+	if err != nil {
+		return Target{}, err
+	}
+	candidates = voice.restrict(candidates)
 
 	// Admission-queue params (CP4): the servers to watch for a freeing slot, and the wait
 	// timeout = the MAX admission_queue_timeout_seconds across the candidate apps (0 = at
@@ -805,7 +841,9 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 			return Target{}, err
 		}
 		if !ok {
-			return Target{}, ErrNoHealthyHost
+			// ErrVoiceUnavailable instead when the voice narrowed the pool: the servers
+			// that list it are all unusable (see voiceScope.refine).
+			return Target{}, voice.refine(ErrNoHealthyHost)
 		}
 		target, err := r.targetFrom(ctx, selected, apiFlavor)
 		if err != nil {
@@ -1294,7 +1332,9 @@ func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, mod
 // specific server before calling Resolve; this method only performs the ROUTING checks:
 // the requested model must actually be offered by that server (a live active mapping on
 // an active application), and the server must be enabled + reachable unless the caller
-// explicitly forces through an unhealthy/unreachable one.
+// explicitly forces through an unhealthy/unreachable one. A requested voice
+// (req.RequiredVoice) is deliberately not applied either: the override names ONE server,
+// so there is nothing for the voice to choose between, and it does not veto the override.
 func (r *Resolver) resolveServerOverride(ctx context.Context, req inference.Request, apiFlavor string) (Target, error) {
 	candidates, err := r.store.ActiveMappingsForModel(ctx, req.Model, apiFlavor)
 	if err != nil {
@@ -2076,12 +2116,72 @@ const (
 // modeClimbUp is the climb_up value of GroupPolicy.FailoverMode.
 const modeClimbUp = "climb_up"
 
+// memberPool is the pool one gateway model name (a group member, or the model itself)
+// offers a request BEFORE any policy or request preference narrows it: the store read
+// (active mappings on active applications serving apiFlavor), the provisioning gate,
+// the endpoint-mode refinement and the capability gate, in that order. It is the one
+// definition of "could serve this request" that eligibleCandidates (the walk and the
+// speed ordering) and groupVoiceScope (the voice pre-pass over the flattened group)
+// both start from, so the pre-pass can never count a candidate the walk would not see.
+func (r *Resolver) memberPool(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, required []string) ([]MappingCandidate, error) {
+	cands, err := r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
+	if err != nil {
+		return nil, fmt.Errorf("resolve member mappings: %w", err)
+	}
+	cands, err = r.filterProvisioned(ctx, token, cands)
+	if err != nil {
+		return nil, err
+	}
+	cands = filterServesEndpoint(cands, fineFlavor)
+	// Gated BEFORE live is taken (by the caller): a member whose only live mappings are
+	// all capability-gated must read as memberNoMapping (unknown model), the same
+	// no-leak posture the provisioning gate above already uses, not as
+	// memberUnavailable (a gated-but-real member).
+	return r.filterCapable(ctx, cands, required)
+}
+
+// groupVoiceScope is the group-level voice PRE-PASS: before any member is visited it
+// flattens the group -- every distinct member's memberPool, one flat set of mappings --
+// and asks voiceScopeFor over that whole set. The answer is both halves of the filter at
+// once: "does at least one candidate ANYWHERE in the group list the voice" (the
+// fail-open switch; none does -> nil, the group routes as it always did) and the allowed
+// mapping set the walk then restricts every member to.
+//
+// It has to be group-level, not a per-member rule. eligibleCandidates sees one member's
+// candidates at a time, so "restrict this member only if one of ITS candidates lists the
+// voice" leaves a member without the voice fully eligible, and priority or speed order
+// can then pick it ahead of the member that has it: such a filter never narrows a group.
+//
+// Computed once per request and threaded (groupResolve.voice) through the whole
+// resolveGroup ladder: the loaded-only and speed-floor filters relax between attempts,
+// the voice does not, so a relaxed attempt never reaches a member the voice excluded.
+// Nil for a request that names no voice, without reading anything.
+func (r *Resolver) groupVoiceScope(ctx context.Context, g groupResolve) (*voiceScope, error) {
+	if g.req.RequiredVoice == "" {
+		return nil, nil
+	}
+	var pool []MappingCandidate
+	seen := make(map[string]struct{}, len(g.members))
+	for _, m := range g.members {
+		if _, dup := seen[m.MemberGatewayName]; dup {
+			continue // a duplicated member name is read once
+		}
+		seen[m.MemberGatewayName] = struct{}{}
+		cands, err := r.memberPool(ctx, g.token, m.MemberGatewayName, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities)
+		if err != nil {
+			return nil, err
+		}
+		pool = append(pool, cands...)
+	}
+	return r.voiceScopeFor(ctx, g.req.RequiredVoice, pool)
+}
+
 // eligibleCandidates resolves one group member's candidates and applies every
 // eligibility filter the group's policy imposes: the store read, the provisioning gate,
-// the speed floor, then the loaded-only filter. Both the priority walk (selectMember)
-// and the speed ordering go through it, so they share ONE definition of eligibility
-// instead of two that can drift — the order can never rank a member the walk would
-// refuse.
+// the request's voice restriction (nil for none), the speed floor, then the loaded-only
+// filter. Both the priority walk (selectMember) and the speed ordering go through it, so
+// they share ONE definition of eligibility instead of two that can drift — the order can
+// never rank a member the walk would refuse.
 //
 // live reports whether the member had ANY live, provisioned mapping BEFORE the policy
 // filters ran. It is what keeps the two distinguishable "empty" outcomes apart:
@@ -2102,24 +2202,19 @@ const modeClimbUp = "climb_up"
 // The two policy filters themselves live in filterBySpeedFloor and filterLoaded; both are
 // no-ops for a group that did not opt in, so an opted-out group costs exactly what it did
 // before those settings existed.
-func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, required []string, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
-	cands, err = r.store.ActiveMappingsForModel(ctx, name, apiFlavor)
-	if err != nil {
-		return nil, false, fmt.Errorf("resolve member mappings: %w", err)
-	}
-	cands, err = r.filterProvisioned(ctx, token, cands)
+func (r *Resolver) eligibleCandidates(ctx context.Context, token auth.Token, name, apiFlavor, fineFlavor string, required []string, voice *voiceScope, policy GroupPolicy) (cands []MappingCandidate, live bool, err error) {
+	cands, err = r.memberPool(ctx, token, name, apiFlavor, fineFlavor, required)
 	if err != nil {
 		return nil, false, err
 	}
-	cands = filterServesEndpoint(cands, fineFlavor)
-	// Gated BEFORE live is taken: a member whose only live mappings are all
-	// capability-gated must read as memberNoMapping (unknown model), the same
-	// no-leak posture the provisioning gate above already uses, not as
-	// memberUnavailable (a gated-but-real member).
-	cands, err = r.filterCapable(ctx, cands, required)
-	if err != nil {
-		return nil, false, err
-	}
+	// The group's voice restriction (nil = none), taken over the FLATTENED group by
+	// groupVoiceScope before any member was visited: this member keeps only the
+	// candidates whose mapping is in that set. Applied with the capability gate, BEFORE
+	// live is taken, for the same reason: a member whose every mapping the voice excludes
+	// reads as memberNoMapping, not as a real-but-gated member. It is deliberately not a
+	// GroupPolicy field, so the relaxation ladder (which only ever rewrites the policy)
+	// cannot relax it.
+	cands = voice.restrict(cands)
 	if len(cands) == 0 {
 		return nil, false, nil
 	}
@@ -2183,8 +2278,8 @@ func (r *Resolver) filterLoaded(cands []MappingCandidate, loadedOnly bool) []Map
 //
 // Eligibility (and the memberNoMapping/memberUnavailable distinction it drives) lives in
 // eligibleCandidates; this function only turns that outcome into a status and selects.
-func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, now time.Time, policy GroupPolicy) (MappingCandidate, memberStatus, []string, int, error) {
-	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, req.RequiredCapabilities, policy)
+func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, apiFlavor string, req inference.Request, voice *voiceScope, now time.Time, policy GroupPolicy) (MappingCandidate, memberStatus, []string, int, error) {
+	cands, live, err := r.eligibleCandidates(ctx, token, name, apiFlavor, req.APIFlavor, req.RequiredCapabilities, voice, policy)
 	if err != nil {
 		return MappingCandidate{}, memberUnavailable, nil, 0, err
 	}
@@ -2222,14 +2317,14 @@ func (r *Resolver) selectMember(ctx context.Context, token auth.Token, name, api
 // Cost: this reads EVERY member's mappings (and their telemetry) on every request, where a
 // priority-ordered walk stops at the first available member. That is the price of the
 // ordering, and only groups that opt into it pay it.
-func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, required []string, policy GroupPolicy) ([]GroupMember, error) {
+func (r *Resolver) orderMembersBySpeed(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor, fineFlavor string, required []string, voice *voiceScope, policy GroupPolicy) ([]GroupMember, error) {
 	speed := make(map[string]float64, len(members))
 	for _, m := range members {
 		if _, done := speed[m.MemberGatewayName]; done {
 			continue // a duplicated member name is scored once
 		}
 		best := 0.0
-		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, required, policy)
+		cands, _, err := r.eligibleCandidates(ctx, token, m.MemberGatewayName, apiFlavor, fineFlavor, required, voice, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -2284,12 +2379,12 @@ func (r *Resolver) speedMarginMet(ctx context.Context, best, pinned MappingCandi
 // counts; a member with no mapping does not). anyLive lets resolveGroup pick
 // ErrNoModelRoute (no live mapping anywhere) vs ErrNoHealthyHost (§3g). A hard
 // store/selection error is propagated.
-func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, now time.Time, policy GroupPolicy) (string, MappingCandidate, []string, int, bool, error) {
+func (r *Resolver) firstAvailable(ctx context.Context, token auth.Token, members []GroupMember, apiFlavor string, req inference.Request, voice *voiceScope, now time.Time, policy GroupPolicy) (string, MappingCandidate, []string, int, bool, error) {
 	var atCap []string
 	queueTimeoutSecs := 0
 	anyLive := false
 	for _, m := range members {
-		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, now, policy)
+		sel, status, ids, secs, err := r.selectMember(ctx, token, m.MemberGatewayName, apiFlavor, req, voice, now, policy)
 		if err != nil {
 			return "", MappingCandidate{}, nil, 0, false, err
 		}
@@ -2380,6 +2475,12 @@ type groupResolve struct {
 	members   []GroupMember
 	policy    GroupPolicy
 	now       time.Time
+	// voice is the request's voice restriction over the whole flattened group (nil = none),
+	// set once by resolveGroup's pre-pass (groupVoiceScope) and read by every attempt of
+	// the ladder, the speed ordering, the pin check, the climb and the walk. It is a
+	// field of its own and not part of policy precisely so that the ladder, which only
+	// ever rewrites policy, cannot relax it.
+	voice *voiceScope
 }
 
 // resolveGroup runs resolveGroupOnce under progressively relaxed eligibility filters.
@@ -2393,7 +2494,20 @@ type groupResolve struct {
 // nothing eligible => the restriction is dropped, never a dead end. The first attempt that
 // resolves wins; the LAST attempt's error is the one returned, so the caller still sees
 // ErrNoModelRoute vs ErrNoHealthyHost from a real walk.
+//
+// A requested voice is the one restriction the ladder does NOT relax. It is decided once,
+// up front, over the flattened group (groupVoiceScope), and carried unchanged into every
+// attempt: loaded_only and the speed floor are preferences that give way when nothing
+// satisfies them, but a voice the group is KNOWN to offer on some members is a
+// requirement, and serving it from a member without it would be the wrong answer, not a
+// degraded one. When the members that offer it are all unusable the final no-healthy-host
+// is reported as ErrVoiceUnavailable (voiceScope.refine).
 func (r *Resolver) resolveGroup(ctx context.Context, g groupResolve) (Target, error) {
+	voice, err := r.groupVoiceScope(ctx, g)
+	if err != nil {
+		return Target{}, err
+	}
+	g.voice = voice
 	// Latch the configured loaded_only BEFORE any relaxation, so the climb_up warm gate
 	// keeps reading the group's own setting on every attempt (see GroupPolicy.suppressWarm).
 	g.policy.suppressWarm = g.policy.LoadedOnly
@@ -2420,7 +2534,7 @@ func (r *Resolver) resolveGroup(ctx context.Context, g groupResolve) (Target, er
 		}
 		lastErr = err
 	}
-	return Target{}, lastErr
+	return Target{}, voice.refine(lastErr)
 }
 
 // resolveGroupOnce expands a group into its ordered members and serves the first
@@ -2464,7 +2578,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	// this attempt's filters: an attempt that has dropped loaded_only must rank members on
 	// the candidates it can actually use.
 	if g.policy.MemberOrder == MemberOrderSpeed {
-		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, g.policy)
+		ordered, err := r.orderMembersBySpeed(ctx, g.token, g.members, g.apiFlavor, g.req.APIFlavor, g.req.RequiredCapabilities, g.voice, g.policy)
 		if err != nil {
 			return Target{}, err
 		}
@@ -2497,7 +2611,7 @@ func (r *Resolver) resolveGroupOnce(ctx context.Context, g groupResolve) (Target
 	var deadline time.Time
 	deadlineSet := false
 	for {
-		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.policy)
+		name, sel, atCap, queueTimeoutSecs, anyLive, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.voice, g.now, g.policy)
 		if err != nil {
 			return Target{}, err
 		}
@@ -2550,7 +2664,7 @@ func (r *Resolver) pinnedMember(ctx context.Context, g groupResolve) (string, Ma
 	if pinned == "" {
 		return "", MappingCandidate{}, nil
 	}
-	pinSel, pinStatus, _, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.now, g.policy)
+	pinSel, pinStatus, _, _, err := r.selectMember(ctx, g.token, pinned, g.apiFlavor, g.req, g.voice, g.now, g.policy)
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}
@@ -2584,7 +2698,7 @@ func (r *Resolver) climbTarget(ctx context.Context, g groupResolve, pinned strin
 	// Is a better-ranked member available? The pin is memberOK, so firstAvailable stops
 	// at-or-before it in the effective order → best index <= pin index (the memberIndex
 	// guard below is belt-and-suspenders for that invariant).
-	best, bestSel, _, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.now, g.policy)
+	best, bestSel, _, _, _, err := r.firstAvailable(ctx, g.token, g.members, g.apiFlavor, g.req, g.voice, g.now, g.policy)
 	if err != nil {
 		return "", MappingCandidate{}, err
 	}

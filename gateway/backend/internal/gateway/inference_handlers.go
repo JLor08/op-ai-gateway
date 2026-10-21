@@ -485,6 +485,13 @@ type inferenceShape struct {
 	model                string
 	stream               bool
 	requiredCapabilities []string
+	// requiredVoice is the TTS voice the request names ("" for none), set only by the
+	// speech handler from its raw body (sniffSpeechVoice) and carried onto
+	// inference.Request.RequiredVoice. Like requiredCapabilities it is declared here, at
+	// the one call site that knows the endpoint's identity, never mutated onto the
+	// preflight's result afterwards. It is routing PREFERENCE input (fail-open, see the
+	// field's doc), not a gate: nothing in the preflight refuses on it.
+	requiredVoice string
 }
 
 // inferencePreflight is the ONE shared pre-dispatch gate for every inference
@@ -533,7 +540,7 @@ type inferenceShape struct {
 // "admission marker" the two native-capable handlers used to seed: there is
 // simply no second call site left to dedup.
 func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, shape inferenceShape) (preflight, bool) {
-	req := inference.Request{Model: resolveModelOverride(r.Context(), token, shape.model, s.Portal), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream, RequiredCapabilities: shape.requiredCapabilities}
+	req := inference.Request{Model: resolveModelOverride(r.Context(), token, shape.model, s.Portal), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream, RequiredCapabilities: shape.requiredCapabilities, RequiredVoice: shape.requiredVoice}
 	// Only tokens that opted in pay for the offering lookup; for every other
 	// token this is a single boolean test. req.RequestedModel keeps the client's
 	// original wish either way — the usage events already carry it, so a

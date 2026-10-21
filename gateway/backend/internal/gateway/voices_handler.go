@@ -5,7 +5,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -193,22 +192,19 @@ func (s *Server) cachedVoicesForMappings(ctx context.Context, mappingIDs []strin
 	}
 	seenName := map[string]struct{}{}
 	for _, id := range tts {
-		for _, row := range cached[id] {
-			if row.ScopeKey != "" || strings.TrimSpace(row.Payload) == "" {
+		// routing.VoiceNamesFromCacheRows is the one reader of the cache's encoding, shared
+		// with the router's voice filter so the two cannot disagree about what a row lists.
+		names, err := routing.VoiceNamesFromCacheRows(cached[id])
+		if err != nil {
+			slog.Warn("voices cache row is undecodable and was skipped", "mapping_id", id, "err", err)
+			continue
+		}
+		for _, name := range names {
+			if _, dup := seenName[name]; dup || strings.TrimSpace(name) == "" {
 				continue
 			}
-			var names []string
-			if err := json.Unmarshal([]byte(row.Payload), &names); err != nil {
-				slog.Warn("voices cache row is undecodable and was skipped", "mapping_id", id, "err", err)
-				continue
-			}
-			for _, name := range names {
-				if _, dup := seenName[name]; dup || strings.TrimSpace(name) == "" {
-					continue
-				}
-				seenName[name] = struct{}{}
-				voices = append(voices, name)
-			}
+			seenName[name] = struct{}{}
+			voices = append(voices, name)
 		}
 	}
 	slices.Sort(voices)
