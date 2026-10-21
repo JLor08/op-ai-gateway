@@ -300,11 +300,15 @@ func (s *speechStreamScan) stampCapture(in *captureInput) {
 // whether its rate is known, rather than from the endpoint alone; that is ADR-068's one
 // amendment of ADR-041(c), confined to the success path.
 //
-// This runs once the stream has ended, when ctx -- the request's -- may be cancelled by a
-// client that has gone away after a complete stream, which is still a stream to bill.
-// The rate is read on a context that survives that (context.WithoutCancel): on a
-// cancelled one the store read would fail, and a clean stream would be billed in bytes
-// for no reason but the timing of its client's disconnect.
+// This runs once the stream has ended. A client that went away is not a case this billing
+// ever sees as a success: a disconnect seen when the stream terminates, mid-stream or
+// right after the final frame, has already made the status provider.client_disconnected
+// (nativeTerminalStatus decides it as soon as the copy returns, before this setter reads
+// the rate), and the status != "success" return below turns it into the error row
+// (audio_second, 0), never a billed stream. The rate read is on a context that survives a
+// cancelled ctx (context.WithoutCancel) purely defensively: it covers only the window
+// after that status decision, so a request context cancelled between the decision and the
+// store read cannot make the read fail and drop a stream already judged a success to bytes.
 func (s *Server) setStreamedSpeechBillingQuantity(ctx context.Context, meta *usageMeta, ex nativeExchange, scan *speechStreamScan, status string) {
 	if scan == nil {
 		return

@@ -16,8 +16,8 @@ import (
 // comes from OpenAI's price list, not from this system -- audio.cpp's metering
 // signal is an audio DURATION, so speech and transcription share
 // BillingUnitAudioSecond. BillingUnitAudioBytes measures the relayed audio payload
-// in bytes, the fallback for a streamed speech response whose duration cannot be
-// derived yet (its output byte-rate is not known).
+// in bytes: the fallback measure for streamed speech, used when the output duration
+// is not derivable from the relayed payload (no cached byte-rate).
 const (
 	// BillingUnitTokens is the historical default and a POSITIVE assertion that
 	// the row is token-metered. It is never inferred and never defaulted TO from
