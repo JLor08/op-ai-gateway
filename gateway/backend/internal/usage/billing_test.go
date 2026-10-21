@@ -73,3 +73,24 @@ func TestValidateBillingXORRejectsUnknownUnitAndTokenMeteredQuantity(t *testing.
 		t.Error("a token-metered row with a quantity must be rejected")
 	}
 }
+
+func TestValidBillingUnitAcceptsAudioBytes(t *testing.T) {
+	if !ValidBillingUnit(BillingUnitAudioBytes) {
+		t.Errorf("ValidBillingUnit(%q) = false, want true", BillingUnitAudioBytes)
+	}
+}
+
+func TestValidateBillingXORAudioBytesRow(t *testing.T) {
+	// A streamed-audio row: the measure is the payload size in bytes, and every
+	// token-denominated column stays zero.
+	audioBytes := Event{BillingUnit: BillingUnitAudioBytes, BillingQuantity: 2048}
+	if err := ValidateBillingXOR(audioBytes); err != nil {
+		t.Errorf("audio_bytes row rejected: %v", err)
+	}
+
+	withTokens := audioBytes
+	withTokens.OutputTokens = 1
+	if err := ValidateBillingXOR(withTokens); !errors.Is(err, ErrBillingXORViolated) {
+		t.Errorf("audio_bytes row with output_tokens: err = %v, want ErrBillingXORViolated", err)
+	}
+}
