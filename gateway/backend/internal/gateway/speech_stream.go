@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -273,14 +274,18 @@ func (s *speechStreamScan) stampCapture(in *captureInput) {
 // stream: setSpeechBillingQuantity is the setter of a one-shot WAV, whose duration is a
 // response header).
 //
-// A stream states no duration, so what a clean completion bills is what was relayed:
-// the PCM bytes, in audio_bytes (usage.BillingUnitAudioBytes). Every other outcome is a
-// zero in the endpoint's own unit, audio_second -- the unit every refusal and failed
-// relay of this endpoint carries (ADR-041(c)), so a failed streamed request is never
-// mislabelled -- and the quantity is never a partial count: a stream cut short, torn
-// down, or ended without its terminal events delivered some audio and billed none, which
-// is a loud zero and never an over- or under-bill of what a failed relay may or may not
-// have produced.
+// A stream states no duration, so what a clean completion bills is what was relayed. When
+// the mapping's output byte rate is cached (cachedOutputByteRate: what its speech
+// benchmark measured) that is a duration, the PCM bytes over the bytes a second, in the
+// endpoint's own unit, audio_second -- the unit a one-shot call bills in too. When it is
+// not, it is the PCM bytes themselves, in audio_bytes (usage.BillingUnitAudioBytes): the
+// rate is never guessed, because a guessed one would bill a wrong duration under a
+// plausible unit. Every other outcome is a zero in the endpoint's own unit, audio_second
+// -- the unit every refusal and failed relay of this endpoint carries (ADR-041(c)), so a
+// failed streamed request is never mislabelled -- and the quantity is never a partial
+// count: a stream cut short, torn down, or ended without its terminal events delivered
+// some audio and billed none, which is a loud zero and never an over- or under-bill of
+// what a failed relay may or may not have produced.
 //
 // The loud part (ADR-041) is said once at Error, with enough to find the request, for the
 // two cases whose row would otherwise look like a success that billed nothing: a stream
@@ -290,10 +295,17 @@ func (s *speechStreamScan) stampCapture(in *captureInput) {
 // its cause in its own code and in nativeTerminalStatus's own log line, and logging it
 // again here would make every closed player an Error.
 //
-// ex is read only for that log line. The unit is chosen here from what the stream
-// delivered rather than from the endpoint alone; that is ADR-068's one amendment of
-// ADR-041(c), confined to the success path.
-func setStreamedSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, scan *speechStreamScan, status string) {
+// ex names the request for that log line and the mapping (ex.target.RouteID) whose
+// cached rate is read. The unit is chosen here from what the stream delivered, and from
+// whether its rate is known, rather than from the endpoint alone; that is ADR-068's one
+// amendment of ADR-041(c), confined to the success path.
+//
+// This runs once the stream has ended, when ctx -- the request's -- may be cancelled by a
+// client that has gone away after a complete stream, which is still a stream to bill.
+// The rate is read on a context that survives that (context.WithoutCancel): on a
+// cancelled one the store read would fail, and a clean stream would be billed in bytes
+// for no reason but the timing of its client's disconnect.
+func (s *Server) setStreamedSpeechBillingQuantity(ctx context.Context, meta *usageMeta, ex nativeExchange, scan *speechStreamScan, status string) {
 	if scan == nil {
 		return
 	}
@@ -311,8 +323,12 @@ func setStreamedSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, scan *
 		return
 	}
 	// A clean completion: what was relayed is what is billed. The measure is stated here
-	// and nowhere else, so a better one (a duration, once the output byte rate is known)
-	// replaces these two assignments and nothing around them.
+	// and nowhere else -- a duration when the rate that turns bytes into one is cached,
+	// the bytes themselves when it is not.
+	if rate, ok := s.cachedOutputByteRate(context.WithoutCancel(ctx), ex.target.RouteID); ok {
+		meta.BillingUnit, meta.BillingQuantity = usage.BillingUnitAudioSecond, float64(bytesRelayed)/float64(rate)
+		return
+	}
 	meta.BillingUnit, meta.BillingQuantity = usage.BillingUnitAudioBytes, float64(bytesRelayed)
 }
 

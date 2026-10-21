@@ -920,7 +920,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// setSpeechBillingQuantity -- which would log every streamed success as one that
 	// reported no duration -- is not asked. See setStreamedSpeechBillingQuantity.
 	if speechScan != nil {
-		setStreamedSpeechBillingQuantity(&meta, ex, speechScan, status)
+		s.setStreamedSpeechBillingQuantity(ctx, &meta, ex, speechScan, status)
 	} else {
 		setSpeechBillingQuantity(&meta, ex, resp.Header, status)
 	}

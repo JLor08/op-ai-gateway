@@ -441,6 +441,88 @@ func TestSpeechStreamBillsAudioBytesOnCleanCompletion(t *testing.T) {
 	}
 }
 
+// seedSpeechOutputByteRate caches payload as the output byte rate of the mapping id --
+// what a speech benchmark does -- so the streamed call's billing can read it back.
+func seedSpeechOutputByteRate(t *testing.T, srv *Server, mappingID, payload string) {
+	t.Helper()
+	row := routing.ModelMappingCacheRow{MappingID: mappingID, CacheType: routing.ModelMappingCacheOutputByteRate, ScopeKey: "", Payload: payload, UpdatedAt: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)}
+	if err := srv.Routes.UpsertModelMappingCache(context.Background(), row); err != nil {
+		t.Fatalf("UpsertModelMappingCache %s: %v", mappingID, err)
+	}
+}
+
+// With the mapping's output byte rate cached, a clean stream is billed in audio_second:
+// the PCM the delta frames carried, divided by the rate. 176400 bytes at 88200 bytes a
+// second (24 kHz is 48000, 44.1 kHz 16-bit mono is 88200) is exactly two seconds, on the
+// one usage row, with no Error logged. The audio_bytes of the same stream are gone from
+// the row: a row bills in one unit.
+func TestSpeechStreamBillsAudioSecondWhenRateCached(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	t.Cleanup(restore)
+	deltas := [][]byte{speechPCM(100000, 1), speechPCM(76400, 2)} // 176400 bytes together
+	up, _ := newSSESpeechUpstream(t, speechFrameDelta(deltas[0]), speechFrameDelta(deltas[1]), speechSSEDone, speechSSEEnd)
+	srv := newSpeechStreamingTestServer(t, up.URL)
+	seedSpeechOutputByteRate(t, srv, "route-tts", "88200")
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there.","stream":true}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	ev := onlyUsageEvent(t, srv)
+	if ev.Status != "success" || ev.ErrorCode != "" || !ev.Stream {
+		t.Fatalf("usage row = %q/%q stream=%v, want a streamed success", ev.Status, ev.ErrorCode, ev.Stream)
+	}
+	requireStreamedSpeechRow(t, ev, usage.BillingUnitAudioSecond, 2.0)
+	if errs := errorLogs(buf); len(errs) != 0 {
+		t.Fatalf("a clean streamed speech call with a cached rate logged at Error: %+v", errs)
+	}
+}
+
+// Without a usable cached rate a clean stream falls back to what it relayed, in
+// audio_bytes: the rate is never guessed (a wrong guess would bill a wrong duration
+// with a plausible-looking unit), and a billing path never fails a response over a
+// missing optimization. "Not usable" is every way the cache can be silent: no row, a
+// row for another mapping, a zero, and a payload that is not a positive integer.
+func TestSpeechStreamFallsBackToAudioBytesWithoutRate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, srv *Server) // nil: nothing is cached at all
+	}{
+		{name: "no cached rate"},
+		{name: "a rate cached for another mapping", seed: func(t *testing.T, srv *Server) {
+			seedSpeechOutputByteRate(t, srv, "route-tts-offline", "88200")
+		}},
+		{name: "a zero rate", seed: func(t *testing.T, srv *Server) { seedSpeechOutputByteRate(t, srv, "route-tts", "0") }},
+		{name: "a payload that is no integer", seed: func(t *testing.T, srv *Server) { seedSpeechOutputByteRate(t, srv, "route-tts", "44.1k") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			deltas := [][]byte{speechPCM(100000, 1), speechPCM(76400, 2)}
+			up, _ := newSSESpeechUpstream(t, speechFrameDelta(deltas[0]), speechFrameDelta(deltas[1]), speechSSEDone, speechSSEEnd)
+			srv := newSpeechStreamingTestServer(t, up.URL)
+			if tc.seed != nil {
+				tc.seed(t, srv)
+			}
+
+			rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there.","stream":true}`)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			ev := onlyUsageEvent(t, srv)
+			if ev.Status != "success" || ev.ErrorCode != "" {
+				t.Fatalf("usage row = %q/%q, want a success", ev.Status, ev.ErrorCode)
+			}
+			requireStreamedSpeechRow(t, ev, usage.BillingUnitAudioBytes, 176400)
+			if errs := errorLogs(buf); len(errs) != 0 {
+				t.Fatalf("a clean streamed speech call that fell back to bytes logged at Error: %+v", errs)
+			}
+		})
+	}
+}
+
 // Everything short of a clean completion bills nothing -- and, where the row would
 // otherwise look like a success, says so at Error (ADR-041), once -- while the client
 // still receives every frame the upstream sent: the done event alone, [DONE] alone,
@@ -1228,35 +1310,51 @@ func mustCaptureBody(t *testing.T, in *captureInput) string {
 	return body
 }
 
-// The billing of a streamed call, decided in one place: a clean completion bills the
-// bytes that were relayed in audio_bytes; anything else bills zero in the endpoint's
-// own audio_second unit, and says so at Error exactly when the row would otherwise
-// look like a success that billed nothing.
+// The billing of a streamed call, decided in one place: a clean completion bills a
+// duration in audio_second when the mapping's output byte rate is cached and the bytes
+// that were relayed in audio_bytes when it is not; anything else bills zero in the
+// endpoint's own audio_second unit -- a cached rate changing none of that -- and says so
+// at Error exactly when the row would otherwise look like a success that billed nothing.
 func TestSetStreamedSpeechBillingQuantity(t *testing.T) {
-	ex := nativeExchange{id: "req_1", serverName: "audio-1", req: inference.Request{Model: "tts-voice"}}
+	const mappingID = "route_mock_qwen" // seeded by seedGatewayTestRoutes
+	ex := nativeExchange{id: "req_1", serverName: "audio-1", req: inference.Request{Model: "tts-voice"}, target: routing.Target{RouteID: mappingID}}
 	complete := func() *speechStreamScan {
 		return scanSpeech(newTestSpeechScan(), speechFrameDelta(speechPCM(700, 1))+speechSSEDone+speechSSEEnd, 0)
+	}
+	incomplete := func() *speechStreamScan {
+		return scanSpeech(newTestSpeechScan(), speechFrameDelta(speechPCM(700, 1)), 0)
+	}
+	noAudio := func() *speechStreamScan {
+		return scanSpeech(newTestSpeechScan(), speechSSEDone+speechSSEEnd, 0)
+	}
+	rawClean := func(n int) *speechStreamScan {
+		scan := newTestRawSpeechScan()
+		scan.feed(speechPCM(n, 1))
+		scan.cleanClose()
+		return scan
 	}
 	for _, tc := range []struct {
 		name         string
 		scan         *speechStreamScan
 		status       string
+		rate         string // the mapping's cached output byte rate; "" caches none
 		wantUnit     string
 		wantQuantity float64
 		wantErrorLog bool
 		untouched    bool
 	}{
 		{name: "a clean completion", scan: complete(), status: "success", wantUnit: usage.BillingUnitAudioBytes, wantQuantity: 700},
-		{name: "a stream with no terminal events", scan: scanSpeech(newTestSpeechScan(), speechFrameDelta(speechPCM(700, 1)), 0), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
-		{name: "a complete stream that carried no audio", scan: scanSpeech(newTestSpeechScan(), speechSSEDone+speechSSEEnd, 0), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
+		{name: "a clean completion with a cached rate", scan: complete(), status: "success", rate: "88200", wantUnit: usage.BillingUnitAudioSecond, wantQuantity: 700.0 / 88200},
+		{name: "a clean completion with a cached rate that is no rate", scan: complete(), status: "success", rate: "0", wantUnit: usage.BillingUnitAudioBytes, wantQuantity: 700},
+		{name: "a stream with no terminal events", scan: incomplete(), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
+		{name: "a stream with no terminal events, rate cached", scan: incomplete(), status: "success", rate: "88200", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
+		{name: "a complete stream that carried no audio", scan: noAudio(), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
+		{name: "a complete stream that carried no audio, rate cached", scan: noAudio(), status: "success", rate: "88200", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
 		{name: "a complete stream that failed on the way (an error row)", scan: complete(), status: "error", wantUnit: usage.BillingUnitAudioSecond},
-		{name: "an incomplete stream that failed on the way", scan: scanSpeech(newTestSpeechScan(), speechFrameDelta(speechPCM(700, 1)), 0), status: "error", wantUnit: usage.BillingUnitAudioSecond},
-		{name: "a raw stream closed cleanly", scan: func() *speechStreamScan {
-			scan := newTestRawSpeechScan()
-			scan.feed(speechPCM(900, 1))
-			scan.cleanClose()
-			return scan
-		}(), status: "success", wantUnit: usage.BillingUnitAudioBytes, wantQuantity: 900},
+		{name: "a complete stream that failed on the way, rate cached", scan: complete(), status: "error", rate: "88200", wantUnit: usage.BillingUnitAudioSecond},
+		{name: "an incomplete stream that failed on the way", scan: incomplete(), status: "error", wantUnit: usage.BillingUnitAudioSecond},
+		{name: "a raw stream closed cleanly", scan: rawClean(900), status: "success", wantUnit: usage.BillingUnitAudioBytes, wantQuantity: 900},
+		{name: "a raw stream closed cleanly, rate cached", scan: rawClean(900), status: "success", rate: "88200", wantUnit: usage.BillingUnitAudioSecond, wantQuantity: 900.0 / 88200},
 		{name: "a raw stream that was never closed cleanly", scan: func() *speechStreamScan {
 			scan := newTestRawSpeechScan()
 			scan.feed(speechPCM(900, 1))
@@ -1268,13 +1366,15 @@ func TestSetStreamedSpeechBillingQuantity(t *testing.T) {
 			return scan
 		}(), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
 		{name: "no scan: not a streamed speech call", scan: nil, status: "success", untouched: true},
+		{name: "no scan, rate cached: still not a streamed speech call", scan: nil, status: "success", rate: "88200", untouched: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf, restore := withCapturedSlog(t)
 			t.Cleanup(restore)
 			meta := usageMeta{ReqPath: "/v1/audio/speech", BillingUnit: usage.BillingUnitAudioSecond}
+			srv := newSpeechBillingServer(t, mappingID, tc.rate)
 
-			setStreamedSpeechBillingQuantity(&meta, ex, tc.scan, tc.status)
+			srv.setStreamedSpeechBillingQuantity(context.Background(), &meta, ex, tc.scan, tc.status)
 
 			wantUnit := tc.wantUnit
 			if tc.untouched {
@@ -1291,6 +1391,58 @@ func TestSetStreamedSpeechBillingQuantity(t *testing.T) {
 				t.Fatalf("Error logs = %+v, want none", errs)
 			}
 		})
+	}
+}
+
+// newSpeechBillingServer is a Server that is only a route store, seeded like the
+// gateway tests', with rate cached as the output byte rate of mappingID -- or nothing
+// cached when rate is "". It is all setStreamedSpeechBillingQuantity reads.
+func newSpeechBillingServer(t *testing.T, mappingID, rate string) *Server {
+	t.Helper()
+	routes := routing.NewMemoryStore()
+	seedGatewayTestRoutes(routes, time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC))
+	srv := &Server{Routes: routes}
+	if rate != "" {
+		seedSpeechOutputByteRate(t, srv, mappingID, rate)
+	}
+	return srv
+}
+
+// contextHonoringRateStore is a route store whose cache read fails on a cancelled
+// context, as a database does: a memory store ignores its context, so without this a
+// test could not tell a billing that reads the rate on the request's own (cancelled)
+// context from one that survives it.
+type contextHonoringRateStore struct{ routing.Store }
+
+func (s contextHonoringRateStore) ModelMappingCache(ctx context.Context, mappingID, cacheType string) ([]routing.ModelMappingCacheRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Store.ModelMappingCache(ctx, mappingID, cacheType)
+}
+
+// The billing runs when the stream has ended, and a client that disconnects right after
+// a complete stream has cancelled the request's context by then. That stream was
+// delivered whole and is billed whole: the rate is read on a context that survives the
+// cancellation, so the row is a duration, not the bytes the cancelled read would have
+// fallen back to.
+func TestSetStreamedSpeechBillingQuantityReadsTheRateAfterTheRequestIsCancelled(t *testing.T) {
+	const mappingID = "route_mock_qwen"
+	srv := newSpeechBillingServer(t, mappingID, "88200")
+	srv.Routes = contextHonoringRateStore{Store: srv.Routes}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := srv.cachedOutputByteRate(cancelled, mappingID); ok {
+		t.Fatal("the store double reads on a cancelled context: it cannot tell the two billings apart")
+	}
+	ex := nativeExchange{id: "req_1", req: inference.Request{Model: "tts-voice"}, target: routing.Target{RouteID: mappingID}}
+	scan := scanSpeech(newTestSpeechScan(), speechFrameDelta(speechPCM(88200, 1))+speechSSEDone+speechSSEEnd, 0)
+	meta := usageMeta{ReqPath: "/v1/audio/speech", BillingUnit: usage.BillingUnitAudioSecond}
+
+	srv.setStreamedSpeechBillingQuantity(cancelled, &meta, ex, scan, "success")
+
+	if meta.BillingUnit != usage.BillingUnitAudioSecond || meta.BillingQuantity != 1.0 {
+		t.Fatalf("billing = %v %q, want 1 %q: a cancelled request context must not turn the duration into bytes", meta.BillingQuantity, meta.BillingUnit, usage.BillingUnitAudioSecond)
 	}
 }
 
