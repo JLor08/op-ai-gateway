@@ -1802,10 +1802,12 @@ const de = {
   errorChatRunSpeechDispatchFailed:
     'Die Sprachsynthese konnte nicht gestartet werden. Bitte versuchen Sie es erneut, oder wenden Sie sich an eine Administratorin oder einen Administrator, falls dies anhält.',
   errorChatRunNoAudio: 'Es wurde kein Audio erzeugt. Bitte versuchen Sie es erneut.',
-  // Entweder war der Antwortkörper nicht bis zum Ende lesbar, oder er war nicht als
-  // WAV gekennzeichnet (eine HTML-Fehlerseite, ein anderes Audioformat).
+  // Drei Ursachen, deshalb neutral formuliert: der Antwortkörper war nicht bis zum Ende
+  // lesbar, er war nicht als WAV gekennzeichnet (eine HTML-Fehlerseite, ein anderes
+  // Audioformat), oder ein gestreamtes Audio endete vor seinem Abschluss (ein abgebrochener
+  // Stream wird nie als fertige Antwort gespeichert).
   errorChatRunSpeechResponseUnreadable:
-    'Die Antwort der Sprachsynthese konnte nicht als WAV-Audio gelesen werden. Bitte versuchen Sie es erneut.',
+    'Die Antwort der Sprachsynthese konnte nicht bis zum Ende gelesen werden. Bitte versuchen Sie es erneut.',
   // Der Lauf bricht ab, BEVOR er etwas sendet, wenn die erweiterten Felder ein Feld
   // nennen, das er selbst besitzt (Groß-/Kleinschreibung egal). Der Text nennt das
   // Steuerelement mit seiner Beschriftung (chatSpeechAdvanced).
@@ -4918,10 +4920,11 @@ const en: PortalMessages = {
   errorChatRunSpeechDispatchFailed:
     'Speech synthesis could not be started. Please try again, or contact an administrator if this continues.',
   errorChatRunNoAudio: 'No audio was generated. Please try again.',
-  // Either the response body could not be read to its end, or it was not labelled
-  // as WAV (an HTML error page, another audio format).
+  // Three causes, so worded neutrally: the response body could not be read to its end, it
+  // was not labelled as WAV (an HTML error page, another audio format), or a streamed
+  // synthesis ended before its completion (a cut stream is never stored as a finished reply).
   errorChatRunSpeechResponseUnreadable:
-    'The speech synthesis response could not be read as WAV audio. Please try again.',
+    'The speech synthesis response could not be read to its end. Please try again.',
   // The run stops BEFORE sending anything when the advanced fields name a field it
   // owns (case-insensitive). The text names the control by its label
   // (chatSpeechAdvanced).

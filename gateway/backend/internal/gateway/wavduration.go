@@ -21,10 +21,12 @@ const (
 	wavTrailingSlackBytes = 16 << 10
 )
 
-// Offsets of the fixed PCM fields within the body of a `fmt ` chunk (the 2-byte
-// audio format tag at offset 0 is not read: the consistency check below is what
-// separates a PCM header from one that is not).
+// Offsets of the fixed PCM fields within the body of a `fmt ` chunk. The 2-byte audio
+// format tag at offset 0 is not read by the duration and byte-rate measurements (the
+// consistency check below is what separates a PCM header from one that is not); only
+// wavFormatFromReader reads it, for the caller that has to know WHAT the samples are.
 const (
+	wavFormatTagOffset  = 0
 	wavChannelsOffset   = 2
 	wavSampleRateOffset = 4
 	wavByteRateOffset   = 8
@@ -104,19 +106,90 @@ func wavDurationFromReader(r io.Reader) (int64, bool) {
 // rate is the PCM FORMAT's constant, the divisor that turns PCM bytes into seconds
 // (a streamed speech response is billed as pcmBytes / byteRate), not a throughput.
 func wavByteRateFromReader(r io.Reader) (uint32, bool) {
-	if !wavReadRIFFHeader(r) {
+	fields, ok := wavFmtFieldsFromReader(r)
+	if !ok {
 		return 0, false
+	}
+	return wavConsistentByteRate(fields[:])
+}
+
+// wavFormat is the sample format a WAV's `fmt ` chunk states: what the byte rate alone
+// cannot tell. A byte rate is sample rate x channels x bytes per sample, so one number
+// fits many formats -- 96000 B/s is 48 kHz mono 16-bit, 24 kHz stereo 16-bit and 24 kHz
+// mono float32 alike -- and a caller that must PLAY the audio, or write a header for it,
+// has to know which.
+type wavFormat struct {
+	Tag        uint16 // 1 = integer PCM, 3 = IEEE float, 0xFFFE = extensible, ...
+	Channels   uint16
+	SampleRate uint32
+	ByteRate   uint32
+	Bits       uint16
+}
+
+// wavFormatPCM is the `fmt ` audio format tag of integer PCM.
+const wavFormatPCM = 1
+
+// isMono16PCM reports whether the format is integer PCM, one channel, 16 bits a sample:
+// signed 16-bit little-endian mono, the format a streamed speech response is played and
+// stored as (ADR-068). Any other tag -- float32, extensible -- is not it, whatever its
+// byte rate says.
+func (f wavFormat) isMono16PCM() bool {
+	return f.Tag == wavFormatPCM && f.Channels == 1 && f.Bits == 16
+}
+
+// wavFormatFromReader is wavByteRateFromReader's sibling for the caller that needs the
+// whole format: it reads the same `fmt ` chunk, under the same rules (a stream that is not
+// RIFF/WAVE, a `fmt ` that is truncated, too short or not consistent with itself, or a
+// `data` chunk ahead of any `fmt ` is (wavFormat{}, false)), and returns its tag, channels,
+// sample rate, byte rate and bit depth. It stops at the `fmt ` chunk, like its sibling.
+func wavFormatFromReader(r io.Reader) (wavFormat, bool) {
+	fields, ok := wavFmtFieldsFromReader(r)
+	if !ok {
+		return wavFormat{}, false
+	}
+	byteRate, ok := wavConsistentByteRate(fields[:])
+	if !ok {
+		return wavFormat{}, false
+	}
+	le := binary.LittleEndian
+	return wavFormat{
+		Tag:        le.Uint16(fields[wavFormatTagOffset:]),
+		Channels:   le.Uint16(fields[wavChannelsOffset:]),
+		SampleRate: le.Uint32(fields[wavSampleRateOffset:]),
+		ByteRate:   byteRate,
+		Bits:       le.Uint16(fields[wavBitsOffset:]),
+	}, true
+}
+
+// wavFmtFieldsFromReader walks a RIFF/WAVE stream to its `fmt ` chunk and returns the
+// first wavFmtMinLen bytes of its body, once they agree with each other (see
+// wavConsistentByteRate): the one parse behind wavByteRateFromReader and
+// wavFormatFromReader. Chunks ahead of `fmt ` are passed over; a `data` chunk before it
+// ends the search, as the audio is never read.
+func wavFmtFieldsFromReader(r io.Reader) ([wavFmtMinLen]byte, bool) {
+	var fields [wavFmtMinLen]byte
+	if !wavReadRIFFHeader(r) {
+		return fields, false
 	}
 	for {
 		id, size, ok := wavReadChunkHeader(r)
 		if !ok || id == "data" {
-			return 0, false
+			return fields, false
 		}
 		if id == "fmt " {
-			return wavReadFmtByteRate(r, size)
+			if size < wavFmtMinLen {
+				return fields, false
+			}
+			if _, err := io.ReadFull(r, fields[:]); err != nil {
+				return fields, false
+			}
+			if _, ok := wavConsistentByteRate(fields[:]); !ok {
+				return fields, false
+			}
+			return fields, true
 		}
 		if !wavSkipChunkRest(r, size, 0) {
-			return 0, false
+			return fields, false
 		}
 	}
 }

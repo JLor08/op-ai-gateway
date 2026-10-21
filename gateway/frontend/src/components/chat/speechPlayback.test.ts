@@ -326,6 +326,81 @@ describe('createSpeechPlayback', () => {
     expect(playback.isLive('c1')).toBe(false);
   });
 
+  // A tab that re-adopts a still-running speech run before its first chunk (a reload, a second
+  // tab, during a model's cold start) has never been primed: its context is suspended, and a
+  // chunk scheduled on a suspended context sits on a frozen clock, to be played -- stale, and
+  // possibly over a newer run -- whenever something later resumes it. A run that cannot start
+  // on a running context is not played live at all; its committed WAV is the reply.
+  describe('on a context that is not running', () => {
+    function suspendedSetup(state = 'suspended') {
+      const fake = fakeContext(0);
+      const resume = vi.fn(() => Promise.resolve());
+      const ctx = Object.assign(fake.ctx, { state, resume });
+      const playback = createSpeechPlayback(() => ctx);
+      return { playback, ctx, resume, scheduled: fake.scheduled, sources: fake.sources };
+    }
+
+    it('does not schedule a run adopted on a suspended context, and a later resume plays nothing', () => {
+      const { playback, ctx, resume, scheduled } = suspendedSetup();
+      expect(playback.push('c1', 'r1', chunk(0))).toBe(false);
+      expect(resume).toHaveBeenCalled(); // it still asks, so a primed page unlocks for the NEXT run
+      expect(scheduled).toHaveLength(0);
+      expect(playback.isLive('c1')).toBe(false);
+
+      // The context comes up later (a gesture resumed it): the run stays abandoned, so nothing
+      // that arrived before is played late and nothing from the middle of the stream starts.
+      Object.assign(ctx, { state: 'running' });
+      expect(playback.push('c1', 'r1', chunk(1))).toBe(false);
+      expect(scheduled).toHaveLength(0);
+    });
+
+    it('treats an interrupted context (iOS) like a suspended one', () => {
+      const { playback, scheduled } = suspendedSetup('interrupted');
+      expect(playback.push('c1', 'r1', chunk(0))).toBe(false);
+      expect(scheduled).toHaveLength(0);
+    });
+
+    it('starts the NEXT run of the chat normally once the context is running', () => {
+      const { playback, ctx, scheduled } = suspendedSetup();
+      playback.push('c1', 'r1', chunk(0));
+      Object.assign(ctx, { state: 'running' });
+      expect(playback.push('c1', 'r2', chunk(0))).toBe(true);
+      expect(scheduled).toHaveLength(1);
+    });
+
+    it('plays on a context that says it is running', () => {
+      const { playback, scheduled } = suspendedSetup('running');
+      expect(playback.push('c1', 'r1', chunk(0))).toBe(true);
+      expect(scheduled).toHaveLength(1);
+    });
+
+    it('abandons a live run whose context is suspended mid-run and silences its queue', () => {
+      const { playback, ctx, sources, scheduled } = suspendedSetup('running');
+      expect(playback.push('c1', 'r1', chunk(0))).toBe(true);
+      Object.assign(ctx, { state: 'suspended' });
+      expect(playback.push('c1', 'r1', chunk(1))).toBe(false);
+      expect(playback.isLive('c1')).toBe(false);
+      expect(scheduled).toHaveLength(1);
+      // What was queued on the frozen clock must not play stale when the context resumes.
+      expect(sources[0].stopped).toBe(true);
+    });
+
+    it('silences the queue of a COMPLETED run whose context is not running', () => {
+      const { playback, ctx, sources } = suspendedSetup('running');
+      playback.push('c1', 'r1', chunk(0));
+      Object.assign(ctx, { state: 'suspended' });
+      playback.end('c1', true);
+      expect(sources[0].stopped).toBe(true);
+    });
+
+    it('still lets a completed run play out on a running context', () => {
+      const { playback, sources } = suspendedSetup('running');
+      playback.push('c1', 'r1', chunk(0));
+      playback.end('c1', true);
+      expect(sources[0].stopped).toBe(false);
+    });
+  });
+
   it('prime() resumes a suspended context from inside the user gesture', () => {
     const resume = vi.fn(() => Promise.resolve());
     const fake = fakeContext(0);

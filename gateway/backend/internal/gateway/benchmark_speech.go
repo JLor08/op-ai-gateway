@@ -32,9 +32,12 @@ import (
 // otherwise in the honest audio_bytes fallback (ADR-041, ADR-068). The rate is a
 // property of the model, and the only place the API states it is the `fmt` chunk of a
 // NON-stream WAV answer -- so the benchmark synthesizes one short clip, reads the rate
-// from that header (wavByteRateFromReader) and caches it under the mapping
+// from that header (wavFormatFromReader) and caches it under the mapping
 // (routing.ModelMappingCacheOutputByteRate), where the streamed relay finds it
-// (cachedOutputByteRate). It never guesses: no readable WAV, no rate.
+// (cachedOutputByteRate). It never guesses: no readable WAV, no rate -- and no rate either
+// for a WAV that is not mono 16-bit integer PCM, because the portal plays a streamed
+// response and writes its stored WAV on the assumption that the rate it finds is that
+// format's (errSpeechFormatNotStreamable).
 //
 // The same call yields the audio perf metrics -- the time to the first byte, the wall
 // time and the real-time factor -- recorded as a kind=="speech" history row
@@ -220,6 +223,13 @@ func (p benchmarkViewPartition) refuseNothingRunnableSpeech(w http.ResponseWrite
 func (s *Server) runSpeechTarget(ctx context.Context, tgt benchmarkTarget) BenchmarkResult {
 	res := BenchmarkResult{MappingID: tgt.mapping.ID, GatewayModelName: tgt.mapping.GatewayModelName}
 	m, err := s.measureSpeechTarget(ctx, tgt)
+	if errors.Is(err, errSpeechFormatNotStreamable) {
+		// Unlike a failed measurement, this IS an observation: the model answers in a format
+		// the cached rate could not describe. A rate cached before (by a model that was
+		// swapped for this one behind the same mapping) no longer holds, and would keep the
+		// portal's gate open on audio it cannot play, so it is retired.
+		s.retireOutputByteRate(ctx, tgt.mapping.ID)
+	}
 	if err == nil {
 		err = s.cacheOutputByteRate(ctx, tgt.mapping.ID, m.byteRate)
 	}
@@ -271,6 +281,32 @@ func (s *Server) recordRateIdentity(ctx context.Context, tgt benchmarkTarget) {
 	}
 }
 
+// errSpeechFormatNotStreamable is the benchmark's refusal to cache a rate read from a WAV
+// that is not mono 16-bit integer PCM (wavFormat.isMono16PCM). It is the one assumption the
+// portal's streamed speech playback makes about a rate it finds -- that the PCM is
+// 16-bit mono, so the sample rate is byteRate/2 -- made true at the only place a rate is
+// written. A model that fails it is simply not rate-cached: its streamed calls bill the
+// honest audio_bytes and the portal plays it buffered.
+var errSpeechFormatNotStreamable = errors.New("speech benchmark: the model's audio is not mono 16-bit PCM; no output byte rate is cached (streamed calls bill audio_bytes, the portal plays it buffered)")
+
+// retireOutputByteRate retires a mapping's cached output byte rate the way the health loop
+// does when a rate goes stale: an empty payload, which every reader takes as no rate. It
+// writes nothing for a mapping that has none (no stray row), and a failure is only logged:
+// the run's own result already says the model is not rate-cacheable.
+func (s *Server) retireOutputByteRate(ctx context.Context, mappingID string) {
+	if _, ok := s.cachedOutputByteRate(ctx, mappingID); !ok {
+		return
+	}
+	err := s.Routes.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+		MappingID: mappingID,
+		CacheType: routing.ModelMappingCacheOutputByteRate,
+		UpdatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		slog.Warn("speech benchmark: could not retire the stale output byte rate", "mapping_id", mappingID, "err", err)
+	}
+}
+
 // cacheOutputByteRate stores a mapping's output byte rate as its
 // routing.ModelMappingCacheOutputByteRate row: scope "", the payload the decimal
 // bytes per second, the exact form cachedOutputByteRate parses.
@@ -299,7 +335,8 @@ func (s *Server) cacheOutputByteRate(ctx context.Context, mappingID string, rate
 //
 // The figures:
 //
-//   - the output byte rate is the WAV's own (wavByteRateFromReader);
+//   - the output byte rate is the WAV's own (wavFormatFromReader), taken only from a
+//     mono 16-bit integer-PCM WAV (see errSpeechFormatNotStreamable);
 //   - ttftMS is the time from sending the request to the response's first byte, which
 //     for a non-stream synthesis is close to the synthesis time (audio.cpp answers a
 //     one-shot call once the clip is done), not the time to the first audio of a
@@ -354,10 +391,21 @@ func (s *Server) measureSpeechTarget(ctx context.Context, tgt benchmarkTarget) (
 	case len(audio) > speechBenchmarkMaxAudioBytes:
 		return speechMeasurement{}, fmt.Errorf("speech benchmark: the answer exceeds %d bytes", speechBenchmarkMaxAudioBytes)
 	}
-	rate, ok := wavByteRateFromReader(bytes.NewReader(audio))
+	format, ok := wavFormatFromReader(bytes.NewReader(audio))
 	if !ok {
 		return speechMeasurement{}, errors.New("speech benchmark: the answer is not a WAV whose header states a consistent byte rate")
 	}
+	// The rate is only worth caching if it can be read back as a sample rate: the portal plays
+	// a streamed response as headerless mono 16-bit PCM at byteRate/2 and writes the stored
+	// WAV's `fmt` chunk from the same assumption (portalSpeechStreamRate). A byte rate alone
+	// cannot say that -- 96000 B/s is 48 kHz mono s16 and also 24 kHz stereo s16 or 24 kHz
+	// mono float32 -- so a model whose WAV is anything else caches no rate and stays on
+	// audio_bytes, buffered in the portal, rather than being played at the wrong speed.
+	if !format.isMono16PCM() {
+		return speechMeasurement{}, fmt.Errorf("%w: the WAV is format tag %d, %d channel(s), %d-bit at %d Hz",
+			errSpeechFormatNotStreamable, format.Tag, format.Channels, format.Bits, format.SampleRate)
+	}
+	rate := format.ByteRate
 
 	audioSeconds, haveAudio := speechDurationSeconds(resp.Header.Get(speechDurationHeader))
 	if !haveAudio {

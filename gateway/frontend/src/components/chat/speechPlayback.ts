@@ -51,10 +51,12 @@ export type LiveState =
   | { phase: 'waiting' }
   // Playing: the rate it plays at and the number the next chunk must have.
   | { phase: 'live'; rate: number; nextSeq: number }
-  // Given up for this run, for good: the stream has a hole in it (or was joined late), or its
-  // chunks are not audio this player can play. What is already queued is left to finish; the
-  // run's committed WAV is the complete audio.
-  | { phase: 'abandoned'; reason: 'gap' | 'format' };
+  // Given up for this run, for good: the stream has a hole in it (or was joined late), its
+  // chunks are not audio this player can play, or the browser's audio is not running (a run
+  // adopted by a tab that was never primed). What is already queued is left to finish --
+  // except on a context that is not running, where it is silenced (see `push`); the run's
+  // committed WAV is the complete audio.
+  | { phase: 'abandoned'; reason: 'gap' | 'format' | 'suspended' };
 
 /**
  * Decide whether `chunk` may be played, given where playback stands. The reducer of
@@ -231,7 +233,19 @@ export type SpeechPlayback = {
   isLive(chatId: string): boolean;
 };
 
-type Session = { runId: string; state: LiveState; player: StreamingPcmPlayer };
+type Session = {
+  runId: string;
+  state: LiveState;
+  player: StreamingPcmPlayer;
+  ctx: PlaybackContext;
+};
+
+// Whether the context is producing sound: it says it is running, or (a stand-in that keeps
+// no state) says nothing. A suspended or interrupted context has a frozen clock, on which
+// anything scheduled waits to be played -- stale -- whenever something later resumes it.
+function isRunning(ctx: PlaybackContext): boolean {
+  return ctx.state === undefined || ctx.state === 'running';
+}
 
 /**
  * One playback session per chat on top of the pieces above. `getContext` is asked lazily, so
@@ -260,8 +274,21 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
         const ctx = getContext();
         if (!ctx) return false;
         resume(ctx);
-        session = { runId, state: { phase: 'waiting' }, player: new StreamingPcmPlayer(ctx) };
+        session = { runId, state: { phase: 'waiting' }, player: new StreamingPcmPlayer(ctx), ctx };
         sessions.set(chatId, session);
+      }
+      // Live playback needs a context that is running NOW. A tab that re-adopts a speech run
+      // before its first chunk (a reload, a second tab, during a model's cold start) was never
+      // primed by a gesture, so its context is suspended -- and `resume` above only asks: it
+      // answers later, if at all. Audio scheduled on the frozen clock would play, stale and
+      // possibly over a newer run, whenever something finally resumed it, so such a run is not
+      // played live (and neither is one whose context is suspended mid-run, whose queue is
+      // silenced for the same reason); its committed WAV is the reply. The resume request is
+      // kept: it is what unlocks the page for the NEXT run.
+      if (session.state.phase !== 'abandoned' && !isRunning(session.ctx)) {
+        session.player.stop();
+        session.state = { phase: 'abandoned', reason: 'suspended' };
+        return false;
       }
       const verdict = acceptChunk(session.state, chunk);
       session.state = verdict.state;
@@ -278,8 +305,10 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
       const session = sessions.get(chatId);
       if (!session) return;
       // A completed run's queued audio is left to finish by itself: the session is
-      // forgotten, and the sources it scheduled play out on the audio clock.
-      if (!completed) session.player.stop();
+      // forgotten, and the sources it scheduled play out on the audio clock -- provided the
+      // clock is running. On a suspended context the queue is frozen, and would play stale
+      // when something resumed it, so it is silenced like a run that did not complete.
+      if (!completed || !isRunning(session.ctx)) session.player.stop();
       sessions.delete(chatId);
     },
 

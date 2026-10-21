@@ -3572,6 +3572,18 @@ describe('portal chat speech error i18n keys', () => {
     'errorSpeechUpstreamError',
   ] as const;
 
+  // gateway.chat_run_speech_response_unreadable has three causes (a body that could not be
+  // read to its end, one not labelled as WAV, and -- for a streamed synthesis -- a stream cut
+  // before its completion), so its label must not name a WAV-format cause that two of them
+  // are not.
+  it('words the unreadable-response label neutrally, not as a WAV-format failure', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].errorChatRunSpeechResponseUnreadable;
+      expect(text, locale).not.toMatch(/WAV/);
+      expect(text, locale).toMatch(locale === 'de' ? /bis zum Ende/ : /to its end/);
+    }
+  });
+
   it('defines a user-facing label for each speech error code in de and en', () => {
     for (const k of keys) {
       expect(typeof messages.de[k], k).toBe('string');

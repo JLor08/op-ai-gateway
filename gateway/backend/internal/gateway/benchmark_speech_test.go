@@ -12,9 +12,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"op-ai-gateway/internal/apierror"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -224,7 +226,7 @@ func speechBenchRateRows(t *testing.T, s *Server, mappingID string) []routing.Mo
 }
 
 // The speech benchmark reads the byte rate off the answer's WAV `fmt` chunk -- a
-// stereo 44.1 kHz model gets 176400, a mono 24 kHz one 48000, never a constant --
+// mono 44.1 kHz model gets 88200, a mono 24 kHz one 48000, never a constant --
 // caches it under the MAPPING id, which is the id the streamed relay reads it by
 // (cachedOutputByteRate), and appends one kind=speech history row carrying the
 // audio perf metrics. With audio.cpp's metering headers present they are the wall
@@ -245,7 +247,7 @@ func TestSpeechBenchmarkCachesByteRate(t *testing.T) {
 		wantDuration float64 // seconds, the WAV's own length
 	}{
 		{"mono 24 kHz with audio.cpp's metering headers", 24000, 1, true, "48000", 48000, 400, 0.4, 1},
-		{"stereo 44.1 kHz without metering headers", 44100, 2, false, "176400", 176400, 0, 0, 1},
+		{"mono 44.1 kHz without metering headers", 44100, 1, false, "88200", 88200, 0, 0, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dataBytes := int(tc.sampleRate) * int(tc.channels) * 2 // one second of 16-bit PCM
@@ -388,6 +390,108 @@ func TestSpeechBenchmarkWritesNoRateWhenTheSynthesisFails(t *testing.T) {
 				t.Fatalf("upstream calls = %d, want exactly one (a failed synthesis is not retried)", got)
 			}
 		})
+	}
+}
+
+// The rate is cached only from a WAV the portal can play and store on the assumption it
+// makes about a rate (ADR-068): mono, 16-bit, integer PCM, so the sample rate is byteRate/2.
+// A byte rate alone cannot say that -- 96000 B/s is 48 kHz mono s16 and equally 24 kHz stereo
+// s16 or 24 kHz mono float32 -- so a model whose WAV is anything else writes NO rate (and no
+// identity row): its streamed calls bill audio_bytes and the portal's gate stays closed
+// (buffered), instead of the audio being played, and its stored WAV labelled, at the wrong
+// speed. The run's result and history row say why.
+func TestSpeechBenchmarkCachesNoRateForAWAVThatIsNotMono16BitPCM(t *testing.T) {
+	// 24 kHz float32 mono and 24 kHz s16 stereo are BOTH 96000 B/s: the same number as
+	// 48 kHz mono s16, which is the only one of the three the portal's arithmetic reads right.
+	float32Mono := wavFile(t, wavFmtChunkTagged(t, 3, 1, 24000, 32), wavDataChunk(t, 96000))
+	extensibleMono16 := wavFile(t, wavFmtChunkTagged(t, 0xFFFE, 1, 24000, 16), wavDataChunk(t, 48000))
+	for _, tc := range []struct {
+		name string
+		wav  []byte
+	}{
+		{"stereo 16-bit", buildPCMWav(t, 24000, 2, 16, 96000)},
+		{"mono 24-bit", buildPCMWav(t, 32000, 1, 24, 96000)},
+		{"mono float32", float32Mono},
+		{"mono 16-bit with a WAVE_FORMAT_EXTENSIBLE tag", extensibleMono16},
+		{"mono 8-bit", buildPCMWav(t, 24000, 1, 8, 24000)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newSpeechBenchUpstream(t, answerWAV(tc.wav, true))
+			s := newSpeechBenchFixture(t, up)
+			ctx := context.Background()
+
+			if status, code, body := postSpeechBenchmark(t, s, "/api/portal/mappings/sb_tts/benchmark?mode=speech"); status != http.StatusAccepted {
+				t.Fatalf("POST = %d %q (%s), want 202", status, code, body)
+			}
+			res := speechBenchResult(t, finishedSpeechRun(t, s), "sb_tts")
+			if res.OutputByteRate != 0 || res.TTFTMS != 0 || res.WallMS != 0 || res.RTF != 0 {
+				t.Fatalf("result = %+v, want no rate and no figures", res)
+			}
+			if !strings.Contains(res.Error, "not mono 16-bit PCM") {
+				t.Fatalf("result error = %q, want it to say the model's audio is not mono 16-bit PCM", res.Error)
+			}
+			if rows := speechBenchRateRows(t, s, "sb_tts"); len(rows) != 0 {
+				t.Fatalf("output_byte_rate rows = %+v, want none", rows)
+			}
+			identity, err := s.Routes.ModelMappingCache(ctx, "sb_tts", routing.ModelMappingCacheOutputByteRateModel)
+			if err != nil || len(identity) != 0 {
+				t.Fatalf("identity rows = %+v (%v), want none", identity, err)
+			}
+			// The mapping bills audio_bytes: the streamed relay's reader finds no rate ...
+			if rate, ok := s.cachedOutputByteRate(ctx, "sb_tts"); ok {
+				t.Fatalf("cachedOutputByteRate = (%d, true), want no rate", rate)
+			}
+			// ... and the portal's gate stays closed: the run would be the buffered one.
+			if rate, open, err := s.portalSpeechStreamRate(ctx, auth.Token{UserID: "usr_a"}, "tts-bench"); err != nil || open {
+				t.Fatalf("portal gate = (%d, %v, %v), want closed", rate, open, err)
+			}
+			// One failed kind=speech history row carrying the reason.
+			runs := speechBenchRuns(t, s, "sb_tts")
+			if len(runs) != 1 || runs[0].Kind != "speech" || runs[0].Error != res.Error || runs[0].TTFTMS != 0 {
+				t.Fatalf("history = %+v, want one failed kind=speech row with the same reason", runs)
+			}
+		})
+	}
+}
+
+// The other half of the guarantee: where a mono 16-bit WAV IS measured the rate is cached and
+// the portal's gate opens at byteRate/2 -- the benchmark and the gate agree on the format.
+func TestSpeechBenchmarkMono16BitRateOpensThePortalGate(t *testing.T) {
+	up := newSpeechBenchUpstream(t, answerWAV(buildPCMWav(t, 24000, 1, 16, 48000), true))
+	s := newSpeechBenchFixture(t, up)
+	if status, code, body := postSpeechBenchmark(t, s, "/api/portal/mappings/sb_tts/benchmark?mode=speech"); status != http.StatusAccepted {
+		t.Fatalf("POST = %d %q (%s), want 202", status, code, body)
+	}
+	if res := speechBenchResult(t, finishedSpeechRun(t, s), "sb_tts"); res.Error != "" || res.OutputByteRate != 48000 {
+		t.Fatalf("result = %+v, want a measured 48000 B/s", res)
+	}
+	rate, open, err := s.portalSpeechStreamRate(context.Background(), auth.Token{UserID: "usr_a"}, "tts-bench")
+	if err != nil || !open || rate != 24000 {
+		t.Fatalf("portal gate = (%d, %v, %v), want open at 24000 Hz", rate, open, err)
+	}
+}
+
+// A rate cached earlier (by a model that was swapped for this one behind the same mapping) no
+// longer describes the audio, and would keep the portal's gate open on PCM it cannot play: a
+// non-mono-16-bit answer is an observation, not a failed measurement, so it retires the stale
+// rate the way the health loop does (an empty payload every reader takes as no rate). A mapping
+// that has no rate gains no row for it.
+func TestSpeechBenchmarkRetiresAStaleRateWhenTheModelIsNotMono16BitPCM(t *testing.T) {
+	up := newSpeechBenchUpstream(t, answerWAV(buildPCMWav(t, 24000, 2, 16, 96000), true))
+	s := newSpeechBenchFixture(t, up)
+	ctx := context.Background()
+	if err := s.Routes.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{MappingID: "sb_tts", CacheType: routing.ModelMappingCacheOutputByteRate, Payload: "48000", UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("seed rate: %v", err)
+	}
+	if status, code, body := postSpeechBenchmark(t, s, "/api/portal/mappings/sb_tts/benchmark?mode=speech"); status != http.StatusAccepted {
+		t.Fatalf("POST = %d %q (%s), want 202", status, code, body)
+	}
+	finishedSpeechRun(t, s)
+	if rate, ok := s.cachedOutputByteRate(ctx, "sb_tts"); ok {
+		t.Fatalf("cachedOutputByteRate = (%d, true), want the stale rate retired", rate)
+	}
+	if _, open, _ := s.portalSpeechStreamRate(ctx, auth.Token{UserID: "usr_a"}, "tts-bench"); open {
+		t.Fatal("the portal gate stayed open on a retired rate")
 	}
 }
 
