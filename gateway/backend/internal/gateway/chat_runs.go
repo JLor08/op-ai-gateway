@@ -1222,7 +1222,7 @@ func (r *ChatRun) currentMetrics() runMetrics {
 // terminal. The persisted status uses the transcript vocabulary
 // (complete/error/canceled).
 func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string) {
-	s.finishRunWithParts(ctx, owner, run, status, errMsg, nil)
+	s.finishRunWithParts(ctx, owner, run, status, errMsg, nil, false)
 }
 
 // finishRunWithParts is finishRun for a run whose output is NOT the streamed
@@ -1242,7 +1242,12 @@ func (s *Server) finishRun(ctx context.Context, owner auth.Token, run *ChatRun, 
 // Keeping ONE commit function rather than a second one for images (and for
 // speech) is what keeps the retire/finish/log bookkeeping below
 // single-sourced: a run's terminal step is the same step whatever it produced.
-func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string, parts json.RawMessage) {
+// audioStreamed is whether a SPEECH run actually streamed its synthesis through to the
+// client (it took the consumeSpeechStream branch). It is always false for a text, image
+// or transcription run, and it rides onto the committed turn only for a speech run (the
+// run's pinned kind), where the audio answer lifecycle (#281) reads it -- see
+// portal.AssistantTurn.AudioStreamed.
+func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *ChatRun, status, errMsg string, parts json.RawMessage, audioStreamed bool) {
 	// The commit must outlive the deadline that ended the run: this is called
 	// with the run's OWN ctx on every failing path (the two
 	// request-construction failures, the Do failure and the non-200 on the
@@ -1300,10 +1305,17 @@ func (s *Server) finishRunWithParts(ctx context.Context, owner auth.Token, run *
 	// reload" loss in its other direction, and it is precisely the case
 	// (portal.chat_too_large) where the user is told to start a new chat.
 	committed := parts
+	// A speech run's answer is the only one the audio answer lifecycle (#281) acts on
+	// at commit: AudioAnswer scopes the N=0 "do not store" rules and the abort marker
+	// to it, read from the run's pinned kind so the UI never describes a turn the
+	// executor did not run. audioStreamed is meaningful only with it.
+	audioAnswer := run.kindValue() == chatRunKindSpeech
 	if err := s.Portal.CommitAssistant(commitCtx, owner, run.ChatID, portal.AssistantTurn{
 		Reasoning: reasoning, Content: content, TTFTMs: m.TTFTMs, ReasoningMs: m.ReasoningMs,
 		CharsPerSecond: m.CharsPerSecond, TokensPerSecond: m.TokensPerSecond,
-		ContentParts: parts,
+		ContentParts:  parts,
+		AudioAnswer:   audioAnswer,
+		AudioStreamed: audioStreamed,
 	}, persistStatus); err != nil {
 		log.Printf("chat run %s: commit assistant turn failed: %v", run.ID, err)
 		committed = nil

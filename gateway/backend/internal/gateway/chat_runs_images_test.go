@@ -1398,7 +1398,7 @@ func TestImageRunBlobCommitOnADeletedChatIsTheChatGonePath(t *testing.T) {
 				t.Fatalf("add: %v", err)
 			}
 			parts := json.RawMessage(`[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]`)
-			srv.finishRunWithParts(context.Background(), owner, run, tc.status, "", parts)
+			srv.finishRunWithParts(context.Background(), owner, run, tc.status, "", parts, false)
 
 			if !chats.deleted.Load() {
 				t.Fatal("the commit never reached SaveChatWithBlobs, so the race was not exercised")

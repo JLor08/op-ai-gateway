@@ -1035,6 +1035,23 @@ type AssistantTurn struct {
 	// into `null` but FAILS outright on a non-nil zero-length one
 	// ("unexpected end of JSON input"), which would break the terminal commit.
 	ContentParts json.RawMessage
+	// AudioAnswer marks this turn as a SPEECH run's answer -- the only turns the
+	// audio answer lifecycle (#281) acts on at commit time. It is set by the run
+	// executor (finishRunWithParts, from the run's pinned kind) and false for
+	// every text, image and transcription turn and every checkpoint, so the N=0
+	// "do not store" rules and the abort marker below never touch them. An
+	// image turn's generated image and a text turn's partial buffer are committed
+	// exactly as before.
+	AudioAnswer bool
+	// AudioStreamed is whether a speech run ACTUALLY streamed its synthesis
+	// through to the client (it took the consumeSpeechStream branch) rather than
+	// falling back to the buffered one-shot WAV. It only has meaning with
+	// AudioAnswer, and it is what tells the commit apart the two N=0 cases: a
+	// streamed answer under keep_last_audio=0 was produced only to bill ADR-068's
+	// loud non-zero and is committed as the not-stored marker (its audio is never
+	// stored), while a buffered-fallback answer is STORED so the un-heard paid
+	// audio is not lost -- see writeAssistant.
+	AudioStreamed bool
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -1109,24 +1126,56 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 	}
 	doc.Messages = append(doc.Messages, raw)
 
+	// The audio answer lifecycle (#281) for a SPEECH run's terminal commit. The
+	// just-built answer's audio may not be stored at all, and that is decided HERE,
+	// before the blob extraction, so nothing is ever moved into chat_blobs for it:
+	//
+	//   - a canceled/aborted run commits the not-stored marker instead of an empty
+	//     turn, so the bubble reads "not stored" and the turn is regenerate-able; and
+	//   - under keep_last_audio = 0, a run that STREAMED its synthesis (the user heard
+	//     it live) commits the marker too -- the audio was produced only to bill
+	//     ADR-068's loud non-zero and must not be stored.
+	//
+	// Billing and the "commit nothing paid on cancel" guarantee are untouched: the
+	// marker holds no audio, so no bytes are stored; it is the only addition.
+	keep, keepSet := storedKeepLastAudio(doc.Settings)
+	storeNone := keepSet && keep == 0
+	aborted := turn.AudioAnswer && status == "canceled"
+	dropStreamed := turn.AudioAnswer && status == "complete" && storeNone && turn.AudioStreamed
+	if aborted || dropStreamed {
+		if err := markNewestAnswerNotStored(&doc); err != nil {
+			return err
+		}
+	}
+
 	// A generated image arrives as an inline data: part of the turn just built.
 	// Store it in chat_blobs and rewrite its url before the document is sealed,
 	// exactly as PrepareChatRun does for an upload (and so, too, before the 4 MiB
 	// cap: a generated image no longer has to fit in the document). Only the turn
 	// built here is unvetted; the messages before it were stored -- and their
 	// references verified -- by an earlier commit, so a checkpoint, which runs
-	// every few seconds, does no ownership lookups for them.
+	// every few seconds, does no ownership lookups for them. A marker turn (above)
+	// holds no audio, so it stores nothing.
 	blobs, err := s.extractChatBlobs(ctx, chatID, &doc, len(doc.Messages)-1)
 	if err != nil {
 		return err
 	}
 
-	// The audio answer lifecycle (#281): the answer just built makes room for itself
-	// under the thread's retention. Older answers beyond keep_last_audio are rewritten
-	// to the not-stored marker in doc, and their blobs are deleted in the very save that
-	// writes the document, so no commit leaves more answers stored than the thread
-	// keeps. A thread with no retention set (every legacy one) prunes nothing.
-	deleteBlobIDs, err := pruneForRetention(&doc)
+	// The lazy going-forward prune: the answer just built makes room for itself under
+	// the thread's retention. Older answers beyond keep_last_audio are rewritten to the
+	// not-stored marker in doc, and their blobs are deleted in the very save that writes
+	// the document, so no commit leaves more answers stored than the thread keeps. A
+	// buffered-fallback answer under keep_last_audio = 0 is a special case: it is STORED
+	// (the un-heard paid audio is not lost) but keeps only itself -- every older stored
+	// answer becomes a marker -- so an N=0 thread never accumulates on a model that only
+	// sometimes falls back to buffered (keep-last-1). A thread with no retention set
+	// (every legacy one) prunes nothing.
+	var deleteBlobIDs []string
+	if turn.AudioAnswer && status == "complete" && storeNone && !turn.AudioStreamed {
+		deleteBlobIDs, err = pruneAudioBeyond(&doc, 1)
+	} else {
+		deleteBlobIDs, err = pruneForRetention(&doc)
+	}
 	if err != nil {
 		return err
 	}

@@ -309,6 +309,79 @@ func pruneForRetention(doc *chatDoc) (deleteBlobIDs []string, err error) {
 	return pruneAudioBeyond(doc, keep)
 }
 
+// markNewestAnswerNotStored rewrites the just-appended assistant answer (the newest
+// message of doc) into the not-stored marker state, for the two speech-answer commits
+// that keep the turn WITHOUT its audio (#281): a retention of 0 answers on a run that
+// STREAMED -- the audio was synthesized only to bill ADR-068's loud non-zero (the user
+// heard it live) and must not be stored -- and a canceled/aborted run, whose empty turn
+// becomes a regenerate-able marker rather than a blank bubble.
+//
+// It is called BEFORE the blob extraction, so a streamed answer's inline audio is never
+// moved into chat_blobs at all. An answer that holds audio is rewritten by
+// markMessageAudioRemoved -- its audio parts dropped, one marker appended, every other
+// member (id, status, metrics) kept in place. An answer that holds none -- a canceled
+// run commits an empty turn -- has its content replaced by the lone marker, since there
+// is no audio part for markMessageAudioRemoved to strip. Only the newest message is
+// touched; a stored older answer is the retention prune's business, never this one's. A
+// newest that is not an assistant message is left alone.
+func markNewestAnswerNotStored(doc *chatDoc) error {
+	if len(doc.Messages) == 0 {
+		return nil
+	}
+	i := len(doc.Messages) - 1
+	raw := doc.Messages[i]
+	if !isAssistantMessage(raw) {
+		return nil
+	}
+	has, err := messageHasStoredAudio(raw)
+	if err != nil {
+		return err
+	}
+	if has {
+		rewritten, _, changed, err := markMessageAudioRemoved(raw)
+		if err != nil {
+			return err
+		}
+		if changed {
+			doc.Messages[i] = rewritten
+		}
+		return nil
+	}
+	rewritten, err := setMessageContentToRemovedMarker(raw)
+	if err != nil {
+		return err
+	}
+	doc.Messages[i] = rewritten
+	return nil
+}
+
+// setMessageContentToRemovedMarker replaces (or appends) a message's `content` member
+// with the lone not-stored marker array, every other member kept in its order, byte
+// for byte. It is how a canceled speech turn -- which commits no audio part at all, so
+// markMessageAudioRemoved finds nothing to strip -- is given the not-stored bubble. A
+// message spelled in a way parseJSONObject cannot read comes back untouched.
+func setMessageContentToRemovedMarker(raw json.RawMessage) (json.RawMessage, error) {
+	msg, ok := parseJSONObject(raw)
+	if !ok {
+		return raw, nil
+	}
+	marker, err := json.Marshal([]removedAudioPart{{Type: removedAudioPartType}})
+	if err != nil {
+		return nil, err
+	}
+	set := false
+	for i := range msg {
+		if strings.EqualFold(msg[i].key, "content") {
+			msg[i].val = marker
+			set = true
+		}
+	}
+	if !set {
+		msg = append(msg, jsonField{key: "content", val: marker})
+	}
+	return msg.marshal()
+}
+
 // storedKeepLastAudio reads the retention out of a chat document's settings: the
 // count and true when one is set, 0 and false for every document that sets none.
 // The document is schema-free, so this decodes the one member it needs rather than

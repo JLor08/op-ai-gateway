@@ -196,6 +196,143 @@ func (e *retentionEnv) requirePruned(t *testing.T, label string, msg storedMessa
 
 func keepLast(n int) *ChatAudioSettings { return &ChatAudioSettings{KeepLastAudio: &n} }
 
+// commitAudioAnswer commits one speech answer the way the run executor does: a
+// speech-run turn (AudioAnswer) that either actually streamed (AudioStreamed) or fell
+// back to the buffered one-shot, with one audio_url part per wav. It returns the blob
+// ids the answer stored -- none when it is committed as the not-stored marker.
+func (e *retentionEnv) commitAudioAnswer(t *testing.T, chatID string, streamed bool, wavs ...[]byte) []string {
+	t.Helper()
+	parts := make([]string, len(wavs))
+	for i, wav := range wavs {
+		parts[i] = fmt.Sprintf(`{"type":"audio_url","audio_url":{"url":%q}}`, dataURL("audio/wav", wav))
+	}
+	turn := AssistantTurn{
+		ContentParts:  json.RawMessage("[" + strings.Join(parts, ",") + "]"),
+		AudioAnswer:   true,
+		AudioStreamed: streamed,
+	}
+	if err := e.svc.CommitAssistant(context.Background(), e.owner, chatID, turn, "complete"); err != nil {
+		t.Fatalf("CommitAssistant: %v", err)
+	}
+	msgs := e.messages(t, chatID)
+	return blobIDsOf(MessageAudio(msgs[len(msgs)-1].Content))
+}
+
+// With keep_last_audio = 0 a speech answer the run ACTUALLY STREAMED is committed as
+// the not-stored marker and stores no blob at all: the audio was synthesized only to
+// bill ADR-068's loud non-zero (the user heard it live), and "store none" means the
+// stored transcript holds the marker, never the bytes. The turn is still a complete,
+// regenerate-able assistant answer with its own id.
+func TestN0StreamedCommitsMarker(t *testing.T) {
+	forEachRetentionLeg(t, func(t *testing.T, e *retentionEnv) {
+		chatID := e.newChat(t, `{"settings":{},"messages":[]}`)
+		settings := keepLast(0)
+
+		e.ask(t, chatID, "say hi", settings)
+		if ids := e.commitAudioAnswer(t, chatID, true /*streamed*/, taggedWAV(1)); len(ids) != 0 {
+			t.Fatalf("a streamed N=0 answer stored %d blobs, want 0 (it is the marker)", len(ids))
+		}
+
+		answers := e.answers(t, chatID)
+		if len(answers) != 1 {
+			t.Fatalf("stored answers = %d, want 1", len(answers))
+		}
+		e.requirePruned(t, "streamed N=0 answer", answers[0], nil)
+		if e.rec.storedBlobs() != 0 {
+			t.Fatalf("the store was handed %d blobs, want 0: a streamed N=0 answer stores none", e.rec.storedBlobs())
+		}
+		for i, d := range e.rec.deletes {
+			if len(d) != 0 {
+				t.Fatalf("save %d deleted %v; a streamed N=0 answer that stored nothing deletes nothing", i, d)
+			}
+		}
+	})
+}
+
+// With keep_last_audio = 0 an answer that fell back to the BUFFERED one-shot is not
+// lost: the user never heard it live, so it is STORED. But the thread must not
+// accumulate on a model that only sometimes falls back, so each buffered-fallback
+// answer keeps only itself -- every older stored answer becomes a marker in the same
+// save (keep-last-1). [Review Focus]
+func TestN0BufferedFallbackKeepsOne(t *testing.T) {
+	forEachRetentionLeg(t, func(t *testing.T, e *retentionEnv) {
+		chatID := e.newChat(t, `{"settings":{},"messages":[]}`)
+		settings := keepLast(0)
+
+		// The paid, un-heard answer is stored, not turned into a marker.
+		e.ask(t, chatID, "one", settings)
+		first := e.commitAudioAnswer(t, chatID, false /*buffered*/, taggedWAV(1))
+		if len(first) != 1 {
+			t.Fatalf("the first buffered-fallback answer stored %d blobs, want 1 (it must be kept)", len(first))
+		}
+		e.requireStored(t, "first buffered-fallback answer", e.answers(t, chatID)[0], first)
+
+		// A second buffered-fallback answer is stored too, and the first becomes a
+		// marker: keep-last-1, so an N=0 thread never accumulates.
+		e.ask(t, chatID, "two", settings)
+		second := e.commitAudioAnswer(t, chatID, false, taggedWAV(2))
+		if len(second) != 1 {
+			t.Fatalf("the second buffered-fallback answer stored %d blobs, want 1", len(second))
+		}
+		answers := e.answers(t, chatID)
+		if len(answers) != 2 {
+			t.Fatalf("stored answers = %d, want 2 (a prune rewrites an answer, never drops one)", len(answers))
+		}
+		e.requirePruned(t, "first buffered-fallback answer after the second", answers[0], first)
+		e.requireStored(t, "second buffered-fallback answer", answers[1], second)
+
+		// The first answer's blob left in the save that stored the second.
+		var deleted [][]string
+		for _, d := range e.rec.deletes {
+			if len(d) > 0 {
+				deleted = append(deleted, d)
+			}
+		}
+		if len(deleted) != 1 || !slices.Equal(deleted[0], first) {
+			t.Fatalf("blob deletes per save = %v, want just %v in the second answer's save", deleted, first)
+		}
+	})
+}
+
+// A canceled/aborted speech run commits the not-stored marker turn instead of an
+// empty canceled bubble: the run billed ADR-068's loud-zero incomplete and stored no
+// audio bytes, and the marker is the only addition, so the bubble reads "not stored"
+// and the turn is regenerate-able (it keeps an id). Nothing is stored or deleted.
+func TestAbortedSpeechRunCommitsMarker(t *testing.T) {
+	forEachRetentionLeg(t, func(t *testing.T, e *retentionEnv) {
+		chatID := e.newChat(t, `{"settings":{"kind":"speech"},"messages":[]}`)
+		e.ask(t, chatID, "speak", nil)
+
+		// An aborted run produced no stored audio: no content parts, status canceled.
+		if err := e.svc.CommitAssistant(context.Background(), e.owner, chatID, AssistantTurn{AudioAnswer: true}, "canceled"); err != nil {
+			t.Fatalf("CommitAssistant(canceled): %v", err)
+		}
+
+		answers := e.answers(t, chatID)
+		if len(answers) != 1 {
+			t.Fatalf("stored answers = %d, want 1", len(answers))
+		}
+		a := answers[0]
+		if a.Content == nil || string(a.Content) != `[{"type":"audio_removed"}]` {
+			t.Fatalf("aborted turn content = %s, want exactly the audio_removed marker (not an empty bubble)", a.Content)
+		}
+		if a.ID == "" {
+			t.Fatalf("aborted turn has no id; the marker turn must be regenerate-able")
+		}
+		if a.Role != "assistant" || a.Status != "canceled" {
+			t.Fatalf("aborted turn = %+v, want a canceled assistant turn", a)
+		}
+		if e.rec.storedBlobs() != 0 {
+			t.Fatalf("the aborted run stored %d blobs, want 0", e.rec.storedBlobs())
+		}
+		for i, d := range e.rec.deletes {
+			if len(d) != 0 {
+				t.Fatalf("save %d deleted %v; an aborted run deletes nothing", i, d)
+			}
+		}
+	})
+}
+
 // With keep_last_audio = 1, each new answer's commit takes the audio of the one
 // before it: after the third commit the first two answers are markers whose blob
 // rows are gone, and the third is whole. The prune rides the commit of the answer

@@ -287,6 +287,44 @@ func docOf(messages ...json.RawMessage) *chatDoc {
 	return &chatDoc{Messages: messages}
 }
 
+// storedKeepLastAudio distinguishes a SET 0 from unset, and that distinction is what
+// the N=0 commit behaviors (#281, Task 5) are built on: a set 0 means "store none"
+// (0, true), everything else that is not a usable count -- unset, no audio block, a
+// negative value, a non-integer, a malformed knob -- means "keep all" (0, false). The
+// count itself is returned for a positive value. This pins the function the retention
+// prune and the N=0 commit both read through.
+func TestStoredKeepLastAudio(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		settings string
+		wantN    int
+		wantOK   bool
+	}{
+		{"a set 0 is store-none, distinct from unset", `{"audio":{"keep_last_audio":0}}`, 0, true},
+		{"a positive count", `{"kind":"speech","audio":{"keep_last_audio":3}}`, 3, true},
+		{"a set 1", `{"audio":{"keep_last_audio":1}}`, 1, true},
+		{"no settings at all", ``, 0, false},
+		{"null settings", `null`, 0, false},
+		{"empty settings", `{}`, 0, false},
+		{"no audio block", `{"kind":"speech"}`, 0, false},
+		{"audio block without the field", `{"audio":{"voice":"alloy"}}`, 0, false},
+		{"explicit null", `{"audio":{"keep_last_audio":null}}`, 0, false},
+		{"a negative count reads as unset", `{"audio":{"keep_last_audio":-1}}`, 0, false},
+		{"a large negative count reads as unset", `{"audio":{"keep_last_audio":-42}}`, 0, false},
+		{"a string is not a count", `{"audio":{"keep_last_audio":"2"}}`, 0, false},
+		{"a fraction is not a count", `{"audio":{"keep_last_audio":1.5}}`, 0, false},
+		{"malformed settings", `{"audio":`, 0, false},
+		{"settings that are not an object", `[1]`, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n, ok := storedKeepLastAudio(json.RawMessage(tc.settings))
+			if n != tc.wantN || ok != tc.wantOK {
+				t.Fatalf("storedKeepLastAudio(%s) = (%d, %v), want (%d, %v)", tc.settings, n, ok, tc.wantN, tc.wantOK)
+			}
+		})
+	}
+}
+
 // pruneIDs is the blob ids a prune is expected to return, as one slice.
 func pruneIDs(ids ...string) []string { return ids }
 
