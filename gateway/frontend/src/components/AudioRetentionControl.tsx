@@ -3,7 +3,9 @@
 
 import { useState } from 'react';
 import {
+  Alert,
   Box,
+  Button,
   Checkbox,
   FormControlLabel,
   Radio,
@@ -12,7 +14,11 @@ import {
   Typography,
 } from '@mui/material';
 import type { Translation } from './shared/types';
-import { isKeepLastInvalid, type AudioSettings } from './chat/ChatStore';
+import {
+  isKeepLastInvalid,
+  type AudioSettings,
+  type PendingAudioRetention,
+} from './chat/ChatStore';
 
 // The retention half of the speech thread's audio settings, which is all this control edits.
 export type AudioRetention = Pick<AudioSettings, 'keepAudio' | 'keepLast'>;
@@ -33,6 +39,13 @@ export type AudioRetention = Pick<AudioSettings, 'keepAudio' | 'keepLast'>;
 // whose model stopped streaming shows the box unticked, and only SELECTING it is withheld, so
 // the box can still be switched back on.
 //
+// A value that would delete audio already stored (a lower N, or "do not store", on a chat that
+// holds more) is not applied by the store but HELD, and `pending` says so: the control keeps
+// showing what was asked for, and a notice beside it names how many answers would lose their
+// audio and offers to apply it (`onApply`, which deletes them) or discard it (`onDiscard`,
+// which puts the control back and touches nothing). The notice is inline, not a dialog, so the
+// count can be edited on with the field still in reach.
+//
 // Key it by the chat: the local choice belongs to one thread's text.
 export function AudioRetentionControl({
   keepAudio,
@@ -40,6 +53,9 @@ export function AudioRetentionControl({
   speechStreaming,
   disabled,
   onChange,
+  pending,
+  onApply,
+  onDiscard,
   t,
 }: Readonly<{
   keepAudio: boolean;
@@ -47,6 +63,9 @@ export function AudioRetentionControl({
   speechStreaming: boolean;
   disabled: boolean;
   onChange: (patch: Partial<AudioRetention>) => void;
+  pending: PendingAudioRetention | null;
+  onApply: () => void;
+  onDiscard: () => void;
   t: Translation;
 }>) {
   const [pickedLast, setPickedLast] = useState(false);
@@ -118,6 +137,24 @@ export function AudioRetentionControl({
             />
           )}
         </Box>
+      )}
+      {pending && (
+        <Alert
+          severity="warning"
+          sx={{ justifySelf: 'stretch' }}
+          action={
+            <>
+              <Button color="inherit" size="small" onClick={onDiscard}>
+                {t.chatAudioPruneDiscard}
+              </Button>
+              <Button color="error" size="small" onClick={onApply} disabled={disabled}>
+                {t.chatAudioPruneConfirm}
+              </Button>
+            </>
+          }
+        >
+          {t.chatAudioPrunePending(pending.keepLast, pending.excess)}
+        </Alert>
       )}
     </Box>
   );

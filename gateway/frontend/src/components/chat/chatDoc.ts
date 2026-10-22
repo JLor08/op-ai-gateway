@@ -19,6 +19,7 @@ import type {
   PortalToken,
 } from '../../api';
 import {
+  audioUrlsOf,
   isMaskPart,
   maskPart,
   type ChatContent,
@@ -673,9 +674,82 @@ export function audioSetting(
   if (!s.stream) audio.stream = false;
   // Likewise only the non-default retention: do-not-store (0) when keep-audio is off, else a
   // positive keep-last-N. Keep-all (the default, or a blank/invalid keepLast) writes nothing.
-  const keepLast = s.keepAudio ? toKeepLast(s.keepLast) : 0;
+  const keepLast = keepLastAudioOf(s);
   if (keepLast !== undefined) audio.keep_last_audio = keepLast;
   return { audio };
+}
+
+// The `keep_last_audio` these settings put on the wire: 0 (do not store), N >= 1 (keep the
+// last N answers' audio), or undefined (keep every answer: the default, and what a blank or
+// unusable keepLast means). THE parse of the retention -- audioSetting writes exactly this --
+// so anything that has to reason about what a setting DOES (the store's "does this change
+// tighten the retention?") reads it here and never the raw keepLast text, which can say
+// something the wire drops.
+export function keepLastAudioOf(s: AudioSettings): number | undefined {
+  return s.keepAudio ? toKeepLast(s.keepLast) : 0;
+}
+
+// The number of answers the settings keep the audio of, as a comparable number: Infinity for
+// keep-all, else keepLastAudioOf's count (0 for do-not-store).
+function audioRetentionLimit(s: AudioSettings): number {
+  return keepLastAudioOf(s) ?? Number.POSITIVE_INFINITY;
+}
+
+// Whether changing `current` into `next` keeps the audio of FEWER answers: a smaller N,
+// do-not-store, or keep-all narrowed to a finite N. Judged on what the wire would carry
+// (keepLastAudioOf), so a blank or invalid count -- which the wire drops, i.e. keep-all -- is
+// never a tightening, and neither is raising N, keep-all or storing audio again. The case
+// that asks the user before it deletes anything (the retroactive prune).
+export function lowersAudioRetention(current: AudioSettings, next: AudioSettings): boolean {
+  return audioRetentionLimit(next) < audioRetentionLimit(current);
+}
+
+// Whether a message is an ANSWER holding stored audio: an assistant message with at least one
+// audio_url part. What the gateway's retention counts, prunes and deletes (chat_audio_retention.go:
+// isAssistantMessage + messageHasStoredAudio) and what this side mirrors -- a user turn's audio
+// is a transcription clip the user supplied and is never an answer's, a text answer has none, and
+// a not-stored answer (the audio_removed marker) no longer holds any, so it takes no slot.
+export function holdsStoredAudio(message: ChatUiMessage): boolean {
+  return message.role === 'assistant' && audioUrlsOf(message.content).length > 0;
+}
+
+// The not-stored state of one answer, as the gateway rewrites it: every audio_url part gone,
+// one `audio_removed` marker after the parts that stay (the text of a mixed answer keeps its
+// place), everything else about the message as it was. The very same object comes back for a
+// message that holds no stored audio, so applying it twice, or to a text answer or a user
+// turn, changes nothing.
+export function withAudioRemoved(message: ChatUiMessage): ChatUiMessage {
+  if (!holdsStoredAudio(message) || typeof message.content === 'string') return message;
+  const kept = message.content.filter((part) => part.type !== 'audio_url');
+  const marked = kept.some((part) => part.type === 'audio_removed');
+  return { ...message, content: marked ? kept : [...kept, { type: 'audio_removed' }] };
+}
+
+// The answers of a transcript that hold audio beyond the newest `keepLast` of them, i.e. the
+// ones a prune to that count would turn into the not-stored state. keepLast 0 counts every
+// one; a negative count is no count and prunes nothing.
+export function audioAnswersBeyond(messages: readonly ChatUiMessage[], keepLast: number): number {
+  if (keepLast < 0) return 0;
+  const holding = messages.filter(holdsStoredAudio).length;
+  return Math.max(0, holding - keepLast);
+}
+
+// The transcript pruned to the newest `keepLast` answers that hold audio: every older one is
+// rewritten into the not-stored state (withAudioRemoved), in place. The gateway's own walk
+// (pruneAudioBeyond in chat_audio_retention.go) -- newest to oldest over the assistant answers
+// that hold audio, the newest `keepLast` kept -- run over the local copy once the gateway has
+// pruned its stored one, so the two agree and a later save cannot write back audio the gateway
+// deleted. The very same array comes back when nothing is beyond the limit.
+export function pruneAudioBeyond(messages: ChatUiMessage[], keepLast: number): ChatUiMessage[] {
+  if (audioAnswersBeyond(messages, keepLast) === 0) return messages;
+  let kept = 0;
+  const out = [...messages];
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (!holdsStoredAudio(out[i])) continue;
+    if (kept < keepLast) kept++;
+    else out[i] = withAudioRemoved(out[i]);
+  }
+  return out;
 }
 
 // The positive integer a keep-last text means, or undefined for keep-all: blank, unparseable,

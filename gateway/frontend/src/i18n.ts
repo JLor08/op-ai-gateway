@@ -288,6 +288,20 @@ const de = {
     'Ausschalten, um Audio-Antworten gar nicht zu speichern. Das geht nur, solange die Antwort beim Erzeugen abgespielt wird (Streaming): Audio, das nicht gestreamt wird, lässt sich nur aus dem Speicher anhören und wird deshalb trotzdem behalten.',
   chatAudioKeepLastInvalid:
     'Geben Sie eine ganze Zahl ab 1 ein oder wählen Sie „Alle behalten“. Solange der Wert ungültig ist, werden alle Antworten behalten.',
+  // The retroactive prune's confirm (#281): tightening the retention of a chat whose stored audio
+  // exceeds it deletes that audio for good, so the stricter value waits here for a yes. `keep` is
+  // the count it prunes to (0 = audio is no longer stored), `removed` how many answers lose their
+  // audio; the answers' text stays either way. The two buttons apply it and drop it.
+  chatAudioPrunePending: (keep: number, removed: number) => {
+    const answers = removed === 1 ? 'Antwort' : 'Antworten';
+    if (keep === 0) {
+      return `Das gespeicherte Audio von ${removed} ${answers} wird unwiderruflich gelöscht, weil Audio nicht mehr gespeichert wird. Der Text bleibt erhalten.`;
+    }
+    const kept = keep === 1 ? 'Antwort' : 'Antworten';
+    return `Das gespeicherte Audio von ${removed} älteren ${answers} wird unwiderruflich gelöscht, damit nur die letzten ${keep} ${kept} ihr Audio behalten. Der Text bleibt erhalten.`;
+  },
+  chatAudioPruneConfirm: 'Übernehmen und Audio löschen',
+  chatAudioPruneDiscard: 'Verwerfen',
   // The collapsible "Advanced" section: extra request fields as a JSON object (the
   // OpenAI `instructions` field or a model-native option).
   chatSpeechAdvanced: 'Erweitert',
@@ -3611,6 +3625,17 @@ const en: PortalMessages = {
     'Turn this off to not store audio answers at all. That only works while the answer streams (plays while it is generated): audio that is not streamed can only be heard from storage, so it is kept anyway.',
   chatAudioKeepLastInvalid:
     'Enter a whole number of 1 or more, or choose "Keep all". While the value is invalid, every answer is kept.',
+  // See the German block: the confirm of a retention change that deletes stored audio.
+  chatAudioPrunePending: (keep: number, removed: number) => {
+    const answers = removed === 1 ? 'answer' : 'answers';
+    if (keep === 0) {
+      return `The stored audio of ${removed} ${answers} will be permanently deleted because audio is no longer stored. The text stays.`;
+    }
+    const kept = keep === 1 ? 'answer' : 'answers';
+    return `The stored audio of ${removed} older ${answers} will be permanently deleted so that only the last ${keep} ${kept} keep their audio. The text stays.`;
+  },
+  chatAudioPruneConfirm: 'Apply and delete audio',
+  chatAudioPruneDiscard: 'Discard',
   chatSpeechAdvanced: 'Advanced',
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:

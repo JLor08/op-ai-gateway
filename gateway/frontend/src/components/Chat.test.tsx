@@ -150,6 +150,9 @@ function makeChatApi() {
     })),
     cancelChatRun: vi.fn(async () => ({ ok: true })),
     activeChatRuns: vi.fn(async () => ({ data: [] as ActiveChatRun[] })),
+    // The audio answer lifecycle's two mutations (#281): the gateway answers {ok:true}.
+    deleteMessageAudio: vi.fn(async (_chatId: string, _messageId: string) => ({ ok: true })),
+    pruneChatAudio: vi.fn(async (_chatId: string, _keepLast: number) => ({ ok: true })),
     // The server-override picker's filtered-model fetch (Task 6, step 3).
     serverModels: vi.fn(async (serverId: string) => serverModelsByServer[serverId] ?? []),
     // The per-model sd-server image options the store fetches whenever the picked
@@ -1831,6 +1834,171 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           content: { settings: { audio: unknown } };
         };
         expect(saved.content.settings.audio).toEqual({ keep_last_audio: 5 });
+      });
+    });
+
+    // Tightening the retention of a chat that already holds more audio deletes that audio for
+    // good, so the composer asks first (#281): the stricter value waits beside the control,
+    // shown but neither saved nor sent, until it is applied (which deletes the excess) or
+    // discarded (which puts the control back and touches nothing).
+    describe('the confirm of a retention that deletes stored audio', () => {
+      const open: SpeechStreamingGate = { streaming: true, sampleRate: 44100 };
+      const wav = { type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } };
+      const answers = [
+        { id: 'u1', role: 'user', content: 'one' },
+        { id: 'a1', role: 'assistant', content: [wav], status: 'complete' },
+        { id: 'u2', role: 'user', content: 'two' },
+        { id: 'a2', role: 'assistant', content: [wav], status: 'complete' },
+        { id: 'u3', role: 'user', content: 'three' },
+        { id: 'a3', role: 'assistant', content: [wav], status: 'complete' },
+      ];
+      const keepBox = () => screen.getByRole('checkbox', { name: t.chatAudioKeep });
+      const keepLastRadio = () => screen.getByRole('radio', { name: t.chatAudioKeepLast });
+      const countField = () =>
+        screen.getByRole('spinbutton', { name: t.chatAudioKeepLastCount }) as HTMLInputElement;
+      const typeCount = (value: string) => fireEvent.change(countField(), { target: { value } });
+      const applyButton = () => screen.getByRole('button', { name: t.chatAudioPruneConfirm });
+      const discardButton = () => screen.getByRole('button', { name: t.chatAudioPruneDiscard });
+      const notice = () => screen.queryByRole('alert');
+
+      // A saved speech thread of three spoken answers, opened with its settings panel.
+      async function renderThread(audio: Record<string, unknown> = {}) {
+        chatApi.spies.modelSpeechStreaming.mockResolvedValue(open);
+        chatApi.rows.push({
+          id: 'c_prune',
+          title: '',
+          created_at: '2026-07-22T12:00:00Z',
+          updated_at: '2026-07-22T12:00:00Z',
+          content: { settings: { model: 'kokoro', kind: 'speech', audio }, messages: answers },
+        });
+        renderChat(tokens, speechModels);
+        await waitForChatReady();
+        await waitFor(() =>
+          expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalledWith('kokoro'),
+        );
+        openSettings();
+        await flushMicrotasks();
+      }
+
+      it('asks, naming how many answers lose their audio, before keeping fewer', async () => {
+        await renderThread();
+        expect(notice()).not.toBeInTheDocument();
+
+        fireEvent.click(keepLastRadio());
+        typeCount('2');
+
+        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(2, 1));
+        expect(applyButton()).toBeEnabled();
+        expect(discardButton()).toBeEnabled();
+        // What was asked for stays in its field, so a count can be typed on.
+        expect(countField()).toHaveValue(2);
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        // Nothing was saved either (the save is debounced: wait it out).
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+        expect(screen.queryByText(t.chatAudioNotStored)).not.toBeInTheDocument();
+      });
+
+      it('deletes the excess and keeps the new count once it is applied', async () => {
+        await renderThread();
+        fireEvent.click(keepLastRadio());
+        typeCount('2');
+
+        fireEvent.click(applyButton());
+
+        await waitFor(() =>
+          expect(chatApi.spies.pruneChatAudio).toHaveBeenCalledWith('c_prune', 2),
+        );
+        // The oldest answer is now the not-stored placeholder; the two newest keep a player.
+        expect(await screen.findByText(t.chatAudioNotStored)).toBeInTheDocument();
+        expect(screen.getAllByText(t.chatAudioNotStored)).toHaveLength(1);
+        await waitFor(() => expect(notice()).not.toBeInTheDocument());
+        expect(countField()).toHaveValue(2);
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+        const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+          content: { settings: { audio: unknown } };
+        };
+        expect(saved.content.settings.audio).toEqual({ keep_last_audio: 2 });
+      });
+
+      it('puts the control back and deletes and saves nothing when it is discarded', async () => {
+        await renderThread({ keep_last_audio: 3 });
+        expect(countField()).toHaveValue(3);
+
+        typeCount('1');
+        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(1, 2));
+        fireEvent.click(discardButton());
+
+        expect(notice()).not.toBeInTheDocument();
+        expect(countField()).toHaveValue(3);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+        expect(screen.queryByText(t.chatAudioNotStored)).not.toBeInTheDocument();
+      });
+
+      it('asks before "do not store" removes every answer audio, and switches it off when applied', async () => {
+        await renderThread();
+
+        fireEvent.click(keepBox());
+
+        expect(keepBox()).not.toBeChecked();
+        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(0, 3));
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+
+        fireEvent.click(applyButton());
+        await waitFor(() =>
+          expect(chatApi.spies.pruneChatAudio).toHaveBeenCalledWith('c_prune', 0),
+        );
+        await waitFor(() => expect(screen.getAllByText(t.chatAudioNotStored)).toHaveLength(3));
+        expect(keepBox()).not.toBeChecked();
+      });
+
+      it('switches the box back on when "do not store" is discarded', async () => {
+        await renderThread();
+        fireEvent.click(keepBox());
+
+        fireEvent.click(discardButton());
+
+        expect(keepBox()).toBeChecked();
+        expect(notice()).not.toBeInTheDocument();
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+      });
+
+      it('does not ask for a loosening, or for a count the stored audio does not exceed', async () => {
+        await renderThread({ keep_last_audio: 2 });
+
+        typeCount('5');
+
+        expect(notice()).not.toBeInTheDocument();
+        expect(countField()).toHaveValue(5);
+        typeCount('3');
+        expect(notice()).not.toBeInTheDocument(); // three answers, a count of three
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+      });
+
+      it('does not ask while the count is blank or not a whole number', async () => {
+        await renderThread();
+        fireEvent.click(keepLastRadio());
+
+        for (const text of ['abc', '1.5', '0', '']) {
+          typeCount(text);
+          expect(notice(), JSON.stringify(text)).not.toBeInTheDocument();
+        }
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+      });
+
+      it('lets a count be typed through a stricter first digit without asking about the last', async () => {
+        await renderThread();
+        fireEvent.click(keepLastRadio());
+
+        typeCount('1');
+        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(1, 2));
+        typeCount('10');
+
+        expect(notice()).not.toBeInTheDocument();
+        expect(countField()).toHaveValue(10);
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
       });
     });
 

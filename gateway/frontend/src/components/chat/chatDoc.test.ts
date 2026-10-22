@@ -13,6 +13,7 @@ import {
   TRANSCRIPTION_AUDIO_ACCEPT,
   TRANSCRIPTION_RESERVED_FIELDS,
   attachModeOf,
+  audioAnswersBeyond,
   audioDataUrl,
   audioPassthroughMessage,
   audioSetting,
@@ -21,29 +22,39 @@ import {
   bareAudioMediaType,
   deriveTitleFromTranscript,
   historyHasImage,
+  holdsStoredAudio,
   imageSetting,
   imageSettingsFrom,
   isChatBlobUrl,
   isKeepLastInvalid,
   isMaskPart,
+  keepLastAudioOf,
   kindSetting,
   lastUserHasAudio,
   lastUserHasImage,
+  lowersAudioRetention,
   maskPart,
   metricsOf,
   normalizeDoc,
   optionsOr,
   parseAudioPassthrough,
   parseTranscriptionPassthrough,
+  pruneAudioBeyond,
   speechPassthroughInvalid,
   transcriptionPassthroughInvalid,
   transcriptionPassthroughMessage,
   transcriptionSetting,
   transcriptionSettingsFrom,
   userTurnContent,
+  withAudioRemoved,
   type ChatUiMessage,
 } from './chatDoc';
-import { audioUrlsOf, hasRemovedAudio, imageUrlsOf } from '../shared/chatContent';
+import {
+  audioUrlsOf,
+  hasRemovedAudio,
+  imageUrlsOf,
+  type ChatContentPart,
+} from '../shared/chatContent';
 
 describe('metricsOf', () => {
   it('maps the snake_case SSE metrics onto the camelCase message fields', () => {
@@ -733,6 +744,239 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
       expect(audioSetting(undefined, moved)).toEqual({});
       expect(audioSetting('image', moved)).toEqual({});
       expect(audioSetting('transcription', moved)).toEqual({});
+    });
+  });
+
+  // The local half of the audio answer lifecycle (#281): what the store reads off the settings
+  // to decide whether a change tightens the retention, and how it rewrites the transcript
+  // after the gateway has deleted or pruned audio. They mirror the gateway's walk
+  // (chat_audio_retention.go), so these pin the same rules it has.
+  describe('the audio retention and prune helpers', () => {
+    const wavPart = (n: number): ChatContentPart => ({
+      type: 'audio_url',
+      audio_url: { url: `/api/portal/chat-blobs/blob_${n}` },
+    });
+    const removed: ChatContentPart = { type: 'audio_removed' };
+    const answer = (id: string, content: ChatContentPart[]): ChatUiMessage => ({
+      id,
+      role: 'assistant',
+      content,
+      status: 'complete',
+    });
+    const spoken = (id: string, n = 1): ChatUiMessage => answer(id, [wavPart(n)]);
+    const settings = (patch: Partial<typeof DEFAULT_AUDIO_SETTINGS>) => ({
+      ...DEFAULT_AUDIO_SETTINGS,
+      ...patch,
+    });
+
+    describe('keepLastAudioOf', () => {
+      it('is the very value audioSetting writes to the wire', () => {
+        const cases = [
+          settings({}),
+          settings({ keepLast: '3' }),
+          settings({ keepLast: ' 4 ' }),
+          settings({ keepLast: '2.0' }),
+          settings({ keepAudio: false }),
+          settings({ keepAudio: false, keepLast: '5' }),
+          settings({ keepLast: 'abc' }),
+          settings({ keepLast: '0' }),
+          settings({ keepLast: '-2' }),
+          settings({ keepLast: '1.5' }),
+          settings({ keepLast: '' }),
+        ];
+        for (const s of cases) {
+          const wire = audioSetting('speech', s).audio?.keep_last_audio;
+          expect(keepLastAudioOf(s), JSON.stringify(s)).toBe(wire);
+        }
+      });
+
+      it('is 0 for do-not-store, N for keep-last-N, and undefined for keep-all', () => {
+        expect(keepLastAudioOf(settings({ keepAudio: false }))).toBe(0);
+        expect(keepLastAudioOf(settings({ keepLast: '3' }))).toBe(3);
+        expect(keepLastAudioOf(settings({}))).toBeUndefined();
+      });
+    });
+
+    describe('lowersAudioRetention', () => {
+      it('is true for a smaller N, for do-not-store, and from keep-all to a finite N', () => {
+        expect(lowersAudioRetention(settings({ keepLast: '5' }), settings({ keepLast: '2' }))).toBe(
+          true,
+        );
+        expect(
+          lowersAudioRetention(settings({ keepLast: '5' }), settings({ keepAudio: false })),
+        ).toBe(true);
+        expect(lowersAudioRetention(settings({}), settings({ keepLast: '3' }))).toBe(true);
+        expect(lowersAudioRetention(settings({}), settings({ keepAudio: false }))).toBe(true);
+      });
+
+      it('is false for a larger N, keep-all, re-enabling, and no change', () => {
+        expect(lowersAudioRetention(settings({ keepLast: '2' }), settings({ keepLast: '5' }))).toBe(
+          false,
+        );
+        expect(lowersAudioRetention(settings({ keepLast: '2' }), settings({}))).toBe(false);
+        expect(lowersAudioRetention(settings({ keepAudio: false }), settings({}))).toBe(false);
+        expect(
+          lowersAudioRetention(settings({ keepAudio: false }), settings({ keepLast: '1' })),
+        ).toBe(false);
+        expect(lowersAudioRetention(settings({ keepLast: '2' }), settings({ keepLast: '2' }))).toBe(
+          false,
+        );
+        expect(lowersAudioRetention(settings({}), settings({}))).toBe(false);
+      });
+
+      // Judged on what the wire would carry, never on the raw text: a keepLast the wire drops
+      // is keep-all, which is never a tightening.
+      it('never reads a blank or invalid keepLast as a tightening', () => {
+        for (const keepLast of ['', '   ', 'abc', '0', '-2', '1.5', 'NaN', 'Infinity']) {
+          expect(lowersAudioRetention(settings({}), settings({ keepLast })), keepLast).toBe(false);
+          expect(
+            lowersAudioRetention(settings({ keepLast: '3' }), settings({ keepLast })),
+            keepLast,
+          ).toBe(false);
+        }
+      });
+
+      // "keep audio" off wins over any leftover count.
+      it('reads do-not-store as 0 whatever count text is left over', () => {
+        expect(
+          lowersAudioRetention(
+            settings({ keepLast: '5' }),
+            settings({ keepAudio: false, keepLast: '9' }),
+          ),
+        ).toBe(true);
+      });
+    });
+
+    describe('holdsStoredAudio', () => {
+      it('is true for an assistant message with an audio_url part, mixed with text or not', () => {
+        expect(holdsStoredAudio(spoken('a'))).toBe(true);
+        expect(holdsStoredAudio(answer('a', [{ type: 'text', text: 'hi' }, wavPart(1)]))).toBe(
+          true,
+        );
+      });
+
+      it('is false for a text answer, a not-stored answer and a user turn (a transcription clip)', () => {
+        expect(holdsStoredAudio({ id: 'a', role: 'assistant', content: 'hello' })).toBe(false);
+        expect(holdsStoredAudio(answer('a', [removed]))).toBe(false);
+        expect(holdsStoredAudio({ id: 'u', role: 'user', content: [wavPart(1)] })).toBe(false);
+      });
+    });
+
+    describe('withAudioRemoved', () => {
+      it('replaces the audio parts with one marker and keeps the rest of the message', () => {
+        const message: ChatUiMessage = {
+          id: 'a1',
+          role: 'assistant',
+          status: 'complete',
+          tps: 12,
+          content: [{ type: 'text', text: 'hi' }, wavPart(1), wavPart(2)],
+        };
+        expect(withAudioRemoved(message)).toEqual({
+          id: 'a1',
+          role: 'assistant',
+          status: 'complete',
+          tps: 12,
+          content: [{ type: 'text', text: 'hi' }, { type: 'audio_removed' }],
+        });
+        expect(audioUrlsOf(withAudioRemoved(message).content)).toEqual([]);
+      });
+
+      it('turns a pure audio answer into exactly the marker', () => {
+        expect(withAudioRemoved(spoken('a1')).content).toEqual([{ type: 'audio_removed' }]);
+      });
+
+      it('is a no-op (the same object) for a message with no stored audio, so it is idempotent', () => {
+        const text: ChatUiMessage = { id: 'a', role: 'assistant', content: 'hello' };
+        const marked = withAudioRemoved(spoken('b'));
+        const user: ChatUiMessage = { id: 'u', role: 'user', content: [wavPart(1)] };
+        expect(withAudioRemoved(text)).toBe(text);
+        expect(withAudioRemoved(marked)).toBe(marked);
+        expect(withAudioRemoved(user)).toBe(user);
+      });
+
+      it('adds no second marker to a message that already carries one', () => {
+        const message = answer('a', [removed, wavPart(1)]);
+        expect(withAudioRemoved(message).content).toEqual([{ type: 'audio_removed' }]);
+      });
+    });
+
+    describe('audioAnswersBeyond / pruneAudioBeyond', () => {
+      const transcript = (): ChatUiMessage[] => [
+        { id: 'u1', role: 'user', content: 'one' },
+        spoken('a1', 1),
+        { id: 'u2', role: 'user', content: 'two' },
+        spoken('a2', 2),
+        { id: 'u3', role: 'user', content: 'three' },
+        spoken('a3', 3),
+      ];
+
+      it('counts the answers with audio older than the newest keepLast', () => {
+        expect(audioAnswersBeyond(transcript(), 0)).toBe(3);
+        expect(audioAnswersBeyond(transcript(), 1)).toBe(2);
+        expect(audioAnswersBeyond(transcript(), 2)).toBe(1);
+        expect(audioAnswersBeyond(transcript(), 3)).toBe(0);
+        expect(audioAnswersBeyond(transcript(), 10)).toBe(0);
+      });
+
+      it('keeps the newest keepLast answers and marks every older one, in place', () => {
+        const pruned = pruneAudioBeyond(transcript(), 2);
+        expect(pruned.map((m) => m.id)).toEqual(['u1', 'a1', 'u2', 'a2', 'u3', 'a3']);
+        expect(pruned[1].content).toEqual([{ type: 'audio_removed' }]);
+        expect(audioUrlsOf(pruned[3].content)).toEqual(['/api/portal/chat-blobs/blob_2']);
+        expect(audioUrlsOf(pruned[5].content)).toEqual(['/api/portal/chat-blobs/blob_3']);
+      });
+
+      it('removes every answer audio for a keepLast of 0, and leaves the text and user turns', () => {
+        const pruned = pruneAudioBeyond(transcript(), 0);
+        for (const id of ['a1', 'a2', 'a3']) {
+          const message = pruned.find((m) => m.id === id)!;
+          expect(message.content, id).toEqual([{ type: 'audio_removed' }]);
+        }
+        expect(pruned.filter((m) => m.role === 'user')).toEqual(
+          transcript().filter((m) => m.role === 'user'),
+        );
+      });
+
+      // The gateway's rule: N counts answers that HOLD audio. A not-stored answer takes no slot,
+      // so it never pushes a still-stored older answer out of the last N; a text answer and a
+      // user turn's transcription clip are never counted or rewritten.
+      it('counts only assistant answers that hold audio', () => {
+        const mixed: ChatUiMessage[] = [
+          spoken('old', 1),
+          { id: 'clip', role: 'user', content: [wavPart(9)] },
+          { id: 'text', role: 'assistant', content: 'just text' },
+          answer('gone', [removed]),
+          spoken('new', 2),
+        ];
+        expect(audioAnswersBeyond(mixed, 1)).toBe(1);
+        const pruned = pruneAudioBeyond(mixed, 1);
+        expect(pruned.find((m) => m.id === 'old')!.content).toEqual([{ type: 'audio_removed' }]);
+        expect(pruned.find((m) => m.id === 'new')!.content).toEqual(mixed[4].content);
+        expect(pruned.find((m) => m.id === 'clip')).toBe(mixed[1]);
+        expect(pruned.find((m) => m.id === 'text')).toBe(mixed[2]);
+        expect(pruned.find((m) => m.id === 'gone')).toBe(mixed[3]);
+      });
+
+      it('returns the very same array when nothing is beyond the limit, and is idempotent', () => {
+        const same = transcript();
+        expect(pruneAudioBeyond(same, 3)).toBe(same);
+        expect(pruneAudioBeyond(same, 99)).toBe(same);
+        const once = pruneAudioBeyond(transcript(), 1);
+        expect(pruneAudioBeyond(once, 1)).toBe(once);
+      });
+
+      it('does not mutate its input', () => {
+        const input = transcript();
+        const snapshot = JSON.stringify(input);
+        pruneAudioBeyond(input, 0);
+        expect(JSON.stringify(input)).toBe(snapshot);
+      });
+
+      it('prunes nothing for a negative count, as the gateway does', () => {
+        const same = transcript();
+        expect(pruneAudioBeyond(same, -1)).toBe(same);
+        expect(audioAnswersBeyond(same, -1)).toBe(0);
+      });
     });
   });
 

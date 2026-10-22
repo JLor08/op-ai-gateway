@@ -59,6 +59,9 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     setImageSettings: vi.fn(),
     audioSettings: DEFAULT_AUDIO_SETTINGS,
     setAudioSettings: vi.fn(),
+    pendingAudioRetention: null,
+    confirmAudioRetention: vi.fn(),
+    cancelAudioRetention: vi.fn(),
     transcriptionSettings: DEFAULT_TRANSCRIPTION_SETTINGS,
     setTranscriptionSettings: vi.fn(),
     runKind: undefined,
@@ -90,7 +93,12 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     setTemperature: vi.fn(),
     setMaxTokens: vi.fn(),
     setSelectedTokenId: vi.fn(),
-    handlersFor: vi.fn(() => ({ onEdit: () => {}, onRegenerate: () => {}, onRefine: () => {} })),
+    handlersFor: vi.fn(() => ({
+      onEdit: () => {},
+      onRegenerate: () => {},
+      onRefine: () => {},
+      onDeleteAudio: () => {},
+    })),
     ...overrides,
   };
 }

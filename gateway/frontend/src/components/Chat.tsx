@@ -738,6 +738,9 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                     speechStreaming={c.speechStreaming}
                     disabled={c.streaming}
                     onChange={(patch) => c.setAudioSettings((s) => ({ ...s, ...patch }))}
+                    pending={c.pendingAudioRetention}
+                    onApply={c.confirmAudioRetention}
+                    onDiscard={c.cancelAudioRetention}
                     t={t}
                   />
                   <Typography variant="caption" color="text.secondary">
