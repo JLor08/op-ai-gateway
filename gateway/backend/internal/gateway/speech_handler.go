@@ -40,14 +40,21 @@ const (
 	speechModelRequired = "speech.model_required"
 	speechInputRequired = "speech.input_required"
 	// speechResponseFormatUnsupported is the code for a response_format this relay
-	// cannot honor -- every value but "wav", or "pcm" on a stream; see
-	// validateSpeechRequest.
+	// cannot honor -- every value but "wav" and "pcm" on a one-shot request, or but
+	// "pcm" on a stream; see validateSpeechRequest.
 	speechResponseFormatUnsupported = "speech.response_format_unsupported"
 	// speechStreamUnsupported is the code for a request whose stream fields the relay
 	// cannot honor: a stream that is no boolean, a stream_format on a request that is
 	// no stream or outside the two audio.cpp emits, or a stream asking for wav; see
 	// validateSpeechRequest.
 	speechStreamUnsupported = "speech.stream_unsupported"
+	// speechPcmUnavailable is the code for a one-shot request that asked for
+	// response_format "pcm" whose synthesized clip cannot be served as such: the mapped
+	// model's native format is not 16-bit mono PCM. Unlike the codes above it is a
+	// POST-synthesis code -- validateSpeechRequest never returns it, because the format
+	// of the audio is known only once the upstream has answered -- so the relay raises
+	// it after the upstream call, not before.
+	speechPcmUnavailable = "speech.pcm_unavailable"
 )
 
 // speechInferenceShape is the shape handleOpenAISpeech hands the ONE preflight
@@ -175,15 +182,18 @@ func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 //
 // response_format decision, which depends on whether the request streams:
 //
-//   - A request that does NOT stream accepts only "wav" (or an absent value); EVERY other
-//     value -- mp3, opus, flac, aac and pcm, but also json and b64_json -- is refused with
+//   - A request that does NOT stream accepts "wav" or "pcm" (or an absent value); EVERY other
+//     value -- mp3, opus, flac, aac, but also json and b64_json -- is refused with
 //     speechResponseFormatUnsupported. The relay of a one-shot request is a purely binary
-//     audio/wav body: audio.cpp answers an unsupported value such as mp3 with raw WAV
-//     labelled audio/wav (a client asking for mp3 would be handed WAV without being told),
-//     and json/b64_json are not OpenAI speech formats at all and, unlike the wav response,
+//     body: audio.cpp answers an unsupported value such as mp3 with raw WAV labelled
+//     audio/wav (a client asking for mp3 would be handed WAV without being told), and
+//     json/b64_json are not OpenAI speech formats at all and, unlike the wav response,
 //     carry none of the metering headers the usage row's billing quantity is read from --
 //     relayed, they would be billed as zero seconds. A 400 the client can act on beats both
-//     silent outcomes.
+//     silent outcomes. "pcm" is the one value the gateway can honor honestly on top of the
+//     upstream's WAV: the relay strips the WAV header down to its data chunk. Whether the
+//     clip IS 16-bit mono PCM is known only once the upstream has answered, so that refusal
+//     (speechPcmUnavailable) is the relay's, not this validation's.
 //   - A request that streams accepts "pcm" (or an absent value) -- the only format
 //     audio.cpp's streaming mode serves. "wav" is refused with speechStreamUnsupported,
 //     because audio.cpp answers a wav stream with a 500 ("streaming speech currently
@@ -256,24 +266,24 @@ const (
 )
 
 // validateSpeechResponseFormat applies validateSpeechRequest's response_format rule to a
-// present value: "wav" or absent for a request that does not stream, "pcm" or absent
+// present value: "wav", "pcm" or absent for a request that does not stream, "pcm" or absent
 // for one that does (and "wav" on a stream is the stream's own refusal).
 func validateSpeechResponseFormat(rawFormat json.RawMessage, stream bool) *inference.Error {
-	want := "wav"
+	mustBe, only := `the string "wav" or "pcm"`, `only "wav" and "pcm" are`
 	if stream {
-		want = "pcm"
+		mustBe, only = `the string "pcm"`, `only "pcm" is`
 	}
 	var format string
 	if err := json.Unmarshal(rawFormat, &format); err != nil {
-		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format must be the string %q; got %s", want, rawFormat)}
+		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format must be %s; got %s", mustBe, rawFormat)}
 	}
 	switch {
-	case format == "" || format == want:
+	case format == "" || format == "pcm" || (!stream && format == "wav"):
 		return nil
 	case stream && format == "wav":
 		return &inference.Error{Code: speechStreamUnsupported, Message: "a streamed response is headerless PCM; response_format must be \"pcm\" (or absent) when stream is true"}
 	default:
-		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only %q is", format, want)}
+		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; %s", format, only)}
 	}
 }
 

@@ -49,7 +49,7 @@ func TestApiFlavorSpeechIsTheRoutingAudioFlavor(t *testing.T) {
 }
 
 // TestValidateSpeechRequest pins the request shape the handler owns, including
-// the wav-only rule of a one-shot request and the pcm-only rule of a streamed one.
+// the wav-or-pcm rule of a one-shot request and the pcm-only rule of a streamed one.
 // want is the expected error code, "" for a request that must pass.
 func TestValidateSpeechRequest(t *testing.T) {
 	cases := []struct {
@@ -81,11 +81,21 @@ func TestValidateSpeechRequest(t *testing.T) {
 		{"opus", `{"model":"m","input":"hi","response_format":"opus"}`, "m", speechResponseFormatUnsupported},
 		{"flac", `{"model":"m","input":"hi","response_format":"flac"}`, "m", speechResponseFormatUnsupported},
 		{"aac", `{"model":"m","input":"hi","response_format":"aac"}`, "m", speechResponseFormatUnsupported},
-		{"pcm", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", speechResponseFormatUnsupported},
+		{"pcm", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", ""},
 		{"json", `{"model":"m","input":"hi","response_format":"json"}`, "m", speechResponseFormatUnsupported},
 		{"b64_json", `{"model":"m","input":"hi","response_format":"b64_json"}`, "m", speechResponseFormatUnsupported},
 		{"response_format is an array", `{"model":"m","input":"hi","response_format":["wav"]}`, "m", speechResponseFormatUnsupported},
 		{"response_format is a number", `{"model":"m","input":"hi","response_format":123}`, "m", speechResponseFormatUnsupported},
+
+		// A one-shot request admits pcm as well as wav (#253): the relay answers it by
+		// stripping the WAV the upstream always produces down to its data chunk. Whether the
+		// mapped model's native format allows that is only known after synthesis
+		// (speechPcmUnavailable), so validation accepts the value here.
+		{"pcm alone", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", ""},
+		{"pcm beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"pcm"}`, "m", ""},
+		{"pcm beside stream null", `{"model":"m","input":"hi","stream":null,"response_format":"pcm"}`, "m", ""},
+		{"wav beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"wav"}`, "m", ""},
+		{"mp3 beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"mp3"}`, "m", speechResponseFormatUnsupported},
 
 		// A streamed request: stream=true is admitted with pcm or no response_format (what
 		// audio.cpp's streaming mode serves), and stream_format sse or audio is relayed.
@@ -108,14 +118,12 @@ func TestValidateSpeechRequest(t *testing.T) {
 		{"stream true with a stream_format that is no string", `{"model":"m","input":"hi","stream":true,"stream_format":1}`, "m", speechStreamUnsupported},
 
 		// stream must be a boolean; and what only a stream has a meaning for -- a
-		// stream_format, a pcm response -- is refused on a request that is not one.
+		// stream_format -- is refused on a request that is not one.
 		{"stream is a string", `{"model":"m","input":"hi","stream":"true"}`, "m", speechStreamUnsupported},
 		{"stream is a number", `{"model":"m","input":"hi","stream":1}`, "m", speechStreamUnsupported},
 		{"stream_format sse alone", `{"model":"m","input":"hi","stream_format":"sse"}`, "m", speechStreamUnsupported},
 		{"stream_format audio alone", `{"model":"m","input":"hi","stream_format":"audio"}`, "m", speechStreamUnsupported},
 		{"stream_format beside stream false", `{"model":"m","input":"hi","stream":false,"stream_format":"audio"}`, "m", speechStreamUnsupported},
-		{"pcm alone", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", speechResponseFormatUnsupported},
-		{"pcm beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"pcm"}`, "m", speechResponseFormatUnsupported},
 		{"response_format is checked before stream", `{"model":"m","input":"hi","response_format":"mp3","stream":"yes"}`, "m", speechResponseFormatUnsupported},
 	}
 	for _, tc := range cases {
@@ -141,6 +149,7 @@ func TestSpeechErrorCodesAreStable(t *testing.T) {
 		speechInputRequired:             "speech.input_required",
 		speechResponseFormatUnsupported: "speech.response_format_unsupported",
 		speechStreamUnsupported:         "speech.stream_unsupported",
+		speechPcmUnavailable:            "speech.pcm_unavailable",
 	} {
 		if got != want {
 			t.Errorf("code = %q, want %q", got, want)
@@ -376,7 +385,6 @@ func TestSpeechRejectsAnInvalidRequestBeforeRouting(t *testing.T) {
 		{"a stream that is no boolean", `{"model":"tts-voice","input":"hi","stream":"true"}`, "speech.stream_unsupported"},
 		{"stream_format without a stream", `{"model":"tts-voice","input":"hi","stream_format":"sse"}`, "speech.stream_unsupported"},
 		{"a stream asking for wav", `{"model":"tts-voice","input":"hi","stream":true,"response_format":"wav"}`, "speech.stream_unsupported"},
-		{"pcm without a stream", `{"model":"tts-voice","input":"hi","response_format":"pcm"}`, "speech.response_format_unsupported"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
