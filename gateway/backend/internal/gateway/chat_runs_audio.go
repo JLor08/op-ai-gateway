@@ -115,11 +115,12 @@ const (
 // depends on. The run commits ONE complete audio/wav turn, and it decides whether to
 // get it buffered or as an event stream it can read (Server.speechRunStreamRate): it
 // states stream and stream_format itself when it streams and states neither when it
-// does not, and a pcm response_format is only valid beside a stream. A passthrough
-// that set any of them would override the run's own value -- stream_format=audio would
-// answer raw PCM in a shape the run does not parse, a pcm format a body it cannot
-// commit as a WAV -- and the endpoint itself refuses any format but wav on a request
-// that does not stream (validateSpeechRequest) but admits a stream. Rejecting them
+// does not, and it states no response_format at all (the endpoint's default is the WAV
+// the run commits). A passthrough that set any of them would override the run's own
+// value: stream_format=audio would answer raw PCM in a shape the run does not parse, and
+// a pcm format a headerless body it cannot commit as a WAV (validateSpeechRequest
+// admits wav, pcm or an absent value on a request that does not stream, a pcm answer
+// being headerless octet-stream PCM, and pcm or absent on one that does). Rejecting them
 // here turns what would be an opaque answer the run cannot use, or worse an override of
 // the run's own value, into a refusal that names its cause.
 var speechReservedFields = []string{"model", "input", "stream", "stream_format", "response_format"}

@@ -247,10 +247,21 @@ paths:
         `speech` capability verdict is `yes` (otherwise 404
         `routing.model_not_capable`); an agent-launched model's runtime spec
         must declare the flavor too (otherwise 404
-        `routing.no_model_route`). A request that does not stream accepts only
-        `wav` or an absent `response_format`: every other value, `mp3`, `opus`,
-        `flac`, `aac`, `pcm`, `json` and `b64_json` included, is refused with 400
-        `speech.response_format_unsupported`. Streaming is served for a
+        `routing.no_model_route`). A request that does not stream accepts
+        `wav`, `pcm` or an absent `response_format`: every other value, `mp3`,
+        `opus`, `flac`, `aac`, `json` and `b64_json`, is refused with 400
+        `speech.response_format_unsupported` (audio.cpp has no encoder: it
+        answers a plain WAV for every format, so the compressed ones wait for
+        server-side transcoding, issue #264). `pcm` is the upstream WAV with
+        its RIFF/WAVE header stripped (a header strip, not a transcode, ADR-069):
+        headerless signed 16-bit little-endian mono PCM at the model's native
+        sample rate, as `application/octet-stream` with a `Content-Length` of
+        the data chunk alone. A clip that is not 16-bit mono PCM, is
+        structurally unsound, overruns the upstream's declared length or came
+        with no usable `Content-Length` is refused after synthesis with 502
+        `speech.pcm_unavailable`. A `stream: true` request answered buffered
+        (below) is still a one-shot `audio/wav` even with `response_format:
+        pcm`. Streaming is served for a
         `mode=streaming` model (ADR-068): `stream: true` against a mapping whose
         `speech_streaming` capability verdict is `yes` is relayed as audio.cpp's
         own stream, unbuffered and without a `Content-Length` - by default (or
@@ -276,7 +287,9 @@ paths:
         wrapped with `type: upstream_error` and `code: speech.upstream_error`,
         and any other body is relayed as it came. Metered in seconds of audio
         (`billing_unit: audio_second`, read from the upstream's
-        `X-AudioCPP-Audio-Duration-Ms` header), not in tokens. A streamed call
+        `X-AudioCPP-Audio-Duration-Ms` header, a one-shot `pcm` answer
+        included), not in tokens; a `speech.pcm_unavailable` row is
+        `audio_second` with quantity 0. A streamed call
         has no such header: on a clean completion (`speech.audio.done` then
         `[DONE]`, or a raw body closed cleanly) it is billed from the PCM bytes
         the relay counted, as `audio_second` equal to the bytes divided by the
@@ -301,6 +314,16 @@ paths:
         '200': { $ref: '#/components/responses/AudioWav' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '502':
+          description: >
+            The Error envelope with code `speech.pcm_unavailable` when a
+            one-shot `response_format: pcm` request's synthesized clip cannot
+            be served as raw PCM (not 16-bit mono PCM, structurally unsound,
+            over the upstream's declared length, or no usable
+            `Content-Length`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: >
             The Error envelope with code `routing.voice_unavailable` when the
@@ -320,6 +343,16 @@ paths:
         '200': { $ref: '#/components/responses/AudioWav' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '502':
+          description: >
+            The Error envelope with code `speech.pcm_unavailable` when a
+            one-shot `response_format: pcm` request's synthesized clip cannot
+            be served as raw PCM (not 16-bit mono PCM, structurally unsound,
+            over the upstream's declared length, or no usable
+            `Content-Length`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: >
             The Error envelope with code `routing.voice_unavailable` when the
@@ -3137,11 +3170,17 @@ components:
                 type: string
                 enum: [wav, pcm]
                 description: >
-                  `wav` (or absent, or `null`) for a request that does not
-                  stream; `pcm` (or absent) for one that streams, because
-                  audio.cpp serves streaming only as headerless PCM. `wav`
-                  beside `stream: true` is 400 `speech.stream_unsupported`, and
-                  every other value, or `pcm` without a stream, is 400
+                  `wav`, `pcm` or absent (or `null`) for a request that does
+                  not stream; `pcm` (or absent) for one that streams, because
+                  audio.cpp serves streaming only as headerless PCM. On a
+                  request that does not stream `pcm` is the upstream WAV with
+                  its header stripped: raw signed 16-bit little-endian mono PCM
+                  at the model's native sample rate (not stated on the wire),
+                  `application/octet-stream`, refused after synthesis with 502
+                  `speech.pcm_unavailable` when the clip is not 16-bit mono PCM.
+                  `wav` beside `stream: true` is 400
+                  `speech.stream_unsupported`, and every other value (`mp3`,
+                  `opus`, `flac`, `aac`, `json`, `b64_json`) is 400
                   `speech.response_format_unsupported`. A route that is not
                   known to stream answers a stream request with a buffered WAV
                   whatever this says.
@@ -3228,7 +3267,10 @@ components:
       description: >
         The synthesized clip. A one-shot answer is one binary `audio/wav` body,
         streamed through without being buffered, with the upstream's
-        `Content-Length` forwarded when it declared one; the upstream's metering
+        `Content-Length` forwarded when it declared one, or, for
+        `response_format: pcm`, the WAV's `data` chunk alone as headerless
+        `application/octet-stream` (the `Content-Length` is the data size);
+        the upstream's metering
         headers (`X-AudioCPP-*`) are not forwarded, and the gateway reads
         `X-AudioCPP-Audio-Duration-Ms` for the usage row. A STREAMED answer (a
         `mode=streaming` model asked with `stream: true`) is instead
@@ -3252,8 +3294,11 @@ components:
             type: string
             format: binary
             description: >
-              The streamed case with `stream_format: audio`: headerless raw PCM
-              (signed 16-bit little-endian mono), no container and no duration.
+              Headerless raw PCM (signed 16-bit little-endian mono), no
+              container and no duration: the streamed case with
+              `stream_format: audio`, and a one-shot `response_format: pcm`
+              answer (the upstream WAV's data chunk, at the model's native
+              sample rate, which the response does not state).
     AudioVoices:
       description: >
         The voice names cached for the model, as the deduplicated, sorted union
