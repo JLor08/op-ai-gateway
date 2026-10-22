@@ -73,6 +73,7 @@ type API interface {
 	DeleteChat(context.Context, auth.Token, string) error
 	DeleteGroup(context.Context, auth.Token, string) error
 	DeleteMapping(context.Context, auth.Token, string) error
+	DeleteMessageAudio(context.Context, auth.Token, string, string) error
 	DeleteModelGroup(context.Context, auth.Token, string) error
 	DeleteProject(context.Context, auth.Token, string) error
 	DeleteResourceGroup(context.Context, auth.Token, string) error
@@ -153,6 +154,7 @@ type API interface {
 	ProjectMembersView(context.Context, auth.Token, string) (ProjectMembersDTO, error)
 	ProjectTokens(context.Context, auth.Token, string) (ProjectTokensView, error)
 	PromoteManager(context.Context, auth.Token, string, string, ManagerPermissions) error
+	PruneChatAudio(context.Context, auth.Token, string, int) error
 	PublicLanguage(context.Context) string
 	PublicTheme(context.Context) string
 	PublicThemeView(context.Context) ThemePublicView

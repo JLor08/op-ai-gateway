@@ -649,6 +649,18 @@ func (_d *APIWithTracing) DeleteMapping(ctx context.Context, t1 auth.Token, s1 s
 	return _d.API.DeleteMapping(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) DeleteMessageAudio(ctx context.Context, t1 auth.Token, s1 string, s2 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteMessageAudio")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DeleteMessageAudio(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) DeleteModelGroup(ctx context.Context, t1 auth.Token, s1 string) (err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DeleteModelGroup")
 	defer span.End()
@@ -1477,6 +1489,18 @@ func (_d *APIWithTracing) PromoteManager(ctx context.Context, t1 auth.Token, s1 
 		}
 	}()
 	return _d.API.PromoteManager(ctx, t1, s1, s2, m1)
+}
+
+func (_d *APIWithTracing) PruneChatAudio(ctx context.Context, t1 auth.Token, s1 string, i1 int) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.PruneChatAudio")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.PruneChatAudio(ctx, t1, s1, i1)
 }
 
 func (_d *APIWithTracing) PublicCertificateBundlePEM(ctx context.Context, s1 string) (s2 string, err error) {

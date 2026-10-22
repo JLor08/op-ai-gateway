@@ -60,9 +60,10 @@ func (s *Server) handlePortalChats(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePortalChatItem dispatches everything under /api/portal/chats/: the
-// single-chat CRUD (GET/PUT/DELETE on /{id}) plus the run sub-paths (start,
-// SSE events, cancel) and the active-runs list. Chat ids are "chat_"+hex so
-// they never collide with the "runs" path segment.
+// single-chat CRUD (GET/PUT/DELETE on /{id}), the run sub-paths (start, SSE
+// events, cancel), the active-runs list, and the two audio mutations (delete one
+// answer's audio, retroactive prune). Chat ids are "chat_"+hex so they never
+// collide with the "runs" path segment.
 func (s *Server) handlePortalChatItem(w http.ResponseWriter, r *http.Request) {
 	suffix := strings.TrimPrefix(r.URL.Path, "/api/portal/chats/")
 	parts := strings.Split(suffix, "/")
@@ -81,6 +82,10 @@ func (s *Server) handlePortalChatItem(w http.ResponseWriter, r *http.Request) {
 		s.handleChatRunEvents(w, r, chatID, parts[2])
 	case len(parts) == 4 && parts[1] == "runs" && parts[3] == "cancel": // /{id}/runs/{runId}/cancel
 		s.handleCancelChatRun(w, r, chatID, parts[2])
+	case len(parts) == 4 && parts[1] == "messages" && parts[3] == "audio": // /{id}/messages/{messageID}/audio
+		s.handleDeleteMessageAudio(w, r, chatID, parts[2])
+	case len(parts) == 3 && parts[1] == "audio" && parts[2] == "prune": // /{id}/audio/prune
+		s.handlePruneChatAudio(w, r, chatID)
 	default:
 		writeJSON(w, http.StatusNotFound, apierror.Response("portal.not_found", "not found", ""))
 	}
@@ -119,9 +124,9 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 		// writePortalRunError -- every handler in this package calls only its
 		// own write*Error function, and the response is identical either way
 		// because the row lives once in sharedErrorMap (error_map.go), read by
-		// both mappers. Guarded like the DELETE case just below: nil ChatRuns
-		// (a Server built without one, as tests do) must not panic.
-		if s.ChatRuns != nil && s.ChatRuns.Get(token.UserID, id) != nil {
+		// both mappers. The two audio mutations (portal_chat_audio_endpoints.go)
+		// rewrite the document the same way and share this guard.
+		if s.chatRunActive(token.UserID, id) {
 			writePortalChatError(w, ErrRunAlreadyActive)
 			return
 		}
@@ -155,6 +160,20 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
+// chatRunActive reports whether a run is live for the user's chat: the guard of
+// every chat-document write that is not the run itself (PUT /chats/{id} and the
+// two audio mutations), each of which replaces the WHOLE document and so would
+// overwrite whatever the run has checkpointed or is about to commit. Keyed per
+// (user, chat), so another user's token never sees a run it does not own. A nil
+// ChatRuns (a Server built without one, as tests do) has no runs and must not
+// panic, like the DELETE case of handlePortalChatSingle.
+//
+// The check and the write that follows it are not one atomic step: a run started
+// between them is not seen. That window is the one PUT has always had.
+func (s *Server) chatRunActive(userID, chatID string) bool {
+	return s.ChatRuns != nil && s.ChatRuns.Get(userID, chatID) != nil
+}
+
 // portalChatErrRows are writePortalChatError's mapper-specific rows (checked
 // before sharedErrorMap); portal.ErrChatNotFound and portal.ErrChatTooLarge
 // map identically in writePortalRunError and live in sharedErrorMap instead.
@@ -165,15 +184,16 @@ func (s *Server) handlePortalChatSingle(w http.ResponseWriter, r *http.Request, 
 var portalChatErrRows = []errRow{
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: "portal.chat_not_found", msg: "chat not found"},
 	{err: portal.ErrChatTitleInvalid, status: http.StatusBadRequest, code: "portal.chat_title_invalid", msg: "chat title is invalid"},
+	{err: portal.ErrChatAudioKeepLastInvalid, status: http.StatusBadRequest, code: "portal.chat_audio_keep_last_invalid", msg: "keep_last must be a whole number of at least 0"},
 }
 
 // writePortalChatError maps the chat service's error sentinels (plus, via
 // sharedErrorMap, ErrRunAlreadyActive -- not a chat-service error, but a
-// sentinel this handler's own PUT case passes it directly) to HTTP responses:
-// not-found (missing or foreign, no leak) -> 404, title/size validation ->
-// 400, an active run -> 409, everything else (seal/open/cipher/store
-// failures) -> 500. The 500 arm never echoes chat content; only the error is
-// logged.
+// sentinel the PUT case and the two audio-mutation handlers pass it directly) to
+// HTTP responses: not-found (missing or foreign, no leak) -> 404, title/size and
+// audio-count validation -> 400, an active run -> 409, everything else
+// (seal/open/cipher/store failures) -> 500. The 500 arm never echoes chat content;
+// only the error is logged.
 func writePortalChatError(w http.ResponseWriter, err error) {
 	if writeMappedError(w, err, portalChatErrRows, 0, "", "") {
 		return
