@@ -426,13 +426,15 @@ else when they bite:
   spurious, misleading migration failures such as
   `migration 12 … relation "applications" does not exist`. The same rule keeps
   every other package out of that database, and out of any second schema in it:
-  the store's catalog assertions look tables, columns, indexes and constraints
-  up by bare name, so a copy of the schema beside theirs would be counted as
-  theirs. A package that needs the PostgreSQL driver brings a **database** of its
-  own on the same server instead, created from `template0` under a unique name
-  and dropped afterwards, as `internal/portal` does for the composed audio
-  prune (`TestPruneChatAudioToKeepLastOnPostgres`). Such a test skips, saying
-  why, when the DSN's role may not create a database.
+  the store tests' index-existence check (`indexExists`, which runs
+  `pg_indexes where indexname = ?` with no schema filter) would see the index in
+  both schemas and count two where it asserts one; the column, constraint and
+  table lookups are already scoped to `public`, but that one is not. A package
+  that needs the PostgreSQL driver brings a **database** of its own on the same
+  server instead, created from `template0` under a unique name and dropped
+  afterwards, as `internal/portal` does for the composed audio prune
+  (`TestPruneChatAudioToKeepLastOnPostgres`). Such a test skips, saying why,
+  when the DSN's role may not create a database.
 
 ## 6. Adding to the schema: the recurring traps
 

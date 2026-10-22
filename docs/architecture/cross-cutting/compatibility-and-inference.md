@@ -3320,14 +3320,14 @@ the sealed chat document and the removal is a document rewrite plus a delete on 
   as intended.
 - **Retroactive prune with a confirm.** Lowering N, or turning storing off, on a chat that already
   holds more is an irreversible bulk delete, so the stricter value is **held, not saved**, until
-  the user confirms in an inline notice that names how many answers lose their audio (the notice
-  appears once the held value has stood unchanged for 500 ms, so an interim digit toward a larger
-  count is not announced as a deletion; the hold itself is immediate); confirm
-  calls `POST /api/portal/chats/{id}/audio/prune` with `{"keep_last": N}` (the client states only
-  the count, the gateway computes the set) and only then commits the setting, decline reverts and
-  deletes nothing, and raising N or keeping all needs no confirm. The client then rewrites its
-  own copy of the transcript the same way, because a `PUT` replaces the whole stored document and
-  a stale copy would write back audio the gateway deleted.
+  the user confirms in an inline notice that names how many answers lose their audio. The hold is
+  immediate, but the notice appears only once the held value has stood unchanged for 500 ms, so an
+  interim digit toward a larger count is not announced as a deletion; nothing is persisted or
+  deleted before Apply. Confirm calls `POST /api/portal/chats/{id}/audio/prune` with
+  `{"keep_last": N}` (the client states only the count, the gateway computes the set) and only then
+  commits the setting, decline reverts and deletes nothing, and raising N or keeping all needs no
+  confirm. The client then rewrites its own copy of the transcript the same way, because a `PUT`
+  replaces the whole stored document and a stale copy would write back audio the gateway deleted.
 - **Per-answer delete.** A delete icon on a stored spoken answer asks inline (no modal), then calls
   `DELETE /api/portal/chats/{id}/messages/{messageID}/audio`, which removes every part of that
   answer and leaves the marker; an answer with no stored audio is a no-op. Both routes are refused

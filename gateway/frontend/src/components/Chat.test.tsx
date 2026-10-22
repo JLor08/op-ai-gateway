@@ -2097,6 +2097,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
       });
 
+      // Each of the four values is outwaited for real (outwaitSettle), so the body spends
+      // about 3.2 s on timers alone, which is too close to vitest's 5 s default under CI or
+      // coverage load; the generous limit is only headroom, every value is still waited out.
       it('does not ask while the count is blank or not a whole number', async () => {
         await renderThread();
         fireEvent.click(keepLastRadio());
@@ -2107,7 +2110,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           expect(notice(), JSON.stringify(text)).not.toBeInTheDocument();
         }
         expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
-      });
+      }, 15000);
 
       it('never raises the notice for a stricter first digit that is made looser at once', async () => {
         await renderThread();

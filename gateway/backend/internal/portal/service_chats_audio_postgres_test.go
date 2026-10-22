@@ -30,15 +30,15 @@ import (
 // path -- document rewrite, marker, blob delete -- over the real PostgreSQL driver.
 //
 // It does not touch the shared database's schema at all. A second schema in the same
-// database would not do: the store's tests ask the catalog about tables, columns,
-// indexes and constraints by bare name (`pg_indexes where indexname = ?`,
-// `information_schema.columns`, `pg_constraint`), so a copy of the schema next to
-// theirs would be counted as theirs. Instead the test creates a DATABASE of its own
-// on the same server, from template0, with a unique name, migrates and uses that, and
-// drops it afterwards. Nothing in it is visible from the shared database, and the
-// only thing the two packages hold in common is the server: CREATE DATABASE and DROP
-// DATABASE lock no table of the shared one, and the connection that issues them holds
-// none either.
+// database would not do: the store tests' index-existence check (`indexExists`, which
+// runs `pg_indexes where indexname = ?` with no schema filter) would see the index in
+// both schemas, count two where it asserts one, and fail. The column, constraint and
+// table lookups are already scoped to `public`; that unfiltered index check is the one
+// that is not. Instead the test creates a DATABASE of its own on the same server, from
+// template0, with a unique name, migrates and uses that, and drops it afterwards.
+// Nothing in it is visible from the shared database, and the only thing the two
+// packages hold in common is the server: CREATE DATABASE and DROP DATABASE lock no
+// table of the shared one, and the connection that issues them holds none either.
 
 // A name this long is still a valid identifier (63 bytes at most); it is hex, so it
 // needs no quoting.
@@ -91,7 +91,9 @@ func newPostgresRetentionEnv(t *testing.T) *retentionEnv {
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), retentionPostgresTimeout)
 		defer dropCancel()
 		// WITH (FORCE) so a connection the test failed to close cannot leave the
-		// database behind.
+		// database behind. It needs PostgreSQL 13 or later (CI runs postgres:17); an
+		// older server rejects the statement and the t.Errorf below says to drop the
+		// database by hand.
 		if _, err := admin.ExecContext(dropCtx, `drop database if exists `+name+` with (force)`); err != nil {
 			t.Errorf("drop database %s: %v (drop it by hand)", name, err)
 		}
