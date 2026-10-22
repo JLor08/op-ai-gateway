@@ -6,6 +6,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
 	"testing"
 )
@@ -481,5 +482,121 @@ func TestWavFormatFromReader(t *testing.T) {
 				t.Fatalf("wavByteRateFromReader = (%d, %v), want the format's (%d, %v)", rate, rateOK, got.ByteRate, ok)
 			}
 		})
+	}
+}
+
+// wavStripToData walks to the `data` chunk and stops there, so a caller can relay exactly the
+// PCM that follows: the reader is left on the first byte of the body, and the declared size is
+// how many bytes belong to it.
+func TestWavStripToData(t *testing.T) {
+	// speechTestWAV(): mono, 16-bit, 16000 Hz, 8-byte data chunk.
+	r := bytes.NewReader(speechTestWAV())
+	format, size, ok := wavStripToData(r)
+	if !ok || size != 8 || !format.isMono16PCM() {
+		t.Fatalf("got format=%+v size=%d ok=%v, want mono16 size 8 ok", format, size, ok)
+	}
+	rest, _ := io.ReadAll(r)
+	if want := []byte{0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0x01, 0xc3}; !bytes.Equal(rest[:8], want) {
+		t.Fatalf("data body = %x, want %x", rest[:8], want)
+	}
+}
+
+func TestWavStripToDataRejectsNonWAVAndDataBeforeFmt(t *testing.T) {
+	for name, in := range map[string][]byte{
+		"not riff":        []byte("NOPExxxxWAVEfmt "),
+		"truncated":       []byte("RIFF\x2c\x00\x00\x00WAVEfmt "),
+		"data before fmt": []byte("RIFF\x20\x00\x00\x00WAVEdata\x04\x00\x00\x00\x00\x00\x00\x00"),
+	} {
+		if _, _, ok := wavStripToData(bytes.NewReader(in)); ok {
+			t.Fatalf("%s: ok=true, want false", name)
+		}
+	}
+}
+
+// The walk passes over what is not `data`: foreign chunks on either side of `fmt ` (an odd-length
+// one with its pad byte), and the tail of a `fmt ` chunk longer than its fixed PCM part. The body
+// the reader is left on is the audio and nothing else.
+func TestWavStripToDataSkipsForeignChunksAndTheTailOfALongerFmt(t *testing.T) {
+	pcm := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	list := wavChunk(t, "LIST", 5, []byte("INFOx")) // odd length: padded
+	fmtBody := new(bytes.Buffer)
+	wavPut(t, fmtBody, uint16(1), uint16(1), uint32(24000), uint32(48000), uint16(2), uint16(16), uint16(0)) // cbSize
+	longFmt := wavChunk(t, "fmt ", uint32(fmtBody.Len()), fmtBody.Bytes())
+	for name, wav := range map[string][]byte{
+		"foreign chunk ahead of fmt":   wavFile(t, list, wavFmtChunk(t, 24000, 1, 16), wavChunk(t, "data", uint32(len(pcm)), pcm)),
+		"foreign chunk between":        wavFile(t, wavFmtChunk(t, 24000, 1, 16), list, wavChunk(t, "data", uint32(len(pcm)), pcm)),
+		"fmt longer than its PCM part": wavFile(t, longFmt, wavChunk(t, "data", uint32(len(pcm)), pcm)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := bytes.NewReader(wav)
+			format, size, ok := wavStripToData(r)
+			want := wavFormat{Tag: 1, Channels: 1, SampleRate: 24000, ByteRate: 48000, Bits: 16}
+			if !ok || format != want || size != int64(len(pcm)) {
+				t.Fatalf("wavStripToData = (%+v, %d, %v), want (%+v, %d, true)", format, size, ok, want, len(pcm))
+			}
+			if rest, _ := io.ReadAll(r); !bytes.Equal(rest, pcm) {
+				t.Fatalf("data body = %x, want %x", rest, pcm)
+			}
+		})
+	}
+}
+
+// Whether the audio is the format the caller can relay is the caller's call: a stereo, 24-bit or
+// float32 WAV is still a WAV with a `data` chunk, and comes back with the format it states. The
+// size is the declared one, however much of the body the stream holds.
+func TestWavStripToDataReportsAnyFormatItIsGivenAndTheDeclaredSize(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fmt  []byte
+		want wavFormat
+		mono bool
+	}{
+		{"stereo 16-bit", wavFmtChunk(t, 24000, 2, 16), wavFormat{Tag: 1, Channels: 2, SampleRate: 24000, ByteRate: 96000, Bits: 16}, false},
+		{"mono 24-bit", wavFmtChunk(t, 32000, 1, 24), wavFormat{Tag: 1, Channels: 1, SampleRate: 32000, ByteRate: 96000, Bits: 24}, false},
+		{"mono float32", wavFmtChunkTagged(t, 3, 1, 24000, 32), wavFormat{Tag: 3, Channels: 1, SampleRate: 24000, ByteRate: 96000, Bits: 32}, false},
+		{"mono 16-bit", wavFmtChunk(t, 44100, 1, 16), wavFormat{Tag: 1, Channels: 1, SampleRate: 44100, ByteRate: 88200, Bits: 16}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A header-only stream: the data chunk declares 4096 bytes and the stream ends at its header.
+			wav := wavFile(t, tc.fmt, wavChunk(t, "data", 4096, nil))
+			format, size, ok := wavStripToData(bytes.NewReader(wav))
+			if !ok || format != tc.want || size != 4096 {
+				t.Fatalf("wavStripToData = (%+v, %d, %v), want (%+v, 4096, true)", format, size, ok, tc.want)
+			}
+			if format.isMono16PCM() != tc.mono {
+				t.Fatalf("isMono16PCM = %v, want %v for %+v", format.isMono16PCM(), tc.mono, format)
+			}
+		})
+	}
+}
+
+// What wavFormatFromReader and wavDurationFromReader refuse, the walk refuses: a `fmt ` that
+// contradicts itself or is too short to be read, a `fmt ` that is missing, and a stream that ends
+// before the `data` header.
+func TestWavStripToDataRejectsAnUnreadableFmtAndAStreamThatEndsBeforeData(t *testing.T) {
+	for name, wav := range map[string][]byte{
+		"inconsistent fmt":          wavFile(t, wavFmtChunkWith(t, 1, 24000, 4_800_000, 2, 16), wavDataChunk(t, 8)),
+		"fmt too short":             wavFile(t, wavChunk(t, "fmt ", 8, make([]byte, 8)), wavDataChunk(t, 8)),
+		"fmt cut off mid-body":      wavFile(t, wavChunk(t, "fmt ", 16, make([]byte, 10))),
+		"no fmt, no data":           wavFile(t, wavChunk(t, "LIST", 5, []byte("INFOx"))),
+		"ends after fmt":            wavFile(t, wavFmtChunk(t, 24000, 1, 16)),
+		"ends inside the data head": append(wavFile(t, wavFmtChunk(t, 24000, 1, 16)), 'd', 'a', 't'),
+		"foreign chunk cut short":   wavFile(t, wavFmtChunk(t, 24000, 1, 16), wavChunk(t, "LIST", 64, []byte("INFO"))),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if format, size, ok := wavStripToData(bytes.NewReader(wav)); ok || format != (wavFormat{}) || size != 0 {
+				t.Fatalf("wavStripToData = (%+v, %d, %v), want (wavFormat{}, 0, false)", format, size, ok)
+			}
+		})
+	}
+}
+
+// As in wavDurationFromReader, the last `fmt ` chunk before `data` is the one that counts.
+func TestWavStripToDataTakesTheLastFmtChunkBeforeData(t *testing.T) {
+	wav := wavFile(t, wavFmtChunk(t, 8000, 1, 16), wavFmtChunk(t, 48000, 2, 16), wavDataChunk(t, 8))
+	format, size, ok := wavStripToData(bytes.NewReader(wav))
+	want := wavFormat{Tag: 1, Channels: 2, SampleRate: 48000, ByteRate: 192000, Bits: 16}
+	if !ok || format != want || size != 8 {
+		t.Fatalf("wavStripToData = (%+v, %d, %v), want (%+v, 8, true)", format, size, ok, want)
 	}
 }
