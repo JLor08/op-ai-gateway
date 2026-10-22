@@ -180,7 +180,7 @@ takes over ([ADR-065](09-architecture-decisions.md#adr-065--streaming-transcript
 A speech turn in the portal chat is the one place the speech relay of §6.1.1 is called
 by the gateway itself. The browser never calls `/v1/audio/speech`: it starts a **run**
 like any chat turn, and the run executor calls the endpoint over loopback, stores the
-WAV it gets back as a chat blob and lets the browser fetch that blob for playback.
+WAV it gets back as a chat blob (several ordered blobs for a long answer, [ADR-070](09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)) and lets the browser fetch them for playback.
 A **buffered** speech turn, like an image turn, emits no incremental event between dispatch
 and the finished reply, so the browser shows a wait state fed by a server-measured clock; a
 **streaming** turn (below the diagram) plays the audio as it arrives.
@@ -207,14 +207,14 @@ sequenceDiagram
         AC-->>SP: audio/wav + Content-Length + X-AudioCPP-* headers
         SP->>U: audio_second under the run-as token
         SP-->>GW: audio/wav
-        GW->>GW: read the whole body, require a WAV Content-Type, build ONE audio_url part (data:audio/wav)
-        GW->>S: commit the turn, extractChatBlobs moves the WAV into chat_blobs and rewrites the URL
-        GW-->>B: SSE done with content_parts (the part as produced)
-        B->>GW: GET /api/portal/chat-blobs/{id} (once, session cookie, owner-scoped)
+        GW->>GW: read the whole body, require a WAV Content-Type, build the audio_url parts (data:audio/wav, ONE part unless the clip is over the per-part target)
+        GW->>S: commit the turn in one transaction, extractChatBlobs moves each WAV part into its own chat_blobs row and rewrites the URLs
+        GW-->>B: SSE done with content_parts (the parts as produced)
+        B->>GW: GET /api/portal/chat-blobs/{id} (once per part, session cookie, owner-scoped)
         GW-->>B: audio/wav (no Range support)
-        B->>B: AudioTurn plays an object URL in audio controls, revoked on unmount
+        B->>B: AudioTurn joins several parts into one WAV and plays one object URL in audio controls, revoked on unmount
     else error
-        SP-->>GW: the endpoint's own error, or an empty, unreadable or non-WAV 2xx
+        SP-->>GW: the endpoint's own error, or an empty, unreadable or non-WAV 2xx, or a clip over the total audio cap
         GW-->>B: SSE done, status error with gateway.chat_run_* or speech.* code
     end
 ```
@@ -227,11 +227,25 @@ sends `stream=true` with `stream_format=sse` instead, arming `speechRunDeadline`
 first chunk of audio. Each `speech.audio.delta` reaches the browser as an **`audio`** run event
 (`{seq, rate, data}`: base64 PCM, a sequence number and the sample rate) that the browser
 schedules gaplessly on one shared `AudioContext`, and is buffered nowhere on the server. The
-executor keeps the PCM, and on a stream that ended with `speech.audio.done` and `[DONE]` it wraps
-it in a canonical WAV header at the cached rate and commits the **same one `audio_url` part** as
-the buffered turn, so the rest of the diagram (the blob, the SSE `done`, `AudioTurn`) is
-unchanged; a cut stream commits nothing. Live playback is abandoned for the run at the first
+executor keeps the PCM, cutting it into WAV parts as it arrives (each a canonical WAV header at
+the cached rate over at most one part-target of PCM, `min(8 MiB, blob cap / 2)`), and on a stream
+that ended with `speech.audio.done` and `[DONE]` commits the **same `audio_url` parts** as the
+buffered turn (one part for a clip that fits one blob), so the rest of the diagram (the blob,
+the SSE `done`, `AudioTurn`) is unchanged; a cut stream commits nothing. Live playback is abandoned for the run at the first
 gap in the sequence, which is harmless because the committed WAV is complete.
+
+**Long answers** ([ADR-070](09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch), issue #279). A clip longer than the per-part target
+(`min(8 MiB, MaxChatBlobBytes / 2)` of PCM, about 95 seconds at 44.1 kHz mono by default) is
+committed as several ordered `audio_url` parts, each a standalone 16-bit mono WAV and each its
+own `chat_blobs` row, in the one atomic `SaveChatWithBlobs`; their order is their position in the
+content array, so there is no ordering column and no migration. The buffered turn cuts a
+conforming WAV's `data` chunk the same way, and commits any other WAV whole. The total PCM a turn
+may store is capped (`OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES`, 256 MiB, enforced by the executor): a
+clip over it ends the run `gateway.chat_run_audio_too_large` and commits nothing. A **streamed**
+clip over the cap stops being *kept* but is still read and relayed to `[DONE]`, so the relay
+bills the call as the delivered one it was and the listener hears it to the end. In the browser
+`AudioTurn` fetches the parts and joins them into one gapless WAV for playback and for the
+download (a single part is played and saved as it is).
 
 What differs from the speech relay of §6.1.1: the caller is the executor and the
 credential the internal loopback pair (never a session cookie, [Security
@@ -240,10 +254,12 @@ billing, capture and routing run under the **run-as token**; the response is rea
 whole and checked before anything is stored (empty, unreadable or not labelled WAV is
 `gateway.chat_run_no_audio` or `gateway.chat_run_speech_response_unreadable`); and the
 WAV leaves the sealed transcript for `chat_blobs`, so the document carries a short gateway
-URL. A failed commit (a WAV over `MaxChatBlobBytes`) ends the run
+URL (one per part). A failed commit is named where naming it helps: a blob over
+`MaxChatBlobBytes` is `images.blob_too_large`, a commit that outlived its 30 s bound is
+`gateway.chat_run_commit_timeout`, and only an unclassified store failure is the generic
 `gateway.chat_run_commit_failed`. Playback is the browser's own concern: the blob
-endpoint answers no `Range` request, so `AudioTurn` fetches the blob once and plays an
-object URL. See [Compatibility & Inference
+endpoint answers no `Range` request, so `AudioTurn` fetches each blob once and plays one
+object URL (several parts joined into one WAV). See [Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) and
 [ADR-063](09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs).
 

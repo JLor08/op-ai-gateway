@@ -290,10 +290,11 @@ again, set the format to PNG or JPEG and regenerate, wait for the agent to
 report, or supply a mask the size of the source
 ([API Compatibility & Inference §12](compatibility-and-inference.md#12-in-portal-chat-playground)).
 
-**The speech codes are in the same lists.** The four codes of a speech chat run
+**The speech codes are in the same lists.** The five codes of a speech chat run
 (`gateway.chat_run_speech_dispatch_failed`, `gateway.chat_run_no_audio`,
-`gateway.chat_run_speech_response_unreadable` and `gateway.chat_run_speech_reserved_field`)
-are in the chat-run list, and the four `speech.*` refusals of `POST /v1/audio/speech` that a
+`gateway.chat_run_speech_response_unreadable`, `gateway.chat_run_speech_reserved_field` and
+`gateway.chat_run_audio_too_large`, [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch))
+are in the chat-run list, as is `gateway.chat_run_commit_timeout`, and the four `speech.*` refusals of `POST /v1/audio/speech` that a
 run relays (`speech.input_required`, `speech.response_format_unsupported`,
 `speech.stream_unsupported` and `speech.upstream_error`) are in a list of their own,
 pinned in both directions like the `images.*` set. `speech.model_required` is unmapped on

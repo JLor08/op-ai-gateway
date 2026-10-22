@@ -108,7 +108,7 @@ type Config struct {
 	CaptureMaxBytes                 int
 	CaptureMemoryMaxBytes           int
 	MaxChatBlobBytes                int // per-blob ceiling for one chat binary payload (#124); config only, the service layer enforces it
-	MaxChatAudioBytes               int // total ceiling on the audio one chat run may store across its blobs (#279); default 256 MiB; the per-blob cap above still bounds each blob; config only, the gateway run executor enforces it
+	MaxChatAudioBytes               int // total ceiling on the decoded PCM bytes one chat run may store across its audio blobs (#279); default 256 MiB; the per-blob cap above still bounds each blob; config only, enforced by the gateway run executor
 	MaxRunHistoryBytes              int // ceiling on the stored-image bytes one chat run resolves into its upstream history (#124); config only, the service layer enforces it
 	MaxImageEditBodyBytes           int // cap on the multipart body POST /v1/images/edits holds in memory; default 32 MiB, the server agent's own cap (an edit to an agent-launched model is also refused past that, whatever this is set to)
 	MaxAudioTranscriptionBodyBytes  int // cap on the multipart body POST /v1/audio/transcriptions holds in memory, and on the JSON response it buffers to read the billable duration; default 32 MiB, the server agent's own cap (its own setting, independent of the image-edit cap)

@@ -4350,7 +4350,8 @@ foreign or missing id in a chat that still exists. The failure of a
 *generated* image's extraction at the assistant commit (it is too large or of an
 unlisted type) ends the run as `gateway.chat_run_commit_failed`
 ([ADR-043](#adr-043--the-portal-image-turn-the-model-is-the-affordance-the-kind-is-pinned-to-the-thread)
-(c)); the three `images.blob_*` codes and the history bound are answered by the
+(c); amended by [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch) (e): a blob over the per-blob ceiling is now named,
+`images.blob_too_large`, and only an unlisted type or another store failure stays generic); the three `images.blob_*` codes and the history bound are answered by the
 run-start `POST`. An id in a transcript is a claim, never a grant: authorisation
 is at read (serve) and at resolve (chat-scoped), so neither create nor autosave
 validates the URLs it stores.
@@ -5891,7 +5892,11 @@ could have chosen:
   `Content-Security-Policy: default-src 'none'`, `Content-Disposition: inline`,
   `Cache-Control: private, no-store`) and its owner scoping are untouched. A WAV the
   store refuses at the assistant commit (too large, or a type off the list) ends the run
-  as `gateway.chat_run_commit_failed`, as an image does.
+  as `gateway.chat_run_commit_failed`, as an image does. (Amended by [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch):
+  the reply is **one or more ordered** `audio_url` parts, exactly one for a clip that fits the
+  per-blob ceiling and each its own blob for a longer one; a clip over the total audio cap is
+  `gateway.chat_run_audio_too_large`, and a blob over the per-blob ceiling is surfaced as
+  `images.blob_too_large`, not the generic code.)
 - **(d) Playback fetches the blob into an object URL.** `AudioTurn` renders an HTML5
   `<audio controls>` and a download button, but does **not** hand the gateway URL to the
   element: the endpoint answers no `Range` request, and Safari and iOS will likely not play
@@ -5922,7 +5927,10 @@ could have chosen:
   the user's own cookie, planted only by someone who can already write that user's own
   transcript, and its response goes to an object URL that is played or saved under an
   allow-listed extension: not SSRF and not a cross-user read. Tightening it to the exact
-  blob-id shape is a cheap, deferred hardening, and no code changes here.
+  blob-id shape is a cheap, deferred hardening, and no code changes here. (Amended by
+  [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch) (f): a multi-part answer is fetched part by part and joined
+  client-side into one WAV, the one object URL that plays and the one file the download saves;
+  a single part is as described here.)
 - **(e) The chat's picker widens, and the shared offering view does not.** The Models
   listing carries a **`speech` flag** on `ModelDTO` (`/api/portal/models`, always
   present), the one fail-closed fold the unknown-model redirect already read
@@ -6028,7 +6036,9 @@ buffered request with no progress to show, so the wait is the elapsed clock and 
 honest "no intermediate news"; the first synthesis after a model load can take long
 enough to matter inside the 10-minute bound. The WAV is uncompressed, so a long text can
 produce a payload near `MaxChatBlobBytes` (20 MiB by default), and the commit of one over
-it fails the run as `gateway.chat_run_commit_failed`; the executor holds each in-flight
+it fails the run as `gateway.chat_run_commit_failed` (**superseded by [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)**: a long
+answer is stored as several blobs under a total audio cap, and an over-long one is
+`gateway.chat_run_audio_too_large`); the executor holds each in-flight
 run's whole response in memory, and the browser holds one object URL per audio turn it
 has rendered until it unmounts. Stored WAVs are retained for the chat's lifetime like
 every blob, with no prune (ADR-056). The gateway never converts or re-encodes: the reply
@@ -7338,7 +7348,8 @@ case and leaves the buffered path and every non-streaming metering byte-identica
   endpoint, so the relay and its metering are the public endpoint's, not a second audio path;
   reads the SSE (`consumeSpeechStream`); and commits **the same turn as the buffered run**,
   one `audio_url` part holding an assembled WAV that `chat_blobs` stores as before (the
-  canonical 44-byte PCM header written from the cached rate, `wavFromPCM16`). It reuses the
+  canonical 44-byte PCM header written from the cached rate, `wavFromPCM16`; **since
+  [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch), one or more ordered parts**, cut as the PCM arrives). It reuses the
   run's reservation, first-delta deadline (armed by the executor and **lifted at the first
   chunk**, the transcription run's arrangement, with the relay's idle watchdog bounding it
   after), TTFT metric and single terminal commit. It commits only a stream that ended with
@@ -7662,5 +7673,187 @@ PCM).
 [Security, Authentication & Authorization
 §14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-070 — Long speech is stored as multiple ordered WAV blobs under a total audio cap: positional order with no migration, one atomic commit, an honest audio-too-large error that still bills the delivered call, named commit-failure codes, and a gapless client-side stitch
+**Context:** a portal speech turn ([ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs),
+buffered; [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives),
+streamed) committed its answer as **exactly one `audio_url` part**, which `chat_blobs` stores as
+one row. The store's per-blob ceiling (`MaxChatBlobBytes`, 20 MiB by default, about four minutes
+of 44.1 kHz mono 16-bit audio) was therefore the **only** limit on how long one spoken answer
+could be, and a longer one failed **after** the synthesis had been paid for, and on a streaming
+run after the user had already **heard** the whole clip live. The failure was then reported as
+the generic `gateway.chat_run_commit_failed`, which the portal words as "please try again": a
+retry of the same text and voice produces the same over-long clip and fails the same way
+(issue #279). Four facts about the pieces it joins shaped every choice below:
+
+- **The store already holds N blobs per chat, atomically, with no order column.** `chat_blobs`
+  is a payload-agnostic byte store, one row per payload, and `SaveChatWithBlobs` writes the chat
+  document and every newly extracted blob as **one transaction** on all three drivers.
+  `extractChatBlobs` walks every `audio_url` part of a message in order and gives each its own
+  row. The order of the parts is the order of the **content array in the chat document**; a row
+  never needed to know its position. Splitting a clip into several parts therefore flows through
+  the existing extraction unchanged.
+- **Each blob is served, and checked, as a file of its own.** The serving endpoint answers no
+  `Range` request and re-checks one media type (`audio/wav`) per row, so a part must be a
+  complete, playable WAV, not a fragment of one.
+- **The relay bills a streamed speech call on whole delivery.** A loopback read that stops
+  early is `provider.client_disconnected`, an error row billed `(audio_second, 0)`
+  ([ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+  (d)), so aborting an over-long stream to save memory would change what the operator is billed.
+- **The per-blob ceiling is also what bounded the executor's memory.** Lifting it without a
+  replacement would let one runaway synthesis grow without limit and fail as a crash or a
+  commit timeout, not an honest message.
+
+**Decision — six choices, taken together. Nothing about a clip that fits one blob changes: it
+is still exactly one part, byte for byte.**
+
+- **(a) A long answer is N ordered `audio_url` parts, each a standalone 16-bit mono WAV and
+  each its own `chat_blobs` row, committed in one atomic `SaveChatWithBlobs`. Order is
+  positional, and there is no migration.** The streaming executor cuts the PCM into WAV parts
+  as it arrives (a part is built the moment its PCM is complete and that PCM is released, so
+  the clip is never held as one buffer of PCM, only as its finished parts); the buffered
+  executor cuts the `data` chunk of a conforming WAV the same way (`splitBufferedSpeech`).
+  Each part is `wavFromPCM16` over its own slice, so it is a whole file with its own 44-byte
+  header, in whole samples, and the parts' audio put end to end is the clip. A trailing half
+  sample is dropped and is never a part of its own. A WAV that is not mono 16-bit PCM, or a
+  body that is no WAV at all, is committed whole as the single part it always was (the cut is
+  made on 16-bit samples and would split any other format mid-frame). **There is no schema
+  change**: no ordering column, no message id, nothing for a migration to add, so the migration
+  history stands as it was ([Data
+  Model](reference/data-model.md#4-migration-history-95-migrations)) and the store layer is
+  untouched.
+- **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
+  it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
+  samples (`DefaultAudioPartBytes` is 8 MiB, about 95 seconds at 44.1 kHz mono). Half the cap
+  is the margin that keeps the part's WAV (its PCM plus 44 header bytes) under whatever the
+  cap is measured against, and it **honors a lowered `OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES`**: an
+  operator who sets the ceiling below 8 MiB gets smaller parts, not a part that fails the
+  commit, which is the very bug this removes. The executor holds both caps as `Server` fields
+  wired from config (it could not read `MaxChatBlobBytes` before). The target is a derived
+  constant, not a new knob. **The per-blob size is no longer the limit on audio length.**
+- **(c) A new total cap, `OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES` (default 256 MiB), counted in
+  decoded PCM bytes and enforced only by the gateway run executor.** What the per-blob ceiling
+  stopped bounding, the total bounds: at the default, about 50 minutes of 44.1 kHz mono 16-bit
+  audio, at most 32 default-size parts per turn. It counts the **PCM itself, not the WAV
+  headers**, and **only the run executor applies it**: the store is a plain byte store and gains
+  no total cap (the portal service layer still applies the per-blob ceiling alone, and each
+  part passes it). A clip over the total is the terminal code
+  **`gateway.chat_run_audio_too_large`** and **nothing is committed**, because a clip with its
+  tail cut off would be presented as the whole reply, the silent truncation every other speech
+  code refuses. A streamed clip learns it is over only as it arrives, so the verdict comes
+  once the stream has been read to its end; a buffered clip is measured before anything is
+  built. The portal words the code as "too long to store, use a shorter text" and **not** as
+  "try again", because the same text meets the same cap on a retry. A cap value that is junk,
+  `0` or negative reads as the default, as the other byte caps do. No pre-synthesis refusal
+  exists: the length of the output is unknowable before the synthesis, and an input-length
+  heuristic would refuse clips that fit.
+- **(d) Billing is unchanged: an over-cap stream is still drained to `[DONE]`.** Crossing the
+  cap stops the **keeping** of audio and nothing else: the parts held so far are dropped (the
+  memory bound), but every later line is still read and every later delta still relayed, so the
+  loopback relay sees the stream delivered whole, bills the call exactly as it bills any
+  complete one, and the listener still hears the clip to its end. The over-cap turn then ends as
+  `gateway.chat_run_audio_too_large`. Early-aborting the read would stop the playback at the cap
+  but bill that turn zero (`client_disconnected`), a change to what ADR-068 (d) meters, which
+  this decision does not make.
+- **(e) A commit failure is named wherever naming it tells the user something, and only an
+  unclassifiable one is the generic code.** `commitFailureCode` previously mapped everything
+  but `portal.chat_too_large` to `gateway.chat_run_commit_failed`. It now also surfaces
+  **`images.blob_too_large`** verbatim (one blob of the turn is over the per-blob ceiling, so a
+  retry of the same request cannot succeed) and maps a commit that outlived
+  `chatRunCommitTimeout` (30 s, `context.DeadlineExceeded`) to the new
+  **`gateway.chat_run_commit_timeout`** (the store is slow or wedged and the turn may or may not
+  have landed, so the label says to reload and check, and promises neither "try again" nor
+  "not saved"). The portal has a German and an English label for each new code, pinned by tests
+  to differ from the generic commit-failed sentence. A driver or marshal failure stays
+  `gateway.chat_run_commit_failed`.
+- **(f) Playback and download stitch the parts client-side into one gapless WAV.** `AudioTurn`
+  fetches every stored part of the answer, and `concatWavBlobs` reads each part's `data` chunk,
+  writes the PCM end to end behind **one** canonical 44-byte header, and hands the native
+  `<audio controls>` that single clip. It is the mirror of the gateway's `wavFromPCM16`, and it
+  is what keeps the scrubber, avoids an audible gap at every seam (a sequence of elements would
+  gap) and gives **one whole-clip download** (`downloadBlob` saves exactly what plays). The
+  parts must share one format (they come from one model and one synthesis), and a mismatch
+  throws rather than playing at the wrong rate. The server never concatenates: the stored
+  bytes stay N standalone files and the blob endpoint stays `Range`-less. A **single-part**
+  answer, which is every clip stored before this decision and every short one, takes no part in
+  any of it and is played and saved as the one blob the server served. Live playback of a
+  streaming run (the `audio` events) is untouched.
+
+**Consequence:** a bounded, backward-compatible extension with no new moving part in the
+store. **No migration, no ServerAgent version bump and no new billing unit**: the relay, the
+metering, the loopback request and every error row are as they were, and a clip that fits one
+blob is one part exactly as before. The cost and the residuals are named ([Risks
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
+
+- **The whole clip is materialized once, at the commit.** The atomic single commit is kept on
+  purpose (incremental writes would persist partial or orphan blobs when a later write fails
+  and break "a completed run never survives a failed write"), and it means the answer's finished
+  parts (held as base64 `data:` URLs, then marshalled and decoded into the blobs) are in memory
+  together when `SaveChatWithBlobs` runs. The commit-phase peak therefore **scales with the
+  total cap**, per concurrent over-long turn, which is why the cap is an operator knob and not
+  a constant. What is bounded is the number of simultaneous copies, not the total: each stored
+  blob value stays at most the per-part target, so no per-value store limit and no capture-
+  cipher seal is threatened, and only the number of rows per transaction grows. **O(1)
+  streaming-to-store is a deliberate follow-up and is not built here.**
+- **A clip that is not 16-bit mono PCM is bounded by the per-blob cap only.** The total cap
+  counts 16-bit samples, so a non-conforming WAV (which the probed model never produces) is
+  committed whole and still meets the per-blob ceiling at the commit, as it always did.
+- **Saved playback waits for every part.** The native `<audio>` needs the stitched blob, so a
+  long saved answer fetches all its parts before it plays (a progressive saved player over the
+  streaming player's Web Audio path is a possible follow-up). The stitched object URL pins the
+  whole clip until the turn unmounts, as a single WAV did.
+- **A long clip on the volatile RAM store counts against the same FIFO budget** as every chat
+  blob ([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)),
+  so it can evict older chats there; a clip larger than the whole budget is kept as the sole
+  entry. The persistent drivers have no such coupling.
+- **An over-cap streamed turn is billed and heard in full and stored not at all.** That is the
+  honest outcome of (c) and (d), and it is rare: the default is about fifty minutes.
+
+**Amends:** [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+((c): the reply is **one or more ordered** `audio_url` parts, exactly one for a clip that fits
+the per-blob cap; (d): playback and download of a multi-part answer go through the client-side
+stitch; the Consequence's "a WAV over `MaxChatBlobBytes` fails the run as
+`gateway.chat_run_commit_failed`" is replaced by the total cap and the named codes above),
+[ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+((f): the streaming run commits the same turn as the buffered run, which is now one or more
+parts; (d)'s metering is **unchanged**, and the executor's "whole PCM in memory" cost becomes
+the finished parts up to the total cap) and
+[ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)
+(a generated blob the store refuses as too large at the assistant commit now ends the run as
+`images.blob_too_large`, not the generic commit code; an unlisted media type stays generic).
+ADR-043 (e)'s fresh 30 s commit bound is unchanged; only the code a timed-out commit reports
+is new.
+
+**Rejected:** **A `position`/order column or a message id on `chat_blobs`** (the content array
+already orders the parts and the extraction already walks them in order; a migration would
+buy nothing and touch every driver). **Incremental store writes while the stream is read**
+(partial and orphan blobs on any later failure, and a completed run could no longer be told
+from a half-stored one; the atomic commit stays, and O(1) streaming-to-store is a follow-up).
+**A total cap enforced in the store** (the store is payload-agnostic and a cap there would
+fail inside the transaction as a store error, not as an honest, named run code; the executor
+is where the clip's length is known). **Aborting the loopback stream at the cap** (it bills
+the turn zero, `client_disconnected`, a metering change this decision does not make).
+**Committing the clip's first part or a truncated clip when the cap is crossed** (a tail cut
+off would pass for the whole reply). **Refusing the request up front from the input's
+length** (the output's length is unknowable before synthesis, and a heuristic refuses clips
+that fit). **A new `OP_AI_GATEWAY_*` knob for the part size** (it must follow a lowered
+per-blob ceiling anyway, so a derived constant is the one value that cannot disagree with
+it). **Concatenating the parts on the server into one served WAV** (the stored bytes would
+have to exist twice, or be built per request in a handler that is locked down on purpose,
+and the clip would again be a single blob bounded by the per-blob ceiling). **One `<audio>`
+element per part** (an audible gap at every seam, a scrubber per part and N downloads).
+**Transcoding the clip to a compressed format to make it smaller** (the gateway never
+converts or re-encodes, ADR-063 and ADR-064; #264 owns the opt-in design). **A new billing
+unit or a metering change for a long clip** (the duration the relay counts is the same
+whether the clip is stored as one blob or as many).
+→ [API Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Runtime View
+§6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
+[Configuration & Environment
+Variables](reference/config-env.md#encrypted-payload-capture),
+[Data Model](reference/data-model.md#4-migration-history-95-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

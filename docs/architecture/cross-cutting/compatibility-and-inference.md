@@ -917,7 +917,7 @@ reaches `POST /v1/audio/speech` through the run executor, over the internal loop
 with the run-as header, which is the leg this endpoint admits instead of a session
 cookie. The endpoint, its validation, its relay and its billing are the public endpoint's
 own; the chat takes the whole WAV (a buffered run) or the assembled stream (item 3), stores it
-as a chat blob and plays it back
+as a chat blob (several ordered blobs for a long answer, [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)) and plays it back
 ([§12](#12-in-portal-chat-playground),
 [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs),
 [ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)).
@@ -2974,7 +2974,10 @@ now overrides whatever terminal the run was about to report:
 condition — nothing was stored for this turn, so the one thing that helps is a
 new chat, which starts with the whole budget free. It deliberately does **not**
 tell the user to download the image: the commit failed, so the terminal event
-carries no content parts (below) and there is nothing on screen to save. Any
+carries no content parts (below) and there is nothing on screen to save. `images.blob_too_large` (one blob over the per-blob ceiling, which a retry cannot cure) is
+surfaced by name too, and a commit that outlived its 30 s bound is
+`gateway.chat_run_commit_timeout` (the turn may not have been stored, so its label says to
+reload and check, not to retry; [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch) (e)). Any
 other store failure degrades to one stable `gateway.chat_run_commit_failed`
 rather than reaching a portal bubble as a raw Go error string. **One
 exception:** a
@@ -2991,9 +2994,10 @@ is written from the time an inline image routinely approached
 `portal.MaxChatContentBytes`. An image no longer counts against it: it is moved
 into `chat_blobs` *before* the cap is checked, so the code now means a too-large
 **text** document, and a thread of many images does not reach it. A *generated*
-image the store refuses at the commit (one decoded payload over
-`MaxChatBlobBytes`, or a media type outside the allow-list) is not one of the
-verbatim codes — it degrades to `gateway.chat_run_commit_failed` like any other
+image the store refuses at the commit is named when one decoded payload is over
+`MaxChatBlobBytes` (`images.blob_too_large`, surfaced verbatim since [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch) (e):
+a retry of the same request cannot succeed), while a media type outside the
+allow-list still degrades to `gateway.chat_run_commit_failed` like any other
 store failure — whereas the same refusals on a run-start `POST` are answered by
 their own `400` codes (`images.blob_type_unsupported`, `images.blob_too_large`,
 `images.blob_not_owned`, and `portal.chat_run_history_too_large`; see "Images
@@ -3192,10 +3196,13 @@ success, which would render as a blank bubble);
 end, or whose `Content-Type` is not a WAV label — `audio/wav`, `audio/x-wav`,
 `audio/wave` or `audio/vnd.wave`, all normalised to `audio/wav`, since the media type is
 the one fact about the audio that must come from the response); and
-`gateway.chat_run_speech_reserved_field`. The endpoint's own refusals reach the run as
+`gateway.chat_run_speech_reserved_field`. A fifth, `gateway.chat_run_audio_too_large`
+([ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)), has no image namesake: the synthesized audio is longer than the total
+a turn may store (`MaxChatAudioBytes`), so **nothing is committed**, and its label says what to
+change (a shorter text), not to retry. The endpoint's own refusals reach the run as
 their codes through `upstreamErrorCode` — `speech.input_required`,
 `speech.response_format_unsupported`, `speech.stream_unsupported` and
-`speech.upstream_error` (§3.6, §13) — and all eight have German and English labels in
+`speech.upstream_error` (§3.6, §13) — and all nine have German and English labels in
 `format.ts`'s `errorLabelByCode`, worded for speech rather than reusing the image labels,
 which talk about images. `speech.model_required` is left unlabelled, as its images twin
 is: a run always sends the thread's pinned model. Both-directions tests pin the speech
@@ -3213,7 +3220,11 @@ which Safari and iOS likely require to play from a URL, so `AudioTurn` does not 
 element the stored `/api/portal/chat-blobs/` URL: it fetches it **once**, same-origin with the session cookie, and plays an object URL
 made from the bytes, and the effect's cleanup **revokes the object URL** when the turn
 unmounts or the URL changes (it pins the whole WAV in memory until then) and aborts a
-fetch still in flight. The run's own terminal event carries the part as produced, an inline
+fetch still in flight. A long answer is **several** ordered parts ([ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)):
+`AudioTurn` fetches every stored part and joins them client-side (`concatWavBlobs` writes each
+part's PCM end to end behind one canonical header) into **one** gapless WAV, which is the one
+object URL the element plays and the one file the download saves; a single part is played and
+saved as the blob the server served. The run's own terminal event carries the part as produced, an inline
 `data:audio/wav` URL the element plays directly until the post-`done` refetch swaps in the
 stored one; any other URL shape is refused inline rather than fetched. The download goes
 through `downloadBinary` (a second fetch, on click), whose extension map is keyed on the
@@ -3229,9 +3240,10 @@ hardening rather than a defect.
 a streaming branch, the transcription run's shape (below) on the output side: it POSTs `stream=true`
 with `stream_format=sse` (and no `response_format`) to the gateway's own `/v1/audio/speech` over
 the same loopback, so the relay and its metering are the public endpoint's (§3.6 items 3 and 6),
-reads the SSE (`consumeSpeechStream`), and commits **the same single `audio_url` part** the
-buffered run commits, a WAV assembled from the PCM (the canonical 44-byte header written with the
-cached rate) that `chat_blobs` stores as ever. It reuses the run's reservation, first-delta
+reads the SSE (`consumeSpeechStream`), and commits **the same `audio_url` parts** the
+buffered run commits (one for a clip that fits one blob, several ordered ones for a longer
+clip, [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)), WAVs assembled from the PCM as it arrives (the canonical 44-byte
+header written with the cached rate over each part's slice) that `chat_blobs` stores as ever. It reuses the run's reservation, first-delta
 deadline (armed by the executor itself and **lifted at the first chunk of audio**, after which
 the relay's idle watchdog bounds liveness), TTFT metric and one terminal commit. It commits only
 a stream that ended with `speech.audio.done` then `[DONE]` and some audio: a stream cut short
@@ -3355,7 +3367,8 @@ plural by design because the billed quantity comes from the response rather
 than from the request's `n` (§3.4). That is the same shape an *uploaded* vision
 image already has (§11), so history construction feeds a generated image back
 as a vision input on the next turn with no extra code, and the transcript
-renderer already understood it. A speech turn's one part is an `audio_url` part,
+renderer already understood it. A speech turn's part is an `audio_url` part (one for a clip that fits the per-blob
+ceiling, several ordered ones for a longer answer, [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)),
 `{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,…"}}`, `image_url`'s
 twin, which no history construction ever feeds back as a vision input.
 
