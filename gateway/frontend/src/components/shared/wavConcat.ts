@@ -54,7 +54,7 @@ async function readBytes(blob: Blob, start: number, length: number): Promise<Dat
 }
 
 function fourCC(view: DataView, offset: number): string {
-  return String.fromCharCode(
+  return String.fromCodePoint(
     view.getUint8(offset),
     view.getUint8(offset + 1),
     view.getUint8(offset + 2),
