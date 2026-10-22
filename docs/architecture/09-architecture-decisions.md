@@ -5283,7 +5283,9 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   chunked, and chat, Responses, Messages and images keep relaying chunked as before.
   **(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a streamed speech answer, an event stream or raw PCM, is
   relayed chunked and the length is not set; a stream request answered with a plain
-  `audio/wav` keeps it.)** The
+  `audio/wav` keeps it.)** **(Amended by [ADR-069](#adr-069--non-stream-speech-pcm-is-a-wav-header-strip-not-a-transcode-the-gateway-relays-the-data-chunk-of-a-16-bit-mono-wav-as-headerless-pcm-refuses-any-other-clip-after-synthesis-and-leaves-mp3opusflacaac-to-264): a one-shot `pcm` answer's
+  `Content-Length` is the data chunk's size, not the upstream's, because the header strip
+  shortens the body.)** The
   length is read off the upstream header (the provider response type carries no length
   field), which is sound because Go's client drops that header for a chunked or
   decompressed response, so a surviving value is the length the copier writes. The
@@ -5318,7 +5320,9 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   **(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a STREAMED speech response is `text/event-stream` or
   `application/octet-stream` and is still captured as this redacted summary, never as the
   event text; the capture's endpoint is stamped speech so the binary-speech backstop
-  redacts it.)**
+  redacts it.)** **(Amended by [ADR-069](#adr-069--non-stream-speech-pcm-is-a-wav-header-strip-not-a-transcode-the-gateway-relays-the-data-chunk-of-a-16-bit-mono-wav-as-headerless-pcm-refuses-any-other-clip-after-synthesis-and-leaves-mp3opusflacaac-to-264): a one-shot `pcm` answer is
+  `application/octet-stream`, not `audio/*`, so the same backstop redacts it, with no
+  endpoint stamp needed on the non-stream path.)**
 - **(i) A non-2xx upstream response is normalised to the OpenAI error shape.** The relay
   buffers the (bounded) error body and, in order: an OpenAI error object passes through
   **byte for byte** (audio.cpp's own shape, so its attested `type` is not overwritten
@@ -5436,7 +5440,7 @@ signed 16-bit little-endian mono PCM (`application/octet-stream`, `Content-Lengt
 chunk's, so (f)'s length is the data chunk's for this answer), refused with 502
 `speech.pcm_unavailable` and billed `(audio_second, 0)` when the clip is not 16-bit mono PCM. (g)
 is unchanged: the duration header still meters it. The strip is a container operation, not
-re-encoding, so ADR-063/ADR-064's "never re-encodes" holds.
+re-encoding, so ADR-063/ADR-064's "never converts or re-encodes" holds.
 
 → [API Compatibility & Inference §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
@@ -7468,8 +7472,8 @@ none of its machinery). **A second audio code path for the portal** (the run is 
 existing speech run with a stream branch).
 
 **Amended by [ADR-069](#adr-069--non-stream-speech-pcm-is-a-wav-header-strip-not-a-transcode-the-gateway-relays-the-data-chunk-of-a-16-bit-mono-wav-as-headerless-pcm-refuses-any-other-clip-after-synthesis-and-leaves-mp3opusflacaac-to-264)
-(non-stream `pcm`; issue #253 part 1).** (b)'s validation line for a request that does not
-stream, "`wav` or absent (unchanged)", now reads `wav`, `pcm` or absent: a one-shot `pcm`
+(non-stream `pcm`; issue #253 part 1).** (b)'s validation line, "`wav` or absent for a request that does
+not stream (unchanged)", now reads `wav`, `pcm` or absent for a request that does not stream: a one-shot `pcm`
 request is served as the upstream WAV's `data` chunk, headerless. The buffered downgrade of a
 `stream: true` request (a route not known to stream, or the stale-`yes` retry) is left exactly
 as decided here and still answers a one-shot `audio/wav`, whatever `response_format` it named.
@@ -7544,7 +7548,8 @@ everything else is byte-identical.**
   every other field kept exactly as written, a number keeping its full precision) and marks
   the relay `speechPCMStrip`. The 2xx path of `proxyNative` then reads the WAV header from
   the upstream body through a counting reader with **`wavStripToData`**, which is
-  [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)'s `wavduration.go` chunk walker (RIFF check, foreign chunks and the
+  [ADR-065](#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript) (c)'s `wavduration.go` chunk walker, extended by
+  [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives) (d)'s format decode (RIFF check, foreign chunks and the
   tail of a longer `fmt ` chunk skipped, pad bytes honoured, the `fmt ` decode and its
   self-consistency check shared with `wavFormatFromReader` through `wavFormatFromFields`)
   stopped at the first byte of the `data` chunk instead of read to its end. It relays exactly
@@ -7556,7 +7561,7 @@ everything else is byte-identical.**
   headerless body). The strip is the exact inverse of ADR-068's `wavFromPCM16` (which *adds*
   the 44-byte header to streamed PCM), and ADR-064 itself calls the WAV encoder "a 44-byte
   header": there is **no decode, no resample and no codec**, so it stays inside
-  ADR-063/ADR-064's "the gateway never re-encodes". Real compressed formats need an encoder
+  ADR-063/ADR-064's "never converts or re-encodes". Real compressed formats need an encoder
   and are issue #264.
 - **(c) A conformance gate, `isMono16PCM`, and a post-synthesis failure code.** Raw PCM is
   only honest if the clip *is* signed 16-bit little-endian mono, the one definition of
@@ -7566,8 +7571,10 @@ everything else is byte-identical.**
   `Content-Length`, and the header bytes read plus the declared data size fit within that
   length. Anything else is **502 `speech.pcm_unavailable`**, an OpenAI-shaped error object
   (`type: upstream_error`, a message naming the model and the format and never the
-  operator's server) written *in the copier's place*, so **no partial PCM and no lying
-  `Content-Length` is ever sent**: the check completes before the first client byte. Three
+  operator's server) written *in the copier's place*, so **the gate never lets a
+  non-conforming or over-declared clip start**: the check completes before the first client
+  byte, and once it passes the copy is the ordinary relay (an upstream that drops mid-body
+  yields a short body, exactly as for `wav`). Three
   inputs reach it: a non-16-bit-mono WAV from an exotic future model, a structurally unsound
   or over-declared WAV (a streaming writer's `0xFFFFFFFF` data size, say), and a 2xx with no
   usable `Content-Length` (the overrun guard needs the declared length to bound the data
@@ -7618,7 +7625,7 @@ and residuals are named ([Risks
   needs a deterministic answer should not send `stream: true`.
 - **A non-conforming clip is a 502 that bills zero.** A model whose native audio is not 16-bit
   mono PCM cannot serve `pcm`; the operator absorbs that synthesis cost on each such request.
-  It is a safe failure, never a truncated body.
+  It is a safe failure, refused before any audio is sent.
 - **A 2xx without a usable `Content-Length` is refused**, because the overrun guard needs the
   declared length. Safe, and unreachable with the trusted upstream.
 - **`mp3`, `opus`, `flac` and `aac` stay refused** until #264 decides where a transcoder lives

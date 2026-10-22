@@ -1191,7 +1191,10 @@ is stored as usual. One backstop sits behind the type test: `proxyNative` relays
 missing upstream `Content-Type` as `application/json`, so a 2xx response of the speech
 flavor is treated as binary whatever its type says (`isBinarySpeechResponse`: the
 flavor and a 2xx status), and only an error answer is decided by its `Content-Type`
-alone. That backstop is keyed on the flavor, which transcription shares, so it needs
+alone. A one-shot `pcm` answer ([ADR-069](../09-architecture-decisions.md#adr-069--non-stream-speech-pcm-is-a-wav-header-strip-not-a-transcode-the-gateway-relays-the-data-chunk-of-a-16-bit-mono-wav-as-headerless-pcm-refuses-any-other-clip-after-synthesis-and-leaves-mp3opusflacaac-to-264): the upstream
+WAV's `data` chunk, `application/octet-stream`) is not `audio/*` either, so it is redacted
+through this same backstop and its PCM never reaches the capture; the non-stream relay needs
+no endpoint stamp for that. That backstop is keyed on the flavor, which transcription shares, so it needs
 the endpoint carve-out described next, and the carve-out's dependence on a stamp is the
 residual that is accepted and recorded
 ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),

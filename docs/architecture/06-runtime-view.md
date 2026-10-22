@@ -62,7 +62,7 @@ sequenceDiagram
 
     C->>GW: POST /v1/audio/speech {model, input, voice} (Bearer token)
     GW->>GW: authenticate (bearer or loopback, never a session)
-    GW->>GW: validate: model + input; response_format wav or pcm (pcm only when streaming); stream boolean
+    GW->>GW: validate: model + input; response_format wav or pcm (wav only when not streaming); stream boolean
     Note over GW: 400 speech.* here, before any admission, not recorded
     GW->>R: resolve(model, openai_audio, required capability speech)
     R-->>GW: candidate with speech: yes, or 404 no_model_route / model_not_capable

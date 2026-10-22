@@ -799,7 +799,8 @@ accepts the last two, and either would poison every sum the usage views take). *
 id, the model, the server and the raw header value, and the row records `0`, for the
 reason the images count does: `(audio_second, 0)` on a successful relay is
 indistinguishable from a genuinely empty clip, so the gap is made loud instead of
-repaired. This is also why `response_format` is restricted to `wav` ([API
+repaired. This is also why `response_format` is restricted to `wav` (and `pcm`, which is stripped from
+that same WAV, [ADR-069](../09-architecture-decisions.md#adr-069--non-stream-speech-pcm-is-a-wav-header-strip-not-a-transcode-the-gateway-relays-the-data-chunk-of-a-16-bit-mono-wav-as-headerless-pcm-refuses-any-other-clip-after-synthesis-and-leaves-mp3opusflacaac-to-264); [API
 Compatibility & Inference §3.6](compatibility-and-inference.md#36-openai-audio-speech)):
 the header is present only on audio.cpp's `audio/wav` answer, and `json` and
 `b64_json` carry none, so a relayed one would trip this log on every success. The

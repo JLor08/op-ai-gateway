@@ -727,11 +727,11 @@ with `wavStripToData` (the chunk walker of `wavduration.go`, stopped at the firs
 byte) **before** the client's headers are written, and relays exactly the `data` chunk's
 declared size through the ordinary copier as `Content-Type: application/octet-stream` with
 `Content-Length` set to the data size (the upstream's full-WAV length is not forwarded). There
-is no decode, resample or codec, so ADR-063/ADR-064's "the gateway never re-encodes" holds. The
+is no decode, resample or codec, so ADR-063/ADR-064's "never converts or re-encodes" holds. The
 clip is served only when it **conforms**: `isMono16PCM` (integer PCM, one channel, 16 bits), a
 usable upstream `Content-Length`, and header bytes plus the declared data size within it.
 Otherwise the answer is **502 `speech.pcm_unavailable`**, an OpenAI-shaped error written in the
-copier's place (no partial PCM, no lying length), recorded as an error row billed
+copier's place (the gate lets no non-conforming or over-declared clip start), recorded as an error row billed
 `(audio_second, 0)`; it is a post-synthesis code because the format is known only once audio.cpp
 has answered, so `validateSpeechRequest` never returns it. The answer is **headerless by
 contract**: the sample rate is the model's native one (44100 Hz for the probed model, not the
