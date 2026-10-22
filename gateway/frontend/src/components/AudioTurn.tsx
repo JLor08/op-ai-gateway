@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
 import DownloadIcon from '@mui/icons-material/Download';
 import {
@@ -94,45 +94,65 @@ async function loadClip(urls: readonly string[], signal?: AbortSignal): Promise<
   return concatWavBlobs(await Promise.all(urls.map((url) => loadPart(url, signal))));
 }
 
-function useAudioSource(urls: readonly string[]): AudioSource {
-  // The caller builds a new array on every render, so the effect is keyed on what is IN it:
-  // an unchanged answer is not fetched again just because its message re-rendered.
-  const key = JSON.stringify(urls);
+// The same list of urls as an array with a stable identity: the one passed in the first time,
+// until its CONTENT changes. The caller builds a new array on every render, so the effect that
+// loads the clip is keyed on this instead -- an unchanged answer is not fetched again just
+// because its message re-rendered. It compares the urls themselves (a pointer check for the
+// same string, which an unchanged message hands back), never a serialized copy: an inline
+// reply is megabytes of base64, and this runs on every render.
+function useStableUrls(urls: readonly string[]): readonly string[] {
+  const ref = useRef(urls);
+  const held = ref.current;
+  if (held !== urls && (held.length !== urls.length || held.some((url, i) => url !== urls[i]))) {
+    ref.current = urls;
+  }
+  return ref.current;
+}
+
+// What loading the clip for a list of urls came to: the object URL the element plays and the
+// blob it was made from, or neither when it failed.
+type Loaded = { src: string | null; blob: Blob | null };
+
+// Loads the clip for `urls` into an object URL and reports the outcome to `onLoaded`; returns
+// the cleanup, which aborts a request still in flight and revokes the object URL. A result that
+// lands after the abort is dropped, so nothing is created that the cleanup could not revoke.
+function loadObjectUrl(urls: readonly string[], onLoaded: (loaded: Loaded) => void): () => void {
+  const controller = new AbortController();
+  let objectUrl: string | undefined;
+  const load = async () => {
+    try {
+      const blob = await loadClip(urls, controller.signal);
+      if (controller.signal.aborted) return;
+      objectUrl = URL.createObjectURL(blob);
+      onLoaded({ src: objectUrl, blob });
+    } catch {
+      if (!controller.signal.aborted) onLoaded({ src: null, blob: null });
+    }
+  };
+  void load();
+  return () => {
+    controller.abort();
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+  };
+}
+
+function useAudioSource(passed: readonly string[]): AudioSource {
+  const urls = useStableUrls(passed);
   const inline = urls.length === 1 && isInlineAudio(urls[0]);
   const stored = !inline && playableParts(urls);
-  // `key` is part of the state so a result is only ever read for the urls it was made
+  // `urls` is part of the state so a result is only ever read for the urls it was made
   // from: after a change the old object URL (already revoked by the cleanup) is
   // never shown, without a reset-in-an-effect.
-  const [resolved, setResolved] = useState<{
-    key: string;
-    src: string | null;
-    blob: Blob | null;
-  } | null>(null);
+  const [resolved, setResolved] = useState<(Loaded & { urls: readonly string[] }) | null>(null);
 
   useEffect(() => {
     if (!stored) return;
-    const controller = new AbortController();
-    let objectUrl: string | undefined;
-    const load = async () => {
-      try {
-        const blob = await loadClip(JSON.parse(key) as string[], controller.signal);
-        if (controller.signal.aborted) return;
-        objectUrl = URL.createObjectURL(blob);
-        setResolved({ key, src: objectUrl, blob });
-      } catch {
-        if (!controller.signal.aborted) setResolved({ key, src: null, blob: null });
-      }
-    };
-    void load();
-    return () => {
-      controller.abort();
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [key, stored]);
+    return loadObjectUrl(urls, (loaded) => setResolved({ urls, ...loaded }));
+  }, [urls, stored]);
 
   if (inline) return { src: urls[0], failed: false, blob: null };
   if (!stored) return { src: undefined, failed: true, blob: null };
-  const current = resolved?.key === key ? resolved : null;
+  const current = resolved?.urls === urls ? resolved : null;
   return {
     src: current?.src ?? undefined,
     failed: current !== null && current.src === null,

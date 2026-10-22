@@ -21,6 +21,8 @@ export const WAV_MEDIA_TYPE = 'audio/wav';
 const HEADER_BYTES = 44;
 // The part of a RIFF chunk before its body: a 4-byte id and a 4-byte little-endian size.
 const CHUNK_HEADER_BYTES = 8;
+// The RIFF preamble before the first chunk: `RIFF`, the file size, `WAVE`.
+const PREAMBLE_BYTES = 12;
 // The size of the `fmt ` chunk's fields up to bits-per-sample (the PCM form).
 const FMT_PCM_BYTES = 16;
 // Integer PCM, the only sample format the gateway writes and the header below can describe.
@@ -38,8 +40,11 @@ interface WavPart {
   pcm: Blob;
 }
 
+// The sample format a part's `fmt ` chunk declares.
+type WavFormat = Omit<WavPart, 'pcm'>;
+
 // The bytes of one frame (one sample of every channel); a sample takes whole bytes.
-function blockAlignOf(format: Omit<WavPart, 'pcm'>): number {
+function blockAlignOf(format: WavFormat): number {
   return format.channels * Math.ceil(format.bitsPerSample / 8);
 }
 
@@ -57,55 +62,72 @@ function fourCC(view: DataView, offset: number): string {
   );
 }
 
+// Reads and checks the `fmt ` chunk whose body starts at `body`: integer PCM with at least one
+// channel and one bit per sample. Anything past the first 16 bytes (an extension) is not read.
+async function readFmt(blob: Blob, body: number, size: number, label: string): Promise<WavFormat> {
+  if (size < FMT_PCM_BYTES) throw new Error(`${label} has a fmt chunk too small for PCM`);
+  const fmt = await readBytes(blob, body, FMT_PCM_BYTES);
+  if (fmt.byteLength < FMT_PCM_BYTES) throw new Error(`${label} has a truncated fmt chunk`);
+  if (fmt.getUint16(0, true) !== FORMAT_PCM) throw new Error(`${label} is not integer PCM`);
+  const format = {
+    channels: fmt.getUint16(2, true),
+    sampleRate: fmt.getUint32(4, true),
+    bitsPerSample: fmt.getUint16(14, true),
+  };
+  if (format.channels === 0 || format.bitsPerSample === 0) {
+    throw new Error(`${label} has an empty sample format`);
+  }
+  return format;
+}
+
+// The part whose `data` chunk body starts at `body` and is declared `size` bytes long, in the
+// `format` its fmt chunk gave (which must have come first).
+function readData(
+  blob: Blob,
+  body: number,
+  size: number,
+  format: WavFormat | undefined,
+  label: string,
+): WavPart {
+  if (!format) throw new Error(`${label} has no fmt chunk before its data`);
+  // A header may declare more than the file holds (a streaming writer leaves 0xFFFFFFFF, a
+  // truncated file simply ends early): the data is what is really there. A stray partial
+  // frame at the end is dropped so the next part starts on a frame boundary.
+  const available = Math.min(size, blob.size - body);
+  const whole = available - (available % blockAlignOf(format));
+  return { ...format, pcm: blob.slice(body, body + whole) };
+}
+
+// Checks the 12-byte RIFF/WAVE preamble.
+async function checkPreamble(blob: Blob, label: string): Promise<void> {
+  const top = await readBytes(blob, 0, PREAMBLE_BYTES);
+  if (top.byteLength < PREAMBLE_BYTES || fourCC(top, 0) !== 'RIFF' || fourCC(top, 8) !== 'WAVE') {
+    throw new Error(`${label} is not a RIFF/WAVE file`);
+  }
+}
+
 // Walks the chunks of one WAV (RIFF/WAVE, then `id size body` triples, bodies padded to an even
 // length) to its `fmt ` and `data` chunks. Chunks around them (LIST and the like) are stepped
 // over, and whatever follows `data` is not read. Anything that is not an integer-PCM WAV throws.
 async function parseWav(blob: Blob, index: number): Promise<WavPart> {
   const label = `WAV part ${index + 1}`;
-  const top = await readBytes(blob, 0, 12);
-  if (top.byteLength < 12 || fourCC(top, 0) !== 'RIFF' || fourCC(top, 8) !== 'WAVE') {
-    throw new Error(`${label} is not a RIFF/WAVE file`);
-  }
+  await checkPreamble(blob, label);
 
-  let format: Omit<WavPart, 'pcm'> | undefined;
-  let offset = 12;
+  let format: WavFormat | undefined;
+  let offset = PREAMBLE_BYTES;
   while (offset + CHUNK_HEADER_BYTES <= blob.size) {
     const header = await readBytes(blob, offset, CHUNK_HEADER_BYTES);
     const id = fourCC(header, 0);
     const size = header.getUint32(4, true);
     const body = offset + CHUNK_HEADER_BYTES;
-
-    if (id === 'fmt ') {
-      if (size < FMT_PCM_BYTES) throw new Error(`${label} has a fmt chunk too small for PCM`);
-      const fmt = await readBytes(blob, body, FMT_PCM_BYTES);
-      if (fmt.byteLength < FMT_PCM_BYTES) throw new Error(`${label} has a truncated fmt chunk`);
-      if (fmt.getUint16(0, true) !== FORMAT_PCM) {
-        throw new Error(`${label} is not integer PCM`);
-      }
-      format = {
-        channels: fmt.getUint16(2, true),
-        sampleRate: fmt.getUint32(4, true),
-        bitsPerSample: fmt.getUint16(14, true),
-      };
-      if (format.channels === 0 || format.bitsPerSample === 0) {
-        throw new Error(`${label} has an empty sample format`);
-      }
-    } else if (id === 'data') {
-      if (!format) throw new Error(`${label} has no fmt chunk before its data`);
-      // A header may declare more than the file holds (a streaming writer leaves 0xFFFFFFFF, a
-      // truncated file simply ends early): the data is what is really there. A stray partial
-      // frame at the end is dropped so the next part starts on a frame boundary.
-      const available = Math.min(size, blob.size - body);
-      const frameBytes = blockAlignOf(format);
-      const whole = available - (available % frameBytes);
-      return { ...format, pcm: blob.slice(body, body + whole) };
-    }
+    if (id === 'fmt ') format = await readFmt(blob, body, size, label);
+    else if (id === 'data') return readData(blob, body, size, format, label);
     offset = body + size + (size % 2);
   }
   throw new Error(format ? `${label} has no data chunk` : `${label} has no fmt chunk`);
 }
 
-function sameFormat(a: Omit<WavPart, 'pcm'>, b: Omit<WavPart, 'pcm'>): boolean {
+function sameFormat(a: WavFormat, b: WavFormat): boolean {
   return (
     a.channels === b.channels &&
     a.sampleRate === b.sampleRate &&
@@ -118,7 +140,7 @@ function writeAscii(view: DataView, offset: number, text: string) {
 }
 
 // The 44-byte header of a PCM WAV holding `dataBytes` of the given format.
-function canonicalHeader(format: Omit<WavPart, 'pcm'>, dataBytes: number): Uint8Array<ArrayBuffer> {
+function canonicalHeader(format: WavFormat, dataBytes: number): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(HEADER_BYTES);
   const view = new DataView(out.buffer);
   const blockAlign = blockAlignOf(format);

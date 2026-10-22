@@ -234,11 +234,13 @@ describe('concatWavBlobs', () => {
     it('rejects a file that is not RIFF/WAVE', async () => {
       const junk = new Blob([new Uint8Array(64).fill(7)], { type: 'audio/wav' });
 
-      await expect(concatWavBlobs([good(), junk])).rejects.toThrow(/WAV/);
+      await expect(concatWavBlobs([good(), junk])).rejects.toThrow(/RIFF\/WAVE/);
     });
 
     it('rejects a file too short to hold a header', async () => {
-      await expect(concatWavBlobs([good(), new Blob([new Uint8Array(5)])])).rejects.toThrow(/WAV/);
+      await expect(concatWavBlobs([good(), new Blob([new Uint8Array(5)])])).rejects.toThrow(
+        /RIFF\/WAVE/,
+      );
     });
 
     it('rejects a file with no data chunk', async () => {

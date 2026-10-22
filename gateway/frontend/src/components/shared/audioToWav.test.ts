@@ -76,23 +76,6 @@ const bufferOf = (sampleRate: number, ...channels: number[][]) =>
     channels.map((samples) => Float32Array.from(samples)),
   );
 
-// jsdom's Blob has no arrayBuffer() (every browser has), which the converter reads the upload
-// with. Fill it in, from a FileReader, only where it is missing.
-if (typeof Blob.prototype.arrayBuffer !== 'function') {
-  Object.defineProperty(Blob.prototype, 'arrayBuffer', {
-    configurable: true,
-    writable: true,
-    value(this: Blob): Promise<ArrayBuffer> {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as ArrayBuffer);
-        reader.onerror = () => reject(new Error('read failed'));
-        reader.readAsArrayBuffer(this);
-      });
-    },
-  });
-}
-
 // The bytes of a blob.
 async function bytesOf(blob: Blob): Promise<Uint8Array> {
   return new Uint8Array(await blob.arrayBuffer());
