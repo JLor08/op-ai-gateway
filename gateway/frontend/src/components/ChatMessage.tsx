@@ -11,7 +11,7 @@ import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
 import type { ChatContent, ChatContentPart } from './shared/chatContent';
-import { audioUrlsOf, imageUrlsOf, isMaskPart } from './shared/chatContent';
+import { audioUrlsOf, hasRemovedAudio, imageUrlsOf, isMaskPart } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
 import { keyedUrls } from './shared/urlKeys';
@@ -19,6 +19,7 @@ import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
 import { AudioTurn } from './AudioTurn';
 import { AudioPendingTurn } from './AudioPendingTurn';
+import { AudioNotStoredTurn } from './AudioNotStoredTurn';
 import { TranscriptionPendingTurn } from './TranscriptionPendingTurn';
 
 function contentText(content: ChatContent): string {
@@ -176,6 +177,15 @@ function ChatMessageComponent({
     if (streaming && kind === 'transcription' && text.length === 0) {
       return <TranscriptionPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }
+
+    // A TERMINAL answer whose audio is gone (pruned, deleted, never stored or aborted) carries
+    // the `audio_removed` marker in place of its audio parts, and shows the not-stored
+    // placeholder where the player would be -- the answer's text, if it has any, stays above
+    // it. Not while the run still streams (that row is the pending wait above, or a live
+    // text answer), and not when audio is still stored (a player that plays beats a
+    // placeholder, whatever else the content holds). A turn with neither audio nor marker is
+    // a failed run and keeps rendering its error, not this.
+    const audioRemoved = !streaming && audioUrls.length === 0 && hasRemovedAudio(content);
 
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
     const reasoningText = reasoning ?? '';
@@ -350,8 +360,13 @@ function ChatMessageComponent({
           />
         )}
         {audioUrls.length > 0 && <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />}
+        {audioRemoved && (
+          <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />
+        )}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
-          {onRegenerate && (
+          {/* The not-stored placeholder carries its own regenerate (the same handler), so the
+              stack's would be a second, identically named button in one bubble. */}
+          {onRegenerate && !audioRemoved && (
             <Tooltip title={t.chatRegenerate}>
               <span>
                 <IconButton

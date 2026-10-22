@@ -43,7 +43,7 @@ import {
   userTurnContent,
   type ChatUiMessage,
 } from './chatDoc';
-import { audioUrlsOf, imageUrlsOf } from '../shared/chatContent';
+import { audioUrlsOf, hasRemovedAudio, imageUrlsOf } from '../shared/chatContent';
 
 describe('metricsOf', () => {
   it('maps the snake_case SSE metrics onto the camelCase message fields', () => {
@@ -834,6 +834,36 @@ describe('the audio of a message', () => {
 
   it('is never mistaken for an image, so an image list stays images only', () => {
     expect(imageUrlsOf([audioPart(ref)])).toEqual([]);
+  });
+
+  // The audio_removed marker (#281) is what an answer carries once its audio is gone: a part
+  // with no url, so neither list may ever pick it up as something to play or show.
+  describe('the audio_removed marker', () => {
+    const marker = { type: 'audio_removed' as const };
+
+    it('is not audio: audioUrlsOf lists no url for it', () => {
+      expect(audioUrlsOf([marker])).toEqual([]);
+      expect(audioUrlsOf([textPart('x'), marker])).toEqual([]);
+    });
+
+    it('is not an image either', () => {
+      expect(imageUrlsOf([marker])).toEqual([]);
+    });
+
+    it('leaves the audio parts beside it as they were', () => {
+      expect(audioUrlsOf([marker, audioPart(ref)])).toEqual([ref]);
+    });
+
+    it('is told by hasRemovedAudio, whatever else the message holds', () => {
+      expect(hasRemovedAudio([marker])).toBe(true);
+      expect(hasRemovedAudio([textPart('x'), marker])).toBe(true);
+    });
+
+    it('is absent from a message without one, whatever its shape', () => {
+      expect(hasRemovedAudio('plain')).toBe(false);
+      expect(hasRemovedAudio([])).toBe(false);
+      expect(hasRemovedAudio([textPart('x'), imagePart(ref), audioPart(ref)])).toBe(false);
+    });
   });
 
   it('keeps a stored reference exactly as it is: no copy, no rewrite', () => {

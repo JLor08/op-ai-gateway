@@ -215,6 +215,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
               .map((p) => {
                 if (p.type === 'image_url') return `image_url:${p.image_url.url}`;
                 if (p.type === 'audio_url') return `audio_url:${p.audio_url.url}`;
+                if (p.type === 'audio_removed') return 'audio_removed';
                 return `text:${p.text}`;
               })
               .join('|')

@@ -450,6 +450,11 @@ const de = {
   // reply could not be fetched for playback (a purged blob, a network error).
   chatAudioDownloadError: 'Audio konnte nicht heruntergeladen werden.',
   chatAudioLoadError: 'Audio konnte nicht geladen werden.',
+  // The placeholder of an answer whose audio is gone -- pruned by the retention setting,
+  // deleted, never stored, or aborted (#281). It is worded neutrally on purpose: the one
+  // marker the stored answer carries does not say which of those happened. The bubble's
+  // regenerate button reuses chatRegenerate.
+  chatAudioNotStored: 'Das Audio dieser Antwort ist nicht gespeichert.',
   // The wait of a running transcription (speech-to-text) turn, the transcript twin of the
   // audio wait above: it words the WAIT (the request may still be queued or waiting on a model
   // load), and the sentence says no intermediate news is coming BEFORE the first text -- there
@@ -3703,6 +3708,7 @@ const en: PortalMessages = {
   chatDownloadAudio: 'Download audio',
   chatAudioDownloadError: 'Could not download the audio.',
   chatAudioLoadError: 'Could not load the audio.',
+  chatAudioNotStored: 'The audio for this answer is not stored.',
   chatTranscriptionRunPending: 'Waiting for transcript',
   chatTranscriptionNoIntermediateNews:
     'No intermediate updates – the transcript appears as soon as the model delivers text.',

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Typography } from '@mui/material';
 import { ChatMessage } from './ChatMessage';
@@ -543,6 +543,191 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           expect(screen.queryByText(t.chatAudioRunPending)).toBeNull();
           expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
         });
+      });
+    });
+
+    // An answer whose audio is gone (pruned by the retention knob, deleted, never stored, or
+    // aborted) carries the `audio_removed` marker (#281) instead of an audio part. A TERMINAL
+    // turn with the marker is the not-stored bubble: one placeholder line and a regenerate
+    // button where the player was, with whatever text the answer holds left in place.
+    describe('a speech answer whose audio is not stored', () => {
+      const MARKER = { type: 'audio_removed' as const };
+      const BLOB = '/api/portal/chat-blobs/6f1c2a52-0f43-4d0b-bb0d-8c7a3a1d9e10';
+
+      it('renders the placeholder with no player and no download', () => {
+        const { container } = render(
+          <ChatMessage t={t} role="assistant" content={[MARKER]} turnId="a1" />,
+        );
+
+        expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+        expect(container.querySelector('audio')).toBeNull();
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+        expect(screen.queryByRole('button', { name: t.chatDownloadAudio })).toBeNull();
+      });
+
+      it('is not the wait of a pending run: no clock, no no-news sentence', () => {
+        render(<ChatMessage t={t} role="assistant" content={[MARKER]} kind="speech" />);
+
+        expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioRunPending)).toBeNull();
+        expect(screen.queryByText(t.chatAudioNoIntermediateNews)).toBeNull();
+      });
+
+      // Review focus: the marker answer is a real transcript message, so its regenerate is the
+      // row's own onRegenerate (Chat.tsx binds the message id; Chat.test.tsx pins that
+      // end to end) -- called, once, from the button INSIDE the placeholder.
+      it('regenerates through the row onRegenerate from the placeholder button', () => {
+        const onRegenerate = vi.fn();
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[MARKER]}
+            turnId="a1"
+            onRegenerate={onRegenerate}
+          />,
+        );
+
+        const placeholder = screen.getByRole('group', { name: t.chatAudioNotStored });
+        fireEvent.click(within(placeholder).getByRole('button', { name: t.chatRegenerate }));
+
+        expect(onRegenerate).toHaveBeenCalledTimes(1);
+      });
+
+      it('offers ONE regenerate, the placeholder one, not a second in the action stack', () => {
+        render(<ChatMessage t={t} role="assistant" content={[MARKER]} onRegenerate={() => {}} />);
+
+        const placeholder = screen.getByRole('group', { name: t.chatAudioNotStored });
+        expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+        expect(within(placeholder).getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(
+          1,
+        );
+      });
+
+      it('keeps the regenerate of the action stack for an answer that still holds audio', () => {
+        const onRegenerate = vi.fn();
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,AAAA' } }]}
+            onRegenerate={onRegenerate}
+          />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatRegenerate }));
+        expect(onRegenerate).toHaveBeenCalledTimes(1);
+        expect(screen.queryByRole('group', { name: t.chatAudioNotStored })).toBeNull();
+      });
+
+      it('offers no regenerate where the row has none to give', () => {
+        render(<ChatMessage t={t} role="assistant" content={[MARKER]} />);
+
+        expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.chatRegenerate })).toBeNull();
+      });
+
+      it('disables regenerate while no run may start, like the action stack one', () => {
+        const onRegenerate = vi.fn();
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[MARKER]}
+            onRegenerate={onRegenerate}
+            canRun={false}
+          />,
+        );
+
+        const placeholder = screen.getByRole('group', { name: t.chatAudioNotStored });
+        const button = within(placeholder).getByRole('button', { name: t.chatRegenerate });
+        expect(button).toBeDisabled();
+        fireEvent.click(button);
+        expect(onRegenerate).not.toHaveBeenCalled();
+      });
+
+      it('keeps the text of a mixed answer and puts the placeholder where the player was', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[{ type: 'text', text: 'Hello there' }, MARKER]}
+            onRegenerate={() => {}}
+          />,
+        );
+
+        const text = screen.getByText('Hello there');
+        const placeholder = screen.getByText(t.chatAudioNotStored);
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+        // The text comes first, the placeholder after it: the player's slot.
+        expect(
+          text.compareDocumentPosition(placeholder) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+      });
+
+      it('shows no placeholder for a turn that still holds audio, and the player plays it', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,AAAA' } }]}
+          />,
+        );
+
+        expect(screen.queryByText(t.chatAudioNotStored)).toBeNull();
+        expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+      });
+
+      it('plays audio that is still stored even beside a stray marker', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[MARKER, { type: 'audio_url', audio_url: { url: BLOB } }]}
+          />,
+        );
+
+        expect(screen.queryByText(t.chatAudioNotStored)).toBeNull();
+        expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+      });
+
+      it('is still the pending wait while the run streams and nothing has arrived', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            elapsedMs={5_000}
+            onRegenerate={() => {}}
+          />,
+        );
+
+        expect(screen.getByText(t.chatAudioRunPending)).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioNotStored)).toBeNull();
+      });
+
+      it('is not shown for the row of a run that is still streaming', () => {
+        render(<ChatMessage t={t} role="assistant" content={[MARKER]} streaming kind="speech" />);
+
+        expect(screen.queryByText(t.chatAudioNotStored)).toBeNull();
+      });
+
+      it('is not what a genuinely failed turn shows: its error stays', () => {
+        render(
+          <ChatMessage t={t} role="assistant" content="the run failed" kind="speech" turnId="a1" />,
+        );
+
+        expect(screen.getByText('the run failed')).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioNotStored)).toBeNull();
+      });
+
+      it('is never a user turn: a marker on a user message renders nothing of it', () => {
+        render(<ChatMessage t={t} role="user" content={[{ type: 'text', text: 'hi' }, MARKER]} />);
+
+        expect(screen.getByText('hi')).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioNotStored)).toBeNull();
       });
     });
 

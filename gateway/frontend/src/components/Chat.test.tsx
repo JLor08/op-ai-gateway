@@ -1982,6 +1982,82 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // The not-stored bubble (#281): an answer whose audio is gone carries the `audio_removed`
+  // marker and renders as a placeholder with a regenerate button. The marker answer is a real
+  // transcript message with its own id, so that button replays THAT turn -- the history up to
+  // its own prompt -- through the same store handler as the action stack's.
+  describe(`Chat: regenerating a speech answer whose audio is not stored [${locale}]`, () => {
+    const speechModel: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const marker = { type: 'audio_removed' };
+
+    function seedAnswers() {
+      chatApi.rows.push({
+        id: 'c_not_stored',
+        title: 'Greetings',
+        created_at: '2026-07-22T12:00:00Z',
+        updated_at: '2026-07-22T12:00:00Z',
+        content: {
+          settings: { model: 'kokoro', kind: 'speech' },
+          messages: [
+            { id: 'u1', role: 'user', content: 'say hello' },
+            { id: 'a1', role: 'assistant', content: [marker], status: 'complete' },
+            { id: 'u2', role: 'user', content: 'say goodbye' },
+            {
+              id: 'a2',
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Goodbye.' }, marker],
+              status: 'complete',
+            },
+          ],
+        },
+      });
+    }
+
+    async function renderAnswers() {
+      seedAnswers();
+      renderChat(tokens, [speechModel]);
+      await screen.findByText('Greetings');
+      // Both answers are placeholders: no player, no download, one regenerate each.
+      expect(await screen.findAllByText(t.chatAudioNotStored)).toHaveLength(2);
+      expect(document.querySelector('audio')).toBeNull();
+      expect(screen.queryByRole('button', { name: t.chatDownloadAudio })).toBeNull();
+      return screen.getAllByRole('button', { name: t.chatRegenerate });
+    }
+
+    function startedHistory() {
+      return (chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody).edited_history;
+    }
+
+    it('replays the history up to the answer the button belongs to', async () => {
+      const [, second] = await renderAnswers();
+
+      fireEvent.click(second);
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      // a2's own prompt is the last turn replayed: [u1, a1, u2] -- a2 is dropped.
+      expect(startedHistory()).toEqual([
+        expect.objectContaining({ id: 'u1', role: 'user' }),
+        expect.objectContaining({ id: 'a1', role: 'assistant' }),
+        expect.objectContaining({ id: 'u2', role: 'user' }),
+      ]);
+    });
+
+    it('replays only up to the first prompt from the first answer, not the last one', async () => {
+      const [first] = await renderAnswers();
+
+      fireEvent.click(first);
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(startedHistory()).toEqual([expect.objectContaining({ id: 'u1', role: 'user' })]);
+    });
+  });
+
   // A transcription (speech-to-text) thread: the composer is AUDIO first -- there is no text
   // prompt, the turn is a clip, attached from a file or recorded in the browser -- and the
   // settings are the transcription knobs. The reply is text, so there is no format control.
