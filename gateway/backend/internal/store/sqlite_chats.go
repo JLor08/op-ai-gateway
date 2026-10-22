@@ -112,12 +112,15 @@ func (s *SQLiteStore) updateChatRow(ctx context.Context, ex execer, chat Chat) e
 	return nil
 }
 
-// SaveChatWithBlobs writes a chat and its newly-extracted chat_blobs as ONE
-// atomic unit: either the chat update and every blob persist, or none of them
-// does. It is the primitive a run-commit uses to persist a chat document that
-// now references images together with those images' bytes, so a crash or error
-// between the two writes can never leave a document pointing at blobs that do
-// not exist (or blobs no document references).
+// SaveChatWithBlobs writes a chat, its newly-extracted chat_blobs and the
+// deletion of chat_blobs it no longer references as ONE atomic unit: either the
+// chat update, every insert and every delete persist, or none of them does. It
+// is the primitive a run-commit uses to persist a chat document that now
+// references images together with those images' bytes, so a crash or error
+// between the writes can never leave a document pointing at blobs that do not
+// exist (or blobs no document references). The same call is how a chat sheds
+// blobs (a pruned or discarded audio answer): the document that stops
+// referencing them and the rows themselves go together.
 //
 // The chat side is UpdateChat (title / key_version / blob / updated_at of an
 // existing chat; owner and created_at are not touched) and each blob is a
@@ -127,16 +130,24 @@ func (s *SQLiteStore) updateChatRow(ctx context.Context, ex execer, chat Chat) e
 // refused before anything is written (a save only ever attaches blobs to the
 // chat it saves). The context bounds the whole transaction.
 //
-// Atomicity is the transaction: the UPDATE and every INSERT run on one *sql.Tx
-// and only the final Commit makes them visible; any failure returns before
-// Commit and the deferred Rollback discards the lot. The blobs deliberately do
-// NOT go through PutChatBlob / s.exec, which run on the pool and would commit
-// one by one. The UPDATE runs first, so a missing chat is ErrNotFound without
-// uploading a single blob byte and the error precedence (missing chat, then
-// taken id) matches the in-RAM store's. An empty blobs is just UpdateChat -- a
-// single statement is already atomic.
-func (s *SQLiteStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob) error {
-	if len(blobs) == 0 {
+// deleteBlobIDs names blobs of THIS chat to delete (`chat_id = ? and id in
+// (...)`, so another chat's blob, an unknown id or a repeated id deletes nothing
+// extra and is no error). The delete runs after the inserts, so an insert is
+// judged against the rows as they were before the save, and the caller must not
+// name an id it also inserts: the new row would be deleted again. nil or empty
+// deleteBlobIDs is exactly the save without deletes.
+//
+// Atomicity is the transaction: the UPDATE, every INSERT and the DELETE run on
+// one *sql.Tx and only the final Commit makes them visible; any failure returns
+// before Commit and the deferred Rollback discards the lot. The blobs
+// deliberately do NOT go through PutChatBlob / s.exec, which run on the pool and
+// would commit one by one. The UPDATE runs first, so a missing chat is
+// ErrNotFound without uploading a single blob byte or deleting a row, and the
+// error precedence (missing chat, then taken id) matches the in-RAM store's. No
+// blobs and no deletes is just UpdateChat -- a single statement is already
+// atomic.
+func (s *SQLiteStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob, deleteBlobIDs []string) error {
+	if len(blobs) == 0 && len(deleteBlobIDs) == 0 {
 		return s.UpdateChat(ctx, chat)
 	}
 	for _, blob := range blobs {
@@ -156,6 +167,9 @@ func (s *SQLiteStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []
 		if err := s.insertChatBlob(ctx, tx, blob); err != nil {
 			return err
 		}
+	}
+	if err := s.deleteChatBlobIDs(ctx, tx, chat.ID, deleteBlobIDs); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit save chat with blobs: %w", err)

@@ -26,7 +26,7 @@ func TestChatStoreInterfaceCarriesBlobMethods(t *testing.T) {
 		t.Fatalf("CreateChat: %v", err)
 	}
 	blob := store.ChatBlob{ID: "blob_1", ChatID: "chat_1", KeyVersion: 1, Blob: []byte("png"), ContentType: "image/png", ByteLen: 3, CreatedAt: now}
-	if err := chats.SaveChatWithBlobs(ctx, chat, []store.ChatBlob{blob}); err != nil {
+	if err := chats.SaveChatWithBlobs(ctx, chat, []store.ChatBlob{blob}, nil); err != nil {
 		t.Fatalf("SaveChatWithBlobs: %v", err)
 	}
 

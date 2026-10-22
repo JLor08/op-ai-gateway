@@ -286,7 +286,7 @@ func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title st
 	if err != nil {
 		return err
 	}
-	return s.chats.SaveChatWithBlobs(ctx, updated, blobs)
+	return s.chats.SaveChatWithBlobs(ctx, updated, blobs, nil)
 }
 
 // DeleteChat removes an owned chat. A foreign or missing chat is 404 (no leak).

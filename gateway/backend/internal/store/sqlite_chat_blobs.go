@@ -77,6 +77,41 @@ func (s *SQLStore) ChatBlobOwner(ctx context.Context, id string) (string, error)
 	return chatID, nil
 }
 
+// chatBlobIDsClause builds the one-chat id filter ChatBlobsByIDs and
+// deleteChatBlobIDs share: the comma-separated `?` list for an `id in (...)`
+// that follows `chat_id = ?`, and the bound arguments in that order (the chat id
+// first, then each id). One placeholder per id, so the statement is bounded by
+// the driver's parameter limit. ids must not be empty.
+func chatBlobIDsClause(chatID string, ids []string) (string, []any) {
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, chatID)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	return strings.Join(placeholders, ","), args
+}
+
+// deleteChatBlobIDs deletes the named blobs of ONE chat against an explicit
+// execer, so SaveChatWithBlobs runs it inside its transaction. Ownership is by
+// construction, as in ChatBlobsByIDs: the WHERE clause is
+// `chat_id = ? and id in (...)`, so an id that belongs to another chat, does not
+// exist, or is named twice deletes nothing beyond the chat's own rows and is no
+// error. An empty (or nil) ids is a no-op without a statement. One statement
+// for both dialects (rebind turns the placeholders into $N for postgres); the id
+// list is bounded by the driver's parameter limit like ChatBlobsByIDs' is.
+func (s *SQLStore) deleteChatBlobIDs(ctx context.Context, ex execer, chatID string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	inList, args := chatBlobIDsClause(chatID, ids)
+	if _, err := s.execOn(ctx, ex, "delete from chat_blobs where chat_id = ? and id in ("+inList+")", args...); err != nil {
+		return fmt.Errorf("delete chat blobs: %w", err)
+	}
+	return nil
+}
+
 // ChatBlobsByIDs reads the named blobs of ONE chat in a single query, keyed by
 // blob id. Ownership is by construction: the WHERE clause is
 // `chat_id = ? and id in (...)`, so an id that exists but belongs to another
@@ -94,16 +129,10 @@ func (s *SQLStore) ChatBlobsByIDs(ctx context.Context, chatID string, ids []stri
 	if len(ids) == 0 {
 		return out, nil
 	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, 0, len(ids)+1)
-	args = append(args, chatID)
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
+	inList, args := chatBlobIDsClause(chatID, ids)
 	rows, err := s.query(ctx,
 		"select id, chat_id, key_version, blob, content_type, byte_len, created_at "+
-			"from chat_blobs where chat_id = ? and id in ("+strings.Join(placeholders, ",")+")",
+			"from chat_blobs where chat_id = ? and id in ("+inList+")",
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("chat blobs by ids: %w", err)

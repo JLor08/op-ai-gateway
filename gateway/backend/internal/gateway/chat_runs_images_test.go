@@ -1367,12 +1367,12 @@ type deletingChatStore struct {
 	deleted atomic.Bool
 }
 
-func (s *deletingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error {
+func (s *deletingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob, deleteBlobIDs []string) error {
 	if s.armed.Load() {
 		_ = s.ChatStore.DeleteChat(ctx, chat.ID)
 		s.deleted.Store(true)
 	}
-	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs)
+	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs, deleteBlobIDs)
 }
 
 // A generated image is stored by the commit through SaveChatWithBlobs, which

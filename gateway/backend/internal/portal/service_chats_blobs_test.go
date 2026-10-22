@@ -36,12 +36,12 @@ type recordingChatStore struct {
 	beforeSave   func()
 }
 
-func (r *recordingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error {
+func (r *recordingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob, deleteBlobIDs []string) error {
 	if r.beforeSave != nil {
 		r.beforeSave()
 	}
 	r.saves = append(r.saves, blobs)
-	return r.ChatStore.SaveChatWithBlobs(ctx, chat, blobs)
+	return r.ChatStore.SaveChatWithBlobs(ctx, chat, blobs, deleteBlobIDs)
 }
 
 func (r *recordingChatStore) ChatBlobOwner(ctx context.Context, id string) (string, error) {

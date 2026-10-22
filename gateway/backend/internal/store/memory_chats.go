@@ -103,19 +103,29 @@ func (m *MemoryChatStore) overwriteChat(rec, chat Chat) {
 	m.bytes += len(rec.Blob)
 }
 
-// SaveChatWithBlobs writes a chat and its newly-extracted chat_blobs as one
-// all-or-nothing unit, mirroring SQLStore.SaveChatWithBlobs: the chat side is
-// UpdateChat, each blob is a PutChatBlob, and the errors are theirs (a chat that
-// is not held is ErrNotFound, a blob id already taken -- by a held blob or by an
-// earlier blob of the same batch -- is ErrConflict). A blob whose ChatID is not
-// chat.ID is refused too, exactly as the SQL driver does, so the two never
-// disagree about what a save may attach.
+// SaveChatWithBlobs writes a chat, its newly-extracted chat_blobs and the
+// deletion of chat_blobs it no longer references as one all-or-nothing unit,
+// mirroring SQLStore.SaveChatWithBlobs: the chat side is UpdateChat, each blob is
+// a PutChatBlob, and the errors are theirs (a chat that is not held is
+// ErrNotFound, a blob id already taken -- by a held blob or by an earlier blob of
+// the same batch -- is ErrConflict). A blob whose ChatID is not chat.ID is
+// refused too, exactly as the SQL driver does, so the two never disagree about
+// what a save may attach.
+//
+// deleteBlobIDs names blobs of THIS chat to drop, with the SQL driver's
+// `chat_id = ? and id in (...)` semantics: another chat's blob, an unknown id or
+// a repeated id changes nothing and is no error. The deletes are applied after
+// the inserts (an insert is judged against the blobs held before the save), and
+// the caller must not name an id it also inserts: the new blob would be dropped
+// again, exactly as in SQL. nil or empty is the save without deletes.
 //
 // It is atomic by staging: m.mu is taken ONCE and every refusal is decided in a
 // first pass that mutates nothing, so a refused save leaves the chat, the blobs,
-// the indexes and the byte budget exactly as they were. Only a save that cannot
-// fail any more is applied -- chat fields, blobs and their byte count -- and
-// eviction then runs ONCE, after the whole save. It must not loop PutChatBlob:
+// the indexes and the byte budget exactly as they were -- and deletes nothing.
+// Only a save that cannot fail any more is applied -- chat fields, blobs, the
+// deletes and their byte accounting -- and eviction then runs ONCE, after the
+// whole save, so the bytes the deletes free count against the budget before any
+// unrelated chat is evicted for the bytes the inserts add. It must not loop PutChatBlob:
 // that takes the lock per blob and evicts after each one, so with the chat being
 // saved as the oldest entry a mid-save eviction would drop that very chat (and
 // the blobs already stored for it) and fail the rest of the batch with
@@ -124,7 +134,7 @@ func (m *MemoryChatStore) overwriteChat(rec, chat Chat) {
 // entry and the finished state is over budget -- as UpdateChat can evict the
 // chat it just grew -- but then it goes together with all of its blobs, never
 // half-saved. Like Chat.Blob, the blob byte slices are held, not copied.
-func (m *MemoryChatStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob) error {
+func (m *MemoryChatStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob, deleteBlobIDs []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, ok := m.records[chat.ID]
@@ -150,6 +160,7 @@ func (m *MemoryChatStore) SaveChatWithBlobs(ctx context.Context, chat Chat, blob
 	for _, blob := range blobs {
 		m.storeChatBlob(blob)
 	}
+	m.dropChatBlobIDs(chat.ID, deleteBlobIDs)
 	m.evict()
 	return nil
 }
@@ -251,6 +262,40 @@ func (m *MemoryChatStore) dropChatBlobs(chatID string) {
 		delete(m.blobs, id)
 	}
 	delete(m.chatBlobIDs, chatID)
+}
+
+// dropChatBlobIDs removes the named chat_blobs entries of chatID and subtracts
+// their payload bytes from the budget: dropChatBlobs narrowed to an id set, for
+// SaveChatWithBlobs' deletes. Ownership is by construction, as in the SQL
+// driver's `chat_id = ? and id in (...)`: an id held by ANOTHER chat, an unknown
+// id and an id named twice drop nothing (the second mention finds the entry
+// already gone, so its bytes are subtracted once). A chat left without blobs
+// loses its index entry. Callers must hold m.mu.
+func (m *MemoryChatStore) dropChatBlobIDs(chatID string, ids []string) {
+	dropped := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		blob, ok := m.blobs[id]
+		if !ok || blob.ChatID != chatID {
+			continue
+		}
+		m.bytes -= len(blob.Blob)
+		delete(m.blobs, id)
+		dropped[id] = struct{}{}
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(m.chatBlobIDs[chatID])-len(dropped))
+	for _, id := range m.chatBlobIDs[chatID] {
+		if _, gone := dropped[id]; !gone {
+			kept = append(kept, id)
+		}
+	}
+	if len(kept) == 0 {
+		delete(m.chatBlobIDs, chatID)
+		return
+	}
+	m.chatBlobIDs[chatID] = kept
 }
 
 // PutChatBlob stores one chat_blobs entry, mirroring SQLStore.PutChatBlob: it

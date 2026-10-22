@@ -1413,13 +1413,13 @@ func (s *wedgedChatStore) UpdateChat(ctx context.Context, chat store.Chat) error
 	return s.ChatStore.UpdateChat(ctx, chat)
 }
 
-func (s *wedgedChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error {
+func (s *wedgedChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob, deleteBlobIDs []string) error {
 	if s.armed.Load() {
 		s.blocked.Add(1)
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs)
+	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs, deleteBlobIDs)
 }
 
 // A terminal commit that never returns used to strand the run FOREVER:
