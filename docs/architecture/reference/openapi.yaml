@@ -3177,7 +3177,9 @@ components:
                   its header stripped: raw signed 16-bit little-endian mono PCM
                   at the model's native sample rate (not stated on the wire),
                   `application/octet-stream`, refused after synthesis with 502
-                  `speech.pcm_unavailable` when the clip is not 16-bit mono PCM.
+                  `speech.pcm_unavailable` when the clip is not 16-bit
+                  mono PCM, is structurally unsound, over-declares its
+                  data length, or carries no usable `Content-Length`.
                   `wav` beside `stream: true` is 400
                   `speech.stream_unsupported`, and every other value (`mp3`,
                   `opus`, `flac`, `aac`, `json`, `b64_json`) is 400

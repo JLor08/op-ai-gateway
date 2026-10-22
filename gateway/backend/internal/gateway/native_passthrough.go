@@ -851,7 +851,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 			return
 		}
 		contentType = "application/octet-stream"
-		w.Header().Set("Content-Length", strconv.FormatInt(dataSize, 10))
+		w.Header().Set(contentLengthHeader, strconv.FormatInt(dataSize, 10))
 		relayBody = io.LimitReader(resp.Body, dataSize)
 	}
 
@@ -882,7 +882,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// survives is the length of the bytes the copier will write.
 	if speechRelay && speechScan == nil && !rel.speechPCMStrip {
 		if n, ok := declaredContentLength(resp.Header); ok {
-			w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+			w.Header().Set(contentLengthHeader, strconv.FormatInt(n, 10))
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -990,7 +990,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 // non-numeric and negative values all answer false, so the caller leaves the
 // relay chunked rather than forwarding something net/http would then reject.
 func declaredContentLength(h http.Header) (int64, bool) {
-	v := strings.TrimSpace(h.Get("Content-Length"))
+	v := strings.TrimSpace(h.Get(contentLengthHeader))
 	if v == "" {
 		return 0, false
 	}

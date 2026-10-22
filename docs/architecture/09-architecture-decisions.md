@@ -5438,7 +5438,8 @@ is lifted: a request that does not stream accepts `wav`, `pcm` or an absent `res
 and `pcm` is the upstream WAV with its RIFF/WAVE header stripped, relayed as headerless
 signed 16-bit little-endian mono PCM (`application/octet-stream`, `Content-Length` the data
 chunk's, so (f)'s length is the data chunk's for this answer), refused with 502
-`speech.pcm_unavailable` and billed `(audio_second, 0)` when the clip is not 16-bit mono PCM. (g)
+`speech.pcm_unavailable` and billed `(audio_second, 0)` when the clip is not 16-bit mono PCM, is
+structurally unsound, over-declares its data length, or carries no usable `Content-Length`. (g)
 is unchanged: the duration header still meters it. The strip is a container operation, not
 re-encoding, so ADR-063/ADR-064's "never converts or re-encodes" holds.
 
