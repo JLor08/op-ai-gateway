@@ -686,6 +686,14 @@ function toKeepLast(raw: string): number | undefined {
   return n !== undefined && Number.isSafeInteger(n) && n >= 1 ? n : undefined;
 }
 
+// Whether a keep-last text is filled in but unusable (not a whole number of 1 or more): the
+// case audioSetting() drops in silence (keep-all), so the composer can say so beside the
+// field. A blank text is not invalid, it is simply not filled in yet. Shares toKeepLast, so
+// the warning and the wire can never disagree about what a usable count is.
+export function isKeepLastInvalid(raw: string): boolean {
+  return raw.trim() !== '' && toKeepLast(raw) === undefined;
+}
+
 // Coerce a persisted (all-optional) ChatAudioSettings into the concrete store state,
 // filling anything missing/mistyped from the defaults. The inverse of audioSetting,
 // used to seed the composer when a chat is loaded: the passthrough object comes back

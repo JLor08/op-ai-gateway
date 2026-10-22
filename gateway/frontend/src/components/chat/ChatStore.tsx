@@ -98,8 +98,9 @@ export type { AudioClip };
 // The speech composer's advanced-passthrough check and the settings type it edits,
 // re-exported for Chat.tsx for the same reason as the image presets below: the
 // composer must not reach into chatDoc.ts (arch.test.ts), and it needs to name a
-// passthrough text that is not a JSON object before the user sends it.
-export { audioPassthroughMessage, parseAudioPassthrough } from './chatDoc';
+// passthrough text that is not a JSON object, or a keep-last count the wire would drop,
+// before the user sends it.
+export { audioPassthroughMessage, isKeepLastInvalid, parseAudioPassthrough } from './chatDoc';
 export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
 
 // The transcription composer's twin of the above (its own reserved fields and message), and

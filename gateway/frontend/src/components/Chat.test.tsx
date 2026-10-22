@@ -1579,6 +1579,261 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // Answer-audio retention (#281): a checkbox ("keep audio answers", on by default) over a
+    // keep-all / keep-last-N radio whose N field exists only for "keep last N". Unchecking is
+    // "do not store" and is only selectable while the thread streams (the same gate as the
+    // streaming toggle): a buffered answer is only ever heard from storage. The control
+    // shows what is stored and never writes on its own.
+    describe('the audio retention control', () => {
+      const open: SpeechStreamingGate = { streaming: true, sampleRate: 44100 };
+      const keepBox = () => screen.getByRole('checkbox', { name: t.chatAudioKeep });
+      const keepAllRadio = () => screen.getByRole('radio', { name: t.chatAudioKeepAll });
+      const keepLastRadio = () => screen.getByRole('radio', { name: t.chatAudioKeepLast });
+      const countField = () =>
+        screen.queryByRole('spinbutton', { name: t.chatAudioKeepLastCount }) as HTMLInputElement;
+      const typeCount = (value: string) => fireEvent.change(countField(), { target: { value } });
+
+      // The speech thread with its settings panel open. With an open gate it waits for the
+      // streaming toggle, which only exists once the gate's answer has landed.
+      async function renderRetentionThread(gate: SpeechStreamingGate = NO_SPEECH_STREAMING) {
+        chatApi.spies.modelSpeechStreaming.mockResolvedValue(gate);
+        await renderSpeechThread();
+        await waitFor(() =>
+          expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalledWith('kokoro'),
+        );
+        openSettings();
+        await flushMicrotasks();
+        if (gate.streaming) await screen.findByRole('checkbox', { name: t.chatSpeechStream });
+      }
+
+      // A saved speech thread, opened with its settings panel.
+      async function renderSavedThread(audio: Record<string, unknown>, gate = open) {
+        chatApi.spies.modelSpeechStreaming.mockResolvedValue(gate);
+        chatApi.rows.push({
+          id: 'c_speech_keep',
+          title: '',
+          created_at: '2026-07-22T12:00:00Z',
+          updated_at: '2026-07-22T12:00:00Z',
+          content: { settings: { model: 'kokoro', kind: 'speech', audio }, messages: [] },
+        });
+        renderChat(tokens, speechModels);
+        await waitForChatReady();
+        await waitFor(() =>
+          expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalledWith('kokoro'),
+        );
+        openSettings();
+        await flushMicrotasks();
+      }
+
+      it('offers the checkbox on, with keep-all chosen and no count field', async () => {
+        await renderRetentionThread();
+
+        expect(keepBox()).toBeChecked();
+        expect(keepAllRadio()).toBeChecked();
+        expect(keepLastRadio()).not.toBeChecked();
+        expect(countField()).not.toBeInTheDocument();
+      });
+
+      it('is not offered on a text thread', async () => {
+        renderChat();
+        await waitForChatReady();
+        await pickOption(t.chatModel, models[0].display_name);
+        openSettings();
+
+        expect(screen.queryByRole('checkbox', { name: t.chatAudioKeep })).not.toBeInTheDocument();
+        expect(screen.queryByRole('radio', { name: t.chatAudioKeepAll })).not.toBeInTheDocument();
+      });
+
+      it('reveals a whole-number count of at least 1 for keep-last-N only', async () => {
+        await renderRetentionThread();
+        fireEvent.click(keepLastRadio());
+
+        expect(keepLastRadio()).toBeChecked();
+        expect(keepAllRadio()).not.toBeChecked();
+        expect(countField()).toHaveAttribute('type', 'number');
+        expect(countField()).toHaveAttribute('min', '1');
+        expect(countField()).toHaveAttribute('step', '1');
+        expect(countField()).toHaveValue(null); // blank until the user types one
+
+        fireEvent.click(keepAllRadio());
+        expect(countField()).not.toBeInTheDocument();
+      });
+
+      it('sends the typed count as keep_last_audio', async () => {
+        await renderRetentionThread();
+        fireEvent.click(keepLastRadio());
+        typeCount('3');
+        expect(countField()).toHaveValue(3);
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).toEqual({ keep_last_audio: 3 });
+      });
+
+      it('sends nothing for keep-all, and choosing it clears a typed count', async () => {
+        await renderRetentionThread();
+        fireEvent.click(keepLastRadio());
+        typeCount('3');
+        fireEvent.click(keepAllRadio());
+        expect(keepAllRadio()).toBeChecked();
+
+        // Back to keep-last-N: the count is gone, not remembered.
+        fireEvent.click(keepLastRadio());
+        expect(countField()).toHaveValue(null);
+        fireEvent.click(keepAllRadio());
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).not.toHaveProperty('keep_last_audio');
+      });
+
+      it('keeps keep-last-N chosen while the count is being retyped from empty', async () => {
+        await renderRetentionThread();
+        fireEvent.click(keepLastRadio());
+        typeCount('3');
+        typeCount(''); // the last digit deleted: mid-edit, not a change of mind
+
+        expect(keepLastRadio()).toBeChecked();
+        expect(countField()).toBeInTheDocument();
+        typeCount('7');
+        expect(countField()).toHaveValue(7);
+      });
+
+      // An unusable count otherwise falls through to keep-all in silence, so the field says
+      // so, inline, and says what happens meanwhile. A blank field is not an error (it is
+      // simply not filled in yet), and a fixed one clears the message.
+      it('flags a count that is not a whole number of at least 1, and clears once fixed', async () => {
+        await renderSpeechThread();
+        openSettings();
+        fireEvent.click(keepLastRadio());
+
+        for (const bad of ['0', '-2', '1.5']) {
+          typeCount(bad);
+          expect(countField(), bad).toHaveAttribute('aria-invalid', 'true');
+          expect(countField(), bad).toHaveAccessibleDescription(t.chatAudioKeepLastInvalid);
+        }
+
+        typeCount('4');
+        expect(countField()).not.toHaveAttribute('aria-invalid', 'true');
+        expect(screen.queryByText(t.chatAudioKeepLastInvalid)).not.toBeInTheDocument();
+
+        typeCount('0');
+        expect(screen.getByText(t.chatAudioKeepLastInvalid)).toBeInTheDocument();
+        typeCount('');
+        expect(countField()).not.toHaveAttribute('aria-invalid', 'true');
+        expect(screen.queryByText(t.chatAudioKeepLastInvalid)).not.toBeInTheDocument();
+      });
+
+      it('sends no count while the typed one is unusable', async () => {
+        await renderRetentionThread();
+        fireEvent.click(keepLastRadio());
+        typeCount('0');
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).not.toHaveProperty('keep_last_audio');
+      });
+
+      it('cannot be switched off on a thread that does not stream, and says why', async () => {
+        await renderRetentionThread(NO_SPEECH_STREAMING);
+
+        expect(keepBox()).toBeChecked();
+        expect(keepBox()).toBeDisabled();
+        expect(keepBox()).toHaveAccessibleDescription(t.chatAudioKeepHint);
+        // The rest of the control still works: only "do not store" needs the stream.
+        fireEvent.click(keepLastRadio());
+        expect(countField()).toBeInTheDocument();
+      });
+
+      it('can be switched off on a streaming thread, which hides keep-all/keep-last-N', async () => {
+        await renderRetentionThread(open);
+        expect(keepBox()).toBeEnabled();
+        expect(keepBox()).toHaveAccessibleDescription(t.chatAudioKeepHint);
+
+        fireEvent.click(keepBox());
+        expect(keepBox()).not.toBeChecked();
+        expect(screen.queryByRole('radio', { name: t.chatAudioKeepAll })).not.toBeInTheDocument();
+        expect(countField()).not.toBeInTheDocument();
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).toEqual({ keep_last_audio: 0 });
+      });
+
+      it('switches back on to the choice it had', async () => {
+        await renderRetentionThread(open);
+        fireEvent.click(keepLastRadio());
+        typeCount('5');
+        fireEvent.click(keepBox());
+        fireEvent.click(keepBox());
+
+        expect(keepBox()).toBeChecked();
+        expect(keepLastRadio()).toBeChecked();
+        expect(countField()).toHaveValue(5);
+      });
+
+      it('is locked while a run is in flight, like the other settings', async () => {
+        await renderRetentionThread(open);
+        fireEvent.click(keepLastRadio());
+        typeCount('2');
+
+        await sendSpeech();
+        await waitFor(() => expect(keepBox()).toBeDisabled());
+        expect(keepAllRadio()).toBeDisabled();
+        expect(keepLastRadio()).toBeDisabled();
+        expect(countField()).toBeDisabled();
+      });
+
+      it('shows a stored keep-last-N, and writes nothing on load', async () => {
+        await renderSavedThread({ keep_last_audio: 3 });
+
+        expect(keepBox()).toBeChecked();
+        expect(keepLastRadio()).toBeChecked();
+        expect(countField()).toHaveValue(3);
+
+        // The save is debounced (800 ms): wait it out, and nothing was written.
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+      });
+
+      it('shows a stored do-not-store, and writes nothing on load', async () => {
+        await renderSavedThread({ keep_last_audio: 0 });
+
+        expect(keepBox()).not.toBeChecked();
+        expect(screen.queryByRole('radio', { name: t.chatAudioKeepAll })).not.toBeInTheDocument();
+
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+      });
+
+      // The model may have stopped streaming since: the stored "do not store" shows as it is
+      // (the run stores a buffered answer anyway), and only SELECTING it is withheld, so the
+      // checkbox stays free to be switched back on but never off again.
+      it('shows a stored do-not-store as is on a thread that no longer streams', async () => {
+        await renderSavedThread({ keep_last_audio: 0 }, NO_SPEECH_STREAMING);
+
+        expect(keepBox()).not.toBeChecked();
+        expect(keepBox()).toBeEnabled();
+
+        fireEvent.click(keepBox());
+        expect(keepBox()).toBeChecked();
+        expect(keepBox()).toBeDisabled();
+      });
+
+      // The positive control of the two "writes nothing" tests: an edit IS saved, so their
+      // silence means the control stayed quiet and not that the save never runs here.
+      it('saves an edit', async () => {
+        await renderSavedThread({ keep_last_audio: 3 });
+        typeCount('5');
+
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+        const saved = chatApi.spies.saveChat.mock.calls[0][1] as {
+          content: { settings: { audio: unknown } };
+        };
+        expect(saved.content.settings.audio).toEqual({ keep_last_audio: 5 });
+      });
+    });
+
     describe('an advanced passthrough that is not a JSON object', () => {
       it('is flagged on the field itself, and clears once fixed', async () => {
         await renderSpeechThread();

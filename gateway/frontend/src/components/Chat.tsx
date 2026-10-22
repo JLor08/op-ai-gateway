@@ -25,6 +25,7 @@ import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import { PageTitle } from './shared/PageTitle';
 import { keyedUrls } from './shared/urlKeys';
 import { SearchableSelect, type SearchableOption } from './shared/SearchableSelect';
+import { AudioRetentionControl } from './AudioRetentionControl';
 import { ChatMessage } from './ChatMessage';
 import { SpeechVoiceField } from './SpeechVoiceField';
 import { TranscriptionComposer } from './TranscriptionComposer';
@@ -727,6 +728,18 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       {t.chatSpeechStreamHint}
                     </Typography>
                   )}
+                  {/* The retention of the answers' audio (#281): keep all, keep the last N, or
+                    (streaming only) do not store. Keyed by the chat, since its keep-last-N
+                    choice is local to one thread's text. */}
+                  <AudioRetentionControl
+                    key={c.activeChatId ?? ''}
+                    keepAudio={c.audioSettings.keepAudio}
+                    keepLast={c.audioSettings.keepLast}
+                    speechStreaming={c.speechStreaming}
+                    disabled={c.streaming}
+                    onChange={(patch) => c.setAudioSettings((s) => ({ ...s, ...patch }))}
+                    t={t}
+                  />
                   <Typography variant="caption" color="text.secondary">
                     {t.chatSpeechFormatHint}
                   </Typography>

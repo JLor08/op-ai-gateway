@@ -274,6 +274,20 @@ const de = {
   chatSpeechStream: 'Beim Erzeugen abspielen (Streaming)',
   chatSpeechStreamHint:
     'Das Modell liefert das Audio schon während der Erzeugung, und es wird sofort abgespielt. Das fertige Audio erscheint danach wie gewohnt als Datei.',
+  // The answer-audio retention control of the speech settings (#281): a "keep audio answers"
+  // checkbox (on by default) over a keep-all / keep-last-N choice whose count field exists only
+  // for "keep last N". Unchecking is "do not store" and is selectable only while the thread
+  // streams (the same gate as the streaming toggle above), which the hint says: a buffered
+  // answer is only ever heard from storage. The count's message names what an unusable value
+  // does meanwhile (every answer is kept), since it would otherwise fall through in silence.
+  chatAudioKeep: 'Audio-Antworten behalten',
+  chatAudioKeepAll: 'Alle behalten',
+  chatAudioKeepLast: 'Letzte N behalten',
+  chatAudioKeepLastCount: 'Zu behaltende Antworten (N)',
+  chatAudioKeepHint:
+    'Ausschalten, um Audio-Antworten gar nicht zu speichern. Das geht nur, solange die Antwort beim Erzeugen abgespielt wird (Streaming): Audio, das nicht gestreamt wird, lässt sich nur aus dem Speicher anhören und wird deshalb trotzdem behalten.',
+  chatAudioKeepLastInvalid:
+    'Geben Sie eine ganze Zahl ab 1 ein oder wählen Sie „Alle behalten“. Solange der Wert ungültig ist, werden alle Antworten behalten.',
   // The collapsible "Advanced" section: extra request fields as a JSON object (the
   // OpenAI `instructions` field or a model-native option).
   chatSpeechAdvanced: 'Erweitert',
@@ -3583,6 +3597,15 @@ const en: PortalMessages = {
   chatSpeechStream: 'Play while generating (streaming)',
   chatSpeechStreamHint:
     'The model delivers its audio while it is generated, and it plays at once. The finished audio then appears as a file as usual.',
+  // See the German block: the answer-audio retention control of the speech settings.
+  chatAudioKeep: 'Keep audio answers',
+  chatAudioKeepAll: 'Keep all',
+  chatAudioKeepLast: 'Keep last N',
+  chatAudioKeepLastCount: 'Answers to keep (N)',
+  chatAudioKeepHint:
+    'Turn this off to not store audio answers at all. That only works while the answer streams (plays while it is generated): audio that is not streamed can only be heard from storage, so it is kept anyway.',
+  chatAudioKeepLastInvalid:
+    'Enter a whole number of 1 or more, or choose "Keep all". While the value is invalid, every answer is kept.',
   chatSpeechAdvanced: 'Advanced',
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:

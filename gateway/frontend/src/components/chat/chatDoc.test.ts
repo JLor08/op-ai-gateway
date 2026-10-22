@@ -24,6 +24,7 @@ import {
   imageSetting,
   imageSettingsFrom,
   isChatBlobUrl,
+  isKeepLastInvalid,
   isMaskPart,
   kindSetting,
   lastUserHasAudio,
@@ -692,6 +693,27 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
       expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, keepLast: ' 4 ' }).audio).toEqual({
         keep_last_audio: 4,
       });
+    });
+
+    // The composer's inline warning shares the wire's parse, so what it flags is exactly what
+    // audioSetting() drops: filled in, but not a whole number of 1 or more.
+    it('flags exactly the filled-in keepLast text that the wire drops', () => {
+      for (const unusable of ['0', '-2', '1.5', 'abc', 'NaN', 'Infinity', ' 0 ']) {
+        expect(isKeepLastInvalid(unusable), unusable).toBe(true);
+        const audio = audioSetting('speech', {
+          ...DEFAULT_AUDIO_SETTINGS,
+          keepLast: unusable,
+        }).audio;
+        expect(audio, unusable).not.toHaveProperty('keep_last_audio');
+      }
+      for (const usable of ['1', '3', ' 4 ', '2.0', '100']) {
+        expect(isKeepLastInvalid(usable), usable).toBe(false);
+      }
+    });
+
+    it('does not flag a blank keepLast: it is simply not filled in', () => {
+      expect(isKeepLastInvalid('')).toBe(false);
+      expect(isKeepLastInvalid('   ')).toBe(false);
     });
 
     it('reads a negative or non-integer persisted value defensively as keep-all', () => {
