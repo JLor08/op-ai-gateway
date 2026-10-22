@@ -468,12 +468,20 @@ describe('errorLabelByCode (whole-map invariants)', () => {
     // uploaded webp/gif): `imageRunSourceUnsupportedMessage`, chat_runs_images.go.
     'gateway.chat_run_image_source_unsupported',
     'gateway.chat_run_commit_failed',
+    // A commit that did not return within chatRunCommitTimeout (chat_runs.go,
+    // commitFailureCode): the store write took too long and the turn may not have
+    // been stored, which a "please try again" would misstate.
+    'gateway.chat_run_commit_timeout',
     // A speech run's own terminal codes (chat_runs_audio.go). The reserved-field
     // one is the run refusing, before anything is sent, a passthrough key it owns.
     'gateway.chat_run_speech_dispatch_failed',
     'gateway.chat_run_no_audio',
     'gateway.chat_run_speech_response_unreadable',
     'gateway.chat_run_speech_reserved_field',
+    // The synthesized audio exceeds the total a turn may store
+    // (speechRunAudioTooLargeMessage): nothing is committed, and a retry of the same
+    // text meets the same cap.
+    'gateway.chat_run_audio_too_large',
     // A transcription run's own terminal codes (chat_runs_transcription.go). The
     // source-unreadable one is the run refusing, before anything is sent, a clip it
     // cannot read as audio (it never transcribes a different clip than the user
@@ -649,6 +657,26 @@ describe('errorLabelByCode (whole-map invariants)', () => {
           `${code}: ${t[key]}`,
         );
       }
+    }
+    expect(messages.de[key]).not.toBe(messages.en[key]);
+  });
+
+  // The two terminal codes #279 added. Both mean something a "please try again"
+  // gets wrong (a long clip meets the same cap on a retry; a timed-out write may
+  // or may not have stored the turn), so each must map to its OWN label, in both
+  // locales, and neither may reuse the generic commit-failed sentence.
+  it.each([
+    ['gateway.chat_run_audio_too_large', 'errorChatRunAudioTooLarge'],
+    ['gateway.chat_run_commit_timeout', 'errorChatRunCommitTimeout'],
+  ] as const)('labels the terminal code %s with its own label %s, in both locales', (code, key) => {
+    expect(errorLabelByCode[code]).toBe(key);
+    expect(key).not.toBe(errorLabelByCode['gateway.chat_run_commit_failed']);
+    for (const locale of ['de', 'en'] as const) {
+      const t = messages[locale];
+      expect(t[key].length).toBeGreaterThan(0);
+      expect(formatChatRunErrorCode(code, t)).toBe(t[key]);
+      expect(formatChatRunErrorCode(code, t)).not.toBe(code);
+      expect(t[key]).not.toBe(t.errorChatRunCommitFailed);
     }
     expect(messages.de[key]).not.toBe(messages.en[key]);
   });
