@@ -450,6 +450,8 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
       speed: '',
       passthrough: '',
       stream: true,
+      keepAudio: true,
+      keepLast: '',
     });
     // The key is present for a speech thread (as image's is for an image one),
     // but carries nothing: every knob stays the model's default.
@@ -629,6 +631,87 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
     expect(audioSetting('speech', audioSettingsFrom(wire))).toEqual({ audio: wire });
     // Another kind of thread never carries it.
     expect(audioSetting('image', { ...DEFAULT_AUDIO_SETTINGS, stream: false })).toEqual({});
+  });
+
+  // The answer-audio retention knob (#281): keeping every answer is the default and is never
+  // written, so a thread that never touched it persists nothing and a legacy chat keeps all.
+  // `0` (do not store) and a positive N (keep the last N answers) are the two values, and
+  // both must survive the full-replace PUT: the wire type, audioSetting and audioSettingsFrom
+  // all carry them.
+  describe('the answer-audio retention (keep_last_audio)', () => {
+    it('defaults to keeping all answers: keepAudio on, keepLast blank', () => {
+      expect(DEFAULT_AUDIO_SETTINGS.keepAudio).toBe(true);
+      expect(DEFAULT_AUDIO_SETTINGS.keepLast).toBe('');
+      expect(audioSetting('speech', DEFAULT_AUDIO_SETTINGS)).toEqual({ audio: {} });
+    });
+
+    it('writes nothing for keep-all and reads an absent field back as keep-all', () => {
+      const audio = audioSetting('speech', DEFAULT_AUDIO_SETTINGS).audio ?? {};
+      expect('keep_last_audio' in audio).toBe(false);
+      const state = audioSettingsFrom(audio);
+      expect(state.keepAudio).toBe(true);
+      expect(state.keepLast).toBe('');
+      expect(audioSettingsFrom(undefined)).toMatchObject({ keepAudio: true, keepLast: '' });
+    });
+
+    it('writes keep_last_audio: N for keep-last-N and round-trips it', () => {
+      const state = { ...DEFAULT_AUDIO_SETTINGS, keepAudio: true, keepLast: '3' };
+      const wire = audioSetting('speech', state);
+      expect(wire).toEqual({ audio: { keep_last_audio: 3 } });
+      expect(audioSettingsFrom(wire.audio)).toMatchObject({ keepAudio: true, keepLast: '3' });
+      expect(audioSetting('speech', audioSettingsFrom(wire.audio))).toEqual(wire);
+    });
+
+    it('writes keep_last_audio: 0 for do-not-store and round-trips it', () => {
+      const state = { ...DEFAULT_AUDIO_SETTINGS, keepAudio: false };
+      const wire = audioSetting('speech', state);
+      expect(wire).toEqual({ audio: { keep_last_audio: 0 } });
+      expect(audioSettingsFrom(wire.audio)).toMatchObject({ keepAudio: false, keepLast: '' });
+      expect(audioSetting('speech', audioSettingsFrom(wire.audio))).toEqual(wire);
+    });
+
+    it('lets do-not-store win over a leftover keepLast, and drops that text on the way back', () => {
+      const state = { ...DEFAULT_AUDIO_SETTINGS, keepAudio: false, keepLast: '5' };
+      expect(audioSetting('speech', state)).toEqual({ audio: { keep_last_audio: 0 } });
+      expect(audioSettingsFrom({ keep_last_audio: 0 })).toMatchObject({
+        keepAudio: false,
+        keepLast: '',
+      });
+    });
+
+    it('omits a blank or invalid keepLast (keep-all), so nothing is sent for it', () => {
+      for (const keepLast of ['', '   ', 'abc', '0', '-2', '1.5', '2.0x', 'NaN', 'Infinity']) {
+        const audio =
+          audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, keepAudio: true, keepLast }).audio ??
+          {};
+        expect('keep_last_audio' in audio, keepLast).toBe(false);
+      }
+    });
+
+    it('trims a keepLast before parsing it', () => {
+      expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, keepLast: ' 4 ' }).audio).toEqual({
+        keep_last_audio: 4,
+      });
+    });
+
+    it('reads a negative or non-integer persisted value defensively as keep-all', () => {
+      for (const keep of [-1, 1.5, Number.NaN, 'x' as unknown as number]) {
+        expect(audioSettingsFrom({ keep_last_audio: keep }), String(keep)).toMatchObject({
+          keepAudio: true,
+          keepLast: '',
+        });
+      }
+    });
+
+    it('round-trips with the other knobs, and never reaches a non-speech thread', () => {
+      const wire = { voice: 'af_heart', speed: 0.9, stream: false, keep_last_audio: 2 };
+      expect(audioSetting('speech', audioSettingsFrom(wire))).toEqual({ audio: wire });
+      const moved = { ...DEFAULT_AUDIO_SETTINGS, keepAudio: false };
+      expect(audioSetting('', moved)).toEqual({});
+      expect(audioSetting(undefined, moved)).toEqual({});
+      expect(audioSetting('image', moved)).toEqual({});
+      expect(audioSetting('transcription', moved)).toEqual({});
+    });
   });
 
   it('keeps a speed of 0 (a value, not "unset") across a save/load', () => {

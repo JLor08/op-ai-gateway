@@ -308,6 +308,8 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
             speed: '1.25',
             passthrough: '{"seed":3}',
             stream: true,
+            keepAudio: true,
+            keepLast: '3',
           })
         }
       >
@@ -4275,7 +4277,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const settings = startSettings();
       expect(settings.model).toBe('kokoro');
       expect(settings.kind).toBe('speech');
-      expect(settings.audio).toEqual({ voice: 'af_heart', speed: 1.25, passthrough: { seed: 3 } });
+      expect(settings.audio).toEqual({
+        voice: 'af_heart',
+        speed: 1.25,
+        passthrough: { seed: 3 },
+        keep_last_audio: 3,
+      });
       // A speech run carries no image knobs.
       expect('image' in settings).toBe(false);
 
@@ -4436,6 +4443,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         speed: '0.8',
         passthrough: '',
         stream: true,
+        keepAudio: true,
+        keepLast: '',
       });
 
       // The audio settings are the ONLY thing that changes here, so this also holds
@@ -4451,6 +4460,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         voice: 'af_heart',
         speed: 1.25,
         passthrough: { seed: 3 },
+        keep_last_audio: 3,
       });
 
       // ...and the reload reads them back out of the saved document (the PUT
@@ -4461,11 +4471,15 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toMatchObject({
         voice: 'af_heart',
         speed: '1.25',
+        keepAudio: true,
+        keepLast: '3',
       });
     });
 
     it('keeps the stored audio settings when an unrelated setting is saved', async () => {
-      chatApi = makeChatApi(speechThread({ voice: 'bf_emma', speed: 0.8, passthrough: { a: 1 } }));
+      chatApi = makeChatApi(
+        speechThread({ voice: 'bf_emma', speed: 0.8, passthrough: { a: 1 }, keep_last_audio: 0 }),
+      );
       renderProvider([], { models: speechModels });
       await waitForReady();
 
@@ -4478,6 +4492,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         voice: 'bf_emma',
         speed: 0.8,
         passthrough: { a: 1 },
+        keep_last_audio: 0,
       });
     });
 

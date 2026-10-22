@@ -77,6 +77,13 @@ export type ChatAudioSettings = {
   // buffered WAV whatever this says. Omitted = the default, which streams where it can;
   // only an explicit `false` opts the thread out, so an unset thread persists nothing.
   stream?: boolean;
+  // How many of the thread's most recent spoken answers keep their stored audio (#281).
+  // Omitted = keep every answer (the default, and what every thread from before this knob
+  // does); `0` = do not store the audio at all (the answer is still played as it is
+  // generated, the text stays); `N >= 1` = keep the last N answers' audio, and the audio of
+  // older answers is pruned when a new answer is committed. Only 0 and a positive integer
+  // are ever written, so an unset thread persists nothing.
+  keep_last_audio?: number;
 };
 
 // The speech-to-text knobs of a "transcription" thread, as sent on the wire and persisted

@@ -516,6 +516,15 @@ export type AudioSettings = {
   // and get the buffered WAV instead. audioSetting() writes it only when it is OFF, so a
   // thread that never touched it persists nothing for it.
   stream: boolean;
+  // Whether the thread stores its spoken answers' audio at all (#281), the speech composer's
+  // "keep audio" toggle. On by default, so a new or legacy chat keeps every answer, as before.
+  // OFF is the wire's `keep_last_audio: 0` (do not store); audioSetting() writes it only then.
+  keepAudio: boolean;
+  // How many of the most recent answers keep their audio, as a BLANK-ABLE string like `speed`
+  // ("" = keep all), parsed to the wire's positive integer by audioSetting(); a blank,
+  // non-integer or sub-1 text is omitted. Only meaningful while keepAudio is on: turning it
+  // off wins and this text is not sent.
+  keepLast: string;
 };
 
 export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
@@ -523,6 +532,8 @@ export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   speed: '',
   passthrough: '',
   stream: true,
+  keepAudio: true,
+  keepLast: '',
 };
 
 // The request fields a thread's passthrough may not set: the run's own (`model` is
@@ -660,7 +671,19 @@ export function audioSetting(
   // Only the opt-out is written: streaming is the default, so an unset thread persists
   // nothing and a thread's settings stay byte-identical until the user turns it off.
   if (!s.stream) audio.stream = false;
+  // Likewise only the non-default retention: do-not-store (0) when keep-audio is off, else a
+  // positive keep-last-N. Keep-all (the default, or a blank/invalid keepLast) writes nothing.
+  const keepLast = s.keepAudio ? toKeepLast(s.keepLast) : 0;
+  if (keepLast !== undefined) audio.keep_last_audio = keepLast;
   return { audio };
+}
+
+// The positive integer a keep-last text means, or undefined for keep-all: blank, unparseable,
+// fractional, or below 1 (0 is the do-not-store state, which the keepAudio toggle carries,
+// not this text).
+function toKeepLast(raw: string): number | undefined {
+  const n = toImageNumber(raw);
+  return n !== undefined && Number.isSafeInteger(n) && n >= 1 ? n : undefined;
 }
 
 // Coerce a persisted (all-optional) ChatAudioSettings into the concrete store state,
@@ -680,7 +703,19 @@ export function audioSettingsFrom(audio: ChatAudioSettings | undefined): AudioSe
     // Anything but an explicit false is the default (on): a missing or mistyped value must
     // not silently turn streaming off.
     stream: s.stream !== false,
+    ...keepAudioFrom(s.keep_last_audio),
   };
+}
+
+// The retention half of the audio state from the persisted `keep_last_audio`: 0 = do not
+// store, an integer >= 1 = keep the last N, anything else (absent, negative, fractional,
+// mistyped) = keep all, the default -- a stray value must not silently stop storing audio.
+function keepAudioFrom(keep: unknown): Pick<AudioSettings, 'keepAudio' | 'keepLast'> {
+  if (keep === 0) return { keepAudio: false, keepLast: '' };
+  if (typeof keep === 'number' && Number.isSafeInteger(keep) && keep >= 1) {
+    return { keepAudio: true, keepLast: String(keep) };
+  }
+  return { keepAudio: DEFAULT_AUDIO_SETTINGS.keepAudio, keepLast: DEFAULT_AUDIO_SETTINGS.keepLast };
 }
 
 // The speech-to-text knobs the composer edits, as CONCRETE store state (every field
