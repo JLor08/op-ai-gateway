@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useRef, useState, type SubmitEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type SubmitEvent } from 'react';
 import {
   Box,
   Button,
@@ -161,6 +161,15 @@ function textOf(content: ChatContent): string | undefined {
 // flag stay here.
 export function Chat({ t }: Readonly<{ t: Translation }>) {
   const c = useChatStore();
+  // The live speech bubble's Mute, for the active chat: a stable reference (the store's
+  // muteAudio is) so it never defeats a row's memo.
+  const { activeChatId, muteAudio } = c;
+  const onMuteAudio = useCallback(
+    (muted: boolean) => {
+      if (activeChatId) muteAudio(activeChatId, muted);
+    },
+    [activeChatId, muteAudio],
+  );
   const [showSettings, setShowSettings] = useState(false);
   // The advanced (sd-server) image knobs are collapsed by default: they are
   // power-user controls below the common size/count/format settings.
@@ -1005,6 +1014,13 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   // Gated into the streaming row like kind/elapsedMs, for the same memo
                   // reason: only that row's pending turn reads it.
                   audioLive={rowStreaming ? c.runAudioLive : undefined}
+                  audioMuted={rowStreaming ? c.runAudioMuted : undefined}
+                  // Mute is local playback only (reversible); Abort is the composer's own
+                  // Stop -- the run's ordinary cancel, whose canceled `done` ends the bubble
+                  // as a not-stored answer. Both are stable references, and only the
+                  // streaming row gets them.
+                  onMuteAudio={rowStreaming ? onMuteAudio : undefined}
+                  onAbortAudio={rowStreaming ? c.stop : undefined}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
                   // The refine of a generated image: only where it can run. attachMode

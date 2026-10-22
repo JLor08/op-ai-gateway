@@ -20,7 +20,8 @@
 //     irregularity abandons live playback for the run; the committed WAV is complete.
 //   - decodeBase64 / pcm16ToFloat32 are the pure conversion, including the odd byte a chunk
 //     boundary can leave inside a sample.
-//   - StreamingPcmPlayer schedules decoded chunks back to back on an AudioContext's clock.
+//   - StreamingPcmPlayer schedules decoded chunks back to back on an AudioContext's clock,
+//     through one gain node that is the run's mute.
 //   - createSpeechPlayback holds one session per chat on top of those, which useChatRuns
 //     drives from the run's events.
 //
@@ -144,12 +145,19 @@ export type PlaybackSource = {
   start(when?: number): void;
   stop(when?: number): void;
 };
+// The one gain stage of a stream: every source reaches the destination through it, and its
+// value is the mute (0 silent, 1 as decoded).
+export type PlaybackGain = {
+  readonly gain: { value: number };
+  connect(destination: unknown): unknown;
+};
 export type PlaybackContext = {
   readonly currentTime: number;
   readonly destination: unknown;
   readonly state?: string;
   createBuffer(numberOfChannels: number, length: number, sampleRate: number): PlaybackBuffer;
   createBufferSource(): PlaybackSource;
+  createGain(): PlaybackGain;
   resume?(): Promise<void>;
 };
 
@@ -170,6 +178,12 @@ export class StreamingPcmPlayer {
   private nextTime = 0;
   private carry: number | null = null;
   private stopped = false;
+  // The stream's mute, kept here so it holds before the gain node exists (the node is made
+  // with the first chunk) and for every chunk after.
+  private muted = false;
+  // The persistent gain stage between the sources and the destination: made once, with the
+  // first chunk, and shared by every chunk after it.
+  private gain: PlaybackGain | null = null;
   private readonly sources = new Set<PlaybackSource>();
 
   constructor(
@@ -191,7 +205,7 @@ export class StreamingPcmPlayer {
       buffer.copyToChannel(samples, 0);
       source = this.ctx.createBufferSource();
       source.buffer = buffer;
-      source.connect(this.ctx.destination);
+      source.connect(this.gainStage());
       duration = buffer.duration;
     } catch {
       // A rate the browser cannot make a buffer of: nothing was scheduled.
@@ -204,6 +218,27 @@ export class StreamingPcmPlayer {
     source.start(startAt);
     this.nextTime = startAt + duration;
     return true;
+  }
+
+  /**
+   * Mute or unmute the stream: the gain of what is queued AND of every chunk still to come.
+   * Reversible, and local to this player's output -- nothing is stopped, dropped or
+   * rescheduled, so the stream's clock keeps running and unmuting rejoins it where it is.
+   */
+  setMuted(muted: boolean): void {
+    this.muted = muted;
+    if (this.gain) this.gain.gain.value = muted ? 0 : 1;
+  }
+
+  // The gain stage, made on first use at the current mute and wired to the destination once.
+  private gainStage(): PlaybackGain {
+    if (!this.gain) {
+      const gain = this.ctx.createGain();
+      gain.gain.value = this.muted ? 0 : 1;
+      gain.connect(this.ctx.destination);
+      this.gain = gain;
+    }
+    return this.gain;
   }
 
   /** Silence everything scheduled and ignore every later chunk. */
@@ -232,6 +267,10 @@ export type SpeechPlayback = {
   end(chatId: string, completed: boolean): void;
   /** Silence every chat and forget them all. */
   stopAll(): void;
+  /** Mute or unmute the chat's run: local playback only (the run itself, and what is saved of
+   * it, is untouched), reversible, and gone with the run's session. A chat with no run is a
+   * no-op. */
+  setMuted(chatId: string, muted: boolean): void;
   /** Whether the chat's run is playing live right now. */
   isLive(chatId: string): boolean;
 };
@@ -318,6 +357,10 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
     stopAll() {
       for (const session of sessions.values()) session.player.stop();
       sessions.clear();
+    },
+
+    setMuted(chatId, muted) {
+      sessions.get(chatId)?.player.setMuted(muted);
     },
 
     isLive(chatId) {

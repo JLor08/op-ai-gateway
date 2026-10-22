@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useReducer, useRef } from 'react';
+import { useEffect, useReducer, useRef, type ReactNode } from 'react';
 import { Box, Typography } from '@mui/material';
 import { formatElapsed } from './shared/elapsed';
 
@@ -28,6 +28,7 @@ export function RunPendingTurn({
   roleLabel,
   waitLabel,
   noNewsLabel,
+  actions,
 }: Readonly<{
   elapsedMs: number;
   roleLabel: string;
@@ -35,6 +36,9 @@ export function RunPendingTurn({
   waitLabel: string;
   // The static sentence stating that no intermediate news is coming.
   noNewsLabel: string;
+  // Controls for the run while it waits (the live speech bubble's Mute and Abort), under the
+  // sentence. Absent for the kinds that have none.
+  actions?: ReactNode;
 }>) {
   // Anchor once per distinct server value: (server ms, the performance.now()
   // instant it was read). Re-anchored only when `elapsedMs` itself changes
@@ -96,6 +100,7 @@ export function RunPendingTurn({
       <Typography component="div" sx={{ mt: 0.5, color: 'var(--muted)', fontSize: 13 }}>
         {noNewsLabel}
       </Typography>
+      {actions}
     </Box>
   );
 }

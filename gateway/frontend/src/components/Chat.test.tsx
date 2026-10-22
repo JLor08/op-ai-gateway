@@ -44,6 +44,22 @@ vi.mock('./shared/audioToWav', async (importOriginal) => ({
   audioBlobToWav: vi.fn(async (blob: Blob) => new Blob(['WAV:', blob], { type: 'audio/wav' })),
 }));
 
+// jsdom has no Web Audio, so the progressive speech playback is a recording stand-in: inert
+// (it plays nothing and reports no run live) unless a test makes its `push` say the run is
+// playing, as the live speech bubble's controls (mute, abort) do.
+const playback = vi.hoisted(() => ({
+  prime: vi.fn(),
+  push: vi.fn((..._args: unknown[]) => false),
+  end: vi.fn(),
+  stopAll: vi.fn(),
+  isLive: vi.fn(() => false),
+  setMuted: vi.fn(),
+}));
+vi.mock('./chat/speechPlayback', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./chat/speechPlayback')>()),
+  speechPlayback: playback,
+}));
+
 // Captured before any spy is installed, so a mocked createElement can build a
 // real element without recursing into itself.
 const nativeCreateElement = document.createElement.bind(document);
@@ -1091,6 +1107,76 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await pickOption(t.chatModel, models[0].display_name);
 
       expect(screen.queryByTestId('chat-capacity')).not.toBeInTheDocument();
+    });
+  });
+
+  // The live controls of a streaming speech run (#281), through the real store: Mute is the
+  // reversible silence of local playback (the run goes on), Abort is the composer's own Stop
+  // -- the run's cancel, nothing else.
+  describe(`Chat: the live speech bubble controls [${locale}]`, () => {
+    const kokoro: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+
+    beforeEach(() => {
+      playback.push.mockReset().mockReturnValue(true);
+      playback.setMuted.mockClear();
+    });
+
+    async function startLiveRun() {
+      renderChat(tokens, [kokoro]);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'kokoro');
+      fireEvent.change(screen.getByLabelText(t.chatSpeechPromptLabel), {
+        target: { value: 'hello there' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.send }));
+      await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+      const es = FakeEventSource.instances[0];
+      act(() => {
+        es.emit('snapshot', { reasoning: '', content: '', status: 'running', kind: 'speech' });
+        es.emit('audio', { audio: { seq: 0, rate: 44100, data: 'AAAA' } });
+      });
+      return es;
+    }
+
+    it('offers Mute and Abort once the run plays live', async () => {
+      await startLiveRun();
+      expect(await screen.findByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.chatAudioAbort })).toBeInTheDocument();
+    });
+
+    it('Mute silences the playback and flips to Unmute; Unmute restores it', async () => {
+      await startLiveRun();
+      fireEvent.click(await screen.findByRole('button', { name: t.chatAudioMute }));
+      expect(playback.setMuted).toHaveBeenLastCalledWith('chat_1', true);
+      fireEvent.click(await screen.findByRole('button', { name: t.chatAudioUnmute }));
+      expect(playback.setMuted).toHaveBeenLastCalledWith('chat_1', false);
+      expect(await screen.findByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
+      // Muting is playback only: the run was never cancelled.
+      expect(chatApi.spies.cancelChatRun).not.toHaveBeenCalled();
+    });
+
+    it('Abort cancels the run through the existing cancel', async () => {
+      await startLiveRun();
+      fireEvent.click(await screen.findByRole('button', { name: t.chatAudioAbort }));
+      await waitFor(() => expect(chatApi.spies.cancelChatRun).toHaveBeenCalledTimes(1));
+      expect(chatApi.spies.cancelChatRun).toHaveBeenCalledWith('chat_1', 'run_1');
+    });
+
+    it('drops the controls when the run ends', async () => {
+      const es = await startLiveRun();
+      await screen.findByRole('button', { name: t.chatAudioAbort });
+      act(() => es.emit('done', { content: '', status: 'canceled', error: '', kind: 'speech' }));
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull(),
+      );
+      expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
+      expect(screen.queryByRole('button', { name: t.chatAudioUnmute })).toBeNull();
     });
   });
 

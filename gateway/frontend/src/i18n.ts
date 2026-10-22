@@ -458,6 +458,12 @@ const de = {
   chatAudioStreamLive: 'Wird beim Erzeugen abgespielt',
   chatAudioStreamLiveHint:
     'Das fertige Audio erscheint hier, sobald die Erzeugung abgeschlossen ist.',
+  // The two controls of that live bubble (#281). Mute is a toggle that silences only this
+  // tab's playback (the run finishes and is saved as usual), so its label names the action
+  // the next click does; Abort cancels the run itself (nothing is saved).
+  chatAudioMute: 'Stumm schalten',
+  chatAudioUnmute: 'Ton einschalten',
+  chatAudioAbort: 'Erzeugung abbrechen',
   chatGeneratedAudio: 'Erzeugtes Audio',
   chatDownloadAudio: 'Audio herunterladen',
   // Inline next to the player, in two cases: the download itself failed, or the stored
@@ -3737,6 +3743,9 @@ const en: PortalMessages = {
   // See the German block: the pending turn of a speech run that plays while it generates.
   chatAudioStreamLive: 'Playing while it is generated',
   chatAudioStreamLiveHint: 'The finished audio appears here once the generation is complete.',
+  chatAudioMute: 'Mute',
+  chatAudioUnmute: 'Unmute',
+  chatAudioAbort: 'Abort generation',
   chatGeneratedAudio: 'Generated audio',
   chatDownloadAudio: 'Download audio',
   chatAudioDownloadError: 'Could not download the audio.',

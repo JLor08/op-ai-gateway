@@ -63,6 +63,9 @@ function ChatMessageComponent({
   kind,
   elapsedMs,
   audioLive,
+  audioMuted,
+  onMuteAudio,
+  onAbortAudio,
   ttftMs,
   tps,
   tokensPerSecond,
@@ -110,6 +113,13 @@ function ChatMessageComponent({
   // says so rather than promising that no news is coming. Only meaningful with
   // `streaming` and kind "speech".
   audioLive?: boolean;
+  // The live speech run's controls (#281), threaded to the pending turn like `audioLive`
+  // and, like it, supplied only to the one streaming row: whether the user has muted the
+  // playback (ChatStore's runAudioMuted), the Mute toggle (called with the state it asks for)
+  // and the Abort (the store's ordinary stop). The pending turn draws them only while live.
+  audioMuted?: boolean;
+  onMuteAudio?: (muted: boolean) => void;
+  onAbortAudio?: () => void;
   ttftMs?: number;
   tps?: number;
   tokensPerSecond?: number;
@@ -194,6 +204,9 @@ function ChatMessageComponent({
           elapsedMs={elapsedMs ?? 0}
           roleLabel={roleLabel}
           live={audioLive === true}
+          muted={audioMuted === true}
+          onMute={onMuteAudio}
+          onAbort={onAbortAudio}
         />
       );
     }

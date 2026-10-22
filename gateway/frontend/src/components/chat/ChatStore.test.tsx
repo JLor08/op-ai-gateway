@@ -45,6 +45,7 @@ const playback = vi.hoisted(() => ({
   end: vi.fn(),
   stopAll: vi.fn(),
   isLive: vi.fn(() => false),
+  setMuted: vi.fn(),
 }));
 vi.mock('./speechPlayback', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./speechPlayback')>()),
@@ -288,6 +289,13 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           active chat's run is playing its audio live. */}
       <span data-testid="speech-streaming">{String(c.speechStreaming)}</span>
       <span data-testid="run-audio-live">{String(c.runAudioLive)}</span>
+      <span data-testid="run-audio-muted">{String(c.runAudioMuted)}</span>
+      <button type="button" onClick={() => c.muteAudio('c1', true)}>
+        mute-audio
+      </button>
+      <button type="button" onClick={() => c.muteAudio('c1', false)}>
+        unmute-audio
+      </button>
       <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, stream: false }))}>
         set-audio-stream-off
       </button>
@@ -3945,6 +3953,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       playback.prime.mockClear();
       playback.end.mockClear();
       playback.stopAll.mockClear();
+      playback.setMuted.mockClear();
       playback.push.mockReset().mockReturnValue(true);
     });
 
@@ -4153,6 +4162,44 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       act(() => es.emit('audio', chunk(0)));
       fireEvent.click(screen.getByRole('button', { name: 'delete-c1' }));
       await waitFor(() => expect(playback.end).toHaveBeenCalledWith('c1', false));
+    });
+
+    // The live mute (#281): local playback only -- the run is neither stopped nor changed.
+    describe('muting the live run', () => {
+      it('hands the mute to the playback, mirrors it, and unmutes again', async () => {
+        const { es } = await startRun();
+        act(() => es.emit('audio', chunk(0)));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
+
+        fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+        expect(playback.setMuted).toHaveBeenLastCalledWith('c1', true);
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
+
+        fireEvent.click(screen.getByRole('button', { name: 'unmute-audio' }));
+        expect(playback.setMuted).toHaveBeenLastCalledWith('c1', false);
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
+      });
+
+      it('does not cancel, end or otherwise touch the run', async () => {
+        const { es } = await startRun();
+        act(() => es.emit('audio', chunk(0)));
+        fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+        expect(chatApi.spies.cancelChatRun).not.toHaveBeenCalled();
+        expect(playback.end).not.toHaveBeenCalled();
+        expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
+      });
+
+      it.each([
+        ['completes', { status: 'completed', error: '' }],
+        ['is canceled', { status: 'canceled', error: '' }],
+      ])('does not outlive the run when it %s', async (_name, terminal) => {
+        const { es } = await startRun();
+        act(() => es.emit('audio', chunk(0)));
+        fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
+        act(() => es.emit('done', { content: '', kind: 'speech', ...terminal }));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
+      });
     });
 
     it('silences every chat when the store goes away', async () => {

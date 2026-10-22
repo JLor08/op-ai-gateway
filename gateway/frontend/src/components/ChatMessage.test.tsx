@@ -302,6 +302,65 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getByText(t.chatAudioStreamLive).closest('[aria-hidden="true"]')).toBeNull();
       });
 
+      // The live controls (#281) ride the same row as the live wording: the store's mute state
+      // and its two handlers reach the bubble untouched.
+      it('threads the live mute state and handlers to the speech bubble', () => {
+        const onMuteAudio = vi.fn();
+        const onAbortAudio = vi.fn();
+        const { rerender } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            audioLive
+            audioMuted={false}
+            onMuteAudio={onMuteAudio}
+            onAbortAudio={onAbortAudio}
+            elapsedMs={4_000}
+          />,
+        );
+        fireEvent.click(screen.getByRole('button', { name: t.chatAudioMute }));
+        expect(onMuteAudio).toHaveBeenCalledWith(true);
+        fireEvent.click(screen.getByRole('button', { name: t.chatAudioAbort }));
+        expect(onAbortAudio).toHaveBeenCalledTimes(1);
+
+        rerender(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            audioLive
+            audioMuted
+            onMuteAudio={onMuteAudio}
+            onAbortAudio={onAbortAudio}
+            elapsedMs={4_000}
+          />,
+        );
+        expect(screen.getByRole('button', { name: t.chatAudioUnmute })).toBeInTheDocument();
+      });
+
+      it('shows no live controls for a speech run that is not playing live', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            audioLive={false}
+            onMuteAudio={vi.fn()}
+            onAbortAudio={vi.fn()}
+            elapsedMs={4_000}
+          />,
+        );
+        expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
+        expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull();
+      });
+
       it('keeps the silent wait for a speech run that is not playing live', () => {
         render(
           <ChatMessage

@@ -372,6 +372,13 @@ export type ChatStore = {
   // of "no intermediate news". False for every other run and once the run is over; gated into
   // ChatMessage like runKind above, for the same memo reason.
   runAudioLive: boolean;
+  // Whether the user has muted that live playback (#281): the pending turn's Mute control
+  // shows Unmute then. Local to this tab's speakers; the run is unaffected. Gated into
+  // ChatMessage like runAudioLive.
+  runAudioMuted: boolean;
+  // Mute or unmute a chat's live speech playback (the Mute control; reversible). It is NOT
+  // the abort: aborting a live speech run is `stop`, the ordinary cancel.
+  muteAudio: (chatId: string, muted: boolean) => void;
   // Multi-chat layer.
   chats: ChatSummary[];
   activeChatId: string | null;
@@ -927,6 +934,8 @@ export function ChatStoreProvider({
   const {
     runningChatIds,
     audioLiveChatIds,
+    audioMutedChatIds,
+    muteAudio,
     isRunning,
     statusOf: runStatusOf,
     runIdIfRunning,
@@ -967,6 +976,7 @@ export function ChatStoreProvider({
   const runElapsedMs = activeChatId ? elapsedMsOf(activeChatId) : undefined;
   // Whether the active chat's run is playing streamed audio now (see useChatRuns).
   const runAudioLive = activeChatId ? audioLiveChatIds.has(activeChatId) : false;
+  const runAudioMuted = activeChatId ? audioMutedChatIds.has(activeChatId) : false;
 
   // The persistence layer (FA-2): owns buildDoc/flushSave, the debounced-save
   // effect, the pagehide keepalive, and the unmount flush behind a narrow
@@ -2351,6 +2361,8 @@ export function ChatStoreProvider({
     runKind,
     runElapsedMs,
     runAudioLive,
+    runAudioMuted,
+    muteAudio,
     chats,
     activeChatId,
     chatsLoading,

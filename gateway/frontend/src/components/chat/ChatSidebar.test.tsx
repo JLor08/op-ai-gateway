@@ -67,6 +67,8 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     runKind: undefined,
     runElapsedMs: undefined,
     runAudioLive: false,
+    runAudioMuted: false,
+    muteAudio: vi.fn(),
     chats: [
       { id: 'c1', title: 'First chat', created_at: '', updated_at: '2026-07-17T13:00:00Z' },
       { id: 'c2', title: '', created_at: '', updated_at: '2026-07-17T12:00:00Z' },

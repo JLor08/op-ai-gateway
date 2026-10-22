@@ -141,6 +141,13 @@ export type ChatRunsApi = {
   // model's chunks, played as they arrive): the pending turn says so instead of "no
   // intermediate news". Rendering state only, like runningChatIds.
   audioLiveChatIds: Set<string>;
+  // Chats whose live speech playback the user has muted (#281): a render mirror like
+  // audioLiveChatIds. The mute itself lives in the playback; it is local, reversible, and ends
+  // with the run's live playback (a mark never outlives it).
+  audioMutedChatIds: Set<string>;
+  // Mute or unmute the chat's live speech playback. Silences this tab's speakers only: the
+  // run is not stopped and what is stored of it is unchanged (Abort is `stop`, the cancel).
+  muteAudio: (chatId: string, muted: boolean) => void;
   // Synchronous, always-current "is this chat's run live" check (reads the
   // backing ref directly, never stale). Use this for gating (send / edit /
   // save), never `runningChatIds`.
@@ -220,6 +227,7 @@ export function useChatRuns(
   const chatBuffersRef = useRef<Map<string, ChatUiMessage[]>>(new Map());
   const [runningChatIds, setRunningChatIds] = useState<Set<string>>(new Set());
   const [audioLiveChatIds, setAudioLiveChatIds] = useState<Set<string>>(new Set());
+  const [audioMutedChatIds, setAudioMutedChatIds] = useState<Set<string>>(new Set());
   const onTerminalRef = useRef<RunTerminalHandler | null>(null);
   const onTranscriptStaleRef = useRef<TranscriptStaleHandler | null>(null);
 
@@ -235,17 +243,43 @@ export function useChatRuns(
     });
   }, []);
 
-  // Add/remove a chat from the audio-live set (the render mirror of "this run is playing its
-  // audio now"; the source of truth is the playback itself).
-  const markAudioLive = useCallback((chatId: string, live: boolean) => {
-    setAudioLiveChatIds((prev) => {
-      if (live === prev.has(chatId)) return prev;
+  // Add/remove a chat from the audio-muted set (the render mirror of "the user muted this
+  // run's live playback"; the source of truth is the playback's gain).
+  const markAudioMuted = useCallback((chatId: string, muted: boolean) => {
+    setAudioMutedChatIds((prev) => {
+      if (muted === prev.has(chatId)) return prev;
       const next = new Set(prev);
-      if (live) next.add(chatId);
+      if (muted) next.add(chatId);
       else next.delete(chatId);
       return next;
     });
   }, []);
+
+  // Add/remove a chat from the audio-live set (the render mirror of "this run is playing its
+  // audio now"; the source of truth is the playback itself). A run that is not playing live
+  // has no live playback to be muted, so going not-live also clears the mute mark: the next
+  // run's playback starts unmuted (the playback's session is per run) and must read so.
+  const markAudioLive = useCallback(
+    (chatId: string, live: boolean) => {
+      setAudioLiveChatIds((prev) => {
+        if (live === prev.has(chatId)) return prev;
+        const next = new Set(prev);
+        if (live) next.add(chatId);
+        else next.delete(chatId);
+        return next;
+      });
+      if (!live) markAudioMuted(chatId, false);
+    },
+    [markAudioMuted],
+  );
+
+  const muteAudio = useCallback(
+    (chatId: string, muted: boolean) => {
+      playback.setMuted(chatId, muted);
+      markAudioMuted(chatId, muted);
+    },
+    [playback, markAudioMuted],
+  );
 
   // Apply an updater to a chat's transcript, keyed by chatId. The active chat's
   // transcript is the visible `messages`; a background chat's lives only in its
@@ -674,6 +708,8 @@ export function useChatRuns(
   return {
     runningChatIds,
     audioLiveChatIds,
+    audioMutedChatIds,
+    muteAudio,
     isRunning,
     statusOf,
     runIdIfRunning,
