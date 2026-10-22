@@ -195,46 +195,52 @@ func TestAudioMutationsOnAnotherOwnersChatAreNotFound(t *testing.T) {
 // to a count the chat is already under, finds nothing and writes nothing. [Review
 // Focus]
 func TestPruneChatAudioToKeepLast(t *testing.T) {
-	forEachRetentionLeg(t, func(t *testing.T, e *retentionEnv) {
-		ctx := context.Background()
-		chatID := e.newChat(t, `{"settings":{},"messages":[]}`)
-		a1 := e.turn(t, chatID, nil, 1)
-		e.ask(t, chatID, "a long one", nil)
-		a2 := e.answerWith(t, chatID, taggedWAV(2), taggedWAV(22))
-		a3 := e.turn(t, chatID, nil, 3)
-		a4 := e.turn(t, chatID, nil, 4)
-		before := len(e.messages(t, chatID))
-		settings := e.settingsOf(t, chatID)
-		saves := len(e.rec.saves)
+	forEachRetentionLeg(t, pruneChatAudioToKeepLast)
+}
 
-		if err := e.svc.PruneChatAudio(ctx, e.owner, chatID, 2); err != nil {
-			t.Fatalf("PruneChatAudio(2): %v", err)
-		}
+// pruneChatAudioToKeepLast is the scenario of TestPruneChatAudioToKeepLast over one
+// driver's env, so the PostgreSQL test (which brings its own database) runs the very
+// same assertions.
+func pruneChatAudioToKeepLast(t *testing.T, e *retentionEnv) {
+	t.Helper()
+	ctx := context.Background()
+	chatID := e.newChat(t, `{"settings":{},"messages":[]}`)
+	a1 := e.turn(t, chatID, nil, 1)
+	e.ask(t, chatID, "a long one", nil)
+	a2 := e.answerWith(t, chatID, taggedWAV(2), taggedWAV(22))
+	a3 := e.turn(t, chatID, nil, 3)
+	a4 := e.turn(t, chatID, nil, 4)
+	before := len(e.messages(t, chatID))
+	settings := e.settingsOf(t, chatID)
+	saves := len(e.rec.saves)
 
-		e.requireOneSaveDeleting(t, saves, append(slices.Clone(a1), a2...))
-		answers := e.answers(t, chatID)
-		e.requirePruned(t, "oldest answer", answers[0], a1)
-		e.requirePruned(t, "second answer (two blobs)", answers[1], a2)
-		e.requireStored(t, "third answer", answers[2], a3)
-		e.requireStored(t, "newest answer", answers[3], a4)
-		if got := len(e.messages(t, chatID)); got != before {
-			t.Fatalf("messages = %d, want the %d it had: a prune rewrites answers, it never removes a turn", got, before)
-		}
-		// Not the prune's business to touch: the thread's settings ride along as they were.
-		if got := e.settingsOf(t, chatID); got != settings {
-			t.Fatalf("settings = %s, want %s unchanged by the prune", got, settings)
-		}
+	if err := e.svc.PruneChatAudio(ctx, e.owner, chatID, 2); err != nil {
+		t.Fatalf("PruneChatAudio(2): %v", err)
+	}
 
-		for _, keep := range []int{2, 5} {
-			saves = len(e.rec.saves)
-			if err := e.svc.PruneChatAudio(ctx, e.owner, chatID, keep); err != nil {
-				t.Fatalf("PruneChatAudio(%d) again: %v", keep, err)
-			}
-			if len(e.rec.saves) != saves {
-				t.Fatalf("PruneChatAudio(%d) with nothing to prune saved again (%d -> %d)", keep, saves, len(e.rec.saves))
-			}
+	e.requireOneSaveDeleting(t, saves, append(slices.Clone(a1), a2...))
+	answers := e.answers(t, chatID)
+	e.requirePruned(t, "oldest answer", answers[0], a1)
+	e.requirePruned(t, "second answer (two blobs)", answers[1], a2)
+	e.requireStored(t, "third answer", answers[2], a3)
+	e.requireStored(t, "newest answer", answers[3], a4)
+	if got := len(e.messages(t, chatID)); got != before {
+		t.Fatalf("messages = %d, want the %d it had: a prune rewrites answers, it never removes a turn", got, before)
+	}
+	// Not the prune's business to touch: the thread's settings ride along as they were.
+	if got := e.settingsOf(t, chatID); got != settings {
+		t.Fatalf("settings = %s, want %s unchanged by the prune", got, settings)
+	}
+
+	for _, keep := range []int{2, 5} {
+		saves = len(e.rec.saves)
+		if err := e.svc.PruneChatAudio(ctx, e.owner, chatID, keep); err != nil {
+			t.Fatalf("PruneChatAudio(%d) again: %v", keep, err)
 		}
-	})
+		if len(e.rec.saves) != saves {
+			t.Fatalf("PruneChatAudio(%d) with nothing to prune saved again (%d -> %d)", keep, saves, len(e.rec.saves))
+		}
+	}
 }
 
 // keepLast 0 is "keep none": every stored answer's audio goes, and every blob row

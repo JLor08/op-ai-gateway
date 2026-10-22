@@ -32,13 +32,15 @@ type retentionEnv struct {
 	owner auth.Token
 }
 
-// forEachRetentionLeg runs run once per driver the portal package can reach: the
-// in-memory store and a freshly migrated SQLite file, whose blob rows have real
-// foreign keys to the chat. There is deliberately no PostgreSQL leg here: the
-// store package owns the one shared test database (every subtest of it drops and
-// re-migrates the schema), so a second package opening it would race that, and the
-// atomic delete the prune relies on is pinned on all three drivers there
-// (TestSaveChatWithBlobsDeletes* in internal/store).
+// forEachRetentionLeg runs run once per driver the portal package can reach in every
+// run: the in-memory store and a freshly migrated SQLite file, whose blob rows have
+// real foreign keys to the chat. There is deliberately no PostgreSQL leg here: the
+// store package owns the shared test database (every subtest of it drops and
+// re-migrates its public schema), so a second package opening THAT database would
+// race it, and the atomic delete the prune relies on is pinned on all three drivers
+// there (TestSaveChatWithBlobsDeletes* in internal/store). The composed prune on
+// PostgreSQL is covered by TestPruneChatAudioToKeepLastOnPostgres, which brings its
+// own database (service_chats_audio_postgres_test.go).
 func forEachRetentionLeg(t *testing.T, run func(t *testing.T, e *retentionEnv)) {
 	t.Helper()
 	owner := chatToken("usr_a")
@@ -56,16 +58,23 @@ func forEachRetentionLeg(t *testing.T, run func(t *testing.T, e *retentionEnv)) 
 		if err := st.Migrate(ctx); err != nil {
 			t.Fatalf("Migrate: %v", err)
 		}
-		now := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
-		if err := st.CreateUser(ctx, store.User{
-			ID: owner.UserID, Email: "usr_a@example.test", DisplayName: "A", Role: "user",
-			Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
-			t.Fatalf("seed user: %v", err)
-		}
+		seedRetentionOwner(t, st, owner)
 		rec := &recordingChatStore{ChatStore: st}
 		run(t, &retentionEnv{svc: NewService(ServiceDeps{Chats: rec}), rec: rec, owner: owner})
 	})
+}
+
+// seedRetentionOwner creates the user the chats of a SQL leg belong to (chats.user_id
+// is a foreign key).
+func seedRetentionOwner(t *testing.T, st *store.SQLStore, owner auth.Token) {
+	t.Helper()
+	now := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	if err := st.CreateUser(context.Background(), store.User{
+		ID: owner.UserID, Email: "usr_a@example.test", DisplayName: "A", Role: "user",
+		Status: store.UserStatusActive, PreferredLanguage: "de", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
 }
 
 func (e *retentionEnv) newChat(t *testing.T, content string) string {

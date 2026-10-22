@@ -52,9 +52,11 @@ jobs:
         working-directory: gateway/backend
         # Only the backend reads this: the server-agent has no store. The suite
         # gives itself a clean slate per PostgreSQL subtest (drop schema public
-        # cascade), which is safe because internal/store is the single package
-        # that touches the database -- its tests are serialized within the
-        # package, so no two of them share the schema at once.
+        # cascade), which is safe because internal/store is the only package that
+        # touches THIS database -- its tests are serialized within the package, so
+        # no two of them share the schema at once. internal/portal's PostgreSQL
+        # test creates and drops a database of its own on the same server instead
+        # (service_chats_audio_postgres_test.go), so it never shares that schema.
         env:
           OP_AI_GATEWAY_TEST_POSTGRES_DSN: postgres://postgres:postgres@127.0.0.1:5432/op_test?sslmode=disable
         # -timeout: Go's default is 10 minutes PER PACKAGE, and internal/store
