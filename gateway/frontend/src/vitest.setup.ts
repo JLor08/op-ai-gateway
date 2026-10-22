@@ -14,6 +14,25 @@ import { afterEach } from 'vitest';
 HTMLCanvasElement.prototype.getContext = (() =>
   null) as typeof HTMLCanvasElement.prototype.getContext;
 
+// jsdom's Blob has no arrayBuffer() (every browser has). Code that reads a fetched blob's
+// bytes (the WAV stitching of a multi-part speech reply, shared/wavConcat.ts) and the tests
+// that read the blob it returns need it, so fill it in -- from a FileReader -- only where it is
+// missing.
+if (typeof Blob.prototype.arrayBuffer !== 'function') {
+  Object.defineProperty(Blob.prototype, 'arrayBuffer', {
+    configurable: true,
+    writable: true,
+    value(this: Blob): Promise<ArrayBuffer> {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as ArrayBuffer);
+        reader.onerror = () => reject(new Error('read failed'));
+        reader.readAsArrayBuffer(this);
+      });
+    },
+  });
+}
+
 // Depending on the Node/jsdom combination, `window.localStorage` may be
 // missing entirely (observed: Node 26 + jsdom 25 → undefined, while CI's
 // Node 22 has a working one). Code under test treats localStorage as

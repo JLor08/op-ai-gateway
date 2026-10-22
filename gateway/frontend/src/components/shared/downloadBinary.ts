@@ -67,17 +67,17 @@ function resolveName(name: DownloadName, mediaType: string): string {
   return typeof name === 'string' ? name : name(extensionFor(mediaType));
 }
 
-// The existing data: branch, unchanged in behavior: decode the base64 payload
-// into a Blob carrying the URL's own media type and hand it to saveBlob.
-function saveDataUrl(name: DownloadName, dataUrl: string): boolean {
+// Decodes `data:<mime>;base64,<payload>` into its media type and bytes, or null when the shape
+// or the base64 payload does not decode.
+function decodeDataUrl(dataUrl: string): { mime: string; bytes: Uint8Array<ArrayBuffer> } | null {
   const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
-  if (!match) return false;
+  if (!match) return null;
   const [, mime, b64] = match;
   let binary: string;
   try {
     binary = atob(b64);
   } catch {
-    return false;
+    return null;
   }
   const bytes = new Uint8Array(binary.length);
   // codePointAt, not charCodeAt: they differ only on a surrogate PAIR, and
@@ -85,8 +85,29 @@ function saveDataUrl(name: DownloadName, dataUrl: string): boolean {
   // no surrogate can occur here and the two are exactly equivalent. The `?? 0`
   // is for the type only -- `i` is always in range.
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.codePointAt(i) ?? 0;
-  saveBlob(new Blob([bytes], { type: mime }), resolveName(name, mime));
+  return { mime, bytes };
+}
+
+// A data: URL as a Blob carrying the URL's own media type, or null when it does not decode:
+// for a caller that needs the bytes themselves (stitching a multi-part reply), not a file.
+export function dataUrlToBlob(dataUrl: string): Blob | null {
+  const decoded = decodeDataUrl(dataUrl);
+  return decoded && new Blob([decoded.bytes], { type: decoded.mime });
+}
+
+// The existing data: branch, unchanged in behavior: decode the base64 payload
+// into a Blob carrying the URL's own media type and hand it to saveBlob.
+function saveDataUrl(name: DownloadName, dataUrl: string): boolean {
+  const decoded = decodeDataUrl(dataUrl);
+  if (!decoded) return false;
+  saveBlob(new Blob([decoded.bytes], { type: decoded.mime }), resolveName(name, decoded.mime));
   return true;
+}
+
+// Saves a Blob the caller already holds -- a clip it assembled itself, so there is no url
+// to hand downloadBinary -- named like any other download, by the blob's own type.
+export function downloadBlob(name: DownloadName, blob: Blob): void {
+  saveBlob(blob, resolveName(name, blob.type));
 }
 
 // The gateway branch: fetch the bytes, then save them like any other blob.
