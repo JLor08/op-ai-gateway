@@ -926,7 +926,12 @@ paths:
   /api/portal/chats/{id}:
     description: >
       Chat detail plus run sub-paths (run start, SSE run events, run cancel)
-      under /api/portal/chats/{id}/runs… — see api-surface.md.
+      under /api/portal/chats/{id}/runs… — see api-surface.md. The chat
+      document's settings.audio (a speech thread) is a ChatAudioSettings
+      (below), including the retention keep_last_audio of the audio answer
+      lifecycle (ADR-071); PUT is refused with 409 portal.chat_run_active while
+      a run is active for the chat. The audio of a stored answer is removed
+      through the two audio sub-paths below, never by writing the document.
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
@@ -948,6 +953,76 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/chats/{id}/messages/{messageID}/audio:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: 'Chat id, "chat_" + hex.' }
+      - { name: messageID, in: path, required: true, schema: { type: string }, description: 'The id of a stored message of the chat (the assistant answer whose audio is deleted).' }
+    delete:
+      tags: [portal]
+      summary: Delete the stored audio of one spoken answer (leaves the audio_removed marker)
+      description: >
+        Removes the audio of ONE assistant answer of an owned chat (ADR-071, the
+        audio answer lifecycle): every audio_url part of the message, however
+        many ordered parts a long ADR-070 answer spans, is dropped and the
+        message gains one audio_removed content part, while the message itself
+        keeps its id, its place and every other member. The rewritten document
+        and the delete of the answer's chat_blobs rows are ONE atomic save
+        (SaveChatWithBlobs with deleteBlobIDs), so the stored document never
+        points at a deleted blob and a failed save changes neither. A message
+        with no stored audio of its own (a text answer, an answer whose audio is
+        already gone, a user turn, whose audio is a transcription clip and never
+        an answer's) is a 200 no-op that writes nothing, so the call is safe to
+        repeat. Standard portal auth (a session cookie also needs the CSRF
+        header, a bearer token does not; scope gateway:use). 404
+        portal.chat_not_found is the answer for a missing chat, another owner's
+        chat AND a message id the chat does not hold (no existence leak). 409
+        portal.chat_run_active while a run is active for that chat, the guard of
+        PUT /api/portal/chats/{id}: the call rewrites the whole document and
+        would race the run's checkpoint or terminal commit. See api-surface.md.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { description: 'Any method other than DELETE (Allow: DELETE).' }
+        '409': { $ref: '#/components/responses/ChatRunActive' }
+  /api/portal/chats/{id}/audio/prune:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: 'Chat id, "chat_" + hex.' }
+    post:
+      tags: [portal]
+      summary: Prune a chat's stored audio down to the newest N answers (the retroactive half of the retention setting)
+      description: >
+        Prunes an owned chat's stored audio to the newest keep_last assistant
+        answers that hold audio (ADR-071). Every older answer becomes the
+        not-stored audio_removed marker and ALL of its blobs are deleted, in one
+        atomic save; keep_last 0 removes every answer's audio. The client states
+        only the count: which answers and blobs go is computed server-side from
+        the stored document, so a stale or hostile client cannot name another
+        answer's audio. N counts answers, not blobs, and an answer already in the
+        not-stored state takes no slot. The call does NOT change the thread's
+        stored keep_last_audio setting (the portal saves that itself, after the
+        prune succeeded). A chat already within the count is a 200 no-op. A
+        missing, null or negative keep_last is 400
+        portal.chat_audio_keep_last_invalid; a value that is not a whole number
+        is the decoder's 400 request.invalid_json. Same auth, 404 and 409
+        behavior as DELETE /api/portal/chats/{id}/messages/{messageID}/audio.
+        See api-surface.md.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatAudioPruneRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '409': { $ref: '#/components/responses/ChatRunActive' }
   /api/portal/chat-blobs/{id}:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string }, description: 'Blob id, "blob_" + 32 hex digits, as it appears in an image_url.url or audio_url.url of a stored chat transcript.' }
@@ -3371,6 +3446,16 @@ components:
             required: [ok]
             properties:
               ok: { type: boolean }
+    ChatRunActive:
+      description: >
+        A run is active for the chat -- the Error envelope carries
+        portal.chat_run_active. Refused because the call replaces or rewrites the
+        chat's whole stored document, which the live run owns (it would
+        overwrite the run's checkpoint or terminal commit). The same refusal
+        PUT /api/portal/chats/{id} answers. Retry once the run has finished.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     VendorAccountsUnavailable:
       description: >
         The vendor-accounts feature refuses the operation -- the Error envelope
@@ -3436,6 +3521,58 @@ components:
               description: Stable machine-readable code, e.g. request.not_found, auth.invalid_token
             message: { type: string }
             request_id: { type: string }
+    ChatAudioSettings:
+      type: object
+      description: >
+        The speech thread's knobs, stored under settings.audio of the chat
+        document and sent under settings.audio of a run start (portal.ChatAudioSettings).
+        Cleared server-side for every non-speech kind. Every member is optional
+        and omitted when unset, so an existing chat's stored bytes do not move.
+      properties:
+        voice:
+          type: string
+          description: The voice name. Absent leaves the model on its default voice.
+        speed:
+          type: number
+          description: Speech speed, passed through as given. The model applies its own range.
+        passthrough:
+          type: object
+          additionalProperties: true
+          description: >
+            Advanced JSON merged into the speech request body. The keys model,
+            input, stream, stream_format and response_format are reserved.
+        stream:
+          type: boolean
+          description: >
+            The thread's choice to hear the audio while it is generated.
+            Default on; only an explicit false is stored (ADR-068).
+        keep_last_audio:
+          type: integer
+          description: >
+            The thread's retention of its assistant audio answers (ADR-071),
+            three-valued. ABSENT keeps every answer (the default, and what a
+            chat from before this field reads as). An integer N >= 1 keeps the
+            audio of the newest N answers: when a new answer is committed, older
+            answers beyond N are rewritten to the audio_removed marker and their
+            blobs deleted in the same atomic commit. 0 stores no answer audio
+            (the portal offers it only for a thread that streams): a run that
+            streamed commits the answer as the marker with no blob, while a run
+            that fell back to a buffered clip stores that one answer anyway (a
+            paid answer that was never heard live must not vanish) and it
+            supersedes any older stored audio of the chat. N counts answers, not
+            blobs. A negative value is read as absent. It is never sent upstream.
+    ChatAudioPruneRequest:
+      type: object
+      description: The body of POST /api/portal/chats/{id}/audio/prune.
+      required: [keep_last]
+      properties:
+        keep_last:
+          type: integer
+          minimum: 0
+          description: >
+            How many of the newest answers that hold audio keep it; 0 removes all
+            stored audio of the chat. Missing, null or negative is 400
+            portal.chat_audio_keep_last_invalid.
     ModelCapabilities:
       type: object
       description: >

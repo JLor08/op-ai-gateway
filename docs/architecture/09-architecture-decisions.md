@@ -4198,7 +4198,11 @@ includes the bounds that replace it.
   denormalised `user_id`, which could disagree with the chat's owner and would
   duplicate a cascade that already reaches the blobs transitively through
   `chats`. **Delete is the cascade and nothing else**: retention is the chat's
-  lifetime, with no prune and no dedup (every payload gets a random id).
+  lifetime, with no prune and no dedup (every payload gets a random id). (Amended by
+  [ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump): a speech answer's audio is also deleted, by a retention prune, a
+  per-answer delete or a "do not store" commit, through the `deleteBlobIDs` that
+  `SaveChatWithBlobs` gained; the cascade stays the delete of everything else, and of the
+  chat itself.)
   **No gzip**: images are already compressed, and a second pass would cost CPU
   for nothing. Sealing with the existing cipher adds **no new decryptable
   secret**, so the at-rest guarantee
@@ -4342,7 +4346,9 @@ transcript is small (so the keepalive and the autosave stay cheap), and "no
 bounded, one run's resolved history is bounded, one request body is bounded. Two
 costs are accepted on purpose. **Blobs are retained for the chat's lifetime and
 an edit or regenerate that drops a message leaves its image behind** — no prune,
-no reference counting — the price of cascade-only deletion. **A RAM-store chat
+no reference counting — the price of cascade-only deletion. (For a speech answer's audio
+this is now only the default: [ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump) adds a per-chat retention, a
+per-answer delete and an atomic blob delete.) **A RAM-store chat
 that is evicted takes its images with it** (the chat and its blobs are dropped
 together), so an already-open tab's image URLs then answer 404 and a run on that
 chat is refused as chat-not-found; `[image unavailable]` arises only for a
@@ -6042,7 +6048,9 @@ answer is stored as several blobs under a total audio cap, and an over-long one 
 `gateway.chat_run_audio_too_large`); the executor holds each in-flight
 run's whole response in memory, and the browser holds one object URL per audio turn it
 has rendered until it unmounts. Stored WAVs are retained for the chat's lifetime like
-every blob, with no prune (ADR-056). The gateway never converts or re-encodes: the reply
+every blob, with no prune (ADR-056) (**the default only since
+[ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump)**: a chat may keep all, the last N, or none of its answers' audio, and
+one answer's audio can be deleted). The gateway never converts or re-encodes: the reply
 is WAV because the endpoint serves only WAV, and mp3, streaming and per-model native
 controls need the translation, streaming contract or discovery this project has not
 built. Nothing else moved: no change to `handleOpenAISpeech` or the relay, no schema
@@ -6083,6 +6091,20 @@ request, so the earlier reasoning that `stream_format` need not be reserved is g
 run's 10-minute deadline bounds a streaming run only until its first chunk of audio, as for a
 streaming transcription. A new session-cookie `GET /api/portal/model-speech-streaming` is the
 composer's gate.
+
+**Amended by [ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump) (audio answer lifecycle; issue #281).** Three of this entry's
+claims now hold only by default. (c)'s reply is no longer always its `audio_url` parts: an
+answer whose audio was pruned, deleted, never stored or aborted carries one **`audio_removed`**
+marker part in their place (the part walks and the run history already ignore a part with no
+`audio_url`), so the transcript keeps a real message with its id. (d)'s playback is
+`AudioTurn` only for an answer that still holds audio: a finished answer with the marker renders
+the not-stored bubble (one line and a regenerate, no player, no download), and the live wait
+(`AudioPendingTurn`) gains Mute and Abort while it plays. The Consequence's "Stored WAVs are
+retained for the chat's lifetime ... with no prune" is the default of a per-chat
+`keep_last_audio` retention (keep all, the last N, or do not store), and one answer's audio can
+be deleted, through the new `DELETE /api/portal/chats/{id}/messages/{messageID}/audio` and
+`POST /api/portal/chats/{id}/audio/prune`. No schema change, no migration and no ServerAgent
+version bump.
 
 → [API Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
@@ -7490,6 +7512,19 @@ not stream (unchanged)", now reads `wav`, `pcm` or absent for a request that doe
 request is served as the upstream WAV's `data` chunk, headerless. The buffered downgrade of a
 `stream: true` request (a route not known to stream, or the stale-`yes` retry) is left exactly
 as decided here and still answers a one-shot `audio/wav`, whatever `response_format` it named.
+
+**Amended by [ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump) (audio answer lifecycle; issue #281).** (f)'s streaming run
+still commits the same turn as the buffered run, but **what is stored of it now follows the
+thread's retention**: under `keep_last_audio = 0` a run that actually streamed commits the
+not-stored `audio_removed` marker and no blob (the user heard it live; a buffered fallback is
+stored anyway, keeping only itself), and a user **cancel** of a speech run commits the marker
+instead of an empty canceled turn (a deadline stays an error, with no marker). Billing is
+untouched: an aborted stream still bills the loud-zero incomplete of (c), and nothing paid is
+lost. The portal's progressive playback gains one persistent `GainNode` in
+`StreamingPcmPlayer`, through which every scheduled source reaches the destination, so a user
+can **mute** the stream (local, reversible, the run finishes and is stored per retention) or
+**abort** the run (the composer's Stop) while it plays. (f)'s "the committed WAV is the complete
+audio" holds for what is stored, which is no longer every answer.
 → [API Compatibility & Inference
 §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [§7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle),
@@ -7853,6 +7888,15 @@ element per part** (an audible gap at every seam, a scrubber per part and N down
 converts or re-encodes, ADR-063 and ADR-064; #264 owns the opt-in design). **A new billing
 unit or a metering change for a long clip** (the duration the relay counts is the same
 whether the clip is stored as one blob or as many).
+
+**Amended by [ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump) (audio answer lifecycle; issue #281).** (a)'s "the store layer is
+untouched" described this decision's own change and stands for it: the store has since gained
+the atomic delete that removes stored parts, `SaveChatWithBlobs(..., deleteBlobIDs)`. The N
+ordered parts of one answer are **one retention slot** and are removed **together** (a prune
+counts answers, never blobs, so a long answer is never left half-stored), and the answer's
+`audio_url` parts are replaced by one `audio_removed` marker in the same save. (f)'s gapless
+stitch applies to answers that still hold their parts; an answer without them renders the
+not-stored bubble. No migration and no ServerAgent bump, as here.
 → [API Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
 [Runtime View
@@ -7860,5 +7904,315 @@ whether the clip is stored as one blob or as many).
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
 [Data Model](reference/data-model.md#4-migration-history-95-migrations) (no migration),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-071 — Audio answer lifecycle: a per-chat retention knob (keep all, keep the last N, or do not store), one atomic delete that leaves an `audio_removed` marker, a lazy and a confirmed retroactive prune, a manual per-answer delete, and live mute and abort, with no migration and no agent bump
+**Context:** a portal speech answer is stored as one or more ordered WAV blobs
+([ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs), [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)) so it can be replayed and downloaded later, and until
+this decision it lived until the **whole chat** was deleted: the cascade was the only delete
+([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url) (a)). There was no way to keep only recent audio, to drop one answer, or to
+decline storing at all (issue #281, the follow-up to #279). The user named two reasons:
+**data minimization** (a synthesized answer need not be kept once it has been heard) and
+**bounding per-chat storage growth** (a long TTS clip is large, and a chat should not grow
+without limit). The brainstorm added a third concern: while a streaming answer plays
+([ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)) the user wants to **stop listening**, and wants two *different* controls
+for it, **mute** (silence it, let it finish and be saved) and **abort** (cancel the run). A
+fourth, separate feature (issue #264) will later *shrink* a kept clip by re-encoding it and
+replacing the stored blob in place; this decision deliberately transcodes nothing, and what it
+leaves for that work is the delete-and-rewrite building block at the store. Five facts about the
+pieces it joins shaped every choice below:
+
+- **The chat document is schema-free JSON in one sealed column, and `chat_blobs` is a
+  payload-agnostic byte store with a cascade.** The document (`settings` + `messages`) is ONE
+  opaque sealed `chats.blob`, and `chat_blobs` (migration 87) keys each row by chat id with
+  `on delete cascade`. A retention setting can ride `settings`, a "not stored" state can ride a
+  message's content array, and removing audio is a document rewrite plus a `delete from
+  chat_blobs`. Nothing here needs a schema.
+- **A stored answer's audio is referenced from the document by gateway URL, so a delete has two
+  halves that must never disagree.** A document that points at a deleted blob shows a player the
+  user can still press and a `404` behind it (`portal.chat_blob_not_found`); a blob no document
+  references is an orphan nothing can reach. Whatever removes audio must change both in one step.
+- **The one multi-write primitive was insert-only.** `SaveChatWithBlobs` writes the document and
+  every newly extracted blob as one transaction on all three drivers
+  ([ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url) (c)), and it had no way to remove a row.
+- **A paid answer the user never heard is the one outcome that must not happen.** The relay bills
+  a streamed speech call only on a complete delivery, from the PCM it counted
+  ([ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives) (c)), and a buffered one from the finished clip. A retention that silently
+  dropped an answer that was synthesized and billed but never played would charge for audio
+  nobody could listen to. That drives the N=0 gate and its fallback, (g).
+- **The run owns the transcript tail while it is live.** `PUT /api/portal/chats/{id}` is refused
+  with `409 portal.chat_run_active` for exactly that reason (it replaces the whole document and
+  would overwrite a checkpoint or the terminal commit), and any other whole-document rewrite
+  meets the same race.
+
+**Decision — ten choices, taken together. Nothing changes for a chat that sets none of it:
+keep-all is the default and the absent value, so no row, no part and no byte of an existing
+chat moves.**
+
+- **(a) Retention is a per-chat setting, one optional integer, `keep_last_audio`, with three
+  states.**
+
+  | State | Wire value | Meaning |
+  |---|---|---|
+  | Keep all (default) | omitted | unlimited; what every chat from before this decision reads as |
+  | Keep the last N | `N` (>= 1) | the newest N assistant audio answers keep their audio |
+  | Do not store | `0` | the answer's audio is not stored (a streaming thread only, (g)) |
+
+  It is `ChatAudioSettings.KeepLastAudio`, a `*int` with `omitempty` that follows the
+  pointer-versus-unset discipline of `speed` and `stream` (a plain `int` would drop the
+  meaningful `0`), declared **last** on the struct so an existing chat's serialized bytes do not
+  move. `PrepareChatRun` reads a negative value as unset (it copies the settings first, so the
+  caller's own struct is left as sent) and keeps clearing the whole `audio` block for every
+  non-speech kind. The commit-time readers (`storedKeepLastAudio`) decode **only that one member**
+  of the schema-free stored settings, so an unrelated malformed knob cannot switch the retention
+  off, and a value that is negative or not a whole number is read as unset. The retention is the
+  thread's own and is never sent upstream. It is **per chat only**: a global or operator-level
+  default is a separate surface (operator settings, precedence rules) and a later follow-up.
+  The composer (`AudioRetentionControl`) is a checkbox **"Keep audio answers"**, on by default,
+  over a **"Keep all"** / **"Keep last N"** radio whose number field (N >= 1) is active only for
+  the second choice, so there is no `1 → 0 → ∞` stepper and no infinity sentinel. **Unchecking
+  the box is "do not store" (`0`) and is selectable only while the portal's `speechStreaming`
+  gate holds** (the flag that shows the Stream toggle): on a buffered-only model the box is
+  forced on, because a buffered answer is only ever heard from storage. On load the control shows
+  the stored value and never re-persists it: a thread that stored `0` whose model now buffers
+  shows the box unchecked, and only a *new* selection is withheld. `keepLastAudioOf` is the one
+  parse of the wire value; `audioSetting` and `audioSettingsFrom` round-trip it (the document is
+  a full-replace `PUT`, so both directions are required).
+- **(b) N counts whole answers, not blobs.** The prune walks `doc.Messages` newest to oldest and
+  counts the messages that are **both** assistant messages (`isAssistantMessage`) **and** hold at
+  least one `audio_url` part (`messageHasStoredAudio`, which reads parts through the same
+  predicate the player and the blob extraction use, so the count and the player cannot disagree
+  about which answers hold audio). It keeps the newest N and rewrites every older one. A long
+  answer is several blobs ([ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)) but **one slot**, and it goes with all of its
+  blobs together. An answer whose audio is already gone holds none, takes no slot, and so never
+  pushes a still-stored older answer out of the last N; a mixed text-and-audio answer counts as
+  one. A transcription turn's user message carries an `audio_url` clip too, but that is the
+  user's input on a different thread kind ([ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)), and the role check comes first,
+  so it is never counted or pruned.
+- **(c) An answer whose audio is gone carries one marker part, `audio_removed`.** The marker is
+  `{"type":"audio_removed"}`: no URL (there is nothing to play) and no reason (pruned, deleted,
+  never stored and aborted all render the same placeholder). Removing audio rewrites the
+  message: every `audio_url` part is dropped, **one** marker is appended after the parts that
+  stay (the text of a mixed answer keeps its place), the chat_blobs id of each removed part is
+  returned for deletion, and every other member of the message (`id`, `status`, metrics) stays
+  byte for byte. The rewrite is idempotent (an answer holding no audio, marked or not, comes back
+  as it was, and never gains a second marker). Every path that leaves an answer without audio
+  writes it, so one rendering rule covers every not-stored case: the lazy prune, the retroactive
+  prune, the manual delete, the "do not store" commit of a streamed run, and the abort commit,
+  (e) to (h). It is the signal the not-stored bubble keys on and **not** "zero audio", so a
+  genuinely failed run (status `error`, no marker) still renders its error. It keeps the answer a
+  real, non-empty message with its id, which is what makes it regenerate-able, (j). It **rides the
+  schema-free document and needs no migration**; the backend's audio-URL extractor, the blob
+  extraction and the run-history walks already ignore a part with no `image_url`/`audio_url`
+  member, and the frontend's content-part union gained `{type: 'audio_removed'}`.
+- **(d) One atomic store primitive: `SaveChatWithBlobs(ctx, chat, blobs, deleteBlobIDs)`.** The
+  existing method is **extended**, not accompanied by a sibling, so the document rewrite, the
+  blob inserts and the blob deletes are **one transaction**: the saved document never points at a
+  row the same save removed, and a failed save changes neither. The delete is `delete from
+  chat_blobs where chat_id = ? and id in (...)`, run on the same transaction **after** the
+  inserts (an insert is judged against the rows as they were before the save, and a caller must
+  not name an id it also inserts). **Ownership is by construction**, as in `ChatBlobsByIDs`: an
+  id that belongs to another chat, does not exist or is named twice deletes nothing beyond the
+  chat's own rows and is no error. `nil` or empty is exactly the save without deletes. One
+  statement serves SQLite and PostgreSQL (the placeholders are rebound for the latter), and the
+  list is bounded by the driver's parameter limit as `ChatBlobsByIDs`' is. The RAM store mirrors
+  it (`dropChatBlobIDs`): it stages every refusal before mutating, applies the deletes with
+  their byte accounting, and evicts **once** after the whole save, so the bytes the deletes free
+  count against the FIFO budget before any unrelated chat is evicted for the bytes the inserts
+  add. `commitChatRun` takes the ids (`PrepareChatRun` passes none) and `portal.ChatStore` and
+  both stores carry the new parameter. This is the delete-and-rewrite building block issue #264's
+  in-place shrink can sit beside.
+- **(e) Two prunes, one routine: lazy going-forward, and retroactive with a confirm.**
+  - *Lazy.* `writeAssistant` appends the new answer, moves its inline audio into blob rows
+    (`extractChatBlobs`), and then `pruneForRetention` rewrites the older answers beyond N into
+    the marker and returns their blob ids, which ride the **same** `commitChatRun`. The newest
+    answer is the one just appended, so it is never the one pruned. It acts only for
+    N >= 1 and only when the newest message is an answer that holds audio, so a checkpoint (text
+    only, every few seconds) and an errored commit prune nothing, and a thread with no retention
+    (every legacy one) prunes nothing. The lazy prune then runs **silently**: it is the chosen
+    setting operating as intended, one newly excess answer per send, and not a surprise bulk
+    delete, so it is not re-confirmed.
+  - *Retroactive.* When the user lowers N or turns storing off on a chat that already holds more,
+    the excess is removed at once, but because that is an **irreversible bulk delete** the
+    stricter setting is **held pending an explicit confirm**, not auto-saved first. `ChatStore`
+    judges "stricter" on what the wire would carry (`lowersAudioRetention`, never the raw count
+    text, so a blank or unusable count is keep-all and loosens or changes nothing) and only
+    holds a tightening the open transcript's audio actually exceeds (`audioAnswersBeyond`); a
+    held value is neither saved nor sent, the control keeps showing what was asked for, and an
+    inline notice (not a dialog, so the count stays editable) names how many answers would lose
+    their audio. **Confirm** calls the prune route (below), and only once the gateway has done it
+    commits the new setting (the autosave persists it) and shows the pruned answers as not
+    stored, in that order on purpose: a refused or failed prune leaves everything as it was with
+    the value still pending, and the setting is never saved for a prune that did not happen.
+    **Decline** puts the control back and persists and deletes nothing. Raising N, choosing keep
+    all or storing again needs no confirm and deletes nothing. The set that goes is computed
+    **server-side** from the stored document by the very walk of (b) (`PruneChatAudio`), so the
+    request states only the count and a stale or hostile client cannot name another answer's
+    audio; `keep_last` `0` removes every answer's audio.
+- **(f) Manual per-answer delete, the two routes, and the active-run guard.**
+  - `DELETE /api/portal/chats/{id}/messages/{messageID}/audio` removes **one answer's audio**,
+    every part of a long one, and leaves the answer in the not-stored state, blob rows deleted in
+    the same atomic save (`DeleteMessageAudio`). A message with no stored audio of its own (a
+    text answer, an answer whose audio is already gone, a user turn) is a `200` no-op that
+    writes nothing, so a repeat is safe and adds no second marker. The UI asks first, **inline**
+    (local state beside the control, no modal), and the delete is the one-at-a-time version of the
+    same path the prune uses.
+  - `POST /api/portal/chats/{id}/audio/prune` with `{"keep_last": N}` is the retroactive prune of
+    (e). A missing or negative `keep_last` is `400 portal.chat_audio_keep_last_invalid` (a
+    pointer, so an absent field is told apart from the real count `0`); a value that is not a
+    whole number is the decoder's `request.invalid_json`; the portal's own client never sends
+    either, so the new code has no German or English label. A chat already within the count is a
+    `200` no-op.
+  - **Both are refused with `409 portal.chat_run_active` while a run is active for the chat**
+    (`chatRunActive`, the guard `PUT` now shares), because each rewrites the whole document and
+    hard-deletes rows, and a rewrite racing a run could resurrect a dangling `audio_url` or
+    clobber a just-committed turn. The consequence is that a per-answer delete and a retention
+    change are unavailable while a run is live for that chat; the composer is disabled during a
+    run anyway, and the client store refuses both while the chat is running (`chatBusy`). The check and
+    the write are not one atomic step: a run started between them is not seen, which is the
+    window `PUT` has always had. Everything else is the chat endpoints' own: the standard portal
+    auth (a session cookie also needs the CSRF header, a bearer token does not; scope
+    `gateway:use`), the service's owner scoping, and `200 {"ok": true}`. **A missing chat,
+    another owner's chat and, for the delete, a message id the chat does not hold are the same
+    `404 portal.chat_not_found`**, so neither leaks whether the chat exists. After either call
+    the **client brings its own copy of the transcript in line** (`rewriteTranscript`, using the
+    mirror of the gateway's walk, `pruneAudioBeyond` and `withAudioRemoved` in `chatDoc.ts`): a
+    `PUT` replaces the whole stored document, so a later autosave of the stale copy would put back
+    `audio_url` parts of blobs the gateway deleted.
+- **(g) "Do not store" (`0`) is for a run that actually streamed, and a buffered fallback keeps
+  exactly one answer.** "Do not store" only makes sense when the answer is heard live. The UI
+  offers it only on a streaming thread, (a), and the commit decides it again from what the run
+  **did**, not from the setting: `AssistantTurn.AudioAnswer` (set from the run's pinned kind, so
+  it is false for every text, image and transcription turn and every checkpoint) and
+  `AssistantTurn.AudioStreamed` (the fourth result of `generateSpeechTurn`: the run took the
+  `consumeSpeechStream` branch rather than falling back to the buffered one-shot WAV, as a
+  verdict gone stale does, [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives) (b) and (f)).
+  - **Streamed under `0`:** the just-produced audio is dropped and the answer commits in the
+    not-stored state (the marker, no blobs). It is rewritten **before** the blob extraction, so
+    nothing is ever moved into `chat_blobs` for it. The call was a delivered, billed stream and
+    the user heard it live, so nothing paid is lost.
+  - **Not streamed under `0` (a buffered fallback):** the answer is **stored anyway**, because it
+    was never heard live and a paid answer must not vanish, and it **supersedes any previously
+    stored audio in the chat** (`pruneAudioBeyond(&doc, 1)`, effectively keep-last-1), so a `0`
+    thread never accumulates even on a model that only sometimes falls back to buffered.
+  - **`0` is an explicit exception to the generic "keep the newest N" prune**, which read
+    literally as keep-newest-0 would delete the answer that was just stored. The same fallback
+    makes a raw API client that sets `0` on a non-streaming model **safe without a hard
+    rejection**: it simply keeps the one buffered answer.
+- **(h) A user cancel commits the marker; a timeout or any error does not.** The abort commit
+  was an empty `canceled` turn. For a **speech** run (`AudioAnswer`) with status `canceled` it now
+  commits the not-stored marker instead (`markNewestAnswerNotStored`: a canceled turn holds no
+  audio part, so its content becomes the lone marker), so the bubble ends in the not-stored state
+  with a regenerate. Everything paid is as before: the executor's cancel path commits no audio,
+  and the aborted stream bills the loud-zero incomplete the relay already records
+  (`provider.client_disconnected`, `(audio_second, 0)`, [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives) (c)); the partial audio
+  is discarded. **A deadline is not a cancel**: `gateway.chat_run_timeout` (and every other error
+  status, a failed commit included) commits as an error with **no marker**, because the marker
+  means "audio intentionally not stored" and a failed run is not that, so it still renders its
+  error. A canceled text, image or transcription run commits exactly as before.
+- **(i) Live mute and abort are two distinct controls on the streaming bubble.** While audio
+  plays live ([ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives) (f)) the pending bubble (`AudioPendingTurn`, `live`) says
+  "playing" and offers:
+  - **Mute**, a reversible toggle that silences **this tab's playback only**. `StreamingPcmPlayer`
+    gains one persistent `GainNode` (made with the first chunk, the one stage every scheduled
+    source reaches the destination through, gain `0` or `1`) and a `setMuted`, which holds the
+    state so it applies before the node exists and to every later chunk; `SpeechPlayback.setMuted`
+    and the store's `muteAudio` wrap it, and a render mirror of the muted chats is cleared when
+    playback stops being live, so the next run starts unmuted. Nothing is stopped, dropped or
+    rescheduled, so the stream's clock keeps running and unmuting rejoins it where it is. The run
+    keeps generating, completes normally, is **stored per the retention**, and becomes the normal
+    saved player. It is a "listen no more" control, not a cancel.
+  - **Abort**, the composer's own `stop()`: cancel the chat run, which closes the live stream,
+    and, by (h), nothing is stored and the bubble ends in the not-stored state with regenerate.
+  - Both exist **only while `live`**: with no audio playing there is nothing to mute, and a
+    buffered run's cancel is the composer's Stop. A control whose handler is not supplied is not
+    drawn. The user explicitly asked for both, as distinct controls.
+- **(j) The not-stored bubble: one placeholder and a regenerate, nothing else.** A finished
+  answer that carries the marker (`hasRemovedAudio`) and no audio renders `AudioNotStoredTurn`: a
+  "the audio for this answer is not stored" line plus **regenerate**, with no player and no
+  download (audio that is still stored always wins over a placeholder). For a pure-speech
+  answer that is the whole bubble; for a mixed text-and-audio answer the text stays and the
+  placeholder sits where the player was. Regenerate is the existing `regenerate(id)` →
+  `startRunWithHistory` (slice the history before the answer and replay), which is why a
+  not-stored answer stays a real message with its id and is never deleted from the transcript.
+  The per-answer delete icon sits on the assistant action stack of a stored answer, threaded like
+  `onRefine` (`onDeleteAudio`). Every new label has a German and an English entry (`en` is typed
+  from `de`, so a missing key is a compile error); regenerate reuses the existing label.
+
+**Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
+migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
+document ([Data Model](reference/data-model.md#4-migration-history-95-migrations)), the store
+change is a parameter on an existing method, and the whole change is portal and gateway only (no
+new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
+nothing is byte-identical, since the field is a trailing `omitempty` pointer and keep-all is the
+absent value. The cost and the residuals are named ([Risks
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
+
+- **Deletion is irreversible, so every bulk or manual path is behind an explicit confirm.** The
+  retroactive prune and the per-answer delete ask first, inline; the lazy prune does not,
+  because it is the setting the user chose operating as intended.
+- **Keep-all is the default, so growth is bounded only where the user chooses.** There is no
+  global or operator default (a deliberate non-goal), so every new chat starts unbounded.
+- **The mutations are unavailable while a run is live, and the guard has `PUT`'s window.** A
+  delete or a retention change waits for the run to finish.
+- **The client mirrors the gateway's walk.** `pruneAudioBeyond` and `withAudioRemoved` in
+  `chatDoc.ts` repeat `chat_audio_retention.go`'s selection over the local transcript, because a
+  full-replace `PUT` of a copy that still held the audio would resurrect dangling parts. The
+  gateway's walk is the authority for what is stored and the mirror is kept deliberately small, as
+  `SPEECH_RESERVED_FIELDS` mirrors the reserved-field list.
+- **A not-stored answer is regenerated, not restored.** Regenerating synthesizes again and bills
+  again, and a streamed answer under `0` is heard once.
+- **`0` keeps one answer when it falls back to buffered.** The setting said "do not store" and a
+  paid answer was stored anyway: the honest outcome of the anti-goal in the Context, shown as
+  stored in the control and never silently rewritten.
+- **Mute is local to the tab and cheap only in what it silences.** The run still generates,
+  bills and (per retention) stores the full answer, and a second tab's playback is its own.
+  Mute and abort exist only while live playback does ([ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): best-effort, abandoned
+  at the first gap), where the composer's Stop is the cancel.
+- **On the RAM store the freed bytes return to the same FIFO budget** as every chat blob, so a
+  prune can keep other chats resident longer there; the persistent drivers have no such coupling.
+
+**Amends:** [ADR-056](#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url) ((a)'s "delete is the cascade and nothing else", and the
+Consequence's "no prune": a speech answer's audio is now also deleted by `SaveChatWithBlobs` with
+`deleteBlobIDs`; the cascade stays the delete of everything else, and of the chat itself),
+[ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) ((c): an answer may carry the `audio_removed` marker instead of its
+`audio_url` parts; (d): such an answer renders the not-stored bubble and not `AudioTurn`, and the
+live wait gains Mute and Abort; the Consequence's "retained for the chat's lifetime like every
+blob, with no prune" is now only the default),
+[ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives) ((f): the streamed run's commit follows the retention, so a streamed answer
+under `0` commits the marker and a canceled run commits the marker; live playback gains the gain
+stage, mute and abort; "the committed WAV is the complete audio" holds for what is stored) and
+[ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch) ((a): "the store layer is untouched" stood for that decision, and
+`SaveChatWithBlobs` has since gained `deleteBlobIDs`; N counts answers, so all the ordered
+parts of one answer go together; (f)'s stitch applies to stored answers only).
+
+**Rejected:** **A global or operator-level retention default** (a separate surface with
+precedence rules; per chat first, a default later). **Counting blobs instead of answers** (an
+ADR-070 answer would be half-pruned and play truncated). **Deleting the message instead of
+marking it** (it loses the answer's place and the id regenerate needs; the marker keeps a real,
+regenerate-able turn). **A sibling delete method instead of extending `SaveChatWithBlobs`** (two
+transactions reopen the dangling-reference window the single save closes). **A reference-counting
+or scanning garbage collector for unreferenced blobs** (the removed ids are known exactly at the
+rewrite, so the delete is exact and needs no scan). **Auto-saving a stricter setting before the
+confirm** (a decline would have to undo a persisted setting, and the destructive half is not
+undoable). **A modal dialog for the delete confirm** (inline, kept beside the control). **Reading
+`0` literally as keep-newest-0** (it deletes the answer just stored and billed). **Hard-rejecting
+`0` on a non-streaming model** (the buffered fallback already makes it safe, and a stale verdict
+cannot be known before the run). **A second write to prune after the commit** (not atomic: a
+failure between them leaves more stored than the thread keeps). **A marker on timeout and error
+turns** (it would say "not stored" about a run that failed, hiding its error). **Mute that stops
+the run or drops chunks** (it would change what is stored and billed, and the clock would have to
+be rebuilt on unmute; the gain stage changes only what is heard). **Folding mute and abort into
+one control** (the user named them as two different intents). **Serializing the mutations against a
+run with a store-level lock** (the `PUT` guard already exists and is the one convention). **Counting
+or pruning user transcription inputs** (a different thread kind and the user's own input).
+**Transcoding or compressing a kept clip** (issue #264 owns it).
+→ [API Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Runtime View
+§6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
+[HTTP API Surface](reference/api-surface.md#tokens-chats-usage),
+[Data Model](reference/data-model.md#portal-chat) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

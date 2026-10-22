@@ -247,6 +247,25 @@ bills the call as the delivered one it was and the listener hears it to the end.
 `AudioTurn` fetches the parts and joins them into one gapless WAV for playback and for the
 download (a single part is played and saved as it is).
 
+**Audio answer lifecycle** ([ADR-071](09-architecture-decisions.md#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump), issue #281). What is
+stored of a speech answer now follows the thread's `settings.audio.keep_last_audio` (omitted keeps
+every answer, `N` keeps the newest N, `0` stores none), and an answer without audio carries one
+`audio_removed` marker part instead of its `audio_url` parts. At the terminal commit
+(`writeAssistant`), in the one `SaveChatWithBlobs` that stores the new answer, the gateway also
+rewrites the older answers beyond N to the marker and deletes their `chat_blobs` rows (the new
+answer is never the one pruned; an answer's parts go together). Under `0` a run that **streamed**
+(`AudioStreamed`, from `generateSpeechTurn`) commits the marker with no blob, while a run that fell
+back to a buffered clip stores that one answer anyway and supersedes any older stored audio; a user
+**cancel** commits the marker in place of an empty turn (a deadline stays an error with no marker).
+Two manual routes do the same rewrite on demand,
+`DELETE /api/portal/chats/{id}/messages/{messageID}/audio` and
+`POST /api/portal/chats/{id}/audio/prune` (`{"keep_last": N}`), refused `409 portal.chat_run_active`
+while a run is live for the chat because they rewrite the whole document like `PUT`. In the browser
+a finished marker answer is the not-stored bubble with a regenerate (no `AudioTurn`), and the live
+streaming bubble gains **Mute** (a gain node, local and reversible, the run finishes and is stored
+per retention) and **Abort** (the composer's Stop). See [Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground).
+
 What differs from the speech relay of §6.1.1: the caller is the executor and the
 credential the internal loopback pair (never a session cookie, [Security
 §1](cross-cutting/security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)), so

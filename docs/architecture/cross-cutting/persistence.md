@@ -345,8 +345,10 @@ server/application/model-mapping graph, NetBird columns, energy config,
 telemetry/availability samples, benchmarks, usage record/query/stats/groups,
 captures/chats (including `chat_blobs`: the same behaviour on the memory,
 SQLite and PostgreSQL drivers for put/get, the owner lookup, the batched
-chat-scoped read, the atomic chat-plus-blobs write, and the cascade or
-eviction that drops a chat's payloads with it), system settings and UI
+chat-scoped read, the atomic chat-plus-blobs write (including its
+`deleteBlobIDs` half, chat-scoped so another chat's or an unknown id deletes nothing, and
+deleting nothing when the save is refused, [ADR-071](../09-architecture-decisions.md#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump)),
+and the cascade or eviction that drops a chat's payloads with it), system settings and UI
 preferences — plus two dedicated
 regression tests, `TestMigration4UpgradesInt4ToBigint` and
 `TestMigration43WidensRealToDoublePrecision`, that specifically assert the

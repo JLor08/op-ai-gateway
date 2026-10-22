@@ -1047,6 +1047,16 @@ is the gateway path `/api/portal/chat-blobs/{id}`
   scoped to the chat inside the query, so a grafted foreign id never resolves
   to bytes ([API Compatibility & Inference
   §12](compatibility-and-inference.md#12-in-portal-chat-playground)).
+- **Deleting a blob is addressed by answer, never by blob id, and inherits the same
+  ownership.** The two audio-lifecycle routes
+  ([ADR-071](../09-architecture-decisions.md#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump))
+  take a chat id and a message id (or a count), never a blob id: which `chat_blobs` rows go is
+  computed server-side from the **owner's own stored document**, and the store's delete is
+  `chat_id = ? and id in (…)`, so a stale or hostile client cannot name another chat's blob,
+  and a grafted id in a transcript deletes nothing of anyone else's. A missing chat, another
+  owner's chat and an unknown message id are one `404 portal.chat_not_found` (no existence
+  leak), the standard portal auth applies (a session cookie also needs the CSRF header), and a
+  live run for the chat refuses them with `409 portal.chat_run_active`.
 - **The content type is attacker-influenced, so it is allow-listed twice.** It
   originates in a client's `data:` URL and becomes the `Content-Type` of a
   same-origin, cookie-authenticated, navigable URL, which is the classic
