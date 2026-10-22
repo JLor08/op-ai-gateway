@@ -145,11 +145,7 @@ func removeAudioParts(content json.RawMessage) (rewritten json.RawMessage, blobI
 			continue
 		}
 		stripped = true
-		for _, url := range urls {
-			if id, ok := blobRefID(url); ok && id != "" {
-				blobIDs = append(blobIDs, id)
-			}
-		}
+		blobIDs = append(blobIDs, chatBlobIDsOf(urls)...)
 	}
 	if !stripped {
 		return content, nil, false, nil
@@ -166,6 +162,19 @@ func removeAudioParts(content json.RawMessage) (rewritten json.RawMessage, blobI
 		return nil, nil, false, err
 	}
 	return out, blobIDs, true, nil
+}
+
+// chatBlobIDsOf is the chat_blobs id of each url that is a chat-blob url, in order. A url
+// that is not one -- audio that was never extracted into chat_blobs -- adds none: there
+// is no row to delete.
+func chatBlobIDsOf(urls []string) []string {
+	var ids []string
+	for _, url := range urls {
+		if id, ok := blobRefID(url); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // audioPartURLs is the url of each audio member of one content part, in order; none

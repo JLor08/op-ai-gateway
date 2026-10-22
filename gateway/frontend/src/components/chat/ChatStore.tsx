@@ -550,11 +550,12 @@ export function ChatStoreProvider({
   // The COMMITTED settings: what is saved and sent. The store's setAudioSettings (below) is the
   // only writer the composer gets, so a retention change that waits for a confirm never lands
   // here before it; activateChat seeds it directly.
-  const [audioSettings, setAudioSettingsState] = useState<AudioSettings>(DEFAULT_AUDIO_SETTINGS);
+  const [audioSettingsState, setAudioSettingsState] =
+    useState<AudioSettings>(DEFAULT_AUDIO_SETTINGS);
   // The stricter retention waiting for the user's confirm (see setAudioSettings), kept beside
   // the committed settings and laid over them for display only. A ref mirrors it so the
   // setters and the confirm read the latest value between renders.
-  const [heldRetention, setHeldRetentionState] = useState<HeldRetention | null>(null);
+  const [heldRetentionState, setHeldRetentionState] = useState<HeldRetention | null>(null);
   const heldRetentionRef = useRef<HeldRetention | null>(null);
   const setHeldRetention = useCallback((held: HeldRetention | null) => {
     heldRetentionRef.current = held;
@@ -798,7 +799,7 @@ export function ChatStoreProvider({
   const temperatureRef = useRef(temperature);
   const maxTokensRef = useRef(maxTokens);
   const imageSettingsRef = useRef(imageSettings);
-  const audioSettingsRef = useRef(audioSettings);
+  const audioSettingsRef = useRef(audioSettingsState);
   const transcriptionSettingsRef = useRef(transcriptionSettings);
   const selectedTokenIdRef = useRef(selectedTokenId);
   const serverOverrideRef = useRef(serverOverride);
@@ -906,18 +907,21 @@ export function ChatStoreProvider({
   );
   // What the composer shows: the committed settings with the held retention over them.
   const shownAudioSettings = useMemo(
-    () => (heldRetention ? { ...audioSettings, ...heldRetention.retention } : audioSettings),
-    [audioSettings, heldRetention],
+    () =>
+      heldRetentionState
+        ? { ...audioSettingsState, ...heldRetentionState.retention }
+        : audioSettingsState,
+    [audioSettingsState, heldRetentionState],
   );
   const pendingAudioRetention = useMemo<PendingAudioRetention | null>(
     () =>
-      heldRetention
+      heldRetentionState
         ? {
-            keepLast: heldRetention.keepLast,
-            excess: audioAnswersBeyond(messages, heldRetention.keepLast),
+            keepLast: heldRetentionState.keepLast,
+            excess: audioAnswersBeyond(messages, heldRetentionState.keepLast),
           }
         : null,
-    [heldRetention, messages],
+    [heldRetentionState, messages],
   );
 
   // The run/SSE engine (FA-2): owns the per-chat run subscriptions + transcript
@@ -1009,7 +1013,7 @@ export function ChatStoreProvider({
       temperature,
       maxTokens,
       imageSettings,
-      audioSettings,
+      audioSettings: audioSettingsState,
       transcriptionSettings,
       selectedTokenId,
       serverOverride,
@@ -1052,7 +1056,7 @@ export function ChatStoreProvider({
     temperatureRef.current = temperature;
     maxTokensRef.current = maxTokens;
     imageSettingsRef.current = imageSettings;
-    audioSettingsRef.current = audioSettings;
+    audioSettingsRef.current = audioSettingsState;
     speechStreamingRef.current = speechStreamingGate.streaming;
     transcriptionSettingsRef.current = transcriptionSettings;
     selectedTokenIdRef.current = selectedTokenId;
