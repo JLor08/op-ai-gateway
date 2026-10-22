@@ -2226,6 +2226,98 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // The per-answer delete of a stored spoken answer's audio (#281). The answer's own id is bound
+  // by the store's handlersFor, so the request names THAT answer; the control asks inline first,
+  // and an answer whose audio is already gone offers none.
+  describe(`Chat: deleting the audio of one spoken answer [${locale}]`, () => {
+    const speechModel: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const wav = { type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } };
+    const marker = { type: 'audio_removed' };
+
+    // u1/a1 and u2/a2 hold audio, u3/a3 is already not stored.
+    async function renderAnswers() {
+      chatApi.rows.push({
+        id: 'c_delete_audio',
+        title: 'Greetings',
+        created_at: '2026-07-22T12:00:00Z',
+        updated_at: '2026-07-22T12:00:00Z',
+        content: {
+          settings: { model: 'kokoro', kind: 'speech' },
+          messages: [
+            { id: 'u1', role: 'user', content: 'say one' },
+            { id: 'a1', role: 'assistant', content: [wav], status: 'complete' },
+            { id: 'u2', role: 'user', content: 'say two' },
+            { id: 'a2', role: 'assistant', content: [wav], status: 'complete' },
+            { id: 'u3', role: 'user', content: 'say three' },
+            { id: 'a3', role: 'assistant', content: [marker], status: 'complete' },
+          ],
+        },
+      });
+      renderChat(tokens, [speechModel]);
+      await screen.findByText('Greetings');
+      expect(await screen.findAllByText(t.chatAudioNotStored)).toHaveLength(1);
+    }
+
+    const trashes = () => screen.queryAllByRole('button', { name: t.chatAudioDelete });
+
+    it('offers the control on each answer that holds audio, and on none that does not', async () => {
+      await renderAnswers();
+
+      // a1 and a2 have a player and a trash icon; a3 is the placeholder and has none.
+      expect(trashes()).toHaveLength(2);
+      expect(screen.getAllByLabelText(t.chatGeneratedAudio)).toHaveLength(2);
+    });
+
+    it('deletes the audio of the answer it belongs to, once the inline confirm is accepted', async () => {
+      await renderAnswers();
+
+      fireEvent.click(trashes()[1]);
+      expect(screen.getByText(t.chatAudioDeleteConfirm)).toBeInTheDocument();
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(chatApi.spies.deleteMessageAudio).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole('button', { name: t.chatAudioDeleteAction }));
+
+      await waitFor(() =>
+        expect(chatApi.spies.deleteMessageAudio).toHaveBeenCalledWith('c_delete_audio', 'a2'),
+      );
+      expect(chatApi.spies.deleteMessageAudio).toHaveBeenCalledTimes(1);
+      // a2 is now the not-stored bubble (with a3, two placeholders); a1 still plays and still
+      // offers its own delete, and the placeholders offer none.
+      await waitFor(() => expect(screen.getAllByText(t.chatAudioNotStored)).toHaveLength(2));
+      expect(screen.getAllByLabelText(t.chatGeneratedAudio)).toHaveLength(1);
+      expect(trashes()).toHaveLength(1);
+    });
+
+    it('deletes the other answer when it is the first one that is asked', async () => {
+      await renderAnswers();
+
+      fireEvent.click(trashes()[0]);
+      fireEvent.click(screen.getByRole('button', { name: t.chatAudioDeleteAction }));
+
+      await waitFor(() =>
+        expect(chatApi.spies.deleteMessageAudio).toHaveBeenCalledWith('c_delete_audio', 'a1'),
+      );
+    });
+
+    it('sends nothing, and keeps the audio, when the confirm is cancelled', async () => {
+      await renderAnswers();
+
+      fireEvent.click(trashes()[1]);
+      fireEvent.click(screen.getByRole('button', { name: t.chatCancel }));
+
+      expect(trashes()).toHaveLength(2);
+      expect(screen.queryByText(t.chatAudioDeleteConfirm)).toBeNull();
+      expect(chatApi.spies.deleteMessageAudio).not.toHaveBeenCalled();
+      expect(screen.getAllByText(t.chatAudioNotStored)).toHaveLength(1);
+    });
+  });
+
   // A transcription (speech-to-text) thread: the composer is AUDIO first -- there is no text
   // prompt, the turn is a clip, attached from a file or recorded in the browser -- and the
   // settings are the transcription knobs. The reply is text, so there is no format control.

@@ -469,6 +469,14 @@ const de = {
   // marker the stored answer carries does not say which of those happened. The bubble's
   // regenerate button reuses chatRegenerate.
   chatAudioNotStored: 'Das Audio dieser Antwort ist nicht gespeichert.',
+  // The per-answer delete of a stored spoken answer's audio (#281): the trash icon on the answer's
+  // action stack, and the inline confirm it opens in place of the icon (the question, then Delete
+  // and the generic chatCancel). The question says what the audio's removal means -- final, but
+  // the answer can be generated again, which is what the not-stored bubble then offers.
+  chatAudioDelete: 'Audio löschen',
+  chatAudioDeleteConfirm:
+    'Audio dieser Antwort löschen? Das lässt sich nicht rückgängig machen – mit „Neu generieren“ kann es neu erzeugt werden.',
+  chatAudioDeleteAction: 'Löschen',
   // The wait of a running transcription (speech-to-text) turn, the transcript twin of the
   // audio wait above: it words the WAIT (the request may still be queued or waiting on a model
   // load), and the sentence says no intermediate news is coming BEFORE the first text -- there
@@ -3734,6 +3742,10 @@ const en: PortalMessages = {
   chatAudioDownloadError: 'Could not download the audio.',
   chatAudioLoadError: 'Could not load the audio.',
   chatAudioNotStored: 'The audio for this answer is not stored.',
+  chatAudioDelete: 'Delete audio',
+  chatAudioDeleteConfirm:
+    'Delete the audio of this answer? This cannot be undone – “Regenerate” can create it again.',
+  chatAudioDeleteAction: 'Delete',
   chatTranscriptionRunPending: 'Waiting for transcript',
   chatTranscriptionNoIntermediateNews:
     'No intermediate updates – the transcript appears as soon as the model delivers text.',

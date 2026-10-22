@@ -1017,6 +1017,9 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       ? handlers.onRefine
                       : undefined
                   }
+                  // The delete of a spoken answer's audio, per message like onRegenerate; the
+                  // row itself offers it only where audio is still stored.
+                  onDeleteAudio={message.role === 'assistant' ? handlers.onDeleteAudio : undefined}
                   canRun={c.modelAvailable}
                 />
               );

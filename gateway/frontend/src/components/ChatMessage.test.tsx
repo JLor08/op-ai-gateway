@@ -731,6 +731,254 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // The delete of a stored speech answer's audio (#281): a trash icon on the answer's action
+    // stack that asks INLINE first (a confirm in the stack itself, no dialog), because the
+    // audio is gone for good once the gateway has removed it -- regenerate is the way back.
+    // The row's `onDeleteAudio` is the store's per-message handler (the message id is bound by
+    // Chat.tsx's handlersFor; Chat.test.tsx pins that end to end), so it takes no argument.
+    describe('deleting the audio of a stored speech answer', () => {
+      const AUDIO = {
+        type: 'audio_url' as const,
+        audio_url: { url: 'data:audio/wav;base64,AAAA' },
+      };
+      const MARKER = { type: 'audio_removed' as const };
+      const trash = () => screen.queryByRole('button', { name: t.chatAudioDelete });
+      const confirmButton = () => screen.queryByRole('button', { name: t.chatAudioDeleteAction });
+      const cancelButton = () => screen.queryByRole('button', { name: t.chatCancel });
+
+      it('offers a delete (trash) button on the action stack, asking nothing yet', () => {
+        const onDeleteAudio = vi.fn();
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[AUDIO]}
+            turnId="a1"
+            onDeleteAudio={onDeleteAudio}
+          />,
+        );
+
+        expect(trash()).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioDeleteConfirm)).toBeNull();
+        expect(confirmButton()).toBeNull();
+        expect(cancelButton()).toBeNull();
+        expect(onDeleteAudio).not.toHaveBeenCalled();
+      });
+
+      it('asks inline, in place of the icon, when it is clicked: Delete and Cancel, no dialog', () => {
+        const onDeleteAudio = vi.fn();
+        render(
+          <ChatMessage t={t} role="assistant" content={[AUDIO]} onDeleteAudio={onDeleteAudio} />,
+        );
+
+        fireEvent.click(trash()!);
+
+        expect(screen.getByText(t.chatAudioDeleteConfirm)).toBeInTheDocument();
+        expect(confirmButton()).toBeInTheDocument();
+        expect(cancelButton()).toBeInTheDocument();
+        // Inline: the confirm is part of the bubble, not a modal over it.
+        expect(screen.queryByRole('dialog')).toBeNull();
+        expect(screen.queryByRole('alertdialog')).toBeNull();
+        // The icon gave way to the confirm, and nothing was deleted by merely asking.
+        expect(trash()).toBeNull();
+        expect(onDeleteAudio).not.toHaveBeenCalled();
+      });
+
+      it('deletes once when the confirm is accepted, and closes the confirm', () => {
+        const onDeleteAudio = vi.fn();
+        render(
+          <ChatMessage t={t} role="assistant" content={[AUDIO]} onDeleteAudio={onDeleteAudio} />,
+        );
+
+        fireEvent.click(trash()!);
+        fireEvent.click(confirmButton()!);
+
+        expect(onDeleteAudio).toHaveBeenCalledTimes(1);
+        expect(screen.queryByText(t.chatAudioDeleteConfirm)).toBeNull();
+        expect(confirmButton()).toBeNull();
+      });
+
+      it('restores the icon and deletes nothing when the confirm is cancelled', () => {
+        const onDeleteAudio = vi.fn();
+        render(
+          <ChatMessage t={t} role="assistant" content={[AUDIO]} onDeleteAudio={onDeleteAudio} />,
+        );
+
+        fireEvent.click(trash()!);
+        fireEvent.click(cancelButton()!);
+
+        expect(trash()).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioDeleteConfirm)).toBeNull();
+        expect(confirmButton()).toBeNull();
+        expect(cancelButton()).toBeNull();
+        expect(onDeleteAudio).not.toHaveBeenCalled();
+      });
+
+      it('can be asked again after a cancel', () => {
+        const onDeleteAudio = vi.fn();
+        render(
+          <ChatMessage t={t} role="assistant" content={[AUDIO]} onDeleteAudio={onDeleteAudio} />,
+        );
+
+        fireEvent.click(trash()!);
+        fireEvent.click(cancelButton()!);
+        fireEvent.click(trash()!);
+        fireEvent.click(confirmButton()!);
+
+        expect(onDeleteAudio).toHaveBeenCalledTimes(1);
+      });
+
+      it('words the confirm as final and points at regenerate as the way back', () => {
+        // The wording is the requirement: once deleted the audio is gone, and "Regenerate"
+        // (the button the not-stored bubble then offers) is how to get one again.
+        expect(t.chatAudioDeleteConfirm).toContain(t.chatRegenerate);
+      });
+
+      it('moves focus to Cancel when asking, and back to the icon when cancelled', () => {
+        render(<ChatMessage t={t} role="assistant" content={[AUDIO]} onDeleteAudio={() => {}} />);
+
+        fireEvent.click(trash()!);
+        // The safe answer holds the focus the removed icon left behind.
+        expect(cancelButton()).toHaveFocus();
+
+        fireEvent.click(cancelButton()!);
+        expect(trash()).toHaveFocus();
+      });
+
+      it('is ABSENT on a not-stored bubble: there is nothing to delete', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[MARKER]}
+            onRegenerate={() => {}}
+            onDeleteAudio={() => {}}
+          />,
+        );
+
+        expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+        expect(trash()).toBeNull();
+        expect(confirmButton()).toBeNull();
+      });
+
+      it('is ABSENT on a mixed text + marker answer too', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[{ type: 'text', text: 'Hello there' }, MARKER]}
+            onDeleteAudio={() => {}}
+          />,
+        );
+
+        expect(screen.getByText('Hello there')).toBeInTheDocument();
+        expect(trash()).toBeNull();
+      });
+
+      it('is shown on a mixed text + audio answer', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[{ type: 'text', text: 'Hello there' }, AUDIO]}
+            onDeleteAudio={() => {}}
+          />,
+        );
+
+        expect(trash()).toBeInTheDocument();
+      });
+
+      it('is absent on an answer without audio, whatever the row offers', () => {
+        render(<ChatMessage t={t} role="assistant" content="plain" onDeleteAudio={() => {}} />);
+
+        expect(trash()).toBeNull();
+      });
+
+      it('is absent where the row has no delete to give', () => {
+        render(<ChatMessage t={t} role="assistant" content={[AUDIO]} onRegenerate={() => {}} />);
+
+        expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+        expect(trash()).toBeNull();
+      });
+
+      it('is absent on the row of a run that is still streaming', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[AUDIO]}
+            streaming
+            kind="speech"
+            onDeleteAudio={() => {}}
+          />,
+        );
+
+        expect(trash()).toBeNull();
+      });
+
+      it('is never on a user turn: its audio is a transcription clip the user supplied', () => {
+        render(
+          <ChatMessage t={t} role="user" content={[AUDIO]} onDeleteAudio={() => {}} turnId="u1" />,
+        );
+
+        expect(trash()).toBeNull();
+      });
+
+      it('is not disabled by an unavailable model: deleting starts no run', () => {
+        const onDeleteAudio = vi.fn();
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[AUDIO]}
+            canRun={false}
+            onDeleteAudio={onDeleteAudio}
+          />,
+        );
+
+        expect(trash()).toBeEnabled();
+      });
+
+      it('keeps the regenerate, copy and view-source buttons beside it', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[AUDIO]}
+            onRegenerate={() => {}}
+            onDeleteAudio={() => {}}
+          />,
+        );
+
+        expect(screen.getByRole('button', { name: t.chatRegenerate })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.chatCopy })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.chatViewRaw })).toBeInTheDocument();
+        expect(trash()).toBeInTheDocument();
+      });
+
+      it('does not carry an open confirm over to audio that comes back later', () => {
+        const onDeleteAudio = vi.fn();
+        const { rerender } = render(
+          <ChatMessage t={t} role="assistant" content={[AUDIO]} onDeleteAudio={onDeleteAudio} />,
+        );
+        fireEvent.click(trash()!);
+        expect(confirmButton()).toBeInTheDocument();
+
+        // The audio goes (pruned elsewhere) while the question is open ...
+        rerender(
+          <ChatMessage t={t} role="assistant" content={[MARKER]} onDeleteAudio={onDeleteAudio} />,
+        );
+        expect(confirmButton()).toBeNull();
+        // ... and a later audio of this row starts from the icon, not from a question about it.
+        rerender(
+          <ChatMessage t={t} role="assistant" content={[AUDIO]} onDeleteAudio={onDeleteAudio} />,
+        );
+        expect(trash()).toBeInTheDocument();
+        expect(confirmButton()).toBeNull();
+        expect(screen.queryByText(t.chatAudioDeleteConfirm)).toBeNull();
+      });
+    });
+
     // A transcription (speech-to-text) run is silent like a speech run -- the endpoint answers
     // once, with the finished transcript -- so it gets a wait of its own, not the text-pending
     // state's "reasoning active - 0 chars" (a measured zero where nothing was ever measured).
