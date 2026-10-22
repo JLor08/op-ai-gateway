@@ -276,6 +276,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // older upload): refused before anything was sent (imageRunSourceUnsupportedMessage).
   'gateway.chat_run_image_source_unsupported': 'errorChatRunImageSourceUnsupported',
   'gateway.chat_run_commit_failed': 'errorChatRunCommitFailed',
+  // A commit that did not return within chatRunCommitTimeout (#279; chat_runs.go,
+  // commitFailureCode): the store is slow or wedged and the turn may or may not have
+  // landed, so it gets its own label instead of the generic "try again" one above.
+  'gateway.chat_run_commit_timeout': 'errorChatRunCommitTimeout',
   // Portal chat speech (#248): a speech run's own terminal codes
   // (chat_runs_audio.go) and the speech.* codes of POST /v1/audio/speech, which the
   // run relays verbatim through upstreamErrorCode (speech_handler.go). Mapped to
@@ -286,6 +290,11 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'gateway.chat_run_no_audio': 'errorChatRunNoAudio',
   'gateway.chat_run_speech_response_unreadable': 'errorChatRunSpeechResponseUnreadable',
   'gateway.chat_run_speech_reserved_field': 'errorChatRunSpeechReservedField',
+  // The synthesized audio is longer than the total a turn may store (#279;
+  // speechRunAudioTooLargeMessage, chat_runs_audio.go). Nothing is committed and a
+  // retry of the same text meets the same cap, so its label says what to change
+  // rather than offering a plain retry.
+  'gateway.chat_run_audio_too_large': 'errorChatRunAudioTooLarge',
   'speech.input_required': 'errorSpeechInputRequired',
   'speech.response_format_unsupported': 'errorSpeechResponseFormatUnsupported',
   'speech.stream_unsupported': 'errorSpeechStreamUnsupported',

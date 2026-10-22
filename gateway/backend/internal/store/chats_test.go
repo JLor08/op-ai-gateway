@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -316,6 +317,80 @@ func TestSaveChatWithBlobsPersistsChatAndBlobs(t *testing.T) {
 			t.Fatalf("ChatBlobsByIDs = %v, %v, want all three blobs of c_save", byIDs, err)
 		}
 	})
+}
+
+// TestSaveChatWithBlobsCommitsAMultiPartAudioTurnNearCap pins what a long speech
+// answer asks of the drivers (#279): one SaveChatWithBlobs carrying several
+// audio/wav blobs, each as large as the gateway ever cuts a part (8 MiB of PCM, the
+// default part target, plus the 44-byte WAV header). Every part must come back
+// whole, by its own id and under its own chat, and the sealed document, which alone
+// carries the parts' order (there is no ordinal column), must come back as written.
+// The order itself, from the stored message through to the blobs, is pinned where the
+// document is read: portal.TestCommitMultiPartAudioNearCap.
+func TestSaveChatWithBlobsCommitsAMultiPartAudioTurnNearCap(t *testing.T) {
+	const partBytes = 8<<20 + 44
+	forEachChatSaver(t, func(t *testing.T, s chatSaver) {
+		ctx := context.Background()
+		now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+		original := memChat("c_long_speech", 3, now)
+		if err := s.CreateChat(ctx, original); err != nil {
+			t.Fatalf("CreateChat: %v", err)
+		}
+
+		ids := []string{"blob_part_1", "blob_part_2", "blob_part_3", "blob_part_4"}
+		blobs := make([]ChatBlob, len(ids))
+		for i, id := range ids {
+			payload := make([]byte, partBytes-i) // sizes differ so a mixed-up part is caught by length too
+			for j := range payload {
+				payload[j] = byte(j*31) ^ byte(i+1)
+			}
+			blobs[i] = ChatBlob{
+				ID: id, ChatID: original.ID, KeyVersion: 1, Blob: payload,
+				ContentType: "audio/wav", ByteLen: int64(len(payload)), CreatedAt: now.Add(time.Minute),
+			}
+		}
+		updated := Chat{
+			ID: original.ID, Title: original.Title, KeyVersion: 1, UpdatedAt: now.Add(time.Minute),
+			Blob: []byte(`{"messages":[{"role":"assistant","parts":["` + strings.Join(ids, `","`) + `"]}]}`),
+		}
+		if err := s.SaveChatWithBlobs(ctx, updated, blobs); err != nil {
+			t.Fatalf("SaveChatWithBlobs(%d blobs of %d bytes): %v", len(blobs), partBytes, err)
+		}
+
+		got, err := s.ChatByID(ctx, original.ID)
+		if err != nil || !bytes.Equal(got.Blob, updated.Blob) {
+			t.Fatalf("ChatByID document = %q, %v, want the document as written: %q", got.Blob, err, updated.Blob)
+		}
+		held, err := s.ChatBlobsByIDs(ctx, original.ID, ids)
+		if err != nil || len(held) != len(blobs) {
+			t.Fatalf("ChatBlobsByIDs = %d blobs, %v, want all %d parts of the chat", len(held), err, len(blobs))
+		}
+		for _, want := range blobs {
+			// Compared by hand: a failure must not print megabytes of payload.
+			for name, row := range map[string]ChatBlob{"ChatBlobByID": mustChatBlobByID(ctx, t, s, want.ID), "ChatBlobsByIDs": held[want.ID]} {
+				if row.ID != want.ID || row.ChatID != want.ChatID || row.KeyVersion != want.KeyVersion || row.ContentType != "audio/wav" ||
+					row.ByteLen != want.ByteLen || !row.CreatedAt.Equal(want.CreatedAt) {
+					t.Fatalf("%s(%s) = %s %s v%d %s %d bytes, want %s %s v%d audio/wav %d bytes", name, want.ID, row.ID, row.ChatID, row.KeyVersion, row.ContentType, row.ByteLen, want.ID, want.ChatID, want.KeyVersion, want.ByteLen)
+				}
+				if !bytes.Equal(row.Blob, want.Blob) {
+					t.Fatalf("%s(%s) payload is %d bytes, not the %d that were stored", name, want.ID, len(row.Blob), len(want.Blob))
+				}
+			}
+			if owner, err := s.ChatBlobOwner(ctx, want.ID); err != nil || owner != original.ID {
+				t.Fatalf("ChatBlobOwner(%s) = %q, %v, want %s", want.ID, owner, err, original.ID)
+			}
+		}
+	})
+}
+
+// mustChatBlobByID is ChatBlobByID for a test that only wants the row.
+func mustChatBlobByID(ctx context.Context, t *testing.T, s chatSaver, id string) ChatBlob {
+	t.Helper()
+	row, err := s.ChatBlobByID(ctx, id)
+	if err != nil {
+		t.Fatalf("ChatBlobByID(%s): %v", id, err)
+	}
+	return row
 }
 
 // TestSaveChatWithBlobsEmptyBlobsIsAChatUpdate pins that a save with nothing to

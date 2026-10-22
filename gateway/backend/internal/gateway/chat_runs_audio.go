@@ -107,6 +107,15 @@ const (
 	// without the offending key would answer a request the user did not make, the
 	// silent drop every other code here exists to refuse.
 	speechRunReservedFieldMessage = "gateway.chat_run_speech_reserved_field"
+	// speechRunAudioTooLargeMessage: the synthesized audio is longer than the total
+	// the run may store (Server.maxChatAudioBytes, the cap the run executor holds
+	// all of a turn's audio blobs to). A clip this long will exceed the cap again on
+	// a retry of the same text and voice, so the portal words it apart from the
+	// failures a retry can cure. Nothing is committed: a clip with its tail cut off
+	// would be presented as the whole reply, the silent truncation every other code
+	// here refuses. A streamed run reaches this only after the stream is read to its
+	// end (see readSpeechEvents), so the call is still billed as delivered.
+	speechRunAudioTooLargeMessage = "gateway.chat_run_audio_too_large"
 )
 
 // speechReservedFields are the request fields a thread's passthrough may not set.
@@ -216,14 +225,20 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	if streaming && resp.StatusCode >= 200 && resp.StatusCode <= 299 && isSpeechEventStream(resp.Header) {
 		return s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline)
 	}
-	return bufferedSpeechTurn(ctx, run, resp)
+	return s.bufferedSpeechTurn(ctx, run, resp)
 }
 
 // bufferedSpeechTurn is the outcome of a speech run's loopback answer that is not an
 // event stream: the one-shot WAV (or an error answer) read whole, as
 // generateSpeechTurn's result -- the content parts to commit, the run status and the
 // terminal error message.
-func bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *http.Response) (json.RawMessage, string, string) {
+//
+// A one-shot clip is committed the way a streamed one is (consumeSpeechStream): cut into
+// ordered WAV parts, each at speechPartBytes of the per-blob cap so that each passes the chat
+// store's per-blob check alone, and refused as the audio-too-large error when its audio is
+// past the run's total cap, which is decided before anything is committed. See
+// splitBufferedSpeech for what is cut and what is committed as it came.
+func (s *Server) bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *http.Response) (json.RawMessage, string, string) {
 	// Read the WHOLE body: a WAV cannot be played from a prefix of it, and it is
 	// deliberately not bounded by s.captureMaxBytes (1 MiB, which an ordinary clip
 	// exceeds) -- the same call, and the same backstop, as the image path: the chat
@@ -243,17 +258,56 @@ func bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *http.Response) 
 		return nil, "error", upstreamErrorCode(payload, resp.Status)
 	}
 
-	part, err := speechPartFrom(resp.Header.Get("Content-Type"), payload)
-	if err != nil {
+	if err := speechPayloadError(resp.Header.Get("Content-Type"), payload); err != nil {
 		log.Printf("chat run %s: speech response is not usable audio: %v (content type %q, %d bytes)", run.ID, err, resp.Header.Get("Content-Type"), len(payload))
 		return nil, "error", err.Error()
 	}
-	parts, err := json.Marshal([]speechAudioPart{part})
+	wavs, overCap := s.splitBufferedSpeech(payload)
+	if overCap {
+		audioCap, _ := s.chatAudioCaps()
+		log.Printf("chat run %s: the speech response is longer than the %d byte audio cap; nothing is committed", run.ID, audioCap)
+		return nil, "error", speechRunAudioTooLargeMessage
+	}
+	// No WAVs is no audio -- a clip of less than one sample -- and is refused BEFORE the
+	// commit: an empty content array would be a blank bubble.
+	if len(wavs) == 0 {
+		return nil, "error", speechRunNoAudioMessage
+	}
+	parts, err := marshalSpeechParts(wavs)
 	if err != nil {
 		log.Printf("chat run %s: marshal speech parts failed: %v", run.ID, err)
 		return nil, "error", speechRunDispatchFailedMessage
 	}
 	return parts, "completed", ""
+}
+
+// splitBufferedSpeech is the WAVs a buffered 2xx speech answer is committed as, one per
+// part, and whether the clip is over the run's total audio cap. payload is a body that
+// speechPayloadError has passed.
+//
+// A WAV of mono 16-bit PCM -- what audio.cpp answers and wavFromPCM16 writes -- is cut as a
+// streamed clip is (splitPCMToWAVParts, at speechPartBytes of the per-blob cap), and measured
+// as a streamed clip is: the cap is on the decoded PCM, not on the file with its header. The
+// audio is what the header's data chunk declares, bounded by what the body holds: the
+// declared size is the header's word, and neither sizes an allocation nor invents samples.
+// Anything else is committed whole, as the single part it always was: a WAV of another
+// format, which the cut -- made on whole 16-bit samples -- would split mid-frame, and a body
+// that is no WAV at all, which has no audio to cut. The total cap is not applied to those: it
+// is a count of 16-bit samples, and the per-blob cap stays the chat store's to enforce.
+func (s *Server) splitBufferedSpeech(payload []byte) (wavs [][]byte, overCap bool) {
+	rd := bytes.NewReader(payload)
+	format, dataSize, ok := wavStripToData(rd)
+	if !ok || !format.isMono16PCM() {
+		return [][]byte{payload}, false
+	}
+	// wavStripToData leaves rd at the first byte of the data chunk's body.
+	pcm := payload[len(payload)-rd.Len():]
+	pcm = pcm[:min(dataSize, int64(len(pcm)))]
+	audioCap, blobCap := s.chatAudioCaps()
+	if int64(len(pcm)) > audioCap {
+		return nil, true
+	}
+	return splitPCMToWAVParts(pcm, int(format.SampleRate), speechPartBytes(blobCap)), false
 }
 
 // isSpeechEventStream reports whether a 2xx answer to the run's stream request is the
@@ -264,17 +318,26 @@ func isSpeechEventStream(header http.Header) bool {
 	return err == nil && mediaType == speechStreamSSEType
 }
 
-// speechPartFrom turns a 2xx speech response into the turn's one audio part, or
-// an error whose text is the terminal code. Emptiness is checked first, for the
-// reason imagePartsFrom checks "produced nothing" before the media type: "no
-// audio at all" is the more fundamental fact, and an empty body should not be
-// reported as one whose type could not be named.
-func speechPartFrom(contentType string, payload []byte) (speechAudioPart, error) {
+// speechPayloadError is the check a 2xx speech response must pass before any part is built
+// of it: nil for a body that is audio the run may commit, else an error whose text is the
+// terminal code. Emptiness is checked first, for the reason imagePartsFrom checks "produced
+// nothing" before the media type: "no audio at all" is the more fundamental fact, and an
+// empty body should not be reported as one whose type could not be named.
+func speechPayloadError(contentType string, payload []byte) error {
 	if len(payload) == 0 {
-		return speechAudioPart{}, errors.New(speechRunNoAudioMessage)
+		return errors.New(speechRunNoAudioMessage)
 	}
 	if !speechAudioMediaTypeOf(contentType) {
-		return speechAudioPart{}, errors.New(speechRunResponseUnreadableMessage)
+		return errors.New(speechRunResponseUnreadableMessage)
+	}
+	return nil
+}
+
+// speechPartFrom turns a 2xx speech response into one audio part, or an error whose text is
+// the terminal code (see speechPayloadError).
+func speechPartFrom(contentType string, payload []byte) (speechAudioPart, error) {
+	if err := speechPayloadError(contentType, payload); err != nil {
+		return speechAudioPart{}, err
 	}
 	return speechAudioPart{
 		Type: speechAudioPartType,

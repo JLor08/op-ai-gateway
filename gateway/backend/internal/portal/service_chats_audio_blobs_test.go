@@ -173,6 +173,98 @@ func TestCommitAssistantExtractsAudioBesideTextAndImages(t *testing.T) {
 	}
 }
 
+// A long speech answer is stored as several ordered audio_url parts, each cut to fit
+// the per-blob cap (#279), and committed in ONE save. Under a small cap, four parts
+// that each sit at or just under it must all be extracted -- the cap is inclusive, so
+// a part of exactly the cap's size is kept -- into four chat_blobs rows of their own,
+// and the stored message must still list them in the order they were produced:
+// there is no ordinal column, the order is the position of the parts in the document.
+// Each part ends in a byte of its own, so a url mapped to the wrong blob is caught
+// as well as one in the wrong place.
+//
+// This runs on the portal's in-memory chat store. What the SQL drivers do with the
+// same four-blob save (byte-exact payloads, one transaction) is pinned on SQLite and,
+// when OP_AI_GATEWAY_TEST_POSTGRES_DSN is set, PostgreSQL by
+// TestSaveChatWithBlobsCommitsAMultiPartAudioTurnNearCap in internal/store.
+func TestCommitMultiPartAudioNearCap(t *testing.T) {
+	const blobCap = 4096
+	ctx := context.Background()
+	for _, withCipher := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cipher=%v", withCipher), func(t *testing.T) {
+			e := newBlobTestEnv(t, withCipher, blobCap)
+			chatID := e.startSpeechThread(t, "read the whole chapter")
+
+			sizes := []int{blobCap - 3, blobCap - 2, blobCap - 1, blobCap}
+			wavs := make([][]byte, len(sizes))
+			var parts []string
+			for i, size := range sizes {
+				wavs[i] = wavLike(size)
+				wavs[i][size-1] = byte(0xA1 + i)
+				parts = append(parts, fmt.Sprintf(`{"type":"audio_url","audio_url":{"url":%q}}`, dataURL("audio/wav", wavs[i])))
+			}
+			saves := len(e.rec.saves)
+
+			if err := e.svc.CommitAssistant(ctx, e.owner, chatID, AssistantTurn{ContentParts: json.RawMessage("[" + strings.Join(parts, ",") + "]")}, "complete"); err != nil {
+				t.Fatalf("CommitAssistant: %v (every part is within the %d-byte cap)", err, blobCap)
+			}
+
+			// One save carried all four blobs: the commit is atomic, not a save per part.
+			if len(e.rec.saves) != saves+1 || len(e.rec.saves[saves]) != len(wavs) || e.rec.storedBlobs() != len(wavs) {
+				t.Fatalf("saves = %d (was %d) carrying %d blobs, want one save carrying %d", len(e.rec.saves), saves, e.rec.storedBlobs(), len(wavs))
+			}
+
+			// The document references the blobs and carries none of the bytes.
+			doc := e.stored(t, chatID)
+			if strings.Contains(string(doc), "data:") || strings.Contains(string(doc), "base64") {
+				t.Fatalf("the parts were not committed as references: %.300s", doc)
+			}
+			urls := storedMemberURLs(t, doc, "audio_url")
+			if len(urls) != len(wavs) {
+				t.Fatalf("stored audio urls = %v, want %d", urls, len(wavs))
+			}
+			ids := make([]string, len(urls))
+			for i, url := range urls {
+				ids[i] = strings.TrimPrefix(url, gatewayBlobPrefix)
+				if !strings.HasPrefix(url, gatewayBlobPrefix) || !blobIDPattern.MatchString(ids[i]) || slices.Index(ids, ids[i]) != i {
+					t.Fatalf("stored audio url %d = %q, want its own gateway url (urls %v)", i, url, urls)
+				}
+			}
+
+			// The message's audio, read the way the portal reads it, is those urls in order.
+			var stored struct {
+				Messages []struct {
+					Role    string          `json:"role"`
+					Content json.RawMessage `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.Unmarshal(doc, &stored); err != nil || len(stored.Messages) == 0 {
+				t.Fatalf("stored document: %d messages, %v", len(stored.Messages), err)
+			}
+			reply := stored.Messages[len(stored.Messages)-1]
+			if got := MessageAudio(reply.Content); reply.Role != "assistant" || !slices.Equal(got, urls) {
+				t.Fatalf("MessageAudio(%s message) = %v, want the %d stored urls in order %v", reply.Role, got, len(urls), urls)
+			}
+
+			// Four rows, one per part: url i is blob i, whole and typed audio/wav, and it
+			// is served back as the very bytes.
+			held, err := e.mem.ChatBlobsByIDs(ctx, chatID, ids)
+			if err != nil || len(held) != len(wavs) {
+				t.Fatalf("ChatBlobsByIDs = %d rows, %v, want the chat's %d blobs", len(held), err, len(wavs))
+			}
+			for i, id := range ids {
+				row := held[id]
+				if row.ChatID != chatID || row.ContentType != "audio/wav" || row.ByteLen != int64(len(wavs[i])) || !bytes.Equal(e.blobBytes(t, row), wavs[i]) {
+					t.Fatalf("blob %d (%s) = chat %s type %s, %d bytes: not part %d of %d bytes", i, id, row.ChatID, row.ContentType, row.ByteLen, i, len(wavs[i]))
+				}
+				served, mediaType, err := e.svc.ChatBlobBytes(ctx, e.owner, id)
+				if err != nil || mediaType != "audio/wav" || !bytes.Equal(served, wavs[i]) {
+					t.Fatalf("served blob %d: %d bytes as %q, err %v; want the %d stored bytes as audio/wav", i, len(served), mediaType, err, len(wavs[i]))
+				}
+			}
+		})
+	}
+}
+
 // The allow-list governs an audio part exactly as it governs an image part, and
 // each part kind takes only its own media family: a refusal leaves the transcript
 // and the blob table as they were.

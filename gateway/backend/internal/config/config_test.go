@@ -380,6 +380,32 @@ func TestLoadMaxChatBlobBytesFallsBackOnJunk(t *testing.T) {
 	}
 }
 
+// TestLoadMaxChatAudioBytes pins the total-audio cap one chat run may spread
+// across its stored audio blobs (#279): 256 MiB by default, an operator value
+// honoured, and junk/0/negative falling back to the default.
+func TestLoadMaxChatAudioBytes(t *testing.T) {
+	t.Run("unset uses the 256 MiB default", func(t *testing.T) {
+		t.Setenv("OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES", "")
+		if got := mustLoad(t).MaxChatAudioBytes; got != 256<<20 {
+			t.Fatalf("MaxChatAudioBytes = %d, want %d (256 MiB)", got, 256<<20)
+		}
+	})
+	t.Run("override is honoured", func(t *testing.T) {
+		t.Setenv("OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES", "104857600")
+		if got := mustLoad(t).MaxChatAudioBytes; got != 100<<20 {
+			t.Fatalf("MaxChatAudioBytes = %d, want %d (100 MiB)", got, 100<<20)
+		}
+	})
+	t.Run("junk, zero and negative fall back to the default", func(t *testing.T) {
+		for _, v := range []string{"garbage", "0", "-5"} {
+			t.Setenv("OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES", v)
+			if got := mustLoad(t).MaxChatAudioBytes; got != 256<<20 {
+				t.Fatalf("value %q: MaxChatAudioBytes = %d, want %d", v, got, 256<<20)
+			}
+		}
+	})
+}
+
 func TestLoadMaxRunHistoryBytesDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", "")
 

@@ -445,6 +445,105 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         expect(fetchMock).toHaveBeenCalledTimes(1);
       });
+
+      // A long answer is saved as several ordered parts. The assistant turn plays them as ONE
+      // clip: one player and one download, not a player per part (and not only the first).
+      describe('a reply saved as several parts', () => {
+        const PART_URLS = [
+          '/api/portal/chat-blobs/6f1c2a52-0f43-4d0b-bb0d-8c7a3a1d9e10',
+          '/api/portal/chat-blobs/0a9d3f3e-2b0c-4f55-8f55-6d6f1c5a7a11',
+          '/api/portal/chat-blobs/3c7e9d10-5a41-4b8e-9f27-1d2c3b4a5e6f',
+        ];
+        const partsOf = (urls: string[]) =>
+          urls.map((url) => ({ type: 'audio_url' as const, audio_url: { url } }));
+
+        // A canonical mono 16-bit 16 kHz WAV of `samples` zero samples.
+        function silentWav(samples: number): Uint8Array<ArrayBuffer> {
+          const out = new Uint8Array(44 + samples * 2);
+          const view = new DataView(out.buffer);
+          const ascii = (offset: number, text: string) =>
+            text.split('').forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+          ascii(0, 'RIFF');
+          view.setUint32(4, 36 + samples * 2, true);
+          ascii(8, 'WAVE');
+          ascii(12, 'fmt ');
+          view.setUint32(16, 16, true);
+          view.setUint16(20, 1, true);
+          view.setUint16(22, 1, true);
+          view.setUint32(24, 16000, true);
+          view.setUint32(28, 32000, true);
+          view.setUint16(32, 2, true);
+          view.setUint16(34, 16, true);
+          ascii(36, 'data');
+          view.setUint32(40, samples * 2, true);
+          return out;
+        }
+
+        it('renders exactly ONE player and one download button for three parts', async () => {
+          const createObjectURL = vi.fn(() => 'blob:whole-reply');
+          vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+          const fetchMock = vi.fn(async () => ({
+            ok: true,
+            status: 200,
+            blob: async () => new Blob([silentWav(4)], { type: 'audio/wav' }),
+          }));
+          vi.stubGlobal('fetch', fetchMock);
+
+          const { container } = render(
+            <ChatMessage t={t} role="assistant" turnId="msg_s1" content={partsOf(PART_URLS)} />,
+          );
+
+          await waitFor(() =>
+            expect(screen.getByLabelText(t.chatGeneratedAudio)).toHaveAttribute(
+              'src',
+              'blob:whole-reply',
+            ),
+          );
+          expect(container.querySelectorAll('audio')).toHaveLength(1);
+          expect(screen.getAllByRole('button', { name: t.chatDownloadAudio })).toHaveLength(1);
+          // Every part was fetched, and they became ONE object URL.
+          expect(fetchMock).toHaveBeenCalledTimes(3);
+          expect(createObjectURL).toHaveBeenCalledTimes(1);
+        });
+
+        it('renders ONE player for a one-part reply, as before', () => {
+          const { container } = render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_s1"
+              content={partsOf(['data:audio/wav;base64,AAAA'])}
+            />,
+          );
+
+          expect(container.querySelectorAll('audio')).toHaveLength(1);
+          expect(screen.getByLabelText(t.chatGeneratedAudio)).toHaveAttribute(
+            'src',
+            'data:audio/wav;base64,AAAA',
+          );
+        });
+
+        it('is not the pending state once the first part has arrived, even while streaming', () => {
+          vi.stubGlobal(
+            'fetch',
+            vi.fn(() => new Promise(() => {})),
+          );
+
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              content={partsOf(PART_URLS)}
+              kind="speech"
+              streaming
+              elapsedMs={1_000}
+            />,
+          );
+
+          expect(screen.queryByText(t.chatAudioRunPending)).toBeNull();
+          expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+        });
+      });
     });
 
     // A transcription (speech-to-text) run is silent like a speech run -- the endpoint answers
@@ -647,6 +746,26 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             />,
           );
           expect(screen.getByRole('button', { name: t.chatEdit })).toBeInTheDocument();
+        });
+
+        // Several clips on one user turn are NOT stitched (they are separate recordings): one
+        // player per clip, each its own download.
+        it('still renders one player per clip on a user turn with several audio parts', () => {
+          const { container } = render(
+            <ChatMessage
+              t={t}
+              role="user"
+              turnId="msg_u1"
+              content={['AAAA', 'BBBB', 'CCCC'].map((payload) => ({
+                type: 'audio_url' as const,
+                audio_url: { url: `data:audio/webm;base64,${payload}` },
+              }))}
+            />,
+          );
+
+          expect(container.querySelectorAll('audio')).toHaveLength(3);
+          expect(screen.getAllByLabelText(t.chatAttachedAudio)).toHaveLength(3);
+          expect(screen.getAllByRole('button', { name: t.chatDownloadAudio })).toHaveLength(3);
         });
 
         it('shows no player on a user turn without audio', () => {

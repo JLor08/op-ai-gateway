@@ -3566,6 +3566,7 @@ describe('portal chat speech error i18n keys', () => {
     'errorChatRunNoAudio',
     'errorChatRunSpeechResponseUnreadable',
     'errorChatRunSpeechReservedField',
+    'errorChatRunAudioTooLarge',
     'errorSpeechInputRequired',
     'errorSpeechResponseFormatUnsupported',
     'errorSpeechStreamUnsupported',
@@ -3635,6 +3636,47 @@ describe('portal chat speech error i18n keys', () => {
   it('names WAV as the only supported format', () => {
     expect(messages.de.errorSpeechResponseFormatUnsupported).toContain('WAV');
     expect(messages.en.errorSpeechResponseFormatUnsupported).toContain('WAV');
+  });
+});
+
+// #279: the two terminal codes of a long speech turn. Neither is a "please try
+// again" failure -- the wire codes are pinned in format.test.ts, this guards what
+// the sentences tell the user.
+describe('portal chat audio-too-large and commit-timeout error i18n keys', () => {
+  // The clip exceeds the total a turn may store, so nothing is committed and the
+  // same text meets the same cap on a retry: the label says what to change (a
+  // shorter text) and must not offer a plain retry.
+  it('tells the user a too-long audio answer was not stored and to use a shorter text', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].errorChatRunAudioTooLarge;
+      expect(text, locale).toMatch(locale === 'de' ? /zu lang/ : /too long/);
+      expect(text, locale).toMatch(locale === 'de' ? /kürzer/ : /shorter/);
+      expect(text, locale).not.toMatch(/erneut|try again|erneut versuchen/i);
+    }
+  });
+
+  // A store write that exceeded its bound may or may not have landed, and the store
+  // is slow or wedged, so an immediate retry likely meets the same wall: the label
+  // says the turn may not be stored and sends the user to check, not to retry.
+  it('says a timed-out save may not have stored the turn, without offering a plain retry', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].errorChatRunCommitTimeout;
+      expect(text, locale).toMatch(locale === 'de' ? /zu lange gedauert/ : /took too long/);
+      expect(text, locale).toMatch(
+        locale === 'de' ? /möglicherweise nicht gespeichert/ : /may not have been stored/,
+      );
+      expect(text, locale).not.toMatch(/bitte versuchen sie es erneut|please try again/i);
+    }
+  });
+
+  // Distinct from the generic commit-failed sentence the old code path used.
+  it('words both apart from the generic commit-failed label, in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const t = messages[locale];
+      expect(t.errorChatRunAudioTooLarge, locale).not.toBe(t.errorChatRunCommitFailed);
+      expect(t.errorChatRunCommitTimeout, locale).not.toBe(t.errorChatRunCommitFailed);
+      expect(t.errorChatRunAudioTooLarge, locale).not.toBe(t.errorChatRunCommitTimeout);
+    }
   });
 });
 

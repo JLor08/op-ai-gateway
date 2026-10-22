@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { downloadBinary, extensionFor } from './downloadBinary';
+import { dataUrlToBlob, downloadBinary, downloadBlob, extensionFor } from './downloadBinary';
 
 // Captured once, before any test can have spied on it. afterEach below
 // restores mocks, but capturing the native function at module scope (rather
@@ -485,5 +485,66 @@ describe('downloadBinary from a gateway url', () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(createObjectURL).not.toHaveBeenCalled();
+  });
+});
+
+describe('dataUrlToBlob', () => {
+  it('decodes the payload into a Blob of the URL own media type', () => {
+    const blob = dataUrlToBlob('data:audio/wav;base64,AAAA');
+
+    expect(blob?.type).toBe('audio/wav');
+    expect(blob?.size).toBe(3); // "AAAA" base64-decodes to 3 bytes
+  });
+
+  it.each(['not-a-data-url', 'data:audio/wav,AAAA', 'data:audio/wav;base64,not-valid-base64!!'])(
+    'is null, without throwing, for %j',
+    (url) => {
+      expect(dataUrlToBlob(url)).toBeNull();
+    },
+  );
+});
+
+describe('downloadBlob', () => {
+  it('saves a blob the caller holds, named by the extension of its own type', () => {
+    const names: string[] = [];
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+      const el = nativeCreateElement(tag, options as ElementCreationOptions);
+      if (tag === 'a') {
+        const anchor = el as HTMLAnchorElement;
+        anchor.click = () => names.push(anchor.download);
+      }
+      return el;
+    });
+    const createObjectURL = vi.fn(() => 'blob:stub');
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
+    const blob = new Blob([new Uint8Array([1, 2])], { type: 'audio/wav' });
+
+    downloadBlob((ext) => `clip.${ext}`, blob);
+
+    expect(names).toEqual(['clip.wav']);
+    expect(createObjectURL).toHaveBeenCalledWith(blob);
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:stub');
+  });
+
+  it('takes a plain string name as it is', () => {
+    const names: string[] = [];
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+      const el = nativeCreateElement(tag, options as ElementCreationOptions);
+      if (tag === 'a') {
+        const anchor = el as HTMLAnchorElement;
+        anchor.click = () => names.push(anchor.download);
+      }
+      return el;
+    });
+    vi.stubGlobal('URL', {
+      ...URL,
+      createObjectURL: vi.fn(() => 'blob:stub'),
+      revokeObjectURL: vi.fn(),
+    });
+
+    downloadBlob('whole.wav', new Blob([new Uint8Array([1])], { type: 'audio/wav' }));
+
+    expect(names).toEqual(['whole.wav']);
   });
 });

@@ -20,6 +20,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -974,5 +975,187 @@ func TestSpeechRunSurfacesTheEndpointsOwnRefusal(t *testing.T) {
 	}
 	if got := runError(t, run); got == "" || strings.Contains(got, "127.0.0.1") {
 		t.Fatalf("error = %q, want the gateway's own error code", got)
+	}
+}
+
+// --- the buffered turn: split and total cap (#279) ---------------------------
+//
+// The one-shot WAV a buffered speech run reads is cut into ordered parts exactly as a streamed
+// clip is (the stream's constants and caps are reused: a part is streamTestPartSize bytes of
+// PCM), and a clip past the total audio cap is the honest "audio too large" error.
+
+// bufferedTestTurn runs bufferedSpeechTurn over a 200 answer carrying body as contentType, on
+// a server with the given caps.
+func bufferedTestTurn(srv *Server, contentType string, body []byte) (parts json.RawMessage, status, msg string) {
+	run := newChatRun("run_buffered", "chat_buffered", "usr_buffered", func() {})
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {contentType}},
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+	return srv.bufferedSpeechTurn(context.Background(), run, resp)
+}
+
+// committedWAVs decodes the content array of a completed turn into the WAV of every part.
+func committedWAVs(t *testing.T, raw json.RawMessage) [][]byte {
+	t.Helper()
+	var parts []speechAudioPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		t.Fatalf("the committed content is not a parts array: %v: %.120s", err, raw)
+	}
+	return partWAVs(t, parts)
+}
+
+// A clip of 2.1 parts is committed as three ordered audio_url parts -- two full ones and the
+// remainder -- whose audio put end to end is the clip, sample for sample.
+func TestBufferedSplitsLongWAV(t *testing.T) {
+	pcm := speechPCM(streamTestPartSize*21/10, 3)
+
+	raw, status, msg := bufferedTestTurn(streamTestServer(streamTestAudioCap, streamTestBlobCap), "audio/wav", wavFromPCM16(pcm, partsTestRate))
+
+	if status != "completed" || msg != "" {
+		t.Fatalf("outcome = %q %q, want completed with no message", status, msg)
+	}
+	sizes, joined := dataSizes(t, committedWAVs(t, raw))
+	if want := []int{1000, 1000, 100}; !slices.Equal(sizes, want) {
+		t.Fatalf("part data sizes = %v, want %v", sizes, want)
+	}
+	if !bytes.Equal(joined, pcm) {
+		t.Fatal("the parts' data chunks put end to end are not the PCM the WAV carried")
+	}
+}
+
+// A clip past the total cap is the audio-too-large error and commits nothing. The cap is on
+// the decoded PCM, as the streamed path measures it, so a clip of exactly the cap -- whose WAV
+// is a header longer than the cap -- is still committed, and two more bytes are not.
+func TestBufferedOverCap(t *testing.T) {
+	srv := streamTestServer(streamTestAudioCap, streamTestBlobCap)
+
+	t.Run("over", func(t *testing.T) {
+		raw, status, msg := bufferedTestTurn(srv, "audio/wav", wavFromPCM16(speechPCM(streamTestAudioCap+2, 5), partsTestRate))
+		if status != "error" || msg != speechRunAudioTooLargeMessage {
+			t.Fatalf("outcome = %q %q, want error %q", status, msg, speechRunAudioTooLargeMessage)
+		}
+		if len(raw) != 0 {
+			t.Fatalf("an over-cap clip committed parts: %.120s", raw)
+		}
+	})
+
+	t.Run("exactly the cap", func(t *testing.T) {
+		pcm := speechPCM(streamTestAudioCap, 5)
+		raw, status, msg := bufferedTestTurn(srv, "audio/wav", wavFromPCM16(pcm, partsTestRate))
+		if status != "completed" || msg != "" {
+			t.Fatalf("outcome = %q %q, want completed: the cap counts PCM, not the WAV header", status, msg)
+		}
+		sizes, joined := dataSizes(t, committedWAVs(t, raw))
+		if want := []int{1000, 1000, 1000, 1000, 1000}; !slices.Equal(sizes, want) {
+			t.Fatalf("part data sizes = %v, want %v", sizes, want)
+		}
+		if !bytes.Equal(joined, pcm) {
+			t.Fatal("the parts' data chunks put end to end are not the PCM the WAV carried")
+		}
+	})
+}
+
+// A clip shorter than one part is one part, exactly the WAV the single-part turn has always
+// committed: chunking changes nothing for a short answer.
+func TestBufferedShortWAVOnePart(t *testing.T) {
+	wav := wavFromPCM16(speechPCM(600, 11), partsTestRate)
+
+	raw, status, msg := bufferedTestTurn(streamTestServer(streamTestAudioCap, streamTestBlobCap), "audio/wav", wav)
+
+	if status != "completed" || msg != "" {
+		t.Fatalf("outcome = %q %q, want completed", status, msg)
+	}
+	wavs := committedWAVs(t, raw)
+	if len(wavs) != 1 || !bytes.Equal(wavs[0], wav) {
+		t.Fatalf("committed %d parts, want the one WAV audio.cpp answered, byte for byte", len(wavs))
+	}
+}
+
+// A WAV that is not mono 16-bit PCM is not cut -- the cut is made on 16-bit mono samples and
+// would split any other format mid-frame -- and is committed as the one whole-WAV part it
+// always was, however long it is. So is a body that is not a WAV at all under an audio
+// content type: what the endpoint labelled audio is still committed as the endpoint sent it.
+func TestBufferedKeepsAnyOtherFormatWhole(t *testing.T) {
+	const rate = partsTestRate
+	longData := speechPCM(streamTestPartSize*3, 9) // over two parts of 16-bit mono
+	cases := map[string][]byte{
+		"stereo 16-bit": wavFile(t, wavFmtChunk(t, rate, 2, 16), wavChunk(t, "data", uint32(len(longData)), longData)),
+		"mono 8-bit":    wavFile(t, wavFmtChunk(t, rate, 1, 8), wavChunk(t, "data", uint32(len(longData)), longData)),
+		"mono float32":  wavFile(t, wavFmtChunkTagged(t, 3, 1, rate, 32), wavChunk(t, "data", uint32(len(longData)), longData)),
+		"not a WAV":     []byte("ID3 this is not a RIFF container"),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			raw, status, msg := bufferedTestTurn(streamTestServer(streamTestAudioCap, streamTestBlobCap), "audio/wav", body)
+			if status != "completed" || msg != "" {
+				t.Fatalf("outcome = %q %q, want completed", status, msg)
+			}
+			wavs := committedWAVs(t, raw)
+			if len(wavs) != 1 || !bytes.Equal(wavs[0], body) {
+				t.Fatalf("committed %d parts, want the one body as it came, byte for byte", len(wavs))
+			}
+		})
+	}
+}
+
+// A clip with no whole sample is the no-audio error, as for a stream, and never a header over
+// nothing -- the blank bubble a part without audio would be.
+func TestBufferedClipWithoutASampleIsNoAudio(t *testing.T) {
+	for name, wav := range map[string][]byte{
+		"a header and no data": wavFromPCM16(nil, partsTestRate),
+		"half a sample":        wavFile(t, wavFmtChunk(t, partsTestRate, 1, 16), wavChunk(t, "data", 1, []byte{0x7f})),
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, status, msg := bufferedTestTurn(streamTestServer(streamTestAudioCap, streamTestBlobCap), "audio/wav", wav)
+			if status != "error" || msg != speechRunNoAudioMessage {
+				t.Fatalf("outcome = %q %q, want error %q", status, msg, speechRunNoAudioMessage)
+			}
+			if len(raw) != 0 {
+				t.Fatalf("a clip without audio committed parts: %.120s", raw)
+			}
+		})
+	}
+}
+
+// A header that promises more audio than the body holds -- a truncated answer, or a size left
+// at the format's maximum by a writer that did not know the length -- is cut at the audio that
+// is there: the declared size is the header's word, and neither sizes an allocation nor
+// invents samples.
+func TestBufferedTrustsTheBodyOverTheDeclaredSize(t *testing.T) {
+	pcm := speechPCM(1500, 7)
+	for name, declared := range map[string]uint32{"truncated": 100_000, "maximum": 0xFFFFFFFF} {
+		t.Run(name, func(t *testing.T) {
+			wav := wavFile(t, wavFmtChunk(t, partsTestRate, 1, 16), wavChunk(t, "data", declared, pcm))
+
+			raw, status, msg := bufferedTestTurn(streamTestServer(streamTestAudioCap, streamTestBlobCap), "audio/wav", wav)
+
+			if status != "completed" || msg != "" {
+				t.Fatalf("outcome = %q %q, want completed", status, msg)
+			}
+			sizes, joined := dataSizes(t, committedWAVs(t, raw))
+			if want := []int{1000, 500}; !slices.Equal(sizes, want) {
+				t.Fatalf("part data sizes = %v, want %v", sizes, want)
+			}
+			if !bytes.Equal(joined, pcm) {
+				t.Fatal("the parts' data chunks put end to end are not the audio the body held")
+			}
+		})
+	}
+}
+
+// A Server not built by New has no caps of its own (0) and means the defaults, so a modest
+// clip is one part and not "over a cap of nothing".
+func TestBufferedBareServerUsesTheDefaultCaps(t *testing.T) {
+	wav := wavFromPCM16(speechPCM(600, 11), partsTestRate)
+
+	raw, status, msg := bufferedTestTurn(&Server{}, "audio/wav", wav)
+
+	if status != "completed" || msg != "" {
+		t.Fatalf("outcome = %q %q, want completed", status, msg)
+	}
+	if wavs := committedWAVs(t, raw); len(wavs) != 1 || !bytes.Equal(wavs[0], wav) {
+		t.Fatalf("committed %d parts, want the one WAV, byte for byte", len(wavs))
 	}
 }

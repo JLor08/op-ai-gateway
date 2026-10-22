@@ -25,8 +25,10 @@ import (
 // TTS composer). The speech run of ADR-063 (chat_runs_audio.go) asks the gateway's own
 // /v1/audio/speech for one complete WAV and commits it; this branch asks for a STREAM of
 // the same synthesis instead, so the composer can play the audio while it is still being
-// generated, and commits the same thing at the end -- the assembled WAV, as the same one
-// audio_url part, which chat_blobs stores as it always has. It is the speech twin of the
+// generated, and commits the same thing at the end -- the assembled audio, as WAV audio_url
+// parts, which chat_blobs stores as it always has: one part for a clip that fits the
+// per-blob cap and, for a longer one, several in order, each cut at speechPartBytes and a
+// whole file of its own (chat_runs_audio_parts.go). It is the speech twin of the
 // streaming transcription run (chat_runs_transcription.go) and reuses that run's plumbing:
 // the reservation, the first-delta deadline (armRunDeadline / liftDeadline), the TTFT
 // metric and the single terminal commit. It is not a second audio path: the request is the
@@ -36,9 +38,10 @@ import (
 // What differs from the transcription run is what a delta IS. A transcript delta is text
 // that fills the turn in, so it is published into the run's text buffer; a speech delta is
 // headerless PCM, which is no text and which a late subscriber could not use, so it goes to
-// the run's subscribers as an `audio` event and into a local buffer from which the WAV is
-// built, and never into the text buffer (and so never into a checkpoint -- a clip's prefix is
-// not a turn worth persisting; a stream that does not complete commits nothing, as below).
+// the run's subscribers as an `audio` event and into a local buffer from which the WAV
+// parts are built, and never into the text buffer (and so never into a checkpoint -- a
+// clip's prefix is not a turn worth persisting; a stream that does not complete commits
+// nothing, as below).
 
 // runAudio is one chunk of a streaming speech run's audio, the payload of an `audio` run
 // event: the PCM of one speech.audio.delta, exactly as the stream carried it (base64, 16-bit
@@ -309,10 +312,10 @@ type speechStreamEvent struct {
 // consumeTranscriptionStream's twin (see there for the shape of the reading): the first
 // delta is the moment the run has something to show, so the deadline is lifted and the TTFT
 // stamped, from the dispatch of the request (a cold start is in it); every delta's PCM is
-// relayed to the run's subscribers and kept for the WAV; and the stream is read on to its
-// end after speech.audio.done, because the gateway's relay bills the call on having
-// delivered the stream whole, and a client that hangs up at the done frame would make it a
-// client that disconnected.
+// relayed to the run's subscribers and cut into the WAV parts of the turn as it arrives; and
+// the stream is read on to its end after speech.audio.done, because the gateway's relay
+// bills the call on having delivered the stream whole, and a client that hangs up at the
+// done frame would make it a client that disconnected.
 //
 // The turn is committed only for a stream that ENDED the way a whole synthesis does: its
 // speech.audio.done and then [DONE] (the terminal frames the relay's own billing requires
@@ -321,8 +324,15 @@ type speechStreamEvent struct {
 // cut clip as the reply: an ended context is reported as itself (a deadline is not a cancel),
 // anything else is the unreadable-response error, and nothing is committed. An empty
 // synthesis is the no-audio error, not a blank bubble.
+//
+// A clip longer than the run's total audio cap (Server.maxChatAudioBytes) is the
+// audio-too-large error, and it is decided only here, once the stream is whole: the reader
+// stops KEEPING audio at the cap but not READING it, so the listener hears the whole clip
+// and the call is billed as delivered. The parts are cut at speechPartBytes of the per-blob
+// cap (Server.maxChatBlobBytes) so that each passes the chat store's per-blob check alone.
 func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func()) (json.RawMessage, string, string) {
-	pcm, complete, readErr := readSpeechEvents(run, resp.Body, sampleRate, dispatchedAt, liftDeadline)
+	audioCap, blobCap := s.chatAudioCaps()
+	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, sampleRate, dispatchedAt, liftDeadline, speechPartBytes(blobCap), audioCap)
 	if !complete {
 		// A deadline or a cancel lands here as a read error on the cancelled request, and
 		// reporting either as a broken stream -- or a deadline as a cancel -- would tell the
@@ -331,61 +341,87 @@ func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *ht
 			return nil, status, msg
 		}
 		// The frames are not logged: they are the audio.
-		log.Printf("chat run %s: the speech stream ended before its terminal events (read error: %t, %d PCM bytes)", run.ID, readErr != nil, len(pcm))
+		log.Printf("chat run %s: the speech stream ended before its terminal events (read error: %t, over the audio cap: %t)", run.ID, readErr != nil, overCap)
 		return nil, "error", speechRunResponseUnreadableMessage
 	}
-	if len(pcm) == 0 {
+	if overCap {
+		log.Printf("chat run %s: the speech stream is longer than the %d byte audio cap; nothing is committed", run.ID, audioCap)
+		return nil, "error", speechRunAudioTooLargeMessage
+	}
+	// No parts is no audio -- also for a stream whose only PCM was less than one sample --
+	// and is refused BEFORE the commit: an empty content array would be a blank bubble.
+	if len(parts) == 0 {
 		return nil, "error", speechRunNoAudioMessage
 	}
-	if len(pcm)%speechStreamBytesPerFrame != 0 {
-		log.Printf("chat run %s: the speech stream ended inside a sample (%d PCM bytes); the last byte is dropped", run.ID, len(pcm))
-	}
-	part, err := speechPartFrom(speechAudioMediaType, wavFromPCM16(pcm, sampleRate))
-	if err != nil {
-		log.Printf("chat run %s: the assembled speech stream is not usable audio: %v", run.ID, err)
-		return nil, "error", err.Error()
-	}
-	parts, err := json.Marshal([]speechAudioPart{part})
+	raw, err := json.Marshal(parts)
 	if err != nil {
 		log.Printf("chat run %s: marshal speech parts failed: %v", run.ID, err)
 		return nil, "error", speechRunDispatchFailedMessage
 	}
-	return parts, "completed", ""
+	return raw, "completed", ""
 }
 
 // readSpeechEvents reads a streamed synthesis' event stream to its end. Every
-// speech.audio.delta's PCM is decoded into the returned buffer and relayed, still as the
-// base64 the stream carried it in, to the run's subscribers (see runAudio); the first one
-// lifts the deadline and stamps the TTFT. It returns the PCM, whether the stream completed
-// (speech.audio.done, then [DONE], neither before the other) and the scanner's read error.
+// speech.audio.delta's PCM is relayed, still as the base64 the stream carried it in, to the
+// run's subscribers (see runAudio) and cut into WAV parts of partBytes of PCM (a part is
+// built the moment its PCM is complete, and its PCM released, so the clip is never held
+// whole -- only its finished parts are); the first delta lifts the deadline and stamps the
+// TTFT. It returns the parts, whether the clip went over maxAudioBytes of PCM, whether the
+// stream completed (speech.audio.done, then [DONE], neither before the other) and the
+// scanner's read error.
+//
+// Going over the cap stops the KEEPING of audio and nothing else: the parts held so far are
+// dropped (nothing is committed for such a clip), but every later line is still read and
+// every later delta still relayed, so the stream is drained to [DONE] and the relay bills it
+// as the delivered call it was. A partBytes that is not a whole number of samples is cut at
+// the sample below it, and one below a sample is a sample.
 //
 // A frame that is JSON in shape and cannot be read, and a delta whose audio is not base64,
-// each make the audio incomplete: the buffer would then hold less than the client was
+// each make the audio incomplete: the parts would then hold less than the client was
 // relayed, so the stream is NOT complete however it ends. The line bound is the relay's own
 // (speechStreamMaxLine): a line past it ends the read (bufio.ErrTooLong), which is the same
 // incomplete stream.
-func readSpeechEvents(run *ChatRun, body io.Reader, sampleRate int, dispatchedAt time.Time, liftDeadline func()) (pcm []byte, complete bool, readErr error) {
-	r := &speechEventReader{run: run, sampleRate: sampleRate, dispatchedAt: dispatchedAt, liftDeadline: liftDeadline}
+func readSpeechEvents(run *ChatRun, body io.Reader, sampleRate int, dispatchedAt time.Time, liftDeadline func(), partBytes int, maxAudioBytes int64) (parts []speechAudioPart, overCap, complete bool, readErr error) {
+	r := &speechEventReader{
+		run: run, sampleRate: sampleRate, dispatchedAt: dispatchedAt, liftDeadline: liftDeadline,
+		partBytes:     max(partBytes-partBytes%speechStreamBytesPerFrame, speechStreamBytesPerFrame),
+		maxAudioBytes: maxAudioBytes,
+	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), speechStreamMaxLine)
 	for scanner.Scan() {
 		r.consumeLine(scanner.Text())
 	}
-	return r.pcm, r.sawDone && r.sawEnd && !r.lost, scanner.Err()
+	r.flushTail()
+	return r.parts, r.overCap, r.complete(), scanner.Err()
 }
 
 // speechEventReader is what reading a streamed synthesis' event stream (readSpeechEvents)
-// accumulates, one line at a time: the decoded PCM, the next audio event's sequence
-// number, and the facts that decide whether the stream completed -- whether a delta has
-// been seen (the first lifts the deadline and stamps the TTFT), a speech.audio.done, a
-// [DONE] that came after it, and whether any frame or delta was lost to a read failure.
+// accumulates, one line at a time: the clip as the finished WAV parts so far plus the PCM of
+// the one being filled, how much PCM the clip has had in all and whether that went over the
+// cap, the next audio event's sequence number, and the facts that decide whether the stream
+// completed -- whether a delta has been seen (the first lifts the deadline and stamps the
+// TTFT), a speech.audio.done, a [DONE] that came after it, and whether any frame or delta
+// was lost to a read failure.
 type speechEventReader struct {
 	run          *ChatRun
 	sampleRate   int
 	dispatchedAt time.Time
 	liftDeadline func()
 
-	pcm                             []byte
+	// partBytes is the PCM one part holds, in whole samples (so a cut of it is one too);
+	// maxAudioBytes is the most PCM the clip may have in all.
+	partBytes     int
+	maxAudioBytes int64
+
+	// parts are the finished parts, in order, and segment the PCM of the next one, always
+	// under partBytes between deltas. total counts every byte of PCM seen until overCap,
+	// from which point nothing is counted or kept (parts and segment are nil).
+	parts   []speechAudioPart
+	segment []byte
+	total   int64
+	overCap bool
+
 	sawDelta, sawDone, sawEnd, lost bool
 	seq                             int
 }
@@ -421,8 +457,9 @@ func (r *speechEventReader) consumeLine(line string) {
 }
 
 // consumeDelta takes one speech.audio.delta's base64 audio: an empty one is skipped, one
-// that is not base64 is lost, and any other is decoded into the PCM buffer and relayed to
-// the run's subscribers as it came. The first lifts the deadline and stamps the TTFT.
+// that is not base64 is lost, and any other is relayed to the run's subscribers as it came
+// and kept (keep) for the WAV parts. The first lifts the deadline and stamps the TTFT. The
+// relay does not depend on the keeping: a clip past the cap is still played to its end.
 func (r *speechEventReader) consumeDelta(audio string) {
 	if audio == "" {
 		return
@@ -439,9 +476,69 @@ func (r *speechEventReader) consumeDelta(audio string) {
 		m.TTFTMs = time.Since(r.dispatchedAt).Milliseconds()
 		r.run.setMetrics(m)
 	}
-	r.pcm = append(r.pcm, chunk...)
 	r.run.publishAudio(runAudio{Seq: r.seq, Rate: r.sampleRate, Data: audio})
 	r.seq++
+	r.keep(chunk)
+}
+
+// keep adds one delta's PCM to the clip being cut into parts. Once the clip is over the
+// cap it keeps nothing, and the parts held so far -- of a clip that will not be committed --
+// are released at the moment it crosses. Otherwise it appends to the part being filled and
+// finishes every part that is now full, so no more than one part's PCM (and a delta) is
+// held beside the finished parts.
+func (r *speechEventReader) keep(chunk []byte) {
+	if r.overCap {
+		return
+	}
+	r.total += int64(len(chunk))
+	if r.total > r.maxAudioBytes {
+		r.overCap = true
+		r.parts, r.segment = nil, nil
+		return
+	}
+	r.segment = append(r.segment, chunk...)
+	for len(r.segment) >= r.partBytes {
+		r.finishPart(r.segment[:r.partBytes])
+		r.segment = r.segment[r.partBytes:]
+	}
+}
+
+// complete reports whether the stream ended the way a whole synthesis does: its
+// speech.audio.done and then [DONE], with no frame or delta lost to a read failure.
+func (r *speechEventReader) complete() bool {
+	return r.sawDone && r.sawEnd && !r.lost
+}
+
+// flushTail finishes the part of the PCM left when the stream ends, if there is a whole
+// sample in it: a clip that is an exact multiple of the part size has no empty last part,
+// and a stray half sample at the very end is dropped (wavFromPCM16 drops it from the part it
+// ends) and is never a part of its own, a header over no audio. A stream that is not
+// complete, or is over the cap, is not committed, so it builds no tail part and says nothing
+// of a half sample.
+func (r *speechEventReader) flushTail() {
+	if r.overCap || !r.complete() {
+		return
+	}
+	if r.total%speechStreamBytesPerFrame != 0 {
+		log.Printf("chat run %s: the speech stream ended inside a sample (%d PCM bytes); the last byte is dropped", r.run.ID, r.total)
+	}
+	if len(r.segment) >= speechStreamBytesPerFrame {
+		r.finishPart(r.segment)
+	}
+	r.segment = nil
+}
+
+// finishPart turns whole samples of PCM into the next part of the clip. A part that cannot
+// be built is audio the clip lacks, so it makes the stream incomplete (lost) like any other
+// frame that was lost; it cannot happen for a non-empty WAV of the one fixed media type.
+func (r *speechEventReader) finishPart(pcm []byte) {
+	part, err := speechPartFrom(speechAudioMediaType, wavFromPCM16(pcm, r.sampleRate))
+	if err != nil {
+		log.Printf("chat run %s: a part of the speech stream is not usable audio: %v", r.run.ID, err)
+		r.lost = true
+		return
+	}
+	r.parts = append(r.parts, part)
 }
 
 // wavHeaderLen is the size of the canonical 44-byte PCM WAV header: RIFF, `fmt ` (16 bytes

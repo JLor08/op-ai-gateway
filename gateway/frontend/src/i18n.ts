@@ -1751,6 +1751,13 @@ const de = {
     'Die Antwort der Bilderzeugung konnte nicht gelesen werden. Bitte versuchen Sie es erneut.',
   errorChatRunCommitFailed:
     'Die Antwort konnte nicht gespeichert werden. Bitte versuchen Sie es erneut.',
+  // Der Schreibzugriff auf den Speicher kam nicht rechtzeitig zurück (chatRunCommitTimeout,
+  // 30 s): Der Speicher ist langsam oder hängt, und der Beitrag kann gespeichert worden sein
+  // oder nicht. Deshalb steht hier weder „versuchen Sie es erneut“ (ein sofortiger zweiter
+  // Versuch trifft vermutlich dieselbe Wand) noch „wurde nicht gespeichert“ (das weiß der
+  // Lauf nicht), sondern der Hinweis, den tatsächlichen Stand nachzusehen.
+  errorChatRunCommitTimeout:
+    'Das Speichern hat zu lange gedauert – dieser Beitrag wurde möglicherweise nicht gespeichert. Laden Sie die Seite neu, um zu prüfen, was gespeichert wurde.',
   errorImagesPromptRequired:
     'Für die Bilderzeugung wird ein Text-Prompt benötigt. Bitte geben Sie eine Beschreibung ein.',
   errorImagesStreamUnsupported: 'Die Bilderzeugung unterstützt kein Streaming.',
@@ -1813,6 +1820,12 @@ const de = {
   // Steuerelement mit seiner Beschriftung (chatSpeechAdvanced).
   errorChatRunSpeechReservedField:
     'Die erweiterten Felder dieses Chats enthalten ein reserviertes Feld (model, input, stream, stream_format oder response_format). Die Anfrage wurde nicht gesendet. Entfernen Sie das Feld unter „Erweitert“, und versuchen Sie es erneut.',
+  // Das erzeugte Audio übersteigt die Gesamtgröße, die ein Beitrag speichern darf; nichts
+  // wurde gespeichert (ein abgeschnittenes Audio würde als vollständige Antwort gelten).
+  // Derselbe Text trifft beim nächsten Versuch dieselbe Grenze – deshalb steht hier, was
+  // zu ändern ist (ein kürzerer Text), und kein bloßes „versuchen Sie es erneut“.
+  errorChatRunAudioTooLarge:
+    'Diese Audio-Antwort ist zu lang zum Speichern – dieser Beitrag wurde nicht gespeichert. Verwenden Sie einen kürzeren Text.',
   errorSpeechInputRequired:
     'Für die Sprachsynthese wird ein Text benötigt. Bitte geben Sie den Text ein, der gesprochen werden soll.',
   errorSpeechResponseFormatUnsupported:
@@ -4878,6 +4891,12 @@ const en: PortalMessages = {
   errorChatRunImageResponseUnreadable:
     'The image generation response could not be read. Please try again.',
   errorChatRunCommitFailed: 'The response could not be saved. Please try again.',
+  // The store write did not return in time (chatRunCommitTimeout, 30 s): the store is
+  // slow or wedged and the turn may or may not have landed. So this says neither "please
+  // try again" (an immediate retry likely meets the same wall) nor "was not saved" (the
+  // run cannot know), but to check what actually was saved.
+  errorChatRunCommitTimeout:
+    'Saving took too long, so this turn may not have been stored. Reload the page to check what was saved.',
   errorImagesPromptRequired: 'Image generation needs a text prompt. Please enter a description.',
   errorImagesStreamUnsupported: 'Image generation does not support streaming.',
   errorImagesResponseFormatUnsupported: 'Unsupported response format for image generation.',
@@ -4930,6 +4949,11 @@ const en: PortalMessages = {
   // (chatSpeechAdvanced).
   errorChatRunSpeechReservedField:
     'The advanced fields of this chat contain a reserved field (model, input, stream, stream_format or response_format). The request was not sent. Remove the field under "Advanced" and try again.',
+  // The synthesized audio exceeds the total a turn may store; nothing was committed (a clip
+  // with its tail cut off would pass for the whole reply). The same text meets the same cap
+  // on a retry, so this says what to change (a shorter text), not a bare "please try again".
+  errorChatRunAudioTooLarge:
+    'This audio answer is too long to store, so this turn was not saved. Use a shorter text.',
   errorSpeechInputRequired:
     'Speech synthesis needs text to speak. Please enter the text to be spoken.',
   errorSpeechResponseFormatUnsupported:

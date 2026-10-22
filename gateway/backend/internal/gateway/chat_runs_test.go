@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -1232,6 +1233,42 @@ func TestFinishRunCommitFailureSurfacesChatTooLarge(t *testing.T) {
 	}
 }
 
+// TestCommitFailureCode pins the mapping from a failed CommitAssistant's error
+// to the run-terminal code. The two sentinels the user can act on keep their
+// own codes, a commit that outlived chatRunCommitTimeout is named as a timeout
+// rather than a generic "try again", and only an error nothing can name
+// degrades to the generic code. Wrapped errors must match as well: the store
+// and the portal both wrap what they return.
+func TestCommitFailureCode(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"chat too large", portal.ErrChatTooLarge, "portal.chat_too_large"},
+		{"chat too large, wrapped", fmt.Errorf("commit: %w", portal.ErrChatTooLarge), "portal.chat_too_large"},
+		{"blob too large", portal.ErrChatBlobTooLarge, "images.blob_too_large"},
+		{"blob too large, wrapped", fmt.Errorf("commit: %w", portal.ErrChatBlobTooLarge), "images.blob_too_large"},
+		{"commit deadline exceeded, wrapped", fmt.Errorf("save: %w", context.DeadlineExceeded), "gateway.chat_run_commit_timeout"},
+		{"commit deadline exceeded", context.DeadlineExceeded, chatRunCommitTimeoutMessage},
+		// The size sentinels are more specific than a deadline, so they win when both are
+		// in the chain: a reorder of the switch in commitFailureCode fails these two.
+		{"blob too large beats a wrapped deadline", errors.Join(portal.ErrChatBlobTooLarge, context.DeadlineExceeded), "images.blob_too_large"},
+		{"chat too large beats a wrapped deadline", errors.Join(portal.ErrChatTooLarge, context.DeadlineExceeded), "portal.chat_too_large"},
+		{"unnamed store failure", errors.New("boom"), chatRunCommitFailedMessage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commitFailureCode(tc.err); got != tc.want {
+				t.Fatalf("commitFailureCode(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+	if chatRunCommitTimeoutMessage == chatRunCommitFailedMessage {
+		t.Fatalf("the timeout code must be distinct from the generic commit-failure code %q", chatRunCommitFailedMessage)
+	}
+}
+
 // TestFinishRunCommitFailureDoesNotOverrideACanceledRunWhenTheChatIsGone is
 // the carve-out the primary fix needs: DELETE /chats/{id} cancels the active
 // run AND removes the chat row in the SAME request, so this run's own
@@ -1394,9 +1431,9 @@ func (s *wedgedChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat
 //
 // chatRunCommitTimeout makes that terminal instead of permanent. The
 // assertions below are the three things the wedge took away: the run reaches
-// a terminal status at all, it says WHY (the mapped commit-failure code, not
-// a silent success), and its chat slot is released so the chat is usable
-// again.
+// a terminal status at all, it says WHY (the commit-TIMEOUT code, not a silent
+// success and not the generic "the write failed"), and its chat slot is
+// released so the chat is usable again.
 func TestTerminalCommitThatHangsStillEndsTheRun(t *testing.T) {
 	restore := chatRunCommitTimeout
 	chatRunCommitTimeout = 50 * time.Millisecond
@@ -1424,8 +1461,8 @@ func TestTerminalCommitThatHangsStillEndsTheRun(t *testing.T) {
 	}
 	snap, _, unsub := run.subscribe()
 	defer unsub()
-	if snap.Err != chatRunCommitFailedMessage {
-		t.Fatalf("error = %q, want %q", snap.Err, chatRunCommitFailedMessage)
+	if snap.Err != chatRunCommitTimeoutMessage {
+		t.Fatalf("error = %q, want %q", snap.Err, chatRunCommitTimeoutMessage)
 	}
 	if n := chats.blocked.Load(); n != 1 {
 		t.Fatalf("blocked store writes = %d, want exactly 1 (the terminal commit)", n)

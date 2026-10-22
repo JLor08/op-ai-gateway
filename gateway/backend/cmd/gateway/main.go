@@ -1119,6 +1119,8 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		CaptureMaxBytes:                 b.CaptureMaxBytes,
 		MaxImageEditBodyBytes:           cfg.MaxImageEditBodyBytes,
 		MaxAudioTranscriptionBodyBytes:  cfg.MaxAudioTranscriptionBodyBytes,
+		MaxChatAudioBytes:               cfg.MaxChatAudioBytes,
+		MaxChatBlobBytes:                cfg.MaxChatBlobBytes,
 		CaptureEnabled:                  func() bool { return captureFlagsHook().Enabled },
 		CaptureOverride:                 func() bool { return captureFlagsHook().Override },
 		AppHealth:                       appHealth,

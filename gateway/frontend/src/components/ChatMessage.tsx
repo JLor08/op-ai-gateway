@@ -126,11 +126,11 @@ function ChatMessageComponent({
   const text = contentText(content);
   const images = imageUrlsOf(content);
   const audioUrls = audioUrlsOf(content);
-  // A speech turn's reply is exactly one WAV (see AudioTurn), so only the first audio
-  // part of an ASSISTANT turn is rendered; its presence is what tells a finished speech
-  // turn from a pending one. A USER turn's audio parts are a transcription turn's input
-  // clip and are all rendered (the user branch below).
-  const audioUrl: string | undefined = audioUrls[0];
+  // A speech turn's reply is one audio part when short and SEVERAL ordered parts when long;
+  // the ASSISTANT turn renders them all as ONE player (AudioTurn stitches them into one
+  // gapless clip), and the presence of any is what tells a finished speech turn from a
+  // pending one. A USER turn's audio parts are a transcription turn's input clips and are
+  // rendered one player per clip (the user branch below).
   const mask = contentMask(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
@@ -155,7 +155,7 @@ function ChatMessageComponent({
     // A speech run is the same shape of wait -- one buffered WAV at the end, no
     // incremental events -- so it gets the same state, worded for audio, under the same
     // `no audio yet` guard that keeps it from replacing an arriving reply.
-    if (streaming && kind === 'speech' && audioUrl === undefined) {
+    if (streaming && kind === 'speech' && audioUrls.length === 0) {
       return (
         <AudioPendingTurn
           t={t}
@@ -172,7 +172,7 @@ function ChatMessageComponent({
     // for a run that is not reasoning and emits nothing to count. `text.length === 0` is
     // the `no answer yet` guard that keeps it from replacing an arriving transcript (a
     // streaming model's first delta, a one-shot model's whole text), as images /
-    // audioUrl do for the kinds above.
+    // audio parts do for the kinds above.
     if (streaming && kind === 'transcription' && text.length === 0) {
       return <TranscriptionPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }
@@ -349,7 +349,7 @@ function ChatMessageComponent({
             onRefine={onRefine}
           />
         )}
-        {audioUrl !== undefined && <AudioTurn t={t} url={audioUrl} turnId={turnId ?? ''} />}
+        {audioUrls.length > 0 && <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
           {onRegenerate && (
             <Tooltip title={t.chatRegenerate}>
@@ -500,7 +500,7 @@ function ChatMessageComponent({
               fetch-once object URL (revoked on unmount) as a speech reply, and offered for
               download. */}
           {keyedUrls(audioUrls).map(({ key, url }) => (
-            <AudioTurn key={key} t={t} url={url} turnId={turnId ?? ''} variant="input" />
+            <AudioTurn key={key} t={t} urls={[url]} turnId={turnId ?? ''} variant="input" />
           ))}
           {/* No edit on a turn that carries audio: it is a transcription turn, whose clip is
               all the run reads -- editing its (empty) text would change nothing a run uses
