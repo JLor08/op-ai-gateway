@@ -8044,10 +8044,14 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
     holds a tightening the open transcript's audio actually exceeds (`audioAnswersBeyond`); a
     held value is neither saved nor sent, the control keeps showing what was asked for, and an
     inline notice (not a dialog, so the count stays editable) names how many answers would lose
-    their audio. **Confirm** calls the prune route (below), and only once the gateway has done it
-    commits the new setting (the autosave persists it) and shows the pruned answers as not
-    stored, in that order on purpose: a refused or failed prune leaves everything as it was with
-    the value still pending, and the setting is never saved for a prune that did not happen.
+    their audio. The hold is immediate but the notice, a live region a screen reader reads out,
+    appears only once the held value has stood unchanged for 500 ms, so the interim "1" on the
+    way to "10" is never announced as a permanent deletion; nothing is applied except by the
+    notice's own button either way. **Confirm** calls the prune route (below), and only once the
+    gateway has done it commits the new setting (the autosave persists it) and shows the pruned
+    answers as not stored, in that order on purpose: a refused or failed prune leaves everything
+    as it was with the value still pending, and the setting is never saved for a prune that did
+    not happen.
     **Decline** puts the control back and persists and deletes nothing. Raising N, choosing keep
     all or storing again needs no confirm and deletes nothing. The set that goes is computed
     **server-side** from the stored document by the very walk of (b) (`PruneChatAudio`), so the

@@ -1926,7 +1926,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // Tightening the retention of a chat that already holds more audio deletes that audio for
     // good, so the composer asks first (#281): the stricter value waits beside the control,
     // shown but neither saved nor sent, until it is applied (which deletes the excess) or
-    // discarded (which puts the control back and touches nothing).
+    // discarded (which puts the control back and touches nothing). The value is held at once;
+    // only the notice that asks about it waits for the value to stand still (500 ms), so an
+    // interim digit on the way to a larger count is never announced as a deletion.
     describe('the confirm of a retention that deletes stored audio', () => {
       const open: SpeechStreamingGate = { streaming: true, sampleRate: 44100 };
       const wav = { type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } };
@@ -1946,6 +1948,29 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const applyButton = () => screen.getByRole('button', { name: t.chatAudioPruneConfirm });
       const discardButton = () => screen.getByRole('button', { name: t.chatAudioPruneDiscard });
       const notice = () => screen.queryByRole('alert');
+      // The notice shows once the held value has stood still for its settle time.
+      const noticeAfterSettle = () => screen.findByRole('alert', {}, { timeout: 3000 });
+      // Waits out the settle time, for the tests that assert the notice does NOT come.
+      const outwaitSettle = () =>
+        act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 800));
+        });
+      // Records the text of every alert that is inserted from now on, which is what a screen
+      // reader would read out, so "never shown" holds for a notice that came and went too.
+      function recordAnnouncements(): { texts: string[]; stop: () => void } {
+        const texts: string[] = [];
+        const observer = new MutationObserver((records) => {
+          for (const added of records.flatMap((r) => [...r.addedNodes])) {
+            if (!(added instanceof HTMLElement)) continue;
+            const alerts = added.matches('[role="alert"]')
+              ? [added]
+              : [...added.querySelectorAll('[role="alert"]')];
+            texts.push(...alerts.map((a) => a.textContent ?? ''));
+          }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        return { texts, stop: () => observer.disconnect() };
+      }
 
       // A saved speech thread of three spoken answers, opened with its settings panel.
       async function renderThread(audio: Record<string, unknown> = {}) {
@@ -1972,8 +1997,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         fireEvent.click(keepLastRadio());
         typeCount('2');
+        // The value is held at once, in its field, though the question is not asked yet.
+        expect(countField()).toHaveValue(2);
+        expect(notice()).not.toBeInTheDocument();
 
-        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(2, 1));
+        expect(await noticeAfterSettle()).toHaveTextContent(t.chatAudioPrunePending(2, 1));
         expect(applyButton()).toBeEnabled();
         expect(discardButton()).toBeEnabled();
         // What was asked for stays in its field, so a count can be typed on.
@@ -1989,6 +2017,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await renderThread();
         fireEvent.click(keepLastRadio());
         typeCount('2');
+        await noticeAfterSettle();
+        // The held value waited for this click: nothing has been deleted before it.
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
 
         fireEvent.click(applyButton());
 
@@ -2012,7 +2043,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(countField()).toHaveValue(3);
 
         typeCount('1');
-        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(1, 2));
+        expect(await noticeAfterSettle()).toHaveTextContent(t.chatAudioPrunePending(1, 2));
         fireEvent.click(discardButton());
 
         expect(notice()).not.toBeInTheDocument();
@@ -2029,7 +2060,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         fireEvent.click(keepBox());
 
         expect(keepBox()).not.toBeChecked();
-        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(0, 3));
+        expect(await noticeAfterSettle()).toHaveTextContent(t.chatAudioPrunePending(0, 3));
         expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
 
         fireEvent.click(applyButton());
@@ -2043,6 +2074,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       it('switches the box back on when "do not store" is discarded', async () => {
         await renderThread();
         fireEvent.click(keepBox());
+        await noticeAfterSettle();
 
         fireEvent.click(discardButton());
 
@@ -2055,10 +2087,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await renderThread({ keep_last_audio: 2 });
 
         typeCount('5');
+        await outwaitSettle();
 
         expect(notice()).not.toBeInTheDocument();
         expect(countField()).toHaveValue(5);
         typeCount('3');
+        await outwaitSettle();
         expect(notice()).not.toBeInTheDocument(); // three answers, a count of three
         expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
       });
@@ -2069,21 +2103,50 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         for (const text of ['abc', '1.5', '0', '']) {
           typeCount(text);
+          await outwaitSettle();
           expect(notice(), JSON.stringify(text)).not.toBeInTheDocument();
         }
         expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
       });
 
-      it('lets a count be typed through a stricter first digit without asking about the last', async () => {
+      it('never raises the notice for a stricter first digit that is made looser at once', async () => {
+        await renderThread();
+        fireEvent.click(keepLastRadio());
+        const announced = recordAnnouncements();
+
+        typeCount('1');
+        // Held at once: the field shows it, but the question is not asked for a passing digit.
+        expect(countField()).toHaveValue(1);
+        expect(notice()).not.toBeInTheDocument();
+        typeCount('10');
+        await outwaitSettle();
+        announced.stop();
+
+        expect(announced.texts).toEqual([]);
+        expect(notice()).not.toBeInTheDocument();
+        expect(countField()).toHaveValue(10);
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        // The looser 10 is an ordinary edit and is saved; the passing 1 never was.
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+        for (const call of chatApi.spies.saveChat.mock.calls) {
+          const saved = call[1] as { content: { settings: { audio: unknown } } };
+          expect(saved.content.settings.audio).toEqual({ keep_last_audio: 10 });
+        }
+      });
+
+      it('asks again, after the wait, when a count that went looser comes back stricter', async () => {
         await renderThread();
         fireEvent.click(keepLastRadio());
 
         typeCount('1');
-        expect(notice()).toHaveTextContent(t.chatAudioPrunePending(1, 2));
+        expect(await noticeAfterSettle()).toHaveTextContent(t.chatAudioPrunePending(1, 2));
         typeCount('10');
-
         expect(notice()).not.toBeInTheDocument();
-        expect(countField()).toHaveValue(10);
+        typeCount('1');
+        // The same value as before, but it went away and has to stand still again.
+        expect(notice()).not.toBeInTheDocument();
+
+        expect(await noticeAfterSettle()).toHaveTextContent(t.chatAudioPrunePending(1, 2));
         expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
       });
     });

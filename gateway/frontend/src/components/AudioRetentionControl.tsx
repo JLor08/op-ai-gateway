@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Alert,
   Box,
@@ -22,6 +22,25 @@ import {
 
 // The retention half of the speech thread's audio settings, which is all this control edits.
 export type AudioRetention = Pick<AudioSettings, 'keepAudio' | 'keepLast'>;
+
+// How long a held retention has to stand unchanged before its notice appears.
+const RETENTION_NOTICE_SETTLE_MS = 500;
+
+// True once `key` (null: nothing held) has been the same for `delayMs`. Any change of the key,
+// back to null included, starts the wait over, and a value that comes back after having gone
+// is a new one that waits again.
+function useSettled(key: string | null, delayMs: number): boolean {
+  const [settledKey, setSettledKey] = useState<string | null>(null);
+  useEffect(() => {
+    if (key === null) return;
+    const timer = setTimeout(() => setSettledKey(key), delayMs);
+    return () => {
+      clearTimeout(timer);
+      setSettledKey(null);
+    };
+  }, [key, delayMs]);
+  return key !== null && settledKey === key;
+}
 
 // The speech settings' answer-audio retention (#281): "keep audio answers" (on by default)
 // over a keep-all / keep-last-N choice. N is a blank-able text like the other numeric knobs
@@ -45,6 +64,14 @@ export type AudioRetention = Pick<AudioSettings, 'keepAudio' | 'keepLast'>;
 // audio and offers to apply it (`onApply`, which deletes them) or discard it (`onDiscard`,
 // which puts the control back and touches nothing). The notice is inline, not a dialog, so the
 // count can be edited on with the field still in reach.
+//
+// The notice is a live region (`role="alert"`), so a screen reader reads it out the moment it
+// appears, and "permanently deleted" is not a thing to announce for an interim keystroke: the
+// "1" on the way to "10" holds a stricter value for an instant. So only the NOTICE waits, for
+// the held value to stand unchanged for RETENTION_NOTICE_SETTLE_MS; the HOLD does not. The
+// store has held the value, shown it in its field and kept it from being saved or sent from
+// the very first keystroke, and nothing is applied except by the notice's own button, so the
+// wait changes when the question is asked and never what happens without an answer.
 //
 // Key it by the chat: the local choice belongs to one thread's text.
 export function AudioRetentionControl({
@@ -72,6 +99,10 @@ export function AudioRetentionControl({
   const lastChosen = pickedLast || keepLast !== '';
   const countInvalid = isKeepLastInvalid(keepLast);
   const withheld = keepAudio && !speechStreaming;
+  const noticeSettled = useSettled(
+    pending ? `${pending.keepLast}:${pending.excess}` : null,
+    RETENTION_NOTICE_SETTLE_MS,
+  );
 
   return (
     <Box sx={{ display: 'grid', gap: 0.5, justifyItems: 'start' }}>
@@ -138,7 +169,7 @@ export function AudioRetentionControl({
           )}
         </Box>
       )}
-      {pending && (
+      {pending && noticeSettled && (
         <Alert
           severity="warning"
           sx={{ justifySelf: 'stretch' }}

@@ -3320,7 +3320,9 @@ the sealed chat document and the removal is a document rewrite plus a delete on 
   as intended.
 - **Retroactive prune with a confirm.** Lowering N, or turning storing off, on a chat that already
   holds more is an irreversible bulk delete, so the stricter value is **held, not saved**, until
-  the user confirms in an inline notice that names how many answers lose their audio; confirm
+  the user confirms in an inline notice that names how many answers lose their audio (the notice
+  appears once the held value has stood unchanged for 500 ms, so an interim digit toward a larger
+  count is not announced as a deletion; the hold itself is immediate); confirm
   calls `POST /api/portal/chats/{id}/audio/prune` with `{"keep_last": N}` (the client states only
   the count, the gateway computes the set) and only then commits the setting, decline reverts and
   deletes nothing, and raising N or keeping all needs no confirm. The client then rewrites its
