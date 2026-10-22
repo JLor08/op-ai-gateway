@@ -1251,6 +1251,10 @@ func TestCommitFailureCode(t *testing.T) {
 		{"blob too large, wrapped", fmt.Errorf("commit: %w", portal.ErrChatBlobTooLarge), "images.blob_too_large"},
 		{"commit deadline exceeded, wrapped", fmt.Errorf("save: %w", context.DeadlineExceeded), "gateway.chat_run_commit_timeout"},
 		{"commit deadline exceeded", context.DeadlineExceeded, chatRunCommitTimeoutMessage},
+		// The size sentinels are more specific than a deadline, so they win when both are
+		// in the chain: a reorder of the switch in commitFailureCode fails these two.
+		{"blob too large beats a wrapped deadline", errors.Join(portal.ErrChatBlobTooLarge, context.DeadlineExceeded), "images.blob_too_large"},
+		{"chat too large beats a wrapped deadline", errors.Join(portal.ErrChatTooLarge, context.DeadlineExceeded), "portal.chat_too_large"},
 		{"unnamed store failure", errors.New("boom"), chatRunCommitFailedMessage},
 	}
 	for _, tc := range cases {

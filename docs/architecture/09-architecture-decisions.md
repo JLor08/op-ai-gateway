@@ -7707,8 +7707,9 @@ retry of the same text and voice produces the same over-long clip and fails the 
   replacement would let one runaway synthesis grow without limit and fail as a crash or a
   commit timeout, not an honest message.
 
-**Decision — six choices, taken together. Nothing about a clip that fits one blob changes: it
-is still exactly one part, byte for byte.**
+**Decision — six choices, taken together. Nothing about a clip at or under the per-part target
+(choice (b)) changes: it is still exactly one part, with the same audio. A longer clip is split
+into several parts, each at most the per-part target and therefore under the per-blob cap.**
 
 - **(a) A long answer is N ordered `audio_url` parts, each a standalone 16-bit mono WAV and
   each its own `chat_blobs` row, committed in one atomic `SaveChatWithBlobs`. Order is
@@ -7720,7 +7721,10 @@ is still exactly one part, byte for byte.**
   header, in whole samples, and the parts' audio put end to end is the clip. A trailing half
   sample is dropped and is never a part of its own. A WAV that is not mono 16-bit PCM, or a
   body that is no WAV at all, is committed whole as the single part it always was (the cut is
-  made on 16-bit samples and would split any other format mid-frame). **There is no schema
+  made on 16-bit samples and would split any other format mid-frame). The buffered path
+  re-wraps a conforming clip, even a single-part one, to a canonical 44-byte header via
+  `wavFromPCM16`, so non-canonical upstream header fields and trailing metadata (a `LIST` chunk,
+  say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
   Model](reference/data-model.md#4-migration-history-95-migrations)) and the store layer is
@@ -7784,8 +7788,8 @@ is still exactly one part, byte for byte.**
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part in the
 store. **No migration, no ServerAgent version bump and no new billing unit**: the relay, the
-metering, the loopback request and every error row are as they were, and a clip that fits one
-blob is one part exactly as before. The cost and the residuals are named ([Risks
+metering, the loopback request and every error row are as they were, and a clip at or under
+the per-part target is one part exactly as before. The cost and the residuals are named ([Risks
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
 
 - **The whole clip is materialized once, at the commit.** The atomic single commit is kept on

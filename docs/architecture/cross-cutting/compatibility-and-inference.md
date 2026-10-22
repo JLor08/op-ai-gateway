@@ -3242,7 +3242,7 @@ a streaming branch, the transcription run's shape (below) on the output side: it
 with `stream_format=sse` (and no `response_format`) to the gateway's own `/v1/audio/speech` over
 the same loopback, so the relay and its metering are the public endpoint's (§3.6 items 3 and 6),
 reads the SSE (`consumeSpeechStream`), and commits **the same `audio_url` parts** the
-buffered run commits (one for a clip that fits one blob, several ordered ones for a longer
+buffered run commits (one for a clip at or under the per-part target, several ordered ones for a longer
 clip, [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)), WAVs assembled from the PCM as it arrives (the canonical 44-byte
 header written with the cached rate over each part's slice) that `chat_blobs` stores as ever. It reuses the run's reservation, first-delta
 deadline (armed by the executor itself and **lifted at the first chunk of audio**, after which

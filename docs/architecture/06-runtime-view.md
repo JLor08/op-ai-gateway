@@ -230,7 +230,7 @@ schedules gaplessly on one shared `AudioContext`, and is buffered nowhere on the
 executor keeps the PCM, cutting it into WAV parts as it arrives (each a canonical WAV header at
 the cached rate over at most one part-target of PCM, `min(8 MiB, blob cap / 2)`), and on a stream
 that ended with `speech.audio.done` and `[DONE]` commits the **same `audio_url` parts** as the
-buffered turn (one part for a clip that fits one blob), so the rest of the diagram (the blob,
+buffered turn (one part unless the clip is over the per-part target), so the rest of the diagram (the blob,
 the SSE `done`, `AudioTurn`) is unchanged; a cut stream commits nothing. Live playback is abandoned for the run at the first
 gap in the sequence, which is harmless because the committed WAV is complete.
 
