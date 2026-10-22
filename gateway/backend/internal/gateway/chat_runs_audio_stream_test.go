@@ -16,6 +16,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -633,5 +634,374 @@ func TestPortalModelSpeechStreamingAnswersTheGate(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("no credentials: %d, want 401", rec.Code)
+	}
+}
+
+// --- multi-part commit and the total cap (#279) ------------------------------
+//
+// A streamed clip is committed as ordered WAV parts, each cut at speechPartBytes of the
+// per-blob cap, and a clip past the total-audio cap is the honest "audio too large" error.
+// The reader builds the parts as the PCM arrives (it never holds the whole clip), but it
+// drains the stream to [DONE] either way: the relay bills a streamed call on delivery whole.
+
+const (
+	// streamTestBlobCap makes speechPartBytes 1000: a part of 1000 PCM bytes is the unit
+	// the tests count in, so "2.3 parts" is 2300 bytes.
+	streamTestBlobCap  = 2000
+	streamTestPartSize = 1000
+	streamTestAudioCap = 5000
+)
+
+// streamTestServer is the Server consumeSpeechStream reads its two caps from. A bare
+// &Server{} leaves them 0 (only New defaults them), so a test sets them itself.
+func streamTestServer(audioCap, blobCap int) *Server {
+	return &Server{maxChatAudioBytes: audioCap, maxChatBlobBytes: blobCap}
+}
+
+// drainTrackingReader records whether its source was read to the end, which is what
+// "the stream was drained" means to the relay's billing.
+type drainTrackingReader struct {
+	src io.Reader
+	eof bool
+}
+
+func (d *drainTrackingReader) Read(p []byte) (int, error) {
+	n, err := d.src.Read(p)
+	if err == io.EOF {
+		d.eof = true
+	}
+	return n, err
+}
+
+// speechStreamOf is an event stream: one speech.audio.delta per chunk, then the tail frames.
+func speechStreamOf(chunks [][]byte, tail ...string) string {
+	var sb strings.Builder
+	for _, chunk := range chunks {
+		sb.WriteString(speechFrameDelta(chunk))
+	}
+	for _, frame := range tail {
+		sb.WriteString(frame)
+	}
+	return sb.String()
+}
+
+// cutPCM cuts pcm into consecutive chunks of the given sizes, the rest going into a last
+// chunk when the sizes do not cover it. A chunk may split a sample, as a delta can.
+func cutPCM(pcm []byte, sizes ...int) [][]byte {
+	var chunks [][]byte
+	for _, n := range sizes {
+		chunks, pcm = append(chunks, pcm[:n]), pcm[n:]
+	}
+	if len(pcm) > 0 {
+		chunks = append(chunks, pcm)
+	}
+	return chunks
+}
+
+// streamRead is what readSpeechEvents made of one stream, with what a test needs to say
+// about the reading itself: the audio relayed to the run's subscribers, how often the
+// deadline was lifted, and whether the body was read to its end.
+type streamRead struct {
+	parts    []speechAudioPart
+	overCap  bool
+	complete bool
+	err      error
+	relayed  []runAudio
+	lifted   int
+	drained  bool
+}
+
+func readTestSpeechStream(body string, partBytes int, maxAudioBytes int64) streamRead {
+	run := newChatRun("run_stream", "chat_stream", "usr_stream", func() {})
+	_, events, unsub := run.subscribe()
+	defer unsub()
+	src := &drainTrackingReader{src: strings.NewReader(body)}
+	var got streamRead
+	got.parts, got.overCap, got.complete, got.err = readSpeechEvents(run, src, partsTestRate, time.Now(), func() { got.lifted++ }, partBytes, maxAudioBytes)
+	got.drained = src.eof
+	for len(events) > 0 {
+		if ev := <-events; ev.Event == "audio" && ev.Audio != nil {
+			got.relayed = append(got.relayed, *ev.Audio)
+		}
+	}
+	return got
+}
+
+// partWAVs decodes the data: URL of every part into its WAV.
+func partWAVs(t *testing.T, parts []speechAudioPart) [][]byte {
+	t.Helper()
+	wavs := make([][]byte, 0, len(parts))
+	for i, part := range parts {
+		if part.Type != speechAudioPartType {
+			t.Fatalf("part %d has type %q, want %q", i, part.Type, speechAudioPartType)
+		}
+		payload, ok := strings.CutPrefix(part.AudioURL.URL, "data:audio/wav;base64,")
+		if !ok {
+			t.Fatalf("part %d: url %.60q is not a data:audio/wav;base64 url", i, part.AudioURL.URL)
+		}
+		wav, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			t.Fatalf("part %d: payload is not standard padded base64: %v", i, err)
+		}
+		wavs = append(wavs, wav)
+	}
+	return wavs
+}
+
+// consumeTestSpeechStream runs consumeSpeechStream over body on a server with the given caps.
+func consumeTestSpeechStream(srv *Server, body io.Reader) (parts json.RawMessage, status, msg string, lifted int) {
+	run := newChatRun("run_consume", "chat_consume", "usr_consume", func() {})
+	resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(body)}
+	parts, status, msg = srv.consumeSpeechStream(context.Background(), run, resp, partsTestRate, time.Now(), func() { lifted++ })
+	return parts, status, msg, lifted
+}
+
+// A clip of 2.3 parts is committed as three ordered audio_url parts -- two full ones and the
+// remainder -- whose audio put end to end is the clip, however the deltas cut it (one of
+// them splits a sample).
+func TestStreamCommitsMultipleParts(t *testing.T) {
+	pcm := speechPCM(streamTestPartSize*23/10, 3)
+	body := speechStreamOf(cutPCM(pcm, 701, 699, 800), speechSSEDone, speechSSEEnd)
+
+	raw, status, msg, lifted := consumeTestSpeechStream(streamTestServer(streamTestAudioCap, streamTestBlobCap), strings.NewReader(body))
+
+	if status != "completed" || msg != "" {
+		t.Fatalf("outcome = %q %q, want completed with no message", status, msg)
+	}
+	var parts []speechAudioPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		t.Fatalf("the committed content is not a parts array: %v: %.120s", err, raw)
+	}
+	sizes, joined := dataSizes(t, partWAVs(t, parts))
+	if want := []int{1000, 1000, 300}; !slices.Equal(sizes, want) {
+		t.Fatalf("part data sizes = %v, want %v", sizes, want)
+	}
+	if !bytes.Equal(joined, pcm) {
+		t.Fatal("the parts' data chunks put end to end are not the PCM the stream carried")
+	}
+	if lifted != 1 {
+		t.Fatalf("the deadline was lifted %d times, want once (at the first delta)", lifted)
+	}
+}
+
+// Over the total cap is an error the user can tell from a failure worth retrying, and it is
+// reached only AFTER the stream has been read to its end: the relay bills a streamed call on
+// delivery whole, and a read abandoned at the cap would make it a disconnect, billed zero.
+// The reader says so itself -- it reached [DONE] (complete) and the body's EOF -- and the
+// deadline was lifted once, as for any stream.
+func TestStreamOverCapIsHonestAndDrained(t *testing.T) {
+	pcm := speechPCM(streamTestAudioCap+1000, 5) // 6000 bytes against a cap of 5000
+	body := speechStreamOf(cutPCM(pcm, 2000, 2000, 1000), speechSSEDone, speechSSEEnd)
+
+	t.Run("the reader", func(t *testing.T) {
+		got := readTestSpeechStream(body, streamTestPartSize, streamTestAudioCap)
+		if !got.overCap {
+			t.Fatal("a clip over the cap was not flagged")
+		}
+		if !got.complete || !got.drained {
+			t.Fatalf("complete = %v, drained = %v: the reader stopped before the stream's terminal frames", got.complete, got.drained)
+		}
+		if len(got.parts) != 0 {
+			t.Fatalf("an over-cap clip left %d parts held; nothing is committed, so none should be kept", len(got.parts))
+		}
+		if got.lifted != 1 {
+			t.Fatalf("the deadline was lifted %d times, want once", got.lifted)
+		}
+	})
+
+	t.Run("the outcome", func(t *testing.T) {
+		src := &drainTrackingReader{src: strings.NewReader(body)}
+		raw, status, msg, lifted := consumeTestSpeechStream(streamTestServer(streamTestAudioCap, streamTestBlobCap), src)
+		if status != "error" || msg != speechRunAudioTooLargeMessage {
+			t.Fatalf("outcome = %q %q, want error %q", status, msg, speechRunAudioTooLargeMessage)
+		}
+		if len(raw) != 0 {
+			t.Fatalf("an over-cap clip committed parts: %.120s", raw)
+		}
+		if !src.eof {
+			t.Fatal("the stream was not read to its end")
+		}
+		if lifted != 1 {
+			t.Fatalf("the deadline was lifted %d times, want once", lifted)
+		}
+	})
+}
+
+// Past the cap the listener still hears the clip: every delta, the ones after the cap too,
+// is relayed as it arrived, in an unbroken sequence. Only the SAVING stops.
+func TestStreamOverCapKeepsRelayingLiveAudio(t *testing.T) {
+	pcm := speechPCM(4000, 7)
+	chunks := cutPCM(pcm, 1000, 1000, 1000, 1000)
+	body := speechStreamOf(chunks, speechSSEDone, speechSSEEnd)
+
+	got := readTestSpeechStream(body, streamTestPartSize, 1500) // crossed by the second delta
+
+	if !got.overCap || !got.complete {
+		t.Fatalf("overCap = %v, complete = %v, want both", got.overCap, got.complete)
+	}
+	if len(got.relayed) != len(chunks) {
+		t.Fatalf("relayed %d audio events, want %d (one per delta, past the cap too)", len(got.relayed), len(chunks))
+	}
+	for i, ev := range got.relayed {
+		if ev.Seq != i || ev.Rate != partsTestRate || ev.Data != base64.StdEncoding.EncodeToString(chunks[i]) {
+			t.Fatalf("relayed event %d = seq %d rate %d, want seq %d rate %d carrying delta %d as it came", i, ev.Seq, ev.Rate, i, partsTestRate, i)
+		}
+	}
+}
+
+// A clip shorter than one part is one part, exactly the WAV the single-part turn has always
+// committed: chunking changes nothing for a short answer.
+func TestStreamShortClipOnePart(t *testing.T) {
+	pcm := speechPCM(600, 11)
+	body := speechStreamOf(cutPCM(pcm, 250, 250), speechSSEDone, speechSSEEnd)
+
+	raw, status, msg, _ := consumeTestSpeechStream(streamTestServer(streamTestAudioCap, streamTestBlobCap), strings.NewReader(body))
+
+	if status != "completed" || msg != "" {
+		t.Fatalf("outcome = %q %q, want completed", status, msg)
+	}
+	var parts []speechAudioPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		t.Fatalf("the committed content is not a parts array: %v", err)
+	}
+	wavs := partWAVs(t, parts)
+	if len(wavs) != 1 {
+		t.Fatalf("a short clip is %d parts, want 1", len(wavs))
+	}
+	if !bytes.Equal(wavs[0], wavFromPCM16(pcm, partsTestRate)) {
+		t.Fatal("the one part is not wavFromPCM16's WAV of the clip")
+	}
+}
+
+// Where the cuts fall: a clip that is an exact multiple of the part size has no empty
+// trailing part; a stray half sample at the end is dropped and is never a part of its own
+// (a header over no audio); and a clip exactly at the total cap is still stored -- the cap
+// is crossed by one byte more, not met.
+func TestStreamPartBoundariesAndCapEdge(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pcmLen    int
+		maxAudio  int64
+		wantSizes []int
+		overCap   bool
+	}{
+		{"an exact multiple has no empty tail", 2000, streamTestAudioCap, []int{1000, 1000}, false},
+		{"a stray byte after full parts is dropped", 2001, streamTestAudioCap, []int{1000, 1000}, false},
+		{"a stray byte ends the last part's data", 1501, streamTestAudioCap, []int{1000, 500}, false},
+		{"exactly at the cap is stored", 2000, 2000, []int{1000, 1000}, false},
+		{"one sample over the cap is not", 2002, 2000, nil, true},
+		{"one byte over the cap is not", 2001, 2000, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pcm := speechPCM(tc.pcmLen, 13)
+			body := speechStreamOf(cutPCM(pcm, 333, 700), speechSSEDone, speechSSEEnd)
+
+			got := readTestSpeechStream(body, streamTestPartSize, tc.maxAudio)
+
+			if got.overCap != tc.overCap || !got.complete {
+				t.Fatalf("overCap = %v, complete = %v, want %v and true", got.overCap, got.complete, tc.overCap)
+			}
+			if tc.overCap {
+				return
+			}
+			sizes, joined := dataSizes(t, partWAVs(t, got.parts))
+			if !slices.Equal(sizes, tc.wantSizes) {
+				t.Fatalf("part data sizes = %v, want %v", sizes, tc.wantSizes)
+			}
+			if !bytes.Equal(joined, pcm[:len(pcm)&^1]) {
+				t.Fatal("the parts' data chunks put end to end are not the PCM minus its stray byte")
+			}
+		})
+	}
+}
+
+// What is not audio stays an error: a stream with no delta is the no-audio error, and so is
+// one that carried less than a sample (a half sample is dropped, and a WAV over nothing
+// would be stored and played as silence).
+func TestStreamWithoutWholeSamplesIsNoAudio(t *testing.T) {
+	for name, body := range map[string]string{
+		"no deltas":         speechSSEDone + speechSSEEnd,
+		"half a sample":     speechStreamOf([][]byte{{0x7f}}, speechSSEDone, speechSSEEnd),
+		"empty delta audio": "data: {\"type\":\"speech.audio.delta\",\"audio\":\"\"}\n\n" + speechSSEDone + speechSSEEnd,
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, status, msg, _ := consumeTestSpeechStream(streamTestServer(streamTestAudioCap, streamTestBlobCap), strings.NewReader(body))
+			if status != "error" || msg != speechRunNoAudioMessage || len(raw) != 0 {
+				t.Fatalf("outcome = %q %q %.60s, want error %q and no parts", status, msg, raw, speechRunNoAudioMessage)
+			}
+		})
+	}
+}
+
+// A stream cut before its terminal frames is the unreadable-response error even when what
+// arrived is already over the cap: the cap's verdict is about a whole clip, and this is a
+// prefix of one.
+func TestStreamCutBeforeItsEndIsUnreadableEvenWhenOverCap(t *testing.T) {
+	body := speechStreamOf(cutPCM(speechPCM(4000, 17), 2000, 2000)) // no terminal frames
+
+	raw, status, msg, _ := consumeTestSpeechStream(streamTestServer(1000, streamTestBlobCap), strings.NewReader(body))
+
+	if status != "error" || msg != speechRunResponseUnreadableMessage || len(raw) != 0 {
+		t.Fatalf("outcome = %q %q %.60s, want error %q and no parts", status, msg, raw, speechRunResponseUnreadableMessage)
+	}
+}
+
+// The whole path: a long streamed clip reaches the committed turn as several audio parts, in
+// order, through the real run, and the live relay carries every chunk.
+func TestSpeechRunStreamLongClipIsCommittedAsOrderedParts(t *testing.T) {
+	pcm := speechPCM(2300, 19)
+	chunks := cutPCM(pcm, 900, 900)
+	frames := make([]string, 0, len(chunks)+2)
+	for _, chunk := range chunks {
+		frames = append(frames, speechFrameDelta(chunk))
+	}
+	frames = append(frames, speechSSEDone, speechSSEEnd)
+	srv, owner, chatID, _ := streamableSpeechRunServer(t, func(w http.ResponseWriter, _ *http.Request) { sseFrames(w, frames...) })
+	srv.maxChatBlobBytes = streamTestBlobCap // parts of 1000 PCM bytes
+
+	_, collect := subscribedSpeechRun(t, srv, owner, chatID, speechRunPrep())
+	events := collect()
+
+	done := events[len(events)-1]
+	if done.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", done.Status, done.Err)
+	}
+	if got := len(audioEventsOf(events)); got != len(chunks) {
+		t.Fatalf("audio events = %d, want %d", got, len(chunks))
+	}
+	var parts []speechAudioPart
+	if err := json.Unmarshal(done.ContentParts, &parts); err != nil {
+		t.Fatalf("the terminal content is not a parts array: %v", err)
+	}
+	// The run streams at 44.1 kHz, not partsTestRate, so the parts are read here by their data
+	// chunks alone (dataSizes' header check is for partsTestRate WAVs).
+	var sizes []int
+	var joined []byte
+	for i, wav := range partWAVs(t, parts) {
+		if string(wav[0:4]) != "RIFF" || binary.LittleEndian.Uint32(wav[24:]) != speechRunTestRate {
+			t.Fatalf("part %d is not a WAV at %d Hz", i, speechRunTestRate)
+		}
+		sizes = append(sizes, len(wav)-wavHeaderLen)
+		joined = append(joined, wav[wavHeaderLen:]...)
+	}
+	if want := []int{1000, 1000, 300}; !slices.Equal(sizes, want) {
+		t.Fatalf("part data sizes = %v, want %v", sizes, want)
+	}
+	if !bytes.Equal(joined, pcm) {
+		t.Fatal("the parts' data chunks put end to end are not the PCM the stream carried")
+	}
+}
+
+// A part target that is not a whole number of samples, or is below one, is cut at whole
+// samples and still terminates: the reader clamps it as the whole-clip splitter does.
+func TestStreamPartTargetIsClampedToWholeSamples(t *testing.T) {
+	pcm := speechPCM(6, 23)
+	body := speechStreamOf(cutPCM(pcm, 3), speechSSEDone, speechSSEEnd)
+	for _, partBytes := range []int{3, 2, 1, 0, -4} {
+		got := readTestSpeechStream(body, partBytes, streamTestAudioCap)
+		sizes, joined := dataSizes(t, partWAVs(t, got.parts))
+		if want := []int{2, 2, 2}; !slices.Equal(sizes, want) || !bytes.Equal(joined, pcm) {
+			t.Fatalf("partBytes %d: part data sizes = %v, want %v with the clip's own audio", partBytes, sizes, want)
+		}
 	}
 }
