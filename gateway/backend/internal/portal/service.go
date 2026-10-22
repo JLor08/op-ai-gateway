@@ -355,9 +355,11 @@ type ChatStore interface {
 	// PutChatBlob is deliberately not part of this interface: it is store
 	// internal, used only inside SaveChatWithBlobs.
 
-	// SaveChatWithBlobs writes the chat document and its new blobs as one
+	// SaveChatWithBlobs writes the chat document, its new blobs and the
+	// deletion of deleteBlobIDs (blobs of this chat the document no longer
+	// references; other ids are ignored, nil/empty deletes nothing) as one
 	// atomic step: either all of it persists or none of it does.
-	SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error
+	SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob, deleteBlobIDs []string) error
 	// ChatBlobByID returns one blob row, or store.ErrNotFound. It does not
 	// check which chat the caller may read from: resolve ownership first
 	// (ChatBlobOwner, or ChatBlobsByIDs, which scopes by chat itself).

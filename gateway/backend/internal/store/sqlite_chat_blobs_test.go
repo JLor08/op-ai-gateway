@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -239,7 +240,7 @@ func TestSaveChatWithBlobsCancelledContextPersistsNothing(t *testing.T) {
 		updated := Chat{ID: "c_cancel", Title: "must not stick", KeyVersion: 5, Blob: []byte("nope"), UpdatedAt: now.Add(time.Hour)}
 		err = s.SaveChatWithBlobs(cancelled, updated, []ChatBlob{
 			{ID: "blob_cancel", ChatID: "c_cancel", KeyVersion: 5, Blob: []byte("x"), ContentType: "image/png", ByteLen: 1, CreatedAt: now},
-		})
+		}, nil)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("SaveChatWithBlobs(cancelled ctx) = %v, want context.Canceled", err)
 		}
@@ -253,6 +254,114 @@ func TestSaveChatWithBlobsCancelledContextPersistsNothing(t *testing.T) {
 		}
 		if _, err := s.ChatBlobByID(ctx, "blob_cancel"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("ChatBlobByID(blob_cancel) = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestSaveChatWithBlobsDeletesIDsAtomically pins the delete half of the save
+// (#281): the named rows go in the SAME transaction as the chat update and the
+// inserts, so the chat document and its blobs can never disagree. A save that
+// stores one new blob and deletes two of the chat's three blobs leaves exactly
+// the untouched third and the new one, with the document updated; and every
+// failure -- a cancelled context, and a delete statement that cannot run after
+// the update and the insert already did -- leaves the document and every row as
+// they were.
+//
+// The failing delete is a list of more ids than either driver binds in one
+// statement (sqlite 32766, postgres 65535): the statement is rejected by the
+// driver itself, and it is the LAST statement before the commit, so the chat
+// update and the insert it follows are only undone if they share its
+// transaction. Both SQL legs run (postgres only when the test DSN is set).
+func TestSaveChatWithBlobsDeletesIDsAtomically(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+		seedChatForBlobs(ctx, t, s, "u_del", "c_del", now)
+		before, err := s.ChatByID(ctx, "c_del")
+		if err != nil {
+			t.Fatalf("ChatByID: %v", err)
+		}
+
+		old1 := ChatBlob{ID: "blob_old1", ChatID: "c_del", KeyVersion: 1, Blob: []byte("old1"), ContentType: "audio/wav", ByteLen: 4, CreatedAt: now}
+		old2 := ChatBlob{ID: "blob_old2", ChatID: "c_del", KeyVersion: 1, Blob: []byte("old2"), ContentType: "audio/wav", ByteLen: 4, CreatedAt: now}
+		keep := ChatBlob{ID: "blob_keep", ChatID: "c_del", KeyVersion: 1, Blob: []byte("keep"), ContentType: "audio/wav", ByteLen: 4, CreatedAt: now}
+		for _, b := range []ChatBlob{old1, old2, keep} {
+			if err := s.PutChatBlob(ctx, b); err != nil {
+				t.Fatalf("PutChatBlob %s: %v", b.ID, err)
+			}
+		}
+		fresh := ChatBlob{ID: "blob_new", ChatID: "c_del", KeyVersion: 2, Blob: []byte("fresh"), ContentType: "audio/wav", ByteLen: 5, CreatedAt: now.Add(time.Minute)}
+		updated := Chat{ID: "c_del", Title: "renamed", KeyVersion: 2, Blob: []byte("new document"), UpdatedAt: now.Add(time.Minute)}
+		deletes := []string{"blob_old1", "blob_old2"}
+
+		requireUntouched := func(t *testing.T, label string) {
+			t.Helper()
+			after, err := s.ChatByID(ctx, "c_del")
+			if err != nil {
+				t.Fatalf("%s: ChatByID: %v", label, err)
+			}
+			if after.Title != before.Title || after.KeyVersion != before.KeyVersion || !bytes.Equal(after.Blob, before.Blob) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+				t.Fatalf("%s: chat = %#v, want the unchanged %#v", label, after, before)
+			}
+			for _, want := range []ChatBlob{old1, old2, keep} {
+				got, err := s.ChatBlobByID(ctx, want.ID)
+				if err != nil || !bytes.Equal(got.Blob, want.Blob) {
+					t.Fatalf("%s: ChatBlobByID(%s) = %#v, %v, want the row untouched", label, want.ID, got, err)
+				}
+			}
+			if _, err := s.ChatBlobByID(ctx, "blob_new"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("%s: ChatBlobByID(blob_new) = %v, want ErrNotFound", label, err)
+			}
+		}
+
+		// A cancelled context never opens the transaction, so nothing -- not
+		// the update, the insert or the delete -- can persist.
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		if err := s.SaveChatWithBlobs(cancelled, updated, []ChatBlob{fresh}, deletes); !errors.Is(err, context.Canceled) {
+			t.Fatalf("SaveChatWithBlobs(cancelled ctx) = %v, want context.Canceled", err)
+		}
+		requireUntouched(t, "cancelled context")
+
+		// A delete the driver rejects after the update and the insert ran
+		// rolls both back.
+		tooMany := make([]string, 100_000)
+		for i := range tooMany {
+			tooMany[i] = fmt.Sprintf("blob_ghost_%d", i)
+		}
+		tooMany[0] = "blob_old1"
+		err = s.SaveChatWithBlobs(ctx, updated, []ChatBlob{fresh}, tooMany)
+		if err == nil {
+			t.Fatalf("SaveChatWithBlobs with an unbindable delete list succeeded, want a failure")
+		}
+		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
+			t.Fatalf("SaveChatWithBlobs = %v, want the delete statement's own failure, not a mapped sentinel", err)
+		}
+		requireUntouched(t, "rejected delete")
+
+		// The real save: both named rows gone, the new one stored, the third
+		// untouched, the document updated.
+		if err := s.SaveChatWithBlobs(ctx, updated, []ChatBlob{fresh}, deletes); err != nil {
+			t.Fatalf("SaveChatWithBlobs: %v", err)
+		}
+		after, err := s.ChatByID(ctx, "c_del")
+		if err != nil {
+			t.Fatalf("ChatByID: %v", err)
+		}
+		if after.Title != "renamed" || after.KeyVersion != 2 || !bytes.Equal(after.Blob, updated.Blob) || !after.UpdatedAt.Equal(updated.UpdatedAt) {
+			t.Fatalf("chat after the save = %#v, want the updated document", after)
+		}
+		for _, id := range deletes {
+			if _, err := s.ChatBlobByID(ctx, id); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("ChatBlobByID(%s) = %v, want ErrNotFound (deleted by the save)", id, err)
+			}
+		}
+		got, err := s.ChatBlobsByIDs(ctx, "c_del", []string{"blob_old1", "blob_old2", "blob_keep", "blob_new"})
+		if err != nil || len(got) != 2 {
+			t.Fatalf("ChatBlobsByIDs = %v, %v, want exactly blob_keep and blob_new", got, err)
+		}
+		if !bytes.Equal(got["blob_keep"].Blob, keep.Blob) || !bytes.Equal(got["blob_new"].Blob, fresh.Blob) {
+			t.Fatalf("surviving blobs = %v, want blob_keep and blob_new as stored", got)
 		}
 	})
 }

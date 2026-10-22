@@ -142,10 +142,24 @@ describe('acceptChunk', () => {
 // whole observable behavior (the sound itself cannot be heard in jsdom).
 function fakeContext(initialTime = 0) {
   const scheduled: { start: number; duration: number; rate: number; samples: Float32Array }[] = [];
-  const sources: { stopped: boolean; ended: (() => void) | null }[] = [];
+  const sources: { stopped: boolean; ended: (() => void) | null; connected: unknown[] }[] = [];
+  // The gain nodes the player made: the value is what the speakers would get multiplied by.
+  const gains: { gain: { value: number }; connected: unknown[] }[] = [];
   const ctx = {
     currentTime: initialTime,
     destination: { name: 'destination' },
+    createGain: () => {
+      const node = {
+        gain: { value: 1 },
+        connected: [] as unknown[],
+        connect(destination: unknown) {
+          node.connected.push(destination);
+          return destination;
+        },
+      };
+      gains.push(node);
+      return node;
+    },
     createBuffer: (_channels: number, length: number, rate: number) => {
       let copied: Float32Array = new Float32Array(0);
       return {
@@ -160,11 +174,18 @@ function fakeContext(initialTime = 0) {
       };
     },
     createBufferSource: () => {
-      const entry = { stopped: false, ended: null as (() => void) | null };
+      const entry = {
+        stopped: false,
+        ended: null as (() => void) | null,
+        connected: [] as unknown[],
+      };
       sources.push(entry);
       const src = {
         buffer: null as unknown as ReturnType<PlaybackContext['createBuffer']> | null,
-        connect: vi.fn(),
+        connect: vi.fn((destination: unknown) => {
+          entry.connected.push(destination);
+          return destination;
+        }),
         start(when: number) {
           const b = src.buffer as unknown as {
             duration: number;
@@ -186,7 +207,12 @@ function fakeContext(initialTime = 0) {
       return src;
     },
   };
-  return { ctx: ctx as unknown as PlaybackContext & { currentTime: number }, scheduled, sources };
+  return {
+    ctx: ctx as unknown as PlaybackContext & { currentTime: number },
+    scheduled,
+    sources,
+    gains,
+  };
 }
 
 describe('StreamingPcmPlayer', () => {
@@ -249,6 +275,50 @@ describe('StreamingPcmPlayer', () => {
     sources[0].ended?.();
     player.stop();
     expect(sources[0].stopped).toBe(false);
+  });
+
+  // The mute (#281): every chunk reaches the speakers through ONE persistent gain node, so a
+  // mute is a gain of 0 on what is already queued AND on every chunk still to come -- local
+  // playback only, nothing is stopped or dropped.
+  describe('mute', () => {
+    const tone = () => new Uint8Array(pcm([1, 2, 3, 4]));
+
+    it('routes every chunk through one gain node that feeds the destination', () => {
+      const { ctx, sources, gains } = fakeContext(0);
+      const player = new StreamingPcmPlayer(ctx, 0.1);
+      player.push(tone(), 44100);
+      player.push(tone(), 44100);
+      expect(gains).toHaveLength(1);
+      expect(sources.map((s) => s.connected)).toEqual([[gains[0]], [gains[0]]]);
+      expect(gains[0].connected).toEqual([ctx.destination]);
+      expect(gains[0].gain.value).toBe(1);
+    });
+
+    it('setMuted(true) silences the queue and the chunks to come, and setMuted(false) restores it', () => {
+      const { ctx, scheduled, sources, gains } = fakeContext(0);
+      const player = new StreamingPcmPlayer(ctx, 0.1);
+      player.push(tone(), 44100);
+      player.setMuted(true);
+      expect(gains[0].gain.value).toBe(0);
+      // A chunk that arrives while muted joins the SAME gain: still silent.
+      expect(player.push(tone(), 44100)).toBe(true);
+      expect(gains).toHaveLength(1);
+      expect(sources[1].connected).toEqual([gains[0]]);
+      expect(gains[0].gain.value).toBe(0);
+      player.setMuted(false);
+      expect(gains[0].gain.value).toBe(1);
+      // Reversible, and nothing was stopped, dropped or rescheduled on the way.
+      expect(sources.every((s) => !s.stopped)).toBe(true);
+      expect(scheduled).toHaveLength(2);
+    });
+
+    it('remembers a mute asked for before the first chunk', () => {
+      const { ctx, gains } = fakeContext(0);
+      const player = new StreamingPcmPlayer(ctx, 0.1);
+      player.setMuted(true);
+      player.push(tone(), 44100);
+      expect(gains[0].gain.value).toBe(0);
+    });
   });
 });
 
@@ -398,6 +468,62 @@ describe('createSpeechPlayback', () => {
       playback.push('c1', 'r1', chunk(0));
       playback.end('c1', true);
       expect(sources[0].stopped).toBe(false);
+    });
+  });
+
+  // The live mute of a chat's run (#281): reversible, local to playback, and nothing the run
+  // itself notices -- it stays live, keeps queueing, and finishes as ever.
+  describe('setMuted', () => {
+    it('toggles the run gain to 0 and back while the run stays live', () => {
+      const { playback, gains, sources, scheduled } = setup();
+      playback.push('c1', 'r1', chunk(0));
+      playback.setMuted('c1', true);
+      expect(gains[0].gain.value).toBe(0);
+      // Silenced, not stopped: the run is live and keeps queueing audio (muted).
+      expect(playback.isLive('c1')).toBe(true);
+      expect(playback.push('c1', 'r1', chunk(1))).toBe(true);
+      expect(scheduled).toHaveLength(2);
+      expect(sources.every((s) => !s.stopped)).toBe(true);
+      expect(gains[0].gain.value).toBe(0);
+
+      playback.setMuted('c1', false);
+      expect(gains[0].gain.value).toBe(1);
+      expect(playback.isLive('c1')).toBe(true);
+    });
+
+    it('mutes only the chat it names', () => {
+      const { playback, gains } = setup();
+      playback.push('c1', 'r1', chunk(0));
+      playback.push('c2', 'r2', chunk(0));
+      playback.setMuted('c1', true);
+      expect(gains.map((g) => g.gain.value)).toEqual([0, 1]);
+    });
+
+    it('keeps a completed run muted while its queue plays out', () => {
+      const { playback, gains, sources } = setup();
+      playback.push('c1', 'r1', chunk(0));
+      playback.setMuted('c1', true);
+      playback.end('c1', true);
+      expect(sources[0].stopped).toBe(false);
+      expect(gains[0].gain.value).toBe(0);
+    });
+
+    it('does not carry over to the next run of the chat', () => {
+      const { playback, gains } = setup();
+      playback.push('c1', 'r1', chunk(0));
+      playback.setMuted('c1', true);
+      playback.end('c1', true);
+      playback.push('c1', 'r2', chunk(0));
+      expect(gains).toHaveLength(2);
+      expect(gains[1].gain.value).toBe(1);
+    });
+
+    it('is a no-op, and never throws, for a chat with no run or no audio context', () => {
+      const { playback } = setup(false);
+      expect(() => playback.setMuted('nope', true)).not.toThrow();
+      const live = setup();
+      expect(() => live.playback.setMuted('nope', true)).not.toThrow();
+      expect(live.gains).toHaveLength(0);
     });
   });
 

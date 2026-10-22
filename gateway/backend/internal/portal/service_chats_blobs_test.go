@@ -25,23 +25,27 @@ const gatewayBlobPrefix = "/api/portal/chat-blobs/"
 var blobIDPattern = regexp.MustCompile(`^blob_[0-9a-f]{32}$`)
 
 // recordingChatStore wraps a real chat store and records what the service
-// layer asks of it: every SaveChatWithBlobs call with the blobs it carried,
-// and every ChatBlobOwner lookup. hooks let a test change the world at the
-// moment of the save (a chat deleted mid-run) or make the owner lookup fail.
+// layer asks of it: every SaveChatWithBlobs call with the blobs it carried and
+// the blob ids it asked to delete (deletes, one entry per save, nil when the
+// save deleted nothing), and every ChatBlobOwner lookup. hooks let a test change
+// the world at the moment of the save (a chat deleted mid-run) or make the owner
+// lookup fail.
 type recordingChatStore struct {
 	ChatStore
 	saves        [][]store.ChatBlob
+	deletes      [][]string
 	ownerLookups []string
 	ownerErr     error
 	beforeSave   func()
 }
 
-func (r *recordingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error {
+func (r *recordingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob, deleteBlobIDs []string) error {
 	if r.beforeSave != nil {
 		r.beforeSave()
 	}
 	r.saves = append(r.saves, blobs)
-	return r.ChatStore.SaveChatWithBlobs(ctx, chat, blobs)
+	r.deletes = append(r.deletes, deleteBlobIDs)
+	return r.ChatStore.SaveChatWithBlobs(ctx, chat, blobs, deleteBlobIDs)
 }
 
 func (r *recordingChatStore) ChatBlobOwner(ctx context.Context, id string) (string, error) {

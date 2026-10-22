@@ -267,6 +267,12 @@ func (s *Service) sealedChatUpdate(row store.ChatRow, title string, content json
 // document and every blob it now references persist, or none does. It is the
 // write both run commits end in (PrepareChatRun, writeAssistant).
 //
+// deleteBlobIDs are the chat's blobs the rewritten doc no longer references --
+// the audio of answers the retention prune turned into the not-stored marker
+// (pruneForRetention). They are deleted in the same step, so the saved document
+// never points at a blob this save removed; nil, what PrepareChatRun passes,
+// deletes nothing.
+//
 // The document is sealed here, after the extraction, so the MaxChatContentBytes
 // cap measures the rewritten document -- a few hundred bytes per image -- not
 // the bytes it used to carry.
@@ -277,7 +283,7 @@ func (s *Service) sealedChatUpdate(row store.ChatRow, title string, content json
 // ends cleanly rather than as a 500. A volatile memory store can accept the
 // save and evict the chat straight away to stay within its budget; nothing here
 // assumes the chat is still held afterwards.
-func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title string, doc chatDoc, blobs []store.ChatBlob) error {
+func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title string, doc chatDoc, blobs []store.ChatBlob, deleteBlobIDs []string) error {
 	content, err := doc.marshal()
 	if err != nil {
 		return err
@@ -286,7 +292,7 @@ func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title st
 	if err != nil {
 		return err
 	}
-	return s.chats.SaveChatWithBlobs(ctx, updated, blobs)
+	return s.chats.SaveChatWithBlobs(ctx, updated, blobs, deleteBlobIDs)
 }
 
 // DeleteChat removes an owned chat. A foreign or missing chat is 404 (no leak).
@@ -507,7 +513,8 @@ type ChatImageSettings struct {
 // audio.cpp unchanged), refusing the keys that would override the body the run
 // itself owns (model/input/stream/stream_format/response_format). The turn the run
 // commits is always a WAV (a streamed synthesis is assembled into one), so there is
-// no format knob.
+// no format knob. KeepLastAudio is the one field that is not a synthesis knob: it is
+// the thread's own retention of the answers it has stored, and is never sent upstream.
 type ChatAudioSettings struct {
 	// Voice is the voice name; "" leaves the model's default voice. The composer
 	// offers the voices the gateway has cached for the model in a combobox that
@@ -534,6 +541,16 @@ type ChatAudioSettings struct {
 	// chosen false stay distinguishable and an existing thread's persisted settings stay
 	// byte-identical.
 	Stream *bool `json:"stream,omitempty"`
+	// KeepLastAudio is the thread's retention of its generated answers (#281): how many
+	// of the newest speech answers' audio blobs the chat keeps. nil (omitted) keeps every
+	// answer, the default and what a thread stored before this field exists reads as; 0
+	// stores no answer audio at all; N >= 1 keeps the last N. A negative value is not a
+	// count, so PrepareChatRun reads it as unset (nil). A POINTER, like Speed and Stream,
+	// so the meaningful 0 stays distinguishable from "unset" (a plain int with omitempty
+	// would drop it) and an existing thread's persisted settings stay byte-identical.
+	// Declared last, after Stream, on purpose: a field added later must not move an
+	// existing chat's serialized bytes.
+	KeepLastAudio *int `json:"keep_last_audio,omitempty"`
 }
 
 // ChatTranscriptionSettings are the speech-to-text knobs a portal
@@ -744,6 +761,14 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if req.Settings.Kind != chatKindSpeech {
 		req.Settings.Audio = nil
 	}
+	// A negative retention is no count: it reads as unset, which keeps every answer.
+	// 0 (store none) and a positive N (keep the last N) stay as submitted. The settings
+	// are copied before the clamp so the caller's own struct is left as it was sent.
+	if a := req.Settings.Audio; a != nil && a.KeepLastAudio != nil && *a.KeepLastAudio < 0 {
+		clamped := *a
+		clamped.KeepLastAudio = nil
+		req.Settings.Audio = &clamped
+	}
 	// And for the transcription settings and a transcription thread: they are
 	// cleared for every other kind (text, image and speech alike), while the two
 	// lines above already clear the image and audio settings of a transcription
@@ -804,7 +829,7 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if err != nil {
 		return nil, ChatRunSettings{}, err
 	}
-	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
+	if err := s.commitChatRun(ctx, row, title, doc, blobs, nil); err != nil {
 		return nil, ChatRunSettings{}, err
 	}
 
@@ -1010,6 +1035,23 @@ type AssistantTurn struct {
 	// into `null` but FAILS outright on a non-nil zero-length one
 	// ("unexpected end of JSON input"), which would break the terminal commit.
 	ContentParts json.RawMessage
+	// AudioAnswer marks this turn as a SPEECH run's answer -- the only turns the
+	// audio answer lifecycle (#281) acts on at commit time. It is set by the run
+	// executor (finishRunWithParts, from the run's pinned kind) and false for
+	// every text, image and transcription turn and every checkpoint, so the N=0
+	// "do not store" rules and the abort marker below never touch them. An
+	// image turn's generated image and a text turn's partial buffer are committed
+	// exactly as before.
+	AudioAnswer bool
+	// AudioStreamed is whether a speech run ACTUALLY streamed its synthesis
+	// through to the client (it took the consumeSpeechStream branch) rather than
+	// falling back to the buffered one-shot WAV. It only has meaning with
+	// AudioAnswer, and it is what tells the commit apart the two N=0 cases: a
+	// streamed answer under keep_last_audio=0 was produced only to bill ADR-068's
+	// loud non-zero and is committed as the not-stored marker (its audio is never
+	// stored), while a buffered-fallback answer is STORED so the un-heard paid
+	// audio is not lost -- see writeAssistant.
+	AudioStreamed bool
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -1084,16 +1126,58 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 	}
 	doc.Messages = append(doc.Messages, raw)
 
+	// The audio answer lifecycle (#281) for a SPEECH run's terminal commit. The
+	// just-built answer's audio may not be stored at all, and that is decided HERE,
+	// before the blob extraction, so nothing is ever moved into chat_blobs for it:
+	//
+	//   - a canceled/aborted run commits the not-stored marker instead of an empty
+	//     turn, so the bubble reads "not stored" and the turn is regenerate-able; and
+	//   - under keep_last_audio = 0, a run that STREAMED its synthesis (the user heard
+	//     it live) commits the marker too -- the audio was produced only to bill
+	//     ADR-068's loud non-zero and must not be stored.
+	//
+	// Billing and the "commit nothing paid on cancel" guarantee are untouched: the
+	// marker holds no audio, so no bytes are stored; it is the only addition.
+	keep, keepSet := storedKeepLastAudio(doc.Settings)
+	storeNone := keepSet && keep == 0
+	aborted := turn.AudioAnswer && status == "canceled"
+	dropStreamed := turn.AudioAnswer && status == "complete" && storeNone && turn.AudioStreamed
+	if aborted || dropStreamed {
+		if err := markNewestAnswerNotStored(&doc); err != nil {
+			return err
+		}
+	}
+
 	// A generated image arrives as an inline data: part of the turn just built.
 	// Store it in chat_blobs and rewrite its url before the document is sealed,
 	// exactly as PrepareChatRun does for an upload (and so, too, before the 4 MiB
 	// cap: a generated image no longer has to fit in the document). Only the turn
 	// built here is unvetted; the messages before it were stored -- and their
 	// references verified -- by an earlier commit, so a checkpoint, which runs
-	// every few seconds, does no ownership lookups for them.
+	// every few seconds, does no ownership lookups for them. A marker turn (above)
+	// holds no audio, so it stores nothing.
 	blobs, err := s.extractChatBlobs(ctx, chatID, &doc, len(doc.Messages)-1)
 	if err != nil {
 		return err
 	}
-	return s.commitChatRun(ctx, row, row.Title, doc, blobs)
+
+	// The lazy going-forward prune: the answer just built makes room for itself under
+	// the thread's retention. Older answers beyond keep_last_audio are rewritten to the
+	// not-stored marker in doc, and their blobs are deleted in the very save that writes
+	// the document, so no commit leaves more answers stored than the thread keeps. A
+	// buffered-fallback answer under keep_last_audio = 0 is a special case: it is STORED
+	// (the un-heard paid audio is not lost) but keeps only itself -- every older stored
+	// answer becomes a marker -- so an N=0 thread never accumulates on a model that only
+	// sometimes falls back to buffered (keep-last-1). A thread with no retention set
+	// (every legacy one) prunes nothing.
+	var deleteBlobIDs []string
+	if turn.AudioAnswer && status == "complete" && storeNone && !turn.AudioStreamed {
+		deleteBlobIDs, err = pruneAudioBeyond(&doc, 1)
+	} else {
+		deleteBlobIDs, err = pruneForRetention(&doc)
+	}
+	if err != nil {
+		return err
+	}
+	return s.commitChatRun(ctx, row, row.Title, doc, blobs, deleteBlobIDs)
 }

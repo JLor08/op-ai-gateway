@@ -207,7 +207,7 @@ var imageSubtypePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9+.-]{0,31}$`
 // second bound would be a second, divergent promise about the same wait.
 func (s *Server) executeImageRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
 	parts, status, errMsg := s.generateImageTurn(ctx, owner, run, prep)
-	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts)
+	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts, false)
 }
 
 // generateImageTurn performs the single loopback request an image run makes

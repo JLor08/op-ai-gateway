@@ -42,6 +42,7 @@ import {
   DEFAULTS,
   MAX_IMAGES,
   attachModeOf,
+  audioAnswersBeyond,
   audioPassthroughMessage,
   audioSetting,
   audioSettingsFrom,
@@ -56,18 +57,22 @@ import {
   deriveTitleFromMessages,
   deriveTitleFromTranscript,
   historyHasImage,
+  holdsStoredAudio,
   imageSetting,
   imageSettingsFrom,
   isChatBlobUrl,
+  keepLastAudioOf,
   lastUserHasAudio,
   lastUserHasImage,
   lastUserText,
+  lowersAudioRetention,
   lsGet,
   lsSet,
   nextId,
   normalizeDoc,
   parseAudioPassthrough,
   parseTranscriptionPassthrough,
+  pruneAudioBeyond,
   readLegacyDoc,
   resolveTokenOverride,
   speechPassthroughInvalid,
@@ -77,6 +82,7 @@ import {
   transcriptionSetting,
   transcriptionSettingsFrom,
   userTurnContent,
+  withAudioRemoved,
   type AttachMode,
   type AudioSettings,
   type ChatUiMessage,
@@ -98,8 +104,9 @@ export type { AudioClip };
 // The speech composer's advanced-passthrough check and the settings type it edits,
 // re-exported for Chat.tsx for the same reason as the image presets below: the
 // composer must not reach into chatDoc.ts (arch.test.ts), and it needs to name a
-// passthrough text that is not a JSON object before the user sends it.
-export { audioPassthroughMessage, parseAudioPassthrough } from './chatDoc';
+// passthrough text that is not a JSON object, or a keep-last count the wire would drop,
+// before the user sends it.
+export { audioPassthroughMessage, isKeepLastInvalid, parseAudioPassthrough } from './chatDoc';
 export type { AudioPassthroughParse, AudioSettings } from './chatDoc';
 
 // The transcription composer's twin of the above (its own reserved fields and message), and
@@ -136,13 +143,32 @@ export {
 const NO_VOICES: readonly string[] = [];
 
 // The per-message actions the transcript's rows are handed (handlersFor): the user
-// turn's edit, the assistant turn's regenerate, and -- on a generated image -- the
-// refine that makes it the source of the next edit.
+// turn's edit, the assistant turn's regenerate, -- on a generated image -- the
+// refine that makes it the source of the next edit, and -- on a spoken answer -- the
+// delete of its stored audio.
 type MessageHandlers = {
   onEdit: (text: string) => void;
   onRegenerate: () => void;
   onRefine: (url: string) => void;
+  onDeleteAudio: () => void;
 };
+
+// A tightening of the answer-audio retention that is waiting for the user's word (#281): it
+// would remove the stored audio of `excess` answers, which cannot be undone, so it is held
+// until confirmAudioRetention or cancelAudioRetention. `keepLast` is the count it would prune
+// to (0 = keep none, i.e. do not store); `excess` is how many answers of the open transcript
+// hold audio beyond it, recounted as the transcript changes.
+export type PendingAudioRetention = { keepLast: number; excess: number };
+
+// The retention half of AudioSettings, the part the composer's retention control edits.
+type AudioRetention = Pick<AudioSettings, 'keepAudio' | 'keepLast'>;
+
+// The retention change held for a confirm, and the chat it was asked of.
+type HeldRetention = { chatId: string; retention: AudioRetention; keepLast: number };
+
+function sameRetention(a: AudioRetention, b: AudioRetention): boolean {
+  return a.keepAudio === b.keepAudio && a.keepLast === b.keepLast;
+}
 
 export type ChatStore = {
   messages: ChatUiMessage[];
@@ -280,12 +306,28 @@ export type ChatStore = {
   // for a text thread (see imageSetting in chatDoc.ts).
   imageSettings: ImageSettings;
   setImageSettings: Dispatch<SetStateAction<ImageSettings>>;
-  // The text-to-speech knobs of the active thread (voice / speed / passthrough text), as
-  // concrete store state. The speech composer edits them when chatKind === "speech";
-  // they are omitted from the wire and persistence for any other kind (see audioSetting
-  // in chatDoc.ts). A passthrough that is not a JSON object blocks the send (see send()).
+  // The text-to-speech knobs of the active thread (voice / speed / passthrough text /
+  // retention), as concrete store state. The speech composer edits them when chatKind ===
+  // "speech"; they are omitted from the wire and persistence for any other kind (see
+  // audioSetting in chatDoc.ts). A passthrough that is not a JSON object blocks the send
+  // (see send()).
+  //
+  // These are the settings AS THE COMPOSER SHOWS THEM: a retention change that would remove
+  // stored audio (pendingAudioRetention below) shows here while it waits for its confirm, so
+  // the count being typed stays in its field, but it is neither saved nor sent until then --
+  // the thread's own settings stay what they were.
   audioSettings: AudioSettings;
+  // Edits the settings, from the composer's controls. A change of the retention to a stricter
+  // value (fewer answers keep their audio, judged on the wire's keep_last_audio, not the raw
+  // text) that the open chat's stored audio exceeds is HELD rather than applied; everything
+  // else, a loosening included, is applied at once and never deletes anything.
   setAudioSettings: Dispatch<SetStateAction<AudioSettings>>;
+  // The held stricter retention (see PendingAudioRetention), or null. The composer asks the
+  // user about it; confirmAudioRetention persists it and prunes the chat's stored audio to it,
+  // cancelAudioRetention puts the control back as it was and persists and deletes nothing.
+  pendingAudioRetention: PendingAudioRetention | null;
+  confirmAudioRetention: () => void;
+  cancelAudioRetention: () => void;
   // The speech-to-text knobs of the active thread (language / prompt / temperature /
   // passthrough text), as concrete store state: the audio settings' twin. The transcription
   // composer edits them when chatKind === "transcription"; they are omitted from the wire and
@@ -330,6 +372,13 @@ export type ChatStore = {
   // of "no intermediate news". False for every other run and once the run is over; gated into
   // ChatMessage like runKind above, for the same memo reason.
   runAudioLive: boolean;
+  // Whether the user has muted that live playback (#281): the pending turn's Mute control
+  // shows Unmute then. Local to this tab's speakers; the run is unaffected. Gated into
+  // ChatMessage like runAudioLive.
+  runAudioMuted: boolean;
+  // Mute or unmute a chat's live speech playback (the Mute control; reversible). It is NOT
+  // the abort: aborting a live speech run is `stop`, the ordinary cancel.
+  muteAudio: (chatId: string, muted: boolean) => void;
   // Multi-chat layer.
   chats: ChatSummary[];
   activeChatId: string | null;
@@ -453,9 +502,11 @@ export function ChatStoreProvider({
     | 'chats'
     | 'createChat'
     | 'deleteChat'
+    | 'deleteMessageAudio'
     | 'modelImageOptions'
     | 'modelSpeechStreaming'
     | 'modelVoices'
+    | 'pruneChatAudio'
     | 'saveChat'
     | 'saveChatKeepalive'
     | 'serverModels'
@@ -495,7 +546,21 @@ export function ChatStoreProvider({
   // The active speech thread's text-to-speech knobs (concrete, see AudioSettings): the
   // image settings' twin, seeded in activateChat, sent via currentSettings, persisted
   // via buildDoc -- all gated on chatKind "speech".
-  const [audioSettings, setAudioSettings] = useState<AudioSettings>(DEFAULT_AUDIO_SETTINGS);
+  //
+  // The COMMITTED settings: what is saved and sent. The store's setAudioSettings (below) is the
+  // only writer the composer gets, so a retention change that waits for a confirm never lands
+  // here before it; activateChat seeds it directly.
+  const [audioSettingsState, setAudioSettingsState] =
+    useState<AudioSettings>(DEFAULT_AUDIO_SETTINGS);
+  // The stricter retention waiting for the user's confirm (see setAudioSettings), kept beside
+  // the committed settings and laid over them for display only. A ref mirrors it so the
+  // setters and the confirm read the latest value between renders.
+  const [heldRetentionState, setHeldRetentionState] = useState<HeldRetention | null>(null);
+  const heldRetentionRef = useRef<HeldRetention | null>(null);
+  const setHeldRetention = useCallback((held: HeldRetention | null) => {
+    heldRetentionRef.current = held;
+    setHeldRetentionState(held);
+  }, []);
   // The active transcription thread's speech-to-text knobs (concrete, see
   // TranscriptionSettings): the audio settings' twin, seeded in activateChat, sent via
   // currentSettings, persisted via buildDoc -- all gated on chatKind "transcription".
@@ -734,7 +799,7 @@ export function ChatStoreProvider({
   const temperatureRef = useRef(temperature);
   const maxTokensRef = useRef(maxTokens);
   const imageSettingsRef = useRef(imageSettings);
-  const audioSettingsRef = useRef(audioSettings);
+  const audioSettingsRef = useRef(audioSettingsState);
   const transcriptionSettingsRef = useRef(transcriptionSettings);
   const selectedTokenIdRef = useRef(selectedTokenId);
   const serverOverrideRef = useRef(serverOverride);
@@ -789,6 +854,76 @@ export function ChatStoreProvider({
   const chatKindRef = useRef<string>(chatKind);
   chatKindRef.current = chatKind;
 
+  // The composer's writer of the audio settings (#281). Every edit is applied at once EXCEPT
+  // a retention that would remove audio: tightening the retention of a chat whose stored audio
+  // exceeds the new limit is a bulk delete that cannot be undone, so that one change is HELD,
+  // not applied -- it is shown (audioSettings below) but not saved or sent -- until the user
+  // confirms it (confirmAudioRetention) or drops it (cancelAudioRetention). The other settings
+  // of the same edit still apply, and the held value is replaced by the next edit of the
+  // retention, so a count can be typed through a first digit that is stricter than the one
+  // that ends up typed ("1" on the way to "10") without anything being deleted on the way.
+  //
+  // "Tighter" is judged on what the wire would carry (keepLastAudioOf: do-not-store is 0, a
+  // count is N, keep-all is no limit), never on the raw count text: a blank or unusable count
+  // is keep-all and loosens or changes nothing. And a tightening the chat's audio does not
+  // exceed deletes nothing, so it needs no question.
+  const setAudioSettings = useCallback<Dispatch<SetStateAction<AudioSettings>>>(
+    (action) => {
+      const committed = audioSettingsRef.current;
+      const held = heldRetentionRef.current;
+      const shown = held ? { ...committed, ...held.retention } : committed;
+      const next = typeof action === 'function' ? action(shown) : action;
+      const { keepAudio, keepLast, ...others } = next;
+      const asked: AudioRetention = { keepAudio, keepLast };
+      let applied: AudioSettings = { ...committed, ...others };
+      if (sameRetention(asked, committed)) {
+        // Back to what is stored: nothing to hold any more.
+        setHeldRetention(null);
+      } else {
+        const candidate: AudioSettings = { ...committed, ...asked };
+        const chatId = activeChatIdRef.current;
+        const target = keepLastAudioOf(candidate);
+        if (
+          chatId &&
+          target !== undefined &&
+          lowersAudioRetention(committed, candidate) &&
+          audioAnswersBeyond(messagesRef.current, target) > 0
+        ) {
+          setHeldRetention({ chatId, retention: asked, keepLast: target });
+        } else {
+          applied = { ...applied, ...asked };
+          setHeldRetention(null);
+        }
+      }
+      const changed = (Object.keys(applied) as (keyof AudioSettings)[]).some(
+        (key) => applied[key] !== committed[key],
+      );
+      if (changed) {
+        audioSettingsRef.current = applied;
+        setAudioSettingsState(applied);
+      }
+    },
+    [setHeldRetention],
+  );
+  // What the composer shows: the committed settings with the held retention over them.
+  const shownAudioSettings = useMemo(
+    () =>
+      heldRetentionState
+        ? { ...audioSettingsState, ...heldRetentionState.retention }
+        : audioSettingsState,
+    [audioSettingsState, heldRetentionState],
+  );
+  const pendingAudioRetention = useMemo<PendingAudioRetention | null>(
+    () =>
+      heldRetentionState
+        ? {
+            keepLast: heldRetentionState.keepLast,
+            excess: audioAnswersBeyond(messages, heldRetentionState.keepLast),
+          }
+        : null,
+    [heldRetentionState, messages],
+  );
+
   // The run/SSE engine (FA-2): owns the per-chat run subscriptions + transcript
   // buffers behind a narrow interface. See useChatRuns.ts.
   const runs = useChatRuns(
@@ -803,6 +938,8 @@ export function ChatStoreProvider({
   const {
     runningChatIds,
     audioLiveChatIds,
+    audioMutedChatIds,
+    muteAudio,
     isRunning,
     statusOf: runStatusOf,
     runIdIfRunning,
@@ -843,6 +980,7 @@ export function ChatStoreProvider({
   const runElapsedMs = activeChatId ? elapsedMsOf(activeChatId) : undefined;
   // Whether the active chat's run is playing streamed audio now (see useChatRuns).
   const runAudioLive = activeChatId ? audioLiveChatIds.has(activeChatId) : false;
+  const runAudioMuted = activeChatId ? audioMutedChatIds.has(activeChatId) : false;
 
   // The persistence layer (FA-2): owns buildDoc/flushSave, the debounced-save
   // effect, the pagehide keepalive, and the unmount flush behind a narrow
@@ -875,7 +1013,7 @@ export function ChatStoreProvider({
       temperature,
       maxTokens,
       imageSettings,
-      audioSettings,
+      audioSettings: audioSettingsState,
       transcriptionSettings,
       selectedTokenId,
       serverOverride,
@@ -918,7 +1056,7 @@ export function ChatStoreProvider({
     temperatureRef.current = temperature;
     maxTokensRef.current = maxTokens;
     imageSettingsRef.current = imageSettings;
-    audioSettingsRef.current = audioSettings;
+    audioSettingsRef.current = audioSettingsState;
     speechStreamingRef.current = speechStreamingGate.streaming;
     transcriptionSettingsRef.current = transcriptionSettings;
     selectedTokenIdRef.current = selectedTokenId;
@@ -967,7 +1105,9 @@ export function ChatStoreProvider({
       // activateChat does not seed reverts to defaults and is written over the stored
       // value by the next save). normalizeDoc kept the persisted `audio` only for a
       // speech thread, so any other thread seeds defaults harmlessly.
-      setAudioSettings(audioSettingsFrom(doc.settings.audio));
+      setAudioSettingsState(audioSettingsFrom(doc.settings.audio));
+      // A retention change held for another chat's confirm is not this chat's to apply.
+      setHeldRetention(null);
       // The transcription knobs, seeded likewise: normalizeDoc kept the persisted
       // `transcription` only for a transcription thread, so any other thread seeds defaults
       // harmlessly, and one activateChat did not seed would be written over by the next save.
@@ -1011,7 +1151,14 @@ export function ChatStoreProvider({
       activeTitleRef.current = chat.title ?? '';
       lsSet(ACTIVE_ID_KEY, chat.id);
     },
-    [chatBuffers, runStatusOf, skipNextSave, cancelPendingSave, setTranscriptStale],
+    [
+      chatBuffers,
+      runStatusOf,
+      skipNextSave,
+      cancelPendingSave,
+      setTranscriptStale,
+      setHeldRetention,
+    ],
   );
 
   // The current per-chat generation settings sent when starting a run. The model
@@ -1601,6 +1748,110 @@ export function ChatStoreProvider({
     [isRunning],
   );
 
+  // Bring a chat's LOCAL transcript in line with what the gateway just did to its stored one
+  // (an audio delete or prune). The gateway rewrote the stored document and deleted the audio's
+  // blobs; the local copy still holds the audio_url parts, and a PUT replaces the whole stored
+  // document -- so a later save of that stale copy (any settings edit would make one) would put
+  // back parts pointing at deleted blobs, which serve a 404. Rewriting the copy, and the buffer
+  // a reopened chat is seeded from, is what makes every later save carry the not-stored state:
+  // the gateway does not serialize its audio rewrites against a PUT, so the client must not be
+  // the one that writes the old document back. The rewrite changes `messages`, which also
+  // schedules a save of its own that re-asserts the marker.
+  const rewriteTranscript = useCallback(
+    (chatId: string, rewrite: (messages: ChatUiMessage[]) => ChatUiMessage[]) => {
+      if (chatId === activeChatIdRef.current) {
+        const next = rewrite(messagesRef.current);
+        if (next === messagesRef.current) return;
+        messagesRef.current = next;
+        setMessages(next);
+        chatBuffers.set(chatId, next);
+        return;
+      }
+      // Not the open chat (the user moved on while the request was in flight): its buffer
+      // is what a reopened chat with a lingering run is seeded from.
+      const buffered = chatBuffers.get(chatId);
+      if (buffered) chatBuffers.set(chatId, rewrite(buffered));
+    },
+    [chatBuffers],
+  );
+
+  // Delete the stored audio of ONE spoken answer: ask the gateway, and only once it has done it
+  // show the answer as not stored (the not-stored bubble, which offers a regenerate). Gated like
+  // the other per-message actions -- not while the chat has a live run, which owns the
+  // transcript (the gateway refuses it with a 409 too) -- and only for an assistant answer that
+  // holds audio: a user turn's audio is a transcription clip the user supplied, and a text or
+  // already-removed answer has none, so none of them is a request. The control that calls this
+  // asks the user first (a per-answer inline confirm); this does not.
+  const deleteAudio = useCallback(
+    (id: string) => {
+      const chatId = activeChatIdRef.current;
+      if (!chatId) return;
+      const message = messagesRef.current.find((m) => m.id === id);
+      if (!message || !holdsStoredAudio(message)) return;
+      if (isRunning(chatId)) {
+        showErrorRef.current(tRef.current.chatBusy);
+        return;
+      }
+      void (async () => {
+        try {
+          await apiRef.current.deleteMessageAudio(chatId, id);
+        } catch (err) {
+          showErrorRef.current(formatPortalError(err, tRef.current));
+          return;
+        }
+        rewriteTranscript(chatId, (current) => {
+          const next = current.map((m) => (m.id === id ? withAudioRemoved(m) : m));
+          // The same array when the answer is no longer there (or holds no audio any more):
+          // there is nothing to rewrite, so nothing to save.
+          return next.some((m, i) => m !== current[i]) ? next : current;
+        });
+      })();
+    },
+    [isRunning, rewriteTranscript],
+  );
+
+  // Confirm the held stricter retention (#281): prune the chat's stored audio to its count --
+  // the gateway decides which answers go from its own stored document; the request is only the
+  // number -- and, once that has happened, commit the new setting (the autosave persists it) and
+  // show the pruned answers as not stored. In that order on purpose: a refused or failed prune
+  // leaves everything as it was, the held value still pending (so it can be confirmed again or
+  // dropped), and the setting is never saved for a prune that did not happen. Refused while the
+  // chat has a live run, as the gateway refuses it too.
+  const confirmAudioRetention = useCallback(() => {
+    const held = heldRetentionRef.current;
+    if (!held) return;
+    const chatId = held.chatId;
+    if (chatId !== activeChatIdRef.current) {
+      setHeldRetention(null);
+      return;
+    }
+    if (isRunning(chatId)) {
+      showErrorRef.current(tRef.current.chatBusy);
+      return;
+    }
+    void (async () => {
+      try {
+        await apiRef.current.pruneChatAudio(chatId, held.keepLast);
+      } catch (err) {
+        showErrorRef.current(formatPortalError(err, tRef.current));
+        return;
+      }
+      rewriteTranscript(chatId, (current) => pruneAudioBeyond(current, held.keepLast));
+      // The retention is the chat's now -- unless the user left the chat meanwhile, in which
+      // case the held value was already dropped with it and is not another chat's to take. (A
+      // retention edit made while the prune was in flight is replaced by the confirmed value.)
+      if (chatId !== activeChatIdRef.current) return;
+      const applied = { ...audioSettingsRef.current, ...held.retention };
+      audioSettingsRef.current = applied;
+      setAudioSettingsState(applied);
+      setHeldRetention(null);
+    })();
+  }, [isRunning, rewriteTranscript, setHeldRetention]);
+
+  // Drop the held stricter retention: the control goes back to the stored one, and nothing is
+  // saved or deleted.
+  const cancelAudioRetention = useCallback(() => setHeldRetention(null), [setHeldRetention]);
+
   const handlersFor = useCallback(
     (id: string) => {
       const cache = handlerCacheRef.current;
@@ -1610,12 +1861,13 @@ export function ChatStoreProvider({
           onEdit: (text: string) => editUserMessage(id, text),
           onRegenerate: () => regenerate(id),
           onRefine: (url: string) => refineImage(id, url),
+          onDeleteAudio: () => deleteAudio(id),
         };
         cache.set(id, handlers);
       }
       return handlers;
     },
-    [editUserMessage, regenerate, refineImage],
+    [editUserMessage, regenerate, refineImage, deleteAudio],
   );
 
   // Send the composed message: append the optimistic user bubble, clear the
@@ -2103,13 +2355,18 @@ export function ChatStoreProvider({
     chatKind,
     imageSettings,
     setImageSettings,
-    audioSettings,
+    audioSettings: shownAudioSettings,
     setAudioSettings,
+    pendingAudioRetention,
+    confirmAudioRetention,
+    cancelAudioRetention,
     transcriptionSettings,
     setTranscriptionSettings,
     runKind,
     runElapsedMs,
     runAudioLive,
+    runAudioMuted,
+    muteAudio,
     chats,
     activeChatId,
     chatsLoading,

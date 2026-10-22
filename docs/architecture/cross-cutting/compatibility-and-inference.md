@@ -3142,7 +3142,7 @@ shared header set's `Content-Type` as the edit hop does. `buildSpeechBody` sends
 `voice` and `speed`, plus the thread's advanced passthrough, and **no `response_format`**:
 the endpoint answers WAV when it is absent and refuses every other value (§3.6), so there
 is no format knob and the reply is always WAV (a streamed synthesis is assembled into one, below). The run's knobs are a
-`ChatAudioSettings` (`voice`, `speed`, `stream`, `passthrough`), persisted under `settings.audio` the
+`ChatAudioSettings` (`voice`, `speed`, `stream`, `keep_last_audio`, `passthrough`), persisted under `settings.audio` the
 way `kind` and `image` are (`omitempty`, and cleared server-side for any non-speech kind,
 so a text or image chat's stored and wire bytes are unchanged; a speech thread always
 emits the key, `{}` when empty):
@@ -3283,10 +3283,81 @@ verdict has gone stale.
   play stale), or a format it cannot play abandons live playback for that run, and the
   committed WAV, which is complete whatever a subscriber missed, is rendered by `AudioTurn` like
   a buffered reply. While audio is playing live the pending bubble says so
-  (`AudioPendingTurn`'s `live` state) instead of "no intermediate news".
+  (`AudioPendingTurn`'s `live` state) instead of "no intermediate news", and offers two
+  distinct controls, **Mute** and **Abort** (below, the audio answer lifecycle).
 - **The Models view and the benchmark.** A `speech_streaming` capability chip (shown on a `yes`
   only) sits beside the speech chips in the Models view, and the benchmark section renders the
   speech mode's results (§3.6 item 10) with the first-byte time named as including a cold start.
+
+**The audio answer lifecycle: retention, delete, the not-stored bubble, and live mute and abort
+([ADR-071](../09-architecture-decisions.md#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump), issue #281).** A stored answer used to live
+until the whole chat was deleted. A speech thread now chooses how long its answers' audio is
+kept, and the audio of an answer can go on its own. None of it needs a schema: the setting rides
+the sealed chat document and the removal is a document rewrite plus a delete on `chat_blobs`
+(no migration, no ServerAgent bump, no new knob).
+
+- **The retention is one optional integer, `settings.audio.keep_last_audio`.** Omitted (the
+  default, and every chat from before the field) keeps every answer; `N >= 1` keeps the audio of
+  the newest N assistant answers; `0` stores none. The composer shows a **"Keep audio answers"**
+  checkbox (default on) over a **"Keep all"** / **"Keep last N"** radio (the N field, N >= 1,
+  exists only for the second choice); unchecking the box is `0` and is selectable **only while
+  the portal's `speechStreaming` gate holds** (the gate of the Stream toggle), because a
+  buffered answer is only ever heard from storage. The control shows a stored value as it is and
+  never re-persists it. N counts **answers, not blobs** (a long ADR-070 answer is one slot and
+  goes with all its parts), only assistant messages that still hold an `audio_url` part count,
+  and a transcription turn's user clip never does.
+- **A removed answer carries one `audio_removed` content part** (`{"type":"audio_removed"}`, no
+  URL, no reason) in place of its `audio_url` parts: every path that leaves an answer without
+  audio writes it, the message stays a real turn with its id, and the not-stored bubble keys on
+  the marker, not on "no audio", so a genuinely failed run still renders its error. Removing
+  audio is **one atomic save**: the rewritten document and the delete of the answer's blob rows
+  are one `SaveChatWithBlobs(…, deleteBlobIDs)` transaction, so no stored message ever points at
+  a deleted blob.
+- **Lazy prune at commit.** When a run commits an assistant answer that holds audio,
+  `writeAssistant` rewrites the older answers beyond N to the marker in the same commit that
+  stores the new one (the new answer is the newest and is never the one pruned); a checkpoint or
+  an errored commit prunes nothing. The lazy prune is silent: it is the chosen setting operating
+  as intended.
+- **Retroactive prune with a confirm.** Lowering N, or turning storing off, on a chat that already
+  holds more is an irreversible bulk delete, so the stricter value is **held, not saved**, until
+  the user confirms in an inline notice that names how many answers lose their audio. The hold is
+  immediate, but the notice appears only once the held value has stood unchanged for 500 ms, so an
+  interim digit toward a larger count is not announced as a deletion; nothing is persisted or
+  deleted before Apply. Confirm calls `POST /api/portal/chats/{id}/audio/prune` with
+  `{"keep_last": N}` (the client states only the count, the gateway computes the set) and only then
+  commits the setting, decline reverts and deletes nothing, and raising N or keeping all needs no
+  confirm. The client then rewrites its own copy of the transcript the same way, because a `PUT`
+  replaces the whole stored document and a stale copy would write back audio the gateway deleted.
+- **Per-answer delete.** A delete icon on a stored spoken answer asks inline (no modal), then calls
+  `DELETE /api/portal/chats/{id}/messages/{messageID}/audio`, which removes every part of that
+  answer and leaves the marker; an answer with no stored audio is a no-op. Both routes are refused
+  **409 `portal.chat_run_active`** while a run is active for the chat (they rewrite the whole
+  document like `PUT`), a missing chat, another owner's chat and an unknown message id are the
+  same 404, and a negative or missing `keep_last` is 400 `portal.chat_audio_keep_last_invalid`
+  ([HTTP API Surface](../reference/api-surface.md#tokens-chats-usage)).
+- **`0` and the buffered fallback.** `AssistantTurn.AudioStreamed` (from `generateSpeechTurn`'s
+  fourth result) tells the commit whether the run actually streamed. Under `0`, a **streamed**
+  answer is committed as the marker with no blob (the user heard it live; nothing is ever moved
+  into `chat_blobs`), while a run that **fell back to a buffered clip** stores that one answer
+  anyway, because a paid answer never heard live must not vanish, and it supersedes any older
+  stored audio of the chat (keep-last-1), so a `0` thread never accumulates. A raw-API client
+  that sets `0` on a non-streaming model therefore needs no hard refusal.
+- **Abort commits the marker; a timeout does not.** A user cancel of a speech run commits the
+  not-stored marker instead of an empty canceled turn, so the bubble ends as not-stored with a
+  regenerate; billing is unchanged (the aborted stream bills the loud-zero incomplete, ADR-068)
+  and nothing paid is committed. A deadline is `gateway.chat_run_timeout` and any other error
+  commits as an error with **no** marker, so it keeps its error text.
+- **The not-stored bubble and regenerate.** A finished answer with the marker and no audio renders
+  `AudioNotStoredTurn`: one line ("The audio for this answer is not stored.") and a **regenerate**
+  (the existing `regenerate(id)` → `startRunWithHistory`), no player and no download; a mixed
+  text-and-audio answer keeps its text and gets the placeholder where the player was.
+- **Live Mute and Abort.** While a streaming answer plays, the pending bubble offers **Mute**, a
+  reversible toggle that silences this tab's playback only (`StreamingPcmPlayer` has one
+  persistent `GainNode`, set to 0 or 1, that every scheduled source reaches the destination
+  through; nothing is stopped or dropped, so the clock keeps running), after which the run
+  finishes and is stored per the retention; and **Abort**, the composer's own Stop, which cancels
+  the run and ends in the not-stored state. Both exist only while playback is live, and the mute
+  mark is cleared when it stops being live, so the next run starts unmuted.
 
 **A transcription run is the speech run's inverse against `/v1/audio/transcriptions`
 ([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn)).**

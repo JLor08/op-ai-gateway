@@ -345,8 +345,10 @@ server/application/model-mapping graph, NetBird columns, energy config,
 telemetry/availability samples, benchmarks, usage record/query/stats/groups,
 captures/chats (including `chat_blobs`: the same behaviour on the memory,
 SQLite and PostgreSQL drivers for put/get, the owner lookup, the batched
-chat-scoped read, the atomic chat-plus-blobs write, and the cascade or
-eviction that drops a chat's payloads with it), system settings and UI
+chat-scoped read, the atomic chat-plus-blobs write (including its
+`deleteBlobIDs` half, chat-scoped so another chat's or an unknown id deletes nothing, and
+deleting nothing when the save is refused, [ADR-071](../09-architecture-decisions.md#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump)),
+and the cascade or eviction that drops a chat's payloads with it), system settings and UI
 preferences — plus two dedicated
 regression tests, `TestMigration4UpgradesInt4ToBigint` and
 `TestMigration43WidensRealToDoublePrecision`, that specifically assert the
@@ -422,7 +424,17 @@ else when they bite:
 - **`internal/store`'s tests serialize *within* the package**, so two concurrent
   `go test` processes must not run it against one database. Doing so produces
   spurious, misleading migration failures such as
-  `migration 12 … relation "applications" does not exist`.
+  `migration 12 … relation "applications" does not exist`. The same rule keeps
+  every other package out of that database, and out of any second schema in it:
+  the store tests' index-existence check (`indexExists`, which runs
+  `pg_indexes where indexname = ?` with no schema filter) would see the index in
+  both schemas and count two where it asserts one; the column, constraint and
+  table lookups are already scoped to `public`, but that one is not. A package
+  that needs the PostgreSQL driver brings a **database** of its own on the same
+  server instead, created from `template0` under a unique name and dropped
+  afterwards, as `internal/portal` does for the composed audio prune
+  (`TestPruneChatAudioToKeepLastOnPostgres`). Such a test skips, saying why,
+  when the DSN's role may not create a database.
 
 ## 6. Adding to the schema: the recurring traps
 

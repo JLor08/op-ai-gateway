@@ -77,6 +77,13 @@ export type ChatAudioSettings = {
   // buffered WAV whatever this says. Omitted = the default, which streams where it can;
   // only an explicit `false` opts the thread out, so an unset thread persists nothing.
   stream?: boolean;
+  // How many of the thread's most recent spoken answers keep their stored audio (#281).
+  // Omitted = keep every answer (the default, and what every thread from before this knob
+  // does); `0` = do not store the audio at all (the answer is still played as it is
+  // generated, the text stays); `N >= 1` = keep the last N answers' audio, and the audio of
+  // older answers is pruned when a new answer is committed. Only 0 and a positive integer
+  // are ever written, so an unset thread persists nothing.
+  keep_last_audio?: number;
 };
 
 // The speech-to-text knobs of a "transcription" thread, as sent on the wire and persisted
@@ -271,6 +278,34 @@ export function chatApi(fetcher: Fetcher) {
       request<{ ok: boolean }>(fetcher, `/api/portal/chats/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       }),
+    // The two mutations of the audio answer lifecycle (#281). Both rewrite the chat's stored
+    // document on the gateway (the audio parts become the `audio_removed` marker) and delete
+    // the audio's blob rows in one atomic step, so the caller brings its own copy of the
+    // transcript in line afterwards (ChatStore): a later saveChat of the stale copy would put
+    // back an audio_url the gateway no longer serves. Both are refused with a 409
+    // `portal.chat_run_active` while a run is live for the chat (the run owns the transcript),
+    // and answer a 404 for an unknown or another owner's chat (and, for the delete, an unknown
+    // message).
+    //
+    // Removes ONE answer's audio: every audio part of the message, however many blobs it spans.
+    // A message with no stored audio is a successful no-op.
+    deleteMessageAudio: (chatId: string, messageId: string) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/audio`,
+        { method: 'DELETE' },
+      ),
+    // Prunes the chat's stored audio down to the newest `keepLast` answers that hold any (the
+    // retroactive half of the retention setting; the gateway prunes the same way at each run
+    // commit). 0 removes every answer's audio. The gateway decides WHICH answers go from its own
+    // stored document -- the count is the whole request -- and 400s a missing or negative one
+    // (`portal.chat_audio_keep_last_invalid`), which this client never sends.
+    pruneChatAudio: (chatId: string, keepLast: number) =>
+      request<{ ok: boolean }>(
+        fetcher,
+        `/api/portal/chats/${encodeURIComponent(chatId)}/audio/prune`,
+        { method: 'POST', body: { keep_last: keepLast } },
+      ),
     startChatRun: (chatId: string, body: StartChatRunBody) =>
       request<StartChatRunResponse>(
         fetcher,

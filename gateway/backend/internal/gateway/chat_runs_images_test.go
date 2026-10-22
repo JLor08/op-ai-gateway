@@ -1367,12 +1367,12 @@ type deletingChatStore struct {
 	deleted atomic.Bool
 }
 
-func (s *deletingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob) error {
+func (s *deletingChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob, deleteBlobIDs []string) error {
 	if s.armed.Load() {
 		_ = s.ChatStore.DeleteChat(ctx, chat.ID)
 		s.deleted.Store(true)
 	}
-	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs)
+	return s.ChatStore.SaveChatWithBlobs(ctx, chat, blobs, deleteBlobIDs)
 }
 
 // A generated image is stored by the commit through SaveChatWithBlobs, which
@@ -1398,7 +1398,7 @@ func TestImageRunBlobCommitOnADeletedChatIsTheChatGonePath(t *testing.T) {
 				t.Fatalf("add: %v", err)
 			}
 			parts := json.RawMessage(`[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]`)
-			srv.finishRunWithParts(context.Background(), owner, run, tc.status, "", parts)
+			srv.finishRunWithParts(context.Background(), owner, run, tc.status, "", parts, false)
 
 			if !chats.deleted.Load() {
 				t.Fatal("the commit never reached SaveChatWithBlobs, so the race was not exercised")

@@ -190,7 +190,7 @@ func TestMemoryChatStoreEvictsOldest(t *testing.T) {
 type chatSaver interface {
 	chatStore
 	chatBlobStore
-	SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob) error
+	SaveChatWithBlobs(ctx context.Context, chat Chat, blobs []ChatBlob, deleteBlobIDs []string) error
 }
 
 var (
@@ -295,7 +295,7 @@ func TestSaveChatWithBlobsPersistsChatAndBlobs(t *testing.T) {
 			ID: "blob_two", ChatID: "c_save", KeyVersion: 2, Blob: []byte("second payload"),
 			ContentType: "image/jpeg", ByteLen: 5_000_000_000, CreatedAt: now.Add(2 * time.Minute),
 		}
-		if err := s.SaveChatWithBlobs(ctx, updated, []ChatBlob{first, second}); err != nil {
+		if err := s.SaveChatWithBlobs(ctx, updated, []ChatBlob{first, second}, nil); err != nil {
 			t.Fatalf("SaveChatWithBlobs: %v", err)
 		}
 
@@ -353,7 +353,7 @@ func TestSaveChatWithBlobsCommitsAMultiPartAudioTurnNearCap(t *testing.T) {
 			ID: original.ID, Title: original.Title, KeyVersion: 1, UpdatedAt: now.Add(time.Minute),
 			Blob: []byte(`{"messages":[{"role":"assistant","parts":["` + strings.Join(ids, `","`) + `"]}]}`),
 		}
-		if err := s.SaveChatWithBlobs(ctx, updated, blobs); err != nil {
+		if err := s.SaveChatWithBlobs(ctx, updated, blobs, nil); err != nil {
 			t.Fatalf("SaveChatWithBlobs(%d blobs of %d bytes): %v", len(blobs), partBytes, err)
 		}
 
@@ -410,7 +410,7 @@ func TestSaveChatWithBlobsEmptyBlobsIsAChatUpdate(t *testing.T) {
 				ID: "c_plain", Title: fmt.Sprintf("title %d", i), KeyVersion: 1, Blob: []byte{byte('p' + i)},
 				UpdatedAt: now.Add(time.Duration(i+1) * time.Minute),
 			}
-			if err := s.SaveChatWithBlobs(ctx, updated, blobs); err != nil {
+			if err := s.SaveChatWithBlobs(ctx, updated, blobs, nil); err != nil {
 				t.Fatalf("SaveChatWithBlobs(blobs=%#v): %v", blobs, err)
 			}
 			requireChatEquals(ctx, t, s, Chat{
@@ -420,7 +420,7 @@ func TestSaveChatWithBlobsEmptyBlobsIsAChatUpdate(t *testing.T) {
 		}
 
 		missing := Chat{ID: "c_nope", Title: "x", Blob: []byte("y"), UpdatedAt: now}
-		if err := s.SaveChatWithBlobs(ctx, missing, nil); !errors.Is(err, ErrNotFound) {
+		if err := s.SaveChatWithBlobs(ctx, missing, nil, nil); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("SaveChatWithBlobs(missing chat, no blobs) = %v, want ErrNotFound", err)
 		}
 	})
@@ -431,7 +431,8 @@ func TestSaveChatWithBlobsEmptyBlobsIsAChatUpdate(t *testing.T) {
 // failure comes AFTER something that would persist on its own: the chat update
 // and the first, valid blob. All of it must be undone -- the chat row keeps its
 // pre-save values, the valid blob is not stored, and the rows that were already
-// there (the chat's own blob and another chat's) are untouched.
+// there (the chat's own blob and another chat's) are untouched. Each save also
+// names blob_doomed for deletion: a refused save must not delete it either.
 func TestSaveChatWithBlobsIsAllOrNothing(t *testing.T) {
 	now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
 	cases := []struct {
@@ -472,7 +473,8 @@ func TestSaveChatWithBlobsIsAllOrNothing(t *testing.T) {
 				}
 				existing := memBlob("blob_existing", "c_fail", 4, now)
 				otherBlob := memBlob("blob_other", "c_other", 4, now)
-				for _, b := range []ChatBlob{existing, otherBlob} {
+				doomed := memBlob("blob_doomed", "c_fail", 4, now)
+				for _, b := range []ChatBlob{existing, otherBlob, doomed} {
 					if err := s.PutChatBlob(ctx, b); err != nil {
 						t.Fatalf("PutChatBlob %s: %v", b.ID, err)
 					}
@@ -482,7 +484,7 @@ func TestSaveChatWithBlobsIsAllOrNothing(t *testing.T) {
 					ID: "c_fail", Title: "must not stick", KeyVersion: 9, Blob: []byte("must not stick"),
 					UpdatedAt: now.Add(time.Hour),
 				}
-				err := s.SaveChatWithBlobs(ctx, updated, tc.blobs)
+				err := s.SaveChatWithBlobs(ctx, updated, tc.blobs, []string{"blob_doomed"})
 				if err == nil {
 					t.Fatalf("SaveChatWithBlobs succeeded, want a failure")
 				}
@@ -497,6 +499,7 @@ func TestSaveChatWithBlobsIsAllOrNothing(t *testing.T) {
 				requireBlobAbsent(ctx, t, s, "c_other", "blob_stray")
 				requireBlobEquals(ctx, t, s, existing)
 				requireBlobEquals(ctx, t, s, otherBlob)
+				requireBlobEquals(ctx, t, s, doomed)
 			})
 		})
 	}
@@ -510,7 +513,7 @@ func TestSaveChatWithBlobsMissingChatPersistsNothing(t *testing.T) {
 		ctx := context.Background()
 		now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
 		ghost := Chat{ID: "c_ghost", Title: "x", KeyVersion: 1, Blob: []byte("y"), UpdatedAt: now}
-		err := s.SaveChatWithBlobs(ctx, ghost, []ChatBlob{memBlob("blob_a", "c_ghost", 3, now), memBlob("blob_b", "c_ghost", 3, now)})
+		err := s.SaveChatWithBlobs(ctx, ghost, []ChatBlob{memBlob("blob_a", "c_ghost", 3, now), memBlob("blob_b", "c_ghost", 3, now)}, nil)
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("SaveChatWithBlobs(missing chat) = %v, want ErrNotFound", err)
 		}
@@ -519,5 +522,43 @@ func TestSaveChatWithBlobsMissingChatPersistsNothing(t *testing.T) {
 		}
 		requireBlobAbsent(ctx, t, s, "c_ghost", "blob_a")
 		requireBlobAbsent(ctx, t, s, "c_ghost", "blob_b")
+	})
+}
+
+// TestSaveChatWithBlobsDeleteIDsAreScopedToTheChat is the three-driver parity
+// proof for the delete half of the save (#281). The ids are deleted under the
+// saved chat's own id only: another chat's blob that is named, an id that does
+// not exist, and an id named twice are no error and delete nothing beyond the
+// saved chat's real rows -- and a save that carries ONLY deletes (no new blob)
+// still runs them instead of being short-cut to a plain chat update.
+func TestSaveChatWithBlobsDeleteIDsAreScopedToTheChat(t *testing.T) {
+	forEachChatSaver(t, func(t *testing.T, s chatSaver) {
+		ctx := context.Background()
+		now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+		for _, c := range []Chat{memChat("c_a", 3, now), memChat("c_b", 3, now)} {
+			if err := s.CreateChat(ctx, c); err != nil {
+				t.Fatalf("CreateChat %s: %v", c.ID, err)
+			}
+		}
+		a1, a2 := memBlob("blob_a1", "c_a", 4, now), memBlob("blob_a2", "c_a", 5, now)
+		b1 := memBlob("blob_b1", "c_b", 6, now)
+		for _, b := range []ChatBlob{a1, a2, b1} {
+			if err := s.PutChatBlob(ctx, b); err != nil {
+				t.Fatalf("PutChatBlob %s: %v", b.ID, err)
+			}
+		}
+
+		updated := Chat{ID: "c_a", Title: "pruned", KeyVersion: 1, Blob: []byte("pruned document"), UpdatedAt: now.Add(time.Minute)}
+		if err := s.SaveChatWithBlobs(ctx, updated, nil, []string{"blob_a1", "blob_a1", "blob_b1", "blob_ghost"}); err != nil {
+			t.Fatalf("SaveChatWithBlobs(deletes only): %v", err)
+		}
+
+		requireChatEquals(ctx, t, s, Chat{
+			ID: "c_a", UserID: "u", Title: "pruned", KeyVersion: 1, Blob: updated.Blob,
+			CreatedAt: now, UpdatedAt: updated.UpdatedAt,
+		})
+		requireBlobAbsent(ctx, t, s, "c_a", "blob_a1")
+		requireBlobEquals(ctx, t, s, a2)
+		requireBlobEquals(ctx, t, s, b1) // another chat's blob, named but not c_a's: untouched
 	})
 }

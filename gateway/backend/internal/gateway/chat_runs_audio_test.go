@@ -899,6 +899,52 @@ func TestSpeechRunUserCancelStaysACancel(t *testing.T) {
 	}
 }
 
+// A user Stop on a speech run commits the not-stored marker turn, not an empty
+// canceled bubble: the run's own "canceled" status still stands (a Stop carries no
+// message), and the full thread -- generateSpeechTurn -> finishRunWithParts (the run's
+// pinned speech kind) -> the commit -- turns the empty turn into a regenerate-able
+// marker. Billing and the "commit nothing paid" guarantee are untouched: no audio
+// bytes are stored, the marker is the only addition.
+func TestSpeechRunCancelCommitsNotStoredMarker(t *testing.T) {
+	loopback, release := stalledSpeechLoopback(t)
+	defer release()
+	srv, owner, chatID, _ := newSpeechRunTestServer(t, loopback.URL)
+	srv.selfBaseURL = loopback.URL
+
+	run, err := srv.startChatRun(owner, chatID, speechRunPrep())
+	if err != nil {
+		t.Fatalf("startChatRun: %v", err)
+	}
+	if !srv.ChatRuns.cancelChat(owner.UserID, chatID) {
+		t.Fatal("cancelChat found no active run to cancel")
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "canceled" {
+		t.Fatalf("status = %q, want canceled", got)
+	}
+	if got := runError(t, run); got != "" {
+		t.Fatalf("error = %q, want empty -- a Stop carries no message", got)
+	}
+
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stored.Content), `[{"type":"audio_removed"}]`) {
+		t.Fatalf("the canceled speech turn must be committed as the not-stored marker: %s", stored.Content)
+	}
+	if !strings.Contains(string(stored.Content), `"status":"canceled"`) {
+		t.Fatalf("the marker turn must keep the canceled status: %s", stored.Content)
+	}
+	if strings.Contains(string(stored.Content), `"type":"audio_url"`) || strings.Contains(string(stored.Content), "data:") {
+		t.Fatalf("a canceled run must store no audio: %s", stored.Content)
+	}
+	// Regenerate-able: the assistant turn carries an id.
+	if !strings.Contains(string(stored.Content), `"role":"assistant"`) || !strings.Contains(string(stored.Content), `"id":"msg_`) {
+		t.Fatalf("the marker turn must be a regenerate-able assistant turn with an id: %s", stored.Content)
+	}
+}
+
 // --- end to end ------------------------------------------------------------
 
 // The whole seam, with the real gateway on the loopback hop: the executor's call

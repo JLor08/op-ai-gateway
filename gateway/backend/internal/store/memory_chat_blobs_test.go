@@ -442,7 +442,7 @@ func TestMemorySaveChatWithBlobsEvictsOnceAtTheEnd(t *testing.T) {
 
 	shrunk := Chat{ID: "c_save", Title: "c_save", KeyVersion: 1, Blob: bytes.Repeat([]byte{'s'}, 4), UpdatedAt: now.Add(time.Minute)}
 	blobs := []ChatBlob{memBlob("blob_1", "c_save", 10, now), memBlob("blob_2", "c_save", 10, now)}
-	if err := m.SaveChatWithBlobs(ctx, shrunk, blobs); err != nil {
+	if err := m.SaveChatWithBlobs(ctx, shrunk, blobs, nil); err != nil {
 		t.Fatalf("SaveChatWithBlobs: %v", err)
 	}
 
@@ -479,7 +479,7 @@ func TestMemorySaveChatWithBlobsEvictsTheOldestAfterwards(t *testing.T) {
 	// 13 - 3 + 5 + 2*15 = 45 > 40: c_old (2 + 8 = 10) must go, and only it.
 	grown := Chat{ID: "c_save", Title: "c_save", KeyVersion: 1, Blob: bytes.Repeat([]byte{'s'}, 5), UpdatedAt: now.Add(time.Minute)}
 	blobs := []ChatBlob{memBlob("new_1", "c_save", 15, now), memBlob("new_2", "c_save", 15, now)}
-	if err := m.SaveChatWithBlobs(ctx, grown, blobs); err != nil {
+	if err := m.SaveChatWithBlobs(ctx, grown, blobs, nil); err != nil {
 		t.Fatalf("SaveChatWithBlobs: %v", err)
 	}
 
@@ -519,7 +519,7 @@ func TestMemorySaveChatWithBlobsEvictsTheSavedChatWhole(t *testing.T) {
 
 	grown := Chat{ID: "c_save", Title: "c_save", KeyVersion: 1, Blob: bytes.Repeat([]byte{'s'}, 4), UpdatedAt: now.Add(time.Minute)}
 	blobs := []ChatBlob{memBlob("blob_big", "c_save", 40, now), memBlob("blob_small", "c_save", 5, now)}
-	if err := m.SaveChatWithBlobs(ctx, grown, blobs); err != nil {
+	if err := m.SaveChatWithBlobs(ctx, grown, blobs, nil); err != nil {
 		t.Fatalf("SaveChatWithBlobs: %v", err)
 	}
 
@@ -544,7 +544,8 @@ func TestMemorySaveChatWithBlobsEvictsTheSavedChatWhole(t *testing.T) {
 // batch, a blob of another chat, a chat that is not held -- is decided before
 // anything is applied, so the chat keeps its old fields and its old byte count,
 // no blob of the batch (not even a valid one that came first) is stored or
-// indexed, and the byte budget does not move.
+// indexed, and the byte budget does not move. The refused saves also name a
+// held blob for deletion (#281): none of them may delete it.
 func TestMemorySaveChatWithBlobsRefusedLeavesTheStoreUntouched(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
@@ -569,7 +570,7 @@ func TestMemorySaveChatWithBlobsRefusedLeavesTheStoreUntouched(t *testing.T) {
 		"missing chat":     {Chat{ID: "c_ghost", Title: "g", Blob: []byte("g")}, []ChatBlob{memBlob("blob_ok", "c_ghost", 5, now)}, ErrNotFound},
 	}
 	for name, tc := range refusals {
-		err := m.SaveChatWithBlobs(ctx, tc.chat, tc.blobs)
+		err := m.SaveChatWithBlobs(ctx, tc.chat, tc.blobs, []string{"blob_a"})
 		if err == nil || (tc.wantErr != nil && !errors.Is(err, tc.wantErr)) {
 			t.Fatalf("%s: SaveChatWithBlobs = %v, want %v", name, err, tc.wantErr)
 		}
@@ -611,7 +612,7 @@ func TestMemorySaveChatWithBlobsConcurrentAccess(t *testing.T) {
 				_ = m.CreateChat(ctx, memChat(chatID, 4, now))
 				_ = m.SaveChatWithBlobs(ctx,
 					Chat{ID: chatID, Title: chatID, KeyVersion: 1, Blob: bytes.Repeat([]byte{'n'}, 6), UpdatedAt: now},
-					[]ChatBlob{memBlob("b1_"+chatID, chatID, 16, now), memBlob("b2_"+chatID, chatID, 16, now)})
+					[]ChatBlob{memBlob("b1_"+chatID, chatID, 16, now), memBlob("b2_"+chatID, chatID, 16, now)}, nil)
 				_, _ = m.ChatBlobsByIDs(ctx, chatID, []string{"b1_" + chatID, "b2_" + chatID})
 				if i%3 == 0 {
 					_ = m.DeleteChat(ctx, chatID)
@@ -637,5 +638,102 @@ func TestMemorySaveChatWithBlobsConcurrentAccess(t *testing.T) {
 		if _, ok := m.records[b.ChatID]; !ok {
 			t.Fatalf("blob %s outlived its chat %s", id, b.ChatID)
 		}
+	}
+}
+
+// TestMemorySaveChatWithBlobsDeletesIDs pins the delete half of the save (#281)
+// on the in-RAM store: the named blobs of the saved chat are dropped in the same
+// locked pass as the chat update and the inserts, their payload bytes leave the
+// budget, and the id index of the chat shrinks with them. Ids that are not the
+// saved chat's -- another chat's blob, an unknown id, an id named twice -- are no
+// error and change nothing but the single real row (the SQL driver's
+// `chat_id = ? and id in (...)` does exactly that).
+func TestMemorySaveChatWithBlobsDeletesIDs(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+	m := NewMemoryChatStore(0)
+	mustCreateChat(ctx, t, m, memChat("c_a", 3, now))
+	mustPutBlob(ctx, t, m, memBlob("a1", "c_a", 5, now))
+	mustPutBlob(ctx, t, m, memBlob("a2", "c_a", 7, now))
+	mustPutBlob(ctx, t, m, memBlob("a3", "c_a", 11, now))
+	mustCreateChat(ctx, t, m, memChat("c_b", 2, now))
+	mustPutBlob(ctx, t, m, memBlob("b1", "c_b", 13, now))
+	if m.bytes != 3+5+7+11+2+13 {
+		t.Fatalf("bytes = %d before the save, want %d", m.bytes, 3+5+7+11+2+13)
+	}
+
+	// Transcript 3 -> 6, one new 10-byte blob, a1 and a2 deleted (a1 named
+	// twice), plus b1 (another chat's) and a ghost id, which must be ignored.
+	grown := Chat{ID: "c_a", Title: "c_a", KeyVersion: 1, Blob: bytes.Repeat([]byte{'s'}, 6), UpdatedAt: now.Add(time.Minute)}
+	if err := m.SaveChatWithBlobs(ctx, grown, []ChatBlob{memBlob("n1", "c_a", 10, now)}, []string{"a1", "a2", "a1", "b1", "ghost"}); err != nil {
+		t.Fatalf("SaveChatWithBlobs: %v", err)
+	}
+
+	for _, id := range []string{"a1", "a2"} {
+		if _, err := m.ChatBlobByID(ctx, id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("ChatBlobByID(%s) = %v, want ErrNotFound (deleted by the save)", id, err)
+		}
+		if _, err := m.ChatBlobOwner(ctx, id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("ChatBlobOwner(%s) = %v, want ErrNotFound (deleted by the save)", id, err)
+		}
+	}
+	for id, chatID := range map[string]string{"a3": "c_a", "n1": "c_a", "b1": "c_b"} {
+		if got, err := m.ChatBlobByID(ctx, id); err != nil || got.ChatID != chatID {
+			t.Fatalf("ChatBlobByID(%s) = %#v, %v, want it present under %s", id, got, err, chatID)
+		}
+	}
+	// Chat 6 + a3 11 + n1 10 + c_b 2 + b1 13: the deleted a1/a2 (5 + 7) left
+	// the budget exactly once, a1 named twice notwithstanding.
+	if m.bytes != 6+11+10+2+13 {
+		t.Fatalf("bytes = %d after the save, want %d (a1's and a2's bytes subtracted once each)", m.bytes, 6+11+10+2+13)
+	}
+	if !reflect.DeepEqual(m.chatBlobIDs["c_a"], []string{"a3", "n1"}) || !reflect.DeepEqual(m.chatBlobIDs["c_b"], []string{"b1"}) || len(m.blobs) != 3 {
+		t.Fatalf("index = %v with %d blobs, want c_a [a3 n1], c_b [b1], 3 blobs", m.chatBlobIDs, len(m.blobs))
+	}
+
+	// Deleting every remaining blob of the chat leaves no index entry behind.
+	if err := m.SaveChatWithBlobs(ctx, grown, nil, []string{"a3", "n1"}); err != nil {
+		t.Fatalf("SaveChatWithBlobs(delete only): %v", err)
+	}
+	if m.bytes != 6+2+13 {
+		t.Fatalf("bytes = %d after deleting the rest, want %d", m.bytes, 6+2+13)
+	}
+	if _, ok := m.chatBlobIDs["c_a"]; ok || len(m.blobs) != 1 {
+		t.Fatalf("index = %v with %d blobs, want no c_a entry and only b1 held", m.chatBlobIDs, len(m.blobs))
+	}
+}
+
+// TestMemorySaveChatWithBlobsDeletesBeforeTheOneEviction pins that the deleted
+// blobs' bytes are already off the budget when the save's single eviction runs.
+// The saved chat's two 10-byte blobs are replaced by one 15-byte blob: the
+// finished state (12 + 3 + 15 = 30) fits the 40-byte budget, but 35 + 15 = 50
+// would not -- so evicting before the deletes landed would throw the unrelated
+// oldest chat out for bytes the very same save frees.
+func TestMemorySaveChatWithBlobsDeletesBeforeTheOneEviction(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)
+	m := NewMemoryChatStore(40)
+	mustCreateChat(ctx, t, m, memChat("c_old", 2, now)) // oldest
+	mustPutBlob(ctx, t, m, memBlob("old_1", "c_old", 10, now))
+	mustCreateChat(ctx, t, m, memChat("c_save", 3, now))
+	mustPutBlob(ctx, t, m, memBlob("s1", "c_save", 10, now))
+	mustPutBlob(ctx, t, m, memBlob("s2", "c_save", 10, now))
+	if m.bytes != 35 {
+		t.Fatalf("bytes = %d before the save, want 35", m.bytes)
+	}
+
+	same := Chat{ID: "c_save", Title: "c_save", KeyVersion: 1, Blob: bytes.Repeat([]byte{'t'}, 3), UpdatedAt: now.Add(time.Minute)}
+	if err := m.SaveChatWithBlobs(ctx, same, []ChatBlob{memBlob("s3", "c_save", 15, now)}, []string{"s1", "s2"}); err != nil {
+		t.Fatalf("SaveChatWithBlobs: %v", err)
+	}
+
+	if _, err := m.ChatByID(ctx, "c_old"); err != nil {
+		t.Fatalf("c_old = %v, want present (the deletes free what the new blob adds)", err)
+	}
+	if _, err := m.ChatBlobByID(ctx, "old_1"); err != nil {
+		t.Fatalf("old_1 = %v, want present", err)
+	}
+	if m.bytes != 30 {
+		t.Fatalf("bytes = %d, want 30 (c_old 2+10, c_save 3 + the 15-byte blob)", m.bytes)
 	}
 }

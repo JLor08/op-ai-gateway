@@ -179,7 +179,7 @@ func (s *Server) executeTranscriptionRun(ctx context.Context, owner auth.Token, 
 	defer liftDeadline()
 
 	parts, status, errMsg := s.generateTranscriptionTurn(ctx, owner, run, prep, liftDeadline)
-	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts)
+	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts, false)
 }
 
 // armRunDeadline starts the deadline of a run of this kind -- a timer that cancels the

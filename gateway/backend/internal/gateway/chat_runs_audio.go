@@ -165,8 +165,8 @@ func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *Cha
 	liftDeadline := armRunDeadline(chatRunKindSpeech, cancel)
 	defer liftDeadline()
 
-	parts, status, errMsg := s.generateSpeechTurn(ctx, owner, run, prep, liftDeadline)
-	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts)
+	parts, status, errMsg, streamed := s.generateSpeechTurn(ctx, owner, run, prep, liftDeadline)
+	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts, streamed)
 }
 
 // generateSpeechTurn performs the single loopback request a speech run makes and
@@ -185,7 +185,15 @@ func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *Cha
 // IS: the gateway answers a stream request with a stream only for a route it knows to
 // stream, and with the one-shot WAV otherwise (a verdict gone stale), so a 2xx event
 // stream is consumed as one (consumeSpeechStream) and anything else is the buffered WAV.
-func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func()) (json.RawMessage, string, string) {
+//
+// The fourth result, streamed, is whether the run ACTUALLY streamed its synthesis
+// through to the client -- it took the consumeSpeechStream branch -- rather than
+// falling back to the buffered one-shot. It rides through finishRunWithParts onto the
+// committed turn (portal.AssistantTurn.AudioStreamed), where the audio answer
+// lifecycle (#281) needs it: a streamed answer under keep_last_audio=0 was heard live
+// and is committed as the not-stored marker, while a buffered-fallback one is stored.
+// Every failure before the branch, and the buffered branch, is not-streamed.
+func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func()) (json.RawMessage, string, string, bool) {
 	sampleRate, streaming := s.speechRunStreamRate(ctx, owner, prep)
 	build := buildSpeechBody
 	if streaming {
@@ -195,14 +203,14 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	if err != nil {
 		log.Printf("chat run %s: build speech body failed: %v", run.ID, err)
 		if errors.Is(err, errSpeechPassthroughReserved) {
-			return nil, "error", speechRunReservedFieldMessage
+			return nil, "error", speechRunReservedFieldMessage, false
 		}
-		return nil, "error", speechRunDispatchFailedMessage
+		return nil, "error", speechRunDispatchFailedMessage, false
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+"/v1/audio/speech", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("chat run %s: build speech request failed: %v", run.ID, err)
-		return nil, "error", speechRunDispatchFailedMessage
+		return nil, "error", speechRunDispatchFailedMessage, false
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
 
@@ -210,22 +218,24 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if status, msg, ended := runContextOutcome(ctx); ended {
-			return nil, status, msg
+			return nil, status, msg, false
 		}
 		// The operator's copy keeps the whole Go error, internal URL and all; the
 		// user's copy is the code. See speechRunDispatchFailedMessage.
 		log.Printf("chat run %s: speech loopback request failed: %v", run.ID, err)
-		return nil, "error", speechRunDispatchFailedMessage
+		return nil, "error", speechRunDispatchFailedMessage, false
 	}
 	defer resp.Body.Close()
 
 	// The gateway answered the stream request with an event stream: read it as it
 	// comes. (Only a 2xx can be one; anything else, and a one-shot WAV, is read whole
-	// below.)
+	// below.) This is the one branch that ACTUALLY streamed.
 	if streaming && resp.StatusCode >= 200 && resp.StatusCode <= 299 && isSpeechEventStream(resp.Header) {
-		return s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline)
+		parts, status, msg := s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline)
+		return parts, status, msg, true
 	}
-	return s.bufferedSpeechTurn(ctx, run, resp)
+	parts, status, msg := s.bufferedSpeechTurn(ctx, run, resp)
+	return parts, status, msg, false
 }
 
 // bufferedSpeechTurn is the outcome of a speech run's loopback answer that is not an

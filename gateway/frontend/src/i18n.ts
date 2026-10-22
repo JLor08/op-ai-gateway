@@ -274,6 +274,34 @@ const de = {
   chatSpeechStream: 'Beim Erzeugen abspielen (Streaming)',
   chatSpeechStreamHint:
     'Das Modell liefert das Audio schon während der Erzeugung, und es wird sofort abgespielt. Das fertige Audio erscheint danach wie gewohnt als Datei.',
+  // The answer-audio retention control of the speech settings (#281): a "keep audio answers"
+  // checkbox (on by default) over a keep-all / keep-last-N choice whose count field exists only
+  // for "keep last N". Unchecking is "do not store" and is selectable only while the thread
+  // streams (the same gate as the streaming toggle above), which the hint says: a buffered
+  // answer is only ever heard from storage. The count's message names what an unusable value
+  // does meanwhile (every answer is kept), since it would otherwise fall through in silence.
+  chatAudioKeep: 'Audio-Antworten behalten',
+  chatAudioKeepAll: 'Alle behalten',
+  chatAudioKeepLast: 'Letzte N behalten',
+  chatAudioKeepLastCount: 'Zu behaltende Antworten (N)',
+  chatAudioKeepHint:
+    'Ausschalten, um Audio-Antworten gar nicht zu speichern. Das geht nur, solange die Antwort beim Erzeugen abgespielt wird (Streaming): Audio, das nicht gestreamt wird, lässt sich nur aus dem Speicher anhören und wird deshalb trotzdem behalten.',
+  chatAudioKeepLastInvalid:
+    'Geben Sie eine ganze Zahl ab 1 ein oder wählen Sie „Alle behalten“. Solange der Wert ungültig ist, werden alle Antworten behalten.',
+  // The retroactive prune's confirm (#281): tightening the retention of a chat whose stored audio
+  // exceeds it deletes that audio for good, so the stricter value waits here for a yes. `keep` is
+  // the count it prunes to (0 = audio is no longer stored), `removed` how many answers lose their
+  // audio; the answers' text stays either way. The two buttons apply it and drop it.
+  chatAudioPrunePending: (keep: number, removed: number) => {
+    const answers = removed === 1 ? 'Antwort' : 'Antworten';
+    if (keep === 0) {
+      return `Das gespeicherte Audio von ${removed} ${answers} wird unwiderruflich gelöscht, weil Audio nicht mehr gespeichert wird. Der Text bleibt erhalten.`;
+    }
+    const kept = keep === 1 ? 'Antwort' : 'Antworten';
+    return `Das gespeicherte Audio von ${removed} älteren ${answers} wird unwiderruflich gelöscht, damit nur die letzten ${keep} ${kept} ihr Audio behalten. Der Text bleibt erhalten.`;
+  },
+  chatAudioPruneConfirm: 'Übernehmen und Audio löschen',
+  chatAudioPruneDiscard: 'Verwerfen',
   // The collapsible "Advanced" section: extra request fields as a JSON object (the
   // OpenAI `instructions` field or a model-native option).
   chatSpeechAdvanced: 'Erweitert',
@@ -430,12 +458,31 @@ const de = {
   chatAudioStreamLive: 'Wird beim Erzeugen abgespielt',
   chatAudioStreamLiveHint:
     'Das fertige Audio erscheint hier, sobald die Erzeugung abgeschlossen ist.',
+  // The two controls of that live bubble (#281). Mute is a toggle that silences only this
+  // tab's playback (the run finishes and is saved as usual), so its label names the action
+  // the next click does; Abort cancels the run itself (nothing is saved).
+  chatAudioMute: 'Stumm schalten',
+  chatAudioUnmute: 'Ton einschalten',
+  chatAudioAbort: 'Erzeugung abbrechen',
   chatGeneratedAudio: 'Erzeugtes Audio',
   chatDownloadAudio: 'Audio herunterladen',
   // Inline next to the player, in two cases: the download itself failed, or the stored
   // reply could not be fetched for playback (a purged blob, a network error).
   chatAudioDownloadError: 'Audio konnte nicht heruntergeladen werden.',
   chatAudioLoadError: 'Audio konnte nicht geladen werden.',
+  // The placeholder of an answer whose audio is gone -- pruned by the retention setting,
+  // deleted, never stored, or aborted (#281). It is worded neutrally on purpose: the one
+  // marker the stored answer carries does not say which of those happened. The bubble's
+  // regenerate button reuses chatRegenerate.
+  chatAudioNotStored: 'Das Audio dieser Antwort ist nicht gespeichert.',
+  // The per-answer delete of a stored spoken answer's audio (#281): the trash icon on the answer's
+  // action stack, and the inline confirm it opens in place of the icon (the question, then Delete
+  // and the generic chatCancel). The question says what the audio's removal means -- final, but
+  // the answer can be generated again, which is what the not-stored bubble then offers.
+  chatAudioDelete: 'Audio löschen',
+  chatAudioDeleteConfirm:
+    'Audio dieser Antwort löschen? Das lässt sich nicht rückgängig machen – mit „Neu generieren“ kann es neu erzeugt werden.',
+  chatAudioDeleteAction: 'Löschen',
   // The wait of a running transcription (speech-to-text) turn, the transcript twin of the
   // audio wait above: it words the WAIT (the request may still be queued or waiting on a model
   // load), and the sentence says no intermediate news is coming BEFORE the first text -- there
@@ -3583,6 +3630,26 @@ const en: PortalMessages = {
   chatSpeechStream: 'Play while generating (streaming)',
   chatSpeechStreamHint:
     'The model delivers its audio while it is generated, and it plays at once. The finished audio then appears as a file as usual.',
+  // See the German block: the answer-audio retention control of the speech settings.
+  chatAudioKeep: 'Keep audio answers',
+  chatAudioKeepAll: 'Keep all',
+  chatAudioKeepLast: 'Keep last N',
+  chatAudioKeepLastCount: 'Answers to keep (N)',
+  chatAudioKeepHint:
+    'Turn this off to not store audio answers at all. That only works while the answer streams (plays while it is generated): audio that is not streamed can only be heard from storage, so it is kept anyway.',
+  chatAudioKeepLastInvalid:
+    'Enter a whole number of 1 or more, or choose "Keep all". While the value is invalid, every answer is kept.',
+  // See the German block: the confirm of a retention change that deletes stored audio.
+  chatAudioPrunePending: (keep: number, removed: number) => {
+    const answers = removed === 1 ? 'answer' : 'answers';
+    if (keep === 0) {
+      return `The stored audio of ${removed} ${answers} will be permanently deleted because audio is no longer stored. The text stays.`;
+    }
+    const kept = keep === 1 ? 'answer' : 'answers';
+    return `The stored audio of ${removed} older ${answers} will be permanently deleted so that only the last ${keep} ${kept} keep their audio. The text stays.`;
+  },
+  chatAudioPruneConfirm: 'Apply and delete audio',
+  chatAudioPruneDiscard: 'Discard',
   chatSpeechAdvanced: 'Advanced',
   chatSpeechPassthrough: 'Extra request fields (JSON)',
   chatSpeechPassthroughHint:
@@ -3676,10 +3743,18 @@ const en: PortalMessages = {
   // See the German block: the pending turn of a speech run that plays while it generates.
   chatAudioStreamLive: 'Playing while it is generated',
   chatAudioStreamLiveHint: 'The finished audio appears here once the generation is complete.',
+  chatAudioMute: 'Mute',
+  chatAudioUnmute: 'Unmute',
+  chatAudioAbort: 'Abort generation',
   chatGeneratedAudio: 'Generated audio',
   chatDownloadAudio: 'Download audio',
   chatAudioDownloadError: 'Could not download the audio.',
   chatAudioLoadError: 'Could not load the audio.',
+  chatAudioNotStored: 'The audio for this answer is not stored.',
+  chatAudioDelete: 'Delete audio',
+  chatAudioDeleteConfirm:
+    'Delete the audio of this answer? This cannot be undone – “Regenerate” can create it again.',
+  chatAudioDeleteAction: 'Delete',
   chatTranscriptionRunPending: 'Waiting for transcript',
   chatTranscriptionNoIntermediateNews:
     'No intermediate updates – the transcript appears as soon as the model delivers text.',

@@ -12,8 +12,10 @@ import {
   useChatStore,
   useChatStreaming,
   type ChatStore,
+  type ChatUiMessage,
 } from './ChatStore';
 import { ToastProvider } from '../shared/ToastProvider';
+import { formatPortalError } from '../shared/format';
 import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
 import { NO_SPEECH_STREAMING, type SpeechStreamingGate } from '../../api/models';
 import { PortalApiError } from '../../api/transport';
@@ -43,6 +45,7 @@ const playback = vi.hoisted(() => ({
   end: vi.fn(),
   stopAll: vi.fn(),
   isLive: vi.fn(() => false),
+  setMuted: vi.fn(),
 }));
 vi.mock('./speechPlayback', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./speechPlayback')>()),
@@ -172,6 +175,12 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     })),
     cancelChatRun: vi.fn(async () => ({ ok: true })),
     activeChatRuns: vi.fn(async () => ({ data: [] as ActiveChatRun[] })),
+    // The two mutations of the audio answer lifecycle (#281): the gateway answers {ok:true}
+    // and rewrites the stored document itself; the lifecycle tests below override them to
+    // hold or refuse the call. Like every spy here they change no row: what the store does
+    // with its LOCAL transcript afterwards is what is under test.
+    deleteMessageAudio: vi.fn(async (_chatId: string, _messageId: string) => ({ ok: true })),
+    pruneChatAudio: vi.fn(async (_chatId: string, _keepLast: number) => ({ ok: true })),
     // The server-override picker's filtered-model fetch: no test in this file
     // exercises it, but the store now holds a real reference to this method so
     // the mock must provide one.
@@ -215,6 +224,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
               .map((p) => {
                 if (p.type === 'image_url') return `image_url:${p.image_url.url}`;
                 if (p.type === 'audio_url') return `audio_url:${p.audio_url.url}`;
+                if (p.type === 'audio_removed') return 'audio_removed';
                 return `text:${p.text}`;
               })
               .join('|')
@@ -227,6 +237,10 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="model">{c.model}</span>
       <span data-testid="model-available">{String(c.modelAvailable)}</span>
       <span data-testid="chat-kind">{c.chatKind}</span>
+      {/* The whole transcript, as the store holds it, for the audio lifecycle tests. */}
+      <span data-testid="messages-json">{JSON.stringify(c.messages)}</span>
+      {/* The retention change held for an explicit confirm ("null" while there is none). */}
+      <span data-testid="pending-retention">{JSON.stringify(c.pendingAudioRetention)}</span>
       <span data-testid="run-kind">{c.runKind ?? ''}</span>
       <span data-testid="run-elapsed-ms">{c.runElapsedMs ?? ''}</span>
       <span data-testid="model-image-capable">{String(c.modelImageCapable)}</span>
@@ -275,6 +289,13 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           active chat's run is playing its audio live. */}
       <span data-testid="speech-streaming">{String(c.speechStreaming)}</span>
       <span data-testid="run-audio-live">{String(c.runAudioLive)}</span>
+      <span data-testid="run-audio-muted">{String(c.runAudioMuted)}</span>
+      <button type="button" onClick={() => c.muteAudio('c1', true)}>
+        mute-audio
+      </button>
+      <button type="button" onClick={() => c.muteAudio('c1', false)}>
+        unmute-audio
+      </button>
       <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, stream: false }))}>
         set-audio-stream-off
       </button>
@@ -308,6 +329,8 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
             speed: '1.25',
             passthrough: '{"seed":3}',
             stream: true,
+            keepAudio: true,
+            keepLast: '3',
           })
         }
       >
@@ -318,6 +341,33 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
         onClick={() => c.setAudioSettings((s) => ({ ...s, passthrough: '{"seed":' }))}
       >
         break-audio-passthrough
+      </button>
+      {/* The retention control's edits (#281): keep-last-N with the given count text (blank,
+          a number, or text the wire drops), do-not-store, and back on, each a patch over what
+          the composer shows, as the control sends them. */}
+      {['', '1', '2', '5', '10', 'abc', '1.5', '0'].map((text) => (
+        <button
+          key={`keep-last-${text}`}
+          type="button"
+          onClick={() => c.setAudioSettings((s) => ({ ...s, keepAudio: true, keepLast: text }))}
+        >
+          keep-last-{text === '' ? 'blank' : text}
+        </button>
+      ))}
+      <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, keepAudio: false }))}>
+        keep-audio-off
+      </button>
+      <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, keepAudio: true }))}>
+        keep-audio-on
+      </button>
+      <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, voice: 'bf_emma' }))}>
+        set-voice
+      </button>
+      <button type="button" onClick={() => c.confirmAudioRetention()}>
+        confirm-retention
+      </button>
+      <button type="button" onClick={() => c.cancelAudioRetention()}>
+        cancel-retention
       </button>
       {/* ...or valid JSON naming a field the run owns (case-insensitively). */}
       <button
@@ -387,6 +437,9 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
         <span key={`h-${m.id}`}>
           <button type="button" onClick={() => c.handlersFor(m.id).onRegenerate()}>
             regenerate-{m.id}
+          </button>
+          <button type="button" onClick={() => c.handlersFor(m.id).onDeleteAudio()}>
+            delete-audio-{m.id}
           </button>
           <button type="button" onClick={() => c.handlersFor(m.id).onEdit('edited text')}>
             edit-{m.id}
@@ -3900,6 +3953,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       playback.prime.mockClear();
       playback.end.mockClear();
       playback.stopAll.mockClear();
+      playback.setMuted.mockClear();
       playback.push.mockReset().mockReturnValue(true);
     });
 
@@ -4110,6 +4164,44 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(playback.end).toHaveBeenCalledWith('c1', false));
     });
 
+    // The live mute (#281): local playback only -- the run is neither stopped nor changed.
+    describe('muting the live run', () => {
+      it('hands the mute to the playback, mirrors it, and unmutes again', async () => {
+        const { es } = await startRun();
+        act(() => es.emit('audio', chunk(0)));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
+
+        fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+        expect(playback.setMuted).toHaveBeenLastCalledWith('c1', true);
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
+
+        fireEvent.click(screen.getByRole('button', { name: 'unmute-audio' }));
+        expect(playback.setMuted).toHaveBeenLastCalledWith('c1', false);
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
+      });
+
+      it('does not cancel, end or otherwise touch the run', async () => {
+        const { es } = await startRun();
+        act(() => es.emit('audio', chunk(0)));
+        fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+        expect(chatApi.spies.cancelChatRun).not.toHaveBeenCalled();
+        expect(playback.end).not.toHaveBeenCalled();
+        expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
+      });
+
+      it.each([
+        ['completes', { status: 'completed', error: '' }],
+        ['is canceled', { status: 'canceled', error: '' }],
+      ])('does not outlive the run when it %s', async (_name, terminal) => {
+        const { es } = await startRun();
+        act(() => es.emit('audio', chunk(0)));
+        fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
+        act(() => es.emit('done', { content: '', kind: 'speech', ...terminal }));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
+      });
+    });
+
     it('silences every chat when the store goes away', async () => {
       const { unmount } = await startRun();
       unmount();
@@ -4275,7 +4367,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const settings = startSettings();
       expect(settings.model).toBe('kokoro');
       expect(settings.kind).toBe('speech');
-      expect(settings.audio).toEqual({ voice: 'af_heart', speed: 1.25, passthrough: { seed: 3 } });
+      expect(settings.audio).toEqual({
+        voice: 'af_heart',
+        speed: 1.25,
+        passthrough: { seed: 3 },
+        keep_last_audio: 3,
+      });
       // A speech run carries no image knobs.
       expect('image' in settings).toBe(false);
 
@@ -4436,6 +4533,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         speed: '0.8',
         passthrough: '',
         stream: true,
+        keepAudio: true,
+        keepLast: '',
       });
 
       // The audio settings are the ONLY thing that changes here, so this also holds
@@ -4451,6 +4550,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         voice: 'af_heart',
         speed: 1.25,
         passthrough: { seed: 3 },
+        keep_last_audio: 3,
       });
 
       // ...and the reload reads them back out of the saved document (the PUT
@@ -4461,11 +4561,15 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toMatchObject({
         voice: 'af_heart',
         speed: '1.25',
+        keepAudio: true,
+        keepLast: '3',
       });
     });
 
     it('keeps the stored audio settings when an unrelated setting is saved', async () => {
-      chatApi = makeChatApi(speechThread({ voice: 'bf_emma', speed: 0.8, passthrough: { a: 1 } }));
+      chatApi = makeChatApi(
+        speechThread({ voice: 'bf_emma', speed: 0.8, passthrough: { a: 1 }, keep_last_audio: 0 }),
+      );
       renderProvider([], { models: speechModels });
       await waitForReady();
 
@@ -4478,6 +4582,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         voice: 'bf_emma',
         speed: 0.8,
         passthrough: { a: 1 },
+        keep_last_audio: 0,
       });
     });
 
@@ -4516,6 +4621,564 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         if (!kind) expect(Object.keys(saved.content.settings)).not.toContain('kind');
       },
     );
+  });
+
+  // The audio answer lifecycle (#281), store side: deleting one answer's audio and the
+  // retroactive prune that tightening the retention setting asks for. The gateway does the
+  // deleting; the store's job is to ask only when it was told to (a click, a CONFIRMED
+  // tightening), to bring its own transcript in line afterwards so a later save cannot write
+  // an audio_url the gateway has deleted, and never to delete in bulk unconfirmed.
+  describe(`ChatStoreProvider audio answer lifecycle [${locale}]`, () => {
+    const kokoro: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const speechModels: ModelOption[] = [kokoro];
+    const blob = (n: number) => `/api/portal/chat-blobs/blob_${n}`;
+    const audioPart = (n: number) => ({ type: 'audio_url' as const, audio_url: { url: blob(n) } });
+    const marker = { type: 'audio_removed' };
+    const settingsFor = (audio?: Record<string, unknown>) => ({
+      model: kokoro.id,
+      kind: 'speech',
+      ...(audio ? { audio } : {}),
+    });
+    const threeAnswers = [
+      { id: 'u1', role: 'user', content: 'one' },
+      { id: 'a1', role: 'assistant', content: [audioPart(1)], status: 'complete' },
+      { id: 'u2', role: 'user', content: 'two' },
+      { id: 'a2', role: 'assistant', content: [audioPart(2)], status: 'complete' },
+      { id: 'u3', role: 'user', content: 'three' },
+      { id: 'a3', role: 'assistant', content: [audioPart(3)], status: 'complete' },
+    ];
+    // A saved speech thread: three spoken answers unless told otherwise, and a retention
+    // setting only when given.
+    const spokenChat = (
+      audio?: Record<string, unknown>,
+      messageRows: unknown[] = threeAnswers,
+    ): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: { settings: settingsFor(audio), messages: messageRows },
+      },
+    ];
+    const openSpokenChat = async (audio?: Record<string, unknown>, messageRows?: unknown[]) => {
+      chatApi = makeChatApi(spokenChat(audio, messageRows));
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+    };
+
+    const click = (name: string) => fireEvent.click(screen.getByRole('button', { name }));
+    const transcript = () =>
+      JSON.parse(screen.getByTestId('messages-json').textContent!) as ChatUiMessage[];
+    const partsOf = (id: string) => transcript().find((m) => m.id === id)!.content;
+    const pending = () =>
+      JSON.parse(screen.getByTestId('pending-retention').textContent!) as {
+        keepLast: number;
+        excess: number;
+      } | null;
+    const shown = () => JSON.parse(screen.getByTestId('audio-settings').textContent!);
+    type SavedBody = {
+      content: {
+        settings: { audio?: Record<string, unknown> };
+        messages: { id: string; content: unknown }[];
+      };
+    };
+    const lastSaved = () => chatApi.spies.saveChat.mock.calls.at(-1)![1] as SavedBody;
+    const isSavedWithVoice = (call: unknown[]) =>
+      (call[1] as SavedBody).content.settings.audio?.voice === 'bf_emma';
+    // The save is debounced (800 ms): waiting it out is how "nothing was saved" is shown.
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 1000));
+    const savedWithin = (check: () => boolean) =>
+      waitFor(() => expect(check()).toBe(true), { timeout: 3000 });
+    const deferred = <T,>() => {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+    const refused = (status: number, code: string) => new PortalApiError(status, code, 'refused');
+    const originalAudio = [audioPart(1)];
+
+    describe('deleting one answer', () => {
+      it('asks the gateway, then shows that answer as not stored and no other', async () => {
+        await openSpokenChat();
+
+        click('delete-audio-a2');
+
+        await waitFor(() =>
+          expect(chatApi.spies.deleteMessageAudio).toHaveBeenCalledWith('c1', 'a2'),
+        );
+        await waitFor(() => expect(partsOf('a2')).toEqual([marker]));
+        expect(partsOf('a1')).toEqual(originalAudio);
+        expect(partsOf('a3')).toEqual([audioPart(3)]);
+        expect(chatApi.spies.deleteMessageAudio).toHaveBeenCalledTimes(1);
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+      });
+
+      it('keeps the audio on screen until the gateway has actually deleted it', async () => {
+        await openSpokenChat();
+        const held = deferred<{ ok: boolean }>();
+        chatApi.spies.deleteMessageAudio.mockReturnValueOnce(held.promise);
+
+        click('delete-audio-a1');
+        await waitFor(() => expect(chatApi.spies.deleteMessageAudio).toHaveBeenCalled());
+        expect(partsOf('a1')).toEqual(originalAudio);
+
+        held.resolve({ ok: true });
+        await waitFor(() => expect(partsOf('a1')).toEqual([marker]));
+      });
+
+      it('keeps the text of a mixed answer and replaces only its audio', async () => {
+        await openSpokenChat(undefined, [
+          { id: 'u1', role: 'user', content: 'one' },
+          {
+            id: 'a1',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'spoken words' }, audioPart(1), audioPart(2)],
+            status: 'complete',
+          },
+        ]);
+
+        click('delete-audio-a1');
+
+        await waitFor(() =>
+          expect(partsOf('a1')).toEqual([{ type: 'text', text: 'spoken words' }, marker]),
+        );
+      });
+
+      it('leaves the transcript as it was and says why when the gateway refuses', async () => {
+        await openSpokenChat();
+        const err = refused(409, 'portal.chat_run_active');
+        chatApi.spies.deleteMessageAudio.mockRejectedValueOnce(err);
+
+        click('delete-audio-a1');
+
+        expect(await screen.findByText(formatPortalError(err, t))).toBeTruthy();
+        expect(partsOf('a1')).toEqual(originalAudio);
+        expect(partsOf('a2')).toEqual([audioPart(2)]);
+      });
+
+      it('does not ask while the chat has a live run', async () => {
+        await openSpokenChat();
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'again' } });
+        click('send');
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+        click('delete-audio-a1');
+
+        expect(await screen.findByText(t.chatBusy)).toBeTruthy();
+        expect(chatApi.spies.deleteMessageAudio).not.toHaveBeenCalled();
+        expect(partsOf('a1')).toEqual(originalAudio);
+      });
+
+      // Only an assistant answer that holds audio has any to delete: a user turn (a
+      // transcription clip is the user's input), a text answer and an already-removed one are
+      // no-ops, so no request is sent for them.
+      it('sends nothing for a message that holds no answer audio', async () => {
+        await openSpokenChat(undefined, [
+          { id: 'u1', role: 'user', content: [audioPart(9)] },
+          { id: 'a1', role: 'assistant', content: 'plain text', status: 'complete' },
+          { id: 'a2', role: 'assistant', content: [marker], status: 'complete' },
+        ]);
+
+        click('delete-audio-u1');
+        click('delete-audio-a1');
+        click('delete-audio-a2');
+        await settle();
+
+        expect(chatApi.spies.deleteMessageAudio).not.toHaveBeenCalled();
+        expect(partsOf('u1')).toEqual([audioPart(9)]);
+      });
+
+      // THE LOCAL COPY IS REFRESHED: the document a later save writes (a PUT replaces the whole
+      // stored document) carries the marker. Had the store kept the audio_url, that save would
+      // put back a part pointing at a blob the gateway has deleted, which serves a 404.
+      it('saves the marker, never the deleted audio, with every later save', async () => {
+        await openSpokenChat();
+        click('delete-audio-a2');
+        await waitFor(() => expect(partsOf('a2')).toEqual([marker]));
+
+        // An unrelated edit makes a save of its own, after the delete.
+        click('set-voice');
+        await savedWithin(() => chatApi.spies.saveChat.mock.calls.some(isSavedWithVoice));
+
+        const saved = chatApi.spies.saveChat.mock.calls.map((call) => call[1] as SavedBody);
+        const afterDelete = saved.filter(
+          (body) => body.content.settings.audio?.voice === 'bf_emma',
+        );
+        expect(afterDelete.length).toBeGreaterThan(0);
+        for (const body of afterDelete) {
+          expect(JSON.stringify(body.content.messages)).not.toContain(blob(2));
+          expect(body.content.messages.find((m) => m.id === 'a2')!.content).toEqual([marker]);
+          expect(JSON.stringify(body.content.messages)).toContain(blob(1));
+        }
+      });
+    });
+
+    describe('tightening the retention of a chat that holds more audio', () => {
+      it('holds the stricter value for a confirm instead of saving or deleting anything', async () => {
+        await openSpokenChat();
+
+        click('keep-last-2');
+
+        expect(pending()).toEqual({ keepLast: 2, excess: 1 });
+        // The control shows what was asked for, so typing a count can carry on.
+        expect(shown()).toMatchObject({ keepAudio: true, keepLast: '2' });
+        await settle();
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        expect(partsOf('a1')).toEqual(originalAudio);
+      });
+
+      it('runs a send with the stored retention while the stricter one is held', async () => {
+        await openSpokenChat();
+        click('keep-last-2');
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'again' } });
+        click('send');
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+          settings: { audio?: Record<string, unknown> };
+        };
+        expect(body.settings.audio).toEqual({});
+      });
+
+      it('on confirm prunes to the new count, shows the pruned answers, and saves the setting', async () => {
+        await openSpokenChat();
+        click('keep-last-2');
+        const held = deferred<{ ok: boolean }>();
+        chatApi.spies.pruneChatAudio.mockReturnValueOnce(held.promise);
+
+        click('confirm-retention');
+        await waitFor(() => expect(chatApi.spies.pruneChatAudio).toHaveBeenCalledWith('c1', 2));
+        // Nothing is shown as deleted, and no setting is committed, until the gateway says so.
+        expect(partsOf('a1')).toEqual(originalAudio);
+        expect(pending()).toEqual({ keepLast: 2, excess: 1 });
+
+        held.resolve({ ok: true });
+        await waitFor(() => expect(partsOf('a1')).toEqual([marker]));
+        expect(partsOf('a2')).toEqual([audioPart(2)]);
+        expect(partsOf('a3')).toEqual([audioPart(3)]);
+        expect(pending()).toBeNull();
+        expect(shown()).toMatchObject({ keepAudio: true, keepLast: '2' });
+        expect(chatApi.spies.pruneChatAudio).toHaveBeenCalledTimes(1);
+
+        // The new setting is persisted, with the pruned transcript beside it.
+        await savedWithin(
+          () =>
+            chatApi.spies.saveChat.mock.calls.length > 0 &&
+            lastSaved().content.settings.audio?.keep_last_audio === 2,
+        );
+        expect(lastSaved().content.settings.audio).toEqual({ keep_last_audio: 2 });
+        expect(lastSaved().content.messages.find((m) => m.id === 'a1')!.content).toEqual([marker]);
+        expect(JSON.stringify(lastSaved().content.messages)).not.toContain(blob(1));
+      });
+
+      it('carries the confirmed retention into the next run', async () => {
+        await openSpokenChat();
+        click('keep-last-2');
+        click('confirm-retention');
+        await waitFor(() => expect(pending()).toBeNull());
+        await waitFor(() => expect(partsOf('a1')).toEqual([marker]));
+
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'again' } });
+        click('send');
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+          settings: { audio?: Record<string, unknown> };
+        };
+        expect(body.settings.audio).toEqual({ keep_last_audio: 2 });
+      });
+
+      it('on decline reverts the control and persists and deletes nothing', async () => {
+        await openSpokenChat();
+        click('keep-last-2');
+        expect(pending()).not.toBeNull();
+
+        click('cancel-retention');
+
+        expect(pending()).toBeNull();
+        expect(shown()).toMatchObject({ keepAudio: true, keepLast: '' });
+        await settle();
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        expect(partsOf('a1')).toEqual(originalAudio);
+      });
+
+      it('treats turning "keep audio" off as keeping none: confirming removes every answer audio', async () => {
+        await openSpokenChat();
+
+        click('keep-audio-off');
+
+        expect(pending()).toEqual({ keepLast: 0, excess: 3 });
+        expect(shown()).toMatchObject({ keepAudio: false });
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+
+        click('confirm-retention');
+        await waitFor(() => expect(chatApi.spies.pruneChatAudio).toHaveBeenCalledWith('c1', 0));
+        await waitFor(() => expect(partsOf('a3')).toEqual([marker]));
+        expect(partsOf('a1')).toEqual([marker]);
+        expect(partsOf('a2')).toEqual([marker]);
+        // The user turns, their text, are untouched.
+        expect(partsOf('u1')).toBe('one');
+        await savedWithin(
+          () =>
+            chatApi.spies.saveChat.mock.calls.length > 0 &&
+            lastSaved().content.settings.audio?.keep_last_audio === 0,
+        );
+      });
+
+      it('tightens from a stored count the same way', async () => {
+        await openSpokenChat({ keep_last_audio: 3 });
+
+        click('keep-last-1');
+
+        expect(pending()).toEqual({ keepLast: 1, excess: 2 });
+        click('confirm-retention');
+        await waitFor(() => expect(chatApi.spies.pruneChatAudio).toHaveBeenCalledWith('c1', 1));
+        await waitFor(() => expect(partsOf('a2')).toEqual([marker]));
+        expect(partsOf('a1')).toEqual([marker]);
+        expect(partsOf('a3')).toEqual([audioPart(3)]);
+      });
+
+      // Typing a count goes through its first digit: from keep-all, "1" then "0" is a "1"
+      // (stricter, held) and then a "10" that the chat's audio does not exceed. The count that
+      // ends up typed is what counts, and the held value never deletes on the way.
+      it('lets a count be typed through a stricter first digit without deleting', async () => {
+        await openSpokenChat();
+
+        click('keep-last-1');
+        expect(pending()).toEqual({ keepLast: 1, excess: 2 });
+        click('keep-last-2');
+        expect(pending()).toEqual({ keepLast: 2, excess: 1 });
+        click('keep-last-10');
+
+        expect(pending()).toBeNull();
+        expect(shown()).toMatchObject({ keepAudio: true, keepLast: '10' });
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        await savedWithin(
+          () =>
+            chatApi.spies.saveChat.mock.calls.length > 0 &&
+            lastSaved().content.settings.audio?.keep_last_audio === 10,
+        );
+        expect(partsOf('a1')).toEqual(originalAudio);
+      });
+
+      it('applies an edit of another setting at once and keeps the held retention apart', async () => {
+        await openSpokenChat();
+        click('keep-last-2');
+
+        click('set-voice');
+
+        expect(shown()).toMatchObject({ voice: 'bf_emma', keepLast: '2' });
+        expect(pending()).toEqual({ keepLast: 2, excess: 1 });
+        // The voice is saved; the held retention is not.
+        await savedWithin(() => chatApi.spies.saveChat.mock.calls.length > 0);
+        expect(lastSaved().content.settings.audio).toEqual({ voice: 'bf_emma' });
+
+        click('cancel-retention');
+        expect(shown()).toMatchObject({ voice: 'bf_emma', keepAudio: true, keepLast: '' });
+      });
+
+      it('applies a tightening that leaves no stored audio beyond the limit without asking', async () => {
+        await openSpokenChat();
+
+        click('keep-last-5'); // three answers hold audio
+
+        expect(pending()).toBeNull();
+        expect(shown()).toMatchObject({ keepLast: '5' });
+        await savedWithin(
+          () =>
+            chatApi.spies.saveChat.mock.calls.length > 0 &&
+            lastSaved().content.settings.audio?.keep_last_audio === 5,
+        );
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+      });
+
+      it('applies "do not store" at once on a chat that holds no audio', async () => {
+        await openSpokenChat(undefined, [
+          { id: 'u1', role: 'user', content: 'one' },
+          { id: 'a1', role: 'assistant', content: 'a text answer', status: 'complete' },
+        ]);
+
+        click('keep-audio-off');
+
+        expect(pending()).toBeNull();
+        expect(shown()).toMatchObject({ keepAudio: false });
+        await savedWithin(
+          () =>
+            chatApi.spies.saveChat.mock.calls.length > 0 &&
+            lastSaved().content.settings.audio?.keep_last_audio === 0,
+        );
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+      });
+
+      it('counts only answers that hold audio: a not-stored answer takes no slot', async () => {
+        await openSpokenChat(undefined, [
+          { id: 'a1', role: 'assistant', content: [audioPart(1)], status: 'complete' },
+          { id: 'a2', role: 'assistant', content: [marker], status: 'complete' },
+          { id: 'a3', role: 'assistant', content: [audioPart(3)], status: 'complete' },
+        ]);
+
+        click('keep-last-1');
+
+        expect(pending()).toEqual({ keepLast: 1, excess: 1 });
+        click('confirm-retention');
+        await waitFor(() => expect(partsOf('a1')).toEqual([marker]));
+        expect(partsOf('a3')).toEqual([audioPart(3)]);
+      });
+
+      it('keeps the hold, says why, and deletes nothing when the gateway refuses the prune', async () => {
+        await openSpokenChat();
+        click('keep-last-2');
+        const err = refused(409, 'portal.chat_run_active');
+        chatApi.spies.pruneChatAudio.mockRejectedValueOnce(err);
+
+        click('confirm-retention');
+
+        expect(await screen.findByText(formatPortalError(err, t))).toBeTruthy();
+        expect(partsOf('a1')).toEqual(originalAudio);
+        expect(pending()).toEqual({ keepLast: 2, excess: 1 });
+        expect(shown()).toMatchObject({ keepLast: '2' });
+        await settle();
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+
+        // It can be confirmed again.
+        click('confirm-retention');
+        await waitFor(() => expect(partsOf('a1')).toEqual([marker]));
+        expect(chatApi.spies.pruneChatAudio).toHaveBeenCalledTimes(2);
+      });
+
+      it('does not prune while the chat has a live run', async () => {
+        await openSpokenChat();
+        click('keep-last-2');
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'again' } });
+        click('send');
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+        click('confirm-retention');
+
+        expect(await screen.findByText(t.chatBusy)).toBeTruthy();
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        expect(pending()).toEqual({ keepLast: 2, excess: 1 });
+      });
+
+      it('has nothing to confirm or decline when nothing is held', async () => {
+        await openSpokenChat();
+
+        click('confirm-retention');
+        click('cancel-retention');
+        await settle();
+
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+        expect(shown()).toMatchObject({ keepAudio: true, keepLast: '' });
+      });
+
+      it('drops a held retention when another chat is opened', async () => {
+        chatApi = makeChatApi([
+          ...spokenChat(),
+          {
+            id: 'c2',
+            title: 'C2',
+            created_at: T1,
+            updated_at: T1,
+            content: { settings: settingsFor(), messages: [] },
+          },
+        ]);
+        renderProvider([], { models: speechModels });
+        await waitForReady();
+        click('keep-last-2');
+        expect(pending()).not.toBeNull();
+
+        click('select-c2');
+        await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c2'));
+        expect(pending()).toBeNull();
+        expect(shown()).toMatchObject({ keepAudio: true, keepLast: '' });
+
+        click('select-c1');
+        await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c1'));
+        expect(pending()).toBeNull();
+        expect(shown()).toMatchObject({ keepAudio: true, keepLast: '' });
+        click('confirm-retention');
+        await settle();
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+      });
+    });
+
+    // Raising the retention, keeping everything and switching storing back on never delete
+    // anything, so they take effect without a question.
+    describe('loosening the retention', () => {
+      it.each([
+        ['a larger count', { keep_last_audio: 2 }, 'keep-last-5', { keep_last_audio: 5 }],
+        ['keep all', { keep_last_audio: 2 }, 'keep-last-blank', {}],
+        ['storing audio again', { keep_last_audio: 0 }, 'keep-audio-on', {}],
+        [
+          'a count after do-not-store',
+          { keep_last_audio: 0 },
+          'keep-last-1',
+          { keep_last_audio: 1 },
+        ],
+      ] as const)(
+        'applies %s at once, with no question and no prune',
+        async (_label, stored, button, wire) => {
+          await openSpokenChat(stored);
+
+          click(button);
+
+          expect(pending()).toBeNull();
+          await savedWithin(
+            () =>
+              chatApi.spies.saveChat.mock.calls.length > 0 &&
+              JSON.stringify(lastSaved().content.settings.audio) === JSON.stringify(wire),
+          );
+          expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+          expect(chatApi.spies.deleteMessageAudio).not.toHaveBeenCalled();
+          expect(partsOf('a1')).toEqual(originalAudio);
+        },
+      );
+    });
+
+    // Judged on what the wire would carry, not on the raw text: a count the wire drops is
+    // keep-all, which never tightens anything.
+    describe('a blank or invalid count', () => {
+      it.each([['blank'], ['abc'], ['1.5'], ['0']])(
+        'is not read as a stricter change (%s)',
+        async (text) => {
+          await openSpokenChat();
+
+          click(`keep-last-${text}`);
+
+          expect(pending()).toBeNull();
+          expect(shown()).toMatchObject({
+            keepAudio: true,
+            keepLast: text === 'blank' ? '' : text,
+          });
+          expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+          expect(partsOf('a1')).toEqual(originalAudio);
+        },
+      );
+
+      it('does not hold a count that is dropped on the way from a stored one either', async () => {
+        await openSpokenChat({ keep_last_audio: 2 });
+
+        click('keep-last-abc');
+
+        expect(pending()).toBeNull();
+        expect(chatApi.spies.pruneChatAudio).not.toHaveBeenCalled();
+        expect(partsOf('a1')).toEqual(originalAudio);
+      });
+    });
   });
 
   // A speech-to-text model is picked like a text-to-speech one: the chat offers it, the

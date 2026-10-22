@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"op-ai-gateway/internal/store"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -356,5 +357,64 @@ func TestPrepareChatRunKeepsTheSpeechStreamChoice(t *testing.T) {
 	got, _ = svc.GetChat(ctx, owner, created.ID)
 	if strings.Contains(string(got.Content), `"stream"`) {
 		t.Fatalf("an unset choice was persisted: %s", got.Content)
+	}
+}
+
+// keep_last_audio is the per-chat retention of a speech thread's answers (#281):
+// nil keeps every answer, 0 stores none and N >= 1 keeps the last N. A negative
+// value is not a count at all, so PrepareChatRun reads it as unset (keep all) and
+// persists nothing for it, while 0 and a positive N survive untouched -- 0 above
+// all, which a plain int with omitempty would lose. A non-speech thread still has
+// its whole audio carrier cleared, the retention knob included.
+func TestPrepareChatRunClampsKeepLastAudio(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	owner := chatToken("usr_a")
+
+	send := func(kind string, keep int) (ChatRunSettings, string) {
+		t.Helper()
+		created, _ := svc.CreateChat(ctx, owner, CreateChatRequest{Content: json.RawMessage(`{"settings":{},"messages":[]}`)})
+		model := "kokoro"
+		if kind != chatKindSpeech {
+			model = "llama"
+		}
+		_, settings, err := svc.PrepareChatRun(ctx, owner, created.ID, PrepareRunRequest{
+			UserMessage: json.RawMessage(`{"id":"u1","role":"user","content":"read this aloud"}`),
+			Settings:    ChatRunSettings{Model: model, Kind: kind, Audio: &ChatAudioSettings{Voice: "af_bella", KeepLastAudio: &keep}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := svc.GetChat(ctx, owner, created.ID)
+		return settings, storedSettings(t, got.Content)
+	}
+
+	// A negative value is read as unset: nothing handed to the run, nothing stored.
+	settings, stored := send(chatKindSpeech, -3)
+	if settings.Audio == nil || settings.Audio.KeepLastAudio != nil {
+		t.Fatalf("a negative keep_last_audio must come back unset, got %+v", settings.Audio)
+	}
+	if strings.Contains(stored, "keep_last_audio") {
+		t.Fatalf("a negative keep_last_audio must not be persisted: %s", stored)
+	}
+
+	// 0 (do not store) and a positive N (keep the last N) survive, and are stored.
+	for _, keep := range []int{0, 2} {
+		settings, stored := send(chatKindSpeech, keep)
+		if settings.Audio == nil || settings.Audio.KeepLastAudio == nil || *settings.Audio.KeepLastAudio != keep {
+			t.Fatalf("keep_last_audio %d did not survive: %+v", keep, settings.Audio)
+		}
+		if want := `"keep_last_audio":` + strconv.Itoa(keep); !strings.Contains(stored, want) {
+			t.Fatalf("keep_last_audio %d was not persisted (want %s): %s", keep, want, stored)
+		}
+	}
+
+	// A non-speech thread keeps nothing of the audio carrier.
+	settings, stored = send("", 2)
+	if settings.Audio != nil {
+		t.Fatalf("audio settings must be cleared on a text thread, got %+v", settings.Audio)
+	}
+	if strings.Contains(stored, "keep_last_audio") || strings.Contains(stored, `"audio"`) {
+		t.Fatalf("a text thread must carry no audio key at all: %s", stored)
 	}
 }

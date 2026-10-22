@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { memo, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
@@ -10,8 +10,9 @@ import ReplayIcon from '@mui/icons-material/Replay';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
+import DeleteOutlineIcon from '@mui/icons-material/DeleteOutlined';
 import type { ChatContent, ChatContentPart } from './shared/chatContent';
-import { audioUrlsOf, imageUrlsOf, isMaskPart } from './shared/chatContent';
+import { audioUrlsOf, hasRemovedAudio, imageUrlsOf, isMaskPart } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
 import { keyedUrls } from './shared/urlKeys';
@@ -19,6 +20,7 @@ import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
 import { AudioTurn } from './AudioTurn';
 import { AudioPendingTurn } from './AudioPendingTurn';
+import { AudioNotStoredTurn } from './AudioNotStoredTurn';
 import { TranscriptionPendingTurn } from './TranscriptionPendingTurn';
 
 function contentText(content: ChatContent): string {
@@ -61,12 +63,16 @@ function ChatMessageComponent({
   kind,
   elapsedMs,
   audioLive,
+  audioMuted,
+  onMuteAudio,
+  onAbortAudio,
   ttftMs,
   tps,
   tokensPerSecond,
   onEdit,
   onRegenerate,
   onRefine,
+  onDeleteAudio,
   canRun = true,
 }: Readonly<{
   t: Translation;
@@ -107,6 +113,13 @@ function ChatMessageComponent({
   // says so rather than promising that no news is coming. Only meaningful with
   // `streaming` and kind "speech".
   audioLive?: boolean;
+  // The live speech run's controls (#281), threaded to the pending turn like `audioLive`
+  // and, like it, supplied only to the one streaming row: whether the user has muted the
+  // playback (ChatStore's runAudioMuted), the Mute toggle (called with the state it asks for)
+  // and the Abort (the store's ordinary stop). The pending turn draws them only while live.
+  audioMuted?: boolean;
+  onMuteAudio?: (muted: boolean) => void;
+  onAbortAudio?: () => void;
   ttftMs?: number;
   tps?: number;
   tokensPerSecond?: number;
@@ -118,6 +131,12 @@ function ChatMessageComponent({
   // whose model may be edited -- so a turn without it simply offers no control. Only
   // the assistant branch has images to refine; a user turn never shows one.
   onRefine?: (url: string) => void;
+  // Delete the stored audio of THIS spoken answer (the store's per-message handler; the id is
+  // already bound). The action stack offers it, behind an inline confirm, only on an answer that
+  // holds audio -- never on a not-stored one, which has nothing left to delete. Only the
+  // assistant branch has an answer's audio to delete; a user turn's audio is a transcription
+  // clip and is never offered for it.
+  onDeleteAudio?: () => void;
   // Whether a new run may be started. False while the model is unavailable —
   // the Edit/Regenerate controls (which each start a run) are disabled to match
   // the blocked Send. Defaults true so callers that don't gate stay unchanged.
@@ -135,6 +154,29 @@ function ChatMessageComponent({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
   const [showRaw, setShowRaw] = useState(false);
+  // The delete of the answer's audio asks first, in place: this is the question being open.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const deleteButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreDeleteFocus = useRef(false);
+
+  // Whether the audio of this answer can be deleted: it still holds some (a not-stored answer
+  // has none, and its marker is not audio), its run is over (a streaming row's audio is still
+  // arriving and the chat has a live run, which owns the transcript), and the row has a delete
+  // to call. A question left open outlives none of that: it is dropped the moment the audio is
+  // not deletable, so audio that comes back to this row later starts from the icon again.
+  const canDeleteAudio =
+    role === 'assistant' && !streaming && audioUrls.length > 0 && onDeleteAudio !== undefined;
+  if (confirmingDelete && !canDeleteAudio) setConfirmingDelete(false);
+
+  // The question takes the focus from the icon it replaces (its Cancel button is autofocused),
+  // so cancelling hands it back to the icon. Accepting needs no such return: the audio and its
+  // controls are about to go.
+  useEffect(() => {
+    if (!confirmingDelete && restoreDeleteFocus.current) {
+      restoreDeleteFocus.current = false;
+      deleteButtonRef.current?.focus();
+    }
+  }, [confirmingDelete]);
 
   const roleLabel = role === 'user' ? t.userRole : t.assistantRole;
 
@@ -162,6 +204,9 @@ function ChatMessageComponent({
           elapsedMs={elapsedMs ?? 0}
           roleLabel={roleLabel}
           live={audioLive === true}
+          muted={audioMuted === true}
+          onMute={onMuteAudio}
+          onAbort={onAbortAudio}
         />
       );
     }
@@ -176,6 +221,15 @@ function ChatMessageComponent({
     if (streaming && kind === 'transcription' && text.length === 0) {
       return <TranscriptionPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }
+
+    // A TERMINAL answer whose audio is gone (pruned, deleted, never stored or aborted) carries
+    // the `audio_removed` marker in place of its audio parts, and shows the not-stored
+    // placeholder where the player would be -- the answer's text, if it has any, stays above
+    // it. Not while the run still streams (that row is the pending wait above, or a live
+    // text answer), and not when audio is still stored (a player that plays beats a
+    // placeholder, whatever else the content holds). A turn with neither audio nor marker is
+    // a failed run and keeps rendering its error, not this.
+    const audioRemoved = !streaming && audioUrls.length === 0 && hasRemovedAudio(content);
 
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
     const reasoningText = reasoning ?? '';
@@ -350,8 +404,13 @@ function ChatMessageComponent({
           />
         )}
         {audioUrls.length > 0 && <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />}
+        {audioRemoved && (
+          <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />
+        )}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
-          {onRegenerate && (
+          {/* The not-stored placeholder carries its own regenerate (the same handler), so the
+              stack's would be a second, identically named button in one bubble. */}
+          {onRegenerate && !audioRemoved && (
             <Tooltip title={t.chatRegenerate}>
               <span>
                 <IconButton
@@ -383,6 +442,53 @@ function ChatMessageComponent({
               <CodeIcon fontSize="small" />
             </IconButton>
           </Tooltip>
+          {canDeleteAudio &&
+            (confirmingDelete ? (
+              // The confirm of the audio's delete: inline, in the place of the trash icon (not a
+              // dialog over the conversation). It says the removal is final and that regenerate
+              // is the way back. Cancel is the one that holds the focus: the safe answer.
+              <Box
+                role="group"
+                aria-label={t.chatAudioDelete}
+                sx={{ display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 0.5 }}
+              >
+                <Typography component="span" sx={{ color: 'var(--muted)', fontSize: 13, mx: 0.5 }}>
+                  {t.chatAudioDeleteConfirm}
+                </Typography>
+                <Button
+                  size="small"
+                  color="error"
+                  onClick={() => {
+                    setConfirmingDelete(false);
+                    onDeleteAudio?.();
+                  }}
+                >
+                  {t.chatAudioDeleteAction}
+                </Button>
+                <Button
+                  size="small"
+                  color="secondary"
+                  autoFocus
+                  onClick={() => {
+                    restoreDeleteFocus.current = true;
+                    setConfirmingDelete(false);
+                  }}
+                >
+                  {t.chatCancel}
+                </Button>
+              </Box>
+            ) : (
+              <Tooltip title={t.chatAudioDelete}>
+                <IconButton
+                  ref={deleteButtonRef}
+                  size="small"
+                  aria-label={t.chatAudioDelete}
+                  onClick={() => setConfirmingDelete(true)}
+                >
+                  <DeleteOutlineIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            ))}
           {(ttftMs !== undefined || tps !== undefined || tokensPerSecond !== undefined) && (
             <Typography
               component="span"

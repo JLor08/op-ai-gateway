@@ -21,10 +21,18 @@ export type ChatRole = 'system' | 'user' | 'assistant';
 // Either way it is a /api/portal/chat-blobs/{id} reference once the run's commit moved it
 // into the chat blob store, and the key and the `audio_url` name are the contract with the
 // backend's executors and blob extraction (portal extractChatBlobs).
+//
+// An `audio_removed` part is the marker an ASSISTANT turn carries once its audio is gone --
+// pruned by the retention knob, deleted by the user, never stored, or aborted before it was
+// kept (#281). It replaces the turn's `audio_url` parts and carries nothing else: no url (there
+// is nothing to play) and no reason (every way the audio can go renders the same placeholder).
+// The backend writes it (portal removedAudioPartType, the contract for the string); the
+// renderer shows the not-stored bubble where the player would be.
 export type ChatContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string }; purpose?: 'mask' }
-  | { type: 'audio_url'; audio_url: { url: string } };
+  | { type: 'audio_url'; audio_url: { url: string } }
+  | { type: 'audio_removed' };
 export type ChatContent = string | ChatContentPart[];
 
 // The MASK of an image edit (inpainting) -- a PNG whose transparent pixels mark the
@@ -80,4 +88,13 @@ export function audioUrlsOf(content: ChatContent): string[] {
   return content
     .filter((part): part is AudioPart => part.type === 'audio_url')
     .map((part) => part.audio_url.url);
+}
+
+// Whether an answer's audio is gone: the message carries the `audio_removed` marker. The
+// message renderer keys the not-stored bubble on it -- a turn with no audio and no marker is
+// a pending run or a failed one, and renders as such. It says nothing about audio parts the
+// message may also hold (audioUrlsOf lists those); the backend never writes both.
+export function hasRemovedAudio(content: ChatContent): boolean {
+  if (typeof content === 'string') return false;
+  return content.some((part) => part.type === 'audio_removed');
 }
