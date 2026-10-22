@@ -40,14 +40,21 @@ const (
 	speechModelRequired = "speech.model_required"
 	speechInputRequired = "speech.input_required"
 	// speechResponseFormatUnsupported is the code for a response_format this relay
-	// cannot honor -- every value but "wav", or "pcm" on a stream; see
-	// validateSpeechRequest.
+	// cannot honor -- every value but "wav" and "pcm" on a one-shot request, or but
+	// "pcm" on a stream; see validateSpeechRequest.
 	speechResponseFormatUnsupported = "speech.response_format_unsupported"
 	// speechStreamUnsupported is the code for a request whose stream fields the relay
 	// cannot honor: a stream that is no boolean, a stream_format on a request that is
 	// no stream or outside the two audio.cpp emits, or a stream asking for wav; see
 	// validateSpeechRequest.
 	speechStreamUnsupported = "speech.stream_unsupported"
+	// speechPcmUnavailable is the code for a one-shot request that asked for
+	// response_format "pcm" whose synthesized clip cannot be served as such: the mapped
+	// model's native format is not 16-bit mono PCM. Unlike the codes above it is a
+	// POST-synthesis code -- validateSpeechRequest never returns it, because the format
+	// of the audio is known only once the upstream has answered -- so the relay raises
+	// it after the upstream call, not before.
+	speechPcmUnavailable = "speech.pcm_unavailable"
 )
 
 // speechInferenceShape is the shape handleOpenAISpeech hands the ONE preflight
@@ -98,6 +105,28 @@ func sniffSpeechVoice(raw []byte) string {
 		return ""
 	}
 	return voice
+}
+
+// sniffSpeechResponseFormat extracts the response_format a speech request names,
+// tolerantly and exactly as the client sent it -- the sibling of sniffSpeechVoice for
+// the field that decides whether a one-shot relay strips the upstream WAV to raw PCM.
+// Anything that is not a non-blank JSON string -- an absent field, null, a number, an
+// array, a body that is not JSON at all -- is "" (none named), the fail-open answer that
+// relaySpeech reads as "relay the WAV as it is". The value is NOT trimmed: it is compared
+// against the exact strings validateSpeechResponseFormat already admitted, so a value that
+// validation refused ("pcm " say) never reaches relaySpeech to be sniffed here.
+func sniffSpeechResponseFormat(raw []byte) string {
+	var probe struct {
+		ResponseFormat json.RawMessage `json:"response_format"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return ""
+	}
+	var format string
+	if json.Unmarshal(probe.ResponseFormat, &format) != nil || strings.TrimSpace(format) == "" {
+		return ""
+	}
+	return format
 }
 
 // handleOpenAISpeech serves POST /v1/audio/speech (and its /openai/v1/audio/speech
@@ -175,15 +204,18 @@ func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 //
 // response_format decision, which depends on whether the request streams:
 //
-//   - A request that does NOT stream accepts only "wav" (or an absent value); EVERY other
-//     value -- mp3, opus, flac, aac and pcm, but also json and b64_json -- is refused with
+//   - A request that does NOT stream accepts "wav" or "pcm" (or an absent value); EVERY other
+//     value -- mp3, opus, flac, aac, but also json and b64_json -- is refused with
 //     speechResponseFormatUnsupported. The relay of a one-shot request is a purely binary
-//     audio/wav body: audio.cpp answers an unsupported value such as mp3 with raw WAV
-//     labelled audio/wav (a client asking for mp3 would be handed WAV without being told),
-//     and json/b64_json are not OpenAI speech formats at all and, unlike the wav response,
+//     body: audio.cpp answers an unsupported value such as mp3 with raw WAV labelled
+//     audio/wav (a client asking for mp3 would be handed WAV without being told), and
+//     json/b64_json are not OpenAI speech formats at all and, unlike the wav response,
 //     carry none of the metering headers the usage row's billing quantity is read from --
 //     relayed, they would be billed as zero seconds. A 400 the client can act on beats both
-//     silent outcomes.
+//     silent outcomes. "pcm" is the one value the gateway can honor honestly on top of the
+//     upstream's WAV: the relay strips the WAV header down to its data chunk. Whether the
+//     clip IS 16-bit mono PCM is known only once the upstream has answered, so that refusal
+//     (speechPcmUnavailable) is the relay's, not this validation's.
 //   - A request that streams accepts "pcm" (or an absent value) -- the only format
 //     audio.cpp's streaming mode serves. "wav" is refused with speechStreamUnsupported,
 //     because audio.cpp answers a wav stream with a 500 ("streaming speech currently
@@ -256,24 +288,24 @@ const (
 )
 
 // validateSpeechResponseFormat applies validateSpeechRequest's response_format rule to a
-// present value: "wav" or absent for a request that does not stream, "pcm" or absent
+// present value: "wav", "pcm" or absent for a request that does not stream, "pcm" or absent
 // for one that does (and "wav" on a stream is the stream's own refusal).
 func validateSpeechResponseFormat(rawFormat json.RawMessage, stream bool) *inference.Error {
-	want := "wav"
+	mustBe, only := `the string "wav" or "pcm"`, `only "wav" and "pcm" are`
 	if stream {
-		want = "pcm"
+		mustBe, only = `the string "pcm"`, `only "pcm" is`
 	}
 	var format string
 	if err := json.Unmarshal(rawFormat, &format); err != nil {
-		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format must be the string %q; got %s", want, rawFormat)}
+		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format must be %s; got %s", mustBe, rawFormat)}
 	}
 	switch {
-	case format == "" || format == want:
+	case format == "" || format == "pcm" || (!stream && format == "wav"):
 		return nil
 	case stream && format == "wav":
 		return &inference.Error{Code: speechStreamUnsupported, Message: "a streamed response is headerless PCM; response_format must be \"pcm\" (or absent) when stream is true"}
 	default:
-		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; only %q is", format, want)}
+		return &inference.Error{Code: speechResponseFormatUnsupported, Message: fmt.Sprintf("response_format %q is not supported; %s", format, only)}
 	}
 }
 
@@ -389,7 +421,8 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 		pfReq:    req,
 		endpoint: endpointSpeech,
 	}
-	if _, wantsStream := sniffRoutingModel(raw); wantsStream {
+	_, wantsStream := sniffRoutingModel(raw)
+	if wantsStream {
 		if s.mappingStreamsSpeech(r.Context(), target.RouteID) {
 			rel.pfReq.Stream = true
 			rel.streamRefusal = speechStreamingRefusal
@@ -415,6 +448,27 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 			rel.upstreamBody = body
 		}
 	}
+	// A one-shot pcm request (#253): the upstream is forced to wav -- audio.cpp's only
+	// one-shot format, which it answers whatever response_format it is handed -- and
+	// proxyNative strips the WAV header to relay the raw data chunk. Gated on the CLIENT's
+	// own stream intent (wantsStream), not rel.pfReq.Stream, so a stream request downgraded
+	// to a one-shot WAV (the route is not known to stream) is NOT stripped: it kept
+	// response_format off the upstream body (speechBufferedBody) and is relayed as the WAV
+	// it asked to become.
+	if !wantsStream && sniffSpeechResponseFormat(raw) == "pcm" {
+		body, err := speechPCMUpstreamBody(raw)
+		if err != nil {
+			// Not expected for a body validateSpeechRequest accepted (it found a string input,
+			// so the body is a JSON object). Answered as a failed relay rather than guessing a
+			// body, exactly as the buffered-body-error branch above does.
+			slog.Error("speech: building the pcm upstream body failed",
+				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
+			s.recordSpeechRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("build pcm speech body: %w", err))
+			return
+		}
+		rel.speechPCMStrip = true
+		rel.upstreamBody = body
+	}
 	s.proxyNative(w, r, rel)
 }
 
@@ -428,10 +482,12 @@ const speechStreamingRefusal = "speech streaming requires a model configured wit
 
 // speechStreamOnlyFields are the request fields of a speech body that only a stream has a
 // meaning for: stream itself, stream_format (sse or audio) and response_format, which on
-// a stream is pcm and on a one-shot request is wav. The buffered twin of a streamed
+// a stream is pcm and on a one-shot request is wav or pcm. The buffered twin of a streamed
 // request leaves them all out, so audio.cpp answers it with the one-shot WAV it always
 // has: a pcm response_format kept on it would ask for a shape the buffered relay's
-// billing (a WAV's duration header) does not carry.
+// billing (a WAV's duration header) does not carry. A one-shot pcm request's own upstream
+// body is built by speechPCMUpstreamBody instead, which forces response_format to wav
+// rather than dropping it.
 var speechStreamOnlyFields = []string{"stream", "stream_format", "response_format"}
 
 // speechBufferedBody builds the body of the one-shot request answered INSTEAD of a
@@ -461,6 +517,29 @@ func speechBufferedBody(raw []byte) ([]byte, error) {
 			}
 		}
 	}
+	return json.Marshal(fields)
+}
+
+// speechPCMUpstreamBody builds the upstream body for a one-shot pcm request: the client's
+// JSON with response_format forced to "wav", every other field kept exactly as it was
+// written (values travel as raw JSON, so a number keeps its full precision). audio.cpp
+// ignores response_format and always answers a one-shot request with a 44100/mono/16-bit
+// WAV, so forcing wav asks for the one format proxyNative can then strip to the raw data
+// chunk it relays as application/octet-stream; its duration header -- the billing quantity
+// -- is unchanged. The model name is not touched here: proxyNative rewrites it to the
+// mapped one, as for any speech body.
+//
+// It is an error only for a body that is no JSON object, which validateSpeechRequest has
+// already ruled out (it found a string input), mirroring speechBufferedBody.
+func speechPCMUpstreamBody(raw []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("speech body is not valid JSON: %w", err)
+	}
+	if fields == nil {
+		return nil, errors.New("speech body is not a JSON object")
+	}
+	fields["response_format"] = json.RawMessage(`"wav"`)
 	return json.Marshal(fields)
 }
 
@@ -721,4 +800,37 @@ func (s *Server) relaySpeechUpstreamError(w http.ResponseWriter, r *http.Request
 	// apiFlavorSpeech, and a failed relay produced no audio -- BillingQuantity stays
 	// 0, as recordSpeechRoutingFailure leaves it for a refused request.
 	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, errorCode, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: sentContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), written, resp.StatusCode, ex.req.APIFlavor), nil)
+}
+
+// recordSpeechPCMUnavailable answers a one-shot pcm request whose synthesized clip cannot
+// be served as raw PCM. The strip (proxyNative) refuses for any of four reasons, all one
+// client-facing limitation: the upstream WAV is not 16-bit mono PCM, is structurally unsound
+// (no readable RIFF/WAVE), over-declares its data chunk past the upstream's own
+// Content-Length, or carries no usable Content-Length to bound that chunk against -- the last
+// three a garbled or streaming writer's header, never trusted audio.cpp's, caught so the
+// relay never emits a truncated or mislabelled body. It is a POST-synthesis refusal -- the
+// shape is known only once the upstream has answered -- so validateSpeechRequest cannot raise
+// it; proxyNative does, from its 2xx strip path, which is why this takes the request's
+// identity as the one nativeExchange (ex) that relaySpeechUpstreamError does.
+//
+// The client gets an OpenAI-shaped error object under HTTP 502 (a backend limitation, not
+// the client's request): type speechUpstreamErrorType ("upstream_error") and the API-surface
+// code speechPcmUnavailable. The row is an error row with the audio_second unit and a zero
+// quantity -- no audio was served -- exactly as relaySpeechUpstreamError leaves a failed
+// relay. The operator's server name stays out of the client text (it names only the model
+// and the format), and the WAV never reaches the copier: this returns in its place.
+func (s *Server) recordSpeechPCMUnavailable(w http.ResponseWriter, r *http.Request, ex nativeExchange) {
+	const status = http.StatusBadGateway
+	slog.Warn("speech pcm request refused: the mapped model's native speech output cannot be served as pcm",
+		"path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "code", speechPcmUnavailable, "status", status)
+	// Marshal cannot fail on this type (three strings), so there is no failure to report.
+	body, _ := json.Marshal(apierror.Body{Error: apierror.ErrorBody{
+		Message: fmt.Sprintf("response_format \"pcm\" is unavailable for model %q: the mapped model's native speech output cannot be served as pcm (it is not 16-bit mono PCM, is structurally unsound, over-declares its data length, or carries no usable Content-Length)", ex.req.Model),
+		Type:    speechUpstreamErrorType,
+		Code:    speechPcmUnavailable,
+	}})
+	w.Header().Set("Content-Type", jsonContentType)
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+	s.recordUsage(ex.start, ex.token, ex.req, ex.target, provider.Response{}, speechPcmUnavailable, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}, ex.id, buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), body, status, ex.req.APIFlavor), nil)
 }

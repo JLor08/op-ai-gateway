@@ -20,6 +20,11 @@ const (
 	// download handlers below, and read off the request (and set on the rebuilt
 	// mask part) by the image edit handler.
 	contentTypeHeader = "Content-Type"
+
+	// contentLengthHeader is the Content-Length header name: set by the speech relay
+	// (the upstream's declared length, or the data size of a raw-PCM strip) and read
+	// off an upstream response by declaredContentLength.
+	contentLengthHeader = "Content-Length"
 )
 
 // handleSystemEdgeCertificate reports the state of the gateway's OWN edge (nginx)

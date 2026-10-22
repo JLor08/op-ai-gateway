@@ -49,7 +49,7 @@ func TestApiFlavorSpeechIsTheRoutingAudioFlavor(t *testing.T) {
 }
 
 // TestValidateSpeechRequest pins the request shape the handler owns, including
-// the wav-only rule of a one-shot request and the pcm-only rule of a streamed one.
+// the wav-or-pcm rule of a one-shot request and the pcm-only rule of a streamed one.
 // want is the expected error code, "" for a request that must pass.
 func TestValidateSpeechRequest(t *testing.T) {
 	cases := []struct {
@@ -81,11 +81,21 @@ func TestValidateSpeechRequest(t *testing.T) {
 		{"opus", `{"model":"m","input":"hi","response_format":"opus"}`, "m", speechResponseFormatUnsupported},
 		{"flac", `{"model":"m","input":"hi","response_format":"flac"}`, "m", speechResponseFormatUnsupported},
 		{"aac", `{"model":"m","input":"hi","response_format":"aac"}`, "m", speechResponseFormatUnsupported},
-		{"pcm", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", speechResponseFormatUnsupported},
+		{"pcm", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", ""},
 		{"json", `{"model":"m","input":"hi","response_format":"json"}`, "m", speechResponseFormatUnsupported},
 		{"b64_json", `{"model":"m","input":"hi","response_format":"b64_json"}`, "m", speechResponseFormatUnsupported},
 		{"response_format is an array", `{"model":"m","input":"hi","response_format":["wav"]}`, "m", speechResponseFormatUnsupported},
 		{"response_format is a number", `{"model":"m","input":"hi","response_format":123}`, "m", speechResponseFormatUnsupported},
+
+		// A one-shot request admits pcm as well as wav (#253): the relay answers it by
+		// stripping the WAV the upstream always produces down to its data chunk. Whether the
+		// mapped model's native format allows that is only known after synthesis
+		// (speechPcmUnavailable), so validation accepts the value here.
+		{"pcm alone", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", ""},
+		{"pcm beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"pcm"}`, "m", ""},
+		{"pcm beside stream null", `{"model":"m","input":"hi","stream":null,"response_format":"pcm"}`, "m", ""},
+		{"wav beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"wav"}`, "m", ""},
+		{"mp3 beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"mp3"}`, "m", speechResponseFormatUnsupported},
 
 		// A streamed request: stream=true is admitted with pcm or no response_format (what
 		// audio.cpp's streaming mode serves), and stream_format sse or audio is relayed.
@@ -108,14 +118,12 @@ func TestValidateSpeechRequest(t *testing.T) {
 		{"stream true with a stream_format that is no string", `{"model":"m","input":"hi","stream":true,"stream_format":1}`, "m", speechStreamUnsupported},
 
 		// stream must be a boolean; and what only a stream has a meaning for -- a
-		// stream_format, a pcm response -- is refused on a request that is not one.
+		// stream_format -- is refused on a request that is not one.
 		{"stream is a string", `{"model":"m","input":"hi","stream":"true"}`, "m", speechStreamUnsupported},
 		{"stream is a number", `{"model":"m","input":"hi","stream":1}`, "m", speechStreamUnsupported},
 		{"stream_format sse alone", `{"model":"m","input":"hi","stream_format":"sse"}`, "m", speechStreamUnsupported},
 		{"stream_format audio alone", `{"model":"m","input":"hi","stream_format":"audio"}`, "m", speechStreamUnsupported},
 		{"stream_format beside stream false", `{"model":"m","input":"hi","stream":false,"stream_format":"audio"}`, "m", speechStreamUnsupported},
-		{"pcm alone", `{"model":"m","input":"hi","response_format":"pcm"}`, "m", speechResponseFormatUnsupported},
-		{"pcm beside stream false", `{"model":"m","input":"hi","stream":false,"response_format":"pcm"}`, "m", speechResponseFormatUnsupported},
 		{"response_format is checked before stream", `{"model":"m","input":"hi","response_format":"mp3","stream":"yes"}`, "m", speechResponseFormatUnsupported},
 	}
 	for _, tc := range cases {
@@ -141,6 +149,7 @@ func TestSpeechErrorCodesAreStable(t *testing.T) {
 		speechInputRequired:             "speech.input_required",
 		speechResponseFormatUnsupported: "speech.response_format_unsupported",
 		speechStreamUnsupported:         "speech.stream_unsupported",
+		speechPcmUnavailable:            "speech.pcm_unavailable",
 	} {
 		if got != want {
 			t.Errorf("code = %q, want %q", got, want)
@@ -376,7 +385,6 @@ func TestSpeechRejectsAnInvalidRequestBeforeRouting(t *testing.T) {
 		{"a stream that is no boolean", `{"model":"tts-voice","input":"hi","stream":"true"}`, "speech.stream_unsupported"},
 		{"stream_format without a stream", `{"model":"tts-voice","input":"hi","stream_format":"sse"}`, "speech.stream_unsupported"},
 		{"a stream asking for wav", `{"model":"tts-voice","input":"hi","stream":true,"response_format":"wav"}`, "speech.stream_unsupported"},
-		{"pcm without a stream", `{"model":"tts-voice","input":"hi","response_format":"pcm"}`, "speech.response_format_unsupported"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1162,4 +1170,223 @@ func TestCachedOutputByteRate(t *testing.T) {
 			t.Fatalf("cachedOutputByteRate = (%d, %v), want (0, false)", rate, ok)
 		}
 	})
+}
+
+// stereo16WAV is a structurally sound RIFF/WAVE whose fmt chunk declares two
+// channels of 16-bit PCM (sampleRate 44100, byteRate 176400, blockAlign 4): a
+// consistent header the strip walks, but a format isMono16PCM rejects, so a pcm
+// request for it is refused with speechPcmUnavailable rather than relayed.
+func stereo16WAV(t *testing.T) []byte {
+	t.Helper()
+	wav := []byte("RIFF\x28\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x02\x00\x44\xac\x00\x00\x10\xb1\x02\x00\x04\x00\x10\x00data\x04\x00\x00\x00")
+	return append(wav, 0x00, 0x01, 0x02, 0x03)
+}
+
+// A non-stream pcm request: the client gets the WAV's data chunk, headerless, as
+// application/octet-stream with the data length; the upstream was asked for wav with
+// every other field relayed; the usage row bills audio_second from the duration header.
+func TestSpeechPCMStripsTheWAVHeader(t *testing.T) {
+	up, calls := newSpeechUpstream(t, speechTestWAV()) // audio/wav + X-AudioCPP-Audio-Duration-Ms:1500
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","voice":"alba","speed":1.25,"response_format":"pcm"}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.Bytes())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Fatalf("Content-Type=%q, want application/octet-stream", ct)
+	}
+	wantPCM := []byte{0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0x01, 0xc3}
+	if !bytes.Equal(rec.Body.Bytes(), wantPCM) {
+		t.Fatalf("body=%x, want the 8 data bytes %x (no RIFF header)", rec.Body.Bytes(), wantPCM)
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != "8" {
+		t.Fatalf("Content-Length=%q, want 8", cl)
+	}
+	call := <-calls
+	var sent map[string]any
+	_ = json.Unmarshal(call.body, &sent)
+	if sent["response_format"] != "wav" {
+		t.Fatalf("upstream response_format=%v, want wav (forced)", sent["response_format"])
+	}
+	if sent["input"] != "hi" || sent["voice"] != "alba" || sent["speed"] != 1.25 {
+		t.Fatalf("upstream body=%v, want input/voice/speed relayed untouched", sent)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "success" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 1.5 {
+		t.Fatalf("usage=%q/%q/%v, want success/audio_second/1.5", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
+}
+
+// A model whose WAV is not 16-bit mono PCM cannot be served as pcm: a distinct
+// speech.pcm_unavailable error, billed (audio_second, 0), not a partial body.
+func TestSpeechPCMRefusesANonConformingModel(t *testing.T) {
+	stereo := stereo16WAV(t) // RIFF/WAVE, fmt tag 1, channels 2, 16-bit, a small data chunk
+	up, _ := newSpeechUpstream(t, stereo)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","response_format":"pcm"}`)
+
+	if rec.Code < 500 {
+		t.Fatalf("status=%d, want a 5xx backend-limitation answer", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(speechPcmUnavailable)) {
+		t.Fatalf("body=%q, want code %q", rec.Body.Bytes(), speechPcmUnavailable)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
+		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
+}
+
+// Review Focus 3: a pcm request whose upstream answers non-2xx goes through the
+// normal error relay (needsSpeechErrorRelay runs before the strip), billed 0 — the
+// strip never runs, so a pcm error behaves exactly like a wav error.
+func TestSpeechPCMUpstreamErrorIsRelayedNormally(t *testing.T) {
+	up := newSpeechErrorUpstream(t, http.StatusInternalServerError, "application/json", `{"error":{"message":"boom"}}`)
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","response_format":"pcm"}`)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want the upstream 500 relayed", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct == "application/octet-stream" {
+		t.Fatalf("Content-Type=%q, want the error JSON, not stripped PCM", ct)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
+		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
+}
+
+// Review Focus 2: a stream request downgraded to a non-streaming route stays WAV,
+// not stripped PCM (the route-tts mapping has no speech_streaming verdict).
+func TestSpeechStreamPCMDowngradeStaysWAV(t *testing.T) {
+	up, calls := newSpeechUpstream(t, speechTestWAV())
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","stream":true,"response_format":"pcm"}`)
+
+	if ct := rec.Header().Get("Content-Type"); ct != "audio/wav" {
+		t.Fatalf("Content-Type=%q, want audio/wav (downgrade, ADR-068(b))", ct)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), speechTestWAV()) {
+		t.Fatalf("body not the WAV relayed byte for byte")
+	}
+	call := <-calls
+	var sent map[string]any
+	_ = json.Unmarshal(call.body, &sent)
+	if _, ok := sent["response_format"]; ok {
+		t.Fatalf("downgrade upstream kept response_format=%v, want it dropped (speechBufferedBody)", sent["response_format"])
+	}
+}
+
+// Review Focus 4: the octet-stream pcm response is captured as a redacted summary,
+// not as raw PCM bytes.
+func TestSpeechPCMCaptureIsRedacted(t *testing.T) {
+	up, _ := newSpeechUpstream(t, speechTestWAV())
+	srv, cs := newSpeechCaptureServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","response_format":"pcm"}`)
+
+	wantPCM := []byte{0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0x01, 0xc3}
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), wantPCM) {
+		t.Fatalf("status=%d body=%x, want 200 and the 8 PCM bytes", rec.Code, rec.Body.Bytes())
+	}
+	saved, ok := cs.last()
+	if !ok {
+		t.Fatal("no capture saved")
+	}
+	if saved.APIFlavor != apiFlavorSpeech || saved.HTTPStatus != http.StatusOK {
+		t.Fatalf("capture row = %q/%d, want %s/200", saved.APIFlavor, saved.HTTPStatus, apiFlavorSpeech)
+	}
+	env := decryptCapture(t, saved.Blob)
+	doc := decodeCapturedBinaryBody(t, env.RespBody)
+	if doc.ContentType != "application/octet-stream" || doc.Size != int64(len(wantPCM)) || !doc.Redacted {
+		t.Fatalf("summary = %+v, want application/octet-stream, %d bytes, redacted", doc, len(wantPCM))
+	}
+	if strings.Contains(env.RespBody, string(wantPCM)) {
+		t.Fatalf("the capture holds raw PCM bytes: %q", env.RespBody)
+	}
+	if !strings.Contains(env.ReqBody, `"input":"hi"`) {
+		t.Fatalf("request body = %q, want the text to synthesize captured", env.ReqBody)
+	}
+}
+
+// mono16WAVOverDeclaredData is a conformant mono/16-bit/16000 RIFF/WAVE (the fmt chunk
+// isMono16PCM accepts) whose data chunk header DECLARES 0xFFFFFFFF bytes but is followed by
+// only 8: the garbled/streaming writer's over-declaration the strip's overrun guard refuses
+// rather than relay under a lying Content-Length.
+func mono16WAVOverDeclaredData(t *testing.T) []byte {
+	t.Helper()
+	wav := []byte("RIFF\x2c\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff")
+	return append(wav, 0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0x01, 0xc3)
+}
+
+// newSpeechChunkedUpstream serves wav as audio/wav but flushes mid-body so net/http frames
+// the response chunked -- no Content-Length reaches the gateway. It is the one upstream shape
+// the pcm strip refuses for want of a length to bound the data chunk against; the normal
+// newSpeechUpstream (whole-body Write) always carries a Content-Length, so this is separate.
+func newSpeechChunkedUpstream(t *testing.T, wav []byte) *httptest.Server {
+	t.Helper()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Header().Set("X-AudioCPP-Audio-Duration-Ms", "1500")
+		w.WriteHeader(http.StatusOK)
+		half := len(wav) / 2
+		_, _ = w.Write(wav[:half])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // forces chunked transfer encoding; no Content-Length is sent
+		}
+		_, _ = w.Write(wav[half:])
+	}))
+	t.Cleanup(up.Close)
+	return up
+}
+
+// Overrun branch of the strip's dataSize guard: a conformant mono/16 WAV whose data chunk
+// over-declares its size past the upstream's (correct, small) Content-Length is refused with
+// speech.pcm_unavailable, billed (audio_second, 0) -- never relayed truncated or under a
+// lying length.
+func TestSpeechPCMRefusesAnOverDeclaredDataChunk(t *testing.T) {
+	up, _ := newSpeechUpstream(t, mono16WAVOverDeclaredData(t))
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","response_format":"pcm"}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(speechPcmUnavailable)) {
+		t.Fatalf("body=%q, want code %q", rec.Body.Bytes(), speechPcmUnavailable)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
+		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
+}
+
+// No-usable-Content-Length branch of the strip's dataSize guard: a conformant mono/16 WAV the
+// upstream streams chunked leaves the strip no length to bound the data chunk against, so it
+// refuses with speech.pcm_unavailable, billed (audio_second, 0), rather than label a body it
+// cannot promise.
+func TestSpeechPCMRefusesAWAVWithoutAContentLength(t *testing.T) {
+	up := newSpeechChunkedUpstream(t, speechTestWAV())
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","response_format":"pcm"}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(speechPcmUnavailable)) {
+		t.Fatalf("body=%q, want code %q", rec.Body.Bytes(), speechPcmUnavailable)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
+		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
 }

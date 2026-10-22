@@ -694,14 +694,15 @@ that discards its type error would leave a non-string `response_format` such as
 `["mp3"]` at its zero value and walk it past the very check below. A JSON `null` is an
 absent value throughout.
 
-**2. For a request that does not stream, `response_format` accepts only `wav` or an absent
+**2. For a request that does not stream, `response_format` accepts `wav`, `pcm` or an absent
 value; everything else is 400 `speech.response_format_unsupported`** (a streamed request
-asks `pcm` or nothing, item 3).
+asks `pcm` or nothing, item 3; `pcm` on a one-shot request is item 2a).
 
 | `response_format` sent | The gateway | Why |
 |---|---|---|
 | absent, `null`, `""` or `"wav"` | relays | audio.cpp answers a real `audio/wav` body with `Content-Length` and the metering headers |
-| `mp3`, `opus`, `flac`, `aac`, `pcm` (without a stream) | 400 | audio.cpp does not produce them: it answers **raw WAV, still labelled `audio/wav`**, so a client that asked for `mp3` would be handed WAV without being told |
+| `pcm` (without a stream) | relays **the WAV's `data` chunk**, headerless, as `application/octet-stream` (item 2a) | the WAV audio.cpp answers is signed 16-bit little-endian mono PCM in a 44-byte header, so stripping the header yields the raw samples with no re-encoding |
+| `mp3`, `opus`, `flac`, `aac` | 400 | audio.cpp has **no encoder** (re-verified live, 2026-10-22: it answers **raw WAV, still labelled `audio/wav`**, for every one of them), so a client that asked for `mp3` would be handed WAV without being told; compressed output needs a transcoder, issue #264 |
 | `json`, `b64_json` | 400 | not OpenAI speech formats, and audio.cpp's JSON answer (base64 WAV) carries **none** of the metering headers, so a relayed one would be billed as zero seconds on every success |
 | a non-string value | 400 | the same refusal, with the received value in the message |
 
@@ -713,6 +714,32 @@ absent `response_format` means `wav` on this endpoint, **not** OpenAI's default 
 is neither wrong nor silent. Lifting the restriction for `json` and `b64_json` later
 means decoding the clip's RIFF header for its duration, because the upstream's header
 is absent on those responses.
+
+**2a. A one-shot `pcm` request is a WAV-header strip, not a transcode**
+([ADR-069](../09-architecture-decisions.md#adr-069--non-stream-speech-pcm-is-a-wav-header-strip-not-a-transcode-the-gateway-relays-the-data-chunk-of-a-16-bit-mono-wav-as-headerless-pcm-refuses-any-other-clip-after-synthesis-and-leaves-mp3opusflacaac-to-264), issue #253 part 1). A live re-verification on 2026-10-22 found audio.cpp v0.9.1 still
+answering a plain 44100 Hz mono 16-bit WAV for `mp3`, `opus`, `flac`, `aac` and `pcm` alike,
+metering headers included, so the backend has no encoder and metering was never the blocker.
+What the gateway can serve without one is the raw PCM inside that WAV. For a request that
+does not stream and names `pcm` (`sniffSpeechResponseFormat`), `relaySpeech` forces the
+**upstream** `response_format` to `wav` (`speechPCMUpstreamBody`, every other field as
+written) and marks the relay `speechPCMStrip`; `proxyNative`'s 2xx path reads the WAV header
+with `wavStripToData` (the chunk walker of `wavduration.go`, stopped at the first `data`
+byte) **before** the client's headers are written, and relays exactly the `data` chunk's
+declared size through the ordinary copier as `Content-Type: application/octet-stream` with
+`Content-Length` set to the data size (the upstream's full-WAV length is not forwarded). There
+is no decode, resample or codec, so ADR-063/ADR-064's "never converts or re-encodes" holds. The
+clip is served only when it **conforms**: `isMono16PCM` (integer PCM, one channel, 16 bits), a
+usable upstream `Content-Length`, and header bytes plus the declared data size within it.
+Otherwise the answer is **502 `speech.pcm_unavailable`**, an OpenAI-shaped error written in the
+copier's place (the gate lets no non-conforming or over-declared clip start), recorded as an error row billed
+`(audio_second, 0)`; it is a post-synthesis code because the format is known only once audio.cpp
+has answered, so `validateSpeechRequest` never returns it. The answer is **headerless by
+contract**: the sample rate is the model's native one (44100 Hz for the probed model, not the
+24 kHz OpenAI documents for its own `pcm`) and the client learns it out of band, as for
+`stream_format=audio`. The strip is keyed on the client's own stream intent: a `stream: true`
+request answered buffered by item 3 stays a one-shot `audio/wav`, whatever `response_format` it
+named. Metering and capture are unchanged (item 6): `audio_second` from the upstream's
+duration header, and the octet-stream body redacted by the binary-speech backstop.
 
 **3. Streaming is served for a `mode=streaming` model: the stream is headerless PCM, and the
 gateway meters it by counting the bytes it relays**
@@ -750,7 +777,8 @@ sentence; any other upstream error is relayed as item 5 says.
 `Content-Type` verbatim and streams the body through the shared copier, 32 KiB at a
 time with a flush per chunk, so a clip is never held whole. Two things are specific to
 speech. The upstream's declared **`Content-Length` is forwarded** (speech only: images,
-chat, Responses and Messages keep relaying chunked), so a player can show a duration
+chat, Responses and Messages keep relaying chunked; a one-shot `pcm` answer carries the
+data chunk's length instead, item 2a), so a player can show a duration
 and a download its progress, while the per-chunk flush keeps the bytes streaming; an
 upstream that declared no length stays chunked. The length is read off the upstream's
 header, which is sound because Go's client drops that header for a chunked or
@@ -791,7 +819,9 @@ here. A refused or failed request is one `error`-status usage row billed as
 bytes) and its capture holds metadata.** The usage row of a one-shot call carries
 `billing_unit = audio_second` and a quantity read from the upstream's
 `X-AudioCPP-Audio-Duration-Ms` header ([Telemetry
-§8.4.1](telemetry-usage-observability.md#841-the-usage-event)). The upstream's
+§8.4.1](telemetry-usage-observability.md#841-the-usage-event)); a one-shot `pcm` answer is
+billed the same way, since the strip leaves the upstream WAV's headers untouched
+(item 2a). The upstream's
 `X-AudioCPP-*` metering headers are **not** forwarded to the client. A **streamed** call has no
 such header, so the relay **counts the PCM it relays** (`speechStreamScan`: the decoded
 `speech.audio.delta` payloads, or the raw body bytes) and, **on a clean completion only**
@@ -3499,8 +3529,9 @@ Every inference error response uses the gateway-wide envelope
 | `request.body_too_large` | 413 | an edit body over `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, a transcription body over `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, or either one over the agent router's 32 MiB once the gateway has prepared it (§10) |
 | `images.upstream_error` | the upstream's own status | a non-2xx `sd-server` body normalised into the OpenAI error object; `type` and `code` are the **gateway's**, never the backend's (§3.4) — an edit relays it the same way |
 | `speech.model_required` / `speech.input_required` | 400 | the speech body failed `validateSpeechRequest` (§3.6): no `model`, or no non-empty string `input` |
-| `speech.response_format_unsupported` | 400 | on a request that does not stream, a `response_format` other than `wav` or absent — `mp3`, `opus`, `flac`, `aac`, `pcm`, `json`, `b64_json` and any non-string value; on a streamed request, one other than `pcm` or absent (§3.6) |
+| `speech.response_format_unsupported` | 400 | on a request that does not stream, a `response_format` other than `wav`, `pcm` or absent — `mp3`, `opus`, `flac`, `aac`, `json`, `b64_json` and any non-string value (the compressed ones are issue #264); on a streamed request, one other than `pcm` or absent (§3.6) |
 | `speech.stream_unsupported` | 400 | a speech request whose stream fields the relay cannot honor: a non-boolean `stream`, a `stream_format` other than `sse` or `audio` or one on a request that does not stream, or `response_format=wav` beside `stream: true` (audio.cpp serves streaming only as `pcm`) (§3.6) |
+| `speech.pcm_unavailable` | 502 | a one-shot `pcm` request whose synthesized clip cannot be served as raw PCM: the mapped model's native WAV is not 16-bit mono PCM, is structurally unsound or declares a data size past the upstream's body, or the 2xx declared no usable `Content-Length` (§3.6 item 2a). A **post-synthesis** code, so recorded as an error row billed `(audio_second, 0)` |
 | `speech.upstream_error` | the upstream's own status | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"`; an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged (§3.6) |
 | `transcription.model_required` / `transcription.file_required` | 400 | the transcription form failed `validateTranscriptionRequest` (§3.7): no `model`, or no non-empty part named `file` |
 | `transcription.invalid` | 400 | a structurally broken form (§3.7): not `multipart/form-data` or no boundary (a JSON body included), a truncated or malformed part, a field over 1 MiB, a repeated single-use field, a body that could not be read — or **more than one** non-empty `file` part |

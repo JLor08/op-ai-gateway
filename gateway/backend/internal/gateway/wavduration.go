@@ -147,7 +147,14 @@ func wavFormatFromReader(r io.Reader) (wavFormat, bool) {
 	if !ok {
 		return wavFormat{}, false
 	}
-	byteRate, ok := wavConsistentByteRate(fields[:])
+	return wavFormatFromFields(fields[:])
+}
+
+// wavFormatFromFields decodes the first wavFmtMinLen bytes of a `fmt ` chunk into its
+// wavFormat, once they agree with each other (wavConsistentByteRate): the one decode behind
+// wavFormatFromReader and wavStripToData.
+func wavFormatFromFields(fields []byte) (wavFormat, bool) {
+	byteRate, ok := wavConsistentByteRate(fields)
 	if !ok {
 		return wavFormat{}, false
 	}
@@ -159,6 +166,63 @@ func wavFormatFromReader(r io.Reader) (wavFormat, bool) {
 		ByteRate:   byteRate,
 		Bits:       le.Uint16(fields[wavBitsOffset:]),
 	}, true
+}
+
+// wavStripToData walks a RIFF/WAVE stream to its `data` chunk and stops at the first byte
+// of its body: it is wavDurationFromReader's chunk loop for the caller that wants the audio
+// itself rather than its length (a speech response relayed as raw PCM, the WAV header
+// stripped off). It returns the format the `fmt ` chunk states and the size the `data`
+// chunk declares, and true; the caller reads exactly dataSize bytes from r to get the PCM.
+//
+// It returns (wavFormat{}, 0, false) when the stream is not RIFF/WAVE, when a `fmt ` chunk
+// is truncated, too short or not consistent with itself (see wavConsistentByteRate), when a
+// `data` chunk comes before any `fmt ` (there is then no format to say what its bytes are),
+// and when the stream ends before the `data` chunk header. Foreign chunks are passed over,
+// and a later `fmt ` chunk replaces an earlier one, as in wavDurationFromReader.
+//
+// Whether the format is one the caller can relay (see isMono16PCM) is not judged here, and
+// nor is whether the stream holds dataSize bytes: the size is the header's word, and the
+// caller meters and bounds what it reads.
+func wavStripToData(r io.Reader) (format wavFormat, dataSize int64, ok bool) {
+	if !wavReadRIFFHeader(r) {
+		return wavFormat{}, 0, false
+	}
+
+	for {
+		id, size, ok := wavReadChunkHeader(r)
+		if !ok {
+			return wavFormat{}, 0, false
+		}
+		if id == "data" {
+			if format.ByteRate == 0 { // no `fmt ` before it
+				return wavFormat{}, 0, false
+			}
+			return format, int64(size), true
+		}
+		if format, ok = wavConsumeChunk(r, id, size, format); !ok {
+			return wavFormat{}, 0, false
+		}
+	}
+}
+
+// wavConsumeChunk passes over one chunk that is not the `data` chunk, whose header (id and
+// body size) has been read, and returns the format the walk now holds: the chunk's own when
+// it is a `fmt ` chunk (a later one replaces an earlier one), the format it was given
+// otherwise. It reports false when the `fmt ` chunk is truncated, too short or not
+// consistent with itself, or when the stream ends inside the chunk body.
+func wavConsumeChunk(r io.Reader, id string, size uint32, format wavFormat) (wavFormat, bool) {
+	consumed := uint64(0) // bytes of the chunk body already read
+	if id == "fmt " {
+		fields, ok := wavReadConsistentFmtFields(r, size)
+		if !ok {
+			return wavFormat{}, false
+		}
+		if format, ok = wavFormatFromFields(fields[:]); !ok {
+			return wavFormat{}, false
+		}
+		consumed = wavFmtMinLen
+	}
+	return format, wavSkipChunkRest(r, size, consumed)
 }
 
 // wavFmtFieldsFromReader walks a RIFF/WAVE stream to its `fmt ` chunk and returns the

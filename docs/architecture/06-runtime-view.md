@@ -62,7 +62,7 @@ sequenceDiagram
 
     C->>GW: POST /v1/audio/speech {model, input, voice} (Bearer token)
     GW->>GW: authenticate (bearer or loopback, never a session)
-    GW->>GW: validate: model + input; response_format wav (pcm when streaming); stream boolean
+    GW->>GW: validate: model + input; response_format wav or pcm (wav only when not streaming); stream boolean
     Note over GW: 400 speech.* here, before any admission, not recorded
     GW->>R: resolve(model, openai_audio, required capability speech)
     R-->>GW: candidate with speech: yes, or 404 no_model_route / model_not_capable
@@ -84,6 +84,20 @@ from the server's `/v1/models` `task`; the flavor is the application's own
 summary of the audio, never the WAV bytes. See [Compatibility & Inference
 §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech) and
 [ADR-061](09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only).
+
+**`pcm` variant** ([ADR-069](09-architecture-decisions.md#adr-069--non-stream-speech-pcm-is-a-wav-header-strip-not-a-transcode-the-gateway-relays-the-data-chunk-of-a-16-bit-mono-wav-as-headerless-pcm-refuses-any-other-clip-after-synthesis-and-leaves-mp3opusflacaac-to-264), issue #253 part 1). A request that
+does not stream and names `response_format: pcm` takes the same path with one change on the
+2xx branch. The gateway asks audio.cpp for its WAV (the upstream `response_format` is forced to
+`wav`; audio.cpp answers a WAV for every format), reads the RIFF/WAVE header **before** writing
+the client's headers (`wavStripToData`), checks the clip is 16-bit mono PCM and that the
+declared data size fits the upstream's own `Content-Length`, and relays only the `data` chunk
+as `application/octet-stream` with that chunk's size as the `Content-Length`: a header strip,
+not a transcode, headerless at the model's native rate. A clip that fails the check never
+reaches the client in part: the answer is **502 `speech.pcm_unavailable`** and an
+`audio_second` error row of quantity 0. Billing otherwise reads the upstream's
+`X-AudioCPP-Audio-Duration-Ms` exactly as for `wav`, and the capture stays the redacted
+summary (the octet-stream body is redacted by the binary-speech backstop). A `stream: true`
+request answered buffered stays `audio/wav`, as below.
 
 **Streaming variant** ([ADR-068](09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issues #253 and #263). When the client sends
 `stream=true` (with `response_format` `pcm` or absent) and the mapped model's
