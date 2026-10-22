@@ -817,6 +817,44 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	if contentType == "" {
 		contentType = jsonContentType
 	}
+	// The speech scan exists only for a speech request that asked for a stream AND was
+	// answered with one (newSpeechStreamScan reads the answer's Content-Type): a stream
+	// request answered with a plain audio/wav is no stream, and is relayed and billed like
+	// any one-shot synthesis.
+	speechRelay := rel.pfReq.APIFlavor == apiFlavorSpeech && rel.endpoint != endpointTranscription
+	var speechScan *speechStreamScan
+	if speechRelay && rel.pfReq.Stream {
+		speechScan = newSpeechStreamScan(resp.Header)
+	}
+
+	// A one-shot pcm request (rel.speechPCMStrip, set only by relaySpeech, never on a stream
+	// or its buffered downgrade): audio.cpp answered with a WAV and the client asked for its
+	// raw PCM. wavStripToData walks the RIFF/WAVE header through a counting reader and stops
+	// at the first data byte, so counting.n is how many header bytes it consumed. The clip
+	// is served as PCM only when the format is 16-bit mono PCM AND the declared data chunk
+	// fits the upstream's own Content-Length (header bytes + data size <= declared): a format
+	// that cannot be served, or a data size that overruns the body -- a garbled or streaming
+	// writer's 0xFFFFFFFF, never trusted audio.cpp -- is refused with
+	// recordSpeechPCMUnavailable (502) rather than relayed truncated or under a lying length,
+	// and that refusal returns in the copier's place. On success the client Content-Type
+	// becomes application/octet-stream and its Content-Length the data size, and only the
+	// data chunk (io.LimitReader) reaches the copier. Metering is untouched:
+	// setSpeechBillingQuantity below still reads the upstream WAV's duration header, which the
+	// strip leaves in resp.Header.
+	relayBody := io.Reader(resp.Body)
+	if rel.speechPCMStrip {
+		counting := &wavCountingReader{r: resp.Body}
+		format, dataSize, ok := wavStripToData(counting)
+		declared, haveLen := declaredContentLength(resp.Header)
+		if !ok || !format.isMono16PCM() || !haveLen || counting.n+dataSize > declared {
+			s.recordSpeechPCMUnavailable(w, r, ex)
+			return
+		}
+		contentType = "application/octet-stream"
+		w.Header().Set("Content-Length", strconv.FormatInt(dataSize, 10))
+		relayBody = io.LimitReader(resp.Body, dataSize)
+	}
+
 	w.Header().Set("Content-Type", contentType)
 	if rel.pfReq.Stream {
 		w.Header().Set("Cache-Control", "no-cache")
@@ -833,24 +871,16 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// Speech only: every other flavor keeps relaying chunked, exactly as before. (A
 	// transcription shares the openai_audio flavor this test reads; speechRelay
 	// carves it out, and the only transcription that gets here is a stream, which has
-	// no length to declare.) Nor does a STREAMED speech call get it (speechScan, below):
-	// a stream is relayed chunked, whatever length an intermediary declared for it, since
-	// it is not the one file a size describes.
+	// no length to declare.) Nor does a STREAMED speech call get it (speechScan): a
+	// stream is relayed chunked, whatever length an intermediary declared for it, since
+	// it is not the one file a size describes. The pcm strip is excluded too: it already
+	// set the client's Content-Length to the data chunk's size above, and the upstream's
+	// full-WAV length would overstate the headerless body the copier now writes.
 	// provider.ProxyResponse carries no ContentLength field, so the declared
 	// length is read off the header; Go's client drops that header both for a
 	// chunked response and for one it decompressed itself, so a value that
 	// survives is the length of the bytes the copier will write.
-	//
-	// The speech scan exists only for a speech request that asked for a stream AND was
-	// answered with one (newSpeechStreamScan reads the answer's Content-Type): a stream
-	// request answered with a plain audio/wav is no stream, and is relayed and billed like
-	// any one-shot synthesis.
-	speechRelay := rel.pfReq.APIFlavor == apiFlavorSpeech && rel.endpoint != endpointTranscription
-	var speechScan *speechStreamScan
-	if speechRelay && rel.pfReq.Stream {
-		speechScan = newSpeechStreamScan(resp.Header)
-	}
-	if speechRelay && speechScan == nil {
+	if speechRelay && speechScan == nil && !rel.speechPCMStrip {
 		if n, ok := declaredContentLength(resp.Header); ok {
 			w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
 		}
@@ -901,7 +931,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		teeBuf = nil
 	}
 	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan}
-	copyErr := copier.run(resp.Body)
+	// relayBody is resp.Body for every relay but the pcm strip, which already consumed the
+	// WAV header above and hands the copier only the data chunk (io.LimitReader).
+	copyErr := copier.run(relayBody)
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, rel.pfReq, serverName, idledOut.Load(), copyErr, start)
 
@@ -969,6 +1001,23 @@ func declaredContentLength(h http.Header) (int64, bool) {
 	return n, true
 }
 
+// wavCountingReader wraps a reader and counts the bytes read through it. The pcm strip
+// (proxyNative) reads a WAV header from the upstream body through one so it learns how
+// many header bytes wavStripToData consumed: the declared data-chunk size is believed only
+// when those header bytes plus the data size fit the upstream's declared Content-Length, so
+// a garbled or streaming writer's 0xFFFFFFFF data size (far past the body) is caught before
+// any Content-Length is forwarded. It counts only; it never bounds a read.
+type wavCountingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *wavCountingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 // nativeRelay is everything, beyond the HTTP pair, that describes ONE native
 // passthrough relay its caller has already decided on: which principal, which
 // resolved destination, which client bytes, and which endpoint identity. Its
@@ -1026,6 +1075,14 @@ type nativeRelay struct {
 	// speechStreamingRefusal): set beside bufferedRetry, and what peekStreamingRefusal
 	// looks for. The two audio endpoints' sentences differ, so the relay carries its own.
 	streamRefusal string
+	// speechPCMStrip marks a one-shot speech request that asked for response_format=pcm
+	// (#253). audio.cpp always answers a one-shot request with a WAV, so proxyNative's 2xx
+	// path strips that WAV's RIFF/WAVE header and relays only its data chunk, as raw PCM
+	// (application/octet-stream), when the format is 16-bit mono PCM; a non-conforming
+	// format is refused with recordSpeechPCMUnavailable. Set only by relaySpeech, only for
+	// a request the client did not ask to stream, and never on a streamed relay or its
+	// buffered downgrade (which relays the WAV as it is). Nil/false everywhere else.
+	speechPCMStrip bool
 }
 
 // nativeExchange is the request-scoped state proxyNative COMPUTES once and then
