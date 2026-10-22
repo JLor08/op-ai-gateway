@@ -7946,9 +7946,11 @@ pieces it joins shaped every choice below:
   would overwrite a checkpoint or the terminal commit), and any other whole-document rewrite
   meets the same race.
 
-**Decision — ten choices, taken together. Nothing changes for a chat that sets none of it:
-keep-all is the default and the absent value, so no row, no part and no byte of an existing
-chat moves.**
+**Decision — ten choices, taken together. Nothing changes at rest for a chat that sets none of
+it: keep-all is the default and the absent value, so no stored row, no part and no `settings`
+byte of an existing chat moves, and no retention means no prune. The one going-forward
+behavior that is not retention-gated is (h): a user-cancelled speech run commits the
+`audio_removed` marker on every chat, a default keep-all one included.**
 
 - **(a) Retention is a per-chat setting, one optional integer, `keep_last_audio`, with three
   states.**
@@ -8020,9 +8022,9 @@ chat moves.**
   it (`dropChatBlobIDs`): it stages every refusal before mutating, applies the deletes with
   their byte accounting, and evicts **once** after the whole save, so the bytes the deletes free
   count against the FIFO budget before any unrelated chat is evicted for the bytes the inserts
-  add. `commitChatRun` takes the ids (`PrepareChatRun` passes none) and `portal.ChatStore` and
-  both stores carry the new parameter. This is the delete-and-rewrite building block issue #264's
-  in-place shrink can sit beside.
+  add. `commitChatRun` takes the ids (`PrepareChatRun` passes none) and the Go `portal.ChatStore`
+  interface and both stores carry the new parameter. This is the delete-and-rewrite building
+  block issue #264's in-place shrink can sit beside.
 - **(e) Two prunes, one routine: lazy going-forward, and retroactive with a confirm.**
   - *Lazy.* `writeAssistant` appends the new answer, moves its inline audio into blob rows
     (`extractChatBlobs`), and then `pruneForRetention` rewrites the older answers beyond N into
@@ -8035,7 +8037,8 @@ chat moves.**
     delete, so it is not re-confirmed.
   - *Retroactive.* When the user lowers N or turns storing off on a chat that already holds more,
     the excess is removed at once, but because that is an **irreversible bulk delete** the
-    stricter setting is **held pending an explicit confirm**, not auto-saved first. `ChatStore`
+    stricter setting is **held pending an explicit confirm**, not auto-saved first. The portal
+    client's `ChatStore.tsx` (the frontend state store, not the Go `portal.ChatStore` of (d))
     judges "stricter" on what the wire would carry (`lowersAudioRetention`, never the raw count
     text, so a blank or unusable count is keep-all and loosens or changes nothing) and only
     holds a tightening the open transcript's audio actually exceeds (`audioAnswersBeyond`); a
@@ -8145,8 +8148,11 @@ migration and no ServerAgent version bump**: the setting and the marker ride the
 document ([Data Model](reference/data-model.md#4-migration-history-95-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
-nothing is byte-identical, since the field is a trailing `omitempty` pointer and keep-all is the
-absent value. The cost and the residuals are named ([Risks
+nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
+trailing `omitempty` pointer, keep-all is the absent value, and no retention means no prune and
+no `keep_last_audio` byte. It is **not** behavior-identical going forward: (h) commits the
+`audio_removed` marker on every user-cancelled speech run, a keep-all chat included, whatever
+the retention setting. The cost and the residuals are named ([Risks
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
 
 - **Deletion is irreversible, so every bulk or manual path is behind an explicit confirm.** The
