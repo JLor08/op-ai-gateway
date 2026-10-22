@@ -644,8 +644,19 @@ const runTimedOutMessage = "gateway.chat_run_timeout"
 // chatRunCommitFailedMessage is finishRunWithParts' terminal code for a commit
 // failure it cannot name more specifically than "the store write failed" --
 // see commitFailureCode, which is the only place that returns it. A commit
-// that exceeds chatRunCommitTimeout below is one such failure.
+// that exceeds chatRunCommitTimeout is NOT one of these: it has its own code,
+// chatRunCommitTimeoutMessage.
 const chatRunCommitFailedMessage = "gateway.chat_run_commit_failed"
+
+// chatRunCommitTimeoutMessage is finishRunWithParts' terminal code for a
+// commit that did not return within chatRunCommitTimeout: the store write took
+// too long, which is a different thing to tell the user than the generic
+// "the write failed, try again" -- the store is slow or wedged, and an
+// immediate retry will likely meet the same wall. A CODE, not prose: the
+// frontend maps it to a localized label (errorLabelByCode in format.ts), the
+// same way it maps runTimedOutMessage. See commitFailureCode, which is the only
+// place that returns it.
+const chatRunCommitTimeoutMessage = "gateway.chat_run_commit_timeout"
 
 // chatRunCommitTimeout bounds EVERY store write a run makes on a context of
 // its own: the terminal commit (finishRunWithParts) and the periodic
@@ -717,21 +728,39 @@ func commitFailureIsChatGone(err error) bool {
 // commitFailureCode maps a failed CommitAssistant's error (once
 // commitFailureIsChatGone has ruled out "the chat is gone") to the
 // run-terminal code finishRunWithParts substitutes for the status/message the
-// run was about to report. portal.ErrChatTooLarge is surfaced VERBATIM: it is
-// a named, actionable sentinel -- the frontend's label (errorChatTooLarge,
-// i18n.ts) tells the user that nothing was stored for this turn and to start a
-// new chat, which is a thread with the whole budget free. It deliberately does
-// NOT tell them to download the image: on this path the commit failed, so
-// finishRunWithParts withholds the parts from the terminal event and there is
-// no image on screen to save. An arbitrary store failure -- a driver error, a
-// marshal failure -- is something the user cannot act on and therefore
-// degrades to one generic, stable code rather than reaching the browser as a
-// raw Go error string.
+// run was about to report. Three failures are named, because each tells the
+// user something different from "try again":
+//
+//   - portal.ErrChatTooLarge is surfaced VERBATIM: it is a named, actionable
+//     sentinel -- the frontend's label (errorChatTooLarge, i18n.ts) tells the
+//     user that nothing was stored for this turn and to start a new chat,
+//     which is a thread with the whole budget free. It deliberately does NOT
+//     tell them to download the image: on this path the commit failed, so
+//     finishRunWithParts withholds the parts from the terminal event and
+//     there is no image on screen to save.
+//   - portal.ErrChatBlobTooLarge is surfaced VERBATIM too: one blob of the
+//     turn (an image, say) exceeds the per-blob ceiling, so retrying the same
+//     request cannot succeed and "the write failed, try again" would be a lie
+//     about why.
+//   - context.DeadlineExceeded -- the commit outlived chatRunCommitTimeout --
+//     becomes chatRunCommitTimeoutMessage: the store write took too long,
+//     which is not the same as the store refusing it.
+//
+// An arbitrary store failure -- a driver error, a marshal failure -- is
+// something the user cannot act on and therefore degrades to one generic,
+// stable code (chatRunCommitFailedMessage) rather than reaching the browser as
+// a raw Go error string.
 func commitFailureCode(err error) string {
-	if errors.Is(err, portal.ErrChatTooLarge) {
+	switch {
+	case errors.Is(err, portal.ErrChatTooLarge):
 		return portal.ErrChatTooLarge.Error()
+	case errors.Is(err, portal.ErrChatBlobTooLarge):
+		return portal.ErrChatBlobTooLarge.Error()
+	case errors.Is(err, context.DeadlineExceeded):
+		return chatRunCommitTimeoutMessage
+	default:
+		return chatRunCommitFailedMessage
 	}
-	return chatRunCommitFailedMessage
 }
 
 const runEvictionDelay = 30 * time.Second
