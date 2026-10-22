@@ -3224,9 +3224,10 @@ fetch still in flight. A long answer is **several** ordered parts ([ADR-070](../
 `AudioTurn` fetches every stored part and joins them client-side (`concatWavBlobs` writes each
 part's PCM end to end behind one canonical header) into **one** gapless WAV, which is the one
 object URL the element plays and the one file the download saves; a single part is played and
-saved as the blob the server served. The run's own terminal event carries the part as produced, an inline
-`data:audio/wav` URL the element plays directly until the post-`done` refetch swaps in the
-stored one; any other URL shape is refused inline rather than fetched. The download goes
+saved as the blob the server served. The run's own terminal event carries the parts as produced, inline
+`data:audio/wav` URLs: a **single** one the element plays directly until the post-`done` refetch
+swaps in the stored one, while several are joined like stored parts; any other URL shape is
+refused inline rather than fetched. The download goes
 through `downloadBinary` (a second fetch, on click), whose extension map is keyed on the
 whole media type so `audio/wav` saves as `.wav`; the file is named from the turn's id. The
 fetch guard `isFetchableUrl` is the same literal-prefix check the image download uses

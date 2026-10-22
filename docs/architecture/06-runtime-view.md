@@ -214,8 +214,8 @@ sequenceDiagram
         GW-->>B: audio/wav (no Range support)
         B->>B: AudioTurn joins several parts into one WAV and plays one object URL in audio controls, revoked on unmount
     else error
-        SP-->>GW: the endpoint's own error, or an empty, unreadable or non-WAV 2xx, or a clip over the total audio cap
-        GW-->>B: SSE done, status error with gateway.chat_run_* or speech.* code
+        SP-->>GW: the endpoint's own error, or an empty, unreadable or non-WAV 2xx
+        GW-->>B: SSE done, status error with gateway.chat_run_* or speech.* code (gateway.chat_run_audio_too_large when the executor finds a 2xx clip over the total audio cap)
     end
 ```
 

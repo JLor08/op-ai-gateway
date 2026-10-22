@@ -5907,7 +5907,8 @@ could have chosen:
   unmounts or the URL changes, and aborts a request still in flight (a response that
   lands after the abort creates nothing, since nothing would ever revoke it). A run's
   own terminal event carries the part as it was produced (the inline `data:audio/wav`
-  URL), which the element plays directly until the post-`done` refetch swaps in the
+  URL; a single one is what the element plays directly, several are joined like stored
+  parts), until the post-`done` refetch swaps in the
   stored URL; any other shape is refused inline rather than fetched. Download goes
   through `downloadBinary`, a second fetch on click only, so the saved file's type
   and extension come from what the server actually served; its extension map is now keyed
@@ -7793,8 +7794,8 @@ blob is one part exactly as before. The cost and the residuals are named ([Risks
   parts (held as base64 `data:` URLs, then marshalled and decoded into the blobs) are in memory
   together when `SaveChatWithBlobs` runs. The commit-phase peak therefore **scales with the
   total cap**, per concurrent over-long turn, which is why the cap is an operator knob and not
-  a constant. What is bounded is the number of simultaneous copies, not the total: each stored
-  blob value stays at most the per-part target, so no per-value store limit and no capture-
+  a constant. What is bounded is the number of simultaneous copies, not the total: each part's
+  PCM is at most the per-part target (its WAV adds a 44-byte header), so no per-value store limit and no capture-
   cipher seal is threatened, and only the number of rows per transaction grows. **O(1)
   streaming-to-store is a deliberate follow-up and is not built here.**
 - **A clip that is not 16-bit mono PCM is bounded by the per-blob cap only.** The total cap
