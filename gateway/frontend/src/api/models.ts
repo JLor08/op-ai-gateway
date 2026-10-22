@@ -673,6 +673,14 @@ export type ModelServerCapability = {
 // group's flattened candidate list (see api.modelGroupServers).
 export type GroupModelServerRow = ModelServerRow & { model: string };
 
+// The answer of the speech composer's streaming gate (api.modelSpeechStreaming): whether the
+// portal may stream this model's audio, and the sample rate its headerless PCM is played at.
+// `sampleRate` is 0 exactly when `streaming` is false.
+export type SpeechStreamingGate = { streaming: boolean; sampleRate: number };
+
+// "No streaming": the one shape every unusable answer collapses to.
+export const NO_SPEECH_STREAMING: SpeechStreamingGate = { streaming: false, sampleRate: 0 };
+
 export function modelsApi(fetcher: Fetcher) {
   return {
     models: () => request<{ data: ModelOption[] }>(fetcher, '/api/portal/models'),
@@ -707,6 +715,26 @@ export function modelsApi(fetcher: Fetcher) {
         fetcher,
         `/api/portal/model-voices?name=${encodeURIComponent(name)}`,
       ).then((r) => r.voices ?? []),
+    // Whether the portal's speech composer may offer STREAMING playback for a speech model, and
+    // the sample rate it would play at (ADR-068): the gateway says yes only when every
+    // mapping the model could be served by streams (speech_streaming) AND has its output
+    // byte rate cached, which is what makes the headerless PCM playable. Global
+    // (gateway:use); name is a query param like modelServers. FAIL CLOSED: anything but a
+    // boolean true with a usable whole rate is "no streaming" (the buffered WAV run, today's
+    // behavior), so a malformed answer can never open a gate the client cannot honor.
+    modelSpeechStreaming: (name: string) =>
+      request<{ streaming?: unknown; sample_rate?: unknown }>(
+        fetcher,
+        `/api/portal/model-speech-streaming?name=${encodeURIComponent(name)}`,
+      ).then((r): SpeechStreamingGate => {
+        const rate = r.sample_rate;
+        return r.streaming === true &&
+          typeof rate === 'number' &&
+          Number.isInteger(rate) &&
+          rate > 0
+          ? { streaming: true, sampleRate: rate }
+          : NO_SPEECH_STREAMING;
+      }),
     // Every (model, server) a model GROUP can serve (its flattened members), with a
     // live rank across the whole group's candidate list. Global (gateway:use); no
     // SSE — the group-detail view polls this like the model-detail Prio column.

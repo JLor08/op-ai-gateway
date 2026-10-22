@@ -388,7 +388,7 @@ export type BenchmarkResult = {
   // only) or "audio_only" (they serve speech only). A skipped result carries no
   // measurement, and its numeric fields are 0 because the backend does not
   // omit them.
-  skipped?: 'images_only' | 'audio_only';
+  skipped?: 'images_only' | 'audio_only' | 'not_speech' | 'speech_clone';
   max_concurrency?: number;
   recommended_concurrency?: number;
   gen_tokens_per_second_at_capacity?: number;
@@ -398,6 +398,14 @@ export type BenchmarkResult = {
   // number, and that value is what tells the operator what to do next. The two
   // are deliberately distinguishable, unlike `vision_capable` above.
   vram?: VRAMReportDTO;
+  // The speech benchmark's figures (a mode=speech run; absent on every other mode and on a
+  // speech result that failed). output_byte_rate is the bytes of PCM per second of audio the
+  // run read from the WAV it synthesized and cached for the mapping (what a streamed call is
+  // billed and played by); ttft_ms / wall_ms / rtf are the audio perf metrics below.
+  output_byte_rate?: number;
+  ttft_ms?: number;
+  wall_ms?: number;
+  rtf?: number;
   error?: string;
 };
 
@@ -555,6 +563,17 @@ export type BenchmarkRunDTO = {
   // authority: nothing applies it to a launch spec's vram_estimate_mb (operator-
   // owned) or vram_measured_mb (agent-owned).
   vram?: VRAMReportDTO;
+  // Present only for a kind==="speech" row that measured them (omitted on a failed one, which
+  // carries `error`). ttft_ms is the time from sending the synthesis request to the first
+  // byte of the response and INCLUDES any model start: the benchmark's request does not
+  // stream, audio.cpp answers a non-stream call only after the whole clip is synthesized, and
+  // an agent-launched model is started behind the request, so it is roughly synthesis plus
+  // cold start, not a streamed time to first audio. wall_ms is the synthesis wall time (the
+  // upstream's own figure when it reported one) and rtf the real-time factor, wall time over
+  // the audio's length (below 1 is faster than real time).
+  ttft_ms?: number;
+  wall_ms?: number;
+  rtf?: number;
 };
 
 // The optional `?mode=...` query suffix shared by the three benchmark-start

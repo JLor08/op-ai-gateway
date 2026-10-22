@@ -21,10 +21,12 @@ const (
 	wavTrailingSlackBytes = 16 << 10
 )
 
-// Offsets of the fixed PCM fields within the body of a `fmt ` chunk (the 2-byte
-// audio format tag at offset 0 is not read: the consistency check below is what
-// separates a PCM header from one that is not).
+// Offsets of the fixed PCM fields within the body of a `fmt ` chunk. The 2-byte audio
+// format tag at offset 0 is not read by the duration and byte-rate measurements (the
+// consistency check below is what separates a PCM header from one that is not); only
+// wavFormatFromReader reads it, for the caller that has to know WHAT the samples are.
 const (
+	wavFormatTagOffset  = 0
 	wavChannelsOffset   = 2
 	wavSampleRateOffset = 4
 	wavByteRateOffset   = 8
@@ -63,19 +65,16 @@ const (
 // slack bounds what a forger can still get billed as nothing to that many bytes of
 // audio per request.
 func wavDurationFromReader(r io.Reader) (int64, bool) {
-	var riff [wavRIFFHeaderLen]byte
-	if _, err := io.ReadFull(r, riff[:]); err != nil || string(riff[0:4]) != "RIFF" || string(riff[8:12]) != "WAVE" {
+	if !wavReadRIFFHeader(r) {
 		return 0, false
 	}
 
 	var byteRate uint32
 	for {
-		var header [wavChunkHeaderLen]byte
-		if _, err := io.ReadFull(r, header[:]); err != nil {
+		id, size, ok := wavReadChunkHeader(r)
+		if !ok {
 			return 0, false
 		}
-		id := string(header[0:4])
-		size := binary.LittleEndian.Uint32(header[4:])
 
 		consumed := uint64(0) // bytes of the chunk body already read
 		switch id {
@@ -93,6 +92,134 @@ func wavDurationFromReader(r io.Reader) (int64, bool) {
 			return 0, false
 		}
 	}
+}
+
+// wavByteRateFromReader returns the byte rate (sample rate x channels x bytes per
+// sample) of a PCM WAV stream, read from its `fmt ` chunk, and true. It returns
+// (0, false) for a stream that is not RIFF/WAVE and for a `fmt ` chunk that is
+// truncated, too short to carry a byte rate or not consistent with itself (see
+// wavConsistentByteRate), and for a stream whose `data` chunk comes before any `fmt `
+// chunk (wavDurationFromReader does not believe one that follows `data` either).
+//
+// It stops at the `fmt ` chunk: the audio is never read, so a response can be
+// measured from its first bytes, and any chunk ahead of `fmt ` is passed over. The
+// rate is the PCM FORMAT's constant, the divisor that turns PCM bytes into seconds
+// (a streamed speech response is billed as pcmBytes / byteRate), not a throughput.
+func wavByteRateFromReader(r io.Reader) (uint32, bool) {
+	fields, ok := wavFmtFieldsFromReader(r)
+	if !ok {
+		return 0, false
+	}
+	return wavConsistentByteRate(fields[:])
+}
+
+// wavFormat is the sample format a WAV's `fmt ` chunk states: what the byte rate alone
+// cannot tell. A byte rate is sample rate x channels x bytes per sample, so one number
+// fits many formats -- 96000 B/s is 48 kHz mono 16-bit, 24 kHz stereo 16-bit and 24 kHz
+// mono float32 alike -- and a caller that must PLAY the audio, or write a header for it,
+// has to know which.
+type wavFormat struct {
+	Tag        uint16 // 1 = integer PCM, 3 = IEEE float, 0xFFFE = extensible, ...
+	Channels   uint16
+	SampleRate uint32
+	ByteRate   uint32
+	Bits       uint16
+}
+
+// wavFormatPCM is the `fmt ` audio format tag of integer PCM.
+const wavFormatPCM = 1
+
+// isMono16PCM reports whether the format is integer PCM, one channel, 16 bits a sample:
+// signed 16-bit little-endian mono, the format a streamed speech response is played and
+// stored as (ADR-068). Any other tag -- float32, extensible -- is not it, whatever its
+// byte rate says.
+func (f wavFormat) isMono16PCM() bool {
+	return f.Tag == wavFormatPCM && f.Channels == 1 && f.Bits == 16
+}
+
+// wavFormatFromReader is wavByteRateFromReader's sibling for the caller that needs the
+// whole format: it reads the same `fmt ` chunk, under the same rules (a stream that is not
+// RIFF/WAVE, a `fmt ` that is truncated, too short or not consistent with itself, or a
+// `data` chunk ahead of any `fmt ` is (wavFormat{}, false)), and returns its tag, channels,
+// sample rate, byte rate and bit depth. It stops at the `fmt ` chunk, like its sibling.
+func wavFormatFromReader(r io.Reader) (wavFormat, bool) {
+	fields, ok := wavFmtFieldsFromReader(r)
+	if !ok {
+		return wavFormat{}, false
+	}
+	byteRate, ok := wavConsistentByteRate(fields[:])
+	if !ok {
+		return wavFormat{}, false
+	}
+	le := binary.LittleEndian
+	return wavFormat{
+		Tag:        le.Uint16(fields[wavFormatTagOffset:]),
+		Channels:   le.Uint16(fields[wavChannelsOffset:]),
+		SampleRate: le.Uint32(fields[wavSampleRateOffset:]),
+		ByteRate:   byteRate,
+		Bits:       le.Uint16(fields[wavBitsOffset:]),
+	}, true
+}
+
+// wavFmtFieldsFromReader walks a RIFF/WAVE stream to its `fmt ` chunk and returns the
+// first wavFmtMinLen bytes of its body, once they agree with each other (see
+// wavConsistentByteRate): the one parse behind wavByteRateFromReader and
+// wavFormatFromReader. Chunks ahead of `fmt ` are passed over; a `data` chunk before it
+// ends the search, as the audio is never read.
+func wavFmtFieldsFromReader(r io.Reader) ([wavFmtMinLen]byte, bool) {
+	var fields [wavFmtMinLen]byte
+	if !wavReadRIFFHeader(r) {
+		return fields, false
+	}
+	for {
+		id, size, ok := wavReadChunkHeader(r)
+		if !ok || id == "data" {
+			return fields, false
+		}
+		if id == "fmt " {
+			return wavReadConsistentFmtFields(r, size)
+		}
+		if !wavSkipChunkRest(r, size, 0) {
+			return fields, false
+		}
+	}
+}
+
+// wavReadConsistentFmtFields reads the first wavFmtMinLen bytes of a `fmt ` chunk whose
+// declared body size is size, and reports true only when the chunk is long enough to
+// carry them, they can be read, and they agree with each other (wavConsistentByteRate).
+// It leaves the reader wavFmtMinLen bytes into the chunk body. It is
+// wavReadFmtByteRate's counterpart for the caller that needs the fields themselves.
+func wavReadConsistentFmtFields(r io.Reader, size uint32) ([wavFmtMinLen]byte, bool) {
+	var fields [wavFmtMinLen]byte
+	if size < wavFmtMinLen {
+		return fields, false
+	}
+	if _, err := io.ReadFull(r, fields[:]); err != nil {
+		return fields, false
+	}
+	if _, ok := wavConsistentByteRate(fields[:]); !ok {
+		return fields, false
+	}
+	return fields, true
+}
+
+// wavReadRIFFHeader consumes the 12-byte RIFF container header and reports whether
+// it declares a WAVE file.
+func wavReadRIFFHeader(r io.Reader) bool {
+	var riff [wavRIFFHeaderLen]byte
+	_, err := io.ReadFull(r, riff[:])
+	return err == nil && string(riff[0:4]) == "RIFF" && string(riff[8:12]) == "WAVE"
+}
+
+// wavReadChunkHeader consumes one chunk header and returns the chunk's id and the
+// size of its body, and false when the stream ends inside the header.
+func wavReadChunkHeader(r io.Reader) (id string, size uint32, ok bool) {
+	var header [wavChunkHeaderLen]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return "", 0, false
+	}
+	return string(header[0:4]), binary.LittleEndian.Uint32(header[4:]), true
 }
 
 // wavReadFmtByteRate reads the fixed PCM part of a `fmt ` chunk whose declared body

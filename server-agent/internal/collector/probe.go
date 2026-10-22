@@ -477,7 +477,15 @@ type Capabilities struct {
 	// those two, so it is never set beside a Speech of "no" or "". It gates no
 	// route: it only describes the model.
 	SpeechClone string
-	Extra       []string
+	// SpeechStreaming is whether a speech model streams its audio
+	// ("yes"/"no"/""), refining Speech the way TranscriptionStreaming refines
+	// Transcription: a speech "yes" model that streams answers a stream=true
+	// request incrementally, one that does not answers it in one piece. Only the
+	// audio.cpp probe sets it, from the "mode" its /v1/models entry states, and
+	// only for a model whose task is tts or clon, so it is never set beside a
+	// Speech of "no" or "". It gates no route: it only describes the model.
+	SpeechStreaming string
+	Extra           []string
 }
 
 // detectCapabilities is the capability detector for a llama.cpp /props

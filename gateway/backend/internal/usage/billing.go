@@ -12,9 +12,12 @@ import (
 // ("") means the five token columns are the measure, and any other value means
 // BillingQuantity is the measure while every token-denominated column is 0.
 //
-// Two values, not three. "character" is deliberately absent: it comes from
-// OpenAI's price list, not from this system -- audio.cpp's metering signal is an
-// audio DURATION, so speech and transcription share BillingUnitAudioSecond.
+// The non-token units are few on purpose. "character" is deliberately absent: it
+// comes from OpenAI's price list, not from this system -- audio.cpp's metering
+// signal is an audio DURATION, so speech and transcription share
+// BillingUnitAudioSecond. BillingUnitAudioBytes measures the relayed audio payload
+// in bytes: the fallback measure for streamed speech, used when the output duration
+// is not derivable from the relayed payload (no cached byte-rate).
 const (
 	// BillingUnitTokens is the historical default and a POSITIVE assertion that
 	// the row is token-metered. It is never inferred and never defaulted TO from
@@ -22,6 +25,7 @@ const (
 	BillingUnitTokens      = ""
 	BillingUnitImage       = "image"
 	BillingUnitAudioSecond = "audio_second"
+	BillingUnitAudioBytes  = "audio_bytes"
 )
 
 var (
@@ -41,7 +45,7 @@ var (
 // data that crossed a boundary.
 func ValidBillingUnit(unit string) bool {
 	switch unit {
-	case BillingUnitTokens, BillingUnitImage, BillingUnitAudioSecond:
+	case BillingUnitTokens, BillingUnitImage, BillingUnitAudioSecond, BillingUnitAudioBytes:
 		return true
 	default:
 		return false

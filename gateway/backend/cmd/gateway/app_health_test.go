@@ -320,6 +320,31 @@ func (f *fakeHealthStore) assertVoicesPayload(t *testing.T, mappingID, wantPaylo
 	}
 }
 
+// seedCacheRow puts one scope-"" cache row of any type on file, standing in for an
+// earlier write (a benchmark's rate and identity, say). It is not counted as a write.
+func (f *fakeHealthStore) seedCacheRow(mappingID, cacheType, payload string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cache == nil {
+		f.cache = map[string]map[modelMappingCacheKey]routing.ModelMappingCacheRow{}
+	}
+	if f.cache[mappingID] == nil {
+		f.cache[mappingID] = map[modelMappingCacheKey]routing.ModelMappingCacheRow{}
+	}
+	f.cache[mappingID][modelMappingCacheKey{cacheType, ""}] = routing.ModelMappingCacheRow{
+		MappingID: mappingID, CacheType: cacheType, Payload: payload, UpdatedAt: time.Now().UTC().Add(-time.Hour),
+	}
+}
+
+// cachePayloadOf reads one mapping's scope-"" row of a cache type back. ok is false
+// when there is no such row.
+func (f *fakeHealthStore) cachePayloadOf(mappingID, cacheType string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.cache[mappingID][modelMappingCacheKey{cacheType, ""}]
+	return row.Payload, ok
+}
+
 // InsertServerAvailabilitySample records an availability sample so the sampling
 // tests can assert what the health loop wrote. When failInsert is set it returns
 // an error WITHOUT recording, exercising the loop's best-effort retry invariant.
@@ -3937,6 +3962,43 @@ func TestAudioCppCapabilityRows(t *testing.T) {
 			},
 		},
 		{
+			name: "a streaming tts model: speech_streaming yes beside speech yes and speech_clone no",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+				row(routing.CapabilitySpeechClone, routing.CapabilityNo),
+				row(routing.CapabilitySpeechStreaming, routing.CapabilityYes),
+			},
+		},
+		{
+			name: "an offline clone model: speech_streaming no is a real verdict",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes, SpeechStreaming: routing.CapabilityNo},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+				row(routing.CapabilitySpeechClone, routing.CapabilityYes),
+				row(routing.CapabilitySpeechStreaming, routing.CapabilityNo),
+			},
+		},
+		{
+			name: "a speech_streaming verdict on a model that is not a speech model builds no speech_streaming row (asr)",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechStreaming: routing.CapabilityYes},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityNo),
+				row(routing.CapabilityTranscription, routing.CapabilityYes),
+			},
+		},
+		{name: "a speech_streaming verdict with no speech verdict builds no row", v: provider.AudioCppVerdicts{SpeechStreaming: routing.CapabilityYes}, want: nil},
+		{
+			name: "a speech_streaming verdict that is not yes or no builds no row",
+			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechStreaming: "maybe"},
+			want: []routing.CapabilityRow{
+				row(routing.CapabilitySpeech, routing.CapabilityYes),
+				row(routing.CapabilityTranscription, routing.CapabilityNo),
+			},
+		},
+		{
 			name: "a transcription_streaming verdict that is not yes or no builds no row",
 			v:    provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: "maybe"},
 			want: []routing.CapabilityRow{
@@ -3960,6 +4022,46 @@ func TestAudioCppCapabilityRows(t *testing.T) {
 			v:    provider.AudioCppVerdicts{Speech: "", Transcription: routing.CapabilityNo},
 			want: []routing.CapabilityRow{row(routing.CapabilityTranscription, routing.CapabilityNo)},
 		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := audioCppCapabilityRows(tc.v, at)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("audioCppCapabilityRows(%+v) = %+v, want %+v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAudioCppCapabilityRowsEmitSpeechStreaming pins the speech twin of the
+// streaming axis on its own: a speech model's streaming verdict becomes a
+// speech_streaming row, under the same source and stamp as the speech and
+// transcription rows. yes and no are both real answers (the mode names how the
+// model is loaded); no verdict at all -- the mode was absent, unknown or
+// unreadable -- is no row, and never a written no, because the speech handler
+// reads an absent row as "buffered" and a written no as a statement the model
+// cannot stream.
+//
+// The row is the speech capability's refinement, so it is emitted only beside a
+// speech yes: a model that is not a speech model (asr, music, one the listing
+// gives no task) gets NO row on it, not even a no, whatever the verdict says.
+func TestAudioCppCapabilityRowsEmitSpeechStreaming(t *testing.T) {
+	at := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	rowOf := func(capability, verdict string) routing.CapabilityRow {
+		return routing.CapabilityRow{Capability: capability, Verdict: verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: at}
+	}
+	speechRows := []routing.CapabilityRow{rowOf("speech", routing.CapabilityYes), rowOf("transcription", routing.CapabilityNo)}
+	for _, tc := range []struct {
+		name string
+		v    provider.AudioCppVerdicts
+		want []routing.CapabilityRow
+	}{
+		{"a tts model in streaming mode", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes}, append(append([]routing.CapabilityRow{}, speechRows...), rowOf("speech_streaming", routing.CapabilityYes))},
+		{"a tts model in offline mode", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo}, append(append([]routing.CapabilityRow{}, speechRows...), rowOf("speech_streaming", routing.CapabilityNo))},
+		{"a tts model whose mode is not stated", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo}, speechRows},
+		{"an asr model with a speech_streaming verdict", provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechStreaming: routing.CapabilityYes}, []routing.CapabilityRow{
+			rowOf("speech", routing.CapabilityNo), rowOf("transcription", routing.CapabilityYes),
+		}},
+		{"a speech_streaming verdict beside no speech verdict", provider.AudioCppVerdicts{SpeechStreaming: routing.CapabilityYes}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := audioCppCapabilityRows(tc.v, at)
@@ -4243,6 +4345,42 @@ func TestRunAppHealthOnceAudioCppWritesTranscriptionStreamingVerdict(t *testing.
 		t.Fatalf("m5 (a tts model) has a transcription_streaming row %+v, want none: the capability is the transcriber's", row)
 	}
 	st.assertCapability(t, "m5", routing.CapabilitySpeech, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+}
+
+// TestRunAppHealthOnceAudioCppWritesSpeechStreamingVerdict is the speech twin of
+// the transcription_streaming one: the same /v1/models read also states each
+// speech model's mode, and the probe pass stores it as the per-mapping
+// speech_streaming row the speech handler decides stream-versus-buffered on --
+// yes for a streaming model, no for an offline one. A model that does not
+// synthesise speech gets no such row. A model whose listing states no mode writes
+// no row AND leaves the verdict already on file alone: an unknown mode must not
+// turn a stored yes into a buffered answer.
+func TestRunAppHealthOnceAudioCppWritesSpeechStreamingVerdict(t *testing.T) {
+	runner, st, _ := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{
+			"vibevoice_tts":     {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes},
+			"pocket_tts":        {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo},
+			"no_mode":           {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo},
+			"stale_mode":        {Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo},
+			"asr_with_tts_mode": {Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, SpeechStreaming: routing.CapabilityYes},
+		},
+		audioCppMapping("m1", "vibevoice_tts"), audioCppMapping("m2", "pocket_tts"),
+		audioCppMapping("m3", "no_mode"), audioCppMapping("m4", "stale_mode"), audioCppMapping("m5", "asr_with_tts_mode"))
+	st.seedCapability("m4", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+
+	runCapabilityCycle(runner)
+
+	st.assertCapability(t, "m1", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	st.assertCapability(t, "m2", routing.CapabilitySpeechStreaming, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+	if row, ok := st.capabilityOf("m3", routing.CapabilitySpeechStreaming); ok {
+		t.Fatalf("m3 has a speech_streaming row %+v, want none: its listing stated no mode", row)
+	}
+	st.assertCapability(t, "m4", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	// A model that does not synthesise speech gets no speech_streaming row, whatever a verdict says.
+	if row, ok := st.capabilityOf("m5", routing.CapabilitySpeechStreaming); ok {
+		t.Fatalf("m5 (an asr model) has a speech_streaming row %+v, want none: the capability is the synthesiser's", row)
+	}
+	st.assertCapability(t, "m5", routing.CapabilityTranscription, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
 }
 
 // TestRunAppHealthOnceAudioCppNeverReadsRuntimeSpecs pins that the gate is the
@@ -5673,5 +5811,618 @@ func TestRunAppHealthOnceVoicesAgentOnTheWire(t *testing.T) {
 	}
 	if !runner.voicesBackoff.active("m-cold", now) || runner.voicesBackoff.active("m-warm", now) {
 		t.Fatalf("back-off cold=%v warm=%v, want cold=true warm=false", runner.voicesBackoff.active("m-cold", now), runner.voicesBackoff.active("m-warm", now))
+	}
+}
+
+// ---- the speech rate trigger (#263) ----
+//
+// The health loop's part in streamed speech billing: a streaming speech mapping needs
+// its output byte rate cached before a client streams, so a tick that finds one without
+// -- or whose loaded model is no longer the one the rate was measured under -- asks the
+// gateway to run the speech rate benchmark. The loop only ASKS (it never synthesizes);
+// the recorder below stands in for gateway.Server.TriggerSpeechRateBenchmark, whose own
+// behavior (the registry's one-run slot, the idle gate, what is written) is pinned in
+// the gateway package.
+
+// speechRateCall is one start of the speech rate benchmark the health loop asked for.
+type speechRateCall struct{ serverID, appID, mappingID, identity string }
+
+// speechRateRecorder records every trigger and answers started (true) unless told it
+// did not start one (a busy server, the idle gate).
+type speechRateRecorder struct {
+	mu         sync.Mutex
+	calls      []speechRateCall
+	notStarted bool
+}
+
+func (r *speechRateRecorder) trigger(_ context.Context, server routing.AIServer, app routing.Application, mp routing.ModelMapping, identity string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, speechRateCall{server.ID, app.ID, mp.ID, identity})
+	return !r.notStarted
+}
+
+func (r *speechRateRecorder) started() []speechRateCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]speechRateCall(nil), r.calls...)
+}
+
+func (r *speechRateRecorder) setNotStarted(v bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.notStarted = v
+}
+
+// streamingTTSVerdicts is the listing of a LOADED plain tts model in streaming mode at
+// path /m/a: the one shape that makes a mapping a target of the speech rate benchmark.
+var streamingTTSVerdicts = provider.AudioCppVerdicts{
+	Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo,
+	SpeechStreaming: routing.CapabilityYes, Loaded: true, Path: "/m/a",
+}
+
+// speechRateEnv is a static audio_cpp application ("a1" on server "s1") with one
+// mapping "m1" whose listing states streamingTTSVerdicts, a recording trigger and a
+// clock the test moves. Every tick is one full health cycle.
+type speechRateEnv struct {
+	runner *appHealthRunner
+	st     *fakeHealthStore
+	prober *audioCppFakeProber
+	rec    *speechRateRecorder
+	clock  time.Time
+}
+
+func newSpeechRateEnv(t *testing.T) *speechRateEnv {
+	t.Helper()
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"tts_stream": streamingTTSVerdicts}, audioCppMapping("m1", "tts_stream"))
+	env := &speechRateEnv{runner: runner, st: st, prober: prober, rec: &speechRateRecorder{}, clock: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)}
+	runner.speechRate = env.rec.trigger
+	runner.now = func() time.Time { return env.clock }
+	return env
+}
+
+func (e *speechRateEnv) tick() { runCapabilityCycle(e.runner) }
+
+func (e *speechRateEnv) advance(d time.Duration) { e.clock = e.clock.Add(d) }
+
+// setListing edits what the server's listing says about the mapping's model.
+func (e *speechRateEnv) setListing(mutate func(*provider.AudioCppVerdicts)) {
+	e.prober.acMu.Lock()
+	defer e.prober.acMu.Unlock()
+	v := e.prober.acVerdicts["tts_stream"]
+	mutate(&v)
+	e.prober.acVerdicts["tts_stream"] = v
+}
+
+// benchmarkCompletes stands in for a successful speech rate benchmark: the rate and
+// the identity it was measured under, as gateway.runSpeechTarget writes them.
+func (e *speechRateEnv) benchmarkCompletes(rate, identity string) {
+	e.st.seedCacheRow("m1", routing.ModelMappingCacheOutputByteRate, rate)
+	if identity != "" {
+		e.st.seedCacheRow("m1", routing.ModelMappingCacheOutputByteRateModel, identity)
+	}
+}
+
+func (e *speechRateEnv) wantCalls(t *testing.T, when string, want ...speechRateCall) {
+	t.Helper()
+	got := e.rec.started()
+	if len(got) == 0 && len(want) == 0 {
+		return
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s: speech rate benchmark started %+v, want %+v", when, got, want)
+	}
+}
+
+func (e *speechRateEnv) ratePayload() (string, bool) {
+	return e.st.cachePayloadOf("m1", routing.ModelMappingCacheOutputByteRate)
+}
+
+func (e *speechRateEnv) identityPayload() (string, bool) {
+	return e.st.cachePayloadOf("m1", routing.ModelMappingCacheOutputByteRateModel)
+}
+
+var speechRateCallA = speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: "/m/a"}
+
+// TestHealthTriggersSpeechRateBenchmarkOnce is the trigger's whole job: a streaming
+// speech mapping with no cached rate gets the benchmark started, ONCE. The loop only
+// asks -- it writes neither the rate nor the identity -- and it does not ask again on
+// the ticks while the benchmark is out (the back-off), nor once the rate is cached for
+// the model that is loaded.
+func TestHealthTriggersSpeechRateBenchmarkOnce(t *testing.T) {
+	env := newSpeechRateEnv(t)
+
+	env.tick()
+	env.wantCalls(t, "first tick, no rate cached", speechRateCallA)
+	if payload, ok := env.ratePayload(); ok {
+		t.Fatalf("the health loop wrote a rate row %q itself, want none: it only asks the gateway to benchmark", payload)
+	}
+	if payload, ok := env.identityPayload(); ok {
+		t.Fatalf("the health loop wrote an identity row %q itself, want none: the benchmark records it with the rate", payload)
+	}
+
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "second tick, the benchmark has not cached a rate yet", speechRateCallA)
+
+	env.benchmarkCompletes("88200", "/m/a")
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "third tick, the rate is now cached for the loaded model", speechRateCallA)
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "fourth tick", speechRateCallA)
+	if payload, _ := env.ratePayload(); payload != "88200" {
+		t.Fatalf("rate payload = %q, want the benchmark's 88200 untouched", payload)
+	}
+}
+
+// TestHealthReBenchmarksOnModelIdentityChange is Review Focus 5: the model loaded
+// behind one mapping changes (the listing states another file for the same id), which
+// no rename invalidation sees. The cached rate is then of a different model, so the
+// loop (1) stops it billing -- the rate is invalidated at once, and a streamed call
+// bills the honest audio_bytes -- and (2) starts the benchmark to derive the new one.
+// While the identity is unchanged nothing happens, tick after tick.
+func TestHealthReBenchmarksOnModelIdentityChange(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.benchmarkCompletes("88200", "/m/a")
+
+	env.tick()
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "the rate is cached for the loaded model")
+
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Path = "/m/b" })
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "the loaded model's file changed", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: "/m/b"})
+	payload, ok := env.ratePayload()
+	if !ok || payload != "" {
+		t.Fatalf("rate row after the identity change = (%q, present %v), want the stale 88200 invalidated to an empty payload", payload, ok)
+	}
+	if _, usable := routing.ParseOutputByteRate(payload); usable {
+		t.Fatal("the invalidated payload still parses as a rate: billing would keep using the stale one")
+	}
+
+	// The benchmark completes for the new model; nothing more is asked.
+	env.benchmarkCompletes("48000", "/m/b")
+	for i := 0; i < 2; i++ {
+		env.advance(30 * time.Second)
+		env.tick()
+	}
+	env.wantCalls(t, "after the benchmark re-derived the rate", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: "/m/b"})
+}
+
+// A cached rate whose identity differs triggers at once even inside the failure
+// back-off an earlier trigger opened: the back-off is for retrying a benchmark that
+// did not produce a rate, and a changed identity is a different model, not a retry.
+func TestHealthSpeechRateIdentityChangeIgnoresAnOpenBackoff(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.tick() // no rate: triggered, back-off open
+	env.benchmarkCompletes("88200", "/m/a")
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Path = "/m/b" })
+	env.advance(time.Second) // far inside the back-off window
+
+	env.tick()
+	env.wantCalls(t, "identity changed inside the back-off", speechRateCallA, speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: "/m/b"})
+}
+
+// The trigger's gate: a mapping is a target only while its model is observed LOADED,
+// plain (not a clone) and streaming. Each case below breaks exactly one of those on an
+// otherwise eligible mapping with no rate, and none of them may start the benchmark or
+// touch the cache.
+func TestHealthSpeechRateGateRefusesIneligibleMappings(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		listed func(*provider.AudioCppVerdicts)
+	}{
+		{"the model is not loaded", func(v *provider.AudioCppVerdicts) { v.Loaded = false }},
+		{"speech_streaming is no (an offline model)", func(v *provider.AudioCppVerdicts) { v.SpeechStreaming = routing.CapabilityNo }},
+		{"speech_streaming is unknown", func(v *provider.AudioCppVerdicts) { v.SpeechStreaming = "" }},
+		{"a clone model, which the benchmark cannot synthesize", func(v *provider.AudioCppVerdicts) { v.SpeechClone = routing.CapabilityYes }},
+		{"a transcriber", func(v *provider.AudioCppVerdicts) {
+			*v = provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: routing.CapabilityYes, Loaded: true, Path: "/m/a"}
+		}},
+		{"a model that is no speech model", func(v *provider.AudioCppVerdicts) { v.Speech = routing.CapabilityNo }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newSpeechRateEnv(t)
+			env.setListing(tc.listed)
+			env.tick()
+			env.wantCalls(t, "an ineligible mapping")
+			if _, ok := env.ratePayload(); ok {
+				t.Fatal("a rate row appeared for an ineligible mapping")
+			}
+			if _, ok := env.identityPayload(); ok {
+				t.Fatal("an identity row appeared for an ineligible mapping")
+			}
+		})
+	}
+}
+
+// A probe that fails, an inactive mapping and a mapping the listing does not name carry
+// no verdict, so none of them is a target either.
+func TestHealthSpeechRateGateNeedsAVerdictFromTheListing(t *testing.T) {
+	t.Run("the listing probe failed", func(t *testing.T) {
+		env := newSpeechRateEnv(t)
+		env.prober.acErr["tts_stream"] = fmt.Errorf("%w: boom", provider.ErrUnavailable)
+		env.tick()
+		env.wantCalls(t, "a failed probe")
+	})
+	t.Run("the listing does not name the model", func(t *testing.T) {
+		env := newSpeechRateEnv(t)
+		env.setListing(func(v *provider.AudioCppVerdicts) { *v = provider.AudioCppVerdicts{} })
+		env.tick()
+		env.wantCalls(t, "an unnamed model")
+	})
+	t.Run("the mapping is inactive", func(t *testing.T) {
+		env := newSpeechRateEnv(t)
+		mp := audioCppMapping("m1", "tts_stream")
+		mp.Status = routing.ServerStatusDisabled
+		env.st.mappings = map[string][]routing.ModelMapping{"a1": {mp}}
+		env.tick()
+		env.wantCalls(t, "an inactive mapping")
+	})
+}
+
+// A listing that does not state a model path gives the loop nothing to compare: it
+// still starts the benchmark for a mapping with no rate (the identity is then simply
+// empty), but a cached rate is never re-triggered on a guess -- an unstated identity is
+// no statement that the model changed.
+func TestHealthSpeechRateWithoutAStatedPath(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Path = "" })
+
+	env.tick()
+	env.wantCalls(t, "no rate, no stated path", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: ""})
+
+	env.benchmarkCompletes("88200", "")
+	env.advance(time.Hour)
+	env.tick()
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Path = "/m/a" })
+	env.advance(time.Hour)
+	env.tick()
+	env.wantCalls(t, "a cached rate with no recorded identity", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: ""})
+	if payload, ok := env.ratePayload(); !ok || payload != "88200" {
+		t.Fatalf("rate row = (%q, %v), want the cached 88200 untouched", payload, ok)
+	}
+}
+
+// A rate with no recorded identity is one a MANUAL benchmark cached (it knows none).
+// The loop adopts the identity it observes for it -- recording it, with no benchmark --
+// so a LATER change of the loaded model is detected from then on.
+func TestHealthSpeechRateAdoptsTheIdentityOfARateThatHasNone(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.benchmarkCompletes("88200", "")
+
+	env.tick()
+	env.wantCalls(t, "a manual rate is not re-benchmarked")
+	if payload, ok := env.identityPayload(); !ok || payload != "/m/a" {
+		t.Fatalf("identity row = (%q, %v), want the observed /m/a adopted", payload, ok)
+	}
+	if payload, _ := env.ratePayload(); payload != "88200" {
+		t.Fatalf("rate payload = %q, want 88200 untouched by the adoption", payload)
+	}
+
+	n := env.st.cacheWriteCount()
+	env.advance(30 * time.Second)
+	env.tick()
+	if got := env.st.cacheWriteCount(); got != n {
+		t.Fatalf("cache written %d more times on a steady tick, want 0: adoption happens once", got-n)
+	}
+
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Path = "/m/b" })
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "the model changed after the adoption", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: "/m/b"})
+}
+
+// A benchmark that does not produce a rate (it failed, or the server was never idle) is
+// retried, but not every tick: the back-off holds the trigger off for
+// speechRateRetryBackoff, then asks again. A trigger that did NOT start anything (the
+// gateway answered false: a busy server, an idle gate) opens no back-off, so it is asked
+// again on the very next tick.
+func TestHealthSpeechRateRetriesAFailedBenchmarkAfterTheBackoff(t *testing.T) {
+	env := newSpeechRateEnv(t)
+
+	env.tick()
+	env.advance(speechRateRetryBackoff / 2)
+	env.tick()
+	env.wantCalls(t, "inside the back-off", speechRateCallA)
+
+	env.advance(speechRateRetryBackoff)
+	env.tick()
+	env.wantCalls(t, "after the back-off", speechRateCallA, speechRateCallA)
+}
+
+func TestHealthSpeechRateNotStartedIsAskedAgainNextTick(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.rec.setNotStarted(true)
+
+	env.tick()
+	env.advance(time.Second)
+	env.tick()
+	env.wantCalls(t, "the gateway started nothing", speechRateCallA, speechRateCallA)
+	if env.runner.speechRateBackoff.active("m1", env.clock) {
+		t.Fatal("a trigger that started nothing opened a back-off")
+	}
+
+	env.rec.setNotStarted(false)
+	env.advance(time.Second)
+	env.tick()
+	env.wantCalls(t, "the gateway started it at last", speechRateCallA, speechRateCallA, speechRateCallA)
+	env.advance(time.Second)
+	env.tick()
+	env.wantCalls(t, "the started run is in flight", speechRateCallA, speechRateCallA, speechRateCallA)
+}
+
+// A mapping that leaves the eligible set (the model unloaded, say) forgets its
+// back-off, so a reload is asked at once, like the voices back-off.
+func TestHealthSpeechRateBackoffClearsWhenTheModelLeavesTheLoadedSet(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.tick()
+	env.wantCalls(t, "first", speechRateCallA)
+
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Loaded = false })
+	env.advance(time.Second)
+	env.tick()
+	if env.runner.speechRateBackoff.active("m1", env.clock) {
+		t.Fatal("the back-off survived the model leaving the loaded set")
+	}
+
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Loaded = true })
+	env.advance(time.Second)
+	env.tick()
+	env.wantCalls(t, "after a reload", speechRateCallA, speechRateCallA)
+}
+
+// A rate payload billing cannot parse is no rate: the loop starts the benchmark, which
+// overwrites it, exactly as for a missing row. (The invalidation writes such a payload.)
+func TestHealthSpeechRateAnUnusableRateIsNoRate(t *testing.T) {
+	for _, payload := range []string{"", "0", "fast", "-5"} {
+		t.Run(fmt.Sprintf("payload %q", payload), func(t *testing.T) {
+			env := newSpeechRateEnv(t)
+			env.benchmarkCompletes(payload, "/m/a")
+			env.tick()
+			env.wantCalls(t, "an unusable cached rate", speechRateCallA)
+		})
+	}
+}
+
+// With no trigger wired (a runner built without the gateway Server, or before it is
+// bound) the pass skips the whole step: no panic, no cache read or write beyond what the
+// voices step does.
+func TestHealthSpeechRateWithoutATriggerDoesNothing(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.runner.speechRate = nil
+	env.benchmarkCompletes("88200", "/m/a")
+	env.setListing(func(v *provider.AudioCppVerdicts) { v.Path = "/m/b" })
+
+	env.tick()
+	if payload, _ := env.ratePayload(); payload != "88200" {
+		t.Fatalf("rate payload = %q, want 88200: without a trigger the loop must not invalidate a rate it cannot re-derive", payload)
+	}
+	if payload, _ := env.identityPayload(); payload != "/m/a" {
+		t.Fatalf("identity payload = %q, want /m/a untouched", payload)
+	}
+}
+
+// Store failures are best-effort: a cache the loop cannot read is neither a "no rate" to
+// trigger on nor a license to invalidate.
+func TestHealthSpeechRateStoreFailuresAreBestEffort(t *testing.T) {
+	t.Run("a cache read failure triggers nothing", func(t *testing.T) {
+		env := newSpeechRateEnv(t)
+		env.st.cacheReadErr = true
+		env.tick()
+		env.wantCalls(t, "an unreadable cache")
+	})
+	t.Run("a failed invalidation still starts the benchmark", func(t *testing.T) {
+		env := newSpeechRateEnv(t)
+		env.benchmarkCompletes("88200", "/m/a")
+		env.setListing(func(v *provider.AudioCppVerdicts) { v.Path = "/m/b" })
+		env.st.cacheWriteErr = true
+		env.tick()
+		env.wantCalls(t, "the invalidation write failed", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: "/m/b"})
+	})
+}
+
+// ---- the agent-launched child ----
+
+// agentSpeechRateRunner is agentVoicesRunner for the speech rate trigger: ONE running
+// agent-launched audio.cpp child "m1" with the agent's own plain-tts verdicts and a
+// stored speech_streaming yes, a recording trigger and a movable clock.
+func agentSpeechRateRunner(t *testing.T) *speechRateEnv {
+	t.Helper()
+	runner, st, prober, _ := agentVoicesRunner(t, agentVoicesFlag, audioCppMapping("m1", "tts_stream"))
+	st.seedCapability("m1", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	env := &speechRateEnv{runner: runner, st: st, prober: prober, rec: &speechRateRecorder{}, clock: time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)}
+	runner.speechRate = env.rec.trigger
+	runner.now = func() time.Time { return env.clock }
+	return env
+}
+
+func (e *speechRateEnv) setSpec(mutate func(*routing.RuntimeSpec)) {
+	e.st.mu.Lock()
+	defer e.st.mu.Unlock()
+	mutate(&e.st.runtimeSpecs[0])
+}
+
+// An agent-launched child that is running, plain and streaming gets the same trigger as
+// a static server's model. The gateway cannot read a child's own listing, so the identity
+// it records is a fingerprint of what the gateway launches (agentSpecIdentity): a launch
+// spec edited to another model is the hot swap of an agent child.
+func TestHealthSpeechRateAgentChild(t *testing.T) {
+	env := agentSpeechRateRunner(t)
+	env.setSpec(func(sp *routing.RuntimeSpec) { sp.Binary, sp.Args = "audio-server", `["--model","/m/a.gguf"]` })
+	identityA := agentSpecIdentity(routing.RuntimeSpec{Binary: "audio-server", Args: `["--model","/m/a.gguf"]`})
+
+	env.tick()
+	env.wantCalls(t, "a running streaming child with no rate", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: identityA})
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "inside the back-off", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: identityA})
+
+	env.benchmarkCompletes("88200", identityA)
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "the rate is cached for the launched model", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: identityA})
+
+	env.setSpec(func(sp *routing.RuntimeSpec) { sp.Args = `["--model","/m/b.gguf"]` })
+	identityB := agentSpecIdentity(routing.RuntimeSpec{Binary: "audio-server", Args: `["--model","/m/b.gguf"]`})
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "the launch spec now names another model",
+		speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: identityA},
+		speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: identityB})
+	if payload, ok := env.ratePayload(); !ok || payload != "" {
+		t.Fatalf("rate row = (%q, %v), want the stale rate invalidated", payload, ok)
+	}
+}
+
+func TestHealthSpeechRateAgentChildGate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		breakIt func(*speechRateEnv)
+	}{
+		{"speech_streaming is no", func(e *speechRateEnv) {
+			e.st.seedCapability("m1", routing.CapabilitySpeechStreaming, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+		}},
+		{"speech_streaming is unknown", func(e *speechRateEnv) {
+			e.st.mu.Lock()
+			delete(e.st.caps["m1"], routing.CapabilitySpeechStreaming)
+			e.st.mu.Unlock()
+		}},
+		{"a clone model", func(e *speechRateEnv) {
+			e.st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+		}},
+		{"the child is not running", func(e *speechRateEnv) {
+			e.runner.loaded.SetGatewayProbe("a1", nil)
+		}},
+		{"the spec is not an audio.cpp one", func(e *speechRateEnv) {
+			e.setSpec(func(sp *routing.RuntimeSpec) { sp.Type = "llama_cpp" })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := agentSpeechRateRunner(t)
+			tc.breakIt(env)
+			env.tick()
+			env.wantCalls(t, "an ineligible child")
+		})
+	}
+}
+
+// agentSpecIdentity fingerprints what the gateway launches: the launch spec's binary,
+// arguments, environment, config files and working directory. A change to any of them
+// can change which model the child serves; a change to anything else (ports, timeouts,
+// pinning, admin state) cannot, and must not cost a benchmark.
+func TestAgentSpecIdentity(t *testing.T) {
+	base := routing.RuntimeSpec{
+		ID: "rs1", MappingID: "m1", Binary: "audio-server", Args: `["--model","/m/a.gguf"]`, Env: `{"K":"${AGENT_ENV:K}"}`,
+		ConfigFiles: `[{"name":"c.json","content":"{}"}]`, WorkDir: "/srv", Type: "audio_cpp",
+	}
+	id := agentSpecIdentity(base)
+	if id == "" {
+		t.Fatal("agentSpecIdentity is empty for a spec that launches a model")
+	}
+	if again := agentSpecIdentity(base); again != id {
+		t.Fatalf("agentSpecIdentity is not stable: %q then %q", id, again)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*routing.RuntimeSpec)
+	}{
+		{"binary", func(s *routing.RuntimeSpec) { s.Binary = "other-server" }},
+		{"args", func(s *routing.RuntimeSpec) { s.Args = `["--model","/m/b.gguf"]` }},
+		{"env", func(s *routing.RuntimeSpec) { s.Env = `{"K":"${AGENT_ENV:OTHER}"}` }},
+		{"config files", func(s *routing.RuntimeSpec) { s.ConfigFiles = `[]` }},
+		{"work dir", func(s *routing.RuntimeSpec) { s.WorkDir = "/other" }},
+	} {
+		t.Run("a different "+tc.name+" is a different identity", func(t *testing.T) {
+			changed := base
+			tc.mutate(&changed)
+			if got := agentSpecIdentity(changed); got == id {
+				t.Fatalf("agentSpecIdentity did not change with the %s", tc.name)
+			}
+		})
+	}
+	t.Run("fields that do not pick the model are not part of it", func(t *testing.T) {
+		same := base
+		same.ID, same.ListenPort, same.HealthPath, same.IdleTimeoutSeconds = "rs2", 9100, "/other", 300
+		same.Pinned, same.AdminState, same.Enabled = true, "force_running", true
+		same.APITokenMode, same.APIToken = "set", "plain:x"
+		if got := agentSpecIdentity(same); got != id {
+			t.Fatalf("agentSpecIdentity = %q for a spec differing only in port/timeouts/pin/admin/token fields, want %q", got, id)
+		}
+	})
+	t.Run("field boundaries are unambiguous", func(t *testing.T) {
+		a := routing.RuntimeSpec{Binary: "ab", Args: "c"}
+		b := routing.RuntimeSpec{Binary: "a", Args: "bc"}
+		if agentSpecIdentity(a) == agentSpecIdentity(b) {
+			t.Fatal("agentSpecIdentity conflates (binary ab, args c) with (binary a, args bc)")
+		}
+	})
+}
+
+// TestBuildGatewayServerBindsTheSpeechRateTrigger drives the real production wiring: the
+// app-health runner is built before the gateway Server exists, so its trigger is bound
+// late (ServerDeps.SetSpeechRateTrigger, called by buildGatewayServer once srv exists).
+// A runner whose trigger never reached the Server would see every call refused and no
+// mapping would ever get its rate automatically, with every unit test green. The call
+// below is accepted only by a Server that is bound: it reserves the server and starts a
+// speech run.
+func TestBuildGatewayServerBindsTheSpeechRateTrigger(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_DEV_TOKEN", "dev-secret")
+	var runner *appHealthRunner
+	orig := startAppHealthLoop
+	startAppHealthLoop = func(r *appHealthRunner, serverTrigger <-chan string) context.CancelFunc {
+		runner = r
+		return func() {}
+	}
+	t.Cleanup(func() { startAppHealthLoop = orig })
+
+	srv, cleanup, err := buildGatewayServer(config.Config{
+		Addr: "127.0.0.1:8080", DBDriver: "memory", AppHealthProbeTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("buildGatewayServer returned %v", err)
+	}
+	t.Cleanup(func() { _ = cleanup() })
+	if runner == nil || runner.speechRate == nil {
+		t.Fatal("the app-health loop was started with no speech rate trigger")
+	}
+
+	ctx := context.Background()
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	// A closed port: the run the trigger starts fails fast on connection refused.
+	server := routing.AIServer{ID: "s1", Name: "S1", Domain: "127.0.0.1", Provider: routing.ProviderAudioCpp, Endpoint: "http://127.0.0.1:1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}
+	app := routing.Application{ID: "a1", ServerID: "s1", Type: routing.ProviderAudioCpp, Port: 1, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1, TimeoutMS: 1000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+	mp := routing.ModelMapping{ID: "m1", ApplicationID: "a1", GatewayModelName: "tts", AppModelName: "tts_stream", Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+	if err := srv.Routes.CreateAIServer(ctx, server); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := srv.Routes.CreateApplication(ctx, app); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+	if err := srv.Routes.CreateMapping(ctx, mp); err != nil {
+		t.Fatalf("create mapping: %v", err)
+	}
+	if err := srv.Routes.UpsertMappingCapabilities(ctx, "m1", []routing.CapabilityRow{
+		{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+		{Capability: routing.CapabilitySpeechClone, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+		{Capability: routing.CapabilitySpeechStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("seed capabilities: %v", err)
+	}
+
+	if !runner.speechRate(ctx, server, app, mp, "/m/a") {
+		t.Fatal("the runner's trigger was refused by a Server with an eligible mapping: it is not bound to srv.TriggerSpeechRateBenchmark")
+	}
+	if st := srv.Benchmarks.Status("s1"); st.Mode != "speech" || st.Scope != "speech-rate" {
+		t.Fatalf("benchmark status after the trigger = %+v, want a speech-rate run on s1", st)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.Benchmarks.Status("s1").Running && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -550,7 +550,7 @@ func TestTranscriptionStreamFormatStillRefused(t *testing.T) {
 // and nowhere else; and looking for it must not cost the body: whatever was read comes
 // back out in front of the rest.
 func TestPeekStreamingRefusal(t *testing.T) {
-	long := `{"error":{"message":"` + strings.Repeat("x", transcriptionRefusalPeekBytes+10) + `"}}`
+	long := `{"error":{"message":"` + strings.Repeat("x", streamingRefusalPeekBytes+10) + `"}}`
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -568,7 +568,7 @@ func TestPeekStreamingRefusal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := &provider.ProxyResponse{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}
 
-			if got := peekStreamingRefusal(resp); got != tc.want {
+			if got := peekStreamingRefusal(resp, transcriptionStreamingRefusal); got != tc.want {
 				t.Fatalf("peekStreamingRefusal = %v, want %v", got, tc.want)
 			}
 			rest, err := io.ReadAll(resp.Body)

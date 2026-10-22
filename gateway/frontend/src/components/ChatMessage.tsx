@@ -60,6 +60,7 @@ function ChatMessageComponent({
   streaming,
   kind,
   elapsedMs,
+  audioLive,
   ttftMs,
   tps,
   tokensPerSecond,
@@ -101,6 +102,11 @@ function ChatMessageComponent({
   // passed through untouched -- see ImagePendingTurn for how it is
   // interpolated into a ticking display.
   elapsedMs?: number;
+  // Whether this streaming SPEECH run is playing its audio live right now (ChatStore's
+  // runAudioLive, gated into the one streaming row like `kind`): the pending turn then
+  // says so rather than promising that no news is coming. Only meaningful with
+  // `streaming` and kind "speech".
+  audioLive?: boolean;
   ttftMs?: number;
   tps?: number;
   tokensPerSecond?: number;
@@ -150,7 +156,14 @@ function ChatMessageComponent({
     // incremental events -- so it gets the same state, worded for audio, under the same
     // `no audio yet` guard that keeps it from replacing an arriving reply.
     if (streaming && kind === 'speech' && audioUrl === undefined) {
-      return <AudioPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
+      return (
+        <AudioPendingTurn
+          t={t}
+          elapsedMs={elapsedMs ?? 0}
+          roleLabel={roleLabel}
+          live={audioLive === true}
+        />
+      );
     }
     // A transcription run is the same shape of wait until its FIRST text -- a one-shot
     // model answers one finished transcript at the end, a streaming one emits nothing

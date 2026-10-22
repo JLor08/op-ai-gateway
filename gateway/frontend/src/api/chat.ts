@@ -69,8 +69,14 @@ export type ChatAudioSettings = {
   // The advanced extra-JSON surface: top-level request fields merged verbatim into the
   // /v1/audio/speech body (the OpenAI `instructions` field and any audio.cpp-native
   // knob). The values keep the JSON type the user wrote. The backend refuses the keys
-  // the run owns (model / input / stream / response_format).
+  // the run owns (model / input / stream / stream_format / response_format).
   passthrough?: Record<string, unknown>;
+  // The thread's choice to hear a streaming-capable model's audio while it is generated
+  // (ADR-068). A CHOICE, not a request: the gateway streams only where its own gate also
+  // holds (the model streams and its output rate is known) and otherwise answers the
+  // buffered WAV whatever this says. Omitted = the default, which streams where it can;
+  // only an explicit `false` opts the thread out, so an unset thread persists nothing.
+  stream?: boolean;
 };
 
 // The speech-to-text knobs of a "transcription" thread, as sent on the wire and persisted

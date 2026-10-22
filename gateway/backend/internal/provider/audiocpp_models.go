@@ -28,9 +28,10 @@ const audiocppModelsPath = "/v1/models"
 // speech "yes"; "asr" transcribes speech to text, so it is a transcription "yes".
 // Every other task (the music tasks, ...) is a model that does neither. One task
 // answers BOTH capabilities at once: a model is never both a synthesiser and a
-// transcriber. (The transcription_streaming verdict is not a task answer: it is
-// read from the mode field below. The speech_clone verdict is a task answer, and
-// the only one that tells "tts" from "clon": see AudioCppVerdicts.SpeechClone.)
+// transcriber. (The transcription_streaming and speech_streaming verdicts are not
+// task answers: they are read from the mode field below. The speech_clone verdict
+// is a task answer, and the only one that tells "tts" from "clon": see
+// AudioCppVerdicts.SpeechClone.)
 const (
 	audioCppTaskTTS   = "tts"
 	audioCppTaskClone = "clon"
@@ -38,10 +39,11 @@ const (
 )
 
 // audio.cpp mode values. The listing's mode names how the model is LOADED:
-// "streaming" is a model that serves a streamed transcription (stream=true), and
+// "streaming" is a model that serves a streamed answer (stream=true), and
 // "offline" one that answers only a one-shot request and refuses stream=true.
 // Any other value is no statement this code can act on. The mode is read for an
-// ASR model only (parseAudioCppModels): it says how a TRANSCRIBER streams.
+// ASR model (it says how a TRANSCRIBER streams) and for a speech model, tts or
+// clon (it says how a SYNTHESISER streams): parseAudioCppModels.
 const (
 	audioCppModeStreaming = "streaming"
 	audioCppModeOffline   = "offline"
@@ -86,11 +88,25 @@ const (
 // refines Speech, it never replaces it (a clone model is still a Speech "yes", so
 // it stays a /v1/audio/speech candidate), and it gates no route.
 //
-// The four verdicts are the capability axis and are decided from the task
-// (Speech, Transcription, SpeechClone) and, for an asr model, the mode
-// (TranscriptionStreaming) alone. Whether the model is loaded RIGHT NOW is the
-// health axis: an asr model the server lists as unloaded still carries task
-// "asr", and stays a transcription "yes".
+// SpeechStreaming is the fifth axis, the speech twin of TranscriptionStreaming and
+// a refinement of Speech: it says whether a SYNTHESISER can answer a stream=true
+// speech request, which is what the gateway's speech handler decides
+// stream-versus-buffered on. It is stated for a speech model ONLY -- the two
+// speech tasks, tts and clon -- from the same mode field: routing.CapabilityYes for
+// mode "streaming", routing.CapabilityNo for mode "offline", and "" for everything
+// else -- no mode, an empty or unknown one, one of the wrong type, no entry for the
+// model at all, and every model that is not a speech one (asr, music, an entry
+// with no task), whatever its mode. A model that does not synthesise speech has no
+// answer on a speech capability, not even a "no", and an asr model's mode is its
+// TranscriptionStreaming, never this. Like TranscriptionStreaming it gates no
+// route, and the mode never sets or clears the task's verdicts: an odd mode costs
+// only this axis.
+//
+// The five verdicts are the capability axis and are decided from the task
+// (Speech, Transcription, SpeechClone) and, for an asr model or a speech model,
+// the mode (TranscriptionStreaming, SpeechStreaming) alone. Whether the model is
+// loaded RIGHT NOW is the health axis: an asr model the server lists as unloaded
+// still carries task "asr", and stays a transcription "yes".
 //
 // Loaded is that health axis, carried beside the verdicts because the one
 // listing states both: true only when the listing's entry for the model says
@@ -101,18 +117,32 @@ const (
 // be asked about. It decides no verdict and no verdict decides it: it is set by
 // the probe (fetchAudioCppModels), not by parseAudioCppModels, whose table is the
 // capability rule shared verbatim with the agent's copy.
+//
+// Path is the identity axis, set the same way as Loaded and for the same reason (the
+// one listing states it, and it is no part of the shared capability rule): the model
+// file the listing states for the model's id, verbatim, or "" for everything it does not
+// say -- no entry, no field, a null, a blank or non-string value, an unreadable body. A
+// rate measured on a model is a property of THAT model (the streamed speech billing
+// reads the output byte rate cached from a benchmark), and the model behind one id can
+// change under it (the server restarted with another file, the id re-pointed), which no
+// rename of the mapping signals; the health loop compares this string tick to tick to
+// notice. It decides no verdict and no verdict decides it, and an entry the server
+// lists as unloaded states its path too, so it is read whether or not the model is
+// loaded.
 type AudioCppVerdicts struct {
 	Speech                 string
 	Transcription          string
 	TranscriptionStreaming string
 	SpeechClone            string
+	SpeechStreaming        string
 	Loaded                 bool
+	Path                   string
 }
 
 // AudioCppModelsProber is an optional provider capability: it GETs
 // target.Endpoint + /v1/models and derives the speech, transcription,
-// transcription streaming and speech clone verdicts the listing states for
-// modelID, and whether it states the model as loaded right now. A transport
+// transcription streaming, speech clone and speech streaming verdicts the
+// listing states for modelID, and whether it states the model as loaded right now. A transport
 // failure or a non-2xx status is an error and carries no verdict, so the caller
 // writes nothing. A 2xx body that does not name the model, or cannot be read, is
 // NOT an error, only empty verdicts and Loaded false -- the caller writes
@@ -162,38 +192,41 @@ func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target ro
 	if err != nil {
 		return AudioCppVerdicts{}, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	// The verdicts and the loaded flag are two reads of the one body: the
-	// verdicts are the capability rule, pinned by the table the agent's copy
-	// shares, and loaded is the health axis beside them (see AudioCppVerdicts).
-	// The listing is one small document per probe, so decoding it twice costs
-	// nothing worth coupling the two.
+	// The verdicts, the loaded flag and the path are three reads of the one body:
+	// the verdicts are the capability rule, pinned by the table the agent's copy
+	// shares, and loaded and the path are the health and identity axes beside them
+	// (see AudioCppVerdicts). The listing is one small document per probe, so
+	// decoding it three times costs nothing worth coupling them.
 	v := parseAudioCppModels(body, modelID)
 	v.Loaded = parseAudioCppLoaded(body, modelID)
+	v.Path = parseAudioCppPath(body, modelID)
 	return v, nil
 }
 
 // audioCppModelsDoc is the part of the listing this code reads: each entry's id,
-// task, mode and loaded. The rest of an entry (object, owned_by, family, path)
+// task, mode, loaded and path. The rest of an entry (object, owned_by, family)
 // answers no question this code asks and is left undecoded, so an unknown or
 // added field never breaks the read.
 //
-// Mode and Loaded are held raw and decoded on their own (audioCppStreamingVerdict,
-// audioCppLoadedFlag): a mode or a loaded of a type this code does not expect
-// must cost only the streaming verdict or only the loaded flag, never the
-// speech and transcription verdicts the task decides, and a typed field would
-// fail the whole document's decode on one odd value.
+// Mode, Loaded and Path are held raw and decoded on their own
+// (audioCppStreamingVerdict, audioCppLoadedFlag, audioCppPathString): a mode, a
+// loaded or a path of a type this code does not expect must cost only the
+// streaming verdicts, only the loaded flag or only the path, never the speech and
+// transcription verdicts the task decides, and a typed field would fail the whole
+// document's decode on one odd value.
 type audioCppModelsDoc struct {
 	Data []struct {
 		ID     string          `json:"id"`
 		Task   string          `json:"task"`
 		Mode   json.RawMessage `json:"mode"`
 		Loaded json.RawMessage `json:"loaded"`
+		Path   json.RawMessage `json:"path"`
 	} `json:"data"`
 }
 
 // parseAudioCppModels derives the speech, transcription,
-// transcription_streaming and speech_clone verdicts for modelID from a /v1/models
-// body. It is
+// transcription_streaming, speech_clone and speech_streaming verdicts for modelID
+// from a /v1/models body. It is
 // TOLERANT, unlike the strict sdcpp document parser: a body that is not the
 // listing, or an entry of the wrong shape, yields the empty verdict rather than
 // an error, so a probe never breaks over an unexpected shape.
@@ -225,6 +258,22 @@ type audioCppModelsDoc struct {
 //
 // A mode of an unexpected type leaves the task's verdicts alone: it costs only the
 // streaming verdict.
+//
+// The speech_streaming verdict is decided beside those, for a SPEECH model only
+// (task "tts" or "clon"), from the SAME mode field and by the same mapping:
+//   - the entry whose id is modelID, with task "tts" or "clon" and mode "streaming"
+//     -> speech_streaming "yes"
+//   - the entry whose id is modelID, with task "tts" or "clon" and mode "offline"
+//     -> speech_streaming "no"
+//   - the entry whose id is modelID, with task "tts" or "clon" and no mode, an
+//     empty, blank or unknown one, or one that is not a string -> speech_streaming ""
+//   - the entry whose id is modelID, with any other task (asr, music, an unknown
+//     one) or none -> speech_streaming "", WHATEVER its mode: "speech streaming"
+//     is the synthesiser's capability, so a model that does not synthesise speech
+//     is no "no" on it either (an asr model's mode is its transcription_streaming
+//     verdict, never this one)
+//   - no entry for modelID, an empty data list, or an unreadable body ->
+//     speech_streaming ""
 //
 // The speech_clone verdict is decided beside those, for the two speech tasks only,
 // from the entry's task alone:
@@ -273,9 +322,11 @@ func parseAudioCppModels(body []byte, modelID string) AudioCppVerdicts {
 		case audioCppTaskTTS:
 			v.Speech, v.Transcription = routing.CapabilityYes, routing.CapabilityNo
 			v.SpeechClone = routing.CapabilityNo
+			v.SpeechStreaming = audioCppStreamingVerdict(entry.Mode)
 		case audioCppTaskClone:
 			v.Speech, v.Transcription = routing.CapabilityYes, routing.CapabilityNo
 			v.SpeechClone = routing.CapabilityYes
+			v.SpeechStreaming = audioCppStreamingVerdict(entry.Mode)
 		case audioCppTaskASR:
 			v.Speech, v.Transcription = routing.CapabilityNo, routing.CapabilityYes
 			v.TranscriptionStreaming = audioCppStreamingVerdict(entry.Mode)
@@ -327,11 +378,50 @@ func audioCppLoadedFlag(raw json.RawMessage) bool {
 	return loaded
 }
 
-// audioCppStreamingVerdict maps one ASR entry's raw mode onto the transcription
-// streaming verdict (the caller asks it for an asr entry only):
-// "streaming" is routing.CapabilityYes and "offline"
-// routing.CapabilityNo, matched ignoring case and surrounding whitespace, and
-// everything else is "". Everything else covers an absent field, a null, an empty
+// parseAudioCppPath returns the model file a /v1/models body states for modelID: the
+// first entry whose id is modelID, with a path that is a non-blank string, kept
+// verbatim. Like parseAudioCppLoaded it is tolerant -- it never fails -- and every
+// statement it cannot read is "": no entry for modelID, an empty modelID, an entry
+// without a path or with a null, a number or an object there, a blank string, an empty
+// data list, a body that is not the listing. The id match is exact, as in
+// parseAudioCppModels, so the two always speak of the same entry.
+//
+// The path is the identity axis (see AudioCppVerdicts.Path): it decides no capability
+// verdict, and an entry the server lists as unloaded states it too.
+func parseAudioCppPath(body []byte, modelID string) string {
+	if modelID == "" {
+		return ""
+	}
+	var doc audioCppModelsDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return ""
+	}
+	for _, entry := range doc.Data {
+		if entry.ID != modelID {
+			continue
+		}
+		return audioCppPathString(entry.Path)
+	}
+	return ""
+}
+
+// audioCppPathString maps one entry's raw path onto its string: the JSON string
+// itself, verbatim, unless it is blank. An absent field, a null and a value that is
+// not a string at all are "" -- an identity is never guessed.
+func audioCppPathString(raw json.RawMessage) string {
+	var path string
+	if err := json.Unmarshal(raw, &path); err != nil || strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return path
+}
+
+// audioCppStreamingVerdict maps one entry's raw mode onto a streaming verdict:
+// the transcription streaming one for an asr entry and the speech streaming one
+// for a tts or clon entry. The caller asks it for those entries only, so each
+// streaming capability stays its own kind of model's. "streaming" is
+// routing.CapabilityYes and "offline" routing.CapabilityNo, matched ignoring case
+// and surrounding whitespace, and everything else is "". Everything else covers an absent field, a null, an empty
 // or blank string, a mode this code does not know (a "no" is only ever the
 // server's own word for a model that cannot stream, never a guess), and a value
 // that is not a string at all.

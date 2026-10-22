@@ -247,12 +247,28 @@ paths:
         `speech` capability verdict is `yes` (otherwise 404
         `routing.model_not_capable`); an agent-launched model's runtime spec
         must declare the flavor too (otherwise 404
-        `routing.no_model_route`). The only accepted `response_format` is
-        `wav` or absent: every other value, `mp3`, `opus`, `flac`, `aac`, `pcm`,
-        `json` and `b64_json` included, is refused with 400
-        `speech.response_format_unsupported`. Streaming is not served (a
-        `stream: true`, or any `stream_format`, is refused with 400
-        `speech.stream_unsupported`). The 200 response is the synthesized clip as
+        `routing.no_model_route`). A request that does not stream accepts only
+        `wav` or an absent `response_format`: every other value, `mp3`, `opus`,
+        `flac`, `aac`, `pcm`, `json` and `b64_json` included, is refused with 400
+        `speech.response_format_unsupported`. Streaming is served for a
+        `mode=streaming` model (ADR-068): `stream: true` against a mapping whose
+        `speech_streaming` capability verdict is `yes` is relayed as audio.cpp's
+        own stream, unbuffered and without a `Content-Length` - by default (or
+        with `stream_format: sse`) the SSE frames `speech.audio.delta` (base64
+        PCM in `audio`, signed 16-bit little-endian mono, headerless; the stream
+        states neither a sample rate nor a duration) then `speech.audio.done`
+        (only `timing.ttft_ms`) then `[DONE]`, and with `stream_format: audio`
+        the raw PCM as `application/octet-stream`. A streamed request must ask
+        `response_format` `pcm` or omit it: `wav` beside a stream is 400
+        `speech.stream_unsupported` (audio.cpp serves streaming only as `pcm`)
+        and any other value is 400 `speech.response_format_unsupported`. Against
+        an offline, unprobed or not-yet-reported model the same `stream: true`
+        is answered buffered, as one complete `audio/wav` clip whatever
+        `response_format` was named, never as an error, and on a stale-`yes`
+        mode-mismatch 500 the gateway retries buffered once. A non-boolean
+        `stream`, a `stream_format` other than `sse` or `audio`, and a
+        `stream_format` on a request that does not stream are 400
+        `speech.stream_unsupported`. A one-shot 200 is the synthesized clip as
         one binary `audio/wav` body, relayed without buffering and with the
         upstream's own `Content-Length`. A non-2xx upstream answer keeps the
         upstream's status and is normalised to the OpenAI error shape: an OpenAI
@@ -260,7 +276,13 @@ paths:
         wrapped with `type: upstream_error` and `code: speech.upstream_error`,
         and any other body is relayed as it came. Metered in seconds of audio
         (`billing_unit: audio_second`, read from the upstream's
-        `X-AudioCPP-Audio-Duration-Ms` header), not in tokens. A requested
+        `X-AudioCPP-Audio-Duration-Ms` header), not in tokens. A streamed call
+        has no such header: on a clean completion (`speech.audio.done` then
+        `[DONE]`, or a raw body closed cleanly) it is billed from the PCM bytes
+        the relay counted, as `audio_second` equal to the bytes divided by the
+        mapping's cached output byte rate, or, while no rate is cached, as
+        `audio_bytes` with the byte count; every other streamed outcome is
+        `audio_second` with quantity 0. A requested
         `voice` is a fail-open routing preference: when at least one candidate
         mapping's cached voice list (see GET /v1/audio/voices) offers it,
         routing is restricted to the candidates that do, and otherwise it is
@@ -1149,6 +1171,53 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '500':
           description: The Error envelope with code `model.voices_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/model-speech-streaming:
+    get:
+      tags: [portal]
+      summary: Whether the speech composer may stream a model's audio, and at what sample rate (scope gateway:use)
+      description: >
+        The gate of the portal chat's speech-streaming run (ADR-068), for one
+        gateway model. `streaming: true` with a `sample_rate` in Hz means the
+        composer may offer progressive playback; `streaming: false` means the
+        buffered WAV run. The gate is open only when EVERY mapping a speech
+        request for the model could be routed to (the portal-visible plain-TTS
+        ones, the set the voice picker uses) has a `speech_streaming` verdict of
+        `yes` and a usable cached output byte rate, and they agree on it; the
+        sample rate is half the byte rate (the cache only holds a rate read from
+        a mono 16-bit PCM WAV). Every other case (an unknown, hidden, locked,
+        restricted, non-speech, clone, offline or not-yet-benchmarked model) is
+        the same 200 with `streaming: false`, so the answer cannot probe which
+        models exist. A missing or empty `name` is 400 `model.name_required`; a
+        failed read is 500 `model.speech_streaming_failed`, never reported as
+        `streaming: false`. Nothing is loaded and no upstream is contacted. The
+        run evaluates the same gate again server-side when it starts. See
+        api-surface.md and compatibility-and-inference.md section 12.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: The gateway model name (a query parameter because it may contain `/`).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The gate's answer; `sample_rate` is present only when `streaming` is true.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [streaming]
+                properties:
+                  streaming: { type: boolean }
+                  sample_rate:
+                    type: integer
+                    description: The rate, in Hz, the headerless PCM of a streamed answer is played at.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500':
+          description: The Error envelope with code `model.speech_streaming_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3066,21 +3135,33 @@ components:
                   answers an unknown voice with HTTP 500.
               response_format:
                 type: string
-                enum: [wav]
+                enum: [wav, pcm]
                 description: >
-                  Only `wav` (or absent, or `null`) is supported; every other
-                  value is 400 `speech.response_format_unsupported`.
+                  `wav` (or absent, or `null`) for a request that does not
+                  stream; `pcm` (or absent) for one that streams, because
+                  audio.cpp serves streaming only as headerless PCM. `wav`
+                  beside `stream: true` is 400 `speech.stream_unsupported`, and
+                  every other value, or `pcm` without a stream, is 400
+                  `speech.response_format_unsupported`. A route that is not
+                  known to stream answers a stream request with a buffered WAV
+                  whatever this says.
               stream:
                 type: boolean
-                enum: [false]
                 description: >
-                  Streaming is not served. `false` or absent is accepted;
-                  `true` is 400 `speech.stream_unsupported`.
+                  `true` is served as an unbuffered stream when the mapped
+                  model is `mode=streaming` (its `speech_streaming` verdict is
+                  `yes`) and as one buffered `audio/wav` clip otherwise;
+                  `false` or absent takes the one-shot. A non-boolean value is
+                  400 `speech.stream_unsupported`.
               stream_format:
                 type: string
+                enum: [sse, audio]
                 description: >
-                  Not supported. Any value other than an absent field or `null`
-                  is 400 `speech.stream_unsupported`.
+                  The shape of a streamed answer, relayed as audio.cpp emits it:
+                  `sse` (the default) is an event stream, `audio` is raw
+                  headerless PCM. Only meaningful with `stream: true`; on a
+                  request that does not stream, or with any other value, it is
+                  400 `speech.stream_unsupported`. `null` is absent.
     TranscriptionForm:
       required: true
       description: >
@@ -3145,14 +3226,34 @@ components:
           schema: { type: object }
     AudioWav:
       description: >
-        The synthesized clip as one binary `audio/wav` body, streamed through
-        without being buffered. The upstream's `Content-Length` is forwarded
-        when it declared one. The upstream's metering headers
-        (`X-AudioCPP-*`) are not forwarded; the gateway reads
-        `X-AudioCPP-Audio-Duration-Ms` for the usage row.
+        The synthesized clip. A one-shot answer is one binary `audio/wav` body,
+        streamed through without being buffered, with the upstream's
+        `Content-Length` forwarded when it declared one; the upstream's metering
+        headers (`X-AudioCPP-*`) are not forwarded, and the gateway reads
+        `X-AudioCPP-Audio-Duration-Ms` for the usage row. A STREAMED answer (a
+        `mode=streaming` model asked with `stream: true`) is instead
+        `text/event-stream` or `application/octet-stream`, chunked and without a
+        `Content-Length`, relayed byte for byte and billed from the PCM bytes
+        counted on a clean completion.
       content:
         audio/wav:
           schema: { type: string, format: binary }
+        text/event-stream:
+          schema:
+            type: string
+            description: >
+              The streamed case with `stream_format: sse` (the default):
+              audio.cpp's frames `speech.audio.delta` (base64 PCM, signed 16-bit
+              little-endian mono, in `audio`) -> `speech.audio.done` (only
+              `timing.ttft_ms`) -> `[DONE]`. The stream states no sample rate
+              and no duration.
+        application/octet-stream:
+          schema:
+            type: string
+            format: binary
+            description: >
+              The streamed case with `stream_format: audio`: headerless raw PCM
+              (signed 16-bit little-endian mono), no container and no duration.
     AudioVoices:
       description: >
         The voice names cached for the model, as the deduplicated, sorted union

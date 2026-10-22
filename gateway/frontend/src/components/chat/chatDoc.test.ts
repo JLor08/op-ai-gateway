@@ -445,7 +445,12 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
   });
 
   it('has blank defaults: a fresh speech thread leaves the model on its own voice and speed', () => {
-    expect(DEFAULT_AUDIO_SETTINGS).toEqual({ voice: '', speed: '', passthrough: '' });
+    expect(DEFAULT_AUDIO_SETTINGS).toEqual({
+      voice: '',
+      speed: '',
+      passthrough: '',
+      stream: true,
+    });
     // The key is present for a speech thread (as image's is for an image one),
     // but carries nothing: every knob stays the model's default.
     expect(audioSetting('speech', DEFAULT_AUDIO_SETTINGS)).toEqual({ audio: {} });
@@ -508,7 +513,7 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
   // and the backend would end the run gateway.chat_run_speech_reserved_field only after
   // the turn is committed. Matched ignoring case, like the backend.
   it('rejects a passthrough naming a reserved field, in any letter case, and names it', () => {
-    for (const key of ['model', 'input', 'stream', 'response_format']) {
+    for (const key of ['model', 'input', 'stream', 'stream_format', 'response_format']) {
       expect(parseAudioPassthrough(JSON.stringify({ [key]: 'x' }))).toEqual({
         status: 'invalid',
         reservedField: key,
@@ -531,9 +536,8 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
     });
   });
 
-  it('does not reserve its look-alikes: stream_format, voice, speed, a prefix or a nested key', () => {
+  it('does not reserve its look-alikes: voice, speed, a prefix or a nested key', () => {
     for (const text of [
-      '{"stream_format": "sse"}',
       '{"voice": "af"}',
       '{"speed": 1.2}',
       '{"models": 1, "inputs": 2, "response": 3, "format": 4}',
@@ -603,6 +607,28 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
       DEFAULT_AUDIO_SETTINGS,
     );
     expect(audioSettingsFrom({ passthrough: {} })).toEqual(DEFAULT_AUDIO_SETTINGS);
+  });
+
+  // The speech-streaming choice (ADR-068): ON is the default and is never written, so a
+  // thread that never touched the toggle persists nothing for it; only the opt-out is a
+  // value, and it survives a save/load. A missing or mistyped value is the default, never an
+  // accidental opt-out.
+  it('persists only the opt-out of speech streaming, and reads anything else as on', () => {
+    expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, stream: true })).toEqual({
+      audio: {},
+    });
+    expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, stream: false })).toEqual({
+      audio: { stream: false },
+    });
+    expect(audioSettingsFrom({ stream: false }).stream).toBe(false);
+    expect(audioSettingsFrom({ stream: true }).stream).toBe(true);
+    expect(audioSettingsFrom({}).stream).toBe(true);
+    expect(audioSettingsFrom({ stream: 'no' as unknown as boolean }).stream).toBe(true);
+    // The opt-out round-trips with the other knobs.
+    const wire = { voice: 'af_heart', stream: false };
+    expect(audioSetting('speech', audioSettingsFrom(wire))).toEqual({ audio: wire });
+    // Another kind of thread never carries it.
+    expect(audioSetting('image', { ...DEFAULT_AUDIO_SETTINGS, stream: false })).toEqual({});
   });
 
   it('keeps a speed of 0 (a value, not "unset") across a save/load', () => {

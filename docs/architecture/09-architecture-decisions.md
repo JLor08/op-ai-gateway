@@ -618,7 +618,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -674,7 +674,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -843,7 +843,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1038,7 +1038,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1253,7 +1253,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-94-migrations),
+[§4](reference/data-model.md#4-migration-history-95-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1479,7 +1479,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-94-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-95-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1489,6 +1489,9 @@ vocabulary is deliberately small and open only at the code level —
 `internal/usage/billing.go`. Two named units, not three: `"character"` belongs
 to an external price list rather than to this system, and audio.cpp's own
 metering signal is a *duration*, so speech and transcription share one unit.
+(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a third non-token unit, `BillingUnitAudioBytes`
+(`"audio_bytes"`), joined the vocabulary for a streamed speech response whose duration
+cannot yet be derived; see the amendment after the Rejected list.)
 
 **(a) `""` means token-metered, and it is a POSITIVE assertion — a one-way
 one.** This is what makes the pair a true no-op for every row that already
@@ -1516,6 +1519,9 @@ repairing the data would destroy the evidence that a producer is wrong, and
 dropping the row would lose a request from billing outright.
 
 **(c) A unit may only come from ENDPOINT IDENTITY, never from the response.**
+(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a non-token endpoint may carry a success-path
+*measurement-unit* refinement chosen from mapping state, never from the response, provided every
+failure row keeps the endpoint-identity unit; see the amendment after the Rejected list.)
 Nine of the twelve `recordUsage` call sites pass a zero `provider.Response`
 (every error, timeout, disconnect and admission-rejection path — seven of ten
 when this was decided, before the images endpoint added two more of the same
@@ -1598,13 +1604,29 @@ explicitly; the capability gap it leaves (a non-token request consumes
 owned by issue #119. — **`real` for `billing_quantity`**: `double precision`
 from the start, per [ADR-005](#adr-005--postgresql-needs-wide-column-types),
 so the int4/float4 class cannot recur on a brand-new column.
+
+**Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+(streaming speech synthesis, issues #253 and #263): a fourth unit, and a success-path
+measurement-unit refinement with failure rows uniform.** A streamed speech response carries
+no duration, so the relay counts the PCM bytes it relayed. `usage.BillingUnitAudioBytes =
+"audio_bytes"` joins the vocabulary (`ValidBillingUnit` accepts it; the XOR and the schema
+needed no change, `billing_unit` being open text) and is the **fallback** measure of a
+cleanly completed streamed call whose mapping has no cached output byte rate yet; once the
+rate is cached the same call bills `audio_second`, bytes over the rate. Decision (c) is
+**preserved in the form that protects it**: every failure, refusal and incomplete-stream row
+of the speech endpoint stays `(audio_second, 0)`, the endpoint-identity unit, so a failed
+request is never mislabelled; only the **success** path chooses between the two audio units,
+and it chooses from **mapping state** (is the rate cached?), not from the response body. The
+amendment is exactly this: a non-token endpoint may carry a success-path *measurement unit*
+refinement, provided its failure rows are uniform. `audio_bytes` is unpriceable in Tier 3 (the
+modeled tier's non-token guard) until a coefficient declares that unit.
 → [Telemetry, Usage Analytics & Observability
 §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
 [§8.4.2](cross-cutting/telemetry-usage-observability.md#842-query-stats-groups-time-series),
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-94-migrations),
+[§4](reference/data-model.md#4-migration-history-95-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3568,7 +3590,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-94-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-95-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3792,7 +3814,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-94-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-95-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4817,7 +4839,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -4943,7 +4965,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-94-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-95-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5086,7 +5108,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-94-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-95-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -5199,9 +5221,10 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   `audiocpp_models`, ranking 1 with the other probes (never able to outrank a `manual`
   or `vision_benchmark` row, always able to repair its own drift), and it writes the
   `speech` row (the `transcription` row joined it in ADR-062 (c), the
-  `transcription_streaming` row in ADR-065, and the `speech_clone` row in issue #252 —
+  `transcription_streaming` row in ADR-065, the `speech_clone` row in issue #252 —
   `clon` → yes, `tts` → no, all derived from the same per-model `task` the `speech`
-  verdict reads). **A model that is
+  verdict reads — and the `speech_streaming` row in [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), derived from the
+  per-model `mode` instead). **A model that is
   not loaded reads as unknown and refuses**
   until the health loop sees it loaded; for an operator-run server the mapped model is
   loaded, and `speech: yes` set by hand covers the rest. (*Superseded in part by
@@ -5238,7 +5261,14 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   **before the relay**, because audio.cpp would answer those with a 500 that the gateway
   would hand on as a server failure. Both deferrals have a stated way back: streaming
   needs the `mode=streaming` model contract and its SSE events, and `json`/`b64_json`
-  need a RIFF-header duration decode for billing.
+  need a RIFF-header duration decode for billing. **(Amended by
+  [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issues #253 and #263: the streaming half was taken. `stream: true`
+  is admitted, relayed for a model whose `speech_streaming` verdict is `yes` and answered as
+  the one-shot WAV otherwise; while streaming `response_format` must be `pcm` or absent
+  (audio.cpp serves streaming only as `pcm`, so `wav` plus a stream stays 400
+  `speech.stream_unsupported`), and `stream_format` `sse` and `audio` are relayed. A
+  request that does not stream is unchanged: `wav` or absent only. The `json`/`b64_json`
+  half stands.)**
 - **(f) The relay forwards the upstream `Content-Length` and still does not buffer.**
   `proxyNative` relays every native body chunked (it flushes per chunk and sets no
   length). For audio that is a loss a client can see: the body is one sized file,
@@ -5247,13 +5277,20 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   `Content-Length` is set on the client response before the header is written, while the
   copier still moves 32 KiB at a time with a flush per chunk, so net/http frames by the
   declared length and the bytes keep streaming. An upstream that declared none stays
-  chunked, and chat, Responses, Messages and images keep relaying chunked as before. The
+  chunked, and chat, Responses, Messages and images keep relaying chunked as before.
+  **(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a streamed speech answer, an event stream or raw PCM, is
+  relayed chunked and the length is not set; a stream request answered with a plain
+  `audio/wav` keeps it.)** The
   length is read off the upstream header (the provider response type carries no length
   field), which is sound because Go's client drops that header for a chunked or
   decompressed response, so a surviving value is the length the copier writes. The
   usage scanner is nil for speech, as for images: a binary body has no chat usage to
   find, and scanning it would retain audio per in-flight request to learn that.
-- **(g) Speech bills `audio_second` from the upstream's own duration header.** The unit
+- **(g) Speech bills `audio_second` from the upstream's own duration header.** **(Amended by
+  [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): that is the one-shot WAV's measure. A STREAMED response has no such
+  header, so its quantity is counted from the relayed PCM bytes, in `audio_second` over a
+  cached output byte rate or, with none, in the new `audio_bytes` unit, on a clean
+  completion only; every failure row below stays `audio_second` with quantity 0.)** The unit
   is endpoint identity, as for images, so every speech `recordUsage` site, a refused or
   failed request included, carries `billing_unit = audio_second`. The quantity is a
   **measurement** and comes from the response: `X-AudioCPP-Audio-Duration-Ms` divided by
@@ -5275,6 +5312,10 @@ audio.cpp's `audiocpp_server` (v0.9.1, probed live), that no design could have c
   JSON, which carries the `input` text the opt-in capture exists for, is captured as
   usual
   ([Security §14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+  **(Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives): a STREAMED speech response is `text/event-stream` or
+  `application/octet-stream` and is still captured as this redacted summary, never as the
+  event text; the capture's endpoint is stamped speech so the binary-speech backstop
+  redacts it.)**
 - **(i) A non-2xx upstream response is normalised to the OpenAI error shape.** The relay
   buffers the (bounded) error body and, in order: an OpenAI error object passes through
   **byte for byte** (audio.cpp's own shape, so its attested `type` is not overwritten
@@ -5309,7 +5350,7 @@ the idle watchdog does not apply. Speech takes **no affinity pin**, by the guard
 wrote for exactly this: a capability-carrying request never creates one. The costs
 accepted are named, not hidden
 ([Risks §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)): no
-streaming, no `mp3`/`opus`/`flac`/`json`, an unlisted model reading as unknown (an
+streaming (lifted by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)), no `mp3`/`opus`/`flac`/`json`, an unlisted model reading as unknown (an
 agent-launched `audio_cpp` child's verdict comes from the agent's probe of its own
 listing, once per process generation), and a capture gate that trusts the upstream's
 `Content-Type`. The portal's Models view reads no speech flag, so its "Available via"
@@ -5366,6 +5407,21 @@ a discoverable combobox over them that still accepts free text. The upstream's b
 unchanged and is what shaped this: it lists voices only for its loaded model, so a name list
 has to be kept, and an unknown voice still answers HTTP 500, which the endpoint relays like
 any other speech error.
+
+**Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+(streaming speech synthesis; issues #253 and #263).** The streaming deferral of (e) is
+lifted, and four neighbouring claims move with it. (e): `stream: true` is admitted and relayed
+as audio.cpp's SSE or raw PCM for a mapping whose new `speech_streaming` verdict is `yes`
+(the buffered one-shot answers every other mapping, and a retry-buffered net covers a stale
+`yes`); while streaming, `response_format` must be `pcm` or absent and `wav` plus a stream is
+still 400 `speech.stream_unsupported`; a request that does not stream still takes `wav` only.
+(f): the upstream `Content-Length` is not forwarded for a streamed answer. (g): a streamed
+call has no duration header, so it is billed from the PCM bytes the relay counted, in
+`audio_second` over the mapping's cached output byte rate or in the new `audio_bytes` unit
+when none is cached, on a clean completion only, and every failure row stays `(audio_second,
+0)`. (h): the streamed capture stays a redacted summary, by an explicit endpoint stamp. (d):
+the same probe now also writes the `speech_streaming` row, from `mode`. The accepted cost "no
+streaming" in the Consequence is gone; "no `mp3`/`opus`/`flac`/`json`" stands.
 
 → [API Compatibility & Inference §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
@@ -5981,6 +6037,22 @@ upstream; speech is JSON in). **Dropping a reserved passthrough key and sending 
 rest** (a request the user did not make). **Storing the WAV inline in the transcript**
 (ADR-056 retired that for images, and a WAV is larger). **A second blob endpoint or
 table for audio** (the store is payload-type-agnostic).
+
+**Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+(streaming speech synthesis; issues #253 and #263).** Two of this entry's claims no longer
+hold unconditionally. The Context's first fact and the Consequence's "one buffered request with
+no progress to show" are now the **buffered** run: for a model the gateway can stream (its
+`speech_streaming` verdict is `yes` for every mapping the model could route to, each with a
+cached output byte rate, and the thread has not opted out) the run asks the same endpoint for a
+stream, plays the audio in the browser as it arrives through a new `audio` run event, and
+commits the same single WAV turn at the end; anything else is the run described above,
+unchanged. And (g)'s reserved passthrough fields gain `stream_format`, because the run states
+`stream` and `stream_format` itself when it streams (the endpoint no longer refuses a streamed
+request, so the earlier reasoning that `stream_format` need not be reserved is gone). The
+run's 10-minute deadline bounds a streaming run only until its first chunk of audio, as for a
+streaming transcription. A new session-cookie `GET /api/portal/model-speech-streaming` is the
+composer's gate.
+
 → [API Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
 [§3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
@@ -6908,6 +6980,21 @@ loaded" event** (the gateway has none; the change-detected tick is restart-survi
 (it would attribute another model's voices to this mapping). **A code guard for two tts
 models loaded at once** (unverifiable on the available server; the limitation is recorded
 instead).
+
+**Amended by [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+(streaming speech synthesis; issues #253 and #263): the cache has more than one consumer.**
+Choice (a)'s "voices are the first type" now has a successor: `cache_type =
+"output_byte_rate"` (`routing.ModelMappingCacheOutputByteRate`, scope `""`, the payload a plain
+decimal integer of PCM bytes per second) holds the rate that turns a streamed speech response's
+bytes into audio seconds, written by the speech benchmark and read on the billing hot path and
+the portal's streaming gate, and `cache_type = "output_byte_rate_model"` is its companion row
+holding the loaded-model identity the rate was measured under. Neither needed a table or a
+migration, which is the generality the entry argued for. The rename invalidation stands; what is
+added is that a rate is a property of the model, which a rename does not see, so the health loop
+retires a rate (an empty payload, read everywhere as no rate) when the loaded-model identity it
+observes differs from the companion row's, and re-runs the benchmark. A fact obtainable only
+while a model is loaded persisting past an unload is exactly why the rate lives here and not in
+a volatile cache.
 → [API Compatibility & Inference
 §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
@@ -6919,5 +7006,467 @@ instead).
 [Persistence](cross-cutting/persistence.md),
 [Data Model](reference/data-model.md#the-per-mapping-cache-table),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-068 — Streaming speech synthesis: the gateway relays the PCM stream of a streaming model, meters it from the bytes it relayed (`audio_bytes`, or `audio_second` over a benchmark-learned byte rate), and the portal composer plays it as it arrives
+**Context:** `POST /v1/audio/speech`
+([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only), issue #68) relays **one complete `audio/wav` body** and bills
+`audio_second` from the `X-AudioCPP-Audio-Duration-Ms` response header
+(ADR-061 (g)); it refuses `stream` (ADR-061 (e), `speech.stream_unsupported`) because the
+relay's "one complete response" contract is exactly what carries that duration. Issue #253
+(part 2) wants speech streaming, and issue #263 is its metering prerequisite: a streamed
+response carries **no** single-response duration, so a streaming relay built the obvious
+way would bill `audio_second` with quantity `0` on every successful call, a loud zero
+([ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)) on the **common** case. The transcription half of #263 had already
+shipped: [ADR-065](#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript) bills a streamed transcription from the **uploaded** WAV
+header. Speech is the mirror image and has no such input, because the billable audio is
+the **output**, which the stream does not describe. A live probe on 2026-10-21 against
+audio.cpp v0.9.1 on an operator LAN host (a `tts` model of family `audio8_tts`, 44100 Hz
+mono 16-bit) settled what none of this could assume. Five facts about the backend shaped
+every choice below, none of them a design's to pick:
+
+- **Streaming needs `mode=streaming`, and such a model is a superset.** With an `offline`
+  model every streamed speech request answers `500 {"error":{"message":"speech streaming
+  requires a model configured with mode=streaming"}}`, the gate ADR-065 found for
+  transcription. A `mode=streaming` model serves a streamed request **and**, for
+  `stream=false`, still answers `200 audio/wav` with the duration header. Only `offline`
+  is restrictive. `mode` (`offline` | `streaming`) is a field of audio.cpp's `GET
+  /v1/models`, beside the `task` ADR-061 (d) reads.
+- **A streamed response is headerless PCM, with no duration and no format on the wire.**
+  `stream=true` (the default) or `stream_format=sse` answers `text/event-stream`: a
+  `speech.audio.delta` per chunk (base64 PCM in `audio`) → `speech.audio.done` (**only**
+  `timing.ttft_ms`, no `audio_duration_ms`, two probes) → `[DONE]`. `stream_format=audio`
+  answers `application/octet-stream`, chunked, raw PCM (first bytes `e7 ff ea ff`, not
+  `RIFF`). Streaming accepts **`response_format=pcm` or absent only**: `wav` while
+  streaming answers `500 "streaming speech currently supports response_format=pcm"`, so
+  there is never a WAV container, and no `fmt` chunk, on a stream. There is no
+  `X-AudioCPP-Audio-Duration-Ms` header either.
+- **No API states the output sample rate.** `GET /v1/models/{id}` is 404 and the package
+  listing carries no rate. The rate is the model's native one, stable per model and
+  unexposed.
+- **The duration header is exactly `data_bytes ÷ byteRate`.** The probe's baseline WAV had
+  331776 data bytes over a byte rate of 88200, 3.7616 s, which is the header's 3761.633 ms.
+  So counting PCM bytes and dividing by the byte rate is the **identical** number audio.cpp
+  reports, not an approximation. Streamed raw PCM (319488 B) and the summed SSE deltas
+  divided by 88200 gave plausible clip lengths and only 88200 fits (24 kHz would give
+  impossible ones), so the **streamed PCM byte rate equals the non-stream WAV byte rate**
+  for the same model.
+- **The deployment launches streaming models directly as `mode=streaming`.** audio.cpp is
+  normally off and is started per run-spec (agent-managed); there are no manual changes
+  outside the spec. So the response type, streamed or buffered, is chosen **per request**,
+  and the gateway **follows** `mode` and never flips it.
+
+**Decision — six choices, taken together. Every one is a reversal scoped to the streaming
+case and leaves the buffered path and every non-streaming metering byte-identical.**
+
+- **(a) A `speech_streaming` verdict, written from `mode` for a speech model only, as a
+  PATCH agent bump.** The per-mapping vocabulary gains `speech_streaming`
+  (`routing.CapabilitySpeechStreaming`), ADR-065 (b)'s `transcription_streaming` on the
+  synthesiser's side: **yes** = the mapped model is `mode=streaming`, **no** = `offline`,
+  **absent** = unknown (and no row for any other `mode`). It is written **only beside a
+  `(speech, yes)`**, for a `tts` or `clon` model (the axis on which streaming is a
+  question for speech, so an `asr` or music model carries no row, not even a `no`; an `asr`
+  model's `mode` stays the `transcription_streaming` verdict), from the same per-model `mode`
+  of the same `/v1/models` listing and on the same `audiocpp_models` source at probe rank 1.
+  A **static** `audio_cpp` application has it written by the gateway's health loop
+  (`audioCppCapabilityRows`); an **agent-launched** child has it decoded and reported by
+  the ServerAgent's audio collector, riding PR #258's one-sided gateway-declared flag
+  `capability_source_audiocpp` as **one new capability name**. So it is a **PATCH** bump,
+  ServerAgent **0.11.0 → 0.11.1**, with **no new `agent.Features` entry** (an absent
+  verdict already means "buffered", so a flag would gate nothing,
+  [ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)) and **no migration** (the capability vocabulary is open, ADR-062
+  (c)); an agent older than 0.11.1 never reports it, which degrades to the buffered path.
+  The ingest allowlist (`audioCppProbeCapabilities`) gains the name, it is **not** in
+  `reservedAgentCapabilityNames`, and `(speech_streaming, no)` is reserved against a manual
+  write and against a probe being outranked by a stale manual override, as every audio
+  verdict is. The speech handler reads it keyed on the resolved route
+  (`mappingStreamsSpeech`, `MappingCapabilities(ctx, target.RouteID)`, not a new
+  `routing.Target` field; the shared `mappingStreamingVerdictIsYes` serves both audio
+  endpoints): **yes** and the client asked `stream=true` → stream; **no / absent / a read
+  error** → buffered. An unprobed or offline model simply buffers, and a client that asked
+  `stream=true` against one gets a valid one-shot WAV, never an error. The agent caches
+  verdicts once per process generation, so a UI mode-change without a restart goes stale,
+  which is what (b)'s retry exists for.
+- **(b) The streamed relay: the refusal is lifted for a stream that asks for PCM, and the
+  relay is unbuffered, byte for byte.** `validateSpeechRequest` no longer refuses
+  `stream: true`. What stays refused with 400 `speech.stream_unsupported` is a **non-boolean
+  `stream`**, a `stream_format` on a request that does not stream or outside the two audio.cpp
+  emits (`sse`, `audio`; a JSON `null` is absent), and **`response_format=wav` on a
+  stream**, because audio.cpp serves streaming only as `pcm` and 500s a wav stream, so the
+  gateway says so up front instead of forwarding a request that cannot succeed. Every other
+  `response_format` stays 400 `speech.response_format_unsupported`: `wav` or absent for a
+  request that does not stream (unchanged), `pcm` or absent for one that does. `sse` and
+  `audio` are **relayed as the client wrote them**, the gateway translating nothing.
+  - *The decision.* Taken up front from (a)'s verdict: a `yes` sends `stream=true` upstream
+    and relays the event stream or raw PCM **chunked, byte for byte**, through the same
+    native copier every native relay uses, with the idle watchdog once bytes flow and a
+    **first-byte grace** (the larger of the application's `timeout_ms` and the idle timeout,
+    `streamFirstByteBudget`, ADR-065's rule extended to the speech endpoint) so a cold
+    `mode=streaming` model's time to first audio is not cut short. A `no`, an absent
+    verdict or a read error decides **buffered**: the body is sent without
+    `stream`, `stream_format` and `response_format` (`speechBufferedBody`), one upstream
+    call, and the client gets the one-shot WAV. That WAV is what a client that sent
+    `response_format: pcm` beside `stream: true` is handed by a route that does not
+    stream, labelled `audio/wav`; it is the answer that is valid for every model.
+  - *The safety net.* A streamed request answered by `500` whose body names `speech
+    streaming requires a model configured with mode=streaming` (a `yes` gone stale: a model
+    swapped to offline behind the verdict's back) is **re-sent once with `stream` and its
+    companions dropped** and answers the buffered WAV. The refused attempt wrote nothing
+    and recorded nothing; any other upstream error surfaces as ADR-061 (i) relays it. The
+    retry machinery is ADR-065's (`peekStreamingRefusal`, now taking the sentence to look
+    for, because the two endpoints' refusals are worded differently).
+  - *Two things the stream changes in the relay.* The upstream `Content-Length` that
+    ADR-061 (f) forwards is **skipped** for an answer that is a stream (a chunked stream has
+    none, and an intermediary's length would not describe it); a stream request answered
+    with a plain `audio/wav` keeps it. And the usage scanner stays nil and the tee buffer is
+    not filled: a streamed call has no token usage, and megabytes of base64 audio teed for
+    a capture that stores a summary would be spent on nothing.
+  - *The capture stays a redacted binary summary.* A streamed speech response is audio
+    output, so it is captured as the same `{content_type, size, redacted: true}` summary
+    every speech response gets (ADR-061 (h)), **not** assembled like a transcription
+    (ADR-065 (d)); the base64 is no text a reader of the capture could use. Because the
+    stream's `Content-Type` is `text/event-stream`, the capture's endpoint is **stamped
+    as speech** (`speechStreamScan.stampCapture`), so the binary-speech backstop
+    (`isBinarySpeechResponse`) redacts it instead of storing the event text.
+- **(c) A streamed call is metered from the PCM bytes it relayed: `audio_second` over a
+  cached byte rate when one is known, the new `audio_bytes` unit when not, and zero in the
+  endpoint's own unit for everything else.** A stream states no duration, so the relay
+  **counts** what it relays. A tee (`speechStreamScan`, `transcriptionStreamScan`'s
+  sibling) is fed every chunk **after** it was written and flushed to the client, so it
+  never holds a byte back: for an event stream it sums the decoded base64 `audio` payloads
+  of the `speech.audio.delta` events, for raw PCM the bytes of the body. A **clean
+  completion** is an event stream's `speech.audio.done` followed by `[DONE]`, or a raw body
+  the upstream closed at a clean EOF (a read error is never a clean close); a count the
+  scan could not make whole (an unreadable JSON frame, a delta that is not base64, a line
+  past its 16 MiB bound) marks it lost and is not a completion, because billing it would be
+  a silent under-bill. The measure is then decided in one place
+  (`setStreamedSpeechBillingQuantity`):
+
+  | Outcome | Billed |
+  |---|---|
+  | Clean completion **and** the mapping's output byte rate is cached | `(audio_second, pcmBytes ÷ byteRate)`, the number audio.cpp's own header would have stated |
+  | Clean completion, rate **not** cached | `(audio_bytes, pcmBytes)`, an exact count, never a guess |
+  | Anything else: an upstream error status, a copy error, an idle timeout, a client that went away, a stream that ended without its terminal events or with a lost count, a stream that carried no audio | `(audio_second, 0)`, uniform with every other speech error row |
+
+  The two failure shapes that would otherwise read as a success that billed nothing (a
+  stream that ended without a completion the gateway can count, and one that completed
+  carrying no audio) are logged once at `Error`, ADR-041's loud-zero rule; a row that is
+  already an error row carries its cause in its own code and is not logged again. **The
+  quantity is never a partial count**: a stream cut short delivered some audio and bills
+  none, which is also what ADR-065 (c) decided for a partial transcript. **A client
+  disconnect seen when the stream terminates is an error row, whatever it cut off**: the
+  relay decides the status as soon as the copy returns (`nativeTerminalStatus`:
+  `r.Context().Err() != nil` is `provider.client_disconnected`), and the setter returns
+  before it reads the rate for any status but `success`, so a hang-up mid-stream **or right
+  after the final frame** is `(audio_second, 0)` with that code, never a billed stream. The
+  rate is nevertheless read on a context stripped of cancellation (`context.WithoutCancel`);
+  that is **defensive**, covering only the window after the status decision (a request
+  context cancelled between that decision and the store read), so a cancelled read cannot
+  drop a stream the relay had already judged a success to bytes.
+  - *Amends [ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar): a new unit, and a success-path measurement-unit
+    refinement with failure rows uniform.* `usage.BillingUnitAudioBytes = "audio_bytes"`
+    joins the code-level vocabulary (`ValidBillingUnit` accepts it); its quantity is the
+    relayed PCM payload in bytes. `ValidateBillingXOR` is generic and needed no change (a
+    non-token row zeroes the seven token-denominated columns, and the usage scanner is nil for
+    speech), and there is **no migration**: `billing_unit` is an open text column and
+    `billing_quantity` a `double`. ADR-041 (c) says a unit may only come from the endpoint's
+    identity and never from the response, and it is **preserved in the form that protects
+    it**: the unit stays audio-derived, **every failure row stays `audio_second`** (the
+    endpoint-identity unit, so a failed streamed request is never mislabelled), and only the
+    **success** path chooses between `audio_second` and `audio_bytes`, and it chooses from
+    **mapping state** (is the byte rate cached?), not from anything in the response. That is
+    a deliberate amendment: a non-token endpoint may carry a success-path *measurement-unit*
+    refinement, provided its failure rows are uniform. `audio_bytes` is **unpriceable in Tier
+    3**: the modeled tier's guard (`modeledEnergy` answers `unpriceable` for any non-token
+    unit) already holds, and ADR-041's rule that a coefficient must carry the unit it declares
+    means no modeled figure exists until a coefficient declares `audio_bytes` (the token-blind
+    measured and estimated tiers still apply on a host with power telemetry). `NonTokenRequests` counts any
+    `billing_unit <> ''` row, so disclosure works unchanged, and the portal's unit chip shows
+    the raw value with no tooltip (its help table has no entry, which is honest silence).
+- **(d) The output byte rate: a per-mapping value learned by the benchmark, held in the
+  generic cache.** The **byte rate** here is the PCM *format* constant, `sampleRate ×
+  channels × bytesPerSample` as one integer (88200 B/s for the probed model): the divisor
+  that turns PCM bytes into seconds. It is **not** a throughput (`bytes ÷ wall time` varies
+  per run, and billing from it would be a wrong bill). It is read from the `fmt` chunk of a
+  non-stream WAV answer, which states it and is self-checked (`wavConsistentByteRate`:
+  `byteRate == sampleRate × blockAlign`, `blockAlign == channels × ceil(bits/8)`), and it
+  equals `data_bytes ÷ (header duration ÷ 1000)`. It is held as a `cache_type` of
+  [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)'s **generic** `model_mapping_cache`, its second consumer, with **no new
+  table and no migration**: `routing.ModelMappingCacheOutputByteRate` (`output_byte_rate`),
+  scope `""`, the payload a **plain decimal integer**, read on the billing path
+  (`cachedOutputByteRate`, via `routing.ParseOutputByteRate`, the one definition of a
+  usable rate: positive and fitting a `uint32`) and on the portal's gate. It inherits the
+  foreign-key cascade and the rename invalidation of every cache row. Four properties of
+  that rate are recorded, because a wrong rate is a wrong bill, worse than a loud zero:
+  - *The rate is never guessed.* It comes from a real non-stream observation or it does not
+    exist; an absent, empty or unparseable row reads as "no rate" and the call bills
+    `audio_bytes`.
+  - *Mono, 16-bit integer PCM.* A byte rate alone cannot say what it is the rate **of**
+    (96000 B/s is 48 kHz mono 16-bit and equally 24 kHz stereo 16-bit or 24 kHz mono
+    float32), and the portal must play and store a stream as one format. A streamed
+    response is OpenAI's `pcm`, signed 16-bit little-endian mono, so the benchmark
+    **caches a rate only from a WAV whose `fmt` is integer PCM (tag 1), one channel,
+    16 bits** (`wavFormat.isMono16PCM`). Wherever a rate exists, therefore,
+    `sampleRate = byteRate ÷ 2`, and a **non-conforming model is simply not rate-cached**: it
+    stays on `audio_bytes` and plays buffered in the portal. When a run observes a
+    non-conforming WAV, a rate cached earlier for the mapping (by a model since swapped
+    behind the name) is **retired** (an empty payload) so a stale rate cannot keep the
+    portal's gate open on audio it cannot play.
+  - *The streamed rate equals the buffered rate.* A streamed call is billed from a rate
+    read off a **non-stream** WAV, so the design assumes audio.cpp streams at the model's
+    native rate, the buffered WAV's. It was verified equal for the probed model (both
+    44100). It is also **required for the client**: a client receives headerless PCM and can
+    only play it at one consistent, known rate, so a stream resampled differently from the
+    WAV would break playback before it mis-billed. The named residual is a future model or
+    engine that resamples only the stream (Consequence, [Risks
+    §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+  - *A rate is a property of the model, not of the mapping's name.* ADR-067's
+    invalidation fires on an `app_model_name` rename and cannot see a model swapped behind
+    the same name, so a **companion** cache row, `routing.ModelMappingCacheOutputByteRateModel`
+    (`output_byte_rate_model`, scope `""`, the payload the **loaded-model identity** the
+    rate was measured under), sits beside the rate and **never inside it**, so the rate's
+    payload stays the plain decimal billing parses. The identity is the model file audio.cpp's
+    listing states for a static server (`path`) and a fingerprint of the launch spec for an
+    agent-launched child (`launch:` plus the first 16 hex digits of a SHA-256 over the
+    binary, arguments, environment placeholders, config files and working directory, each
+    length-prefixed). The health loop compares the identity it observes with the companion row
+    (`ensureSpeechRate`): a rate with no recorded identity (one a manual benchmark cached) has
+    the observed identity **adopted**; a rate recorded under another identity is **invalidated
+    at once** (an empty payload, so a streamed call bills the honest `audio_bytes` and never
+    a wrong `audio_second`) and the benchmark re-run, whatever back-off an earlier trigger
+    opened, because a changed model is not a retry; an unstated identity is never taken for a
+    change.
+- **(e) The speech benchmark: synthesizes straight to the mapping's upstream, learns the
+  rate, and records audio perf metrics.** Audio mappings were excluded from every benchmark
+  (`benchmark.audio_only`, ADR-061 (b)) because the benchmark engine measures with
+  **streaming chat completions**, which a native speech relay cannot reuse. A new mode,
+  `POST .../benchmark?mode=speech` (the mapping, application and server scopes of the
+  existing starters, `benchmarkModeSpeech`), is modelled on the vision benchmark's shape
+  (`runSpeechTarget`: measure, write what was established, append a kind-tagged history
+  row). It **inverts the audio-only rule for speech only**: it runs exactly on the plain
+  text-to-speech mappings the chat benchmark refuses (`partitionSpeechBenchmarkViews`, the
+  `speech: yes` and not `speech_clone: yes` rule of `routing.CapabilityRowsPlainTTS`,
+  on a mapping the gateway would route speech to), while the chat modes keep refusing audio.
+  A scope with no such mapping answers a new **409 `benchmark.speech_unavailable`**, and an
+  application- or server-scope run records the closed skip values **`not_speech`** (a chat
+  model, a transcriber, an unprobed model) and **`speech_clone`** (a voice-cloning model,
+  whose synthesis needs a server-side reference WAV and mandatory `reference_text`, so a
+  plain `{model, input}` request answers 500). **Clone models therefore stay on
+  `audio_bytes`**: their streaming still works, since the verdict is written for `clon`
+  too, and metering a clone call in seconds is deferred with the rest of the clone epic
+  (issue #272).
+  - *The mechanism is a DIRECT native call, not a loopback.* The plan was to send the
+    synthesis through the internal loopback pair that the portal's speech run uses
+    (ADR-063). **As built it is not**: the benchmark calls
+    `provider.NativeProxyClient.ProxyNative` on the mapping's own application endpoint, the
+    primitive the gateway's own speech relay is built on and the benchmark subsystem's own
+    mechanism for addressing a mapping (`benchmarkTargetReq`). Three blockers made the
+    loopback unfit: the run **holds the server's reservation**
+    (`BenchmarkRegistry.TryStart`), which the resolver honours by excluding the server, so a
+    request routed through the gateway would never find the server under test; the loopback
+    pair authenticates as a real user and the scheduled run and the health loop's automatic
+    trigger have **no principal** to speak as; and the relay answers its client the body,
+    `Content-Type` and `Content-Length` only, so audio.cpp's `X-AudioCPP-Wall-Ms`,
+    `X-AudioCPP-RTF` and duration headers, which the perf figures use, are **not forwarded**
+    (and the relay would record a usage row, which a benchmark is not). A direct call
+    reaches a direct `audio_cpp` application and an agent-launched child alike (the agent's
+    router starts a child that is not running, as for the chat benchmark), needs no
+    credentials of its own beyond the application's upstream token, and reads the upstream's
+    own headers.
+  - *What it does.* It sends one fixed short non-stream request (`{model, input}`, the
+    application's own model id and a fixed sentence, so runs of one model compare), bounded
+    by `coldStartBudget` (the larger of `timeout_ms` and the idle budget, long enough for
+    the router to start a cold child), accepts only a 2xx `audio/wav` answer, reads the
+    byte rate from the WAV `fmt` (the mono 16-bit guard of (d) applies) and writes it, under
+    the **mapping id** the billing path reads it by, beside the identity companion once the
+    rate is written. A failed measurement writes no rate and leaves a cached one as it was.
+  - *Audio perf metrics, and migration 95.* The run appends a **`kind=speech`** history row
+    with `ttft_ms`, `wall_ms` and `rtf`, three **nullable** columns added to
+    `model_mapping_benchmarks` by **migration 95** (`bigint`, `bigint`, `double precision`
+    per [ADR-005](#adr-005--postgresql-needs-wide-column-types); no default and no backfill, so a row that measured none reads as
+    NULL, not zero; the store writes NULL for a zero and reads NULL as zero). This is the
+    branch's only migration. `wall_ms` is audio.cpp's own `X-AudioCPP-Wall-Ms` when it sent
+    one, else the measured elapsed time, and `rtf` its `X-AudioCPP-RTF` or else wall time over
+    the clip's length. **`ttft_ms` on this call is not a streamed time to first audio**: the
+    request does not stream and audio.cpp answers a non-stream call only once the whole clip
+    is synthesized, so it is roughly **synthesis time plus any cold start** (for an
+    agent-launched child the router holds the request until the child is ready, so it can far
+    exceed `wall_ms`); the portal labels it so. The result and the history DTO carry the three
+    figures (and the result `output_byte_rate`).
+  - *It runs automatically.* The health loop already visits each audio mapping while its
+    model is loaded (ADR-067's voices gate). For a **loaded**, plain-TTS mapping whose
+    `speech_streaming` verdict is `yes` it asks the gateway to start the speech benchmark
+    (`TriggerSpeechRateBenchmark`, scope `speech-rate`) when `ensureSpeechRate` finds no usable
+    cached rate or a rate recorded under another model identity. The loop **never
+    synthesizes inline**: the trigger decides, takes the server's single benchmark slot, gives
+    it back if the server has in-flight requests (like the scheduled benchmark it never
+    competes with live traffic) and launches the run on a background context. Static
+    `audio_cpp` applications are triggered from the same `/v1/models` read that states the
+    verdict (and `loaded` and `path`); an agent-launched child rides the voices pass's
+    eligibility (running, a spec of kind `audio_cpp`, the agent declaring
+    `runtime_voices`), so it **never starts a cold child**. A run that was started opens a
+    5-minute back-off per mapping (`speechRateRetryBackoff`) so a benchmark that produced no
+    rate costs one run per window, not one per tick. The auto-trigger is narrower than the
+    manual mode (`speech_streaming: yes`, since the rate is read only by a streamed call and
+    the portal's streaming gate); the manual mode runs on every plain-TTS mapping. Until a
+    mapping has been benchmarked, its streamed calls bill the honest `audio_bytes`.
+- **(f) The portal: the speech run gains a streaming branch, on by default where the
+  gateway can honor it.** `executeAudioRun` (ADR-063) keeps its buffered path and gains a
+  streaming one, ADR-065 (e)'s shape for the transcription run: the run POSTs `stream=true`
+  with `stream_format=sse` (and no `response_format`) over the loopback to the gateway's own
+  endpoint, so the relay and its metering are the public endpoint's, not a second audio path;
+  reads the SSE (`consumeSpeechStream`); and commits **the same turn as the buffered run**,
+  one `audio_url` part holding an assembled WAV that `chat_blobs` stores as before (the
+  canonical 44-byte PCM header written from the cached rate, `wavFromPCM16`). It reuses the
+  run's reservation, first-delta deadline (armed by the executor and **lifted at the first
+  chunk**, the transcription run's arrangement, with the relay's idle watchdog bounding it
+  after), TTFT metric and single terminal commit. It commits only a stream that ended with
+  `speech.audio.done` and then `[DONE]` and some audio: a stream cut short commits nothing
+  (an ended context is reported as itself; anything else is
+  `gateway.chat_run_speech_response_unreadable`), and an empty one is
+  `gateway.chat_run_no_audio`. The branch also handles a one-shot answer (a route whose
+  verdict went stale is answered buffered), read for what it **is**.
+  - *Progressive playback.* Each `speech.audio.delta` becomes a new run SSE event, **`audio`**
+    (`{"audio": {"seq", "rate", "data"}}`: the chunk's base64 PCM exactly as the stream
+    carried it, numbered, with the sample rate, since a stream carries no format). It is
+    fanned out to the run's subscribers and **buffered nowhere**: not in the run's text
+    buffer, so never in a checkpoint, and a late subscriber is served the terminal turn's
+    WAV, not a replay. The browser (`speechPlayback.ts`) decodes the chunks and schedules
+    them back to back on one shared `AudioContext`'s own clock with **scheduled
+    `AudioBufferSourceNode`s**, which are gapless without an AudioWorklet (a second thread, a
+    separately served module and an underrun protocol this does not need). It plays only an
+    **unbroken** stream from chunk 0 at one rate, because the run's events are lossy by design
+    (a subscriber whose buffer is full is dropped events, an audible gap for audio): the
+    first irregularity, a context that is not running (a tab that re-adopted the run without
+    a gesture), or a format it cannot play abandons live playback for the run, and the
+    committed WAV is the complete audio and is rendered by `AudioTurn` exactly like a buffered
+    reply. Live playback is an enhancement that can be abandoned without losing anything.
+  - *The gate: stream only where the stream is playable.* The run streams only when
+    `portalSpeechStreamRate` says so: **every** mapping a speech request for the model could be
+    routed to (the portal-visible plain-TTS ones, `Portal.ModelVoiceMappingIDs`, what the
+    voice picker asks) is `(speech_streaming, yes)` **and** has a usable cached rate, **and
+    they agree on it**, and the rate is a whole number of 16-bit frames within 8 to 192 kHz
+    when halved. A route is picked per request after the gate is asked, so a model with two
+    mappings streams only if it makes no difference which serves it. The gate fails closed
+    (an empty candidate set, a store error). The run evaluates it **again at run time**
+    (`speechRunStreamRate`, for the model the request will route for, the run-as token's
+    override applied), never trusting the client, whose toggle is a choice and not an
+    authority. Anything else is today's buffered run. So the portal never plays un-playable
+    PCM and never needs the `audio_bytes` path: portal streaming and `audio_second` billing
+    become available together, both gated on the cached rate.
+  - *Default ON for a capable thread, opt-out.* `settings.audio.stream` (a pointer, so an
+    unset field and an explicit `false` stay distinguishable) is the thread's choice; only an
+    explicit `false` is persisted, so an existing thread's settings stay byte-identical.
+    The composer shows a "stream" checkbox, checked by default, only for a model the gate
+    says can stream. `stream_format` joins `model`, `input`, `stream` and `response_format` as a
+    **reserved** passthrough field (the run states `stream` and `stream_format` itself when it
+    streams and omits both when it does not).
+  - *New surfaces.* **`GET /api/portal/model-speech-streaming?name=<model>`**
+    (`handlePortalModelSpeechStreaming`, session cookie, `gateway:use`, the voices endpoint's
+    twin: `name` as a query parameter, blank → 400 `model.name_required`, one no-leak 200 for
+    every "no", 500 `model.speech_streaming_failed` for a store failure, never read as a "no")
+    answers `{"streaming": true, "sample_rate": <Hz>}` or `{"streaming": false}`; the
+    **`audio`** run event; `settings.audio.stream`; a **`speech_streaming` capability chip** on
+    the Models view (shown on a `yes` only); and the benchmark section renders the speech
+    mode's results (a per-result line, a history table for `kind=speech`, and the
+    `not_speech`/`speech_clone` skips).
+
+**Consequence:** streaming speech is a staged, backward-compatible addition, not a new
+audio path. The relay, the byte metering with its `audio_bytes` fallback and the
+retry-buffered-on-500 net stand on their own (stage 1: a streamed call bills honestly before
+any rate exists); the benchmark is what upgrades a mapping from `audio_bytes` to
+`audio_second` (stage 2); the verdict is what takes the decision up front (stage 3); the
+portal run is the UX (stage 4). Nothing breaks without a later stage or with a stale
+one: an absent verdict buffers, an absent rate bills bytes and plays buffered, and a stale
+`yes` retries buffered. The non-streaming path, every error row and the buffered portal run
+are byte-identical. The accepted costs and residuals are named, not hidden ([Risks
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
+
+- **The rate-equality assumption (d).** A streamed call is billed from a rate read off a
+  non-stream WAV. It holds for the probed model and is required for client playback, but a
+  future model or engine that resamples only the stream would mis-bill; the mitigations are
+  the operator's trusted server, a re-check on an audio.cpp upgrade and the identity-change
+  re-benchmark.
+- **The raw-path completion residual.** SSE proves a clean completion with its terminal
+  frames; the raw `application/octet-stream` shape has none, so it is billed from the PCM byte
+  count on a **clean HTTP close** (a mid-stream copy error is an error row). That bills
+  exactly what the client received, so a partial delivery is no full-amount over-bill, but a
+  body the trusted upstream truncates **and** closes cleanly would bill as complete. SSE is
+  the default shape and the primary path.
+- **Clone models bill `audio_bytes`**, and so does any mapping not yet benchmarked or
+  whose model is not mono 16-bit PCM. `audio_bytes` is unpriceable in Tier 3 until a coefficient
+  declares that unit, so those calls carry no modeled energy figure (a host with measured or
+  estimated power still attributes some).
+- **A permanently non-conforming or non-benchmarkable model is retried every five minutes.**
+  The back-off is a **fixed** window: a model whose WAV is not mono 16-bit PCM, or whose
+  synthesis keeps failing, is benchmarked again every `speechRateRetryBackoff`, writing an
+  error history row and holding the server's benchmark slot (which excludes the server from
+  routing) for the length of each run. An escalating back-off is the known fix; it is **not
+  built** and is recorded as debt.
+- **Partial delivery bills nothing.** A client that disconnects mid-stream, or right after the
+  final frame, is a `provider.client_disconnected` error row of `(audio_second, 0)`; the audio
+  it heard is not billed, matching ADR-065 (c).
+- **The portal's live playback is best-effort.** It needs a running `AudioContext`, plays only
+  an unbroken stream and abandons at the first gap; the run's fan-out drops events for a
+  subscriber whose buffer is full (which a reconnect's fresh snapshot repairs), and the
+  executor holds each streaming run's whole PCM in memory as the buffered run held its WAV.
+
+**Amends:** [ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar) (the `audio_bytes` unit; (c)'s "unit from endpoint identity"
+now has a success-path measurement-unit refinement with failure rows uniform, above),
+[ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only) ((e): streaming is **lifted** for `stream=true` with `response_format=pcm`
+or absent, `wav` plus a stream stays a 400 because audio.cpp serves streaming as `pcm` only,
+`stream_format` `sse` and `audio` are relayed and a request that does not stream still takes
+`wav` only; (f): the upstream `Content-Length` is not forwarded for a streamed answer; (g): a
+streamed call's quantity is counted from the relayed PCM, never read from a header; (h): the
+streamed capture stays a redacted summary, now by an explicit stamp; (d): the verdict probe
+also writes `speech_streaming`; the Consequence's "no streaming" cost is lifted),
+[ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (the speech run is no longer always one buffered zero-delta request: it
+streams where the gate allows, `stream_format` is a reserved passthrough field, and the
+run's deadline bounds a streaming run only until its first chunk) and
+[ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter) (the per-mapping cache's second consumers: `output_byte_rate` and its
+`output_byte_rate_model` companion; the rename invalidation stays and a loaded-model
+identity change now also retires a rate).
+
+**Rejected:** **Translating `stream_format` or the event shape** (audio.cpp emits its own;
+the project proxies natively shaped backends and does not translate). **Billing a streamed
+call `audio_second` 0 until a rate exists** (a loud zero on the common success; `audio_bytes`
+is exact and never guessed). **Guessing the rate, from a constant, from a per-family table or
+from `bytes ÷ wall time`** (ADR-041: a wrong rate is a wrong bill, worse than a loud zero;
+the rate is observed from a real WAV `fmt` or it does not exist). **Reading the rate from the
+stream** (headerless PCM; no API states it). **Billing a partial or aborted stream** (a
+partial count is no measurement; the zero is loud). **Assembling the streamed capture like a
+transcription** (it is audio, and the base64 is no text a viewer could use). **A synthesis
+benchmark through the gateway's own loopback** (the run holds the reservation that excludes
+the server, no principal exists for a scheduled run, and the relay forwards none of the
+metering headers, (e)). **Triggering the benchmark inline from the health loop** (a tick
+must stay cheap; the trigger only launches). **Storing the identity inside the rate's
+payload** (a billing-hot-path parse of a structured payload, and a row that could be mistaken
+for a rate; the companion row keeps the rate a plain decimal). **A new table or a migration
+for the rate** (the generic cache is exactly for a fact learned while the model is loaded).
+**A new `agent.Features` flag for the verdict** (an absent verdict already means the correct
+buffered behaviour, ADR-025). **Flipping a model's `mode` from the gateway** (mode is
+run-spec and config; the gateway only reads and follows it). **Playing the portal stream
+without a known rate or with an assumed one** (a wrong rate plays and stores audio at the
+wrong speed). **An AudioWorklet for playback** (scheduled buffer sources are gapless with
+none of its machinery). **A second audio code path for the portal** (the run is the
+existing speech run with a stream branch).
+→ [API Compatibility & Inference
+§3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
+[§7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Routing & Model Selection
+§2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
+[Telemetry, Usage Analytics & Observability
+§8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[Security, Authentication & Authorization
+§14](cross-cutting/security-auth-rbac.md#14-capture-redaction-of-sensitive-headers),
+[Agent-Managed Model Runtime
+§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
+[§6.5](06-runtime-view.md#65-model-selection-benchmark),
+[Data Model](reference/data-model.md#4-migration-history-95-migrations),
+[HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Glossary](12-glossary.md),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

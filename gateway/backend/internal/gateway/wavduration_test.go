@@ -60,6 +60,17 @@ func wavFmtChunkWith(t *testing.T, channels uint16, sampleRate, byteRate uint32,
 	return wavChunk(t, "fmt ", uint32(body.Len()), body.Bytes())
 }
 
+// wavFmtChunkTagged builds a 16-byte `fmt ` chunk that agrees with itself, like
+// wavFmtChunk, but with the audio format tag as given (3 = IEEE float, 0xFFFE =
+// extensible) instead of PCM's 1.
+func wavFmtChunkTagged(t *testing.T, tag, channels uint16, sampleRate uint32, bits uint16) []byte {
+	t.Helper()
+	blockAlign := channels * bits / 8
+	var body bytes.Buffer
+	wavPut(t, &body, tag, channels, sampleRate, sampleRate*uint32(blockAlign), blockAlign, bits)
+	return wavChunk(t, "fmt ", uint32(body.Len()), body.Bytes())
+}
+
 // wavDataChunk builds a `data` chunk holding dataBytes of silence.
 func wavDataChunk(t *testing.T, dataBytes int) []byte {
 	t.Helper()
@@ -105,6 +116,66 @@ func buildPCMWavWithLeadingChunk(t *testing.T, sampleRate uint32, channels, bits
 // files as slices.
 func wavDurationMillis(b []byte) (int64, bool) {
 	return wavDurationFromReader(bytes.NewReader(b))
+}
+
+// wavByteRate reads the byte rate of a WAV held in memory: wavByteRateFromReader, the
+// production entry point, over a byte slice (the twin of wavDurationMillis).
+func wavByteRate(b []byte) (uint32, bool) {
+	return wavByteRateFromReader(bytes.NewReader(b))
+}
+
+// The byte rate is the PCM FORMAT rate (sample rate x channels x bytes per sample),
+// read from the `fmt ` chunk alone: the audio after it is never needed, so the
+// fixtures below are as often header-only as complete files.
+func TestWavByteRateFromReader(t *testing.T) {
+	list := wavChunk(t, "LIST", 5, []byte("INFOx"))
+	for _, tc := range []struct {
+		name string
+		in   []byte
+		want uint32
+	}{
+		{"44.1kHz mono 16-bit", buildPCMWav(t, 44100, 1, 16, 4410), 88200},
+		{"24kHz mono 16-bit", buildPCMWav(t, 24000, 1, 16, 2400), 48000},
+		{"44.1kHz stereo 16-bit", buildPCMWav(t, 44100, 2, 16, 4410), 176400},
+		{"empty data chunk", buildPCMWav(t, 44100, 1, 16, 0), 88200},
+		{"fmt only, the body never follows", wavFile(t, wavFmtChunk(t, 44100, 1, 16)), 88200},
+		{"a foreign chunk before fmt is passed over, odd length and pad byte included", wavFile(t, list, wavFmtChunk(t, 24000, 1, 16), wavDataChunk(t, 100)), 48000},
+		{"a foreign chunk between fmt and data is never reached", buildPCMWavWithLeadingChunk(t, 24000, 1, 16, 100), 48000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rate, ok := wavByteRate(tc.in)
+			if !ok || rate != tc.want {
+				t.Fatalf("wavByteRate = (%d, %v), want (%d, true)", rate, ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestWavByteRateFromReaderRejectsWhatIsNotAnAgreeingWav(t *testing.T) {
+	validFmt := wavFmtChunk(t, 44100, 1, 16)
+	for _, tc := range []struct {
+		name string
+		in   []byte
+	}{
+		{"nil", nil},
+		{"not a wav", []byte("not a wav")},
+		{"riff but webm", []byte("RIFF\x00\x00\x00\x00WEBM")},
+		{"header only, no chunks", []byte("RIFF\x04\x00\x00\x00WAVE")},
+		{"fmt chunk truncated mid-body", buildPCMWav(t, 44100, 1, 16, 100)[:wavRIFFHeaderLen+wavChunkHeaderLen+wavFmtMinLen-1]},
+		{"fmt chunk too short to carry a byte rate", wavFile(t, wavChunk(t, "fmt ", 8, make([]byte, 8)), wavDataChunk(t, 100))},
+		{"data before fmt", wavFile(t, wavDataChunk(t, 100), validFmt)},
+		{"no fmt chunk", wavFile(t, wavChunk(t, "LIST", 5, []byte("INFOx")))},
+		{"byte rate inflated 100x", wavFile(t, wavFmtChunkWith(t, 1, 44100, 8820000, 2, 16), wavDataChunk(t, 100))},
+		{"byte rate zero", wavFile(t, wavFmtChunkWith(t, 1, 44100, 0, 2, 16), wavDataChunk(t, 100))},
+		{"block align not channels x sample size", wavFile(t, wavFmtChunkWith(t, 2, 44100, 88200, 2, 16), wavDataChunk(t, 100))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rate, ok := wavByteRate(tc.in)
+			if ok || rate != 0 {
+				t.Fatalf("wavByteRate = (%d, %v), want (0, false)", rate, ok)
+			}
+		})
+	}
 }
 
 func TestWavDurationMillis(t *testing.T) {
@@ -372,4 +443,43 @@ func TestWavDurationMillisTakesTheLastFmtChunkBeforeData(t *testing.T) {
 			t.Fatalf("wavDurationMillis = (%d, %v), want (0, false)", ms, ok)
 		}
 	})
+}
+
+// wavFormatFromReader reads what the byte rate cannot say: the format tag, the channels, the
+// sample rate and the bit depth, from the same `fmt ` chunk and under the same rules as
+// wavByteRateFromReader (which it must agree with on the rate).
+func TestWavFormatFromReader(t *testing.T) {
+	list := wavChunk(t, "LIST", 5, []byte("INFOx"))
+	for _, tc := range []struct {
+		name string
+		wav  []byte
+		want wavFormat
+		ok   bool
+		mono bool // isMono16PCM
+	}{
+		{"mono 16-bit PCM", buildPCMWav(t, 44100, 1, 16, 0), wavFormat{Tag: 1, Channels: 1, SampleRate: 44100, ByteRate: 88200, Bits: 16}, true, true},
+		{"mono 16-bit behind a foreign chunk", wavFile(t, list, wavFmtChunk(t, 24000, 1, 16)), wavFormat{Tag: 1, Channels: 1, SampleRate: 24000, ByteRate: 48000, Bits: 16}, true, true},
+		{"stereo 16-bit PCM", buildPCMWav(t, 24000, 2, 16, 0), wavFormat{Tag: 1, Channels: 2, SampleRate: 24000, ByteRate: 96000, Bits: 16}, true, false},
+		{"mono 24-bit PCM", buildPCMWav(t, 32000, 1, 24, 0), wavFormat{Tag: 1, Channels: 1, SampleRate: 32000, ByteRate: 96000, Bits: 24}, true, false},
+		{"mono float32", wavFile(t, wavFmtChunkTagged(t, 3, 1, 24000, 32)), wavFormat{Tag: 3, Channels: 1, SampleRate: 24000, ByteRate: 96000, Bits: 32}, true, false},
+		{"mono 16-bit with the extensible tag", wavFile(t, wavFmtChunkTagged(t, 0xFFFE, 1, 24000, 16)), wavFormat{Tag: 0xFFFE, Channels: 1, SampleRate: 24000, ByteRate: 48000, Bits: 16}, true, false},
+		{"a header that contradicts itself", wavFile(t, wavFmtChunkWith(t, 1, 24000, 4_800_000, 2, 16)), wavFormat{}, false, false},
+		{"not a WAV", []byte("not riff at all, not at all"), wavFormat{}, false, false},
+		{"data before fmt", wavFile(t, wavDataChunk(t, 8), wavFmtChunk(t, 24000, 1, 16)), wavFormat{}, false, false},
+		{"a truncated fmt chunk", wavFile(t, wavChunk(t, "fmt ", 8, make([]byte, 8))), wavFormat{}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := wavFormatFromReader(bytes.NewReader(tc.wav))
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("wavFormatFromReader = (%+v, %v), want (%+v, %v)", got, ok, tc.want, tc.ok)
+			}
+			if got.isMono16PCM() != tc.mono {
+				t.Fatalf("isMono16PCM = %v, want %v for %+v", got.isMono16PCM(), tc.mono, got)
+			}
+			// The two readers never disagree about the rate.
+			if rate, rateOK := wavByteRate(tc.wav); rateOK != ok || rate != got.ByteRate {
+				t.Fatalf("wavByteRateFromReader = (%d, %v), want the format's (%d, %v)", rate, rateOK, got.ByteRate, ok)
+			}
+		})
+	}
 }

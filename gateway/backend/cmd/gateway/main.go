@@ -439,6 +439,13 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	// no run and no operator write can interleave; no agent is connected yet,
 	// so an agent sees only the final document.
 	srv.ReconcileBenchmarkOverrideLeases(context.Background())
+	// Bind the app-health loop's speech rate trigger (#263) now that srv exists, the same
+	// construction-order gap as the hooks above: the loop was built, and started, before the
+	// Server. It comes after the lease reconcile, so no run the loop starts can interleave
+	// with that settling, and before the scheduler starts.
+	if deps.SetSpeechRateTrigger != nil {
+		deps.SetSpeechRateTrigger(srv.TriggerSpeechRateBenchmark)
+	}
 	// Wire the affinity session-mode to the resolver from the stored setting
 	// before serving. deps.Portal is the tracing decorator (not the concrete
 	// *portal.Service, and RouteAffinitySessionMode is intentionally off the
@@ -1012,12 +1019,19 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 	// poke an immediate scoped health pass for one server, out of band from
 	// the fleet cadence.
 	appHealthServerTrigger := make(chan string, 64)
+	// The loop starts the speech rate benchmark (#263) through the gateway Server, which
+	// does not exist until gateway.New(deps) returns, so the trigger is bound late: the
+	// loop holds speechRate.trigger, buildGatewayServer binds the Server's method through
+	// the ServerDeps.SetSpeechRateTrigger conduit below. Until then the trigger starts
+	// nothing and the loop asks again on its next tick.
+	speechRate := &lateSpeechRateTrigger{}
 	cancelHealth := startAppHealthLoop(&appHealthRunner{
 		store:                b.Routes,
 		prober:               mux,
 		syncer:               portalService,
 		registry:             appHealth,
 		loaded:               loadedModels,
+		speechRate:           speechRate.trigger,
 		imageOptionsRegistry: appImageOptions,
 		agents:               agentRegistries{presence: agentPresence, certReports: agentCertReports, transport: agentTransport, proxyStatus: agentProxyStatus, runtimeStatus: runtimeStatus, agentFeatures: agentFeatures},
 		groups:               groups,
@@ -1083,6 +1097,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SetRuntimeConfigChangedHook:     portalService.SetRuntimeConfigChangedHook,
 		SetBenchmarkReservationHook:     portalService.SetBenchmarkReservationHook,
 		SetVendorTokenRefresher:         portalService.SetVendorTokenRefresher,
+		SetSpeechRateTrigger:            speechRate.set,
 		Account:                         b.Account,
 		CookieSecure:                    resolveCookieSecure(cfg),
 		SessionMaxAge:                   cfg.SessionMaxTTL,

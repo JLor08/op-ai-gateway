@@ -13,7 +13,7 @@ import (
 // AudioCppModelsPath is audio.cpp's OpenAI-shaped model listing. It is the ONLY
 // place audio.cpp states what a model can do: there is no separate capability
 // document like sd-server's /sdcpp/v1/capabilities, so the capability signal
-// is the task field of each listed model and, for an asr model, its mode.
+// is the task field of each listed model and, for an asr or a speech model, its mode.
 const AudioCppModelsPath = "/v1/models"
 
 // audio.cpp task values, spelled as the server emits them in /v1/models. The
@@ -23,7 +23,9 @@ const AudioCppModelsPath = "/v1/models"
 // it in a reference voice, so both are a speech "yes"; "asr" transcribes speech to
 // text, so it is a transcription "yes". Every other task (the music tasks, ...) is
 // a model that does neither. The speech_clone verdict is a task answer too, and the
-// only one that tells "tts" from "clon".
+// only one that tells "tts" from "clon". The transcription_streaming and
+// speech_streaming verdicts are not task answers: they are read from the mode
+// field below.
 const (
 	audioCppTaskTTS   = "tts"
 	audioCppTaskClone = "clon"
@@ -31,10 +33,11 @@ const (
 )
 
 // audio.cpp mode values. The listing's mode names how the model is LOADED:
-// "streaming" is a model that serves a streamed transcription (stream=true), and
+// "streaming" is a model that serves a streamed answer (stream=true), and
 // "offline" one that answers only a one-shot request and refuses stream=true.
 // Any other value is no statement this code can act on. The mode is read for an
-// ASR model only (parseAudioCppModels): it says how a TRANSCRIBER streams.
+// ASR model (it says how a TRANSCRIBER streams) and for a speech model, tts or
+// clon (it says how a SYNTHESISER streams): parseAudioCppModels.
 const (
 	audioCppModeStreaming = "streaming"
 	audioCppModeOffline   = "offline"
@@ -46,10 +49,10 @@ const (
 // field never breaks the read.
 //
 // Mode is held raw and decoded on its own (audioCppStreamingVerdict), and only
-// for an asr entry: a mode of a type this code does not expect must cost only
-// the streaming verdict, never the speech and transcription verdicts the task
-// decides, and a typed string field would fail the whole document's decode on
-// one odd mode.
+// for an asr, tts or clon entry: a mode of a type this code does not expect must
+// cost only the streaming verdicts, never the speech and transcription verdicts
+// the task decides, and a typed string field would fail the whole document's
+// decode on one odd mode.
 type audioCppModelsDoc struct {
 	Data []struct {
 		ID   string          `json:"id"`
@@ -65,9 +68,9 @@ type audioCppModelsDoc struct {
 // both (the gateway's TestAudioCppModelsCasesMatchTheAgentsTable holds the
 // two copies of that table byte-identical). Change them together.
 //
-// It derives the speech, transcription, transcription streaming and speech clone
-// verdicts for model from a /v1/models body, each "yes", "no" or "" (no answer).
-// It is
+// It derives the speech, transcription, transcription streaming, speech clone and
+// speech streaming verdicts for model from a /v1/models body, each "yes", "no" or
+// "" (no answer), in that order. It is
 // TOLERANT: a body that is not the listing, or an entry of the wrong shape,
 // yields no verdict rather than an error. The rule:
 //   - the entry whose id is model, with task "tts" or "clon" ->
@@ -97,6 +100,22 @@ type audioCppModelsDoc struct {
 // A mode of an unexpected type leaves the task's verdicts alone: it costs only
 // the streaming verdict.
 //
+// The speech_streaming verdict is decided beside those, for a SPEECH model only
+// (task "tts" or "clon"), from the SAME mode field and by the same mapping:
+//   - the entry whose id is model, with task "tts" or "clon" and mode "streaming"
+//     -> speech_streaming "yes"
+//   - the entry whose id is model, with task "tts" or "clon" and mode "offline"
+//     -> speech_streaming "no"
+//   - the entry whose id is model, with task "tts" or "clon" and no mode, an
+//     empty, blank or unknown one, or one that is not a string -> speech_streaming ""
+//   - the entry whose id is model, with any other task (asr, music, an unknown
+//     one) or none -> speech_streaming "", WHATEVER its mode: "speech streaming"
+//     is the synthesiser's capability, so a model that does not synthesise speech
+//     is no "no" on it either (an asr model's mode is its transcription_streaming
+//     verdict, never this one)
+//   - no entry for model, an empty data list, or an unreadable body ->
+//     speech_streaming ""
+//
 // The speech_clone verdict is decided beside those, for the two speech tasks
 // only, from the entry's task alone: it refines speech by saying whether the
 // model synthesises only in a reference voice (which a text-only caller cannot
@@ -113,13 +132,13 @@ type audioCppModelsDoc struct {
 // whitespace, so a "TTS" or "ASR" the server might one day emit does not fall
 // to the "no" default. The first entry that carries the id answers. Whether the
 // model is loaded is the health axis and is deliberately not decoded.
-func parseAudioCppModels(body []byte, model string) (speech, transcription, streaming, speechClone string) {
+func parseAudioCppModels(body []byte, model string) (speech, transcription, streaming, speechClone, speechStreaming string) {
 	if model == "" {
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
 	var doc audioCppModelsDoc
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
 	for _, entry := range doc.Data {
 		if entry.ID != model {
@@ -127,24 +146,26 @@ func parseAudioCppModels(body []byte, model string) (speech, transcription, stre
 		}
 		switch strings.ToLower(strings.TrimSpace(entry.Task)) {
 		case "":
-			return "", "", "", ""
+			return "", "", "", "", ""
 		case audioCppTaskTTS:
-			return "yes", "no", "", "no"
+			return "yes", "no", "", "no", audioCppStreamingVerdict(entry.Mode)
 		case audioCppTaskClone:
-			return "yes", "no", "", "yes"
+			return "yes", "no", "", "yes", audioCppStreamingVerdict(entry.Mode)
 		case audioCppTaskASR:
-			return "no", "yes", audioCppStreamingVerdict(entry.Mode), ""
+			return "no", "yes", audioCppStreamingVerdict(entry.Mode), "", ""
 		default:
-			return "no", "no", "", ""
+			return "no", "no", "", "", ""
 		}
 	}
-	return "", "", "", ""
+	return "", "", "", "", ""
 }
 
-// audioCppStreamingVerdict maps one ASR entry's raw mode onto the transcription
-// streaming verdict (the caller asks it for an asr entry only): "streaming" is
-// "yes" and "offline" "no", matched ignoring case and surrounding whitespace,
-// and everything else is "". Everything else covers an absent field, a null, an
+// audioCppStreamingVerdict maps one entry's raw mode onto a streaming verdict:
+// the transcription streaming one for an asr entry and the speech streaming one
+// for a tts or clon entry. The caller asks it for those entries only, so each
+// streaming capability stays its own kind of model's. "streaming" is "yes" and
+// "offline" "no", matched ignoring case and surrounding whitespace, and
+// everything else is "". Everything else covers an absent field, a null, an
 // empty or blank string, a mode this code does not know (a "no" is only ever
 // the server's own word for a model that cannot stream, never a guess), and a
 // value that is not a string at all.
@@ -164,8 +185,8 @@ func audioCppStreamingVerdict(raw json.RawMessage) string {
 }
 
 // ProbeAudioCppVerdicts GETs baseURL+AudioCppModelsPath and returns the speech,
-// transcription, transcription streaming and speech clone verdicts the listing
-// states for model, in the same PropsVerdicts shape and under the same stable/transient
+// transcription, transcription streaming, speech clone and speech streaming
+// verdicts the listing states for model, in the same PropsVerdicts shape and under the same stable/transient
 // contract as ProbeSdcppVerdicts, ProbePropsVerdicts and ProbeOllamaVerdicts:
 //   - 404/401/403/405 are fixed properties of the running binary, so they
 //     are conclusive (stable, no verdict);
@@ -190,11 +211,12 @@ func ProbeAudioCppVerdicts(ctx context.Context, client *http.Client, baseURL, mo
 	if !json.Valid(body) {
 		return PropsVerdicts{}, false
 	}
-	speech, transcription, streaming, speechClone := parseAudioCppModels(body, model)
+	speech, transcription, streaming, speechClone, speechStreaming := parseAudioCppModels(body, model)
 	return PropsVerdicts{Caps: Capabilities{
 		Speech:                 speech,
 		Transcription:          transcription,
 		TranscriptionStreaming: streaming,
 		SpeechClone:            speechClone,
+		SpeechStreaming:        speechStreaming,
 	}}, true
 }

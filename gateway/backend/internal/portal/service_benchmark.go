@@ -52,6 +52,14 @@ type BenchmarkRunDTO struct {
 	// nothing applies it to a launch spec's vram_estimate_mb or
 	// vram_measured_mb.
 	VRAM *VRAMReportDTO `json:"vram,omitempty"`
+	// TTFTMS, WallMS and RTF are the audio perf metrics of a kind=="speech" row
+	// (routing.BenchmarkRun documents each): the time to the first response byte
+	// and the synthesis wall time in milliseconds, and the real-time factor. Set
+	// only for that kind, and omitted for a speech row that failed or measured
+	// none, which carries its Error instead.
+	TTFTMS int64   `json:"ttft_ms,omitempty"`
+	WallMS int64   `json:"wall_ms,omitempty"`
+	RTF    float64 `json:"rtf,omitempty"`
 }
 
 // CapacityLevelDTO / CapacityReportDTO are the decoded capacity curve for a
@@ -204,6 +212,8 @@ func benchmarkRunDTO(r routing.BenchmarkRun) BenchmarkRunDTO {
 		dto.VisionCapable = &v
 	case "vram":
 		dto.VRAM = decodeVRAMReport(r.VRAMJSON)
+	case "speech":
+		dto.TTFTMS, dto.WallMS, dto.RTF = r.TTFTMS, r.WallMS, r.RTF
 	}
 	return dto
 }

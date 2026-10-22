@@ -1197,6 +1197,20 @@ residual that is accepted and recorded
 ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only),
 [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 
+**A STREAMED speech response is captured as the same redacted summary, whatever its framing**
+([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issue #263). With a `mode=streaming` model the relay answers an event
+stream (`text/event-stream`: base64 PCM frames) or raw PCM (`application/octet-stream`), and
+neither is text a reader of the capture could use, so the capture is **not** assembled the way a
+streamed transcription's is: the response body is the `{content_type, size, redacted: true}`
+summary, the `size` being the bytes the copier wrote, with no tee of the event text at all (the
+copier is handed no capture buffer for a streamed speech call). Because the stream's
+`Content-Type` is not `audio/*`, the summary's type test alone would store the event text, so the
+capture's `Endpoint` is **stamped as speech** (`speechStreamScan.stampCapture`) and the
+`isBinarySpeechResponse` backstop (the speech flavor, an endpoint other than transcription and a
+2xx status) redacts it: the stamp is what makes the decision explicit, and the backstop's
+negative carve-out means a missing stamp still redacts rather than leaks. The request side is
+unchanged (the speech JSON, with the `input` text, is stored as usual).
+
 **A transcription is the opposite case on the response side, and its transcript is
 output-sensitive.** `POST /v1/audio/transcriptions` shares speech's `openai_audio`
 flavor, and the backstop behind the `audio/*` test, `isBinarySpeechResponse`, was keyed on

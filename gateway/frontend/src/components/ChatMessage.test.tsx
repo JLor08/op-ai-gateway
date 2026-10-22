@@ -278,6 +278,46 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         }
       });
 
+      // A streaming model's audio is played AS IT IS GENERATED (ADR-068), so the wait is no
+      // longer silent: "no intermediate news" would be false while the user is listening. The
+      // pending turn says it is playing live, and that the finished audio follows.
+      it('says the audio is playing live, not that no news is coming, while a streamed run plays', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            audioLive
+            elapsedMs={4_000}
+          />,
+        );
+        expect(screen.getByText(t.chatAudioStreamLive)).toBeInTheDocument();
+        expect(screen.getByText(t.chatAudioStreamLiveHint)).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioRunPending)).toBeNull();
+        expect(screen.queryByText(t.chatAudioNoIntermediateNews)).toBeNull();
+        // The clock still ticks, hidden from assistive technology like the other pending turns.
+        expect(screen.getByText('4s').closest('[aria-hidden="true"]')).not.toBeNull();
+        expect(screen.getByText(t.chatAudioStreamLive).closest('[aria-hidden="true"]')).toBeNull();
+      });
+
+      it('keeps the silent wait for a speech run that is not playing live', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="speech"
+            audioLive={false}
+            elapsedMs={4_000}
+          />,
+        );
+        expect(screen.getByText(t.chatAudioRunPending)).toBeInTheDocument();
+        expect(screen.queryByText(t.chatAudioStreamLive)).toBeNull();
+      });
+
       it('does not show the pending state once the audio has arrived, even while still streaming', () => {
         render(
           <ChatMessage

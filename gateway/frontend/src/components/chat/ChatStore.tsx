@@ -13,16 +13,18 @@ import {
   type ReactNode,
   type SetStateAction,
 } from 'react';
-import type {
-  ActiveChatRun,
-  Chat,
-  ChatSummary,
-  ImageModelOptions,
-  ModelOption,
-  PortalApi,
-  PortalServer,
-  PortalToken,
-  ServerModelOption,
+import {
+  NO_SPEECH_STREAMING,
+  type ActiveChatRun,
+  type Chat,
+  type ChatSummary,
+  type ImageModelOptions,
+  type ModelOption,
+  type PortalApi,
+  type PortalServer,
+  type PortalToken,
+  type ServerModelOption,
+  type SpeechStreamingGate,
 } from '../../api';
 import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
@@ -82,6 +84,7 @@ import {
   type TranscriptionSettings,
 } from './chatDoc';
 import { AudioAttachError, prepareAudioClip, type AudioClip } from './audioAttach';
+import { speechPlayback } from './speechPlayback';
 import { useChatRuns } from './useChatRuns';
 import { useChatPersistence } from './useChatPersistence';
 
@@ -255,6 +258,15 @@ export type ChatStore = {
   // then plain free text -- a list is only ever an offer, never a constraint, since
   // the cache holds just the voices the health loop has seen.
   modelVoices: readonly string[];
+  // Whether the speech composer may offer STREAMING playback for the effective model: the
+  // gateway's own answer (api.modelSpeechStreaming) that every mapping the model could be
+  // served by streams its audio AND has its output rate known, which is what makes the
+  // headerless PCM playable (ADR-068). False whenever there is nothing to offer -- not a
+  // speech model, the lookup is in flight, it failed (fail closed), or the gateway said no --
+  // and the thread then runs the buffered WAV run it always has. The gateway decides again
+  // at run time; this only decides whether the toggle exists and whether the browser's audio
+  // is readied when a turn is sent.
+  speechStreaming: boolean;
   // The THREAD's kind: "" (text), "image", "speech" or "transcription". Pinned by the backend
   // at the thread's first send and authoritative from then on; while the thread is
   // still empty it follows the picked model, because that is what the next
@@ -313,6 +325,11 @@ export type ChatStore = {
   // WHOLE transcript on every token delta of any live run, not just the row
   // in flight.
   runElapsedMs: number | undefined;
+  // Whether the active chat's running speech run is playing its audio live right now (a
+  // streaming model's chunks, played as they arrive). The pending turn then says so instead
+  // of "no intermediate news". False for every other run and once the run is over; gated into
+  // ChatMessage like runKind above, for the same memo reason.
+  runAudioLive: boolean;
   // Multi-chat layer.
   chats: ChatSummary[];
   activeChatId: string | null;
@@ -437,6 +454,7 @@ export function ChatStoreProvider({
     | 'createChat'
     | 'deleteChat'
     | 'modelImageOptions'
+    | 'modelSpeechStreaming'
     | 'modelVoices'
     | 'saveChat'
     | 'saveChatKeepalive'
@@ -518,6 +536,11 @@ export function ChatStoreProvider({
   // The effective speech model's cached voice names (see api.modelVoices), offered by the
   // speech composer's voice picker. Empty while there are none.
   const [modelVoices, setModelVoices] = useState<readonly string[]>(NO_VOICES);
+  // The effective speech model's streaming gate (see api.modelSpeechStreaming): closed
+  // until the gateway says otherwise.
+  const [speechStreamingGate, setSpeechStreamingGate] =
+    useState<SpeechStreamingGate>(NO_SPEECH_STREAMING);
+  const speechStreamingRef = useRef(false);
 
   // The caller's manageable servers (undefined prop -> []): drives whether the
   // server-override picker renders at all and its option list.
@@ -779,6 +802,7 @@ export function ChatStoreProvider({
   );
   const {
     runningChatIds,
+    audioLiveChatIds,
     isRunning,
     statusOf: runStatusOf,
     runIdIfRunning,
@@ -817,6 +841,8 @@ export function ChatStoreProvider({
   // runElapsedMs need not tick here.
   const runKind = activeChatId ? kindOf(activeChatId) : undefined;
   const runElapsedMs = activeChatId ? elapsedMsOf(activeChatId) : undefined;
+  // Whether the active chat's run is playing streamed audio now (see useChatRuns).
+  const runAudioLive = activeChatId ? audioLiveChatIds.has(activeChatId) : false;
 
   // The persistence layer (FA-2): owns buildDoc/flushSave, the debounced-save
   // effect, the pagehide keepalive, and the unmount flush behind a narrow
@@ -893,6 +919,7 @@ export function ChatStoreProvider({
     maxTokensRef.current = maxTokens;
     imageSettingsRef.current = imageSettings;
     audioSettingsRef.current = audioSettings;
+    speechStreamingRef.current = speechStreamingGate.streaming;
     transcriptionSettingsRef.current = transcriptionSettings;
     selectedTokenIdRef.current = selectedTokenId;
     serverOverrideRef.current = serverOverride;
@@ -1287,6 +1314,47 @@ export function ChatStoreProvider({
     };
   }, [modelSpeechCapable, effectiveModel]);
 
+  // Ask the gateway whether the effective SPEECH model may be streamed (ADR-068), for the
+  // composer's toggle. The voices effect above, for the streaming gate: closed up front (the
+  // answer belongs to ONE model, and a stale yes must not stay on offer while the next
+  // lookup is in flight -- the toggle would promise streaming the gateway will not do), a
+  // latest-wins guard against a slow stale response, and no lookup at all for a non-speech
+  // (or no) model. FAIL CLOSED: a failed lookup is a no, which leaves the thread on the
+  // buffered WAV run it always had. The deps list ends at the model, like the voices
+  // effect's: the answer does not depend on the thread.
+  useEffect(() => {
+    setSpeechStreamingGate(NO_SPEECH_STREAMING);
+    if (!modelSpeechCapable || effectiveModel === '') return;
+    let cancelled = false;
+    void apiRef.current
+      .modelSpeechStreaming(effectiveModel)
+      .then((gate) => {
+        if (!cancelled) setSpeechStreamingGate(gate);
+      })
+      .catch(() => {
+        if (!cancelled) setSpeechStreamingGate(NO_SPEECH_STREAMING);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelSpeechCapable, effectiveModel]);
+
+  // Ready the browser's audio from inside the user's gesture, for a turn that will stream.
+  // A page may only make sound once the user has acted on it, and Safari wants the audio
+  // context created and resumed INSIDE the handler of the click that sends: by the time the
+  // first chunk arrives over the network the gesture is long gone. So send() and the replay
+  // entry points call this before their first await -- and only for a speech thread that has
+  // streaming on and available, so no other send touches the browser's audio.
+  const primeSpeechPlayback = useCallback(() => {
+    if (
+      chatKindRef.current === 'speech' &&
+      audioSettingsRef.current.stream &&
+      speechStreamingRef.current
+    ) {
+      speechPlayback.prime();
+    }
+  }, []);
+
   // The run/SSE engine's subscribe/finishRun/adoptCanonicalTranscript/
   // ensureAssistant/writeAssistant/updateChatMessages/markRunning now live in
   // useChatRuns.ts (FA-2); `runs` above exposes the narrow interface this
@@ -1402,6 +1470,7 @@ export function ChatStoreProvider({
       messagesRef.current = history;
       chatBuffers.set(chatId, history);
       handlerCacheRef.current.clear();
+      primeSpeechPlayback();
       try {
         const res = await apiRef.current.startChatRun(chatId, {
           edited_history: history.map((m) => ({ ...m })),
@@ -1412,7 +1481,7 @@ export function ChatStoreProvider({
         showErrorRef.current(formatPortalError(err, tRef.current));
       }
     },
-    [subscribeRun, currentSettings, chatBuffers, passthroughRefusal],
+    [subscribeRun, currentSettings, chatBuffers, passthroughRefusal, primeSpeechPlayback],
   );
 
   // Set the active chat's title from the first user message, when it is still
@@ -1638,6 +1707,7 @@ export function ChatStoreProvider({
     // in the composer afterwards, as if it had been attached to the next turn.
     abandonAudioAttach();
 
+    primeSpeechPlayback();
     try {
       const res = await apiRef.current.startChatRun(chatId, {
         user_message: content,
@@ -2029,6 +2099,7 @@ export function ChatStoreProvider({
     attachMode,
     modelImageOptions,
     modelVoices,
+    speechStreaming: speechStreamingGate.streaming,
     chatKind,
     imageSettings,
     setImageSettings,
@@ -2038,6 +2109,7 @@ export function ChatStoreProvider({
     setTranscriptionSettings,
     runKind,
     runElapsedMs,
+    runAudioLive,
     chats,
     activeChatId,
     chatsLoading,

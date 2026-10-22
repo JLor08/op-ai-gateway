@@ -129,7 +129,7 @@ var (
 )
 
 type runEvent struct {
-	Event     string      `json:"-"` // "snapshot" | "delta" | "done"
+	Event     string      `json:"-"` // "snapshot" | "delta" | "audio" | "done"
 	Reasoning string      `json:"reasoning,omitempty"`
 	Content   string      `json:"content,omitempty"`
 	Metrics   *runMetrics `json:"metrics,omitempty"`
@@ -174,6 +174,12 @@ type runEvent struct {
 	// holds the same image by reference (a /api/portal/chat-blobs/ url), which
 	// the post-`done` canonical refetch delivers.
 	ContentParts json.RawMessage `json:"content_parts,omitempty"`
+	// Audio is one chunk of the audio a STREAMING speech run is generating, carried by
+	// the `audio` event only (never snapshot, delta or done): the PCM the composer plays
+	// as it arrives. It is not part of any buffer, so a snapshot cannot replay it and a
+	// late subscriber is served the terminal turn's WAV (ContentParts) instead. See
+	// runAudio.
+	Audio *runAudio `json:"audio,omitempty"`
 }
 
 type runMetrics struct {
@@ -573,6 +579,10 @@ var imageRunDeadline = 10 * time.Minute
 // within N minutes" is the only honest thing the UI can promise about the wait.
 // Same value, its own var, so the two kinds' promises can move independently and
 // a test can shrink one without touching the other.
+//
+// It is the end-to-end bound of the BUFFERED run only. A run that streams (ADR-068,
+// executeAudioRun) is bounded by it only until its first chunk of audio, like a
+// transcription run, and from there the gateway relay's idle timeout watches it.
 var speechRunDeadline = 10 * time.Minute
 
 // transcriptionRunDeadline bounds a TRANSCRIPTION run, for the reason imageRunDeadline
@@ -595,7 +605,8 @@ var transcriptionRunDeadline = 10 * time.Minute
 // when the kind is UNBOUNDED.
 //
 // Only image, speech and transcription runs are bounded: each is a single request
-// whose output arrives at the end -- or, for a transcription, whose first delta does.
+// whose output arrives at the end -- or, for a transcription or a streaming speech run,
+// whose first delta (chunk of audio) does.
 // A text run streams deltas, so the user can see for themselves that it is alive and
 // the honesty argument above simply does not apply to it -- while a ceiling would
 // newly kill long generations from a slow local model that complete today.
@@ -613,6 +624,14 @@ func runDeadlineFor(kind string) (time.Duration, bool) {
 		return transcriptionRunDeadline, true
 	}
 	return 0, false
+}
+
+// armsItsOwnDeadline reports whether the executor of this kind arms (and may lift) its
+// own deadline instead of running under the end-to-end one executeRun derives: the kinds
+// whose answer can be a stream, which shows by itself that it is alive from its first
+// delta on (see runDeadlineFor).
+func armsItsOwnDeadline(kind string) bool {
+	return kind == chatRunKindTranscription || kind == chatRunKindSpeech
 }
 
 // runTimedOutMessage is the terminal error of a run its own deadline ended. A
@@ -803,10 +822,12 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	// cancels this -- and the deferred cancel releases the timer on every
 	// terminal path, including the ordinary success one.
 	//
-	// The transcription kind is bounded too (runDeadlineFor), but not here: its
-	// deadline is only the budget for the wait for the first delta of a stream, so its
-	// executor arms it itself and lifts it there (executeTranscriptionRun).
-	if d, bounded := runDeadlineFor(prep.Settings.Kind); bounded && prep.Settings.Kind != chatRunKindTranscription {
+	// The transcription and speech kinds are bounded too (runDeadlineFor), but not
+	// here: when they stream, their deadline is only the budget for the wait for the
+	// first delta (a transcription's) or chunk (a speech run's), so their executors arm
+	// it themselves and lift it there (executeTranscriptionRun, executeAudioRun). What
+	// they answer without a stream is still bounded to its end by the same timer.
+	if d, bounded := runDeadlineFor(prep.Settings.Kind); bounded && !armsItsOwnDeadline(prep.Settings.Kind) {
 		var cancelDeadline context.CancelFunc
 		ctx, cancelDeadline = context.WithTimeout(ctx, d)
 		defer cancelDeadline()

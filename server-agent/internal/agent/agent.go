@@ -315,7 +315,21 @@ import (
 // there. The agent itself gates nothing on it. The same
 // reasoning made 0.7.0 (runtime_upstream_props), 0.8.0 (runtime_ensure), 0.9.0
 // (multipart_proxy) and 0.10.0 (runtime_config_files) a MINOR.
-const Version = "0.11.0"
+//
+// 0.11.0 -> 0.11.1 is the single bump for the streamed-speech-metering branch
+// (issues #253/#263): the same audio_cpp probe of /v1/models now also reads the
+// listed model's "mode" for a speech model (task "tts" or "clon", where 0.9.2
+// read it for an asr one) and reports it as the "speech_streaming" verdict ("yes"
+// for streaming, "no" for offline, nothing for any other mode), so the gateway can
+// answer a stream=true speech request up front -- streamed or buffered -- instead
+// of discovering a refusal from the child. It rides the same
+// sample.CapabilitySourceAudioCppModels source, gated on the same gateway-declared
+// "capability_source_audiocpp", and is cached with the other verdicts of the same
+// document. PATCH, and the rule decides it: agent.Features gains NO entry, and no
+// wire shape changes (an open-vocabulary verdict name on an existing source), the
+// reasoning of 0.9.1 -> 0.9.2 above. An older agent never reports the name, which
+// the gateway reads as unknown and answers buffered, the correct default.
+const Version = "0.11.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1683,8 +1697,9 @@ func (a *Agent) clock() time.Time {
 //     capability signal: each listed model carries a task, and the entry for
 //     st.Model answers the speech and transcription capabilities as "yes" or
 //     "no" and, for an asr model, the transcription_streaming capability from
-//     its mode, and nothing else; its LiveProgress is ALWAYS "", because
-//     audio.cpp has no timings surface.
+//     its mode (for a tts or clon model, speech_streaming from its mode),
+//     and nothing else; its LiveProgress is ALWAYS "", because audio.cpp has no
+//     timings surface.
 //   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
 //     GETs collector.LiveProgressProbePath ("/props").
 //
@@ -1923,10 +1938,10 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 }
 
 // capabilitiesSample converts one probe's collector.Capabilities into
-// RuntimeSample.Capabilities' wire pointer type: each of the nine named
+// RuntimeSample.Capabilities' wire pointer type: each of the ten named
 // fields (vision, video, audio, tools, image, speech, transcription,
-// transcription_streaming, speech_clone) becomes one CapabilityVerdict entry keyed by its
-// name, every Extra name becomes a "yes" entry (a reported extra capability is
+// transcription_streaming, speech_clone, speech_streaming) becomes one
+// CapabilityVerdict entry keyed by its name, every Extra name becomes a "yes" entry (a reported extra capability is
 // a positive assertion), and an empty ("" -- undetermined) field is skipped
 // entirely rather than carried as an entry, mirroring the store's
 // row-absence-means-unknown model.
@@ -1943,7 +1958,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // side the ingest folds this list into capability rows and keeps the FIRST
 // entry for a given name, dropping every later one -- so a name that appears
 // both as a structured field and in Extra resolves to the STRUCTURED answer.
-// The nine named fields therefore go first and Extra after; swapping the two
+// The ten named fields therefore go first and Extra after; swapping the two
 // blocks silently hands the open list the last word.
 //
 // Always returns a non-nil pointer whose Verdicts is itself non-nil (though
@@ -1953,7 +1968,7 @@ func imageOptionsSample(o *collector.SdcppImageOptions) *sample.RuntimeImageOpti
 // uncached, undetermined probe -- see sample.RuntimeSample.Capabilities' own
 // doc comment for why that distinction is load-bearing.
 func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabilities {
-	verdicts := make([]sample.CapabilityVerdict, 0, 9+len(c.Extra))
+	verdicts := make([]sample.CapabilityVerdict, 0, 10+len(c.Extra))
 	if c.Vision != "" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "vision", Verdict: c.Vision})
 	}
@@ -1991,6 +2006,15 @@ func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabil
 	// alone; this keeps the emission itself from putting the name on any other.
 	if c.SpeechClone != "" && c.Speech == "yes" {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "speech_clone", Verdict: c.SpeechClone})
+	}
+	// speech_streaming refines speech the same way transcription_streaming
+	// refines transcription: it says whether a speech model streams its audio,
+	// so it is stated only beside a speech "yes". A model that does not
+	// synthesise has no answer on it, not even a "no". The audio.cpp probe
+	// already sets it for a tts or clone model alone; this keeps the emission
+	// itself from putting the name on any other.
+	if c.SpeechStreaming != "" && c.Speech == "yes" {
+		verdicts = append(verdicts, sample.CapabilityVerdict{Name: "speech_streaming", Verdict: c.SpeechStreaming})
 	}
 	for _, name := range c.Extra {
 		verdicts = append(verdicts, sample.CapabilityVerdict{Name: name, Verdict: "yes"})

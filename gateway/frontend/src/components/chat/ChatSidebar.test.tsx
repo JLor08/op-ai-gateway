@@ -53,6 +53,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     attachMode: 'vision',
     modelImageOptions: null,
     modelVoices: [],
+    speechStreaming: false,
     chatKind: '',
     imageSettings: DEFAULT_IMAGE_SETTINGS,
     setImageSettings: vi.fn(),
@@ -62,6 +63,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     setTranscriptionSettings: vi.fn(),
     runKind: undefined,
     runElapsedMs: undefined,
+    runAudioLive: false,
     chats: [
       { id: 'c1', title: 'First chat', created_at: '', updated_at: '2026-07-17T13:00:00Z' },
       { id: 'c2', title: '', created_at: '', updated_at: '2026-07-17T12:00:00Z' },

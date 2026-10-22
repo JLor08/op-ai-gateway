@@ -3271,6 +3271,15 @@ describe('speech capability i18n key', () => {
     expect(messages.en.capabilitySpeech).toBe('Speech synthesis');
   });
 
+  // "speech_streaming" refines "speech" (the model streams its audio as it is generated), so
+  // its chip must read as that refinement, distinct from the plain Speech chip beside it.
+  it('labels the speech_streaming chip in de and en, distinct from Speech', () => {
+    expect(messages.de.capabilitySpeechStreaming).toBe('Streaming-Sprachsynthese');
+    expect(messages.en.capabilitySpeechStreaming).toBe('Streaming speech synthesis');
+    expect(messages.de.capabilitySpeechStreaming).not.toBe(messages.de.capabilitySpeech);
+    expect(messages.en.capabilitySpeechStreaming).not.toBe(messages.en.capabilitySpeech);
+  });
+
   // "speech" is the text-to-speech endpoint, "audio" the input modality.
   it('keeps the speech chip label distinct from the audio modality label', () => {
     expect(messages.de.capabilitySpeech).not.toBe(messages.de.capabilityAudio);
@@ -3403,13 +3412,35 @@ describe('portal chat speech i18n keys', () => {
     for (const locale of ['de', 'en'] as const) {
       const text = messages[locale].chatSpeechPassthroughReserved('Response_Format');
       expect(text, locale).toContain('Response_Format');
-      for (const reserved of ['model', 'input', 'stream', 'response_format']) {
+      for (const reserved of ['model', 'input', 'stream', 'stream_format', 'response_format']) {
         expect(text, `${locale} lists ${reserved}`).toContain(reserved);
       }
     }
     expect(messages.de.chatSpeechPassthroughReserved('x')).not.toBe(
       messages.en.chatSpeechPassthroughReserved('x'),
     );
+  });
+
+  // The streaming playback of a speech run (ADR-068): the composer's toggle and the pending
+  // turn that says the audio is playing while it is generated.
+  it('defines the speech streaming keys in de and en, distinct from the silent wait', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const t = messages[locale];
+      for (const k of [
+        'chatSpeechStream',
+        'chatSpeechStreamHint',
+        'chatAudioStreamLive',
+        'chatAudioStreamLiveHint',
+      ] as const) {
+        expect(typeof t[k], `${locale} ${k}`).toBe('string');
+        expect(t[k].length, `${locale} ${k}`).toBeGreaterThan(0);
+      }
+      // A live run is not the silent wait: neither sentence may be the one that promises
+      // there is no news.
+      expect(t.chatAudioStreamLive).not.toBe(t.chatAudioRunPending);
+      expect(t.chatAudioStreamLiveHint).not.toBe(t.chatAudioNoIntermediateNews);
+    }
+    expect(messages.de.chatSpeechStream).not.toBe(messages.en.chatSpeechStream);
   });
 
   it('defines every speech composer, settings and audio-answer key in de and en', () => {
@@ -3436,7 +3467,7 @@ describe('portal chat speech i18n keys', () => {
 
   // The hint says what happens to the passthrough (the composer's reserved-field check,
   // mirroring buildSpeechBody in chat_runs_audio.go), not what a reader might assume. A
-  // reserved key (model, input, stream, response_format -- speechReservedFields, matched
+  // reserved key (model, input, stream, stream_format, response_format -- speechReservedFields, matched
   // ignoring case) is refused before anything is sent; it is NOT silently "set by the
   // chat". And the
   // voice and speed fields of the panel win over a same-named passthrough key. The
@@ -3447,7 +3478,7 @@ describe('portal chat speech i18n keys', () => {
       const t = messages[locale];
 
       it('names every reserved field the run refuses', () => {
-        for (const field of ['model', 'input', 'stream', 'response_format']) {
+        for (const field of ['model', 'input', 'stream', 'stream_format', 'response_format']) {
           expect(t.chatSpeechPassthroughHint).toContain(field);
         }
       });
@@ -3541,6 +3572,18 @@ describe('portal chat speech error i18n keys', () => {
     'errorSpeechUpstreamError',
   ] as const;
 
+  // gateway.chat_run_speech_response_unreadable has three causes (a body that could not be
+  // read to its end, one not labelled as WAV, and -- for a streamed synthesis -- a stream cut
+  // before its completion), so its label must not name a WAV-format cause that two of them
+  // are not.
+  it('words the unreadable-response label neutrally, not as a WAV-format failure', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].errorChatRunSpeechResponseUnreadable;
+      expect(text, locale).not.toMatch(/WAV/);
+      expect(text, locale).toMatch(locale === 'de' ? /bis zum Ende/ : /to its end/);
+    }
+  });
+
   it('defines a user-facing label for each speech error code in de and en', () => {
     for (const k of keys) {
       expect(typeof messages.de[k], k).toBe('string');
@@ -3569,18 +3612,23 @@ describe('portal chat speech error i18n keys', () => {
       const t = messages[locale];
       const label = t.errorChatRunSpeechReservedField;
       expect(label).toContain(t.chatSpeechAdvanced);
-      for (const field of ['model', 'input', 'stream', 'response_format']) {
+      for (const field of ['model', 'input', 'stream', 'stream_format', 'response_format']) {
         expect(label).toContain(field);
       }
       expect(label).toMatch(locale === 'de' ? /nicht gesendet/ : /not sent/);
     }
   });
 
-  // speech.stream_unsupported is reachable from the portal only through a
-  // stream_format passthrough key, so the sentence names the field to remove.
-  it('names the stream_format field in the streaming refusal', () => {
-    expect(messages.de.errorSpeechStreamUnsupported).toContain('stream_format');
-    expect(messages.en.errorSpeechStreamUnsupported).toContain('stream_format');
+  // The run sets stream and stream_format itself now (ADR-068), so speech.stream_unsupported
+  // is only a fallback from the portal -- and the sentence must not claim that speech
+  // synthesis has no streaming, which it has: it points at the thread's streaming choice.
+  it('points the streaming refusal at turning streaming off, not at a field that is reserved', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const text = messages[locale].errorSpeechStreamUnsupported;
+      expect(text, locale).toMatch(/streaming/i);
+      expect(text, locale).not.toContain('stream_format');
+      expect(text, locale).not.toMatch(/unterstützt kein Streaming|does not support streaming/);
+    }
   });
 
   // The endpoint answers WAV only; the format refusal states the one that works.

@@ -2783,8 +2783,8 @@ func TestCapabilitiesSampleEmitsImageBetweenNamedFieldsAndExtra(t *testing.T) {
 
 // TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra pins where the
 // audio.cpp verdicts (speech, transcription and, for a transcriber,
-// transcription_streaming, and for a synthesiser, speech_clone) land on the
-// wire: after the five other named fields and before every Extra entry, in both
+// transcription_streaming, and for a synthesiser, speech_clone and
+// speech_streaming) land on the wire: after the five other named fields and before every Extra entry, in both
 // directions, and not at all when undetermined. As for image, the position is the load-bearing part: the
 // gateway keeps the FIRST entry for a name, so a "speech" that also appears in
 // Extra (Extra can only say "yes") must lose to the structured field.
@@ -2920,6 +2920,52 @@ func TestCapabilitiesSampleEmitsSpeechAndTranscriptionBeforeExtra(t *testing.T) 
 		{
 			name: "a speech_clone verdict with no speech verdict is not carried",
 			caps: collector.Capabilities{SpeechClone: "no"},
+			want: []sample.CapabilityVerdict{},
+		},
+		{
+			name: "speech_streaming follows speech_clone and precedes Extra",
+			caps: collector.Capabilities{
+				Speech: "yes", Transcription: "no", SpeechClone: "no", SpeechStreaming: "yes", Extra: []string{"thinking"},
+			},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "transcription", Verdict: "no"},
+				{Name: "speech_clone", Verdict: "no"},
+				{Name: "speech_streaming", Verdict: "yes"},
+				{Name: "thinking", Verdict: "yes"},
+			},
+		},
+		{
+			name: "a speech_streaming no is carried, ahead of an Extra entry of the same name",
+			caps: collector.Capabilities{
+				Speech: "yes", SpeechStreaming: "no", Extra: []string{"speech_streaming"},
+			},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "speech_streaming", Verdict: "no"},
+				{Name: "speech_streaming", Verdict: "yes"},
+			},
+		},
+		{
+			name: "an undetermined speech_streaming verdict is omitted",
+			caps: collector.Capabilities{Speech: "yes", Transcription: "no", SpeechClone: "yes"},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "yes"},
+				{Name: "transcription", Verdict: "no"},
+				{Name: "speech_clone", Verdict: "yes"},
+			},
+		},
+		{
+			name: "a speech_streaming verdict beside a speech no is not carried",
+			caps: collector.Capabilities{Speech: "no", Transcription: "yes", SpeechStreaming: "yes"},
+			want: []sample.CapabilityVerdict{
+				{Name: "speech", Verdict: "no"},
+				{Name: "transcription", Verdict: "yes"},
+			},
+		},
+		{
+			name: "a speech_streaming verdict with no speech verdict is not carried",
+			caps: collector.Capabilities{SpeechStreaming: "yes"},
 			want: []sample.CapabilityVerdict{},
 		},
 	}
@@ -3957,6 +4003,23 @@ func audioCppTTSCaps() *sample.Capabilities {
 	}
 }
 
+// audioCppSpeechStreamingCaps is the capability set a plain-synthesiser
+// audio_cpp child reports when its listing also states a mode: the speech,
+// transcription and speech_clone verdicts the task decides, then the
+// speech_streaming one the mode decides, in that order, under the literal source
+// the gateway matches.
+func audioCppSpeechStreamingCaps(speechClone, speechStreaming string) *sample.Capabilities {
+	return &sample.Capabilities{
+		Verdicts: []sample.CapabilityVerdict{
+			{Name: "speech", Verdict: "yes"},
+			{Name: "transcription", Verdict: "no"},
+			{Name: "speech_clone", Verdict: speechClone},
+			{Name: "speech_streaming", Verdict: speechStreaming},
+		},
+		Source: "audiocpp_models",
+	}
+}
+
 // TestProbeRuntimeChildPropsAudioCppReadsItsModelListing is the wiring proof
 // for audio.cpp: when the gateway declares capability_source_audiocpp, an
 // audio_cpp child is asked exactly one thing, GET /v1/models, and never
@@ -4031,8 +4094,10 @@ func audioCppStreamingCaps(streaming string) *sample.Capabilities {
 // the child's own listing states for the spec's model comes out as a
 // transcription_streaming verdict beside the speech and transcription ones, with
 // no second child request and no new gateway feature. A model that is not an ASR
-// model gets no such verdict, whatever its mode, and an ASR model whose listing
-// states no mode gets none either.
+// model gets no such verdict, whatever its mode (a speech model's mode is its
+// speech_streaming verdict instead, pinned by
+// TestProbeRuntimeChildPropsAudioCppReportsSpeechStreaming), and an ASR model
+// whose listing states no mode gets none either.
 func TestProbeRuntimeChildPropsAudioCppReportsTranscriptionStreaming(t *testing.T) {
 	asr := func(mode string) string {
 		return `{"object":"list","data":[{"id":"whisper-small","task":"tts","mode":"streaming"},{"id":"kokoro-82m","task":"asr","mode":` + mode + `}]}`
@@ -4047,14 +4112,14 @@ func TestProbeRuntimeChildPropsAudioCppReportsTranscriptionStreaming(t *testing.
 		{"an asr child with an unknown mode", asr(`"realtime"`), audioCppCaps("no", "yes")},
 		{"an asr child with no mode", audioCppASRDoc, audioCppCaps("no", "yes")},
 		{
-			"a tts child in streaming mode",
+			"a tts child in streaming mode gets no transcription_streaming verdict",
 			`{"data":[{"id":"kokoro-82m","task":"tts","mode":"streaming"}]}`,
-			audioCppTTSCaps(),
+			audioCppSpeechStreamingCaps("no", "yes"),
 		},
 		{
-			"a tts child in offline mode, as audio.cpp v0.9.1 lists it",
+			"a tts child in offline mode, as audio.cpp v0.9.1 lists it, gets no transcription_streaming verdict",
 			`{"data":[{"id":"kokoro-82m","task":"tts","mode":"offline"}]}`,
-			audioCppTTSCaps(),
+			audioCppSpeechStreamingCaps("no", "no"),
 		},
 	}
 	for _, tc := range cases {
@@ -4063,6 +4128,67 @@ func TestProbeRuntimeChildPropsAudioCppReportsTranscriptionStreaming(t *testing.
 			features := &fakeGatewayFeatures{names: []string{"capability_source_audiocpp"}}
 			a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
 			st, base := audioCppStatus(t, child, 7230)
+
+			var rs sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)
+			if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("child requests = %v, want exactly %v (one listing read answers every verdict)", got, want)
+			}
+			if rs.Capabilities == nil || !reflect.DeepEqual(*rs.Capabilities, *tc.want) {
+				t.Errorf("Capabilities = %+v, want %+v", rs.Capabilities, tc.want)
+			}
+
+			// The verdict is cached with the others: a second cycle on the same
+			// pid reports it again without asking the child a second time.
+			var again sample.RuntimeSample
+			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &again)
+			if got, want := child.requests(), map[string]int{audioCppModelsRoute: 1}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("child requests after a same-pid call = %v, want still %v", got, want)
+			}
+			if again.Capabilities == nil || !reflect.DeepEqual(*again.Capabilities, *tc.want) {
+				t.Errorf("Capabilities (cache hit) = %+v, want %+v", again.Capabilities, tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeRuntimeChildPropsAudioCppReportsSpeechStreaming is the wiring proof
+// for the speech_streaming verdict on the EXISTING audio.cpp source: the mode the
+// child's own listing states for a tts or clon spec model comes out as a
+// speech_streaming verdict after the speech, transcription and speech_clone ones
+// ("streaming" a yes, "offline" a no), with no second child request and no new
+// gateway feature. A mode the rule does not know states nothing, and a model
+// that does not synthesise speech (asr above all, whose mode is the
+// transcription_streaming verdict instead) gets no speech_streaming verdict,
+// whatever its mode: it refines a speech "yes", so a model that does not
+// synthesise has no answer on it, not even a "no".
+func TestProbeRuntimeChildPropsAudioCppReportsSpeechStreaming(t *testing.T) {
+	listing := func(task, mode string) string {
+		return `{"object":"list","data":[{"id":"whisper-small","task":"asr","mode":"streaming"},{"id":"kokoro-82m","task":"` + task + `","mode":` + mode + `}]}`
+	}
+	cases := []struct {
+		name string
+		doc  string
+		want *sample.Capabilities
+	}{
+		{"a tts child in streaming mode", listing("tts", `"streaming"`), audioCppSpeechStreamingCaps("no", "yes")},
+		{"a tts child in offline mode", listing("tts", `"offline"`), audioCppSpeechStreamingCaps("no", "no")},
+		{"a clone child in streaming mode", listing("clon", `"streaming"`), audioCppSpeechStreamingCaps("yes", "yes")},
+		{"a clone child in offline mode", listing("clon", `"offline"`), audioCppSpeechStreamingCaps("yes", "no")},
+		{"a tts child with an unknown mode states nothing", listing("tts", `"realtime"`), audioCppTTSCaps()},
+		{"a tts child with a null mode states nothing", listing("tts", `null`), audioCppTTSCaps()},
+		{
+			"an asr child in streaming mode states transcription_streaming and no speech_streaming",
+			`{"data":[{"id":"kokoro-82m","task":"asr","mode":"streaming"}]}`,
+			audioCppStreamingCaps("yes"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newProbeChild(t, map[string]string{audioCppModelsRoute: tc.doc})
+			features := &fakeGatewayFeatures{names: []string{"capability_source_audiocpp"}}
+			a := NewFromDeps(config.Config{}, Deps{GatewayFeatures: features})
+			st, base := audioCppStatus(t, child, 7250)
 
 			var rs sample.RuntimeSample
 			a.probeRuntimeChildProps(context.Background(), child.srv.Client(), base, st, &rs)

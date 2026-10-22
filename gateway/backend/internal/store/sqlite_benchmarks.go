@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"op-ai-gateway/internal/routing"
@@ -30,8 +31,8 @@ func (s *SQLiteStore) InsertBenchmarkRun(ctx context.Context, run routing.Benchm
 			id, mapping_id, server_id, created_at,
 			gen_tokens_per_second, prompt_tokens_per_second,
 			load_time_ms, context_size, error, kind, capacity_curve, vision_capable,
-			vram_json
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			vram_json, ttft_ms, wall_ms, rtf
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id,
 		run.MappingID,
 		run.ServerID,
@@ -45,6 +46,9 @@ func (s *SQLiteStore) InsertBenchmarkRun(ctx context.Context, run routing.Benchm
 		run.CapacityCurve,
 		run.VisionCapable,
 		run.VRAMJSON,
+		nullInt64OfZero(run.TTFTMS),
+		nullInt64OfZero(run.WallMS),
+		nullFloat64OfZero(run.RTF),
 	)
 	if err != nil {
 		if s.dl.isForeignKeyViolation(err) {
@@ -65,7 +69,7 @@ func (s *SQLiteStore) BenchmarkRunsByMapping(ctx context.Context, mappingID stri
 		select id, mapping_id, server_id, created_at,
 			gen_tokens_per_second, prompt_tokens_per_second,
 			load_time_ms, context_size, error, kind, capacity_curve, vision_capable,
-			vram_json
+			vram_json, ttft_ms, wall_ms, rtf
 		from model_mapping_benchmarks
 		where mapping_id = ?
 		order by created_at desc
@@ -78,21 +82,37 @@ func (s *SQLiteStore) BenchmarkRunsByMapping(ctx context.Context, mappingID stri
 	for rows.Next() {
 		var run routing.BenchmarkRun
 		var visionCapable int64
+		var ttftMS, wallMS sql.NullInt64
+		var rtf sql.NullFloat64
 		if err := rows.Scan(
 			&run.ID, &run.MappingID, &run.ServerID, &run.CreatedAt,
 			&run.GenTokensPerSecond, &run.PromptTokensPerSecond,
 			&run.LoadTimeMS, &run.ContextSize, &run.Error, &run.Kind, &run.CapacityCurve, &visionCapable,
-			&run.VRAMJSON,
+			&run.VRAMJSON, &ttftMS, &wallMS, &rtf,
 		); err != nil {
 			return nil, fmt.Errorf("scan benchmark run: %w", err)
 		}
 		run.VisionCapable = visionCapable != 0
+		// NULL (a row that measured no audio metric) reads as zero, "not measured".
+		run.TTFTMS, run.WallMS, run.RTF = ttftMS.Int64, wallMS.Int64, rtf.Float64
 		out = append(out, run)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate benchmark runs: %w", err)
 	}
 	return out, nil
+}
+
+// nullInt64OfZero stores a zero as SQL NULL: the audio perf columns (migration 95)
+// are nullable so a row that measured none reads as "not measured", and a real
+// measurement is never exactly zero (see routing.BenchmarkRun.TTFTMS).
+func nullInt64OfZero(v int64) sql.NullInt64 {
+	return sql.NullInt64{Int64: v, Valid: v != 0}
+}
+
+// nullFloat64OfZero is nullInt64OfZero for the real-time factor.
+func nullFloat64OfZero(v float64) sql.NullFloat64 {
+	return sql.NullFloat64{Float64: v, Valid: v != 0}
 }
 
 // PruneBenchmarkRuns deletes benchmark-run rows older than the cutoff (retention).

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"op-ai-gateway/internal/inference"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -617,6 +618,28 @@ type BenchmarkRun struct {
 	// number to their own field themselves (see the agent-runtime-manager
 	// cross-cutting doc's ownership split).
 	VRAMJSON string
+	// TTFTMS, WallMS and RTF are the audio perf metrics of a kind=="speech" row
+	// (migration 95, #263), and are zero for every other kind and for a speech run
+	// that failed or measured none of them: zero is "not measured", and the SQL
+	// driver stores it as NULL (the columns are nullable), so a real measurement
+	// is never confused with an absent one. A measurement is never exactly zero
+	// -- the speech benchmark rounds a sub-millisecond time up to 1 -- so the two
+	// readings cannot collide.
+	//
+	//   - TTFTMS is the time from sending the synthesis request to the first byte
+	//     of the response, in milliseconds. The speech benchmark's request does not
+	//     stream, and audio.cpp answers a non-stream call only once the whole clip
+	//     is synthesized, so this is close to the synthesis time itself, not the
+	//     time to the first audio of a streamed call.
+	//   - WallMS is the synthesis wall time in milliseconds: audio.cpp's own
+	//     X-AudioCPP-Wall-Ms when it reported one, else the benchmark's measured
+	//     elapsed time.
+	//   - RTF is the real-time factor, wall time over the length of audio produced
+	//     (below 1 is faster than real time): audio.cpp's own X-AudioCPP-RTF when it
+	//     reported one, else WallMS over the WAV's duration.
+	TTFTMS int64
+	WallMS int64
+	RTF    float64
 }
 
 // CapacityLevel is one concurrency level measured during a capacity ramp. Every
@@ -1383,6 +1406,57 @@ type ModelMappingCacheRow struct {
 // after the model is unloaded.
 const ModelMappingCacheVoices = "voices"
 
+// ModelMappingCacheOutputByteRate is the cache type of a mapping's speech output
+// byte rate: ScopeKey "", Payload the PCM format rate as a decimal integer of bytes
+// per second (sample rate x channels x bytes per sample, 88200 for a 44.1 kHz mono
+// 16-bit model). It is the constant that turns the PCM bytes of a streamed speech
+// response into audio seconds, read from the `fmt` chunk of a non-stream WAV answer
+// (wavByteRateFromReader) and cached because a streamed response carries no header
+// to read it from. It is not a throughput.
+//
+// An EMPTY payload is how a rate known to be stale is retired: when the health loop sees
+// that the model behind the mapping changed (ModelMappingCacheOutputByteRateModel), it
+// blanks the row, which ParseOutputByteRate reads as no rate, so the streamed call bills
+// the honest audio_bytes until the speech rate benchmark writes the new one.
+const ModelMappingCacheOutputByteRate = "output_byte_rate"
+
+// ModelMappingCacheOutputByteRateModel is the cache type of the loaded-model identity
+// a mapping's output byte rate was measured under: ScopeKey "", Payload the identity
+// string the health loop observed when it started the speech rate benchmark (the model
+// file audio.cpp's listing states for a static server, a fingerprint of the launch spec
+// for an agent-launched child). It is a COMPANION to the rate, written beside it and
+// never inside it: the rate's own payload stays the plain decimal the streamed relay's
+// billing parses (ParseOutputByteRate), so a row of this type can never be mistaken for,
+// or break the reading of, a rate.
+//
+// A rate is a property of the MODEL, and the app-model-name rename invalidation every
+// cache row gets does not see a model swapped behind the same name. The health loop
+// compares the identity it observes now with this row, and a difference re-derives the
+// rate instead of letting the old one bill a different model. The benchmark writes it,
+// and only after it wrote the rate it vouches for. It has no row for a rate a manual
+// benchmark cached (which knows no identity); the health loop writes the identity it
+// observes for such a rate, to adopt it, and writes it nowhere else.
+const ModelMappingCacheOutputByteRateModel = "output_byte_rate_model"
+
+// ParseOutputByteRate reads a ModelMappingCacheOutputByteRate payload: the decimal
+// integer bytes per second, surrounding whitespace tolerated, and true only for a
+// positive value that fits a uint32. Everything else -- an empty payload (how a rate
+// known to be stale is invalidated), zero (the caller divides by it), a negative, a
+// fraction, a unit suffix, a value past the range (strconv.ParseUint hands back its
+// range maximum with the error, so the value is never trusted without the error check)
+// -- is no rate: (0, false).
+//
+// It is the ONE definition of "a usable cached rate", shared by the streamed relay's
+// billing read and the health loop's gate, so the two can never disagree about whether
+// a mapping has one.
+func ParseOutputByteRate(payload string) (uint32, bool) {
+	rate, err := strconv.ParseUint(strings.TrimSpace(payload), 10, 32)
+	if err != nil || rate == 0 {
+		return 0, false
+	}
+	return uint32(rate), true
+}
+
 // ValidateModelMappingCacheRow rejects a row that cannot be a meaningful cache
 // entry: one without a cache type (nothing could ever read it back by type).
 // Both UpsertModelMappingCache implementations call this exact function, so the
@@ -1519,6 +1593,28 @@ const (
 	// Like CapabilitySpeech the string does not coincide with the billable unit
 	// (usage.BillingUnitAudioSecond).
 	CapabilitySpeechClone = "speech_clone"
+
+	// CapabilitySpeechStreaming means the model can answer a STREAMED speech
+	// synthesis: POST /v1/audio/speech with stream=true. It is the speech twin of
+	// CapabilityTranscriptionStreaming and refines CapabilitySpeech the way that
+	// one refines CapabilityTranscription: it does not gate a route (no request
+	// declares it required, so a model without it is still a speech candidate), and
+	// what reads it is the speech handler, which relays stream=true as a stream
+	// only on a yes and answers the buffered one-shot for a no and for no row at
+	// all -- the absence is "unknown", and the handler's retry-buffered fallback
+	// covers a yes that has gone stale.
+	//
+	// It is DERIVED from audio.cpp's /v1/models, the per-model mode field of the same
+	// listing the speech and transcription verdicts come from
+	// (CapabilitySourceAudioCppModels), and for a SPEECH model only (task "tts" or
+	// "clon"): mode "streaming" is a yes, "offline" a no, anything else no row. The
+	// name is the synthesiser's, so a model that does not synthesise speech (asr,
+	// music) carries no row on it, not even a no -- and an asr model's mode is the
+	// CapabilityTranscriptionStreaming verdict, never this one.
+	//
+	// Like CapabilitySpeech the string does not coincide with the billable unit
+	// (usage.BillingUnitAudioSecond).
+	CapabilitySpeechStreaming = "speech_streaming"
 )
 
 // Capability verdicts.
@@ -1614,8 +1710,8 @@ const (
 // CapabilitySourceAudioCppModels names the fifth probe-rank source: audio.cpp's
 // own model listing, GET /v1/models, from whose per-model task field the
 // CapabilitySpeech, CapabilityTranscription and CapabilitySpeechClone verdicts are
-// derived, and from whose mode field the CapabilityTranscriptionStreaming
-// verdict is. It is named for the document it read, like the sources above, and
+// derived, and from whose mode field the CapabilityTranscriptionStreaming and
+// CapabilitySpeechStreaming verdicts are. It is named for the document it read, like the sources above, and
 // ranks 1 through capabilitySourceRank's DEFAULT branch for the same reason:
 // never able to overwrite manual (3) or vision_benchmark (2), always able to
 // repair its own drift (1 vs 1).
@@ -1624,9 +1720,9 @@ const (
 // the gateway's health loop, for an audio_cpp application (audioCppCapabilityRows
 // in cmd/gateway), and the agent's own read of the /v1/models of an audio.cpp
 // child it launched, which the gateway's agent ingest accepts under this source
-// for the speech, transcription, transcription_streaming and speech_clone rows
-// only (and only when the gateway declares the capability_source_audiocpp
-// feature).
+// for the speech, transcription, transcription_streaming, speech_clone and
+// speech_streaming rows only (and only when the gateway declares the
+// capability_source_audiocpp feature).
 //
 // It is the sdcpp_capabilities source's twin in the one respect that matters:
 // it is entitled to establish a "no" as well as a "yes", for each of its rows.
@@ -1640,8 +1736,12 @@ const (
 // no, any other mode no row) and a model of any other task carries none, not
 // even a no. The speech_clone row is the speech synthesiser's own, so it exists
 // for a tts model (a no) and a clone model (a yes) only, and a model of any other
-// task carries none, not even a no. It writes the speech, transcription,
-// transcription_streaming and speech_clone rows, and no other.
+// task carries none, not even a no. The speech_streaming row is the speech
+// synthesiser's twin of the streaming row, so it exists for a tts or clone model
+// only (mode "streaming" a yes, "offline" a no, any other mode no row) and a model
+// of any other task carries none, not even a no. It writes the speech,
+// transcription, transcription_streaming, speech_clone and speech_streaming
+// rows, and no other.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"

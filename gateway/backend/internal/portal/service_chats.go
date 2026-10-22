@@ -505,8 +505,9 @@ type ChatImageSettings struct {
 // Passthrough. buildSpeechBody (chat_runs_audio.go) forwards the set fields and
 // merges Passthrough into the request JSON (the gateway relays the body to
 // audio.cpp unchanged), refusing the keys that would override the body the run
-// itself owns (model/input/stream/response_format). The response is always WAV
-// (the gateway serves only wav), so there is no format knob.
+// itself owns (model/input/stream/stream_format/response_format). The turn the run
+// commits is always a WAV (a streamed synthesis is assembled into one), so there is
+// no format knob.
 type ChatAudioSettings struct {
 	// Voice is the voice name; "" leaves the model's default voice. The composer
 	// offers the voices the gateway has cached for the model in a combobox that
@@ -523,6 +524,16 @@ type ChatAudioSettings struct {
 	// upstream with the exact type the user wrote, and they round-trip through
 	// the stored document untouched. A nil or empty map is omitted.
 	Passthrough map[string]json.RawMessage `json:"passthrough,omitempty"`
+	// Stream is the thread's choice to hear a streaming-capable model's audio while it
+	// is generated (ADR-068, the portal speech-streaming run). It is a CHOICE, not a
+	// request: the run streams only when the gateway's own gate also holds (the mapped
+	// model is speech_streaming yes and its output byte rate is cached,
+	// Server.speechRunStreamRate), and otherwise stays the buffered WAV run of ADR-063
+	// whatever this says. nil (omitted) is the default, which streams where it can; only
+	// an explicit false opts the thread out -- hence a pointer, so an unset field and a
+	// chosen false stay distinguishable and an existing thread's persisted settings stay
+	// byte-identical.
+	Stream *bool `json:"stream,omitempty"`
 }
 
 // ChatTranscriptionSettings are the speech-to-text knobs a portal

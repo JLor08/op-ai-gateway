@@ -895,7 +895,7 @@ document, from two producers
   with a warning. While the gateway does not declare it, the agent probes and caches
   nothing for that child and withholds a verdict it cached earlier, so a gateway upgrade
   takes effect without a child restart. The ingest accepts the source for the `speech`,
-  `transcription`, `transcription_streaming` and `speech_clone` rows only, at probe rank 1, so a manual verdict (rank 3) still
+  `transcription`, `transcription_streaming`, `speech_clone` and `speech_streaming` rows only, at probe rank 1, so a manual verdict (rank 3) still
   outranks it. Unlike the health loop, which asks again every tick, the agent asks
   **once per process generation**: a listing that does not name the model is a conclusive
   answer there, cached with the child's pid, so such a child reads as unknown until it
@@ -919,9 +919,9 @@ gate excludes on, and it has the same writers as `speech`, **from the same listi
   **and** `(transcription, no)`; any other non-empty task writes both `no`; and an absent
   task, an unnamed model, an unreachable server, a non-2xx status or an unreadable body
   writes **nothing**, because none of those says a model cannot transcribe and a `no` can
-  switch a route off. `audioCppCapabilityRows` projects the verdicts into at most four
-  rows (the third, `transcription_streaming`, and the fourth, `speech_clone`, are described
-  below), each only when stated, so an unanswered axis never suppresses the other. The
+  switch a route off. `audioCppCapabilityRows` projects the verdicts into at most five
+  rows (the third, `transcription_streaming`, the fourth, `speech_clone`, and the fifth,
+  `speech_streaming`, are described below), each only when stated, so an unanswered axis never suppresses the other. The
   task match ignores case and surrounding whitespace, so an `ASR` the server might one day
   emit does not fall to the `no` default. The same ranking, the same type gate (a
   `server_agent` mapping with an `audio_cpp` spec is **not probed** by the health loop)
@@ -988,6 +988,34 @@ and open-vocabulary storage as `speech`:
   on the same terms as `(transcription_streaming, no)`: an absent row already offers the model
   (fail-open), so a manual `no` would needlessly outrank the `task` probe and permanently
   force-offer a clone model the chat cannot drive. `(speech_clone, yes)` stays writable, and
+  the name is **not** in `reservedAgentCapabilityNames`, because the agent reports it.
+
+**Who writes the `speech_streaming` verdict.** `transcription_streaming`'s twin on the
+synthesiser's side ([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)): not a gate capability — no endpoint
+requires it, and a model without it is still a speech candidate — but a per-mapping verdict that
+decides, up front, whether the speech handler relays a `stream=true` request as audio.cpp's
+stream or answers the buffered one-shot WAV (§3.6 of [API Compatibility &
+Inference](compatibility-and-inference.md#36-openai-audio-speech)). It is read from audio.cpp's
+`/v1/models` **`mode`** field by the **same two producers**, under the same ranking, type gate and
+open-vocabulary storage as `transcription_streaming`:
+
+- **`audiocpp_models`** writes it from `mode`, **only for a speech model** whose `speech`
+  verdict is `yes` (a `tts` or `clon` entry): `mode` `streaming` writes `(speech_streaming,
+  yes)`, `offline` writes `(speech_streaming, no)`, and a non-speech task (an `asr` model's mode
+  is the `transcription_streaming` verdict, never this one), an absent or other `mode`, an
+  unnamed model, an unreachable server or an unreadable body writes **nothing** (absent =
+  unknown = buffered). The gateway's health loop decodes it for a **static** `audio_cpp`
+  application, and the **agent** (0.11.1) for an agent-launched child, reporting it under this
+  same source with **no new feature flag** — a PATCH bump riding the already-declared
+  `capability_source_audiocpp`, the `transcription_streaming` shape. The agent caches once per
+  process generation, so a `mode` change without a restart goes stale, which the relay's
+  retry-buffered-on-500 safety-net covers. The same listing read also feeds the speech rate
+  benchmark's auto-trigger (a loaded, plain-TTS, `speech_streaming: yes` mapping with no cached
+  output byte rate), see §3.6 item 10 of the same document.
+- **`manual`**, the operator's `speech_streaming: yes`. `(speech_streaming, no)` is
+  **reserved** in `reservedManualVerdicts` on the same terms as `(transcription_streaming, no)`:
+  an absent row already means "buffer", so a manual `no` would needlessly outrank the `mode`
+  probe entitled to establish streaming, forever. `(speech_streaming, yes)` stays writable, and
   the name is **not** in `reservedAgentCapabilityNames`, because the agent reports it.
 
 A transcription request avoids the vendor-account path for speech's reason: the

@@ -17,14 +17,16 @@ import {
 import { ToastProvider } from './shared/ToastProvider';
 import { AudioDecodeError, audioBlobToWav } from './shared/audioToWav';
 import { messages, type Locale } from '../i18n';
-import type {
-  ActiveChatRun,
-  ImageModelOptions,
-  ModelOption,
-  PortalServer,
-  PortalToken,
-  ServerModelOption,
-  StartChatRunBody,
+import {
+  NO_SPEECH_STREAMING,
+  type ActiveChatRun,
+  type ImageModelOptions,
+  type ModelOption,
+  type PortalServer,
+  type PortalToken,
+  type ServerModelOption,
+  type SpeechStreamingGate,
+  type StartChatRunBody,
 } from '../api';
 
 // heic-to loads a libheif WASM decoder at runtime, which jsdom cannot run: mock it
@@ -158,6 +160,11 @@ function makeChatApi() {
     // speech: none by default (the voice field is then plain free text); the voice
     // picker tests below seed their own.
     modelVoices: vi.fn(async (_name: string) => [] as string[]),
+    // The speech composer's streaming gate the store fetches for the same models: closed by
+    // default (no stream toggle, the buffered run); the streaming-toggle tests below open it.
+    modelSpeechStreaming: vi.fn(
+      async (_name: string): Promise<SpeechStreamingGate> => NO_SPEECH_STREAMING,
+    ),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.
@@ -1497,6 +1504,78 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         fireEvent.change(voice, { target: { value: 'bf_emma' } });
         expect(voice).toHaveValue('bf_emma');
         await expectSentVoice({ voice: 'bf_emma' });
+      });
+    });
+
+    // Streaming playback (ADR-068): the toggle exists only where the gateway says the picked
+    // model streams AND its rate is known (api.modelSpeechStreaming), is on by default, and
+    // writes only its opt-out into the run's settings.
+    describe('the streaming toggle', () => {
+      const open: SpeechStreamingGate = { streaming: true, sampleRate: 44100 };
+      const toggle = () => screen.queryByRole('checkbox', { name: t.chatSpeechStream });
+
+      async function renderStreamingThread(gate: SpeechStreamingGate) {
+        chatApi.spies.modelSpeechStreaming.mockResolvedValue(gate);
+        await renderSpeechThread();
+        await waitFor(() =>
+          expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalledWith('kokoro'),
+        );
+        openSettings();
+        await flushMicrotasks();
+      }
+
+      it('is offered, on, for a model the gateway says streams', async () => {
+        await renderStreamingThread(open);
+
+        const box = await screen.findByRole('checkbox', { name: t.chatSpeechStream });
+        expect(box).toBeChecked();
+        expect(box).toHaveAccessibleDescription(t.chatSpeechStreamHint);
+      });
+
+      it('is not offered for a model that cannot be streamed (or not yet known to)', async () => {
+        await renderStreamingThread(NO_SPEECH_STREAMING);
+
+        expect(toggle()).not.toBeInTheDocument();
+        expect(screen.queryByText(t.chatSpeechStreamHint)).not.toBeInTheDocument();
+      });
+
+      it('is not offered on a text thread', async () => {
+        chatApi.spies.modelSpeechStreaming.mockResolvedValue(open);
+        renderChat();
+        await waitForChatReady();
+        await pickOption(t.chatModel, models[0].display_name);
+        openSettings();
+        await flushMicrotasks();
+
+        expect(toggle()).not.toBeInTheDocument();
+        expect(chatApi.spies.modelSpeechStreaming).not.toHaveBeenCalled();
+      });
+
+      it('writes nothing for streaming left on (the default)', async () => {
+        await renderStreamingThread(open);
+        await screen.findByRole('checkbox', { name: t.chatSpeechStream });
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).not.toHaveProperty('stream');
+      });
+
+      it('sends the opt-out once it is switched off', async () => {
+        await renderStreamingThread(open);
+        fireEvent.click(await screen.findByRole('checkbox', { name: t.chatSpeechStream }));
+        expect(toggle()).not.toBeChecked();
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).toEqual({ stream: false });
+      });
+
+      it('is locked while a run is in flight, like the other settings', async () => {
+        await renderStreamingThread(open);
+        await screen.findByRole('checkbox', { name: t.chatSpeechStream });
+
+        await sendSpeech();
+        await waitFor(() => expect(toggle()).toBeDisabled());
       });
     });
 

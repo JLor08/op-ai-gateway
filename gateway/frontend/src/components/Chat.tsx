@@ -697,6 +697,36 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       }}
                     />
                   </Box>
+                  {/* The streaming toggle exists only for a model the gateway says it can
+                    stream (c.speechStreaming: it streams and its output rate is known).
+                    On by default; only its opt-out is persisted. The run decides again
+                    server-side, so this is a choice, never an authority. */}
+                  {c.speechStreaming && (
+                    <FormControlLabel
+                      sx={{ justifySelf: 'start', mr: 0 }}
+                      control={
+                        <Checkbox
+                          size="small"
+                          checked={c.audioSettings.stream}
+                          onChange={(event) =>
+                            c.setAudioSettings((s) => ({ ...s, stream: event.target.checked }))
+                          }
+                          disabled={c.streaming}
+                          slotProps={{ input: { 'aria-describedby': 'chat-speech-stream-hint' } }}
+                        />
+                      }
+                      label={t.chatSpeechStream}
+                    />
+                  )}
+                  {c.speechStreaming && (
+                    <Typography
+                      id="chat-speech-stream-hint"
+                      variant="caption"
+                      color="text.secondary"
+                    >
+                      {t.chatSpeechStreamHint}
+                    </Typography>
+                  )}
                   <Typography variant="caption" color="text.secondary">
                     {t.chatSpeechFormatHint}
                   </Typography>
@@ -956,6 +986,9 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   // state while the run itself reports a text kind".
                   kind={rowStreaming ? c.runKind : undefined}
                   elapsedMs={rowStreaming ? c.runElapsedMs : undefined}
+                  // Gated into the streaming row like kind/elapsedMs, for the same memo
+                  // reason: only that row's pending turn reads it.
+                  audioLive={rowStreaming ? c.runAudioLive : undefined}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
                   // The refine of a generated image: only where it can run. attachMode

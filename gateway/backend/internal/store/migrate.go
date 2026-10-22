@@ -127,6 +127,7 @@ var migrations = []migration{
 	{version: 92, name: "resource_group_vendor_accounts", up: migration92Up},
 	{version: 93, name: "runtime_spec_config_files", up: migration93Up},
 	{version: 94, name: "model_mapping_cache", up: migration94Up},
+	{version: 95, name: "model_mapping_benchmarks_audio_perf", up: migration95Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4229,6 +4230,43 @@ func migration94Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	}
 	for _, stmt := range stmts {
 		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration95Up adds the audio perf-metric columns to model_mapping_benchmarks
+// (#263): ttft_ms, wall_ms and rtf, the time to first byte, the wall time and the
+// real-time factor of a kind=="speech" history row -- what the speech benchmark
+// measures when it synthesizes a clip to learn a mapping's output byte rate. The
+// row's other metric columns are token throughputs and mean nothing for audio,
+// and audio models had no benchmark history at all before this.
+//
+// All three are NULLABLE with no default, on purpose and unlike the table's older
+// metric columns (`not null default 0`): a speed, capacity, vision or VRAM row has
+// no audio measurement, and a failed speech run measured none, and "never
+// measured" must stay distinguishable from a measured zero. So there is no
+// backfill either -- every pre-existing row reads back NULL -- and the store
+// writes NULL for a zero and reads NULL as zero (sqlite_benchmarks.go).
+//
+// ADR-005's wide types: `bigint` for the two millisecond counts (Go int64; an
+// `integer` would be int4 on PostgreSQL) and `double precision` for the factor
+// (Go float64; `real` would be float4). Both are plain, valid column types on
+// SQLite too, where they get INTEGER and REAL affinity.
+//
+// Append-only: the table's v60-frozen baseline is not touched, so a fresh install
+// gets the columns by replaying this migration, exactly as it does for
+// migration71Up's vram_json. addColumnIfMissing makes the step replayable on both
+// dialects (`add column if not exists` on PostgreSQL, the duplicate-column
+// tolerance on SQLite).
+func migration95Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"ttft_ms bigint",
+		"wall_ms bigint",
+		"rtf double precision",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "model_mapping_benchmarks", col); err != nil {
 			return err
 		}
 	}

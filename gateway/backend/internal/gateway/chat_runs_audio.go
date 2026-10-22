@@ -18,6 +18,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"slices"
 	"strings"
+	"time"
 )
 
 // This file is the speech kind's half of the run executor, and it is the image
@@ -27,6 +28,11 @@ import (
 // assumes a stream of deltas, and /v1/audio/speech answers ONE buffered binary
 // body, so there is nothing to checkpoint and no rate that could be measured
 // rather than invented.
+//
+// That is the BUFFERED run. When the mapped model streams and its output byte rate
+// is known (Server.speechRunStreamRate), the run instead asks for a stream and plays
+// it to the client as it arrives; that branch, which commits the same turn, is
+// chat_runs_audio_stream.go.
 //
 // The two differ in the response and in what is reported by whom. The images
 // endpoint answers JSON with the format named in the body; the speech endpoint
@@ -105,49 +111,77 @@ const (
 
 // speechReservedFields are the request fields a thread's passthrough may not set.
 // model and input are the run's own (the thread's pinned model and the user's
-// text); stream and response_format are the two the endpoint's contract -- one
-// complete audio/wav body -- depends on, and it refuses a streamed request or any
-// format but wav anyway (validateSpeechRequest). Rejecting them here turns what
-// would be an opaque upstream refusal, or worse an override of the run's own
-// value, into a refusal that names its cause.
-//
-// stream_format is deliberately not listed: the endpoint already refuses any
-// non-null one with speech.stream_unsupported, which the run surfaces as that code.
-var speechReservedFields = []string{"model", "input", "stream", "response_format"}
+// text); stream, stream_format and response_format are the three the run's contract
+// depends on. The run commits ONE complete audio/wav turn, and it decides whether to
+// get it buffered or as an event stream it can read (Server.speechRunStreamRate): it
+// states stream and stream_format itself when it streams and states neither when it
+// does not, and a pcm response_format is only valid beside a stream. A passthrough
+// that set any of them would override the run's own value -- stream_format=audio would
+// answer raw PCM in a shape the run does not parse, a pcm format a body it cannot
+// commit as a WAV -- and the endpoint itself refuses any format but wav on a request
+// that does not stream (validateSpeechRequest) but admits a stream. Rejecting them
+// here turns what would be an opaque answer the run cannot use, or worse an override of
+// the run's own value, into a refusal that names its cause.
+var speechReservedFields = []string{"model", "input", "stream", "stream_format", "response_format"}
 
 // errSpeechPassthroughReserved is what buildSpeechBody returns for a passthrough
 // key in speechReservedFields; generateSpeechTurn maps it to
 // speechRunReservedFieldMessage and logs the key for the operator.
 var errSpeechPassthroughReserved = errors.New("speech passthrough names a reserved field")
 
-// executeAudioRun is executeRun's speech branch: one buffered request to the
-// gateway's own /v1/audio/speech and one terminal commit carrying the synthesized
-// audio as the assistant turn's structured content.
+// executeAudioRun is executeRun's speech branch: one request to the gateway's own
+// /v1/audio/speech and one terminal commit carrying the synthesized audio as the
+// assistant turn's structured content.
 //
 // It calls finishRunWithParts EXACTLY ONCE, on every path, because the work is
 // split into a function that only COMPUTES the outcome (generateSpeechTurn,
 // below) and this one, which only commits it -- the same shape, and for the same
 // reason, as executeImageRun: nothing in the computation can return without an
-// outcome, so "one terminal commit per run" is a property of the shape.
+// outcome, so "one terminal commit per run" is a property of the shape. (A streamed
+// answer publishes audio events along the way, but none of that is a commit.)
 //
-// The deadline is NOT applied here: executeRun already derived the bounded context
-// from the run's kind before branching (see runDeadlineFor).
+// The deadline is applied HERE, and not by executeRun as it is for the image kind,
+// because a speech run has two shapes: a buffered one, which emits nothing between
+// dispatch and its finished audio and so is bounded end to end, and a streaming one,
+// for which the bound is only the budget for the wait for the first chunk and is
+// lifted there (the transcription run's arrangement, see executeTranscriptionRun and
+// armRunDeadline). The buffered request never lifts it, so it is bounded to its end
+// exactly as before; a stream that delivers a chunk is watched by the gateway relay's
+// idle timeout from there on, and one that never does ends at the deadline as a
+// timeout, not a cancel.
 func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) {
-	parts, status, errMsg := s.generateSpeechTurn(ctx, owner, run, prep)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	liftDeadline := armRunDeadline(chatRunKindSpeech, cancel)
+	defer liftDeadline()
+
+	parts, status, errMsg := s.generateSpeechTurn(ctx, owner, run, prep, liftDeadline)
 	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts)
 }
 
 // generateSpeechTurn performs the single loopback request a speech run makes and
 // returns the turn's outcome: the content parts to commit, the run status, and the
-// terminal error message. It never commits, never finishes the run and never
-// publishes a delta -- there are none to publish.
+// terminal error message. It never commits and never finishes the run. A streamed
+// answer publishes audio events into the run on the way -- the only thing it does to
+// the run before returning -- and calls liftDeadline when the first one arrives; a
+// buffered answer publishes nothing.
 //
-// The request is a POST of buildSpeechBody to /v1/audio/speech under the shared
+// The request is a POST of the speech body to /v1/audio/speech under the shared
 // loopback header set (setRunLoopbackHeaders), which already states
 // Content-Type: application/json -- speech is JSON-in, so, unlike the image edit
-// hop, nothing overrides it.
-func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) (json.RawMessage, string, string) {
-	body, err := buildSpeechBody(prep)
+// hop, nothing overrides it. The body asks for a stream (buildSpeechStreamBody) only
+// when the run's gate is open (speechRunStreamRate), and is otherwise exactly the
+// buffered body of ADR-063 (buildSpeechBody). Either way the answer is read for what it
+// IS: the gateway answers a stream request with a stream only for a route it knows to
+// stream, and with the one-shot WAV otherwise (a verdict gone stale), so a 2xx event
+// stream is consumed as one (consumeSpeechStream) and anything else is the buffered WAV.
+func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func()) (json.RawMessage, string, string) {
+	sampleRate, streaming := s.speechRunStreamRate(ctx, owner, prep)
+	build := buildSpeechBody
+	if streaming {
+		build = buildSpeechStreamBody
+	}
+	body, err := build(prep)
 	if err != nil {
 		log.Printf("chat run %s: build speech body failed: %v", run.ID, err)
 		if errors.Is(err, errSpeechPassthroughReserved) {
@@ -162,6 +196,7 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
 
+	dispatchedAt := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if status, msg, ended := runContextOutcome(ctx); ended {
@@ -174,6 +209,20 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	}
 	defer resp.Body.Close()
 
+	// The gateway answered the stream request with an event stream: read it as it
+	// comes. (Only a 2xx can be one; anything else, and a one-shot WAV, is read whole
+	// below.)
+	if streaming && resp.StatusCode >= 200 && resp.StatusCode <= 299 && isSpeechEventStream(resp.Header) {
+		return s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline)
+	}
+	return bufferedSpeechTurn(ctx, run, resp)
+}
+
+// bufferedSpeechTurn is the outcome of a speech run's loopback answer that is not an
+// event stream: the one-shot WAV (or an error answer) read whole, as
+// generateSpeechTurn's result -- the content parts to commit, the run status and the
+// terminal error message.
+func bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *http.Response) (json.RawMessage, string, string) {
 	// Read the WHOLE body: a WAV cannot be played from a prefix of it, and it is
 	// deliberately not bounded by s.captureMaxBytes (1 MiB, which an ordinary clip
 	// exceeds) -- the same call, and the same backstop, as the image path: the chat
@@ -204,6 +253,14 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 		return nil, "error", speechRunDispatchFailedMessage
 	}
 	return parts, "completed", ""
+}
+
+// isSpeechEventStream reports whether a 2xx answer to the run's stream request is the
+// event stream the run asked for, by its Content-Type (the relay passes audio.cpp's own
+// through). The one-shot WAV a route that does not stream answers with is not.
+func isSpeechEventStream(header http.Header) bool {
+	mediaType, _, err := mime.ParseMediaType(header.Get(contentTypeHeader))
+	return err == nil && mediaType == speechStreamSSEType
 }
 
 // speechPartFrom turns a 2xx speech response into the turn's one audio part, or
@@ -280,13 +337,23 @@ func speechAudioMediaTypeOf(contentType string) bool {
 // second copy of that rule in the executor would be free to drift from it. The
 // refusal reaches the run through upstreamErrorCode.
 func buildSpeechBody(prep PrepareRunResult) ([]byte, error) {
+	fields, err := speechBodyFields(prep)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(fields)
+}
+
+// speechBodyFields is the body buildSpeechBody and buildSpeechStreamBody share, before it
+// is encoded: the fields, or errSpeechPassthroughReserved for a reserved passthrough key.
+func speechBodyFields(prep PrepareRunResult) (map[string]any, error) {
 	body := map[string]any{
 		"model": prep.Settings.Model,
 		"input": lastUserPrompt(prep.History),
 	}
 	audio := prep.Settings.Audio
 	if audio == nil {
-		return json.Marshal(body)
+		return body, nil
 	}
 	// Sorted, so the key reported on a rejection and the order of the merge are
 	// deterministic whatever the map's iteration order.
@@ -309,7 +376,7 @@ func buildSpeechBody(prep PrepareRunResult) ([]byte, error) {
 		}
 		body[key] = audio.Passthrough[key]
 	}
-	return json.Marshal(body)
+	return body, nil
 }
 
 // isSpeechReservedField reports whether key names a field in speechReservedFields,

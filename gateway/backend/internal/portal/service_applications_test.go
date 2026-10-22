@@ -3955,6 +3955,29 @@ func TestTranscriptionStreamingNoIsAReservedManualVerdict(t *testing.T) {
 	}
 }
 
+// (speech_streaming, no) is reserved for the same reason (transcription_streaming,
+// no) is. A manual row is rank 3 and outranks every automated source, and nothing
+// re-derives it, so a stale manual `no` would permanently outrank the audio.cpp
+// /v1/models probe's verdict (audiocpp_models, read from the model's mode) -- the
+// writer entitled to establish it -- and keep a streaming-capable speech model
+// buffered forever. The cost to the operator is nil: an ABSENT row already answers
+// buffered, which is what a `no` would say.
+func TestReservedManualVerdictSpeechStreamingNo(t *testing.T) {
+	if !reservedManualVerdict(routing.CapabilitySpeechStreaming, routing.CapabilityNo) {
+		t.Error("(speech_streaming, no) must be reserved")
+	}
+	// yes stays writable: it is the operator's override of the probe and the
+	// enablement path where no probe verdict exists (an agent that predates the
+	// verdict, or a model the listing gives no mode).
+	if reservedManualVerdict(routing.CapabilitySpeechStreaming, routing.CapabilityYes) {
+		t.Error("(speech_streaming, yes) must stay writable: it is the operator's override of the probe and the enablement path for a model no probe has stated a mode for")
+	}
+	// The reset is never refused, for any pair.
+	if reservedManualVerdict(routing.CapabilitySpeechStreaming, "") {
+		t.Error("the reset must never be refused")
+	}
+}
+
 // TestNormalizeFlavorsAcceptsImagesAndKeepsEmptyDefault guards the change's
 // migration safety. The empty-list default must stay exactly
 // [openai, anthropic]: if it ever gained openai_images, every existing

@@ -5,8 +5,10 @@ package portal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"testing"
 	"time"
 )
@@ -237,6 +239,72 @@ func TestMappingBenchmarksCapacityDecode(t *testing.T) {
 	}
 	if speed.Capacity != nil {
 		t.Fatalf("speed.Capacity = %#v, want nil", speed.Capacity)
+	}
+}
+
+// TestMappingBenchmarksSpeechMetrics covers the DTO layer's handling of the
+// kind=="speech" history row (#263): its audio perf metrics reach the wire, and --
+// like every kind-specific payload -- only on a row of that kind, so the same
+// bytes on a row of another kind are not served as a speech result. A failed
+// speech row carries its error and no metrics.
+func TestMappingBenchmarksSpeechMetrics(t *testing.T) {
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	svc, routeStore := newServerTestService(t, now)
+	ctx := context.Background()
+
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app, err := svc.CreateApplication(ctx, ownerToken(), server.ID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8000, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{
+		GatewayModelName: "gw", AppModelName: "up", Status: routing.ServerStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	for i, r := range []routing.BenchmarkRun{
+		{MappingID: mapping.ID, ServerID: "srv-speech", CreatedAt: now.Add(3 * time.Minute), Kind: "speech", TTFTMS: 850, WallMS: 1234, RTF: 0.4125},
+		{MappingID: mapping.ID, ServerID: "srv-failed", CreatedAt: now.Add(2 * time.Minute), Kind: "speech", Error: "upstream answered HTTP 500"},
+		{MappingID: mapping.ID, ServerID: "srv-otherkind", CreatedAt: now.Add(time.Minute), Kind: "capacity", TTFTMS: 850, WallMS: 1234, RTF: 0.4125},
+		{MappingID: mapping.ID, ServerID: "srv-speed", CreatedAt: now, GenTokensPerSecond: 20},
+	} {
+		if err := routeStore.InsertBenchmarkRun(ctx, r); err != nil {
+			t.Fatalf("InsertBenchmarkRun %d: %v", i, err)
+		}
+	}
+	got, err := svc.MappingBenchmarks(ctx, ownerToken(), mapping.ID, 50)
+	if err != nil {
+		t.Fatalf("MappingBenchmarks: %v", err)
+	}
+	byServer := make(map[string]BenchmarkRunDTO, len(got))
+	for _, r := range got {
+		byServer[r.ServerID] = r
+	}
+	if sp := byServer["srv-speech"]; sp.Kind != "speech" || sp.TTFTMS != 850 || sp.WallMS != 1234 || sp.RTF != 0.4125 || sp.Error != "" {
+		t.Fatalf("speech row = %#v, want kind=speech with ttft 850, wall 1234, rtf 0.4125", sp)
+	}
+	if f := byServer["srv-failed"]; f.Kind != "speech" || f.Error == "" || f.TTFTMS != 0 || f.WallMS != 0 || f.RTF != 0 {
+		t.Fatalf("failed speech row = %#v, want its error and no metrics", f)
+	}
+	if o := byServer["srv-otherkind"]; o.Kind != "capacity" || o.TTFTMS != 0 || o.WallMS != 0 || o.RTF != 0 {
+		t.Fatalf("other-kind row = %#v, want the audio metrics read for kind==speech only", o)
+	}
+	if sp := byServer["srv-speed"]; sp.Kind != "speed" || sp.TTFTMS != 0 || sp.WallMS != 0 || sp.RTF != 0 {
+		t.Fatalf("speed row = %#v, want kind=speed with no audio metrics", sp)
+	}
+	// The metrics are omitted from the wire for a row without them.
+	raw, err := json.Marshal(byServer["srv-speed"])
+	if err != nil {
+		t.Fatalf("marshal speed row: %v", err)
+	}
+	for _, key := range []string{"ttft_ms", "wall_ms", "rtf"} {
+		if strings.Contains(string(raw), `"`+key+`"`) {
+			t.Fatalf("speed row JSON %s carries %q, want it omitted", raw, key)
+		}
 	}
 }
 

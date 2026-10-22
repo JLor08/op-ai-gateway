@@ -704,7 +704,7 @@ v81), not a scalar, and it is an **XOR** with the token columns.
 `billing_unit == ''` means the row is **token-metered**: the five token counts
 are its measure, and `billing_quantity` must be `0` (the XOR is enforced from
 both sides, so "meaningless" is not the same as "ignored"). Any other value —
-`image`, `audio_second` (`internal/usage/billing.go`) — means
+`image`, `audio_second`, `audio_bytes` (`internal/usage/billing.go`) — means
 `billing_quantity` is the measure and every token-denominated column is `0`.
 The full decision, including why a scalar `units` column would have been wrong
 in three separate ways, is
@@ -872,6 +872,46 @@ because audio.cpp would then mis-transcribe the clip the header describes. The W
 math is exact for a PCM WAV, and the upload is one because audio.cpp refuses a non-WAV one,
 which then never completes; the **non-streaming path is unchanged**, still billing from the
 response body above.
+
+**A STREAMED speech call has no duration to read, so the relay COUNTS what it relays, and its
+unit is `audio_second` or `audio_bytes` by mapping state** ([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issues #253
+and #263, which amends ADR-041 (c) on the success path only). When the gateway relays audio.cpp's
+stream (a `mode=streaming` model asked with `stream: true`) the response carries no
+`X-AudioCPP-Audio-Duration-Ms` header and no sample rate: the SSE `speech.audio.done` states only
+`timing.ttft_ms`, and raw PCM states nothing. `speechStreamScan` (`internal/gateway/speech_stream.go`)
+is fed each chunk **after** it was written and flushed to the client, so it never delays a byte,
+and counts the PCM: the sum of the decoded base64 `speech.audio.delta` payloads, or the bytes of a
+raw `application/octet-stream` body. `setStreamedSpeechBillingQuantity` then decides the measure,
+and only on a **clean completion** (`speech.audio.done` then `[DONE]`; for raw PCM, which has no
+terminal frame, a body the upstream closed at a clean EOF, never a read error) with nothing lost
+(an unreadable frame, a delta that is not base64 or a line past the 16 MiB bound each mark the
+scan lost, because billing a short count would be a silent under-bill):
+
+| Outcome | `billing_unit` | `billing_quantity` |
+|---|---|---|
+| Clean completion, the mapping's output byte rate cached (`model_mapping_cache`, `output_byte_rate`, learned by the speech benchmark) | `audio_second` | PCM bytes ÷ byte rate — exactly what the one-shot header would have stated |
+| Clean completion, no rate cached | `audio_bytes` | the PCM byte count |
+| Any other outcome (error status, copy error, idle timeout, client gone, no terminal events, a lost count, no audio) | `audio_second` | `0` |
+
+The rule of the unit above is **preserved in the form that protects it**: every failure,
+refusal and aborted-stream row keeps the endpoint-identity unit `audio_second`, so a failed
+request is never mislabelled, and only the success path chooses between the two audio units, from
+**mapping state** (is the rate cached?) and never from the response. The quantity is never a
+partial count: a stream cut short delivered some audio and bills none, and the two shapes that
+would read as a success that billed nothing (a stream that ended without a completion the gateway
+can count, and one that completed with no audio) are logged once at `Error`, the loud-zero rule
+of this section. A client that disconnects **at or before the stream's termination**, including
+right after the final frame, is a `provider.client_disconnected` error row of `(audio_second, 0)`:
+the relay decides the status as soon as the copy returns, and a non-`success` row never reads the
+rate or bills a quantity (a billed success after a disconnect effectively cannot occur). The rate
+read of a `success` row uses a context stripped of cancellation purely defensively, to cover the
+window after that status decision. `audio_bytes` is **unpriceable in Tier 3**: the modeled tier's guard returns
+the terminal `unpriceable` provenance for any non-token unit (§8.4.4), and a coefficient applies
+only on an exact unit match, so no modeled watt-hour figure exists until one declares
+`audio_bytes` (the token-blind measured and estimated tiers still apply on a host that has power
+telemetry); the non-token disclosure counts (`NonTokenRequests`) work unchanged, and the
+portal's unit chip shows the raw value without a tooltip. The streamed response's capture stays the redacted binary summary
+([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
@@ -1540,7 +1580,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-94-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-95-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -1856,7 +1896,10 @@ deliberately never decoded (whether a model is resident is the health axis, not 
 capability axis). The `audioCppModelCases` table, duplicated verbatim in both modules'
 tests, pins both copies, and the gateway's `TestAudioCppModelsCasesMatchTheAgentsTable`
 reads the agent's test file and fails when the two declarations differ by a byte, or when
-either is missing, so a change to one parser and its own table cannot pass both suites.
+either is missing, so a change to one parser and its own table cannot pass both suites. The
+same entry's `mode` also states the `transcription_streaming` verdict (an `asr` model) and the
+`speech_streaming` verdict (a `tts` or `clon` model, agent 0.11.1, [ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)),
+decided by both copies under the same table.
 The result rides the sample as `runtimes[].capabilities` under the source
 `audiocpp_models`, and the agent sends it only while the gateway declares
 `capability_source_audiocpp` ([Agent-Managed Model Runtime
@@ -2041,7 +2084,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-94-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-95-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open

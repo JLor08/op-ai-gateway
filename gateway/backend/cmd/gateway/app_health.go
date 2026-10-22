@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +39,13 @@ var (
 	// server that does not serve the listing then costs one small GET per loaded
 	// tts mapping per backoff window instead of one per health tick.
 	audioCppVoicesBackoff = 5 * time.Minute
+	// speechRateRetryBackoff is how long a mapping whose speech rate benchmark the
+	// loop started is left alone before the pass starts it again while the mapping
+	// still has no usable rate (see ensureSpeechRate): a benchmark that failed, or a
+	// model that cannot synthesize, then costs one run per window instead of one per
+	// health tick. A rate that appears ends the wait on the next tick, and a model
+	// whose identity changed is not held by it.
+	speechRateRetryBackoff = 5 * time.Minute
 )
 
 // healthStore is the store surface the app-health loop needs. *store.SQLiteStore
@@ -266,7 +276,42 @@ type appHealthRunner struct {
 	// the router finds cold, is not asked every tick (fetchAndCacheVoices,
 	// shared by cacheAudioCppVoices and probeAgentVoices). Its zero value is
 	// ready; the runner is used by pointer, never copied.
-	voicesBackoff voicesBackoff
+	voicesBackoff mappingBackoff
+	// speechRate starts the speech rate benchmark for one mapping (ensureSpeechRate):
+	// in production a late-bound handle on the gateway Server's
+	// TriggerSpeechRateBenchmark (the runner is built before the Server exists). Nil
+	// is valid and means the step is off: a runner without a Server never starts a
+	// benchmark, never reads the rate caches for it and never invalidates a rate it
+	// could not re-derive.
+	speechRate gateway.SpeechRateTrigger
+	// speechRateBackoff remembers which mappings had a speech rate benchmark started
+	// lately, so one that produced no rate is retried after speechRateRetryBackoff
+	// and not on every tick. Its zero value is ready; the runner is used by
+	// pointer, never copied.
+	speechRateBackoff mappingBackoff
+}
+
+// lateSpeechRateTrigger is the app-health runner's handle on the gateway Server's
+// TriggerSpeechRateBenchmark, which cannot be handed over when the runner is built: the
+// Server does not exist until gateway.New returns, and the runner is built (and its loop
+// started) with the dependencies the Server is built from. The runner holds trigger, which
+// answers false -- nothing started, so the loop asks again next tick -- until set binds the
+// Server's method. The binding is atomic because the loop's probe goroutines read it while
+// buildGatewayServer binds it.
+type lateSpeechRateTrigger struct {
+	fn atomic.Pointer[gateway.SpeechRateTrigger]
+}
+
+// set binds the Server's trigger (ServerDeps.SetSpeechRateTrigger).
+func (l *lateSpeechRateTrigger) set(fn gateway.SpeechRateTrigger) { l.fn.Store(&fn) }
+
+// trigger is the gateway.SpeechRateTrigger the runner calls: the bound one, or a refusal.
+func (l *lateSpeechRateTrigger) trigger(ctx context.Context, server routing.AIServer, app routing.Application, mapping routing.ModelMapping, identity string) bool {
+	fn := l.fn.Load()
+	if fn == nil || *fn == nil {
+		return false
+	}
+	return (*fn)(ctx, server, app, mapping, identity)
 }
 
 // cycleCfg is the once-per-cycle settings snapshot read via
@@ -610,12 +655,13 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 }
 
 // audioCppCapabilityRows projects what one audio.cpp /v1/models listing says
-// about ONE model onto the store's row shape: up to four rows, a
+// about ONE model onto the store's row shape: up to five rows, a
 // routing.CapabilitySpeech row, a routing.CapabilityTranscription row, a
-// routing.CapabilityTranscriptionStreaming row and a routing.CapabilitySpeechClone
-// row, each attributed to routing.CapabilitySourceAudioCppModels and stamped at, and
-// each written only when the listing answered yes or no for THAT capability (the
-// streaming and clone rows have a second condition, below). No answer is the
+// routing.CapabilityTranscriptionStreaming row, a routing.CapabilitySpeechClone
+// row and a routing.CapabilitySpeechStreaming row, each attributed to
+// routing.CapabilitySourceAudioCppModels and stamped at, and each written only when
+// the listing answered yes or no for THAT capability (the streaming and clone rows
+// have a second condition, below). No answer is the
 // absence of a row -- "unknown" is exactly as in sdcppCapabilityRows -- so one
 // unanswered axis never suppresses another. Pure: no I/O.
 //
@@ -623,11 +669,12 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // "" for everything the listing does not say -- the model is not in it
 // (the server does not name it in /v1/models), the listing is empty or unreadable, the
 // entry carries no task, (streaming) its mode is absent or not one this code knows, or
-// the model is no transcriber, or (clone) the model is no speech model -- and none
-// of those is a statement that the model cannot speak, cannot transcribe, cannot
-// stream or is not a clone. A written "no" can switch a model's route off (speech,
-// transcription), pin it to the buffered answer (transcription streaming), or mark it a
-// plain non-clone synthesiser (speech_clone), so an unknown verdict must never become one.
+// the model is no transcriber (transcription streaming) or no synthesiser (speech
+// streaming), or (clone) the model is no speech model -- and none of those is a
+// statement that the model cannot speak, cannot transcribe, cannot stream or is not a
+// clone. A written "no" can switch a model's route off (speech, transcription), pin it
+// to the buffered answer (transcription or speech streaming), or mark it a plain
+// non-clone synthesiser (speech_clone), so an unknown verdict must never become one.
 //
 // A "no" is a real verdict where it IS stated: the listing names the
 // model's task, so a model present with a task that does not serve the
@@ -655,6 +702,15 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // music, one the listing gives no task) carries no row on it, not even a "no", whatever
 // its clone verdict says. Same rule at the row boundary: a verdict assembled elsewhere
 // cannot put a clone chip on a model that cannot speak.
+//
+// The speech_streaming row is the streaming row's twin on the synthesiser's side
+// (routing.CapabilitySpeechStreaming): the one the speech handler reads to choose
+// between relaying stream=true and the buffered one-shot, gating no route. It refines
+// the speech capability, so it is written only for a model whose speech verdict is
+// yes: a model that does not synthesise speech (asr, music, one the listing gives no
+// task) carries no row on it, not even a "no", whatever its verdict says. The parser
+// already states no such verdict for such a model; this is the same rule held at the
+// row boundary.
 func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing.CapabilityRow {
 	var rows []routing.CapabilityRow
 	for _, axis := range []struct{ capability, verdict string }{
@@ -662,6 +718,7 @@ func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing
 		{routing.CapabilityTranscription, v.Transcription},
 		{routing.CapabilityTranscriptionStreaming, v.TranscriptionStreaming},
 		{routing.CapabilitySpeechClone, v.SpeechClone},
+		{routing.CapabilitySpeechStreaming, v.SpeechStreaming},
 	} {
 		if axis.verdict != routing.CapabilityYes && axis.verdict != routing.CapabilityNo {
 			continue
@@ -670,6 +727,9 @@ func audioCppCapabilityRows(v provider.AudioCppVerdicts, at time.Time) []routing
 			continue
 		}
 		if axis.capability == routing.CapabilitySpeechClone && v.Speech != routing.CapabilityYes {
+			continue
+		}
+		if axis.capability == routing.CapabilitySpeechStreaming && v.Speech != routing.CapabilityYes {
 			continue
 		}
 		rows = append(rows, routing.CapabilityRow{
@@ -786,8 +846,9 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // whose runtime spec is of kind audio_cpp, is NOT probed here: the agent
 // router's /v1/models carries no task, so it could state no verdict. That gap
 // is closed agent-side, not here: the agent reads the child's own /v1/models
-// and reports the speech, transcription, transcription_streaming and speech_clone verdicts
-// under the same audiocpp_models source, which the gateway's agent ingest accepts, so this
+// and reports the speech, transcription, transcription_streaming, speech_clone and
+// speech_streaming verdicts under the same audiocpp_models source, which the gateway's
+// agent ingest accepts, so this
 // loop deliberately leaves an agent-launched child alone. Its voices are the one thing
 // this loop does fetch for it, in a pass of their own: probeAgentVoices.)
 //
@@ -815,6 +876,12 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // loaded). The step runs after the capability write, on the same verdict, and
 // only through the prober's optional voices listing; its failures never touch
 // the verdicts above.
+//
+// A third step per mapping starts the speech rate benchmark (cacheAudioCppSpeechRate,
+// #263): a loaded plain model that streams speech, which has no cached output byte
+// rate for the model the listing states (its path), has the gateway benchmark it, so
+// a streamed call bills in audio seconds and not in the honest audio_bytes fallback.
+// The step only asks for the benchmark; it never synthesizes.
 func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.AudioCppModelsProber) {
 	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
 	if err != nil {
@@ -851,6 +918,7 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 		}
 		r.writeCapabilityRows(ctx, mp, audioCppCapabilityRows(v, r.now()))
 		r.cacheAudioCppVoices(pctx, lister, target, mp, v)
+		r.cacheAudioCppSpeechRate(ctx, server, app, mp, v)
 	}
 }
 
@@ -874,26 +942,28 @@ func audioCppVoicesWanted(v provider.AudioCppVerdicts) bool {
 	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechClone != routing.CapabilityYes
 }
 
-// voicesBackoff is the cross-tick memory of which mappings' voices listing
-// failed lately, so that a server that does not serve the listing (an older
-// audio.cpp, a proxy without the route) is not asked once per loaded tts mapping
-// per health tick for as long as the model stays loaded. A failure opens a
-// window of audioCppVoicesBackoff for THAT mapping; a success, or the model
-// leaving the loaded-tts set (an unload, a reload, a task change), clears it, so
-// a reload retries at once.
+// mappingBackoff is a cross-tick memory of which mappings a per-mapping step of
+// the audio passes should leave alone for a while. The runner holds two: the
+// voices one (voicesBackoff), so that a server that does not serve the voices
+// listing (an older audio.cpp, a proxy without the route) is not asked once per
+// loaded tts mapping per health tick for as long as the model stays loaded, and
+// the speech rate one (speechRateBackoff), so that a benchmark that produced no
+// rate is not started once per tick. A window is opened for THAT mapping, and a
+// success, or the model leaving the set the step applies to (an unload, a reload,
+// a task change), clears it, so a reload retries at once.
 //
 // The audio.cpp passes (static and agent-launched) run one goroutine per
 // application, so the memory is mutex-guarded. It is keyed by mapping id and
-// bounded by the mappings that ever failed: an expired entry is swept whenever a
-// new one is opened. The zero value is ready to use, which is how the tests
-// build their runners.
-type voicesBackoff struct {
+// bounded by the mappings that ever opened a window: an expired entry is swept
+// whenever a new one is opened. The zero value is ready to use, which is how the
+// tests build their runners.
+type mappingBackoff struct {
 	mu    sync.Mutex
 	until map[string]time.Time
 }
 
 // active reports whether mappingID is inside a back-off window at now.
-func (b *voicesBackoff) active(mappingID string, now time.Time) bool {
+func (b *mappingBackoff) active(mappingID string, now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	until, ok := b.until[mappingID]
@@ -902,7 +972,7 @@ func (b *voicesBackoff) active(mappingID string, now time.Time) bool {
 
 // start opens a window for mappingID ending at until, dropping every entry
 // whose window has already ended.
-func (b *voicesBackoff) start(mappingID string, now, until time.Time) {
+func (b *mappingBackoff) start(mappingID string, now, until time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.until == nil {
@@ -917,7 +987,7 @@ func (b *voicesBackoff) start(mappingID string, now, until time.Time) {
 }
 
 // clear ends mappingID's window, if it has one.
-func (b *voicesBackoff) clear(mappingID string) {
+func (b *mappingBackoff) clear(mappingID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.until, mappingID)
@@ -1018,6 +1088,12 @@ func (r *appHealthRunner) fetchAndCacheVoices(ctx context.Context, lister provid
 // the router's 404 for a child that stopped after the agent's report among them
 // -- keeps the row on file and opens a back-off. A mapping leaving the loaded or
 // plain-tts set clears its back-off, so a reload is asked at once.
+//
+// The same eligible set -- running, audio.cpp, plain tts -- is where the speech rate
+// step for an agent-launched child runs (cacheAgentSpeechRate, #263): after the voices
+// fetch, a child whose stored speech_streaming verdict is yes has the gateway benchmark
+// its output byte rate when none is cached for the launch spec it runs under. It starts
+// no child, for the same reason the voices route does not: only a running one is asked.
 func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.AIServer, app routing.Application, lister provider.AudioCppVoicesLister) {
 	specs, err := r.store.RuntimeSpecsByApplication(ctx, app.ID)
 	if err != nil {
@@ -1038,7 +1114,7 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 		loadedSet[name] = struct{}{}
 	}
 	for _, mp := range mappings {
-		spec, ask := r.agentVoiceProbeSpec(ctx, mp, specByMapping, loadedSet)
+		spec, rows, ask := r.agentVoiceProbeSpec(ctx, mp, specByMapping, loadedSet)
 		if !ask {
 			continue
 		}
@@ -1050,6 +1126,7 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 			Timeout:  r.probeTimeout,
 		}
 		r.fetchAndCacheVoices(provider.WithUpstreamAuth(ctx, header, token), lister, target, mp)
+		r.cacheAgentSpeechRate(ctx, server, app, mp, spec, rows)
 	}
 }
 
@@ -1060,32 +1137,38 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 // mapping must be active with an app model name, carry an audio.cpp runtime spec, be in the
 // loaded set, and have stored verdicts that make it a plain tts model.
 //
-// A mapping that has left the loaded set or the plain-tts set has its back-off cleared, so a
-// later reload is asked at once. A runtime-spec miss or a capability read that FAILS leaves
-// the mapping unasked this tick without clearing a back-off: what the child is cannot be
-// told, the same reason the caller requires the agent's runtime_voices declaration.
-func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.ModelMapping, specByMapping map[string]routing.RuntimeSpec, loadedSet map[string]struct{}) (routing.RuntimeSpec, bool) {
+// A mapping that has left the loaded set or the plain-tts set has its back-offs cleared (the
+// voices one and the speech rate one), so a later reload is asked at once. A runtime-spec miss
+// or a capability read that FAILS leaves the mapping unasked this tick without clearing a
+// back-off: what the child is cannot be told, the same reason the caller requires the
+// agent's runtime_voices declaration.
+//
+// The capability rows it read are returned with the spec: the caller's speech rate step
+// (cacheAgentSpeechRate) needs the stored speech_streaming verdict from the same read.
+func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.ModelMapping, specByMapping map[string]routing.RuntimeSpec, loadedSet map[string]struct{}) (routing.RuntimeSpec, []routing.CapabilityRow, bool) {
 	if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
-		return routing.RuntimeSpec{}, false
+		return routing.RuntimeSpec{}, nil, false
 	}
 	spec, ok := specByMapping[mp.ID]
 	if !ok || routing.EffectiveRuntimeSpecType(spec) != routing.RuntimeSpecTypeAudioCpp {
-		return routing.RuntimeSpec{}, false
+		return routing.RuntimeSpec{}, nil, false
 	}
 	if _, loaded := loadedSet[mp.AppModelName]; !loaded {
 		r.voicesBackoff.clear(mp.ID)
-		return routing.RuntimeSpec{}, false
+		r.speechRateBackoff.clear(mp.ID)
+		return routing.RuntimeSpec{}, nil, false
 	}
 	rows, err := r.store.MappingCapabilities(ctx, mp.ID)
 	if err != nil {
 		slog.Debug("app health: capabilities for the agent voices pass failed", "mapping_id", mp.ID, "error", err)
-		return routing.RuntimeSpec{}, false
+		return routing.RuntimeSpec{}, nil, false
 	}
 	if !routing.CapabilityRowsPlainTTS(rows) {
 		r.voicesBackoff.clear(mp.ID)
-		return routing.RuntimeSpec{}, false
+		r.speechRateBackoff.clear(mp.ID)
+		return routing.RuntimeSpec{}, nil, false
 	}
-	return spec, true
+	return spec, rows, true
 }
 
 // writeVoicesCache is the one writer of a mapping's voices cache row (#251),
@@ -1154,6 +1237,189 @@ func voicesCachePayload(voices []provider.Voice) (string, error) {
 		return "", fmt.Errorf("encode the voices payload: %w", err)
 	}
 	return string(payload), nil
+}
+
+// audioCppSpeechRateWanted reports whether the model this probe observed is a
+// target of the speech rate benchmark (#263): the listing states it LOADED right
+// now, a plain tts model -- (speech, yes) and not (speech_clone, yes) -- that
+// STREAMS speech, (speech_streaming, yes). All of it comes from the fresh verdict,
+// like audioCppVoicesWanted, without a store read.
+//
+// Streaming is what narrows it below the manual benchmark: the rate is read only by
+// the streamed call's billing, so a model that answers one-shot has no use for it,
+// and the unknown verdict ("") is no statement that it streams. Loaded is strict
+// because the benchmark synthesizes, and asking a static server to synthesize with
+// a model it does not have loaded could make it swap the model another client is
+// using. A clone model is left out because the benchmark skips it (a plain request
+// 500s without a reference voice), so triggering it would only repeat a refusal.
+func audioCppSpeechRateWanted(v provider.AudioCppVerdicts) bool {
+	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechClone != routing.CapabilityYes && v.SpeechStreaming == routing.CapabilityYes
+}
+
+// cacheAudioCppSpeechRate is the speech rate step of probeAudioCppModels for ONE
+// mapping, run with the verdict that mapping's /v1/models probe just returned: when
+// the model is a target (audioCppSpeechRateWanted) it settles the mapping's cached
+// output byte rate against the model file the listing states (ensureSpeechRate). A
+// mapping that is not a target has its back-off cleared, so a reload is asked at
+// once, and nothing else is touched.
+func (r *appHealthRunner) cacheAudioCppSpeechRate(ctx context.Context, server routing.AIServer, app routing.Application, mp routing.ModelMapping, v provider.AudioCppVerdicts) {
+	if !audioCppSpeechRateWanted(v) {
+		r.speechRateBackoff.clear(mp.ID)
+		return
+	}
+	r.ensureSpeechRate(ctx, server, app, mp, v.Path)
+}
+
+// cacheAgentSpeechRate is the speech rate step of probeAgentVoices for ONE running
+// agent-launched audio.cpp child, the twin of cacheAudioCppSpeechRate for a child the
+// gateway cannot read the listing of. It rides the voices pass's eligibility -- the
+// child is running (the agent's own report), its runtime spec is of kind audio.cpp --
+// and so never starts a cold child: the benchmark synthesizes, and a child the agent
+// reported stopped would be started by it. Whether it is a target comes from
+// the stored rows probeAgentVoices already read (agentSpeechRateWanted), since the
+// agent reports a child's verdicts under source audiocpp_models; the identity is a
+// fingerprint of the launch spec (agentSpecIdentity), the one thing the gateway can
+// see of which model a child serves.
+//
+// Because it rides that pass it shares the pass's gates: the agent must declare
+// runtime_voices (gateway.RuntimeVoicesFeature) and the prober must list voices. Both
+// hold for every agent that can state a speech_streaming verdict at all, since the
+// voices route arrived with agent 0.11.0 and the verdict with 0.11.1.
+func (r *appHealthRunner) cacheAgentSpeechRate(ctx context.Context, server routing.AIServer, app routing.Application, mp routing.ModelMapping, spec routing.RuntimeSpec, rows []routing.CapabilityRow) {
+	if !agentSpeechRateWanted(rows) {
+		r.speechRateBackoff.clear(mp.ID)
+		return
+	}
+	r.ensureSpeechRate(ctx, server, app, mp, agentSpecIdentity(spec))
+}
+
+// agentSpeechRateWanted is audioCppSpeechRateWanted for stored rows: a plain tts model
+// (routing.CapabilityRowsPlainTTS, the voices rule) whose speech_streaming verdict is
+// yes. The caller has already required the child to be running.
+func agentSpeechRateWanted(rows []routing.CapabilityRow) bool {
+	return routing.CapabilityRowsPlainTTS(rows) &&
+		routing.CapabilityRowsByName(rows)[routing.CapabilitySpeechStreaming].Verdict == routing.CapabilityYes
+}
+
+// agentSpecIdentity is the identity the speech rate step records for an agent-launched
+// child: a short fingerprint of what the gateway tells the agent to launch -- the
+// binary, its arguments, its environment (placeholders, never secret values), the config
+// files it is handed and the working directory. A change to any of them can change which
+// model the child serves behind the same app model name, which is the hot swap the rate
+// must follow; everything else in the spec (ports, timeouts, pinning, admin state, the
+// credential) cannot, and must not cost a benchmark. A fingerprint that changes without
+// the model changing only re-derives an unchanged rate.
+//
+// Each field is length-prefixed, so no two different field splits hash alike.
+func agentSpecIdentity(spec routing.RuntimeSpec) string {
+	h := sha256.New()
+	for _, field := range []string{spec.Binary, spec.Args, spec.Env, spec.ConfigFiles, spec.WorkDir} {
+		fmt.Fprintf(h, "%d:%s;", len(field), field)
+	}
+	return "launch:" + hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// ensureSpeechRate is the one decision of the speech rate step, shared by both audio
+// passes (#263): for a mapping that is a target (the caller checked loaded, plain,
+// streaming), start the speech rate benchmark through r.speechRate when the mapping has
+// no usable cached output byte rate, or has one that was measured under another model.
+// It never synthesizes itself -- r.speechRate only starts the gateway's async benchmark --
+// and with no trigger wired it does nothing at all.
+//
+// identity is the loaded-model identity the caller observed ("" when it observed none).
+// The streamed call's billing reads the rate as a plain decimal and never the identity;
+// the benchmark records the identity beside the rate (as the companion row
+// routing.ModelMappingCacheOutputByteRateModel) only once the rate is written, and this
+// step compares them. The cases, by what is stored:
+//
+//   - no usable rate (none, empty, unparseable: routing.ParseOutputByteRate): start the
+//     benchmark, unless one was started lately (speechRateBackoff) -- a failed benchmark
+//     is retried after speechRateRetryBackoff, not every tick;
+//   - a usable rate and no identity observed: nothing to compare, so nothing to do -- an
+//     unstated identity is never taken for a change;
+//   - a usable rate whose recorded identity is the observed one: current, nothing to do;
+//     the back-off ends, the benchmark having delivered;
+//   - a usable rate with no recorded identity: one a manual benchmark cached, which knows
+//     none. The observed identity is adopted (recorded, no benchmark) so a LATER change is
+//     detected;
+//   - a usable rate recorded under another identity: the model behind the mapping changed
+//     (which no rename invalidation sees), so the rate is of a different model. It is
+//     invalidated at once -- an empty payload, which billing reads as no rate, so a streamed
+//     call bills the honest audio_bytes and not a wrong audio_second -- and the benchmark is
+//     started to derive the new one, whatever back-off an earlier trigger opened: a changed
+//     model is not a retry.
+//
+// A back-off opens only when the gateway reports it started a run; a trigger that started
+// none (a busy server, the idle gate, a mapping that is not a target) is asked again on the
+// next tick. Every store failure is best-effort: logged, and the step carries on or stops
+// without guessing (a cache that cannot be read is neither "no rate" nor a changed model).
+func (r *appHealthRunner) ensureSpeechRate(ctx context.Context, server routing.AIServer, app routing.Application, mp routing.ModelMapping, identity string) {
+	if r.speechRate == nil {
+		return
+	}
+	now := r.now()
+	haveRate, recorded, err := r.storedSpeechRate(ctx, mp.ID)
+	if err != nil {
+		slog.Debug("app health: speech rate cache read failed", "mapping_id", mp.ID, "error", err)
+		return
+	}
+	switch {
+	case !haveRate:
+		if r.speechRateBackoff.active(mp.ID, now) {
+			return
+		}
+	case identity == "" || recorded == identity:
+		r.speechRateBackoff.clear(mp.ID)
+		return
+	case recorded == "":
+		r.speechRateBackoff.clear(mp.ID)
+		if err := r.upsertSpeechRateCache(ctx, mp.ID, routing.ModelMappingCacheOutputByteRateModel, identity); err != nil {
+			log.Printf("app health: could not adopt the model identity of mapping %s's output byte rate: %v", mp.ID, err)
+		}
+		return
+	default:
+		r.speechRateBackoff.clear(mp.ID)
+		if err := r.upsertSpeechRateCache(ctx, mp.ID, routing.ModelMappingCacheOutputByteRate, ""); err != nil {
+			log.Printf("app health: could not invalidate the stale output byte rate of mapping %s after its model changed: %v", mp.ID, err)
+		}
+	}
+	if r.speechRate(ctx, server, app, mp, identity) {
+		r.speechRateBackoff.start(mp.ID, now, now.Add(speechRateRetryBackoff))
+	}
+}
+
+// storedSpeechRate reads what ensureSpeechRate compares: whether the mapping has a usable
+// cached output byte rate, and the identity recorded beside it ("" when none is).
+func (r *appHealthRunner) storedSpeechRate(ctx context.Context, mappingID string) (haveRate bool, recordedIdentity string, err error) {
+	rateRows, err := r.store.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheOutputByteRate)
+	if err != nil {
+		return false, "", fmt.Errorf("read the output byte rate cache: %w", err)
+	}
+	for _, row := range rateRows {
+		if _, ok := routing.ParseOutputByteRate(row.Payload); ok && row.ScopeKey == "" {
+			haveRate = true
+		}
+	}
+	if !haveRate {
+		return false, "", nil
+	}
+	identityRows, err := r.store.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheOutputByteRateModel)
+	if err != nil {
+		return false, "", fmt.Errorf("read the output byte rate identity cache: %w", err)
+	}
+	for _, row := range identityRows {
+		if row.ScopeKey == "" {
+			recordedIdentity = row.Payload
+		}
+	}
+	return haveRate, recordedIdentity, nil
+}
+
+// upsertSpeechRateCache writes one scope-"" row of the speech rate's two cache types.
+func (r *appHealthRunner) upsertSpeechRateCache(ctx context.Context, mappingID, cacheType, payload string) error {
+	return r.store.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+		MappingID: mappingID, CacheType: cacheType, ScopeKey: "", Payload: payload, UpdatedAt: r.now(),
+	})
 }
 
 // cacheSdcppImageOptions reads the image options of one external
@@ -1660,8 +1926,8 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 
 		// audio.cpp capability pass: for every active audio_cpp application,
 		// read the server's own /v1/models listing for each of its active
-		// mappings and write the speech, transcription, transcription_streaming and
-		// speech_clone verdicts that listing states for that model, and, for a
+		// mappings and write the speech, transcription, transcription_streaming,
+		// speech_clone and speech_streaming verdicts that listing states for that model, and, for a
 		// model it states loaded and plain tts, cache its voices (probeAudioCppModels). A separate
 		// branch from the context probe for the same reason as the sdcpp one:
 		// audio_cpp has no context probe path, and the listing is not a
