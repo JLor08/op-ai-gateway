@@ -507,7 +507,8 @@ type ChatImageSettings struct {
 // audio.cpp unchanged), refusing the keys that would override the body the run
 // itself owns (model/input/stream/stream_format/response_format). The turn the run
 // commits is always a WAV (a streamed synthesis is assembled into one), so there is
-// no format knob.
+// no format knob. KeepLastAudio is the one field that is not a synthesis knob: it is
+// the thread's own retention of the answers it has stored, and is never sent upstream.
 type ChatAudioSettings struct {
 	// Voice is the voice name; "" leaves the model's default voice. The composer
 	// offers the voices the gateway has cached for the model in a combobox that
@@ -534,6 +535,16 @@ type ChatAudioSettings struct {
 	// chosen false stay distinguishable and an existing thread's persisted settings stay
 	// byte-identical.
 	Stream *bool `json:"stream,omitempty"`
+	// KeepLastAudio is the thread's retention of its generated answers (#281): how many
+	// of the newest speech answers' audio blobs the chat keeps. nil (omitted) keeps every
+	// answer, the default and what a thread stored before this field exists reads as; 0
+	// stores no answer audio at all; N >= 1 keeps the last N. A negative value is not a
+	// count, so PrepareChatRun reads it as unset (nil). A POINTER, like Speed and Stream,
+	// so the meaningful 0 stays distinguishable from "unset" (a plain int with omitempty
+	// would drop it) and an existing thread's persisted settings stay byte-identical.
+	// Declared last, after Stream, on purpose: a field added later must not move an
+	// existing chat's serialized bytes.
+	KeepLastAudio *int `json:"keep_last_audio,omitempty"`
 }
 
 // ChatTranscriptionSettings are the speech-to-text knobs a portal
@@ -743,6 +754,14 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// (the line above already clears them, as speech is not image).
 	if req.Settings.Kind != chatKindSpeech {
 		req.Settings.Audio = nil
+	}
+	// A negative retention is no count: it reads as unset, which keeps every answer.
+	// 0 (store none) and a positive N (keep the last N) stay as submitted. The settings
+	// are copied before the clamp so the caller's own struct is left as it was sent.
+	if a := req.Settings.Audio; a != nil && a.KeepLastAudio != nil && *a.KeepLastAudio < 0 {
+		clamped := *a
+		clamped.KeepLastAudio = nil
+		req.Settings.Audio = &clamped
 	}
 	// And for the transcription settings and a transcription thread: they are
 	// cleared for every other kind (text, image and speech alike), while the two
