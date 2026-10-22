@@ -1314,3 +1314,79 @@ func TestSpeechPCMCaptureIsRedacted(t *testing.T) {
 		t.Fatalf("request body = %q, want the text to synthesize captured", env.ReqBody)
 	}
 }
+
+// mono16WAVOverDeclaredData is a conformant mono/16-bit/16000 RIFF/WAVE (the fmt chunk
+// isMono16PCM accepts) whose data chunk header DECLARES 0xFFFFFFFF bytes but is followed by
+// only 8: the garbled/streaming writer's over-declaration the strip's overrun guard refuses
+// rather than relay under a lying Content-Length.
+func mono16WAVOverDeclaredData(t *testing.T) []byte {
+	t.Helper()
+	wav := []byte("RIFF\x2c\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff")
+	return append(wav, 0x00, 0xff, 0xfe, 0x80, 0x7f, 0x00, 0x01, 0xc3)
+}
+
+// newSpeechChunkedUpstream serves wav as audio/wav but flushes mid-body so net/http frames
+// the response chunked -- no Content-Length reaches the gateway. It is the one upstream shape
+// the pcm strip refuses for want of a length to bound the data chunk against; the normal
+// newSpeechUpstream (whole-body Write) always carries a Content-Length, so this is separate.
+func newSpeechChunkedUpstream(t *testing.T, wav []byte) *httptest.Server {
+	t.Helper()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Header().Set("X-AudioCPP-Audio-Duration-Ms", "1500")
+		w.WriteHeader(http.StatusOK)
+		half := len(wav) / 2
+		_, _ = w.Write(wav[:half])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // forces chunked transfer encoding; no Content-Length is sent
+		}
+		_, _ = w.Write(wav[half:])
+	}))
+	t.Cleanup(up.Close)
+	return up
+}
+
+// Overrun branch of the strip's dataSize guard: a conformant mono/16 WAV whose data chunk
+// over-declares its size past the upstream's (correct, small) Content-Length is refused with
+// speech.pcm_unavailable, billed (audio_second, 0) -- never relayed truncated or under a
+// lying length.
+func TestSpeechPCMRefusesAnOverDeclaredDataChunk(t *testing.T) {
+	up, _ := newSpeechUpstream(t, mono16WAVOverDeclaredData(t))
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","response_format":"pcm"}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(speechPcmUnavailable)) {
+		t.Fatalf("body=%q, want code %q", rec.Body.Bytes(), speechPcmUnavailable)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
+		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
+}
+
+// No-usable-Content-Length branch of the strip's dataSize guard: a conformant mono/16 WAV the
+// upstream streams chunked leaves the strip no length to bound the data chunk against, so it
+// refuses with speech.pcm_unavailable, billed (audio_second, 0), rather than label a body it
+// cannot promise.
+func TestSpeechPCMRefusesAWAVWithoutAContentLength(t *testing.T) {
+	up := newSpeechChunkedUpstream(t, speechTestWAV())
+	srv, _ := newSpeechCapableTestServer(t, up.URL)
+
+	rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","response_format":"pcm"}`)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(speechPcmUnavailable)) {
+		t.Fatalf("body=%q, want code %q", rec.Body.Bytes(), speechPcmUnavailable)
+	}
+	got := lastUsageEvent(t, srv)
+	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
+		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
+}

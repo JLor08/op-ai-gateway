@@ -803,12 +803,15 @@ func (s *Server) relaySpeechUpstreamError(w http.ResponseWriter, r *http.Request
 }
 
 // recordSpeechPCMUnavailable answers a one-shot pcm request whose synthesized clip cannot
-// be served as raw PCM: the mapped model's native WAV is not 16-bit mono PCM (or its data
-// chunk does not fit the upstream's declared length -- a garbled/streaming writer's header,
-// never trusted audio.cpp's). It is a POST-synthesis refusal -- the format is known only
-// once the upstream has answered -- so validateSpeechRequest cannot raise it; proxyNative
-// does, from its 2xx strip path, which is why this takes the request's identity as the one
-// nativeExchange (ex) that relaySpeechUpstreamError does.
+// be served as raw PCM. The strip (proxyNative) refuses for any of four reasons, all one
+// client-facing limitation: the upstream WAV is not 16-bit mono PCM, is structurally unsound
+// (no readable RIFF/WAVE), over-declares its data chunk past the upstream's own
+// Content-Length, or carries no usable Content-Length to bound that chunk against -- the last
+// three a garbled or streaming writer's header, never trusted audio.cpp's, caught so the
+// relay never emits a truncated or mislabelled body. It is a POST-synthesis refusal -- the
+// shape is known only once the upstream has answered -- so validateSpeechRequest cannot raise
+// it; proxyNative does, from its 2xx strip path, which is why this takes the request's
+// identity as the one nativeExchange (ex) that relaySpeechUpstreamError does.
 //
 // The client gets an OpenAI-shaped error object under HTTP 502 (a backend limitation, not
 // the client's request): type speechUpstreamErrorType ("upstream_error") and the API-surface
@@ -818,11 +821,11 @@ func (s *Server) relaySpeechUpstreamError(w http.ResponseWriter, r *http.Request
 // and the format), and the WAV never reaches the copier: this returns in its place.
 func (s *Server) recordSpeechPCMUnavailable(w http.ResponseWriter, r *http.Request, ex nativeExchange) {
 	const status = http.StatusBadGateway
-	slog.Warn("speech pcm request refused: the model's synthesized audio is not 16-bit mono PCM",
+	slog.Warn("speech pcm request refused: the mapped model's native speech output cannot be served as pcm",
 		"path", r.URL.Path, "api_flavor", ex.req.APIFlavor, "model", ex.req.Model, "server", ex.serverName, "code", speechPcmUnavailable, "status", status)
 	// Marshal cannot fail on this type (three strings), so there is no failure to report.
 	body, _ := json.Marshal(apierror.Body{Error: apierror.ErrorBody{
-		Message: fmt.Sprintf("response_format \"pcm\" is unavailable for model %q: its native audio is not 16-bit mono PCM", ex.req.Model),
+		Message: fmt.Sprintf("response_format \"pcm\" is unavailable for model %q: the mapped model's native speech output cannot be served as pcm (it is not 16-bit mono PCM, is structurally unsound, over-declares its data length, or carries no usable Content-Length)", ex.req.Model),
 		Type:    speechUpstreamErrorType,
 		Code:    speechPcmUnavailable,
 	}})
