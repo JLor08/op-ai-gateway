@@ -199,3 +199,135 @@ func isAssistantMessage(raw json.RawMessage) bool {
 	}
 	return json.Unmarshal(raw, &m) == nil && m.Role == "assistant"
 }
+
+// pruneAudioBeyond is the prune itself: it walks doc.Messages newest to oldest and
+// counts the answers that hold audio -- the messages that are BOTH an assistant
+// message (isAssistantMessage) AND hold at least one stored audio part
+// (messageHasStoredAudio) -- keeps the newest keepLast of them as they are, and
+// rewrites every older one in place into the not-stored state
+// (markMessageAudioRemoved), returning the chat_blobs ids those rewrites leave
+// unreferenced, newest answer first, for the caller to delete in the save that
+// writes the document.
+//
+// What counts is what the retention is about, and it is decided here, in one place:
+//
+//   - N counts ANSWERS, not blobs: ADR-070 stores one long answer as several blobs,
+//     and the whole answer is one slot and goes with all of its blobs together.
+//   - Only assistant messages count and are rewritten. A transcription turn's user
+//     message carries an audio_url clip too, but that is the user's input, and
+//     messageHasStoredAudio deliberately does not look at the role.
+//   - An answer that holds no audio takes no slot: a text answer, an errored one,
+//     and above all one already in the not-stored state, so an answer pruned earlier
+//     never pushes a still-stored older one out of the last N.
+//
+// keepLast 0 removes every answer's audio (the retroactive prune's "keep none"); a
+// negative keepLast is no count and prunes nothing. Pruning is idempotent: the
+// answers it has rewritten hold no audio and are skipped, so a second call over the
+// same document returns no ids.
+//
+// The document is rewritten only if the whole walk succeeds: on an error doc is
+// exactly as it came in, so a caller that gives up has nothing to undo. The newest
+// answer is never special-cased -- the commit-time caller (pruneForRetention) only
+// prunes with a freshly appended answer in the newest slot, so keepLast >= 1 always
+// keeps it.
+func pruneAudioBeyond(doc *chatDoc, keepLast int) (deleteBlobIDs []string, err error) {
+	if keepLast < 0 {
+		return nil, nil
+	}
+	type rewrite struct {
+		at  int
+		raw json.RawMessage
+	}
+	var rewrites []rewrite
+	kept := 0
+	for i := len(doc.Messages) - 1; i >= 0; i-- {
+		raw := doc.Messages[i]
+		if !isAssistantMessage(raw) {
+			continue
+		}
+		has, err := messageHasStoredAudio(raw)
+		if err != nil {
+			return nil, err
+		}
+		if !has {
+			continue
+		}
+		if kept < keepLast {
+			kept++
+			continue
+		}
+		rewritten, ids, changed, err := markMessageAudioRemoved(raw)
+		if err != nil {
+			return nil, err
+		}
+		if !changed {
+			continue
+		}
+		rewrites = append(rewrites, rewrite{at: i, raw: rewritten})
+		deleteBlobIDs = append(deleteBlobIDs, ids...)
+	}
+	for _, r := range rewrites {
+		doc.Messages[r.at] = r.raw
+	}
+	return deleteBlobIDs, nil
+}
+
+// pruneForRetention is the lazy, going-forward prune of a run commit: called with the
+// document a run is about to save, after its new answer is appended as the newest
+// message (and its inline audio moved into chat_blobs), it applies the thread's
+// retention to the older answers. It returns the blob ids to delete in the same
+// atomic save; doc has had those answers rewritten to the marker.
+//
+// It acts only for a retention of at least one answer (the thread's
+// ChatAudioSettings.KeepLastAudio, read from the stored settings):
+//
+//   - unset keeps every answer -- what the default and every chat stored before the
+//     setting existed read as. That includes a negative count, which PrepareChatRun
+//     clamps to unset but which could still reach the schema-free document by
+//     another write path; and a value that is not a whole number, or settings that
+//     do not parse, which are no retention either.
+//   - 0 stores no answer audio at all, which is decided by the run that produces the
+//     answer (it never stores the audio there would be to prune), not by pruning the
+//     answers before it.
+//
+// And only when the newest message is an answer that holds audio: the prune is that
+// answer making room for itself, so a commit that holds none -- a checkpoint (text
+// only, every few seconds), an errored run -- prunes nothing, and the newest answer
+// is never the one rewritten.
+func pruneForRetention(doc *chatDoc) (deleteBlobIDs []string, err error) {
+	keep, ok := storedKeepLastAudio(doc.Settings)
+	if !ok || keep < 1 || len(doc.Messages) == 0 {
+		return nil, nil
+	}
+	newest := doc.Messages[len(doc.Messages)-1]
+	if !isAssistantMessage(newest) {
+		return nil, nil
+	}
+	if has, err := messageHasStoredAudio(newest); err != nil || !has {
+		return nil, err
+	}
+	return pruneAudioBeyond(doc, keep)
+}
+
+// storedKeepLastAudio reads the retention out of a chat document's settings: the
+// count and true when one is set, 0 and false for every document that sets none.
+// The document is schema-free, so this decodes the one member it needs rather than
+// the whole ChatAudioSettings (an unrelated malformed knob must not switch the
+// retention off), and a value that is not a non-negative whole number is read as
+// unset: a negative count is what PrepareChatRun's clamp already calls unset, and
+// anything else is no count at all. A set 0 is returned as (0, true), distinct from
+// unset, for the callers that treat "store none" differently.
+func storedKeepLastAudio(settings json.RawMessage) (n int, ok bool) {
+	if len(settings) == 0 {
+		return 0, false
+	}
+	var s struct {
+		Audio *struct {
+			KeepLastAudio *int `json:"keep_last_audio"`
+		} `json:"audio"`
+	}
+	if json.Unmarshal(settings, &s) != nil || s.Audio == nil || s.Audio.KeepLastAudio == nil || *s.Audio.KeepLastAudio < 0 {
+		return 0, false
+	}
+	return *s.Audio.KeepLastAudio, true
+}

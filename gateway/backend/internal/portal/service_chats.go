@@ -267,6 +267,12 @@ func (s *Service) sealedChatUpdate(row store.ChatRow, title string, content json
 // document and every blob it now references persist, or none does. It is the
 // write both run commits end in (PrepareChatRun, writeAssistant).
 //
+// deleteBlobIDs are the chat's blobs the rewritten doc no longer references --
+// the audio of answers the retention prune turned into the not-stored marker
+// (pruneForRetention). They are deleted in the same step, so the saved document
+// never points at a blob this save removed; nil, what PrepareChatRun passes,
+// deletes nothing.
+//
 // The document is sealed here, after the extraction, so the MaxChatContentBytes
 // cap measures the rewritten document -- a few hundred bytes per image -- not
 // the bytes it used to carry.
@@ -277,7 +283,7 @@ func (s *Service) sealedChatUpdate(row store.ChatRow, title string, content json
 // ends cleanly rather than as a 500. A volatile memory store can accept the
 // save and evict the chat straight away to stay within its budget; nothing here
 // assumes the chat is still held afterwards.
-func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title string, doc chatDoc, blobs []store.ChatBlob) error {
+func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title string, doc chatDoc, blobs []store.ChatBlob, deleteBlobIDs []string) error {
 	content, err := doc.marshal()
 	if err != nil {
 		return err
@@ -286,7 +292,7 @@ func (s *Service) commitChatRun(ctx context.Context, row store.ChatRow, title st
 	if err != nil {
 		return err
 	}
-	return s.chats.SaveChatWithBlobs(ctx, updated, blobs, nil)
+	return s.chats.SaveChatWithBlobs(ctx, updated, blobs, deleteBlobIDs)
 }
 
 // DeleteChat removes an owned chat. A foreign or missing chat is 404 (no leak).
@@ -823,7 +829,7 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if err != nil {
 		return nil, ChatRunSettings{}, err
 	}
-	if err := s.commitChatRun(ctx, row, title, doc, blobs); err != nil {
+	if err := s.commitChatRun(ctx, row, title, doc, blobs, nil); err != nil {
 		return nil, ChatRunSettings{}, err
 	}
 
@@ -1114,5 +1120,15 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 	if err != nil {
 		return err
 	}
-	return s.commitChatRun(ctx, row, row.Title, doc, blobs)
+
+	// The audio answer lifecycle (#281): the answer just built makes room for itself
+	// under the thread's retention. Older answers beyond keep_last_audio are rewritten
+	// to the not-stored marker in doc, and their blobs are deleted in the very save that
+	// writes the document, so no commit leaves more answers stored than the thread
+	// keeps. A thread with no retention set (every legacy one) prunes nothing.
+	deleteBlobIDs, err := pruneForRetention(&doc)
+	if err != nil {
+		return err
+	}
+	return s.commitChatRun(ctx, row, row.Title, doc, blobs, deleteBlobIDs)
 }

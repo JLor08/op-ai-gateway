@@ -281,3 +281,294 @@ func TestMessageHasStoredAudioDoesNotLookAtTheRole(t *testing.T) {
 		t.Fatal("isAssistantMessage of a non-message = true, want false")
 	}
 }
+
+// docOf is a chat document holding the given stored messages, oldest first.
+func docOf(messages ...json.RawMessage) *chatDoc {
+	return &chatDoc{Messages: messages}
+}
+
+// pruneIDs is the blob ids a prune is expected to return, as one slice.
+func pruneIDs(ids ...string) []string { return ids }
+
+// pruneAudioBeyond keeps the newest N ANSWERS holding audio and rewrites every older
+// one in place into the marker, returning the blob ids the rewrites free. What counts
+// as an answer, and as holding audio, is the part this table pins: the role gate
+// (a transcription turn's clip is a user message), the part gate (a text answer holds
+// none), the marker (an answer already pruned takes no slot), and the unit (one
+// answer is one slot whatever its blob count).
+func TestPruneAudioBeyond(t *testing.T) {
+	const marker = `{"type":"audio_removed"}`
+	a := func(ids ...string) json.RawMessage {
+		parts := make([]string, len(ids))
+		for i, id := range ids {
+			parts[i] = retentionAudioPart(id)
+		}
+		return retentionMessage("assistant", parts...)
+	}
+	user := json.RawMessage(`{"id":"u","role":"user","content":"hello"}`)
+	clip := retentionMessage("user", retentionAudioPart("blob_clip"))
+	text := retentionMessage("assistant", retentionTextPart)
+	// gone is an answer in the not-stored state: what a pruned answer becomes and what an
+	// already-pruned one is, byte for byte (the rewrite keeps every other member).
+	gone := retentionMessage("assistant", marker)
+
+	for _, tc := range []struct {
+		name     string
+		messages []json.RawMessage
+		keepLast int
+		wantIDs  []string
+		want     []json.RawMessage // the messages after the prune
+	}{
+		{
+			name:     "keep 1 of 3: the two older answers go, the newest stays",
+			messages: []json.RawMessage{user, a("blob_1"), user, a("blob_2"), user, a("blob_3")},
+			keepLast: 1,
+			wantIDs:  pruneIDs("blob_2", "blob_1"), // newest to oldest: the walk's order
+			want:     []json.RawMessage{user, gone, user, gone, user, a("blob_3")},
+		},
+		{
+			name:     "keep 2 of 3: only the oldest goes",
+			messages: []json.RawMessage{user, a("blob_1"), user, a("blob_2"), user, a("blob_3")},
+			keepLast: 2,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{user, gone, user, a("blob_2"), user, a("blob_3")},
+		},
+		{
+			name:     "within N: nothing to do",
+			messages: []json.RawMessage{user, a("blob_1"), user, a("blob_2")},
+			keepLast: 2,
+			want:     []json.RawMessage{user, a("blob_1"), user, a("blob_2")},
+		},
+		{
+			name:     "keep 0 removes every answer's audio (the retroactive prune's zero)",
+			messages: []json.RawMessage{user, a("blob_1"), user, a("blob_2")},
+			keepLast: 0,
+			wantIDs:  pruneIDs("blob_2", "blob_1"),
+			want:     []json.RawMessage{user, gone, user, gone},
+		},
+		{
+			name:     "a negative count is no count: nothing is pruned",
+			messages: []json.RawMessage{user, a("blob_1"), user, a("blob_2")},
+			keepLast: -1,
+			want:     []json.RawMessage{user, a("blob_1"), user, a("blob_2")},
+		},
+		{
+			name:     "a multi-blob answer is one slot, and goes with all of its blobs",
+			messages: []json.RawMessage{user, a("blob_1a", "blob_1b", "blob_1c"), user, a("blob_2a"), user, a("blob_3a", "blob_3b")},
+			keepLast: 2,
+			wantIDs:  pruneIDs("blob_1a", "blob_1b", "blob_1c"),
+			want:     []json.RawMessage{user, gone, user, a("blob_2a"), user, a("blob_3a", "blob_3b")},
+		},
+		{
+			// The clip of a transcription turn is audio, but not an answer: it takes no slot
+			// and is never rewritten, whatever N is.
+			name:     "a user message's audio clip is neither counted nor pruned",
+			messages: []json.RawMessage{clip, a("blob_1"), clip, a("blob_2")},
+			keepLast: 1,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{clip, gone, clip, a("blob_2")},
+		},
+		{
+			// The gate that stops a clip taking a slot: were it counted, the newest
+			// answer would be pushed out of the last N by a message that is no answer.
+			name:     "a newer user clip takes no slot from the answers before it",
+			messages: []json.RawMessage{user, a("blob_1"), user, a("blob_2"), clip},
+			keepLast: 1,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{user, gone, user, a("blob_2"), clip},
+		},
+		{
+			name:     "keep 0 still leaves a user's clip alone",
+			messages: []json.RawMessage{clip, a("blob_1")},
+			keepLast: 0,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{clip, gone},
+		},
+		{
+			name:     "a text answer holds no audio: no slot, never rewritten",
+			messages: []json.RawMessage{user, a("blob_1"), user, text, user, a("blob_2")},
+			keepLast: 1,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{user, gone, user, text, user, a("blob_2")},
+		},
+		{
+			// An answer whose audio is already gone must not push a still-stored older
+			// answer out of the last N.
+			name:     "a marked answer takes no slot",
+			messages: []json.RawMessage{user, a("blob_1"), user, gone, user, a("blob_3")},
+			keepLast: 2,
+			want:     []json.RawMessage{user, a("blob_1"), user, gone, user, a("blob_3")},
+		},
+		{
+			name:     "a marked answer in between is skipped, not rewritten twice",
+			messages: []json.RawMessage{user, a("blob_1"), user, gone, user, a("blob_3")},
+			keepLast: 1,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{user, gone, user, gone, user, a("blob_3")},
+		},
+		{
+			name: "a mixed text+audio answer is one audio answer; its text stays",
+			messages: []json.RawMessage{
+				retentionMessage("assistant", retentionTextPart, retentionAudioPart("blob_1")), user, a("blob_2"),
+			},
+			keepLast: 1,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{retentionMessage("assistant", retentionTextPart, marker), user, a("blob_2")},
+		},
+		{
+			name:     "a stored element that is not a message is skipped",
+			messages: []json.RawMessage{json.RawMessage(`null`), json.RawMessage(`"x"`), a("blob_1"), json.RawMessage(`{"role":`)},
+			keepLast: 0,
+			wantIDs:  pruneIDs("blob_1"),
+			want:     []json.RawMessage{json.RawMessage(`null`), json.RawMessage(`"x"`), gone, json.RawMessage(`{"role":`)},
+		},
+		{
+			name:     "an empty document",
+			messages: nil,
+			keepLast: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := docOf(append([]json.RawMessage(nil), tc.messages...)...)
+			ids, err := pruneAudioBeyond(doc, tc.keepLast)
+			if err != nil {
+				t.Fatalf("pruneAudioBeyond: %v", err)
+			}
+			if !slices.Equal(ids, tc.wantIDs) {
+				t.Fatalf("ids = %v, want %v", ids, tc.wantIDs)
+			}
+			if len(doc.Messages) != len(tc.want) {
+				t.Fatalf("%d messages after the prune, want %d: pruning rewrites an answer, it never drops one", len(doc.Messages), len(tc.want))
+			}
+			for i := range tc.want {
+				if string(doc.Messages[i]) != string(tc.want[i]) {
+					t.Fatalf("message %d = %s, want %s", i, doc.Messages[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// A second prune of the same document finds nothing: the answers it rewrote hold no
+// audio now and take no slot, so repeating the call (a retry, two commits in a row)
+// returns no ids and writes no second marker.
+func TestPruneAudioBeyondIsIdempotent(t *testing.T) {
+	doc := docOf(
+		retentionMessage("assistant", retentionAudioPart("blob_1")),
+		retentionMessage("assistant", retentionAudioPart("blob_2")),
+		retentionMessage("assistant", retentionAudioPart("blob_3")),
+	)
+	if ids, err := pruneAudioBeyond(doc, 1); err != nil || !slices.Equal(ids, []string{"blob_2", "blob_1"}) {
+		t.Fatalf("first prune = %v, %v, want blob_2 and blob_1", ids, err)
+	}
+	before := slices.Clone(doc.Messages)
+	ids, err := pruneAudioBeyond(doc, 1)
+	if err != nil || len(ids) != 0 {
+		t.Fatalf("second prune = %v, %v, want none", ids, err)
+	}
+	for i := range before {
+		if string(before[i]) != string(doc.Messages[i]) {
+			t.Fatalf("second prune rewrote message %d: %s -> %s", i, before[i], doc.Messages[i])
+		}
+	}
+}
+
+// The commit-time prune reads the thread's retention from the stored settings, and
+// acts only when that is a count of at least one. Everything else leaves the
+// document and the blob rows alone: unset (keep all, what every legacy chat reads
+// as), a negative count (not a count; PrepareChatRun clamps it, but the document is
+// schema-free), a malformed value, and 0 -- "store none" is the N=0 run's business
+// (it never stores the answer to prune), not this prune's.
+func TestPruneForRetention(t *testing.T) {
+	three := func() *chatDoc {
+		return docOf(
+			retentionMessage("assistant", retentionAudioPart("blob_1")),
+			retentionMessage("user", retentionTextPart),
+			retentionMessage("assistant", retentionAudioPart("blob_2")),
+			retentionMessage("user", retentionTextPart),
+			retentionMessage("assistant", retentionAudioPart("blob_3")),
+		)
+	}
+	for _, tc := range []struct {
+		name     string
+		settings string
+		wantIDs  []string
+	}{
+		{"no settings at all", ``, nil},
+		{"null settings", `null`, nil},
+		{"empty settings", `{}`, nil},
+		{"audio settings without the field", `{"kind":"speech","audio":{"voice":"alloy"}}`, nil},
+		{"explicit null", `{"audio":{"keep_last_audio":null}}`, nil},
+		{"zero is the N=0 run's, not this prune's", `{"audio":{"keep_last_audio":0}}`, nil},
+		{"negative reads as unset", `{"audio":{"keep_last_audio":-3}}`, nil},
+		{"a string is not a count", `{"audio":{"keep_last_audio":"2"}}`, nil},
+		{"a fraction is not a count", `{"audio":{"keep_last_audio":1.5}}`, nil},
+		{"malformed settings", `{"audio":`, nil},
+		{"settings that are not an object", `[1]`, nil},
+		{"keep 1", `{"kind":"speech","audio":{"keep_last_audio":1}}`, []string{"blob_2", "blob_1"}},
+		{"keep 2", `{"kind":"speech","audio":{"keep_last_audio":2}}`, []string{"blob_1"}},
+		{"keep more than there are", `{"audio":{"keep_last_audio":9}}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := three()
+			doc.Settings = json.RawMessage(tc.settings)
+			before := slices.Clone(doc.Messages)
+			ids, err := pruneForRetention(doc)
+			if err != nil {
+				t.Fatalf("pruneForRetention: %v", err)
+			}
+			if !slices.Equal(ids, tc.wantIDs) {
+				t.Fatalf("ids = %v, want %v", ids, tc.wantIDs)
+			}
+			if tc.wantIDs == nil {
+				for i := range before {
+					if string(before[i]) != string(doc.Messages[i]) {
+						t.Fatalf("no prune was due, yet message %d changed: %s -> %s", i, before[i], doc.Messages[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// The prune is the commit of an audio answer making room for itself, so it runs only
+// when the newest message IS an answer holding audio. A commit whose newest message
+// holds none -- a checkpoint (text only, every few seconds), an errored run, a text
+// answer -- prunes nothing, however many answers the chat already holds, and the
+// newest answer is never itself the one rewritten.
+func TestPruneForRetentionOnlyWhenTheNewestAnswerHoldsAudio(t *testing.T) {
+	settings := json.RawMessage(`{"audio":{"keep_last_audio":1}}`)
+	for _, tc := range []struct {
+		name    string
+		newest  json.RawMessage
+		wantIDs []string
+	}{
+		{"a text-only newest answer (a checkpoint)", retentionMessage("assistant", retentionTextPart), nil},
+		{"an errored newest answer with no content parts", json.RawMessage(`{"id":"m","role":"assistant","status":"error","content":""}`), nil},
+		{"a marker newest answer", retentionMessage("assistant", `{"type":"audio_removed"}`), nil},
+		{"a user message as the newest", retentionMessage("user", retentionAudioPart("blob_clip")), nil},
+		{"an audio answer", retentionMessage("assistant", retentionAudioPart("blob_new")), []string{"blob_2", "blob_1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := docOf(
+				retentionMessage("assistant", retentionAudioPart("blob_1")),
+				retentionMessage("assistant", retentionAudioPart("blob_2")),
+				tc.newest,
+			)
+			doc.Settings = settings
+			ids, err := pruneForRetention(doc)
+			if err != nil {
+				t.Fatalf("pruneForRetention: %v", err)
+			}
+			if !slices.Equal(ids, tc.wantIDs) {
+				t.Fatalf("ids = %v, want %v", ids, tc.wantIDs)
+			}
+			if string(doc.Messages[2]) != string(tc.newest) {
+				t.Fatalf("the newest message was rewritten: %s -> %s", tc.newest, doc.Messages[2])
+			}
+			if tc.wantIDs == nil && strings.Contains(string(doc.Messages[0])+string(doc.Messages[1]), "audio_removed") {
+				t.Fatalf("no prune was due, yet an older answer was marked: %s %s", doc.Messages[0], doc.Messages[1])
+			}
+		})
+	}
+}
