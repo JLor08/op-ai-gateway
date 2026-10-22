@@ -108,14 +108,13 @@ const (
 	// silent drop every other code here exists to refuse.
 	speechRunReservedFieldMessage = "gateway.chat_run_speech_reserved_field"
 	// speechRunAudioTooLargeMessage: the synthesized audio is longer than the total
-	// the run may store (Server.maxChatAudioBytes, the cap the chat store enforces
-	// over all of a turn's audio blobs). It is a clip too long for ANY retry of the
-	// same text -- the same text synthesizes the same length -- so the portal words
-	// it as such, apart from the failures a retry can cure. Nothing is committed: a
-	// clip with its tail cut off would be presented as the whole reply, the silent
-	// truncation every other code here refuses. A streamed run reaches this only
-	// after the stream is read to its end (see readSpeechEvents), so the call is
-	// still billed as delivered.
+	// the run may store (Server.maxChatAudioBytes, the cap the run executor holds
+	// all of a turn's audio blobs to). A clip this long will exceed the cap again on
+	// a retry of the same text and voice, so the portal words it apart from the
+	// failures a retry can cure. Nothing is committed: a clip with its tail cut off
+	// would be presented as the whole reply, the silent truncation every other code
+	// here refuses. A streamed run reaches this only after the stream is read to its
+	// end (see readSpeechEvents), so the call is still billed as delivered.
 	speechRunAudioTooLargeMessage = "gateway.chat_run_audio_too_large"
 )
 

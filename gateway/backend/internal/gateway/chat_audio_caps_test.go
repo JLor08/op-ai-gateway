@@ -41,3 +41,28 @@ func TestServerAudioCapsDefaulted(t *testing.T) {
 		})
 	}
 }
+
+// A run executor reads the caps through chatAudioCaps, which keeps the field comment's
+// promise: a Server that was not built by New (its caps 0) means the defaults, never "a
+// zero-byte audio budget" or "a part per sample". Positive values pass through unchanged.
+func TestChatAudioCapsResolvesZeroToTheDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		srv       *Server
+		wantAudio int64
+		wantBlob  int
+	}{
+		{"a bare Server has the defaults", &Server{}, DefaultMaxChatAudioBytes, portal.DefaultMaxChatBlobBytes},
+		{"negative values are the defaults", &Server{maxChatAudioBytes: -1, maxChatBlobBytes: -1}, DefaultMaxChatAudioBytes, portal.DefaultMaxChatBlobBytes},
+		{"configured values pass through", &Server{maxChatAudioBytes: 4096, maxChatBlobBytes: 1024}, 4096, 1024},
+		{"each cap defaults on its own", &Server{maxChatBlobBytes: 1024}, DefaultMaxChatAudioBytes, 1024},
+		{"a Server built by New has what New defaulted", New(ServerDeps{}), DefaultMaxChatAudioBytes, portal.DefaultMaxChatBlobBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			audioCap, blobCap := tc.srv.chatAudioCaps()
+			if audioCap != tc.wantAudio || blobCap != tc.wantBlob {
+				t.Fatalf("chatAudioCaps() = (%d, %d), want (%d, %d)", audioCap, blobCap, tc.wantAudio, tc.wantBlob)
+			}
+		})
+	}
+}

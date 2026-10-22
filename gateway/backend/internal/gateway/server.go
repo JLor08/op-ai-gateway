@@ -44,9 +44,9 @@ const maxJSONBodyBytes int64 = 1 << 20
 const defaultCaptureMaxBytes = 1 << 20
 
 // DefaultMaxChatAudioBytes is the default total-audio cap for one chat run (#279)
-// when ServerDeps.MaxChatAudioBytes is unset (<= 0): the most decoded audio the
-// run executor stores across all of a run's audio blobs, each of which is still
-// bounded by the per-blob cap. Mirrors config default
+// when ServerDeps.MaxChatAudioBytes is unset (<= 0): the most decoded PCM bytes
+// (the audio itself, not its WAV headers) the run executor keeps across all of a
+// run's audio blobs, each of which is still bounded by the per-blob cap. Mirrors config default
 // OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES = 256 MiB (config cannot import this package,
 // so it holds the literal).
 const DefaultMaxChatAudioBytes = 256 << 20
@@ -134,9 +134,10 @@ type ServerDeps struct {
 	// OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES). <= 0 defaults in New to
 	// defaultMaxAudioTranscriptionBodyBytes.
 	MaxAudioTranscriptionBodyBytes int
-	// MaxChatAudioBytes is the total decoded audio one chat run may store across
-	// its audio blobs when a long speech response is spread over several blobs
-	// (config OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES, #279). <= 0 defaults in New to
+	// MaxChatAudioBytes is the total decoded PCM bytes (the audio itself, not its
+	// WAV headers) one chat run may store across its audio blobs when a long
+	// speech response is spread over several blobs (config
+	// OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES, #279). <= 0 defaults in New to
 	// DefaultMaxChatAudioBytes.
 	MaxChatAudioBytes int
 	// MaxChatBlobBytes is the per-blob ceiling (decoded bytes) the portal enforces
@@ -429,11 +430,12 @@ type Server struct {
 	// /v1/audio/transcriptions, defaulted in New; a bare &Server{} leaves it 0,
 	// which transcriptionBodyLimit reads as the default.
 	maxAudioTranscriptionBodyBytes int64
-	// maxChatAudioBytes is the total decoded audio one chat run may store across
-	// its audio blobs, and maxChatBlobBytes the per-blob ceiling each blob must
-	// fit (see ServerDeps.MaxChatAudioBytes / MaxChatBlobBytes), both defaulted
-	// in New. A bare &Server{} leaves them 0, so a reader that can run on one
-	// must treat 0 as the default.
+	// maxChatAudioBytes is the total decoded PCM bytes (the audio itself, not its
+	// WAV headers) one chat run may store across its audio blobs, and
+	// maxChatBlobBytes the per-blob ceiling each blob must fit (see
+	// ServerDeps.MaxChatAudioBytes / MaxChatBlobBytes), both defaulted in New. A
+	// bare &Server{} leaves them 0, so a reader that can run on one must treat 0
+	// as the default: chatAudioCaps does.
 	maxChatAudioBytes int
 	maxChatBlobBytes  int
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
@@ -1056,6 +1058,23 @@ func New(deps ServerDeps) *Server {
 	}
 	s.routes()
 	return s
+}
+
+// chatAudioCaps is the pair of caps the run executors bound a speech turn's audio by: the
+// most decoded PCM bytes the whole turn may keep (maxChatAudioBytes) and the per-blob
+// ceiling (maxChatBlobBytes) each part must fit, which sizes the parts (speechPartBytes).
+// New has already defaulted both, so a Server built by it returns what it holds; a bare
+// &Server{} holds 0 for each, and a value <= 0 is read here as the default New would have
+// applied rather than as a cap of nothing (every clip over the audio cap, a part per sample).
+func (s *Server) chatAudioCaps() (audioCap int64, blobCap int) {
+	audioCap, blobCap = int64(s.maxChatAudioBytes), s.maxChatBlobBytes
+	if audioCap <= 0 {
+		audioCap = DefaultMaxChatAudioBytes
+	}
+	if blobCap <= 0 {
+		blobCap = portal.DefaultMaxChatBlobBytes
+	}
+	return audioCap, blobCap
 }
 
 // AgentListenerActive reports whether ANY NetBird agent listener is currently

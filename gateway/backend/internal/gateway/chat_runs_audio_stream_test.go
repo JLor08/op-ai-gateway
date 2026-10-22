@@ -10,12 +10,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -1003,5 +1005,63 @@ func TestStreamPartTargetIsClampedToWholeSamples(t *testing.T) {
 		if want := []int{2, 2, 2}; !slices.Equal(sizes, want) || !bytes.Equal(joined, pcm) {
 			t.Fatalf("partBytes %d: part data sizes = %v, want %v with the clip's own audio", partBytes, sizes, want)
 		}
+	}
+}
+
+// A Server that was not built by New has both caps at 0, which the executor reads as the
+// defaults: an ordinary short clip is one committed part, not "over the cap" (an audio
+// budget of 0) and not cut into one part per sample (a blob cap of 0).
+func TestStreamOnABareServerUsesTheDefaultCaps(t *testing.T) {
+	pcm := speechPCM(3000, 29)
+	body := speechStreamOf(cutPCM(pcm, 1000, 1000), speechSSEDone, speechSSEEnd)
+
+	raw, status, msg, _ := consumeTestSpeechStream(&Server{}, strings.NewReader(body))
+
+	if status != "completed" || msg != "" {
+		t.Fatalf("outcome = %q %q, want completed (a bare Server's caps are the defaults, not zero)", status, msg)
+	}
+	var parts []speechAudioPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		t.Fatalf("the committed content is not a parts array: %v", err)
+	}
+	wavs := partWAVs(t, parts)
+	if len(wavs) != 1 || !bytes.Equal(wavs[0], wavFromPCM16(pcm, partsTestRate)) {
+		t.Fatalf("a short clip is %d parts, want the one WAV of the clip", len(wavs))
+	}
+}
+
+// A stream that will not be committed -- cut before its terminal frames, or one that lost a
+// frame -- builds no tail part (it would be base64-encoded only to be discarded) and says
+// nothing of a half sample being dropped. A stream that completes does, which the first case
+// shows is observable at all.
+func TestStreamUncommittedStreamBuildsNoTailPart(t *testing.T) {
+	pcm := speechPCM(1501, 31) // one full part of 1000, a tail of 501 bytes
+	deltas := speechStreamOf(cutPCM(pcm, 700, 700))
+	for _, tc := range []struct {
+		name         string
+		body         string
+		wantComplete bool
+		wantParts    int
+		wantLog      bool
+	}{
+		{"complete: the tail is a part and the stray byte is logged", deltas + speechSSEDone + speechSSEEnd, true, 2, true},
+		{"cut before the terminal frames", deltas, false, 1, false},
+		{"done but no [DONE]", deltas + speechSSEDone, false, 1, false},
+		{"a delta that is not base64", deltas + "data: {\"type\":\"speech.audio.delta\",\"audio\":\"***\"}\n\n" + speechSSEDone + speechSSEEnd, false, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			log.SetOutput(&logged)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+			got := readTestSpeechStream(tc.body, streamTestPartSize, streamTestAudioCap)
+
+			if got.complete != tc.wantComplete || len(got.parts) != tc.wantParts {
+				t.Fatalf("complete = %v with %d parts, want %v with %d", got.complete, len(got.parts), tc.wantComplete, tc.wantParts)
+			}
+			if said := strings.Contains(logged.String(), "ended inside a sample"); said != tc.wantLog {
+				t.Fatalf("half-sample log = %v, want %v (log: %q)", said, tc.wantLog, logged.String())
+			}
+		})
 	}
 }

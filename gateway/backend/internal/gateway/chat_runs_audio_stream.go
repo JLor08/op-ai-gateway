@@ -331,8 +331,8 @@ type speechStreamEvent struct {
 // and the call is billed as delivered. The parts are cut at speechPartBytes of the per-blob
 // cap (Server.maxChatBlobBytes) so that each passes the chat store's per-blob check alone.
 func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func()) (json.RawMessage, string, string) {
-	partBytes := speechPartBytes(s.maxChatBlobBytes)
-	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, sampleRate, dispatchedAt, liftDeadline, partBytes, int64(s.maxChatAudioBytes))
+	audioCap, blobCap := s.chatAudioCaps()
+	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, sampleRate, dispatchedAt, liftDeadline, speechPartBytes(blobCap), audioCap)
 	if !complete {
 		// A deadline or a cancel lands here as a read error on the cancelled request, and
 		// reporting either as a broken stream -- or a deadline as a cancel -- would tell the
@@ -345,7 +345,7 @@ func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *ht
 		return nil, "error", speechRunResponseUnreadableMessage
 	}
 	if overCap {
-		log.Printf("chat run %s: the speech stream is longer than the %d byte audio cap; nothing is committed", run.ID, s.maxChatAudioBytes)
+		log.Printf("chat run %s: the speech stream is longer than the %d byte audio cap; nothing is committed", run.ID, audioCap)
 		return nil, "error", speechRunAudioTooLargeMessage
 	}
 	// No parts is no audio -- also for a stream whose only PCM was less than one sample --
@@ -393,7 +393,7 @@ func readSpeechEvents(run *ChatRun, body io.Reader, sampleRate int, dispatchedAt
 		r.consumeLine(scanner.Text())
 	}
 	r.flushTail()
-	return r.parts, r.overCap, r.sawDone && r.sawEnd && !r.lost, scanner.Err()
+	return r.parts, r.overCap, r.complete(), scanner.Err()
 }
 
 // speechEventReader is what reading a streamed synthesis' event stream (readSpeechEvents)
@@ -503,12 +503,20 @@ func (r *speechEventReader) keep(chunk []byte) {
 	}
 }
 
+// complete reports whether the stream ended the way a whole synthesis does: its
+// speech.audio.done and then [DONE], with no frame or delta lost to a read failure.
+func (r *speechEventReader) complete() bool {
+	return r.sawDone && r.sawEnd && !r.lost
+}
+
 // flushTail finishes the part of the PCM left when the stream ends, if there is a whole
 // sample in it: a clip that is an exact multiple of the part size has no empty last part,
 // and a stray half sample at the very end is dropped (wavFromPCM16 drops it from the part it
-// ends) and is never a part of its own, a header over no audio.
+// ends) and is never a part of its own, a header over no audio. A stream that is not
+// complete, or is over the cap, is not committed, so it builds no tail part and says nothing
+// of a half sample.
 func (r *speechEventReader) flushTail() {
-	if r.overCap {
+	if r.overCap || !r.complete() {
 		return
 	}
 	if r.total%speechStreamBytesPerFrame != 0 {
