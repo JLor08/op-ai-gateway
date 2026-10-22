@@ -108,6 +108,7 @@ type Config struct {
 	CaptureMaxBytes                 int
 	CaptureMemoryMaxBytes           int
 	MaxChatBlobBytes                int // per-blob ceiling for one chat binary payload (#124); config only, the service layer enforces it
+	MaxChatAudioBytes               int // total ceiling on the audio one chat run may store across its blobs (#279); default 256 MiB; the per-blob cap above still bounds each blob; config only, the gateway run executor enforces it
 	MaxRunHistoryBytes              int // ceiling on the stored-image bytes one chat run resolves into its upstream history (#124); config only, the service layer enforces it
 	MaxImageEditBodyBytes           int // cap on the multipart body POST /v1/images/edits holds in memory; default 32 MiB, the server agent's own cap (an edit to an agent-launched model is also refused past that, whatever this is set to)
 	MaxAudioTranscriptionBodyBytes  int // cap on the multipart body POST /v1/audio/transcriptions holds in memory, and on the JSON response it buffers to read the billable duration; default 32 MiB, the server agent's own cap (its own setting, independent of the image-edit cap)
@@ -256,6 +257,11 @@ func Load() (Config, error) {
 		// Audio-transcription upload cap: a dedicated setting so operators can size
 		// audio independently of images. Junk/0/negative -> the 32 MiB default.
 		MaxAudioTranscriptionBodyBytes: l.integer("OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES", 32<<20),
+		// Total-audio cap for one chat run (#279): long speech audio is spread across
+		// several blobs, each still under MaxChatBlobBytes, and this bounds their sum.
+		// 256<<20 is the literal of gateway.DefaultMaxChatAudioBytes (this package
+		// cannot import gateway). Junk/0/negative -> the 256 MiB default.
+		MaxChatAudioBytes: l.integer("OP_AI_GATEWAY_MAX_CHAT_AUDIO_BYTES", 256<<20),
 		// Test-only artificial provider delay for the mock provider (default 0 = off,
 		// production-safe). Junk/0/negative -> 0 via integer().
 		MockDelay: time.Duration(l.integer("OP_AI_GATEWAY_MOCK_DELAY_MS", 0)) * time.Millisecond,
