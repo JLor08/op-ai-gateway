@@ -52,6 +52,30 @@ func TestModelsResponseSpeechCloneFlag(t *testing.T) {
 	}
 }
 
+// offerSharedAudioMapping seeds ONE active audio.cpp mapping on its own server and
+// application, so several calls can put more than one mapping under the same
+// gateway model name (offerSpeechModel names its rows after the model and so can
+// seed only one per name). rows are the mapping's capability rows.
+func offerSharedAudioMapping(t *testing.T, rs *routing.MemoryStore, srvID, appID, mappingID, gateway string, rows ...routing.CapabilityRow) {
+	t.Helper()
+	ctx := context.Background()
+	audio := []string{routing.APIFlavorOpenAIAudio}
+	if err := rs.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateAIServer %s: %v", srvID, err)
+	}
+	if err := rs.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderAudioCpp, Port: 8000, Scheme: "http", APIFlavors: audio, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateApplication %s: %v", appID, err)
+	}
+	if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: mappingID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+		t.Fatalf("CreateMapping %s: %v", mappingID, err)
+	}
+	if len(rows) > 0 {
+		if err := rs.UpsertMappingCapabilities(ctx, mappingID, rows); err != nil {
+			t.Fatalf("UpsertMappingCapabilities %s: %v", mappingID, err)
+		}
+	}
+}
+
 // The fold is an OR across a name's mappings, the inverse of the fail-closed AND
 // the Speech fold uses: a model mapped onto one tts server and one clone server
 // is SpeechClone:true, because a chat send to that name could route to the clone
@@ -59,30 +83,11 @@ func TestModelsResponseSpeechCloneFlag(t *testing.T) {
 // seeds false and only a real clone mapping raises it.
 func TestModelsResponseSpeechCloneIsOrAcrossMappings(t *testing.T) {
 	ctx := context.Background()
-	audio := []string{routing.APIFlavorOpenAIAudio}
 	rs := routing.NewMemoryStore()
-	offerSharedAudioMapping := func(srvID, appID, mappingID, gateway string, rows ...routing.CapabilityRow) {
-		t.Helper()
-		if err := rs.CreateAIServer(ctx, routing.AIServer{ID: srvID, Name: srvID, Domain: srvID + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
-			t.Fatalf("CreateAIServer %s: %v", srvID, err)
-		}
-		if err := rs.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srvID, Type: routing.ProviderAudioCpp, Port: 8000, Scheme: "http", APIFlavors: audio, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
-			t.Fatalf("CreateApplication %s: %v", appID, err)
-		}
-		if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: mappingID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
-			t.Fatalf("CreateMapping %s: %v", mappingID, err)
-		}
-		if len(rows) > 0 {
-			if err := rs.UpsertMappingCapabilities(ctx, mappingID, rows); err != nil {
-				t.Fatalf("UpsertMappingCapabilities %s: %v", mappingID, err)
-			}
-		}
-	}
-
-	offerSharedAudioMapping("srv_a", "app_a", "map_a", "mixed", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityNo))
-	offerSharedAudioMapping("srv_b", "app_b", "map_b", "mixed", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityYes))
-	offerSharedAudioMapping("srv_c", "app_c", "map_c", "both-tts", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityNo))
-	offerSharedAudioMapping("srv_d", "app_d", "map_d", "both-tts", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityNo))
+	offerSharedAudioMapping(t, rs, "srv_a", "app_a", "map_a", "mixed", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityNo))
+	offerSharedAudioMapping(t, rs, "srv_b", "app_b", "map_b", "mixed", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityYes))
+	offerSharedAudioMapping(t, rs, "srv_c", "app_c", "map_c", "both-tts", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityNo))
+	offerSharedAudioMapping(t, rs, "srv_d", "app_d", "map_d", "both-tts", speechRow(routing.CapabilityYes), speechCloneRow(routing.CapabilityNo))
 	byID := modelsByID(offerSvc(rs, nil).Models(ctx, auth.Token{UserID: "usr_1"}))
 
 	if !byID["mixed"].Speech || !byID["mixed"].SpeechClone {

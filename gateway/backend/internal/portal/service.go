@@ -1416,6 +1416,20 @@ type ModelDTO struct {
 	// ever requires it. Independent of Transcription (one audio.cpp task decides
 	// both speech and transcription, so a clone model is transcription:false).
 	SpeechClone bool `json:"speech_clone"`
+	// SpeechCloneVoices marks a clone speech model that is CONFIGURED for the chat
+	// picker: every one of the name's clone mappings has preset voices cached, so
+	// a text-only composer can drive it without supplying a reference voice. The
+	// picker offers a speech model when `speech && (!speech_clone ||
+	// speech_clone_voices)`, which re-opens exactly the clone models SpeechClone
+	// hides. Where SpeechClone is the fail-open OR ("hide if ANY mapping is a
+	// clone"), this is the fail-closed AND ("offer only if EVERY clone mapping has
+	// presets"): a name mixing a preset clone and a reference-only clone stays
+	// hidden, because a send could route to the reference-only mapping and fail.
+	// A name with no clone mapping is true vacuously, which is harmless because
+	// the picker reads it only when speech_clone is set. It is
+	// speechCloneVoicesByName's result and gates NO route; no request ever
+	// requires it.
+	SpeechCloneVoices bool `json:"speech_clone_voices"`
 	// OriginalModelID is set ONLY on a generated Claude alias row (the token's
 	// claude_model_aliases setting): the real gateway model/group id the
 	// `anthropic-local-<hash>` ID resolves to. DisplayName on such a row is the
@@ -2589,6 +2603,24 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					"mappings", len(mappingIDs), "err", capErr)
 				capsByMapping = nil
 			}
+			// The voices cache for the same mappings, in one batch read too (no
+			// per-mapping N+1), for speech_clone_voices below. Best-effort and
+			// FAIL-CLOSED like the capability read: a store error leaves
+			// hasVoicesByMapping empty, so every clone mapping reads as having no
+			// presets and every clone model stays hidden from the chat picker
+			// rather than being offered on voices nobody could confirm.
+			hasVoicesByMapping := make(map[string]bool, len(mappingIDs))
+			voiceRows, voiceErr := s.routes.ModelMappingCacheForMappings(ctx, mappingIDs, routing.ModelMappingCacheVoices)
+			if voiceErr != nil {
+				slog.Warn("portal: models-listing voices cache read failed; clone speech models stay hidden from the chat picker",
+					"mappings", len(mappingIDs), "err", voiceErr)
+			}
+			for id, rows := range voiceRows {
+				// An undecodable row reads as no presets: not a preset clone.
+				if names, err := routing.VoiceNamesFromCacheRows(rows); err == nil && len(names) > 0 {
+					hasVoicesByMapping[id] = true
+				}
+			}
 			// The fold below asks each mapping exactly TWO single-row capability
 			// questions (vision and image), so both rows are picked out here, keyed
 			// by mapping id, rather than by keying that mapping's whole row set by
@@ -2631,7 +2663,14 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// and runtime-spec index as the folds above. It gates NO route -- Speech
 			// stays the authority for /v1/audio/speech and the redirect -- so it has
 			// no ModelOffering.Capable twin.
-			speechCloneOn := speechCloneFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeechClone), idx)
+			speechCloneRows := capabilityRowsFor(capsByMapping, routing.CapabilitySpeechClone)
+			speechCloneOn := speechCloneFlagsByName(views, speechCloneRows, idx)
+			// speech_clone_voices is speechCloneVoicesByName, speech_clone's
+			// counterpart in the OFFER direction: a fail-closed AND ("no clone
+			// mapping of this name lacks preset voices"), the voices cache read
+			// above and the same clone rows and runtime-spec index. It gates NO
+			// route either.
+			speechCloneVoicesOn := speechCloneVoicesByName(views, speechCloneRows, hasVoicesByMapping, idx)
 			// Each model's flavors are the ones dispatch serves it under
 			// (routing.MappingServesAPIFlavor), from perNameFlavors, the fold
 			// flavorSetsFromViews applies for /v1/models too. Every model keeps
@@ -2786,6 +2825,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				groupSpeech := groupCapabilityFlags(entries, speechOn)
 				groupTranscription := groupCapabilityFlags(entries, transcriptionOn)
 				groupSpeechClone := groupCapabilityFlagsOr(entries, speechCloneOn)
+				// speech_clone_voices is the AND again (it OFFERS, so one member
+				// without presets keeps the whole group hidden).
+				groupSpeechCloneVoices := groupCapabilityFlags(entries, speechCloneVoicesOn)
 				// Suppress hidden/locked models from the standalone listing (the
 				// inference/chat path). The admin management path (suppress==false)
 				// retains them so they stay editable / group-addable.
@@ -2826,6 +2868,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					speechOn[e.Name] = groupSpeech[e.Name]
 					transcriptionOn[e.Name] = groupTranscription[e.Name]
 					speechCloneOn[e.Name] = groupSpeechClone[e.Name]
+					speechCloneVoicesOn[e.Name] = groupSpeechCloneVoices[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
 			}
@@ -2905,6 +2948,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if v, ok := speechCloneOn[target]; ok {
 						speechCloneOn[name] = v
 					}
+					if v, ok := speechCloneVoicesOn[target]; ok {
+						speechCloneVoicesOn[name] = v
+					}
 					if _, ok := isGroup[target]; ok {
 						isGroup[name] = struct{}{}
 					}
@@ -2972,6 +3018,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.Speech = speechOn[id]
 				dto.Transcription = transcriptionOn[id]
 				dto.SpeechClone = speechCloneOn[id]
+				dto.SpeechCloneVoices = speechCloneVoicesOn[id]
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v
 				}
@@ -3121,6 +3168,27 @@ func speechCloneFlagsByName(views []mappingView, speechCloneRows map[string]rout
 		out[name] = out[name] || clone
 	}
 	return out
+}
+
+// speechCloneVoicesByName is speechCloneFlagsByName's counterpart in the OFFER
+// direction (ModelDTO.SpeechCloneVoices, #301): it answers "may the chat picker
+// offer this clone-task model?", so it is a fail-closed AND across the name's
+// mappings, NOT an OR. A mapping is "clone-unsafe" when it carries a
+// (speech_clone, yes) verdict, would serve a speech request (viewServesAudio, the
+// same two conditions speechCloneFlagsByName ORs over) AND has no preset voices
+// cached (hasVoices, keyed by mapping id: absent, empty or undecodable all read
+// false); the name folds true only when NO mapping is clone-unsafe. So a plain-tts
+// mapping and a clone mapping with presets both fold true, and only a
+// reference-only clone folds false -- which keeps a name mixing a preset clone and
+// a reference-only clone hidden, since a chat send to it could route to the
+// reference-only mapping and fail upstream. A name with no clone mapping folds
+// true vacuously; the picker reads the flag only beside speech_clone, so that is
+// harmless. Like speech_clone it gates NO route.
+func speechCloneVoicesByName(views []mappingView, speechCloneRows map[string]routing.CapabilityRow, hasVoices map[string]bool, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		clone := speechCloneRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesAudio(view, idx)
+		return !clone || hasVoices[view.mapping.ID]
+	})
 }
 
 // foldMappingFlags is the per-name AND shared by the capability folds: for each
