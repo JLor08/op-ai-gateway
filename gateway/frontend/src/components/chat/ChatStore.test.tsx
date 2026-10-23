@@ -4389,13 +4389,19 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(language()).toBe(locale));
     });
 
-    it('pre-fills when the model takes a language but declares no default', async () => {
+    it('leaves the language blank when the model declares no default (voice/auto decides)', async () => {
+      // A model that takes a language but declares NO default (e.g. audio.cpp's
+      // kokoro, whose default is "the selected voice prefix") must be treated like
+      // an auto-detecting one: the control is offered, but nothing is forced in --
+      // an empty default is not a wrong-language default to correct, and the model
+      // may not even support the UI language (kokoro rejects "de").
       chatApi = makeChatApi(speechThread());
       chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes());
       renderProvider([], { models: [kokoro] });
       await waitForReady();
+      await waitFor(() => expect(offered()).toBe('true'));
 
-      await waitFor(() => expect(language()).toBe(locale));
+      expect(language()).toBe('');
     });
 
     it.each(['auto', 'AUTO'])(
