@@ -417,7 +417,7 @@ func (m *Manager) startProxyLocked(r Route) {
 	// is deliberately narrow -- a rejection just dials, as before). Wrapping
 	// happens here, at listener start, but the RESOLUTION inside the wrapper
 	// happens per request; see localFirst.
-	var handler http.Handler = newReverseProxy(target)
+	handler := newReverseProxy(target)
 	if m.localUpstream != nil {
 		if port, ok := loopbackUpstreamPort(target); ok {
 			handler = &localFirst{resolve: m.localUpstream, port: port, fallback: handler}
@@ -497,14 +497,28 @@ func (m *Manager) retireServeGeneration(rp *runningProxy) {
 // request onto target (scheme+host, joining paths) via NewSingleHostReverseProxy's
 // director, flushes immediately after every write (FlushInterval:-1) so streamed
 // responses are not buffered, and returns 502 when the upstream is unreachable.
-func newReverseProxy(target *url.URL) *httputil.ReverseProxy {
+//
+// It enables full-duplex per request BEFORE the ReverseProxy serves it. Without
+// that, net/http drains up to ~256 KiB of the inbound request body before the
+// ReverseProxy writes the response -- on the dialled /live path those bytes are
+// consumed by the server loop and never forwarded to the child, yet the session
+// completes normally and the gateway bills audio the child never transcribed
+// (ADR-041: never mis-bill). It is harmless for the buffered routes (a handler
+// that reads the whole body has nothing left to drain); the in-process
+// localFirst path is unaffected -- serveLive enables full-duplex itself on the
+// same (w,r). An error from EnableFullDuplex (e.g. a writer that does not
+// support it) is tolerated by falling through.
+func newReverseProxy(target *url.URL) http.Handler {
 	rp := httputil.NewSingleHostReverseProxy(target)
 	rp.FlushInterval = -1
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		slog.Warn("proxy: upstream error", "upstream", target.String(), "path", r.URL.Path, "error", err)
 		w.WriteHeader(http.StatusBadGateway)
 	}
-	return rp
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = http.NewResponseController(w).EnableFullDuplex()
+		rp.ServeHTTP(w, r)
+	})
 }
 
 // dedupeValidRoutes drops malformed routes and collapses duplicate listen ports
