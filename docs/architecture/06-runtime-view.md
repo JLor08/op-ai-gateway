@@ -427,8 +427,9 @@ writes no row**, and the session is billed once, to the loopback user (a token-l
 `TokenID`, service or project, like a portal chat run). **The ticket decides what it can and the loopback decides the
 rest.** The ticket POST validates the params and runs the routing gate **without** the admission, so a wrong or
 non-streaming model is a fast, plain HTTP refusal for the browser; the admission is spent **once, at `/v1`**. A refusal
-there (a rate, quota or budget denial, `transcription.live_busy`) arrives after the upgrade as one generic `error`
-frame, no longer a 1013 close. `Expect: 100-continue` on the loopback is what lets such a refusal, written before
+there (a rate, quota or budget denial, `transcription.live_busy`) arrives after the upgrade as one `error`
+frame carrying the loopback's code and message (the composer shows a busy-specific message for a busy slot, a
+generic one for a rate limit), no longer a 1013 close. `Expect: 100-continue` on the loopback is what lets such a refusal, written before
 `/v1` reads a byte of the open body, reach the browser instead of deadlocking. **Audio goes up in frames, not in a
 body.** The browser sends binary PCM frames and one text control, `end`; the adapter turns the frames into one chunked
 loopback body, and only `end` becomes the terminating chunk audio.cpp needs to emit `transcript.text.done`, so a Stop that

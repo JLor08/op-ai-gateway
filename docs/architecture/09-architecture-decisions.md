@@ -8638,12 +8638,16 @@ taking them together is what changed the shape:
 - **The portal path re-gates as the user.** The mint evaluates the authenticated caller's own token
   settings; the loopback re-gates as the ticket user's token-less session principal, which has none. For the
   portal's session-cookie caller, itself such a principal, the two gates are the same.
-- **A refusal after the mint reaches the browser as an `error` frame, not as a status or a 1013 close.** An
-  admission denial (`429`, `402`, `503`), `transcription.live_busy` and any other non-2xx `/v1` answers after
-  the ticket was minted arrive **after the upgrade** as one `{"type":"error"}` frame with a generic message
-  (the loopback's status is logged, not forwarded), and the `StatusTryAgainLater` close of [ADR-072](#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input) (g) is
-  no longer sent. The composer therefore shows its generic live-error sentence, not a busy-specific one;
-  carrying the loopback's error code into the frame is a follow-up ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). The refusals the mint still
+- **A refusal after the mint reaches the browser as an `error` frame carrying the loopback's code, not as a
+  status or a 1013 close.** An admission denial (`429`, `402`, `503`), `transcription.live_busy` and any other
+  non-2xx `/v1` answers after the ticket was minted arrive **after the upgrade** as one `{"type":"error"}`
+  frame built from a bounded (64 KiB) read of the loopback's error body: it forwards that body's `error.code`
+  and `message`, falling back to a generic sentence only when neither parses (the HTTP status is logged, not
+  forwarded), and the `StatusTryAgainLater` close of [ADR-072](#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input) (g) is
+  no longer sent. The composer keys on the code: a busy slot (`transcription.live_busy`) shows the busy-specific
+  message and the unsupported family (`transcription.live_not_streaming`/`_agent_unsupported`/`_params_invalid`)
+  the unsupported one. What remains a follow-up is only text — a rate limit (`429`) or any other code the
+  composer maps no message for still shows the generic live-error sentence ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). The refusals the mint still
   makes (an unknown or incapable model, a non-streaming one, an agent without `fullduplex_proxy`, bad params)
   stay plain HTTP responses with their codes.
 - **Two full-duplex hops, one context.** The loopback is a second hop inside the process. One context

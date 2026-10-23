@@ -1312,8 +1312,10 @@ through an `io.Pipe`; the loopback's SSE comes back through the shared `transcri
 response until the body ended, which for a microphone is never; with it the client holds the body until `/v1` sends
 `100 Continue` (on its first body read, after every refusal) or answers a final status. A non-2xx loopback answer
 (an admission denial, `transcription.live_busy`, anything past the mint's gate) reaches the browser as one
-`{"type":"error"}` frame with a **generic** message after the upgrade (the status is logged, not forwarded); the
-`StatusTryAgainLater` (1013) close of phase 1 is no longer sent. The adapter has **no** admission, **no** session
+`{"type":"error"}` frame after the upgrade, carrying the loopback's `code` and `message` from a bounded (64 KiB)
+read of its body (a generic message only when neither parses; the status is logged, not forwarded); the composer
+maps a busy or unsupported code to a specific sentence and any other, a `429` rate limit among them, to a generic
+one. The `StatusTryAgainLater` (1013) close of phase 1 is no longer sent. The adapter has **no** admission, **no** session
 slot, **no** upstream call and **no** usage row of its own.
 
 **4. The portal WebSocket's wire.**
@@ -1422,7 +1424,7 @@ reaches the client promptly rather than after it has streamed audio into the voi
 timing note is that the gateway's chunked upstream request sends its headers up front, so the upstream
 exchange begins as soon as the request is dispatched (the first PCM frame follows immediately in the real
 microphone flow). A ticket opens only on the gateway process that minted it (issue #285). A refused portal
-session shows a generic error, not a busy-specific one (item 3). **Through a Kubernetes Ingress** the portal
+session shows the loopback's own error: a busy or unsupported code maps to a specific message, a rate-limit or other code to the generic one (item 3). **Through a Kubernetes Ingress** the portal
 WebSocket works, but the bearer endpoint is **not** streamed full-duplex by the shipped `ingress.yaml`, because
 ingress-nginx buffers request bodies per Ingress and not per path; a dedicated Ingress for the two live paths is
 the follow-up ([Deployment View §7.3](../07-deployment-view.md#73-kubernetes), [Networking & Mesh §10](networking-mesh.md#10-agentgateway-websocket-transport)). The path is verified against mock backends and a real agent proxy and router on
