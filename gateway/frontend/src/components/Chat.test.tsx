@@ -20,6 +20,7 @@ import { ToastProvider } from './shared/ToastProvider';
 import { AudioDecodeError, audioBlobToWav } from './shared/audioToWav';
 import { messages, type Locale } from '../i18n';
 import {
+  NO_SPEECH_LANGUAGE,
   NO_SPEECH_STREAMING,
   type ActiveChatRun,
   type ImageModelOptions,
@@ -27,6 +28,7 @@ import {
   type PortalServer,
   type PortalToken,
   type ServerModelOption,
+  type SpeechLanguageGate,
   type SpeechStreamingGate,
   type StartChatRunBody,
 } from '../api';
@@ -193,6 +195,11 @@ function makeChatApi() {
     // default (no stream toggle, the buffered run); the streaming-toggle tests below open it.
     modelSpeechStreaming: vi.fn(
       async (_name: string): Promise<SpeechStreamingGate> => NO_SPEECH_STREAMING,
+    ),
+    // The speech composer's language gate the store fetches for the same models: closed by
+    // default (no language control, nothing pre-filled); the language-control tests below open it.
+    modelSpeechLanguage: vi.fn(
+      async (_name: string): Promise<SpeechLanguageGate> => NO_SPEECH_LANGUAGE,
     ),
     // The transcription composer's live gate the store fetches for transcription models:
     // closed by default (no live mode, the buffered recording).
@@ -446,6 +453,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           servers={serversOverride}
           onRefresh={onRefresh}
           t={t}
+          locale={locale}
         >
           <Chat t={t} />
         </ChatStoreProvider>
@@ -464,6 +472,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             servers={nextServers}
             onRefresh={onRefresh}
             t={t}
+            locale={locale}
           >
             <Chat t={t} />
           </ChatStoreProvider>
@@ -1686,6 +1695,138 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // The language control (settings.audio.language): a free-text field (any code may be typed;
+    // the gateway does not say which a model accepts) that exists only where the gateway says
+    // the picked model takes a `language` (api.modelSpeechLanguage). An empty thread starts on
+    // the portal's UI language unless the model declares it detects the language itself
+    // ("auto"); the user can change or clear it, and a blank one is never written.
+    describe('the language control', () => {
+      const field = () => screen.queryByRole('textbox', { name: t.chatSpeechLanguage });
+      const takes = (def: string): SpeechLanguageGate => ({ accepts: true, default: def });
+
+      async function renderLanguageThread(gate: SpeechLanguageGate | Error) {
+        if (gate instanceof Error) chatApi.spies.modelSpeechLanguage.mockRejectedValue(gate);
+        else chatApi.spies.modelSpeechLanguage.mockResolvedValue(gate);
+        await renderSpeechThread();
+        await waitFor(() =>
+          expect(chatApi.spies.modelSpeechLanguage).toHaveBeenCalledWith('kokoro'),
+        );
+        openSettings();
+        await flushMicrotasks();
+      }
+
+      async function expectSentAudio(expected: Record<string, unknown>) {
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).toEqual(expected);
+      }
+
+      it('is offered, blank, for a model the gateway says takes a language', async () => {
+        await renderLanguageThread(takes('auto'));
+
+        const language = await screen.findByRole('textbox', { name: t.chatSpeechLanguage });
+        expect(language).toHaveValue('');
+        // The placeholder says "model default" -- a hint, never written.
+        expect(language).toHaveAttribute('placeholder', t.chatSpeechLanguageDefault);
+        expect(language).toHaveAccessibleDescription(t.chatSpeechLanguageHint);
+      });
+
+      it('is absent for a model the gateway says takes none', async () => {
+        await renderLanguageThread(NO_SPEECH_LANGUAGE);
+
+        expect(field()).not.toBeInTheDocument();
+        // The rest of the speech settings are untouched.
+        expect(screen.getByRole('combobox', { name: t.chatSpeechVoice })).toBeInTheDocument();
+      });
+
+      it('is absent when the gateway cannot be asked', async () => {
+        await renderLanguageThread(new Error('language unavailable'));
+
+        expect(field()).not.toBeInTheDocument();
+      });
+
+      it('is not offered on a text thread', async () => {
+        chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+        renderChat();
+        await waitForChatReady();
+        await pickOption(t.chatModel, models[0].display_name);
+        openSettings();
+        await flushMicrotasks();
+
+        expect(field()).not.toBeInTheDocument();
+        expect(chatApi.spies.modelSpeechLanguage).not.toHaveBeenCalled();
+      });
+
+      it('sets settings.audio.language in the started run when a code is typed', async () => {
+        await renderLanguageThread(takes('auto'));
+        const language = await screen.findByRole('textbox', { name: t.chatSpeechLanguage });
+
+        fireEvent.change(language, { target: { value: 'fr' } });
+
+        expect(language).toHaveValue('fr');
+        await expectSentAudio({ language: 'fr' });
+      });
+
+      it('pre-fills the portal UI language when the model declares a default other than auto', async () => {
+        await renderLanguageThread(takes('zh'));
+
+        const language = await screen.findByRole('textbox', { name: t.chatSpeechLanguage });
+        await waitFor(() => expect(language).toHaveValue(locale));
+        await expectSentAudio({ language: locale });
+      });
+
+      it('starts blank, and sends no language, when the model declares auto', async () => {
+        await renderLanguageThread(takes('auto'));
+
+        const language = await screen.findByRole('textbox', { name: t.chatSpeechLanguage });
+        expect(language).toHaveValue('');
+        await expectSentAudio({});
+      });
+
+      it('sends no language once the pre-filled field is cleared', async () => {
+        await renderLanguageThread(takes('zh'));
+        const language = await screen.findByRole('textbox', { name: t.chatSpeechLanguage });
+        await waitFor(() => expect(language).toHaveValue(locale));
+
+        fireEvent.change(language, { target: { value: '' } });
+
+        expect(language).toHaveValue('');
+        await expectSentAudio({});
+        // Cleared means absent, not an empty string on the wire.
+        expect(startedSettings().audio).not.toHaveProperty('language');
+      });
+
+      it('keeps a saved language the gateway would pre-fill over', async () => {
+        chatApi.rows.push({
+          id: 'c_speech_saved_language',
+          title: '',
+          created_at: '2026-07-22T12:00:00Z',
+          updated_at: '2026-07-22T12:00:00Z',
+          content: {
+            settings: { model: 'kokoro', kind: 'speech', audio: { language: 'fr' } },
+            messages: [],
+          },
+        });
+        chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+        renderChat(tokens, speechModels);
+        await waitForChatReady();
+        openSettings();
+
+        const language = await screen.findByRole('textbox', { name: t.chatSpeechLanguage });
+        await flushMicrotasks();
+        expect(language).toHaveValue('fr');
+        await expectSentAudio({ language: 'fr' });
+      });
+
+      it('is locked while a run is in flight, like the other settings', async () => {
+        await renderLanguageThread(takes('auto'));
+        await screen.findByRole('textbox', { name: t.chatSpeechLanguage });
+
+        await sendSpeech();
+        await waitFor(() => expect(field()).toBeDisabled());
+      });
+    });
+
     // Answer-audio retention (#281): a checkbox ("keep audio answers", on by default) over a
     // keep-all / keep-last-N radio whose N field exists only for "keep last N". Unchecking is
     // "do not store" and is only selectable while the thread streams (the same gate as the
@@ -2288,6 +2429,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               servers={[]}
               onRefresh={vi.fn(async () => {})}
               t={t}
+              locale={locale}
             >
               <Harness />
             </ChatStoreProvider>
@@ -3468,6 +3610,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
                 tokens={tokens}
                 onRefresh={vi.fn(async () => {})}
                 t={t}
+                locale={locale}
               >
                 <Page />
               </ChatStoreProvider>

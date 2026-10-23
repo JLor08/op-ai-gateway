@@ -127,6 +127,67 @@ describe('portal api', () => {
     });
   });
 
+  // The speech composer's language gate: the language control is offered only when the gateway
+  // says the model takes a `language` parameter, and the model's declared default (if any) is
+  // what the composer's pre-fill rule reads. Anything but a boolean true is "no control" -- a
+  // malformed answer must never offer a knob the model would silently drop.
+  it("fetches whether a speech model takes a language and unwraps the gate's answer", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ accepts: true, default: 'zh' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    const result = await api.modelSpeechLanguage('org/tts one');
+
+    expect(fetcher).toHaveBeenCalledWith('/api/portal/model-speech-language?name=org%2Ftts%20one', {
+      headers: {},
+      credentials: 'include',
+    });
+    expect(result).toEqual({ accepts: true, default: 'zh' });
+  });
+
+  it.each([
+    ['a yes without a declared default', { accepts: true }, { accepts: true, default: '' }],
+    [
+      'a yes whose default is not a string',
+      { accepts: true, default: 7 },
+      { accepts: true, default: '' },
+    ],
+  ])('reads %s as accepting with no usable default', async (_name, body, expected) => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(createPortalApi(fetcher).modelSpeechLanguage('confucius4')).resolves.toEqual(
+      expected,
+    );
+  });
+
+  it.each([
+    ['a no', { accepts: false }],
+    ['a no that still names a default', { accepts: false, default: 'zh' }],
+    ['a yes that is not the boolean true', { accepts: 'yes', default: 'zh' }],
+    ['an empty answer', {}],
+  ])('reads %s as no language control', async (_name, body) => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(createPortalApi(fetcher).modelSpeechLanguage('kokoro')).resolves.toEqual({
+      accepts: false,
+      default: '',
+    });
+  });
+
   // The transcription composer's live gate: the model may be offered a live recording only when
   // the gateway says its mapping streams a transcription. There is no rate to learn (the
   // browser fixes the PCM it sends), so the answer is a plain boolean and anything but the

@@ -2402,8 +2402,8 @@ for, and it now has two producers.** The gateway's health loop reads an
 **external** application's `/sdcpp/v1/capabilities` directly; an
 **agent-launched** child's own agent reads the identical document behind the
 agent's router — which the health loop cannot reach, since the router passes
-only `/props` through per model (an audio.cpp child's voices, from 0.11.0, are
-the one other endpoint, [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)) — and reports the verdict up the telemetry
+only `/props` through per model (an audio.cpp child's voices, from 0.11.0, and its
+model listing, from 0.13.0, are the only other endpoints, [ADR-074](#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough), [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)) — and reports the verdict up the telemetry
 channel under the same source name, but only while the gateway declares the
 agent feature `capability_source_sdcpp` (issue #154). Either way
 `supported_modes` is exhaustive, so it is the only source that answers
@@ -7048,6 +7048,18 @@ retires a rate (an empty payload, read everywhere as no rate) when the loaded-mo
 observes differs from the companion row's, and re-runs the benchmark. A fact obtainable only
 while a model is loaded persisting past an unload is exactly why the rate lives here and not in
 a volatile cache.
+
+**Amended by [ADR-074](#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)
+(the portal speech language; issue #282): the cache has a third consumer, and its first reader
+that is neither a picker nor a routing filter.** `cache_type = "speech_language"`
+(`routing.ModelMappingCacheSpeechLanguage`, scope `""`, the payload the JSON object
+`{"accepts":<bool>,"default":"<code>"}`) holds whether a plain tts mapping's audio.cpp model declares
+a `language` request param and the default it states, written by the health loop while the model is
+loaded and read by the portal's language gate. Again no table and no migration. Unlike the byte rate
+it needs no empty-payload retirement and has the voices cache's two reader states (no row is unknown,
+a row is known): the param is re-read on every loaded tick and dropped with the mapping's rows on a
+rename. The agent router's `/upstream` allowlist, which this entry's choice (b) described as two
+endpoints, holds a third since agent 0.13.0 (`/v1/models`, `runtime_model_params`).
 → [API Compatibility & Inference
 §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
 [§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
@@ -8698,4 +8710,145 @@ is per Ingress, so it would unbuffer every upload through the host).
 [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
 [HTTP API Surface](reference/api-surface.md#live-transcription-the-bearer-endpoint-the-ticket-and-the-websocket),
 [Networking & Mesh §10](cross-cutting/networking-mesh.md#10-agentgateway-websocket-transport), [Deployment View §7.3](07-deployment-view.md#73-kubernetes),
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-074 — Portal speech language: a per-thread composer control injected as a top-level `language`, gated by a cached `include_params` fact, with a fail-closed agent `/v1/models` passthrough
+**Context:** a portal speech run never sent a `language` to audio.cpp, so a text-to-speech model whose
+spec default is a fixed code rendered every text with that code's frontend: German through
+`confucius4_tts` (default `zh`) came out with a Chinese text frontend, while `qwen3_tts` (default
+`auto`) detected the language from the text. audio.cpp accepts `language` as a **top-level** field of
+`POST /v1/audio/speech`, sets the transcript language with it (the authority for the text frontend),
+applies it **per model**, and **silently drops** it for a model that does not take it, so a client may
+send it unconditionally. Its `GET /v1/models?include_params=true` adds a `params` array to each entry
+(`name`, `type`, `default`, `required`): the only place audio.cpp says whether a model takes a language
+and what it defaults to, and it states **only the default**, never the accepted values. The gateway
+had no way to know whether a model takes the field, nor to supply one, which blocked otherwise capable
+models, notably `confucius4_tts`, a strong German TTS that streams at 44.1 kHz.
+
+**Decision — five choices, taken together. No schema migration, and the yes/no capability wire is
+unchanged.**
+
+- **(a) The language is a per-thread composer setting, injected as a top-level `language`.**
+  `ChatAudioSettings.Language` (`language`, `omitempty`) is the twin of the per-thread `voice`, `speed`
+  and `stream` (read exactly where the speech body is built) and of the transcription composer's
+  `Language`; it is declared **last**, after `KeepLastAudio`, so a stored chat's bytes do not move.
+  `speechBodyFields` sets `body["language"]` when it is non-empty, after `voice`/`speed` and before the
+  passthrough merge, for the buffered and the streamed run alike. `language` stays **non-reserved**, so
+  an Advanced-passthrough `language` still works and the first-class value wins when both are set (the
+  existing `hasKeyFold` rule). **The injection does not gate on the cached fact**: audio.cpp drops an
+  unsupported value, so the gate is a composer concern and the run never takes the client's word either
+  way. The control is free text (any code), not a closed enum, because audio.cpp publishes no accepted
+  set.
+- **(b) The fact is a new `model_mapping_cache` type, `speech_language`, with two reader states.**
+  `routing.ModelMappingCacheSpeechLanguage`, scope `""`, payload `{"accepts":<bool>,"default":"<code>"}`
+  (`SpeechLanguagePayload`; read back only through `ParseSpeechLanguage`, the one definition of a usable
+  fact). `accepts` is "the model's `params` array declares a `language` entry", `default` that entry's
+  string default (`""` for none). **No row is unknown; a row is known, and `accepts:false` is a real
+  "no"**: the voices cache's shape, not the byte rate's (a `language` param is re-read on the next
+  loaded tick, so there is no empty-payload retirement; a fact is overwritten by the next loaded read
+  and dropped on an `AppModelName` change). It is **written by the app-health loop only while the model
+  is observed loaded and plain tts** (`speech: yes`, not `speech_clone: yes`: a text speech chat is
+  never routed to a clone model), through one change-only writer (`writeSpeechLanguageCache`) fed by one
+  gateway parser (`parseAudioCppLanguageParam`, a **separate decode** of the listing from the verdict
+  rule, so the table the agent's copy shares is untouched). The **static** path
+  (`probeAudioCppModels` → `cacheAudioCppSpeechParams`) takes the fact from the listing it already reads
+  for the verdicts, now asked with `?include_params=true`, and makes no request or back-off of its own.
+  The **agent-managed** path is the next choice.
+- **(c) An agent child's fact is pulled through a new Status-only passthrough, behind its own feature,
+  fail-closed.** The gateway cannot see an agent child's `params` by telemetry (a default language is a
+  string and the verdict wire is yes/no by design), so the agent router allowlists
+  `GET /upstream/{model}/v1/models` with `forwardQuery` (so `?include_params=true` reaches the child),
+  a Status-only, never-start read like `/props` and the voices read. It is declared as the agent feature
+  **`runtime_model_params`** (`Since: "0.13.0"`, agent-only, so `gateway.RuntimeModelParamsFeature` is a
+  mirror constant outside `gatewayAgentFeatures`, as `RuntimeVoicesFeature` is), with **one MINOR bump**
+  of `ServerAgent` `0.12.0` → `0.13.0` for the branch (ADR-025: negotiate by name, never by version).
+  The agent's collector, telemetry sample and ingest are **unchanged**. The gateway side is
+  `fetchAndCacheSpeechParams`, **folded into `probeAgentVoices`** so it reuses that pass's eligible set
+  (running, audio.cpp spec, plain tts, observed loaded) without a second capability read, gated on
+  `runtime_model_params` **on its own and not under `runtime_voices`** (an older router serves the voices
+  route and answers a 404 for `/v1/models`), writing only the language fact with the same change-only,
+  leave-the-last-row-on-failure policy and its own back-off (`speechParamsBackoff`).
+- **(d) The composer gate is `GET /api/portal/model-speech-language`, and it opens on ANY accepting
+  candidate.** `handlePortalModelSpeechLanguage` answers `{"accepts":true,"default":"zh"}` (`default`
+  only when declared) or `{"accepts":false}` from the cache rows of the portal-visible plain-tts
+  mappings (`portalPlainTTSMappings`, the candidate set it now shares with the streaming gate). It has
+  the streaming gate's **no-leak** discipline (every "no", including "no fact yet", is the same 200; a
+  blank name is `400 model.name_required`; a store failure is the only `500
+  model.speech_language_failed`; nothing loads a model or contacts an upstream), but the opposite fold:
+  the streaming gate requires EVERY candidate to agree because a wrong "yes" plays PCM at a wrong rate,
+  while a `language` sent to a model without the param is silently dropped, so offering the control
+  costs nothing where the request lands elsewhere and withholding it would take the control away from a
+  model that has it. The `default` is the first accepting candidate's, in the portal's sorted order: a
+  pre-fill, not a promise.
+- **(e) The composer shows a `Language` field only on a gate yes, and pre-fills it conservatively.**
+  `api.modelSpeechLanguage` fails closed (anything but a boolean `true` is "no control"), the gate is
+  closed first on every model change and a stale answer is discarded. When the gate says `accepts` and
+  the declared default is **not** `auto`, a **blank** language on an **empty speech thread** is filled
+  once, as the answer arrives, with the portal's UI language (`de` or `en`); it never runs on the
+  user's own edits, never overwrites a language the thread already has, and a model whose default is
+  `auto` starts blank ("model default"). The literal `auto` is never assumed to be an accepted value,
+  since the `params` array does not list them.
+
+**Consequence:**
+
+- **German on `confucius4_tts` works without hand-written JSON, and nothing changes for a model that
+  takes no `language`.** Such a thread has no control, sends no `language` and persists nothing; an
+  `auto`-default model starts blank; every existing chat is byte-identical.
+- **A wrong or unsupported value is silent.** audio.cpp drops a value a model does not support rather
+  than refusing it, and states no accepted set, so a mistyped code yields the model's default language
+  with no error. Accepted: validating would need a list that does not exist.
+- **A model has no control until it has been observed loaded once.** "No fact" reads as "no control",
+  and a fact survives an unload and a restart (the persistent cache's reason to exist). A mapping that
+  accepts a language and a sibling that does not make the gate open, and a request that routes to the
+  sibling has its `language` dropped.
+- **The static path asks `include_params=true` unconditionally, which assumes an audio.cpp that
+  accepts the query.** The parameter only adds a field to each entry. An audio.cpp old enough to answer
+  an unknown query with a 4xx would fail the whole listing read, so no verdict (and no language fact)
+  would be written for it: the fail-safe outcome is "unknown", and **persistently** so (the query is
+  unconditional, so every tick fails the same way until the audio.cpp server is upgraded or the verdict
+  is set by hand), and a low-likelihood case. A model whose entry carries no `params`, or a malformed one, costs only the
+  language axis (`accepts:false`), never a verdict.
+- **Whether audio.cpp reports a model's `params` while it is unloaded is not asserted.** The write is
+  loaded-gated either way (an ungated write could flap `accepts` if it did not, and the gate keeps the
+  static path symmetric with the agent path, which can read the fact only while the child runs), so the
+  design is correct whichever is true; the gate is strictly necessary or merely conservative.
+- **Mixed fleets are safe.** A gateway older than the name never asks; an agent older than 0.13.0 is
+  never asked by a newer gateway, and its servers carry no fact. The agent's `/upstream` allowlist now
+  holds three endpoints (`/props`, the voices read and `/v1/models`), each added behind its own feature
+  and ADR because the allowlist is a security boundary.
+- **Verification status.** The language param's presence and defaults (`qwen3_tts` `auto`,
+  `confucius4_tts` `zh`) were read from a live audio.cpp for the issue; the parser, the writers, the
+  gate, the injection, the router route and the composer are covered by unit tests, and a live
+  end-to-end synthesis with `language=de` is a check this entry does not claim.
+
+**Extends:** [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)'s
+persistent per-mapping cache (a third consumer, and a reader that is a composer gate), the voices pass
+it describes (the agent pull is folded into it), and [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)'s
+speech run (a new first-class setting beside `voice` and `speed`); it mirrors
+[ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)'s
+streaming gate with the opposite fold, and follows
+[ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)'s feature negotiation.
+**Rejected:** **An operator per-mapping language setting** (heavier: a new mapping setting, an admin UI
+and threading mapping config into a run whose body builder cannot see it, and it is the operator, not
+the synthesizing user, choosing the language; a later convenience at most). **Validating the language
+against an accepted set** (audio.cpp publishes none and drops an unsupported value). **Gating the
+injection on the cached fact** (the fact may be unknown while the model takes the field, and audio.cpp
+already drops it where it does not). **Carrying the default language on the capability verdict wire**
+(a string does not belong on a yes/no wire, and it would change the agent's telemetry and force a
+gateway-first upgrade). **Reading an agent child's params from telemetry** (the same collector, sample
+and ingest change, for a fact the router can serve). **An ungated write** (it could flap `accepts` if
+audio.cpp reports params only while loaded). **A three-state reader with an empty-payload retirement**
+(a `language` param, unlike a byte rate, is not tied to an identity that can change under a name). **A
+fact row for a clone model** (a text speech chat is never routed to one, so it would be written and
+never read). **Gating the agent pull under `runtime_voices`** (an older router has the voices route
+without this one and would answer 404 each tick). **A gate that requires every candidate to accept**
+(it would take the control away from a model that has it, to protect against a drop that is harmless).
+**Pre-selecting the literal `auto`** (the `params` array does not list accepted values).
+→ [Routing & Model Selection §2.6](cross-cutting/routing-and-model-selection.md#26-the-speech-language-fact-a-composer-gate-not-a-routing-filter),
+[Agent-Managed Model Runtime §4.1](cross-cutting/agent-runtime-manager.md#41-control-routes),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[API Compatibility & Inference §3.6](cross-cutting/compatibility-and-inference.md#36-openai-audio-speech),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[HTTP API Surface](reference/api-surface.md#models-servers-applications-mappings),
+[Data Model](reference/data-model.md#the-per-mapping-cache-table),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

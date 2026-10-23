@@ -506,9 +506,9 @@ type ChatImageSettings struct {
 // ChatAudioSettings are the text-to-speech knobs a portal "speech" thread
 // forwards to /v1/audio/speech. Every field is optional and omitted when unset,
 // so an unset field leaves the model on its own default rather than being handed
-// an inert zero. Only the OpenAI-shaped first-class knobs live here; everything
-// else -- the OpenAI "instructions" field and any native audio.cpp knob -- rides
-// Passthrough. buildSpeechBody (chat_runs_audio.go) forwards the set fields and
+// an inert zero. Only the first-class knobs (voice, speed and language) live here;
+// everything else -- the OpenAI "instructions" field and any other native audio.cpp
+// knob -- rides Passthrough. buildSpeechBody (chat_runs_audio.go) forwards the set fields and
 // merges Passthrough into the request JSON (the gateway relays the body to
 // audio.cpp unchanged), refusing the keys that would override the body the run
 // itself owns (model/input/stream/stream_format/response_format). The turn the run
@@ -548,9 +548,16 @@ type ChatAudioSettings struct {
 	// count, so PrepareChatRun reads it as unset (nil). A POINTER, like Speed and Stream,
 	// so the meaningful 0 stays distinguishable from "unset" (a plain int with omitempty
 	// would drop it) and an existing thread's persisted settings stay byte-identical.
-	// Declared last, after Stream, on purpose: a field added later must not move an
-	// existing chat's serialized bytes.
+	// Declared after Stream on purpose: a field added later must not move an
+	// existing chat's serialized bytes (Language was later appended after it, for the
+	// same byte-stability reason).
 	KeepLastAudio *int `json:"keep_last_audio,omitempty"`
+	// Language is the ISO-639-1-ish code of the language to speak (e.g. "de"), the twin
+	// of ChatTranscriptionSettings.Language; "" leaves the model on its default. It rides
+	// the body as a top-level "language" field, which audio.cpp applies per model and
+	// silently drops where the model has no such parameter. Declared after KeepLastAudio,
+	// last, for the same reason: a stored chat's serialized bytes must not move.
+	Language string `json:"language,omitempty"`
 }
 
 // ChatTranscriptionSettings are the speech-to-text knobs a portal

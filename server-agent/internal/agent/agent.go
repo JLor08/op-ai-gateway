@@ -337,7 +337,18 @@ import (
 // it: agent.Features gains "fullduplex_proxy", the name the gateway checks before
 // it relies on that relay. The same reasoning made 0.7.0 (runtime_upstream_props)
 // through 0.11.0 (runtime_voices) MINOR.
-const Version = "0.12.0"
+//
+// 0.12.0 -> 0.13.0 is the single bump for the speech-language branch. The runtime
+// router gains GET /upstream/{model}/v1/models, a Status-only, never-start
+// passthrough to a running audio.cpp child's model listing that relays the inbound
+// query (so ?include_params=true reaches the child), which the gateway reads to
+// learn the request params -- notably language -- each model declares. MINOR, and
+// the rule decides it: agent.Features gains "runtime_model_params", the name the
+// gateway checks, fail-closed, before it pulls that listing through the router --
+// an older router answers a 404 (runtime.upstream_endpoint_not_allowed) for the
+// route. The agent itself gates nothing on it. This is the ONE bump for the whole
+// branch; later commits on it do not bump again.
+const Version = "0.13.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

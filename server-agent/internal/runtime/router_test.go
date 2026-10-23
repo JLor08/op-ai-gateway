@@ -1452,9 +1452,10 @@ func TestRouterUpstreamPropsUnknownModelAndNilManager(t *testing.T) {
 	}
 }
 
-// TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints: /props and
-// /v1/audio/voices are the entire allowlist (the two entries of
-// upstreamEndpoints). A running child must see ZERO traffic for any other path.
+// TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints: /props,
+// /v1/audio/voices and /v1/models are the entire allowlist (the three entries
+// of upstreamEndpoints). A running child must see ZERO traffic for any other
+// path.
 func TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints(t *testing.T) {
 	var hits atomic.Int32
 	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -1465,7 +1466,7 @@ func TestRouterUpstreamPropsAllowlistRefusesOtherEndpoints(t *testing.T) {
 	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "m", State: StateRunning, Port: childPort(t, child.URL)}}}
 	rt := newRouter(m)
 
-	for _, path := range []string{"/upstream/m/completion", "/upstream/m/props/", "/upstream/props", "/upstream/m/metrics"} {
+	for _, path := range []string{"/upstream/m/completion", "/upstream/m/props/", "/upstream/props", "/upstream/m/metrics", "/upstream/m/v1/models/extra"} {
 		rec := httptest.NewRecorder()
 		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusNotFound {
@@ -1779,5 +1780,120 @@ func TestServeVoicesNonGETFallsThroughToBodyDispatch(t *testing.T) {
 	}
 	if got := hits.Load(); got != 0 {
 		t.Fatalf("child hits = %d, want 0 -- a POST must never reach the running child through the voices read", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /upstream/{model}/v1/models: the third endpoint on the allowlisted,
+// never-starting /upstream passthrough, behind the runtime_model_params feature
+// flag. The gateway reads it with ?include_params=true to learn which request
+// params (e.g. "language") a running audio.cpp child's model declares.
+// ---------------------------------------------------------------------------
+
+// TestServeUpstreamModelsRelaysIncludeParams: a RUNNING audio.cpp child's model
+// listing comes back through the router byte-verbatim. The child sees the path
+// EXACTLY /v1/models (never the inbound /upstream path) WITH the inbound query
+// -- audio.cpp reads ?include_params=true to add each model's declared request
+// params -- the per-spec token headers are forwarded, the model id carries a
+// slash (HF style), and EnsureRunning is never called.
+func TestServeUpstreamModelsRelaysIncludeParams(t *testing.T) {
+	const body = `{"object":"list","data":[{"id":"org/asr","params":[{"name":"language"}]}]}`
+	var hits atomic.Int32
+	var gotMethod, gotPath, gotQuery, gotAuth string
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.RawQuery
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer child.Close()
+
+	m := &statusManager{statuses: []Status{{SpecID: "s1", Model: "org/asr", State: StateRunning, Port: childPort(t, child.URL)}}}
+	rt := newRouter(m)
+
+	req := httptest.NewRequest(http.MethodGet, "/upstream/org/asr/v1/models?include_params=true", nil)
+	req.Header.Set("Authorization", "Bearer spec-tok")
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("child hits = %d, want 1", got)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v1/models" {
+		t.Fatalf("child saw %s %q, want GET exactly /v1/models (the inbound /upstream path must never be forwarded)", gotMethod, gotPath)
+	}
+	if gotQuery != "include_params=true" {
+		t.Fatalf("child saw query %q, want include_params=true (audio.cpp reads it to list each model's declared params)", gotQuery)
+	}
+	if gotAuth != "Bearer spec-tok" {
+		t.Fatalf("Authorization = %q, want the spec token forwarded verbatim", gotAuth)
+	}
+	if rec.Body.String() != body {
+		t.Fatalf("body not relayed verbatim: %q", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want the child's application/json", ct)
+	}
+	if n := m.ensures.Load(); n != 0 {
+		t.Fatalf("EnsureRunning called %d times, want 0 (a models read must never start a child)", n)
+	}
+}
+
+// TestServeUpstreamModelsNeverStartsAndKeepsSentinels: the Status-only,
+// never-start contract is unchanged for the models read -- a managed child that
+// is not running answers 404 runtime.model_not_running with ZERO hits on its
+// port, and an unknown model, an empty model or a nil manager answers 404
+// runtime.model_not_managed; EnsureRunning is never called in any case. The
+// "starting with a live port" case pins the State==StateRunning half of the
+// guard (snapshotStatus fills Port for every state where a process exists).
+func TestServeUpstreamModelsNeverStartsAndKeepsSentinels(t *testing.T) {
+	var hits atomic.Int32
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer child.Close()
+	livePort := childPort(t, child.URL)
+
+	for _, tc := range []struct {
+		name     string
+		statuses []Status
+		nilMgr   bool
+		path     string
+		wantCode string
+	}{
+		{"stopped", []Status{{SpecID: "s1", Model: "asr", State: StateStopped}}, false, "/upstream/asr/v1/models?include_params=true", "runtime.model_not_running"},
+		{"starting with a live port", []Status{{SpecID: "s1", Model: "asr", State: StateStarting, Port: livePort}}, false, "/upstream/asr/v1/models?include_params=true", "runtime.model_not_running"},
+		{"unknown model", nil, false, "/upstream/nope/v1/models?include_params=true", codeModelNotManaged},
+		{"nil manager", nil, true, "/upstream/nope/v1/models?include_params=true", codeModelNotManaged},
+		{"empty model", nil, false, "/upstream//v1/models?include_params=true", codeModelNotManaged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := &statusManager{statuses: tc.statuses}
+			var mp managerPort = sm
+			if tc.nilMgr {
+				mp = nil
+			}
+			rec := httptest.NewRecorder()
+			newRouter(mp).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
+			}
+			if code := decodeErrorCode(t, rec); code != tc.wantCode {
+				t.Fatalf("code = %q, want %s", code, tc.wantCode)
+			}
+			if n := sm.ensures.Load(); n != 0 {
+				t.Fatalf("EnsureRunning called %d times, want 0 (a models read must never start a child)", n)
+			}
+		})
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("child hits = %d, want 0 (a cold child must see no traffic)", got)
 	}
 }

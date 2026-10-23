@@ -685,9 +685,11 @@ by the same tolerant `sniffRoutingModel` probe as every native endpoint) and a
 non-empty string `input` (`speech.input_required`), and answers those as a gateway 400
 rather than relaying them, because audio.cpp answers a missing `input` or an unknown
 model with **HTTP 500**, which the gateway would otherwise hand on as a server
-failure. Every other field (`voice`, `instructions`, `speed`, ...) is the client's own
+failure. Every other field (`voice`, `instructions`, `speed`, `language`, ...) is the client's own
 business and reaches the upstream unexamined, with the exceptions below. (`voice` is
-additionally **read**, never changed, as a routing preference: item 8.)
+additionally **read**, never changed, as a routing preference: item 8. `language` is a top-level
+audio.cpp field that sets the transcript language per model and that audio.cpp silently drops for a
+model that takes none, so the gateway neither reads nor gates on it: item 11.)
 `response_format`, `stream` and `stream_format` are type-checked rather than decoded
 straight into Go types, for the reason `validateImagesRequest` gives: a struct decode
 that discards its type error would leave a non-string `response_format` such as
@@ -948,6 +950,25 @@ clone model is skipped (its synthesis needs a server-side reference WAV) and bil
 `audio_bytes`. The run also records a `kind=speech` history row with `ttft_ms`, `wall_ms` and
 `rtf` (migration 95): `ttft_ms` is the time to the first byte of a **non-stream** answer, so it
 is roughly synthesis plus any model cold start, not a streamed time to first audio.
+
+**11. A `language` is the client's own field; the gateway only learns whether a model takes
+one** ([ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough), issue #282). audio.cpp accepts `language` as a
+**top-level** field of `POST /v1/audio/speech`, uses it as the transcript language (the authority for
+the text frontend), applies it **per model** and **silently drops** it for a model that does not take
+it, so a client may send it unconditionally and the relay passes it byte for byte like every other
+field (it is not in the portal's reserved set either, so an Advanced-passthrough `language` still
+works). Why it matters: a model whose default is a fixed code speaks the wrong language for other
+text (German through `confucius4_tts`, default `zh`, comes out with a Chinese frontend), while a
+model whose default is `auto` (`qwen3_tts`) detects it. What the gateway adds is the **fact**, not a
+filter: whether the model behind a mapping declares a `language` request param and the default it
+states, read from `GET /v1/models?include_params=true`, cached as the `speech_language` row of
+`model_mapping_cache` while the model is observed loaded, for a static `audio_cpp` server and, through
+the agent router's `/upstream/{model}/v1/models` passthrough (agent 0.13.0, `runtime_model_params`),
+for an agent-launched child ([Routing & Model Selection
+§2.6](routing-and-model-selection.md#26-the-speech-language-fact-a-composer-gate-not-a-routing-filter)).
+The portal's composer reads it through `GET /api/portal/model-speech-language` (§12). The audio.cpp
+`params` array states only the **default**, never the accepted values, so the gateway validates no
+language: the control is free text and an unsupported value is dropped by audio.cpp.
 
 ### 3.7 OpenAI audio transcriptions
 
@@ -3378,10 +3399,10 @@ shares (the reservation, the deadline, the loopback header set and the one termi
 commit) and nothing of the stream consumer. Its request is JSON, so nothing overrides the
 shared header set's `Content-Type` as the edit hop does. `buildSpeechBody` sends `model`
 (the thread's pinned model), `input` (the **last user message's text**) and, when set,
-`voice` and `speed`, plus the thread's advanced passthrough, and **no `response_format`**:
+`voice`, `speed` and `language`, plus the thread's advanced passthrough, and **no `response_format`**:
 the endpoint answers WAV when it is absent and refuses every other value (§3.6), so there
 is no format knob and the reply is always WAV (a streamed synthesis is assembled into one, below). The run's knobs are a
-`ChatAudioSettings` (`voice`, `speed`, `stream`, `keep_last_audio`, `passthrough`), persisted under `settings.audio` the
+`ChatAudioSettings` (`voice`, `speed`, `stream`, `keep_last_audio`, `language`, `passthrough`), persisted under `settings.audio` the
 way `kind` and `image` are (`omitempty`, and cleared server-side for any non-speech kind,
 so a text or image chat's stored and wire bytes are unchanged; a speech thread always
 emits the key, `{}` when empty):
@@ -3409,6 +3430,33 @@ emits the key, `{}` when empty):
   (f) amendment).
 - **`speed` is passed through as given** (placeholder `1.0`, no clamp: the model's own
   range applies).
+- **`language` is a free-text field shown only where the gateway says the model takes one**
+  ([ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough), issue #282, the twin of the transcription
+  composer's `Language`). `ChatAudioSettings.Language` (`language`, `omitempty`, declared **last**,
+  after `KeepLastAudio`, so a stored chat's serialized bytes do not move) is merged into the speech
+  body as a top-level `language` by `speechBodyFields`, after `voice` and `speed` and before the
+  passthrough merge, on the buffered and the streamed run alike, only when non-empty. **The
+  injection does not gate on the cached fact**: audio.cpp drops an unsupported value, so the gate is
+  a composer concern only and the server never takes the client's word either way. `language` is
+  **not** reserved, and the first-class control wins over an Advanced-passthrough `language` key when
+  set (the `voice`/`speed` rule, logged). The composer asks `GET
+  /api/portal/model-speech-language?name=<model>` (`api.modelSpeechLanguage`, fail-closed: anything
+  but a boolean `true` is "no control", a non-string `default` reads as "none declared") on every
+  speech-model change, **closes the gate first** (a stale yes must not stay on offer while the next
+  lookup is in flight) and discards a stale response (latest pick wins), and renders a `Language`
+  text field (labelled `Sprache` in German, with a placeholder saying the model default applies and a
+  hint naming an ISO-639-1 code such as `de` or `en`) only on a yes. Any code may be typed: audio.cpp publishes no accepted-value list, so
+  there is no closed enum and no validation. **The pre-fill:** when the gate answers `accepts` and
+  the declared default is **not** `auto`, a **blank** language on an **empty speech thread** (no
+  message yet) is filled once, when the answer arrives, with the portal's UI language (`de` or
+  `en`), so `confucius4_tts` speaks German in a German portal without the user finding the field;
+  it never runs on the user's own edits (a field they cleared stays cleared), never overwrites a
+  language the thread already has (typed or saved), and a model whose default is `auto` starts
+  blank ("model default"). A blank language is never written (`audioSetting` trims it and omits
+  it), so an unset thread persists nothing and every existing chat is byte-identical. The gate's
+  server side (which candidate mappings it folds, why it opens on ANY accepting candidate where the
+  streaming gate needs EVERY one, the no-leak rule) is [Routing & Model Selection
+  §2.6](routing-and-model-selection.md#26-the-speech-language-fact-a-composer-gate-not-a-routing-filter).
 - **Advanced is a JSON passthrough.** One text box takes a JSON object whose keys are
   merged into the body verbatim as top-level fields (the OpenAI `instructions` field and
   audio.cpp's native knobs; each value keeps the JSON type the user wrote). `model`,
@@ -3417,8 +3465,8 @@ emits the key, `{}` when empty):
   nothing**, since dropping the key and sending the rest would answer a request the user
   did not make. (`stream_format` joined the list with streaming: the run states `stream` and
   `stream_format` itself when it streams and omits both when it does not, and a passthrough
-  `stream_format=audio` would answer raw PCM in a shape the run does not parse.) A `voice` or
-  `speed` passthrough key yields to the same field when the first-class control is set. The composer refuses, on send and on replay, text that is not a JSON
+  `stream_format=audio` would answer raw PCM in a shape the run does not parse.) A `voice`,
+  `speed` or `language` passthrough key yields to the same field when the first-class control is set. The composer refuses, on send and on replay, text that is not a JSON
   object (it would otherwise be omitted from the request in silence) and an object that
   names a reserved key (so a turn is not committed only to fail): the reserved list is
   copied to the client (`SPEECH_RESERVED_FIELDS`, matched ignoring case), the Advanced

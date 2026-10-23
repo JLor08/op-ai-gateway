@@ -267,6 +267,13 @@ const de = {
   chatSpeechVoiceDefault: 'Standard (Modell)',
   chatSpeechVoiceHint: 'Eine Stimme aus der Liste wählen oder einen Namen eintippen',
   chatSpeechSpeed: 'Geschwindigkeit',
+  // The language control of the speech settings, shown ONLY for a model the gateway says takes
+  // a language. Free text (any code may be typed); an empty thread starts on the portal's
+  // language unless the model detects the language itself. Blank is the model's own default.
+  chatSpeechLanguage: 'Sprache',
+  chatSpeechLanguageDefault: 'Standard (Modell)',
+  chatSpeechLanguageHint:
+    'ISO-639-1-Code der Sprache, in der gesprochen wird, zum Beispiel de oder en. Leer lassen für den Standard des Modells.',
   chatSpeechFormatHint: 'Das Audio wird immer als WAV zurückgegeben.',
   // The streaming toggle of the speech settings (ADR-068), shown ONLY for a model the gateway
   // says it can stream (it streams and its output rate is known). On by default: the audio
@@ -3662,6 +3669,11 @@ const en: PortalMessages = {
   chatSpeechVoiceDefault: 'Default (model)',
   chatSpeechVoiceHint: 'Pick a voice from the list or type a name',
   chatSpeechSpeed: 'Speed',
+  // See the German block: shown only for a model the gateway says takes a language.
+  chatSpeechLanguage: 'Language',
+  chatSpeechLanguageDefault: 'Default (model)',
+  chatSpeechLanguageHint:
+    'ISO-639-1 code of the language to speak in, for example de or en. Leave blank for the model default.',
   chatSpeechFormatHint: 'The audio is always returned as WAV.',
   // See the German block: shown only for a model the gateway can stream.
   chatSpeechStream: 'Play while generating (streaming)',

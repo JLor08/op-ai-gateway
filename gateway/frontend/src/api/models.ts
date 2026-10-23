@@ -681,6 +681,15 @@ export type SpeechStreamingGate = { streaming: boolean; sampleRate: number };
 // "No streaming": the one shape every unusable answer collapses to.
 export const NO_SPEECH_STREAMING: SpeechStreamingGate = { streaming: false, sampleRate: 0 };
 
+// The answer of the speech composer's language gate (api.modelSpeechLanguage): whether the
+// model behind the name takes a `language` parameter (so the composer offers the control), and
+// the default the model declares for it ("" when it declares none). `default` is "" whenever
+// `accepts` is false.
+export type SpeechLanguageGate = { accepts: boolean; default: string };
+
+// "No language control": the one shape every unusable answer collapses to.
+export const NO_SPEECH_LANGUAGE: SpeechLanguageGate = { accepts: false, default: '' };
+
 // The sample rate (Hz) of the mono s16le PCM a live transcription session streams: the
 // ticket request states it (api.createLiveTranscriptionTicket) and the recorder that resamples
 // to it must agree, so both read this one constant.
@@ -740,6 +749,22 @@ export function modelsApi(fetcher: Fetcher) {
           ? { streaming: true, sampleRate: rate }
           : NO_SPEECH_STREAMING;
       }),
+    // Whether the portal's speech composer may offer a LANGUAGE control for a speech model,
+    // and the default the model declares for it: the gateway says yes only when the model's
+    // cached audio.cpp parameters include a `language` (the voices and streaming gates' twin).
+    // Global (gateway:use); name is a query param like modelSpeechStreaming. FAIL CLOSED:
+    // anything but a boolean true is "no control" (nothing offered, nothing pre-filled), so a
+    // malformed answer can never offer a knob the model would silently drop. A non-string
+    // default reads as "none declared".
+    modelSpeechLanguage: (name: string) =>
+      request<{ accepts?: unknown; default?: unknown }>(
+        fetcher,
+        `/api/portal/model-speech-language?name=${encodeURIComponent(name)}`,
+      ).then((r): SpeechLanguageGate =>
+        r.accepts === true
+          ? { accepts: true, default: typeof r.default === 'string' ? r.default : '' }
+          : NO_SPEECH_LANGUAGE,
+      ),
     // Whether the portal's transcription composer may offer a LIVE recording for a
     // transcription model (#266): the gateway says yes only when every mapping the model could
     // be served by is known to stream a transcription (transcription_streaming). The speech

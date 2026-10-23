@@ -18,7 +18,16 @@ import (
 // states what a model can do: there is no separate capability document like
 // sd-server's /sdcpp/v1/capabilities, so the capability signal is the task and
 // mode fields of each listed model.
-const audiocppModelsPath = "/v1/models"
+//
+// The include_params=true query asks the server to add each entry's params array
+// (the request params the model declares: objects of name, type, default and
+// required), which is the only place audio.cpp states whether a model takes a
+// language and what it defaults to (AudioCppVerdicts.AcceptsLanguage). The query
+// adds a field to each entry and changes none of the others, so every other read
+// of the listing is unaffected by it. endpointURL concatenates the path verbatim,
+// and http.NewRequestWithContext splits the query off it, so it reaches the wire
+// intact.
+const audiocppModelsPath = "/v1/models?include_params=true"
 
 // audio.cpp task values, spelled as the server emits them in /v1/models. The
 // listing's task names what the listed model DOES: "tts" synthesises speech from
@@ -37,6 +46,12 @@ const (
 	audioCppTaskClone = "clon"
 	audioCppTaskASR   = "asr"
 )
+
+// audioCppParamLanguage is the name of the request param audio.cpp's params array
+// uses for a model's language, spelled as the server emits it in
+// /v1/models?include_params=true (verified: qwen3_tts defaults it to "auto",
+// confucius4_tts to "zh").
+const audioCppParamLanguage = "language"
 
 // audio.cpp mode values. The listing's mode names how the model is LOADED:
 // "streaming" is a model that serves a streamed answer (stream=true), and
@@ -129,6 +144,17 @@ const (
 // notice. It decides no verdict and no verdict decides it, and an entry the server
 // lists as unloaded states its path too, so it is read whether or not the model is
 // loaded.
+//
+// AcceptsLanguage and LanguageDefault are the language axis, set the same way as Loaded
+// and Path and for the same reason (the one listing states it when asked for its params,
+// and it is no part of the shared capability rule): AcceptsLanguage is true only when the
+// listing's entry for the model declares a request param named "language", and
+// LanguageDefault is that param's default when it is a string ("auto", "zh"), or "" for a
+// param that states none or a non-string one. Both are false/"" for everything the listing
+// does not say -- no entry, no params field, a params field of the wrong shape, no
+// language param among them, an unreadable body -- because a model not observed to take a
+// language must never be sent one. It decides no verdict and no verdict decides it; an
+// odd params shape costs only this axis.
 type AudioCppVerdicts struct {
 	Speech                 string
 	Transcription          string
@@ -137,12 +163,16 @@ type AudioCppVerdicts struct {
 	SpeechStreaming        string
 	Loaded                 bool
 	Path                   string
+	AcceptsLanguage        bool
+	LanguageDefault        string
 }
 
 // AudioCppModelsProber is an optional provider capability: it GETs
-// target.Endpoint + /v1/models and derives the speech, transcription,
-// transcription streaming, speech clone and speech streaming verdicts the
-// listing states for modelID, and whether it states the model as loaded right now. A transport
+// target.Endpoint + /v1/models?include_params=true and derives the speech,
+// transcription, transcription streaming, speech clone and speech streaming
+// verdicts the listing states for modelID, whether it states the model as loaded
+// right now, and whether it declares a language request param and that param's
+// default. A transport
 // failure or a non-2xx status is an error and carries no verdict, so the caller
 // writes nothing. A 2xx body that does not name the model, or cannot be read, is
 // NOT an error, only empty verdicts and Loaded false -- the caller writes
@@ -192,28 +222,31 @@ func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target ro
 	if err != nil {
 		return AudioCppVerdicts{}, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	// The verdicts, the loaded flag and the path are three reads of the one body:
-	// the verdicts are the capability rule, pinned by the table the agent's copy
-	// shares, and loaded and the path are the health and identity axes beside them
-	// (see AudioCppVerdicts). The listing is one small document per probe, so
-	// decoding it three times costs nothing worth coupling them.
+	// The verdicts, the loaded flag, the path and the language param are four reads
+	// of the one body: the verdicts are the capability rule, pinned by the table the
+	// agent's copy shares, and loaded, the path and the language param are the
+	// health, identity and request-param axes beside them (see AudioCppVerdicts).
+	// The listing is one small document per probe, so decoding it four times costs
+	// nothing worth coupling them.
 	v := parseAudioCppModels(body, modelID)
 	v.Loaded = parseAudioCppLoaded(body, modelID)
 	v.Path = parseAudioCppPath(body, modelID)
+	v.AcceptsLanguage, v.LanguageDefault = parseAudioCppLanguageParam(body, modelID)
 	return v, nil
 }
 
 // audioCppModelsDoc is the part of the listing this code reads: each entry's id,
-// task, mode, loaded and path. The rest of an entry (object, owned_by, family)
-// answers no question this code asks and is left undecoded, so an unknown or
-// added field never breaks the read.
+// task, mode, loaded, path and params. The rest of an entry (object, owned_by,
+// family) answers no question this code asks and is left undecoded, so an unknown
+// or added field never breaks the read.
 //
-// Mode, Loaded and Path are held raw and decoded on their own
-// (audioCppStreamingVerdict, audioCppLoadedFlag, audioCppPathString): a mode, a
-// loaded or a path of a type this code does not expect must cost only the
-// streaming verdicts, only the loaded flag or only the path, never the speech and
-// transcription verdicts the task decides, and a typed field would fail the whole
-// document's decode on one odd value.
+// Mode, Loaded, Path and Params are held raw and decoded on their own
+// (audioCppStreamingVerdict, audioCppLoadedFlag, audioCppPathString,
+// audioCppLanguageParam): a mode, a loaded, a path or a params of a type this code
+// does not expect must cost only the streaming verdicts, only the loaded flag,
+// only the path or only the language axis, never the speech and transcription
+// verdicts the task decides, and a typed field would fail the whole document's
+// decode on one odd value.
 type audioCppModelsDoc struct {
 	Data []struct {
 		ID     string          `json:"id"`
@@ -221,6 +254,7 @@ type audioCppModelsDoc struct {
 		Mode   json.RawMessage `json:"mode"`
 		Loaded json.RawMessage `json:"loaded"`
 		Path   json.RawMessage `json:"path"`
+		Params json.RawMessage `json:"params"`
 	} `json:"data"`
 }
 
@@ -414,6 +448,75 @@ func audioCppPathString(raw json.RawMessage) string {
 		return ""
 	}
 	return path
+}
+
+// parseAudioCppLanguageParam reports whether a /v1/models?include_params=true body
+// states that modelID takes a language, and that param's default: the first entry
+// whose id is modelID, scanned for its first param named "language". Like
+// parseAudioCppPath it is tolerant -- it never fails -- and every statement it
+// cannot read is (false, ""): no entry for modelID, an empty modelID, an entry
+// without a params field or with a null, a string or an object there, a params
+// array with no language param, an empty data list, a body that is not the listing.
+// The id match is exact, as in parseAudioCppModels, so the two always speak of the
+// same entry.
+//
+// The language param's presence and its default are two statements: a language param
+// whose default is absent, null or not a string is (true, ""), because the model does
+// take a language and merely states no default for it.
+//
+// The language axis (see AudioCppVerdicts.AcceptsLanguage) decides no capability
+// verdict, and no verdict decides it. It is a SEPARATE read from parseAudioCppModels,
+// whose table is the capability rule shared verbatim with the agent's copy, and an odd
+// params shape costs only this axis.
+func parseAudioCppLanguageParam(body []byte, modelID string) (accepts bool, def string) {
+	if modelID == "" {
+		return false, ""
+	}
+	var doc audioCppModelsDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return false, ""
+	}
+	for _, entry := range doc.Data {
+		if entry.ID != modelID {
+			continue
+		}
+		return audioCppLanguageParam(entry.Params)
+	}
+	return false, ""
+}
+
+// audioCppLanguageParam finds the first param named "language" in one entry's raw
+// params array and reads its default. The array is decoded as raw elements and each
+// element on its own, so a param of an odd shape (not an object, a name that is not a
+// string) is skipped and cannot hide a language param beside it. The name matches
+// ignoring case and surrounding whitespace, like the task and mode matches, and exactly
+// otherwise: "language_code" is not "language". The default is the JSON string itself,
+// verbatim, unless it is blank (empty or whitespace only), which is "" like a blank Path
+// (audioCppPathString); an absent default, a null and a value that is not a string at
+// all are "" too -- a default is never guessed.
+func audioCppLanguageParam(raw json.RawMessage) (accepts bool, def string) {
+	var params []json.RawMessage
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return false, ""
+	}
+	for _, p := range params {
+		var param struct {
+			Name    string          `json:"name"`
+			Default json.RawMessage `json:"default"`
+		}
+		if err := json.Unmarshal(p, &param); err != nil {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(param.Name)) != audioCppParamLanguage {
+			continue
+		}
+		var d string
+		if err := json.Unmarshal(param.Default, &d); err != nil || strings.TrimSpace(d) == "" {
+			d = ""
+		}
+		return true, d
+	}
+	return false, ""
 }
 
 // audioCppStreamingVerdict maps one entry's raw mode onto a streaming verdict:

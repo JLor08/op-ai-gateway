@@ -486,6 +486,7 @@ export default function App() {
           onRefresh={refreshPortalDataSilently}
           refreshModels={refreshModels}
           t={t}
+          locale={locale}
         >
           <Box
             sx={{

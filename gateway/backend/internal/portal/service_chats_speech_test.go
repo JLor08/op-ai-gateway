@@ -297,6 +297,35 @@ func TestChatAudioSettingsWireShape(t *testing.T) {
 	}
 }
 
+// The speech language is declared LAST, after KeepLastAudio: a chat stored before the
+// field existed decodes with Language "" and re-encodes to the very same bytes, and a set
+// language is emitted after every earlier knob, so no stored document's bytes move.
+func TestChatAudioSettingsLanguageWireShape(t *testing.T) {
+	const stored = `{"voice":"af_bella","speed":1.25,"passthrough":{"instructions":"calm"},"stream":false,"keep_last_audio":3}`
+	var back ChatAudioSettings
+	if err := json.Unmarshal([]byte(stored), &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Language != "" {
+		t.Fatalf("a document without language must read as unset, got %q", back.Language)
+	}
+	if again, _ := json.Marshal(back); string(again) != stored {
+		t.Fatalf("re-marshal = %s, want the stored bytes %s", again, stored)
+	}
+
+	back.Language = "de"
+	withLang, err := json.Marshal(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.TrimSuffix(stored, "}") + `,"language":"de"}`; string(withLang) != want {
+		t.Fatalf("marshal = %s, want language appended last: %s", withLang, want)
+	}
+	if b, _ := json.Marshal(ChatAudioSettings{Language: "de"}); string(b) != `{"language":"de"}` {
+		t.Fatalf("a lone language must marshal as {\"language\":\"de\"}, got %s", b)
+	}
+}
+
 // The speech-streaming choice (ADR-068): unset stays off the wire so an existing thread's
 // persisted settings are byte-identical, while an explicit false -- the opt-out -- is
 // emitted and survives the round trip (a plain bool with omitempty would lose it).

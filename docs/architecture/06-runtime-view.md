@@ -234,6 +234,18 @@ buffered turn (one part unless the clip is over the per-part target), so the res
 the SSE `done`, `AudioTurn`) is unchanged; a cut stream commits nothing. Live playback is abandoned for the run at the first
 gap in the sequence, which is harmless because the committed WAV is complete.
 
+**Language** ([ADR-074](09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough), issue #282). The body the executor
+builds (buffered and streamed alike) carries a top-level `language` when the thread's
+`settings.audio.language` is non-empty, which audio.cpp applies per model as the transcript language
+and silently drops where a model takes none; the run never consults a gate for it. What the composer
+may offer comes from the other side of the health loop: while a plain tts model is observed loaded,
+the loop caches whether it declares a `language` param and its default (`speech_language` in
+`model_mapping_cache`: from the verdict probe's own `GET /v1/models?include_params=true` for a static
+`audio_cpp` server, and through the agent router's `GET /upstream/{model}/v1/models` for an
+agent-launched child, only on an agent that declared `runtime_model_params`), and the composer asks
+`GET /api/portal/model-speech-language` on each speech-model change to show its `Language` field and,
+for an empty thread on a model whose default is not `auto`, pre-fill the portal's UI language.
+
 **Long answers** ([ADR-070](09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch), issue #279). A clip longer than the per-part target
 (`min(8 MiB, MaxChatBlobBytes / 2)` of PCM, about 95 seconds at 44.1 kHz mono by default) is
 committed as several ordered `audio_url` parts, each a standalone 16-bit mono WAV and each its

@@ -110,6 +110,27 @@ const RuntimeUpstreamPropsFeature = "runtime_upstream_props"
 // TestRuntimeVoicesFeatureIsAgentDeclaredOnly pins this side.
 const RuntimeVoicesFeature = "runtime_voices"
 
+// RuntimeModelParamsFeature is the agent-declared capability naming the runtime
+// router's GET /upstream/{model}/v1/models passthrough: a Status-only,
+// never-start read of a RUNNING audio.cpp child's model listing, relayed with
+// the inbound query so ?include_params=true reaches the child and the gateway
+// reads each model's declared request params -- the `language` axis among them
+// (#282). It is on the agent's list only, not on gatewayAgentFeatures. The
+// health loop's agent-child speech-language pull fetches through that route only
+// from an agent with positive evidence the route exists (AgentFeatures.Has) --
+// fail-closed, the RuntimeVoicesFeature precedent -- because an older router
+// never serves the route and answers a 404
+// (runtime.upstream_endpoint_not_allowed), so the read cannot succeed there and
+// would only add silent no-op traffic each tick. It is exported, like
+// RuntimeVoicesFeature, for that loop in cmd/gateway, which checks it too
+// (hasAgentFeature).
+//
+// The agent module cannot import this package, so the agent names the identical
+// string in its own registry (server-agent/internal/agent/features.go) -- the
+// same arrangement as RuntimeVoicesFeature. The two spellings must stay equal;
+// TestRuntimeModelParamsFeatureName pins this side.
+const RuntimeModelParamsFeature = "runtime_model_params"
+
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
 // route an image EDIT (POST /v1/images/edits, which is multipart) or an audio

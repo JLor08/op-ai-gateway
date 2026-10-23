@@ -209,3 +209,27 @@ func TestMultipartProxyFeatureName(t *testing.T) {
 		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, multipartProxyFeature)
 	}
 }
+
+// TestRuntimeModelParamsFeatureName pins the literal the agent declares for its
+// router's /v1/models passthrough (its features.go; the agent module cannot
+// import this one), and that the name stays off the gateway's own list: it
+// states a fact about the agent's router alone, and the health loop only reads
+// it off the agent's declared set (AgentFeatures.Has, fail-closed) before it
+// pulls a child's model params through the route. Its twin for the voices route
+// is TestRuntimeVoicesFeatureIsAgentDeclaredOnly.
+func TestRuntimeModelParamsFeatureName(t *testing.T) {
+	if RuntimeModelParamsFeature != "runtime_model_params" {
+		t.Fatalf("RuntimeModelParamsFeature = %q, want the agent's literal %q", RuntimeModelParamsFeature, "runtime_model_params")
+	}
+	if slices.Contains(gatewayAgentFeatures, RuntimeModelParamsFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeModelParamsFeature)
+	}
+	srv := NewTestServer()
+	if srv.AgentFeatures.Has("params-host", RuntimeModelParamsFeature) {
+		t.Fatalf("a server that declared nothing must not read as having %q (fail-closed)", RuntimeModelParamsFeature)
+	}
+	srv.AgentFeatures.Set("params-host", []string{RuntimeModelParamsFeature})
+	if !srv.AgentFeatures.Has("params-host", RuntimeModelParamsFeature) {
+		t.Fatalf("a server that declared %q must read as having it", RuntimeModelParamsFeature)
+	}
+}
