@@ -194,7 +194,24 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 		slog.Warn("bearer live transcription: upstream non-2xx", "id", id, "status", resp.StatusCode, "model", target.Model, "server", s.serverName(target.ServerID))
 		return
 	}
-	s.relayBearerLiveSSE(w, resp, scan)
+	// The idle watchdog + per-chunk write deadline, the streamed-transcription relay's own
+	// guard (proxyNative): the first SSE frame is a cold-start time-to-first-token, so the
+	// first-byte budget is coldStartBudget; every frame then re-arms the watchdog to idle
+	// (nativeCopier.writeChunk), and a write that then BLOCKS -- a client that keeps streaming
+	// PCM but stops READING the SSE -- is cut by the write deadline after idle, so it can
+	// never hold the one per-route session slot open forever and deny every future session on
+	// the model. On idle the watchdog cancels the one context, which tears the whole relay
+	// down and releases the slot. A genuine dictation pause is not cut here: with no PCM the
+	// upstream produces no SSE, and audio.cpp's own idle_timeout_ms ends the stream first (a
+	// clean EOF the relay bills normally). When idle is 0 (the operator disabled it) the copier
+	// is built without a watchdog, exactly as every other streamed relay is.
+	idle := s.streamIdleTimeout
+	var watchdog *time.Timer
+	if idle > 0 {
+		watchdog = time.AfterFunc(coldStartBudget(target, idle), cancel)
+		defer watchdog.Stop()
+	}
+	s.relayBearerLiveSSE(w, resp, scan, watchdog, idle)
 }
 
 // liveBodyCopyLoop pumps the client's inbound PCM into the upstream request body through pw
@@ -238,11 +255,13 @@ func liveBodyCopyLoop(body io.Reader, cancel context.CancelFunc, pw *io.PipeWrit
 // relayBearerLiveSSE relays the upstream's own SSE response to the client VERBATIM, flushed
 // per write, and feeds the completion scanner so billing knows whether the stream ended the
 // way a delivered-whole transcription does (transcript.text.done then [DONE]). It reuses the
-// streamed-transcription copier (nativeCopier) with only its client writer and the
-// transcript scan set -- no watchdog, no capture tee, no usage scanner -- so the SSE is as
-// unbuffered here as it is on the buffered streamed-transcription relay. A failed write (the
-// client went away) ends the copy; billing then sees an incomplete session and loud-zeros it.
-func (s *Server) relayBearerLiveSSE(w http.ResponseWriter, resp *provider.ProxyResponse, scan *transcriptionStreamScan) {
+// streamed-transcription copier (nativeCopier) with its client writer, the transcript scan
+// and -- so a client that stops reading cannot block the write forever -- the idle watchdog +
+// per-chunk write deadline; the capture tee and usage scanner stay off, so the SSE is as
+// unbuffered here as on the buffered streamed-transcription relay. A failed or timed-out write
+// (the client went away or stopped reading) ends the copy; billing then sees an incomplete
+// session and loud-zeros it.
+func (s *Server) relayBearerLiveSSE(w http.ResponseWriter, resp *provider.ProxyResponse, scan *transcriptionStreamScan, watchdog *time.Timer, idle time.Duration) {
 	w.Header().Set(contentTypeHeader, liveSSEContentType)
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -256,7 +275,7 @@ func (s *Server) relayBearerLiveSSE(w http.ResponseWriter, resp *provider.ProxyR
 	if flusher != nil {
 		flusher.Flush()
 	}
-	copier := &nativeCopier{w: w, rc: http.NewResponseController(w), flusher: flusher, transcript: scan}
+	copier := &nativeCopier{w: w, rc: http.NewResponseController(w), flusher: flusher, watchdog: watchdog, idle: idle, transcript: scan}
 	_ = copier.run(resp.Body)
 }
 

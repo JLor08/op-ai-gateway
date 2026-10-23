@@ -30,9 +30,9 @@ const (
 	// The wire codes of the endpoint's own refusals. Literals on purpose: they are the
 	// client contract, so a typo in the gateway's constants must fail here rather than agree
 	// with itself.
-	liveCodeParamsInvalid    = "portal.live_transcription_params_invalid"
-	liveCodeNotStreaming     = "portal.live_transcription_not_streaming"
-	liveCodeAgentUnsupported = "portal.live_transcription_agent_unsupported"
+	liveCodeParamsInvalid    = "transcription.live_params_invalid"
+	liveCodeNotStreaming     = "transcription.live_not_streaming"
+	liveCodeAgentUnsupported = "transcription.live_agent_unsupported"
 	liveCodeTicketFailed     = "portal.live_transcription_ticket_failed"
 
 	// liveAgentModel is the one mapping of the server_agent fixture (gateway and upstream

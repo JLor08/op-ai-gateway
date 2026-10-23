@@ -347,6 +347,56 @@ func TestBearerLiveTranscriptionBusyRejectsSecondSession(t *testing.T) {
 	requireOneBearerLiveRow(t, srv, usage.BillingUnitAudioSecond, 320.0/32000.0)
 }
 
+// AVAILABILITY: a client that establishes a session and then goes idle -- the half-open
+// shape, the twin of the WebSocket ping guard -- must not hold the single per-route slot
+// forever. The idle watchdog (streamIdleTimeout, armed on the SSE relay) fires, tears the
+// relay down and RELEASES the slot, so a later session on the same model is not denied 503
+// forever. A short idle makes the test fast; the slot's release is asserted directly on the
+// registry.
+func TestBearerLiveTranscriptionIdleClientReleasesSlot(t *testing.T) {
+	child := newMockLiveChild(t)
+	srv, _ := newTranscriptionCapableTestServer(t, child.server.URL)
+	srv.streamIdleTimeout = 300 * time.Millisecond
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pw, resp := startBearerLive(t, ctx, ts, bearerLiveQuery("asr-model"), devBearerHeader)
+	defer resp.Body.Close()
+	defer pw.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	br := bufio.NewReader(resp.Body)
+	// Establish: one PCM frame -> one delta (the copier writes it, which arms the per-chunk
+	// write deadline and re-arms the idle watchdog to the idle budget).
+	if _, err := pw.Write(make([]byte, 320)); err != nil {
+		t.Fatalf("write pcm: %v", err)
+	}
+	_ = readBearerSSE(t, br, 5*time.Second)
+
+	// The client now goes idle: it neither streams more PCM nor reads the SSE. The watchdog
+	// must fire within ~idle, tear the relay down and release the per-route slot. The slot is
+	// busy until it does, so acquiring it succeeds only once the idle session has been reaped.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if release, ok := srv.liveSessions.acquire("route-asr"); ok {
+			release()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the per-route slot was never released after the client went idle: the idle watchdog did not reap the session")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The reaped session is a loud zero (no terminating chunk, no done event), success + 0.
+	ev := requireOneBearerLiveRow(t, srv, usage.BillingUnitAudioSecond, 0)
+	if ev.Status != "success" {
+		t.Fatalf("status = %q, want success (an idle-reaped session is a loud zero, not an error row)", ev.Status)
+	}
+}
+
 // A missing bearer is refused 401 with no relay (the upstream is never called).
 func TestBearerLiveTranscriptionMissingBearerUnauthorized(t *testing.T) {
 	child := newMockLiveChild(t)
@@ -392,8 +442,8 @@ func TestBearerLiveTranscriptionNonStreamingModelConflict(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), portalLiveTranscriptionNotStreaming) {
-		t.Fatalf("body = %s, want %q", rec.Body.String(), portalLiveTranscriptionNotStreaming)
+	if !strings.Contains(rec.Body.String(), liveTranscriptionNotStreaming) {
+		t.Fatalf("body = %s, want %q", rec.Body.String(), liveTranscriptionNotStreaming)
 	}
 	if child.path() != "" {
 		t.Fatalf("the upstream was called for a non-streaming model")
@@ -410,8 +460,8 @@ func TestBearerLiveTranscriptionInvalidParamsBadRequest(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), portalLiveTranscriptionParamsInvalid) {
-		t.Fatalf("body = %s, want %q", rec.Body.String(), portalLiveTranscriptionParamsInvalid)
+	if !strings.Contains(rec.Body.String(), liveTranscriptionParamsInvalid) {
+		t.Fatalf("body = %s, want %q", rec.Body.String(), liveTranscriptionParamsInvalid)
 	}
 }
 
