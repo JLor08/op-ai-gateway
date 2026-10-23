@@ -584,7 +584,25 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           </ChatStoreProvider>
         </ToastProvider>,
       );
-    return { onRefresh, rerenderWithModels, unmount: view.unmount };
+    // The same provider re-rendered under the OTHER portal language (no remount), for the
+    // tests that pin what a UI-language switch must not do to the thread's own settings.
+    const rerenderWithLocale = (nextLocale: Locale) =>
+      view.rerender(
+        <ToastProvider>
+          <ChatStoreProvider
+            api={chatApi.api}
+            models={modelsToUse}
+            tokens={tokens}
+            onRefresh={onRefresh}
+            refreshModels={opts.refreshModels}
+            t={messages[nextLocale]}
+            locale={nextLocale}
+          >
+            <Probe altModelId={opts.altModelId ?? modelsToUse[0]?.id ?? ''} />
+          </ChatStoreProvider>
+        </ToastProvider>,
+      );
+    return { onRefresh, rerenderWithModels, rerenderWithLocale, unmount: view.unmount };
   }
 
   // The provider opens/creates a chat asynchronously on mount; wait for that to
@@ -4441,6 +4459,23 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(language()).toBe(locale));
 
       fireEvent.click(screen.getByRole('button', { name: 'clear-language' }));
+      await act(async () => {});
+
+      expect(language()).toBe('');
+    });
+
+    it('does not refill a cleared language when the portal language changes', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+      const { rerenderWithLocale } = renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(language()).toBe(locale));
+      fireEvent.click(screen.getByRole('button', { name: 'clear-language' }));
+      await act(async () => {});
+      expect(language()).toBe('');
+
+      // The pre-fill reads the UI language through a ref, so switching it re-runs nothing.
+      rerenderWithLocale(locale === 'de' ? 'en' : 'de');
       await act(async () => {});
 
       expect(language()).toBe('');

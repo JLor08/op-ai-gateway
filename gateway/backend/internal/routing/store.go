@@ -1487,7 +1487,8 @@ type speechLanguageFact struct {
 // SpeechLanguagePayload builds the ModelMappingCacheSpeechLanguage payload for a model
 // that does (accepts) or does not take a `language` request param, def being the
 // default the model declares for it ("" for none). ParseSpeechLanguage reads it back
-// exactly, the default included, for every input: the pair is one persisted shape.
+// exactly, the default included, for every valid-UTF-8 default (encoding/json replaces an
+// invalid byte with U+FFFD): the pair is one persisted shape.
 func SpeechLanguagePayload(accepts bool, def string) string {
 	// A struct of a bool and a string cannot fail to marshal.
 	b, _ := json.Marshal(speechLanguageFact{Accepts: accepts, Default: def})
@@ -1500,7 +1501,8 @@ func SpeechLanguagePayload(accepts bool, def string) string {
 // else -- an empty payload, malformed JSON, trailing data, a non-object (an array, null),
 // an object without "accepts" (which would otherwise read as a made-up "no"), a field of
 // the wrong type -- is no fact: (false, "", false), which a reader treats exactly like a
-// mapping that was never probed. A usable "no" is (false, "", true), a different answer.
+// mapping that was never probed. A usable "no" is ok == true with accepts == false (its
+// default may be non-empty), a different answer.
 //
 // It is the ONE definition of "a usable cached language fact", shared by every reader of
 // the row (the composer's language gate, and any future one), so they can never disagree

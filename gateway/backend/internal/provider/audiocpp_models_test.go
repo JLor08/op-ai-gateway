@@ -354,6 +354,7 @@ func TestParseAudioCppLanguageParam(t *testing.T) {
 		{"the name matches ignoring case and surrounding whitespace", `{"data":[{"id":"m","params":[{"name":" Language ","default":"fr"}]}]}`, "m", true, "fr"},
 		{"the name match is not a prefix or a substring", `{"data":[{"id":"m","params":[{"name":"language_code","default":"x"},{"name":"lang","default":"y"}]}]}`, "m", false, ""},
 		{"the first language param answers", `{"data":[{"id":"m","params":[{"name":"language","default":"first"},{"name":"language","default":"second"}]}]}`, "m", true, "first"},
+		{"a blank default is no default, like a blank path", `{"data":[{"id":"m","params":[{"name":"language","default":"  "}]}]}`, "m", true, ""},
 		{"the default is kept verbatim", `{"data":[{"id":"m","params":[{"name":"language","default":" Zh-CN "}]}]}`, "m", true, " Zh-CN "},
 		{"the entry is picked out by id", `{"data":[{"id":"a","params":[{"name":"language","default":"a"}]},{"id":"b","params":[{"name":"language","default":"b"}]}]}`, "b", true, "b"},
 		{"a sibling's language param does not leak", `{"data":[{"id":"a","params":[{"name":"language","default":"a"}]},{"id":"b","params":[{"name":"text"}]}]}`, "b", false, ""},

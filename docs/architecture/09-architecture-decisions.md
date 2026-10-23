@@ -8722,8 +8722,8 @@ applies it **per model**, and **silently drops** it for a model that does not ta
 send it unconditionally. Its `GET /v1/models?include_params=true` adds a `params` array to each entry
 (`name`, `type`, `default`, `required`): the only place audio.cpp says whether a model takes a language
 and what it defaults to, and it states **only the default**, never the accepted values. The gateway
-had no way to know whether a model takes the field, nor to supply one, which blocked otherwise strong
-models, notably `confucius4_tts`, the only installed German TTS that streams at 44.1 kHz.
+had no way to know whether a model takes the field, nor to supply one, which blocked otherwise capable
+models, notably `confucius4_tts`, a strong German TTS that streams at 44.1 kHz.
 
 **Decision — five choices, taken together. No schema migration, and the yes/no capability wire is
 unchanged.**
@@ -8804,8 +8804,9 @@ unchanged.**
 - **The static path asks `include_params=true` unconditionally, which assumes an audio.cpp that
   accepts the query.** The parameter only adds a field to each entry. An audio.cpp old enough to answer
   an unknown query with a 4xx would fail the whole listing read, so no verdict (and no language fact)
-  would be written for it: the fail-safe outcome, "unknown, the next tick asks again", and a
-  low-likelihood case. A model whose entry carries no `params`, or a malformed one, costs only the
+  would be written for it: the fail-safe outcome is "unknown", and **persistently** so (the query is
+  unconditional, so every tick fails the same way until the audio.cpp server is upgraded or the verdict
+  is set by hand), and a low-likelihood case. A model whose entry carries no `params`, or a malformed one, costs only the
   language axis (`accepts:false`), never a verdict.
 - **Whether audio.cpp reports a model's `params` while it is unloaded is not asserted.** The write is
   loaded-gated either way (an ungated write could flap `accepts` if it did not, and the gate keeps the

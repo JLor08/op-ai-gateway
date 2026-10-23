@@ -21,6 +21,8 @@ func TestSpeechLanguagePayloadRoundTrip(t *testing.T) {
 		{"accepts with no declared default", true, ""},
 		{"a real no: the model declares no language param", false, ""},
 		{"a default that needs JSON escaping", true, `a"b\c`},
+		{"a default with HTML-escaped characters", true, `a<b&c>`},
+		{"a real no that still carries a default", false, "zh"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			accepts, def, ok := ParseSpeechLanguage(SpeechLanguagePayload(tc.accepts, tc.def))

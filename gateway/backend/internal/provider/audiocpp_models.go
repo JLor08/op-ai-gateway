@@ -491,8 +491,9 @@ func parseAudioCppLanguageParam(body []byte, modelID string) (accepts bool, def 
 // string) is skipped and cannot hide a language param beside it. The name matches
 // ignoring case and surrounding whitespace, like the task and mode matches, and exactly
 // otherwise: "language_code" is not "language". The default is the JSON string itself,
-// verbatim; an absent default, a null and a value that is not a string at all are "" --
-// a default is never guessed.
+// verbatim, unless it is blank (empty or whitespace only), which is "" like a blank Path
+// (audioCppPathString); an absent default, a null and a value that is not a string at
+// all are "" too -- a default is never guessed.
 func audioCppLanguageParam(raw json.RawMessage) (accepts bool, def string) {
 	var params []json.RawMessage
 	if err := json.Unmarshal(raw, &params); err != nil {
@@ -510,7 +511,7 @@ func audioCppLanguageParam(raw json.RawMessage) (accepts bool, def string) {
 			continue
 		}
 		var d string
-		if err := json.Unmarshal(param.Default, &d); err != nil {
+		if err := json.Unmarshal(param.Default, &d); err != nil || strings.TrimSpace(d) == "" {
 			d = ""
 		}
 		return true, d

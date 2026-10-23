@@ -1588,7 +1588,9 @@ export function ChatStoreProvider({
   // a thread that has not spoken yet: a language the thread already has (typed, or saved) is
   // never overwritten, and neither is the settings of a thread whose earlier answers were made
   // without one. Another kind of thread (a text thread with a speech model picked) is not a
-  // speech thread and gets nothing. Declared after the effect that mirrors the refs it reads.
+  // speech thread and gets nothing. Switching to a different speech model re-fires this and
+  // still refills only a BLANK field (never a typed or saved one). Declared after the effect that
+  // mirrors the refs it reads.
   useEffect(() => {
     if (!speechLanguageGate.accepts) return;
     if (speechLanguageGate.default.trim().toLowerCase() === 'auto') return;

@@ -37,7 +37,9 @@ var (
 	// audioCppVoicesBackoff is how long a mapping whose voices listing failed is
 	// left alone before the audio.cpp pass asks again (see voicesBackoff). A
 	// server that does not serve the listing then costs one small GET per loaded
-	// tts mapping per backoff window instead of one per health tick.
+	// tts mapping per backoff window instead of one per health tick. The agent
+	// pass's speech params /v1/models pull (speechParamsBackoff) shares this window
+	// length, so the one tunable paces both failing reads.
 	audioCppVoicesBackoff = 5 * time.Minute
 	// speechRateRetryBackoff is how long a mapping whose speech rate benchmark the
 	// loop started is left alone before the pass starts it again while the mapping
@@ -884,11 +886,11 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // only through the prober's optional voices listing; its failures never touch
 // the verdicts above.
 //
-// A speech params step per mapping (cacheAudioCppSpeechParams, #282) caches the
+// A third, speech params step per mapping (cacheAudioCppSpeechParams, #282) caches the
 // `language` request param fact the same verdict carries, for the same loaded plain tts
 // models; unlike the voices step it asks the server for nothing more.
 //
-// A third step per mapping starts the speech rate benchmark (cacheAudioCppSpeechRate,
+// A fourth step per mapping starts the speech rate benchmark (cacheAudioCppSpeechRate,
 // #263): a loaded plain model that streams speech, which has no cached output byte
 // rate for the model the listing states (its path), has the gateway benchmark it, so
 // a streamed call bills in audio seconds and not in the honest audio_bytes fallback.
@@ -950,6 +952,10 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 // is the one writing them, so it reads its own tick's answer without a store
 // read, and an operator's manual override of a row only narrows what the voice
 // picker offers (it re-checks the stored verdict on read), never what is cached.
+//
+// The same gate also decides the speech params step (cacheAudioCppSpeechParams), not
+// only the voices one: the `language` fact is cached for exactly the models whose voices
+// are, for the same reasons (loaded, so the entry is the model the server answers for).
 func audioCppVoicesWanted(v provider.AudioCppVerdicts) bool {
 	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechClone != routing.CapabilityYes
 }

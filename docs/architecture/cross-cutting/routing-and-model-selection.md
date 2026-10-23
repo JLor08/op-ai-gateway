@@ -885,8 +885,9 @@ document, from two producers
   rule reads; the same document then also yields the `speech_language` fact (§2.6). The one
   assumption behind the query is stated rather than discovered: an audio.cpp old enough to answer
   an **unknown query parameter** with a 4xx would fail the whole listing read, so no verdict would
-  be written for its models (the fail-safe outcome, "unknown, the next tick asks again", and the
-  builds that publish the params array accept the query, so this is a low-likelihood case).
+  be written for its models (the fail-safe outcome is "unknown", persistently, until the audio.cpp
+  server is upgraded or the verdict is set by hand, and the builds that publish the params array accept
+  the query, so this is a low-likelihood case).
 - **`audiocpp_models`, reported by the agent** (issue #255, agent 0.9.1) answers the same
   rows for an **agent-launched** `audio_cpp` child (the `speech` and `transcription` pair
   decided here, and the mode-derived `transcription_streaming` verdict of agent 0.9.2,

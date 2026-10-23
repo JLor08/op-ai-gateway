@@ -362,32 +362,16 @@ func TestFeaturesDeclareRuntimeVoices(t *testing.T) {
 	}
 }
 
-// TestFeaturesDeclareFullduplexProxy pins the fullduplex_proxy flag and the
-// version bump that ships it. The version assertion lives here, beside the
-// newest feature, and it is the forcing function for the repository's bump
-// rule: a change that moves Version has to come THROUGH this test and state
-// which rule it followed. 0.8.0 was MINOR because agent.Features gained
-// runtime_ensure; 0.8.1 and 0.8.2 were PATCH because they gained nothing
-// (0.8.2 added the image_options telemetry field, gated on the
-// gateway-declared capability_source_sdcpp, which is not an agent.Features
-// entry); 0.9.0 was MINOR because agent.Features gained multipart_proxy;
-// 0.9.1 and 0.9.2 were PATCH because they gained nothing (they probe an
-// audio_cpp child's /v1/models, gated on the gateway-declared
-// capability_source_audiocpp, which is not an agent.Features entry
-// either); 0.10.0 was MINOR because agent.Features gained
-// runtime_config_files; 0.10.1 and 0.10.2 were PATCH (the speech_clone
-// verdict, then the "clone" -> "clon" task-string correction, both read from
-// the child's /v1/models task on the same gateway-declared
-// capability_source_audiocpp source, which is not an agent.Features entry);
-// 0.11.0 is MINOR because agent.Features gained runtime_voices; 0.11.1 is
-// PATCH (the speech_streaming verdict, read from the audio_cpp child's
-// /v1/models mode on the same gateway-declared capability_source_audiocpp
-// source, which is not an agent.Features entry: an absent verdict already
-// means the correct default, buffered); 0.12.0 is MINOR because
-// agent.Features gained fullduplex_proxy. A Since records the version a
-// feature shipped in, so runtime_ensure's stays 0.8.0, multipart_proxy's stays
-// 0.9.0, runtime_config_files' stays 0.10.0, runtime_voices' stays 0.11.0 and
-// fullduplex_proxy's stays 0.12.0.
+// TestFeaturesDeclareFullduplexProxy pins the full-duplex relay capability: this
+// agent's runtime router can relay a full-duplex chunked request body to a
+// child's streaming endpoint (live transcription), and the GATEWAY mints a
+// live-transcription ticket for an agent target only from an agent that
+// declares this exact name, fail-closed -- an older router has no such relay
+// and answers 404 for the route, which cannot be told from an unknown model --
+// so a rename here silently disables live transcription through the agent. The
+// gateway spells the same string in its own constant (fullduplexProxyFeature,
+// gateway/backend/internal/gateway/agent_features.go); this module cannot
+// import it.
 func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
 	found := false
 	for _, f := range Features {
@@ -421,11 +405,28 @@ func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
 //
 // The version assertion lives here, beside the newest feature, and it is the
 // forcing function for the repository's bump rule: a change that moves Version
-// has to come THROUGH this test and state which rule it followed. 0.12.0 was
-// MINOR because agent.Features gained fullduplex_proxy; 0.13.0 is MINOR because
+// has to come THROUGH this test and state which rule it followed. 0.8.0 was
+// MINOR because agent.Features gained runtime_ensure; 0.8.1 and 0.8.2 were
+// PATCH because they gained nothing (0.8.2 added the image_options telemetry
+// field, gated on the gateway-declared capability_source_sdcpp, which is not an
+// agent.Features entry); 0.9.0 was MINOR because agent.Features gained
+// multipart_proxy; 0.9.1 and 0.9.2 were PATCH because they gained nothing (they
+// probe an audio_cpp child's /v1/models, gated on the gateway-declared
+// capability_source_audiocpp, which is not an agent.Features entry either);
+// 0.10.0 was MINOR because agent.Features gained runtime_config_files; 0.10.1
+// and 0.10.2 were PATCH (the speech_clone verdict, then the "clone" -> "clon"
+// task-string correction, both read from the child's /v1/models task on the
+// same gateway-declared capability_source_audiocpp source, which is not an
+// agent.Features entry); 0.11.0 was MINOR because agent.Features gained
+// runtime_voices; 0.11.1 was PATCH (the speech_streaming verdict, read from the
+// audio_cpp child's /v1/models mode on the same gateway-declared
+// capability_source_audiocpp source, which is not an agent.Features entry: an
+// absent verdict already means the correct default, buffered); 0.12.0 was MINOR
+// because agent.Features gained fullduplex_proxy; 0.13.0 is MINOR because
 // agent.Features gained runtime_model_params. A Since records the version a
-// feature shipped in, so fullduplex_proxy's stays 0.12.0 and
-// runtime_model_params' stays 0.13.0.
+// feature shipped in, so runtime_ensure's stays 0.8.0, multipart_proxy's stays
+// 0.9.0, runtime_config_files' stays 0.10.0, runtime_voices' stays 0.11.0,
+// fullduplex_proxy's stays 0.12.0 and runtime_model_params' stays 0.13.0.
 func TestFeaturesDeclareRuntimeModelParams(t *testing.T) {
 	found := false
 	for _, f := range Features {
