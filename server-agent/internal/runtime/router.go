@@ -695,15 +695,16 @@ func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
 }
 
 // liveChildQuery builds the child's query string for serveLive: the inbound
-// RawQuery verbatim (preserving the forwarded sample_rate/channels/
-// sample_format/language params exactly) with model=<decoded path model>
-// appended, since audio.cpp reads the model from its own query.
+// params (the forwarded sample_rate/channels/sample_format/language, carried
+// through unchanged) with model set to the decoded PATH model, since audio.cpp
+// reads the model from its own query. The path model is AUTHORITATIVE -- it is
+// what the route was dispatched on and what EnsureRunning admitted -- so a stray
+// inbound model= is overwritten rather than appended, which would otherwise
+// leave two model params and let Query().Get("model") read the inbound one.
 func liveChildQuery(inbound, model string) string {
-	q := "model=" + url.QueryEscape(model)
-	if inbound == "" {
-		return q
-	}
-	return inbound + "&" + q
+	values, _ := url.ParseQuery(inbound) // partial parse on error is fine; model is set authoritatively below
+	values.Set("model", model)
+	return values.Encode()
 }
 
 // writeBodyReadError answers a request whose body, read through a

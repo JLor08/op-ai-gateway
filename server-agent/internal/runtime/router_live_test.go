@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,14 @@ func newLiveChild(t *testing.T) (*httptest.Server, <-chan liveCapture) {
 	t.Helper()
 	capCh := make(chan liveCapture, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The relay MUST stream, not buffer: a buffered serveLive (io.ReadAll +
+		// bytes.NewReader) would set a Content-Length and arrive with a known
+		// length, where the real streaming relay sends the body chunked. Pin it
+		// here so this test cannot pass against a buffering implementation --
+		// chunked requests report ContentLength == -1.
+		if r.ContentLength != -1 {
+			t.Errorf("child received the body with ContentLength = %d (want -1, chunked): serveLive buffered the upload instead of streaming it", r.ContentLength)
+		}
 		q := r.URL.Query()
 		rc := http.NewResponseController(w)
 		_ = rc.EnableFullDuplex() // let this child interleave reading the body with writing SSE
@@ -88,7 +97,10 @@ func TestRouterLiveRelaysFullDuplex(t *testing.T) {
 		_ = pw.Close()
 	}()
 
-	target := srv.URL + "/live/whisper-1?sample_rate=16000&channels=1&sample_format=s16le&language=de"
+	// The inbound model=should-not-win must be overridden by the PATH model
+	// (whisper-1) the route was dispatched on -- a stray query param must never
+	// redirect the routed child.
+	target := srv.URL + "/live/whisper-1?sample_rate=16000&channels=1&sample_format=s16le&language=de&model=should-not-win"
 	req, err := http.NewRequest(http.MethodPost, target, pr)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
@@ -129,7 +141,7 @@ func TestRouterLiveRelaysFullDuplex(t *testing.T) {
 		t.Errorf("child path = %q, want /v1/audio/transcriptions/live", got.path)
 	}
 	if got.model != "whisper-1" {
-		t.Errorf("child query model = %q, want whisper-1 (taken from the path)", got.model)
+		t.Errorf("child query model = %q, want whisper-1 (the path model, overriding the inbound model=should-not-win)", got.model)
 	}
 	if got.sampleRate != "16000" || got.channels != "1" || got.sampleFormat != "s16le" || got.language != "de" {
 		t.Errorf("forwarded params = {sample_rate:%q channels:%q sample_format:%q language:%q}, want {16000 1 s16le de}",
@@ -177,6 +189,41 @@ func TestRouterLiveUnknownOrEmptyModelReturns404(t *testing.T) {
 			}
 			if code := decodeErrorCode(t, rec); code != codeModelNotManaged {
 				t.Fatalf("error code = %q, want %q", code, codeModelNotManaged)
+			}
+		})
+	}
+}
+
+// TestLiveChildQueryPathModelIsAuthoritative pins liveChildQuery directly: the
+// forwarded params are carried through unchanged, and the PATH model always wins
+// -- an inbound model= is overwritten, never leaving a duplicate for the child's
+// Query().Get("model") to read the wrong one from.
+func TestLiveChildQueryPathModelIsAuthoritative(t *testing.T) {
+	cases := []struct {
+		name    string
+		inbound string
+		model   string
+	}{
+		{"no inbound model", "sample_rate=16000&channels=1&sample_format=s16le&language=de", "whisper-1"},
+		{"inbound model overridden", "sample_rate=16000&model=should-not-win&language=de", "whisper-1"},
+		{"empty inbound", "", "whisper-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := liveChildQuery(tc.inbound, tc.model)
+			parsed, err := url.ParseQuery(out)
+			if err != nil {
+				t.Fatalf("liveChildQuery produced an unparsable query %q: %v", out, err)
+			}
+			if models := parsed["model"]; len(models) != 1 || models[0] != tc.model {
+				t.Fatalf("model params = %v, want exactly one %q (the path model must be authoritative)", models, tc.model)
+			}
+			// Forwarded params survive unchanged.
+			inboundParsed, _ := url.ParseQuery(tc.inbound)
+			for _, k := range []string{"sample_rate", "channels", "sample_format", "language"} {
+				if want := inboundParsed.Get(k); want != "" && parsed.Get(k) != want {
+					t.Errorf("%s = %q, want %q (forwarded unchanged)", k, parsed.Get(k), want)
+				}
 			}
 		})
 	}
