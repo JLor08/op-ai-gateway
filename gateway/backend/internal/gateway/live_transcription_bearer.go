@@ -173,7 +173,7 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 		_ = rc.SetReadDeadline(time.Now())
 		cancel()
 		wg.Wait()
-		s.recordLiveUsage(start, id, r.URL.Path, target, params, bearerLiveAttribution(token), target.APIFlavor, liveUsageResult{
+		s.recordLiveUsage(start, id, r.URL.Path, target, params, bearerLiveAttribution(token), liveUsageResult{
 			endRequested: endReceived.Load(),
 			scan:         scan,
 			pcmBytes:     atomic.LoadInt64(&pcmBytes),

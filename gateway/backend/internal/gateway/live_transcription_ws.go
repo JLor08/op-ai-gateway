@@ -618,12 +618,12 @@ type liveUsageResult struct {
 // for the bearer HTTP relay attr comes straight off the request's bearer token. Either
 // way a live row is attributed like a buffered transcription's.
 //
-// target + params + attr + apiFlavor replace the ticket claims the WebSocket path once
-// passed, so the bearer HTTP relay -- which has no ticket -- bills through the SAME
-// classifier from a resolved target, its query params and its bearer token. The
-// per-session outcome is bundled into liveUsageResult, keeping this entry point within a
-// sane parameter count (go:S107).
-func (s *Server) recordLiveUsage(start time.Time, id, reqPath string, target routing.Target, params liveParams, attr liveAttribution, apiFlavor string, result liveUsageResult) {
+// target + params + attr replace the ticket claims the WebSocket path once passed, so
+// the bearer HTTP relay -- which has no ticket -- bills through the SAME classifier from
+// a resolved target, its query params and its bearer token. The per-session outcome is
+// bundled into liveUsageResult and the API flavor is read from the target, keeping this
+// entry point within a sane parameter count (go:S107).
+func (s *Server) recordLiveUsage(start time.Time, id, reqPath string, target routing.Target, params liveParams, attr liveAttribution, result liveUsageResult) {
 	meta := usageMeta{
 		ReqPath:     reqPath,
 		HTTPStatus:  liveHTTPStatus(result.upErr, result.resp),
@@ -668,7 +668,7 @@ func (s *Server) recordLiveUsage(start time.Time, id, reqPath string, target rou
 		ProjectID:   attr.ProjectID,
 		ProjectName: attr.ProjectName,
 	}
-	req := inference.Request{Model: target.Model, APIFlavor: apiFlavor}
+	req := inference.Request{Model: target.Model, APIFlavor: target.APIFlavor}
 	if req.APIFlavor == "" {
 		req.APIFlavor = apiFlavorSpeech
 	}
