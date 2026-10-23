@@ -330,6 +330,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.serveUpstream(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, ensurePathPrefix):
 		rt.serveEnsure(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, livePathPrefix):
+		rt.serveLive(w, r)
 	default:
 		rt.serveProxy(w, r)
 	}
@@ -526,6 +528,17 @@ func (rt *router) relayToRunningChild(w http.ResponseWriter, r *http.Request, mo
 // after it is the model.
 const ensurePathPrefix = "/ensure/"
 
+// livePathPrefix is the path prefix of POST /live/{model}; everything after it
+// is the model. Unlike the model-routed proxy, this route reads the model from
+// the PATH and never buffers the body, so it can carry a full-duplex streaming
+// upload (live transcription, issue #266).
+const livePathPrefix = "/live/"
+
+// liveChildPath is the audio.cpp child endpoint POST /live/{model} relays to:
+// the streaming transcription endpoint, which consumes a chunked audio upload
+// and emits SSE transcript events for the life of the connection.
+const liveChildPath = "/v1/audio/transcriptions/live"
+
 // ensureResponse is POST /ensure/{model}'s success body.
 type ensureResponse struct {
 	Status string `json:"status"`
@@ -594,6 +607,103 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 	}
 	refreshWriteDeadline(w)
 	writeJSON(w, http.StatusOK, ensureResponse{Status: "running"})
+}
+
+// serveLive handles POST /live/{model}: the full-duplex relay to a managed
+// audio.cpp child's streaming transcription endpoint (issue #266). It is the
+// one proxied route that reads the model from the PATH rather than the body --
+// precisely so it never has to buffer the body to route it (serveProxy's
+// io.ReadAll), and can instead stream the inbound chunked audio upload straight
+// to the child while relaying the child's SSE transcript events back on the
+// same connection.
+//
+// Deliberate properties:
+//   - The model is the decoded PATH after "/live/", the same prefix decode
+//     serveEnsure does, so an id containing "/" works. An empty model or a nil
+//     manager is 404 runtime.model_not_managed, exactly as serveEnsure answers.
+//   - release() is deferred AFTER a successful EnsureRunning and runs exactly
+//     once on every exit path (clean completion, upstream error, client
+//     disconnect) -- unlike serveEnsure, which releases immediately because it
+//     forwards nothing; here the child admission must be held for the whole
+//     relay.
+//   - EnableFullDuplex lets the server interleave reading r.Body with writing
+//     the SSE response on the one HTTP/1.1 connection. An error from it (e.g. a
+//     test recorder that does not support it) is tolerated by falling through;
+//     the production in-process path supports it.
+//   - The body is streamed, never buffered: r.Body is handed to the child
+//     request directly with ContentLength left unset, so Go's HTTP/1.1
+//     transport sends it chunked in a background goroutine and returns the
+//     response once the child's headers arrive -- the full-duplex behavior this
+//     route needs.
+//   - The child URL is {childBase}/v1/audio/transcriptions/live with query =
+//     the inbound RawQuery plus model=<decoded path model> (audio.cpp reads the
+//     model from its query), forwarding the inbound sample_rate/channels/
+//     sample_format/language params unchanged.
+//   - A RoundTrip failure (child unreachable) is 502 runtime.upstream_gone, the
+//     same code the other proxy paths use for a failure reaching an admitted
+//     child.
+func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
+	model := strings.TrimPrefix(r.URL.Path, livePathPrefix)
+	if rt.m == nil || model == "" {
+		writeSentinelError(w, ErrModelNotManaged)
+		return
+	}
+	endpoint, release, err := rt.m.EnsureRunning(r.Context(), model)
+	if err != nil {
+		writeSentinelError(w, err)
+		return
+	}
+	defer release()
+
+	// Interleave reading r.Body with writing the SSE response on the same
+	// HTTP/1.1 connection. Tolerate an error by falling through (see the doc
+	// comment): a writer that does not support it is no worse off than before.
+	_ = http.NewResponseController(w).EnableFullDuplex()
+
+	target := endpoint + liveChildPath + "?" + liveChildQuery(r.URL.RawQuery, model)
+	// Stream r.Body straight through: do NOT io.ReadAll it, and leave
+	// ContentLength unset so the Transport sends it chunked (Request.outgoing
+	// Length reports -1 for a non-nil body with no declared length).
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, codeUpstreamGone, err.Error())
+		return
+	}
+	req.Header = r.Header.Clone()
+	for _, h := range hopByHopHeaders {
+		req.Header.Del(h)
+	}
+	req.Header.Del("Content-Length") // the streamed body has no declared length; send it chunked
+	// I2: never forward the caller's Accept-Encoding, so the Transport
+	// negotiates and transparently decompresses on our behalf and the relayed
+	// SSE bytes are the decoded body (see buildUpstreamRequest's own note).
+	req.Header.Del("Accept-Encoding")
+
+	resp, err := rt.transport.RoundTrip(req)
+	if err != nil {
+		// The child is unreachable (or died before answering): the same code
+		// the other proxy paths use for a failure reaching an admitted child.
+		writeError(w, http.StatusBadGateway, codeUpstreamGone, err.Error())
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck // read-side close, best-effort
+
+	// Relay status + headers + body back flushed per write, so SSE transcript
+	// deltas reach the gateway as the child produces them.
+	flusher, _ := w.(http.Flusher)
+	forwardUpstreamResponse(w, flusher, resp)
+}
+
+// liveChildQuery builds the child's query string for serveLive: the inbound
+// RawQuery verbatim (preserving the forwarded sample_rate/channels/
+// sample_format/language params exactly) with model=<decoded path model>
+// appended, since audio.cpp reads the model from its own query.
+func liveChildQuery(inbound, model string) string {
+	q := "model=" + url.QueryEscape(model)
+	if inbound == "" {
+		return q
+	}
+	return inbound + "&" + q
 }
 
 // writeBodyReadError answers a request whose body, read through a
