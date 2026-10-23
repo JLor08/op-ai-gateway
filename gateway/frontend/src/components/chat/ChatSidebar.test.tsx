@@ -54,6 +54,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     modelImageOptions: null,
     modelVoices: [],
     speechStreaming: false,
+    speechLanguage: false,
     transcriptionStreaming: false,
     chatKind: '',
     imageSettings: DEFAULT_IMAGE_SETTINGS,

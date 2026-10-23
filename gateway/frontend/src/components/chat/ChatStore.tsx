@@ -14,6 +14,7 @@ import {
   type SetStateAction,
 } from 'react';
 import {
+  NO_SPEECH_LANGUAGE,
   NO_SPEECH_STREAMING,
   type ActiveChatRun,
   type Chat,
@@ -24,8 +25,10 @@ import {
   type PortalServer,
   type PortalToken,
   type ServerModelOption,
+  type SpeechLanguageGate,
   type SpeechStreamingGate,
 } from '../../api';
+import type { Locale } from '../../i18n';
 import type { Translation } from '../shared/types';
 import { formatPortalError } from '../shared/format';
 import { useToast } from '../shared/ToastProvider';
@@ -302,6 +305,14 @@ export type ChatStore = {
   // at run time; this only decides whether the toggle exists and whether the browser's audio
   // is readied when a turn is sent.
   speechStreaming: boolean;
+  // Whether the speech composer may offer the LANGUAGE control for the effective model: the
+  // gateway's own answer (api.modelSpeechLanguage) that the model takes a `language`
+  // parameter. False whenever there is nothing to offer -- not a speech model, the lookup is
+  // in flight, it failed (fail closed), or the gateway said no -- and the composer then has no
+  // language field, so nothing is shown or pre-filled for a model that would drop the value.
+  // The same answer's declared default drives the pre-fill of an empty speech thread (see the
+  // store's pre-fill effect): this only decides whether the control exists.
+  speechLanguage: boolean;
   // Whether the transcription composer may offer a LIVE recording for the effective model: the
   // gateway's own answer (api.modelTranscriptionStreaming) that every mapping the model could
   // be served by is known to stream a transcription (#266). The speech gate's twin, minus the
@@ -525,6 +536,7 @@ export function ChatStoreProvider({
   onRefresh,
   refreshModels,
   t,
+  locale,
   children,
 }: Readonly<{
   api: Pick<
@@ -538,6 +550,7 @@ export function ChatStoreProvider({
     | 'deleteChat'
     | 'deleteMessageAudio'
     | 'modelImageOptions'
+    | 'modelSpeechLanguage'
     | 'modelSpeechStreaming'
     | 'modelTranscriptionStreaming'
     | 'modelVoices'
@@ -565,6 +578,10 @@ export function ChatStoreProvider({
   // care about recovery keep working unchanged.
   refreshModels?: () => void;
   t: Translation;
+  // The portal's current UI language (the one `t` is in). The speech composer pre-fills its
+  // language control with it (see the pre-fill effect), so a spoken answer follows the
+  // language the user reads the portal in unless they say otherwise.
+  locale: Locale;
   children: ReactNode;
 }>) {
   // The active chat's live state. Content is loaded from the server (defaults
@@ -641,6 +658,10 @@ export function ChatStoreProvider({
   const [speechStreamingGate, setSpeechStreamingGate] =
     useState<SpeechStreamingGate>(NO_SPEECH_STREAMING);
   const speechStreamingRef = useRef(false);
+  // The effective speech model's language gate (see api.modelSpeechLanguage): closed until
+  // the gateway says otherwise.
+  const [speechLanguageGate, setSpeechLanguageGate] =
+    useState<SpeechLanguageGate>(NO_SPEECH_LANGUAGE);
   // The effective transcription model's live gate (see api.modelTranscriptionStreaming):
   // closed until the gateway says otherwise. A plain boolean: unlike the speech gate there is
   // no rate to carry, so nothing reads it between renders and it needs no ref.
@@ -865,6 +886,10 @@ export function ChatStoreProvider({
   refreshModelsRef.current = refreshModels;
   const tRef = useRef(t);
   tRef.current = t;
+  // The UI language is read by the language pre-fill, which must not re-run when only the
+  // portal's language changes (a field the user cleared would fill itself again).
+  const localeRef = useRef(locale);
+  localeRef.current = locale;
   const showErrorRef = useRef(showError);
   showErrorRef.current = showError;
   // Mirror the derived availability so the stable send/edit/regenerate callbacks
@@ -1529,6 +1554,47 @@ export function ChatStoreProvider({
       cancelled = true;
     };
   }, [modelSpeechCapable, effectiveModel]);
+
+  // Ask the gateway whether the effective SPEECH model takes a language (settings.audio.
+  // language), for the composer's language control. The streaming gate's effect above, for the
+  // language gate: closed up front (the answer belongs to ONE model, and a stale yes must not
+  // stay on offer while the next lookup is in flight -- the field would promise a knob the
+  // next model drops), a latest-wins guard against a slow stale response, and no lookup at all
+  // for a non-speech (or no) model. FAIL CLOSED: a failed lookup is a no, which leaves the
+  // composer without a language field, as before this gate existed. The deps list ends at the
+  // model, like the streaming gate's: the answer does not depend on the thread.
+  useEffect(() => {
+    setSpeechLanguageGate(NO_SPEECH_LANGUAGE);
+    if (!modelSpeechCapable || effectiveModel === '') return;
+    let cancelled = false;
+    void apiRef.current
+      .modelSpeechLanguage(effectiveModel)
+      .then((gate) => {
+        if (!cancelled) setSpeechLanguageGate(gate);
+      })
+      .catch(() => {
+        if (!cancelled) setSpeechLanguageGate(NO_SPEECH_LANGUAGE);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelSpeechCapable, effectiveModel]);
+
+  // Pre-fill the language of an EMPTY speech thread with the portal's UI language, when the
+  // model takes a language and does not declare "auto" as its default (so it will not detect
+  // the language itself: audio.cpp's confucius4 speaks Chinese unless told otherwise, and a
+  // German text would come out as Chinese). Runs when a gate answer ARRIVES -- never on the
+  // user's own edits, so a field they cleared stays cleared -- and only fills a blank field of
+  // a thread that has not spoken yet: a language the thread already has (typed, or saved) is
+  // never overwritten, and neither is the settings of a thread whose earlier answers were made
+  // without one. Another kind of thread (a text thread with a speech model picked) is not a
+  // speech thread and gets nothing. Declared after the effect that mirrors the refs it reads.
+  useEffect(() => {
+    if (!speechLanguageGate.accepts) return;
+    if (speechLanguageGate.default.trim().toLowerCase() === 'auto') return;
+    if (chatKindRef.current !== 'speech' || messagesRef.current.length > 0) return;
+    setAudioSettings((s) => (s.language === '' ? { ...s, language: localeRef.current } : s));
+  }, [speechLanguageGate, setAudioSettings]);
 
   // Ask the gateway whether the effective TRANSCRIPTION model may go live (#266), for the
   // composer's live record mode. The speech gate's effect above, for the transcription twin:
@@ -2495,6 +2561,7 @@ export function ChatStoreProvider({
     modelImageOptions,
     modelVoices,
     speechStreaming: speechStreamingGate.streaming,
+    speechLanguage: speechLanguageGate.accepts,
     transcriptionStreaming,
     chatKind,
     imageSettings,

@@ -502,6 +502,11 @@ export type AudioSettings = {
   // parsed to a number on the wire by audioSetting(); a blank or unparseable one is
   // omitted. Not clamped: the model's own range applies.
   speed: string;
+  // The language to speak in, free text (an ISO-639-1-ish code such as "de"): typed by the
+  // user or pre-filled with the portal's UI language where the model takes one (the composer's
+  // control exists only then). "" = the model's own default; audioSetting() trims it and omits
+  // it when blank, so an empty string is never sent.
+  language: string;
   // The advanced passthrough as the TEXT of a JSON object (the composer's textarea):
   // extra top-level request fields merged verbatim into /v1/audio/speech -- the OpenAI
   // `instructions` field and any audio.cpp-native knob -- each value keeping the JSON
@@ -531,6 +536,7 @@ export type AudioSettings = {
 export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   voice: '',
   speed: '',
+  language: '',
   passthrough: '',
   stream: true,
   keepAudio: true,
@@ -667,6 +673,8 @@ export function audioSetting(
   if (voice) audio.voice = voice;
   const speed = toImageNumber(s.speed);
   if (speed !== undefined) audio.speed = speed;
+  const language = s.language.trim();
+  if (language) audio.language = language;
   const passthrough = parseAudioPassthrough(s.passthrough);
   if (passthrough.status === 'ok') audio.passthrough = passthrough.value;
   // Only the opt-out is written: streaming is the default, so an unset thread persists
@@ -781,6 +789,7 @@ export function audioSettingsFrom(audio: ChatAudioSettings | undefined): AudioSe
   return {
     voice: typeof s.voice === 'string' ? s.voice : DEFAULT_AUDIO_SETTINGS.voice,
     speed: imageNumToStr(s.speed),
+    language: typeof s.language === 'string' ? s.language : DEFAULT_AUDIO_SETTINGS.language,
     passthrough,
     // Anything but an explicit false is the default (on): a missing or mistyped value must
     // not silently turn streaming off.

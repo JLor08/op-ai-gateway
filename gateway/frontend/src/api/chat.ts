@@ -84,6 +84,12 @@ export type ChatAudioSettings = {
   // older answers is pruned when a new answer is committed. Only 0 and a positive integer
   // are ever written, so an unset thread persists nothing.
   keep_last_audio?: number;
+  // The language to speak in (an ISO-639-1-ish code such as "de"), typed as free text or
+  // pre-filled by the composer from the portal's UI language where the model takes a
+  // `language` (api.modelSpeechLanguage). The gateway merges it into the speech request and
+  // audio.cpp drops it for a model without such a parameter; omitted = the model's default.
+  // Declared last, like the backend's field, so a stored thread's keys do not move.
+  language?: string;
 };
 
 // The speech-to-text knobs of a "transcription" thread, as sent on the wire and persisted

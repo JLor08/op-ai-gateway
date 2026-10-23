@@ -18,7 +18,12 @@ import { ToastProvider } from '../shared/ToastProvider';
 import { formatPortalError } from '../shared/format';
 import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
 import { createLiveSession, type LiveSessionArgs } from './liveTranscription';
-import { NO_SPEECH_STREAMING, type SpeechStreamingGate } from '../../api/models';
+import {
+  NO_SPEECH_LANGUAGE,
+  NO_SPEECH_STREAMING,
+  type SpeechLanguageGate,
+  type SpeechStreamingGate,
+} from '../../api/models';
 import { PortalApiError } from '../../api/transport';
 import { messages, type Locale } from '../../i18n';
 import type {
@@ -210,6 +215,12 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     modelSpeechStreaming: vi.fn(
       async (_name: string): Promise<SpeechStreamingGate> => NO_SPEECH_STREAMING,
     ),
+    // The speech composer's language gate, fetched whenever the picked model SYNTHESIZES
+    // speech. Closed by default (no language control, nothing pre-filled); the speech-language
+    // tests below override it.
+    modelSpeechLanguage: vi.fn(
+      async (_name: string): Promise<SpeechLanguageGate> => NO_SPEECH_LANGUAGE,
+    ),
     // The transcription composer's live gate, fetched whenever the picked model TRANSCRIBES
     // speech. Closed by default (no live mode); the transcription-streaming tests below open it.
     modelTranscriptionStreaming: vi.fn(async (_name: string): Promise<boolean> => false),
@@ -307,6 +318,9 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       {/* Whether the speech composer may offer streaming (the gate is open), and whether the
           active chat's run is playing its audio live. */}
       <span data-testid="speech-streaming">{String(c.speechStreaming)}</span>
+      {/* Whether the speech composer may offer the language control (the gate says the model
+          takes a language). */}
+      <span data-testid="speech-language">{String(c.speechLanguage)}</span>
       {/* Whether the transcription composer may offer a live recording (the gate is open). */}
       <span data-testid="transcription-streaming">{String(c.transcriptionStreaming)}</span>
       {/* The live transcription session: its state, the transcript so far and its error. */}
@@ -364,6 +378,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           c.setAudioSettings({
             voice: 'af_heart',
             speed: '1.25',
+            language: 'de',
             passthrough: '{"seed":3}',
             stream: true,
             keepAudio: true,
@@ -399,6 +414,13 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       </button>
       <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, voice: 'bf_emma' }))}>
         set-voice
+      </button>
+      {/* The language control's two edits: a typed code, and the field cleared again. */}
+      <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, language: 'fr' }))}>
+        set-language
+      </button>
+      <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, language: '' }))}>
+        clear-language
       </button>
       <button type="button" onClick={() => c.confirmAudioRetention()}>
         confirm-retention
@@ -540,6 +562,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           onRefresh={onRefresh}
           refreshModels={opts.refreshModels}
           t={t}
+          locale={locale}
         >
           <Probe altModelId={opts.altModelId ?? modelsToUse[0]?.id ?? ''} />
         </ChatStoreProvider>
@@ -555,6 +578,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             onRefresh={onRefresh}
             refreshModels={opts.refreshModels}
             t={t}
+            locale={locale}
           >
             <Probe altModelId={opts.altModelId ?? nextModels[0]?.id ?? ''} />
           </ChatStoreProvider>
@@ -1198,6 +1222,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             tokens={[]}
             onRefresh={onRefresh}
             t={t}
+            locale={locale}
           >
             <Probe />
             <HookPeek />
@@ -4246,6 +4271,215 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // The speech composer's language control (settings.audio.language). It exists only where the
+  // gateway says the model takes a `language` (api.modelSpeechLanguage): the speech streaming
+  // gate's twin, so it is fetched for a speech model only, closed until the gateway answers,
+  // latest-wins, and FAIL CLOSED. The gate also carries the model's declared default, which
+  // drives the pre-fill: an EMPTY speech thread starts on the portal's UI language unless the
+  // model says it detects the language itself ("auto") -- so German text on a model that
+  // defaults to Chinese just works -- and anything the thread already has is left alone.
+  describe(`ChatStoreProvider speech language [${locale}]`, () => {
+    const speechModel = (id: string): ModelOption => ({
+      id,
+      display_name: id,
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    });
+    const kokoro = speechModel('kokoro');
+    const piper = speechModel('piper');
+    const takes = (def?: string): SpeechLanguageGate => ({ accepts: true, default: def ?? '' });
+    // A speech thread on kokoro, optionally with saved audio settings and turns already spoken.
+    const speechThread = (audio?: unknown, withTurn = false): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: {
+          settings: { model: kokoro.id, kind: 'speech', ...(audio ? { audio } : {}) },
+          messages: withTurn ? [{ id: 'm1', role: 'user', content: 'hello' }] : [],
+        },
+      },
+    ];
+    const offered = () => screen.getByTestId('speech-language').textContent;
+    const language = () =>
+      (JSON.parse(screen.getByTestId('audio-settings').textContent!) as { language: string })
+        .language;
+
+    it('asks whether the picked speech model takes a language, and offers the control only on a yes', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('auto'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(offered()).toBe('true'));
+      expect(chatApi.spies.modelSpeechLanguage).toHaveBeenCalledWith('kokoro');
+    });
+
+    it('offers nothing while the gate is closed, and not before the answer arrives', async () => {
+      chatApi = makeChatApi(speechThread());
+      let answer: (g: SpeechLanguageGate) => void = () => {};
+      chatApi.spies.modelSpeechLanguage.mockImplementation(
+        () => new Promise<SpeechLanguageGate>((resolve) => (answer = resolve)),
+      );
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelSpeechLanguage).toHaveBeenCalled());
+      expect(offered()).toBe('false');
+      await act(async () => answer(NO_SPEECH_LANGUAGE));
+      expect(offered()).toBe('false');
+    });
+
+    it('fails closed when the lookup fails', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockRejectedValue(new Error('boom'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelSpeechLanguage).toHaveBeenCalled());
+      expect(offered()).toBe('false');
+      expect(language()).toBe('');
+    });
+
+    it('does not ask for a model that is not a speech model', async () => {
+      renderProvider([], { models });
+      await waitForReady();
+      expect(chatApi.spies.modelSpeechLanguage).not.toHaveBeenCalled();
+      expect(offered()).toBe('false');
+    });
+
+    it("drops the previous model's answer at once when another model is picked", async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockImplementation(async (name: string) =>
+        name === 'kokoro' ? takes('auto') : NO_SPEECH_LANGUAGE,
+      );
+      renderProvider([], { models: [kokoro, piper] });
+      await waitForReady();
+      await waitFor(() => expect(offered()).toBe('true'));
+      fireEvent.click(screen.getByRole('button', { name: 'pick-piper' }));
+      await waitFor(() =>
+        expect(chatApi.spies.modelSpeechLanguage).toHaveBeenLastCalledWith('piper'),
+      );
+      expect(offered()).toBe('false');
+    });
+
+    it('pre-fills the portal UI language when the model declares a default other than auto', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+
+      await waitFor(() => expect(language()).toBe(locale));
+    });
+
+    it('pre-fills when the model takes a language but declares no default', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes());
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+
+      await waitFor(() => expect(language()).toBe(locale));
+    });
+
+    it.each(['auto', 'AUTO'])(
+      'leaves the language blank when the model detects it itself (default "%s")',
+      async (def) => {
+        chatApi = makeChatApi(speechThread());
+        chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes(def));
+        renderProvider([], { models: [kokoro] });
+        await waitForReady();
+        await waitFor(() => expect(offered()).toBe('true'));
+
+        expect(language()).toBe('');
+      },
+    );
+
+    it('pre-fills nothing for a model that does not take a language', async () => {
+      chatApi = makeChatApi(speechThread());
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelSpeechLanguage).toHaveBeenCalled());
+
+      expect(language()).toBe('');
+    });
+
+    it('never overwrites a language the thread already has', async () => {
+      chatApi = makeChatApi(speechThread({ language: 'fr' }));
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(offered()).toBe('true'));
+
+      expect(language()).toBe('fr');
+    });
+
+    it('keeps a typed language when the gate answers again for another model', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('auto'));
+      renderProvider([], { models: [kokoro, piper] });
+      await waitForReady();
+      await waitFor(() => expect(offered()).toBe('true'));
+      fireEvent.click(screen.getByRole('button', { name: 'set-language' }));
+      expect(language()).toBe('fr');
+
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+      fireEvent.click(screen.getByRole('button', { name: 'pick-piper' }));
+      await waitFor(() =>
+        expect(chatApi.spies.modelSpeechLanguage).toHaveBeenLastCalledWith('piper'),
+      );
+      // Let piper's answer land before judging what it did to the field.
+      await act(async () => {});
+      expect(offered()).toBe('true');
+
+      expect(language()).toBe('fr');
+    });
+
+    it('does not refill a language the user cleared', async () => {
+      chatApi = makeChatApi(speechThread());
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(language()).toBe(locale));
+
+      fireEvent.click(screen.getByRole('button', { name: 'clear-language' }));
+      await act(async () => {});
+
+      expect(language()).toBe('');
+    });
+
+    it('does not rewrite a thread that has already spoken', async () => {
+      chatApi = makeChatApi(speechThread(undefined, true));
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(offered()).toBe('true'));
+      await act(async () => {});
+
+      expect(language()).toBe('');
+    });
+
+    it('does not pre-fill a text thread that has a speech model picked', async () => {
+      chatApi = makeChatApi([
+        {
+          id: 'c1',
+          title: 'C1',
+          created_at: T,
+          updated_at: T,
+          content: {
+            settings: { model: kokoro.id },
+            messages: [{ id: 'm1', role: 'user', content: 'hello' }],
+          },
+        },
+      ]);
+      chatApi.spies.modelSpeechLanguage.mockResolvedValue(takes('zh'));
+      renderProvider([], { models: [kokoro] });
+      await waitForReady();
+      await waitFor(() => expect(offered()).toBe('true'));
+      await act(async () => {});
+
+      expect(language()).toBe('');
+    });
+  });
+
   describe(`ChatStoreProvider speech-thread kind [${locale}]`, () => {
     // A TTS model: only the openai_audio flavor, with the backend's speech verdict.
     const kokoro: ModelOption = {
@@ -4407,6 +4641,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(settings.audio).toEqual({
         voice: 'af_heart',
         speed: 1.25,
+        language: 'de',
         passthrough: { seed: 3 },
         keep_last_audio: 3,
       });
@@ -4568,6 +4803,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toEqual({
         voice: 'bf_emma',
         speed: '0.8',
+        language: '',
         passthrough: '',
         stream: true,
         keepAudio: true,
@@ -4586,6 +4822,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(saved.content.settings.audio).toEqual({
         voice: 'af_heart',
         speed: 1.25,
+        language: 'de',
         passthrough: { seed: 3 },
         keep_last_audio: 3,
       });
@@ -4598,6 +4835,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toMatchObject({
         voice: 'af_heart',
         speed: '1.25',
+        language: 'de',
         keepAudio: true,
         keepLast: '3',
       });

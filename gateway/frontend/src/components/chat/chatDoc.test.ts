@@ -460,6 +460,7 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
     expect(DEFAULT_AUDIO_SETTINGS).toEqual({
       voice: '',
       speed: '',
+      language: '',
       passthrough: '',
       stream: true,
       keepAudio: true,
@@ -483,6 +484,29 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
     expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, voice: '   ' })).toEqual({
       audio: {},
     });
+  });
+
+  // The language is the voice's twin: a free-text code the user typed (or the composer
+  // pre-filled), trimmed, and OMITTED when blank -- never an empty string on the wire, which
+  // would hand the model an inert value instead of leaving it on its own default.
+  it('sends the language trimmed when set, and nothing for a blank one', () => {
+    expect(audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, language: ' de ' })).toEqual({
+      audio: { language: 'de' },
+    });
+    for (const language of ['', '   ']) {
+      const audio = audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, language }).audio ?? {};
+      expect('language' in audio).toBe(false);
+    }
+    // Another kind of thread never carries it.
+    expect(audioSetting('image', { ...DEFAULT_AUDIO_SETTINGS, language: 'de' })).toEqual({});
+  });
+
+  it('round-trips the language through audioSettingsFrom, and reads a mistyped one as blank', () => {
+    const wire = { voice: 'af_heart', language: 'zh' };
+    expect(audioSettingsFrom(wire).language).toBe('zh');
+    expect(audioSetting('speech', audioSettingsFrom(wire))).toEqual({ audio: wire });
+    expect(audioSettingsFrom({}).language).toBe('');
+    expect(audioSettingsFrom({ language: 7 as unknown as string }).language).toBe('');
   });
 
   it('omits a blank or unparseable speed, so the model keeps its own', () => {

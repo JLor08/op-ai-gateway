@@ -690,6 +690,28 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       disabled={c.streaming}
                       t={t}
                     />
+                    {/* The language is free text (an ISO-639-1-ish code; the gateway does not say
+                      which codes a model accepts), offered only for a model the gateway says
+                      takes one (c.speechLanguage). The store pre-fills an empty thread with the
+                      portal's language unless the model detects it itself; blank = the model's
+                      own default and is never written. */}
+                    {c.speechLanguage && (
+                      <TextField
+                        id="chat-speech-language"
+                        label={t.chatSpeechLanguage}
+                        value={c.audioSettings.language}
+                        placeholder={t.chatSpeechLanguageDefault}
+                        helperText={t.chatSpeechLanguageHint}
+                        onChange={(event) =>
+                          c.setAudioSettings((s) => ({ ...s, language: event.target.value }))
+                        }
+                        disabled={c.streaming}
+                        // Pinned shrunk with the notch open, like the other speech fields, so the
+                        // placeholder (the model-default hint) is visible, not hidden behind the
+                        // resting label.
+                        slotProps={{ inputLabel: { shrink: true }, input: { notched: true } }}
+                      />
+                    )}
                     <TextField
                       id="chat-speech-speed"
                       label={t.chatSpeechSpeed}
