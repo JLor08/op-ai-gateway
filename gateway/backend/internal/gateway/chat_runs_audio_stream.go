@@ -124,24 +124,9 @@ func speechStreamSampleRate(byteRate uint32) (int, bool) {
 // candidate: a speech request is never routed to it. An empty candidate set is a closed gate.
 // A store failure is an error and is never read as an open gate.
 func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Token, gatewayModel string) (int, bool, error) {
-	if s.Routes == nil || s.Portal == nil || strings.TrimSpace(gatewayModel) == "" {
-		return 0, false, nil
-	}
-	ids, err := s.Portal.ModelVoiceMappingIDs(ctx, principal, gatewayModel)
-	if err != nil {
+	candidates, verdicts, err := s.portalPlainTTSMappings(ctx, principal, gatewayModel)
+	if err != nil || len(candidates) == 0 {
 		return 0, false, err
-	}
-	ids = dedupeNonEmpty(ids)
-	if len(ids) == 0 {
-		return 0, false, nil
-	}
-	verdicts, err := s.Routes.MappingCapabilitiesForMappings(ctx, ids)
-	if err != nil {
-		return 0, false, err
-	}
-	candidates := plainTTSMappingIDs(ids, verdicts)
-	if len(candidates) == 0 {
-		return 0, false, nil
 	}
 	cached, err := s.Routes.ModelMappingCacheForMappings(ctx, candidates, routing.ModelMappingCacheOutputByteRate)
 	if err != nil {
@@ -149,6 +134,39 @@ func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Toke
 	}
 	rate, ok := agreedSpeechStreamRate(candidates, verdicts, cached)
 	return rate, ok, nil
+}
+
+// portalPlainTTSMappings resolves the mappings a speech request for gatewayModel could be
+// routed to, as the portal's speech gates ask it (portalSpeechStreamRate, and
+// portalSpeechLanguage for the language control): the ids Portal.ModelVoiceMappingIDs
+// offers principal (the visibility the voice picker applies: hidden/locked suppression,
+// group expansion, provisioning, active mappings of openai_audio applications), narrowed
+// to the plain-tts ones by their CURRENT capability rows (plainTTSMappingIDs), together
+// with the rows it read, so a caller that needs a verdict does not read them again. The
+// ids are deduped and keep the portal's order (sorted), so what a caller folds over them is
+// deterministic.
+//
+// No candidate -- no routing store or portal, a blank or unknown name, a name the portal
+// hides, a non-speech or clone model -- is an empty slice and no error: the gates read it as
+// closed, and their answer cannot tell those cases apart. A store failure is an error and is
+// never read as that.
+func (s *Server) portalPlainTTSMappings(ctx context.Context, principal auth.Token, gatewayModel string) ([]string, map[string][]routing.CapabilityRow, error) {
+	if s.Routes == nil || s.Portal == nil || strings.TrimSpace(gatewayModel) == "" {
+		return nil, nil, nil
+	}
+	ids, err := s.Portal.ModelVoiceMappingIDs(ctx, principal, gatewayModel)
+	if err != nil {
+		return nil, nil, err
+	}
+	ids = dedupeNonEmpty(ids)
+	if len(ids) == 0 {
+		return nil, nil, nil
+	}
+	verdicts, err := s.Routes.MappingCapabilitiesForMappings(ctx, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	return plainTTSMappingIDs(ids, verdicts), verdicts, nil
 }
 
 // plainTTSMappingIDs keeps, in order, the mappings whose capability rows say plain tts

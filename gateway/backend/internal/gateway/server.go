@@ -1461,6 +1461,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/model-image-options", s.handlePortalModelImageOptions)
 	s.mux.HandleFunc("/api/portal/model-voices", s.handlePortalModelVoices)
 	s.mux.HandleFunc("/api/portal/model-speech-streaming", s.handlePortalModelSpeechStreaming)
+	s.mux.HandleFunc("/api/portal/model-speech-language", s.handlePortalModelSpeechLanguage)
 	s.mux.HandleFunc("/api/portal/model-transcription-streaming", s.handlePortalModelTranscriptionStreaming)
 	s.mux.HandleFunc("/api/portal/transcription-live-ticket", s.handlePortalLiveTranscriptionTicket)
 	s.mux.HandleFunc("/api/portal/transcription-live", s.handleLiveTranscription)
