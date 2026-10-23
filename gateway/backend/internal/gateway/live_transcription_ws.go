@@ -98,12 +98,15 @@ var (
 
 // liveDownMsg is the typed envelope the gateway relays down to the browser over the
 // WebSocket. delta/partial/done carry Text (the increment, the provisional whole
-// transcript, or the final transcript); error carries Message. One field per shape
+// transcript, or the final transcript); error carries Message and, when /v1 refused the
+// session with one of its stable codes (transcription.live_busy, ...), that Code, which is
+// what lets the browser tell a busy model from an unsupported one. One field per shape
 // keeps the wire minimal; the browser switches on Type.
 type liveDownMsg struct {
 	Type    string `json:"type"`
 	Text    string `json:"text,omitempty"`
 	Message string `json:"message,omitempty"`
+	Code    string `json:"code,omitempty"`
 }
 
 // liveUpControl is the only text (non-binary) message the browser sends up: an
@@ -270,7 +273,10 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream error"}))
+		// /v1 refused the session (a busy route 503, a non-streaming model 409, an
+		// admission denial 429, ...). Forward ITS code and message rather than a
+		// generic sentence: the browser's busy/unsupported handling keys on the code.
+		writer.send(ctx, liveMarshal(liveRefusalFrame(resp.Body)))
 		slog.Warn("live transcription: loopback non-2xx", "id", id, "status", resp.StatusCode, "model", claims.Target.Model)
 		return
 	}
@@ -532,6 +538,45 @@ func liveErrorMessage(payload []byte) string {
 		}
 	}
 	return "live transcription upstream error"
+}
+
+// maxLiveRefusalBodyBytes bounds how much of a /v1 refusal body the loopback relay reads.
+// A refusal is a one-line JSON object; the bound only keeps a misbehaving answer from
+// being buffered unboundedly.
+const maxLiveRefusalBodyBytes = 64 << 10
+
+// maxLiveRefusalCodeBytes is the longest error code forwarded to the browser. The gateway's
+// codes are short dotted identifiers; anything longer is not one (and a truncated code
+// would be a wrong one), so it is dropped.
+const maxLiveRefusalCodeBytes = 128
+
+// liveRefusalFrame builds the browser's error frame from the body of a non-2xx /v1
+// answer: the gateway's standard envelope {"error":{"code":...,"message":...}} (apierror)
+// yields its code AND message; an upstream's own one-line error that /v1 relayed verbatim
+// yields whatever message it states, with no code. An empty, unreadable or unrecognised
+// body falls back to the generic message, so the frame always says something.
+func liveRefusalFrame(body io.Reader) liveDownMsg {
+	data, _ := io.ReadAll(io.LimitReader(body, maxLiveRefusalBodyBytes))
+	return liveDownMsg{Type: "error", Message: liveErrorMessage(data), Code: liveErrorCode(data)}
+}
+
+// liveErrorCode extracts the stable error code from an error body's {"error":{"code":"..."}}
+// (the gateway's envelope), or "" when there is none, it is not a string, or it is not a
+// plausible code.
+func liveErrorCode(payload []byte) string {
+	var shape struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(payload, &shape) != nil {
+		return ""
+	}
+	code := strings.TrimSpace(shape.Error.Code)
+	if len(code) > maxLiveRefusalCodeBytes {
+		return ""
+	}
+	return code
 }
 
 // liveMarshal marshals a down-message. The shapes here never fail to marshal; a

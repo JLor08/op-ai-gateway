@@ -241,6 +241,25 @@ describe('createLiveSession in a (fake) browser', () => {
       expect(run.states.at(-1)).toBe('error');
     });
 
+    it('an error frame that carries the gateway code is "refused" with that code', async () => {
+      // What the portal gets when the gateway's /v1 refuses the looped-back session: the /v1
+      // code rides the frame, so a busy model reads as busy and not as a generic failure.
+      const run = start();
+      const socket = await listening(run);
+      socket.say({
+        type: 'error',
+        message: 'a live transcription session is already active for this model',
+        code: 'transcription.live_busy',
+      });
+      expect(run.errors).toEqual([
+        {
+          message: 'a live transcription session is already active for this model',
+          detail: { kind: 'refused', code: 'transcription.live_busy' },
+        },
+      ]);
+      expect(run.states.at(-1)).toBe('error');
+    });
+
     it('a busy close (1013) is "refused" with the busy code', async () => {
       const run = start();
       const socket = await listening(run);

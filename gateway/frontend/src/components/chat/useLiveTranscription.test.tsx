@@ -317,6 +317,22 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(sessions).toHaveLength(1);
       });
 
+      it('a busy refusal at the very start (an error frame with the busy code, nothing heard yet) is busy: no retry', () => {
+        const h = setup();
+        h.start();
+
+        // What the portal sees when /v1 refuses the looped-back session: refused, with the code.
+        emit.error(sessions[0], { kind: 'refused', code: 'transcription.live_busy' });
+
+        expect(h.live().liveSession).toEqual({
+          state: 'error',
+          transcript: '',
+          error: t.chatTranscriptionLiveBusy,
+        });
+        h.advance(60_000);
+        expect(sessions).toHaveLength(1);
+      });
+
       it('an error frame that carries the gateway code of a busy model reads as busy', () => {
         const h = setup();
         h.start();

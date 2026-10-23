@@ -211,6 +211,34 @@ func readLiveMsg(t *testing.T, ctx context.Context, conn *websocket.Conn) (liveD
 	return m, nil
 }
 
+// readErrorFrame reads down-frames until the first error frame and returns it, or reports
+// false when the socket ended without one.
+func readErrorFrame(t *testing.T, ctx context.Context, conn *websocket.Conn) (liveDownMsg, bool) {
+	t.Helper()
+	for {
+		m, err := readLiveMsg(t, ctx, conn)
+		if err != nil {
+			return liveDownMsg{}, false
+		}
+		if m.Type == "error" {
+			return m, true
+		}
+	}
+}
+
+// requireForwardedRefusal asserts an error frame carries /v1's refusal: a non-empty code
+// (wantCode when it is non-empty) and a message that is /v1's own, not the generic
+// fallback the relay used before it forwarded them.
+func requireForwardedRefusal(t *testing.T, m liveDownMsg, wantCode string) {
+	t.Helper()
+	if m.Code == "" || (wantCode != "" && m.Code != wantCode) {
+		t.Fatalf("error frame code = %q, want %q (the /v1 code must reach the browser)", m.Code, wantCode)
+	}
+	if m.Message == "" || m.Message == "live transcription upstream error" {
+		t.Fatalf("error frame message = %q, want /v1's own message, not the generic fallback", m.Message)
+	}
+}
+
 func sendEnd(t *testing.T, ctx context.Context, conn *websocket.Conn) {
 	t.Helper()
 	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"end"}`)); err != nil {
@@ -487,20 +515,13 @@ func TestLiveTranscriptionLoopbackNonStreamingModelErrorFrame(t *testing.T) {
 	}
 	defer conn.CloseNow()
 
-	sawError := false
-	for {
-		m, rerr := readLiveMsg(t, ctx, conn)
-		if rerr != nil {
-			break
-		}
-		if m.Type == "error" {
-			sawError = true
-			break
-		}
-	}
+	// The frame carries /v1's own stable code and message (not a generic sentence), so
+	// the browser can tell "this model cannot stream" from every other failure.
+	refusal, sawError := readErrorFrame(t, ctx, conn)
 	if !sawError {
 		t.Fatal("never received an error message for a non-streaming model")
 	}
+	requireForwardedRefusal(t, refusal, liveTranscriptionNotStreaming)
 	// A gate refusal never bills and never reaches the child.
 	if child.path() != "" {
 		t.Fatalf("the child was contacted (%q) for a non-streaming model", child.path())
@@ -543,20 +564,13 @@ func TestLiveTranscriptionLoopbackBusyRejectsSecondSession(t *testing.T) {
 		t.Fatalf("dial 2: %v", err)
 	}
 	defer conn2.CloseNow()
-	sawError := false
-	for {
-		m, rerr := readLiveMsg(t, ctx, conn2)
-		if rerr != nil {
-			break
-		}
-		if m.Type == "error" {
-			sawError = true
-			break
-		}
-	}
+	refusal, sawError := readErrorFrame(t, ctx, conn2)
 	if !sawError {
 		t.Fatal("session 2 never received a busy error frame")
 	}
+	// The busy code reaches the browser intact: it is what makes the portal show "the
+	// model is busy" and not retry, instead of a generic failure.
+	requireForwardedRefusal(t, refusal, liveBearerBusyCode)
 }
 
 // TestLiveTranscriptionLoopbackAdmitsOnceAtV1NotAtMint is the no-double-admit invariant:
@@ -606,20 +620,13 @@ func TestLiveTranscriptionLoopbackAdmitsOnceAtV1NotAtMint(t *testing.T) {
 		t.Fatalf("dial 2: %v", err)
 	}
 	defer conn2.CloseNow()
-	sawError := false
-	for {
-		m, rerr := readLiveMsg(t, ctx, conn2)
-		if rerr != nil {
-			break
-		}
-		if m.Type == "error" {
-			sawError = true
-			break
-		}
-	}
+	refusal, sawError := readErrorFrame(t, ctx, conn2)
 	if !sawError {
 		t.Fatal("session 2 was not denied: /v1 did not admit, so admission is not enforced at the one relay")
 	}
+	// The denial's own code and message are forwarded too (whatever the 429 states), not
+	// collapsed to the generic upstream-error sentence.
+	requireForwardedRefusal(t, refusal, "")
 
 	// Exactly one usage row overall: session 1's clean session. Session 2 was denied
 	// before any relay (no row), and the portal transport records none.
@@ -742,5 +749,48 @@ func TestLiveTranscriptionReadLimitEnforced(t *testing.T) {
 	_, _, rerr := conn.Read(ctx)
 	if websocket.CloseStatus(rerr) != websocket.StatusMessageTooBig {
 		t.Fatalf("close status = %v (err %v), want StatusMessageTooBig", websocket.CloseStatus(rerr), rerr)
+	}
+}
+
+// TestLiveRefusalFrame pins how a non-2xx /v1 body becomes the browser's error frame: the
+// gateway's envelope yields its code and message; other shapes yield what they state
+// (never a code); anything unreadable falls back to the generic message with no code.
+func TestLiveRefusalFrame(t *testing.T) {
+	const generic = "live transcription upstream error"
+	cases := []struct {
+		name        string
+		body        string
+		wantMessage string
+		wantCode    string
+	}{
+		{"gateway envelope", `{"error":{"code":"transcription.live_busy","message":"busy now","request_id":"req_1"}}`, "busy now", "transcription.live_busy"},
+		{"envelope without a code", `{"error":{"message":"no code here"}}`, "no code here", ""},
+		{"upstream one-line string error", `{"error":"model not managed"}`, "model not managed", ""},
+		{"upstream flat message", `{"message":"admission blocked"}`, "admission blocked", ""},
+		{"code that is not a string", `{"error":{"code":503,"message":"numeric"}}`, "numeric", ""},
+		{"code that is not a plausible code", `{"error":{"code":"` + strings.Repeat("x", maxLiveRefusalCodeBytes+1) + `","message":"long"}}`, "long", ""},
+		{"empty body", ``, generic, ""},
+		{"not json", `<html>502 Bad Gateway</html>`, generic, ""},
+		{"json without an error", `{"ok":false}`, generic, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := liveRefusalFrame(strings.NewReader(tc.body))
+			want := liveDownMsg{Type: "error", Message: tc.wantMessage, Code: tc.wantCode}
+			if got != want {
+				t.Fatalf("liveRefusalFrame(%q) = %+v, want %+v", tc.body, got, want)
+			}
+		})
+	}
+}
+
+// TestLiveRefusalFrameBoundsTheBody proves an oversized refusal body is read only up to
+// the bound: a body whose JSON is complete within the bound is parsed, and one whose
+// envelope would only close past it falls back rather than being buffered whole.
+func TestLiveRefusalFrameBoundsTheBody(t *testing.T) {
+	huge := `{"error":{"code":"x.y","message":"` + strings.Repeat("a", maxLiveRefusalBodyBytes) + `"}}`
+	got := liveRefusalFrame(strings.NewReader(huge))
+	if got.Message != "live transcription upstream error" || got.Code != "" {
+		t.Fatalf("liveRefusalFrame(oversized) = %+v, want the generic fallback with no code", got)
 	}
 }

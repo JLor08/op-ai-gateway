@@ -15,10 +15,11 @@
 //   - UP: binary frames of raw s16le PCM, ~100 ms each (a frame of 1 MiB or more closes the
 //     connection with 1009), and one text frame {"type":"end"} when the speaker is done. A
 //     close WITHOUT it is a truncated session, which the gateway does not finish or bill.
-//   - DOWN: text frames {"type": "delta" | "partial" | "done" | "error", text? | message?}.
+//   - DOWN: text frames {"type": "delta" | "partial" | "done" | "error", text? | message? | code?}.
 //     A delta is appended to the transcript, a partial replaces all of it (a model that revises
 //     its hypothesis), done is the final transcript (an empty one means "keep what you have")
-//     and error is the end of the session, with a message.
+//     and error is the end of the session, with a message and, when the gateway refused the
+//     session with one of its stable codes (a busy model, an unsupported one), that code.
 //
 // A session is made with createLiveSession and ended with stop() (finish: the audio so far is
 // transcribed and delivered as `done`) or abort() (cancel: nothing more is sent or wanted).
@@ -69,7 +70,7 @@ export type LiveDownFrame =
   | { type: 'delta'; text: string }
   | { type: 'partial'; text: string }
   | { type: 'done'; text: string }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; code?: string };
 
 /**
  * Reads one text frame the gateway sent down, or null for anything that is not one: text that is
@@ -78,7 +79,9 @@ export type LiveDownFrame =
  * newer gateway adding a frame type cannot break an older portal.
  *
  * The gateway leaves an empty field out of its frames, so a missing `text` or `message` is the
- * empty string (a `done` with nothing to add reads as `{type: 'done', text: ''}`).
+ * empty string (a `done` with nothing to add reads as `{type: 'done', text: ''}`). An error
+ * frame's `code` is left off the parsed frame when it is missing, empty or not a string: it is
+ * an optional hint, and an error frame must stay an error frame whatever it says.
  */
 export function parseLiveDownFrame(data: string): LiveDownFrame | null {
   let parsed: unknown;
@@ -88,7 +91,7 @@ export function parseLiveDownFrame(data: string): LiveDownFrame | null {
     return null;
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-  const frame = parsed as { type?: unknown; text?: unknown; message?: unknown };
+  const frame = parsed as { type?: unknown; text?: unknown; message?: unknown; code?: unknown };
   switch (frame.type) {
     case 'delta':
     case 'partial':
@@ -98,7 +101,10 @@ export function parseLiveDownFrame(data: string): LiveDownFrame | null {
     }
     case 'error': {
       const message = frame.message === undefined ? '' : frame.message;
-      return typeof message === 'string' ? { type: 'error', message } : null;
+      if (typeof message !== 'string') return null;
+      return typeof frame.code === 'string' && frame.code !== ''
+        ? { type: 'error', message, code: frame.code }
+        : { type: 'error', message };
     }
     default:
       return null;
@@ -347,7 +353,10 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
         finish('closed', () => args.onDone(frame.text));
         break;
       case 'error':
-        fail(frame.message || 'live transcription failed', { kind: 'refused' });
+        fail(frame.message || 'live transcription failed', {
+          kind: 'refused',
+          ...(frame.code === undefined ? {} : { code: frame.code }),
+        });
         break;
     }
   };

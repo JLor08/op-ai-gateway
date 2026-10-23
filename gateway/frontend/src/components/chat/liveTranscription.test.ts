@@ -24,6 +24,33 @@ describe('parseLiveDownFrame', () => {
     });
   });
 
+  it('reads an error frame with the gateway code the session was refused with', () => {
+    expect(
+      parseLiveDownFrame(
+        '{"type":"error","message":"a session is already active","code":"transcription.live_busy"}',
+      ),
+    ).toEqual({
+      type: 'error',
+      message: 'a session is already active',
+      code: 'transcription.live_busy',
+    });
+  });
+
+  it.each([
+    ['empty', '""'],
+    ['not a string', '503'],
+    ['null', 'null'],
+    ['an object', '{"a":1}'],
+  ])(
+    'leaves the code off an error frame whose code is %s, and still reads the error',
+    (_n, code) => {
+      expect(parseLiveDownFrame(`{"type":"error","message":"nope","code":${code}}`)).toEqual({
+        type: 'error',
+        message: 'nope',
+      });
+    },
+  );
+
   it('reads a frame whose empty field the gateway left out (omitempty) as empty', () => {
     // The gateway's envelope drops an empty text/message, so a done with nothing to add (keep
     // what you had) arrives as just its type.
