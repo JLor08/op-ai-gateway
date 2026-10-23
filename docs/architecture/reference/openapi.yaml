@@ -303,7 +303,12 @@ paths:
         before (audio.cpp answers an unknown voice with HTTP 500). When the
         voice narrowed the candidates and none of those is usable the answer
         is 503 `routing.voice_unavailable`, in place of
-        `routing.no_healthy_host` and only then. Beyond those it answers the
+        `routing.no_healthy_host` and only then. A top-level `language` is the
+        client's own field: audio.cpp applies it per model as the transcript
+        language and silently drops it for a model that takes none, so the
+        gateway neither reads nor gates on it (ADR-074; the portal composer
+        learns which models take one from GET /api/portal/model-speech-language).
+        Beyond those it answers the
         same statuses as every other inference path (429/402 from the
         principal limiter, 503 from the capacity queue or no healthy host),
         which this path-level spec does not enumerate. Alias:
@@ -1590,6 +1595,63 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '500':
           description: The Error envelope with code `model.speech_streaming_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/model-speech-language:
+    get:
+      tags: [portal]
+      summary: Whether the speech composer may offer a language control for a model, and the model's declared default (scope gateway:use)
+      description: >
+        The gate of the portal chat's speech language control (ADR-074, issue
+        #282), for one gateway model. `accepts: true` means the composer may
+        offer a `language` field (sent as a top-level `language` on
+        POST /v1/audio/speech) and `default` carries the value the model
+        declares for it (for example `auto`, or a fixed code such as `zh`),
+        present only when the model declares one; `accepts: false` means it
+        does not. It reads the `speech_language` cache the health loop writes
+        while a model is loaded (a static audio_cpp application, or an
+        agent-launched child through the router's /upstream/{model}/v1/models,
+        agent 0.13.0) for the mappings a speech request for the model could be
+        routed to (the portal-visible plain-TTS ones, the set the voice picker
+        and the streaming gate use). The gate opens when ANY such mapping is
+        known to accept a language, unlike /api/portal/model-speech-streaming,
+        which needs every mapping to agree: audio.cpp silently drops a
+        `language` a model does not take, so offering the control costs
+        nothing where the request lands on another mapping. `default` is the
+        first accepting mapping's, a pre-fill and not a promise. Every other
+        case (an unknown, hidden, locked, restricted, non-speech or clone
+        model, one whose language no probe has stated yet, one that declares
+        no such param) is the same 200 with `accepts: false`, so the answer
+        cannot probe which models exist. A missing or empty `name` is 400
+        `model.name_required`; a failed read is 500
+        `model.speech_language_failed`, never reported as `accepts: false`.
+        Nothing is loaded and no upstream is contacted, and the run injects the
+        thread's `language` without consulting this answer. See api-surface.md
+        and compatibility-and-inference.md sections 3.6 and 12.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: The gateway model name (a query parameter because it may contain `/`).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }, { sessionCookie: [] }]
+      responses:
+        '200':
+          description: The gate's answer; `default` is present only when `accepts` is true and the model declares one.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepts]
+                properties:
+                  accepts: { type: boolean }
+                  default:
+                    type: string
+                    description: The default language the model declares for its `language` param.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500':
+          description: The Error envelope with code `model.speech_language_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -3671,7 +3733,8 @@ components:
       required: true
       description: >
         The JSON body of POST /v1/audio/speech. Only the fields named here are
-        examined by the gateway; any other (`instructions`, `speed`, ...) reaches
+        examined by the gateway (`language` is named for documentation and is
+        relayed unexamined); any other (`instructions`, `speed`, ...) reaches
         the upstream unexamined.
       content:
         application/json:
@@ -3699,6 +3762,20 @@ components:
                   the candidates that do, otherwise it is unfiltered, so a
                   free-text or unknown voice still reaches the upstream, which
                   answers an unknown voice with HTTP 500.
+              language:
+                type: string
+                description: >
+                  The transcript language (for example `de`), passed to the
+                  upstream as sent and never read by the gateway. audio.cpp
+                  applies it per model, as the language of the text frontend, and
+                  silently drops it for a model that declares no `language`
+                  request param, so it may be sent unconditionally. A model's
+                  own default differs (`auto` detects it from the text; a fixed
+                  code such as `zh` does not). audio.cpp states only the default,
+                  never the accepted values, so the gateway validates none. The
+                  portal's speech composer offers it where
+                  GET /api/portal/model-speech-language says the model takes one
+                  (ADR-074).
               response_format:
                 type: string
                 enum: [wav, pcm]
@@ -4019,6 +4096,20 @@ components:
             paid answer that was never heard live must not vanish) and it
             supersedes any older stored audio of the chat. N counts answers, not
             blobs. A negative value is read as absent. It is never sent upstream.
+        language:
+          type: string
+          description: >
+            The language to speak in (an ISO-639-1-style code such as `de`),
+            merged into the speech request as a top-level `language` when
+            non-empty (ADR-074). Free text: audio.cpp publishes no accepted-value
+            list, so the gateway validates none, and it silently drops the field
+            for a model that takes none. Absent leaves the model on its own
+            default. The portal composer offers it only for a model
+            GET /api/portal/model-speech-language says takes one, and
+            pre-fills an empty thread with the UI language when the model's
+            declared default is not `auto`. A first-class language wins over a
+            `language` key of the passthrough object. Declared after
+            keep_last_audio, so an existing chat's stored bytes do not move.
     ChatAudioPruneRequest:
       type: object
       description: The body of POST /api/portal/chats/{id}/audio/prune.

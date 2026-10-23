@@ -1227,7 +1227,7 @@ fact about this runtime is, and why:
   around it.** The gateway's health loop reaches only an **external**
   `stable_diffusion_cpp` application's `/sdcpp/v1/capabilities` — the agent's
   router passes only `/props` (and, since 0.11.0, an audio.cpp child's
-  `/v1/audio/voices`) through per model, so the health loop cannot reach an
+  `/v1/audio/voices`, and since 0.13.0 its `/v1/models`) through per model, so the health loop cannot reach an
   agent-launched sd-server child's capabilities document at all. Instead the agent's own per-type
   capability probe reads that same document over its loopback connection to
   the child and reports the verdict under the identical `sdcpp_capabilities`
@@ -1382,10 +1382,11 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Six fixed GET-only routes and two POST routes (the `/upstream` passthrough counts
-once per allowlisted endpoint: `/props` and, since 0.11.0, `/v1/audio/voices`; the second
-POST route, `/live/{model}`, since 0.12.0, is the one that streams a request body rather
-than controlling anything); any other method on those paths falls through to model routing.
+Seven fixed GET-only routes and two POST routes (the `/upstream` passthrough counts
+once per allowlisted endpoint: `/props`, since 0.11.0 `/v1/audio/voices` and since 0.13.0
+`/v1/models`; the second POST route, `/live/{model}`, since 0.12.0, is the one that streams a
+request body rather than controlling anything); any other method on those paths falls through
+to model routing.
 
 | Route | Answers | Blocks during a load? |
 |---|---|---|
@@ -1394,6 +1395,7 @@ than controlling anything); any other method on those paths falls through to mod
 | `GET /v1/models` | OpenAI's shape, listing **every** managed spec including cold ones. | Never |
 | `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved via `Status()` **only** — a match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one. Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `GET /upstream/{model}/v1/audio/voices` | The second endpoint on the same `/upstream` allowlist (issue #251, the `runtime_voices` feature, `Since: "0.11.0"`): an audio.cpp child's voice listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved via `Status()` **only**, **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Two differences from `/props`: the outbound path is exactly `/v1/audio/voices`, and the **inbound query string is not forwarded** (audio.cpp ignores `?model=` and lists the voices of the model it has loaded, so the request's model only selects the child). | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
+| `GET /upstream/{model}/v1/models` | The allowlist's third endpoint (issue #282, the `runtime_model_params` feature, `Since: "0.13.0"`): an audio.cpp child's model listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved via `Status()` **only**, **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Unlike the voices read it **forwards the inbound query string** (`forwardQuery`), because audio.cpp adds each model's declared request `params` array only when asked with `?include_params=true`; the outbound path is exactly `/v1/models`. **Not** the router's own `GET /v1/models` control route above, which lists the managed specs and answers for the router itself. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `POST /ensure/{model}` | Starts the managed child for `model` and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
 | `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureRunning`, so the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
 
@@ -1434,9 +1436,11 @@ a new contract BESIDE §4.2's byte-for-byte body dispatch, not a change to
 it.** A `GET` on the path whose suffix is anything other than an allowlisted
 endpoint is refused outright (`runtime.upstream_endpoint_not_allowed`, §4.3): the
 allowlist is a fixed table, never a generic reverse proxy. It held exactly one
-endpoint, `/props`, until issue #251 added a second, `/v1/audio/voices`; each
+endpoint, `/props`, until issue #251 added a second, `/v1/audio/voices`, and issue #282 a
+third, `/v1/models`; each
 table entry carries its own `forwardQuery`, true for `/props` (llama.cpp reads
-e.g. `?model=`) and false for the voices read, which is why the two share one
+e.g. `?model=`) and for the models read (audio.cpp reads `?include_params=true`) and false for
+the voices read, which is why the three share one
 `serveUpstream` handler and one Status-only relay (`relayToRunningChild`) and still
 differ in the outbound query. A non-`GET` on the same path falls through to the
 ordinary model-routed proxy, same as any other method on the other control routes
@@ -1456,6 +1460,24 @@ flag it is gated on), attaches the mapping's own `routing.SpecUpstreamAuth` cred
 as `/props` does, and reaches the route with the endpoint
 `<router>/upstream/<model>` to which its lister appends `/v1/audio/voices`. The
 response is the child's own `{"voices": [...]}`, relayed unmodified.
+
+**The models route exists because audio.cpp states a model's request parameters only in its
+own model listing, and the child listens on a loopback port the gateway cannot reach**
+([ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)).
+`GET /upstream/{model}/v1/models?include_params=true` is the same Status-only, never-start read as
+the other two, and what it returns is the child's own listing with each entry's `params` array
+(`name`, `type`, `default`, `required`), relayed unmodified. The gateway reads one thing out of
+it, the `language` param (whether the model declares it and the default it states), and caches
+it as the `speech_language` fact. The agent's own collector, telemetry sample and ingest are
+**unchanged**: the agent already reads `/v1/models` for the capability verdicts and reports
+those yes/no verdicts by telemetry, but a default language is a string and the verdict wire is
+yes/no by design, so the agent only gained a route and the gateway pulls the fact itself. The
+gateway side is folded into the voices pass (`probeAgentVoices`): the same eligible set (a
+running audio.cpp child whose stored verdicts make it a plain tts model, observed loaded), the
+mapping's own `routing.SpecUpstreamAuth` credential, and a back-off of its own
+(`speechParamsBackoff`) when the pull fails: a child the router finds cold (`404
+runtime.model_not_running`) keeps the last row on file, is not asked again every tick and is
+never started. §7 has the flag it is gated on, checked **separately** from `runtime_voices`.
 
 **`POST /ensure/{model}` is the one control route that starts a child**, and it
 starts it without forwarding a request
@@ -1588,13 +1610,13 @@ request-id concept.
 | Code | Status | Meaning |
 |---|---|---|
 | `runtime.model_not_managed` | 404 | No active launch spec for this model. |
-| `runtime.model_not_running` | 404 | Managed but not currently running — `/upstream/{model}/props` and `/upstream/{model}/v1/audio/voices` (§4.1) never start a child, so a cold match gets this instead of a boot. For the voices read it is the gateway's "no voices this tick", not an error to act on. |
+| `runtime.model_not_running` | 404 | Managed but not currently running — `/upstream/{model}/props`, `/upstream/{model}/v1/audio/voices` and `/upstream/{model}/v1/models` (§4.1) never start a child, so a cold match gets this instead of a boot. For the voices and the models read it is the gateway's "no voices (or no language fact) this tick", not an error to act on. |
 | `runtime.start_failed` | 502 | The process exited or never became healthy. |
 | `runtime.start_timeout` | 504 | `startup_timeout_seconds` elapsed — kept distinct from `start_failed` because it is a different diagnosis. |
 | `runtime.admission_blocked` | 503 | No slot freed within the wait window. |
 | `runtime.not_permitted` | 502 | Agent-local policy refused the binary, the directory or a placeholder — a configuration error, explicitly **not** transient. |
 | `runtime.request_too_large` | 413 | Body over the router's limit. |
-| `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props` or `/v1/audio/voices` — the passthrough allowlist (§4.1) is exactly those two endpoints. |
+| `runtime.upstream_endpoint_not_allowed` | 404 | `/upstream/{model}/…` requested a suffix other than `/props`, `/v1/audio/voices` or `/v1/models` — the passthrough allowlist (§4.1) is exactly those three endpoints. A router from 0.7.0 on that predates 0.13.0 answers this for `/v1/models` (and one that predates 0.11.0 for `/v1/audio/voices`). |
 | `runtime.upstream_gone` | 502 | The child died during the request — **and the fallthrough** for a raw connection failure, a non-2xx the router could not forward, or the manager-closed sentinel. |
 
 Collapsing or renaming any of these destroys the distinction between a
@@ -2787,11 +2809,12 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Nine
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Ten
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
-`runtime_config_files`, `runtime_voices`, `fullduplex_proxy`); two,
+`runtime_config_files`, `runtime_voices`, `fullduplex_proxy`,
+`runtime_model_params`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
@@ -2823,7 +2846,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `multipart_proxy` ([§4.2](#42-model-routing)), `Since: "0.9.0"`, and
 `runtime_config_files` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)), `Since: "0.10.0"`, and
 `runtime_voices` ([§4.1](#41-control-routes)), `Since: "0.11.0"`, and
-`fullduplex_proxy` ([§4.1](#41-control-routes)), `Since: "0.12.0"`
+`fullduplex_proxy` ([§4.1](#41-control-routes)), `Since: "0.12.0"`, and
+`runtime_model_params` ([§4.1](#41-control-routes)), `Since: "0.13.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -3040,6 +3064,29 @@ alone and spelled identically on both sides (`fullduplexProxyFeature` in
 `internal/gateway/agent_features.go`, pinned by `TestFullduplexProxyFeatureName`, and the agent's own
 registry entry by `TestFeaturesDeclareFullduplexProxy`), since the agent module imports nothing from the
 gateway. `server-agent`'s `Version` moved `0.11.1` → `0.12.0` for this entry, MINOR per the same rule.
+
+`runtime_model_params` (issue #282, [ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)) has
+the `runtime_voices` shape: **the gateway gates real behavior on it, fail-closed, and that gate is
+the flag's purpose.** It says the router serves `GET /upstream/{model}/v1/models` (§4.1), the
+Status-only, never-start read of a running audio.cpp child's model listing that relays the inbound
+query, so `?include_params=true` reaches the child and the listing carries each model's declared
+request params. The gateway's agent-child speech-language pull, which `probeAgentVoices` folds into
+its voices loop (`fetchAndCacheSpeechParams`), reads the flag off the agent's sample
+(`hasAgentFeature(…, gateway.RuntimeModelParamsFeature)`, `AgentFeatures.Has`) before it asks
+anything, and it checks this flag **on its own, not under `runtime_voices`**: an older router can
+serve the voices route and still answer `404 runtime.upstream_endpoint_not_allowed` for `/v1/models`
+(a router from 0.7.0 on; `runtime.model_not_managed` before it), so the read cannot succeed there and
+would only add a silent no-op request per eligible mapping each tick. (The registry is append-only,
+so `runtime_model_params` implies `runtime_voices`, and the pull never applies where the voices pass
+is not already running.) A server on an agent without the flag (or one that has not reported since a
+gateway restart) simply has no cached speech-language fact, which the portal reads as unknown and
+offers no language control for. The flag gates nothing on the agent. The name is on the agent's list
+alone, spelled identically on both sides because the agent module imports nothing from the gateway
+(`gateway.RuntimeModelParamsFeature` is exported for the health loop in `cmd/gateway`, as
+`RuntimeVoicesFeature` is, and is deliberately **not** in `gatewayAgentFeatures`;
+`TestRuntimeModelParamsFeatureName` pins this side, the agent's registry entry
+`TestFeaturesDeclareRuntimeModelParams`).
+`server-agent`'s `Version` moved `0.12.0` → `0.13.0` for this entry, MINOR per the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -3303,6 +3350,20 @@ moved to the newest feature's test, `TestFeaturesDeclareFullduplexProxy`, beside
 There is no mixed-fleet hazard: a gateway that predates the name never asks, and an agent older
 than 0.12.0 is never sent a live session by a newer gateway, only refused at the gate
 ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)).
+
+**`0.12.0` → `0.13.0` (issue #282, the portal speech language) is MINOR, the plain case once
+more.** `agent.Features` gained `runtime_model_params` for the router's
+`GET /upstream/{model}/v1/models` ([§4.1](#41-control-routes)), a new observable router behavior
+that the gateway's agent-child speech-language pull gates on, fail-closed
+([§7](#7-feature-negotiation)). The bump is **one for the whole branch**: the allowlist entry (with
+`forwardQuery`, so the `include_params` query reaches the child), the flag and the version pin ship
+together, and the `Version` assertion moved to the newest feature's test,
+`TestFeaturesDeclareRuntimeModelParams`, beside `TestFeaturesDeclareFullduplexProxy` (which keeps
+its own presence and `Since` check, `"0.12.0"`).
+The agent's collector, telemetry sample and ingest are unchanged: the agent only gained a route.
+There is no mixed-fleet hazard: a gateway that predates the name never asks, and an agent older than
+0.13.0 is never asked by a newer gateway, so its servers simply carry no language fact
+([ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -7460,11 +7521,16 @@ operator meets first:
   ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)). The
   agent's loopback probe carries no credential
   ([ADR-037](../09-architecture-decisions.md#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)),
-  and the router's `/upstream` allowlist forwards only `/props` (and, since
-  0.11.0, an audio.cpp child's `/v1/audio/voices`), and vLLM serves neither.
-  Closing it means widening that allowlist to `GET /v1/models`, behind a new
-  agent feature and with its own ADR, because the allowlist is a security
-  boundary (the voices read was added that way: its own flag and ADR-067). Two shortcuts were rejected: a
+  and the router's `/upstream` allowlist forwards `/props`, an audio.cpp child's
+  `/v1/audio/voices` (since 0.11.0) and its `/v1/models` (since 0.13.0, added for
+  the audio.cpp language param and read only for an audio.cpp child, [ADR-074](../09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)),
+  and vLLM serves neither of the first two. The `/v1/models` entry is a
+  generic Status-only relay, so it would reach a vLLM child too, but nothing in
+  the benchmark path reads it for one, so this gap is **not** closed by it: closing it
+  would mean the gateway's vLLM benchmark asking for the listing through that route,
+  as its own change, because the allowlist is a security
+  boundary (the voices and models reads were each added with their own flag and
+  ADR: ADR-067, ADR-074). Two shortcuts were rejected: a
   gateway-side `POST /tokenize` counts as a use of the model and relies on an
   endpoint vLLM leaves unguarded, and parsing `--max-model-len` out of the
   launch args records a guess, not an observation.
