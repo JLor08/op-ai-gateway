@@ -210,6 +210,12 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 		Language:   language,
 		UserID:     token.UserID,
 		TokenID:    token.ID,
+		// The WebSocket has no principal, so the usage row's service/project
+		// attribution rides in the ticket (as the buffered path reads it off the token).
+		ServiceID:   token.ServiceID,
+		ServiceName: token.ServiceName,
+		ProjectID:   token.ProjectID,
+		ProjectName: token.ProjectName,
 	})
 	if err != nil {
 		slog.Error("live transcription ticket not minted", "model", model, "err", err)

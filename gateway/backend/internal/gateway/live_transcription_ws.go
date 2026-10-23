@@ -515,9 +515,9 @@ type liveUsageResult struct {
 //     incomplete stream, a non-positive rate) leaves the quantity 0 and says so once
 //     at Error -- a loud zero, never a silent one, and never a guessed count.
 //
-// The row attributes UserID + TokenID + RouteID + ServerID from the claims. The
-// claims carry no ServiceID/ProjectID, so a live row is not service/project-scoped
-// (acceptable for phase 1; a follow-up could thread them through the ticket).
+// The row attributes UserID + TokenID + ServiceID/ServiceName + ProjectID/ProjectName +
+// RouteID + ServerID from the claims: the ticket endpoint copied the service and project
+// off the authenticated token, so a live row is attributed like a buffered transcription's.
 //
 // The per-session outcome is bundled into liveUsageResult rather than passed as
 // loose parameters, keeping this billing entry point within a sane parameter
@@ -559,7 +559,14 @@ func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, cl
 		}
 	}
 
-	token := auth.Token{UserID: claims.UserID, ID: claims.TokenID}
+	token := auth.Token{
+		UserID:      claims.UserID,
+		ID:          claims.TokenID,
+		ServiceID:   claims.ServiceID,
+		ServiceName: claims.ServiceName,
+		ProjectID:   claims.ProjectID,
+		ProjectName: claims.ProjectName,
+	}
 	req := inference.Request{Model: claims.Target.Model, APIFlavor: claims.Target.APIFlavor}
 	if req.APIFlavor == "" {
 		req.APIFlavor = apiFlavorSpeech

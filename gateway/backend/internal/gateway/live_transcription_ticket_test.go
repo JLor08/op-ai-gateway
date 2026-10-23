@@ -149,6 +149,36 @@ func TestLiveTranscriptionTicketMintsForADirectStreamingModel(t *testing.T) {
 	}
 }
 
+// A project-attributed token's project rides in the ticket: the live session bills later, on a
+// WebSocket that carries no principal, so the ticket is the only place the row's project
+// attribution can come from. A user token carries no service (a service token is refused at
+// this portal gate), so the service fields stay empty.
+func TestLiveTranscriptionTicketCarriesTheTokensProjectAttribution(t *testing.T) {
+	up, _ := newTranscriptionUpstream(t, http.StatusOK, transcriptionOKBody)
+	srv, directory := newTranscriptionCapableTestServer(t, up.URL)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	if err := directory.CreateProject(ctx, store.Project{ID: "proj_notes", Name: "Call Notes", OwnerUserID: "usr_dev", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if err := directory.CreatePlainToken(ctx, store.TokenRecord{ID: "tok_proj", UserID: "usr_dev", ProjectID: "proj_notes", Name: "Project token", Status: store.TokenStatusActive, Scopes: `["gateway:use"]`, CreatedAt: now, UpdatedAt: now}, "proj-secret"); err != nil {
+		t.Fatalf("CreatePlainToken: %v", err)
+	}
+
+	rec := postLiveTicketWith(t, srv, liveTicketJSON("asr-model"), map[string]string{"Authorization": "Bearer proj-secret"})
+
+	claims := redeemMintedTicket(t, srv, rec)
+	if claims.UserID != "usr_dev" || claims.TokenID != "tok_proj" {
+		t.Fatalf("UserID/TokenID = %q/%q, want usr_dev/tok_proj", claims.UserID, claims.TokenID)
+	}
+	if claims.ProjectID != "proj_notes" || claims.ProjectName != "Call Notes" {
+		t.Fatalf("ProjectID/ProjectName = %q/%q, want proj_notes/Call Notes", claims.ProjectID, claims.ProjectName)
+	}
+	if claims.ServiceID != "" || claims.ServiceName != "" {
+		t.Fatalf("ServiceID/ServiceName = %q/%q, want empty for a user token", claims.ServiceID, claims.ServiceName)
+	}
+}
+
 // The response is exactly {"ticket": ...}: the claims are encrypted inside it, and nothing of
 // the routing decision (the upstream endpoint, the sealed credential) is echoed beside it.
 func TestLiveTranscriptionTicketResponseCarriesOnlyTheTicket(t *testing.T) {

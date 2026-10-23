@@ -60,6 +60,12 @@ func sampleLiveTicketClaims() liveTicketClaims {
 		Language:   "de",
 		UserID:     "user-1",
 		TokenID:    "token-1",
+		// The billing attribution the live usage row carries; it must survive the
+		// round trip like every other claim.
+		ServiceID:   "svc-1",
+		ServiceName: "Nightly Batch",
+		ProjectID:   "proj-1",
+		ProjectName: "Call Notes",
 	}
 }
 
@@ -141,9 +147,14 @@ func TestLiveTicketClaimsAreNotReadableFromTheToken(t *testing.T) {
 	claims.Target.ExtraHeaders = map[string]string{"x-secret-extra": "secret-extra-value"}
 	claims.UserID = "secret-user-id"
 	claims.TokenID = "secret-token-id"
+	claims.ServiceID = "secret-service-id"
+	claims.ServiceName = "secret-service-name"
+	claims.ProjectID = "secret-project-id"
+	claims.ProjectName = "secret-project-name"
 	secrets := []string{
 		"secret-upstream", "9000", "secret-model-name", "secret-sealed-credential",
 		"X-Secret-Header", "secret-extra", "secret-user-id", "secret-token-id",
+		"secret-service-id", "secret-service-name", "secret-project-id", "secret-project-name",
 		"Endpoint", "APIToken", "Nonce", "audiocpp",
 	}
 
@@ -176,6 +187,9 @@ func TestLiveTicketClaimsAreNotReadableFromTheToken(t *testing.T) {
 		}
 		if got.Target.Endpoint != claims.Target.Endpoint || got.Target.APIToken != claims.Target.APIToken {
 			t.Fatalf("claims did not round-trip: %+v", got.Target)
+		}
+		if got.ServiceID != claims.ServiceID || got.ServiceName != claims.ServiceName || got.ProjectID != claims.ProjectID || got.ProjectName != claims.ProjectName {
+			t.Fatalf("attribution did not round-trip: %+v", got)
 		}
 	}
 }

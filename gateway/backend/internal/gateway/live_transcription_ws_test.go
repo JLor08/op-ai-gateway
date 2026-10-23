@@ -175,7 +175,7 @@ func liveTarget(child *mockLiveChild, providerKind string) routing.Target {
 
 func mintLiveTicket(t *testing.T, srv *Server, target routing.Target, sampleRate, channels int, format, language string) string {
 	t.Helper()
-	ticket, err := srv.liveTickets.Mint(liveTicketClaims{
+	return mintLiveTicketFor(t, srv, liveTicketClaims{
 		Target:     target,
 		SampleRate: sampleRate,
 		Channels:   channels,
@@ -184,6 +184,13 @@ func mintLiveTicket(t *testing.T, srv *Server, target routing.Target, sampleRate
 		UserID:     "usr_dev",
 		TokenID:    "tok_dev",
 	})
+}
+
+// mintLiveTicketFor mints a ticket for exactly the given claims, for a test that needs a
+// field mintLiveTicket does not set (the billing attribution).
+func mintLiveTicketFor(t *testing.T, srv *Server, claims liveTicketClaims) string {
+	t.Helper()
+	ticket, err := srv.liveTickets.Mint(claims)
 	if err != nil {
 		t.Fatalf("mint ticket: %v", err)
 	}
@@ -389,6 +396,130 @@ func TestLiveTranscriptionTruncatedLoudZero(t *testing.T) {
 	// error row -- that is reserved for a non-2xx upstream answer.
 	if ev.Status != "success" {
 		t.Fatalf("status = %q, want success (truncated is success + loud zero, not an error row)", ev.Status)
+	}
+}
+
+// attributedLiveClaims is a 16 kHz mono s16le session on a direct child whose ticket was
+// minted by a token carrying a service and a project (the attribution the ticket endpoint
+// copies off the authenticated token).
+func attributedLiveClaims(child *mockLiveChild) liveTicketClaims {
+	return liveTicketClaims{
+		Target:      liveTarget(child, "audio_cpp"),
+		SampleRate:  16000,
+		Channels:    1,
+		Format:      "s16le",
+		UserID:      "usr_dev",
+		TokenID:     "tok_dev",
+		ServiceID:   "svc_live",
+		ServiceName: "Nightly Batch",
+		ProjectID:   "proj_live",
+		ProjectName: "Call Notes",
+	}
+}
+
+// requireLiveRowAttribution fails unless the row carries the service and project of
+// attributedLiveClaims.
+func requireLiveRowAttribution(t *testing.T, ev usage.Event) {
+	t.Helper()
+	if ev.ServiceID != "svc_live" || ev.ServiceName != "Nightly Batch" || ev.ProjectID != "proj_live" || ev.ProjectName != "Call Notes" {
+		t.Fatalf("service/project = %q/%q/%q/%q, want svc_live/Nightly Batch/proj_live/Call Notes",
+			ev.ServiceID, ev.ServiceName, ev.ProjectID, ev.ProjectName)
+	}
+}
+
+// TestLiveTranscriptionCleanRowIsServiceAndProjectAttributed proves the billed row of a
+// clean session carries the service and project the ticket was minted with, as the buffered
+// transcription row does -- the WebSocket has no principal of its own, so the ticket is
+// where the attribution travels.
+func TestLiveTranscriptionCleanRowIsServiceAndProjectAttributed(t *testing.T) {
+	srv := newLiveTestServer(t)
+	child := newMockLiveChild(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ticket := mintLiveTicketFor(t, srv, attributedLiveClaims(child))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+
+	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 32000)); err != nil {
+		t.Fatalf("send pcm: %v", err)
+	}
+	if _, err := readLiveMsg(t, ctx, conn); err != nil {
+		t.Fatalf("read delta: %v", err)
+	}
+	sendEnd(t, ctx, conn)
+	for {
+		m, err := readLiveMsg(t, ctx, conn)
+		if err != nil || m.Type == "done" {
+			break
+		}
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+
+	requireLiveRowAttribution(t, requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 1.0))
+}
+
+// TestLiveTranscriptionLoudZeroRowIsServiceAndProjectAttributed proves a truncated session's
+// loud-zero row is attributed too: the zero is a real, visible row and belongs to the same
+// service and project as a clean one.
+func TestLiveTranscriptionLoudZeroRowIsServiceAndProjectAttributed(t *testing.T) {
+	srv := newLiveTestServer(t)
+	child := newMockLiveChild(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ticket := mintLiveTicketFor(t, srv, attributedLiveClaims(child))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 16000)); err != nil {
+		t.Fatalf("send pcm: %v", err)
+	}
+	if _, err := readLiveMsg(t, ctx, conn); err != nil {
+		t.Fatalf("read delta: %v", err)
+	}
+	// Drop WITHOUT end-of-input.
+	_ = conn.CloseNow()
+
+	requireLiveRowAttribution(t, requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0))
+}
+
+// TestLiveTranscriptionUnattributedTicketLeavesServiceAndProjectEmpty is the control: a
+// ticket minted by a token with no service or project (a plain portal session) bills a row
+// with none, so the attribution above comes from the claims and from nowhere else.
+func TestLiveTranscriptionUnattributedTicketLeavesServiceAndProjectEmpty(t *testing.T) {
+	srv := newLiveTestServer(t)
+	child := newMockLiveChild(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 16000)); err != nil {
+		t.Fatalf("send pcm: %v", err)
+	}
+	if _, err := readLiveMsg(t, ctx, conn); err != nil {
+		t.Fatalf("read delta: %v", err)
+	}
+	_ = conn.CloseNow()
+
+	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
+	if ev.ServiceID != "" || ev.ServiceName != "" || ev.ProjectID != "" || ev.ProjectName != "" {
+		t.Fatalf("service/project = %q/%q/%q/%q, want all empty for an unattributed ticket",
+			ev.ServiceID, ev.ServiceName, ev.ProjectID, ev.ProjectName)
 	}
 }
 

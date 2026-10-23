@@ -59,6 +59,15 @@ type liveTicketClaims struct {
 	Language   string
 	UserID     string
 	TokenID    string
+
+	// ServiceID/ServiceName/ProjectID/ProjectName are the billing attribution the
+	// authenticated token carried at mint time. The WebSocket has no principal of its
+	// own, so the usage row it records takes its service and project from here, as the
+	// buffered transcription row takes them off the request's token.
+	ServiceID   string
+	ServiceName string
+	ProjectID   string
+	ProjectName string
 }
 
 // liveTicketStore mints and redeems live-transcription tickets.
