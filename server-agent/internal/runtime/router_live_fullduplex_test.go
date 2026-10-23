@@ -58,13 +58,11 @@ import (
 //     reaching the child), so the exchange deadlocks and the bounded timeouts
 //     fail the test fast rather than hanging the suite.
 func TestLiveFullDuplexInterleavesThroughProxyAndRouter(t *testing.T) {
-	// Realistic PCM chunk sizes, deliberately larger than the client/relay
-	// transports' 4 KiB write buffer: a sub-buffer write would sit in the
-	// sender's bufio.Writer until the body completed (or the buffer filled),
-	// so chunk 1 would never reach the wire mid-request and even a correct
-	// relay could not interleave. A real live-transcription frame is this big
-	// (16 kHz * 2 bytes/sample is 32 KiB/s), so this is the production shape,
-	// not a test contrivance.
+	// Realistic PCM chunk sizes: 16 KiB mirrors production live-audio chunking
+	// (16 kHz * 2 bytes/sample is 32 KiB/s). It is NOT a buffering workaround --
+	// net/http flushes a chunked request body per chunk, so the test would pass
+	// with tiny chunks too. Its soundness rests on the ContentLength == -1
+	// (chunked) assertion and the interleave timing below, not on a buffer size.
 	chunk1 := bytes.Repeat([]byte("PCM1"), 4096) // 16 KiB
 	chunk2 := bytes.Repeat([]byte("PCM2"), 4096) // 16 KiB
 
