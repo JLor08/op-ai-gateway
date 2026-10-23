@@ -240,6 +240,22 @@ var Features = []Feature{
 	// Since is 0.12.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
 	{Name: "fullduplex_proxy", Since: "0.12.0"},
+	// runtime_model_params: this agent's runtime router serves
+	// GET /upstream/{model}/v1/models -- a Status-only passthrough to a
+	// RUNNING audio.cpp child's model listing, relayed with the inbound query
+	// so ?include_params=true reaches the child and the gateway reads each
+	// model's declared request params (e.g. language); it never starts a child.
+	//
+	// Like runtime_voices and fullduplex_proxy, this flag gates nothing on the
+	// agent -- the route is simply there or not -- it is declared for the
+	// GATEWAY's benefit, which negotiates on the name before it pulls
+	// /v1/models through the router, fail-closed. An older router answers a
+	// 404 (runtime.upstream_endpoint_not_allowed) for the route, which is
+	// exactly the read the gateway must not attempt without evidence.
+	//
+	// Since is 0.13.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block).
+	{Name: "runtime_model_params", Since: "0.13.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

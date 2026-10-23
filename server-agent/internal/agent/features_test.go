@@ -404,7 +404,45 @@ func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "fullduplex_proxy") {
 		t.Fatal("FeatureNames() does not carry fullduplex_proxy, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.12.0" {
-		t.Fatalf("Version = %q, want 0.12.0 (fullduplex_proxy is a new agent.Features entry, so the bump is MINOR)", Version)
+	// The Version assertion moved to TestFeaturesDeclareRuntimeModelParams,
+	// beside the newest feature (see the bump-rule note there).
+}
+
+// TestFeaturesDeclareRuntimeModelParams pins the model-params-route capability
+// and the version bump that ships it. This agent's runtime router serves GET
+// /upstream/{model}/v1/models, a Status-only passthrough to a RUNNING audio.cpp
+// child's model listing relayed with the inbound query (so ?include_params=true
+// reaches the child), and the GATEWAY pulls each model's declared request params
+// (e.g. language) only from an agent that declares this exact name, fail-closed
+// -- an older router answers a 404 (runtime.upstream_endpoint_not_allowed) for
+// the route -- so a rename here silently stops every agent child's declared
+// params from being read. The gateway spells the same string in its own constant;
+// this module cannot import it.
+//
+// The version assertion lives here, beside the newest feature, and it is the
+// forcing function for the repository's bump rule: a change that moves Version
+// has to come THROUGH this test and state which rule it followed. 0.12.0 was
+// MINOR because agent.Features gained fullduplex_proxy; 0.13.0 is MINOR because
+// agent.Features gained runtime_model_params. A Since records the version a
+// feature shipped in, so fullduplex_proxy's stays 0.12.0 and
+// runtime_model_params' stays 0.13.0.
+func TestFeaturesDeclareRuntimeModelParams(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_model_params" {
+			found = true
+			if f.Since != "0.13.0" {
+				t.Fatalf("runtime_model_params Since = %q, want 0.13.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_model_params")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_model_params") {
+		t.Fatal("FeatureNames() does not carry runtime_model_params, so it never reaches the gateway in capabilities.features")
+	}
+	if Version != "0.13.0" {
+		t.Fatalf("Version = %q, want 0.13.0 (runtime_model_params is a new agent.Features entry, so the bump is MINOR)", Version)
 	}
 }

@@ -23,10 +23,14 @@
 //     via Status() only -- NEVER EnsureRunning, a probe must not start or
 //     keep alive a child -- and relayed byte-verbatim so the gateway's
 //     evidence rule reads the child's own document. The allowlist is
-//     /props plus GET /upstream/{model}/v1/audio/voices (issue #251, the
+//     /props, GET /upstream/{model}/v1/audio/voices (issue #251, the
 //     "runtime_voices" feature: an audio.cpp child's voice listing, same
 //     Status-only never-start shape, outbound path /v1/audio/voices with
-//     no query); widening it further is #49-2/#55 business.
+//     no query) and GET /upstream/{model}/v1/models (the
+//     "runtime_model_params" feature: an audio.cpp child's model listing
+//     with each model's declared request params, outbound path /v1/models
+//     with the inbound query, so ?include_params=true reaches the child);
+//     widening it further is #49-2/#55 business.
 //   - POST /ensure/{model} -- start a managed child without forwarding a
 //     request to it: model from the PATH (everything after "/ensure/", so
 //     ids containing "/" work), EnsureRunning under the request context,
@@ -398,12 +402,13 @@ func (rt *router) serveModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, modelsResponse{Object: "list", Data: data})
 }
 
-// upstreamPropsSuffix and upstreamVoicesSuffix are the child endpoints the
-// /upstream passthrough allowlists -- both the inbound suffix match and the
-// outbound path.
+// upstreamPropsSuffix, upstreamVoicesSuffix and upstreamModelsSuffix are the
+// child endpoints the /upstream passthrough allowlists -- both the inbound
+// suffix match and the outbound path.
 const (
 	upstreamPropsSuffix  = "/props"
 	upstreamVoicesSuffix = "/v1/audio/voices"
+	upstreamModelsSuffix = "/v1/models"
 )
 
 // upstreamEndpoint is one allowlisted child endpoint of the /upstream
@@ -415,24 +420,29 @@ type upstreamEndpoint struct {
 	// forwardQuery relays the inbound query string to the child. /props keeps
 	// it (llama.cpp reads e.g. ?model=); the voices read drops it, because
 	// audio.cpp ignores ?model= (it lists the voices of the model it has
-	// loaded), so the request's model only selects the child.
+	// loaded), so the request's model only selects the child. The models
+	// read keeps it: audio.cpp adds each model's declared request params
+	// only when asked with ?include_params=true.
 	forwardQuery bool
 }
 
 var upstreamEndpoints = []upstreamEndpoint{
 	{path: upstreamPropsSuffix, forwardQuery: true},
 	{path: upstreamVoicesSuffix, forwardQuery: false},
+	{path: upstreamModelsSuffix, forwardQuery: true},
 }
 
-// serveUpstream handles GET /upstream/{model}/props (issue #58) and GET
-// /upstream/{model}/v1/audio/voices (issue #251): the llama-swap-style
-// upstream passthrough, restricted to a GET of exactly one allowlisted
-// endpoint on a RUNNING child. The gateway probes an api-key-protected
-// child's live-progress capability (/props) and an audio.cpp child's voice
-// listing (/v1/audio/voices, the "runtime_voices" feature) through it,
-// attaching the spec's token -- which this handler, like the proxy paths,
-// forwards verbatim (Authorization and custom token headers are not
-// hop-by-hop).
+// serveUpstream handles GET /upstream/{model}/props (issue #58), GET
+// /upstream/{model}/v1/audio/voices (issue #251) and GET
+// /upstream/{model}/v1/models: the llama-swap-style upstream passthrough,
+// restricted to a GET of exactly one allowlisted endpoint on a RUNNING child.
+// The gateway probes an api-key-protected child's live-progress capability
+// (/props), an audio.cpp child's voice listing (/v1/audio/voices, the
+// "runtime_voices" feature) and its model listing with declared request
+// params (/v1/models?include_params=true, the "runtime_model_params"
+// feature) through it, attaching the spec's token -- which this handler, like
+// the proxy paths, forwards verbatim (Authorization and custom token headers
+// are not hop-by-hop).
 //
 // Deliberate properties, each one a guardrail from the issue:
 //   - Status() only, never EnsureRunning: llama-swap's own /upstream route
@@ -460,7 +470,7 @@ func (rt *router) serveUpstream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeError(w, http.StatusNotFound, "runtime.upstream_endpoint_not_allowed",
-		"only /props and /v1/audio/voices may be requested through /upstream/{model}")
+		"only /props, /v1/audio/voices and /v1/models may be requested through /upstream/{model}")
 }
 
 // relayToRunningChild is the Status-only relay behind serveUpstream: resolve
