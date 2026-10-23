@@ -153,7 +153,7 @@ reachable that way (§9). Every body but the two multipart ones (the image edits
 and the audio transcriptions) is read with `readRawJSONUnlimited` (§7); those two
 bodies are `multipart/form-data` and each is read by its own capped reader (§3.5,
 §3.7, §10). All eight POST endpoints call `liftInferenceDeadlines` before reading
-the body (§6).
+the body (§6); the bearer live-transcription endpoint of §3.8, a ninth POST, lifts them as well, after its own gate.
 
 ### 3.1 OpenAI Chat Completions
 
@@ -1192,75 +1192,131 @@ agent-launched child the `transcription_streaming` verdict is **reported by the 
 (0.9.2), riding the existing `capability_source_audiocpp` wire with no new feature flag
 (§6, [Agent-Managed Model Runtime §7](agent-runtime-manager.md#7-feature-negotiation)).
 
-### 3.8 Live transcription: the portal WebSocket transport
+### 3.8 Live transcription: the bearer `/v1` endpoint and the portal WebSocket
 
 Live transcription is the **live-input** sibling of §3.7 item 11: text appears **while the user is
 still speaking**, where a streamed transcription (item 11) streams the deltas of a clip that was
-already uploaded whole. It is **not a `/v1` endpoint** and has no bearer public API in this phase: its
-consumer is the portal, over two `/api/portal/` endpoints, because a browser cannot drive audio.cpp's
-chunked, full-duplex `POST /v1/audio/transcriptions/live` itself (a streaming `fetch()` body needs HTTP/2
-and is half-duplex, and a WebSocket cannot carry `X-OP-CSRF`). The gateway is the native full-duplex client,
-and the browser speaks a WebSocket to it
-([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266; the sequence is [Runtime View
-§6.1.5](../06-runtime-view.md#615-live-transcription-browser-websocket-gateway-agent-live-audiocpp)):
+already uploaded whole. It has **two client surfaces over one relay**
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266; [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)):
+
+- **`POST /v1/audio/transcriptions/live`** (and `/openai/v1/audio/transcriptions/live`) is the **canonical
+  relay**: a chunked, full-duplex HTTP request that mirrors audio.cpp's own native `/live`, for programmatic
+  clients (item 1).
+- **`GET /api/portal/transcription-live`** is the **portal's WebSocket**, a thin adapter that **loops back** to
+  the first one (items 2 and 3). A browser cannot drive a chunked, full-duplex POST (a streaming `fetch()` body
+  needs HTTP/2 and is half-duplex) and a WebSocket cannot carry `X-OP-CSRF`, hence a ticket and a WebSocket
+  for the browser. Using live transcription in the portal therefore also exercises, and tests, the public endpoint.
 
 ```
-browser --(WebSocket: binary PCM frames, one {"type":"end"})--> gateway --(chunked PCM, full-duplex POST)--> agent /live/{model} --> audio.cpp /v1/audio/transcriptions/live
-browser <--(JSON delta / partial / done / error)-------------- gateway <--(SSE, flushed)--------------------- agent /live/{model} <-- audio.cpp
+bearer client --(raw PCM, chunked, bearer token)------------------------------------+
+                                                                                     v
+browser --(WebSocket: PCM frames, {"type":"end"})--> portal adapter --(loopback POST)--> POST /v1/audio/transcriptions/live
+browser <--(JSON delta / partial / done / error)---- portal adapter <-------(SSE)------- (the one relay: resolve, gate, admit once,
+                                                                                          per-route slot, billing)
+                                                         (chunked PCM, full-duplex POST) |  ^  (SSE, flushed)
+                                                                                         v  |
+                                                      agent POST /live/{model} --> audio.cpp /v1/audio/transcriptions/live
 ```
 
-**1. A CSRF-protected ticket POST decides everything; the upgrade only redeems it.**
+The sequence is [Runtime View §6.1.5](../06-runtime-view.md#615-live-transcription-browser-websocket-gateway-loopback-agent-live-audiocpp).
+
+**1. The canonical relay: `POST /v1/audio/transcriptions/live`.** `handleBearerLiveTranscription`
+(`internal/gateway/live_transcription_bearer.go`). The request is chunked HTTP/1.1: the body is raw interleaved
+PCM, the parameters ride the **query string** (`model`, `sample_rate`, `channels`, `sample_format`,
+`language`), and the response is the upstream's own SSE (`transcript.text.delta`, then
+`transcript.text.done`, then `data: [DONE]`, plus `transcript.text.partial` for a revisable-hypothesis model and an
+`error` event), relayed **verbatim** and flushed per write. The response headers are flushed **before** any body
+byte, as audio.cpp's own `/live` does: a full-duplex client waits for them before it starts sending audio, and
+the first SSE frame is itself downstream of that audio. The client ends the session by **finishing its chunked
+body** (the terminating chunk): there is no WebSocket framing, no `{"type":"end"}` and no ticket. Auth is
+`requireInternalOrBearerAnyScope` (scope `gateway:use` or `llm:invoke`): a **bearer token** (a user's or a
+service's) or the **internal trusted-loopback pair**, **never** the portal session cookie, so there is **no
+CSRF** step (nothing ambient to forge). The order, each step a refusal before the next:
+
+| Step | Refusal |
+|---|---|
+| method | `405` for anything but `POST` |
+| authentication and scope | `401` (no or invalid bearer, and a session cookie alone), `403 auth.insufficient_scope` |
+| `model` (trimmed, non-empty) | `400 transcription.model_required` |
+| the params: `sample_rate` 1000 to 384000, `channels` 1 to 16, `sample_format` `s16le` or `f32le`, `language` empty or `[A-Za-z0-9_-]` up to 64 characters (an absent or non-integer number is out of range) | `400 transcription.live_params_invalid` |
+| the buffered transcription's own gate (§3.7: the token's model and server overrides, the allowlist, then the principal's **one** rate, quota and budget admission) | `403 model.not_allowed` or `server_override.forbidden`, `429 limit.rate_limited` (with `Retry-After`), `limit.request_quota_exceeded` or `limit.token_quota_exceeded`, `402 limit.cost_budget_exceeded` |
+| the resolve: the user's reachable servers, the `transcription` capability, the effective-flavor rule | `404 routing.no_model_route` or `routing.model_not_capable` (so no new way to probe which models exist), `503 routing.no_healthy_host` or `routing.admission_queue_timeout`/`_full` |
+| a stored `transcription_streaming = yes` verdict | `409 transcription.live_not_streaming` |
+| for a `server_agent` target, positive evidence the agent declared `fullduplex_proxy` (fail-closed like `multipart_proxy`'s gate in §3.7 item 6, [Agent-Managed Model Runtime §7](agent-runtime-manager.md#7-feature-negotiation); a direct `audio_cpp` target has no agent in front and is exempt) | `409 transcription.live_agent_unsupported` |
+| the **per-route session slot** (audio.cpp serves one `/live` per model) | `503 transcription.live_busy`, before a byte moves, no usage row |
+
+Past the slot, `liftInferenceDeadlines` removes the 30 s control-plane deadlines and `EnableFullDuplex` lets the
+gateway read the client's body while it writes the SSE. A dial failure is the mapped provider error; a **non-2xx
+upstream** (the agent's `404 runtime.model_not_managed` or `503 runtime.admission_blocked`, a child error) is relayed
+under **the upstream's own status** with its bounded body, and records an `error` row. The gate (the table from
+`model` on) is the one function the portal's ticket also runs, `resolveLiveTarget`, so a model is admitted by
+the bearer endpoint exactly when the portal's gate admits it. `inferencePreflight` was split into `inferenceGate`
+(everything but the admission) and `admitPrincipal` so the ticket can run the gate alone (item 2).
+
+**2. The portal's gate and ticket.** The composer offers its **live** record mode only when
+`GET /api/portal/model-transcription-streaming?name=<model>` answers `{"streaming": true}`
+(`handlePortalModelTranscriptionStreaming`, `internal/gateway/chat_runs_audio_stream.go`; scope `gateway:use`, the
+speech-streaming gate's twin without a sample rate): true only when the model has at least one portal-visible
+mapping with a `transcription` verdict of `yes` and **every** such mapping also carries
+`transcription_streaming = yes` (fail-closed). It is **no-leak**: an unknown, hidden, locked, restricted,
+non-transcription, offline or not-yet-probed model is the same `200 {"streaming": false}`; a blank `name` is `400
+model.name_required`; a failed read is `500 model.transcription_streaming_failed`, never read as `false`. The
+gate is advisory (it reads the stores, loads nothing, contacts nothing); the ticket decides again.
+
 `POST /api/portal/transcription-live-ticket` (`handlePortalLiveTranscriptionTicket`,
-`internal/gateway/live_transcription.go`) is the portal's own authentication (scope `gateway:use`; a session
-cookie also needs `X-OP-CSRF`, a bearer does not), because the upgrade that follows cannot carry that
-header. The body is `{model, sample_rate, channels, sample_format, language?}`, and the order is fixed: the
-request is **validated first**, before anything is spent on it (a blank model is `400 model.name_required`;
-`sample_rate` outside 1000 to 384000, `channels` outside 1 to 16, a `sample_format` that is not `s16le` or
-`f32le`, or a `language` outside `[A-Za-z0-9_-]` up to 64 characters is `400
-portal.live_transcription_params_invalid`); the model then goes through the **buffered transcription's own
-gate** (§3.7: the token's model and server overrides, the principal's **one** rate, quota and budget
-admission, the user's reachable servers, the `transcription` capability and the effective-flavor rule, so an
-unknown or incapable model is that endpoint's own `404 routing.no_model_route` or
-`routing.model_not_capable` and the route adds no way to probe which models exist). The same shared preflight
-and resolve can also refuse with `403 model.not_allowed` or `403 server_override.forbidden` (a service-account
-allowlist, a forbidden server override), `429 limit.rate_limited` (with `Retry-After`),
-`limit.request_quota_exceeded` or `limit.token_quota_exceeded`, `402 limit.cost_budget_exceeded`, and `503`
-`routing.no_healthy_host` or `routing.admission_queue_timeout`/`_full`. The admission is spent
-**here**, once, because a refusal is a plain HTTP response on this POST and opaque on an upgrade. This is a
-**gate, not a relay**: no usage row, no capture, no upstream contact. Two more refusals follow, both `409`: the
-mapping must carry a stored `transcription_streaming = yes` verdict
-(`portal.live_transcription_not_streaming`), and a `server_agent` target needs positive evidence its agent
-declared `fullduplex_proxy` (`portal.live_transcription_agent_unsupported`, fail-closed like
-`multipart_proxy`'s gate in §3.7 item 6, [Agent-Managed Model Runtime
-§7](agent-runtime-manager.md#7-feature-negotiation); a direct `audio_cpp` target has no agent in front and
-is exempt). It answers `200 {"ticket": "..."}`.
+`internal/gateway/live_transcription.go`) is the portal's own authentication (scope `gateway:use`; a session cookie
+also needs `X-OP-CSRF`, a bearer does not), because the upgrade that follows cannot carry that header. The
+body is `{model, sample_rate, channels, sample_format, language?}`. It **validates first** (a blank model is
+`400 model.name_required`, the params are `400 transcription.live_params_invalid`), then runs the **same
+`resolveLiveTarget` as item 1, without the admission** (`admit=false`): the buffered transcription's gate and
+resolve, the streaming verdict (`409 transcription.live_not_streaming`) and the agent flag (`409
+transcription.live_agent_unsupported`), with the refusals listed in item 1. It is a **gate, not a relay**: **no admission**,
+no usage row, no capture, no upstream contact. The point of running it at all is a fast, plain HTTP error for the
+browser (an unknown or non-streaming model) before it opens a microphone session; **the session's one admission is
+spent once, later, at `/v1/audio/transcriptions/live`** ([ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)). It answers `200 {"ticket": "..."}`; a failed
+mint is `500 portal.live_transcription_ticket_failed`.
 
-**2. The ticket is the server's decision, sealed.** It lives about **30 seconds**, is **single-use**, and is
+The ticket is the server's decision, sealed. It lives about **30 seconds**, is **single-use**, and is
 **AES-256-GCM encrypted** under a random per-process key (additional authenticated data bound to its purpose; a
 tampered, truncated, foreign or non-canonical token fails to open), not merely signed, because its claims
 carry the resolved `routing.Target` (the internal upstream endpoint, the sealed upstream credential,
 upstream headers), the **one validated `(sample_rate, channels, sample_format, language)` set** and the
-`UserID` and `TokenID` the session bills to. The WebSocket handler therefore never takes a model, a route or
-a billing rate from the client, never re-resolves and never re-admits. The token is a valid
-`Sec-WebSocket-Protocol` value (URL-safe base64, no padding). A ticket opens only on the process that minted
-it (the key is per process, and single-use is an in-memory set), which suits one instance and a 30 s TTL
-([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+`UserID` (with the `TokenID`, service and project as a record that billing does not read). The WebSocket
+handler therefore never takes a model, a route or a billing rate from the client; the loopback consumes the
+model name, the params and the `UserID`. The token is a valid `Sec-WebSocket-Protocol` value (URL-safe base64, no
+padding). A ticket opens only on the process that minted it (the key is per process, and single-use is an
+in-memory set), which suits one instance and a 30 s TTL; sharing both across instances is issue #285
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), [Risks & Technical Debt §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). The bearer
+endpoint uses no ticket.
 
-**3. The upgrade is origin-checked and authenticated before it happens.** `GET
-/api/portal/transcription-live` (`handleLiveTranscription`, `internal/gateway/live_transcription_ws.go`) reads
-the ticket from `Sec-WebSocket-Protocol` (the browser calls `new WebSocket(url, ["op-live-transcription",
-<ticket>])`; **never** a `?ticket=` query, which would land in access logs and `Referer`) and redeems it
-**before** `websocket.Accept`: an absent, expired, replayed or foreign ticket is a plain **`401` with no
-upgrade**. The handshake selects the fixed `op-live-transcription` subprotocol, so the opaque ticket never
-becomes the negotiated one. `Accept` uses coder/websocket's **default same-origin check** (no
-`InsecureSkipVerify`, no `OriginPatterns`), so a cross-origin upgrade is refused `403` by the library; that
-check plus a ticket a foreign page cannot obtain are the CSRF defense of a handshake that cannot carry
-`X-OP-CSRF`. **Operationally**, that default check compares the request's `Origin` host with its `Host`, so
-a reverse proxy in front of the gateway must preserve the original `Host`, or the upgrade is refused `403`.
-A second session on the same route is closed `StatusTryAgainLater` (1013) after the upgrade
-(item 5).
+**3. The portal WebSocket: origin-checked, then a loopback adapter.** `GET /api/portal/transcription-live`
+(`handleLiveTranscription`, `internal/gateway/live_transcription_ws.go`) reads the ticket from
+`Sec-WebSocket-Protocol` (the browser calls `new WebSocket(url, ["op-live-transcription", <ticket>])`;
+**never** a `?ticket=` query, which would land in access logs and `Referer`) and redeems it **before**
+`websocket.Accept`: an absent, expired, replayed or foreign ticket is a plain **`401` with no upgrade**. The
+handshake selects the fixed `op-live-transcription` subprotocol, so the opaque ticket never becomes the
+negotiated one. `Accept` uses coder/websocket's **default same-origin check** (no `InsecureSkipVerify`, no
+`OriginPatterns`), so a cross-origin upgrade is refused `403` by the library; that check plus a ticket a foreign page
+cannot obtain are the CSRF defense of a handshake that cannot carry `X-OP-CSRF`. **Operationally**, that check
+compares the request's `Origin` host **and port** with its `Host`, so a reverse proxy in front of the gateway must forward
+the original `Host` with its port (the bundled nginx uses `$http_host` on this location, [Networking & Mesh §10](networking-mesh.md#10-agentgateway-websocket-transport)), or the upgrade is refused `403`.
 
-**4. The wire.**
+After the upgrade, `relayLiveTranscription` is the **adapter**: it opens an internal **full-duplex loopback**
+`POST {selfBaseURL}/v1/audio/transcriptions/live?model=...&sample_rate=...&channels=...&sample_format=...[&language=...]`,
+built from what the ticket sealed, with the trusted-loopback header pair (the per-process secret and the
+ticket's `UserID`), as a portal chat run loops back to `/v1/chat/completions` (§12): `loopbackPrincipal` resolves it
+to a token-less session principal of that user. The browser's PCM is pumped into the loopback request body
+through an `io.Pipe`; the loopback's SSE comes back through the shared `transcriptionStreamScan` and
+`decodeTranscriptionEvent` as typed WebSocket frames. The request carries **`Expect: 100-continue`**: `/v1` may refuse
+(`409`, `429`/`402`, `503`) before it reads a byte of the open body, and the Go client would otherwise not surface that
+response until the body ended, which for a microphone is never; with it the client holds the body until `/v1` sends
+`100 Continue` (on its first body read, after every refusal) or answers a final status. A non-2xx loopback answer
+(an admission denial, `transcription.live_busy`, anything past the mint's gate) reaches the browser as one
+`{"type":"error"}` frame with a **generic** message after the upgrade (the status is logged, not forwarded); the
+`StatusTryAgainLater` (1013) close of phase 1 is no longer sent. The adapter has **no** admission, **no** session
+slot, **no** upstream call and **no** usage row of its own.
+
+**4. The portal WebSocket's wire.**
 
 | Direction | Frame | Meaning |
 |---|---|---|
@@ -1269,68 +1325,108 @@ A second session on the same route is closed `StatusTryAgainLater` (1013) after 
 | Down | text `{"type":"delta","text":"..."}` | An increment to **append**. |
 | Down | text `{"type":"partial","text":"..."}` | A whole provisional transcript to **replace** (a revisable-hypothesis model). |
 | Down | text `{"type":"done","text":"..."}` | The final transcript (an empty text is a valid statement: keep what you have). If audio.cpp emits `done` **per utterance, mid-stream**, which is unconfirmed, a `done` is not necessarily the last message ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). |
-| Down | text `{"type":"error","message":"..."}` | A failure, terminal: an upstream SSE `error` event, an unreachable upstream, or a non-2xx upstream. |
+| Down | text `{"type":"error","message":"..."}` | A failure, terminal: an upstream SSE `error` event, an unreachable upstream, a non-2xx upstream or loopback answer. |
 
 The upstream SSE is parsed by the **same** `transcriptionStreamScan` and `decodeTranscriptionEvent` the
-streamed relay of §3.7 item 11 uses; the live path adds only the `partial` and `error` event types. The
-request forwarded upstream is the ticket's params as the query (`sample_rate`, `channels`, `sample_format`,
-`language` when set), POSTed **chunked** through `NativeDuplexProxyClient.ProxyNativeDuplex`
-(`internal/provider/proxy.go`), an optional provider interface beside the unchanged
-`NativeProxyClient`, which applies **no `target.Timeout`**. A `server_agent` target is addressed at the
-agent router's `/live/{model}` (the agent adds `model` to the child query), a direct `audio_cpp` target at
-`/v1/audio/transcriptions/live` with `model=<provider model>`. The upstream request carries the target's own
-per-mapping credential (`target.APIToken` and `APITokenHeader`, attached by `upstreamAuthCtx` exactly as the
-buffered native path does), so a child that needs a token is reachable live; the relay forwards no client
-header, and a token-less target sends none.
+streamed relay of §3.7 item 11 uses; the live path adds only the `partial` and `error` event types.
 
-**5. The lifecycle.** The handler owns **one context**, cancelled on any exit (a clean done, an upstream
-error, a client drop, a failed write), which tears down the read loop, the upstream request and the PCM pump
-together. **One goroutine owns every WebSocket write**: transcript frames, the 30 s ping (10 s to answer) and
-the close, so a second writer can never make a write "succeed" while its frame is lost. A read loop pumps PCM
-through an `io.Pipe` into the upstream request body. **End-of-input is explicit:** `{"type":"end"}` closes
-the pipe cleanly, the transport sends the **terminating chunk**, and only then does audio.cpp emit
-`transcript.text.done` and `[DONE]`; a WebSocket **close without it** aborts the upstream body (no
-terminating chunk), a **truncated** session that bills a loud zero, so the portal's Stop sends `end` and does
-not close the socket. A **busy** route is refused by a per-route registry: audio.cpp serves one `/live` per
-model, so a second concurrent session on the same route is closed `StatusTryAgainLater` with a structured
-reason, never left to collide at the backend (a missing registry fails closed). Live-versus-**non-live**
-contention on a single-slot model is not guarded: audio.cpp's one-at-a-time behavior surfaces as an upstream
-error, an honest loud zero. Teardown is deferred, so a panic cannot skip it: it unblocks the pipe from
-both sides, cancels the context, joins both goroutines and **records the usage row exactly once**. The close
-**handshake** is deliberately not used on this path (it would stall about 5 s on the read lock the read
-loop holds): the writer flushes queued frames and closes abruptly, after the browser already has every
-transcript frame.
+**5. The upstream request.** The relay (item 1) forwards the validated params as the query (`sample_rate`, `channels`,
+`sample_format`, `language` when set), POSTed **chunked** through `NativeDuplexProxyClient.ProxyNativeDuplex`
+(`internal/provider/proxy.go`), an optional provider interface beside the unchanged `NativeProxyClient`, which
+applies **no `target.Timeout`**. A `server_agent` target is addressed at the agent router's `/live/{model}` (the
+agent adds `model` to the child query), a direct `audio_cpp` target at `/v1/audio/transcriptions/live` with
+`model=<provider model>`. The upstream request carries the target's own per-mapping credential
+(`target.APIToken` and `APITokenHeader`, attached by `upstreamAuthCtx` exactly as the buffered native path does), so
+a child that needs a token is reachable live; the relay forwards no client header, and a token-less target
+sends none.
 
-**6. It is not subject to the 30 s deadlines, and has no idle watchdog of its own.** `websocket.Accept`
-**hijacks** the connection, which detaches it from the server's default 30 s read and write deadlines (§7),
-so no `liftInferenceDeadlines` is called, unlike the eight POST inference endpoints. A session's length is
-bounded by the client (a stop, a drop) and by the ping/pong keepalive, not by `OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`
-(§7), and the upstream call has no `target.Timeout`. The upstream SSE line is bounded at 1 MiB, past which
-the read fails and the relay ends, billing a loud zero.
+**6. The lifecycle.** Both relays own **one context**, cancelled on any exit. On the **WebSocket adapter**: the
+context tears down the read loop, the loopback request and the PCM pump together; **one goroutine owns every
+WebSocket write** (transcript frames, the 30 s ping, 10 s to answer, and the close), so a second writer can
+never make a write "succeed" while its frame is lost; a read loop pumps PCM through an `io.Pipe` into the loopback
+body. **End-of-input is explicit:** `{"type":"end"}` closes the pipe cleanly, the loopback body ends, `/v1`
+sends the **terminating chunk** upstream, and only then does audio.cpp emit `transcript.text.done` and `[DONE]`;
+a WebSocket **close without it** aborts the loopback body and so the upstream one (no terminating chunk), a
+**truncated** session that bills a loud zero, so the portal's Stop sends `end` and does not close the socket.
+On the **`/v1` relay**: the per-route slot is acquired before anything else and released exactly once
+(`liveSessionRegistry`; a missing registry fails closed); a copy goroutine pumps the client's body into the
+upstream request through an `io.Pipe`, latching a clean EOF (the terminating chunk) versus a truncated body (any
+other read error, which aborts the upstream body and cancels the context). The teardown of both is **deferred**, so a
+panic cannot skip it: it unblocks the pipe from both sides, expires the request read deadline (`/v1` only, the one
+thing that unblocks a copy goroutine still reading the client's body), cancels the context, joins, and
+**`/v1` records the usage row exactly once, then releases the slot**. Live-versus-**non-live** contention on a single-slot model is not
+guarded: audio.cpp's one-at-a-time behavior surfaces as an upstream error, an honest loud zero. The WebSocket close
+**handshake** is deliberately not used on this path (it would stall about 5 s on the read lock the read loop
+holds): the writer flushes queued frames and closes abruptly, after the browser already has every transcript frame.
 
-**7. Billing is the input PCM the gateway received over the byte rate it told the backend to decode at.** On
-a clean end only (end-of-input requested, `transcript.text.done` then `[DONE]`, a positive rate), the row is
-`(audio_second, pcmBytes ÷ (sample_rate × channels × bytes_per_sample))`, where the rate is recomputed from the
-**same validated params forwarded upstream** (the billing-rate ≡ forwarded-rate invariant), `s16le` is 2 bytes
-and `f32le` 4; every other end is `(audio_second, 0)` with one `Error` log line
-([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event), [ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). A dial
-failure or a non-2xx upstream is an `error` row (`upstream.<status>` or the mapped code); a truncated session
-and a mid-stream `error` after a `200` stay `success` with the loud zero. The completion check is a latch the
-end-of-input does not reset, so if `done` + `[DONE]` can appear per utterance (unconfirmed), an upstream that
-fails after the client sent `end` could still bill clean for the PCM it sent. The row is attributed to
-`UserID`, `TokenID`, `RouteID` and `ServerID`, with no `ServiceID` or `ProjectID`.
+**7. Deadlines and the idle watchdog.** The WebSocket upgrade **hijacks** the connection, which detaches it from the
+server's default 30 s read and write deadlines (§7), so the adapter calls no `liftInferenceDeadlines`; its session is
+bounded by the client (a stop, a drop) and the ping/pong keepalive. The **`/v1` relay** calls `liftInferenceDeadlines`
+and guards the SSE leg like every streamed relay (§7): the streamed-transcription copier (`nativeCopier`) with the
+**idle watchdog** (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, default 120 s) and the per-chunk **write deadline**. The first frame gets the
+cold-start budget (the larger of the target's `timeout_ms` and the idle timeout), every frame re-arms the watchdog,
+and a client that keeps streaming PCM but stops **reading** the SSE is cut by the write deadline after the idle timeout; the
+watchdog cancels the context, the relay tears down, the **per-route slot is released** (a non-reading client cannot
+hold the model's one live slot and deny every later session) and the session bills the **loud zero**. A
+genuine dictation pause is not cut: with no PCM the upstream emits no SSE, and audio.cpp's own idle timeout ends the
+stream first, a clean end billed normally. With the idle timeout disabled there is no watchdog. Because the portal's
+session passes through this relay, the guard covers it too. The upstream SSE line is bounded at 1 MiB, past which the
+read fails and the relay ends, billing a loud zero.
 
-**8. Limits worth knowing.** Full duplex is enabled on **both** ways into the agent's router, the in-process
+**8. Billing is the input PCM the gateway received over the byte rate it told the backend to decode at, and it happens at
+`/v1/audio/transcriptions/live`.** On a clean end only (end-of-input requested, `transcript.text.done` then `[DONE]`, a
+positive rate), the row is `(audio_second, pcmBytes ÷ (sample_rate × channels × bytes_per_sample))`, where the rate is
+recomputed from the **same validated params forwarded upstream** (the billing-rate ≡ forwarded-rate invariant), `s16le`
+is 2 bytes and `f32le` 4; every other end, **an idle-reaped session included**, is `(audio_second, 0)` with one `Error`
+log line ([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event), [ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). A dial failure or a non-2xx upstream is an `error` row (`upstream.<status>` or the mapped code); a
+truncated session and a mid-stream `error` after a `200` stay `success` with the loud zero. The completion
+check is a latch the end-of-input does not reset, so if `done` + `[DONE]` can appear per utterance (unconfirmed), an upstream
+that fails after the client sent `end` could still bill clean for the PCM it sent. The row's attribution depends on the
+caller: a **bearer** session is attributed to its token (`UserID`, `TokenID` and, for a service token, `ServiceID` and
+`ProjectID`, as a buffered transcription is), a **portal** session to the **loopback user** (`UserID` only, like a portal
+chat run's loopback call). Only `/v1` writes a row; the portal adapter and the ticket mint write none.
+
+**9. The portal client.** The composer's record-mode switch (**file**, **record**, **live**) offers *live* only when
+the gate of item 2 is true for the effective transcription model, in a transcription thread
+(`ChatStore.transcriptionStreaming`, `api.modelTranscriptionStreaming`, fail-closed). Under it
+(`gateway/frontend/src/components/chat/`):
+
+- **Capture** (`captureWorklet.ts`, `livePcm.ts`): an `AudioWorkletProcessor` on the page's `AudioContext` takes the
+  microphone as one channel (the browser mixes it to mono), resamples the context's rate (usually 48 kHz) to **16 kHz** by linear
+  interpolation and posts **s16le** PCM in ~100 ms batches (3200 bytes, transferred, far below the 1 MiB frame cap) that
+  the page sends as binary frames. The audio captured while the ticket and the handshake are in flight is kept
+  (up to 100 batches) so the first words are not lost.
+- **Session** (`liveTranscription.ts`, `createLiveSession`): everything up to the first `await` runs inside the user's
+  gesture (the microphone and the audio context need it); the ticket is minted only **after** the microphone is granted (it is
+  single-use and good for 30 s); `stop()` asks the worklet for its last batch, sends `{"type":"end"}` and waits up to 10 s for
+  `done`; `abort()` closes without `end`. The client fixes `16000` Hz, mono, `s16le`.
+- **Transcript** (`liveSession.ts`): `delta` appends, `partial` **replaces** the current session's whole transcript, `done`
+  finalizes (an empty `done` keeps what there is). The text of earlier sessions of a recording is kept apart (`base`) so a
+  reconnected session's partial cannot wipe it.
+- **Recording and reconnect** (`useLiveTranscription.ts`): a recording outlives its connections. On an **unexpected drop while the
+  user is still recording** the hook starts a **new session** (a fresh ticket, a new backend session, no audio resent) after a
+  bounded backoff of **1 s, 2 s, 4 s**, at most **3 attempts in a row** (a session that transcribes something gives them
+  back), carrying the transcript so far across; what is said while the connection is down is lost, and the reconnecting
+  state says so. A **refusal** (an `error` frame, a busy or unsupported model), a **denied microphone** and a **browser
+  without `AudioWorklet`/`getUserMedia`** are never retried.
+- **Commit** (`ChatStore.tsx`): on a finished recording the transcript is appended as **one completed turn written directly**, **not a chat
+  run** (the live endpoint has already done, and billed, the work): a user marker for the recording (there is no clip) and an
+  assistant message `status: 'complete'` in the same shape a buffered transcription answer has, so it renders, auto-titles the chat and
+  saves like one. It is refused while a run is in flight; a failure that left a transcript keeps it (`keepLiveTranscript` commits it).
+  The text is in German and English.
+
+**10. Limits worth knowing.** Full duplex is enabled on **both** ways into the agent's router, the in-process
 path and the dialed fallback, and before any response, so a refusal or a non-2xx from the agent or the child
-reaches the browser promptly rather than after the client has streamed audio into the void
-([Agent-Managed Model Runtime
-§4.7](agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)). The one
+reaches the client promptly rather than after it has streamed audio into the void
+([Agent-Managed Model Runtime §4.7](agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)). The one
 timing note is that the gateway's chunked upstream request sends its headers up front, so the upstream
 exchange begins as soon as the request is dispatched (the first PCM frame follows immediately in the real
-microphone flow). A
-ticket opens only on the gateway process that minted it, and a live usage row carries no `ServiceID` or
-`ProjectID`. The path is verified against mock backends and a real agent proxy and router on both paths, **not
-yet against a real audio.cpp `/live`** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). The portal's microphone client is a later phase.
+microphone flow). A ticket opens only on the gateway process that minted it (issue #285). A refused portal
+session shows a generic error, not a busy-specific one (item 3). **Through a Kubernetes Ingress** the portal
+WebSocket works, but the bearer endpoint is **not** streamed full-duplex by the shipped `ingress.yaml`, because
+ingress-nginx buffers request bodies per Ingress and not per path; a dedicated Ingress for the two live paths is
+the follow-up ([Deployment View §7.3](../07-deployment-view.md#73-kubernetes), [Networking & Mesh §10](networking-mesh.md#10-agentgateway-websocket-transport)). The path is verified against mock backends and a real agent proxy and router on
+both paths, **not yet against a real audio.cpp `/live`** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)).
 
 ## 4. Session / continuity signals
 
@@ -3571,6 +3667,12 @@ transcodes nothing; the conversion's accepted costs are in [Risks
 find nothing; an untitled transcription chat is **titled from its transcript** on
 completion (`titleFromTranscript`), falling back to the localized "Untitled" placeholder.
 
+**A live input mode.** For a model the gateway says streams (`GET /api/portal/model-transcription-streaming`, §3.8
+item 2), the composer's record-mode switch has a third choice beside attaching a file and recording a clip: **live**.
+The microphone is streamed up a WebSocket while the user speaks and the transcript appears as it is said; on
+Stop it lands as **one completed turn written directly, not a chat run** (the live endpoint has already done
+and billed the work), so it bypasses the clip, the WAV conversion and the run described above (§3.8 item 9).
+
 **The turn is committed as structured content.** `portal.AssistantTurn` carries
 an optional `ContentParts`, written as the message's `content` when it is
 non-empty and ignored otherwise, so a text turn's stored shape stays
@@ -3759,16 +3861,18 @@ Every inference error response uses the gateway-wide envelope
 | `speech.stream_unsupported` | 400 | a speech request whose stream fields the relay cannot honor: a non-boolean `stream`, a `stream_format` other than `sse` or `audio` or one on a request that does not stream, or `response_format=wav` beside `stream: true` (audio.cpp serves streaming only as `pcm`) (§3.6) |
 | `speech.pcm_unavailable` | 502 | a one-shot `pcm` request whose synthesized clip cannot be served as raw PCM: the mapped model's native WAV is not 16-bit mono PCM, is structurally unsound or declares a data size past the upstream's body, or the 2xx declared no usable `Content-Length` (§3.6 item 2a). A **post-synthesis** code, so recorded as an error row billed `(audio_second, 0)` |
 | `speech.upstream_error` | the upstream's own status | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"`; an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged (§3.6) |
-| `transcription.model_required` / `transcription.file_required` | 400 | the transcription form failed `validateTranscriptionRequest` (§3.7): no `model`, or no non-empty part named `file` |
+| `transcription.model_required` / `transcription.file_required` | 400 | the transcription form failed `validateTranscriptionRequest` (§3.7): no `model`, or no non-empty part named `file`; and, for `model` alone, a blank `model` query on the bearer live endpoint (§3.8) |
 | `transcription.invalid` | 400 | a structurally broken form (§3.7): not `multipart/form-data` or no boundary (a JSON body included), a truncated or malformed part, a field over 1 MiB, a repeated single-use field, a body that could not be read — or **more than one** non-empty `file` part |
 | `transcription.response_format_unsupported` | 400 | a `response_format` other than `json` or absent — `verbose_json`, `text`, `srt`, `vtt` and any other value (§3.7) |
 | `transcription.stream_unsupported` | 400 | a **non-boolean** `stream`, or any `stream_format` — the only shapes still refused, since a `stream=true` against a `mode=streaming` model is now served as an SSE relay (§3.7 items 5, 11) |
 | `transcription.unavailable` | 404 | a transcription resolved to an agent-launched model whose agent has not declared `multipart_proxy` (an agent older than 0.9.0, or one that has not reported since the gateway restarted or the agent was upgraded); nothing is relayed (§3.7) |
 | `transcription.upstream_error` | the upstream's own status, or **502** | a non-2xx audio.cpp body that was a **plain string**, wrapped into the OpenAI error object with the gateway's own `type: "upstream_error"` (an already OpenAI-shaped body passes through with its own `type` and `code`, and any other body is relayed unchanged); **and**, as a 502, a 2xx response that was **over the buffer bound** or broke off mid-read, with nothing of the body written (§3.7) |
-| `portal.live_transcription_params_invalid` | 400 | the live-transcription ticket request's `sample_rate` (outside 1000 to 384000), `channels` (outside 1 to 16), `sample_format` (not `s16le` or `f32le`) or `language` (outside `[A-Za-z0-9_-]`, up to 64) is out of range; refused at the ticket so no session is opened that could only bill a loud zero (§3.8) |
-| `portal.live_transcription_not_streaming` | 409 | the live-transcription ticket's model resolved to a mapping with no stored `transcription_streaming = yes` verdict (§3.8) |
-| `portal.live_transcription_agent_unsupported` | 409 | the live-transcription ticket's model is agent-launched and its agent has not declared `fullduplex_proxy` (an agent older than 0.12.0, or one that has not reported since the gateway restarted or the agent was upgraded); a direct `audio_cpp` target is exempt (§3.8) |
-| `portal.live_transcription_ticket_failed` | 500 | the ticket could not be minted (no ticket store, or the random source or the encoding failed) (§3.8) |
+| `transcription.live_params_invalid` | 400 | the live-transcription params are out of range or absent, on either transport (the portal ticket's body or the bearer `/v1/audio/transcriptions/live` query): `sample_rate` (outside 1000 to 384000), `channels` (outside 1 to 16), `sample_format` (not `s16le` or `f32le`) or `language` (outside `[A-Za-z0-9_-]`, up to 64); refused before admission so no session is opened that could only bill a loud zero (§3.8). Surface-neutral since [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once), which phase 1 namespaced under `portal.` |
+| `transcription.live_not_streaming` | 409 | the live-transcription model resolved to a mapping with no stored `transcription_streaming = yes` verdict; the shared gate's refusal on the portal ticket and the bearer endpoint alike (§3.8) |
+| `transcription.live_agent_unsupported` | 409 | the live-transcription model is agent-launched and its agent has not declared `fullduplex_proxy` (an agent older than 0.12.0, or one that has not reported since the gateway restarted or the agent was upgraded); a direct `audio_cpp` target is exempt; the shared gate's refusal on both transports (§3.8) |
+| `transcription.live_busy` | 503 | the route of a bearer `/v1/audio/transcriptions/live` request already has an active live session (audio.cpp serves one `/live` per model); transient, the slot frees when that session ends; refused before a byte moves, so no usage row. A portal session meets the same refusal on its loopback and sees it as a generic `error` frame (§3.8) |
+| `portal.live_transcription_ticket_failed` | 500 | the ticket could not be minted (no ticket store, or the random source or the encoding failed); portal-only, the bearer endpoint mints no ticket (§3.8) |
+| `model.transcription_streaming_failed` | 500 | a store failure while reading `GET /api/portal/model-transcription-streaming`; never read as `streaming: false` (§3.8 item 2) |
 | `routing.no_model_route` | **404** | no mapping for the model/flavor — and what an all-chat model **group** answers a capability-carrying request, what the images, speech and transcription relays answer when the resolved agent-launched child's spec excludes `openai_images` (`openai_audio` for speech and transcription), and what the text translate path answers when that child's spec is images-only or audio-only (§6) |
 | `routing.no_healthy_host` | **503** | mappings exist but every candidate is gated |
 | `routing.voice_unavailable` | **503** | a speech request named a `voice` that at least one candidate is **known** (from its cached voice list) to lack while an eligible candidate (one that lists it, or of unknown/uncached status) remained, so the voice **narrowed** the candidates to the eligible ones and none of those is usable (unreachable, unhealthy or busy) — `routing.no_healthy_host`'s narrower twin, answered instead of it **only** when the voice narrowed the pool; a voice no candidate is known to lack, or one **every** candidate is known-absent for (fail open), never produces it ([Routing & Model Selection §2.5](routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open), §3.6 item 8) |

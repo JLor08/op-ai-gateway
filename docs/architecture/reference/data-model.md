@@ -599,7 +599,10 @@ catch-all `model_override`, which has its own column).
 **No migration for live transcription** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266). The fifth `audio_second` producer
 reuses migration 81's `billing_unit`/`billing_quantity` pair and the existing `audio_second` unit unchanged, and a
 live session keeps no persistent state of its own: the single-use ticket store and the per-route session registry
-are in-process (a ticket opens only on the gateway process that minted it).
+are in-process (a ticket opens only on the gateway process that minted it, issue #285). The phase 2 and 3 work
+(the portal's microphone client, the `model-transcription-streaming` gate, the bearer `/v1/audio/transcriptions/live`
+endpoint and the WebSocket's loopback to it, [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)) added no migration either: the one usage row per session reuses the
+same columns, recorded at `/v1/audio/transcriptions/live`.
 
 ### External vendor accounts
 

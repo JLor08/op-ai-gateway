@@ -331,6 +331,25 @@ built by `server-agent/internal/client/ws.go`'s `WSSender` and served by
   re-declare **all six** `X-OP-*` directives (the five internal-header
   blankings plus `X-OP-Edge-Scheme`) verbatim — see
   `gateway/deploy/nginx/locations.conf`.
+- **The same location rules apply to the portal's live-transcription WebSocket, with one difference.** The
+  composer's `GET /api/portal/transcription-live` (not an agent route) is upgraded by its own `location =
+  /api/portal/transcription-live` block in `gateway/deploy/nginx/locations.conf` (and the mirrored copy in the k8s
+  `nginx-configmap.yaml`): `proxy_http_version 1.1`, `Upgrade`/`Connection: upgrade`, the same six `X-OP-*` directives
+  re-declared verbatim (any `proxy_set_header` there discards the inherited set), `proxy_buffering off` and
+  `proxy_read_timeout 3600s` (the idle limit of an upgraded connection, which must never be shorter than the gateway's
+  own idle watchdog and ping). **`Host` is `$http_host`, not `$host`**: the gateway guards a browser upgrade, which
+  cannot carry the CSRF header, with coder/websocket's default same-origin check, which compares the `Origin` header's
+  host **and port** with the `Host` it sees. `$host` drops the port, so a gateway published on a non-default port
+  (the compose files publish `:8080` and `:8443`) would see `gateway.example` against `Origin:
+  https://gateway.example:8443` and refuse every upgrade with `403`; `$http_host` forwards the browser's `Host` as sent.
+  (The agent stream keeps `$host`: its clients are agents, not browsers, and send no `Origin` to compare.) The Vite dev and preview proxy gets a dedicated
+  `ws: true` context for the path, for the same reason without `changeOrigin`. The portal WebSocket's loopback to
+  `/v1/audio/transcriptions/live` stays inside the gateway process and never passes through nginx. The bearer
+  `/v1/audio/transcriptions/live` (and its `/openai/` alias) is a chunked, full-duplex POST and has its own regex
+  location (`proxy_request_buffering off`, `proxy_buffering off`, `client_max_body_size 0`, a body timeout as long as
+  the stream); **a Kubernetes Ingress in front buffers request bodies per Ingress, not per path**, so the shipped
+  `ingress.yaml` does not stream that endpoint full-duplex, and a dedicated Ingress for the two paths is the follow-up
+  ([ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once), [Deployment View §7.3](../07-deployment-view.md#73-kubernetes)).
 
 **One registration table, two muxes.** Every agent endpoint — including the
 three the [agent-managed model runtime](agent-runtime-manager.md) adds

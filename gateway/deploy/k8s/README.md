@@ -425,3 +425,33 @@ WebSocket support on by default). The one thing that actually gates it is the ap
 — see `configmap.yaml`/README.md above and
 `docs/architecture/cross-cutting/networking-mesh.md` §6.1 (the public-mux gate) and §10
 (one registration table, two muxes).
+
+## Live transcription (portal WebSocket and bearer endpoint)
+
+Live transcription ("transcribe while speaking", issue #266) uses two paths with different needs; the
+`op-gateway-web` nginx (`nginx-configmap.yaml`, mirroring `../nginx/locations.conf`) already carries both of its
+locations, and the Ingress caveat below is the only thing left to you.
+
+- **The portal's microphone WebSocket (`/api/portal/transcription-live`) works through the shipped Ingress.** Its
+  nginx block upgrades the connection like the agent stream's, with one deliberate difference: `Host` is
+  `$http_host`, not `$host`. The gateway guards the browser upgrade (which cannot carry the CSRF header) with a
+  same-origin check that compares the `Origin` header's host **and port** with the `Host` it receives; `$host`
+  drops the port, so a gateway published on a non-default port would refuse every upgrade with `403`. If you
+  put another reverse proxy in front of the Ingress, it must forward the original `Host` (with its port) too. The
+  portal's session loops back to the gateway's own `POST /v1/audio/transcriptions/live` **inside the backend
+  pod**, so that second hop never touches nginx or the Ingress.
+- **The bearer `POST /v1/audio/transcriptions/live` (and `/openai/v1/...`) is not streamed full-duplex by the
+  shipped `ingress.yaml`.** It is a chunked request whose body is a live PCM stream and whose response is SSE on
+  the same exchange. The web pod's nginx has an unbuffered location for it (`proxy_request_buffering off`), but
+  ingress-nginx buffers request bodies by default, so the stream would be held back until it ends and no transcript
+  would come back in time. The annotation that turns this off,
+  `nginx.ingress.kubernetes.io/proxy-request-buffering: "off"`, is **per Ingress, not per path**: setting it on
+  the existing Ingress would unbuffer every upload through the host. The intended fix (not shipped, and not
+  exercised against a cluster here) is a **second Ingress** for exactly the two paths
+  (`/v1/audio/transcriptions/live` and `/openai/v1/audio/transcriptions/live`, `pathType: Exact`) pointing at the
+  same `op-gateway-web` Service and carrying that annotation. Note that the controller's own `client-body-timeout`
+  (a global key of the ingress-nginx ConfigMap, 60 s by default) is the longest gap it tolerates between two
+  reads of an unbuffered body, so a speaker who pauses longer than that needs it raised. That dedicated Ingress
+  is a known follow-up; until it exists the portal's live mode is unaffected and only programmatic bearer
+  clients of the live endpoint need it. The reasoning is `docs/architecture/09-architecture-decisions.md` ADR-073
+  and `docs/architecture/07-deployment-view.md` §7.3.

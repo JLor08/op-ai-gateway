@@ -1501,7 +1501,8 @@ request with **no declared length**, so the transport sends it chunked in a back
 returns the response as soon as the child's headers arrive; the inbound `Accept-Encoding` is stripped as on
 every proxy path, so the relayed SSE is the decoded body. The existing buffering `serveProxy` is
 unchanged; `/live` is the new, non-buffering path beside it. No protocol upgrade is involved (§4.5): the
-browser's WebSocket ends at the gateway, and this leg is a plain chunked POST.
+browser's WebSocket ends at the gateway (whose handler loops it back to the gateway's own bearer endpoint, [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)),
+and this leg, from that endpoint to the router, is a plain chunked POST.
 
 Which hop `EnableFullDuplex` governs is the load-bearing question, and §4.7 has the answer: in
 production the agent's TLS proxy serves this router **in-process** with the same `(w, r)`, so the router's
@@ -3027,10 +3028,11 @@ the gateway (`gateway.RuntimeVoicesFeature` is exported for the health loop in
 `multipart_proxy`: **the gateway gates real behavior on it, fail-closed, and that gate is the
 flag's purpose.** It says the router serves `POST /live/{model}` (§4.1), a full-duplex relay of a
 chunked request body to the child's streaming transcription endpoint. The gateway's
-live-transcription ticket endpoint mints a ticket for an **agent-launched** target only on positive
+live-transcription gate admits an **agent-launched** target only on positive
 evidence of it (`AgentFeatures.Has`, which is false for a server that has never reported, for one whose
 last sample lacked the name, and for a nil registry) and refuses the rest with
-`409 portal.live_transcription_agent_unsupported`; a direct `audio_cpp` target has no router in front of
+`409 transcription.live_agent_unsupported`, both at the portal's ticket endpoint and at the bearer
+`/v1/audio/transcriptions/live` (they share the one gate, [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)); a direct `audio_cpp` target has no router in front of
 it and is exempt. Trying the route instead is not an option, because a router without it answers `404`
 for `/live/{model}`, the same status it answers an unmanaged model with. The flag gates nothing on the
 agent, which needs no permission to serve a route it carries. The name is on the agent's list
@@ -3294,12 +3296,12 @@ is no hard version dependency
 **`0.11.1` → `0.12.0` (issue #266, live transcription) is MINOR, the plain case once more.**
 `agent.Features` gained `fullduplex_proxy` for the router's `POST /live/{model}`
 ([§4.1](#41-control-routes)), a new observable router behavior that the gateway's live-transcription
-ticket endpoint gates on, fail-closed ([§7](#7-feature-negotiation)). The bump is **one for the
+gate (the portal's ticket endpoint and the bearer `/v1/audio/transcriptions/live`) checks, fail-closed ([§7](#7-feature-negotiation)). The bump is **one for the
 whole branch**: the route, the flag and the version pin ship together, and the `Version` assertion
 moved to the newest feature's test, `TestFeaturesDeclareFullduplexProxy`, beside
 `TestFeaturesDeclareRuntimeVoices` (which keeps its own presence and `Since` check, `"0.11.0"`).
 There is no mixed-fleet hazard: a gateway that predates the name never asks, and an agent older
-than 0.12.0 is never sent a live session by a newer gateway, only refused at the ticket
+than 0.12.0 is never sent a live session by a newer gateway, only refused at the gate
 ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The

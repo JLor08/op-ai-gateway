@@ -12,19 +12,19 @@ different trust boundary:
 |---|---|---|---|
 | Portal session | The browser SPA | `op_ai_gateway_session` cookie + `X-OP-CSRF` header on unsafe methods | `internal/gateway/auth.go` (`authenticateWeb`) |
 | Bearer API token | External OpenAI/Anthropic-compatible clients, Codex, Claude Code, service integrations | `Authorization: Bearer <secret>` | `internal/auth.TokenStore`, `internal/gateway/server.go` (`authenticate`) |
-| Internal trusted loopback | The gateway's own background chat-run executor calling itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions` and `/v1/audio/voices` only) |
+| Internal trusted loopback | The gateway's own background chat-run executor, and the portal's live-transcription WebSocket adapter, calling the gateway itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/transcriptions/live` and `/v1/audio/voices` only) |
 | Agent token | The `op-ai-server-agent` reporting/proxy process on each AI server | `Authorization: Bearer <agent-secret>` against a separate token universe | `internal/gateway/agent_auth.go` |
 
 `/v1/chat/completions` (and its `/openai/v1/` alias) is the one inference
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
 token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`,
-`/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions` and
-`/v1/audio/voices` (and their `/openai/v1/` aliases) accept
+`/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions`,
+`/v1/audio/transcriptions/live` and `/v1/audio/voices` (and their `/openai/v1/` aliases) accept
 **either** the internal trusted-loopback pair **or** a bearer token, but never a portal
 session cookie: they are reachable by the gateway's own background executor over
 loopback, never by a logged-in browser (`requireInternalOrBearerAnyScope` → `authenticateInternalOrBearer`,
 `internal/gateway/auth_internal_or_bearer.go`; speech is the third user of that leg,
-transcription the fourth and the cache-backed voices listing the fifth: a browser reads
+transcription the fourth, the cache-backed voices listing the fifth and the live-transcription relay the sixth: a browser reads
 the same cache through the session-cookie `GET /api/portal/model-voices` instead,
 [ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter).
 The portal chat's `speech` run kind calls `/v1/audio/speech`
@@ -40,19 +40,22 @@ endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
 accepted there at all.
 
 **One short-lived credential sits beside the four surfaces: the live-transcription ticket**
-([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). A browser WebSocket cannot send `X-OP-CSRF` (or any header), so
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)). A browser WebSocket cannot send `X-OP-CSRF` (or any header), so
 `GET /api/portal/transcription-live` cannot be CSRF-protected the way every other portal mutation is. The
-authenticated, CSRF-protected `POST /api/portal/transcription-live-ticket` mints, after the full
-routing and admission gate, an **AES-256-GCM-encrypted, single-use ticket of about 30 seconds** (random
-per-process key) whose claims carry the resolved target, the validated audio parameters and the
-`UserID` and `TokenID`. The upgrade presents it as a `Sec-WebSocket-Protocol` value, **never** in the
-URL, and the handler redeems it **before** `websocket.Accept` (a miss is `401`, no upgrade); `Accept` keeps
-coder/websocket's default same-origin check, so a cross-origin upgrade is refused `403`. The ticket is the
-upgrade's only credential: the handler reads no session cookie, takes no model, route or rate from the
-client, and spends no second admission. It is per process (a ticket opens only on the instance that minted
-it), the follow-up being a cross-instance key and single-use store
-([API Compatibility & Inference
-§3.8](compatibility-and-inference.md#38-live-transcription-the-portal-websocket-transport)).
+authenticated, CSRF-protected `POST /api/portal/transcription-live-ticket` mints, after the routing gate (but
+**without** the rate/quota/budget admission, which is spent later at `/v1/audio/transcriptions/live`), an
+**AES-256-GCM-encrypted, single-use ticket of about 30 seconds** (random per-process key) whose claims carry the
+resolved target, the validated audio parameters and the `UserID` (the token id, service and project travel as a
+record). The upgrade presents it as a `Sec-WebSocket-Protocol` value, **never** in the URL, and the handler redeems it
+**before** `websocket.Accept` (a miss is `401`, no upgrade); `Accept` keeps coder/websocket's default same-origin
+check, so a cross-origin upgrade is refused `403`. The ticket is the upgrade's only credential: the handler reads no
+session cookie and takes no model, route or rate from the client. What the handler then does with the ticket is the
+**loopback leg's newest use** (the sixth user of the bearer-or-loopback leg above): it replays the ticket's `UserID` over the internal trusted-loopback pair to the gateway's own
+`POST /v1/audio/transcriptions/live`, so the session is authenticated, admitted once and billed there as that user (a
+token-less session principal, never elevated, never a cookie); a bearer client of the same endpoint authenticates
+with its token and needs no ticket and no CSRF. The ticket is per process (a ticket opens only on the instance that
+minted it), the follow-up being a cross-instance key and single-use store, issue #285
+([API Compatibility & Inference §3.8](compatibility-and-inference.md#38-live-transcription-the-bearer-v1-endpoint-and-the-portal-websocket)).
 
 ## 2. Local password authentication
 
@@ -375,7 +378,7 @@ flowchart TD
     P -- no/invalid bearer --> X2
     P -- pass --> L
 
-    D -- "/v1/images/generations, /v1/images/edits,\n/v1/audio/speech, /v1/audio/transcriptions,\n/v1/audio/voices (/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
+    D -- "/v1/images/generations, /v1/images/edits,\n/v1/audio/speech, /v1/audio/transcriptions,\n/v1/audio/transcriptions/live, /v1/audio/voices\n(/openai/v1/... aliases)" --> R{"X-OP-Internal-Auth\nmatches secret?"}
     R -- yes --> S["Loopback principal\n(session-shaped, never elevated)"]
     R -- no --> T{"Authorization: Bearer present?"}
     T -- yes --> U["Bearer principal\n(TokenStore.LookupBearer)"]
@@ -390,7 +393,7 @@ flowchart TD
 ```
 
 Note that `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`,
-`/v1/audio/transcriptions` and `/v1/audio/voices` resolve their principal through `authenticateInternalOrBearer` (`auth_internal_or_bearer.go`)
+`/v1/audio/transcriptions`, `/v1/audio/transcriptions/live` and `/v1/audio/voices` resolve their principal through `authenticateInternalOrBearer` (`auth_internal_or_bearer.go`)
 rather than through `authenticateWeb`. The `X-OP-Internal-Auth` check itself is **not**
 duplicated: both entry points call the same `loopbackPrincipal`
 (`internal/gateway/auth.go`), so the constant-time secret comparison and its
