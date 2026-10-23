@@ -207,6 +207,7 @@ func TestLiveChildQueryPathModelIsAuthoritative(t *testing.T) {
 		{"no inbound model", "sample_rate=16000&channels=1&sample_format=s16le&language=de", "whisper-1"},
 		{"inbound model overridden", "sample_rate=16000&model=should-not-win&language=de", "whisper-1"},
 		{"empty inbound", "", "whisper-1"},
+		{"colon in the model id stays verbatim", "sample_rate=16000&channels=1&sample_format=s16le", "CrisperWhisper2.0-GGUF:BF16"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -217,6 +218,12 @@ func TestLiveChildQueryPathModelIsAuthoritative(t *testing.T) {
 			}
 			if models := parsed["model"]; len(models) != 1 || models[0] != tc.model {
 				t.Fatalf("model params = %v, want exactly one %q (the path model must be authoritative)", models, tc.model)
+			}
+			// audio.cpp reads the query value VERBATIM, so the model must appear with its
+			// characters literal -- url.Values.Encode would percent-escape a ':' to %3A,
+			// which audio.cpp would then fail to match ("unknown model id: …%3A…").
+			if !strings.Contains(out, "model="+tc.model) {
+				t.Fatalf("raw query %q does not carry model=%q verbatim (a ':' must not be percent-escaped)", out, tc.model)
 			}
 			// Forwarded params survive unchanged.
 			inboundParsed, _ := url.ParseQuery(tc.inbound)

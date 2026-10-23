@@ -713,8 +713,16 @@ func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
 // leave two model params and let Query().Get("model") read the inbound one.
 func liveChildQuery(inbound, model string) string {
 	values, _ := url.ParseQuery(inbound) // partial parse on error is fine; model is set authoritatively below
-	values.Set("model", model)
-	return values.Encode()
+	values.Del("model")                  // drop any inbound model= so the authoritative path model is the only one
+	base := values.Encode()
+	// audio.cpp reads the `model` query value VERBATIM (no URL-decode), so a model id with
+	// a ':' must reach it with a LITERAL colon; values.Encode would escape it to %3A and
+	// audio.cpp would fail to match ("unknown model id: …%3A…"). A ':' is legal unescaped
+	// in a query and a model id carries no query delimiter, so append it literally.
+	if base != "" {
+		base += "&"
+	}
+	return base + "model=" + model
 }
 
 // writeBodyReadError answers a request whose body, read through a
