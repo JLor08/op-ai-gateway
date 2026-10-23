@@ -6111,6 +6111,145 @@ func TestRunAppHealthOnceVoicesAgentOnTheWire(t *testing.T) {
 	}
 }
 
+// ---- the agent-launched child's speech-language pull (#282) ----
+
+// agentSpeechParamsFlag declares BOTH router flags the agent audio pass depends
+// on: runtime_voices (the pass itself) and runtime_model_params (the params
+// pull folded into it). The two arrive together in practice -- the feature
+// registry is append-only, so runtime_model_params (0.13.0) implies
+// runtime_voices (0.11.0) -- which is why the params pull rides the voices-gated
+// pass under its OWN flag.
+var agentSpeechParamsFlag = []string{gateway.RuntimeVoicesFeature, gateway.RuntimeModelParamsFeature}
+
+// TestRunAppHealthOnceSpeechParamsAgentPullsThroughTheRouterAndWrites is the
+// params pull's whole job (#282): a RUNNING agent-launched audio.cpp child that
+// is a plain tts model, on a server whose agent declared runtime_model_params,
+// has its /v1/models listing pulled through the agent router's Status-only
+// GET /upstream/<model>/v1/models and the `language` fact it carries
+// (AcceptsLanguage, LanguageDefault) written to the mapping's speech_language
+// cache row. It is the twin of the static server's speech-params step, through
+// the route the gateway reaches an agent child by -- the same target the voices
+// pass builds, with the per-mapping spec credential attached.
+func TestRunAppHealthOnceSpeechParamsAgentPullsThroughTheRouterAndWrites(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentSpeechParamsFlag, audioCppMapping("m1", "pocket_tts"))
+	prober.acVerdicts["pocket_tts"] = provider.AudioCppVerdicts{AcceptsLanguage: true, LanguageDefault: "zh"}
+	at := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return at }
+
+	runCapabilityCycle(runner)
+
+	if got, want := prober.audioCppAsked(), []string{"pocket_tts"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("models probe asked about %v, want %v", got, want)
+	}
+	target := prober.acTargets[0]
+	if target.Provider != routing.ProviderServerAgent || target.Endpoint != "http://s1.local:8001/upstream/pocket_tts" || target.Timeout != time.Second {
+		t.Fatalf("models probe target = %+v, want {Provider:server_agent Endpoint:http://s1.local:8001/upstream/pocket_tts Timeout:1s}", target)
+	}
+	if got, want := prober.acAuth[0], (provider.UpstreamAuth{Header: "X-App-Key", Token: "app-tok"}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("models probe credential = %+v, want the spec's %+v", got, want)
+	}
+	row, ok := st.speechLanguageRowOf("m1")
+	if !ok {
+		t.Fatal("m1 has no speech_language row, want one")
+	}
+	want := routing.ModelMappingCacheRow{
+		MappingID: "m1", CacheType: "speech_language", ScopeKey: "",
+		Payload: `{"accepts":true,"default":"zh"}`, UpdatedAt: at,
+	}
+	if row != want {
+		t.Fatalf("speech_language row = %+v, want %+v", row, want)
+	}
+}
+
+// TestRunAppHealthOnceSpeechParamsAgentWithoutTheFlagNeverPulls is the
+// fail-closed gate on the params route, separate from the voices gate: an agent
+// that declared runtime_voices but NOT runtime_model_params runs the voices pass
+// yet is NEVER asked for /v1/models, because an older router answers a 404
+// (runtime.upstream_endpoint_not_allowed) for the route, so the pull could not
+// succeed and would only add silent no-op traffic each tick. No request is made
+// and no speech_language row is written. The control case, with the params flag,
+// proves the setup is otherwise pull-capable.
+func TestRunAppHealthOnceSpeechParamsAgentWithoutTheFlagNeverPulls(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		features  []string
+		wantPulls int
+	}{
+		{"control: the params flag is declared", agentSpeechParamsFlag, 1},
+		{"only the voices flag is declared", agentVoicesFlag, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober, _ := agentVoicesRunner(t, tc.features, audioCppMapping("m1", "pocket_tts"))
+			prober.acVerdicts["pocket_tts"] = provider.AudioCppVerdicts{AcceptsLanguage: true, LanguageDefault: "zh"}
+
+			runCapabilityCycle(runner)
+
+			if got := len(prober.audioCppAsked()); got != tc.wantPulls {
+				t.Fatalf("models probe asked %d times, want %d", got, tc.wantPulls)
+			}
+			if tc.wantPulls == 0 {
+				if row, ok := st.speechLanguageRowOf("m1"); ok {
+					t.Fatalf("m1 has a speech_language row %+v, want none (the params route was not pulled)", row)
+				}
+			} else if _, ok := st.speechLanguageRowOf("m1"); !ok {
+				t.Fatal("m1 has no speech_language row, want one")
+			}
+		})
+	}
+}
+
+// TestRunAppHealthOnceSpeechParamsAgentFailedReadLeavesLastGoodAndBacksOff: the
+// route answers 404 for a child that stopped between the agent's loaded report
+// and this GET, which says nothing about the model's params, so it is a FAILED
+// read -- the speech_language row on file (the last fact learned while the model
+// was loaded) survives, and a back-off opens so the pull does not retry every
+// tick. Once the window elapses it asks again; a success is written over the row
+// and clears the back-off. The fake hands a verdict back beside the error, so
+// only the error guard stands between it and the row.
+func TestRunAppHealthOnceSpeechParamsAgentFailedReadLeavesLastGoodAndBacksOff(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentSpeechParamsFlag, audioCppMapping("m1", "pocket_tts"))
+	current := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return current }
+	prober.acVerdicts["pocket_tts"] = provider.AudioCppVerdicts{AcceptsLanguage: true, LanguageDefault: "would_overwrite"}
+	prober.acErr["pocket_tts"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+	seeded := routing.SpeechLanguagePayload(false, "")
+	st.seedCacheRow("m1", routing.ModelMappingCacheSpeechLanguage, seeded)
+	asked := func() int { return len(prober.audioCppAsked()) }
+
+	runCapabilityCycle(runner)
+	if n := asked(); n != 1 {
+		t.Fatalf("asked %d times after the first tick, want 1", n)
+	}
+	if !runner.speechParamsBackoff.active("m1", current) {
+		t.Fatal("no back-off is open after a failed params read")
+	}
+	if got, ok := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); !ok || got != seeded {
+		t.Fatalf("speech_language payload = %q (present=%v), want the seeded %s left untouched", got, ok, seeded)
+	}
+
+	current = current.Add(audioCppVoicesBackoff / 2)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 1 {
+		t.Fatalf("asked %d times inside the back-off, want still 1", n)
+	}
+
+	// The child answers again past the window: the success is written over the
+	// seeded row and clears the back-off, so the next tick asks without waiting.
+	delete(prober.acErr, "pocket_tts")
+	prober.acVerdicts["pocket_tts"] = provider.AudioCppVerdicts{AcceptsLanguage: true, LanguageDefault: "auto"}
+	current = current.Add(audioCppVoicesBackoff + time.Second)
+	runCapabilityCycle(runner)
+	if n := asked(); n != 2 {
+		t.Fatalf("asked %d times after the back-off elapsed, want 2", n)
+	}
+	if runner.speechParamsBackoff.active("m1", current) {
+		t.Fatal("back-off still open after a successful read, want it cleared")
+	}
+	if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":true,"default":"auto"}` {
+		t.Fatalf("speech_language payload = %s, want the recovered {accepts:true,default:auto}", got)
+	}
+}
+
 // ---- the speech rate trigger (#263) ----
 //
 // The health loop's part in streamed speech billing: a streaming speech mapping needs

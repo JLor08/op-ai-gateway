@@ -289,6 +289,13 @@ type appHealthRunner struct {
 	// and not on every tick. Its zero value is ready; the runner is used by
 	// pointer, never copied.
 	speechRateBackoff mappingBackoff
+	// speechParamsBackoff remembers which agent-launched mappings' /v1/models pull
+	// failed lately (the separate passthrough read probeAgentVoices folds in, #282),
+	// so an agent child the router finds cold is not asked once per loaded tts
+	// mapping per health tick. Its own back-off and not voicesBackoff's because it
+	// is its own read that can fail independently. Its zero value is ready; the
+	// runner is used by pointer, never copied.
+	speechParamsBackoff mappingBackoff
 }
 
 // lateSpeechRateTrigger is the app-health runner's handle on the gateway Server's
@@ -948,14 +955,16 @@ func audioCppVoicesWanted(v provider.AudioCppVerdicts) bool {
 }
 
 // mappingBackoff is a cross-tick memory of which mappings a per-mapping step of
-// the audio passes should leave alone for a while. The runner holds two: the
+// the audio passes should leave alone for a while. The runner holds three: the
 // voices one (voicesBackoff), so that a server that does not serve the voices
 // listing (an older audio.cpp, a proxy without the route) is not asked once per
-// loaded tts mapping per health tick for as long as the model stays loaded, and
-// the speech rate one (speechRateBackoff), so that a benchmark that produced no
-// rate is not started once per tick. A window is opened for THAT mapping, and a
-// success, or the model leaving the set the step applies to (an unload, a reload,
-// a task change), clears it, so a reload retries at once.
+// loaded tts mapping per health tick for as long as the model stays loaded; the
+// speech rate one (speechRateBackoff), so that a benchmark that produced no rate
+// is not started once per tick; and the speech params one (speechParamsBackoff),
+// the agent pass's /v1/models pull, the same shape as the voices one. A window is
+// opened for THAT mapping, and a success, or the model leaving the set the step
+// applies to (an unload, a reload, a task change), clears it, so a reload retries
+// at once.
 //
 // The audio.cpp passes (static and agent-launched) run one goroutine per
 // application, so the memory is mutex-guarded. It is keyed by mapping id and
@@ -1118,11 +1127,16 @@ func (r *appHealthRunner) cacheAudioCppSpeechParams(ctx context.Context, mp rout
 // -- keeps the row on file and opens a back-off. A mapping leaving the loaded or
 // plain-tts set clears its back-off, so a reload is asked at once.
 //
-// The same eligible set -- running, audio.cpp, plain tts -- is where the speech rate
-// step for an agent-launched child runs (cacheAgentSpeechRate, #263): after the voices
-// fetch, a child whose stored speech_streaming verdict is yes has the gateway benchmark
-// its output byte rate when none is cached for the launch spec it runs under. It starts
-// no child, for the same reason the voices route does not: only a running one is asked.
+// The same eligible set -- running, audio.cpp, plain tts -- is where two more steps for an
+// agent-launched child run. The speech-language pull (fetchAndCacheSpeechParams, #282) is
+// a second passthrough read, GET /upstream/<model>/v1/models, gated on its own
+// RuntimeModelParamsFeature (fail-closed, its own route) and folded into this loop so it
+// reuses the eligibility without a second capabilities read; it writes only the `language`
+// fact, the verdicts arriving by telemetry instead. The speech rate step
+// (cacheAgentSpeechRate, #263) has a child whose stored speech_streaming verdict is yes
+// benchmark its output byte rate when none is cached for the launch spec it runs under.
+// Both start no child, for the same reason the voices route does not: only a running one
+// is asked.
 func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.AIServer, app routing.Application, lister provider.AudioCppVoicesLister) {
 	specs, err := r.store.RuntimeSpecsByApplication(ctx, app.ID)
 	if err != nil {
@@ -1142,6 +1156,21 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 	for _, name := range r.loaded.LoadedAppModels(app.ID, server.ID) {
 		loadedSet[name] = struct{}{}
 	}
+	// The speech-language pull (#282) is the second passthrough read folded into
+	// this same eligible-mapping loop -- GET /upstream/<model>/v1/models through
+	// the agent router -- so it reuses the set agentVoiceProbeSpec already decides
+	// (no second per-mapping capabilities read). It is gated on its OWN feature,
+	// computed once here, NOT folded under the voices flag: an older router can
+	// serve the voices route but not /v1/models, and the pull must be fail-closed
+	// on positive evidence of ITS route (RuntimeModelParamsFeature) or it would
+	// add silent 404 traffic each tick. Checking it here rather than at the caller
+	// is safe because the feature registry is append-only, so runtime_model_params
+	// (0.13.0) implies runtime_voices (0.11.0): whenever the params pull could
+	// apply, this voices-gated pass is already running. The Multiplexer that lists
+	// voices also probes /v1/models, so the lister type-asserts to the prober (nil
+	// when it cannot, which simply skips the pull).
+	paramsProber, _ := lister.(provider.AudioCppModelsProber)
+	pullParams := paramsProber != nil && hasAgentFeature(r.agents, server.ID, gateway.RuntimeModelParamsFeature)
 	for _, mp := range mappings {
 		spec, rows, ask := r.agentVoiceProbeSpec(ctx, mp, specByMapping, loadedSet)
 		if !ask {
@@ -1149,13 +1178,53 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 		}
 		specToken, header := routing.SpecUpstreamAuth(spec, app)
 		token, _ := capture.OpenSecret(r.cipher, specToken)
+		pctx := provider.WithUpstreamAuth(ctx, header, token)
 		target := routing.Target{
 			Provider: app.Type,
 			Endpoint: routing.ApplicationEndpoint(server, app) + provider.ExpandModelPath(routing.AgentRouterUpstreamPath, mp.AppModelName),
 			Timeout:  r.probeTimeout,
 		}
-		r.fetchAndCacheVoices(provider.WithUpstreamAuth(ctx, header, token), lister, target, mp)
+		r.fetchAndCacheVoices(pctx, lister, target, mp)
+		if pullParams {
+			r.fetchAndCacheSpeechParams(pctx, paramsProber, target, mp)
+		}
 		r.cacheAgentSpeechRate(ctx, server, app, mp, spec, rows)
+	}
+}
+
+// fetchAndCacheSpeechParams is the speech-language pull of probeAgentVoices for ONE
+// running agent-launched audio.cpp child (#282), the twin of cacheAudioCppSpeechParams
+// for a child whose /v1/models the gateway cannot read directly: it pulls the listing
+// through the agent router (ProbeAudioCppModels against the <router base>/upstream/<model>
+// target the voices fetch already built) and writes ONLY the `language` fact it carries
+// (AcceptsLanguage, LanguageDefault) with writeSpeechLanguageCache. It never writes the
+// speech/transcription/clone/streaming verdicts that read also returns: those arrive via
+// telemetry under source audiocpp_models, and re-writing them here would double-write the
+// same fact under a different provenance.
+//
+// It is modelled on fetchAndCacheVoices and shares that write policy, because unlike the
+// static speech-params step this is a separate passthrough read that can fail: a read that
+// SUCCEEDS writes the fact change-only (accepts:false is a real value) and clears the
+// back-off; a read that FAILS (the router's 404 for a child that stopped after the agent's
+// report among them) writes nothing -- the row on file is the last known good, learned
+// while the model was loaded -- and opens speechParamsBackoff so the pull is not retried
+// every tick. A mapping leaving the eligible set clears the back-off (agentVoiceProbeSpec),
+// so a reload is pulled at once. Best-effort: every failure is logged and the pass carries
+// on.
+func (r *appHealthRunner) fetchAndCacheSpeechParams(ctx context.Context, prober provider.AudioCppModelsProber, target routing.Target, mp routing.ModelMapping) {
+	now := r.now()
+	if r.speechParamsBackoff.active(mp.ID, now) {
+		return
+	}
+	v, err := prober.ProbeAudioCppModels(ctx, target, mp.AppModelName)
+	if err != nil {
+		r.speechParamsBackoff.start(mp.ID, now, now.Add(audioCppVoicesBackoff))
+		slog.Debug("app health: agent audio.cpp model params pull failed", "mapping_id", mp.ID, "model", mp.AppModelName, "error", err)
+		return
+	}
+	r.speechParamsBackoff.clear(mp.ID)
+	if _, err := r.writeSpeechLanguageCache(ctx, mp.ID, v.AcceptsLanguage, v.LanguageDefault); err != nil {
+		log.Printf("app health: speech language cache write for mapping %s failed: %v", mp.ID, err)
 	}
 }
 
@@ -1167,10 +1236,10 @@ func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.A
 // loaded set, and have stored verdicts that make it a plain tts model.
 //
 // A mapping that has left the loaded set or the plain-tts set has its back-offs cleared (the
-// voices one and the speech rate one), so a later reload is asked at once. A runtime-spec miss
-// or a capability read that FAILS leaves the mapping unasked this tick without clearing a
-// back-off: what the child is cannot be told, the same reason the caller requires the
-// agent's runtime_voices declaration.
+// voices one, the speech rate one and the speech params one), so a later reload is asked at
+// once. A runtime-spec miss or a capability read that FAILS leaves the mapping unasked this
+// tick without clearing a back-off: what the child is cannot be told, the same reason the
+// caller requires the agent's runtime_voices declaration.
 //
 // The capability rows it read are returned with the spec: the caller's speech rate step
 // (cacheAgentSpeechRate) needs the stored speech_streaming verdict from the same read.
@@ -1185,6 +1254,7 @@ func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.Mo
 	if _, loaded := loadedSet[mp.AppModelName]; !loaded {
 		r.voicesBackoff.clear(mp.ID)
 		r.speechRateBackoff.clear(mp.ID)
+		r.speechParamsBackoff.clear(mp.ID)
 		return routing.RuntimeSpec{}, nil, false
 	}
 	rows, err := r.store.MappingCapabilities(ctx, mp.ID)
@@ -1195,6 +1265,7 @@ func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.Mo
 	if !routing.CapabilityRowsPlainTTS(rows) {
 		r.voicesBackoff.clear(mp.ID)
 		r.speechRateBackoff.clear(mp.ID)
+		r.speechParamsBackoff.clear(mp.ID)
 		return routing.RuntimeSpec{}, nil, false
 	}
 	return spec, rows, true
