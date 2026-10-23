@@ -1931,6 +1931,40 @@ func CapabilityRowsPlainTTS(rows []CapabilityRow) bool {
 		byName[CapabilitySpeechClone].Verdict != CapabilityYes
 }
 
+// CapabilityRowsSpeech reports whether a mapping's stored capability rows say its
+// model synthesises speech at all -- (speech, yes), clone or not (#301). An absent
+// row is unknown, so an unstated speech verdict is not speech.
+//
+// It is the producer eligibility for the voices cache: a model that is a
+// speech-synthesis one is worth asking for its voices, whether those are the fixed
+// named voices of a plain tts model or the named presets a configured clone model
+// ships. Unlike CapabilityRowsPlainTTS it does not exclude a clone model, because
+// a clone model with named presets is offerable too.
+func CapabilityRowsSpeech(rows []CapabilityRow) bool {
+	return CapabilityRowsByName(rows)[CapabilitySpeech].Verdict == CapabilityYes
+}
+
+// CapabilityRowsOfferableTTS reports whether a speech model may be offered to a
+// caller as one it can ask for by voice -- (speech, yes) and either NOT
+// (speech_clone, yes), or it has a non-empty voice list to pick from (#301).
+//
+// hasNonEmptyVoices is the caller's answer to "does this model have at least one
+// named voice on file": a plain tts model is offerable without it (it is not a
+// clone, so an empty list is just a model that does not advertise its voices),
+// while a clone model synthesises only in a reference voice it is handed, so it is
+// offerable only once it has named presets to pick instead. An absent speech row
+// is unknown, so an unstated speech verdict is never offerable.
+//
+// It is the reader rule for the voice picker and the language gate.
+// CapabilityRowsPlainTTS keeps its narrower meaning -- reference-free named-voice
+// tts, still the gate for the streamed-rate benchmark -- and is not changed by
+// this.
+func CapabilityRowsOfferableTTS(rows []CapabilityRow, hasNonEmptyVoices bool) bool {
+	byName := CapabilityRowsByName(rows)
+	return byName[CapabilitySpeech].Verdict == CapabilityYes &&
+		(byName[CapabilitySpeechClone].Verdict != CapabilityYes || hasNonEmptyVoices)
+}
+
 // WritableCapabilityRows answers the one question every capability writer --
 // a probe, or the vision benchmark -- has to ask -- which of the verdicts I
 // just determined may I actually write, given what is already on file -- and
