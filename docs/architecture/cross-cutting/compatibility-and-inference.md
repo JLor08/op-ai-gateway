@@ -1221,7 +1221,11 @@ portal.live_transcription_params_invalid`); the model then goes through the **bu
 gate** (§3.7: the token's model and server overrides, the principal's **one** rate, quota and budget
 admission, the user's reachable servers, the `transcription` capability and the effective-flavor rule, so an
 unknown or incapable model is that endpoint's own `404 routing.no_model_route` or
-`routing.model_not_capable` and the route adds no way to probe which models exist). The admission is spent
+`routing.model_not_capable` and the route adds no way to probe which models exist). The same shared preflight
+and resolve can also refuse with `403 model.not_allowed` or `403 server_override.forbidden` (a service-account
+allowlist, a forbidden server override), `429 limit.rate_limited` (with `Retry-After`),
+`limit.request_quota_exceeded` or `limit.token_quota_exceeded`, `402 limit.cost_budget_exceeded`, and `503`
+`routing.no_healthy_host` or `routing.admission_queue_timeout`/`_full`. The admission is spent
 **here**, once, because a refusal is a plain HTTP response on this POST and opaque on an upgrade. This is a
 **gate, not a relay**: no usage row, no capture, no upstream contact. Two more refusals follow, both `409`: the
 mapping must carry a stored `transcription_streaming = yes` verdict
@@ -1251,7 +1255,9 @@ upgrade**. The handshake selects the fixed `op-live-transcription` subprotocol, 
 becomes the negotiated one. `Accept` uses coder/websocket's **default same-origin check** (no
 `InsecureSkipVerify`, no `OriginPatterns`), so a cross-origin upgrade is refused `403` by the library; that
 check plus a ticket a foreign page cannot obtain are the CSRF defense of a handshake that cannot carry
-`X-OP-CSRF`. A second session on the same route is closed `StatusTryAgainLater` (1013) after the upgrade
+`X-OP-CSRF`. **Operationally**, that default check compares the request's `Origin` host with its `Host`, so
+a reverse proxy in front of the gateway must preserve the original `Host`, or the upgrade is refused `403`.
+A second session on the same route is closed `StatusTryAgainLater` (1013) after the upgrade
 (item 5).
 
 **4. The wire.**
@@ -1262,7 +1268,7 @@ check plus a ticket a foreign page cannot obtain are the CSRF defense of a hands
 | Up | text `{"type":"end"}` | The explicit **end-of-input**. Any other text frame is ignored. |
 | Down | text `{"type":"delta","text":"..."}` | An increment to **append**. |
 | Down | text `{"type":"partial","text":"..."}` | A whole provisional transcript to **replace** (a revisable-hypothesis model). |
-| Down | text `{"type":"done","text":"..."}` | The final transcript (an empty text is a valid statement: keep what you have). |
+| Down | text `{"type":"done","text":"..."}` | The final transcript (an empty text is a valid statement: keep what you have). If audio.cpp emits `done` **per utterance, mid-stream**, which is unconfirmed, a `done` is not necessarily the last message ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). |
 | Down | text `{"type":"error","message":"..."}` | A failure, terminal: an upstream SSE `error` event, an unreachable upstream, or a non-2xx upstream. |
 
 The upstream SSE is parsed by the **same** `transcriptionStreamScan` and `decodeTranscriptionEvent` the
@@ -1306,16 +1312,21 @@ a clean end only (end-of-input requested, `transcript.text.done` then `[DONE]`, 
 and `f32le` 4; every other end is `(audio_second, 0)` with one `Error` log line
 ([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event), [ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). A dial
 failure or a non-2xx upstream is an `error` row (`upstream.<status>` or the mapped code); a truncated session
-and a mid-stream `error` after a `200` stay `success` with the loud zero. The row is attributed to
+and a mid-stream `error` after a `200` stay `success` with the loud zero. The completion check is a latch the
+end-of-input does not reset, so if `done` + `[DONE]` can appear per utterance (unconfirmed), an upstream that
+fails after the client sent `end` could still bill clean for the PCM it sent. The row is attributed to
 `UserID`, `TokenID`, `RouteID` and `ServerID`, with no `ServiceID` or `ProjectID`.
 
-**8. Limits worth knowing.** A non-2xx upstream is seen only once the browser's PCM starts flowing (Go flushes
-a chunked request's headers with its first body chunk). A session that lands on the agent's dialed-proxy
-fallback while its router port is briefly unresolved fails cleanly rather than buffering
+**8. Limits worth knowing.** Full duplex is enabled on **both** ways into the agent's router, the in-process
+path and the dialed fallback, and before any response, so a refusal or a non-2xx from the agent or the child
+reaches the browser promptly rather than after the client has streamed audio into the void
 ([Agent-Managed Model Runtime
-§4.7](agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)). The path is
-verified against mock backends and a real agent proxy and router, **not yet against a real audio.cpp
-`/live`** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). The portal's microphone client is a later phase.
+§4.7](agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)). The one
+timing note is that the gateway's chunked upstream request sends its headers with its first body chunk, so the
+upstream exchange begins when the first PCM frame is sent, which in the real microphone flow is immediate. A
+ticket opens only on the gateway process that minted it, and a live usage row carries no `ServiceID` or
+`ProjectID`. The path is verified against mock backends and a real agent proxy and router on both paths, **not
+yet against a real audio.cpp `/live`** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). The portal's microphone client is a later phase.
 
 ## 4. Session / continuity signals
 

@@ -938,6 +938,15 @@ decides the row once, when the session ends, with `(audio_second, 0)` as the def
 | A mid-stream SSE `error` after a `200`, or a stream that ended without both terminal events | `success` | `audio_second` | `0`, and one `Error` log line |
 | The upstream could not be reached, or answered **non-2xx** (the agent's `404`/`503`, a child error) | `error`, code the mapped provider code or `upstream.<status>` | `audio_second` | `0`, and one `Error` log line |
 
+**What the gate does and does not bound.** The completion check is a **latch** (`transcriptionStreamScan.complete()`:
+`done` seen, then `[DONE]`) that the end-of-input does not reset, and the two conditions are not ordered. A close
+without `end`, a dial failure or non-2xx, and a stream that never shows both terminal events are all bounded to zero.
+Whether audio.cpp emits `transcript.text.done` + `[DONE]` **per utterance, mid-stream** is **unconfirmed**; if it does,
+the latch is set early and a session whose upstream then fails **after** the client sent `end` can still bill clean
+for all the PCM it sent. Billing only on the terminal events that follow the terminating chunk is **not
+implemented** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), [Risks
+§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
 The rule is the loud-zero rule of this section, never a guessed count: a session that delivered
 audio and did not complete **bills none of it**, and the log line (`live transcription billed zero`,
 with the request id, model, server, `end_requested`, `complete`, the byte rate and the PCM byte

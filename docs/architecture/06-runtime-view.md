@@ -372,7 +372,7 @@ sequenceDiagram
     WS-->>B: 101 Switching Protocols (subprotocol op-live-transcription)
     WS->>AG: POST /live/{model}?sample_rate&channels&sample_format&language, chunked body fed from an io.Pipe (ProxyNativeDuplex, no target.Timeout)
     Note over WS,AG: a direct audio_cpp target skips the agent: the gateway POSTs the child's own /v1/audio/transcriptions/live?model=...
-    AG->>AG: EnsureRunning (a cold start is held), EnableFullDuplex, release() deferred for the whole relay
+    AG->>AG: EnableFullDuplex FIRST (so any refusal below is answered promptly), then EnsureRunning (a cold start is held), release() deferred for the whole relay
     AG->>AC: POST /v1/audio/transcriptions/live?...&model=path model, the inbound body streamed chunked (never buffered)
     loop while the user speaks
         B->>WS: binary frame, raw PCM (at most 1 MiB), payload bytes counted
@@ -399,7 +399,7 @@ sequenceDiagram
         WS-->>B: {type: error, message}
         WS->>U: audio_second 0 (an error row for a dial failure or a non-2xx, a success row for an error event after a 200)
     end
-    WS->>WS: deferred teardown: unblock the pipe, cancel the one context, join, CloseNow, release the route slot, record the one usage row
+    WS->>WS: deferred teardown: unblock the pipe, cancel the one context (the writer flushes and CloseNows), join, record the one usage row, THEN release the route slot
 ```
 
 What differs from the transcription relays of §6.1.2 and §6.1.4. **The ticket is the decision.** The routing
@@ -412,9 +412,10 @@ the frames into one chunked request body, and only `end` becomes the terminating
 `transcript.text.done`, so a Stop that merely closes the socket is a truncated session that bills nothing.
 **One goroutine owns every WebSocket write** and one context tears the relay down on any exit, so no
 goroutine is left blocked on the pipe and the usage row is written exactly once. **Full duplex is the
-agent's, and it is the in-process hop that matters**: in production the agent's TLS proxy hands the router
-the same `(w, r)`, so the router's `EnableFullDuplex` governs the gateway-facing connection; a session that
-lands on the transient dialed fallback fails cleanly instead of buffering
+agent's, and it holds on both ways into the router**: in production the agent's TLS proxy hands the router
+the same `(w, r)`, so the router's `EnableFullDuplex` (its first statement, ahead of every refusal) governs
+the gateway-facing connection, and the dialed fallback enables it per request too, so a refusal or a
+non-2xx reaches the browser promptly on either path and no PCM is drained and lost
 ([Agent-Managed Model Runtime
 §4.7](cross-cutting/agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)).
 **Billing is the input**, over the rate the gateway told the backend to decode at, on a clean end only. The

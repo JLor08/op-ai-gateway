@@ -8273,7 +8273,8 @@ transcription is a separate path beside them.**
   never reads the body to route and never buffers it. It calls `EnsureRunning` (a cold start is
   held; an unmanaged or empty model is `404 runtime.model_not_managed`, as on every proxy path),
   defers `release()` for the **whole** relay (unlike `/ensure`, which releases at once), calls
-  `http.NewResponseController(w).EnableFullDuplex()`, and hands the inbound `r.Body` itself to the
+  `http.NewResponseController(w).EnableFullDuplex()` as its **first statement**, ahead of the model
+  guard and `EnsureRunning` (see (b)), and hands the inbound `r.Body` itself to the
   child's `/v1/audio/transcriptions/live` with no declared length, so the transport sends it
   chunked. The child's query is the forwarded `sample_rate`/`channels`/`sample_format`/`language`
   plus `model=<path model>`; the **path model is authoritative**, so a stray inbound `model=` is
@@ -8283,22 +8284,29 @@ transcription is a separate path beside them.**
   with the same `404 runtime.model_not_managed` it gives an unmanaged model, so the name is the
   only evidence the gateway has, and the gateway gates on it fail-closed, as it does
   `multipart_proxy` ([ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions)).
-- **(b) The full-duplex hop is the in-process one, and the dialed fallback fails cleanly.**
-  `EnableFullDuplex` governs the connection its `ResponseWriter` belongs to. In production the
-  agent's gateway-facing TLS proxy does **not** dial the router for a managed model: `localFirst`
-  hands the router the **same `(w, r)` in-process** whenever the router's port is resolved
-  ([Agent-Managed Model Runtime §4.7](cross-cutting/agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)), so the router's own call enables full duplex on the real
-  gateway-facing connection, and (a) is sufficient. The dialed `httputil.ReverseProxy` is only
-  the transient fallback while the port is unresolvable (just after an agent or router restart,
-  on the roughly 60 s runtime cadence); it does not enable full duplex on its inbound writer, so a
-  live session that landed on it would block its request-body read once the response starts.
-  Teaching it to is a possible hardening and is out of scope: such a session **fails cleanly**
-  and the client retries, and it is never silently buffered and mis-billed. This is **proved, not
-  assumed**: an end-to-end test wires a real proxy `Manager` with `SetLocalUpstream` to the
-  router exactly as `main.go` does, against a mock child that emits a delta after the first PCM
-  chunk, and the client writes the second chunk only after receiving that delta. A buffering
-  relay deadlocks and fails the bounded timeouts
-  (`TestLiveFullDuplexInterleavesThroughProxyAndRouter`).
+- **(b) Full duplex is enabled on both ways into the router, before any response, and proved on both.**
+  `EnableFullDuplex` governs the connection its `ResponseWriter` belongs to, so each door a request can
+  come through has to enable it on its own connection. In production the agent's gateway-facing TLS proxy
+  does **not** dial the router for a managed model: `localFirst` hands the router the **same `(w, r)`
+  in-process** whenever the router's port is resolved
+  ([Agent-Managed Model Runtime §4.7](cross-cutting/agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)),
+  so the router's own call enables full duplex on the real gateway-facing connection. The call is the
+  **first statement** of `serveLive`, ahead of every refusal, because on a connection that is not
+  full-duplex net/http drains up to about 256 KiB of the unread request body before it writes **any**
+  response: a refusal written first would reach the client only after it had streamed seconds of audio
+  into the void. The dialed `httputil.ReverseProxy` is the fallback while the router's port is
+  unresolvable (just after an agent or router restart, on the roughly 60 s runtime cadence), and
+  `newReverseProxy` now returns it wrapped in a handler that calls `EnableFullDuplex` **per request**.
+  The wrap is not optional: without it that same drain consumes up to about 256 KiB of the inbound body
+  in the server loop, **never forwarded to the child**, while the session still completes normally, so
+  the gateway would bill audio the child never transcribed ([ADR-041](#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). The relay is therefore full-duplex on **both**
+  paths, which is **proved, not assumed**, by two end-to-end interleave tests: a mock child emits a delta
+  after the first PCM chunk and the client writes the second chunk only after receiving that delta, so a
+  relay that buffers or drains the body deadlocks and fails the bounded timeouts.
+  `TestLiveFullDuplexInterleavesThroughProxyAndRouter` wires a real proxy `Manager` with
+  `SetLocalUpstream` to the router exactly as `main.go` does, and `TestManagerDialledPathInterleavesFullDuplex`
+  runs the same kind of `Manager` forced to dial; `TestRouterLiveRefusalDoesNotDrainStreamedBody` pins the
+  prompt refusal.
 - **(c) The gateway reaches `/live` through a new, narrow, optional provider interface.**
   `NativeDuplexProxyClient.ProxyNativeDuplex(ctx, target, path, body io.Reader, contentType)` POSTs
   `body` chunked and returns the response as soon as its headers arrive, `Body` still open. Like
@@ -8352,12 +8360,15 @@ transcription is a separate path beside them.**
   becomes the negotiated one. `Accept` runs with coder/websocket's **default same-origin check** (no
   `InsecureSkipVerify`, no `OriginPatterns`), so a cross-origin upgrade is refused `403` by the
   library itself; that origin check, plus a ticket a foreign page cannot obtain, is the CSRF defense of
-  an upgrade that cannot carry `X-OP-CSRF`. On the wire:
+  an upgrade that cannot carry `X-OP-CSRF`. **Operational note:** that default check compares the
+  request's `Origin` host with its `Host`, so a reverse proxy in front of the gateway must preserve the
+  original `Host`, or the upgrade is refused `403`. On the wire:
   - **Up:** a **binary** frame is raw PCM (read limit 1 MiB per frame, a **contract** the client's
     capture worklet must frame against, since a frame one byte over closes the socket `1009`); the
     one **text** control is `{"type":"end"}`.
   - **Down:** JSON text messages `{type, text | message}` where `type` is `delta` (append),
-    `partial` (replace the provisional transcript), `done` (the final transcript) or `error`
+    `partial` (replace the provisional transcript), `done` (the final transcript, unless audio.cpp
+    emits `done` per utterance mid-stream, which is unconfirmed) or `error`
     (a message; terminal). The upstream SSE is parsed by the **shared** `transcriptionStreamScan` and
     `decodeTranscriptionEvent`, not a fork.
   - **End-of-input is explicit, and it is what makes a normal session bill at all.** `{"type":"end"}`
@@ -8416,33 +8427,40 @@ at rest moves: no table, no setting and no existing endpoint changes behavior. T
 residuals are named ([Risks
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
 
-- **Verification status: mock-backed, with one real full-duplex proof, and no session against a
-  real audio.cpp `/live`.** Unit and integration tests pass, including the end-to-end **interleave
-  test** through a real agent proxy and router wired like production ((b)), the provider's
+- **Verification status: mock-backed, with real full-duplex proofs on both agent paths, and no session
+  against a real audio.cpp `/live`.** Unit and integration tests pass, including the two end-to-end
+  **interleave tests** through a real agent proxy (in-process and dialed) and router ((b)), the provider's
   duplex tests, the ticket's mint/redeem/replay/tamper tests, and the WebSocket relay's
   clean-end versus truncated-session tests (which must stay two distinct cases) and the
   billing-rate ≡ forwarded-rate and busy-close tests. An end-to-end session against a **real**
   audio.cpp `/live` was **not** verified in the build environment: it needs the whole gateway +
   agent + audio.cpp stack with a streaming ASR model. The `/live` contract is per the issue's live
   probe. One detail it does not settle is whether `transcript.text.done` and `[DONE]` can appear
-  **per utterance, mid-stream**; billing requires both the terminal events **and** the explicit
-  end-of-input, which bounds that case, and a first run against a real model should confirm it.
+  **per utterance, mid-stream**, and the billing gate bounds that only in part. A clean bill needs the
+  explicit end-of-input **and** the scan's completion, but `scan.complete()` is a **latch** that
+  end-of-input does not reset, and the two are not ordered. What is bounded: a session that closes
+  without `end`, a dial failure or non-2xx before the response, and a stream that never shows both
+  terminal events all bill zero. What is **not** bounded: if audio.cpp does emit `done` + `[DONE]` per
+  utterance, the latch is set early, so a session whose upstream then fails **after** the client sent
+  `end` can still bill clean for all the PCM it sent. The design's idea of billing only on the terminal
+  events that follow **our** terminating chunk is **not implemented**. A first run against a real model
+  should settle the open question, and if it is confirmed the scan has to be re-armed at end-of-input.
 - **A ticket opens only on the process that minted it.** The key is random per process, so a
   restart invalidates every outstanding ticket, and behind several gateway instances or a
   non-sticky load balancer a ticket minted on one will not open on another. That is fine for a
   single instance and a 30 s TTL. Single-use is likewise per process (an in-memory set of redeemed
-  nonces), so a same-user replay on another instance within the TTL is the residual. The follow-up
-  is a cross-instance ticket: a shared key plus a shared single-use store.
+  nonces). Because another instance cannot open the ticket at all today, a cross-instance replay
+  **cannot occur now**; it would become possible only if a later change shared the key without also
+  sharing the single-use set. The follow-up is therefore a cross-instance ticket that shares **both**:
+  the key and a redeemed-nonce store.
 - **A live usage row carries no `ServiceID` or `ProjectID`.** The claims hold `UserID`, `TokenID`
   and the resolved target only, so the row is not service- or project-scoped. Acceptable for the
   portal consumer of phase 1; a follow-up can thread them through the ticket.
-- **A non-2xx upstream is observed late.** Go flushes a chunked request's headers together with the
-  first body chunk, so the gateway sees the agent's or the child's refusal (`404`, `503`) only
-  once the browser's PCM starts flowing. The user sees the error a moment after speaking begins,
-  and the session bills a loud zero on an `error` row.
-- **The dialed-fallback window.** While the agent's router port is unresolved (briefly after an
-  agent or router restart) a live session fails instead of streaming; retrying a moment later
-  succeeds.
+- **The upstream exchange begins with the first PCM frame.** The gateway's chunked upstream request
+  sends its headers together with its first body chunk (Go's `FlushAfterChunkWriter`), so the agent
+  and the child see the request when the first frame is sent, which in the real microphone flow is
+  immediate. A refusal or a non-2xx then reaches the browser promptly (the agent enables full duplex
+  first, (b)) as an `error` message, and the session bills a loud zero on an `error` row.
 - **A busy model is a hard stop, not a queue.** A second live session on the route, or any other
   request reaching a single-slot model during one, is refused or fails with a loud zero; a
   broader per-model admission guard and the busy-model UX are phase 3.
@@ -8467,15 +8485,18 @@ signed but readable ticket** (the claims hold the upstream endpoint and sealed c
 the model or the rate from the WebSocket's own handshake** (the client would choose the routing and
 the billing rate; the ticket is the server's decision). **Widening `NativeProxyClient`, or reusing
 `serveProxy`** (the first has many implementers for which a never-ending body is meaningless, and
-the second buffers the body to read `model`, which would defeat the feature). **Teaching the dialed
-`ReverseProxy` to enable full duplex** (the in-process path is the production one; a transient
-fallback that fails cleanly is enough). **Billing on a WebSocket close** (a close without `end` is a
+the second buffers the body to read `model`, which would defeat the feature). **Enabling full duplex
+on the in-process path only** (the dialed fallback would then drain up to about 256 KiB of the body
+before responding and mis-bill, so both doors enable it). **Billing on a WebSocket close** (a close without `end` is a
 truncated session, and the audio was not cleanly consumed). **A learned rate cache or an
 `audio_bytes` fallback** (the rate is the client's declared input format, validated, not a backend
 secret). **Forwarding an unvalidated `sample_format`** (it only produces an upstream error and a
 loud zero a validation would have prevented). **Queueing a second session** (a microphone cannot
-wait). **A shared single-use store in this phase** (the ticket is session- and origin-bound and
-short-lived; a cross-instance store is the follow-up). **Re-resolving or re-admitting at the
+wait). **A shared key and single-use store in this phase** (a per-process key already confines a ticket
+to the instance that minted it, so there is nothing to replay across instances; the ticket is bound to
+the **principal** by its encrypted `UserID`/`TokenID` claims and lives about 30 s, the handler reads no
+session cookie, and the browser `Origin` is checked by `Accept` independently of the ticket; a
+cross-instance ticket is the follow-up). **Re-resolving or re-admitting at the
 upgrade** (the ticket endpoint already spent the one admission and made the decision).
 → [API Compatibility & Inference
 §3.8](cross-cutting/compatibility-and-inference.md#38-live-transcription-the-portal-websocket-transport),

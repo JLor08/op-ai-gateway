@@ -1489,9 +1489,14 @@ route is modelled on `/ensure/{model}`: the model comes from the decoded path, `
 and, if needed, cold-starts the child, and what follows differs in three ways. The handler **defers
 `release()`** after a successful `EnsureRunning`, because the admission must be held for the whole relay
 (`/ensure` forwards nothing and releases at once). It calls
-`http.NewResponseController(w).EnableFullDuplex()` so the server may write the SSE response while it is
+`http.NewResponseController(w).EnableFullDuplex()` so the server may write the response while it is
 still reading the request body on the one HTTP/1.1 connection (an error from it is tolerated: a writer
-that cannot do it is no worse off than before). And it hands the inbound `r.Body` itself to the child
+that cannot do it is no worse off than before). That call is the handler's **first statement**, ahead of
+the model guard and `EnsureRunning`, and the order matters: on a connection that is not full-duplex,
+net/http drains up to about 256 KiB of the unread request body before it writes **any** response, a
+refusal included, so a refusal written while full duplex was still off would reach a client only after it
+had streamed seconds of audio into the void. With the call first, a `404 runtime.model_not_managed`, a
+`503`, `504` or `502` start refusal and a non-2xx from the child all reach the client promptly. And it hands the inbound `r.Body` itself to the child
 request with **no declared length**, so the transport sends it chunked in a background goroutine and
 returns the response as soon as the child's headers arrive; the inbound `Accept-Encoding` is stripped as on
 every proxy path, so the relayed SSE is the decoded body. The existing buffering `serveProxy` is
@@ -1500,7 +1505,8 @@ browser's WebSocket ends at the gateway, and this leg is a plain chunked POST.
 
 Which hop `EnableFullDuplex` governs is the load-bearing question, and §4.7 has the answer: in
 production the agent's TLS proxy serves this router **in-process** with the same `(w, r)`, so the router's
-own call enables full duplex on the real gateway-facing connection. The gateway sends the route only to an
+own call enables full duplex on the real gateway-facing connection, and the dialed fallback enables it per
+request too, so **both ways in are full-duplex**. The gateway sends the route only to an
 agent that declared `fullduplex_proxy` (§7). An older router has no such route and answers `/live/...`
 with the same `404 runtime.model_not_managed` it gives an unmanaged model (the body names no model), which
 no later signal can tell from a genuine unknown, so the flag is the only evidence there is.
@@ -1809,23 +1815,30 @@ longer free — it confines the router to loopback, so an application routed as
 plain `http` to that same port becomes unreachable from the gateway. The agent
 says so at Warn on startup when it sees that combination.
 
-**Which of the two ways in is full-duplex.** `POST /live/{model}` (§4.1) calls
-`EnableFullDuplex` on the response writer it is handed, and a writer belongs to
-exactly one connection, so the answer depends on which door the request came
-through ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). On the **in-process** path the router is handed the TLS
-proxy's own `(w, r)` (`localFirst`, `local_upstream.go`), so the router's call
-enables full duplex on the real gateway-facing connection, and that is the
-production path. The **dialed** `httputil.ReverseProxy` (`newReverseProxy`,
-`FlushInterval: -1`) is only the transient fallback used while the router's
-port is unresolvable (just after an agent or router restart, on the roughly 60 s runtime
-cadence); it does not call `EnableFullDuplex` on its inbound writer, so a live
-session that lands on it would block its request-body read once the response starts.
-That window is accepted rather than engineered away: such a session **fails
-cleanly**, the client retries, and it is never silently buffered and mis-billed.
-The end-to-end test that holds this together wires a real proxy `Manager` with
-`SetLocalUpstream` to the router exactly as `main.go` does and asserts that a
-transcript delta reaches the client **before** it writes the second audio chunk;
-a buffering relay deadlocks and fails it.
+**Both ways in are full-duplex.** `POST /live/{model}` (§4.1) needs full duplex enabled on the
+connection its response writer belongs to, and a writer belongs to exactly one connection, so each door a
+request can come through has to enable it on its own connection
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). On the **in-process** path the router is handed the TLS proxy's own `(w, r)`
+(`localFirst`, `local_upstream.go`), so the router's call (the first statement of `serveLive`) enables
+full duplex on the real gateway-facing connection; that is the production path. The **dialed**
+`httputil.ReverseProxy` (`newReverseProxy`, `FlushInterval: -1`) is the fallback used while the router's
+port is unresolvable (just after an agent or router restart, on the roughly 60 s runtime cadence). It is
+returned as a handler that calls `EnableFullDuplex` **per request** before it delegates to the proxy, so
+that hop is full-duplex as well, and the router behind it enables it again on its own connection. The wrap
+is not optional: without it net/http drains up to about 256 KiB of the inbound body before the
+`ReverseProxy` writes a response, and on the dialed `/live` path those bytes would be consumed by the server
+loop and **never forwarded to the child** while the session still completed normally, so the gateway would
+bill audio the child never transcribed
+([ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). The call is harmless for the buffered routes, whose handlers have read the whole
+body and have nothing left to drain.
+
+Both ways in are **proved, not assumed**, by an interleave test each: the delta of the first audio chunk must
+reach the client **before** it writes the second chunk, and a relay that buffers or drains the body
+deadlocks and fails the bounded timeouts. `TestLiveFullDuplexInterleavesThroughProxyAndRouter` wires a real
+proxy `Manager` with `SetLocalUpstream` to the router exactly as `main.go` does (the in-process path), and
+`TestManagerDialledPathInterleavesFullDuplex` runs a real proxy `Manager` with no local upstream, forced to
+dial. A refusal is covered too: `TestRouterLiveRefusalDoesNotDrainStreamedBody` asserts that a `404` is
+flushed after the server has read about one header-sized buffer, not 256 KiB, of an endless streamed body.
 
 ## 5. Admission control
 
@@ -7342,11 +7355,6 @@ operator meets first:
   the AI servers**, bounded solely by the agent-local binary allowlist (§3.1).
 - **WebSocket-serving model servers are not supported** through a `server_agent`
   application (§4.5). Their HTTP/JSON endpoints work.
-- **A live transcription session cannot run on the dialed-proxy fallback.**
-  `POST /live/{model}` is full-duplex on the in-process path only (§4.7); while the
-  router's port is briefly unresolved (just after an agent or router restart) a
-  session fails cleanly and a retry succeeds. The route also needs an agent that
-  declared `fullduplex_proxy` (§7).
 - **VRAM measurement is NVIDIA-only** (§5.3). On AMD, Apple unified memory and
   GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for

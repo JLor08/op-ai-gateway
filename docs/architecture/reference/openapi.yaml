@@ -1347,8 +1347,12 @@ paths:
         server overrides, the principal's ONE rate/quota/budget admission, the
         user's reachable servers, the `transcription` capability and the
         effective-flavor rule), whose refusals are unchanged (404
-        `routing.no_model_route` or `routing.model_not_capable`, the rate/quota
-        codes); the mapping must carry a stored `transcription_streaming = yes`
+        `routing.no_model_route` or `routing.model_not_capable`, and the shared
+        preflight's 403 `model.not_allowed` or `server_override.forbidden`, 429
+        `limit.rate_limited` (with Retry-After), `limit.request_quota_exceeded` or
+        `limit.token_quota_exceeded`, 402 `limit.cost_budget_exceeded`, and 503
+        `routing.no_healthy_host` or `routing.admission_queue_timeout`/`_full`);
+        the mapping must carry a stored `transcription_streaming = yes`
         verdict (409 `portal.live_transcription_not_streaming`); and a
         `server_agent` target needs positive evidence its agent declared
         `fullduplex_proxy` (409 `portal.live_transcription_agent_unsupported`; a
@@ -1383,9 +1387,37 @@ paths:
                       upgrade; never put it in a URL.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '402':
+          description: The Error envelope with code `limit.cost_budget_exceeded` (the shared preflight's cost budget).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: >
+            The Error envelope: `auth.csrf_required` (a session cookie without
+            X-OP-CSRF), `auth.insufficient_scope` (no gateway:use),
+            `model.not_allowed` (the effective model is outside a service
+            account's allowlist) or `server_override.forbidden`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '405': { description: 'Any method other than POST (Allow: POST).' }
+        '429':
+          description: >
+            The Error envelope with code `limit.rate_limited` (with a Retry-After
+            header), `limit.request_quota_exceeded` or `limit.token_quota_exceeded`:
+            the one admission the ticket spends.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: >
+            The Error envelope with code `routing.no_healthy_host` (every candidate
+            is gated) or `routing.admission_queue_timeout` / `routing.admission_queue_full`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: >
             The Error envelope with code `portal.live_transcription_not_streaming`
@@ -1413,8 +1445,9 @@ paths:
         ['op-live-transcription', ticket])`) and never in the URL. The ticket is
         redeemed BEFORE the upgrade: an absent, malformed, expired, replayed or
         foreign-process ticket is 401 with NO upgrade; the upgrade keeps the
-        library's default same-origin check, so a cross-origin request is 403; any
-        method but GET is 405. No cookie and no CSRF header is read, and the
+        library's default same-origin check (it compares Origin with Host, so a
+        reverse proxy in front of the gateway must preserve the original Host), so
+        a cross-origin request is 403; any method but GET is 405. No cookie and no CSRF header is read, and the
         handler takes no model, route or rate from the client. After 101 the
         subprotocol `op-live-transcription` is selected. The browser sends BINARY
         frames of raw interleaved PCM in the ticket's format (at most 1 MiB each; a
@@ -1423,7 +1456,9 @@ paths:
         truncated session that bills a loud zero). The gateway sends TEXT frames
         of JSON: `{"type":"delta","text":...}` (append),
         `{"type":"partial","text":...}` (replace the provisional transcript),
-        `{"type":"done","text":...}` (the final transcript) and
+        `{"type":"done","text":...}` (the final transcript; if audio.cpp emits a
+        done per utterance mid-stream, which is unconfirmed, it is not
+        necessarily the last message) and
         `{"type":"error","message":...}` (terminal). A second session on the same
         route is closed with status 1013 (StatusTryAgainLater, one live session
         per model). The session is billed as `audio_second` (PCM payload bytes over
