@@ -444,6 +444,12 @@ type Server struct {
 	// per-process key; a bare &Server{} leaves it nil, which the ticket endpoint
 	// answers as a failed mint rather than a panic.
 	liveTickets *liveTicketStore
+	// liveSessions enforces one live-transcription session per route
+	// (live_session_registry.go): the WebSocket handler acquires the route's slot
+	// before relaying and releases it once. Built in New; a bare &Server{} leaves
+	// it nil, which acquire treats as fail-closed (every session rejected busy), so
+	// the handler must be wired with a constructed registry.
+	liveSessions *liveSessionRegistry
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -1041,6 +1047,7 @@ func New(deps ServerDeps) *Server {
 		maxChatAudioBytes:              maxChatAudioBytes,
 		maxChatBlobBytes:               maxChatBlobBytes,
 		liveTickets:                    newLiveTicketStore(),
+		liveSessions:                   newLiveSessionRegistry(),
 	}
 	if s.newMailer == nil {
 		s.newMailer = func(cfg mail.Config) Mailer { return mail.New(cfg) }
@@ -1453,6 +1460,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/model-voices", s.handlePortalModelVoices)
 	s.mux.HandleFunc("/api/portal/model-speech-streaming", s.handlePortalModelSpeechStreaming)
 	s.mux.HandleFunc("/api/portal/transcription-live-ticket", s.handlePortalLiveTranscriptionTicket)
+	s.mux.HandleFunc("/api/portal/transcription-live", s.handleLiveTranscription)
 	s.mux.HandleFunc("/api/portal/model-group-servers", s.handlePortalModelGroupServers)
 	s.mux.HandleFunc("/api/portal/servers", s.handlePortalServers)
 	s.mux.HandleFunc("/api/portal/servers/", s.handlePortalServerItem)
