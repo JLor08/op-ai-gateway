@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/usage"
 	"strconv"
 	"strings"
 	"sync"
@@ -130,6 +131,26 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 
 	start := time.Now()
 	id := nextRequestID()
+
+	// Register the live session in the Active Requests view (GET /api/portal/usage/active)
+	// for its whole lifetime, the same way the chat/stream/native paths do, so an operator
+	// sees a live session holding the model's one /live slot. Added once the per-route slot
+	// is held (the busy 503 above returns first, and nothing is relayed or billed there) and
+	// removed on every exit path by the defer -- clean end, truncation, dial failure, panic.
+	// No Progress: like the buffered inference path, a transcription session has no output
+	// tokens to count; its billable measure is the input audio (audio_second), billed once at
+	// the end by the teardown below.
+	s.Active.Add(ActiveRequest{
+		ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name,
+		ServiceID: token.ServiceID, ServiceName: token.ServiceName,
+		ServerName: s.serverName(target.ServerID), ServerID: target.ServerID,
+		Model: target.Model, RequestedModel: strings.TrimSpace(r.URL.Query().Get("model")),
+		APIFlavor: target.APIFlavor, BillingUnit: usage.BillingUnitAudioSecond,
+		ReqPath: r.URL.Path, ProviderPath: liveUpstreamPath(target, params),
+		ProviderModel: effectiveProviderModel(target, target.Model),
+		Stream:        true, StartedAt: start,
+	})
+	defer s.Active.Remove(id)
 
 	// The one context: cancelled on any exit tears down the upstream request and the pipe
 	// feeder together. Derived from the request, but the copy goroutine deliberately reads
