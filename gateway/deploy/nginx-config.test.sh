@@ -221,6 +221,17 @@ for f in nginx/locations.conf "$work/k8s-locations.conf"; do
     || bad "$f: the agent WebSocket location is gone -- the agent transport depends on it"
   grep -q 'location = /api/portal/transcription-live ' "$f" \
     || bad "$f: the live-transcription WebSocket location is gone -- the portal's live mode depends on it"
+  # The live-transcription WebSocket forwards the browser's Host AS SENT ($http_host), NOT
+  # $host like the agent stream just above it: the gateway's same-origin check on the
+  # upgrade compares the Origin header's host AND PORT with the Host it sees, and $host
+  # drops the port -- so a copy-paste from the agent block would silently 403 every live
+  # upgrade on the compose ports (:8080/:8443). Pinned inside that one location only.
+  awk '/^[ \t]*location[ \t]+=[ \t]+\/api\/portal\/transcription-live[ \t]/ { inb = 1 }
+       inb { line = $0; sub(/#.*/, "", line) }
+       inb && line ~ /proxy_set_header[ \t]+Host[ \t]+\$http_host[ \t]*;/ { ok = 1 }
+       inb && /^[ \t]*}/ { inb = 0 }
+       END { exit ok ? 0 : 1 }' "$f" \
+    || bad "$f: the live-transcription WebSocket location does not set 'proxy_set_header Host \$http_host;' -- \$host drops the port and the gateway's same-origin check would 403 every upgrade on a non-default port"
   # The bearer live endpoint is a chunked FULL-DUPLEX POST: without an unbuffered request
   # body nginx holds the PCM until the speaker stops and no transcript ever comes back.
   awk '/^[ \t]*location[ \t]+~[ \t]+\^\/\(\?:openai\/\)\?v1\/audio\/transcriptions\/live\$/ { inb = 1 }
