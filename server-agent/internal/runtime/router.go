@@ -627,9 +627,14 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 //     forwards nothing; here the child admission must be held for the whole
 //     relay.
 //   - EnableFullDuplex lets the server interleave reading r.Body with writing
-//     the SSE response on the one HTTP/1.1 connection. An error from it (e.g. a
-//     test recorder that does not support it) is tolerated by falling through;
-//     the production in-process path supports it.
+//     the SSE response on the one HTTP/1.1 connection. It is enabled at the TOP,
+//     before the model guard and EnsureRunning, so EVERY response path -- the
+//     refusals included -- is full-duplex: net/http otherwise drains up to
+//     ~256 KiB of the unread streaming body before writing a refusal, so a
+//     refusal written with full-duplex still off would make the client stream
+//     ~8 s of PCM before learning it was refused. An error from it (e.g. a test
+//     recorder that does not support it) is tolerated by falling through; the
+//     production in-process path supports it.
 //   - The body is streamed, never buffered: r.Body is handed to the child
 //     request directly with ContentLength left unset, so Go's HTTP/1.1
 //     transport sends it chunked in a background goroutine and returns the
@@ -643,6 +648,16 @@ func (rt *router) serveEnsure(w http.ResponseWriter, r *http.Request) {
 //     same code the other proxy paths use for a failure reaching an admitted
 //     child.
 func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
+	// Interleave reading r.Body with writing the response on the same HTTP/1.1
+	// connection. Tolerate an error by falling through (see the doc comment): a
+	// writer that does not support it is no worse off than before. This MUST
+	// happen before the first write on ANY path -- the refusals below included:
+	// net/http, on a non-full-duplex connection, drains up to ~256 KiB of the
+	// unread request body before it writes the response, so a refusal written
+	// while full-duplex was still off would make the client stream ~8 s of
+	// 16 kHz mono s16le PCM into the void before the refusal reached it.
+	_ = http.NewResponseController(w).EnableFullDuplex()
+
 	model := strings.TrimPrefix(r.URL.Path, livePathPrefix)
 	if rt.m == nil || model == "" {
 		writeSentinelError(w, ErrModelNotManaged)
@@ -654,11 +669,6 @@ func (rt *router) serveLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-
-	// Interleave reading r.Body with writing the SSE response on the same
-	// HTTP/1.1 connection. Tolerate an error by falling through (see the doc
-	// comment): a writer that does not support it is no worse off than before.
-	_ = http.NewResponseController(w).EnableFullDuplex()
 
 	target := endpoint + liveChildPath + "?" + liveChildQuery(r.URL.RawQuery, model)
 	// Stream r.Body straight through: do NOT io.ReadAll it, and leave
