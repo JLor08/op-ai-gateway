@@ -268,7 +268,9 @@ function LiveRecording({ t }: Readonly<{ t: Translation }>) {
             // Straight from the click, with nothing awaited first: the microphone and the
             // browser's audio are only granted to a call made inside the user's gesture.
             onClick={() => c.startLiveTranscription()}
-            disabled={c.streaming || c.audioConverting || !c.modelAvailable}
+            // Not while a transcript is waiting to be used or discarded: Start begins from a clean
+            // slate, so pressing it would throw that text away without the user having decided to.
+            disabled={c.streaming || c.audioConverting || !c.modelAvailable || salvageable}
           >
             {t.chatTranscriptionLiveStart}
           </Button>

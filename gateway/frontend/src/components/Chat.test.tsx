@@ -3395,6 +3395,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           expect(transcriptRegion()).not.toBeInTheDocument();
         });
 
+        it('does not let Start discard a transcript that can still be used', async () => {
+          await renderStreamingThread();
+          await failWith({ kind: 'refused' }, 'Worth keeping');
+
+          // Use and Discard are the ways out; Start (which begins from a clean slate) would drop
+          // the text without the user having chosen to.
+          expect(startButton()).toBeDisabled();
+          fireEvent.click(startButton()!);
+          expect(sessions).toHaveLength(1);
+          expect(transcriptRegion()).toHaveTextContent('Worth keeping');
+
+          fireEvent.click(screen.getByRole('button', { name: t.chatRecordDiscard }));
+          expect(startButton()).toBeEnabled();
+        });
+
+        it('lets Start through again once the transcript has been used', async () => {
+          await renderStreamingThread();
+          await failWith({ kind: 'refused' }, 'Worth keeping');
+          expect(startButton()).toBeDisabled();
+
+          fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionLiveUse }));
+
+          expect(startButton()).toBeEnabled();
+        });
+
         it('lets the user throw the transcript away', async () => {
           await renderStreamingThread();
           await failWith({ kind: 'refused' }, 'Not wanted');
