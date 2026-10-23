@@ -383,7 +383,13 @@ func TestLiveTranscriptionTruncatedLoudZero(t *testing.T) {
 	// Drop WITHOUT end-of-input.
 	_ = conn.CloseNow()
 
-	requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
+	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
+	// A 200-then-truncated session is deliberately success + loud zero (the upstream
+	// answered 2xx; only the delivery was cut). It must NOT be over-classified as an
+	// error row -- that is reserved for a non-2xx upstream answer.
+	if ev.Status != "success" {
+		t.Fatalf("status = %q, want success (truncated is success + loud zero, not an error row)", ev.Status)
+	}
 }
 
 // TestLiveTranscriptionBusyRejectsSecondSession proves a second concurrent session on
@@ -635,7 +641,12 @@ func TestLiveTranscriptionErrorEventRelayed(t *testing.T) {
 	if !sawError {
 		t.Fatal("never received an error message")
 	}
-	requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
+	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
+	// A post-200 mid-stream SSE error event is deliberately success + loud zero (the
+	// upstream answered 2xx), distinct from the non-2xx-upstream status="error" row.
+	if ev.Status != "success" {
+		t.Fatalf("status = %q, want success (a post-200 SSE error is success + loud zero, not an error row)", ev.Status)
+	}
 }
 
 // TestLiveTranscriptionNon2xxUpstreamErrorRow proves a non-2xx UPSTREAM answer is
