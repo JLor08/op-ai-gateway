@@ -1581,9 +1581,10 @@ export function ChatStoreProvider({
   }, [modelSpeechCapable, effectiveModel]);
 
   // Pre-fill the language of an EMPTY speech thread with the portal's UI language, when the
-  // model takes a language and does not declare "auto" as its default (so it will not detect
-  // the language itself: audio.cpp's confucius4 speaks Chinese unless told otherwise, and a
-  // German text would come out as Chinese). Runs when a gate answer ARRIVES -- never on the
+  // model takes a language and declares a CONCRETE non-auto default (not "auto", and not an
+  // empty "the voice/model decides" default): such a model will not detect the language itself,
+  // so audio.cpp's confucius4 (default "zh") speaks Chinese unless told otherwise, and a German
+  // text would come out as Chinese. Runs when a gate answer ARRIVES -- never on the
   // user's own edits, so a field they cleared stays cleared -- and only fills a blank field of
   // a thread that has not spoken yet: a language the thread already has (typed, or saved) is
   // never overwritten, and neither is the settings of a thread whose earlier answers were made
@@ -1593,7 +1594,14 @@ export function ChatStoreProvider({
   // mirrors the refs it reads.
   useEffect(() => {
     if (!speechLanguageGate.accepts) return;
-    if (speechLanguageGate.default.trim().toLowerCase() === 'auto') return;
+    // Skip a model that decides the language itself: a literal "auto" default, OR no
+    // declared default at all. An empty default means "the model/voice decides" (e.g.
+    // kokoro defaults to the selected voice prefix) -- auto-like, not a wrong-language
+    // default worth correcting, and the model may not even support the UI language
+    // (kokoro rejects "de"). Only a CONCRETE non-auto default (confucius4's "zh") is
+    // the case this pre-fill exists for.
+    const declaredDefault = speechLanguageGate.default.trim().toLowerCase();
+    if (declaredDefault === '' || declaredDefault === 'auto') return;
     if (chatKindRef.current !== 'speech' || messagesRef.current.length > 0) return;
     setAudioSettings((s) => (s.language === '' ? { ...s, language: localeRef.current } : s));
   }, [speechLanguageGate, setAudioSettings]);
