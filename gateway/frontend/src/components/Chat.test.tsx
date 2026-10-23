@@ -3,12 +3,14 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { heicTo } from 'heic-to';
 
 import { Chat } from './Chat';
+import { createLiveSession, type LiveSessionArgs } from './chat/liveTranscription';
 import {
   ChatStoreProvider,
+  useChatStore,
   IMAGE_OUTPUT_FORMATS,
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
@@ -58,6 +60,14 @@ const playback = vi.hoisted(() => ({
 vi.mock('./chat/speechPlayback', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./chat/speechPlayback')>()),
   speechPlayback: playback,
+}));
+
+// jsdom has no microphone or WebSocket either: a live transcription session is a recording
+// stand-in, driven by hand from the tests of the composer's live mode (the session itself has
+// its own tests: liveTranscription.session.test.ts).
+vi.mock('./chat/liveTranscription', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./chat/liveTranscription')>()),
+  createLiveSession: vi.fn(),
 }));
 
 // Captured before any spy is installed, so a mocked createElement can build a
@@ -187,6 +197,11 @@ function makeChatApi() {
     // The transcription composer's live gate the store fetches for transcription models:
     // closed by default (no live mode, the buffered recording).
     modelTranscriptionStreaming: vi.fn(async (_name: string): Promise<boolean> => false),
+    // The live recording's ticket POST: no test in this file starts a live session, but the store
+    // now holds a real reference to this method so the mock must provide one.
+    createLiveTranscriptionTicket: vi.fn(async (_body: { model: string; language?: string }) => ({
+      ticket: 'tkt',
+    })),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.
@@ -3103,6 +3118,399 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         await waitForChatReady();
 
         expect(screen.queryByText(t.chatTranscriptionConverting)).not.toBeInTheDocument();
+      });
+    });
+
+    // The LIVE mode (#266): for a model the gateway says can stream a transcription, the composer
+    // offers a third way to give the turn -- speaking into the microphone, with the transcript
+    // appearing as the user talks -- beside the file and the buffered recording. A model that
+    // cannot stream gets none of it: no switch, the two inputs as they always were.
+    describe('the live mode', () => {
+      type FakeLive = {
+        args: LiveSessionArgs;
+        stop: Mock<() => void>;
+        abort: Mock<() => void>;
+      };
+      let sessions: FakeLive[];
+
+      beforeEach(() => {
+        sessions = [];
+        vi.mocked(createLiveSession).mockImplementation((args) => {
+          const session: FakeLive = {
+            args,
+            stop: vi.fn(() => args.onState('finalizing')),
+            abort: vi.fn(),
+          };
+          sessions.push(session);
+          args.onState('connecting');
+          return session;
+        });
+      });
+      afterEach(() => vi.mocked(createLiveSession).mockReset());
+
+      const modeButton = (name: string) => screen.queryByRole('button', { name });
+      const startButton = () =>
+        screen.queryByRole('button', { name: t.chatTranscriptionLiveStart });
+      const stopButton = () => screen.queryByRole('button', { name: t.chatTranscriptionLiveStop });
+      const transcriptRegion = () =>
+        screen.queryByRole('region', { name: t.chatTranscriptionLiveTranscript });
+
+      async function renderStreamingThread() {
+        chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+        await renderTranscriptionThread();
+        // The gate answers a moment after the model is picked: the switch is the proof.
+        await screen.findByRole('button', { name: t.chatTranscriptionModeLive });
+      }
+
+      const chooseLive = () =>
+        fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionModeLive }));
+
+      // A live recording, started from the panel and listening.
+      async function startRecording() {
+        chooseLive();
+        fireEvent.click(startButton()!);
+        await act(async () => sessions[0].args.onState('listening'));
+      }
+
+      describe('what is offered', () => {
+        it('is not offered for a model that cannot stream: the file and the recorder, as ever', async () => {
+          await renderTranscriptionThread();
+          await waitFor(() =>
+            expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalledWith('whisper'),
+          );
+
+          expect(modeButton(t.chatTranscriptionModeLive)).not.toBeInTheDocument();
+          expect(modeButton(t.chatTranscriptionModeFile)).not.toBeInTheDocument();
+          expect(modeButton(t.chatTranscriptionModeRecord)).not.toBeInTheDocument();
+          expect(screen.getByLabelText(t.chatAttachAudio)).toBeInTheDocument();
+          expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeInTheDocument();
+          expect(startButton()).not.toBeInTheDocument();
+        });
+
+        it('is offered as the third of file / record / live, once the gateway says the model streams', async () => {
+          await renderStreamingThread();
+
+          for (const name of [
+            t.chatTranscriptionModeFile,
+            t.chatTranscriptionModeRecord,
+            t.chatTranscriptionModeLive,
+          ]) {
+            expect(modeButton(name)).toBeInTheDocument();
+          }
+          // The switch is named, as a group of choices.
+          expect(screen.getByRole('group', { name: t.chatTranscriptionMode })).toBeInTheDocument();
+        });
+
+        it('shows the file input first, as the one that always was', async () => {
+          await renderStreamingThread();
+
+          expect(modeButton(t.chatTranscriptionModeFile)).toHaveAttribute('aria-pressed', 'true');
+          expect(screen.getByLabelText(t.chatAttachAudio)).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatRecordStart })).not.toBeInTheDocument();
+          expect(startButton()).not.toBeInTheDocument();
+        });
+
+        it('shows only the chosen input', async () => {
+          await renderStreamingThread();
+
+          fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionModeRecord }));
+          expect(screen.getByRole('button', { name: t.chatRecordStart })).toBeInTheDocument();
+          expect(screen.queryByLabelText(t.chatAttachAudio)).not.toBeInTheDocument();
+          expect(startButton()).not.toBeInTheDocument();
+
+          chooseLive();
+          expect(modeButton(t.chatTranscriptionModeLive)).toHaveAttribute('aria-pressed', 'true');
+          expect(startButton()).toBeEnabled();
+          expect(screen.getByText(t.chatTranscriptionLiveHint)).toBeInTheDocument();
+          expect(screen.queryByLabelText(t.chatAttachAudio)).not.toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatRecordStart })).not.toBeInTheDocument();
+
+          fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionModeFile }));
+          expect(screen.getByLabelText(t.chatAttachAudio)).toBeInTheDocument();
+          expect(startButton()).not.toBeInTheDocument();
+        });
+
+        it('has no transcript area until a recording has begun', async () => {
+          await renderStreamingThread();
+          chooseLive();
+          expect(transcriptRegion()).not.toBeInTheDocument();
+        });
+
+        it('keeps the file and the recorded clip working in their modes', async () => {
+          await renderStreamingThread();
+
+          attachAudio(wavFile());
+          expect(await screen.findByLabelText(t.chatAttachedAudio)).toBeInTheDocument();
+          expect(sendButton()).toBeEnabled();
+          // The clip waiting to be sent is shown whichever input is showing.
+          chooseLive();
+          expect(screen.getByLabelText(t.chatAttachedAudio)).toBeInTheDocument();
+          fireEvent.click(sendButton());
+          await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+          expect(sessions).toHaveLength(0);
+        });
+      });
+
+      describe('recording', () => {
+        it('starts a session from the click, for the thread, and says it is connecting', async () => {
+          await renderStreamingThread();
+          chooseLive();
+
+          fireEvent.click(startButton()!);
+
+          expect(sessions).toHaveLength(1);
+          expect(sessions[0].args.model).toBe('whisper');
+          expect(screen.getByRole('status')).toHaveTextContent(t.chatTranscriptionLiveConnecting);
+          expect(startButton()).not.toBeInTheDocument();
+          expect(stopButton()).toBeEnabled();
+          expect(transcriptRegion()).toBeInTheDocument();
+        });
+
+        it('says it is listening, and shows the transcript as it comes: deltas add, a partial replaces', async () => {
+          await renderStreamingThread();
+          await startRecording();
+          expect(screen.getByRole('status')).toHaveTextContent(t.chatTranscriptionLiveListening);
+
+          await act(async () => sessions[0].args.onDelta('Hello wor'));
+          expect(transcriptRegion()).toHaveTextContent('Hello wor');
+          await act(async () => sessions[0].args.onDelta('ld'));
+          expect(transcriptRegion()).toHaveTextContent('Hello world');
+          await act(async () => sessions[0].args.onPartial('Hello, world'));
+          expect(transcriptRegion()).toHaveTextContent('Hello, world');
+          expect(transcriptRegion()).not.toHaveTextContent('Hello world');
+        });
+
+        it('holds everything that could start another turn while it runs', async () => {
+          await renderStreamingThread();
+          await startRecording();
+
+          expect(sendButton()).toBeDisabled();
+          // The mode cannot be switched from under it.
+          expect(modeButton(t.chatTranscriptionModeFile)).toBeDisabled();
+          expect(modeButton(t.chatTranscriptionModeRecord)).toBeDisabled();
+        });
+
+        it('Stop finishes it: the transcript is shown as final, then it lands in the chat as a turn', async () => {
+          await renderStreamingThread();
+          await startRecording();
+          await act(async () => sessions[0].args.onDelta('Hello wor'));
+
+          fireEvent.click(stopButton()!);
+
+          expect(sessions[0].stop).toHaveBeenCalledTimes(1);
+          expect(screen.getByRole('status')).toHaveTextContent(t.chatTranscriptionRunPending);
+          expect(stopButton()).not.toBeInTheDocument();
+          expect(transcriptRegion()).toHaveTextContent('Hello wor');
+
+          await act(async () => {
+            sessions[0].args.onDone('Hello world.');
+            sessions[0].args.onState('closed');
+          });
+
+          // The turn is in the transcript (the user's marker, and the answer), and the panel is
+          // ready for the next recording.
+          const turns = screen.getAllByRole('article');
+          expect(turns).toHaveLength(2);
+          expect(turns[0]).toHaveTextContent(t.chatTranscriptionLiveTurn);
+          expect(turns[1]).toHaveTextContent('Hello world.');
+          expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+          expect(startButton()).toBeEnabled();
+          expect(transcriptRegion()).not.toBeInTheDocument();
+          // Still a transcription thread: the composer did not turn into the text one.
+          expect(screen.getByRole('group', { name: t.chatTranscriptionInputLabel })).toBeVisible();
+        });
+
+        it('says it is reconnecting when the connection drops, and carries on', async () => {
+          await renderStreamingThread();
+          await startRecording();
+          await act(async () => sessions[0].args.onDelta('First part'));
+
+          vi.useFakeTimers();
+          try {
+            act(() => {
+              sessions[0].args.onError('closed (1006)', { kind: 'dropped' });
+              sessions[0].args.onState('error');
+            });
+            expect(screen.getByRole('status')).toHaveTextContent(
+              t.chatTranscriptionLiveReconnecting,
+            );
+            // What was transcribed stays on screen, and the recording can still be ended.
+            expect(transcriptRegion()).toHaveTextContent('First part');
+            expect(stopButton()).toBeEnabled();
+
+            act(() => void vi.advanceTimersByTime(1000));
+            expect(sessions).toHaveLength(2);
+          } finally {
+            vi.useRealTimers();
+          }
+          await act(async () => sessions[1].args.onState('listening'));
+          expect(screen.getByRole('status')).toHaveTextContent(t.chatTranscriptionLiveListening);
+          await act(async () => sessions[1].args.onDelta('second'));
+          expect(transcriptRegion()).toHaveTextContent('First part second');
+        });
+      });
+
+      describe('when it fails', () => {
+        async function failWith(detail: { kind: 'refused' | 'denied' | 'capture' }, said = '') {
+          await startRecording();
+          if (said) await act(async () => sessions[0].args.onDelta(said));
+          await act(async () => {
+            sessions[0].args.onError('it failed', detail);
+            sessions[0].args.onState('error');
+          });
+        }
+
+        it('shows the error as an alert, and can be started again', async () => {
+          await renderStreamingThread();
+          await failWith({ kind: 'refused' });
+
+          expect(screen.getByRole('alert')).toHaveTextContent(t.chatTranscriptionLiveError);
+          expect(screen.queryByRole('button', { name: t.chatTranscriptionLiveUse })).toBeNull();
+          expect(startButton()).toBeEnabled();
+          // Nothing is running, so the other inputs are reachable again.
+          expect(modeButton(t.chatTranscriptionModeFile)).toBeEnabled();
+
+          fireEvent.click(startButton()!);
+          expect(sessions).toHaveLength(2);
+          expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        });
+
+        it('says what to do about a refused microphone', async () => {
+          await renderStreamingThread();
+          await failWith({ kind: 'denied' });
+          expect(screen.getByRole('alert')).toHaveTextContent(t.chatRecordDenied);
+        });
+
+        it('offers what was transcribed before the failure: use it, or throw it away', async () => {
+          await renderStreamingThread();
+          await failWith({ kind: 'refused' }, 'Worth keeping');
+          expect(transcriptRegion()).toHaveTextContent('Worth keeping');
+
+          fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionLiveUse }));
+
+          const turns = screen.getAllByRole('article');
+          expect(turns).toHaveLength(2);
+          expect(turns[1]).toHaveTextContent('Worth keeping');
+          expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+          expect(transcriptRegion()).not.toBeInTheDocument();
+        });
+
+        it('lets the user throw the transcript away', async () => {
+          await renderStreamingThread();
+          await failWith({ kind: 'refused' }, 'Not wanted');
+
+          fireEvent.click(screen.getByRole('button', { name: t.chatRecordDiscard }));
+
+          expect(screen.queryAllByRole('article')).toHaveLength(0);
+          expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+          expect(transcriptRegion()).not.toBeInTheDocument();
+        });
+
+        it('switching to another input clears the error', async () => {
+          await renderStreamingThread();
+          await failWith({ kind: 'refused' });
+
+          fireEvent.click(screen.getByRole('button', { name: t.chatTranscriptionModeFile }));
+          chooseLive();
+
+          expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        });
+      });
+
+      describe('leaving', () => {
+        // The chat view going away (the user opens another page of the portal) while the store,
+        // which is mounted app-wide, stays: only the composer's own cleanup can end a recording.
+        function renderLeavableChat() {
+          function Page() {
+            const [shown, setShown] = useState(true);
+            const c = useChatStore();
+            return (
+              <>
+                <button type="button" onClick={() => setShown(false)}>
+                  leave-chat
+                </button>
+                {/* What the store holds of the recording, whether or not the chat is shown. */}
+                <span data-testid="live-state">{c.liveSession.state}</span>
+                {shown && <Chat t={t} />}
+              </>
+            );
+          }
+          render(
+            <ToastProvider>
+              <ChatStoreProvider
+                api={chatApi.api}
+                models={asrModels}
+                tokens={tokens}
+                onRefresh={vi.fn(async () => {})}
+                t={t}
+              >
+                <Page />
+              </ChatStoreProvider>
+            </ToastProvider>,
+          );
+        }
+        const leave = () => fireEvent.click(screen.getByRole('button', { name: 'leave-chat' }));
+
+        async function renderLeavableStreamingThread() {
+          chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+          renderLeavableChat();
+          await waitForChatReady();
+          await pickOption(t.chatModel, 'whisper');
+          await screen.findByRole('button', { name: t.chatTranscriptionModeLive });
+        }
+
+        it('lets go of the microphone when the composer goes away mid-recording', async () => {
+          await renderLeavableStreamingThread();
+          await startRecording();
+
+          leave();
+
+          expect(sessions[0].abort).toHaveBeenCalledTimes(1);
+          expect(screen.getByTestId('live-state')).toHaveTextContent('idle');
+        });
+
+        it('lets go of an error and its transcript as well: nothing is left behind to reappear', async () => {
+          await renderLeavableStreamingThread();
+          await startRecording();
+          await act(async () => sessions[0].args.onDelta('left behind'));
+          await act(async () => {
+            sessions[0].args.onError('it failed', { kind: 'refused' });
+            sessions[0].args.onState('error');
+          });
+
+          leave();
+
+          // Nothing to abort (the session was over), but the state goes with the composer.
+          expect(screen.getByTestId('live-state')).toHaveTextContent('idle');
+        });
+
+        it('does not cut off a recording that is already delivering its final transcript', async () => {
+          await renderLeavableStreamingThread();
+          await startRecording();
+          await act(async () => sessions[0].args.onDelta('Almost done'));
+          fireEvent.click(stopButton()!);
+
+          leave();
+          expect(sessions[0].abort).not.toHaveBeenCalled();
+
+          // The transcript still arrives, and is kept in the thread it was recorded in.
+          await act(async () => {
+            sessions[0].args.onDone('Almost done.');
+            sessions[0].args.onState('closed');
+          });
+          await waitFor(
+            () => {
+              const saved = chatApi.spies.saveChat.mock.calls.at(-1)?.[1].content as {
+                messages: { content: unknown }[];
+              };
+              expect(saved.messages.map((m) => m.content)).toEqual([
+                t.chatTranscriptionLiveTurn,
+                'Almost done.',
+              ]);
+            },
+            { timeout: 2500 },
+          );
+        });
       });
     });
 

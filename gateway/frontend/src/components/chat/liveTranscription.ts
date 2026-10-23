@@ -51,6 +51,16 @@ const FLUSH_WAIT_MS = 500;
 // takes longer than the cap drops the oldest.
 const MAX_PENDING_BATCHES = 100;
 
+// How long the session waits for a context that was resumed in the user's gesture to be running
+// before giving up on it, in ms: a browser answers within a few ms, so a context that is still
+// suspended after this has been refused (or has no gesture to run under).
+const CONTEXT_RUN_WAIT_MS = 1_000;
+
+// The WebSocket close code of a server that is busy ("try again later"), and the gateway's own
+// code for the same refusal on its other transports.
+const WS_TRY_AGAIN_LATER = 1013;
+export const LIVE_BUSY_CODE = 'transcription.live_busy';
+
 /** Where a live session stands. It starts `connecting`; `closed` and `error` are final. */
 export type LiveSessionState = 'connecting' | 'listening' | 'finalizing' | 'closed' | 'error';
 
@@ -103,6 +113,27 @@ export function liveTranscriptionWsUrl(location: { protocol: string; host: strin
 /** What createLiveSession needs of the portal's API client: the ticket POST. */
 export type LiveTicketApi = Pick<PortalApi, 'createLiveTranscriptionTicket'>;
 
+/**
+ * Why a session failed, which is what tells the caller whether trying again can help.
+ *
+ *  - `dropped`: the connection ended without the gateway saying why, or the ticket request did
+ *    not get through (a network failure, a 5xx). The same request may well work next time.
+ *  - `refused`: the gateway said no -- an error frame, a ticket it refused (a 4xx, with its
+ *    `code`), a busy close. The same request would be refused again.
+ *  - `denied`: the user, or the browser's policy, refused the microphone.
+ *  - `unsupported`: this browser cannot capture audio this way (no microphone API, no
+ *    AudioWorklet).
+ *  - `capture`: the microphone or the audio pipeline failed (no device, a worklet that died, a
+ *    context the browser would not run).
+ */
+export type LiveErrorKind = 'dropped' | 'refused' | 'denied' | 'unsupported' | 'capture';
+
+export type LiveErrorDetail = {
+  kind: LiveErrorKind;
+  /** The gateway's error code, when there is one (a refused ticket, a busy close). */
+  code?: string;
+};
+
 export type LiveSessionArgs = {
   api: LiveTicketApi;
   model: string;
@@ -114,8 +145,8 @@ export type LiveSessionArgs = {
   onPartial(text: string): void;
   /** The final transcript (empty: keep what the deltas and partials gave). The session is over. */
   onDone(text: string): void;
-  /** The session failed, with a message for the log or the user. The session is over. */
-  onError(message: string): void;
+  /** The session failed, with a message for the log and the kind of failure. The session is over. */
+  onError(message: string, detail: LiveErrorDetail): void;
   /** Every state the session is in, `connecting` (made before createLiveSession returns) first. */
   onState(state: LiveSessionState): void;
 };
@@ -139,6 +170,50 @@ function audioContextConstructor(): typeof AudioContext | undefined {
 function describeError(error: unknown): string {
   if (error instanceof Error) return error.message || error.name;
   return String(error);
+}
+
+// A getUserMedia refusal by the user or the browser's policy (NotAllowedError is the standard
+// name, PermissionDeniedError the old one, SecurityError a page the browser will not give the
+// microphone to). Read by `name`, never `instanceof`: the rejection is a DOMException, which is
+// not an Error of this realm in every environment.
+function isPermissionDenied(error: unknown): boolean {
+  const name =
+    typeof error === 'object' && error !== null && 'name' in error ? String(error.name) : '';
+  return name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError';
+}
+
+// A failure with its kind, thrown inside start() so that the one catch there can report it.
+class LiveFailure extends Error {
+  readonly detail: LiveErrorDetail;
+  constructor(message: string, detail: LiveErrorDetail) {
+    super(message);
+    this.detail = detail;
+  }
+}
+
+// What a failed ticket request means: a 4xx is the gateway refusing this session (the same
+// request is refused again); anything else -- a network failure, a 5xx -- did not get an answer.
+function ticketFailure(error: unknown): LiveFailure {
+  const status = (error as { status?: unknown } | null)?.status;
+  const code = (error as { code?: unknown } | null)?.code;
+  const refused = typeof status === 'number' && status >= 400 && status < 500;
+  return new LiveFailure(describeError(error), {
+    kind: refused ? 'refused' : 'dropped',
+    ...(refused && typeof code === 'string' && code !== '' ? { code } : {}),
+  });
+}
+
+// Waits for `promise`, but not longer than `ms`; the timer does not outlive the wait.
+async function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  try {
+    await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -223,7 +298,8 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
     }
   };
 
-  const fail = (message: string) => finish('error', () => args.onError(message));
+  const fail = (message: string, detail: LiveErrorDetail) =>
+    finish('error', () => args.onError(message, detail));
 
   // The end of input, once everything captured has been sent: the last batch from the worklet
   // (flushed), and the connection to send it on (open).
@@ -271,7 +347,7 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
         finish('closed', () => args.onDone(frame.text));
         break;
       case 'error':
-        fail(frame.message || 'live transcription failed');
+        fail(frame.message || 'live transcription failed', { kind: 'refused' });
         break;
     }
   };
@@ -289,6 +365,9 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
       processorOptions: { outputRate: LIVE_TRANSCRIPTION_SAMPLE_RATE },
     });
     node.port.onmessage = onWorkletMessage;
+    // A processor that throws goes silent: audio would stop flowing with nothing to say so,
+    // and only the end of the recording would notice. Fail at once instead.
+    node.onprocessorerror = () => fail('the audio capture stopped working', { kind: 'capture' });
     source.connect(node);
     // The node writes no output (silence), but is connected on to the destination so that every
     // browser pulls it: one that only renders what reaches the destination would never run it.
@@ -313,7 +392,15 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
     // An error event carries nothing; the close that follows it has the code and the reason.
     ws.onclose = (event) => {
       const why = event.reason ? `: ${event.reason}` : '';
-      fail(`live transcription connection closed (${event.code}${why})`);
+      const message = `live transcription connection closed (${event.code}${why})`;
+      // A close the gateway chose ("busy", try again later) is a no; any other end of the
+      // connection without a final transcript is a drop.
+      fail(
+        message,
+        event.code === WS_TRY_AGAIN_LATER
+          ? { kind: 'refused', code: LIVE_BUSY_CODE }
+          : { kind: 'dropped' },
+      );
     };
   };
 
@@ -322,12 +409,14 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
     const Context = audioContextConstructor();
     const mediaDevices = typeof navigator === 'undefined' ? undefined : navigator.mediaDevices;
     if (!Context || !mediaDevices?.getUserMedia) {
-      throw new Error('this browser cannot capture the microphone');
+      throw new LiveFailure('this browser cannot capture the microphone', { kind: 'unsupported' });
     }
     const ctx = new Context();
     context = ctx;
-    if (!ctx.audioWorklet) throw new Error('this browser has no AudioWorklet');
-    void ctx.resume().catch(() => undefined);
+    if (!ctx.audioWorklet) {
+      throw new LiveFailure('this browser has no AudioWorklet', { kind: 'unsupported' });
+    }
+    const resumed = ctx.resume().catch(() => undefined);
     const [media, worklet] = await Promise.allSettled([
       mediaDevices.getUserMedia({ audio: true }),
       ctx.audioWorklet.addModule(workletUrl),
@@ -340,13 +429,32 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
       else stream = media.value;
     }
     if (over) return;
-    if (media.status === 'rejected') throw media.reason;
-    if (worklet.status === 'rejected') throw worklet.reason;
+    if (media.status === 'rejected') {
+      throw new LiveFailure(describeError(media.reason), {
+        kind: isPermissionDenied(media.reason) ? 'denied' : 'capture',
+      });
+    }
+    if (worklet.status === 'rejected') {
+      throw new LiveFailure(describeError(worklet.reason), { kind: 'capture' });
+    }
+    // A context the browser did not let run (it was resumed in the gesture above, and has had
+    // all the time the permission prompt took) captures nothing: the worklet is never called,
+    // and the session would sit "listening" to silence until its grace period ran out.
+    if (ctx.state !== 'running') await settleWithin(resumed, CONTEXT_RUN_WAIT_MS);
+    if (over) return;
+    if (ctx.state !== 'running') {
+      throw new LiveFailure('the browser would not start the audio capture', { kind: 'capture' });
+    }
     connectCapture(ctx, media.value);
-    const { ticket } = await args.api.createLiveTranscriptionTicket({
-      model: args.model,
-      language: args.language,
-    });
+    let ticket: string;
+    try {
+      ({ ticket } = await args.api.createLiveTranscriptionTicket({
+        model: args.model,
+        language: args.language,
+      }));
+    } catch (error) {
+      throw ticketFailure(error);
+    }
     if (over) return;
     openSocket(ticket);
   };
@@ -370,7 +478,7 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
       }
       stopTracks(stream);
       graceTimer = setTimeout(
-        () => fail('live transcription did not deliver its final transcript'),
+        () => fail('live transcription did not deliver its final transcript', { kind: 'dropped' }),
         LIVE_FINALIZE_GRACE_MS,
       );
       flushTimer = setTimeout(() => {
@@ -385,6 +493,8 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
   };
 
   args.onState(state);
-  start().catch((error: unknown) => fail(describeError(error)));
+  start().catch((error: unknown) =>
+    fail(describeError(error), error instanceof LiveFailure ? error.detail : { kind: 'capture' }),
+  );
   return session;
 }

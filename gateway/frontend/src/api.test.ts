@@ -227,22 +227,44 @@ describe('portal api', () => {
     expect('language' in body).toBe(false);
   });
 
-  it('surfaces a refused live ticket as a PortalApiError carrying the gateway code', async () => {
+  // The gateway's refusals of a live session, on the portal's ticket endpoint and the public
+  // bearer endpoint alike (one code for one reason): the model is not known to stream, its agent
+  // cannot, or the session's parameters are outside what the relay accepts. The store reads the
+  // code to tell the user live transcription is not available here, so the client must hand it on
+  // exactly as sent.
+  it.each([
+    [409, 'transcription.live_not_streaming', 'this model does not support live transcription'],
+    [409, 'transcription.live_agent_unsupported', 'this model does not support live transcription'],
+    [400, 'transcription.live_params_invalid', 'unsupported live transcription parameters'],
+  ])(
+    'surfaces a refused live ticket (%i %s) as a PortalApiError carrying the gateway code',
+    async (status, code, message) => {
+      const fetcher = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: { code, message } }), {
+          status,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+
+      await expect(
+        createPortalApi(fetcher).createLiveTranscriptionTicket({ model: 'whisper' }),
+      ).rejects.toMatchObject({ status, code });
+    },
+  );
+
+  it('surfaces a ticket the gateway failed to mint as a PortalApiError with its (portal) code', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
-          error: {
-            code: 'portal.live_transcription_not_streaming',
-            message: 'this model does not support live transcription',
-          },
+          error: { code: 'portal.live_transcription_ticket_failed', message: 'ticket failed' },
         }),
-        { status: 409, headers: { 'Content-Type': 'application/json' } },
+        { status: 500, headers: { 'Content-Type': 'application/json' } },
       ),
     );
 
     await expect(
       createPortalApi(fetcher).createLiveTranscriptionTicket({ model: 'whisper' }),
-    ).rejects.toMatchObject({ status: 409, code: 'portal.live_transcription_not_streaming' });
+    ).rejects.toMatchObject({ status: 500, code: 'portal.live_transcription_ticket_failed' });
   });
 
   it('carries the backend-folded image_edit flag on a model option, independent of image', async () => {
