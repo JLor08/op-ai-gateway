@@ -8234,8 +8234,8 @@ clip, it is relayed multipart, and the transcript returns as the assistant turn.
 decoding a clip that was **already uploaded whole**. Issue #266 asks for the live-**input**
 sibling: text that appears **while the user is still speaking**. audio.cpp already exposes the
 capability on `POST /v1/audio/transcriptions/live`; what is missing is every hop between a
-browser and it. Four facts shaped each choice below. The first rests on the issue's live probe
-and is **treated as given, not re-verified by this work** (see the Consequence):
+browser and it. Four facts shaped each choice below. The first came from the issue's live probe
+and has **since been verified live** against audio.cpp v0.9.1 with a streaming ASR model (see the Consequence):
 
 - **audio.cpp `/live` is one chunked, full-duplex HTTP/1.1 exchange per model.** The request body
   is raw interleaved PCM, with the parameters (`model`, `sample_rate`, `channels`,
@@ -8381,8 +8381,8 @@ the streaming **idle watchdog**. The text below is corrected for each; [ADR-073]
     capture worklet must frame against, since a frame one byte over closes the socket `1009`); the
     one **text** control is `{"type":"end"}`.
   - **Down:** JSON text messages `{type, text | message}` where `type` is `delta` (append),
-    `partial` (replace the provisional transcript), `done` (the final transcript, unless audio.cpp
-    emits `done` per utterance mid-stream, which is unconfirmed) or `error`
+    `partial` (replace the provisional transcript), `done` (the final transcript; audio.cpp sends one
+    terminal `done` after end-of-input, not per utterance — verified live) or `error`
     (a message; terminal). The SSE is parsed by the **shared** `transcriptionStreamScan` and
     `decodeTranscriptionEvent`, not a fork.
   - **End-of-input is explicit, and it is what makes a normal session bill at all.** `{"type":"end"}`
@@ -8449,24 +8449,31 @@ at rest moves: no table, no setting and no existing endpoint changes behavior. T
 residuals are named ([Risks
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)):
 
-- **Verification status: mock-backed, with real full-duplex proofs on both agent paths, and no session
-  against a real audio.cpp `/live`.** Unit and integration tests pass, including the two end-to-end
-  **interleave tests** through a real agent proxy (in-process and dialed) and router ((b)), the provider's
-  duplex tests, the ticket's mint/redeem/replay/tamper tests, and the WebSocket relay's
+- **Verification status: mock-backed, with real full-duplex proofs on both agent paths, and the
+  audio.cpp `/live` contract since confirmed live.** Unit and integration tests pass, including the two
+  end-to-end **interleave tests** through a real agent proxy (in-process and dialed) and router ((b)),
+  the provider's duplex tests, the ticket's mint/redeem/replay/tamper tests, and the WebSocket relay's
   clean-end versus truncated-session tests (which must stay two distinct cases) and the
-  billing-rate ≡ forwarded-rate and busy-reject tests. An end-to-end session against a **real**
-  audio.cpp `/live` was **not** verified in the build environment: it needs the whole gateway +
-  agent + audio.cpp stack with a streaming ASR model. The `/live` contract is per the issue's live
-  probe. One detail it does not settle is whether `transcript.text.done` and `[DONE]` can appear
-  **per utterance, mid-stream**, and the billing gate bounds that only in part. A clean bill needs the
-  explicit end-of-input **and** the scan's completion, but `scan.complete()` is a **latch** that
-  end-of-input does not reset, and the two are not ordered. What is bounded: a session that closes
-  without `end`, a dial failure or non-2xx before the response, and a stream that never shows both
-  terminal events all bill zero. What is **not** bounded: if audio.cpp does emit `done` + `[DONE]` per
-  utterance, the latch is set early, so a session whose upstream then fails **after** the client sent
-  `end` can still bill clean for all the PCM it sent. The design's idea of billing only on the terminal
-  events that follow **our** terminating chunk is **not implemented**. A first run against a real model
-  should settle the open question, and if it is confirmed the scan has to be re-armed at end-of-input.
+  billing-rate ≡ forwarded-rate and busy-reject tests. The full gateway + agent + audio.cpp chain was
+  not run as one stack, but the `/live` **contract the relay depends on** — the issue's live probe — was
+  **verified live** against audio.cpp v0.9.1 with a streaming ASR model (`vibevoice_asr_streaming`),
+  driven with exactly the chunked request the gateway sends: a non-chunked body is refused `400`, the
+  `model`/`sample_rate`/`channels`/`sample_format`/`language` query is accepted, and the SSE is
+  `transcript.text.delta` (streamed **during** input, before end-of-input, so the full-duplex relay
+  shows live text) then a single `transcript.text.done` (the full text plus `timing.ttft_ms`) then
+  `data: [DONE]`. **This settles the open question of whether `transcript.text.done` and `[DONE]` appear
+  per utterance:** even across several utterances separated by a pause the run emitted the deltas
+  incrementally but **one** terminal `done` + `[DONE]`, **after** end-of-input — `[DONE]` ends the SSE and
+  the socket closes — never per utterance. So `scan.complete()` cannot latch early and the billing gate
+  (end-of-input **and** completion) is sound as written: a clean bill needs the explicit end-of-input
+  **and** the scan's completion, `scan.complete()` is a latch that end-of-input does not reset, and the
+  two are not ordered, but since the terminal events only follow **our** terminating chunk the two-latch
+  gap cannot be exploited by this model. What is bounded: a session that closes without `end`, a dial
+  failure or non-2xx before the response, and a stream that never shows both terminal events all bill
+  zero. The only residual is the VERIFY-LIVE boundary: a different streaming model or audio.cpp version
+  that emitted a mid-stream `done` + `[DONE]` would set the latch early (a session whose upstream then
+  failed after the client sent `end` could bill clean for all its PCM), and only then would the scan have
+  to be re-armed at end-of-input; the verified model does not, so that re-arming is **not implemented**.
 - **A ticket opens only on the process that minted it.** The key is random per process, so a
   restart invalidates every outstanding ticket, and behind several gateway instances or a
   non-sticky load balancer a ticket minted on one will not open on another. That is fine for a
