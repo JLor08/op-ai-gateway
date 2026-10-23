@@ -220,47 +220,53 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 		liveReadLoop(conn, cancel, pw, &pcmBytes, &endRequested)
 	}()
 
-	// Open the full-duplex upstream request. ProxyNativeDuplex returns as soon as the
-	// response headers arrive, with the body still open and the request body (pr)
-	// still being read; it applies no target.Timeout.
 	scan := s.newTranscriptionStreamScan(endpointTranscription, false)
-	resp, upErr := s.proxyLiveDuplex(ctx, claims, pr)
-	if upErr == nil {
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream error"}))
-			slog.Error("live transcription: upstream non-2xx", "id", id, "status", resp.StatusCode, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID))
-		} else {
-			s.liveRelaySSE(ctx, resp.Body, scan, writer)
-		}
-	} else {
-		writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream unavailable"}))
-		slog.Error("live transcription: upstream dial failed", "id", id, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID), "err", upErr)
-	}
+	var resp *provider.ProxyResponse
+	var upErr error
 
-	// Teardown, leak-free and in order:
+	// Teardown + billing, DEFERRED so they are airtight even if the relay panics (a
+	// panic in proxyLiveDuplex/liveRelaySSE must not skip the pipe close, the
+	// goroutine join or the usage row; net/http recovers the panic after this runs).
+	// Leak-free and in order:
 	//   1. Unblock the pipe from BOTH sides at once: the transport's body-copy
 	//      (reading pr) and the read loop's possibly-blocked pw.Write both return.
 	//      The transport uses io.NopCloser, so it never closes pr for us; net/http
 	//      cancels r.Context() on a client drop only AFTER the body is drained, so
-	//      teardown is driven from here, never by waiting on r.Context().
-	_ = pr.CloseWithError(errLiveRelayDone)
-	//   2. Cancel the one context: this is the single teardown signal. The writer
-	//      flushes any queued transcript frames and then CloseNow()s the connection
-	//      (an abrupt close after clean data delivery), which unblocks the read loop's
-	//      conn.Read. A clean close HANDSHAKE is deliberately NOT used on this hot
-	//      path: coder/websocket's Close() needs the read mutex to complete, but the
-	//      read loop holds it blocked in conn.Read, so a handshake would stall ~5s
-	//      every session -- the same reason handleAgentStream CloseNow()s its hot
-	//      path. The browser already has every transcript frame (the done/error
-	//      message is the semantic end); the close code is not load-bearing here. The
-	//      structured close frame IS used where it matters and no reader competes: the
-	//      busy reject (handleLiveTranscription).
-	cancel()
+	//      teardown is driven from the handler's own context, never from r.Context().
+	//   2. Cancel the one context: the single teardown signal. The writer flushes any
+	//      queued transcript frames then CloseNow()s the connection (an abrupt close
+	//      after clean data delivery), which unblocks the read loop's conn.Read. A
+	//      clean close HANDSHAKE is deliberately NOT used on this hot path:
+	//      coder/websocket's Close() needs the read mutex the read loop holds blocked
+	//      in conn.Read, so a handshake would stall ~5s every session -- the same
+	//      reason handleAgentStream CloseNow()s its hot path. The browser already has
+	//      every transcript frame; the structured close frame IS used where it matters
+	//      and no reader competes: the busy reject (handleLiveTranscription).
 	//   3. Join: pcmBytes and endRequested are stable once both goroutines return.
-	wg.Wait()
+	//   4. Bill exactly once.
+	defer func() {
+		_ = pr.CloseWithError(errLiveRelayDone)
+		cancel()
+		wg.Wait()
+		s.recordLiveUsage(start, id, r, claims, endRequested.Load(), scan, atomic.LoadInt64(&pcmBytes), upErr, resp)
+	}()
 
-	s.recordLiveUsage(start, id, r, claims, endRequested.Load(), scan, atomic.LoadInt64(&pcmBytes), upErr, resp)
+	// Open the full-duplex upstream request. ProxyNativeDuplex returns as soon as the
+	// response headers arrive, with the body still open and the request body (pr)
+	// still being read; it applies no target.Timeout.
+	resp, upErr = s.proxyLiveDuplex(ctx, claims, pr)
+	if upErr != nil {
+		writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream unavailable"}))
+		slog.Error("live transcription: upstream dial failed", "id", id, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID), "err", upErr)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream error"}))
+		slog.Error("live transcription: upstream non-2xx", "id", id, "status", resp.StatusCode, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID))
+		return
+	}
+	s.liveRelaySSE(ctx, resp.Body, scan, writer)
 }
 
 // proxyLiveDuplex opens the full-duplex upstream request for claims, feeding its body
@@ -499,11 +505,25 @@ func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, cl
 	case upErr == nil && endRequested && scan.complete() && rateOK && byteRate > 0:
 		meta.BillingQuantity = float64(pcmBytes) / float64(byteRate)
 	default:
+		// Loud zero (ADR-041): every non-clean end logs once; the quantity stays 0.
 		slog.Error("live transcription billed zero",
 			"id", id, "path", meta.ReqPath, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID),
 			"end_requested", endRequested, "complete", scan.complete(), "rate_ok", rateOK, "byte_rate", byteRate, "pcm_bytes", pcmBytes, "upstream_error", upErr)
-		if upErr != nil {
+		// Classify the row's status honestly. A dial failure and a non-2xx UPSTREAM
+		// are backend ERRORS: leaving them status="success" while HTTPStatus carries
+		// the 4xx/5xx would be a self-contradictory row that hides a real failure (the
+		// agent's 404 model_not_managed / 503 admission_blocked, a child error) from
+		// error-rate views. The non-2xx code mirrors the native path's own
+		// (nativeTerminalStatus: "upstream.<status>"). A clean-but-truncated client
+		// session (drop without end-of-input) and a mid-stream SSE error AFTER a 200
+		// stay status="success" with the loud zero -- the same way
+		// setStreamedTranscriptionBillingQuantity treats a 2xx stream that did not
+		// complete.
+		switch {
+		case upErr != nil:
 			status, errorCode = "error", completionErrorCode(upErr)
+		case resp != nil && (resp.StatusCode < 200 || resp.StatusCode >= 300):
+			status, errorCode = "error", fmt.Sprintf("upstream.%d", resp.StatusCode)
 		}
 	}
 

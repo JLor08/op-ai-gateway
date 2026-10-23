@@ -44,6 +44,10 @@ type mockLiveChild struct {
 	// emitError, when set, makes the child emit an SSE error event instead of
 	// reading the body (a mid-stream failure).
 	emitError bool
+	// statusCode, when non-zero and not 2xx, makes the child answer that HTTP status
+	// with a short error body instead of upgrading to the SSE stream (an upstream
+	// error, e.g. the agent's 404 model_not_managed / 503 admission_blocked).
+	statusCode int
 }
 
 func newMockLiveChild(t *testing.T) *mockLiveChild {
@@ -60,10 +64,25 @@ func (c *mockLiveChild) serve(w http.ResponseWriter, r *http.Request) {
 	c.gotQuery = r.URL.RawQuery
 	emitPartial := c.emitPartial
 	emitError := c.emitError
+	statusCode := c.statusCode
 	c.mu.Unlock()
 
 	rc := http.NewResponseController(w)
+	// Full-duplex so the server may write the response while the request body is still
+	// incoming -- what a real audio.cpp /live upstream does, and what lets a non-2xx
+	// answer (below) reach the client without the server first draining an open body.
 	_ = rc.EnableFullDuplex()
+
+	// A non-2xx upstream answer: report the status with a short error body and do NOT
+	// upgrade to the SSE stream. Flush so the client's full-duplex request (whose body
+	// is still open) receives the response headers promptly.
+	if statusCode != 0 && (statusCode < 200 || statusCode >= 300) {
+		w.WriteHeader(statusCode)
+		fmt.Fprint(w, `{"error":{"message":"model not managed"}}`)
+		_ = rc.Flush()
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 	_ = rc.Flush()
@@ -605,4 +624,61 @@ func TestLiveTranscriptionErrorEventRelayed(t *testing.T) {
 		t.Fatal("never received an error message")
 	}
 	requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
+}
+
+// TestLiveTranscriptionNon2xxUpstreamErrorRow proves a non-2xx UPSTREAM answer is
+// recorded as an ERROR row (status "error" + an upstream.<code>) with a loud-zero
+// quantity -- never a self-contradictory status="success" row that hides a real
+// backend failure while HTTPStatus carries the 4xx.
+func TestLiveTranscriptionNon2xxUpstreamErrorRow(t *testing.T) {
+	srv := newLiveTestServer(t)
+	child := newMockLiveChild(t)
+	child.statusCode = http.StatusNotFound
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// A PCM frame flushes the upstream request (the client transport flushes the
+	// chunked request headers only with the first body chunk), so the child actually
+	// receives the request and answers its non-2xx status. In the real flow the mic's
+	// PCM always flows, so a non-2xx upstream is observed once streaming starts.
+	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 320)); err != nil {
+		t.Fatalf("send pcm: %v", err)
+	}
+
+	// The handler relays a typed error down-message on a non-2xx upstream.
+	sawError := false
+	for {
+		m, rerr := readLiveMsg(t, ctx, conn)
+		if rerr != nil {
+			break
+		}
+		if m.Type == "error" {
+			sawError = true
+			break
+		}
+	}
+	if !sawError {
+		t.Fatal("never received an error message on a non-2xx upstream")
+	}
+
+	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
+	if ev.Status != "error" {
+		t.Fatalf("status = %q, want error", ev.Status)
+	}
+	if ev.ErrorCode != "upstream.404" {
+		t.Fatalf("errorCode = %q, want upstream.404", ev.ErrorCode)
+	}
+	if ev.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("httpStatus = %d, want 404", ev.HTTPStatus)
+	}
 }
