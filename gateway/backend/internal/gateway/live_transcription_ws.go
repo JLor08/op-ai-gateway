@@ -248,7 +248,7 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 		_ = pr.CloseWithError(errLiveRelayDone)
 		cancel()
 		wg.Wait()
-		s.recordLiveUsage(start, id, r, claims, liveUsageResult{
+		s.recordLiveUsage(start, id, r.URL.Path, claims.Target, claims.params(), claims.attribution(), claims.Target.APIFlavor, liveUsageResult{
 			endRequested: endRequested.Load(),
 			scan:         scan,
 			pcmBytes:     atomic.LoadInt64(&pcmBytes),
@@ -260,7 +260,7 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	// Open the full-duplex upstream request. ProxyNativeDuplex returns as soon as the
 	// response headers arrive, with the body still open and the request body (pr)
 	// still being read; it applies no target.Timeout.
-	resp, upErr = s.proxyLiveDuplex(ctx, claims, pr)
+	resp, upErr = s.proxyLiveDuplex(ctx, claims.Target, claims.params(), pr)
 	if upErr != nil {
 		writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream unavailable"}))
 		slog.Error("live transcription: upstream dial failed", "id", id, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID), "err", upErr)
@@ -275,10 +275,12 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	s.liveRelaySSE(ctx, resp.Body, scan, writer)
 }
 
-// proxyLiveDuplex opens the full-duplex upstream request for claims, feeding its body
-// from pr. The native provider must offer the optional duplex capability (the
-// Multiplexer over the OpenAI-compatible client does); a provider without it is a
-// clean ErrUnavailable, never a panic.
+// proxyLiveDuplex opens the full-duplex upstream request for (target, params), feeding
+// its body from pr. The WebSocket and the bearer HTTP relay both call it, so the
+// upstream-path building and the credential attachment are one source of truth rather
+// than two transports' copies. The native provider must offer the optional duplex
+// capability (the Multiplexer over the OpenAI-compatible client does); a provider
+// without it is a clean ErrUnavailable, never a panic.
 //
 // The per-mapping upstream credential (target.APIToken / APITokenHeader) is attached
 // to ctx first, exactly as the buffered native path does before ProxyNative: a child
@@ -288,39 +290,39 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 // plain upstreamAuthCtx suffices -- the live relay forwards no client headers (raw
 // PCM) -- and it is a no-op for a token-less target. Wrapping only adds a value, so
 // the caller's cancellation still propagates.
-func (s *Server) proxyLiveDuplex(ctx context.Context, claims liveTicketClaims, pr *io.PipeReader) (*provider.ProxyResponse, error) {
+func (s *Server) proxyLiveDuplex(ctx context.Context, target routing.Target, params liveParams, pr io.Reader) (*provider.ProxyResponse, error) {
 	duplex, ok := s.Provider.(provider.NativeDuplexProxyClient)
 	if !ok {
 		return nil, fmt.Errorf("%w: live transcription duplex relay not supported by the native provider", provider.ErrUnavailable)
 	}
-	ctx = s.upstreamAuthCtx(ctx, claims.Target)
-	return duplex.ProxyNativeDuplex(ctx, claims.Target, liveUpstreamPath(claims), pr, liveUpstreamContentType)
+	ctx = s.upstreamAuthCtx(ctx, target)
+	return duplex.ProxyNativeDuplex(ctx, target, liveUpstreamPath(target, params), pr, liveUpstreamContentType)
 }
 
-// liveUpstreamPath builds the upstream request path from the claims, by provider.
+// liveUpstreamPath builds the upstream request path from the resolved target and the
+// validated params, by provider.
 //   - A server_agent target is reached through the agent's /live/{model} relay, which
 //     extracts the model from the PATH and adds model= to the CHILD query itself, so
 //     the gateway forwards only the audio params and NEVER adds model here.
 //   - A direct audio_cpp target has no agent in front, so the model rides in the
 //     query of audio.cpp's own /v1/audio/transcriptions/live.
 //
-// The (sample_rate, channels, sample_format, language) triple-plus-language comes
-// from the claims -- the SAME validated values the session bills at (billing-rate ≡
-// forwarded-rate). Language is already validated to [A-Za-z0-9_-]{0,64}, so it
-// cannot smuggle a second query parameter; it is omitted when empty (audio.cpp then
-// detects the language).
-func liveUpstreamPath(claims liveTicketClaims) string {
+// The (sample_rate, channels, sample_format) triple plus language comes from params --
+// the SAME validated values the session bills at (billing-rate ≡ forwarded-rate).
+// Language is already validated to [A-Za-z0-9_-]{0,64}, so it cannot smuggle a second
+// query parameter; it is omitted when empty (audio.cpp then detects the language).
+func liveUpstreamPath(target routing.Target, params liveParams) string {
 	q := url.Values{}
-	q.Set("sample_rate", strconv.Itoa(claims.SampleRate))
-	q.Set("channels", strconv.Itoa(claims.Channels))
-	q.Set("sample_format", claims.Format)
-	if claims.Language != "" {
-		q.Set("language", claims.Language)
+	q.Set("sample_rate", strconv.Itoa(params.SampleRate))
+	q.Set("channels", strconv.Itoa(params.Channels))
+	q.Set("sample_format", params.Format)
+	if params.Language != "" {
+		q.Set("language", params.Language)
 	}
-	if claims.Target.Provider == routing.ProviderServerAgent {
-		return provider.ExpandModelPath("/live/{model}", claims.Target.ProviderModel) + "?" + q.Encode()
+	if target.Provider == routing.ProviderServerAgent {
+		return provider.ExpandModelPath("/live/{model}", target.ProviderModel) + "?" + q.Encode()
 	}
-	q.Set("model", claims.Target.ProviderModel)
+	q.Set("model", target.ProviderModel)
 	return "/v1/audio/transcriptions/live?" + q.Encode()
 }
 
@@ -516,22 +518,26 @@ type liveUsageResult struct {
 //     at Error -- a loud zero, never a silent one, and never a guessed count.
 //
 // The row attributes UserID + TokenID + ServiceID/ServiceName + ProjectID/ProjectName +
-// RouteID + ServerID from the claims: the ticket endpoint copied the service and project
-// off the authenticated token, so a live row is attributed like a buffered transcription's.
+// RouteID + ServerID from attr: for the WebSocket the ticket endpoint copied the service
+// and project off the authenticated token (the upgrade carries no principal of its own);
+// for the bearer HTTP relay attr comes straight off the request's bearer token. Either
+// way a live row is attributed like a buffered transcription's.
 //
-// The per-session outcome is bundled into liveUsageResult rather than passed as
-// loose parameters, keeping this billing entry point within a sane parameter
-// count (go:S107) with the exact same inputs.
-func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, claims liveTicketClaims, result liveUsageResult) {
+// target + params + attr + apiFlavor replace the ticket claims the WebSocket path once
+// passed, so the bearer HTTP relay -- which has no ticket -- bills through the SAME
+// classifier from a resolved target, its query params and its bearer token. The
+// per-session outcome is bundled into liveUsageResult, keeping this entry point within a
+// sane parameter count (go:S107).
+func (s *Server) recordLiveUsage(start time.Time, id, reqPath string, target routing.Target, params liveParams, attr liveAttribution, apiFlavor string, result liveUsageResult) {
 	meta := usageMeta{
-		ReqPath:     r.URL.Path,
+		ReqPath:     reqPath,
 		HTTPStatus:  liveHTTPStatus(result.upErr, result.resp),
 		ContentType: liveSSEContentType,
 		Endpoint:    endpointTranscription,
 	}
 	meta.BillingUnit, meta.BillingQuantity = usage.BillingUnitAudioSecond, 0
 
-	byteRate, rateOK := liveByteRate(claims.SampleRate, claims.Channels, claims.Format)
+	byteRate, rateOK := liveByteRate(params.SampleRate, params.Channels, params.Format)
 	status, errorCode := "success", ""
 	switch {
 	case result.upErr == nil && result.endRequested && result.scan.complete() && rateOK && byteRate > 0:
@@ -539,7 +545,7 @@ func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, cl
 	default:
 		// Loud zero (ADR-041): every non-clean end logs once; the quantity stays 0.
 		slog.Error("live transcription billed zero",
-			"id", id, "path", meta.ReqPath, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID),
+			"id", id, "path", meta.ReqPath, "model", target.Model, "server", s.serverName(target.ServerID),
 			"end_requested", result.endRequested, "complete", result.scan.complete(), "rate_ok", rateOK, "byte_rate", byteRate, "pcm_bytes", result.pcmBytes, "upstream_error", result.upErr)
 		// Classify the row's status honestly. A dial failure and a non-2xx UPSTREAM
 		// are backend ERRORS: leaving them status="success" while HTTPStatus carries
@@ -560,18 +566,18 @@ func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, cl
 	}
 
 	token := auth.Token{
-		UserID:      claims.UserID,
-		ID:          claims.TokenID,
-		ServiceID:   claims.ServiceID,
-		ServiceName: claims.ServiceName,
-		ProjectID:   claims.ProjectID,
-		ProjectName: claims.ProjectName,
+		UserID:      attr.UserID,
+		ID:          attr.TokenID,
+		ServiceID:   attr.ServiceID,
+		ServiceName: attr.ServiceName,
+		ProjectID:   attr.ProjectID,
+		ProjectName: attr.ProjectName,
 	}
-	req := inference.Request{Model: claims.Target.Model, APIFlavor: claims.Target.APIFlavor}
+	req := inference.Request{Model: target.Model, APIFlavor: apiFlavor}
 	if req.APIFlavor == "" {
 		req.APIFlavor = apiFlavorSpeech
 	}
-	s.recordUsage(start, token, req, claims.Target, provider.Response{}, errorCode, status, meta, id, nil, nil)
+	s.recordUsage(start, token, req, target, provider.Response{}, errorCode, status, meta, id, nil, nil)
 }
 
 // liveHTTPStatus is the status recorded on the usage row: the mapped status of an

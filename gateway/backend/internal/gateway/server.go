@@ -1416,6 +1416,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/audio/speech", s.handleOpenAISpeech)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions", s.handleOpenAITranscription)
+	s.mux.HandleFunc("/openai/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
+	s.mux.HandleFunc("/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
 	s.mux.HandleFunc("/openai/v1/audio/voices", s.handleAudioVoices)
 	s.mux.HandleFunc("/v1/audio/voices", s.handleAudioVoices)
 	s.mux.HandleFunc("/openai/v1/models", s.handleOpenAIModels)

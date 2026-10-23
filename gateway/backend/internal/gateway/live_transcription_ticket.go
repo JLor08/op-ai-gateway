@@ -70,6 +70,27 @@ type liveTicketClaims struct {
 	ProjectName string
 }
 
+// params is the validated PCM shape the WebSocket relay forwards upstream and bills at,
+// lifted out of the claims so the live relay/billing core takes the SAME liveParams the
+// bearer HTTP relay builds from its query string.
+func (c liveTicketClaims) params() liveParams {
+	return liveParams{SampleRate: c.SampleRate, Channels: c.Channels, Format: c.Format, Language: c.Language}
+}
+
+// attribution is who the WebSocket session's usage row is billed to: the service and
+// project the ticket endpoint sealed off the authenticated token, so a WebSocket row --
+// whose upgrade carries no principal -- is attributed like a buffered transcription's.
+func (c liveTicketClaims) attribution() liveAttribution {
+	return liveAttribution{
+		UserID:      c.UserID,
+		TokenID:     c.TokenID,
+		ServiceID:   c.ServiceID,
+		ServiceName: c.ServiceName,
+		ProjectID:   c.ProjectID,
+		ProjectName: c.ProjectName,
+	}
+}
+
 // liveTicketStore mints and redeems live-transcription tickets.
 //
 // A browser cannot send custom headers on a WebSocket upgrade, so it cannot

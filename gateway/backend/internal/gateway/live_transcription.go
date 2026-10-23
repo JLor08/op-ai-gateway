@@ -37,6 +37,47 @@ const (
 // query parameter, so it is a language tag or name and nothing longer.
 const liveLanguageMaxLen = 64
 
+// liveParams is the validated PCM shape of a live transcription session: the three
+// audio.cpp /live parameters plus the optional language. It is the source of truth both
+// live transports pass to liveUpstreamPath (the forwarded query) and to the billing
+// classifier (the byte-rate), so the rate a session bills at is the rate it tells the
+// backend to decode at. The WebSocket builds it from the redeemed ticket; the bearer
+// HTTP relay from the request's query string.
+type liveParams struct {
+	SampleRate int
+	Channels   int
+	Format     string
+	Language   string
+}
+
+// liveAttribution is who a live session's usage row is billed to: the principal, its
+// service and its project. The WebSocket reads it off the ticket (the upgrade carries no
+// principal of its own, so the ticket endpoint sealed the authenticated token's values
+// into it); the bearer HTTP relay reads it straight off its request's bearer token, where
+// a service token's own service and project populate it directly.
+type liveAttribution struct {
+	UserID      string
+	TokenID     string
+	ServiceID   string
+	ServiceName string
+	ProjectID   string
+	ProjectName string
+}
+
+// bearerLiveAttribution is the attribution of a bearer-authenticated live session: the
+// request's own token, whose service/project populate the row directly (a service token
+// works on this endpoint, unlike the portal ticket endpoint).
+func bearerLiveAttribution(token auth.Token) liveAttribution {
+	return liveAttribution{
+		UserID:      token.UserID,
+		TokenID:     token.ID,
+		ServiceID:   token.ServiceID,
+		ServiceName: token.ServiceName,
+		ProjectID:   token.ProjectID,
+		ProjectName: token.ProjectName,
+	}
+}
+
 // bytesPerSample returns the size in bytes of one sample of a live PCM format.
 // Only the two formats audio.cpp accepts for live transcription are known.
 func bytesPerSample(format string) (int, bool) {
@@ -169,31 +210,9 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 		writeJSON(w, http.StatusBadRequest, apierror.Response(audioVoicesModelRequired, "model name is required", ""))
 		return
 	}
-	language := strings.TrimSpace(req.Language)
-	if _, valid := liveByteRate(req.SampleRate, req.Channels, req.SampleFormat); !valid || !validLiveLanguage(language) {
-		writeJSON(w, http.StatusBadRequest, apierror.Response(portalLiveTranscriptionParamsInvalid,
-			"sample_rate must be 1000-384000, channels 1-16, sample_format s16le or f32le, and language a bare language tag", ""))
-		return
-	}
-
-	pf, handled := s.inferencePreflight(w, r, token, nil, transcriptionInferenceShape(model))
-	if handled {
-		return
-	}
-	target, err := s.resolveLiveTranscriptionTarget(r.Context(), &token, pf.Req)
-	if err != nil {
-		slog.Debug("live transcription ticket rejected: routing failed", "model", model, "err", err)
-		writeJSON(w, completionHTTPStatus(err), completionErrorResponse(err))
-		return
-	}
-	if !s.mappingStreamsTranscription(r.Context(), target.RouteID) {
-		writeJSON(w, http.StatusConflict, apierror.Response(portalLiveTranscriptionNotStreaming,
-			"this model does not support live transcription: its mapping has no transcription_streaming verdict of yes", ""))
-		return
-	}
-	if !s.liveTranscriptionTargetServed(target) {
-		writeJSON(w, http.StatusConflict, apierror.Response(portalLiveTranscriptionAgentUnsupported,
-			"live transcription is not available on this model's server: its agent has not declared the "+fullduplexProxyFeature+" feature. The agent is older than 0.12.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported", ""))
+	params := liveParams{SampleRate: req.SampleRate, Channels: req.Channels, Format: req.SampleFormat, Language: strings.TrimSpace(req.Language)}
+	target, ok := s.resolveLiveTarget(w, r, token, model, params)
+	if !ok {
 		return
 	}
 
@@ -204,10 +223,10 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 	}
 	ticket, err := s.liveTickets.Mint(liveTicketClaims{
 		Target:     target,
-		SampleRate: req.SampleRate,
-		Channels:   req.Channels,
-		Format:     req.SampleFormat,
-		Language:   language,
+		SampleRate: params.SampleRate,
+		Channels:   params.Channels,
+		Format:     params.Format,
+		Language:   params.Language,
 		UserID:     token.UserID,
 		TokenID:    token.ID,
 		// The WebSocket has no principal, so the usage row's service/project
@@ -223,6 +242,61 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 		return
 	}
 	writeJSON(w, http.StatusOK, liveTicketResponse{Ticket: ticket})
+}
+
+// resolveLiveTarget validates the live params and resolves + gates the target for a live
+// transcription, SHARED by the portal ticket endpoint and the bearer HTTP handler so the
+// gate stays byte-for-byte identical across both transports. In order it:
+//
+//  1. validates the audio params (liveByteRate's ranges, audio.cpp's) and the language (a
+//     bare tag): 400 portal.live_transcription_params_invalid otherwise. Validated here,
+//     before admission is spent, so an invalid request costs nothing;
+//  2. runs the buffered transcription endpoint's own gate (inferencePreflight over
+//     transcriptionInferenceShape): the token's model/server overrides, the allowlist and
+//     the principal's rate/quota/budget admission. Terminal on failure (403/429/402),
+//     written by the preflight;
+//  3. resolves the target (resolveLiveTranscriptionTarget: the user's reachable servers,
+//     the transcription capability and the effective-served audio conjunct). A refusal is
+//     the buffered endpoint's own (404 routing.no_model_route / routing.model_not_capable);
+//  4. requires the mapping to stream a transcription (mappingStreamsTranscription): 409
+//     portal.live_transcription_not_streaming otherwise;
+//  5. requires a server_agent target's agent to have declared fullduplex_proxy
+//     (liveTranscriptionTargetServed): 409 portal.live_transcription_agent_unsupported
+//     otherwise. A direct audio_cpp target has no agent in front and needs no flag.
+//
+// On any refusal it writes the response and returns ok == false; it is a gate, not a
+// relay, so it contacts no upstream and records no usage row. token is taken by value: the
+// resolve refreshes only a last-used-model snapshot neither caller reads again, so there is
+// no second resolve for a pointer to feed. The caller has already rejected a blank model
+// (whose code differs between the two endpoints).
+func (s *Server) resolveLiveTarget(w http.ResponseWriter, r *http.Request, token auth.Token, model string, params liveParams) (routing.Target, bool) {
+	if _, valid := liveByteRate(params.SampleRate, params.Channels, params.Format); !valid || !validLiveLanguage(params.Language) {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(portalLiveTranscriptionParamsInvalid,
+			"sample_rate must be 1000-384000, channels 1-16, sample_format s16le or f32le, and language a bare language tag", ""))
+		return routing.Target{}, false
+	}
+	pf, handled := s.inferencePreflight(w, r, token, nil, transcriptionInferenceShape(model))
+	if handled {
+		return routing.Target{}, false
+	}
+	tok := token
+	target, err := s.resolveLiveTranscriptionTarget(r.Context(), &tok, pf.Req)
+	if err != nil {
+		slog.Debug("live transcription rejected: routing failed", "path", r.URL.Path, "model", model, "err", err)
+		writeJSON(w, completionHTTPStatus(err), completionErrorResponse(err))
+		return routing.Target{}, false
+	}
+	if !s.mappingStreamsTranscription(r.Context(), target.RouteID) {
+		writeJSON(w, http.StatusConflict, apierror.Response(portalLiveTranscriptionNotStreaming,
+			"this model does not support live transcription: its mapping has no transcription_streaming verdict of yes", ""))
+		return routing.Target{}, false
+	}
+	if !s.liveTranscriptionTargetServed(target) {
+		writeJSON(w, http.StatusConflict, apierror.Response(portalLiveTranscriptionAgentUnsupported,
+			"live transcription is not available on this model's server: its agent has not declared the "+fullduplexProxyFeature+" feature. The agent is older than 0.12.0, or it has not reported to the gateway since the gateway restarted or the agent was upgraded; update the agent, or retry once it has reported", ""))
+		return routing.Target{}, false
+	}
+	return target, true
 }
 
 // resolveLiveTranscriptionTarget resolves the routing target of an already-gated live
