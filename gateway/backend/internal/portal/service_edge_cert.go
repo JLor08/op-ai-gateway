@@ -1192,6 +1192,48 @@ server {
         proxy_read_timeout 3600s;
     }
 
+    # Portal live transcription (WebSocket). The same Upgrade shape as the agent
+    # stream above, so ANY proxy_set_header here discards the inherited set and
+    # all of it is repeated. Host is $http_host (NOT $host): the gateway guards a
+    # browser upgrade -- which cannot carry the CSRF header -- with
+    # coder/websocket's default same-origin check, which compares the Origin
+    # header's host AND PORT with the Host it sees. $host drops the port, so a
+    # gateway published on a non-default port would refuse every upgrade with 403.
+    location = /api/portal/transcription-live {
+        proxy_pass %[1]s;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-OP-Internal-Auth "";
+        proxy_set_header X-OP-Internal-User "";
+        proxy_set_header X-OP-Server-Override "";
+        proxy_set_header X-OP-Server-Override-Force "";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+
+    # Live transcription, bearer surface: a chunked, FULL-DUPLEX POST (the client
+    # streams PCM up while the gateway streams SSE transcript frames back on the
+    # one request). On top of the server-level defaults it needs
+    # proxy_request_buffering off -- nginx otherwise reads the WHOLE request body
+    # before it contacts the gateway, and a live body only ends when the speaker
+    # stops, so nothing would be forwarded and no transcript would come back; and
+    # client_body_timeout as long as the stream (its 60 s default would cut a
+    # client that pauses its PCM). No proxy_set_header here, so the server-level
+    # set is inherited; the regex outranks the /v1/ and /openai/ prefixes below.
+    location ~ ^/(?:openai/)?v1/audio/transcriptions/live$ {
+        client_max_body_size 0;
+        client_body_timeout 3600s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_http_version 1.1;
+        proxy_read_timeout 3600s;
+        proxy_pass %[1]s;
+    }
+
     # Inference endpoints carry base64 image data -- no body cap (the rest of
     # the control plane stays at nginx's 1 MiB default; the chat documents
     # above are the exception).

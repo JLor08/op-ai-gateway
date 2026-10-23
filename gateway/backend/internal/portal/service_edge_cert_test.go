@@ -1593,15 +1593,23 @@ func TestEdgeProxyConfigCarriesTheStreamingAndHeaderRules(t *testing.T) {
 		`proxy_set_header X-OP-Internal-User "";`,
 		`proxy_set_header X-OP-Server-Override "";`,
 		`proxy_set_header X-OP-Server-Override-Force "";`,
+		// Live transcription (added after the agent stream): the portal WebSocket
+		// upgrade, whose Host is $http_host so the gateway's same-origin check keeps
+		// the port, and the bearer full-duplex POST, which must not buffer its body.
+		"location = /api/portal/transcription-live",
+		"proxy_set_header Host $http_host;",
+		`location ~ ^/(?:openai/)?v1/audio/transcriptions/live$`,
+		"proxy_request_buffering off;",
 	} {
 		if !strings.Contains(cfg, want) {
 			t.Fatalf("missing %q:\n%s", want, cfg)
 		}
 	}
-	// The four internal headers must be blanked in BOTH the server block and the
-	// WebSocket location (the location resets the inherited set).
-	if n := strings.Count(cfg, `proxy_set_header X-OP-Internal-Auth "";`); n != 2 {
-		t.Fatalf("X-OP-Internal-Auth blanked %d times, want 2 (server block + WebSocket location)", n)
+	// The four internal headers must be blanked in the server block AND in each
+	// WebSocket location (the agent stream and the portal live transcription), since
+	// a location with any proxy_set_header resets the inherited set.
+	if n := strings.Count(cfg, `proxy_set_header X-OP-Internal-Auth "";`); n != 3 {
+		t.Fatalf("X-OP-Internal-Auth blanked %d times, want 3 (server block + agent + portal WebSocket locations)", n)
 	}
 }
 
