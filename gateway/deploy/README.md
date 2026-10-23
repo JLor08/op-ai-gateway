@@ -91,6 +91,13 @@ regardless. See [Persistence](../../docs/architecture/cross-cutting/persistence.
   reverse proxy in front **must** allow at least that on `/api/portal/chats`
   too, or saving a large chat document (or sending a large image upload, which
   rides inline in the run-start body) is refused with an HTML 413.
+- Live transcription adds two locations to the same file: a WebSocket upgrade for
+  `/api/portal/transcription-live` (with `Host $http_host`, so the port survives the gateway's same-origin
+  check; a custom reverse proxy must forward the original `Host` with its port) and an unbuffered, full-duplex one
+  for the bearer `POST /v1/audio/transcriptions/live` and its `/openai/` alias (`proxy_request_buffering off`, no
+  body cap, a long body timeout). A custom proxy in front must not buffer that request body either. On Kubernetes
+  the ingress-nginx buffering is per Ingress, so a dedicated Ingress for those two paths is the follow-up (see
+  `k8s/README.md`).
 - `OP_AI_GATEWAY_SESSION_COOKIE_SECURE=false` (in `.env.example`) is required for
   the plain-HTTP Compose stack; set it `true` once TLS terminates in front.
 - Set `OP_AI_GATEWAY_PUBLIC_URL` to include the `/portal` segment so invite links

@@ -127,6 +127,146 @@ describe('portal api', () => {
     });
   });
 
+  // The transcription composer's live gate: the model may be offered a live recording only when
+  // the gateway says its mapping streams a transcription. There is no rate to learn (the
+  // browser fixes the PCM it sends), so the answer is a plain boolean and anything but the
+  // boolean true is a no -- a malformed answer must never open a mode the backend would refuse.
+  it("fetches whether a transcription model may go live and unwraps the gate's answer", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ streaming: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    const result = await api.modelTranscriptionStreaming('org/asr one');
+
+    expect(fetcher).toHaveBeenCalledWith(
+      '/api/portal/model-transcription-streaming?name=org%2Fasr%20one',
+      { headers: {}, credentials: 'include' },
+    );
+    expect(result).toBe(true);
+  });
+
+  it.each([
+    ['a no', { streaming: false }],
+    ['a yes that is not the boolean true', { streaming: 'yes' }],
+    ['a yes that is a number', { streaming: 1 }],
+    ['a null verdict', { streaming: null }],
+    ['an empty answer', {}],
+    ['an answer that is not an object', 'streaming'],
+    ['a verdict under another name', { transcription_streaming: true }],
+  ])('reads %s as no live transcription', async (_name, body) => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(createPortalApi(fetcher).modelTranscriptionStreaming('whisper')).resolves.toBe(
+      false,
+    );
+  });
+
+  // The one authenticated, CSRF-protected step before a live session: the browser WebSocket
+  // cannot send X-OP-CSRF, so this POST mints the single-use ticket the upgrade presents.
+  it('posts the live ticket request with the fixed PCM params and returns the ticket', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ticket: 'tkt_abc' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const api = createPortalApi(fetcher);
+
+    const result = await api.createLiveTranscriptionTicket({
+      model: 'org/asr one',
+      language: 'de',
+    });
+
+    expect(result).toEqual({ ticket: 'tkt_abc' });
+    const [path, init] = fetcher.mock.calls[0];
+    expect(path).toBe('/api/portal/transcription-live-ticket');
+    expect(init.method).toBe('POST');
+    expect(init.credentials).toBe('include');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(init.headers['Content-Type']).toBe('application/json');
+    // The model travels in the body (a gateway name may hold '/'), beside the PCM the browser
+    // will stream: 16 kHz mono signed 16-bit little-endian.
+    expect(JSON.parse(init.body)).toEqual({
+      model: 'org/asr one',
+      sample_rate: 16000,
+      channels: 1,
+      sample_format: 's16le',
+      language: 'de',
+    });
+  });
+
+  it.each([
+    ['no language', undefined],
+    ['an empty language (auto-detect)', ''],
+  ])('leaves the language out of the live ticket request for %s', async (_name, language) => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ticket: 'tkt_abc' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await createPortalApi(fetcher).createLiveTranscriptionTicket({ model: 'whisper', language });
+
+    const body = JSON.parse(fetcher.mock.calls[0][1].body);
+    expect(body).toEqual({
+      model: 'whisper',
+      sample_rate: 16000,
+      channels: 1,
+      sample_format: 's16le',
+    });
+    expect('language' in body).toBe(false);
+  });
+
+  // The gateway's refusals of a live session, on the portal's ticket endpoint and the public
+  // bearer endpoint alike (one code for one reason): the model is not known to stream, its agent
+  // cannot, or the session's parameters are outside what the relay accepts. The store reads the
+  // code to tell the user live transcription is not available here, so the client must hand it on
+  // exactly as sent.
+  it.each([
+    [409, 'transcription.live_not_streaming', 'this model does not support live transcription'],
+    [409, 'transcription.live_agent_unsupported', 'this model does not support live transcription'],
+    [400, 'transcription.live_params_invalid', 'unsupported live transcription parameters'],
+  ])(
+    'surfaces a refused live ticket (%i %s) as a PortalApiError carrying the gateway code',
+    async (status, code, message) => {
+      const fetcher = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: { code, message } }), {
+          status,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+
+      await expect(
+        createPortalApi(fetcher).createLiveTranscriptionTicket({ model: 'whisper' }),
+      ).rejects.toMatchObject({ status, code });
+    },
+  );
+
+  it('surfaces a ticket the gateway failed to mint as a PortalApiError with its (portal) code', async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: { code: 'portal.live_transcription_ticket_failed', message: 'ticket failed' },
+        }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await expect(
+      createPortalApi(fetcher).createLiveTranscriptionTicket({ model: 'whisper' }),
+    ).rejects.toMatchObject({ status: 500, code: 'portal.live_transcription_ticket_failed' });
+  });
+
   it('carries the backend-folded image_edit flag on a model option, independent of image', async () => {
     // ModelDTO.image_edit is derived and folded in the backend (image:yes and no
     // operator opt-out, ANDed across a model's mappings), so the client never

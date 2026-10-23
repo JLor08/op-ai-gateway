@@ -539,7 +539,37 @@ type inferenceShape struct {
 // what makes admitPrincipal single-execution without the mutable per-request
 // "admission marker" the two native-capable handlers used to seed: there is
 // simply no second call site left to dedup.
+//
+// Steps 1-4 and 6 are the GATE (inferenceGate below); step 5, admitPrincipal,
+// is the one step this function adds on top of it. The split exists for the one
+// caller that must resolve+gate WITHOUT spending admission -- the portal
+// live-transcription ticket mint (resolveLiveTarget with admit=false): it needs
+// a fast model/route/capability error for the browser, but the live session's
+// single admission is spent ONCE, later, when the portal WebSocket loops back to
+// /v1/audio/transcriptions/live (which calls resolveLiveTarget with admit=true,
+// reaching admitPrincipal here). Every other caller admits exactly once, here.
 func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, shape inferenceShape) (preflight, bool) {
+	pf, handled := s.inferenceGate(w, r, token, raw, shape)
+	if handled {
+		return preflight{}, true
+	}
+	if s.admitPrincipal(w, r, token) {
+		return preflight{}, true
+	}
+	return pf, false
+}
+
+// inferenceGate is inferencePreflight MINUS the principal admission step (step
+// 5): model-override resolution, the unknown-model redirect, the server-override
+// re-auth, the model allowlist and client-session extraction, but NOT
+// admitPrincipal. Every ordinary inference request reaches it only through
+// inferencePreflight (which admits right after); the sole caller that runs it on
+// its own is the no-admit resolve the portal live-transcription ticket mint
+// needs (resolveLiveTarget, admit=false). Extracting the session before (rather
+// than after) the admission check is immaterial -- extractClientSession is pure
+// and writes nothing, so a denied request's response is unchanged -- and it lets
+// the no-admit caller reuse the exact same gate the admitting one runs.
+func (s *Server) inferenceGate(w http.ResponseWriter, r *http.Request, token auth.Token, raw []byte, shape inferenceShape) (preflight, bool) {
 	req := inference.Request{Model: resolveModelOverride(r.Context(), token, shape.model, s.Portal), RequestedModel: shape.model, APIFlavor: shape.apiFlavor, Stream: shape.stream, RequiredCapabilities: shape.requiredCapabilities, RequiredVoice: shape.requiredVoice}
 	// Only tokens that opted in pay for the offering lookup; for every other
 	// token this is a single boolean test. req.RequestedModel keeps the client's
@@ -573,9 +603,6 @@ func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, toke
 	}
 	if !modelAllowed(token, req.Model) {
 		writeModelNotAllowed(w)
-		return preflight{}, true
-	}
-	if s.admitPrincipal(w, r, token) {
 		return preflight{}, true
 	}
 	si := extractClientSession(r.Header, raw, shape.endpoint)

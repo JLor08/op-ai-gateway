@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -636,6 +637,223 @@ func TestPortalModelSpeechStreamingAnswersTheGate(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("no credentials: %d, want 401", rec.Code)
+	}
+}
+
+// --- the portal's live-transcription gate -------------------------------------
+//
+// GET /api/portal/model-transcription-streaming is the speech gate's twin for the live
+// record mode: the portal offers it only for a model the ticket endpoint would also let
+// stream. Its fixture is the speech run's server (a Portal over one audio.cpp application),
+// to which a test adds the transcription mappings it needs.
+
+// addTranscriptionMapping adds a mapping of gatewayModel on the fixture's audio.cpp
+// application with a (transcription, yes) verdict and, when streams is given, a
+// transcription_streaming verdict of yes or no (nil: no row at all, a model no probe has
+// stated the mode of).
+func addTranscriptionMapping(t *testing.T, srv *Server, id, gatewayModel string, streams *bool) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	if err := srv.Routes.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: "app-audio", GatewayModelName: gatewayModel, AppModelName: "asr_" + id, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping %s: %v", id, err)
+	}
+	rows := []routing.CapabilityRow{{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now}}
+	if streams != nil {
+		verdict := routing.CapabilityNo
+		if *streams {
+			verdict = routing.CapabilityYes
+		}
+		rows = append(rows, routing.CapabilityRow{Capability: routing.CapabilityTranscriptionStreaming, Verdict: verdict, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now})
+	}
+	if err := srv.Routes.UpsertMappingCapabilities(ctx, id, rows); err != nil {
+		t.Fatalf("UpsertMappingCapabilities %s: %v", id, err)
+	}
+}
+
+// askTranscriptionStreaming GETs the gate as the fixture's dev bearer and returns the
+// recorder, for a test that reads the status, the code or the raw body.
+func askTranscriptionStreaming(srv *Server, query string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/api/portal/model-transcription-streaming?"+query, nil)
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// requireTranscriptionGate fails unless the gate answers 200 with exactly
+// {"streaming": want}: one key, so the "no" carries nothing to learn from and a "yes" no
+// sample rate (the client fixes its own format and the ticket endpoint re-gates).
+func requireTranscriptionGate(t *testing.T, srv *Server, model string, want bool) {
+	t.Helper()
+	rec := askTranscriptionStreaming(srv, "name="+model)
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("%q: the answer is not JSON: %v (body = %s)", model, err, rec.Body.String())
+	}
+	if rec.Code != http.StatusOK || len(body) != 1 || body["streaming"] != want {
+		t.Fatalf("%q: %d %s, want 200 {\"streaming\":%v}", model, rec.Code, rec.Body.String(), want)
+	}
+}
+
+// The gate is open only for a model every transcription mapping of which has a
+// transcription_streaming verdict of yes: the verdict the buffered endpoint relays a stream
+// on, and the one the ticket endpoint (mappingStreamsTranscription) requires.
+func TestPortalModelTranscriptionStreamingAnswersTheGate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arrange func(t *testing.T, srv *Server)
+		model   string
+		want    bool
+	}{
+		{"a streaming asr model", func(t *testing.T, srv *Server) {
+			addTranscriptionMapping(t, srv, "route-asr-live", "asr-live", ptr(true))
+		}, "asr-live", true},
+		{"an offline asr model", func(t *testing.T, srv *Server) {
+			addTranscriptionMapping(t, srv, "route-asr-off", "asr-off", ptr(false))
+		}, "asr-off", false},
+		{"an asr model whose mode no probe has stated", func(t *testing.T, srv *Server) { addTranscriptionMapping(t, srv, "route-asr-new", "asr-new", nil) }, "asr-new", false},
+		{"a speech-only model", func(*testing.T, *Server) {}, speechGatewayModel, false},
+		{"a speech model that streams its synthesis", func(t *testing.T, srv *Server) { seedStreamableSpeech(t, srv, "route-tts", speechRunTestByteRate) }, speechGatewayModel, false},
+		{"an unknown model", func(*testing.T, *Server) {}, "no-such-asr", false},
+		{"two mappings that both stream", func(t *testing.T, srv *Server) {
+			addTranscriptionMapping(t, srv, "route-asr-a", "asr-two", ptr(true))
+			addTranscriptionMapping(t, srv, "route-asr-b", "asr-two", ptr(true))
+		}, "asr-two", true},
+		// A transcription request may be routed to either mapping, so the model streams only
+		// if it makes no difference which one serves it.
+		{"two mappings, one offline", func(t *testing.T, srv *Server) {
+			addTranscriptionMapping(t, srv, "route-asr-a", "asr-two", ptr(true))
+			addTranscriptionMapping(t, srv, "route-asr-b", "asr-two", ptr(false))
+		}, "asr-two", false},
+		{"two mappings, one unprobed", func(t *testing.T, srv *Server) {
+			addTranscriptionMapping(t, srv, "route-asr-a", "asr-two", ptr(true))
+			addTranscriptionMapping(t, srv, "route-asr-b", "asr-two", nil)
+		}, "asr-two", false},
+		// A mapping that is no transcription route (no (transcription, yes) verdict) is never
+		// a candidate of a transcription request, whatever else it says: a speech mapping of
+		// the name does not close the gate, and a streaming verdict on a non-transcriber does
+		// not open it.
+		{"a speech mapping beside the streaming asr one", func(t *testing.T, srv *Server) {
+			addTranscriptionMapping(t, srv, "route-asr-a", speechGatewayModel, ptr(true))
+		}, speechGatewayModel, true},
+		{"a streaming verdict on a mapping that does not transcribe", func(t *testing.T, srv *Server) {
+			addTranscriptionMapping(t, srv, "route-asr-a", "asr-odd", ptr(true))
+			if err := srv.Routes.UpsertMappingCapabilities(context.Background(), "route-asr-a", []routing.CapabilityRow{{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: time.Date(2026, 10, 23, 12, 0, 1, 0, time.UTC)}}); err != nil {
+				t.Fatal(err)
+			}
+		}, "asr-odd", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, _ := newSSESpeechUpstream(t, speechSSEDone, speechSSEEnd)
+			srv, _, _, _ := newSpeechRunTestServer(t, up.URL)
+			tc.arrange(t, srv)
+			requireTranscriptionGate(t, srv, tc.model, tc.want)
+		})
+	}
+}
+
+// The gate follows the portal's visibility, not routing's: a hidden or locked model is the
+// same 200 {"streaming":false} as an unknown one (a "no" that cannot probe which models
+// exist), while a model reachable through a model group is judged over ALL the group's
+// members, as the voice picker does.
+func TestPortalModelTranscriptionStreamingFollowsThePortalsVisibility(t *testing.T) {
+	up, _ := newSSESpeechUpstream(t, speechSSEDone, speechSSEEnd)
+	srv, _, _, _ := newSpeechRunTestServer(t, up.URL)
+	addTranscriptionMapping(t, srv, "route-asr-live", "asr-live", ptr(true))
+	addTranscriptionMapping(t, srv, "route-asr-lock", "asr-lock", ptr(true))
+	addTranscriptionMapping(t, srv, "route-asr-off", "asr-off", ptr(false))
+	requireTranscriptionGate(t, srv, "asr-live", true)
+	requireTranscriptionGate(t, srv, "asr-lock", true)
+
+	ctx := context.Background()
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	for name, visibility := range map[string]string{"asr-live": "hidden", "asr-lock": "locked"} {
+		if err := srv.Routes.UpsertModelSetting(ctx, routing.ModelSetting{GatewayModelName: name, Visibility: visibility, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("UpsertModelSetting %s: %v", name, err)
+		}
+	}
+	requireTranscriptionGate(t, srv, "asr-live", false)
+	requireTranscriptionGate(t, srv, "asr-lock", false)
+
+	// A group streams only when every member does; a locked member is still a full member of
+	// a visible group.
+	for _, group := range []struct {
+		name    string
+		members []string
+		want    bool
+	}{
+		{"asr-group", []string{"asr-live", "asr-lock"}, true},
+		{"asr-group-mixed", []string{"asr-live", "asr-off"}, false},
+	} {
+		members := make([]routing.GroupMember, len(group.members))
+		for i, m := range group.members {
+			members[i] = routing.GroupMember{MemberGatewayName: m, Priority: i}
+		}
+		if err := srv.Routes.CreateModelGroup(ctx, routing.ModelGroup{ID: "grp-" + group.name, GatewayModelName: group.name, DisplayName: group.name, Status: routing.ServerStatusActive, FailoverMode: "sticky", CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("CreateModelGroup %s: %v", group.name, err)
+		}
+		if err := srv.Routes.SetGroupMembers(ctx, "grp-"+group.name, members); err != nil {
+			t.Fatalf("SetGroupMembers %s: %v", group.name, err)
+		}
+		requireTranscriptionGate(t, srv, group.name, group.want)
+	}
+}
+
+// A blank name is a 400 (an empty name would otherwise read as "cannot stream"), the method
+// is GET only and the portal's session auth applies.
+func TestPortalModelTranscriptionStreamingRequestShape(t *testing.T) {
+	up, _ := newSSESpeechUpstream(t, speechSSEDone, speechSSEEnd)
+	srv, _, _, _ := newSpeechRunTestServer(t, up.URL)
+	addTranscriptionMapping(t, srv, "route-asr-live", "asr-live", ptr(true))
+
+	for _, query := range []string{"name=", "name=%20%20", ""} {
+		rec := askTranscriptionStreaming(srv, query)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("query %q: %d, want 400", query, rec.Code)
+		}
+		requireErrorCode(t, rec.Body.String(), "model.name_required")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/portal/model-transcription-streaming?name=asr-live", nil)
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST: %d, want 405", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/portal/model-transcription-streaming?name=asr-live", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no credentials: %d, want 401", rec.Code)
+	}
+}
+
+// capabilityBatchFailingStore is the server's route store with the batch capability reader
+// broken, as a store that has gone away would.
+type capabilityBatchFailingStore struct{ routing.Store }
+
+func (capabilityBatchFailingStore) MappingCapabilitiesForMappings(context.Context, []string) (map[string][]routing.CapabilityRow, error) {
+	return nil, errors.New("capability store unavailable")
+}
+
+// A verdict that cannot be read is a 500 with its own stable code, never the "no" it would
+// look like: reading a store failure as "cannot stream" would hide the fault behind a normal
+// answer.
+func TestPortalModelTranscriptionStreamingStoreFailureIsA500(t *testing.T) {
+	up, _ := newSSESpeechUpstream(t, speechSSEDone, speechSSEEnd)
+	srv, _, _, _ := newSpeechRunTestServer(t, up.URL)
+	addTranscriptionMapping(t, srv, "route-asr-live", "asr-live", ptr(true))
+	srv.Routes = capabilityBatchFailingStore{Store: srv.Routes}
+
+	rec := askTranscriptionStreaming(srv, "name=asr-live")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "model.transcription_streaming_failed")
+	if strings.Contains(rec.Body.String(), `"streaming"`) {
+		t.Fatalf("a failed read answered a verdict: %s", rec.Body.String())
 	}
 }
 

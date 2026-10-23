@@ -596,6 +596,14 @@ catch-all `model_override`, which has its own column).
 |---|---|---|
 | 81 | `usage_events_billing_unit` | Adds `usage_events.billing_unit` (`text not null default ''`) and `billing_quantity` (`double precision not null default 0`): the non-token billable measure as a **(unit, quantity) pair**, never a scalar ([ADR-041](../09-architecture-decisions.md#adr-041--a-billable-measure-is-a-unit-quantity-pair-never-a-scalar)). Both columns land in the **same** migration by necessity — a quantity without its unit is the scalar that decision rejects, and a unit without its quantity records nothing. `''` means token-metered, and it is a **one-way positive assertion** rather than an "unknown": every request recorded before this migration really was token-metered, so the two DDL defaults backfill the whole of history *truthfully* and no LLM path changes — the same no-op upgrade argument migrations 74 and 80 make, but resting on a semantic claim about the data rather than only on a default value. Nothing may ever default *to* `''` from an unrecognised unit; `usage.ValidateBillingXOR` returns an error instead of clamping. `double precision`, not `real`, per [ADR-005](../09-architecture-decisions.md#adr-005--postgresql-needs-wide-column-types). Both columns via `addColumnIfMissing`, so a replay is idempotent; does not touch `baselineCreateStatements` (frozen at v60) or `migration43FloatColumns`. |
 
+**No migration for live transcription** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266). The fifth `audio_second` producer
+reuses migration 81's `billing_unit`/`billing_quantity` pair and the existing `audio_second` unit unchanged, and a
+live session keeps no persistent state of its own: the single-use ticket store and the per-route session registry
+are in-process (a ticket opens only on the gateway process that minted it, issue #285). The phase 2 and 3 work
+(the portal's microphone client, the `model-transcription-streaming` gate, the bearer `/v1/audio/transcriptions/live`
+endpoint and the WebSocket's loopback to it, [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)) added no migration either: the one usage row per session reuses the
+same columns, recorded at `/v1/audio/transcriptions/live`.
+
 ### External vendor accounts
 
 | # | Migration | Purpose |

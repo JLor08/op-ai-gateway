@@ -248,3 +248,71 @@ func TestModelVoicesMappingIDsUnknownNameIsEmpty(t *testing.T) {
 		requireVoiceMappingIDs(t, svc, adminToken(), name)
 	}
 }
+
+// ModelTranscriptionMappingIDs is the transcription twin of ModelVoiceMappingIDs and the
+// same portal gate: the openai_audio flavor (a transcription request shares it with
+// speech), a name hidden or locked for a non-admin suppressed, a group expanded to its
+// members (a locked member still a full one) and resource-group provisioning applied. It
+// reads no capability verdict: which of these mappings transcribe, and stream, is the
+// gateway's to read.
+func TestModelTranscriptionMappingIDsIsThePortalsAudioGate(t *testing.T) {
+	ctx := context.Background()
+	svc, rs := newModelServersTestService(t, voiceNow, fakeLoadedModels{})
+	audio := routing.APIFlavorOpenAIAudio
+	seedVoiceServer(t, rs, voiceNow, "srv-a", "asr", audio)
+	seedVoiceServer(t, rs, voiceNow, "srv-b", "asr", audio)
+	seedVoiceServer(t, rs, voiceNow, "srv-text", "asr", routing.APIFlavorOpenAI)
+	seedVoiceServer(t, rs, voiceNow, "srv-hidden", "asr-hidden", audio)
+	seedVoiceServer(t, rs, voiceNow, "srv-locked", "asr-locked", audio)
+	seedVoiceGroup(t, rs, voiceNow, "asr-group", routing.ServerStatusActive, "asr", "asr-locked")
+	setVoiceVisibility(t, rs, voiceNow, "asr-hidden", "hidden")
+	setVoiceVisibility(t, rs, voiceNow, "asr-locked", "locked")
+	nonAdmin := auth.Token{UserID: "usr_plain_asr", Scopes: []string{"gateway:use"}}
+
+	for _, tc := range []struct {
+		principal auth.Token
+		name      string
+		want      []string
+	}{
+		// Sorted, deduped, only the application that declares openai_audio.
+		{nonAdmin, "asr", []string{"map-srv-a", "map-srv-b"}},
+		{nonAdmin, "asr-hidden", []string{}},
+		{nonAdmin, "asr-locked", []string{}},
+		{adminToken(), "asr-hidden", []string{"map-srv-hidden"}},
+		{nonAdmin, "asr-group", []string{"map-srv-a", "map-srv-b", "map-srv-locked"}},
+		{nonAdmin, "no-such-asr", []string{}},
+		{nonAdmin, "  ", []string{}},
+	} {
+		got, err := svc.ModelTranscriptionMappingIDs(ctx, tc.principal, tc.name)
+		if err != nil {
+			t.Fatalf("ModelTranscriptionMappingIDs(%s, %q): %v", tc.principal.UserID, tc.name, err)
+		}
+		if got == nil || !slices.Equal(got, tc.want) {
+			t.Fatalf("ModelTranscriptionMappingIDs(%s, %q) = %#v, want %#v (a non-nil slice)", tc.principal.UserID, tc.name, got, tc.want)
+		}
+		// The two methods are one gate: a name resolves to the same mappings for voices.
+		voices, err := svc.ModelVoiceMappingIDs(ctx, tc.principal, tc.name)
+		if err != nil || !slices.Equal(got, voices) {
+			t.Fatalf("ModelVoiceMappingIDs(%s, %q) = %v (err %v), want the transcription gate's %v", tc.principal.UserID, tc.name, voices, err, got)
+		}
+	}
+}
+
+// The suppression read fails CLOSED here too: a store blip is an error for a non-admin,
+// never a leaked hidden or locked mapping.
+func TestModelTranscriptionMappingIDsFailsClosedOnSettingsError(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("settings table unavailable")
+	routes := &failingModelSettingsStore{MemoryStore: routing.NewMemoryStore(), err: boom}
+	svc := newModelServersTestServiceWithRoutes(t, voiceNow, fakeLoadedModels{}, routes)
+	seedVoiceServer(t, routes, voiceNow, "srv-a", "asr", routing.APIFlavorOpenAIAudio)
+	nonAdmin := auth.Token{UserID: "usr_plain_asr", Scopes: []string{"gateway:use"}}
+
+	got, err := svc.ModelTranscriptionMappingIDs(ctx, nonAdmin, "asr")
+	if !errors.Is(err, boom) || len(got) != 0 {
+		t.Fatalf("ModelTranscriptionMappingIDs(non-admin) = %v, %v, want no ids and %v", got, err, boom)
+	}
+	if ids, err := svc.ModelTranscriptionMappingIDs(ctx, adminToken(), "asr"); err != nil || !slices.Equal(ids, []string{"map-srv-a"}) {
+		t.Fatalf("ModelTranscriptionMappingIDs(admin) = %v, %v, want [map-srv-a] (an admin never reads the settings)", ids, err)
+	}
+}

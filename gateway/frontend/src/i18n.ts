@@ -328,6 +328,43 @@ const de = {
   // The indicator beside the attach controls while a clip is being converted to WAV in the
   // browser (it takes a moment for a long one); Send and the attach controls wait for it.
   chatTranscriptionConverting: 'Konvertiere Audio…',
+  // The LIVE mode of the transcription composer (#266), offered only for a model the gateway
+  // says can stream a transcription: the mic is streamed as the user speaks, and the text
+  // appears while they talk. The mode switch (shown only beside that offer: otherwise the file
+  // and the recorder are simply both there), the panel's label (what the streaming toggle of
+  // the speech settings is to speech) and its hint, which says what a live recording is and
+  // that no audio is kept.
+  chatTranscriptionMode: 'Eingabeart',
+  chatTranscriptionModeFile: 'Datei',
+  chatTranscriptionModeRecord: 'Aufnahme',
+  chatTranscriptionModeLive: 'Live',
+  chatTranscriptionLive: 'Beim Sprechen transkribieren (Streaming)',
+  chatTranscriptionLiveHint:
+    'Das Modell wandelt Ihre Sprache schon während des Sprechens in Text um, und der Text erscheint sofort. Mit „Live-Aufnahme beenden“ wird das fertige Transkript in den Chat übernommen. Das Audio selbst wird nicht gespeichert.',
+  // The controls and the state of a live recording: start and stop, the wait for the microphone
+  // and the connection, the recording itself, the reconnect after the connection dropped (the
+  // text so far is kept, and what was said while it was down is lost), and the transcript
+  // that is shown while it runs (the region's name for assistive technology).
+  chatTranscriptionLiveStart: 'Live-Aufnahme starten',
+  chatTranscriptionLiveStop: 'Live-Aufnahme beenden',
+  chatTranscriptionLiveConnecting: 'Verbinde…',
+  chatTranscriptionLiveListening: 'Höre zu…',
+  chatTranscriptionLiveReconnecting:
+    'Die Verbindung wurde unterbrochen. Verbinde erneut… Was in der Zwischenzeit gesagt wird, geht verloren.',
+  chatTranscriptionLiveTranscript: 'Live-Transkript',
+  // After a failure that leaves a transcript behind: the button that keeps it as a turn of the
+  // chat anyway, and the name the turn carries (a live recording has no clip to show).
+  chatTranscriptionLiveUse: 'Transkript übernehmen',
+  chatTranscriptionLiveTurn: 'Live-Aufnahme',
+  // Why a live recording ended: anything unexpected, a browser or a model without live
+  // transcription (the buffered clip still works), and a model that is already busy with another
+  // live recording (it transcribes one at a time).
+  chatTranscriptionLiveError:
+    'Die Live-Transkription ist fehlgeschlagen. Versuchen Sie es erneut oder nehmen Sie stattdessen einen Clip auf.',
+  chatTranscriptionLiveUnsupported:
+    'Live-Transkription ist hier nicht verfügbar (Browser oder Modell). Nehmen Sie stattdessen einen Clip auf oder hängen Sie eine Audiodatei an.',
+  chatTranscriptionLiveBusy:
+    'Das Modell transkribiert gerade eine andere Live-Aufnahme. Versuchen Sie es in einem Moment erneut.',
   // Why a clip could not be attached (the picker's `accept` is only a hint, so the type is
   // checked again): a file that is not audio, its size (the backend stores up to 20 MB per
   // clip, counted on the WAV the browser converts it to), an empty file, audio the browser
@@ -3665,6 +3702,28 @@ const en: PortalMessages = {
   chatRemoveAudio: 'Remove audio',
   chatAudioRecordingLabel: 'Recording',
   chatTranscriptionConverting: 'Converting audio…',
+  // See the German block: the live mode of the transcription composer (#266).
+  chatTranscriptionMode: 'Input mode',
+  chatTranscriptionModeFile: 'File',
+  chatTranscriptionModeRecord: 'Record',
+  chatTranscriptionModeLive: 'Live',
+  chatTranscriptionLive: 'Transcribe while speaking (streaming)',
+  chatTranscriptionLiveHint:
+    'The model turns your speech into text while you speak, and the text appears at once. "Stop live recording" puts the finished transcript into the chat. The audio itself is not stored.',
+  chatTranscriptionLiveStart: 'Start live recording',
+  chatTranscriptionLiveStop: 'Stop live recording',
+  chatTranscriptionLiveConnecting: 'Connecting…',
+  chatTranscriptionLiveListening: 'Listening…',
+  chatTranscriptionLiveReconnecting:
+    'The connection was interrupted. Reconnecting… What is said meanwhile is lost.',
+  chatTranscriptionLiveTranscript: 'Live transcript',
+  chatTranscriptionLiveUse: 'Use transcript',
+  chatTranscriptionLiveTurn: 'Live recording',
+  chatTranscriptionLiveError: 'The live transcription failed. Try again, or record a clip instead.',
+  chatTranscriptionLiveUnsupported:
+    'Live transcription is not available here (browser or model). Record a clip or attach an audio file instead.',
+  chatTranscriptionLiveBusy:
+    'The model is already transcribing another live recording. Try again in a moment.',
   chatAudioError: 'Could not attach the audio.',
   chatAudioErrorType:
     'Unsupported file type. Attach an audio file, for example WAV, MP3, M4A, OGG or WEBM.',

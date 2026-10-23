@@ -484,6 +484,18 @@ func (c *OpenAICompatibleClient) ProxyNative(ctx context.Context, target routing
 	return doNativeProxy(ctx, c.http, target, path, body, contentType)
 }
 
+var _ NativeDuplexProxyClient = (*OpenAICompatibleClient)(nil)
+
+// ProxyNativeDuplex streams body (chunked) to the upstream's own endpoint path
+// while returning its still-open response -- the live-transcription relay to
+// audio.cpp's /v1/audio/transcriptions/live. This one client serves both a direct
+// audio_cpp target and, with the agent router's URL as target.Endpoint, a
+// server_agent target, so both reach the same implementation. See
+// NativeDuplexProxyClient for the body-ownership and timeout contract.
+func (c *OpenAICompatibleClient) ProxyNativeDuplex(ctx context.Context, target routing.Target, path string, body io.Reader, contentType string) (*ProxyResponse, error) {
+	return doNativeDuplexProxy(ctx, c.http, target, path, body, contentType)
+}
+
 var _ StreamingClient = (*OpenAICompatibleClient)(nil)
 
 // streamRequestBody builds the Chat Completions STREAMING body. withLiveProgress

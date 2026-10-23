@@ -56,6 +56,16 @@ flowchart TB
   patches the config accordingly.
 - The public Ingress exposes only the public/edge surface; the portal/admin and
   agent/mesh surfaces are separate.
+- **Live transcription needs two nginx locations, and one Ingress caveat.** The bundled nginx (the compose
+  files' `nginx/locations.conf`, mirrored in the k8s `nginx-configmap.yaml`) carries a WebSocket-upgrade location for
+  the portal's `/api/portal/transcription-live` (its `Host` is `$http_host` so the port survives the gateway's same-origin
+  check, [Networking & Mesh §10](cross-cutting/networking-mesh.md#10-agentgateway-websocket-transport)) and a full-duplex, unbuffered location for the bearer `POST /v1/audio/transcriptions/live` and its
+  `/openai/` alias (`proxy_request_buffering off`; a body timeout as long as the stream). The portal WebSocket works
+  through the Ingress, which already upgrades WebSockets. ingress-nginx, however, **buffers request bodies per Ingress,
+  not per path**, so the shipped `ingress.yaml` does **not** stream the bearer endpoint full-duplex: a live PCM
+  stream would be held back until it ended. Setting `nginx.ingress.kubernetes.io/proxy-request-buffering: "off"` on the
+  shared Ingress would unbuffer every upload through the host, so the follow-up is a **dedicated Ingress for those two
+  paths** carrying the annotation (`gateway/deploy/k8s/README.md` has the note; [ADR-073](09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once), [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 
 ## 7.4 Listeners
 

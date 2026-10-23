@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { memo } from 'react';
 import {
@@ -17,6 +17,7 @@ import {
 import { ToastProvider } from '../shared/ToastProvider';
 import { formatPortalError } from '../shared/format';
 import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
+import { createLiveSession, type LiveSessionArgs } from './liveTranscription';
 import { NO_SPEECH_STREAMING, type SpeechStreamingGate } from '../../api/models';
 import { PortalApiError } from '../../api/transport';
 import { messages, type Locale } from '../../i18n';
@@ -50,6 +51,16 @@ const playback = vi.hoisted(() => ({
 vi.mock('./speechPlayback', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./speechPlayback')>()),
   speechPlayback: playback,
+}));
+
+// jsdom has no microphone or WebSocket, so a live transcription session (liveTranscription.ts,
+// whose glue liveTranscription.session.test.ts runs against a fake browser) is a recording
+// stand-in here: these tests are about what the STORE does with a session -- see
+// useLiveTranscription.test.tsx for the state machine, and the live describe below for how it is
+// wired into the chat (the thread it runs in, the turn it commits).
+vi.mock('./liveTranscription', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./liveTranscription')>()),
+  createLiveSession: vi.fn(),
 }));
 
 const models: ModelOption[] = [
@@ -199,6 +210,14 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     modelSpeechStreaming: vi.fn(
       async (_name: string): Promise<SpeechStreamingGate> => NO_SPEECH_STREAMING,
     ),
+    // The transcription composer's live gate, fetched whenever the picked model TRANSCRIBES
+    // speech. Closed by default (no live mode); the transcription-streaming tests below open it.
+    modelTranscriptionStreaming: vi.fn(async (_name: string): Promise<boolean> => false),
+    // The live session's ticket POST. The session itself is a stand-in (see the vi.mock of
+    // ./liveTranscription), so nothing here calls it: the store only has to hand it over.
+    createLiveTranscriptionTicket: vi.fn(async (_body: { model: string; language?: string }) => ({
+      ticket: 'tkt',
+    })),
   };
   return { api: spies, rows, spies };
 }
@@ -288,6 +307,24 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       {/* Whether the speech composer may offer streaming (the gate is open), and whether the
           active chat's run is playing its audio live. */}
       <span data-testid="speech-streaming">{String(c.speechStreaming)}</span>
+      {/* Whether the transcription composer may offer a live recording (the gate is open). */}
+      <span data-testid="transcription-streaming">{String(c.transcriptionStreaming)}</span>
+      {/* The live transcription session: its state, the transcript so far and its error. */}
+      <span data-testid="live-state">{c.liveSession.state}</span>
+      <span data-testid="live-transcript">{c.liveSession.transcript}</span>
+      <span data-testid="live-error">{c.liveSession.error ?? ''}</span>
+      <button type="button" onClick={() => c.startLiveTranscription()}>
+        live-start
+      </button>
+      <button type="button" onClick={() => c.stopLiveTranscription()}>
+        live-stop
+      </button>
+      <button type="button" onClick={() => c.abortLiveTranscription()}>
+        live-abort
+      </button>
+      <button type="button" onClick={() => c.keepLiveTranscript()}>
+        live-keep
+      </button>
       <span data-testid="run-audio-live">{String(c.runAudioLive)}</span>
       <span data-testid="run-audio-muted">{String(c.runAudioMuted)}</span>
       <button type="button" onClick={() => c.muteAudio('c1', true)}>
@@ -6320,6 +6357,610 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         expect(screen.getByTestId('chats').textContent).toBe('c1:');
         expect(titleOnlySaves()).toEqual([]);
+      });
+    });
+  });
+
+  // The transcription composer's live gate (#266): a live recording is offered only where the
+  // gateway says the picked transcription model's mapping streams a transcription. The speech
+  // gate's twin, minus the rate: closed until an answer says yes, closed again at once when the
+  // model changes, fail closed on a failed lookup, and never asked of a model that does not
+  // transcribe.
+  describe(`ChatStoreProvider transcription streaming gate [${locale}]`, () => {
+    const asrModel = (id: string): ModelOption => ({
+      id,
+      display_name: id,
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      transcription: true,
+    });
+    const whisper = asrModel('whisper');
+    const parakeet = asrModel('parakeet');
+    const kokoro: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const flag = () => screen.getByTestId('transcription-streaming').textContent;
+    const transcriptionThread = (): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: { settings: { model: whisper.id, kind: 'transcription' }, messages: [] },
+      },
+    ];
+
+    it('asks whether the picked transcription model may go live, and offers it only on a yes', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(flag()).toBe('true'));
+      expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalledWith('whisper');
+    });
+
+    it('offers no live mode while the gate is closed, and not before the answer arrives', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      let answer: (streams: boolean) => void = () => {};
+      chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+        () => new Promise<boolean>((resolve) => (answer = resolve)),
+      );
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalled());
+      expect(flag()).toBe('false');
+      await act(async () => answer(false));
+      expect(flag()).toBe('false');
+    });
+
+    it('fails closed when the lookup fails', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockRejectedValue(new Error('boom'));
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalled());
+      expect(flag()).toBe('false');
+    });
+
+    it('follows the picked model: a yes for one is dropped at once when another is picked', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+        async (name: string) => name === 'whisper',
+      );
+      renderProvider([], { models: [whisper, parakeet] });
+      await waitForReady();
+      await waitFor(() => expect(flag()).toBe('true'));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-parakeet' }));
+      await waitFor(() =>
+        expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenLastCalledWith('parakeet'),
+      );
+      expect(flag()).toBe('false');
+
+      // And back: the first model's gate is asked again and reopens.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      await waitFor(() => expect(flag()).toBe('true'));
+      expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenLastCalledWith('whisper');
+    });
+
+    it('lets the latest pick win over a slow answer for the previous model', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      const answers = new Map<string, (streams: boolean) => void>();
+      chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+        (name: string) => new Promise<boolean>((resolve) => answers.set(name, resolve)),
+      );
+      renderProvider([], { models: [whisper, parakeet] });
+      await waitForReady();
+      await waitFor(() => expect(answers.has('whisper')).toBe(true));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-parakeet' }));
+      await waitFor(() => expect(answers.has('parakeet')).toBe(true));
+      // The first model's slow yes lands after the switch: it belongs to a model no longer
+      // picked and must not open the new model's gate.
+      await act(async () => answers.get('whisper')?.(true));
+      expect(flag()).toBe('false');
+      await act(async () => answers.get('parakeet')?.(false));
+      expect(flag()).toBe('false');
+    });
+
+    it('does not ask for a model that does not transcribe, and keeps the gate closed', async () => {
+      renderProvider([], { models: [...models, kokoro] });
+      await waitForReady();
+      expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+      expect(flag()).toBe('false');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+      expect(flag()).toBe('false');
+    });
+
+    it('asks nothing of the speech gate for a transcription model', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(flag()).toBe('true'));
+      expect(chatApi.spies.modelSpeechStreaming).not.toHaveBeenCalled();
+      expect(screen.getByTestId('speech-streaming').textContent).toBe('false');
+    });
+  });
+
+  // The live recording of a transcription thread (#266), as the store wires it into the chat:
+  // the session is made for the thread's model and language, through the provider's api; the
+  // finished transcript is committed as one completed turn WITHOUT a chat run (the gateway's live
+  // endpoint did, and billed, the work); and the recording does not outlive the thread it started
+  // in. How a session's states and its reconnects are handled is useLiveTranscription.test.tsx's.
+  describe(`ChatStoreProvider live transcription [${locale}]`, () => {
+    const whisper: ModelOption = {
+      id: 'whisper',
+      display_name: 'whisper',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      transcription: true,
+    };
+    const liveThread = (
+      overrides: Partial<ChatRow> = {},
+      settings: Record<string, unknown> = {},
+    ): ChatRow => ({
+      id: 'c1',
+      title: '',
+      created_at: T,
+      updated_at: T,
+      content: { settings: { model: 'whisper', kind: 'transcription', ...settings }, messages: [] },
+      ...overrides,
+    });
+
+    type FakeLive = { args: LiveSessionArgs; stop: Mock<() => void>; abort: Mock<() => void> };
+    let sessions: FakeLive[];
+
+    beforeEach(() => {
+      sessions = [];
+      vi.mocked(createLiveSession).mockImplementation((args) => {
+        const session: FakeLive = {
+          args,
+          stop: vi.fn(() => args.onState('finalizing')),
+          abort: vi.fn(),
+        };
+        sessions.push(session);
+        args.onState('connecting');
+        return session;
+      });
+    });
+    afterEach(() => vi.mocked(createLiveSession).mockReset());
+
+    const state = () => screen.getByTestId('live-state').textContent;
+    const transcript = () => screen.getByTestId('live-transcript').textContent;
+    const click = (name: string) => fireEvent.click(screen.getByRole('button', { name }));
+    const storedMessages = () =>
+      JSON.parse(screen.getByTestId('messages-json').textContent ?? '[]') as ChatUiMessage[];
+
+    // A transcription thread whose model may go live, open and ready.
+    async function renderLive(rows: ChatRow[] = [liveThread()]) {
+      chatApi = makeChatApi(rows);
+      chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+      const view = renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() =>
+        expect(screen.getByTestId('transcription-streaming').textContent).toBe('true'),
+      );
+      return view;
+    }
+
+    // One short recording: started, listening, a few words said, then stopped and delivered.
+    async function record(words: string, final = words) {
+      click('live-start');
+      act(() => sessions.at(-1)!.args.onState('listening'));
+      act(() => sessions.at(-1)!.args.onDelta(words));
+      click('live-stop');
+      await act(async () => {
+        sessions.at(-1)!.args.onDone(final);
+        sessions.at(-1)!.args.onState('closed');
+      });
+    }
+
+    describe('starting', () => {
+      it('makes a session for the thread: its model, its language (trimmed), the provider api', async () => {
+        await renderLive([liveThread({}, { transcription: { language: ' de ' } })]);
+
+        click('live-start');
+
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0].args.model).toBe('whisper');
+        expect(sessions[0].args.language).toBe('de');
+        expect(sessions[0].args.api).toBe(chatApi.api);
+        expect(state()).toBe('connecting');
+      });
+
+      it('starts without a language when the thread has none (auto-detect)', async () => {
+        await renderLive();
+        click('live-start');
+        expect(sessions[0].args.language).toBeUndefined();
+      });
+
+      it('does not start where live is not on offer (the gate is closed)', async () => {
+        chatApi = makeChatApi([liveThread()]);
+        renderProvider([], { models: [whisper] });
+        await waitForReady();
+        await waitFor(() => expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalled());
+
+        click('live-start');
+
+        expect(sessions).toHaveLength(0);
+        expect(state()).toBe('idle');
+      });
+
+      it('does not start on a thread that is not a transcription one', async () => {
+        chatApi = makeChatApi();
+        renderProvider([], { models });
+        await waitForReady();
+
+        click('live-start');
+
+        expect(sessions).toHaveLength(0);
+        expect(state()).toBe('idle');
+      });
+
+      it('does not start while the chat has a run in flight, and says so', async () => {
+        chatApi = makeChatApi([liveThread()]);
+        chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+        chatApi.spies.activeChatRuns.mockResolvedValue({
+          data: [
+            {
+              chat_id: 'c1',
+              run_id: 'r1',
+              status: 'running',
+              kind: 'transcription',
+              elapsed_ms: 0,
+            },
+          ],
+        });
+        renderProvider([], { models: [whisper] });
+        await waitForReady();
+        await waitFor(() =>
+          expect(screen.getByTestId('transcription-streaming').textContent).toBe('true'),
+        );
+
+        click('live-start');
+
+        expect(sessions).toHaveLength(0);
+        expect(await screen.findByText(t.chatBusy)).toBeInTheDocument();
+      });
+    });
+
+    describe('a finished recording', () => {
+      it('is committed as one completed turn: a marker for the recording, and the transcript', async () => {
+        await renderLive();
+        expect(screen.getByTestId('count').textContent).toBe('0');
+
+        await record('Hello wor', 'Hello world.');
+
+        const turns = storedMessages();
+        expect(turns).toHaveLength(2);
+        expect(turns[0]).toMatchObject({ role: 'user', content: t.chatTranscriptionLiveTurn });
+        expect(turns[1]).toMatchObject({
+          role: 'assistant',
+          content: 'Hello world.',
+          status: 'complete',
+        });
+        expect(turns[0].id).not.toBe(turns[1].id);
+        expect(state()).toBe('idle');
+        expect(transcript()).toBe('');
+        // The answer is the thread's last text, which is what its title and replays read.
+        expect(screen.getByTestId('last').textContent).toBe('Hello world.');
+      });
+
+      it('starts NO chat run: the work was done, and billed, by the live endpoint', async () => {
+        await renderLive();
+        await record('Hello');
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(FakeEventSource.instances).toHaveLength(0);
+        expect(screen.getByTestId('streaming').textContent).toBe('false');
+      });
+
+      it('keeps the thread a transcription thread, pinned by the turn', async () => {
+        // A thread with no pin yet: it follows the model, until the first turn pins it.
+        await renderLive([liveThread({}, { kind: undefined })]);
+        expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+
+        await record('Hello');
+
+        expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+        await waitFor(
+          () => {
+            const saved = chatApi.spies.saveChat.mock.calls.at(-1)?.[1].content as {
+              settings: { kind?: string };
+              messages: unknown[];
+            };
+            expect(saved.settings.kind).toBe('transcription');
+            expect(saved.messages).toHaveLength(2);
+          },
+          { timeout: 2500 },
+        );
+      });
+
+      it('is saved with the chat, like any other turn', async () => {
+        await renderLive();
+        await record('Save me please');
+
+        await waitFor(
+          () => {
+            const saved = chatApi.spies.saveChat.mock.calls.at(-1)?.[1].content as {
+              messages: { role: string; content: string }[];
+            };
+            expect(saved.messages.map((m) => m.content)).toEqual([
+              t.chatTranscriptionLiveTurn,
+              'Save me please',
+            ]);
+          },
+          { timeout: 2500 },
+        );
+      });
+
+      it('names an untitled chat after what was said', async () => {
+        await renderLive();
+        await record('Remember to buy oat milk');
+        expect(screen.getByTestId('chats').textContent).toBe('c1:Remember to buy oat milk');
+      });
+
+      it('leaves a chat that already has a title alone', async () => {
+        await renderLive([liveThread({ title: 'Meeting notes' })]);
+        await record('Something else entirely');
+        expect(screen.getByTestId('chats').textContent).toBe('c1:Meeting notes');
+      });
+
+      it('appends to a thread that already has turns', async () => {
+        await renderLive([
+          liveThread({
+            title: 'Meeting notes',
+            content: {
+              settings: { model: 'whisper', kind: 'transcription' },
+              messages: [
+                { id: 'u1', role: 'user', content: t.chatTranscriptionLiveTurn },
+                { id: 'a1', role: 'assistant', content: 'First recording.', status: 'complete' },
+              ],
+            },
+          }),
+        ]);
+
+        await record('Second one');
+
+        expect(storedMessages().map((m) => m.content)).toEqual([
+          t.chatTranscriptionLiveTurn,
+          'First recording.',
+          t.chatTranscriptionLiveTurn,
+          'Second one',
+        ]);
+      });
+
+      it('with no speech commits nothing, and says so', async () => {
+        await renderLive();
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+        click('live-stop');
+        await act(async () => {
+          sessions[0].args.onDone('');
+          sessions[0].args.onState('closed');
+        });
+
+        expect(screen.getByTestId('count').textContent).toBe('0');
+        expect(await screen.findByText(t.errorChatRunNoTranscript)).toBeInTheDocument();
+        expect(state()).toBe('idle');
+      });
+    });
+
+    describe('failures', () => {
+      it('an error shows its message, keeps the transcript, and "use" commits it anyway', async () => {
+        await renderLive();
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+        act(() => sessions[0].args.onDelta('Said before it broke'));
+        act(() => {
+          sessions[0].args.onError('upstream error', { kind: 'refused' });
+          sessions[0].args.onState('error');
+        });
+
+        expect(state()).toBe('error');
+        expect(screen.getByTestId('live-error').textContent).toBe(t.chatTranscriptionLiveError);
+        expect(transcript()).toBe('Said before it broke');
+        expect(screen.getByTestId('count').textContent).toBe('0');
+
+        click('live-keep');
+
+        expect(state()).toBe('idle');
+        expect(storedMessages().map((m) => m.content)).toEqual([
+          t.chatTranscriptionLiveTurn,
+          'Said before it broke',
+        ]);
+      });
+
+      it('a dropped connection reconnects with a new session for the same thread', async () => {
+        await renderLive();
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+        act(() => sessions[0].args.onDelta('First'));
+        // Fake timers only from here: the provider's own loading above waits on real ones.
+        vi.useFakeTimers();
+        try {
+          act(() => {
+            sessions[0].args.onError('closed (1006)', { kind: 'dropped' });
+            sessions[0].args.onState('error');
+          });
+          expect(state()).toBe('reconnecting');
+
+          act(() => void vi.advanceTimersByTime(1000));
+
+          expect(sessions).toHaveLength(2);
+          expect(sessions[1].args.model).toBe('whisper');
+          expect(transcript()).toBe('First');
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
+
+    describe('stopping and aborting', () => {
+      it('Stop finishes the session; the recording is not over until its transcript is in', async () => {
+        await renderLive();
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+
+        click('live-stop');
+
+        expect(sessions[0].stop).toHaveBeenCalledTimes(1);
+        expect(state()).toBe('finalizing');
+      });
+
+      it('Abort cancels it and commits nothing', async () => {
+        await renderLive();
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+        act(() => sessions[0].args.onDelta('dropped on the floor'));
+
+        click('live-abort');
+
+        expect(sessions[0].abort).toHaveBeenCalledTimes(1);
+        expect(state()).toBe('idle');
+        expect(screen.getByTestId('count').textContent).toBe('0');
+      });
+
+      it('the recording ends with the provider', async () => {
+        const view = await renderLive();
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+
+        view.unmount();
+
+        expect(sessions[0].abort).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('the thread it belongs to', () => {
+      const secondChat = (): ChatRow =>
+        liveThread({ id: 'c2', title: 'Other', updated_at: T2 }, { model: 'whisper' });
+
+      it('another chat opened mid-recording ends the recording, and the words are not committed there', async () => {
+        await renderLive([liveThread({ title: 'First', updated_at: T1 }), secondChat()]);
+        // c2 is the newest, so it is the one open.
+        expect(screen.getByTestId('active').textContent).toBe('c2');
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+        act(() => sessions[0].args.onDelta('for chat two'));
+
+        click('select-c1');
+        await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('c1'));
+
+        await waitFor(() => expect(state()).toBe('idle'));
+        expect(sessions[0].abort).toHaveBeenCalledTimes(1);
+        expect(screen.getByTestId('count').textContent).toBe('0');
+      });
+
+      it('a new chat opened mid-recording ends the recording', async () => {
+        await renderLive();
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+
+        click('newchat');
+        await waitFor(() => expect(screen.getByTestId('active').textContent).not.toBe('c1'));
+
+        await waitFor(() => expect(state()).toBe('idle'));
+        expect(sessions[0].abort).toHaveBeenCalledTimes(1);
+      });
+
+      it('another model picked mid-recording ends the recording', async () => {
+        const parakeet: ModelOption = { ...whisper, id: 'parakeet', display_name: 'parakeet' };
+        chatApi = makeChatApi([liveThread()]);
+        chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+        renderProvider([], { models: [whisper, parakeet] });
+        await waitForReady();
+        await waitFor(() =>
+          expect(screen.getByTestId('transcription-streaming').textContent).toBe('true'),
+        );
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+
+        click('pick-parakeet');
+
+        await waitFor(() => expect(sessions[0].abort).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(state()).toBe('idle'));
+      });
+    });
+
+    describe('the rest of the composer while recording', () => {
+      it('refuses a send of a clip: the thread is busy with the recording', async () => {
+        await renderLive();
+        click('attach-recording');
+        await waitFor(() => expect(screen.getByTestId('composer-audio').textContent).not.toBe(''));
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+
+        click('send');
+
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(await screen.findByText(t.chatBusy)).toBeInTheDocument();
+      });
+
+      // A thread with one transcribed turn, which Regenerate and Edit would replay (the clip is
+      // what a replay transcribes). While a recording runs they are refused like a send: a
+      // replay started now would own the transcript the recording's turn is to land in.
+      const replayableThread = () =>
+        liveThread({
+          title: 'Clip',
+          content: {
+            settings: { model: 'whisper', kind: 'transcription' },
+            messages: [
+              {
+                id: 'u1',
+                role: 'user',
+                content: [
+                  { type: 'text', text: '' },
+                  { type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } },
+                ],
+              },
+              { id: 'a1', role: 'assistant', content: 'The clip', status: 'complete' },
+            ],
+          },
+        });
+
+      it.each([
+        ['regenerate', 'regenerate-a1'],
+        ['edit', 'edit-u1'],
+      ])(
+        'refuses %s: the thread is busy with the recording, and nothing is touched',
+        async (_n, button) => {
+          await renderLive([replayableThread()]);
+          click('live-start');
+          act(() => sessions[0].args.onState('listening'));
+
+          click(button);
+
+          expect(await screen.findByText(t.chatBusy)).toBeInTheDocument();
+          expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+          // The transcript is as it was (a replay truncates it before it starts the run), and
+          // the recording is still going.
+          expect(screen.getByTestId('count').textContent).toBe('2');
+          expect(screen.getByTestId('last').textContent).toBe('The clip');
+          expect(state()).toBe('listening');
+        },
+      );
+
+      it.each([
+        ['regenerate', 'regenerate-a1'],
+        ['edit', 'edit-u1'],
+      ])('lets %s through again once the recording has ended', async (_n, button) => {
+        await renderLive([replayableThread()]);
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+        click('live-abort');
+        expect(state()).toBe('idle');
+
+        click(button);
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(screen.queryByText(t.chatBusy)).not.toBeInTheDocument();
       });
     });
   });

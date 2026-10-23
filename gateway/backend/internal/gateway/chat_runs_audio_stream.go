@@ -285,6 +285,100 @@ type portalSpeechStreamingResponse struct {
 	SampleRate int  `json:"sample_rate,omitempty"`
 }
 
+// portalTranscriptionStreams is the gate of the portal's live transcription: whether the
+// record mode may be offered for gatewayModel, which is the case only when EVERY mapping a
+// transcription request for the model could be routed to is known to stream. Those are the
+// portal-visible mappings (Portal.ModelTranscriptionMappingIDs, the visibility the voice
+// picker and the speech gate apply too) that carry a (transcription, yes) verdict -- the
+// capability gate every transcription request passes (transcriptionInferenceShape), so a
+// speech mapping of the same name is no candidate -- and each of them must say
+// (transcription_streaming, yes): the verdict the ticket endpoint requires of the one
+// mapping it resolves (mappingStreamsTranscription). A route is picked per request, after
+// this is asked, so a model with two mappings streams only if it makes no difference which
+// serves it: the AND the portal's other capability flags use (fail closed). A no and an
+// absent row, which is "unknown", are the same closed gate, and so is an empty candidate set.
+//
+// The verdicts are read with the batch reader and not mappingStreamsTranscription's keyed
+// one, which answers a failed read as a "no": a store failure here is an error, so the
+// handler can tell it from a closed gate and is never read as one.
+//
+// This is the composer's question and not the session's authority: the ticket endpoint
+// asks again, with the admission and the routing a live session needs, when one is opened.
+func (s *Server) portalTranscriptionStreams(ctx context.Context, principal auth.Token, gatewayModel string) (bool, error) {
+	if s.Routes == nil || s.Portal == nil || strings.TrimSpace(gatewayModel) == "" {
+		return false, nil
+	}
+	ids, err := s.Portal.ModelTranscriptionMappingIDs(ctx, principal, gatewayModel)
+	if err != nil {
+		return false, err
+	}
+	ids = dedupeNonEmpty(ids)
+	if len(ids) == 0 {
+		return false, nil
+	}
+	verdicts, err := s.Routes.MappingCapabilitiesForMappings(ctx, ids)
+	if err != nil {
+		return false, err
+	}
+	candidates := 0
+	for _, id := range ids {
+		byName := routing.CapabilityRowsByName(verdicts[id])
+		if byName[routing.CapabilityTranscription].Verdict != routing.CapabilityYes {
+			continue
+		}
+		if byName[routing.CapabilityTranscriptionStreaming].Verdict != routing.CapabilityYes {
+			return false, nil
+		}
+		candidates++
+	}
+	return candidates > 0, nil
+}
+
+// handlePortalModelTranscriptionStreaming answers whether the portal may offer the live
+// record mode for a gateway model (?name=<model>): {"streaming":true} when
+// portalTranscriptionStreams' gate is open, {"streaming":false} otherwise. It is
+// handlePortalModelSpeechStreaming's twin in everything but its answer, which carries no
+// sample rate: the live client fixes its own audio format and the ticket endpoint validates
+// it. The same session-cookie auth (requireWebScope, gateway:use), the same name-as-a-query-
+// parameter, the same blank-name 400 (model.name_required: an empty name would otherwise
+// read as "cannot stream") and the same no-leak rule -- every "no" (an unknown, hidden,
+// locked or restricted model, a non-transcription one, an offline one, one whose mode no
+// probe has stated) is the same 200, so the answer cannot probe which models exist. A store
+// failure is the only 500, never read as a "no". Nothing here loads a model, runs an
+// admission or contacts an upstream.
+func (s *Server) handlePortalModelTranscriptionStreaming(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	token, ok := s.requireWebScope(w, r, scopeGatewayUse)
+	if !ok {
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if strings.TrimSpace(name) == "" {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(audioVoicesModelRequired, "model name is required", ""))
+		return
+	}
+	streaming, err := s.portalTranscriptionStreams(r.Context(), token, name)
+	if err != nil {
+		slog.Error("portal transcription streaming lookup failed", "model", name, "err", err)
+		writeJSON(w, http.StatusInternalServerError, apierror.Response(portalTranscriptionStreamingFailed, "transcription streaming lookup failed", ""))
+		return
+	}
+	writeJSON(w, http.StatusOK, portalTranscriptionStreamingResponse{Streaming: streaming})
+}
+
+// portalTranscriptionStreamingFailed is the code of a failed read of the live gate (API
+// surface).
+const portalTranscriptionStreamingFailed = "model.transcription_streaming_failed"
+
+// portalTranscriptionStreamingResponse is the body of GET
+// /api/portal/model-transcription-streaming. It carries the verdict alone: unlike the
+// speech gate's there is no rate to learn.
+type portalTranscriptionStreamingResponse struct {
+	Streaming bool `json:"streaming"`
+}
+
 // buildSpeechStreamBody is buildSpeechBody for a run that streams: the same body, plus the
 // two fields only a stream has a meaning for. stream is the literal true; stream_format is
 // "sse", audio.cpp's own default, said outright because the run reads an event stream and

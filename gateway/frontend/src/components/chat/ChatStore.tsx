@@ -90,9 +90,15 @@ import {
   type TranscriptionSettings,
 } from './chatDoc';
 import { AudioAttachError, prepareAudioClip, type AudioClip } from './audioAttach';
+import { liveSessionRunning } from './liveSession';
 import { speechPlayback } from './speechPlayback';
 import { useChatRuns } from './useChatRuns';
 import { useChatPersistence } from './useChatPersistence';
+import {
+  useLiveTranscription,
+  type LiveStart,
+  type LiveTranscription,
+} from './useLiveTranscription';
 
 // Re-exported so existing/external imports of these types from ChatStore keep
 // working unchanged after the FA-2 extraction into chatDoc.ts.
@@ -100,6 +106,9 @@ export type { ActiveChatDoc, ChatMessageStatus } from './chatDoc';
 export type { AttachMode, ChatUiMessage };
 // The transcription composer's clip, for the view that previews it.
 export type { AudioClip };
+// The live recording's state, for the view that shows it.
+export type { LiveTranscription, LiveTranscriptionPhase } from './useLiveTranscription';
+export { liveSessionRunning } from './liveSession';
 
 // The speech composer's advanced-passthrough check and the settings type it edits,
 // re-exported for Chat.tsx for the same reason as the image presets below: the
@@ -293,6 +302,15 @@ export type ChatStore = {
   // at run time; this only decides whether the toggle exists and whether the browser's audio
   // is readied when a turn is sent.
   speechStreaming: boolean;
+  // Whether the transcription composer may offer a LIVE recording for the effective model: the
+  // gateway's own answer (api.modelTranscriptionStreaming) that every mapping the model could
+  // be served by is known to stream a transcription (#266). The speech gate's twin, minus the
+  // rate -- the browser fixes the PCM it streams. False whenever there is nothing to offer --
+  // not a transcription model, the lookup is in flight, it failed (fail closed), or the gateway
+  // said no -- and the thread then records and transcribes the buffered clip it always has. The
+  // gateway decides again when the live ticket is minted; this only decides whether the live
+  // mode exists.
+  transcriptionStreaming: boolean;
   // The THREAD's kind: "" (text), "image", "speech" or "transcription". Pinned by the backend
   // at the thread's first send and authoritative from then on; while the thread is
   // still empty it follows the picked model, because that is what the next
@@ -400,6 +418,21 @@ export type ChatStore = {
   // picked file. removeAudio drops the clip again.
   attachRecording: (blob: Blob) => Promise<void>;
   removeAudio: () => void;
+  // The LIVE recording of a transcription thread (#266): the microphone streamed to the gateway
+  // while the user speaks, with the transcript appearing as they talk. Offered by the composer
+  // only while transcriptionStreaming is true. `liveSession` is its state and the transcript so
+  // far (across reconnects); start it from the user's gesture (the click that asks for the
+  // microphone), stop it to have the transcript committed as a completed turn of the chat (the
+  // gateway's live endpoint has done, and billed, the work: no chat run is started), abort it to
+  // throw it away. A connection that drops while recording is reconnected, a few times, as a new
+  // session; the error state keeps what was transcribed, and keepLiveTranscript commits it as a
+  // turn anyway. The recording belongs to the thread it started in: another chat or model, or live
+  // going off offer, ends it.
+  liveSession: LiveTranscription;
+  startLiveTranscription: () => void;
+  stopLiveTranscription: () => void;
+  abortLiveTranscription: () => void;
+  keepLiveTranscript: () => void;
   // The mask of an image EDIT (inpainting): one PNG data url, or null. It exists
   // only beside a source image in edit mode (handleMaskFile refuses it otherwise,
   // and it is dropped with its source or when the mode changes) and is sent as a
@@ -501,10 +534,12 @@ export function ChatStoreProvider({
     | 'chat'
     | 'chats'
     | 'createChat'
+    | 'createLiveTranscriptionTicket'
     | 'deleteChat'
     | 'deleteMessageAudio'
     | 'modelImageOptions'
     | 'modelSpeechStreaming'
+    | 'modelTranscriptionStreaming'
     | 'modelVoices'
     | 'pruneChatAudio'
     | 'saveChat'
@@ -606,6 +641,10 @@ export function ChatStoreProvider({
   const [speechStreamingGate, setSpeechStreamingGate] =
     useState<SpeechStreamingGate>(NO_SPEECH_STREAMING);
   const speechStreamingRef = useRef(false);
+  // The effective transcription model's live gate (see api.modelTranscriptionStreaming):
+  // closed until the gateway says otherwise. A plain boolean: unlike the speech gate there is
+  // no rate to carry, so nothing reads it between renders and it needs no ref.
+  const [transcriptionStreaming, setTranscriptionStreaming] = useState(false);
 
   // The caller's manageable servers (undefined prop -> []): drives whether the
   // server-override picker renders at all and its option list.
@@ -832,6 +871,11 @@ export function ChatStoreProvider({
   // (which read via refs, not props) can gate on the latest value.
   const modelAvailableRef = useRef(modelAvailable);
   modelAvailableRef.current = modelAvailable;
+  // Whether a live recording of this thread is under way. The recording (useLiveTranscription,
+  // below) is created after the replay callbacks that must refuse while it runs, so they read it
+  // through this ref, set at render like the mirrors around it; send() reads the same fact
+  // from the recording's own state.
+  const liveRunningRef = useRef(false);
   // Mirror the derived vision-capability so the stable send/edit/regenerate
   // callbacks (which read via refs, not props) can gate on the latest value.
   // Direct render-time assignment (not an effect) to match modelAvailableRef
@@ -1486,6 +1530,31 @@ export function ChatStoreProvider({
     };
   }, [modelSpeechCapable, effectiveModel]);
 
+  // Ask the gateway whether the effective TRANSCRIPTION model may go live (#266), for the
+  // composer's live record mode. The speech gate's effect above, for the transcription twin:
+  // closed up front (the answer belongs to ONE model, and a stale yes must not stay on offer
+  // while the next lookup is in flight -- the mode would promise a session the gateway will
+  // refuse a ticket for), a latest-wins guard against a slow stale response, and no lookup at
+  // all for a non-transcription (or no) model. FAIL CLOSED: a failed lookup is a no, which
+  // leaves the thread on the buffered recording it always had. The deps list ends at the
+  // model, like the speech gate's: the answer does not depend on the thread.
+  useEffect(() => {
+    setTranscriptionStreaming(false);
+    if (!modelTranscriptionCapable || effectiveModel === '') return;
+    let cancelled = false;
+    void apiRef.current
+      .modelTranscriptionStreaming(effectiveModel)
+      .then((streams) => {
+        if (!cancelled) setTranscriptionStreaming(streams);
+      })
+      .catch(() => {
+        if (!cancelled) setTranscriptionStreaming(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelTranscriptionCapable, effectiveModel]);
+
   // Ready the browser's audio from inside the user's gesture, for a turn that will stream.
   // A page may only make sound once the user has acted on it, and Safari wants the audio
   // context created and resumed INSIDE the handler of the click that sends: by the time the
@@ -1537,6 +1606,13 @@ export function ChatStoreProvider({
   // then generates a fresh assistant turn appended after it.
   const startRunWithHistory = useCallback(
     async (chatId: string, history: ChatUiMessage[]) => {
+      // A live recording of this thread is under way: it commits its own turn when it ends,
+      // and a replay started now would own the transcript that turn is to land in (the commit
+      // would then fail with chatBusy). Refused like send()'s, before any state is touched.
+      if (liveRunningRef.current) {
+        showErrorRef.current(tRef.current.chatBusy);
+        return;
+      }
       // Block edit/regenerate while the effective model is unavailable — BEFORE
       // any state mutation. Otherwise the setMessages(history) below would
       // truncate the transcript (dropping the assistant turn) and the debounced
@@ -1650,7 +1726,7 @@ export function ChatStoreProvider({
     (id: string, text: string) => {
       const chatId = activeChatIdRef.current;
       if (!chatId) return;
-      if (isRunning(chatId)) {
+      if (isRunning(chatId) || liveRunningRef.current) {
         showErrorRef.current(tRef.current.chatBusy);
         return;
       }
@@ -1688,7 +1764,7 @@ export function ChatStoreProvider({
     (id: string) => {
       const chatId = activeChatIdRef.current;
       if (!chatId) return;
-      if (isRunning(chatId)) {
+      if (isRunning(chatId) || liveRunningRef.current) {
         showErrorRef.current(tRef.current.chatBusy);
         return;
       }
@@ -1870,6 +1946,67 @@ export function ChatStoreProvider({
     [editUserMessage, regenerate, refineImage, deleteAudio],
   );
 
+  // The live recording of a transcription thread (useLiveTranscription.ts), for the composer's
+  // live mode. It starts only where the composer offers it -- a transcription thread whose model
+  // the gateway says streams (transcriptionStreaming) -- and belongs to the thread it started in.
+  //
+  // What the thread says to Start (the model it records for, the language its settings name; the
+  // refusals, in the same words as send()'s for the same two reasons) and how a finished
+  // recording lands in it are decided HERE, because they read the thread's own state: the
+  // recording itself never touches the chat. A finished recording becomes ONE completed turn,
+  // appended directly -- NOT started as a chat run, because the gateway's live endpoint has
+  // already done, and billed, the work: a marker for the recording as the user's turn (there is
+  // no clip to show, and the transcript is all that is kept), and the transcript as the answer,
+  // in the shape the run's own commit gives a transcription answer, so it renders, titles the
+  // chat and is saved like one. The first turn pins the thread's kind, as the first send does. It
+  // is refused, with the sentence of why, while a run is in flight (the server owns the
+  // transcript then; the recording keeps its text and may be committed again), and for a
+  // thread that is no longer the one it was recorded for.
+  const live = useLiveTranscription({
+    apiRef,
+    tRef,
+    showErrorRef,
+    thread: {
+      chatId: activeChatId,
+      model: effectiveModel,
+      available: transcriptionStreaming && chatKind === 'transcription',
+    },
+    begin: (): LiveStart | null => {
+      const chatId = activeChatIdRef.current;
+      if (!chatId || chatKindRef.current !== 'transcription' || !transcriptionStreaming) {
+        return null;
+      }
+      if (!modelAvailable) {
+        showErrorRef.current(tRef.current.chatModelUnavailable);
+        return null;
+      }
+      if (isRunning(chatId)) {
+        showErrorRef.current(tRef.current.chatBusy);
+        return null;
+      }
+      return { chatId, model: effectiveModel, language: transcriptionSettings.language.trim() };
+    },
+    commit: (chatId, transcript) => {
+      if (chatId !== activeChatIdRef.current || chatKindRef.current !== 'transcription') {
+        return tRef.current.chatTranscriptionLiveError;
+      }
+      if (isRunning(chatId)) return tRef.current.chatBusy;
+      if (messagesRef.current.length === 0) setPinnedChatKind(chatKindRef.current);
+      maybeAutoTitle(transcript);
+      const next: ChatUiMessage[] = [
+        ...messagesRef.current,
+        { id: nextId(), role: 'user', content: tRef.current.chatTranscriptionLiveTurn },
+        { id: nextId(), role: 'assistant', content: transcript, status: 'complete' },
+      ];
+      setMessages(next);
+      messagesRef.current = next;
+      chatBuffers.set(chatId, next);
+      return null;
+    },
+  });
+  const { liveSession } = live;
+  liveRunningRef.current = liveSessionRunning(liveSession.state);
+
   // Send the composed message: append the optimistic user bubble, clear the
   // composer, then start a SERVER run and subscribe to it. One run per chat —
   // refuse if this chat already has a live run. On a hard start failure the
@@ -1882,6 +2019,12 @@ export function ChatStoreProvider({
       return;
     }
     if (isRunning(chatId)) {
+      showErrorRef.current(tRef.current.chatBusy);
+      return;
+    }
+    // A live recording of this thread is under way (its Send is closed too): it commits its
+    // own turn when it ends, and a run started now would own the transcript it is to land in.
+    if (liveSessionRunning(liveSession.state)) {
       showErrorRef.current(tRef.current.chatBusy);
       return;
     }
@@ -2352,6 +2495,7 @@ export function ChatStoreProvider({
     modelImageOptions,
     modelVoices,
     speechStreaming: speechStreamingGate.streaming,
+    transcriptionStreaming,
     chatKind,
     imageSettings,
     setImageSettings,
@@ -2381,6 +2525,11 @@ export function ChatStoreProvider({
     removeImage,
     attachRecording,
     removeAudio,
+    liveSession,
+    startLiveTranscription: live.startLiveTranscription,
+    stopLiveTranscription: live.stopLiveTranscription,
+    abortLiveTranscription: live.abortLiveTranscription,
+    keepLiveTranscript: live.keepLiveTranscript,
     mask,
     handleMaskFile,
     removeMask,

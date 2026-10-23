@@ -360,30 +360,51 @@ func TestFeaturesDeclareRuntimeVoices(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_voices") {
 		t.Fatal("FeatureNames() does not carry runtime_voices, so it never reaches the gateway in capabilities.features")
 	}
-	// The version assertion lives here, beside the newest feature, and it
-	// is the forcing function for the repository's bump rule: a change that
-	// moves Version has to come THROUGH this test and state which rule it
-	// followed. 0.8.0 was MINOR because agent.Features gained
-	// runtime_ensure; 0.8.1 and 0.8.2 were PATCH because they gained nothing
-	// (0.8.2 added the image_options telemetry field, gated on the
-	// gateway-declared capability_source_sdcpp, which is not an agent.Features
-	// entry); 0.9.0 was MINOR because agent.Features gained multipart_proxy;
-	// 0.9.1 and 0.9.2 were PATCH because they gained nothing (they probe an
-	// audio_cpp child's /v1/models, gated on the gateway-declared
-	// capability_source_audiocpp, which is not an agent.Features entry
-	// either); 0.10.0 was MINOR because agent.Features gained
-	// runtime_config_files; 0.10.1 and 0.10.2 were PATCH (the speech_clone
-	// verdict, then the "clone" -> "clon" task-string correction, both read from
-	// the child's /v1/models task on the same gateway-declared
-	// capability_source_audiocpp source, which is not an agent.Features entry);
-	// 0.11.0 is MINOR because agent.Features gained runtime_voices; 0.11.1 is
-	// PATCH (the speech_streaming verdict, read from the audio_cpp child's
-	// /v1/models mode on the same gateway-declared capability_source_audiocpp
-	// source, which is not an agent.Features entry: an absent verdict already
-	// means the correct default, buffered). A Since records the version a feature
-	// shipped in, so runtime_ensure's stays 0.8.0, multipart_proxy's stays 0.9.0,
-	// runtime_config_files' stays 0.10.0 and runtime_voices' stays 0.11.0.
-	if Version != "0.11.1" {
-		t.Fatalf("Version = %q, want 0.11.1 (the speech_streaming verdict is an open-vocabulary name on an existing source, and agent.Features gained nothing, so the bump is PATCH)", Version)
+}
+
+// TestFeaturesDeclareFullduplexProxy pins the fullduplex_proxy flag and the
+// version bump that ships it. The version assertion lives here, beside the
+// newest feature, and it is the forcing function for the repository's bump
+// rule: a change that moves Version has to come THROUGH this test and state
+// which rule it followed. 0.8.0 was MINOR because agent.Features gained
+// runtime_ensure; 0.8.1 and 0.8.2 were PATCH because they gained nothing
+// (0.8.2 added the image_options telemetry field, gated on the
+// gateway-declared capability_source_sdcpp, which is not an agent.Features
+// entry); 0.9.0 was MINOR because agent.Features gained multipart_proxy;
+// 0.9.1 and 0.9.2 were PATCH because they gained nothing (they probe an
+// audio_cpp child's /v1/models, gated on the gateway-declared
+// capability_source_audiocpp, which is not an agent.Features entry
+// either); 0.10.0 was MINOR because agent.Features gained
+// runtime_config_files; 0.10.1 and 0.10.2 were PATCH (the speech_clone
+// verdict, then the "clone" -> "clon" task-string correction, both read from
+// the child's /v1/models task on the same gateway-declared
+// capability_source_audiocpp source, which is not an agent.Features entry);
+// 0.11.0 is MINOR because agent.Features gained runtime_voices; 0.11.1 is
+// PATCH (the speech_streaming verdict, read from the audio_cpp child's
+// /v1/models mode on the same gateway-declared capability_source_audiocpp
+// source, which is not an agent.Features entry: an absent verdict already
+// means the correct default, buffered); 0.12.0 is MINOR because
+// agent.Features gained fullduplex_proxy. A Since records the version a
+// feature shipped in, so runtime_ensure's stays 0.8.0, multipart_proxy's stays
+// 0.9.0, runtime_config_files' stays 0.10.0, runtime_voices' stays 0.11.0 and
+// fullduplex_proxy's stays 0.12.0.
+func TestFeaturesDeclareFullduplexProxy(t *testing.T) {
+	found := false
+	for _, f := range Features {
+		if f.Name == "fullduplex_proxy" {
+			found = true
+			if f.Since != "0.12.0" {
+				t.Fatalf("fullduplex_proxy Since = %q, want 0.12.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare fullduplex_proxy")
+	}
+	if !slices.Contains(FeatureNames(), "fullduplex_proxy") {
+		t.Fatal("FeatureNames() does not carry fullduplex_proxy, so it never reaches the gateway in capabilities.features")
+	}
+	if Version != "0.12.0" {
+		t.Fatalf("Version = %q, want 0.12.0 (fullduplex_proxy is a new agent.Features entry, so the bump is MINOR)", Version)
 	}
 }

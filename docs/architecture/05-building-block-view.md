@@ -210,7 +210,7 @@ section (`DashboardVendorUsage`, which reads the stored usage snapshots from the
 vendor-accounts list and never calls a vendor,
 [§5.4](cross-cutting/external-vendor-accounts.md#54-reading-it-and-what-is-deferred)).
 
-Two additions worth knowing when looking for code on this side:
+Three additions worth knowing when looking for code on this side:
 
 - The `api.ts` barrel also carries a **`runtime` domain module**
   (`api/runtime.ts`) covering mapping-scoped launch specs, application-scoped
@@ -231,6 +231,19 @@ Two additions worth knowing when looking for code on this side:
   `components/shared/ResourceFallback.tsx` (`resourceState()` +
   `<ResourceFallback>`) was extracted there as the canonical
   loading/error/stale-error/ready rendering for `useResource` call sites.
+- **The live transcription client** (`gateway/frontend/src/components/chat/`, issue #266, [ADR-073](09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)) is the portal's microphone-to-gateway streaming path. `captureWorklet.ts` (an `AudioWorkletProcessor`, bundled
+  separately by Vite as `?worker&url`) takes the microphone as one channel, resamples it to 16 kHz and posts
+  s16le PCM in ~100 ms batches, with its audio logic in the testable `livePcm.ts`; `liveTranscription.ts`
+  (`createLiveSession`) mints the ticket, opens the `op-live-transcription` WebSocket, relays the batches as binary
+  frames and `{"type":"end"}`, and parses the `delta`/`partial`/`done`/`error` frames; `liveSession.ts` is the
+  pure reducer of the transcript (`delta` appends, `partial` replaces the current session's text, `done`
+  finalizes); `useLiveTranscription.ts` owns a **recording** that outlives its connections (a bounded
+  1 s / 2 s / 4 s reconnect, at most three in a row, only for a drop while still recording) and commits the finished
+  transcript as one completed turn **without** a chat run. The store feeds it the `transcriptionStreaming` flag
+  (`api.modelTranscriptionStreaming`, `GET /api/portal/model-transcription-streaming`, fail-closed), and
+  `components/TranscriptionComposer.tsx` shows the file / record / **live** mode switch, offering *live* only for a streaming
+  model. All of it is bilingual in `i18n.ts`. The gateway side is [Compatibility & Inference
+  §3.8](cross-cutting/compatibility-and-inference.md#38-live-transcription-the-bearer-v1-endpoint-and-the-portal-websocket).
 - `RowAction.title` — the "why is this disabled" reason — is honoured on
   **both** rendering paths and is reachable by keyboard and screen readers, not
   only on pointer hover. `RowActionsCell` previously dropped it on the inline

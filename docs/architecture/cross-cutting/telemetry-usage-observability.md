@@ -914,6 +914,64 @@ telemetry); the non-token disclosure counts (`NonTokenRequests`) work unchanged,
 portal's unit chip shows the raw value without a tooltip. The streamed response's capture stays the redacted binary summary
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
+**LIVE transcription is the fifth audio producer: `audio_second` from the INPUT PCM the gateway
+received, over the byte rate the client declared and the gateway validated, on a clean end only, and it is
+recorded at `POST /v1/audio/transcriptions/live`**
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once), issue #266). The live endpoint
+([API Compatibility & Inference §3.8](compatibility-and-inference.md#38-live-transcription-the-bearer-v1-endpoint-and-the-portal-websocket)) streams
+audio **up** and text **down**, so the billable audio is what the client *sent*, which no response
+states and no upload header describes. Unlike a streamed speech call (the paragraph above), whose
+output rate is a native, unexposed property of the model and had to be learned by a benchmark, the
+live input's format is **declared**: `sample_rate`, `channels` and `sample_format` are validated
+(1000 to 384000 Hz, 1 to 16 channels, `s16le` or `f32le`) and used for **both** the parameters forwarded to
+audio.cpp **and** the billing rate (**billing-rate ≡ forwarded-rate**), so a client cannot declare a
+cheap rate while streaming audio at another. So there is **no learned rate cache and no
+`audio_bytes` fallback**. The relay counts the **PCM payload bytes** it pumped into the upstream body
+(never WebSocket framing), and `recordLiveUsage` (`internal/gateway/live_transcription_ws.go`)
+decides the row once, when the session ends, with `(audio_second, 0)` as the default.
+
+**Where it is recorded, and to whom it is attributed.** There is **one** place: the `/v1/audio/transcriptions/live` relay
+(`internal/gateway/live_transcription_bearer.go`), whose teardown calls `recordLiveUsage` exactly once. The portal's
+live-transcription WebSocket **loops back** to that endpoint, so a portal session records its row **there**, not in the
+WebSocket handler, which records nothing; the ticket mint records nothing either (it is a gate and spends no admission).
+The row's `req_path` is `/v1/audio/transcriptions/live` on both paths. What differs is the principal:
+
+| Path | Principal | Row carries |
+|---|---|---|
+| A **bearer** client calls `/v1/audio/transcriptions/live` | the **bearer token** | `UserID`, `TokenID` and, for a service token, `ServiceID`/`ServiceName` and `ProjectID`/`ProjectName`, plus `RouteID` and `ServerID`, attributed like a buffered transcription |
+| The **portal** WebSocket (the composer's live mode) | the **loopback user**: a token-less session principal of the ticket's `UserID` | `UserID`, `RouteID` and `ServerID` only, with **no `TokenID`, `ServiceID` or `ProjectID`**, exactly as a portal chat run's loopback call is attributed |
+
+No token column is set on either, so `ValidateBillingXOR` holds, and the unit is `audio_second`, so the row reads in the
+usage views and the energy tiers exactly as the other `audio_second` producers' rows do (§8.4.4).
+
+| Outcome | `status` | `billing_unit` | `billing_quantity` |
+|---|---|---|---|
+| **Clean end**: the client finished its body with the terminating chunk (a bearer client; the portal's `{"type":"end"}` is turned into it by the loopback), no upstream error, the scan saw `transcript.text.done` **then** `[DONE]`, and the rate is positive | `success` | `audio_second` | PCM bytes ÷ (`sample_rate` × `channels` × bytes per sample: 2 for `s16le`, 4 for `f32le`) |
+| The client's body was **truncated** (a bearer connection dropped mid-body, a portal WebSocket closed **without** `end`: the upstream body was aborted, no terminating chunk, no `transcript.text.done`) | `success` | `audio_second` | `0`, and one `Error` log line |
+| The session was **reaped by the idle watchdog**: the client kept sending PCM but stopped reading the SSE, so the write deadline cut it and the watchdog cancelled the relay (the route's slot is released) | `success` | `audio_second` | `0`, and one `Error` log line |
+| A mid-stream SSE `error` after a `200`, or a stream that ended without both terminal events | `success` | `audio_second` | `0`, and one `Error` log line |
+| The upstream could not be reached, or answered **non-2xx** (the agent's `404`/`503`, a child error) | `error`, code the mapped provider code or `upstream.<status>` | `audio_second` | `0`, and one `Error` log line |
+
+A session refused **before** the relay (a failed gate, a denied admission, a busy route: `503 transcription.live_busy`) moved no
+byte and records **no row**.
+
+**What the gate does and does not bound.** The completion check is a **latch** (`transcriptionStreamScan.complete()`:
+`done` seen, then `[DONE]`) that the end-of-input does not reset, and the two conditions are not ordered. A truncated
+body, an idle reap, a dial failure or non-2xx, and a stream that never shows both terminal events are all bounded to zero.
+Whether audio.cpp emits `transcript.text.done` + `[DONE]` **per utterance, mid-stream** is **unconfirmed**; if it does,
+the latch is set early and a session whose upstream then fails **after** the client sent its end can still bill clean
+for all the PCM it sent. Billing only on the terminal events that follow the terminating chunk is **not
+implemented** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), [Risks & Technical Debt §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+The rule is the loud-zero rule of this section, never a guessed count: a session that delivered
+audio and did not complete **bills none of it**, and the log line (`live transcription billed zero`,
+with the request id, model, server, `end_requested`, `complete`, the byte rate and the PCM byte
+count) is where the zero is explained. A dial failure and a non-2xx upstream are `error` rows so a
+real backend failure is not hidden as `success` while the HTTP status says otherwise; a truncated
+session, an idle reap and a post-`200` SSE error stay `success`, the way an incomplete streamed transcription does
+(the streamed-transcription paragraph above). The ticket endpoint and the WebSocket handler record **no row** of
+their own: the first is a gate and the second a loopback adapter.
+
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
 the response, because a zero `provider.Response` on a failed request would

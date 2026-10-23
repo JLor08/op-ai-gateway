@@ -6,6 +6,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"io"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/tracing"
@@ -150,6 +151,40 @@ func (m *Multiplexer) RecordLiveProgressRejection(target routing.Target) {
 	if memo, ok := m.liveProgressMemoFor(target); ok {
 		memo.RecordLiveProgressRejection(target)
 	}
+}
+
+var _ NativeDuplexProxyClient = (*Multiplexer)(nil)
+
+// ProxyNativeDuplex routes a full-duplex native passthrough to the provider's
+// client. The capability is OPTIONAL (NativeDuplexProxyClient), like the live
+// progress memo, but unlike that memo a miss is an error: a stream silently
+// dropped is worse than one refused. And exactly like ProxyNative it does NOT
+// cross-route to the fallback on a capability mismatch -- the stream must reach
+// the provider routing resolved to.
+func (m *Multiplexer) ProxyNativeDuplex(ctx context.Context, target routing.Target, path string, body io.Reader, contentType string) (*ProxyResponse, error) {
+	ctx, span := tracing.Start(ctx, "provider.ProxyNativeDuplex")
+	defer span.End()
+	res, err := m.dispatchProxyNativeDuplex(ctx, target, path, body, contentType)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return res, err
+}
+
+func (m *Multiplexer) dispatchProxyNativeDuplex(ctx context.Context, target routing.Target, path string, body io.Reader, contentType string) (*ProxyResponse, error) {
+	if m == nil {
+		return nil, ErrUnavailable
+	}
+	client := m.clients[strings.TrimSpace(target.Provider)]
+	if client == nil {
+		client = m.fallback
+	}
+	proxy, ok := client.(NativeDuplexProxyClient)
+	if !ok {
+		return nil, fmt.Errorf("%w: duplex native proxy not supported for provider %q", ErrUnavailable, target.Provider)
+	}
+	return proxy.ProxyNativeDuplex(ctx, target, path, body, contentType)
 }
 
 func (m *Multiplexer) dispatchProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
