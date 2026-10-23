@@ -57,6 +57,10 @@ type mockLiveChild struct {
 	// with a short error body instead of upgrading to the SSE stream (an upstream
 	// error, e.g. the agent's 404 model_not_managed / 503 admission_blocked).
 	statusCode int
+	// onServe, when set, is called at the start of serve (before any response) -- a hook
+	// for a test to observe gateway state while the relay is in flight, e.g. to snapshot
+	// the Active Requests list and prove the live session is registered for its duration.
+	onServe func()
 }
 
 func newMockLiveChild(t *testing.T) *mockLiveChild {
@@ -74,7 +78,11 @@ func (c *mockLiveChild) serve(w http.ResponseWriter, r *http.Request) {
 	emitPartial := c.emitPartial
 	emitError := c.emitError
 	statusCode := c.statusCode
+	onServe := c.onServe
 	c.mu.Unlock()
+	if onServe != nil {
+		onServe()
+	}
 
 	rc := http.NewResponseController(w)
 	// Full-duplex so the server may write the response while the request body is still

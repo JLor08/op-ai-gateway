@@ -1168,11 +1168,15 @@ different panels, and the menu's reset restores both defaults.
 
 **The live row carries its billing unit, so a non-token request is not shown a
 token count.** `ActiveRequest.BillingUnit` (JSON `billing_unit`, always sent, `""`
-for a token-metered request) is set at **every** registration site from the same
-`billingUnitFor(apiFlavor)` chokepoint the completed row uses: the non-streaming
-chat path, the streaming chat path (`beginStream`) and the native-passthrough path,
-the last being the shared site for images generations, image edits, speech and
-transcription. It is
+for a token-metered request) is set at **every** registration site: the non-streaming
+chat path, the streaming chat path (`beginStream`) and the native-passthrough path —
+all three from the `billingUnitFor(apiFlavor)` chokepoint the completed row uses, the
+last being the shared site for images generations, image edits, speech and **buffered**
+transcription — plus the **live transcription relay** (`relayBearerLiveTranscription`,
+run by both the bearer `/v1/audio/transcriptions/live` and the portal WebSocket's
+loopback), which registers a streaming row and sets `audio_second` **directly** rather
+than through `billingUnitFor`, exactly as it bills: a live session is always metered in
+`audio_second` whatever its resolved API flavor. It is
 the in-flight twin of the completed row's field, and it is populated for **every**
 flavor, chat included (`""`), rather than only the non-token ones, so the portal
 never has to guess a missing field. The Active Requests panel applies the per-row

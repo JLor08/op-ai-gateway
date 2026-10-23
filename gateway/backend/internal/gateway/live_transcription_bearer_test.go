@@ -495,3 +495,54 @@ func TestBearerLiveTranscriptionRefusesOtherMethods(t *testing.T) {
 		t.Fatalf("status = %d, want 405", rec.Code)
 	}
 }
+
+// TestBearerLiveTranscriptionRegistersActiveRequest pins that a live session shows in the
+// Active Requests view (GET /api/portal/usage/active) for its whole lifetime, like the
+// chat/stream/native paths -- an operator must be able to see a live session holding a
+// model's single /live slot. The mock child's onServe hook snapshots s.Active WHILE the
+// relay is in flight; after the relay ends the deferred Remove has run and nothing lingers.
+func TestBearerLiveTranscriptionRegistersActiveRequest(t *testing.T) {
+	child := newMockLiveChild(t)
+	srv, _ := newTranscriptionCapableTestServer(t, child.server.URL)
+
+	duringCh := make(chan []ActiveRequest, 1)
+	child.onServe = func() { duringCh <- srv.Active.Snapshot() }
+
+	rec := postBearerLiveRecorder(t, srv, bearerLiveQuery("asr-model"), devBearerHeader)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200\n%s", rec.Code, rec.Body.String())
+	}
+
+	// DURING the relay (the child was serving) the live session is registered, attributed,
+	// and shaped like a streaming audio_second request.
+	var during []ActiveRequest
+	select {
+	case during = <-duringCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the upstream child was never contacted; the relay did not run")
+	}
+	if len(during) != 1 {
+		t.Fatalf("active snapshot during the relay = %d entries, want exactly one live session: %+v", len(during), during)
+	}
+	got := during[0]
+	if got.ReqPath != "/v1/audio/transcriptions/live" {
+		t.Errorf("ReqPath = %q, want /v1/audio/transcriptions/live", got.ReqPath)
+	}
+	if got.BillingUnit != usage.BillingUnitAudioSecond {
+		t.Errorf("BillingUnit = %q, want %q", got.BillingUnit, usage.BillingUnitAudioSecond)
+	}
+	if !got.Stream {
+		t.Errorf("Stream = false, want true (a live session is a streaming relay)")
+	}
+	if got.RequestedModel != "asr-model" {
+		t.Errorf("RequestedModel = %q, want asr-model (the client's requested model)", got.RequestedModel)
+	}
+	if got.Model == "" || got.UserID == "" || got.TokenID == "" {
+		t.Errorf("live row not fully attributed: Model=%q UserID=%q TokenID=%q", got.Model, got.UserID, got.TokenID)
+	}
+
+	// AFTER the relay ends the deferred Remove has run: no live session lingers in the view.
+	if after := srv.Active.Snapshot(); len(after) != 0 {
+		t.Fatalf("live session still in the Active view after end: %+v", after)
+	}
+}
