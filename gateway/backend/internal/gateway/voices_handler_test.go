@@ -499,7 +499,7 @@ func TestAudioVoicesReadSideVerdictGate(t *testing.T) {
 	setCache(`[]`)
 	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), nil)
 
-	// A model that is not a clone is offerable without voices, and has none to show.
+	// Once it is no longer a clone, the list on file is offered again.
 	set(routing.CapabilitySpeechClone, routing.CapabilityNo)
 	setCache(`["flip-voice"]`)
 	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), []string{"flip-voice"})
@@ -790,6 +790,7 @@ func TestCachedVoicesForMappingsAppliesTheVerdictGateOverGivenIDs(t *testing.T) 
 // only with a non-empty list. A model that is not a speech model never
 // contributes, whatever list is stranded on file for it.
 func TestCachedVoicesForMappingsOffersPresetClonesOnly(t *testing.T) {
+	buf := withCapturedSlogAtTheDefaultLevel(t)
 	w := newVoicesWorld(t)
 	ctx := context.Background()
 	const yes = routing.CapabilityYes
@@ -829,6 +830,12 @@ func TestCachedVoicesForMappingsOffersPresetClonesOnly(t *testing.T) {
 			}
 			requireVoices(t, got, c.want)
 		})
+	}
+
+	// The undecodable clone row was skipped AND said so: warn-and-skip applies to a
+	// clone mapping exactly as it does to a plain one.
+	if !findLogRecord(buf.Snapshot(), "WARN", "voices cache row") {
+		t.Fatalf("no warning about the undecodable voices row; records: %+v", buf.Snapshot())
 	}
 }
 
