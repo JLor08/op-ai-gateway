@@ -521,6 +521,43 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(sessions).toHaveLength(1);
       });
 
+      it('a drop after the session stopped ITSELF (microphone unplugged) is not reconnected either', () => {
+        const h = setup();
+        h.start();
+        emit.listening(sessions[0]);
+        emit.delta(sessions[0], 'said');
+
+        // The session ends the recording on its own, the way a lost microphone does: it reports
+        // finalizing without the user having pressed Stop.
+        emit.state(sessions[0], 'finalizing');
+        expect(h.live().liveSession.state).toBe('finalizing');
+        emit.error(sessions[0], dropped, 'did not deliver its final transcript');
+
+        expect(h.live().liveSession).toEqual({
+          state: 'error',
+          transcript: 'said',
+          error: t.chatTranscriptionLiveError,
+        });
+        // No reconnect, and so no new request for the microphone that was just lost.
+        h.advance(600_000);
+        expect(sessions).toHaveLength(1);
+      });
+
+      it('a session that stopped itself and then delivers its final transcript commits it', () => {
+        const h = setup();
+        h.start();
+        emit.listening(sessions[0]);
+        emit.delta(sessions[0], 'said');
+
+        emit.state(sessions[0], 'finalizing');
+        emit.done(sessions[0], 'said it all');
+
+        expect(h.commit).toHaveBeenCalledWith('c1', 'said it all');
+        expect(h.live().liveSession.state).toBe('idle');
+        h.advance(600_000);
+        expect(sessions).toHaveLength(1);
+      });
+
       it('Stop while waiting to reconnect commits what was said and starts nothing', () => {
         const h = setup();
         h.start();

@@ -236,6 +236,12 @@ export function useLiveTranscription(deps: LiveTranscriptionDeps): LiveTranscrip
           apply({ type: 'listening' });
           break;
         case 'finalizing':
+          // The session ends its own recording too: a microphone that goes away (unplugged,
+          // permission revoked) stops it exactly like Stop, without the user pressing
+          // anything. From here the user's intent is to be done, so a drop while the final
+          // transcript is awaited is a failed ending, not an unexpected drop to reconnect
+          // from (which would ask for the microphone that was just lost).
+          if (intentRef.current === 'recording') intentRef.current = 'stopping';
           apply({ type: 'finalizing' });
           break;
         case 'closed':
