@@ -248,7 +248,13 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 		_ = pr.CloseWithError(errLiveRelayDone)
 		cancel()
 		wg.Wait()
-		s.recordLiveUsage(start, id, r, claims, endRequested.Load(), scan, atomic.LoadInt64(&pcmBytes), upErr, resp)
+		s.recordLiveUsage(start, id, r, claims, liveUsageResult{
+			endRequested: endRequested.Load(),
+			scan:         scan,
+			pcmBytes:     atomic.LoadInt64(&pcmBytes),
+			upErr:        upErr,
+			resp:         resp,
+		})
 	}()
 
 	// Open the full-duplex upstream request. ProxyNativeDuplex returns as soon as the
@@ -476,6 +482,18 @@ func liveMarshal(m liveDownMsg) []byte {
 	return b
 }
 
+// liveUsageResult carries the per-session outcome recordLiveUsage bills from --
+// everything the relay observed by the time the session ended. It is bundled
+// into one value so the billing call stays within a sane parameter count
+// (go:S107) while passing the exact same inputs as before.
+type liveUsageResult struct {
+	endRequested bool                     // the client signalled end-of-input
+	scan         *transcriptionStreamScan // SSE completion scanner (transcript.text.done THEN [DONE])
+	pcmBytes     int64                    // total inbound PCM payload bytes relayed upstream
+	upErr        error                    // a dial/transport failure reaching the child, if any
+	resp         *provider.ProxyResponse  // the upstream response (for its status), if the dial succeeded
+}
+
 // recordLiveUsage bills the session ONCE, honestly (ADR-041), mirroring
 // setStreamedSpeechBillingQuantity:
 //   - the failure default is (audio_second, 0);
@@ -490,10 +508,14 @@ func liveMarshal(m liveDownMsg) []byte {
 // The row attributes UserID + TokenID + RouteID + ServerID from the claims. The
 // claims carry no ServiceID/ProjectID, so a live row is not service/project-scoped
 // (acceptable for phase 1; a follow-up could thread them through the ticket).
-func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, claims liveTicketClaims, endRequested bool, scan *transcriptionStreamScan, pcmBytes int64, upErr error, resp *provider.ProxyResponse) {
+//
+// The per-session outcome is bundled into liveUsageResult rather than passed as
+// loose parameters, keeping this billing entry point within a sane parameter
+// count (go:S107) with the exact same inputs.
+func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, claims liveTicketClaims, result liveUsageResult) {
 	meta := usageMeta{
 		ReqPath:     r.URL.Path,
-		HTTPStatus:  liveHTTPStatus(upErr, resp),
+		HTTPStatus:  liveHTTPStatus(result.upErr, result.resp),
 		ContentType: liveSSEContentType,
 		Endpoint:    endpointTranscription,
 	}
@@ -502,13 +524,13 @@ func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, cl
 	byteRate, rateOK := liveByteRate(claims.SampleRate, claims.Channels, claims.Format)
 	status, errorCode := "success", ""
 	switch {
-	case upErr == nil && endRequested && scan.complete() && rateOK && byteRate > 0:
-		meta.BillingQuantity = float64(pcmBytes) / float64(byteRate)
+	case result.upErr == nil && result.endRequested && result.scan.complete() && rateOK && byteRate > 0:
+		meta.BillingQuantity = float64(result.pcmBytes) / float64(byteRate)
 	default:
 		// Loud zero (ADR-041): every non-clean end logs once; the quantity stays 0.
 		slog.Error("live transcription billed zero",
 			"id", id, "path", meta.ReqPath, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID),
-			"end_requested", endRequested, "complete", scan.complete(), "rate_ok", rateOK, "byte_rate", byteRate, "pcm_bytes", pcmBytes, "upstream_error", upErr)
+			"end_requested", result.endRequested, "complete", result.scan.complete(), "rate_ok", rateOK, "byte_rate", byteRate, "pcm_bytes", result.pcmBytes, "upstream_error", result.upErr)
 		// Classify the row's status honestly. A dial failure and a non-2xx UPSTREAM
 		// are backend ERRORS: leaving them status="success" while HTTPStatus carries
 		// the 4xx/5xx would be a self-contradictory row that hides a real failure (the
@@ -520,10 +542,10 @@ func (s *Server) recordLiveUsage(start time.Time, id string, r *http.Request, cl
 		// setStreamedTranscriptionBillingQuantity treats a 2xx stream that did not
 		// complete.
 		switch {
-		case upErr != nil:
-			status, errorCode = "error", completionErrorCode(upErr)
-		case resp != nil && (resp.StatusCode < 200 || resp.StatusCode >= 300):
-			status, errorCode = "error", fmt.Sprintf("upstream.%d", resp.StatusCode)
+		case result.upErr != nil:
+			status, errorCode = "error", completionErrorCode(result.upErr)
+		case result.resp != nil && (result.resp.StatusCode < 200 || result.resp.StatusCode >= 300):
+			status, errorCode = "error", fmt.Sprintf("upstream.%d", result.resp.StatusCode)
 		}
 	}
 
