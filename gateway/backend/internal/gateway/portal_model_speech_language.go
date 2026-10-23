@@ -16,11 +16,15 @@ import (
 // portalSpeechLanguage is the gate of the portal's speech language control: whether the
 // composer may offer one for gatewayModel, and the default to pre-fill it with. accepts is
 // true when a mapping a speech request for the model could be routed to (the portal-
-// visible, plain-tts ones: portalPlainTTSMappings, which is what the voice picker and the
-// streaming gate resolve too) has a cached speech_language fact (routing.ParseSpeechLanguage
-// of the scope-"" row the health loop writes) that says it accepts a `language` request
-// field; def is the default that fact declares ("" for none), and is empty whenever accepts
-// is false.
+// visible, OFFERABLE ones: portalOfferableSpeechMappings, the set the voice picker offers
+// too -- plain tts, and a configured clone model with named presets, #301) has a cached
+// speech_language fact (routing.ParseSpeechLanguage of the scope-"" row the health loop
+// writes) that says it accepts a `language` request field; def is the default that fact
+// declares ("" for none), and is empty whenever accepts is false.
+//
+// The streaming gate does not share this candidate set: it resolves plain tts alone
+// (portalPlainTTSMappings), since a clone model has no cached stream rate and would close it
+// for a name that streams.
 //
 // A route is picked per request, after this is asked, and the streaming gate therefore
 // requires EVERY candidate to agree. This one is the other way round, and deliberately:
@@ -39,7 +43,7 @@ import (
 // This is the composer's question and not the run's authority: audio.cpp decides what a
 // `language` field means, per model, when the request arrives.
 func (s *Server) portalSpeechLanguage(ctx context.Context, principal auth.Token, gatewayModel string) (accepts bool, def string, err error) {
-	candidates, _, err := s.portalPlainTTSMappings(ctx, principal, gatewayModel)
+	candidates, _, err := s.portalOfferableSpeechMappings(ctx, principal, gatewayModel)
 	if err != nil || len(candidates) == 0 {
 		return false, "", err
 	}
@@ -83,8 +87,8 @@ func scopeLessSpeechLanguage(rows []routing.ModelMappingCacheRow) (accepts bool,
 // cookie auth (requireWebScope, gateway:use), the same name-as-a-query-parameter, the same
 // blank-name 400 (model.name_required, for the reason an empty name would otherwise read as
 // "no language control"), and the same no-leak rule -- every "no" (an unknown, hidden,
-// locked or restricted model, a non-speech or clone one, one whose language no probe has
-// stated yet) is the same 200, so the answer cannot probe which models exist. A store
+// locked or restricted model, a non-speech one, a clone one with no named preset, one whose
+// language no probe has stated yet) is the same 200, so the answer cannot probe which models exist. A store
 // failure is the only 500, never read as a "no". Nothing here loads a model or contacts an
 // upstream.
 func (s *Server) handlePortalModelSpeechLanguage(w http.ResponseWriter, r *http.Request) {

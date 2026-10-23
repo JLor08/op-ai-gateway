@@ -136,19 +136,24 @@ func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Toke
 	return rate, ok, nil
 }
 
-// portalPlainTTSMappings resolves the mappings a speech request for gatewayModel could be
-// routed to, as the portal's speech gates ask it (portalSpeechStreamRate, and
-// portalSpeechLanguage for the language control): the ids Portal.ModelVoiceMappingIDs
-// offers principal (the visibility the voice picker applies: hidden/locked suppression,
-// group expansion, provisioning, active mappings of openai_audio applications), narrowed
-// to the plain-tts ones by their CURRENT capability rows (plainTTSMappingIDs), together
-// with the rows it read, so a caller that needs a verdict does not read them again. The
-// ids are deduped and keep the portal's order (sorted), so what a caller folds over them is
-// deterministic.
+// portalPlainTTSMappings resolves the mappings a speech STREAM for gatewayModel could be
+// routed to, as the portal's streaming gate asks it (portalSpeechStreamRate): the ids
+// Portal.ModelVoiceMappingIDs offers principal (the visibility the voice picker applies:
+// hidden/locked suppression, group expansion, provisioning, active mappings of openai_audio
+// applications), narrowed to the plain-tts ones by their CURRENT capability rows
+// (plainTTSMappingIDs), together with the rows it read, so a caller that needs a verdict
+// does not read them again. The ids are deduped and keep the portal's order (sorted), so
+// what a caller folds over them is deterministic.
+//
+// It is deliberately STRICTER than what the portal offers elsewhere
+// (portalOfferableSpeechMappings: the voice picker and the language control also take a
+// configured clone model, #301). A clone model has no cached stream rate, so taking it in
+// here would close the gate for a name that streams today (a mixed name falling from
+// streaming to buffered); the stream gate therefore stays plain tts alone.
 //
 // No candidate -- no routing store or portal, a blank or unknown name, a name the portal
-// hides, a non-speech or clone model -- is an empty slice and no error: the gates read it as
-// closed, and their answer cannot tell those cases apart. A store failure is an error and is
+// hides, a non-speech or clone model -- is an empty slice and no error: the gate reads it as
+// closed, and its answer cannot tell those cases apart. A store failure is an error and is
 // never read as that.
 func (s *Server) portalPlainTTSMappings(ctx context.Context, principal auth.Token, gatewayModel string) ([]string, map[string][]routing.CapabilityRow, error) {
 	if s.Routes == nil || s.Portal == nil || strings.TrimSpace(gatewayModel) == "" {
@@ -179,6 +184,67 @@ func plainTTSMappingIDs(ids []string, verdicts map[string][]routing.CapabilityRo
 		}
 	}
 	return candidates
+}
+
+// portalOfferableSpeechMappings resolves the mappings the portal may OFFER a speech request
+// for gatewayModel on: portalPlainTTSMappings' resolution (the ids Portal.ModelVoiceMappingIDs
+// offers principal, deduped, in the portal's sorted order, with the capability rows it read)
+// widened to a configured clone model (#301). A mapping stays when its CURRENT verdicts say
+// routing.CapabilityRowsOfferableTTS given whether its voices cache lists a named voice: a
+// plain tts model always, a clone model only with a named preset to pick (a reference-only
+// clone synthesises only in a reference voice it is handed, so there is nothing to offer).
+// It is the candidate set of the speech language control (portalSpeechLanguage), the
+// counterpart of what the voice picker offers (cachedVoicesForMappings).
+//
+// The streaming gate does NOT use it: portalPlainTTSMappings stays plain tts only, because a
+// clone model has no cached stream rate and would close the gate for a name that streams.
+//
+// The voices cache is read, in one batch, for the speech mappings only (the others are
+// offerable by no row of it), and only the scope-"" row decides (routing.VoiceNamesFromCacheRows,
+// the one reader of its encoding). A row that does not decode counts as no named voice: it
+// keeps a clone model out, as it does from the picker (which logs it), and costs a plain model
+// nothing, since the voices decide a clone model alone.
+//
+// No candidate -- no routing store or portal, a blank or unknown name, a name the portal
+// hides, a non-speech model, a clone model with nothing to pick -- is an empty slice and no
+// error. A store failure is an error and is never read as that.
+func (s *Server) portalOfferableSpeechMappings(ctx context.Context, principal auth.Token, gatewayModel string) ([]string, map[string][]routing.CapabilityRow, error) {
+	if s.Routes == nil || s.Portal == nil || strings.TrimSpace(gatewayModel) == "" {
+		return nil, nil, nil
+	}
+	ids, err := s.Portal.ModelVoiceMappingIDs(ctx, principal, gatewayModel)
+	if err != nil {
+		return nil, nil, err
+	}
+	ids = dedupeNonEmpty(ids)
+	if len(ids) == 0 {
+		return nil, nil, nil
+	}
+	verdicts, err := s.Routes.MappingCapabilitiesForMappings(ctx, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	speech := ids[:0:0]
+	for _, id := range ids {
+		if routing.CapabilityRowsSpeech(verdicts[id]) {
+			speech = append(speech, id)
+		}
+	}
+	if len(speech) == 0 {
+		return nil, verdicts, nil
+	}
+	voices, err := s.Routes.ModelMappingCacheForMappings(ctx, speech, routing.ModelMappingCacheVoices)
+	if err != nil {
+		return nil, nil, err
+	}
+	candidates := speech[:0:0]
+	for _, id := range speech {
+		names, err := routing.VoiceNamesFromCacheRows(voices[id])
+		if routing.CapabilityRowsOfferableTTS(verdicts[id], err == nil && len(names) > 0) {
+			candidates = append(candidates, id)
+		}
+	}
+	return candidates, verdicts, nil
 }
 
 // agreedSpeechStreamRate folds the candidate mappings into the one sample rate a stream
