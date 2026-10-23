@@ -60,6 +60,7 @@ type fakeHealthStore struct {
 	// make the corresponding call fail.
 	cache         map[string]map[modelMappingCacheKey]routing.ModelMappingCacheRow
 	cacheWrites   int
+	cacheWritesBy map[string]int // the same count split by cache type
 	cacheReadErr  bool
 	cacheWriteErr bool
 }
@@ -257,6 +258,10 @@ func (f *fakeHealthStore) UpsertModelMappingCache(_ context.Context, row routing
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cacheWrites++
+	if f.cacheWritesBy == nil {
+		f.cacheWritesBy = map[string]int{}
+	}
+	f.cacheWritesBy[row.CacheType]++
 	if f.cacheWriteErr {
 		return fmt.Errorf("model mapping cache: boom")
 	}
@@ -278,6 +283,15 @@ func (f *fakeHealthStore) cacheWriteCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cacheWrites
+}
+
+// cacheWriteCountOf is cacheWriteCount for ONE cache type: the audio.cpp pass writes
+// several rows per loaded tts mapping (voices, speech_language), and a test about one
+// of them must not count the others.
+func (f *fakeHealthStore) cacheWriteCountOf(cacheType string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cacheWritesBy[cacheType]
 }
 
 // seedVoicesCache puts a voices row on file, standing in for an earlier write.
@@ -4712,25 +4726,25 @@ func TestRunAppHealthOnceAudioCppVoicesWriteIsChangeDetected(t *testing.T) {
 	prober.acVoices["pocket_tts"] = voiceList("b", "a")
 
 	runCapabilityCycle(runner)
-	if n := st.cacheWriteCount(); n != 1 {
+	if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 1 {
 		t.Fatalf("cache writes after the first tick = %d, want 1", n)
 	}
 	st.assertVoicesPayload(t, "m1", `["a","b"]`)
 
 	runCapabilityCycle(runner)
-	if n := st.cacheWriteCount(); n != 1 {
+	if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 1 {
 		t.Fatalf("cache writes after an identical second tick = %d, want still 1 (change detection)", n)
 	}
 
 	prober.acVoices["pocket_tts"] = voiceList("a", "b", "a")
 	runCapabilityCycle(runner)
-	if n := st.cacheWriteCount(); n != 1 {
+	if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 1 {
 		t.Fatalf("cache writes after a re-ordered, repeated listing = %d, want still 1 (the payload is normalized before the compare)", n)
 	}
 
 	prober.acVoices["pocket_tts"] = voiceList("a", "b", "c")
 	runCapabilityCycle(runner)
-	if n := st.cacheWriteCount(); n != 2 {
+	if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 2 {
 		t.Fatalf("cache writes after a changed listing = %d, want 2", n)
 	}
 	st.assertVoicesPayload(t, "m1", `["a","b","c"]`)
@@ -4840,7 +4854,7 @@ func TestRunAppHealthOnceAudioCppVoicesFetchErrorKeepsTheRow(t *testing.T) {
 	if n := len(prober.voicesAsked()); n != 1 {
 		t.Fatalf("voices listing asked %d times, want 1 (the fetch must have run for this to mean anything)", n)
 	}
-	if n := st.cacheWriteCount(); n != 0 {
+	if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 0 {
 		t.Fatalf("cache written %d times after a failed listing, want 0", n)
 	}
 	st.assertVoicesPayload(t, "m1", `["old_a","old_b"]`)
@@ -4871,12 +4885,12 @@ func TestRunAppHealthOnceAudioCppVoicesGenuineEmptyListingIsWritten(t *testing.T
 			runCapabilityCycle(runner)
 
 			st.assertVoicesPayload(t, "m1", `[]`)
-			if n := st.cacheWriteCount(); n != 1 {
+			if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 1 {
 				t.Fatalf("cache written %d times, want 1", n)
 			}
 
 			runCapabilityCycle(runner)
-			if n := st.cacheWriteCount(); n != 1 {
+			if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 1 {
 				t.Fatalf("cache written %d times after a second empty listing, want still 1", n)
 			}
 		})
@@ -4914,7 +4928,7 @@ func TestRunAppHealthOnceAudioCppVoicesBackOffAfterAnError(t *testing.T) {
 	if n := asked(); n != 2 {
 		t.Fatalf("asked %d times after the back-off elapsed, want 2", n)
 	}
-	if n := st.cacheWriteCount(); n != 0 {
+	if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 0 {
 		t.Fatalf("cache written %d times while every listing failed, want 0", n)
 	}
 
@@ -4962,7 +4976,8 @@ func (p *audioCppModelsOnlyProber) ProbeAudioCppModels(ctx context.Context, targ
 
 // TestRunAppHealthOnceAudioCppVoicesWithoutAListerStillWritesVerdicts: a prober
 // that cannot list voices skips the voices step, silently, and the capability
-// verdicts the same pass derives are unaffected.
+// verdicts the same pass derives are unaffected -- as is the speech language fact,
+// which rides the verdict and asks the server for nothing.
 func TestRunAppHealthOnceAudioCppVoicesWithoutAListerStillWritesVerdicts(t *testing.T) {
 	runner, st, prober := audioCppProbeRunner(t,
 		map[string]provider.AudioCppVerdicts{"pocket_tts": audioCppLoadedTTS()},
@@ -4975,8 +4990,11 @@ func TestRunAppHealthOnceAudioCppVoicesWithoutAListerStillWritesVerdicts(t *test
 	if row, ok := st.voicesRowOf("m1"); ok {
 		t.Fatalf("m1 has a voices row %+v, want none: nothing could list voices", row)
 	}
-	if n := st.cacheWriteCount(); n != 0 {
+	if n := st.cacheWriteCountOf(routing.ModelMappingCacheVoices); n != 0 {
 		t.Fatalf("cache written %d times, want 0", n)
+	}
+	if _, ok := st.speechLanguageRowOf("m1"); !ok {
+		t.Fatal("m1 has no speech_language row, want one: the step needs no voices lister")
 	}
 }
 
@@ -5108,6 +5126,263 @@ func TestWriteVoicesCache(t *testing.T) {
 	})
 }
 
+// speechLanguageRowOf reads one mapping's stored speech_language row back. ok is
+// false when the mapping has NO such row, which is how "never observed loaded"
+// (unknown) differs from "observed, and it declares no language param" (a row
+// whose payload says accepts:false).
+func (f *fakeHealthStore) speechLanguageRowOf(mappingID string) (routing.ModelMappingCacheRow, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.cache[mappingID][modelMappingCacheKey{routing.ModelMappingCacheSpeechLanguage, ""}]
+	return row, ok
+}
+
+// TestCacheAudioCppSpeechParams pins the static pass's speech-language step for ONE
+// mapping: a model observed LOADED and plain tts has the `language` fact its
+// /v1/models verdict carried cached on the mapping (routing.ModelMappingCacheSpeechLanguage),
+// change-only; any other model has NO row written and a row already on file left alone.
+// The step reads nothing of its own -- the fact rides the verdict -- so there is no
+// fetch to fail and no back-off.
+func TestCacheAudioCppSpeechParams(t *testing.T) {
+	at := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	newRunner := func() (*appHealthRunner, *fakeHealthStore) {
+		st := newHealthTestStore()
+		return &appHealthRunner{store: st, now: func() time.Time { return at }}, st
+	}
+	mp := audioCppMapping("m1", "qwen3_tts")
+	withLanguage := func(v provider.AudioCppVerdicts, accepts bool, def string) provider.AudioCppVerdicts {
+		v.AcceptsLanguage, v.LanguageDefault = accepts, def
+		return v
+	}
+
+	t.Run("a loaded plain tts model that accepts language is cached with its default", func(t *testing.T) {
+		r, st := newRunner()
+		r.cacheAudioCppSpeechParams(context.Background(), mp, withLanguage(audioCppLoadedTTS(), true, "zh"))
+		row, ok := st.speechLanguageRowOf("m1")
+		if !ok {
+			t.Fatal("m1 has no speech_language row, want one")
+		}
+		want := routing.ModelMappingCacheRow{
+			MappingID: "m1", CacheType: "speech_language", ScopeKey: "",
+			Payload: `{"accepts":true,"default":"zh"}`, UpdatedAt: at,
+		}
+		if row != want {
+			t.Fatalf("speech_language row = %+v, want %+v", row, want)
+		}
+		if n := st.cacheWriteCount(); n != 1 {
+			t.Fatalf("cache written %d times, want 1", n)
+		}
+	})
+
+	t.Run("a second identical tick writes nothing", func(t *testing.T) {
+		r, st := newRunner()
+		v := withLanguage(audioCppLoadedTTS(), true, "zh")
+		r.cacheAudioCppSpeechParams(context.Background(), mp, v)
+		r.cacheAudioCppSpeechParams(context.Background(), mp, v)
+		if n := st.cacheWriteCount(); n != 1 {
+			t.Fatalf("cache written %d times over two identical ticks, want 1", n)
+		}
+	})
+
+	t.Run("a loaded plain tts model that declares no language param is a real no", func(t *testing.T) {
+		r, st := newRunner()
+		r.cacheAudioCppSpeechParams(context.Background(), mp, withLanguage(audioCppLoadedTTS(), false, ""))
+		row, ok := st.speechLanguageRowOf("m1")
+		if !ok || row.Payload != `{"accepts":false,"default":""}` {
+			t.Fatalf("speech_language row = %+v (present=%v), want a row {accepts:false,default:\"\"}: accepts:false is a stated fact, not an absence", row, ok)
+		}
+	})
+
+	t.Run("a changed fact replaces the row", func(t *testing.T) {
+		r, st := newRunner()
+		st.seedCacheRow("m1", routing.ModelMappingCacheSpeechLanguage, routing.SpeechLanguagePayload(true, "auto"))
+		r.cacheAudioCppSpeechParams(context.Background(), mp, withLanguage(audioCppLoadedTTS(), true, "zh"))
+		if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":true,"default":"zh"}` {
+			t.Fatalf("speech_language payload = %s, want the new default zh", got)
+		}
+	})
+
+	// Every model audioCppVoicesWanted refuses writes NO row, and a row already on file
+	// (the fact learned while the model was loaded) stays: an unload does not retract it.
+	notWanted := []struct {
+		name string
+		v    provider.AudioCppVerdicts
+	}{
+		{"an unloaded model", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, SpeechClone: routing.CapabilityNo, Loaded: false}},
+		{"a clone model", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, SpeechClone: routing.CapabilityYes, Loaded: true}},
+		{"an asr model", provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, Loaded: true}},
+		{"a model whose speech verdict is unknown", provider.AudioCppVerdicts{Loaded: true}},
+	}
+	for _, tc := range notWanted {
+		t.Run(tc.name+" writes no row", func(t *testing.T) {
+			r, st := newRunner()
+			r.cacheAudioCppSpeechParams(context.Background(), mp, withLanguage(tc.v, true, "zh"))
+			if row, ok := st.speechLanguageRowOf("m1"); ok {
+				t.Fatalf("speech_language row = %+v, want none", row)
+			}
+			if n := st.cacheWriteCount(); n != 0 {
+				t.Fatalf("cache written %d times, want 0", n)
+			}
+		})
+		t.Run(tc.name+" leaves the row on file alone", func(t *testing.T) {
+			r, st := newRunner()
+			st.seedCacheRow("m1", routing.ModelMappingCacheSpeechLanguage, routing.SpeechLanguagePayload(false, ""))
+			r.cacheAudioCppSpeechParams(context.Background(), mp, withLanguage(tc.v, true, "zh"))
+			if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":false,"default":""}` {
+				t.Fatalf("speech_language payload = %s, want the seeded last-known row untouched", got)
+			}
+			if n := st.cacheWriteCount(); n != 0 {
+				t.Fatalf("cache written %d times, want 0", n)
+			}
+		})
+	}
+
+	t.Run("a store failure is logged and does not panic", func(t *testing.T) {
+		for name, setup := range map[string]func(*fakeHealthStore){
+			"read":  func(st *fakeHealthStore) { st.cacheReadErr = true },
+			"write": func(st *fakeHealthStore) { st.cacheWriteErr = true },
+		} {
+			r, st := newRunner()
+			setup(st)
+			var buf bytes.Buffer
+			log.SetOutput(&buf)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+			r.cacheAudioCppSpeechParams(context.Background(), mp, withLanguage(audioCppLoadedTTS(), true, "zh"))
+			if !strings.Contains(buf.String(), "speech language") {
+				t.Fatalf("%s failure: log output = %q, want it logged", name, buf.String())
+			}
+		}
+	})
+}
+
+// TestWriteSpeechLanguageCache pins the writer the static pass and a later agent pass
+// share: a canonical routing.SpeechLanguagePayload row at scope "", written only when it
+// differs from the row on file, with changed reporting whether it wrote.
+func TestWriteSpeechLanguageCache(t *testing.T) {
+	at := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	newRunner := func() (*appHealthRunner, *fakeHealthStore) {
+		st := newHealthTestStore()
+		return &appHealthRunner{store: st, now: func() time.Time { return at }}, st
+	}
+
+	t.Run("writes the canonical payload and reports a change", func(t *testing.T) {
+		r, st := newRunner()
+		changed, err := r.writeSpeechLanguageCache(context.Background(), "m1", true, "auto")
+		if err != nil || !changed {
+			t.Fatalf("writeSpeechLanguageCache = (%v, %v), want (true, nil)", changed, err)
+		}
+		row, ok := st.speechLanguageRowOf("m1")
+		if !ok || row.Payload != routing.SpeechLanguagePayload(true, "auto") || row.ScopeKey != "" || !row.UpdatedAt.Equal(at) {
+			t.Fatalf("row = %+v (present=%v), want the canonical payload at scope \"\" stamped %v", row, ok, at)
+		}
+	})
+
+	t.Run("an unchanged fact writes nothing and reports changed=false", func(t *testing.T) {
+		r, st := newRunner()
+		if _, err := r.writeSpeechLanguageCache(context.Background(), "m1", false, ""); err != nil {
+			t.Fatal(err)
+		}
+		changed, err := r.writeSpeechLanguageCache(context.Background(), "m1", false, "")
+		if err != nil || changed {
+			t.Fatalf("writeSpeechLanguageCache = (%v, %v), want (false, nil)", changed, err)
+		}
+		if n := st.cacheWriteCount(); n != 1 {
+			t.Fatalf("cache written %d times, want 1", n)
+		}
+	})
+
+	t.Run("a payload in another layout for the same fact is rewritten once to the canonical one", func(t *testing.T) {
+		r, st := newRunner()
+		st.seedCacheRow("m1", routing.ModelMappingCacheSpeechLanguage, `{ "accepts": true, "default": "zh" }`)
+		changed, err := r.writeSpeechLanguageCache(context.Background(), "m1", true, "zh")
+		if err != nil || !changed {
+			t.Fatalf("writeSpeechLanguageCache = (%v, %v), want (true, nil)", changed, err)
+		}
+		if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":true,"default":"zh"}` {
+			t.Fatalf("payload = %s, want the canonical form", got)
+		}
+	})
+
+	t.Run("a cache read failure is an error and writes nothing", func(t *testing.T) {
+		r, st := newRunner()
+		st.cacheReadErr = true
+		changed, err := r.writeSpeechLanguageCache(context.Background(), "m1", true, "zh")
+		if err == nil || changed {
+			t.Fatalf("writeSpeechLanguageCache = (%v, %v), want (false, error)", changed, err)
+		}
+		if n := st.cacheWriteCount(); n != 0 {
+			t.Fatalf("cache written %d times after a failed read, want 0", n)
+		}
+	})
+
+	t.Run("a cache write failure is an error and not a change", func(t *testing.T) {
+		r, st := newRunner()
+		st.cacheWriteErr = true
+		changed, err := r.writeSpeechLanguageCache(context.Background(), "m1", true, "zh")
+		if err == nil || changed {
+			t.Fatalf("writeSpeechLanguageCache = (%v, %v), want (false, error)", changed, err)
+		}
+	})
+}
+
+// TestRunAppHealthOnceAudioCppCachesSpeechLanguage drives the step through the whole
+// static pass (the wiring, not just the step): the loaded plain tts model's mapping gets
+// its language fact from the same /v1/models verdict read, a second tick with nothing
+// changed does not rewrite the row, and a mapping whose model is not a loaded plain tts
+// one gets none.
+func TestRunAppHealthOnceAudioCppCachesSpeechLanguage(t *testing.T) {
+	loadedLang := audioCppLoadedTTS()
+	loadedLang.AcceptsLanguage, loadedLang.LanguageDefault = true, "zh"
+	idle := loadedLang
+	idle.Loaded = false
+	runner, st, _ := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"qwen3_tts": loadedLang, "idle_tts": idle},
+		audioCppMapping("m1", "qwen3_tts"), audioCppMapping("m2", "idle_tts"))
+	first := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return first }
+
+	runCapabilityCycle(runner)
+
+	row, ok := st.speechLanguageRowOf("m1")
+	if !ok || row.Payload != `{"accepts":true,"default":"zh"}` || !row.UpdatedAt.Equal(first) {
+		t.Fatalf("m1 speech_language row = %+v (present=%v), want {accepts:true,default:zh} stamped %v", row, ok, first)
+	}
+	if row, ok := st.speechLanguageRowOf("m2"); ok {
+		t.Fatalf("m2 (model not loaded) speech_language row = %+v, want none", row)
+	}
+
+	runner.now = func() time.Time { return first.Add(time.Minute) }
+	runCapabilityCycle(runner)
+	if row, _ := st.speechLanguageRowOf("m1"); !row.UpdatedAt.Equal(first) {
+		t.Fatalf("m1 speech_language row restamped to %v on an unchanged tick, want it left at %v", row.UpdatedAt, first)
+	}
+}
+
+// TestRunAppHealthOnceAudioCppFailedProbeLeavesSpeechLanguageAlone: a /v1/models read that
+// FAILS states nothing, so the pass moves on before the language step and the row already
+// on file (the last fact learned while the model was loaded) is left exactly as it was.
+// The fake returns a loaded accepts:true verdict BESIDE the error, so a pass that ignored
+// the error would overwrite the seeded accepts:false row and be caught.
+func TestRunAppHealthOnceAudioCppFailedProbeLeavesSpeechLanguageAlone(t *testing.T) {
+	v := audioCppLoadedTTS()
+	v.AcceptsLanguage, v.LanguageDefault = true, "zh"
+	runner, st, prober := audioCppProbeRunner(t,
+		map[string]provider.AudioCppVerdicts{"qwen3_tts": v},
+		audioCppMapping("m1", "qwen3_tts"))
+	prober.acErr["qwen3_tts"] = errors.New("probe: connection refused")
+	seeded := routing.SpeechLanguagePayload(false, "")
+	st.seedCacheRow("m1", routing.ModelMappingCacheSpeechLanguage, seeded)
+
+	runCapabilityCycle(runner)
+
+	if got := len(prober.audioCppAsked()); got != 1 {
+		t.Fatalf("audio.cpp probe asked %d times, want 1 (the failed read must have happened)", got)
+	}
+	if got, ok := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); !ok || got != seeded {
+		t.Fatalf("speech_language payload = %q (present=%v), want the seeded %s left untouched", got, ok, seeded)
+	}
+}
+
 // TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts drives the audio.cpp branch
 // through the REAL production chain -- providerClients' Multiplexer, its
 // OpenAI-compatible client, a MemoryStore -- against an httptest server serving
@@ -5146,9 +5421,9 @@ func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"object":"list","data":[` +
-			`{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/m/pocket"},` +
+			`{"id":"pocket_tts_english_bf16","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":true,"path":"/m/pocket","params":[{"name":"language","type":"string","default":"auto"}]},` +
 			`{"id":"whisper_small","object":"model","owned_by":"engine","family":"whisper","task":"asr","mode":"offline","loaded":true,"path":"/m/whisper"},` +
-			`{"id":"idle_tts","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":false,"path":"/m/idle"}]}`))
+			`{"id":"idle_tts","object":"model","owned_by":"engine","family":"pocket_tts","task":"tts","mode":"offline","loaded":false,"path":"/m/idle","params":[{"name":"language","type":"string","default":"auto"}]}]}`))
 	}))
 	defer upstream.Close()
 	u, err := url.Parse(upstream.URL)
@@ -5249,6 +5524,28 @@ func TestAudioCppModelsPassE2EWritesSpeechAndTranscriptionVerdicts(t *testing.T)
 	for _, id := range []string{"m2", "m3", "m4"} {
 		if payload, ok := voicesPayload(id); ok {
 			t.Fatalf("%s has a voices row %q, want none -- only the loaded tts model's mapping is cached", id, payload)
+		}
+	}
+	// The speech language fact rides the same listing read (#282): the loaded tts
+	// model's mapping carries what its params declare, and no other mapping has a row --
+	// the unloaded tts entry declares the same param and is still left out.
+	languageRows := func(mappingID string) []routing.ModelMappingCacheRow {
+		rows, err := store.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheSpeechLanguage)
+		if err != nil {
+			t.Fatalf("model mapping cache %s: %v", mappingID, err)
+		}
+		return rows
+	}
+	wantLanguage := routing.ModelMappingCacheRow{
+		MappingID: "m1", CacheType: routing.ModelMappingCacheSpeechLanguage, ScopeKey: "",
+		Payload: `{"accepts":true,"default":"auto"}`, UpdatedAt: now,
+	}
+	if rows := languageRows("m1"); len(rows) != 1 || rows[0] != wantLanguage {
+		t.Fatalf("m1 speech_language rows = %+v, want exactly [%+v]", rows, wantLanguage)
+	}
+	for _, id := range []string{"m2", "m3", "m4"} {
+		if rows := languageRows(id); len(rows) != 0 {
+			t.Fatalf("%s speech_language rows = %+v, want none -- only the loaded tts model's mapping is cached", id, rows)
 		}
 	}
 	mu.Lock()

@@ -877,6 +877,10 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // only through the prober's optional voices listing; its failures never touch
 // the verdicts above.
 //
+// A speech params step per mapping (cacheAudioCppSpeechParams, #282) caches the
+// `language` request param fact the same verdict carries, for the same loaded plain tts
+// models; unlike the voices step it asks the server for nothing more.
+//
 // A third step per mapping starts the speech rate benchmark (cacheAudioCppSpeechRate,
 // #263): a loaded plain model that streams speech, which has no cached output byte
 // rate for the model the listing states (its path), has the gateway benchmark it, so
@@ -918,6 +922,7 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 		}
 		r.writeCapabilityRows(ctx, mp, audioCppCapabilityRows(v, r.now()))
 		r.cacheAudioCppVoices(pctx, lister, target, mp, v)
+		r.cacheAudioCppSpeechParams(ctx, mp, v)
 		r.cacheAudioCppSpeechRate(ctx, server, app, mp, v)
 	}
 }
@@ -1045,6 +1050,30 @@ func (r *appHealthRunner) fetchAndCacheVoices(ctx context.Context, lister provid
 	r.voicesBackoff.clear(mp.ID)
 	if _, err := r.writeVoicesCache(ctx, mp.ID, voices); err != nil {
 		log.Printf("app health: voices cache write for mapping %s failed: %v", mp.ID, err)
+	}
+}
+
+// cacheAudioCppSpeechParams is the speech params step of probeAudioCppModels for ONE
+// mapping (#282), run with the verdict that mapping's /v1/models probe just returned:
+// when the model is observed loaded and is a plain tts one (audioCppVoicesWanted, the
+// voices step's gate), the `language` fact that same listing read carried
+// (AcceptsLanguage, LanguageDefault) is stored on the mapping with
+// writeSpeechLanguageCache, so the composer can offer the language control after the
+// model is unloaded.
+//
+// Unlike the voices step it makes no request of its own: the fact rides the verdict, so
+// there is no fetch to fail and no back-off. A listing read that FAILS never reaches it
+// (probeAudioCppModels moves on to the next mapping), which is what keeps the row on
+// file the last fact learned while the model was loaded; a mapping whose model is not
+// observed loaded and plain tts writes nothing and leaves that row alone, because an
+// unloaded model's listing entry is not the model the server answers for. Best-effort: a
+// store failure is logged and the pass carries on.
+func (r *appHealthRunner) cacheAudioCppSpeechParams(ctx context.Context, mp routing.ModelMapping, v provider.AudioCppVerdicts) {
+	if !audioCppVoicesWanted(v) {
+		return
+	}
+	if _, err := r.writeSpeechLanguageCache(ctx, mp.ID, v.AcceptsLanguage, v.LanguageDefault); err != nil {
+		log.Printf("app health: speech language cache write for mapping %s failed: %v", mp.ID, err)
 	}
 }
 
@@ -1237,6 +1266,42 @@ func voicesCachePayload(voices []provider.Voice) (string, error) {
 		return "", fmt.Errorf("encode the voices payload: %w", err)
 	}
 	return string(payload), nil
+}
+
+// writeSpeechLanguageCache is the one writer of a mapping's speech_language cache row
+// (#282): the fact "does the model accept a `language` request param, and what does it
+// default to", as routing.SpeechLanguagePayload encodes it. It follows writeVoicesCache's
+// write policy -- the row on file is read and the write happens only when its payload
+// differs, so a pass that runs every health tick costs a store read, not a write, while
+// nothing changes -- and a row in some other layout for the same fact is rewritten once
+// to the canonical one.
+//
+// accepts:false is a real value and is written like any other (a loaded model that
+// declares no language param, which the composer reads as "offer no control" rather
+// than "never asked"). The caller passes only a fact read from a model observed loaded
+// -- see cacheAudioCppSpeechParams -- so an unloaded or failed read never reaches here
+// to erase the last known good.
+//
+// changed reports whether a row was written. A read or write failure is returned as an
+// error with changed=false; the caller logs it and carries on.
+func (r *appHealthRunner) writeSpeechLanguageCache(ctx context.Context, mappingID string, accepts bool, def string) (changed bool, err error) {
+	payload := routing.SpeechLanguagePayload(accepts, def)
+	rows, err := r.store.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheSpeechLanguage)
+	if err != nil {
+		return false, fmt.Errorf("read the speech language cache: %w", err)
+	}
+	for _, row := range rows {
+		if row.ScopeKey == "" && row.Payload == payload {
+			return false, nil
+		}
+	}
+	if err := r.store.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{
+		MappingID: mappingID, CacheType: routing.ModelMappingCacheSpeechLanguage, ScopeKey: "",
+		Payload: payload, UpdatedAt: r.now(),
+	}); err != nil {
+		return false, fmt.Errorf("write the speech language cache: %w", err)
+	}
+	return true, nil
 }
 
 // audioCppSpeechRateWanted reports whether the model this probe observed is a
