@@ -39,6 +39,21 @@ endpoint (`/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and the
 `/openai/api/v1/models` model-listing endpoints) is **bearer-only**: no session cookie and no loopback pair is
 accepted there at all.
 
+**One short-lived credential sits beside the four surfaces: the live-transcription ticket**
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). A browser WebSocket cannot send `X-OP-CSRF` (or any header), so
+`GET /api/portal/transcription-live` cannot be CSRF-protected the way every other portal mutation is. The
+authenticated, CSRF-protected `POST /api/portal/transcription-live-ticket` mints, after the full
+routing and admission gate, an **AES-256-GCM-encrypted, single-use ticket of about 30 seconds** (random
+per-process key) whose claims carry the resolved target, the validated audio parameters and the
+`UserID` and `TokenID`. The upgrade presents it as a `Sec-WebSocket-Protocol` value, **never** in the
+URL, and the handler redeems it **before** `websocket.Accept` (a miss is `401`, no upgrade); `Accept` keeps
+coder/websocket's default same-origin check, so a cross-origin upgrade is refused `403`. The ticket is the
+upgrade's only credential: the handler reads no session cookie, takes no model, route or rate from the
+client, and spends no second admission. It is per process (a ticket opens only on the instance that minted
+it), the follow-up being a cross-instance key and single-use store
+([API Compatibility & Inference
+§3.8](compatibility-and-inference.md#38-live-transcription-the-portal-websocket-transport)).
+
 ## 2. Local password authentication
 
 Users authenticate with an email + password pair (`POST /api/auth/login`,

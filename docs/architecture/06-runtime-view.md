@@ -344,6 +344,87 @@ issue #262). See [Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) and
 [ADR-064](09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn).
 
+### 6.1.5 Live transcription (browser WebSocket, gateway, agent `/live`, audio.cpp)
+
+Live transcription is the one scenario where audio flows **up** while text flows **down** on the
+same exchange: the transcript appears **while the user is still speaking**, where §6.1.4's turn
+transcribes a clip that was recorded and uploaded whole. A browser cannot drive audio.cpp's chunked,
+full-duplex `/v1/audio/transcriptions/live` itself, so a **WebSocket** carries the PCM to the gateway
+and the gateway is the full-duplex client. The WebSocket cannot carry `X-OP-CSRF`, so a
+CSRF-protected **ticket POST** makes the routing and billing decision first
+([ADR-072](09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266).
+
+```mermaid
+sequenceDiagram
+    participant B as Portal (browser)
+    participant TK as Gateway (ticket endpoint)
+    participant WS as Gateway (live WebSocket)
+    participant AG as Agent router (POST /live)
+    participant AC as audio.cpp (/v1/audio/transcriptions/live)
+    participant U as usage
+
+    B->>TK: POST /api/portal/transcription-live-ticket {model, sample_rate, channels, sample_format, language?} (session + X-OP-CSRF)
+    TK->>TK: validate the params (400 portal.live_transcription_params_invalid), then the transcription gate: the one admission, resolveTarget, the transcription capability
+    TK->>TK: transcription_streaming = yes (else 409), and for a server_agent target the agent declared fullduplex_proxy (else 409)
+    TK-->>B: 200 {ticket} (about 30 s, single-use, AES-256-GCM of the resolved target + the validated params + UserID/TokenID). No usage row.
+    B->>WS: GET /api/portal/transcription-live, Upgrade, Origin, Sec-WebSocket-Protocol: op-live-transcription + the ticket (never in the URL)
+    WS->>WS: redeem the ticket BEFORE Accept (a miss is 401 and no upgrade), Accept with the default same-origin check (cross-origin 403), take the route's one session slot (busy closes 1013)
+    WS-->>B: 101 Switching Protocols (subprotocol op-live-transcription)
+    WS->>AG: POST /live/{model}?sample_rate&channels&sample_format&language, chunked body fed from an io.Pipe (ProxyNativeDuplex, no target.Timeout)
+    Note over WS,AG: a direct audio_cpp target skips the agent: the gateway POSTs the child's own /v1/audio/transcriptions/live?model=...
+    AG->>AG: EnsureRunning (a cold start is held), EnableFullDuplex, release() deferred for the whole relay
+    AG->>AC: POST /v1/audio/transcriptions/live?...&model=path model, the inbound body streamed chunked (never buffered)
+    loop while the user speaks
+        B->>WS: binary frame, raw PCM (at most 1 MiB), payload bytes counted
+        WS->>AG: PCM into the pipe
+        AG->>AC: PCM chunk
+        AC-->>AG: SSE transcript.text.delta (or transcript.text.partial)
+        AG-->>WS: SSE, flushed per write
+        WS-->>B: {type: delta, text} to append, or {type: partial, text} to replace
+    end
+    alt clean end
+        B->>WS: text frame {type: end} (the explicit end-of-input)
+        WS->>AG: close the pipe, so the terminating chunk is sent
+        AG->>AC: terminating chunk
+        AC-->>AG: transcript.text.done then [DONE]
+        AG-->>WS: SSE, flushed
+        WS-->>B: {type: done, text} with the final transcript
+        WS->>U: audio_second = PCM bytes / byte-rate of the SAME validated params forwarded upstream
+    else the socket closes or drops without end
+        B--xWS: close or drop
+        WS->>AG: abort the request body (no terminating chunk, a truncated session)
+        WS->>U: audio_second 0 (loud zero, one Error log line)
+    else the upstream fails
+        AC-->>WS: SSE error event, or the agent or child answered non-2xx, or it was unreachable
+        WS-->>B: {type: error, message}
+        WS->>U: audio_second 0 (an error row for a dial failure or a non-2xx, a success row for an error event after a 200)
+    end
+    WS->>WS: deferred teardown: unblock the pipe, cancel the one context, join, CloseNow, release the route slot, record the one usage row
+```
+
+What differs from the transcription relays of §6.1.2 and §6.1.4. **The ticket is the decision.** The routing
+gate, the one admission and the validated audio parameters all happen on the POST, where a refusal is a
+plain HTTP response (an upgrade's refusal is opaque to a browser); the WebSocket handler takes **no** model,
+route or rate from the client, re-resolves nothing and spends no second admission, and a ticket
+that is absent, replayed, expired or minted by another process never reaches `Accept`. **Audio goes up in
+frames, not in a body.** The browser sends binary PCM frames and one text control, `end`; the gateway turns
+the frames into one chunked request body, and only `end` becomes the terminating chunk audio.cpp needs to emit
+`transcript.text.done`, so a Stop that merely closes the socket is a truncated session that bills nothing.
+**One goroutine owns every WebSocket write** and one context tears the relay down on any exit, so no
+goroutine is left blocked on the pipe and the usage row is written exactly once. **Full duplex is the
+agent's, and it is the in-process hop that matters**: in production the agent's TLS proxy hands the router
+the same `(w, r)`, so the router's `EnableFullDuplex` governs the gateway-facing connection; a session that
+lands on the transient dialed fallback fails cleanly instead of buffering
+([Agent-Managed Model Runtime
+§4.7](cross-cutting/agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)).
+**Billing is the input**, over the rate the gateway told the backend to decode at, on a clean end only. The
+upgrade hijacks the connection, so none of the 30 s server deadlines applies and the session lasts as long as
+the client keeps it. One live session per route is allowed, because audio.cpp serves one `/live` per model.
+See [API Compatibility & Inference
+§3.8](cross-cutting/compatibility-and-inference.md#38-live-transcription-the-portal-websocket-transport),
+[Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event) and
+[ADR-072](09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input).
+
 ## 6.2 Portal login (session + CSRF) with optional TOTP
 
 ```mermaid

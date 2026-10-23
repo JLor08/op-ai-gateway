@@ -1382,9 +1382,10 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Six fixed GET-only routes and one POST route (the `/upstream` passthrough counts
-once per allowlisted endpoint: `/props` and, since 0.11.0, `/v1/audio/voices`); any
-other method on those paths falls through to model routing.
+Six fixed GET-only routes and two POST routes (the `/upstream` passthrough counts
+once per allowlisted endpoint: `/props` and, since 0.11.0, `/v1/audio/voices`; the second
+POST route, `/live/{model}`, since 0.12.0, is the one that streams a request body rather
+than controlling anything); any other method on those paths falls through to model routing.
 
 | Route | Answers | Blocks during a load? |
 |---|---|---|
@@ -1394,6 +1395,7 @@ other method on those paths falls through to model routing.
 | `GET /upstream/{model}/props` | The allowlisted upstream passthrough (issue #58): `model` is decomposed from the path by prefix/suffix, not segment matching, since an upstream id may itself contain `/`; resolved via `Status()` **only** — a match that is not currently `running` gets `runtime.model_not_running` (§4.3) rather than starting one. Request headers minus the hop-by-hop set forward verbatim, so the runtime-spec token rides `Authorization`/a custom header exactly as it does for inference; the outbound path is always exactly `/props`, and the response is relayed unmodified. | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `GET /upstream/{model}/v1/audio/voices` | The second endpoint on the same `/upstream` allowlist (issue #251, the `runtime_voices` feature, `Since: "0.11.0"`): an audio.cpp child's voice listing, with the passthrough's whole shape — `model` decomposed by prefix/suffix, resolved via `Status()` **only**, **never starts a child**, a managed-but-cold match answers `runtime.model_not_running`, headers minus the hop-by-hop set forward verbatim (the spec's token rides as for `/props`), response relayed unmodified. Two differences from `/props`: the outbound path is exactly `/v1/audio/voices`, and the **inbound query string is not forwarded** (audio.cpp ignores `?model=` and lists the voices of the model it has loaded, so the request's model only selects the child). | Never — and never keeps a child alive either: no `inFlight`/`lastUsed` touch. |
 | `POST /ensure/{model}` | Starts the managed child for `model` and forwards nothing: `200 {"status":"running"}` once it is healthy, or the §4.3 code `EnsureRunning` failed with — `runtime.model_not_managed` (404, also for an empty model), `runtime.admission_blocked` (503), `runtime.start_timeout` (504), `runtime.start_failed` or `runtime.not_permitted` (502), or `runtime.upstream_gone` (502) for any other failure, such as the manager shutting down. Bodiless: the gateway sends no body, and any body a caller sends anyway is read and discarded, never forwarded, so the router notices a caller that leaves; one over the 32 MiB body bound gets `413 runtime.request_too_large` before anything starts. `model` is the decoded path after `/ensure/`, so an id containing `/` works ([ADR-046](../09-architecture-decisions.md#adr-046--a-request-scoped-router-ensure-route-start-a-managed-child-without-forwarding-a-request)). | Yes, for the start it asked for, and that is the route: one call that holds until the child is healthy or its start failed, with no heartbeat (§4.4). It counts as a use, like an inference request. |
+| `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureRunning`, so the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
 "the router accepts requests", never "a model is warm". Making the health check
@@ -1478,6 +1480,31 @@ predates the route hands the request to model routing, which answers 404
 `EnsureRunning` (§4.2), so the route starts nothing there. The gateway sends it
 only to an agent that declares `runtime_ensure` (§7).
 
+**`POST /live/{model}` is the one route that streams its request body, and it is routed
+on the path precisely so it never has to buffer it**
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266). Model routing (§4.2) buffers the body because it must read `model`
+and `stream` out of it before it knows where to send the request; a live transcription's body is an
+audio upload that never ends until the user stops speaking, so buffering it would defeat the feature. The
+route is modelled on `/ensure/{model}`: the model comes from the decoded path, `EnsureRunning` admits
+and, if needed, cold-starts the child, and what follows differs in three ways. The handler **defers
+`release()`** after a successful `EnsureRunning`, because the admission must be held for the whole relay
+(`/ensure` forwards nothing and releases at once). It calls
+`http.NewResponseController(w).EnableFullDuplex()` so the server may write the SSE response while it is
+still reading the request body on the one HTTP/1.1 connection (an error from it is tolerated: a writer
+that cannot do it is no worse off than before). And it hands the inbound `r.Body` itself to the child
+request with **no declared length**, so the transport sends it chunked in a background goroutine and
+returns the response as soon as the child's headers arrive; the inbound `Accept-Encoding` is stripped as on
+every proxy path, so the relayed SSE is the decoded body. The existing buffering `serveProxy` is
+unchanged; `/live` is the new, non-buffering path beside it. No protocol upgrade is involved (§4.5): the
+browser's WebSocket ends at the gateway, and this leg is a plain chunked POST.
+
+Which hop `EnableFullDuplex` governs is the load-bearing question, and §4.7 has the answer: in
+production the agent's TLS proxy serves this router **in-process** with the same `(w, r)`, so the router's
+own call enables full duplex on the real gateway-facing connection. The gateway sends the route only to an
+agent that declared `fullduplex_proxy` (§7). An older router has no such route and answers `/live/...`
+with the same `404 runtime.model_not_managed` it gives an unmanaged model (the body names no model), which
+no later signal can tell from a genuine unknown, so the flag is the only evidence there is.
+
 ### 4.2 Model routing
 
 Every other request is routed on a `model` field in a JSON request body — or,
@@ -1486,7 +1513,9 @@ on the multipart branch below).
 
 - **Request bodies are buffered** (bounded at 32 MiB; over that is
   `413 runtime.request_too_large`) because the router must read `model` and
-  `stream` before it knows where to send the request. **Responses are never
+  `stream` before it knows where to send the request. The one exception is
+  `POST /live/{model}` (§4.1), which is routed on the path and streams its body.
+  **Responses are never
   buffered** — `httputil.ReverseProxy` with `FlushInterval: -1` on the plain
   path, a hand-rolled splice loop flushing after every write on the streaming
   path.
@@ -1585,6 +1614,12 @@ not the agent's TLS proxy, not the router's own server. The non-streaming proxy
 path holds a cold start the same way. A proxy an operator adds in between cuts
 either call when its timeout is shorter
 ([Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
+
+`POST /live/{model}` (§4.1) is not heartbeated either, for a different reason: it
+is a pure splice of the child's own SSE, the child's status and headers are the
+response, and the cold start it holds happens **before** the first response byte
+exactly as for `/ensure`, so a live session is subject to the same rule that no hop
+in front of the agent may arm a shorter idle timer than the load takes.
 
 `Accept-Encoding` is stripped from the outbound request so the transport can
 negotiate and transparently decompress; forwarding it would splice gzip bytes
@@ -1773,6 +1808,24 @@ override is no longer needed to make the *proxied* path work, and it is no
 longer free — it confines the router to loopback, so an application routed as
 plain `http` to that same port becomes unreachable from the gateway. The agent
 says so at Warn on startup when it sees that combination.
+
+**Which of the two ways in is full-duplex.** `POST /live/{model}` (§4.1) calls
+`EnableFullDuplex` on the response writer it is handed, and a writer belongs to
+exactly one connection, so the answer depends on which door the request came
+through ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). On the **in-process** path the router is handed the TLS
+proxy's own `(w, r)` (`localFirst`, `local_upstream.go`), so the router's call
+enables full duplex on the real gateway-facing connection, and that is the
+production path. The **dialed** `httputil.ReverseProxy` (`newReverseProxy`,
+`FlushInterval: -1`) is only the transient fallback used while the router's
+port is unresolvable (just after an agent or router restart, on the roughly 60 s runtime
+cadence); it does not call `EnableFullDuplex` on its inbound writer, so a live
+session that lands on it would block its request-body read once the response starts.
+That window is accepted rather than engineered away: such a session **fails
+cleanly**, the client retries, and it is never silently buffered and mis-billed.
+The end-to-end test that holds this together wires a real proxy `Manager` with
+`SetLocalUpstream` to the router exactly as `main.go` does and asserts that a
+transcript delta reaches the client **before** it writes the second audio chunk;
+a buffering relay deadlocks and fails it.
 
 ## 5. Admission control
 
@@ -2720,11 +2773,11 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Eight
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Nine
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
-`runtime_config_files`, `runtime_voices`); two,
+`runtime_config_files`, `runtime_voices`, `fullduplex_proxy`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
@@ -2755,7 +2808,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 [§11.9](#119-manual-runs-on-an-images-only-mapping)), `Since: "0.8.0"`,
 `multipart_proxy` ([§4.2](#42-model-routing)), `Since: "0.9.0"`, and
 `runtime_config_files` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)), `Since: "0.10.0"`, and
-`runtime_voices` ([§4.1](#41-control-routes)), `Since: "0.11.0"`
+`runtime_voices` ([§4.1](#41-control-routes)), `Since: "0.11.0"`, and
+`fullduplex_proxy` ([§4.1](#41-control-routes)), `Since: "0.12.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -2955,6 +3009,22 @@ name is on the agent's list alone, spelled identically on both sides because the
 the gateway (`gateway.RuntimeVoicesFeature` is exported for the health loop in
 `cmd/gateway`, the way `RuntimeUpstreamPropsFeature` is). `server-agent`'s `Version` moved
 `0.10.2` → `0.11.0` for this entry, MINOR per the same rule.
+
+`fullduplex_proxy` (issue #266, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)) has the same shape as `runtime_voices` and
+`multipart_proxy`: **the gateway gates real behavior on it, fail-closed, and that gate is the
+flag's purpose.** It says the router serves `POST /live/{model}` (§4.1), a full-duplex relay of a
+chunked request body to the child's streaming transcription endpoint. The gateway's
+live-transcription ticket endpoint mints a ticket for an **agent-launched** target only on positive
+evidence of it (`AgentFeatures.Has`, which is false for a server that has never reported, for one whose
+last sample lacked the name, and for a nil registry) and refuses the rest with
+`409 portal.live_transcription_agent_unsupported`; a direct `audio_cpp` target has no router in front of
+it and is exempt. Trying the route instead is not an option, because a router without it answers `404`
+for `/live/{model}`, the same status it answers an unmanaged model with. The flag gates nothing on the
+agent, which needs no permission to serve a route it carries. The name is on the agent's list
+alone and spelled identically on both sides (`fullduplexProxyFeature` in
+`internal/gateway/agent_features.go`, pinned by `TestFullduplexProxyFeatureName`, and the agent's own
+registry entry by `TestFeaturesDeclareFullduplexProxy`), since the agent module imports nothing from the
+gateway. `server-agent`'s `Version` moved `0.11.1` → `0.12.0` for this entry, MINOR per the same rule.
 
 `runtime_logs` is negotiated in the opposite direction from `runtime_manager`,
 and the asymmetry is worth stating because it looks like an oversight otherwise.
@@ -3207,6 +3277,17 @@ name is not on that older gateway's `audioCppProbeCapabilities`): the operator r
 gateway first", and an older agent that omits the verdict degrades to the buffered path, so there
 is no hard version dependency
 ([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)).
+
+**`0.11.1` → `0.12.0` (issue #266, live transcription) is MINOR, the plain case once more.**
+`agent.Features` gained `fullduplex_proxy` for the router's `POST /live/{model}`
+([§4.1](#41-control-routes)), a new observable router behavior that the gateway's live-transcription
+ticket endpoint gates on, fail-closed ([§7](#7-feature-negotiation)). The bump is **one for the
+whole branch**: the route, the flag and the version pin ship together, and the `Version` assertion
+moved to the newest feature's test, `TestFeaturesDeclareFullduplexProxy`, beside
+`TestFeaturesDeclareRuntimeVoices` (which keeps its own presence and `Since` check, `"0.11.0"`).
+There is no mixed-fleet hazard: a gateway that predates the name never asks, and an agent older
+than 0.12.0 is never sent a live session by a newer gateway, only refused at the ticket
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -7261,6 +7342,11 @@ operator meets first:
   the AI servers**, bounded solely by the agent-local binary allowlist (§3.1).
 - **WebSocket-serving model servers are not supported** through a `server_agent`
   application (§4.5). Their HTTP/JSON endpoints work.
+- **A live transcription session cannot run on the dialed-proxy fallback.**
+  `POST /live/{model}` is full-duplex on the in-process path only (§4.7); while the
+  router's port is briefly unresolved (just after an agent or router restart) a
+  session fails cleanly and a retry succeeds. The route also needs an agent that
+  declared `fullduplex_proxy` (§7).
 - **VRAM measurement is NVIDIA-only** (§5.3). On AMD, Apple unified memory and
   GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for

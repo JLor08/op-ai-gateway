@@ -914,6 +914,43 @@ telemetry); the non-token disclosure counts (`NonTokenRequests`) work unchanged,
 portal's unit chip shows the raw value without a tooltip. The streamed response's capture stays the redacted binary summary
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
+**LIVE transcription is the fifth audio producer: `audio_second` from the INPUT PCM the gateway
+received, over the byte rate the client declared and the gateway validated, on a clean end only**
+([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input), issue #266). The portal's live-transcription WebSocket
+([API Compatibility & Inference
+§3.8](compatibility-and-inference.md#38-live-transcription-the-portal-websocket-transport)) streams
+audio **up** and text **down**, so the billable audio is what the client *sent*, which no response
+states and no upload header describes. Unlike a streamed speech call (the paragraph above), whose
+output rate is a native, unexposed property of the model and had to be learned by a benchmark, the
+live input's format is **declared in the handshake**: `sample_rate`, `channels` and `sample_format`
+are validated **once**, at the ticket endpoint (1000 to 384000 Hz, 1 to 16 channels, `s16le` or
+`f32le`), captured in the encrypted ticket, and used for **both** the parameters forwarded to
+audio.cpp **and** the billing rate (**billing-rate ≡ forwarded-rate**), so a client cannot declare a
+cheap rate while streaming audio at another. So there is **no learned rate cache and no
+`audio_bytes` fallback**. The relay counts the **PCM payload bytes** it pumped into the upstream body
+(never WebSocket framing), and `recordLiveUsage` (`internal/gateway/live_transcription_ws.go`)
+decides the row once, when the session ends, with `(audio_second, 0)` as the default:
+
+| Outcome | `status` | `billing_unit` | `billing_quantity` |
+|---|---|---|---|
+| **Clean end**: the browser sent `{"type":"end"}` (the terminating chunk), no upstream error, the scan saw `transcript.text.done` **then** `[DONE]`, and the rate is positive | `success` | `audio_second` | PCM bytes ÷ (`sample_rate` × `channels` × bytes per sample: 2 for `s16le`, 4 for `f32le`) |
+| The WebSocket closed or dropped **without** `end` (a truncated session: the upstream body was aborted, no terminating chunk, no `transcript.text.done`) | `success` | `audio_second` | `0`, and one `Error` log line |
+| A mid-stream SSE `error` after a `200`, or a stream that ended without both terminal events | `success` | `audio_second` | `0`, and one `Error` log line |
+| The upstream could not be reached, or answered **non-2xx** (the agent's `404`/`503`, a child error) | `error`, code the mapped provider code or `upstream.<status>` | `audio_second` | `0`, and one `Error` log line |
+
+The rule is the loud-zero rule of this section, never a guessed count: a session that delivered
+audio and did not complete **bills none of it**, and the log line (`live transcription billed zero`,
+with the request id, model, server, `end_requested`, `complete`, the byte rate and the PCM byte
+count) is where the zero is explained. A dial failure and a non-2xx upstream are `error` rows so a
+real backend failure is not hidden as `success` while the HTTP status says otherwise; a truncated
+session and a post-`200` SSE error stay `success`, the way an incomplete streamed transcription does
+(the streamed-transcription paragraph above). The row is attributed with `UserID`, `TokenID`, `RouteID` and `ServerID` from the
+ticket's claims, and it carries **no `ServiceID` or `ProjectID`**, so a live session is not service-
+or project-scoped in this phase (the ticket would have to carry them). No token column is set, so
+`ValidateBillingXOR` holds, and the unit is `audio_second`, so the row reads in the usage views and
+the energy tiers exactly as the other `audio_second` producers' rows do (§8.4.4). The ticket endpoint
+that gates a session records **no row** of its own, since it is a gate and not a relay.
+
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
 the response, because a zero `provider.Response` on a failed request would

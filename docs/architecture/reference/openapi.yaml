@@ -1329,6 +1329,125 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/transcription-live-ticket:
+    post:
+      tags: [portal]
+      summary: Mint a single-use ticket for a live transcription WebSocket (scope gateway:use, CSRF on a session)
+      description: >
+        Step one of live transcription (ADR-072, issue #266): the authenticated,
+        CSRF-protected request that makes the routing and billing decision the
+        WebSocket (GET /api/portal/transcription-live) then redeems, because a
+        browser WebSocket cannot send X-OP-CSRF. In order: the body is validated
+        (a body that is not JSON is 400 `request.invalid_json`; a blank `model` is
+        400 `model.name_required`; `sample_rate` outside 1000-384000, `channels`
+        outside 1-16, a `sample_format` that is not `s16le` or `f32le`, or a
+        `language` outside `[A-Za-z0-9_-]` of at most 64 characters is 400
+        `portal.live_transcription_params_invalid`); the model then goes through
+        the buffered transcription endpoint's own gate (the token's model and
+        server overrides, the principal's ONE rate/quota/budget admission, the
+        user's reachable servers, the `transcription` capability and the
+        effective-flavor rule), whose refusals are unchanged (404
+        `routing.no_model_route` or `routing.model_not_capable`, the rate/quota
+        codes); the mapping must carry a stored `transcription_streaming = yes`
+        verdict (409 `portal.live_transcription_not_streaming`); and a
+        `server_agent` target needs positive evidence its agent declared
+        `fullduplex_proxy` (409 `portal.live_transcription_agent_unsupported`; a
+        direct `audio_cpp` target is exempt). It is a gate, not a relay: no usage
+        row, no capture, no upstream contact. The ticket lives about 30 seconds,
+        is single-use, is AES-256-GCM encrypted under a per-process key (it
+        carries the resolved target, the validated params and the user and token
+        ids, none of which the browser can read or alter) and opens only on the
+        gateway process that minted it. A failed mint is 500
+        `portal.live_transcription_ticket_failed`; any method but POST is 405.
+        See api-surface.md and compatibility-and-inference.md section 3.8.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LiveTranscriptionTicketRequest' }
+      responses:
+        '200':
+          description: The opaque ticket, and nothing of the decision it carries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket]
+                properties:
+                  ticket:
+                    type: string
+                    description: >
+                      Unpadded URL-safe base64, a valid Sec-WebSocket-Protocol
+                      value. Present it as the second offered subprotocol on the
+                      upgrade; never put it in a URL.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '409':
+          description: >
+            The Error envelope with code `portal.live_transcription_not_streaming`
+            (the mapping has no transcription_streaming = yes verdict) or
+            `portal.live_transcription_agent_unsupported` (the agent has not
+            declared fullduplex_proxy: older than 0.12.0, or not reported since
+            the gateway restarted or the agent was upgraded).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: The Error envelope with code `portal.live_transcription_ticket_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/transcription-live:
+    get:
+      tags: [portal]
+      summary: Live transcription WebSocket (ticket-authenticated, same-origin; PCM up, typed transcript messages down)
+      description: >
+        Step two of live transcription (ADR-072, issue #266): a WebSocket upgrade
+        whose ONLY credential is the single-use ticket minted by POST
+        /api/portal/transcription-live-ticket, offered as a
+        `Sec-WebSocket-Protocol` value (`new WebSocket(url,
+        ['op-live-transcription', ticket])`) and never in the URL. The ticket is
+        redeemed BEFORE the upgrade: an absent, malformed, expired, replayed or
+        foreign-process ticket is 401 with NO upgrade; the upgrade keeps the
+        library's default same-origin check, so a cross-origin request is 403; any
+        method but GET is 405. No cookie and no CSRF header is read, and the
+        handler takes no model, route or rate from the client. After 101 the
+        subprotocol `op-live-transcription` is selected. The browser sends BINARY
+        frames of raw interleaved PCM in the ticket's format (at most 1 MiB each; a
+        larger frame closes the socket 1009) and ONE text control,
+        `{"type":"end"}`, the explicit end-of-input (a close WITHOUT it is a
+        truncated session that bills a loud zero). The gateway sends TEXT frames
+        of JSON: `{"type":"delta","text":...}` (append),
+        `{"type":"partial","text":...}` (replace the provisional transcript),
+        `{"type":"done","text":...}` (the final transcript) and
+        `{"type":"error","message":...}` (terminal). A second session on the same
+        route is closed with status 1013 (StatusTryAgainLater, one live session
+        per model). The session is billed as `audio_second` (PCM payload bytes over
+        the byte rate of the validated params) on a clean end only. The
+        upgrade hijacks the connection, so the server's 30 s deadlines do not
+        apply. See api-surface.md and compatibility-and-inference.md section 3.8.
+      security: []
+      parameters:
+        - name: Sec-WebSocket-Protocol
+          in: header
+          required: true
+          description: >
+            `op-live-transcription, <ticket>`: the fixed subprotocol name and the
+            ticket, in either order (the ticket is the one value that is not the
+            fixed name).
+          schema: { type: string }
+      responses:
+        '101':
+          description: Switching Protocols; the WebSocket is open and `op-live-transcription` is the selected subprotocol.
+        '401':
+          description: No valid ticket (absent, malformed, expired, replayed or minted by another process); plain text, no upgrade.
+        '403':
+          description: A cross-origin upgrade, refused by the same-origin check.
+        '405': { description: 'Any method other than GET.' }
   /api/portal/model-group-servers:
     get:
       tags: [portal]
@@ -3573,6 +3692,37 @@ components:
             How many of the newest answers that hold audio keep it; 0 removes all
             stored audio of the chat. Missing, null or negative is 400
             portal.chat_audio_keep_last_invalid.
+    LiveTranscriptionTicketRequest:
+      type: object
+      description: The body of POST /api/portal/transcription-live-ticket.
+      required: [model, sample_rate, channels, sample_format]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: The gateway model name (trimmed); blank is 400 `model.name_required`.
+        sample_rate:
+          type: integer
+          minimum: 1000
+          maximum: 384000
+          description: The PCM sample rate in Hz the browser will stream (audio.cpp's own range).
+        channels:
+          type: integer
+          minimum: 1
+          maximum: 16
+          description: The number of interleaved channels (audio.cpp's own range).
+        sample_format:
+          type: string
+          enum: [s16le, f32le]
+          description: >
+            The sample encoding, 2 bytes per sample for `s16le` and 4 for `f32le`.
+            The validated triple is forwarded to the backend AND is the rate the
+            session bills at.
+        language:
+          type: string
+          maxLength: 64
+          pattern: '^[A-Za-z0-9_-]*$'
+          description: Optional language tag or name; empty lets the backend detect the language.
     ModelCapabilities:
       type: object
       description: >
