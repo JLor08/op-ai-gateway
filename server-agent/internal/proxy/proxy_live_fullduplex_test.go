@@ -53,11 +53,11 @@ func TestManagerDialledPathInterleavesFullDuplex(t *testing.T) {
 	certDir := t.TempDir()
 	pool := writeTestLeaf(t, certDir)
 
-	// Chunks deliberately larger than the client/relay transports' 4 KiB write
-	// buffer, so a sub-buffer write would sit in a bufio.Writer until the body
-	// completed and even a correct relay could not interleave. A real live
-	// frame is this big (16 kHz * 2 bytes/sample = 32 KiB/s), so this is the
-	// production shape.
+	// 16 KiB chunks mirror a real live-audio frame (16 kHz * 2 bytes/sample =
+	// 32 KiB/s) -- the production shape -- NOT a buffering workaround: net/http
+	// flushes a chunked request body per chunk, so the interleave does not
+	// depend on the chunk size. The test's soundness rests on the
+	// ContentLength == -1 assertion below and the interleave timing.
 	chunk1 := bytes.Repeat([]byte("PCM1"), 4096) // 16 KiB
 	chunk2 := bytes.Repeat([]byte("PCM2"), 4096) // 16 KiB
 
