@@ -5,6 +5,7 @@ package routing
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"op-ai-gateway/internal/inference"
 	"strconv"
@@ -1455,6 +1456,64 @@ func ParseOutputByteRate(payload string) (uint32, bool) {
 		return 0, false
 	}
 	return uint32(rate), true
+}
+
+// ModelMappingCacheSpeechLanguage is the cache type of a mapping's speech `language`
+// fact: ScopeKey "", Payload the JSON object {"accepts":<bool>,"default":"<code>"} that
+// SpeechLanguagePayload writes. "accepts" is whether the audio.cpp model behind the
+// mapping declares a `language` request param (its /v1/models `params` array has the
+// entry), "default" is the value that entry declares ("" when it declares none, or when
+// the model declares no param at all). The health loop writes it while the mapping's
+// model is observed loaded (and only then), and the composer's language gate reads it,
+// so the answer stays on offer after the model is unloaded -- the voices cache's shape.
+//
+// A reader sees exactly TWO states, not three: NO ROW is unknown (the model was never
+// observed loaded, so the composer offers no control and the model speaks its own
+// default), and a ROW is a known {accepts, default}, where accepts:false is a real "this
+// model declares no language param". There is no empty-payload retire state, unlike the
+// byte-rate cache: a rate is tied to a loaded-model identity that can change under the
+// same name, but a language param is simply re-read on every loaded tick, so a fact is
+// overwritten by the next loaded read and dropped with the rest of the mapping's cache
+// rows when ModelMapping.AppModelName changes.
+const ModelMappingCacheSpeechLanguage = "speech_language"
+
+// speechLanguageFact is the persisted shape of a ModelMappingCacheSpeechLanguage
+// payload. The key names are what every written row carries, so they are never renamed.
+type speechLanguageFact struct {
+	Accepts bool   `json:"accepts"`
+	Default string `json:"default"`
+}
+
+// SpeechLanguagePayload builds the ModelMappingCacheSpeechLanguage payload for a model
+// that does (accepts) or does not take a `language` request param, def being the
+// default the model declares for it ("" for none). ParseSpeechLanguage reads it back
+// exactly, the default included, for every input: the pair is one persisted shape.
+func SpeechLanguagePayload(accepts bool, def string) string {
+	// A struct of a bool and a string cannot fail to marshal.
+	b, _ := json.Marshal(speechLanguageFact{Accepts: accepts, Default: def})
+	return string(b)
+}
+
+// ParseSpeechLanguage reads a ModelMappingCacheSpeechLanguage payload: the JSON object
+// SpeechLanguagePayload writes, surrounding whitespace tolerated, and true only for an
+// object that carries the "accepts" boolean (a missing "default" reads as ""). Everything
+// else -- an empty payload, malformed JSON, trailing data, a non-object (an array, null),
+// an object without "accepts" (which would otherwise read as a made-up "no"), a field of
+// the wrong type -- is no fact: (false, "", false), which a reader treats exactly like a
+// mapping that was never probed. A usable "no" is (false, "", true), a different answer.
+//
+// It is the ONE definition of "a usable cached language fact", shared by every reader of
+// the row (the composer's language gate, and any future one), so they can never disagree
+// about whether a mapping has one.
+func ParseSpeechLanguage(payload string) (accepts bool, def string, ok bool) {
+	var fact struct {
+		Accepts *bool  `json:"accepts"`
+		Default string `json:"default"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(payload)), &fact); err != nil || fact.Accepts == nil {
+		return false, "", false
+	}
+	return *fact.Accepts, fact.Default, true
 }
 
 // ValidateModelMappingCacheRow rejects a row that cannot be a meaningful cache
