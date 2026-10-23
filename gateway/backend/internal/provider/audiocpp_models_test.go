@@ -319,6 +319,117 @@ func TestParseAudioCppPath(t *testing.T) {
 	}
 }
 
+// TestParseAudioCppLanguageParam pins the language axis the prober reports beside the
+// verdicts: whether the listing's entry for THIS id declares a request param named
+// "language" (GET /v1/models?include_params=true adds each model's params array,
+// objects of name, type, default and required), and that param's default. The
+// speech-language feature acts on it, so a statement the listing does not make is "no
+// language param, no default" -- never a guessed one: no entry, no params field, a
+// params field of the wrong shape, a body that is not the listing.
+//
+// Like the loaded flag and the path it is a SEPARATE table from audioCppModelCases: it
+// is not part of the capability rule the agent's copy shares.
+func TestParseAudioCppLanguageParam(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		model       string
+		wantAccepts bool
+		wantDefault string
+	}{
+		{"a tts model's language param and its default", `{"data":[{"id":"m","task":"tts","params":[{"name":"text","type":"string","required":true},{"name":"language","type":"string","default":"zh","required":false}]}]}`, "m", true, "zh"},
+		{"qwen3_tts defaults to auto", `{"data":[{"id":"qwen3_tts","task":"tts","params":[{"name":"language","type":"string","default":"auto","required":false}]}]}`, "qwen3_tts", true, "auto"},
+		{"a language param with no default", `{"data":[{"id":"m","task":"tts","params":[{"name":"language","type":"string","required":false}]}]}`, "m", true, ""},
+		{"a language param with a null default", `{"data":[{"id":"m","params":[{"name":"language","default":null}]}]}`, "m", true, ""},
+		{"a language param with a non-string default keeps the param and loses the default", `{"data":[{"id":"m","params":[{"name":"language","default":7}]}]}`, "m", true, ""},
+		{"a language param with an object default keeps the param and loses the default", `{"data":[{"id":"m","params":[{"name":"language","default":{"a":"b"}}]}]}`, "m", true, ""},
+		{"params with no language entry", `{"data":[{"id":"m","task":"tts","params":[{"name":"text","type":"string"},{"name":"speed","type":"number","default":1}]}]}`, "m", false, ""},
+		{"an empty params array", `{"data":[{"id":"m","task":"tts","params":[]}]}`, "m", false, ""},
+		{"no params field at all", `{"data":[{"id":"m","task":"tts","mode":"offline","loaded":true}]}`, "m", false, ""},
+		{"params null", `{"data":[{"id":"m","params":null}]}`, "m", false, ""},
+		{"params as a string is not a params array", `{"data":[{"id":"m","params":"language"}]}`, "m", false, ""},
+		{"params as an object is not a params array", `{"data":[{"id":"m","params":{"name":"language","default":"zh"}}]}`, "m", false, ""},
+		{"a param that is not an object is skipped, the language entry after it still counts", `{"data":[{"id":"m","params":["language",{"name":"language","default":"de"}]}]}`, "m", true, "de"},
+		{"a param whose name is not a string is skipped", `{"data":[{"id":"m","params":[{"name":7,"default":"x"},{"name":"language","default":"de"}]}]}`, "m", true, "de"},
+		{"the name matches ignoring case and surrounding whitespace", `{"data":[{"id":"m","params":[{"name":" Language ","default":"fr"}]}]}`, "m", true, "fr"},
+		{"the name match is not a prefix or a substring", `{"data":[{"id":"m","params":[{"name":"language_code","default":"x"},{"name":"lang","default":"y"}]}]}`, "m", false, ""},
+		{"the first language param answers", `{"data":[{"id":"m","params":[{"name":"language","default":"first"},{"name":"language","default":"second"}]}]}`, "m", true, "first"},
+		{"the default is kept verbatim", `{"data":[{"id":"m","params":[{"name":"language","default":" Zh-CN "}]}]}`, "m", true, " Zh-CN "},
+		{"the entry is picked out by id", `{"data":[{"id":"a","params":[{"name":"language","default":"a"}]},{"id":"b","params":[{"name":"language","default":"b"}]}]}`, "b", true, "b"},
+		{"a sibling's language param does not leak", `{"data":[{"id":"a","params":[{"name":"language","default":"a"}]},{"id":"b","params":[{"name":"text"}]}]}`, "b", false, ""},
+		{"model absent from the listing", `{"data":[{"id":"other","params":[{"name":"language","default":"zh"}]}]}`, "m", false, ""},
+		{"id match is exact, not a prefix", `{"data":[{"id":"qwen3_tts","params":[{"name":"language","default":"auto"}]}]}`, "qwen3", false, ""},
+		{"id match is case-sensitive", `{"data":[{"id":"M","params":[{"name":"language","default":"zh"}]}]}`, "m", false, ""},
+		{"an empty model id never matches", `{"data":[{"id":"","params":[{"name":"language","default":"zh"}]}]}`, "", false, ""},
+		{"the first entry carrying the id answers", `{"data":[{"id":"m"},{"id":"m","params":[{"name":"language","default":"zh"}]}]}`, "m", false, ""},
+		{"empty data", `{"data":[]}`, "m", false, ""},
+		{"data null", `{"data":null}`, "m", false, ""},
+		{"data of the wrong type", `{"data":"m"}`, "m", false, ""},
+		{"not JSON", `<html>502</html>`, "m", false, ""},
+		{"empty body", ``, "m", false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accepts, def := parseAudioCppLanguageParam([]byte(tc.body), tc.model)
+			if accepts != tc.wantAccepts || def != tc.wantDefault {
+				t.Fatalf("parseAudioCppLanguageParam = (%v, %q), want (%v, %q)", accepts, def, tc.wantAccepts, tc.wantDefault)
+			}
+		})
+	}
+}
+
+// TestProbeAudioCppModelsLanguageParam: the prober asks for the listing WITH its params
+// (include_params=true) and reports the language axis beside the five verdicts, the
+// loaded flag and the path, which the new query must leave exactly as they were. The
+// handler answers params ONLY when the query reaches it, so the case also proves the
+// query survives to the wire.
+func TestProbeAudioCppModelsLanguageParam(t *testing.T) {
+	const withParams = `{"data":[{"id":"qwen3_tts","family":"qwen3_tts","task":"tts","mode":"streaming","loaded":true,"path":"/models/qwen3_tts.gguf","params":[{"name":"text","type":"string","required":true},{"name":"language","type":"string","default":"auto","required":false}]}]}`
+	const withoutParams = `{"data":[{"id":"qwen3_tts","family":"qwen3_tts","task":"tts","mode":"streaming","loaded":true,"path":"/models/qwen3_tts.gguf"}]}`
+	var method, path, query string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path, query = r.Method, r.URL.Path, r.URL.RawQuery
+		if r.URL.Query().Get("include_params") == "true" {
+			_, _ = w.Write([]byte(withParams))
+			return
+		}
+		_, _ = w.Write([]byte(withoutParams))
+	}))
+	defer srv.Close()
+	got, err := NewOpenAICompatibleClient(srv.Client()).ProbeAudioCppModels(context.Background(), routing.Target{Endpoint: srv.URL}, "qwen3_tts")
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	want := AudioCppVerdicts{
+		Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes,
+		Loaded: true, Path: "/models/qwen3_tts.gguf", AcceptsLanguage: true, LanguageDefault: "auto",
+	}
+	if got != want {
+		t.Fatalf("got %+v, want %+v (the language axis is read from the params; the five verdicts, loaded and path are unchanged by the new query)", got, want)
+	}
+	if method != http.MethodGet || path != "/v1/models" || query != "include_params=true" {
+		t.Fatalf("request = %s %s?%s, want GET /v1/models?include_params=true", method, path, query)
+	}
+}
+
+// TestProbeAudioCppModelsOddParamsCostsOnlyTheLanguageAxis: a params field of a shape
+// this code does not expect must cost only the language axis, never the verdicts the
+// task decides, the loaded flag or the path (the mode and path precedent), because a
+// capability "yes" must not hang on an unrelated param description.
+func TestProbeAudioCppModelsOddParamsCostsOnlyTheLanguageAxis(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","task":"tts","mode":"streaming","loaded":true,"path":"/models/m.gguf","params":"language"}]}`))
+	}))
+	defer srv.Close()
+	got, err := NewOpenAICompatibleClient(srv.Client()).ProbeAudioCppModels(context.Background(), routing.Target{Endpoint: srv.URL}, "m")
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	want := AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityYes, Loaded: true, Path: "/models/m.gguf"}
+	if got != want {
+		t.Fatalf("got %+v, want %+v (an odd params shape must not cost the verdicts, the loaded flag or the path)", got, want)
+	}
+}
+
 // TestProbeAudioCppModelsOddPathCostsOnlyPath: a path of a type this code does not
 // expect must cost only Path, never the verdicts the task decides or the loaded flag.
 func TestProbeAudioCppModelsOddPathCostsOnlyPath(t *testing.T) {
@@ -398,9 +509,9 @@ func TestProbeAudioCppModels(t *testing.T) {
 	}
 
 	t.Run("a tts model yields yes from GET /v1/models", func(t *testing.T) {
-		var method, path string
+		var method, path, query string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			method, path = r.Method, r.URL.Path
+			method, path, query = r.Method, r.URL.Path, r.URL.RawQuery
 			_, _ = w.Write([]byte(audioCppLiveListing))
 		}))
 		defer srv.Close()
@@ -411,8 +522,8 @@ func TestProbeAudioCppModels(t *testing.T) {
 		if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo, Loaded: true, Path: "/models/pocket_tts_english_bf16.gguf"}); got != want {
 			t.Fatalf("got %+v, want %+v (the live entry is a loaded tts model: speech_clone no, mode offline so speech_streaming no, but no transcription streaming verdict; its path is the identity axis)", got, want)
 		}
-		if method != http.MethodGet || path != "/v1/models" {
-			t.Fatalf("request = %s %s, want GET /v1/models", method, path)
+		if method != http.MethodGet || path != "/v1/models" || query != "include_params=true" {
+			t.Fatalf("request = %s %s?%s, want GET /v1/models?include_params=true (the params carry the language axis)", method, path, query)
 		}
 	})
 
@@ -567,9 +678,10 @@ func TestProbeAudioCppModels(t *testing.T) {
 // rides the outbound app transport -- while a provider whose client lacks the
 // capability answers ErrUnavailable and sends nothing (no cross-route).
 func TestMultiplexerDispatchesAudioCppModelsToOpenAICompatibleClient(t *testing.T) {
-	var paths []string
+	var paths, queries []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
+		queries = append(queries, r.URL.RawQuery)
 		_, _ = w.Write([]byte(audioCppLiveListing))
 	}))
 	defer srv.Close()
@@ -587,8 +699,8 @@ func TestMultiplexerDispatchesAudioCppModelsToOpenAICompatibleClient(t *testing.
 	if want := (AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo, Loaded: true, Path: "/models/pocket_tts_english_bf16.gguf"}); got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
-	if len(paths) != 1 || paths[0] != "/v1/models" {
-		t.Fatalf("upstream paths = %v, want exactly [/v1/models]", paths)
+	if len(paths) != 1 || paths[0] != "/v1/models" || queries[0] != "include_params=true" {
+		t.Fatalf("upstream paths = %v, queries = %v, want exactly [/v1/models] with include_params=true", paths, queries)
 	}
 
 	got, err = mux.ProbeAudioCppModels(context.Background(), routing.Target{Provider: routing.ProviderOllama, Endpoint: srv.URL}, "pocket_tts_english_bf16")
