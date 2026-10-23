@@ -184,6 +184,9 @@ function makeChatApi() {
     modelSpeechStreaming: vi.fn(
       async (_name: string): Promise<SpeechStreamingGate> => NO_SPEECH_STREAMING,
     ),
+    // The transcription composer's live gate the store fetches for transcription models:
+    // closed by default (no live mode, the buffered recording).
+    modelTranscriptionStreaming: vi.fn(async (_name: string): Promise<boolean> => false),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.

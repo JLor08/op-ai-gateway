@@ -293,6 +293,15 @@ export type ChatStore = {
   // at run time; this only decides whether the toggle exists and whether the browser's audio
   // is readied when a turn is sent.
   speechStreaming: boolean;
+  // Whether the transcription composer may offer a LIVE recording for the effective model: the
+  // gateway's own answer (api.modelTranscriptionStreaming) that every mapping the model could
+  // be served by is known to stream a transcription (#266). The speech gate's twin, minus the
+  // rate -- the browser fixes the PCM it streams. False whenever there is nothing to offer --
+  // not a transcription model, the lookup is in flight, it failed (fail closed), or the gateway
+  // said no -- and the thread then records and transcribes the buffered clip it always has. The
+  // gateway decides again when the live ticket is minted; this only decides whether the live
+  // mode exists.
+  transcriptionStreaming: boolean;
   // The THREAD's kind: "" (text), "image", "speech" or "transcription". Pinned by the backend
   // at the thread's first send and authoritative from then on; while the thread is
   // still empty it follows the picked model, because that is what the next
@@ -505,6 +514,7 @@ export function ChatStoreProvider({
     | 'deleteMessageAudio'
     | 'modelImageOptions'
     | 'modelSpeechStreaming'
+    | 'modelTranscriptionStreaming'
     | 'modelVoices'
     | 'pruneChatAudio'
     | 'saveChat'
@@ -606,6 +616,10 @@ export function ChatStoreProvider({
   const [speechStreamingGate, setSpeechStreamingGate] =
     useState<SpeechStreamingGate>(NO_SPEECH_STREAMING);
   const speechStreamingRef = useRef(false);
+  // The effective transcription model's live gate (see api.modelTranscriptionStreaming):
+  // closed until the gateway says otherwise. A plain boolean: unlike the speech gate there is
+  // no rate to carry, so nothing reads it between renders and it needs no ref.
+  const [transcriptionStreaming, setTranscriptionStreaming] = useState(false);
 
   // The caller's manageable servers (undefined prop -> []): drives whether the
   // server-override picker renders at all and its option list.
@@ -1486,6 +1500,31 @@ export function ChatStoreProvider({
     };
   }, [modelSpeechCapable, effectiveModel]);
 
+  // Ask the gateway whether the effective TRANSCRIPTION model may go live (#266), for the
+  // composer's live record mode. The speech gate's effect above, for the transcription twin:
+  // closed up front (the answer belongs to ONE model, and a stale yes must not stay on offer
+  // while the next lookup is in flight -- the mode would promise a session the gateway will
+  // refuse a ticket for), a latest-wins guard against a slow stale response, and no lookup at
+  // all for a non-transcription (or no) model. FAIL CLOSED: a failed lookup is a no, which
+  // leaves the thread on the buffered recording it always had. The deps list ends at the
+  // model, like the speech gate's: the answer does not depend on the thread.
+  useEffect(() => {
+    setTranscriptionStreaming(false);
+    if (!modelTranscriptionCapable || effectiveModel === '') return;
+    let cancelled = false;
+    void apiRef.current
+      .modelTranscriptionStreaming(effectiveModel)
+      .then((streams) => {
+        if (!cancelled) setTranscriptionStreaming(streams);
+      })
+      .catch(() => {
+        if (!cancelled) setTranscriptionStreaming(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelTranscriptionCapable, effectiveModel]);
+
   // Ready the browser's audio from inside the user's gesture, for a turn that will stream.
   // A page may only make sound once the user has acted on it, and Safari wants the audio
   // context created and resumed INSIDE the handler of the click that sends: by the time the
@@ -2352,6 +2391,7 @@ export function ChatStoreProvider({
     modelImageOptions,
     modelVoices,
     speechStreaming: speechStreamingGate.streaming,
+    transcriptionStreaming,
     chatKind,
     imageSettings,
     setImageSettings,

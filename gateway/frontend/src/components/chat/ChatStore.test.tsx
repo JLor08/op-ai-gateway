@@ -199,6 +199,9 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     modelSpeechStreaming: vi.fn(
       async (_name: string): Promise<SpeechStreamingGate> => NO_SPEECH_STREAMING,
     ),
+    // The transcription composer's live gate, fetched whenever the picked model TRANSCRIBES
+    // speech. Closed by default (no live mode); the transcription-streaming tests below open it.
+    modelTranscriptionStreaming: vi.fn(async (_name: string): Promise<boolean> => false),
   };
   return { api: spies, rows, spies };
 }
@@ -288,6 +291,8 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       {/* Whether the speech composer may offer streaming (the gate is open), and whether the
           active chat's run is playing its audio live. */}
       <span data-testid="speech-streaming">{String(c.speechStreaming)}</span>
+      {/* Whether the transcription composer may offer a live recording (the gate is open). */}
+      <span data-testid="transcription-streaming">{String(c.transcriptionStreaming)}</span>
       <span data-testid="run-audio-live">{String(c.runAudioLive)}</span>
       <span data-testid="run-audio-muted">{String(c.runAudioMuted)}</span>
       <button type="button" onClick={() => c.muteAudio('c1', true)}>
@@ -6321,6 +6326,134 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getByTestId('chats').textContent).toBe('c1:');
         expect(titleOnlySaves()).toEqual([]);
       });
+    });
+  });
+
+  // The transcription composer's live gate (#266): a live recording is offered only where the
+  // gateway says the picked transcription model's mapping streams a transcription. The speech
+  // gate's twin, minus the rate: closed until an answer says yes, closed again at once when the
+  // model changes, fail closed on a failed lookup, and never asked of a model that does not
+  // transcribe.
+  describe(`ChatStoreProvider transcription streaming gate [${locale}]`, () => {
+    const asrModel = (id: string): ModelOption => ({
+      id,
+      display_name: id,
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      transcription: true,
+    });
+    const whisper = asrModel('whisper');
+    const parakeet = asrModel('parakeet');
+    const kokoro: ModelOption = {
+      id: 'kokoro',
+      display_name: 'kokoro',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const flag = () => screen.getByTestId('transcription-streaming').textContent;
+    const transcriptionThread = (): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: { settings: { model: whisper.id, kind: 'transcription' }, messages: [] },
+      },
+    ];
+
+    it('asks whether the picked transcription model may go live, and offers it only on a yes', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(flag()).toBe('true'));
+      expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalledWith('whisper');
+    });
+
+    it('offers no live mode while the gate is closed, and not before the answer arrives', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      let answer: (streams: boolean) => void = () => {};
+      chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+        () => new Promise<boolean>((resolve) => (answer = resolve)),
+      );
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalled());
+      expect(flag()).toBe('false');
+      await act(async () => answer(false));
+      expect(flag()).toBe('false');
+    });
+
+    it('fails closed when the lookup fails', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockRejectedValue(new Error('boom'));
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenCalled());
+      expect(flag()).toBe('false');
+    });
+
+    it('follows the picked model: a yes for one is dropped at once when another is picked', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+        async (name: string) => name === 'whisper',
+      );
+      renderProvider([], { models: [whisper, parakeet] });
+      await waitForReady();
+      await waitFor(() => expect(flag()).toBe('true'));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-parakeet' }));
+      await waitFor(() =>
+        expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenLastCalledWith('parakeet'),
+      );
+      expect(flag()).toBe('false');
+
+      // And back: the first model's gate is asked again and reopens.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-whisper' }));
+      await waitFor(() => expect(flag()).toBe('true'));
+      expect(chatApi.spies.modelTranscriptionStreaming).toHaveBeenLastCalledWith('whisper');
+    });
+
+    it('lets the latest pick win over a slow answer for the previous model', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      const answers = new Map<string, (streams: boolean) => void>();
+      chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+        (name: string) => new Promise<boolean>((resolve) => answers.set(name, resolve)),
+      );
+      renderProvider([], { models: [whisper, parakeet] });
+      await waitForReady();
+      await waitFor(() => expect(answers.has('whisper')).toBe(true));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-parakeet' }));
+      await waitFor(() => expect(answers.has('parakeet')).toBe(true));
+      // The first model's slow yes lands after the switch: it belongs to a model no longer
+      // picked and must not open the new model's gate.
+      await act(async () => answers.get('whisper')?.(true));
+      expect(flag()).toBe('false');
+      await act(async () => answers.get('parakeet')?.(false));
+      expect(flag()).toBe('false');
+    });
+
+    it('does not ask for a model that does not transcribe, and keeps the gate closed', async () => {
+      renderProvider([], { models: [...models, kokoro] });
+      await waitForReady();
+      expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+      expect(flag()).toBe('false');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+      expect(flag()).toBe('false');
+    });
+
+    it('asks nothing of the speech gate for a transcription model', async () => {
+      chatApi = makeChatApi(transcriptionThread());
+      chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+      renderProvider([], { models: [whisper] });
+      await waitForReady();
+      await waitFor(() => expect(flag()).toBe('true'));
+      expect(chatApi.spies.modelSpeechStreaming).not.toHaveBeenCalled();
+      expect(screen.getByTestId('speech-streaming').textContent).toBe('false');
     });
   });
 

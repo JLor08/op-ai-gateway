@@ -681,6 +681,11 @@ export type SpeechStreamingGate = { streaming: boolean; sampleRate: number };
 // "No streaming": the one shape every unusable answer collapses to.
 export const NO_SPEECH_STREAMING: SpeechStreamingGate = { streaming: false, sampleRate: 0 };
 
+// The sample rate (Hz) of the mono s16le PCM a live transcription session streams: the
+// ticket request states it (api.createLiveTranscriptionTicket) and the recorder that resamples
+// to it must agree, so both read this one constant.
+export const LIVE_TRANSCRIPTION_SAMPLE_RATE = 16000;
+
 export function modelsApi(fetcher: Fetcher) {
   return {
     models: () => request<{ data: ModelOption[] }>(fetcher, '/api/portal/models'),
@@ -734,6 +739,39 @@ export function modelsApi(fetcher: Fetcher) {
           rate > 0
           ? { streaming: true, sampleRate: rate }
           : NO_SPEECH_STREAMING;
+      }),
+    // Whether the portal's transcription composer may offer a LIVE recording for a
+    // transcription model (#266): the gateway says yes only when every mapping the model could
+    // be served by is known to stream a transcription (transcription_streaming). The speech
+    // gate's twin minus the rate -- the browser fixes the PCM it streams, so there is nothing
+    // to learn but the verdict, and the answer is a plain boolean. Global (gateway:use); name
+    // is a query param like modelServers. FAIL CLOSED: anything but a boolean true is "no
+    // live mode" (the buffered recording, today's behavior), so a malformed answer can never
+    // open a mode the gateway would refuse a ticket for.
+    modelTranscriptionStreaming: (name: string) =>
+      request<{ streaming?: unknown }>(
+        fetcher,
+        `/api/portal/model-transcription-streaming?name=${encodeURIComponent(name)}`,
+      ).then((r): boolean => r.streaming === true),
+    // Mint the single-use ticket a live transcription session's WebSocket upgrade presents
+    // (#266). A browser WebSocket cannot send the portal's X-OP-CSRF header, so the upgrade
+    // cannot be protected the way every other portal mutation is: this POST is (the transport
+    // adds the header and the session cookie), and the ticket it returns -- short-lived,
+    // single-use, opaque -- is what the upgrade carries instead. The gateway validates the
+    // model and takes its own routing decision here; a refusal (unknown model, no live
+    // transcription on its mapping, an agent too old) is a PortalApiError carrying its code.
+    // The PCM the browser will stream is fixed by the recorder, not chosen by the caller:
+    // 16 kHz, mono, signed 16-bit little-endian. A blank language is left out (auto-detect).
+    createLiveTranscriptionTicket: (args: { model: string; language?: string }) =>
+      request<{ ticket: string }>(fetcher, '/api/portal/transcription-live-ticket', {
+        method: 'POST',
+        body: {
+          model: args.model,
+          sample_rate: LIVE_TRANSCRIPTION_SAMPLE_RATE,
+          channels: 1,
+          sample_format: 's16le',
+          ...(args.language ? { language: args.language } : {}),
+        },
       }),
     // Every (model, server) a model GROUP can serve (its flattened members), with a
     // live rank across the whole group's candidate list. Global (gateway:use); no
