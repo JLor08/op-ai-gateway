@@ -610,12 +610,14 @@ func TestLiveTranscriptionTicketRequiresTheGatewayUseScope(t *testing.T) {
 	requireNoTicket(t, rec)
 }
 
-// The ticket is the admission of the live session: the one shared pre-dispatch gate
-// (inferencePreflight) runs here, once per mint, so a principal over its rate limit is
-// refused with a clean 429 on this ordinary HTTP response (a WebSocket refusal is opaque to
-// the browser). Request validation runs BEFORE it -- the refusals of a malformed request spend
-// no admission -- and the limiter is live the whole time (the second valid mint is denied).
-func TestLiveTranscriptionTicketAdmitsOncePerMintAfterValidation(t *testing.T) {
+// The mint VALIDATES and gates but does NOT admit: the live session's single
+// rate/quota/budget admission is spent once, later, when the portal WebSocket loops
+// back to /v1/audio/transcriptions/live (resolveLiveTarget with admit=false here,
+// admit=true there). So a principal rate-limited to ONE admission can still mint
+// repeatedly -- the mint spends none -- while a malformed request is still refused
+// before any gate runs. Admitting here too would double-tick the caller's budget for
+// one live session (Task 4b: admit exactly once, at the canonical relay).
+func TestLiveTranscriptionTicketValidatesButDoesNotAdmit(t *testing.T) {
 	up, _ := newTranscriptionUpstream(t, http.StatusOK, transcriptionOKBody)
 	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
 	fakeStore := newFakePrincipalStore()
@@ -623,20 +625,23 @@ func TestLiveTranscriptionTicketAdmitsOncePerMintAfterValidation(t *testing.T) {
 	now := utc(2026, 3, 15, 12, 0, 0)
 	srv.Limiter = NewPrincipalLimiter(fakeStore, PrincipalLimiterOptions{Now: clockAt(&now)})
 
+	// Validation still runs before any gate: a malformed request spends nothing.
 	if rec := postLiveTicket(t, srv, `{"model":"asr-model","sample_rate":1,"channels":1,"sample_format":"s16le"}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid params: status = %d, want 400", rec.Code)
 	}
 	if rec := postLiveTicket(t, srv, `{"sample_rate":16000,"channels":1,"sample_format":"s16le"}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("blank model: status = %d, want 400", rec.Code)
 	}
-	redeemMintedTicket(t, srv, postLiveTicket(t, srv, liveTicketJSON("asr-model")))
 
-	rec := postLiveTicket(t, srv, liveTicketJSON("asr-model"))
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("the second valid mint: status = %d, want 429 (the limiter must have been live); body = %s", rec.Code, rec.Body.String())
+	// Two valid mints in a row, both 200: the mint never spends the one admission its
+	// rate limit permits. Had it admitted, the second would be the denied second tick.
+	for i := 0; i < 2; i++ {
+		rec := postLiveTicket(t, srv, liveTicketJSON("asr-model"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("mint %d: status = %d, want 200 (the mint must not admit); body = %s", i+1, rec.Code, rec.Body.String())
+		}
+		redeemMintedTicket(t, srv, rec)
 	}
-	requireErrorCode(t, rec.Body.String(), "limit.rate_limited")
-	requireNoTicket(t, rec)
 }
 
 // A server with no ticket store (a bare Server that never went through New) fails the mint

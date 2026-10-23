@@ -116,8 +116,12 @@ type liveUpControl struct {
 
 // handleLiveTranscription is GET /api/portal/transcription-live: the browser's
 // full-duplex WebSocket transport for live transcription (PCM up, typed transcript
-// text down). It is the merged Task 9 (upgrade/auth/guard/envelope) + Task 10
-// (relay/billing/lifecycle).
+// text down). It is a thin ADAPTER: after the ticket is redeemed and the socket
+// upgraded, it loops the session back to the gateway's own public endpoint,
+// /v1/audio/transcriptions/live (relayLiveTranscription), exactly as a portal chat
+// run loops back to /v1/chat/completions. Admission, the per-route session guard
+// and billing all live at that one canonical relay now, so the portal mic exercises
+// the very endpoint a programmatic client would -- one relay, zero drift.
 //
 // Security boundary (BEFORE any upgrade): the single-use, encrypted ticket the
 // authenticated CSRF-protected POST minted (live_transcription_ticket.go) rides as a
@@ -127,8 +131,10 @@ type liveUpControl struct {
 // which is coder/websocket's same-origin check -- the CSRF/origin defense for a
 // browser upgrade that cannot carry X-OP-CSRF. The handler never takes a model,
 // route or billing rate from the client: all of that is the server's own decision,
-// sealed in the redeemed claims, which this handler TRUSTS (no re-resolve, no
-// re-gate, no second admission -- the ticket endpoint already spent the one).
+// sealed in the redeemed claims, which the loopback replays as the model name + the
+// PCM params + the ticket user's trusted-loopback identity. The resolve, the
+// transcription/streaming/served gates, the one admission and the one usage row are
+// all re-run at /v1 as the loopback user.
 func (s *Server) handleLiveTranscription(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -159,16 +165,11 @@ func (s *Server) handleLiveTranscription(w http.ResponseWriter, r *http.Request)
 	}
 	conn.SetReadLimit(maxLiveFrameBytes)
 
-	// 3. One live session per route (audio.cpp serves one /live per model). A second
-	// concurrent session on the same route is refused with a structured busy close,
-	// never a silent collision at the backend. A nil registry fails closed.
-	release, acquired := s.liveSessions.acquire(claims.Target.RouteID)
-	if !acquired {
-		_ = conn.Close(websocket.StatusTryAgainLater, "live transcription busy: one session per model")
-		return
-	}
-	defer release()
-
+	// The per-route session guard is NOT taken here any more: it is acquired at
+	// /v1/audio/transcriptions/live, so a second concurrent portal session on the
+	// same model is refused there (a 503 busy) and surfaced to the browser as an
+	// error down-frame, never a silent collision -- the same guard a bearer client
+	// meets.
 	s.relayLiveTranscription(r, conn, claims)
 }
 
@@ -185,17 +186,27 @@ func extractLiveTicket(header string) string {
 	return ""
 }
 
-// relayLiveTranscription runs the full-duplex relay and bills it once. It owns the
+// relayLiveTranscription runs the browser-facing half of the two chained full-duplex
+// hops. It does NOT touch the backend, bill, or guard the route: it relays the
+// browser's WebSocket through an internal loopback to the gateway's own
+// /v1/audio/transcriptions/live, which performs the resolve, the admission, the
+// per-route session guard, the real upstream relay and the one usage row (as the
+// ticket user, over the trusted-loopback pair). It owns only the browser-side
 // lifecycle: ONE context cancelled on any exit; a single writer goroutine that owns
-// every WS write (data frames, the keepalive ping, and the connection close); a read
-// loop that pumps inbound PCM into the upstream request body through an io.Pipe
-// while counting the payload bytes; and a release-once teardown that can leave no
-// goroutine blocked on the pipe.
+// every WS write (data frames, the keepalive ping, the connection close); a read
+// loop that pumps inbound PCM into the LOOPBACK request body through an io.Pipe; and
+// a teardown that can leave no goroutine -- nor the loopback request/response --
+// blocked or leaked.
+//
+// The loopback is itself full-duplex: the request body (pr) streams chunked while
+// the SSE response is read concurrently. http.DefaultClient with an io.Pipe body
+// does exactly this over HTTP/1.1 (the request writeLoop and the response readLoop
+// run independently), and /v1/audio/transcriptions/live calls EnableFullDuplex, so
+// the browser's PCM and the transcript deltas cross in flight rather than deadlock.
 func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, claims liveTicketClaims) {
-	start := time.Now()
 	id := nextRequestID()
 
-	// The one context: cancelled on any exit tears down the upstream request, the
+	// The one context: cancelled on any exit tears down the loopback request, the
 	// read loop and the pipe feeder together. Derived from the request, but the read
 	// loop deliberately does NOT read on it (see liveReadLoop).
 	ctx, cancel := context.WithCancel(r.Context())
@@ -209,8 +220,10 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	wg.Add(1)
 	go func() { defer wg.Done(); writer.run(ctx) }()
 
-	// The upstream request body is the read side of this pipe; the read loop writes
-	// inbound PCM into the write side and counts the payload.
+	// The loopback request body is the read side of this pipe; the read loop writes
+	// inbound PCM into the write side. pcmBytes is no longer billed here (the usage
+	// row is recorded at /v1), but liveReadLoop counts it all the same; it is dropped
+	// on this side.
 	pr, pw := io.Pipe()
 	var pcmBytes int64
 	var endRequested atomic.Bool
@@ -221,58 +234,95 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	}()
 
 	scan := s.newTranscriptionStreamScan(endpointTranscription, false)
-	var resp *provider.ProxyResponse
-	var upErr error
 
-	// Teardown + billing, DEFERRED so they are airtight even if the relay panics (a
-	// panic in proxyLiveDuplex/liveRelaySSE must not skip the pipe close, the
-	// goroutine join or the usage row; net/http recovers the panic after this runs).
-	// Leak-free and in order:
-	//   1. Unblock the pipe from BOTH sides at once: the transport's body-copy
-	//      (reading pr) and the read loop's possibly-blocked pw.Write both return.
-	//      The transport uses io.NopCloser, so it never closes pr for us; net/http
-	//      cancels r.Context() on a client drop only AFTER the body is drained, so
-	//      teardown is driven from the handler's own context, never from r.Context().
-	//   2. Cancel the one context: the single teardown signal. The writer flushes any
-	//      queued transcript frames then CloseNow()s the connection (an abrupt close
-	//      after clean data delivery), which unblocks the read loop's conn.Read. A
-	//      clean close HANDSHAKE is deliberately NOT used on this hot path:
-	//      coder/websocket's Close() needs the read mutex the read loop holds blocked
-	//      in conn.Read, so a handshake would stall ~5s every session -- the same
-	//      reason handleAgentStream CloseNow()s its hot path. The browser already has
-	//      every transcript frame; the structured close frame IS used where it matters
-	//      and no reader competes: the busy reject (handleLiveTranscription).
-	//   3. Join: pcmBytes and endRequested are stable once both goroutines return.
-	//   4. Bill exactly once.
+	// Teardown, DEFERRED so it is airtight even if the relay panics. Leak-free and in
+	// order:
+	//   1. Unblock the pipe from BOTH sides at once: the loopback transport's body
+	//      write (reading pr) and the read loop's possibly-blocked pw.Write both
+	//      return. On a clean end-of-input liveReadLoop already closed pw with EOF
+	//      (the terminating chunk) and the writeLoop finished, so this is a no-op for
+	//      it; on a client drop WITHOUT end-of-input liveReadLoop closed pw with
+	//      errLiveClientGone, so the loopback body is truncated and /v1 loud-zeros.
+	//   2. Cancel the one context: aborts the loopback request (if still in flight)
+	//      and the SSE body read, then the writer flushes any queued transcript
+	//      frames and CloseNow()s the connection (an abrupt close after clean data
+	//      delivery), which unblocks the read loop's conn.Read. A clean close
+	//      HANDSHAKE is deliberately NOT used on this hot path: coder/websocket's
+	//      Close() needs the read mutex the read loop holds blocked in conn.Read, so a
+	//      handshake would stall ~5s every session.
+	//   3. Join the browser-side goroutines. No billing here: /v1 owns the usage row.
 	defer func() {
 		_ = pr.CloseWithError(errLiveRelayDone)
 		cancel()
 		wg.Wait()
-		s.recordLiveUsage(start, id, r.URL.Path, claims.Target, claims.params(), claims.attribution(), claims.Target.APIFlavor, liveUsageResult{
-			endRequested: endRequested.Load(),
-			scan:         scan,
-			pcmBytes:     atomic.LoadInt64(&pcmBytes),
-			upErr:        upErr,
-			resp:         resp,
-		})
 	}()
 
-	// Open the full-duplex upstream request. ProxyNativeDuplex returns as soon as the
-	// response headers arrive, with the body still open and the request body (pr)
-	// still being read; it applies no target.Timeout.
-	resp, upErr = s.proxyLiveDuplex(ctx, claims.Target, claims.params(), pr)
-	if upErr != nil {
-		writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream unavailable"}))
-		slog.Error("live transcription: upstream dial failed", "id", id, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID), "err", upErr)
+	// Open the full-duplex loopback to the gateway's own /v1 endpoint. Do returns as
+	// soon as the response headers arrive, with the SSE body still open and the
+	// request body (pr) still streaming.
+	resp, err := s.openLiveLoopback(ctx, claims, pr)
+	if err != nil {
+		if ctx.Err() == nil {
+			writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription unavailable"}))
+			slog.Error("live transcription: loopback dial failed", "id", id, "model", claims.Target.Model, "err", err)
+		}
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		writer.send(ctx, liveMarshal(liveDownMsg{Type: "error", Message: "live transcription upstream error"}))
-		slog.Error("live transcription: upstream non-2xx", "id", id, "status", resp.StatusCode, "model", claims.Target.Model, "server", s.serverName(claims.Target.ServerID))
+		slog.Warn("live transcription: loopback non-2xx", "id", id, "status", resp.StatusCode, "model", claims.Target.Model)
 		return
 	}
 	s.liveRelaySSE(ctx, resp.Body, scan, writer)
+}
+
+// openLiveLoopback opens the internal full-duplex loopback POST to the gateway's own
+// /v1/audio/transcriptions/live for a redeemed ticket, feeding its chunked request
+// body from pr (the browser's PCM). It mirrors chat_runs.go's setRunLoopbackHeaders:
+// the trusted-loopback header pair (internalAuthHeaderName = the per-process secret,
+// internalUserHeaderName = the ticket user) is what loopbackPrincipal resolves into a
+// token-less session for that user, so /v1 admits the call without a bearer and never
+// the browser session cookie (requireInternalOrBearerAnyScope). The model name and
+// the PCM params the ticket sealed become the query the public endpoint re-resolves
+// and re-gates, so the portal path runs the exact same relay a bearer client would.
+//
+// The body is an io.PipeReader -- not one of the length-carrying reader types
+// net/http special-cases -- so the request is sent chunked and streamed, never
+// buffered: the PCM reaches /v1 as the browser produces it, which is what keeps the
+// two hops full-duplex. Content-Type is honest octet-stream labelling of raw PCM;
+// /v1 reads the body as PCM regardless.
+//
+// Expect: 100-continue is load-bearing, not an optimisation. /v1 may REFUSE the
+// request before reading a byte of the body -- a 409 non-streaming model, a 429
+// admission denial, a 503 busy route -- and writes that status while the chunked
+// request body is still open. Without 100-continue the Go client will not surface
+// that early response until it has finished sending the body, which for a live
+// session's streaming PCM may be never, so the refusal would deadlock instead of
+// reaching the browser as an error frame. With it, the client holds the body until
+// /v1 either sends 100 Continue (it does so on its first body read, when it accepts
+// the session and the relay begins) or answers a final status (the refusal, which Do
+// then returns at once). DefaultTransport's ExpectContinueTimeout bounds the wait, so
+// a /v1 that somehow neither reads nor refuses cannot stall the dial forever.
+func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, pr io.Reader) (*http.Response, error) {
+	q := url.Values{}
+	q.Set("model", claims.Target.Model)
+	q.Set("sample_rate", strconv.Itoa(claims.SampleRate))
+	q.Set("channels", strconv.Itoa(claims.Channels))
+	q.Set("sample_format", claims.Format)
+	if claims.Language != "" {
+		q.Set("language", claims.Language)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+"/v1/audio/transcriptions/live?"+q.Encode(), pr)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", liveUpstreamContentType)
+	req.Header.Set("Expect", "100-continue")
+	req.Header.Set(csrfHeaderName, "1")
+	req.Header.Set(internalAuthHeaderName, s.internalAuthSecret)
+	req.Header.Set(internalUserHeaderName, claims.UserID)
+	return http.DefaultClient.Do(req)
 }
 
 // proxyLiveDuplex opens the full-duplex upstream request for (target, params), feeding

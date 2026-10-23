@@ -62,7 +62,11 @@ func (s *Server) handleBearerLiveTranscription(w http.ResponseWriter, r *http.Re
 		return
 	}
 	params := liveParamsFromQuery(q)
-	target, ok := s.resolveLiveTarget(w, r, token, model, params)
+	// admit=true: this endpoint is where a live session's single rate/quota/budget
+	// admission is spent -- for a bearer client directly, and for a portal session
+	// through the WebSocket's internal loopback. The portal ticket mint resolves
+	// with admit=false so the one admission is never double-counted.
+	target, ok := s.resolveLiveTarget(w, r, token, model, params, true)
 	if !ok {
 		return
 	}

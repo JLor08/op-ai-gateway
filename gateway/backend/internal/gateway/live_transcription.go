@@ -215,7 +215,11 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 		return
 	}
 	params := liveParams{SampleRate: req.SampleRate, Channels: req.Channels, Format: req.SampleFormat, Language: strings.TrimSpace(req.Language)}
-	target, ok := s.resolveLiveTarget(w, r, token, model, params)
+	// admit=false: the mint resolves + gates for a fast browser error but does NOT
+	// spend the session's single admission -- that happens once, when the WebSocket
+	// loops back to /v1/audio/transcriptions/live. Admitting here too would
+	// double-tick the caller's rate/quota budget for one live session.
+	target, ok := s.resolveLiveTarget(w, r, token, model, params, false)
 	if !ok {
 		return
 	}
@@ -273,13 +277,28 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 // resolve refreshes only a last-used-model snapshot neither caller reads again, so there is
 // no second resolve for a pointer to feed. The caller has already rejected a blank model
 // (whose code differs between the two endpoints).
-func (s *Server) resolveLiveTarget(w http.ResponseWriter, r *http.Request, token auth.Token, model string, params liveParams) (routing.Target, bool) {
+//
+// admit controls step 2's admission. The bearer /v1/audio/transcriptions/live
+// handler and the portal WebSocket's loopback to it call with admit=true, so the
+// live session's rate/quota/budget admission is spent there, once. The portal
+// ticket mint calls with admit=false: it still validates the params, re-auths the
+// server override, resolves the target and runs the streaming/served gates -- so
+// a bad model is a fast, plain HTTP error for the browser -- but it does NOT spend
+// admission, because the portal session admits exactly once, later, at
+// /v1/audio/transcriptions/live (the same canonical relay the bearer client hits).
+// Threading the bool keeps the two live transports gated byte-for-byte identically
+// while moving the single admission to the one relay both now share.
+func (s *Server) resolveLiveTarget(w http.ResponseWriter, r *http.Request, token auth.Token, model string, params liveParams, admit bool) (routing.Target, bool) {
 	if _, valid := liveByteRate(params.SampleRate, params.Channels, params.Format); !valid || !validLiveLanguage(params.Language) {
 		writeJSON(w, http.StatusBadRequest, apierror.Response(liveTranscriptionParamsInvalid,
 			"sample_rate must be 1000-384000, channels 1-16, sample_format s16le or f32le, and language a bare language tag", ""))
 		return routing.Target{}, false
 	}
-	pf, handled := s.inferencePreflight(w, r, token, nil, transcriptionInferenceShape(model))
+	gate := s.inferenceGate
+	if admit {
+		gate = s.inferencePreflight
+	}
+	pf, handled := gate(w, r, token, nil, transcriptionInferenceShape(model))
 	if handled {
 		return routing.Target{}, false
 	}

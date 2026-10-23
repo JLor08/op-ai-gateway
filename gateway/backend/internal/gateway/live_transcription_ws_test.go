@@ -4,14 +4,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"op-ai-gateway/internal/capture"
-	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
 	"strings"
@@ -21,6 +20,15 @@ import (
 
 	"github.com/coder/websocket"
 )
+
+// The portal's live-transcription WebSocket (GET /api/portal/transcription-live) is a
+// thin adapter: after the ticket is redeemed it loops the session back to the
+// gateway's OWN /v1/audio/transcriptions/live, so the portal mic exercises the very
+// endpoint a programmatic bearer client hits. These tests stand up the whole chain --
+// browser WebSocket -> in-process loopback -> /v1/audio/transcriptions/live -> a mock
+// full-duplex /live child -- and assert that resolution, admission, the per-route
+// guard and the SINGLE usage row all happen at /v1 (as the ticket's loopback user),
+// never a second time at the portal.
 
 // liveWSProtocol is the fixed subprotocol the browser offers first; the ticket is
 // the second offered value. Must match the handler's constant.
@@ -39,9 +47,6 @@ type mockLiveChild struct {
 	gotPath  string
 	gotQuery string
 	gotBytes int
-	// gotHeader is a copy of the inbound request headers, so a test can assert which
-	// upstream credential (if any) the gateway attached.
-	gotHeader http.Header
 	// emitPartial, when set, makes the child emit a transcript.text.partial before
 	// the done event, to exercise the partial relay.
 	emitPartial bool
@@ -66,7 +71,6 @@ func (c *mockLiveChild) serve(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.gotPath = r.URL.Path
 	c.gotQuery = r.URL.RawQuery
-	c.gotHeader = r.Header.Clone()
 	emitPartial := c.emitPartial
 	emitError := c.emitError
 	statusCode := c.statusCode
@@ -143,54 +147,36 @@ func (c *mockLiveChild) path() string {
 	return c.gotPath
 }
 
-// header returns the first value of the named inbound request header ("" when absent).
-func (c *mockLiveChild) header(name string) string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.gotHeader.Get(name)
-}
-
-// newLiveTestServer builds a test Server whose native provider is a real
-// OpenAI-compatible client (which implements NativeDuplexProxyClient), pointed by
-// the seeded target at the mock child.
-func newLiveTestServer(t *testing.T) *Server {
+// newLiveLoopbackTestServer builds the full loopback chain's gateway: the
+// transcription-capable routing fixtures (asr-model -> route-asr -> whisper_x,
+// streaming yes; asr-offline, streaming no), the dev user usr_dev, the internal
+// trusted-loopback secret and the live ticket store -- all pointed at the mock /live
+// child. selfBaseURL is wired to the returned httptest server so the portal
+// WebSocket's loopback is a real in-process HTTP call to the gateway's own address.
+func newLiveLoopbackTestServer(t *testing.T, child *mockLiveChild) (*Server, *httptest.Server) {
 	t.Helper()
-	srv := NewTestServer()
+	srv, _ := newTranscriptionCapableTestServer(t, child.server.URL)
 	srv.SetBaseContext(context.Background())
-	srv.Provider = provider.NewOpenAICompatibleClient(http.DefaultClient)
-	return srv
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	srv.selfBaseURL = ts.URL
+	return srv, ts
 }
 
-func liveTarget(child *mockLiveChild, providerKind string) routing.Target {
-	return routing.Target{
-		RouteID:       "route_live",
-		ServerID:      "srv_live",
-		Provider:      providerKind,
-		Endpoint:      child.server.URL,
-		Model:         "whisper",
-		ProviderModel: "whisper-1",
-		APIFlavor:     apiFlavorSpeech,
-	}
-}
-
-func mintLiveTicket(t *testing.T, srv *Server, target routing.Target, sampleRate, channels int, format, language string) string {
+// mintLiveModelTicket mints a ticket the portal WebSocket will loop back with: the
+// resolved model NAME (the loopback re-resolves it at /v1), the PCM params, and the
+// user whose trusted-loopback identity the loopback replays as. Unlike the old direct
+// relay, the ticket carries no live upstream target -- /v1 resolves it fresh.
+func mintLiveModelTicket(t *testing.T, srv *Server, model string, sampleRate, channels int, format, language string) string {
 	t.Helper()
-	return mintLiveTicketFor(t, srv, liveTicketClaims{
-		Target:     target,
+	ticket, err := srv.liveTickets.Mint(liveTicketClaims{
+		Target:     routing.Target{Model: model},
 		SampleRate: sampleRate,
 		Channels:   channels,
 		Format:     format,
 		Language:   language,
 		UserID:     "usr_dev",
-		TokenID:    "tok_dev",
 	})
-}
-
-// mintLiveTicketFor mints a ticket for exactly the given claims, for a test that needs a
-// field mintLiveTicket does not set (the billing attribution).
-func mintLiveTicketFor(t *testing.T, srv *Server, claims liveTicketClaims) string {
-	t.Helper()
-	ticket, err := srv.liveTickets.Mint(claims)
 	if err != nil {
 		t.Fatalf("mint ticket: %v", err)
 	}
@@ -232,20 +218,46 @@ func sendEnd(t *testing.T, ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
-// requireLiveUsageRow polls for the single recorded usage row and asserts its unit,
-// quantity and attribution.
-func requireLiveUsageRow(t *testing.T, srv *Server, wantUnit string, wantQuantity float64) usage.Event {
+// readUntilDone drains down-frames until the done message (or the socket ends).
+func readUntilDone(t *testing.T, ctx context.Context, conn *websocket.Conn) bool {
+	t.Helper()
+	for {
+		m, err := readLiveMsg(t, ctx, conn)
+		if err != nil {
+			return false
+		}
+		if m.Type == "done" {
+			return true
+		}
+	}
+}
+
+// requireLiveLoopbackRow polls for the single recorded usage row and asserts it was
+// recorded at the /v1 relay (ReqPath), billed as it is, and attributed to the loopback
+// user -- a bare session principal: UserID set, TokenID/ServiceID/ProjectID all empty.
+// That is the proof the portal session produced exactly one row, at the canonical
+// relay, not a second one at the portal transport.
+func requireLiveLoopbackRow(t *testing.T, srv *Server, wantQuantity float64) usage.Event {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		rows := srv.Usage.All()
 		if len(rows) == 1 {
 			ev := rows[0]
-			if ev.BillingUnit != wantUnit || ev.BillingQuantity != wantQuantity {
-				t.Fatalf("billing = %v %q, want %v %q", ev.BillingQuantity, ev.BillingUnit, wantQuantity, wantUnit)
+			if ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != wantQuantity {
+				t.Fatalf("billing = %v %q, want %v %q", ev.BillingQuantity, ev.BillingUnit, wantQuantity, usage.BillingUnitAudioSecond)
 			}
-			if ev.RouteID != "route_live" || ev.UserID != "usr_dev" || ev.TokenID != "tok_dev" {
-				t.Fatalf("attribution = route=%q user=%q token=%q, want route_live/usr_dev/tok_dev", ev.RouteID, ev.UserID, ev.TokenID)
+			if ev.ReqPath != "/v1/audio/transcriptions/live" {
+				t.Fatalf("ReqPath = %q, want /v1/audio/transcriptions/live (the row must be recorded at the canonical relay, not the portal transport)", ev.ReqPath)
+			}
+			if ev.UserID != "usr_dev" || ev.TokenID != "" {
+				t.Fatalf("UserID/TokenID = %q/%q, want usr_dev and no token (the bare loopback session principal)", ev.UserID, ev.TokenID)
+			}
+			if ev.ServiceID != "" || ev.ProjectID != "" {
+				t.Fatalf("ServiceID/ProjectID = %q/%q, want empty (the loopback user has no service/project)", ev.ServiceID, ev.ProjectID)
+			}
+			if ev.RouteID != "route-asr" {
+				t.Fatalf("RouteID = %q, want route-asr", ev.RouteID)
 			}
 			return ev
 		}
@@ -259,17 +271,16 @@ func requireLiveUsageRow(t *testing.T, srv *Server, wantUnit string, wantQuantit
 	}
 }
 
-// TestLiveTranscriptionHappyPathRelaysDeltasLive proves the valid ticket upgrades
-// (the fixed subprotocol is selected) and that a PCM frame up produces a delta down
-// before the next frame is sent -- no buffering.
-func TestLiveTranscriptionHappyPathRelaysDeltasLive(t *testing.T) {
-	srv := newLiveTestServer(t)
+// TestLiveTranscriptionLoopbackRelaysDeltasLive proves the valid ticket upgrades (the
+// fixed subprotocol is selected) and that a PCM frame up produces a transcript delta
+// down -- through the whole browser -> loopback -> /v1 -> child chain -- before the
+// next frame is sent (no buffering).
+func TestLiveTranscriptionLoopbackRelaysDeltasLive(t *testing.T) {
 	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	srv, ts := newLiveLoopbackTestServer(t, child)
 
-	ticket := mintLiveTicket(t, srv, liveTarget(child, routing.ProviderServerAgent), 16000, 1, "s16le", "en")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "en")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
@@ -293,27 +304,28 @@ func TestLiveTranscriptionHappyPathRelaysDeltasLive(t *testing.T) {
 		t.Fatalf("first message = %+v, want a non-empty delta", m)
 	}
 
-	// Agent path: model rides in the URL path, NOT the query.
-	if child.path() != "/live/whisper-1" {
-		t.Fatalf("child path = %q, want /live/whisper-1", child.path())
+	// The loopback re-resolved asr-model to the direct child and forwarded the mapped
+	// name + the PCM triple (billing-rate == forwarded-rate), proving the /v1 relay --
+	// not the portal transport -- built the upstream request.
+	if child.path() != "/v1/audio/transcriptions/live" {
+		t.Fatalf("child path = %q, want /v1/audio/transcriptions/live", child.path())
 	}
-	if strings.Contains(child.query(), "model=") {
-		t.Fatalf("agent child query %q must not carry model= (the agent adds it)", child.query())
+	if !strings.Contains(child.query(), "model=whisper_x") || !strings.Contains(child.query(), "sample_rate=16000") {
+		t.Fatalf("forwarded query %q lacks model=whisper_x and the rate triple", child.query())
 	}
 	_ = conn.Close(websocket.StatusNormalClosure, "")
 }
 
-// TestLiveTranscriptionCleanEndBills proves end-of-input -> terminating chunk ->
-// clean done -> billed pcmBytes/byteRate (a DISTINCT test from the truncated one).
-func TestLiveTranscriptionCleanEndBills(t *testing.T) {
-	srv := newLiveTestServer(t)
+// TestLiveTranscriptionLoopbackCleanEndBillsOnceAtV1 proves end-of-input -> terminating
+// chunk -> clean done -> ONE usage row, recorded at /v1 and attributed to the loopback
+// user, never a second row at the portal. 32000 bytes at 16 kHz mono s16le (32000 B/s)
+// is 1.0 second.
+func TestLiveTranscriptionLoopbackCleanEndBillsOnceAtV1(t *testing.T) {
 	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	srv, ts := newLiveLoopbackTestServer(t, child)
 
-	// 16000 * 1 * 2 = 32000 bytes/sec. Send 32000 bytes -> 1.0 second.
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
@@ -325,56 +337,30 @@ func TestLiveTranscriptionCleanEndBills(t *testing.T) {
 	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 32000)); err != nil {
 		t.Fatalf("send pcm: %v", err)
 	}
-	// Drain the delta.
 	if _, err := readLiveMsg(t, ctx, conn); err != nil {
 		t.Fatalf("read delta: %v", err)
 	}
 	sendEnd(t, ctx, conn)
-
-	// Read until the done message arrives.
-	sawDone := false
-	for {
-		m, err := readLiveMsg(t, ctx, conn)
-		if err != nil {
-			break
-		}
-		if m.Type == "done" {
-			sawDone = true
-			break
-		}
-	}
-	if !sawDone {
+	if !readUntilDone(t, ctx, conn) {
 		t.Fatal("never received a done message")
 	}
 	_ = conn.Close(websocket.StatusNormalClosure, "")
 
-	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 1.0)
-	// Billing-rate == forwarded-rate: the direct child's query carries the same triple.
-	if !strings.Contains(child.query(), "sample_rate=16000") || !strings.Contains(child.query(), "sample_format=s16le") {
-		t.Fatalf("forwarded query %q lacks the billed rate triple", child.query())
-	}
-	if ev.HTTPStatus == 0 {
-		t.Fatalf("usage row has no HTTP status")
-	}
-	// Direct path: model rides in the query.
-	if child.path() != "/v1/audio/transcriptions/live" {
-		t.Fatalf("direct child path = %q", child.path())
-	}
-	if !strings.Contains(child.query(), "model=whisper-1") {
-		t.Fatalf("direct child query %q must carry model=whisper-1", child.query())
+	ev := requireLiveLoopbackRow(t, srv, 1.0)
+	if ev.Status != "success" || ev.HTTPStatus == 0 {
+		t.Fatalf("usage row status/httpStatus = %q/%d, want success and a non-zero status", ev.Status, ev.HTTPStatus)
 	}
 }
 
-// TestLiveTranscriptionTruncatedLoudZero proves a WS close WITHOUT end-of-input is a
-// truncated session -> loud zero (quantity 0), a DISTINCT test from the clean one.
-func TestLiveTranscriptionTruncatedLoudZero(t *testing.T) {
-	srv := newLiveTestServer(t)
+// TestLiveTranscriptionLoopbackTruncatedLoudZero proves a WS close WITHOUT end-of-input
+// truncates the loopback body, so /v1 loud-zeros: exactly one row, quantity 0, still
+// status success (the upstream answered 2xx; only delivery was cut).
+func TestLiveTranscriptionLoopbackTruncatedLoudZero(t *testing.T) {
 	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	srv, ts := newLiveLoopbackTestServer(t, child)
 
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
@@ -390,315 +376,21 @@ func TestLiveTranscriptionTruncatedLoudZero(t *testing.T) {
 	// Drop WITHOUT end-of-input.
 	_ = conn.CloseNow()
 
-	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
-	// A 200-then-truncated session is deliberately success + loud zero (the upstream
-	// answered 2xx; only the delivery was cut). It must NOT be over-classified as an
-	// error row -- that is reserved for a non-2xx upstream answer.
+	ev := requireLiveLoopbackRow(t, srv, 0)
 	if ev.Status != "success" {
 		t.Fatalf("status = %q, want success (truncated is success + loud zero, not an error row)", ev.Status)
 	}
 }
 
-// attributedLiveClaims is a 16 kHz mono s16le session on a direct child whose ticket was
-// minted by a token carrying a service and a project (the attribution the ticket endpoint
-// copies off the authenticated token).
-func attributedLiveClaims(child *mockLiveChild) liveTicketClaims {
-	return liveTicketClaims{
-		Target:      liveTarget(child, "audio_cpp"),
-		SampleRate:  16000,
-		Channels:    1,
-		Format:      "s16le",
-		UserID:      "usr_dev",
-		TokenID:     "tok_dev",
-		ServiceID:   "svc_live",
-		ServiceName: "Nightly Batch",
-		ProjectID:   "proj_live",
-		ProjectName: "Call Notes",
-	}
-}
-
-// requireLiveRowAttribution fails unless the row carries the service and project of
-// attributedLiveClaims.
-func requireLiveRowAttribution(t *testing.T, ev usage.Event) {
-	t.Helper()
-	if ev.ServiceID != "svc_live" || ev.ServiceName != "Nightly Batch" || ev.ProjectID != "proj_live" || ev.ProjectName != "Call Notes" {
-		t.Fatalf("service/project = %q/%q/%q/%q, want svc_live/Nightly Batch/proj_live/Call Notes",
-			ev.ServiceID, ev.ServiceName, ev.ProjectID, ev.ProjectName)
-	}
-}
-
-// TestLiveTranscriptionCleanRowIsServiceAndProjectAttributed proves the billed row of a
-// clean session carries the service and project the ticket was minted with, as the buffered
-// transcription row does -- the WebSocket has no principal of its own, so the ticket is
-// where the attribution travels.
-func TestLiveTranscriptionCleanRowIsServiceAndProjectAttributed(t *testing.T) {
-	srv := newLiveTestServer(t)
-	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	ticket := mintLiveTicketFor(t, srv, attributedLiveClaims(child))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.CloseNow()
-
-	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 32000)); err != nil {
-		t.Fatalf("send pcm: %v", err)
-	}
-	if _, err := readLiveMsg(t, ctx, conn); err != nil {
-		t.Fatalf("read delta: %v", err)
-	}
-	sendEnd(t, ctx, conn)
-	for {
-		m, err := readLiveMsg(t, ctx, conn)
-		if err != nil || m.Type == "done" {
-			break
-		}
-	}
-	_ = conn.Close(websocket.StatusNormalClosure, "")
-
-	requireLiveRowAttribution(t, requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 1.0))
-}
-
-// TestLiveTranscriptionLoudZeroRowIsServiceAndProjectAttributed proves a truncated session's
-// loud-zero row is attributed too: the zero is a real, visible row and belongs to the same
-// service and project as a clean one.
-func TestLiveTranscriptionLoudZeroRowIsServiceAndProjectAttributed(t *testing.T) {
-	srv := newLiveTestServer(t)
-	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	ticket := mintLiveTicketFor(t, srv, attributedLiveClaims(child))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 16000)); err != nil {
-		t.Fatalf("send pcm: %v", err)
-	}
-	if _, err := readLiveMsg(t, ctx, conn); err != nil {
-		t.Fatalf("read delta: %v", err)
-	}
-	// Drop WITHOUT end-of-input.
-	_ = conn.CloseNow()
-
-	requireLiveRowAttribution(t, requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0))
-}
-
-// TestLiveTranscriptionUnattributedTicketLeavesServiceAndProjectEmpty is the control: a
-// ticket minted by a token with no service or project (a plain portal session) bills a row
-// with none, so the attribution above comes from the claims and from nowhere else.
-func TestLiveTranscriptionUnattributedTicketLeavesServiceAndProjectEmpty(t *testing.T) {
-	srv := newLiveTestServer(t)
-	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 16000)); err != nil {
-		t.Fatalf("send pcm: %v", err)
-	}
-	if _, err := readLiveMsg(t, ctx, conn); err != nil {
-		t.Fatalf("read delta: %v", err)
-	}
-	_ = conn.CloseNow()
-
-	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
-	if ev.ServiceID != "" || ev.ServiceName != "" || ev.ProjectID != "" || ev.ProjectName != "" {
-		t.Fatalf("service/project = %q/%q/%q/%q, want all empty for an unattributed ticket",
-			ev.ServiceID, ev.ServiceName, ev.ProjectID, ev.ProjectName)
-	}
-}
-
-// TestLiveTranscriptionBusyRejectsSecondSession proves a second concurrent session on
-// the same route gets the busy close code, and that a new one connects after release.
-func TestLiveTranscriptionBusyRejectsSecondSession(t *testing.T) {
-	srv := newLiveTestServer(t)
-	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	target := liveTarget(child, "audio_cpp")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Session 1: holds the slot.
-	conn1, _, err := dialLive(t, ctx, ts.URL, mintLiveTicket(t, srv, target, 16000, 1, "s16le", ""), nil)
-	if err != nil {
-		t.Fatalf("dial 1: %v", err)
-	}
-	// Make sure session 1 is fully established (slot acquired) by exchanging a frame.
-	if err := conn1.Write(ctx, websocket.MessageBinary, make([]byte, 320)); err != nil {
-		t.Fatalf("session1 pcm: %v", err)
-	}
-	if _, err := readLiveMsg(t, ctx, conn1); err != nil {
-		t.Fatalf("session1 delta: %v", err)
-	}
-
-	// Session 2: same route -> busy close.
-	conn2, _, err := dialLive(t, ctx, ts.URL, mintLiveTicket(t, srv, target, 16000, 1, "s16le", ""), nil)
-	if err != nil {
-		t.Fatalf("dial 2: %v", err)
-	}
-	_, _, err = conn2.Read(ctx)
-	if websocket.CloseStatus(err) != websocket.StatusTryAgainLater {
-		t.Fatalf("session 2 close status = %v (err %v), want StatusTryAgainLater", websocket.CloseStatus(err), err)
-	}
-	_ = conn2.CloseNow()
-
-	// Release session 1.
-	sendEnd(t, ctx, conn1)
-	for {
-		if _, err := readLiveMsg(t, ctx, conn1); err != nil {
-			break
-		}
-	}
-	_ = conn1.Close(websocket.StatusNormalClosure, "")
-
-	// Session 3: the slot is free again.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		conn3, _, err := dialLive(t, ctx, ts.URL, mintLiveTicket(t, srv, target, 16000, 1, "s16le", ""), nil)
-		if err == nil {
-			// Confirm it is live, not immediately busy-closed.
-			if werr := conn3.Write(ctx, websocket.MessageBinary, make([]byte, 320)); werr == nil {
-				if _, rerr := readLiveMsg(t, ctx, conn3); rerr == nil {
-					_ = conn3.Close(websocket.StatusNormalClosure, "")
-					return
-				}
-			}
-			_ = conn3.CloseNow()
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("session 3 never connected after release")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// TestLiveTranscriptionMissingTicketNoUpgrade proves a missing ticket is refused with
-// an HTTP error and no upgrade.
-func TestLiveTranscriptionMissingTicketNoUpgrade(t *testing.T) {
-	srv := newLiveTestServer(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	conn, resp, err := dialLive(t, ctx, ts.URL, "", nil)
-	if err == nil {
-		_ = conn.CloseNow()
-		t.Fatal("expected the upgrade to be refused without a ticket")
-	}
-	if resp == nil || (resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden) {
-		t.Fatalf("status = %v, want 401/403", resp)
-	}
-}
-
-// TestLiveTranscriptionReplayedTicketRefused proves a ticket is single-use: the second
-// upgrade with the same ticket is refused with no upgrade.
-func TestLiveTranscriptionReplayedTicketRefused(t *testing.T) {
-	srv := newLiveTestServer(t)
-	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	conn1, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
-	if err != nil {
-		t.Fatalf("dial 1: %v", err)
-	}
-	defer conn1.CloseNow()
-
-	conn2, resp, err := dialLive(t, ctx, ts.URL, ticket, nil)
-	if err == nil {
-		_ = conn2.CloseNow()
-		t.Fatal("expected the replayed ticket to be refused")
-	}
-	if resp == nil || (resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden) {
-		t.Fatalf("replay status = %v, want 401/403", resp)
-	}
-}
-
-// TestLiveTranscriptionCrossOriginRefused proves a cross-origin upgrade is refused by
-// coder/websocket's default (same-origin) Accept, even with a valid ticket.
-func TestLiveTranscriptionCrossOriginRefused(t *testing.T) {
-	srv := newLiveTestServer(t)
-	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	hdr := http.Header{}
-	hdr.Set("Origin", "https://evil.example")
-	conn, resp, err := dialLive(t, ctx, ts.URL, ticket, hdr)
-	if err == nil {
-		_ = conn.CloseNow()
-		t.Fatal("expected a cross-origin upgrade to be refused")
-	}
-	if resp == nil || resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("cross-origin status = %v, want 403", resp)
-	}
-}
-
-// TestLiveTranscriptionReadLimitEnforced proves SetReadLimit caps an inbound frame: a
-// frame over the cap closes the connection with StatusMessageTooBig.
-func TestLiveTranscriptionReadLimitEnforced(t *testing.T) {
-	srv := newLiveTestServer(t)
-	child := newMockLiveChild(t)
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.CloseNow()
-	// A client is allowed to WRITE a large frame; the SERVER's read limit rejects it.
-	conn.SetReadLimit(1 << 21)
-	oversize := make([]byte, maxLiveFrameBytes+1)
-	_ = conn.Write(ctx, websocket.MessageBinary, oversize)
-	// The server closes with StatusMessageTooBig once it reads the oversized frame.
-	_, _, rerr := conn.Read(ctx)
-	if websocket.CloseStatus(rerr) != websocket.StatusMessageTooBig {
-		t.Fatalf("close status = %v (err %v), want StatusMessageTooBig", websocket.CloseStatus(rerr), rerr)
-	}
-}
-
-// TestLiveTranscriptionRelaysPartialAndError proves the partial and error SSE events
-// relay as their typed down-messages.
-func TestLiveTranscriptionRelaysPartialAndError(t *testing.T) {
-	srv := newLiveTestServer(t)
+// TestLiveTranscriptionLoopbackRelaysPartial proves a transcript.text.partial event
+// relays through the chain as its typed partial down-message.
+func TestLiveTranscriptionLoopbackRelaysPartial(t *testing.T) {
 	child := newMockLiveChild(t)
 	child.emitPartial = true
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	srv, ts := newLiveLoopbackTestServer(t, child)
 
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
@@ -736,17 +428,16 @@ func TestLiveTranscriptionRelaysPartialAndError(t *testing.T) {
 	}
 }
 
-// TestLiveTranscriptionErrorEventRelayed proves a mid-stream SSE error event relays as
-// a typed error down-message and bills a loud zero.
-func TestLiveTranscriptionErrorEventRelayed(t *testing.T) {
-	srv := newLiveTestServer(t)
+// TestLiveTranscriptionLoopbackErrorEventRelayed proves a mid-stream SSE error event
+// relays as a typed error down-message and the /v1 relay loud-zeros it (status success,
+// the upstream answered 2xx before the error).
+func TestLiveTranscriptionLoopbackErrorEventRelayed(t *testing.T) {
 	child := newMockLiveChild(t)
 	child.emitError = true
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	srv, ts := newLiveLoopbackTestServer(t, child)
 
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
@@ -772,27 +463,22 @@ func TestLiveTranscriptionErrorEventRelayed(t *testing.T) {
 	if !sawError {
 		t.Fatal("never received an error message")
 	}
-	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
-	// A post-200 mid-stream SSE error event is deliberately success + loud zero (the
-	// upstream answered 2xx), distinct from the non-2xx-upstream status="error" row.
+	ev := requireLiveLoopbackRow(t, srv, 0)
 	if ev.Status != "success" {
-		t.Fatalf("status = %q, want success (a post-200 SSE error is success + loud zero, not an error row)", ev.Status)
+		t.Fatalf("status = %q, want success (a post-200 SSE error is success + loud zero)", ev.Status)
 	}
 }
 
-// TestLiveTranscriptionNon2xxUpstreamErrorRow proves a non-2xx UPSTREAM answer is
-// recorded as an ERROR row (status "error" + an upstream.<code>) with a loud-zero
-// quantity -- never a self-contradictory status="success" row that hides a real
-// backend failure while HTTPStatus carries the 4xx.
-func TestLiveTranscriptionNon2xxUpstreamErrorRow(t *testing.T) {
-	srv := newLiveTestServer(t)
+// TestLiveTranscriptionLoopbackNonStreamingModelErrorFrame proves the /v1 gate surfaces
+// to the browser: a model whose transcription_streaming verdict is not yes is refused at
+// /v1 (409), the loopback sees the non-2xx, and the WebSocket relays a typed error
+// down-frame. The refusal is a gate, not a relay, so NO usage row is recorded.
+func TestLiveTranscriptionLoopbackNonStreamingModelErrorFrame(t *testing.T) {
 	child := newMockLiveChild(t)
-	child.statusCode = http.StatusNotFound
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
+	srv, ts := newLiveLoopbackTestServer(t, child)
 
-	ticket := mintLiveTicket(t, srv, liveTarget(child, "audio_cpp"), 16000, 1, "s16le", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ticket := mintLiveModelTicket(t, srv, "asr-offline", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
@@ -801,15 +487,6 @@ func TestLiveTranscriptionNon2xxUpstreamErrorRow(t *testing.T) {
 	}
 	defer conn.CloseNow()
 
-	// The gateway's chunked upstream request sends its headers up front, so the
-	// upstream exchange begins as soon as the request is dispatched (the first PCM
-	// frame follows immediately in the mic flow). A PCM frame is sent here to mirror
-	// that flow; the child answers its non-2xx status and the relay reports it.
-	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 320)); err != nil {
-		t.Fatalf("send pcm: %v", err)
-	}
-
-	// The handler relays a typed error down-message on a non-2xx upstream.
 	sawError := false
 	for {
 		m, rerr := readLiveMsg(t, ctx, conn)
@@ -822,116 +499,248 @@ func TestLiveTranscriptionNon2xxUpstreamErrorRow(t *testing.T) {
 		}
 	}
 	if !sawError {
-		t.Fatal("never received an error message on a non-2xx upstream")
+		t.Fatal("never received an error message for a non-streaming model")
 	}
-
-	ev := requireLiveUsageRow(t, srv, usage.BillingUnitAudioSecond, 0)
-	if ev.Status != "error" {
-		t.Fatalf("status = %q, want error", ev.Status)
+	// A gate refusal never bills and never reaches the child.
+	if child.path() != "" {
+		t.Fatalf("the child was contacted (%q) for a non-streaming model", child.path())
 	}
-	if ev.ErrorCode != "upstream.404" {
-		t.Fatalf("errorCode = %q, want upstream.404", ev.ErrorCode)
-	}
-	if ev.HTTPStatus != http.StatusNotFound {
-		t.Fatalf("httpStatus = %d, want 404", ev.HTTPStatus)
+	time.Sleep(50 * time.Millisecond)
+	if n := len(srv.Usage.All()); n != 0 {
+		t.Fatalf("usage rows = %d, want 0 for a /v1 gate refusal", n)
 	}
 }
 
-// TestLiveTranscriptionAppliesUpstreamCredential proves the live relay attaches the
-// per-mapping upstream credential to its upstream request -- exactly as the buffered
-// native path does -- so a mapping whose child needs a token (a direct audio_cpp
-// server with an API key, or an agent-managed child launched with ${API_TOKEN}) is
-// reachable live. The ticket carries a sealed target.APIToken; the real
-// OpenAI-compatible client (through the real upstreamAuthCtx -> applyUpstreamAuth
-// chain) must deliver it to the child, and a token-less target must send none.
-func TestLiveTranscriptionAppliesUpstreamCredential(t *testing.T) {
-	const token = "live-upstream-token"
-	cases := []struct {
-		name         string
-		providerKind string
-		apiToken     string
-		tokenHeader  string
-		wantHeader   string // the header expected to carry the credential ("" = none)
-		wantValue    string
-		wantAbsent   []string // headers that must NOT be sent
-	}{
-		{
-			name:         "direct audio_cpp default bearer",
-			providerKind: "audio_cpp",
-			apiToken:     token,
-			wantHeader:   "Authorization",
-			wantValue:    "Bearer " + token,
-			wantAbsent:   []string{"X-Api-Key"},
-		},
-		{
-			name:         "agent-managed target default bearer",
-			providerKind: routing.ProviderServerAgent,
-			apiToken:     token,
-			wantHeader:   "Authorization",
-			wantValue:    "Bearer " + token,
-		},
-		{
-			name:         "custom credential header",
-			providerKind: "audio_cpp",
-			apiToken:     token,
-			tokenHeader:  "X-Api-Key",
-			wantHeader:   "X-Api-Key",
-			wantValue:    token,
-			wantAbsent:   []string{"Authorization"},
-		},
-		{
-			name:         "token-less target sends no credential",
-			providerKind: "audio_cpp",
-			wantAbsent:   []string{"Authorization", "X-Api-Key"},
-		},
+// TestLiveTranscriptionLoopbackBusyRejectsSecondSession proves the per-route session
+// guard now lives at /v1: a second concurrent portal session on the same route is
+// refused there (503 busy) and surfaced to the browser as an error down-frame, not a
+// silent collision.
+func TestLiveTranscriptionLoopbackBusyRejectsSecondSession(t *testing.T) {
+	child := newMockLiveChild(t)
+	srv, ts := newLiveLoopbackTestServer(t, child)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Session 1 holds the route's slot: established once it has exchanged a frame (its
+	// /v1 relay has acquired the slot by the time the first delta comes back).
+	conn1, _, err := dialLive(t, ctx, ts.URL, mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", ""), nil)
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := newLiveTestServer(t)
-			cipher := newDispatchCipher(t)
-			srv.Cipher = cipher
-			child := newMockLiveChild(t)
-			ts := httptest.NewServer(srv)
-			defer ts.Close()
+	defer conn1.CloseNow()
+	if err := conn1.Write(ctx, websocket.MessageBinary, make([]byte, 320)); err != nil {
+		t.Fatalf("session1 pcm: %v", err)
+	}
+	if _, err := readLiveMsg(t, ctx, conn1); err != nil {
+		t.Fatalf("session1 delta: %v", err)
+	}
 
-			target := liveTarget(child, tc.providerKind)
-			if tc.apiToken != "" {
-				sealed, err := capture.SealSecret(cipher, false, tc.apiToken)
-				if err != nil {
-					t.Fatalf("seal token: %v", err)
-				}
-				target.APIToken = sealed
-				target.APITokenHeader = tc.tokenHeader
-			}
-			ticket := mintLiveTicket(t, srv, target, 16000, 1, "s16le", "")
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
+	// Session 2 on the same route: its /v1 loopback is refused 503 busy -> the WebSocket
+	// relays an error down-frame.
+	conn2, _, err := dialLive(t, ctx, ts.URL, mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", ""), nil)
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer conn2.CloseNow()
+	sawError := false
+	for {
+		m, rerr := readLiveMsg(t, ctx, conn2)
+		if rerr != nil {
+			break
+		}
+		if m.Type == "error" {
+			sawError = true
+			break
+		}
+	}
+	if !sawError {
+		t.Fatal("session 2 never received a busy error frame")
+	}
+}
 
-			conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
-			defer conn.CloseNow()
+// TestLiveTranscriptionLoopbackAdmitsOnceAtV1NotAtMint is the no-double-admit invariant:
+// with the ticket user rate-limited to ONE admission, the ticket mint never spends the
+// budget (admit=false: both mints return 200), the first portal session's /v1 loopback
+// spends it (admission #1 -> success + one usage row), and a second session's /v1
+// loopback is the SECOND admission -> denied 429 -> an error down-frame and no extra
+// usage row. Had the mint admitted, session 1 would already have been the second tick
+// and failed.
+func TestLiveTranscriptionLoopbackAdmitsOnceAtV1NotAtMint(t *testing.T) {
+	child := newMockLiveChild(t)
+	srv, ts := newLiveLoopbackTestServer(t, child)
 
-			// A round trip (PCM up, delta down) proves the child received and handled the
-			// upstream request, so its recorded headers are the ones the relay sent.
-			if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 320)); err != nil {
-				t.Fatalf("send pcm: %v", err)
-			}
-			if _, err := readLiveMsg(t, ctx, conn); err != nil {
-				t.Fatalf("read delta: %v", err)
-			}
+	// usr_dev may admit exactly once per hour.
+	store := newFakePrincipalStore()
+	store.setConfig(Principal{Type: routing.PrincipalTypeUser, ID: "usr_dev"}, routing.LimitConfig{RateRequests: 1, RateWindowSeconds: 3600})
+	srv.Limiter = NewPrincipalLimiter(store, PrincipalLimiterOptions{})
 
-			if tc.wantHeader != "" {
-				if got := child.header(tc.wantHeader); got != tc.wantValue {
-					t.Fatalf("upstream %s = %q, want %q (the per-mapping credential never reached the live upstream)", tc.wantHeader, got, tc.wantValue)
-				}
-			}
-			for _, name := range tc.wantAbsent {
-				if got := child.header(name); got != "" {
-					t.Fatalf("upstream %s = %q, want none", name, got)
-				}
-			}
-		})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Two mints through the real endpoint: both 200. If the mint admitted, the second
+	// would be the (denied) second tick -- so two 200s prove the mint spends nothing.
+	ticket1 := mintTicketViaEndpoint(t, srv, "asr-model")
+	ticket2 := mintTicketViaEndpoint(t, srv, "asr-model")
+
+	// Session 1: /v1 admission #1 -> succeeds end to end.
+	conn1, _, err := dialLive(t, ctx, ts.URL, ticket1, nil)
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	if err := conn1.Write(ctx, websocket.MessageBinary, make([]byte, 32000)); err != nil {
+		t.Fatalf("session1 pcm: %v", err)
+	}
+	if _, err := readLiveMsg(t, ctx, conn1); err != nil {
+		t.Fatalf("session1 delta: %v", err)
+	}
+	sendEnd(t, ctx, conn1)
+	if !readUntilDone(t, ctx, conn1) {
+		t.Fatal("session 1 never finished: /v1 denied the FIRST admission, so the mint must have already spent it")
+	}
+	_ = conn1.Close(websocket.StatusNormalClosure, "")
+
+	// Session 2: /v1 admission #2 -> denied 429 -> error down-frame.
+	conn2, _, err := dialLive(t, ctx, ts.URL, ticket2, nil)
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer conn2.CloseNow()
+	sawError := false
+	for {
+		m, rerr := readLiveMsg(t, ctx, conn2)
+		if rerr != nil {
+			break
+		}
+		if m.Type == "error" {
+			sawError = true
+			break
+		}
+	}
+	if !sawError {
+		t.Fatal("session 2 was not denied: /v1 did not admit, so admission is not enforced at the one relay")
+	}
+
+	// Exactly one usage row overall: session 1's clean session. Session 2 was denied
+	// before any relay (no row), and the portal transport records none.
+	ev := requireLiveLoopbackRow(t, srv, 1.0)
+	if ev.Status != "success" {
+		t.Fatalf("row status = %q, want success", ev.Status)
+	}
+}
+
+// mintTicketViaEndpoint mints a ticket through the real POST
+// /api/portal/transcription-live-ticket (admit=false), authenticated by the dev bearer,
+// and returns the opaque ticket. A non-200 fails the test.
+func mintTicketViaEndpoint(t *testing.T, srv *Server, model string) string {
+	t.Helper()
+	body := fmt.Sprintf(`{"model":%q,"sample_rate":16000,"channels":1,"sample_format":"s16le"}`, model)
+	req := httptest.NewRequest(http.MethodPost, "/api/portal/transcription-live-ticket", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mint endpoint status = %d, want 200 (the mint must NOT admit); body = %s", rec.Code, rec.Body.String())
+	}
+	var resp liveTicketResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode ticket response %q: %v", rec.Body.Bytes(), err)
+	}
+	if resp.Ticket == "" {
+		t.Fatalf("mint endpoint returned an empty ticket: %s", rec.Body.String())
+	}
+	return resp.Ticket
+}
+
+// TestLiveTranscriptionMissingTicketNoUpgrade proves a missing ticket is refused with
+// an HTTP error and no upgrade.
+func TestLiveTranscriptionMissingTicketNoUpgrade(t *testing.T) {
+	child := newMockLiveChild(t)
+	_, ts := newLiveLoopbackTestServer(t, child)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, resp, err := dialLive(t, ctx, ts.URL, "", nil)
+	if err == nil {
+		_ = conn.CloseNow()
+		t.Fatal("expected the upgrade to be refused without a ticket")
+	}
+	if resp == nil || (resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden) {
+		t.Fatalf("status = %v, want 401/403", resp)
+	}
+}
+
+// TestLiveTranscriptionReplayedTicketRefused proves a ticket is single-use: the second
+// upgrade with the same ticket is refused with no upgrade.
+func TestLiveTranscriptionReplayedTicketRefused(t *testing.T) {
+	child := newMockLiveChild(t)
+	srv, ts := newLiveLoopbackTestServer(t, child)
+
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn1, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	defer conn1.CloseNow()
+
+	conn2, resp, err := dialLive(t, ctx, ts.URL, ticket, nil)
+	if err == nil {
+		_ = conn2.CloseNow()
+		t.Fatal("expected the replayed ticket to be refused")
+	}
+	if resp == nil || (resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden) {
+		t.Fatalf("replay status = %v, want 401/403", resp)
+	}
+}
+
+// TestLiveTranscriptionCrossOriginRefused proves a cross-origin upgrade is refused by
+// coder/websocket's default (same-origin) Accept, even with a valid ticket.
+func TestLiveTranscriptionCrossOriginRefused(t *testing.T) {
+	child := newMockLiveChild(t)
+	srv, ts := newLiveLoopbackTestServer(t, child)
+
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	hdr := http.Header{}
+	hdr.Set("Origin", "https://evil.example")
+	conn, resp, err := dialLive(t, ctx, ts.URL, ticket, hdr)
+	if err == nil {
+		_ = conn.CloseNow()
+		t.Fatal("expected a cross-origin upgrade to be refused")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin status = %v, want 403", resp)
+	}
+}
+
+// TestLiveTranscriptionReadLimitEnforced proves SetReadLimit caps an inbound frame: a
+// frame over the cap closes the connection with StatusMessageTooBig, before the PCM is
+// ever relayed to the loopback.
+func TestLiveTranscriptionReadLimitEnforced(t *testing.T) {
+	child := newMockLiveChild(t)
+	srv, ts := newLiveLoopbackTestServer(t, child)
+
+	ticket := mintLiveModelTicket(t, srv, "asr-model", 16000, 1, "s16le", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	// A client is allowed to WRITE a large frame; the SERVER's read limit rejects it.
+	conn.SetReadLimit(1 << 21)
+	oversize := make([]byte, maxLiveFrameBytes+1)
+	_ = conn.Write(ctx, websocket.MessageBinary, oversize)
+	_, _, rerr := conn.Read(ctx)
+	if websocket.CloseStatus(rerr) != websocket.StatusMessageTooBig {
+		t.Fatalf("close status = %v (err %v), want StatusMessageTooBig", websocket.CloseStatus(rerr), rerr)
 	}
 }

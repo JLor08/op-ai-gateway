@@ -40,15 +40,23 @@ var liveTicketAAD = []byte("op-ai-gateway/live-transcription-ticket/v1")
 // slip through as the same bytes.
 var liveTicketEncoding = base64.RawURLEncoding.Strict()
 
-// liveTicketClaims is what a live-transcription ticket carries: the routing and
-// billing decision the authorize endpoint made, so the WebSocket handler never
-// takes a model, mapping or audio rate from the client. Mint sets Nonce and Exp;
-// the caller supplies the rest. The fields are exported so they survive the JSON
-// round-trip through the token.
+// liveTicketClaims is what a live-transcription ticket carries: the resolved
+// model and the validated PCM shape the authorize endpoint settled, plus who
+// asked, so the WebSocket handler never takes a model, mapping or audio rate from
+// the client. Mint sets Nonce and Exp; the caller supplies the rest. The fields
+// are exported so they survive the JSON round-trip through the token.
 //
 // The claims travel ENCRYPTED: the browser holds the token but cannot read it,
 // so Target may carry what must not reach the end user (the internal upstream
 // Endpoint, the sealed APIToken, upstream headers).
+//
+// The WebSocket handler consumes only Target.Model (the model name it loops back
+// with), the four PCM params and UserID (the trusted-loopback identity it replays
+// as). Resolution, the per-route guard, admission and billing all re-run at
+// /v1/audio/transcriptions/live, so a live row is attributed to that loopback user.
+// TokenID and the service/project fields still travel for audit and so a ticket is
+// a faithful record of the authenticated request; they are no longer read by the
+// relay's billing path.
 type liveTicketClaims struct {
 	Nonce      string
 	Exp        int64 // Unix seconds; a ticket is redeemable while now <= Exp
@@ -60,35 +68,10 @@ type liveTicketClaims struct {
 	UserID     string
 	TokenID    string
 
-	// ServiceID/ServiceName/ProjectID/ProjectName are the billing attribution the
-	// authenticated token carried at mint time. The WebSocket has no principal of its
-	// own, so the usage row it records takes its service and project from here, as the
-	// buffered transcription row takes them off the request's token.
 	ServiceID   string
 	ServiceName string
 	ProjectID   string
 	ProjectName string
-}
-
-// params is the validated PCM shape the WebSocket relay forwards upstream and bills at,
-// lifted out of the claims so the live relay/billing core takes the SAME liveParams the
-// bearer HTTP relay builds from its query string.
-func (c liveTicketClaims) params() liveParams {
-	return liveParams{SampleRate: c.SampleRate, Channels: c.Channels, Format: c.Format, Language: c.Language}
-}
-
-// attribution is who the WebSocket session's usage row is billed to: the service and
-// project the ticket endpoint sealed off the authenticated token, so a WebSocket row --
-// whose upgrade carries no principal -- is attributed like a buffered transcription's.
-func (c liveTicketClaims) attribution() liveAttribution {
-	return liveAttribution{
-		UserID:      c.UserID,
-		TokenID:     c.TokenID,
-		ServiceID:   c.ServiceID,
-		ServiceName: c.ServiceName,
-		ProjectID:   c.ProjectID,
-		ProjectName: c.ProjectName,
-	}
 }
 
 // liveTicketStore mints and redeems live-transcription tickets.
