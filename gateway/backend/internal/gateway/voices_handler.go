@@ -138,17 +138,27 @@ func (s *Server) voicesForModel(ctx context.Context, token auth.Token, modelName
 }
 
 // cachedVoicesForMappings returns the deduped, sorted union of the voice lists
-// cached for the given mappings, restricted to the mappings that are plain tts
-// models NOW. It is the visibility-free half of voicesForModel: the caller has
-// already decided which mappings its principal may see, and this applies only
-// what does not depend on the principal.
+// cached for the given mappings, restricted to the mappings that are OFFERABLE
+// speech models NOW (routing.CapabilityRowsOfferableTTS). It is the
+// visibility-free half of voicesForModel: the caller has already decided which
+// mappings its principal may see, and this applies only what does not depend on
+// the principal.
 //
 // The verdict gate runs here, at READ time, on the mappings' current stored
-// rows (routing.CapabilityRowsPlainTTS): the cache is written while a model is
-// loaded and a row can outlive the verdict that justified it, so a mapping that
-// has since become a clone model, or stopped being a speech model, offers no
-// voices even though a list is still on file. The same read keeps a manual
-// verdict override authoritative.
+// rows: the cache is written while a model is loaded and a row can outlive the
+// verdict that justified it, so a mapping that has since stopped being a speech
+// model offers no voices even though a list is still on file. The same read keeps
+// a manual verdict override authoritative.
+//
+// Offerable is "a speech model, and either not a clone model or with a named
+// voice on file" (#301). A plain tts model is offerable whatever its list holds
+// (an empty one adds nothing). A clone model synthesises only in a reference
+// voice it is handed, so it is offerable only when it also ships named presets:
+// its cached list is the answer, and a reference-only clone (an empty list), one
+// never fetched (no row) or one whose row does not decode contributes nothing.
+// That is why the cache is read for every speech mapping, clone models included,
+// before the gate: whether a clone model is offerable depends on what the cache
+// says.
 //
 // A voices row whose payload does not decode costs only its own mapping (logged
 // at Warn, since the writer cannot produce one), so a single bad row never blanks
@@ -169,20 +179,20 @@ func (s *Server) cachedVoicesForMappings(ctx context.Context, mappingIDs []strin
 	if err != nil {
 		return nil, fmt.Errorf("read capability verdicts: %w", err)
 	}
-	tts := ids[:0:0]
+	speech := ids[:0:0]
 	for _, id := range ids {
-		if routing.CapabilityRowsPlainTTS(verdicts[id]) {
-			tts = append(tts, id)
+		if routing.CapabilityRowsSpeech(verdicts[id]) {
+			speech = append(speech, id)
 		}
 	}
-	if len(tts) == 0 {
+	if len(speech) == 0 {
 		return voices, nil
 	}
-	cached, err := s.Routes.ModelMappingCacheForMappings(ctx, tts, routing.ModelMappingCacheVoices)
+	cached, err := s.Routes.ModelMappingCacheForMappings(ctx, speech, routing.ModelMappingCacheVoices)
 	if err != nil {
 		return nil, fmt.Errorf("read the voices cache: %w", err)
 	}
-	voices = unionVoiceNames(voices, tts, cached)
+	voices = unionVoiceNames(voices, speech, verdicts, cached)
 	slices.Sort(voices)
 	return voices, nil
 }
@@ -201,18 +211,23 @@ func dedupeNonEmpty(ids []string) []string {
 	return out
 }
 
-// unionVoiceNames adds the voice names cached for each tts mapping to voices, deduped and
-// skipping blanks, returning the extended slice. A voices row whose payload does not decode
-// costs only its own mapping (logged at Warn, since the writer cannot produce one), so a
-// single bad row never blanks the union.
-func unionVoiceNames(voices, tts []string, cached map[string][]routing.ModelMappingCacheRow) []string {
+// unionVoiceNames adds the voice names cached for each offerable speech mapping to voices,
+// deduped and skipping blanks, returning the extended slice. A mapping's names join the
+// union only when routing.CapabilityRowsOfferableTTS says it is offerable given whether it
+// has any name on file: a plain model always is, a clone model only with presets. A voices
+// row whose payload does not decode costs only its own mapping (logged at Warn, since the
+// writer cannot produce one), so a single bad row never blanks the union.
+func unionVoiceNames(voices, speech []string, verdicts map[string][]routing.CapabilityRow, cached map[string][]routing.ModelMappingCacheRow) []string {
 	seenName := map[string]struct{}{}
-	for _, id := range tts {
+	for _, id := range speech {
 		// routing.VoiceNamesFromCacheRows is the one reader of the cache's encoding, shared
 		// with the router's voice filter so the two cannot disagree about what a row lists.
 		names, err := routing.VoiceNamesFromCacheRows(cached[id])
 		if err != nil {
 			slog.Warn("voices cache row is undecodable and was skipped", "mapping_id", id, "err", err)
+			continue
+		}
+		if !routing.CapabilityRowsOfferableTTS(verdicts[id], len(names) > 0) {
 			continue
 		}
 		for _, name := range names {

@@ -73,6 +73,17 @@ func TestPortalModelVoicesExpandsAGroupToItsMembers(t *testing.T) {
 	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "tts-group"), []string{"one-a", "shared", "two-b"})
 }
 
+// A clone model that ships named presets offers them in the portal picker too
+// (#301), through the same union core as the public endpoint; a group takes a
+// preset clone member's presets beside its plain members' voices, and a
+// reference-only or never-fetched clone member adds nothing.
+func TestPortalModelVoicesOffersAPresetCloneModelsVoices(t *testing.T) {
+	w := newVoicesWorld(t)
+
+	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "tts-clone-presets"), []string{"Frank", "Thorsten"})
+	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "grp-clones"), []string{"Frank", "Thorsten", "one-a", "shared"})
+}
+
 // A missing, empty or blank ?name= is a 400 model.name_required, because it is a
 // client bug that an empty list would hide.
 func TestPortalModelVoicesRequiresAName(t *testing.T) {
@@ -90,8 +101,8 @@ func TestPortalModelVoicesRequiresAName(t *testing.T) {
 
 // Every "nothing to show" case is the SAME 200 with an empty list, so the answer
 // cannot be used to tell an unknown name from a hidden, locked, restricted,
-// non-speech, clone or not-yet-cached one. Where a row could exist the world gave
-// the mapping one, so only the gate keeps it out. Each case is asked as the user
+// non-speech, preset-less clone or not-yet-cached one. Where a row could exist the
+// world gave the mapping one, so only the gate keeps it out. Each case is asked as the user
 // the gate is about: the plain user for the portal's hidden/locked rules (the
 // admin bypasses them), the unprovisioned admin for the restricted server.
 func TestPortalModelVoicesEveryNothingToShowCaseIsAnEmpty200(t *testing.T) {
@@ -100,7 +111,8 @@ func TestPortalModelVoicesEveryNothingToShowCaseIsAnEmpty200(t *testing.T) {
 	for name, c := range map[string]struct{ secret, model string }{
 		"unknown name":                   {voicesOtherSecret, "no-such-model"},
 		"not a speech model":             {voicesOtherSecret, "asr-model"},
-		"a clone model":                  {voicesOtherSecret, "tts-clone"},
+		"a reference-only clone model":   {voicesOtherSecret, "tts-clone"},
+		"a clone model, nothing cached":  {voicesOtherSecret, "tts-clone-uncached"},
 		"no verdict yet":                 {voicesOtherSecret, "tts-unprobed"},
 		"nothing cached":                 {voicesOtherSecret, "tts-uncached"},
 		"cached, and the model has none": {voicesOtherSecret, "tts-emptycache"},
@@ -174,8 +186,9 @@ func TestPortalModelVoicesFollowsProvisioning(t *testing.T) {
 
 // The portal route shares the public endpoint's union core, so the READ-time
 // verdict gate and the undecodable-row rule are the same: a mapping flipped to
-// clone after its voices were cached stops offering them, and a corrupt row costs
-// only its own mapping.
+// clone after its voices were cached keeps offering a non-empty list (a preset
+// clone) and stops when the list is empty (a reference-only one), and a corrupt
+// row costs only its own mapping.
 func TestPortalModelVoicesSharesTheUnionCore(t *testing.T) {
 	buf := withCapturedSlogAtTheDefaultLevel(t)
 	w := newVoicesWorld(t)
@@ -184,6 +197,10 @@ func TestPortalModelVoicesSharesTheUnionCore(t *testing.T) {
 	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "tts-flip"), []string{"flip-voice"})
 	if err := w.routes.UpsertMappingCapabilities(ctx, "map-flip", []routing.CapabilityRow{{Capability: routing.CapabilitySpeechClone, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: w.now}}); err != nil {
 		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "tts-flip"), []string{"flip-voice"})
+	if err := w.routes.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{MappingID: "map-flip", CacheType: routing.ModelMappingCacheVoices, ScopeKey: "", Payload: `[]`, UpdatedAt: w.now}); err != nil {
+		t.Fatalf("UpsertModelMappingCache: %v", err)
 	}
 	requireVoices(t, w.portalVoices(t, voicesOtherSecret, "tts-flip"), nil)
 

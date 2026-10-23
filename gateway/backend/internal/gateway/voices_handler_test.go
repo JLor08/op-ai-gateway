@@ -162,7 +162,10 @@ func newVoicesWorld(t *testing.T) *voicesWorld {
 		// "Nothing to show" cases. Each carries a voices row where a row could
 		// exist, so only the gate keeps it out of the answer.
 		{id: "map-asr", app: "a", gateway: "asr-model", speech: no, voices: []string{"asr-leak"}},
-		{id: "map-clone", app: "a", gateway: "tts-clone", speech: yes, clone: yes, voices: []string{"clone-leak"}},
+		// A REFERENCE-ONLY clone model: it synthesises only in a reference voice it is
+		// handed and ships no named presets, so what the producers cache for it is a
+		// genuine empty list. That empty list is what keeps it out of the picker.
+		{id: "map-clone", app: "a", gateway: "tts-clone", speech: yes, clone: yes, voices: []string{}},
 		{id: "map-unprobed", app: "a", gateway: "tts-unprobed", voices: []string{"unprobed-leak"}},
 		{id: "map-uncached", app: "a", gateway: "tts-uncached", speech: yes},
 		{id: "map-emptycache", app: "a", gateway: "tts-emptycache", speech: yes, voices: []string{}},
@@ -171,6 +174,13 @@ func newVoicesWorld(t *testing.T) *voicesWorld {
 		// A clone verdict that is merely unknown does not exclude: only an
 		// affirmative one does (the writers' own rule).
 		{id: "map-cloneno", app: "a", gateway: "tts-cloneno", speech: yes, clone: no, voices: []string{"plain"}},
+
+		// A clone model that DOES ship named presets (audio.cpp lists a model's
+		// configured voice_presets whatever its task): offerable, because it has
+		// something to pick. Unsorted on purpose, the reader sorts. The other has
+		// never been fetched (no row at all), which is not "has presets" either.
+		{id: "map-clone-presets", app: "a", gateway: "tts-clone-presets", speech: yes, clone: yes, voices: []string{"Thorsten", "Frank"}},
+		{id: "map-clone-uncached", app: "a", gateway: "tts-clone-uncached", speech: yes, clone: yes},
 
 		// Flipped after caching, by the flip tests.
 		{id: "map-flip", app: "a", gateway: "tts-flip", speech: yes, voices: []string{"flip-voice"}},
@@ -207,6 +217,9 @@ func newVoicesWorld(t *testing.T) *voicesWorld {
 		// A visible group whose members include a hidden and a locked model: both are
 		// still full members of it.
 		{"grp_open", "grp-open", []string{"tts-one", "tts-hidden", "tts-locked"}},
+		// A plain model, a preset clone and the two clones with nothing to offer: only
+		// the first two contribute.
+		{"grp_clones", "grp-clones", []string{"tts-one", "tts-clone-presets", "tts-clone", "tts-clone-uncached"}},
 	} {
 		if err := routes.CreateModelGroup(ctx, routing.ModelGroup{ID: g.id, GatewayModelName: g.name, DisplayName: g.name, Status: routing.ServerStatusActive, FailoverMode: "sticky", CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("CreateModelGroup %s: %v", g.name, err)
@@ -404,16 +417,17 @@ func TestAudioVoicesRequiresAModel(t *testing.T) {
 }
 
 // Every "nothing to show" case is the SAME 200 with an empty list, so the answer
-// cannot be used to tell an unknown name from a hidden, non-speech, clone or
-// not-yet-cached one. Where a row could exist the world gave the mapping one, so
-// only the gate keeps it out.
+// cannot be used to tell an unknown name from a hidden, non-speech, preset-less
+// clone or not-yet-cached one. Where a row could exist the world gave the mapping
+// one, so only the gate keeps it out.
 func TestAudioVoicesEveryNothingToShowCaseIsAnEmpty200(t *testing.T) {
 	w := newVoicesWorld(t)
 
 	for name, model := range map[string]string{
 		"unknown name":                   "no-such-model",
 		"not a speech model":             "asr-model",
-		"a clone model":                  "tts-clone",
+		"a reference-only clone model":   "tts-clone",
+		"a clone model, nothing cached":  "tts-clone-uncached",
 		"no verdict yet":                 "tts-unprobed",
 		"nothing cached":                 "tts-uncached",
 		"cached, and the model has none": "tts-emptycache",
@@ -428,16 +442,37 @@ func TestAudioVoicesEveryNothingToShowCaseIsAnEmpty200(t *testing.T) {
 }
 
 // An unknown clone verdict does not exclude a model: only an affirmative
-// (speech_clone, yes) does.
+// (speech_clone, yes) puts it on the preset rule.
 func TestAudioVoicesAnExplicitNoCloneVerdictStillServes(t *testing.T) {
 	w := newVoicesWorld(t)
 
 	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-cloneno"), []string{"plain"})
 }
 
-// The verdict gate runs at READ time on the CURRENT verdict, not on what was true
-// when the row was written: a mapping that flips to clone, or to not-speech, after
-// its voices were cached stops offering them, and a flip back restores them.
+// A clone model that ships named presets offers them (#301): the cache holds the
+// names audio.cpp lists, and the clone verdict no longer hides them. The answer is
+// the same deduped, sorted shape as for a plain model.
+func TestAudioVoicesOffersAPresetCloneModelsVoices(t *testing.T) {
+	w := newVoicesWorld(t)
+
+	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-clone-presets"), []string{"Frank", "Thorsten"})
+}
+
+// A group's union takes the presets of a preset clone member beside a plain
+// member's voices, and a reference-only clone (an empty list) and a never-fetched
+// clone (no row) add nothing.
+func TestAudioVoicesGroupUnionsPlainAndPresetCloneMembers(t *testing.T) {
+	w := newVoicesWorld(t)
+
+	requireVoices(t, w.voicesFor(t, voicesDevSecret, "grp-clones"), []string{"Frank", "Thorsten", "one-a", "shared"})
+}
+
+// The verdict gate runs at READ time on the CURRENT verdict and the CURRENT list,
+// not on what was true when the row was written. A mapping that stops being a
+// speech model stops offering its voices, and a flip back restores them. A mapping
+// that becomes a clone model keeps offering a non-empty cached list (that is a
+// preset clone) and stops once the list is empty (a reference-only one); the
+// clone verdict alone no longer hides anything.
 func TestAudioVoicesReadSideVerdictGate(t *testing.T) {
 	w := newVoicesWorld(t)
 	ctx := context.Background()
@@ -447,16 +482,33 @@ func TestAudioVoicesReadSideVerdictGate(t *testing.T) {
 			t.Fatalf("UpsertMappingCapabilities: %v", err)
 		}
 	}
+	setCache := func(payload string) {
+		t.Helper()
+		if err := w.routes.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{MappingID: "map-flip", CacheType: routing.ModelMappingCacheVoices, ScopeKey: "", Payload: payload, UpdatedAt: w.now}); err != nil {
+			t.Fatalf("UpsertModelMappingCache: %v", err)
+		}
+	}
 
 	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), []string{"flip-voice"})
 
+	// A clone model with a non-empty list on file is a preset clone: still offered.
 	set(routing.CapabilitySpeechClone, routing.CapabilityYes)
+	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), []string{"flip-voice"})
+
+	// The same clone model once its list is empty is reference-only: hidden.
+	setCache(`[]`)
 	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), nil)
 
+	// A model that is not a clone is offerable without voices, and has none to show.
 	set(routing.CapabilitySpeechClone, routing.CapabilityNo)
+	setCache(`["flip-voice"]`)
 	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), []string{"flip-voice"})
 
 	set(routing.CapabilitySpeech, routing.CapabilityNo)
+	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), nil)
+
+	// A clone model that stopped being a speech model is never offered, presets or not.
+	set(routing.CapabilitySpeechClone, routing.CapabilityYes)
 	requireVoices(t, w.voicesFor(t, voicesDevSecret, "tts-flip"), nil)
 }
 
@@ -710,9 +762,9 @@ func TestVoicesForModelIsTheRoutingConsistentUnion(t *testing.T) {
 
 // cachedVoicesForMappings is the visibility-free half of the core, for a caller
 // that has already decided which mappings its principal may see: it still applies
-// the CURRENT tts verdict (a mapping the caller was given that is not plain tts
-// contributes nothing), dedupes an id given twice, and answers an empty non-nil
-// slice for no mappings at all.
+// the CURRENT offerable verdict (a mapping the caller was given that is not an
+// offerable speech model contributes nothing), dedupes an id given twice, and
+// answers an empty non-nil slice for no mappings at all.
 func TestCachedVoicesForMappingsAppliesTheVerdictGateOverGivenIDs(t *testing.T) {
 	w := newVoicesWorld(t)
 	ctx := context.Background()
@@ -729,6 +781,54 @@ func TestCachedVoicesForMappingsAppliesTheVerdictGateOverGivenIDs(t *testing.T) 
 	}
 	if got == nil || len(got) != 0 {
 		t.Fatalf("cachedVoicesForMappings(nil) = %#v, want an empty non-nil slice", got)
+	}
+}
+
+// The union core offers a clone model's names iff it has any (#301): the cache is
+// read for every speech mapping, and a mapping's names join the union when it is
+// offerable -- a plain model always (an empty list adds nothing), a clone model
+// only with a non-empty list. A model that is not a speech model never
+// contributes, whatever list is stranded on file for it.
+func TestCachedVoicesForMappingsOffersPresetClonesOnly(t *testing.T) {
+	w := newVoicesWorld(t)
+	ctx := context.Background()
+	const yes = routing.CapabilityYes
+	w.addMapping(t, voicesMapping{id: "map-af", app: "a", gateway: "tts-af", speech: yes, voices: []string{"af_heart"}})
+	w.addMapping(t, voicesMapping{id: "map-frank", app: "b", gateway: "tts-frank", speech: yes, voices: []string{"Frank", "bella"}})
+	w.addMapping(t, voicesMapping{id: "map-clone-bad", app: "a", gateway: "tts-clone-bad", speech: yes, clone: yes, payload: `not json`})
+	// An asr model: a transcription verdict only, no speech row, and a stray list
+	// on file that must not be read as voices.
+	w.addMapping(t, voicesMapping{id: "map-asr-only", app: "a", gateway: "asr-only", voices: []string{"asr-stray"}})
+	if err := w.routes.UpsertMappingCapabilities(ctx, "map-asr-only", []routing.CapabilityRow{{Capability: routing.CapabilityTranscription, Verdict: yes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: w.now}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+
+	for name, c := range map[string]struct {
+		ids  []string
+		want []string
+	}{
+		"a clone with presets contributes them":          {[]string{"map-clone-presets"}, []string{"Frank", "Thorsten"}},
+		"a reference-only clone (an empty list) is not":  {[]string{"map-clone"}, nil},
+		"a clone with no cache row is not":               {[]string{"map-clone-uncached"}, nil},
+		"a clone with an undecodable row is not":         {[]string{"map-clone-bad"}, nil},
+		"a plain model is unchanged":                     {[]string{"map-af"}, []string{"af_heart"}},
+		"a plain model with an empty list adds nothing":  {[]string{"map-emptycache"}, nil},
+		"a transcription model with a stray list":        {[]string{"map-asr-only"}, nil},
+		"a not-speech model with a stray list":           {[]string{"map-asr"}, nil},
+		"plain and preset clone union, sorted":           {[]string{"map-af", "map-clone-presets", "map-clone", "map-clone-uncached"}, []string{"Frank", "Thorsten", "af_heart"}},
+		"a name a plain and a clone model share is once": {[]string{"map-frank", "map-clone-presets"}, []string{"Frank", "Thorsten", "bella"}},
+		"an id given twice counts once":                  {[]string{"map-clone-presets", "map-clone-presets"}, []string{"Frank", "Thorsten"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := w.srv.cachedVoicesForMappings(ctx, c.ids)
+			if err != nil {
+				t.Fatalf("cachedVoicesForMappings: %v", err)
+			}
+			if got == nil {
+				t.Fatalf("cachedVoicesForMappings = nil, want a non-nil slice")
+			}
+			requireVoices(t, got, c.want)
+		})
 	}
 }
 
