@@ -8456,11 +8456,11 @@ residuals are named ([Risks
 - **A live usage row carries no `ServiceID` or `ProjectID`.** The claims hold `UserID`, `TokenID`
   and the resolved target only, so the row is not service- or project-scoped. Acceptable for the
   portal consumer of phase 1; a follow-up can thread them through the ticket.
-- **The upstream exchange begins with the first PCM frame.** The gateway's chunked upstream request
-  sends its headers together with its first body chunk (Go's `FlushAfterChunkWriter`), so the agent
-  and the child see the request when the first frame is sent, which in the real microphone flow is
-  immediate. A refusal or a non-2xx then reaches the browser promptly (the agent enables full duplex
-  first, (b)) as an `error` message, and the session bills a loud zero on an `error` row.
+- **The upstream exchange begins as soon as the request is dispatched.** The gateway's chunked
+  upstream request sends its headers up front, so the agent and the child see the request at once
+  (the first PCM frame follows immediately in the real microphone flow). A refusal or a non-2xx
+  then reaches the browser promptly (the agent enables full duplex first, (b)) as an `error`
+  message, and the session bills a loud zero on an `error` row.
 - **A busy model is a hard stop, not a queue.** A second live session on the route, or any other
   request reaching a single-slot model during one, is refused or fails with a loud zero; a
   broader per-model admission guard and the busy-model UX are phase 3.

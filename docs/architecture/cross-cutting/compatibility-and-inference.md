@@ -1278,7 +1278,10 @@ request forwarded upstream is the ticket's params as the query (`sample_rate`, `
 (`internal/provider/proxy.go`), an optional provider interface beside the unchanged
 `NativeProxyClient`, which applies **no `target.Timeout`**. A `server_agent` target is addressed at the
 agent router's `/live/{model}` (the agent adds `model` to the child query), a direct `audio_cpp` target at
-`/v1/audio/transcriptions/live` with `model=<provider model>`.
+`/v1/audio/transcriptions/live` with `model=<provider model>`. The upstream request carries the target's own
+per-mapping credential (`target.APIToken` and `APITokenHeader`, attached by `upstreamAuthCtx` exactly as the
+buffered native path does), so a child that needs a token is reachable live; the relay forwards no client
+header, and a token-less target sends none.
 
 **5. The lifecycle.** The handler owns **one context**, cancelled on any exit (a clean done, an upstream
 error, a client drop, a failed write), which tears down the read loop, the upstream request and the PCM pump
@@ -1322,8 +1325,9 @@ path and the dialed fallback, and before any response, so a refusal or a non-2xx
 reaches the browser promptly rather than after the client has streamed audio into the void
 ([Agent-Managed Model Runtime
 §4.7](agent-runtime-manager.md#47-the-router-has-two-ways-in-and-only-one-of-them-is-a-socket)). The one
-timing note is that the gateway's chunked upstream request sends its headers with its first body chunk, so the
-upstream exchange begins when the first PCM frame is sent, which in the real microphone flow is immediate. A
+timing note is that the gateway's chunked upstream request sends its headers up front, so the upstream
+exchange begins as soon as the request is dispatched (the first PCM frame follows immediately in the real
+microphone flow). A
 ticket opens only on the gateway process that minted it, and a live usage row carries no `ServiceID` or
 `ProjectID`. The path is verified against mock backends and a real agent proxy and router on both paths, **not
 yet against a real audio.cpp `/live`** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)). The portal's microphone client is a later phase.

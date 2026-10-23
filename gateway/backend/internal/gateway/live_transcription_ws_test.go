@@ -670,10 +670,10 @@ func TestLiveTranscriptionNon2xxUpstreamErrorRow(t *testing.T) {
 	}
 	defer conn.CloseNow()
 
-	// A PCM frame flushes the upstream request (the client transport flushes the
-	// chunked request headers only with the first body chunk), so the child actually
-	// receives the request and answers its non-2xx status. In the real flow the mic's
-	// PCM always flows, so a non-2xx upstream is observed once streaming starts.
+	// The gateway's chunked upstream request sends its headers up front, so the
+	// upstream exchange begins as soon as the request is dispatched (the first PCM
+	// frame follows immediately in the mic flow). A PCM frame is sent here to mirror
+	// that flow; the child answers its non-2xx status and the relay reports it.
 	if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 320)); err != nil {
 		t.Fatalf("send pcm: %v", err)
 	}

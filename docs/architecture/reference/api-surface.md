@@ -369,10 +369,10 @@ socket `1009`.
 **What the ticket's holder can and cannot do.** The ticket is redeemed **once**, within about 30 seconds, on the
 process that minted it; it names no model, route or rate the client could alter (they are the ticket's), and the
 handler reads no cookie: the ticket is bound to the **principal** by its encrypted `UserID`/`TokenID` claims, and the
-browser `Origin` is checked by the upgrade independently of it. The upstream exchange begins when the first PCM
-frame is sent (the gateway's chunked upstream request sends its headers with its first body chunk), which in the
-real microphone flow is immediate; a refusal or non-2xx from the agent or the child then reaches the browser promptly
-as an `error` message.
+browser `Origin` is checked by the upgrade independently of it. The upstream exchange begins as soon as the request is
+dispatched (the gateway's chunked upstream request sends its headers up front, and the first PCM frame follows
+immediately in the real microphone flow); a refusal or non-2xx from the agent or the child then reaches the browser
+promptly as an `error` message.
 
 #### Application `type`, `api_flavors` and `loaded_models_format`
 
