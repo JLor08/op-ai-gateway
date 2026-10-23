@@ -871,6 +871,11 @@ export function ChatStoreProvider({
   // (which read via refs, not props) can gate on the latest value.
   const modelAvailableRef = useRef(modelAvailable);
   modelAvailableRef.current = modelAvailable;
+  // Whether a live recording of this thread is under way. The recording (useLiveTranscription,
+  // below) is created after the replay callbacks that must refuse while it runs, so they read it
+  // through this ref, set at render like the mirrors around it; send() reads the same fact
+  // from the recording's own state.
+  const liveRunningRef = useRef(false);
   // Mirror the derived vision-capability so the stable send/edit/regenerate
   // callbacks (which read via refs, not props) can gate on the latest value.
   // Direct render-time assignment (not an effect) to match modelAvailableRef
@@ -1601,6 +1606,13 @@ export function ChatStoreProvider({
   // then generates a fresh assistant turn appended after it.
   const startRunWithHistory = useCallback(
     async (chatId: string, history: ChatUiMessage[]) => {
+      // A live recording of this thread is under way: it commits its own turn when it ends,
+      // and a replay started now would own the transcript that turn is to land in (the commit
+      // would then fail with chatBusy). Refused like send()'s, before any state is touched.
+      if (liveRunningRef.current) {
+        showErrorRef.current(tRef.current.chatBusy);
+        return;
+      }
       // Block edit/regenerate while the effective model is unavailable — BEFORE
       // any state mutation. Otherwise the setMessages(history) below would
       // truncate the transcript (dropping the assistant turn) and the debounced
@@ -1714,7 +1726,7 @@ export function ChatStoreProvider({
     (id: string, text: string) => {
       const chatId = activeChatIdRef.current;
       if (!chatId) return;
-      if (isRunning(chatId)) {
+      if (isRunning(chatId) || liveRunningRef.current) {
         showErrorRef.current(tRef.current.chatBusy);
         return;
       }
@@ -1752,7 +1764,7 @@ export function ChatStoreProvider({
     (id: string) => {
       const chatId = activeChatIdRef.current;
       if (!chatId) return;
-      if (isRunning(chatId)) {
+      if (isRunning(chatId) || liveRunningRef.current) {
         showErrorRef.current(tRef.current.chatBusy);
         return;
       }
@@ -1993,6 +2005,7 @@ export function ChatStoreProvider({
     },
   });
   const { liveSession } = live;
+  liveRunningRef.current = liveSessionRunning(liveSession.state);
 
   // Send the composed message: append the optimistic user bubble, clear the
   // composer, then start a SERVER run and subscribe to it. One run per chat —

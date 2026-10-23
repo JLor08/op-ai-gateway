@@ -6902,6 +6902,66 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
         expect(await screen.findByText(t.chatBusy)).toBeInTheDocument();
       });
+
+      // A thread with one transcribed turn, which Regenerate and Edit would replay (the clip is
+      // what a replay transcribes). While a recording runs they are refused like a send: a
+      // replay started now would own the transcript the recording's turn is to land in.
+      const replayableThread = () =>
+        liveThread({
+          title: 'Clip',
+          content: {
+            settings: { model: 'whisper', kind: 'transcription' },
+            messages: [
+              {
+                id: 'u1',
+                role: 'user',
+                content: [
+                  { type: 'text', text: '' },
+                  { type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } },
+                ],
+              },
+              { id: 'a1', role: 'assistant', content: 'The clip', status: 'complete' },
+            ],
+          },
+        });
+
+      it.each([
+        ['regenerate', 'regenerate-a1'],
+        ['edit', 'edit-u1'],
+      ])(
+        'refuses %s: the thread is busy with the recording, and nothing is touched',
+        async (_n, button) => {
+          await renderLive([replayableThread()]);
+          click('live-start');
+          act(() => sessions[0].args.onState('listening'));
+
+          click(button);
+
+          expect(await screen.findByText(t.chatBusy)).toBeInTheDocument();
+          expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+          // The transcript is as it was (a replay truncates it before it starts the run), and
+          // the recording is still going.
+          expect(screen.getByTestId('count').textContent).toBe('2');
+          expect(screen.getByTestId('last').textContent).toBe('The clip');
+          expect(state()).toBe('listening');
+        },
+      );
+
+      it.each([
+        ['regenerate', 'regenerate-a1'],
+        ['edit', 'edit-u1'],
+      ])('lets %s through again once the recording has ended', async (_n, button) => {
+        await renderLive([replayableThread()]);
+        click('live-start');
+        act(() => sessions[0].args.onState('listening'));
+        click('live-abort');
+        expect(state()).toBe('idle');
+
+        click(button);
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(screen.queryByText(t.chatBusy)).not.toBeInTheDocument();
+      });
     });
   });
 
