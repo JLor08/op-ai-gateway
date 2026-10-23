@@ -329,7 +329,15 @@ import (
 // wire shape changes (an open-vocabulary verdict name on an existing source), the
 // reasoning of 0.9.1 -> 0.9.2 above. An older agent never reports the name, which
 // the gateway reads as unknown and answers buffered, the correct default.
-const Version = "0.11.1"
+//
+// 0.11.1 -> 0.12.0 is the single bump for the live-transcription branch (issue
+// #266, phase 1). The branch adds a full-duplex chunked request body relay in the
+// runtime router to a child's streaming endpoint, which the gateway negotiates on
+// before it sends a live stream through the router. MINOR, and the rule decides
+// it: agent.Features gains "fullduplex_proxy", the name the gateway checks before
+// it relies on that relay. The same reasoning made 0.7.0 (runtime_upstream_props)
+// through 0.11.0 (runtime_voices) MINOR.
+const Version = "0.12.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

@@ -228,6 +228,18 @@ var Features = []Feature{
 	// Since is 0.11.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
 	{Name: "runtime_voices", Since: "0.11.0"},
+	// fullduplex_proxy: the runtime router can relay a full-duplex chunked
+	// request body to a child's streaming endpoint (live transcription).
+	//
+	// Like runtime_voices, this flag gates nothing on the agent -- it is
+	// declared for the GATEWAY's benefit, which negotiates on the name before
+	// it sends a full-duplex request body through the router. An older router
+	// has no such relay, so the name is the only evidence the gateway can use
+	// to tell the two apart.
+	//
+	// Since is 0.12.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block).
+	{Name: "fullduplex_proxy", Since: "0.12.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.
