@@ -12,10 +12,11 @@
 // The media type of what audioBlobToWav returns, and so of every clip the composer attaches.
 export const WAV_MEDIA_TYPE = 'audio/wav';
 
-// What the converted clip is: mono, 16 kHz, 16-bit samples.
+// What the converted clip is: mono, 16 kHz, 16-bit samples. The channel count and the sample width
+// are exported for the live capture (chat/livePcm.ts), which writes the same PCM format.
 const SAMPLE_RATE = 16000;
-const CHANNELS = 1;
-const BYTES_PER_SAMPLE = 2;
+export const CHANNELS = 1;
+export const BYTES_PER_SAMPLE = 2;
 
 // The canonical RIFF/WAVE header of an uncompressed PCM file is 44 bytes: the RIFF chunk's
 // header (12), the `fmt ` chunk (24) and the `data` chunk's header (8).
@@ -99,8 +100,8 @@ function writeAscii(view: DataView, offset: number, text: string) {
 }
 
 // A float sample as 16-bit PCM: clamped to [-1, 1] (a decoder may overshoot), then scaled so that
-// -1 is -32768 and +1 is +32767, the two ends of an int16.
-function toInt16(sample: number): number {
+// -1 is -32768 and +1 is +32767, the two ends of an int16. Shared with the live capture.
+export function toInt16(sample: number): number {
   const clamped = Math.max(-1, Math.min(1, sample));
   return Math.round(clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff);
 }
