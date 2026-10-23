@@ -378,8 +378,13 @@ func liveUpstreamPath(target routing.Target, params liveParams) string {
 	if target.Provider == routing.ProviderServerAgent {
 		return provider.ExpandModelPath("/live/{model}", target.ProviderModel) + "?" + q.Encode()
 	}
-	q.Set("model", target.ProviderModel)
-	return "/v1/audio/transcriptions/live?" + q.Encode()
+	// audio.cpp's /live reads the `model` query value VERBATIM -- it does not URL-decode
+	// it -- so a model id with a ':' (a common quantization suffix, e.g. "…GGUF:BF16")
+	// must reach it with a LITERAL colon. url.Values.Encode escapes ':' to %3A, which
+	// audio.cpp then fails to match ("unknown model id: …%3A…"). A ':' is legal unescaped
+	// in a query and a model id carries no query delimiter, so append it literally after
+	// the encoded audio params rather than through q.Set/Encode.
+	return "/v1/audio/transcriptions/live?" + q.Encode() + "&model=" + target.ProviderModel
 }
 
 // liveReadLoop pumps inbound WebSocket frames into the upstream request body and

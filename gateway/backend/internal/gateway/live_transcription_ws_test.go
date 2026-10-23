@@ -794,3 +794,30 @@ func TestLiveRefusalFrameBoundsTheBody(t *testing.T) {
 		t.Fatalf("liveRefusalFrame(oversized) = %+v, want the generic fallback with no code", got)
 	}
 }
+
+// TestLiveUpstreamPathSendsModelVerbatim pins the fix for the model-id ':' bug:
+// audio.cpp's /live reads the `model` query value VERBATIM (no URL-decode), so a model
+// id with a ':' (a common quantization suffix, e.g. "…GGUF:BF16") must reach it with a
+// LITERAL colon. url.Values.Encode would escape it to %3A, which audio.cpp then refuses
+// with "unknown model id: …%3A…". Both upstream shapes are checked: the direct audio.cpp
+// query (model=…) and the agent /live/{model} path.
+func TestLiveUpstreamPathSendsModelVerbatim(t *testing.T) {
+	const model = "CrisperWhisper2.0-GGUF:BF16"
+	params := liveParams{SampleRate: 16000, Channels: 1, Format: "s16le", Language: "de"}
+
+	direct := liveUpstreamPath(routing.Target{ProviderModel: model}, params)
+	if !strings.Contains(direct, "model="+model) {
+		t.Fatalf("direct path %q does not carry model=%q verbatim", direct, model)
+	}
+	if strings.Contains(direct, "%3A") {
+		t.Fatalf("direct path %q percent-escaped the model colon; audio.cpp reads it verbatim", direct)
+	}
+
+	agent := liveUpstreamPath(routing.Target{Provider: routing.ProviderServerAgent, ProviderModel: model}, params)
+	if !strings.Contains(agent, "/live/"+model) {
+		t.Fatalf("agent path %q does not carry /live/%s with a literal colon", agent, model)
+	}
+	if strings.Contains(agent, "%3A") {
+		t.Fatalf("agent path %q percent-escaped the model colon", agent)
+	}
+}
