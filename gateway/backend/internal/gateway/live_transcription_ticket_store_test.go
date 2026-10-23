@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"op-ai-gateway/internal/routing"
@@ -49,6 +50,7 @@ func sampleLiveTicketClaims() liveTicketClaims {
 			ProviderModel: "whisper-large-v3",
 			Timeout:       90 * time.Second,
 			APIFlavor:     "native",
+			APIToken:      "enc:sealed-upstream-credential",
 			APIFlavors:    []string{"native"},
 			ExtraHeaders:  map[string]string{"x-test": "1"},
 		},
@@ -114,11 +116,66 @@ func TestLiveTicketMintIgnoresCallerNonceAndExp(t *testing.T) {
 
 func TestLiveTicketTokenIsAValidSubprotocolToken(t *testing.T) {
 	store, _ := newTicketTestStore()
-	shape := regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
+	// RFC 6455 wants a subprotocol to be an HTTP token: no '+', '/', '=', space
+	// or comma. The URL-safe unpadded alphabet is a strict subset of that.
+	shape := regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 	for range 50 {
 		token := mustMintLiveTicket(t, store, sampleLiveTicketClaims())
 		if !shape.MatchString(token) {
-			t.Fatalf("token %q is not payload.mac in the URL-safe unpadded alphabet", token)
+			t.Fatalf("token %q is not in the URL-safe unpadded base64 alphabet", token)
+		}
+	}
+}
+
+// TestLiveTicketClaimsAreNotReadableFromTheToken pins the confidentiality half
+// of the AEAD: the browser holds the token, so nothing in the claims (the
+// upstream endpoint, the sealed upstream credential, the model, the user) may
+// be recoverable by base64-decoding it.
+func TestLiveTicketClaimsAreNotReadableFromTheToken(t *testing.T) {
+	store, _ := newTicketTestStore()
+	claims := sampleLiveTicketClaims()
+	claims.Target.Endpoint = "http://secret-upstream:9000"
+	claims.Target.Model = "secret-model-name"
+	claims.Target.APIToken = "enc:secret-sealed-credential"
+	claims.Target.APITokenHeader = "X-Secret-Header"
+	claims.Target.ExtraHeaders = map[string]string{"x-secret-extra": "secret-extra-value"}
+	claims.UserID = "secret-user-id"
+	claims.TokenID = "secret-token-id"
+	secrets := []string{
+		"secret-upstream", "9000", "secret-model-name", "secret-sealed-credential",
+		"X-Secret-Header", "secret-extra", "secret-user-id", "secret-token-id",
+		"Endpoint", "APIToken", "Nonce", "audiocpp",
+	}
+
+	for range 20 {
+		token := mustMintLiveTicket(t, store, claims)
+		// The token itself, as the browser sees it...
+		for _, secret := range secrets {
+			if strings.Contains(token, secret) {
+				t.Fatalf("token contains readable %q", secret)
+			}
+		}
+		// ...and after the base64 decoding anyone can apply.
+		raw, err := base64.RawURLEncoding.DecodeString(token)
+		if err != nil {
+			t.Fatalf("token is not base64url: %v", err)
+		}
+		for _, secret := range secrets {
+			if bytes.Contains(raw, []byte(secret)) {
+				t.Fatalf("base64-decoded token contains readable %q", secret)
+			}
+		}
+		if json.Valid(raw) {
+			t.Fatalf("base64-decoded token is plain JSON; the claims are not encrypted")
+		}
+
+		// Confidentiality must not cost the round trip.
+		got, ok := store.Redeem(token)
+		if !ok {
+			t.Fatalf("Redeem = false, want true")
+		}
+		if got.Target.Endpoint != claims.Target.Endpoint || got.Target.APIToken != claims.Target.APIToken {
+			t.Fatalf("claims did not round-trip: %+v", got.Target)
 		}
 	}
 }
@@ -185,10 +242,6 @@ func TestLiveTicketExpiredTicketIsNotRedeemableEvenWhenNeverUsed(t *testing.T) {
 func TestLiveTicketTampered(t *testing.T) {
 	store, _ := newTicketTestStore()
 	token := mustMintLiveTicket(t, store, sampleLiveTicketClaims())
-	payload, mac, ok := strings.Cut(token, ".")
-	if !ok {
-		t.Fatalf("token %q has no '.' separator", token)
-	}
 
 	flip := func(s string, i int) string {
 		b := []byte(s)
@@ -199,10 +252,9 @@ func TestLiveTicketTampered(t *testing.T) {
 		}
 		return string(b)
 	}
+	other := mustMintLiveTicket(t, store, sampleLiveTicketClaims())
 
-	otherPayload, _, _ := strings.Cut(mustMintLiveTicket(t, store, sampleLiveTicketClaims()), ".")
-
-	// A different, validly-encoded payload under the original MAC.
+	// Valid, readable claims that simply were never encrypted by the store.
 	forgedClaims := sampleLiveTicketClaims()
 	forgedClaims.Target.Endpoint = "http://evil.example:1"
 	forgedClaims.Nonce = "forged"
@@ -211,23 +263,25 @@ func TestLiveTicketTampered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal forged claims: %v", err)
 	}
-	forgedPayload := base64.RawURLEncoding.EncodeToString(forgedJSON)
 
+	mid := len(token) / 2
 	cases := map[string]string{
-		"flipped payload byte":         flip(payload, len(payload)/2) + "." + mac,
-		"flipped first payload byte":   flip(payload, 0) + "." + mac,
-		"flipped last payload byte":    flip(payload, len(payload)-1) + "." + mac,
-		"flipped mac byte":             payload + "." + flip(mac, len(mac)/2),
-		"flipped first mac byte":       payload + "." + flip(mac, 0),
-		"flipped last mac byte":        payload + "." + flip(mac, len(mac)-1),
-		"other ticket's payload":       otherPayload + "." + mac,
-		"forged payload, original mac": forgedPayload + "." + mac,
-		"truncated mac":                payload + "." + mac[:len(mac)-2],
-		"extended mac":                 payload + "." + mac + "AA",
-		"empty mac":                    payload + ".",
-		"empty payload":                "." + mac,
-		"swapped halves":               mac + "." + payload,
-		"third segment":                token + ".extra",
+		// 0 is inside the GCM nonce, mid is ciphertext, the last characters
+		// are the auth tag.
+		"flipped nonce byte":          flip(token, 0),
+		"flipped ciphertext byte":     flip(token, mid),
+		"flipped tag byte":            flip(token, len(token)-5),
+		"flipped last byte":           flip(token, len(token)-1),
+		"truncated":                   token[:len(token)-4],
+		"extended":                    token + "AAAA",
+		"truncated to the GCM nonce":  token[:16],
+		"shorter than the GCM nonce":  token[:8],
+		"empty":                       "",
+		"first half of two tickets":   token[:mid] + other[mid:],
+		"unencrypted forged claims":   base64.RawURLEncoding.EncodeToString(forgedJSON),
+		"legacy payload.mac shape":    base64.RawURLEncoding.EncodeToString(forgedJSON) + "." + token[:43],
+		"trailing separator":          token + ".",
+		"standard-alphabet re-encode": strings.NewReplacer("-", "+", "_", "/").Replace(token) + "=",
 	}
 	for name, tampered := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -237,40 +291,67 @@ func TestLiveTicketTampered(t *testing.T) {
 		})
 	}
 
-	// None of the rejected attempts may have consumed the genuine ticket.
+	// None of the rejected attempts may have consumed the genuine tickets.
 	if _, ok := store.Redeem(token); !ok {
 		t.Fatalf("genuine ticket no longer redeemable after tamper attempts")
 	}
+	if _, ok := store.Redeem(other); !ok {
+		t.Fatalf("second genuine ticket no longer redeemable after tamper attempts")
+	}
 }
 
-func TestLiveTicketRejectsNonCanonicalMACEncoding(t *testing.T) {
+func TestLiveTicketRejectsNonCanonicalEncoding(t *testing.T) {
 	store, _ := newTicketTestStore()
-	token := mustMintLiveTicket(t, store, sampleLiveTicketClaims())
-	payload, mac, _ := strings.Cut(token, ".")
-
-	// A 32-byte MAC is 43 base64 characters whose last one carries 4 data bits
-	// and 2 padding bits. Swapping in a sibling that shares the data bits but
-	// not the padding bits decodes to the SAME bytes under a lenient decoder,
-	// so it would give one ticket several spellings. It must be refused.
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-	last := strings.IndexByte(alphabet, mac[len(mac)-1])
-	if last < 0 {
-		t.Fatalf("MAC %q does not end in a URL-safe base64 character", mac)
+
+	// When the token's byte length is not a multiple of 3 its last base64
+	// character carries 2 or 4 padding bits. Swapping in a sibling that shares
+	// the data bits but not the padding bits decodes to the SAME bytes under a
+	// lenient decoder, so it would give one ticket several spellings. The
+	// Language length steers the byte length through all three residues.
+	checked := 0
+	for pad := range 3 {
+		claims := sampleLiveTicketClaims()
+		claims.Language = strings.Repeat("x", pad)
+		token := mustMintLiveTicket(t, store, claims)
+		raw, err := base64.RawURLEncoding.DecodeString(token)
+		if err != nil {
+			t.Fatalf("token is not base64url: %v", err)
+		}
+		var padBits uint
+		switch len(raw) % 3 {
+		case 1:
+			padBits = 4
+		case 2:
+			padBits = 2
+		default:
+			continue // no padding bits, so no alternative spelling exists
+		}
+		mask := 1<<padBits - 1
+		last := strings.IndexByte(alphabet, token[len(token)-1])
+		if last < 0 {
+			t.Fatalf("token %q does not end in a URL-safe base64 character", token)
+		}
+		for sibling := last &^ mask; sibling < last&^mask+mask+1; sibling++ {
+			if sibling == last {
+				continue
+			}
+			variant := token[:len(token)-1] + string(alphabet[sibling])
+			lenient, err := base64.RawURLEncoding.DecodeString(variant)
+			if err != nil || !bytes.Equal(lenient, raw) {
+				t.Fatalf("test premise broken: a lenient decoder should read %q as the same bytes (err %v)", variant, err)
+			}
+			if got, ok := store.Redeem(variant); ok {
+				t.Fatalf("non-canonical spelling accepted: %+v", got)
+			}
+			checked++
+		}
+		if _, ok := store.Redeem(token); !ok {
+			t.Fatalf("canonical token rejected")
+		}
 	}
-	for sibling := last &^ 3; sibling < last&^3+4; sibling++ {
-		if sibling == last {
-			continue
-		}
-		variant := payload + "." + mac[:len(mac)-1] + string(alphabet[sibling])
-		if _, err := base64.RawURLEncoding.DecodeString(variant[len(payload)+1:]); err != nil {
-			t.Fatalf("test premise broken: a lenient decoder should accept %q: %v", variant, err)
-		}
-		if got, ok := store.Redeem(variant); ok {
-			t.Fatalf("non-canonical MAC spelling accepted: %+v", got)
-		}
-	}
-	if _, ok := store.Redeem(token); !ok {
-		t.Fatalf("canonical token rejected")
+	if checked == 0 {
+		t.Fatalf("no non-canonical spelling was exercised")
 	}
 }
 
@@ -290,6 +371,9 @@ func TestLiveTicketGarbageTokens(t *testing.T) {
 		strings.Repeat("A", 2048) + "." + strings.Repeat("A", 2048),
 		"Bearer abc.def",
 		"live-ticket.abc",
+		strings.Repeat("A", 28), // exactly nonce + tag, an empty ciphertext of zeros
+		strings.Repeat("A", 128),
+		strings.Repeat("_", 64),
 	} {
 		if got, ok := store.Redeem(token); ok {
 			t.Fatalf("Redeem(%.40q) = true (%+v), want false", token, got)
@@ -297,16 +381,23 @@ func TestLiveTicketGarbageTokens(t *testing.T) {
 	}
 }
 
-func TestLiveTicketRejectsValidMACOverMalformedClaims(t *testing.T) {
+func TestLiveTicketRejectsAuthenticTicketWithMalformedClaims(t *testing.T) {
 	store, clock := newTicketTestStore()
-	sign := func(payload string) string { return payload + "." + store.sign(payload) }
-	encode := func(raw string) string { return base64.RawURLEncoding.EncodeToString([]byte(raw)) }
-	claimsJSON := func(c liveTicketClaims) string {
+	// seal is the store's own authenticated encryption, so each token below is
+	// genuinely the store's output; only what it carries is wrong.
+	seal := func(plaintext []byte) string {
+		token, err := store.seal(plaintext)
+		if err != nil {
+			t.Fatalf("seal: %v", err)
+		}
+		return token
+	}
+	sealClaims := func(c liveTicketClaims) string {
 		raw, err := json.Marshal(c)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		return encode(string(raw))
+		return seal(raw)
 	}
 
 	good := sampleLiveTicketClaims()
@@ -320,17 +411,17 @@ func TestLiveTicketRejectsValidMACOverMalformedClaims(t *testing.T) {
 	expired.Exp = clock.cur.Unix() - 1
 
 	// Sanity: the helper really does produce a redeemable token, so the
-	// rejections below are about the claims, not the signing.
-	if _, ok := store.Redeem(sign(claimsJSON(good))); !ok {
-		t.Fatalf("hand-signed well-formed ticket was rejected")
+	// rejections below are about the claims, not the sealing.
+	if _, ok := store.Redeem(sealClaims(good)); !ok {
+		t.Fatalf("hand-sealed well-formed ticket was rejected")
 	}
 
 	cases := map[string]string{
-		"not json":      sign(encode("this is not json")),
-		"json array":    sign(encode("[1,2,3]")),
-		"empty payload": sign(""),
-		"no nonce":      sign(claimsJSON(noNonce)),
-		"already past":  sign(claimsJSON(expired)),
+		"not json":        seal([]byte("this is not json")),
+		"json array":      seal([]byte("[1,2,3]")),
+		"empty plaintext": seal(nil),
+		"no nonce":        sealClaims(noNonce),
+		"already past":    sealClaims(expired),
 	}
 	for name, token := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -341,13 +432,13 @@ func TestLiveTicketRejectsValidMACOverMalformedClaims(t *testing.T) {
 	}
 }
 
-func TestLiveTicketSignedByDifferentStoreKeyIsRejected(t *testing.T) {
+func TestLiveTicketSealedByDifferentStoreKeyIsRejected(t *testing.T) {
 	issuer, _ := newTicketTestStore()
 	verifier, _ := newTicketTestStore()
 	token := mustMintLiveTicket(t, issuer, sampleLiveTicketClaims())
 
 	if got, ok := verifier.Redeem(token); ok {
-		t.Fatalf("a store redeemed a ticket signed with another store's key: %+v", got)
+		t.Fatalf("a store redeemed a ticket sealed with another store's key: %+v", got)
 	}
 	// The rejection must not have burned the nonce on the issuing store.
 	if _, ok := issuer.Redeem(token); !ok {
