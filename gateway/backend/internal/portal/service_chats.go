@@ -551,6 +551,12 @@ type ChatAudioSettings struct {
 	// Declared last, after Stream, on purpose: a field added later must not move an
 	// existing chat's serialized bytes.
 	KeepLastAudio *int `json:"keep_last_audio,omitempty"`
+	// Language is the ISO-639-1-ish code of the language to speak (e.g. "de"), the twin
+	// of ChatTranscriptionSettings.Language; "" leaves the model on its default. It rides
+	// the body as a top-level "language" field, which audio.cpp applies per model and
+	// silently drops where the model has no such parameter. Declared after KeepLastAudio,
+	// last, for the same reason: a stored chat's serialized bytes must not move.
+	Language string `json:"language,omitempty"`
 }
 
 // ChatTranscriptionSettings are the speech-to-text knobs a portal

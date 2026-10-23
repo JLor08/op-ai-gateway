@@ -392,8 +392,8 @@ func speechAudioMediaTypeOf(contentType string) bool {
 // message's text. response_format is NOT stated -- the endpoint answers WAV when it
 // is absent and refuses every other value (validateSpeechRequest), so there is
 // nothing to choose and an unset field is omitted, the discipline imageRequestFields
-// keeps for every knob. The set first-class settings (voice when non-empty, speed
-// when set) come from the thread's ChatAudioSettings; an unset one is omitted so
+// keeps for every knob. The set first-class settings (voice and language when
+// non-empty, speed when set) come from the thread's ChatAudioSettings; an unset one is omitted so
 // audio.cpp stays on its own default rather than being handed an inert zero.
 //
 // Everything else -- the OpenAI instructions field and any audio.cpp-native knob --
@@ -402,7 +402,7 @@ func speechAudioMediaTypeOf(contentType string) bool {
 // (speechReservedFields, matched ignoring case because the readers of this body
 // decode case-insensitively) is REJECTED with errSpeechPassthroughReserved and no
 // body is returned. A key that repeats a first-class setting which IS set (voice,
-// speed, again ignoring case) is not sent a second time: the first-class control
+// speed, language, again ignoring case) is not sent a second time: the first-class control
 // is the visible one, so it wins; with it unset, the passthrough key is the only
 // statement of it and goes through.
 //
@@ -442,6 +442,9 @@ func speechBodyFields(prep PrepareRunResult) (map[string]any, error) {
 	}
 	if audio.Speed != nil {
 		body["speed"] = *audio.Speed
+	}
+	if audio.Language != "" {
+		body["language"] = audio.Language
 	}
 	for _, key := range passthroughKeys {
 		if hasKeyFold(body, key) {

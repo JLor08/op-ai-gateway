@@ -244,6 +244,62 @@ func TestBuildSpeechBodyFirstClassSettingWinsOverAPassthroughTwin(t *testing.T) 
 	}
 }
 
+// The thread's speech language (the twin of the transcription composer's language) is a
+// first-class top-level "language" field: forwarded when set, omitted when not, and --
+// like voice and speed -- the visible control that wins over a passthrough twin, which is
+// not sent a second time (not even under another case). `language` is not a reserved
+// field, so with the control unset a passthrough language is still the only statement of it.
+func TestBuildSpeechBodyLanguage(t *testing.T) {
+	build := func(audio *portal.ChatAudioSettings) (map[string]any, []byte) {
+		t.Helper()
+		prep := speechRunPrep()
+		prep.Settings.Audio = audio
+		raw, err := buildSpeechBody(prep)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decodeSpeechBody(t, raw), raw
+	}
+
+	t.Run("set is forwarded top-level", func(t *testing.T) {
+		body, raw := build(&portal.ChatAudioSettings{Language: "de"})
+		if body["language"] != "de" || len(body) != 3 {
+			t.Fatalf("want model/input/language=de, got: %s", raw)
+		}
+	})
+
+	t.Run("unset is omitted", func(t *testing.T) {
+		body, raw := build(&portal.ChatAudioSettings{Voice: "alloy"})
+		if _, ok := body["language"]; ok {
+			t.Fatalf("an unset language must be omitted, not sent: %s", raw)
+		}
+	})
+
+	t.Run("first-class wins over a passthrough twin and is sent once", func(t *testing.T) {
+		for _, twin := range []string{"language", "Language", "LANGUAGE"} {
+			body, raw := build(&portal.ChatAudioSettings{
+				Language:    "de",
+				Passthrough: map[string]json.RawMessage{twin: json.RawMessage(`"en"`)},
+			})
+			if body["language"] != "de" || len(body) != 3 {
+				t.Fatalf("twin %q: the first-class language must win, got: %s", twin, raw)
+			}
+			if n := strings.Count(strings.ToLower(string(raw)), `"language"`); n != 1 {
+				t.Fatalf("twin %q: language must be sent exactly once, got %d in %s", twin, n, raw)
+			}
+		}
+	})
+
+	t.Run("a passthrough language goes through when the control is unset", func(t *testing.T) {
+		body, raw := build(&portal.ChatAudioSettings{
+			Passthrough: map[string]json.RawMessage{"language": json.RawMessage(`"en"`)},
+		})
+		if body["language"] != "en" {
+			t.Fatalf("language is not reserved, the passthrough one must go through: %s", raw)
+		}
+	})
+}
+
 // A passthrough value that is not valid JSON cannot be marshalled into the body;
 // buildSpeechBody reports it instead of sending a broken request.
 func TestBuildSpeechBodyReportsAnInvalidPassthroughValue(t *testing.T) {
