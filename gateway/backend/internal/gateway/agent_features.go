@@ -131,6 +131,23 @@ const RuntimeVoicesFeature = "runtime_voices"
 // TestMultipartProxyFeatureName pins this side.
 const multipartProxyFeature = "multipart_proxy"
 
+// fullduplexProxyFeature is the agent-declared capability meaning: this agent's
+// runtime router relays a full-duplex, chunked request body to the child it keys
+// on the model in the path -- its /live/{model} route, the native route behind live
+// transcription (POST /v1/audio/transcriptions/live on audio.cpp). Like
+// multipartProxyFeature it is on the agent's list only, not on gatewayAgentFeatures,
+// and the GATEWAY gates real behavior on it, fail-closed: a live-transcription
+// ticket is minted for an agent target only on positive evidence the agent declared
+// it (the ticket endpoint, handlePortalLiveTranscriptionTicket). Trying the route
+// instead cannot work: a router without it answers 404 for /live/{model}, the same
+// status it answers an unmanaged model with, so the failure could not be told from
+// an unknown model.
+//
+// The agent module cannot import this package, so the agent names the identical
+// string in its own registry (server-agent/internal/agent/features.go). The two
+// spellings must stay equal; TestFullduplexProxyFeatureName pins this side.
+const fullduplexProxyFeature = "fullduplex_proxy"
+
 // agentFeaturesDTO is the GET /api/agent/v1/features response body. Unlike
 // AgentProxyRoutesDTO/AgentRuntimeConfigDTO, the etag is carried ONLY in the
 // ETag header (see handleAgentFeatures) -- there is no in-body etag field,
