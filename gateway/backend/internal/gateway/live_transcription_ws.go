@@ -279,11 +279,21 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 // from pr. The native provider must offer the optional duplex capability (the
 // Multiplexer over the OpenAI-compatible client does); a provider without it is a
 // clean ErrUnavailable, never a panic.
+//
+// The per-mapping upstream credential (target.APIToken / APITokenHeader) is attached
+// to ctx first, exactly as the buffered native path does before ProxyNative: a child
+// that needs a token (a direct audio_cpp server with an API key, or an agent-managed
+// child launched with ${API_TOKEN}) would otherwise 401/403 the live request and the
+// session would loud-zero while the same model's buffered transcription works. The
+// plain upstreamAuthCtx suffices -- the live relay forwards no client headers (raw
+// PCM) -- and it is a no-op for a token-less target. Wrapping only adds a value, so
+// the caller's cancellation still propagates.
 func (s *Server) proxyLiveDuplex(ctx context.Context, claims liveTicketClaims, pr *io.PipeReader) (*provider.ProxyResponse, error) {
 	duplex, ok := s.Provider.(provider.NativeDuplexProxyClient)
 	if !ok {
 		return nil, fmt.Errorf("%w: live transcription duplex relay not supported by the native provider", provider.ErrUnavailable)
 	}
+	ctx = s.upstreamAuthCtx(ctx, claims.Target)
 	return duplex.ProxyNativeDuplex(ctx, claims.Target, liveUpstreamPath(claims), pr, liveUpstreamContentType)
 }
 

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
@@ -38,6 +39,9 @@ type mockLiveChild struct {
 	gotPath  string
 	gotQuery string
 	gotBytes int
+	// gotHeader is a copy of the inbound request headers, so a test can assert which
+	// upstream credential (if any) the gateway attached.
+	gotHeader http.Header
 	// emitPartial, when set, makes the child emit a transcript.text.partial before
 	// the done event, to exercise the partial relay.
 	emitPartial bool
@@ -62,6 +66,7 @@ func (c *mockLiveChild) serve(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.gotPath = r.URL.Path
 	c.gotQuery = r.URL.RawQuery
+	c.gotHeader = r.Header.Clone()
 	emitPartial := c.emitPartial
 	emitError := c.emitError
 	statusCode := c.statusCode
@@ -136,6 +141,13 @@ func (c *mockLiveChild) path() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.gotPath
+}
+
+// header returns the first value of the named inbound request header ("" when absent).
+func (c *mockLiveChild) header(name string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gotHeader.Get(name)
 }
 
 // newLiveTestServer builds a test Server whose native provider is a real
@@ -680,5 +692,104 @@ func TestLiveTranscriptionNon2xxUpstreamErrorRow(t *testing.T) {
 	}
 	if ev.HTTPStatus != http.StatusNotFound {
 		t.Fatalf("httpStatus = %d, want 404", ev.HTTPStatus)
+	}
+}
+
+// TestLiveTranscriptionAppliesUpstreamCredential proves the live relay attaches the
+// per-mapping upstream credential to its upstream request -- exactly as the buffered
+// native path does -- so a mapping whose child needs a token (a direct audio_cpp
+// server with an API key, or an agent-managed child launched with ${API_TOKEN}) is
+// reachable live. The ticket carries a sealed target.APIToken; the real
+// OpenAI-compatible client (through the real upstreamAuthCtx -> applyUpstreamAuth
+// chain) must deliver it to the child, and a token-less target must send none.
+func TestLiveTranscriptionAppliesUpstreamCredential(t *testing.T) {
+	const token = "live-upstream-token"
+	cases := []struct {
+		name         string
+		providerKind string
+		apiToken     string
+		tokenHeader  string
+		wantHeader   string // the header expected to carry the credential ("" = none)
+		wantValue    string
+		wantAbsent   []string // headers that must NOT be sent
+	}{
+		{
+			name:         "direct audio_cpp default bearer",
+			providerKind: "audio_cpp",
+			apiToken:     token,
+			wantHeader:   "Authorization",
+			wantValue:    "Bearer " + token,
+			wantAbsent:   []string{"X-Api-Key"},
+		},
+		{
+			name:         "agent-managed target default bearer",
+			providerKind: routing.ProviderServerAgent,
+			apiToken:     token,
+			wantHeader:   "Authorization",
+			wantValue:    "Bearer " + token,
+		},
+		{
+			name:         "custom credential header",
+			providerKind: "audio_cpp",
+			apiToken:     token,
+			tokenHeader:  "X-Api-Key",
+			wantHeader:   "X-Api-Key",
+			wantValue:    token,
+			wantAbsent:   []string{"Authorization"},
+		},
+		{
+			name:         "token-less target sends no credential",
+			providerKind: "audio_cpp",
+			wantAbsent:   []string{"Authorization", "X-Api-Key"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newLiveTestServer(t)
+			cipher := newDispatchCipher(t)
+			srv.Cipher = cipher
+			child := newMockLiveChild(t)
+			ts := httptest.NewServer(srv)
+			defer ts.Close()
+
+			target := liveTarget(child, tc.providerKind)
+			if tc.apiToken != "" {
+				sealed, err := capture.SealSecret(cipher, false, tc.apiToken)
+				if err != nil {
+					t.Fatalf("seal token: %v", err)
+				}
+				target.APIToken = sealed
+				target.APITokenHeader = tc.tokenHeader
+			}
+			ticket := mintLiveTicket(t, srv, target, 16000, 1, "s16le", "")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			conn, _, err := dialLive(t, ctx, ts.URL, ticket, nil)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.CloseNow()
+
+			// A round trip (PCM up, delta down) proves the child received and handled the
+			// upstream request, so its recorded headers are the ones the relay sent.
+			if err := conn.Write(ctx, websocket.MessageBinary, make([]byte, 320)); err != nil {
+				t.Fatalf("send pcm: %v", err)
+			}
+			if _, err := readLiveMsg(t, ctx, conn); err != nil {
+				t.Fatalf("read delta: %v", err)
+			}
+
+			if tc.wantHeader != "" {
+				if got := child.header(tc.wantHeader); got != tc.wantValue {
+					t.Fatalf("upstream %s = %q, want %q (the per-mapping credential never reached the live upstream)", tc.wantHeader, got, tc.wantValue)
+				}
+			}
+			for _, name := range tc.wantAbsent {
+				if got := child.header(name); got != "" {
+					t.Fatalf("upstream %s = %q, want none", name, got)
+				}
+			}
+		})
 	}
 }
