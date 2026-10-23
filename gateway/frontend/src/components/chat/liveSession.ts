@@ -48,16 +48,16 @@ export type LiveAction =
   | { type: 'reset' };
 
 // The phases in which a session is alive: it has a microphone or a socket, or is about to.
-const RUNNING: readonly LiveTranscriptionPhase[] = [
+const RUNNING: ReadonlySet<LiveTranscriptionPhase> = new Set([
   'connecting',
   'listening',
   'reconnecting',
   'finalizing',
-];
+]);
 
 /** Whether a session is in flight (anything but idle and error). */
 export function liveSessionRunning(state: LiveTranscriptionPhase): boolean {
-  return RUNNING.includes(state);
+  return RUNNING.has(state);
 }
 
 /**

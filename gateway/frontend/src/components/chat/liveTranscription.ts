@@ -413,6 +413,44 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
     };
   };
 
+  // After the microphone and the worklet settle, validate them and bring the capture graph
+  // up. Returns false when the session was aborted while the user was answering the
+  // permission prompt (the caller stops before minting a ticket); throws LiveFailure on a
+  // denied or failed microphone, a failed worklet load, or a context the browser will not run.
+  const bringUpCapture = async (
+    media: PromiseSettledResult<MediaStream>,
+    worklet: PromiseSettledResult<void>,
+    ctx: AudioContext,
+    resumed: Promise<void | undefined>,
+  ): Promise<boolean> => {
+    if (media.status === 'fulfilled') {
+      // Held from here, and released with the rest -- or at once if the session is already over
+      // (aborted while the user was answering the permission prompt), which would leave the
+      // microphone on with nothing to stop it.
+      if (over) stopTracks(media.value);
+      else stream = media.value;
+    }
+    if (over) return false;
+    if (media.status === 'rejected') {
+      throw new LiveFailure(describeError(media.reason), {
+        kind: isPermissionDenied(media.reason) ? 'denied' : 'capture',
+      });
+    }
+    if (worklet.status === 'rejected') {
+      throw new LiveFailure(describeError(worklet.reason), { kind: 'capture' });
+    }
+    // A context the browser did not let run (it was resumed in the gesture above, and has had
+    // all the time the permission prompt took) captures nothing: the worklet is never called,
+    // and the session would sit "listening" to silence until its grace period ran out.
+    if (ctx.state !== 'running') await settleWithin(resumed, CONTEXT_RUN_WAIT_MS);
+    if (over) return false;
+    if (ctx.state !== 'running') {
+      throw new LiveFailure('the browser would not start the audio capture', { kind: 'capture' });
+    }
+    connectCapture(ctx, media.value);
+    return true;
+  };
+
   const start = async () => {
     // Everything up to the first await is synchronous, so it is inside the user's gesture.
     const Context = audioContextConstructor();
@@ -430,31 +468,7 @@ export function createLiveSession(args: LiveSessionArgs): LiveSession {
       mediaDevices.getUserMedia({ audio: true }),
       ctx.audioWorklet.addModule(workletUrl),
     ]);
-    if (media.status === 'fulfilled') {
-      // Held from here, and released with the rest -- or at once if the session is already over
-      // (aborted while the user was answering the permission prompt), which would leave the
-      // microphone on with nothing to stop it.
-      if (over) stopTracks(media.value);
-      else stream = media.value;
-    }
-    if (over) return;
-    if (media.status === 'rejected') {
-      throw new LiveFailure(describeError(media.reason), {
-        kind: isPermissionDenied(media.reason) ? 'denied' : 'capture',
-      });
-    }
-    if (worklet.status === 'rejected') {
-      throw new LiveFailure(describeError(worklet.reason), { kind: 'capture' });
-    }
-    // A context the browser did not let run (it was resumed in the gesture above, and has had
-    // all the time the permission prompt took) captures nothing: the worklet is never called,
-    // and the session would sit "listening" to silence until its grace period ran out.
-    if (ctx.state !== 'running') await settleWithin(resumed, CONTEXT_RUN_WAIT_MS);
-    if (over) return;
-    if (ctx.state !== 'running') {
-      throw new LiveFailure('the browser would not start the audio capture', { kind: 'capture' });
-    }
-    connectCapture(ctx, media.value);
+    if (!(await bringUpCapture(media, worklet, ctx, resumed))) return;
     let ticket: string;
     try {
       ({ ticket } = await args.api.createLiveTranscriptionTicket({

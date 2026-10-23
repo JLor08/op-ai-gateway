@@ -306,6 +306,7 @@ function LiveRecording({ t }: Readonly<{ t: Translation }>) {
         <Box
           role="region"
           aria-label={t.chatTranscriptionLiveTranscript}
+          aria-live="polite"
           sx={{
             minHeight: 56,
             maxHeight: 240,

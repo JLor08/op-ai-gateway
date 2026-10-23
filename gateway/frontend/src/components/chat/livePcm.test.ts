@@ -51,7 +51,7 @@ describe('LinearResampler', () => {
       const pieces = resampleInBlocks(new LinearResampler(inRate, outRate), input, blocks);
       // The fractional position is carried across blocks, so a cut changes nothing (not even
       // by a sample, which a position reset to 0 on every block would).
-      expect(pieces.length).toBe(whole.length);
+      expect(pieces).toHaveLength(whole.length);
       for (let i = 0; i < whole.length; i++) expect(pieces[i]).toBeCloseTo(whole[i], 5);
     }
   });

@@ -118,9 +118,9 @@ export class Pcm16Batcher {
   }
 
   push(samples: Float32Array, emit: (pcm: ArrayBuffer) => void): void {
-    for (let i = 0; i < samples.length; i++) {
+    for (const sample of samples) {
       // Explicitly little-endian: the wire format is s16le whatever the platform's byte order.
-      this.view.setInt16(this.filled * BYTES_PER_SAMPLE, toInt16(samples[i]), true);
+      this.view.setInt16(this.filled * BYTES_PER_SAMPLE, toInt16(sample), true);
       if (++this.filled === this.batchSamples) {
         const full = this.buffer;
         this.start();
