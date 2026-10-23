@@ -18,9 +18,10 @@
 #  could keep an armed plaintext gate extinguished against the attacker) -- and
 #  X-OP-Edge-Scheme. The sixth is SET from $scheme and never blanked -- it is the
 #  gateway's only unforgeable statement about the last hop, and a "" would make it
-#  useless. Nine blocks: server-80, server-443 and the WebSocket location, in each of
-#  the three deployable configurations (the two compose variants share locations.conf,
-#  so the nine live in eight physical text blocks).
+#  useless. Twelve blocks: server-80, server-443 and the two WebSocket locations (the
+#  agent stream and the live-transcription stream), in each of the three deployable
+#  configurations (the two compose variants share locations.conf, so the twelve live in
+#  ten physical text blocks).
 #  It also pins the structural invariants: `listen 80` and the ACME challenge location
 #  survive, `listen 443 ssl` exists, and the shared include is NOT a *.conf under
 #  conf.d/ (nginx auto-includes those at HTTP level, where `location` is illegal).
@@ -172,15 +173,15 @@ for entry in $CONFIGURATIONS; do
     done < "$work/hb.txt"
   done
   note "$name: $blocks header-setting block(s), all six directives present"
-  [ "$blocks" -eq 3 ] \
-    || bad "$name: expected 3 header-setting blocks (server-80, server-443, WebSocket location), found $blocks"
+  [ "$blocks" -eq 4 ] \
+    || bad "$name: expected 4 header-setting blocks (server-80, server-443, the agent and live-transcription WebSocket locations), found $blocks"
   total_blocks=$((total_blocks + blocks))
   IFS='
 '
 done
 IFS=$old_ifs
-note "total across the three configurations: $total_blocks (expected 9)"
-[ "$total_blocks" -eq 9 ] || bad "expected 9 header-setting blocks in total, found $total_blocks"
+note "total across the three configurations: $total_blocks (expected 12)"
+[ "$total_blocks" -eq 12 ] || bad "expected 12 header-setting blocks in total, found $total_blocks"
 
 # A blanked X-OP-Edge-Scheme anywhere is fatal, however it is written.
 for f in nginx/default.conf nginx/default.no-netbird.conf nginx/locations.conf "$CONFIGMAP"; do
@@ -218,6 +219,15 @@ for f in nginx/locations.conf "$work/k8s-locations.conf"; do
     || bad "$f: the ACME HTTP-01 challenge location is gone"
   grep -q 'location = /api/agent/v1/stream' "$f" \
     || bad "$f: the agent WebSocket location is gone -- the agent transport depends on it"
+  grep -q 'location = /api/portal/transcription-live ' "$f" \
+    || bad "$f: the live-transcription WebSocket location is gone -- the portal's live mode depends on it"
+  # The bearer live endpoint is a chunked FULL-DUPLEX POST: without an unbuffered request
+  # body nginx holds the PCM until the speaker stops and no transcript ever comes back.
+  awk '/^[ \t]*location[ \t]+~[ \t]+\^\/\(\?:openai\/\)\?v1\/audio\/transcriptions\/live\$/ { inb = 1 }
+       inb && /proxy_request_buffering[ \t]+off;/ { ok = 1 }
+       inb && /^[ \t]*}/ { inb = 0 }
+       END { exit ok ? 0 : 1 }' "$f" \
+    || bad "$f: the bearer live-transcription location is gone or no longer sets 'proxy_request_buffering off' -- full-duplex streaming depends on it"
 done
 grep -q '/etc/nginx/op-locations.conf' Dockerfile.frontend \
   || bad "Dockerfile.frontend: locations.conf is not installed at /etc/nginx/op-locations.conf"

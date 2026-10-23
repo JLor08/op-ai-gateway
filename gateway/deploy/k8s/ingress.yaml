@@ -25,6 +25,14 @@ metadata:
     # SSE streaming: disable proxy buffering so tokens flush immediately.
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # Not set on purpose: nginx.ingress.kubernetes.io/proxy-request-buffering. The BEARER
+    # live-transcription endpoint (POST /v1/audio/transcriptions/live, also under
+    # /openai/) is a chunked full-duplex request, and ingress-nginx buffers request bodies
+    # by default, which holds a live PCM stream back until it ends. The annotation is per
+    # Ingress, not per path, so setting it here would unbuffer every upload through this
+    # host; to keep buffering elsewhere, give those two paths their own Ingress carrying
+    # `proxy-request-buffering: "off"`. The portal's own live transcription (a WebSocket,
+    # which this Ingress already upgrades) is unaffected.
 spec:
   # Set to your cluster's Ingress controller class (e.g. nginx, traefik, ...).
   ingressClassName: nginx

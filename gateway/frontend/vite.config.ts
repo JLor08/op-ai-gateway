@@ -31,6 +31,16 @@ function portalRootRedirect() {
 }
 
 const proxy = {
+  // The live-transcription WebSocket (npm run dev and the e2e preview). It needs
+  // `ws: true` or the upgrade is never proxied, and it must NOT use the string
+  // shorthand below: that sets changeOrigin, which rewrites Host to the gateway's own
+  // host:port, while the gateway refuses a browser upgrade whose Origin host differs
+  // from the Host it sees (coder/websocket's default same-origin check). Leaving
+  // changeOrigin off passes the browser's Host through, as the production nginx does.
+  // The regex context keeps this to the WebSocket path only -- a plain prefix would
+  // also catch /api/portal/transcription-live-ticket -- and it has to stay ahead of
+  // '/api' because the first matching context wins.
+  '^/api/portal/transcription-live(?:\\?|$)': { target: GATEWAY, ws: true },
   '/api': GATEWAY,
   '/v1': GATEWAY,
   '/openai': GATEWAY,
