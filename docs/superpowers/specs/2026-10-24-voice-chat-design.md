@@ -167,6 +167,11 @@ Both registered on `s.mux` in `server.go` beside the live-transcription routes.
     (optional; when present they override the silence timer for that turn).
   - `{"type":"cancel"}` — stop the current turn's TTS / abandon the in-flight
     turn, return to listening.
+  - `{"type":"playback_done"}` — the client's audio player has finished playing
+    out the answer (its `StreamingPcmPlayer` drained — the #304 `onDrained`
+    signal). This is what lets the server end `draining` at true playout-done
+    rather than relay-done (§6.2); the server still owns the gate and applies its
+    own fallback, so a missing or late signal cannot wedge the session.
   - `{"type":"bye"}` — end the session cleanly.
 
 **Down (server → client):**
@@ -319,11 +324,28 @@ silence timer plus the per-chunk relay close are the source of truth.
 ### 6.2 Half-duplex loop prevention (the guarantee)
 While the state machine is in `speaking` **or** `draining`, inbound binary PCM
 frames are **discarded in the orchestrator** before they ever reach the ASR
-loopback — plus a short post-drain tail (`MicResumeTailMs`, ≈ 200–400 ms). This
-is enforced on the server, so no client behaviour can route TTS-era audio into
-the ASR. That is the whole "loop can never happen" guarantee; it needs no AEC
-and no client cooperation. (Barge-in in phase 4 will *deliberately* relax this
-under an explicit, bounded rule.)
+loopback. This is enforced on the server, so no client behaviour can route
+TTS-era audio into the ASR. That is the whole "loop can never happen" guarantee;
+it needs no AEC. (Barge-in in phase 4 will *deliberately* relax this under an
+explicit, bounded rule.)
+
+**`draining` must track playout, not relay.** The orchestrator relays the TTS PCM
+to the client **faster than real time** (it streams as fast as the TTS
+synthesizes), so "all audio relayed" (`audio_done`) is *not* "the user has
+stopped hearing it." If the gate ended at relay-done, the mic would re-open on a
+speaker setup while the answer is still audible — and feed straight back into the
+ASR. So `draining` ends at **true playout-done**: the client sends
+`{"type":"playback_done"}` when its `StreamingPcmPlayer` drains (the #304
+`onDrained` signal), and only then does the server apply the short
+`MicResumeTailMs` tail and return to `listening`. The gate stays
+**server-authoritative**: the server keeps discarding mic PCM for the whole
+`draining` period and decides when it ends — the client signal only tells it
+*when playout finished*. A **server-side fallback** bounds the wait so a missing
+or late signal cannot wedge the session: the server computes the relayed audio's
+duration (`pcmBytes ÷ byteRate` when the TTS byte-rate is cached, else a generous
+fixed cap) and ends `draining` at the later of that bound and the signal. This
+reuses the exact lesson from #304 ("gate *still playing* on the Web-Audio queue
+drain, not on stream completion").
 
 **A consequence that shapes admission:** because the loop is half-duplex, the
 three legs run *sequentially* within a turn — ASR (listen), then LLM (think),

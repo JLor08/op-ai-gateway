@@ -501,6 +501,47 @@ and close cleanly. The state machine body is Task 6.
 
 ---
 
+## Task 13: Playout-aware half-duplex drain (backend + frontend)
+
+**Added mid-execution (2026-10-24):** Task 8 surfaced a real hole in the loop
+guarantee — the backend ends `draining` at relay-done, but TTS streams faster
+than real time, so on a speaker setup the mic re-opens while the answer is still
+audible and feeds back into the ASR. Fix per spec §6.2 (updated): end `draining`
+at true playout-done via a client `playback_done` signal, server-authoritative
+with a byte-rate-duration fallback. Runs AFTER Task 8, BEFORE Task 9.
+
+**Files:**
+- Modify: `gateway/backend/internal/gateway/voice_chat_ws.go` (parse the
+  `{"type":"playback_done"}` up-control; in `draining`, hold the mic gate until
+  `playback_done` OR the fallback bound, then `MicResumeTailMs` → `listening`)
+- Modify: `gateway/frontend/src/components/chat/voiceSession.ts` (send
+  `{"type":"playback_done"}` when `StreamingPcmPlayer`/`speechPlayback` drains —
+  the #304 `onDrained` hook)
+- Test: `voice_chat_turn_test.go` / `voice_chat_machine_test.go` (backend),
+  `voiceSession.test.ts` (frontend)
+
+**Interfaces:**
+- Consumes: Task 6/7 state machine (`draining`, the mic gate), `parseVoiceUpControl`
+  (add `playback_done`), the TTS byte-rate the speech leg already knows
+  (`cachedOutputByteRate` / the relayed `pcmBytes`), `speechPlayback.onDrained`
+  (#304).
+- Produces: a `draining` exit gated on playout-done. The mic stays discarded for
+  the whole `draining` period (unchanged); only the EXIT condition changes.
+
+- [ ] **Step 1: Write the failing tests.** Backend: `TestVoiceDrainWaitsForPlaybackDone`
+  (after `audio_done`, the machine stays in `draining` / mic-gated until a
+  `{"type":"playback_done"}` up-frame arrives, then applies the tail → `listening`;
+  a binary PCM frame arriving after relay-done but before `playback_done` is
+  DISCARDED, not transcribed) and `TestVoiceDrainFallbackEndsWithoutSignal`
+  (no `playback_done` → `draining` ends after the server's duration-fallback bound,
+  not instantly, and not never). Frontend: `voiceSession sends playback_done when
+  the player drains` (drive the fake player's drain → assert a `{"type":"playback_done"}`
+  up-frame).
+- [ ] **Step 2: Run** the backend `-run 'TestVoiceDrain'` and the frontend vitest → FAIL.
+- [ ] **Step 3: Implement** the up-control + the backend drain-exit (signal-or-fallback) + the frontend send-on-drain.
+- [ ] **Step 4: Run** both → PASS (backend under `-race`).
+- [ ] **Step 5: Commit** `fix(voice-chat): end the half-duplex drain at playout-done, not relay-done`.
+
 ## Self-review notes
 
 - **Spec coverage:** WS + ticket (T1,T3,T5), co-load gate (T2), state machine +
