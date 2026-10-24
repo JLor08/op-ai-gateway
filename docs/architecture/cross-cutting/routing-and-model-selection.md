@@ -1355,9 +1355,10 @@ before the filter consulted clone voices. Treating it as *unknown and kept* (wha
 gets) would newly keep a cold clone in a narrowed pool, where it could win routing and answer a 500 for a voice it
 does not serve, so only clones that carry voice data join the classified set. **What remains is the base ADR-067
 free-text-voice risk, not the mixed-name misroute:** a voice that no classified candidate's cache lists leaves every
-candidate known-absent, so the filter stands aside and the upstream decides, and a never-listed clone, which a
-fail-open request can still land on (an offered name does not contain one in the steady state, because the offer fold
-below, a fail-closed AND, requires presets on file; a direct API call on a hidden name can reach it). A request that
+classified candidate known-absent, so the filter stands aside and the upstream decides; and a never-listed clone is
+unclassified, so a fail-open request can still land on it (an offered name does not contain one in the steady state,
+because the offer fold below, a fail-closed AND, requires presets on file; a direct API call on a hidden name can
+reach it). A request that
 names **no** voice is never filtered, and it is that fold, not this filter, that keeps it off a reference-only clone.
 The staleness is bounded as ADR-067 accepts for plain tts: a clone whose configuration changed while it was unloaded
 is classified by its last list until the next loaded tick rewrites it
