@@ -8180,6 +8180,14 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
   - Both exist **only while `live`**: with no audio playing there is nothing to mute, and a
     buffered run's cancel is the composer's Stop. A control whose handler is not supplied is not
     drawn. The user explicitly asked for both, as distinct controls.
+  - The controls **persist until the streamed tail has fully played out**, not just until the run
+    commits (issue #281): a completed streaming run commits (`streaming` goes false and the saved
+    `AudioTurn` player appears) while its Web-Audio tail is still audible for several seconds. The
+    playback keeps the completed run's session in a **draining** state instead of dropping it, so
+    Mute and a tail-stop still reach it; `runAudioLive` stays true across the tail and the controls
+    ride beside the saved player until `SpeechPlayback.onDrained` fires (the last scheduled source
+    ends, or a bounded fallback for a context frozen mid-tail). In this phase Abort is `abortAudio`
+    (silence the tail only — the stored answer and billing are untouched), not the run's cancel.
 - **(j) The not-stored bubble: one placeholder and a regenerate, nothing else.** A finished
   answer that carries the marker (`hasRemovedAudio`) and no audio renders `AudioNotStoredTurn`: a
   "the audio for this answer is not stored" line plus **regenerate**, with no player and no

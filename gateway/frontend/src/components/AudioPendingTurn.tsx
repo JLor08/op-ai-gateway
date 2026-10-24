@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { Button, Stack } from '@mui/material';
 import type { Translation } from './shared/types';
 import { RunPendingTurn } from './RunPendingTurn';
+import { AudioTailControls } from './AudioTailControls';
 
 // The composer during a speech run's wait -- the audio twin of ImagePendingTurn, for
 // the same reason. A BUFFERED speech run (`/v1/audio/speech` answering one complete WAV)
@@ -58,23 +58,7 @@ export function AudioPendingTurn({
       noNewsLabel={live ? t.chatAudioStreamLiveHint : t.chatAudioNoIntermediateNews}
       actions={
         live && (onMute || onAbort) ? (
-          <Stack direction="row" sx={{ mt: 1.25, gap: 1, flexWrap: 'wrap' }}>
-            {onMute && (
-              <Button
-                variant="outlined"
-                size="small"
-                aria-pressed={muted}
-                onClick={() => onMute(!muted)}
-              >
-                {muted ? t.chatAudioUnmute : t.chatAudioMute}
-              </Button>
-            )}
-            {onAbort && (
-              <Button variant="outlined" size="small" color="error" onClick={onAbort}>
-                {t.chatAudioAbort}
-              </Button>
-            )}
-          </Stack>
+          <AudioTailControls t={t} muted={muted} onMute={onMute} onAbort={onAbort} />
         ) : undefined
       }
     />

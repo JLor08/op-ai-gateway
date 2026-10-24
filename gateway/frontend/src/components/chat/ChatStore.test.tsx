@@ -49,9 +49,12 @@ const playback = vi.hoisted(() => ({
   prime: vi.fn(),
   push: vi.fn((..._args: unknown[]) => true),
   end: vi.fn(),
+  abort: vi.fn(),
   stopAll: vi.fn(),
   isLive: vi.fn(() => false),
+  isPlayingOut: vi.fn(() => false),
   setMuted: vi.fn(),
+  onDrained: vi.fn(),
 }));
 vi.mock('./speechPlayback', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./speechPlayback')>()),
@@ -346,6 +349,9 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       </button>
       <button type="button" onClick={() => c.muteAudio('c1', false)}>
         unmute-audio
+      </button>
+      <button type="button" onClick={() => c.abortAudio('c1')}>
+        abort-audio
       </button>
       <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, stream: false }))}>
         set-audio-stream-off
@@ -4263,10 +4269,20 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     beforeEach(() => {
       playback.prime.mockClear();
       playback.end.mockClear();
+      playback.abort.mockClear();
       playback.stopAll.mockClear();
       playback.setMuted.mockClear();
+      playback.onDrained.mockClear();
       playback.push.mockReset().mockReturnValue(true);
     });
+
+    // The chat's registered drain callback (useChatRuns.onDrained): what the playback calls when
+    // a completed run's tail has fully played out. In jsdom the playback is a stand-in, so a test
+    // fires this itself to model the tail finishing.
+    const fireDrain = (chatId: string) => {
+      const cb = playback.onDrained.mock.calls.at(-1)?.[0] as ((id: string) => void) | undefined;
+      act(() => cb?.(chatId));
+    };
 
     it('asks whether the picked speech model may stream, and offers streaming only on a yes', async () => {
       chatApi = makeChatApi(speechThread());
@@ -4428,7 +4444,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(playback.push).not.toHaveBeenCalled();
     });
 
-    it('lets a completed run play out, and shows the finished turn', async () => {
+    it('keeps the run marked live through the draining tail, then clears it on drain', async () => {
       const { es } = await startRun();
       act(() => es.emit('audio', chunk(0)));
       expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
@@ -4442,12 +4458,79 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         }),
       );
       expect(playback.end).toHaveBeenCalledWith('c1', true);
-      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+      // The saved player appears, AND the run stays marked live -- the tail is still playing out,
+      // so the live controls must persist (issue #281's bug was that they vanished here).
       await waitFor(() =>
         expect(screen.getByTestId('last-parts').textContent).toBe(
           'audio_url:data:audio/wav;base64,UklG',
         ),
       );
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
+
+      // The tail finishes: the playback signals the drain, and only then does the mark clear.
+      fireDrain('c1');
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+    });
+
+    it('clears the run-live mark at once for a completed BUFFERED run (nothing played out)', async () => {
+      // A buffered run never streams a chunk, so it is never live; its drain fires at once from
+      // end(), and the mark is false throughout.
+      const { es } = await startRun();
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+      act(() =>
+        es.emit('done', {
+          content: '',
+          status: 'completed',
+          kind: 'speech',
+          content_parts: [{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } }],
+        }),
+      );
+      expect(playback.end).toHaveBeenCalledWith('c1', true);
+      fireDrain('c1'); // the stand-in's end() would have drained immediately
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+    });
+
+    // Abort once the run is already done and only the tail is playing (issue #281): it silences
+    // the tail (playback.abort) and clears the live mark, and does NOT cancel the run or touch
+    // what is stored.
+    it('aborts the draining tail without cancelling the run or touching the stored answer', async () => {
+      const { es } = await startRun();
+      act(() => es.emit('audio', chunk(0)));
+      act(() =>
+        es.emit('done', {
+          content: '',
+          status: 'completed',
+          kind: 'speech',
+          content_parts: [{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } }],
+        }),
+      );
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
+
+      fireEvent.click(screen.getByRole('button', { name: 'abort-audio' }));
+      expect(playback.abort).toHaveBeenCalledWith('c1');
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+      // The run was never cancelled and the saved answer is untouched.
+      expect(chatApi.spies.cancelChatRun).not.toHaveBeenCalled();
+      expect(screen.getByTestId('last-parts').textContent).toBe(
+        'audio_url:data:audio/wav;base64,UklG',
+      );
+    });
+
+    it('still reaches the playback with a mute during the draining tail', async () => {
+      const { es } = await startRun();
+      act(() => es.emit('audio', chunk(0)));
+      act(() =>
+        es.emit('done', {
+          content: '',
+          status: 'completed',
+          kind: 'speech',
+          content_parts: [{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } }],
+        }),
+      );
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
+      fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+      expect(playback.setMuted).toHaveBeenLastCalledWith('c1', true);
+      expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
     });
 
     it.each([
@@ -4500,15 +4583,24 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getByTestId('run-audio-live').textContent).toBe('true');
       });
 
-      it.each([
-        ['completes', { status: 'completed', error: '' }],
-        ['is canceled', { status: 'canceled', error: '' }],
-      ])('does not outlive the run when it %s', async (_name, terminal) => {
+      it('clears the mute at once when the run is canceled (no tail to play out)', async () => {
         const { es } = await startRun();
         act(() => es.emit('audio', chunk(0)));
         fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
         expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
-        act(() => es.emit('done', { content: '', kind: 'speech', ...terminal }));
+        act(() => es.emit('done', { content: '', status: 'canceled', error: '', kind: 'speech' }));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
+      });
+
+      it('keeps the mute through a completed run’s draining tail, clearing it on drain', async () => {
+        const { es } = await startRun();
+        act(() => es.emit('audio', chunk(0)));
+        fireEvent.click(screen.getByRole('button', { name: 'mute-audio' }));
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
+        act(() => es.emit('done', { content: '', status: 'completed', error: '', kind: 'speech' }));
+        // The tail is still playing out (muted), so the mark stays until it drains.
+        expect(screen.getByTestId('run-audio-muted').textContent).toBe('true');
+        fireDrain('c1');
         expect(screen.getByTestId('run-audio-muted').textContent).toBe('false');
       });
     });

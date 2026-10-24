@@ -20,6 +20,7 @@ import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
 import { AudioTurn } from './AudioTurn';
 import { AudioPendingTurn } from './AudioPendingTurn';
+import { AudioTailControls } from './AudioTailControls';
 import { AudioNotStoredTurn } from './AudioNotStoredTurn';
 import { TranscriptionPendingTurn } from './TranscriptionPendingTurn';
 
@@ -108,15 +109,16 @@ function ChatMessageComponent({
   // passed through untouched -- see ImagePendingTurn for how it is
   // interpolated into a ticking display.
   elapsedMs?: number;
-  // Whether this streaming SPEECH run is playing its audio live right now (ChatStore's
-  // runAudioLive, gated into the one streaming row like `kind`): the pending turn then
-  // says so rather than promising that no news is coming. Only meaningful with
-  // `streaming` and kind "speech".
+  // Whether this SPEECH run's audio is still playing out right now (ChatStore's runAudioLive,
+  // which stays true through the streamed tail until it drains -- #281). Supplied to the one row
+  // that owns the audio: while it is still streaming (the pending bubble says so instead of
+  // promising no news is coming), AND while its committed tail drains beside the saved player.
   audioLive?: boolean;
-  // The live speech run's controls (#281), threaded to the pending turn like `audioLive`
-  // and, like it, supplied only to the one streaming row: whether the user has muted the
-  // playback (ChatStore's runAudioMuted), the Mute toggle (called with the state it asks for)
-  // and the Abort (the store's ordinary stop). The pending turn draws them only while live.
+  // The live speech run's controls (#281), threaded alongside `audioLive`: whether the user has
+  // muted the playback (ChatStore's runAudioMuted), the Mute toggle (called with the state it asks
+  // for) and the Abort. They ride the pending bubble while the run streams, and the saved player
+  // while its tail drains; before the run commits Abort is the store's own stop (the cancel),
+  // afterwards it is the tail-stop (`abortAudio`). Drawn only while the audio is still playing out.
   audioMuted?: boolean;
   onMuteAudio?: (muted: boolean) => void;
   onAbortAudio?: () => void;
@@ -404,6 +406,20 @@ function ChatMessageComponent({
           />
         )}
         {audioUrls.length > 0 && <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />}
+        {/* The streamed tail may still be playing out after the run has committed and its saved
+            player above has appeared (#281): while it is (audioLive), the Mute/Stop controls ride
+            beside the player so the user can still silence it, exactly as the live pending bubble
+            offered them before the commit. They are gone once the tail has drained (audioLive
+            false), and a buffered answer -- never live -- never shows them. Abort here is the
+            tail-stop, not a cancel (the run is already done). */}
+        {audioUrls.length > 0 && audioLive === true && (
+          <AudioTailControls
+            t={t}
+            muted={audioMuted === true}
+            onMute={onMuteAudio}
+            onAbort={onAbortAudio}
+          />
+        )}
         {audioRemoved && (
           <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />
         )}

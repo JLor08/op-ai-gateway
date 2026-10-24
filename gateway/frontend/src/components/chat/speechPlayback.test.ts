@@ -361,11 +361,14 @@ describe('createSpeechPlayback', () => {
     playback.push('c1', 'r1', chunk(0));
     playback.end('c1', true);
     expect(playback.isLive('c1')).toBe(false);
+    // The run is no longer "live" (it is done), but its queued tail is still playing out.
+    expect(playback.isPlayingOut('c1')).toBe(true);
     expect(sources[0].stopped).toBe(false); // the tail of the audio is still playing
 
     playback.push('c2', 'r2', chunk(0));
     playback.end('c2', false); // a Stop or an error: no more sound
     expect(sources[1].stopped).toBe(true);
+    expect(playback.isPlayingOut('c2')).toBe(false);
   });
 
   it('is silent, and never throws, where the browser has no audio context', () => {
@@ -524,6 +527,111 @@ describe('createSpeechPlayback', () => {
       const live = setup();
       expect(() => live.playback.setMuted('nope', true)).not.toThrow();
       expect(live.gains).toHaveLength(0);
+    });
+  });
+
+  // The draining tail (#281): a completed run's queued audio keeps playing after the run commits
+  // and its saved player appears. The session is KEPT alive -- reachable by Mute and a tail-stop
+  // -- in a draining state until the last scheduled source ends, and only then is the drain
+  // signalled (onDrained) and the session dropped. This is what keeps the live controls on screen
+  // until the audio has actually finished, instead of vanishing the instant the run commits.
+  describe('the draining tail of a completed run', () => {
+    it('stays "playing out" and reachable until the tail ends, then signals the drain', () => {
+      const { playback, sources, gains } = setup();
+      const drained: string[] = [];
+      playback.onDrained((chatId) => drained.push(chatId));
+      playback.push('c1', 'r1', chunk(0));
+      playback.push('c1', 'r1', chunk(1));
+
+      playback.end('c1', true);
+      // No longer "live" (the run is done), but the tail is still playing out.
+      expect(playback.isLive('c1')).toBe(false);
+      expect(playback.isPlayingOut('c1')).toBe(true);
+      // The session is still reachable: Mute still silences the draining tail.
+      playback.setMuted('c1', true);
+      expect(gains[0].gain.value).toBe(0);
+      expect(drained).toEqual([]);
+      expect(sources.some((s) => s.stopped)).toBe(false);
+
+      // Each scheduled source ends in turn; the last one empties the queue.
+      sources.forEach((s) => s.ended?.());
+      expect(playback.isPlayingOut('c1')).toBe(false);
+      expect(drained).toEqual(['c1']);
+    });
+
+    it('signals the drain at once when the completed run has nothing left queued', () => {
+      const { playback, sources } = setup();
+      const drained: string[] = [];
+      playback.onDrained((chatId) => drained.push(chatId));
+      playback.push('c1', 'r1', chunk(0));
+      sources[0].ended?.(); // the only chunk finished before the run ended
+      playback.end('c1', true);
+      expect(drained).toEqual(['c1']);
+      expect(playback.isPlayingOut('c1')).toBe(false);
+    });
+
+    it('abort() stops the draining tail at once and signals the drain', () => {
+      const { playback, sources } = setup();
+      const drained: string[] = [];
+      playback.onDrained((chatId) => drained.push(chatId));
+      playback.push('c1', 'r1', chunk(0));
+      playback.end('c1', true);
+      expect(playback.isPlayingOut('c1')).toBe(true);
+
+      playback.abort('c1');
+      expect(sources[0].stopped).toBe(true);
+      expect(playback.isPlayingOut('c1')).toBe(false);
+      expect(drained).toEqual(['c1']);
+    });
+
+    it("a new run's push for the same chat stops the prior draining tail, with no overlap", () => {
+      const { playback, sources, scheduled } = setup();
+      playback.push('c1', 'r1', chunk(0));
+      playback.end('c1', true); // r1 is now draining
+      expect(sources[0].stopped).toBe(false);
+
+      // A new run of the same chat begins while the old tail is still draining.
+      expect(playback.push('c1', 'r2', chunk(0))).toBe(true);
+      expect(sources[0].stopped).toBe(true); // the old tail was cut -- no overlap
+      expect(scheduled).toHaveLength(2); // r2 scheduled its own first chunk
+      expect(playback.isLive('c1')).toBe(true);
+    });
+
+    it('clears the tail via the fallback timer when onended never fires', () => {
+      vi.useFakeTimers();
+      try {
+        const { playback, sources } = setup();
+        const drained: string[] = [];
+        playback.onDrained((chatId) => drained.push(chatId));
+        playback.push('c1', 'r1', chunk(0));
+        playback.end('c1', true);
+        expect(drained).toEqual([]);
+        // onended never fires (a context suspended mid-tail, or a browser quirk): the fallback
+        // elapses so the controls can never hang on screen forever.
+        vi.advanceTimersByTime(60_000);
+        expect(drained).toEqual(['c1']);
+        expect(sources[0].stopped).toBe(true);
+        expect(playback.isPlayingOut('c1')).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('resolves the drain immediately for a completed run whose context is not running', () => {
+      const fake = fakeContext(0);
+      const ctx = Object.assign(fake.ctx, {
+        state: 'running',
+        resume: vi.fn(() => Promise.resolve()),
+      });
+      const playback = createSpeechPlayback(() => ctx);
+      const drained: string[] = [];
+      playback.onDrained((chatId) => drained.push(chatId));
+      playback.push('c1', 'r1', chunk(0));
+      Object.assign(ctx, { state: 'suspended' }); // the clock froze before the run ended
+      playback.end('c1', true);
+      expect(drained).toEqual(['c1']);
+      expect(fake.sources[0].stopped).toBe(true);
+      expect(playback.isPlayingOut('c1')).toBe(false);
     });
   });
 
