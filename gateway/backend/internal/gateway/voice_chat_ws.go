@@ -102,12 +102,13 @@ const (
 	VoiceContinuationGraceMs = 1500
 )
 
-// VoicePlaybackFallbackMs bounds the playout-aware drain (spec 6.2) when the relayed audio's
-// real-time duration cannot be computed -- a defensive case, since the streamed TTS always
-// carries a sample rate. In the normal path the fallback is the relayed audio's own duration
-// (pcmBytes / byteRate); this generous fixed cap is the net for the rare rate-unknown chunk,
-// so a missing playback_done can never wedge the session, while the drain still never ends at
-// relay-done.
+// VoicePlaybackFallbackMs is the drain's ABSOLUTE upper bound (spec 6.2): the most the session
+// will stay in draining before it re-opens the mic, even if no playback_done ever arrives, so a
+// missing or pathologically-late signal can never wedge the session. It is deliberately
+// generous because it is only the ceiling -- the normal drain ends at the relayed audio's own
+// real-time duration (the floor) or at the client's playback_done, whichever is later. It is
+// also the fallback when the relayed audio's duration cannot be computed (a chunk with no
+// usable rate -- defensive, since the streamed TTS always carries one).
 const VoicePlaybackFallbackMs = 30000
 
 // VoiceTiming is the operator-tunable turn-detection and half-duplex timing of a Voice
@@ -122,13 +123,17 @@ type VoiceTiming struct {
 }
 
 // voiceTiming is the resolved (defaults-filled) timing the state machine reads. It is the
-// unexported twin of VoiceTiming so the machine's fields stay internal.
+// unexported twin of VoiceTiming so the machine's fields stay internal. playbackCap is the
+// drain's absolute upper bound (the VoicePlaybackFallbackMs const); it is deliberately NOT in
+// the exported VoiceTiming -- it is not an operator knob, only an internal default and a test
+// seam -- and a machine reads it through playbackCapOrDefault, so a zero value means the const.
 type voiceTiming struct {
 	silenceTimeout    time.Duration
 	minUtterance      time.Duration
 	maxUtterance      time.Duration
 	micResumeTail     time.Duration
 	continuationGrace time.Duration
+	playbackCap       time.Duration
 }
 
 // defaultVoiceTiming is the built-in timing (the Voice*Ms defaults).
@@ -139,6 +144,7 @@ func defaultVoiceTiming() voiceTiming {
 		maxUtterance:      VoiceMaxUtteranceMs * time.Millisecond,
 		micResumeTail:     VoiceMicResumeTailMs * time.Millisecond,
 		continuationGrace: VoiceContinuationGraceMs * time.Millisecond,
+		playbackCap:       VoicePlaybackFallbackMs * time.Millisecond,
 	}
 }
 
@@ -609,19 +615,30 @@ type voiceMachine struct {
 	graceC     <-chan time.Time
 
 	// The playout-aware drain bookkeeping (spec 6.2). The orchestrator relays TTS faster than
-	// real time, so audio_done (relay-done) is NOT "the user stopped hearing it": after
-	// audio_done the session stays in draining -- the mic gated -- until the client's
-	// playback_done arrives OR a server-side fallback bound elapses, only then applying the
-	// mic-resume tail. firstAudioAt/relayedPlaybackDur accumulate as audio is relayed, so the
-	// fallback is the relayed audio's real-time duration measured from when playout would have
-	// started (the first chunk relayed); playbackRateUnknown falls back to the fixed cap for a
-	// chunk that carried no usable rate. awaitingPlayback is set for the whole drain wait. All
-	// are reset per turn in beginAnswer. The mic STAYS discarded for the whole draining period
-	// regardless (micOpen); only the EXIT moment moves from relay-done to playout-done.
+	// real time, so audio_done (relay-done) is NOT "the user stopped hearing it." After
+	// audio_done the session stays in draining -- the mic gated -- until playout-done, which the
+	// server computes as max(FLOOR, the client's playback_done), capped by the absolute ceiling.
+	// The FLOOR = firstAudioAt + relayedPlaybackDur is the relayed audio's own real-time
+	// duration measured from when playout would have started (the first chunk relayed); it is
+	// the SERVER-AUTHORITATIVE minimum, so the mic NEVER re-opens before it, however early a
+	// (buggy or malicious) client claims playout finished. A playback_done before the floor is
+	// clamped UP to the floor; one after the floor (a slow client still playing) EXTENDS the
+	// drain to the signal; with no signal the drain ends at the floor, and the ceiling
+	// (playbackCapOrDefault) bounds how long a missing or late signal can hold it.
+	//   - firstAudioAt/relayedPlaybackDur accumulate as audio is relayed; playbackRateUnknown
+	//     drops the computed floor (the ceiling is then the only bound) for a chunk with no
+	//     usable rate (defensive).
+	//   - awaitingPlayback is set for the whole wait; playbackSignaled records a playback_done
+	//     seen during it; playbackFloorPassed latches when the floor elapses (then the timer is
+	//     re-armed to the ceiling to wait out a slow or absent signal).
+	// All are reset per turn in beginAnswer. The mic STAYS discarded for the whole draining
+	// period regardless (micOpen); only the EXIT moment moves from relay-done to playout-done.
 	firstAudioAt        time.Time
 	relayedPlaybackDur  time.Duration
 	playbackRateUnknown bool
 	awaitingPlayback    bool
+	playbackSignaled    bool
+	playbackFloorPassed bool
 	playbackTimer       *time.Timer
 	playbackC           <-chan time.Time
 }
@@ -697,7 +714,7 @@ func (m *voiceMachine) run() {
 		case <-m.graceC:
 			m.onGrace()
 		case <-m.playbackC:
-			m.onPlaybackFallback()
+			m.onPlaybackTimer()
 		case <-m.tailC:
 			m.onTailDone()
 		case <-m.finalizeC:
@@ -1003,7 +1020,7 @@ func (m *voiceMachine) beginAnswer() {
 	m.audioBuf = nil
 	// The playout-drain accounting is per turn: no audio relayed yet, no drain wait pending.
 	m.firstAudioAt, m.relayedPlaybackDur, m.playbackRateUnknown = time.Time{}, 0, false
-	m.resetPlaybackWait()
+	m.resetPlaybackWait() // clears awaitingPlayback/playbackSignaled/playbackFloorPassed + the timer
 	m.setState(voiceStateThinking)
 	m.armGrace()
 	// Relay whatever the run buffered between launch and subscribe (usually nothing); the
@@ -1197,34 +1214,90 @@ func (m *voiceMachine) finishAnswer() {
 	m.beginPlaybackWait()
 }
 
-// beginPlaybackWait holds the session in draining (the mic gated) until the client reports
-// playout finished (playback_done) OR the server-side fallback bound elapses, then applies the
-// mic-resume tail (spec 6.2). The gate stays server-authoritative: the client signal only says
-// WHEN playout finished; the server decides when the drain ends, and the fallback -- the
-// relayed audio's own real-time duration -- is the net so a missing or late signal cannot
-// wedge the session. When no audio was relayed there is nothing to play out, so it falls
-// straight through to the tail.
+// beginPlaybackWait holds the session in draining (the mic gated) until playout-done, then
+// applies the mic-resume tail (spec 6.2). The drain ends at min(ceiling, max(floor, signal)):
+//   - FLOOR = the relayed audio's real-time duration, the server-authoritative minimum -- the
+//     mic NEVER re-opens before it, so an early (buggy/malicious) playback_done cannot make the
+//     model hear the TTS still playing;
+//   - a playback_done after the floor extends the drain to the signal (a slow client still
+//     playing);
+//   - the ceiling (playbackCapOrDefault) is the absolute bound so a missing or late signal
+//     cannot wedge the session.
+//
+// The gate stays server-authoritative: the client signal only says WHEN playout finished, and
+// is never trusted to shorten the drain below the floor. When no audio was relayed there is
+// nothing to play out, so the drain falls straight through to the tail.
 func (m *voiceMachine) beginPlaybackWait() {
 	m.awaitingPlayback = true
-	remaining := m.playbackFallbackRemaining()
-	if remaining <= 0 {
+	m.playbackSignaled = false
+	m.playbackFloorPassed = false
+	if m.firstAudioAt.IsZero() {
+		m.endDrainWait() // no audio was relayed: nothing to play out
+		return
+	}
+	if floor := m.playbackFloorRemaining(); floor > 0 {
+		m.armPlaybackWait(floor)
+		return
+	}
+	m.onPlaybackFloorReached() // the floor already elapsed by the time the answer finished
+}
+
+// onPlaybackFloorReached runs when the floor (the audio's real-time duration) has elapsed. If
+// the client has already reported playout done, the drain ends now (the floor is the max of an
+// early signal and the floor). Otherwise the drain waits out a slow or absent signal up to the
+// ceiling, so a late playback_done can still extend it.
+func (m *voiceMachine) onPlaybackFloorReached() {
+	m.playbackFloorPassed = true
+	if m.playbackSignaled {
 		m.endDrainWait()
 		return
 	}
-	m.armPlaybackWait(remaining)
+	if ceiling := m.playbackCeilingRemaining(); ceiling > 0 {
+		m.armPlaybackWait(ceiling)
+		return
+	}
+	m.endDrainWait()
 }
 
-// playbackFallbackRemaining is how much longer the relayed answer could still be audibly
-// playing, measured from when playout would have started (the first chunk relayed): the
-// audio's real-time duration (pcmBytes / byteRate) less the time already elapsed. It is zero
-// when no audio was relayed (nothing to play out), and the generous fixed cap when a chunk
-// carried no usable rate.
-func (m *voiceMachine) playbackFallbackRemaining() time.Duration {
+// onPlaybackTimer fires for the one playout timer, which is armed first for the floor and then
+// re-armed for the ceiling. Before the floor it is the floor reach; after it, it is the ceiling
+// elapsing with no signal.
+func (m *voiceMachine) onPlaybackTimer() {
+	if !m.awaitingPlayback {
+		m.stopPlaybackWait() // defensive: a stale fire after the wait already ended
+		return
+	}
+	if !m.playbackFloorPassed {
+		m.onPlaybackFloorReached()
+		return
+	}
+	m.endDrainWait() // the ceiling elapsed with no playback_done
+}
+
+// onPlaybackDone records the client's playout-done signal and ends the drain only when the
+// floor has already passed (so the signal extends, never shortens, the drain). An early signal
+// is remembered and the floor timer ends the drain when the floor elapses. Ignored unless we
+// are awaiting playout: a stray or late frame cannot move a session that is not draining.
+func (m *voiceMachine) onPlaybackDone() {
+	if !m.awaitingPlayback {
+		return
+	}
+	m.playbackSignaled = true
+	if m.playbackFloorPassed {
+		m.endDrainWait()
+	}
+}
+
+// playbackFloorRemaining is how much longer the relayed answer is still playing at its own
+// real-time rate, measured from when playout would have started (the first chunk relayed): the
+// audio's duration (pcmBytes / byteRate) less the time already elapsed. It is zero when no
+// audio was relayed, and the ceiling when a chunk carried no usable rate (no computable floor).
+func (m *voiceMachine) playbackFloorRemaining() time.Duration {
 	if m.firstAudioAt.IsZero() {
 		return 0
 	}
 	if m.playbackRateUnknown {
-		return VoicePlaybackFallbackMs * time.Millisecond
+		return m.playbackCeilingRemaining()
 	}
 	if remaining := time.Until(m.firstAudioAt.Add(m.relayedPlaybackDur)); remaining > 0 {
 		return remaining
@@ -1232,22 +1305,26 @@ func (m *voiceMachine) playbackFallbackRemaining() time.Duration {
 	return 0
 }
 
-// onPlaybackDone ends the drain on the client's playout-done signal. Ignored unless we are
-// actually awaiting playout: a stray or late frame cannot move a session that is not draining.
-func (m *voiceMachine) onPlaybackDone() {
-	if !m.awaitingPlayback {
-		return
+// playbackCeilingRemaining is how much of the absolute drain ceiling is left, measured from
+// when playout would have started, so a missing or pathologically-late playback_done cannot
+// wedge the session.
+func (m *voiceMachine) playbackCeilingRemaining() time.Duration {
+	if m.firstAudioAt.IsZero() {
+		return 0
 	}
-	m.endDrainWait()
+	if remaining := time.Until(m.firstAudioAt.Add(m.playbackCapOrDefault())); remaining > 0 {
+		return remaining
+	}
+	return 0
 }
 
-// onPlaybackFallback ends the drain when the fallback bound elapses with no playback_done.
-func (m *voiceMachine) onPlaybackFallback() {
-	if !m.awaitingPlayback {
-		m.stopPlaybackWait() // defensive: a stale fire after the wait already ended
-		return
+// playbackCapOrDefault is the drain's absolute ceiling: the resolved timing's value, or the
+// VoicePlaybackFallbackMs const when unset (a bare/test timing).
+func (m *voiceMachine) playbackCapOrDefault() time.Duration {
+	if m.timing.playbackCap > 0 {
+		return m.timing.playbackCap
 	}
-	m.endDrainWait()
+	return VoicePlaybackFallbackMs * time.Millisecond
 }
 
 // endDrainWait leaves the playout wait and applies the mic-resume tail (the half-duplex tail)
@@ -1464,8 +1541,8 @@ func (m *voiceMachine) stopGrace() {
 	m.graceC = nil
 }
 
-// stopPlaybackWait disarms the playout fallback timer (it does NOT clear awaitingPlayback, so
-// onPlaybackFallback can tell a real wait from a stale fire).
+// stopPlaybackWait disarms the playout timer (it does NOT clear the awaiting/floor/signal
+// latches, so onPlaybackTimer can tell a real wait from a stale fire).
 func (m *voiceMachine) stopPlaybackWait() {
 	if m.playbackTimer != nil {
 		m.playbackTimer.Stop()
@@ -1474,9 +1551,12 @@ func (m *voiceMachine) stopPlaybackWait() {
 	m.playbackC = nil
 }
 
-// resetPlaybackWait ends any playout drain wait: no longer awaiting, and the fallback disarmed.
+// resetPlaybackWait ends any playout drain wait: no longer awaiting, its latches cleared, and
+// the timer disarmed.
 func (m *voiceMachine) resetPlaybackWait() {
 	m.awaitingPlayback = false
+	m.playbackSignaled = false
+	m.playbackFloorPassed = false
 	m.stopPlaybackWait()
 }
 

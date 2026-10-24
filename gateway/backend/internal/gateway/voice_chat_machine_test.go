@@ -290,15 +290,13 @@ func TestVoiceTwoTurnsEachCommit(t *testing.T) {
 	if f := drainAChunk(t, ctx, conn); f != "first turn" {
 		t.Fatalf("turn 1 final = %q, want %q", f, "first turn")
 	}
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
-	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	finishSpokenTurn(t, ctx, conn)
 
 	// Turn 2: a fresh chunk -> a fresh run on only the second turn's text.
 	if f := drainAChunk(t, ctx, conn); f != "second turn" {
 		t.Fatalf("turn 2 final = %q, want %q", f, "second turn")
 	}
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
-	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	finishSpokenTurn(t, ctx, conn)
 
 	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
 	if err != nil {

@@ -271,6 +271,18 @@ func turnGraceTiming() voiceTiming {
 	}
 }
 
+// finishSpokenTurn mimics the browser once an answer's audio is all relayed: it reads through
+// audio_done, reports the player drained ({"type":"playback_done"} -- the #304 signal), and
+// waits for the session to return to listening after the half-duplex drain ends. Without the
+// signal the drain would hold until its absolute ceiling (VoicePlaybackFallbackMs), so a turn
+// test that expects to reach listening sends it, exactly as the real client does.
+func finishSpokenTurn(t *testing.T, ctx context.Context, conn *websocket.Conn) {
+	t.Helper()
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	sendVoiceControl(t, ctx, conn, "playback_done")
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+}
+
 // drainAChunk sends one PCM frame, waits for the ASR partial, then ends the chunk with
 // push_end and waits for its asr_final, returning the final text.
 func drainAChunk(t *testing.T, ctx context.Context, conn *websocket.Conn) string {
@@ -334,6 +346,8 @@ func TestVoiceHappyPathRoundTrips(t *testing.T) {
 		}
 	}
 answered:
+	// The player drained -> the drain ends and the session returns to listening.
+	sendVoiceControl(t, ctx, conn, "playback_done")
 	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
 	// The committed document: exactly [user, assistant], both complete.
@@ -385,8 +399,7 @@ func TestVoiceResumeCancelsAndExtends(t *testing.T) {
 	if final := readVoiceUntil(t, ctx, conn, voiceDownASRFinal).Text; final != "two" {
 		t.Fatalf("chunk 2 final = %q, want %q", final, "two")
 	}
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
-	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	finishSpokenTurn(t, ctx, conn)
 
 	// Exactly ONE committed turn, carrying the COMBINED user text -- run #1 persisted nothing.
 	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
@@ -426,8 +439,7 @@ func TestVoiceCommitsAfterGraceNoResume(t *testing.T) {
 		t.Fatalf("asr_final = %q, want %q", final, "commit me")
 	}
 	// No resume: the turn walks answer -> speaking -> audio -> commit.
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
-	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	finishSpokenTurn(t, ctx, conn)
 
 	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
 	if err != nil {
@@ -469,8 +481,7 @@ func TestVoiceFastCommitThenResumeDoesNotDoubleCommit(t *testing.T) {
 	if f := drainAChunk(t, ctx, conn); f != "one" {
 		t.Fatalf("turn 1 final = %q, want %q", f, "one")
 	}
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
-	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	finishSpokenTurn(t, ctx, conn)
 	if waited := time.Since(start); waited >= 900*time.Millisecond {
 		t.Fatalf("turn 1 returned to listening after %v, want it closed at commit (<<1s grace): the window did not close on commit", waited)
 	}
@@ -479,8 +490,7 @@ func TestVoiceFastCommitThenResumeDoesNotDoubleCommit(t *testing.T) {
 	if f := drainAChunk(t, ctx, conn); f != "two" {
 		t.Fatalf("turn 2 final = %q, want %q", f, "two")
 	}
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
-	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	finishSpokenTurn(t, ctx, conn)
 
 	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
 	if err != nil {
@@ -632,8 +642,7 @@ func TestVoiceResumeDuringCommitWriteDoesNotExtend(t *testing.T) {
 
 	// Release the commit; the run finishes and the force-close discards the resumed chunk.
 	close(slow.release)
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
-	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	finishSpokenTurn(t, ctx, conn)
 
 	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
 	if err != nil {
@@ -717,23 +726,36 @@ func TestVoiceMidTurnAdmissionBlockedDegrades(t *testing.T) {
 	degradeAssert(t, h, voiceAdmissionBlockedCode)
 }
 
-// TestVoiceDrainWaitsForPlaybackDone is the playout-aware half-duplex drain (spec 6.2): after
-// the TTS is all relayed (audio_done) the machine STAYS in draining -- the mic gated -- until
-// the client's {"type":"playback_done"} arrives, and only then applies the tail and re-opens.
-// The orchestrator relays TTS faster than real time, so a binary PCM frame sent after
-// relay-done but before playback_done must be DISCARDED (never reach the ASR loopback); this
-// is the loop the feature prevents. A ~3s relayed-audio fallback is far off, so it is the
-// signal -- not the fallback -- that ends the drain here.
+// drainBurstDiscarded sends a mic PCM burst and asserts, after a short settle, that NONE of it
+// reached the ASR child -- the half-duplex gate is still holding (the session is still
+// draining). before is the child snapshot taken when draining began.
+func drainBurstDiscarded(t *testing.T, ctx context.Context, conn *websocket.Conn, child *fakeVoiceASRChild, beforeConns int, beforeBytes int64, why string) {
+	t.Helper()
+	for range 5 {
+		sendVoicePCM(t, ctx, conn, 3200)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if conns, bytes := child.snapshot(); conns != beforeConns || bytes != beforeBytes {
+		t.Fatalf("%s (conns %d->%d, bytes %d->%d)", why, beforeConns, conns, beforeBytes, bytes)
+	}
+}
+
+// TestVoiceDrainWaitsForPlaybackDone is the playout-aware half-duplex drain (spec 6.2) and its
+// anti-goal (spec 2): the orchestrator relays TTS faster than real time, so the server holds the
+// mic gated until TRUE playout-done, which it computes as max(FLOOR, playback_done) -- the FLOOR
+// (the relayed audio's own real-time duration) is the server-authoritative minimum. An EARLY
+// {"type":"playback_done"} (a buggy or malicious client that claims playout finished at once)
+// must NOT shorten the drain below the floor: the mic stays gated, and PCM sent before the floor
+// is still DISCARDED, so the model can never transcribe its own TTS output.
 func TestVoiceDrainWaitsForPlaybackDone(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"hold the mic"}
 	timing := turnGraceTiming()
 	timing.micResumeTail = 30 * time.Millisecond
-	// ~3s of audio at the fixture byte rate (88200 B/s): the server-side fallback bound is far
-	// enough off that reaching listening promptly proves playback_done drove the exit.
+	// ~2s of audio at the fixture byte rate (88200 B/s) => a ~2s floor to hold the mic past.
 	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
 		timing:    timing,
-		speechPCM: [][]byte{speechPCM(88200*3, 1)},
+		speechPCM: [][]byte{speechPCM(88200*2, 1)},
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
@@ -749,46 +771,82 @@ func TestVoiceDrainWaitsForPlaybackDone(t *testing.T) {
 	// Relay-done (audio_done) is NOT playout-done: the mic must stay gated in draining.
 	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
 	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
+	tDraining := time.Now()
 	beforeConns, beforeBytes := child.snapshot()
 	if beforeBytes != 320 {
 		t.Fatalf("the one real chunk delivered %d bytes, want 320 (harness sanity)", beforeBytes)
 	}
 
-	// Wait past where the old relay-done drain (the ~30ms tail) would have re-opened the mic,
-	// but well short of the ~3s fallback: the gate must still hold here.
-	time.Sleep(250 * time.Millisecond)
+	// A buggy/early playback_done at the very start of the drain must NOT end it below the floor.
+	sendVoiceControl(t, ctx, conn, "playback_done")
 
-	// Mic PCM after relay-done but before playback_done: it must be DROPPED server-side (the
-	// loop). The fallback is still ~3s away, so draining is still active.
-	for range 5 {
-		sendVoicePCM(t, ctx, conn, 3200)
-	}
-	time.Sleep(250 * time.Millisecond)
-	if conns, bytes := child.snapshot(); conns != beforeConns || bytes != beforeBytes {
-		t.Fatalf("draining-era PCM reached the ASR before playback_done (conns %d->%d, bytes %d->%d): the drain ended at relay-done, not playout-done", beforeConns, conns, beforeBytes, bytes)
-	}
+	// Well after the early signal but before the ~2s floor, the gate still holds: mic PCM is
+	// still discarded despite the client's (false) claim that playout is done.
+	time.Sleep(600 * time.Millisecond)
+	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+		"an early playback_done re-opened the mic before the floor: the server bound is not a floor")
 
-	// The client reports its player drained -> the server applies the tail and re-opens. This
-	// must land well before the ~3s fallback, proving the signal (not the fallback) ended it.
+	// The drain ends only at ~floor+tail, not at the early signal.
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	if waited := time.Since(tDraining); waited < time.Second {
+		t.Fatalf("returned to listening %v after draining began, want it held to the ~2s floor despite the early playback_done", waited)
+	}
+}
+
+// TestVoiceDrainExtendsForLatePlaybackDone: a playback_done that arrives AFTER the floor (a slow
+// client still playing the answer out) EXTENDS the drain to the signal. Past the short floor,
+// with no signal yet, the mic is still gated -- it has NOT re-opened at the floor -- and only
+// the late signal ends the drain.
+func TestVoiceDrainExtendsForLatePlaybackDone(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{"slow client"}
+	timing := turnGraceTiming()
+	timing.micResumeTail = 30 * time.Millisecond
+	// ~0.25s floor, generous (default) ceiling: the LATE signal, not the ceiling, ends the drain.
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+		timing:    timing,
+		speechPCM: [][]byte{speechPCM(88200/4, 1)},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	conn := h.dial(t, ctx)
+	conn.SetReadLimit(1 << 21)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	if f := drainAChunk(t, ctx, conn); f != "slow client" {
+		t.Fatalf("asr_final = %q, want %q", f, "slow client")
+	}
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
+	beforeConns, beforeBytes := child.snapshot()
+
+	// Well past the ~0.25s floor, with no signal yet: the drain must NOT have ended at the floor,
+	// so a slow client's late signal can still extend it. The mic is still gated.
+	time.Sleep(700 * time.Millisecond)
+	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+		"the drain ended at the floor with no signal: a late playback_done could not extend it")
+
+	// The slow client finally reports playout done -> the drain ends now (+ tail).
 	sendVoiceControl(t, ctx, conn, "playback_done")
 	lctx, lcancel := context.WithTimeout(ctx, 2*time.Second)
 	defer lcancel()
 	readVoiceUntilState(t, lctx, conn, voiceStateListening)
 }
 
-// TestVoiceDrainFallbackEndsWithoutSignal: with no playback_done, the drain must still end --
-// not instantly (the mic stays gated for the relayed audio's real-time duration, so PCM sent
-// mid-drain is discarded) and not never (the server-side fallback bound re-opens the session).
-// Here the relayed audio is ~1s, so a burst at 300ms is still gated and listening returns via
-// the fallback.
+// TestVoiceDrainFallbackEndsWithoutSignal: with no playback_done at all, the drain must still
+// end -- not instantly (the mic stays gated past the floor, waiting out the ceiling, so PCM sent
+// mid-drain is discarded) and not never (the absolute ceiling re-opens the session). A short
+// ceiling is set for the test; in production it is the generous VoicePlaybackFallbackMs.
 func TestVoiceDrainFallbackEndsWithoutSignal(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"no signal"}
 	timing := turnGraceTiming()
 	timing.micResumeTail = 30 * time.Millisecond
+	timing.playbackCap = 900 * time.Millisecond // a short absolute ceiling for the test
 	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
 		timing:    timing,
-		speechPCM: [][]byte{speechPCM(88200, 1)}, // ~1s at 88200 B/s
+		speechPCM: [][]byte{speechPCM(88200/4, 1)}, // ~0.25s floor, well under the 900ms ceiling
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
@@ -804,19 +862,14 @@ func TestVoiceDrainFallbackEndsWithoutSignal(t *testing.T) {
 	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
 	beforeConns, beforeBytes := child.snapshot()
 
-	// NOT instantly: past where the old relay-done drain would have re-opened the mic (~30ms
-	// tail), but under the ~1s fallback, a burst is still discarded.
-	time.Sleep(250 * time.Millisecond)
-	for range 5 {
-		sendVoicePCM(t, ctx, conn, 3200)
-	}
-	time.Sleep(250 * time.Millisecond)
-	if conns, bytes := child.snapshot(); conns != beforeConns || bytes != beforeBytes {
-		t.Fatalf("mid-drain PCM reached the ASR (conns %d->%d, bytes %d->%d): the drain ended at relay-done", beforeConns, conns, beforeBytes, bytes)
-	}
+	// NOT instantly: past the ~0.25s floor, with no signal, the mic is still gated (waiting out
+	// the ceiling), so a burst here is discarded.
+	time.Sleep(450 * time.Millisecond)
+	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+		"mid-drain PCM reached the ASR: the drain ended before the ceiling")
 
-	// NOT never: with no playback_done, the fallback bound (~1s) re-opens the session.
-	lctx, lcancel := context.WithTimeout(ctx, 5*time.Second)
+	// NOT never: with no playback_done, the absolute ceiling (~900ms) re-opens the session.
+	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
 	defer lcancel()
 	readVoiceUntilState(t, lctx, conn, voiceStateListening)
 }
