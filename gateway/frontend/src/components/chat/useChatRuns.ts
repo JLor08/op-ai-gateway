@@ -196,6 +196,12 @@ export type ChatRunsApi = {
   // Close every open EventSource without otherwise touching state (provider
   // unmount — the server run keeps going and is re-subscribed on next load).
   closeAll: () => void;
+  // Reload a chat's transcript from the server and adopt it, for a change the server made
+  // that no run of ours reported (a committed Voice Chat turn): the same stale-mark-before-
+  // refetch discipline as a finished run's adopt, never wiping the buffer when the server holds
+  // no transcript, and reporting a failed fetch itself (the chat then stays unsaved). Refreshes
+  // of one chat may overlap: the newest one wins, an older one's late answer is dropped.
+  refreshTranscript: (chatId: string) => Promise<void>;
   // Register the terminal callback (the provider registers exactly one, at
   // render time, wiring persistence's dirty-clearing).
   onTerminal: (cb: RunTerminalHandler) => void;
@@ -432,24 +438,29 @@ export function useChatRuns(
   // turn. Marking BEFORE the await rather than only in the catch is what makes
   // this race-free: a failure that lands after the debounce already fired
   // would be too late to cancel anything.
-  const adoptCanonicalTranscript = useCallback(
-    async (chatId: string, runId: string) => {
+  //
+  // This is the one implementation of that discipline, for every writer of the
+  // server's transcript that this client has to catch up with: a finished run
+  // (adoptCanonicalTranscript) and a committed Voice Chat turn
+  // (refreshTranscript). `owns` is the caller's own answer to "is this still my
+  // cycle", asked once the document is in hand: a cycle that has been
+  // superseded leaves everything -- the buffer and the stale mark -- to the one
+  // that superseded it.
+  const adoptServerTranscript = useCallback(
+    async (chatId: string, owns: () => boolean) => {
       onTranscriptStaleRef.current?.(chatId, true);
       let full: Chat;
       try {
         full = await apiRef.current.chat(chatId);
       } catch {
-        // Loud, not silent: the run itself succeeded and the turn IS on the
-        // server, but this tab can no longer prove its copy matches — and it
-        // has just stopped saving this chat, which the user is entitled to
-        // know about before they keep typing into it.
+        // Loud, not silent: the turn IS on the server, but this tab can no
+        // longer prove its copy matches — and it has just stopped saving this
+        // chat, which the user is entitled to know about before they keep
+        // typing into it.
         showErrorRef.current(tRef.current.errorChatTranscriptStale);
         return;
       }
-      const entry = runsRef.current.get(chatId);
-      // A newer run owns this chat now, so ITS adopt cycle owns the stale mark
-      // as well — leave the mark exactly as that cycle set it.
-      if (entry?.runId !== runId || entry?.status === 'running') return;
+      if (!owns()) return;
       const canonical = normalizeDoc(full.content).messages;
       if (canonical.length > 0) {
         chatBuffersRef.current.set(chatId, canonical);
@@ -465,6 +476,43 @@ export function useChatRuns(
       onTranscriptStaleRef.current?.(chatId, false);
     },
     [apiRef, activeChatIdRef, messagesRef, setMessages, showErrorRef, tRef],
+  );
+
+  // A run's own cycle: it owns the chat only while it is still the chat's (terminal) entry. A
+  // newer run owns it now, so ITS adopt cycle owns the stale mark as well — leave the mark
+  // exactly as that cycle set it.
+  const adoptCanonicalTranscript = useCallback(
+    (chatId: string, runId: string) =>
+      adoptServerTranscript(chatId, () => {
+        const entry = runsRef.current.get(chatId);
+        return entry?.runId === runId && entry?.status !== 'running';
+      }),
+    [adoptServerTranscript],
+  );
+
+  // The newest refresh of each chat (Voice Chat's), by number: refreshes of one chat may overlap
+  // (two turns that end close together), and a document fetched earlier can arrive after one
+  // fetched later, so only the newest may land.
+  const refreshSeqRef = useRef<Map<string, number>>(new Map());
+
+  // Catch up with a transcript the gateway has changed without a run of ours: a Voice Chat turn
+  // is committed by the gateway's own run, which this client never started and holds no
+  // subscription to. The same discipline as a finished run's (adoptServerTranscript), owned
+  // differently: the NEWEST refresh of the chat owns it (an older one that returns after it
+  // leaves the mark to it), and none does while a run of ours is live (that run's own adopt
+  // cycle owns the transcript then). A failed refetch is reported and keeps the chat unsaved,
+  // like a run's.
+  const refreshTranscript = useCallback(
+    (chatId: string) => {
+      const seqs = refreshSeqRef.current;
+      const seq = (seqs.get(chatId) ?? 0) + 1;
+      seqs.set(chatId, seq);
+      return adoptServerTranscript(
+        chatId,
+        () => seqs.get(chatId) === seq && runsRef.current.get(chatId)?.status !== 'running',
+      );
+    },
+    [adoptServerTranscript],
   );
 
   // Register a run's metadata WITHOUT opening its EventSource (bootstrap
@@ -752,6 +800,7 @@ export function useChatRuns(
     subscribe,
     forget,
     closeAll,
+    refreshTranscript,
     onTerminal,
     onTranscriptStale,
   };

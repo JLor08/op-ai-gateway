@@ -1,0 +1,362 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { VoiceChatControl, type VoiceChatControlProps } from './VoiceChatControl';
+import { messages } from '../i18n';
+import type { VoiceChatApi, VoiceChatState } from './chat/ChatStore';
+
+afterEach(cleanup);
+
+const t = messages.en;
+
+// The hook's output, with every control a spy: this component only draws the conversation and
+// forwards the user's gestures (useVoiceChat.test.ts is about the conversation itself).
+function makeVoice(over: Partial<VoiceChatApi> = {}): VoiceChatApi {
+  return {
+    state: 'off',
+    liveTranscript: '',
+    answerPreview: '',
+    error: null,
+    start: vi.fn(),
+    stop: vi.fn(),
+    pushStart: vi.fn(),
+    pushEnd: vi.fn(),
+    cancel: vi.fn(),
+    ...over,
+  };
+}
+
+function renderControl(voice: VoiceChatApi, props: Partial<VoiceChatControlProps> = {}) {
+  const ui = (next: VoiceChatApi) => (
+    <VoiceChatControl t={t} voice={next} capable gap={null} {...props} />
+  );
+  const view = render(ui(voice));
+  return { ...view, update: (next: VoiceChatApi) => view.rerender(ui(next)) };
+}
+
+// The indicator is the one status region of the control that names the state of the microphone.
+function indicator() {
+  return screen.getByRole('status', { name: t.chatVoiceIndicator });
+}
+
+describe('VoiceChatControl toggle', () => {
+  it('toggle is disabled when the model triple is not satisfiable', () => {
+    const voice = makeVoice();
+    renderControl(voice, { capable: false, gap: 'tts' });
+
+    const toggle = screen.getByRole('switch', { name: t.chatVoice });
+    expect(toggle).toBeDisabled();
+    // The reason is on screen (not only in a tooltip), and the click does nothing.
+    expect(screen.getByText(t.chatVoiceUnavailableTts)).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(voice.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['llm', 'chatVoiceUnavailableLlm'],
+    ['asr', 'chatVoiceUnavailableAsr'],
+    ['tts', 'chatVoiceUnavailableTts'],
+    ['checking', 'chatVoiceUnavailableChecking'],
+  ] as const)('names the missing leg: %s', (gap, key) => {
+    renderControl(makeVoice(), { capable: false, gap });
+    expect(screen.getByRole('switch', { name: t.chatVoice })).toBeDisabled();
+    expect(screen.getByText(t[key])).toBeInTheDocument();
+  });
+
+  it('is disabled, and says why, while a chat run holds the thread', () => {
+    renderControl(makeVoice(), { busy: true });
+    expect(screen.getByRole('switch', { name: t.chatVoice })).toBeDisabled();
+    expect(screen.getByText(t.chatBusy)).toBeInTheDocument();
+  });
+
+  it('enabling calls start', () => {
+    const voice = makeVoice();
+    renderControl(voice);
+
+    const toggle = screen.getByRole('switch', { name: t.chatVoice });
+    expect(toggle).toBeEnabled();
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+
+    expect(voice.start).toHaveBeenCalledTimes(1);
+    expect(voice.stop).not.toHaveBeenCalled();
+  });
+
+  it('disabling a running conversation calls stop, even when the models are no longer offered', () => {
+    const voice = makeVoice({ state: 'listening' });
+    // The catalogue moved on under the running conversation: the way OUT must stay open.
+    renderControl(voice, { capable: false, gap: 'asr', busy: true });
+
+    const toggle = screen.getByRole('switch', { name: t.chatVoice });
+    expect(toggle).toBeChecked();
+    expect(toggle).toBeEnabled();
+    fireEvent.click(toggle);
+
+    expect(voice.stop).toHaveBeenCalledTimes(1);
+    expect(voice.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('VoiceChatControl lifetime', () => {
+  it('ends a running conversation when it goes away (another page, another thread)', () => {
+    const voice = makeVoice({ state: 'listening' });
+    const { unmount } = renderControl(voice);
+    expect(voice.stop).not.toHaveBeenCalled();
+    // The control is only mounted while the thread is one Voice Chat is offered on, on the chat
+    // page: when it goes, the microphone must not stay open with nothing on screen to end it.
+    unmount();
+    expect(voice.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not end anything when it goes away with the conversation off', () => {
+    const voice = makeVoice({ state: 'off' });
+    const { unmount } = renderControl(voice);
+    unmount();
+    expect(voice.stop).not.toHaveBeenCalled();
+  });
+
+  it('ends the conversation that is running when it goes, not the one it started with', () => {
+    const first = makeVoice({ state: 'off' });
+    const { update, unmount } = renderControl(first);
+    const second = makeVoice({ state: 'speaking' });
+    update(second);
+    unmount();
+    expect(second.stop).toHaveBeenCalledTimes(1);
+    expect(first.stop).not.toHaveBeenCalled();
+  });
+});
+
+describe('VoiceChatControl listening indicator', () => {
+  it('the indicator shows a listening state when state==="listening" and a not-listening state during speaking/thinking/idle', () => {
+    const { update } = renderControl(makeVoice({ state: 'listening' }));
+
+    // LISTENING: an active mic and its label.
+    expect(within(indicator()).getByText(t.chatVoiceStateListening)).toBeInTheDocument();
+    expect(within(indicator()).getByTestId('MicIcon')).toBeInTheDocument();
+    expect(within(indicator()).queryByTestId('MicOffIcon')).not.toBeInTheDocument();
+
+    // NOT LISTENING: a muted mic and the matching status, never the listening label.
+    const notListening: [VoiceChatState, string][] = [
+      ['thinking', t.chatVoiceStateThinking],
+      ['speaking', t.chatVoiceStateSpeaking],
+      ['draining', t.chatVoiceStateDraining],
+      ['idle', t.chatVoiceStateIdle],
+      ['connecting', t.chatVoiceStateConnecting],
+      ['off', t.chatVoiceStateOff],
+    ];
+    for (const [state, label] of notListening) {
+      update(makeVoice({ state }));
+      expect(within(indicator()).getByText(label), state).toBeInTheDocument();
+      expect(within(indicator()).getByTestId('MicOffIcon'), state).toBeInTheDocument();
+      expect(within(indicator()).queryByTestId('MicIcon'), state).not.toBeInTheDocument();
+      expect(screen.queryByText(t.chatVoiceStateListening), state).not.toBeInTheDocument();
+    }
+  });
+
+  it('says that the microphone waits for the answer while it is spoken', () => {
+    const { update } = renderControl(makeVoice({ state: 'speaking' }));
+    expect(within(indicator()).getByText(t.chatVoiceMicPaused)).toBeInTheDocument();
+
+    update(makeVoice({ state: 'draining' }));
+    expect(within(indicator()).getByText(t.chatVoiceMicPaused)).toBeInTheDocument();
+
+    // ... and not otherwise: the claim is only true while the answer plays.
+    update(makeVoice({ state: 'listening' }));
+    expect(screen.queryByText(t.chatVoiceMicPaused)).not.toBeInTheDocument();
+  });
+
+  it('the live transcript shows while listening', () => {
+    const { update } = renderControl(makeVoice({ state: 'listening', liveTranscript: '' }));
+    // Nothing said yet: no empty box.
+    expect(screen.queryByRole('region', { name: t.chatVoiceTranscript })).not.toBeInTheDocument();
+
+    update(makeVoice({ state: 'listening', liveTranscript: 'what is the wea' }));
+    expect(screen.getByRole('region', { name: t.chatVoiceTranscript })).toHaveTextContent(
+      'what is the wea',
+    );
+
+    update(makeVoice({ state: 'listening', liveTranscript: 'what is the weather today' }));
+    expect(screen.getByRole('region', { name: t.chatVoiceTranscript })).toHaveTextContent(
+      'what is the weather today',
+    );
+  });
+
+  it('keeps what was said on screen while the answer is written and spoken, with the answer', () => {
+    // The thread gets the user's turn only when the gateway commits the turn, so until then
+    // this is the one place the question is shown, beside the answer it is being given.
+    const { update } = renderControl(
+      makeVoice({
+        state: 'thinking',
+        liveTranscript: 'what is the weather today',
+        answerPreview: 'It is sunny',
+      }),
+    );
+    for (const state of ['thinking', 'speaking', 'draining'] as const) {
+      update(
+        makeVoice({
+          state,
+          liveTranscript: 'what is the weather today',
+          answerPreview: 'It is sunny',
+        }),
+      );
+      expect(screen.getByRole('region', { name: t.chatVoiceTranscript }), state).toHaveTextContent(
+        'what is the weather today',
+      );
+      expect(screen.getByRole('region', { name: t.chatVoiceAnswer }), state).toHaveTextContent(
+        'It is sunny',
+      );
+    }
+  });
+
+  it('shows no turn when the conversation is off', () => {
+    renderControl(makeVoice({ state: 'off', liveTranscript: 'left over', answerPreview: 'x' }));
+    expect(screen.queryByRole('region', { name: t.chatVoiceTranscript })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: t.chatVoiceAnswer })).not.toBeInTheDocument();
+  });
+});
+
+describe('VoiceChatControl push-to-talk', () => {
+  it('push-to-talk button calls pushStart/pushEnd', () => {
+    const voice = makeVoice({ state: 'listening' });
+    renderControl(voice);
+
+    const talk = screen.getByRole('button', { name: t.chatVoicePushToTalk });
+    fireEvent.pointerDown(talk);
+    expect(voice.pushStart).toHaveBeenCalledTimes(1);
+    expect(voice.pushEnd).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(talk);
+    expect(voice.pushEnd).toHaveBeenCalledTimes(1);
+    expect(voice.pushStart).toHaveBeenCalledTimes(1);
+  });
+
+  it('ends the turn when the press is cancelled, once, and only for a press that began', () => {
+    const voice = makeVoice({ state: 'listening' });
+    renderControl(voice);
+    const talk = screen.getByRole('button', { name: t.chatVoicePushToTalk });
+
+    // A release with no press before it (the pointer went down elsewhere) is nothing.
+    fireEvent.pointerUp(talk);
+    expect(voice.pushEnd).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(talk);
+    fireEvent.pointerCancel(talk);
+    fireEvent.pointerUp(talk);
+    expect(voice.pushEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('works from the keyboard: Space held talks, released ends', () => {
+    const voice = makeVoice({ state: 'listening' });
+    renderControl(voice);
+    const talk = screen.getByRole('button', { name: t.chatVoicePushToTalk });
+
+    fireEvent.keyDown(talk, { key: ' ' });
+    // The OS key repeat is not a new press.
+    fireEvent.keyDown(talk, { key: ' ', repeat: true });
+    expect(voice.pushStart).toHaveBeenCalledTimes(1);
+    fireEvent.keyUp(talk, { key: ' ' });
+    expect(voice.pushEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-engages from idle (after a failed turn)', () => {
+    const voice = makeVoice({ state: 'idle' });
+    renderControl(voice);
+    const talk = screen.getByRole('button', { name: t.chatVoicePushToTalk });
+    expect(talk).toBeEnabled();
+    fireEvent.pointerDown(talk);
+    expect(voice.pushStart).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['off', 'connecting', 'thinking', 'speaking', 'draining'] as const)(
+    'is closed while the state is %s',
+    (state) => {
+      const voice = makeVoice({ state });
+      renderControl(voice);
+      const talk = screen.queryByRole('button', { name: t.chatVoicePushToTalk });
+      // Off has no talk button at all; the others have it, closed (the gateway ignores it).
+      if (talk) {
+        expect(talk).toBeDisabled();
+        fireEvent.pointerDown(talk);
+      }
+      expect(voice.pushStart).not.toHaveBeenCalled();
+    },
+  );
+
+  it('offers to stop the answer while it is being prepared or spoken, and calls cancel', () => {
+    const voice = makeVoice({ state: 'speaking' });
+    const { update } = renderControl(voice);
+    fireEvent.click(screen.getByRole('button', { name: t.chatVoiceCancel }));
+    expect(voice.cancel).toHaveBeenCalledTimes(1);
+
+    update(makeVoice({ state: 'listening' }));
+    expect(screen.queryByRole('button', { name: t.chatVoiceCancel })).not.toBeInTheDocument();
+  });
+});
+
+describe('VoiceChatControl errors', () => {
+  it('shows a refused ticket by its gateway code, and holds the toggle until it is dismissed', () => {
+    const voice = makeVoice({
+      state: 'off',
+      error: {
+        kind: 'refused',
+        code: 'portal.voice_chat_coload_failed',
+        message: 'portal.voice_chat_coload_failed: the models cannot be held together',
+      },
+    });
+    renderControl(voice);
+
+    expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorCoLoad);
+    // The same request would be refused again: the toggle says so instead of inviting a retry.
+    expect(screen.getByRole('switch', { name: t.chatVoice })).toBeDisabled();
+
+    // Dismissing clears the refusal (stop does that), which opens the toggle again.
+    fireEvent.click(screen.getByRole('button', { name: t.chatVoiceDismiss }));
+    expect(voice.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['portal.voice_chat_asr_unavailable', 'chatVoiceErrorAsrUnavailable'],
+    ['portal.voice_chat_llm_unavailable', 'chatVoiceErrorLlmUnavailable'],
+    ['portal.voice_chat_tts_unavailable', 'chatVoiceErrorTtsUnavailable'],
+    ['portal.voice_chat_coload_failed', 'chatVoiceErrorCoLoad'],
+    ['portal.voice_chat_audio_settings_invalid', 'chatVoiceErrorAudioSettings'],
+    ['portal.voice_chat_ticket_failed', 'chatVoiceErrorTicket'],
+    ['portal.chat_not_found', 'chatVoiceErrorRefused'],
+  ] as const)('maps the refusal %s to its sentence', (code, key) => {
+    renderControl(makeVoice({ error: { kind: 'refused', code, message: 'raw' } }));
+    expect(screen.getByRole('alert')).toHaveTextContent(t[key]);
+    // The raw English of the gateway is diagnostic, never the user's text.
+    expect(screen.queryByText('raw')).not.toBeInTheDocument();
+  });
+
+  it('keeps the toggle open after a failure a retry can get past', () => {
+    for (const kind of ['dropped', 'denied', 'unsupported', 'capture'] as const) {
+      const voice = makeVoice({ error: { kind, message: 'raw' } });
+      const { unmount } = renderControl(voice);
+      expect(screen.getByRole('alert'), kind).toBeInTheDocument();
+      expect(screen.getByRole('switch', { name: t.chatVoice }), kind).toBeEnabled();
+      unmount();
+    }
+  });
+
+  it('says what a failed turn means, with the conversation still open', () => {
+    renderControl(
+      makeVoice({
+        state: 'idle',
+        error: { kind: 'turn', code: 'speech.upstream_error', message: 'raw' },
+      }),
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorTurn);
+    expect(screen.getByRole('alert')).toHaveTextContent('speech.upstream_error');
+    // The conversation is still on, so the toggle is on, and is the way out.
+    expect(screen.getByRole('switch', { name: t.chatVoice })).toBeChecked();
+  });
+
+  it('shows no alert without an error', () => {
+    renderControl(makeVoice({ state: 'listening' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});

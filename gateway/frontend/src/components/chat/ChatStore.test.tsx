@@ -18,6 +18,7 @@ import { ToastProvider } from '../shared/ToastProvider';
 import { formatPortalError } from '../shared/format';
 import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
 import { createLiveSession, type LiveSessionArgs } from './liveTranscription';
+import { createVoiceSession, type VoiceSessionArgs } from './voiceSession';
 import {
   NO_SPEECH_LANGUAGE,
   NO_SPEECH_STREAMING,
@@ -68,6 +69,16 @@ vi.mock('./speechPlayback', async (importOriginal) => ({
 vi.mock('./liveTranscription', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./liveTranscription')>()),
   createLiveSession: vi.fn(),
+}));
+
+// ...nor a microphone, a WebSocket or speakers for a Voice Chat session (voiceSession.ts,
+// whose glue voiceSession.test.ts runs against a fake browser; useVoiceChat.test.ts is the
+// conversation's state machine). A recording stand-in again: these tests are about what the
+// STORE does around the conversation -- when it is offered, what it is started with, how the
+// thread catches up with the turns the gateway commits, and what it holds while it runs.
+vi.mock('./voiceSession', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./voiceSession')>()),
+  createVoiceSession: vi.fn(),
 }));
 
 const models: ModelOption[] = [
@@ -231,6 +242,9 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     createLiveTranscriptionTicket: vi.fn(async (_body: { model: string; language?: string }) => ({
       ticket: 'tkt',
     })),
+    // The Voice Chat ticket POST. The session itself is a stand-in (see the vi.mock of
+    // ./voiceSession), so nothing here calls it: the store only has to hand it over.
+    createVoiceChatTicket: vi.fn(async (_body: unknown) => ({ ticket: 'tkt' })),
   };
   return { api: spies, rows, spies };
 }
@@ -340,6 +354,23 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       </button>
       <button type="button" onClick={() => c.keepLiveTranscript()}>
         live-keep
+      </button>
+      {/* The Voice Chat conversation: its state, what is said and answered, its failure, whether
+          the thread is offered one and can do it (and what is missing), and its two controls. */}
+      <span data-testid="voice-state">{c.voiceChat.state}</span>
+      <span data-testid="voice-transcript">{c.voiceChat.liveTranscript}</span>
+      <span data-testid="voice-answer">{c.voiceChat.answerPreview}</span>
+      <span data-testid="voice-error">
+        {c.voiceChat.error ? `${c.voiceChat.error.kind}:${c.voiceChat.error.code ?? ''}` : ''}
+      </span>
+      <span data-testid="voice-offered">{String(c.voiceChatOffered)}</span>
+      <span data-testid="voice-capable">{String(c.voiceChatCapable)}</span>
+      <span data-testid="voice-gap">{c.voiceChatGap ?? ''}</span>
+      <button type="button" onClick={() => c.voiceChat.start()}>
+        voice-start
+      </button>
+      <button type="button" onClick={() => c.voiceChat.stop()}>
+        voice-stop
       </button>
       <span data-testid="run-audio-live">{String(c.runAudioLive)}</span>
       <span data-testid="run-audio-muted">{String(c.runAudioMuted)}</span>
@@ -7806,6 +7837,580 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
         expect(screen.queryByText(t.chatBusy)).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  // Voice Chat (#312), as the store wires it into the chat: when a thread is offered one and can
+  // do it (its own model chats, and the gateway says a transcription model and a speech model
+  // stream); what a conversation is started with (the thread's model, the first of each other
+  // leg that streams, and the chat that is OPEN); how the thread catches up with the turns the
+  // gateway commits (the canonical-transcript discipline of a finished run's); and what the
+  // conversation holds while it runs (the chat's saves, the text composer). The conversation's
+  // own state machine is useVoiceChat.test.ts's.
+  describe(`ChatStoreProvider voice chat [${locale}]`, () => {
+    const voiceLlm: ModelOption = {
+      id: 'llm',
+      display_name: 'llm',
+      flavors: ['openai'],
+      loading_on_count: 0,
+    };
+    const voiceLlm2: ModelOption = { ...voiceLlm, id: 'llm-2', display_name: 'llm-2' };
+    const audioModel = (id: string, verdict: Partial<ModelOption>): ModelOption => ({
+      id,
+      display_name: id,
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      ...verdict,
+    });
+    const asrA = audioModel('asr-a', { transcription: true });
+    const asrB = audioModel('asr-b', { transcription: true });
+    const ttsA = audioModel('tts-a', { speech: true });
+    const voiceModels = [voiceLlm, voiceLlm2, asrA, asrB, ttsA];
+
+    const turn = (id: string, role: 'user' | 'assistant', content: string) => ({
+      id,
+      role,
+      content,
+      ...(role === 'assistant' ? { status: 'complete' } : {}),
+    });
+    const earlier = [
+      turn('m1', 'user', 'earlier question'),
+      turn('m2', 'assistant', 'earlier answer'),
+    ];
+    const committed = [
+      ...earlier,
+      turn('m3', 'user', 'spoken question'),
+      turn('m4', 'assistant', 'spoken answer'),
+    ];
+    const voiceThread = (
+      id = 'c1',
+      messages: unknown[] = earlier,
+      settings: Record<string, unknown> = {},
+      updated_at = T,
+    ): ChatRow => ({
+      id,
+      title: id,
+      created_at: T,
+      updated_at,
+      content: { settings: { model: 'llm', ...settings }, messages },
+    });
+
+    type FakeVoice = {
+      args: VoiceSessionArgs;
+      pushStart: Mock<() => void>;
+      pushEnd: Mock<() => void>;
+      cancel: Mock<() => void>;
+      stop: Mock<() => void>;
+    };
+    let voiceSessions: FakeVoice[];
+
+    beforeEach(() => {
+      voiceSessions = [];
+      vi.mocked(createVoiceSession).mockImplementation((args) => {
+        const session: FakeVoice = {
+          args,
+          pushStart: vi.fn(),
+          pushEnd: vi.fn(),
+          cancel: vi.fn(),
+          stop: vi.fn(),
+        };
+        voiceSessions.push(session);
+        args.onState('connecting');
+        return session;
+      });
+    });
+    afterEach(() => vi.mocked(createVoiceSession).mockReset());
+
+    const text = (id: string) => screen.getByTestId(id).textContent;
+    const click = (name: string) => fireEvent.click(screen.getByRole('button', { name }));
+    const storedMessages = () =>
+      JSON.parse(screen.getByTestId('messages-json').textContent ?? '[]') as ChatUiMessage[];
+    const streams = { streaming: true, sampleRate: 24000 } satisfies SpeechStreamingGate;
+
+    // The gateway's answers to the streaming gates: which transcription models stream, and
+    // whether the speech model does.
+    function gates(asr: (name: string) => boolean = () => true, tts = true) {
+      chatApi.spies.modelTranscriptionStreaming.mockImplementation(async (name) => asr(name));
+      chatApi.spies.modelSpeechStreaming.mockResolvedValue(tts ? streams : NO_SPEECH_STREAMING);
+    }
+
+    // A provider over the catalogue, its first thread open and a conversation on offer (or not).
+    async function renderVoice(
+      rows: ChatRow[] = [voiceThread()],
+      opts: { models?: ModelOption[]; capable?: boolean } = {},
+    ) {
+      chatApi = makeChatApi(rows);
+      gates();
+      const view = renderProvider([], { models: opts.models ?? voiceModels });
+      await waitForReady();
+      if (opts.capable !== false) {
+        await waitFor(() => expect(text('voice-capable')).toBe('true'));
+      }
+      return view;
+    }
+
+    // One turn the gateway has committed: the stored thread now has it, and the session says so.
+    async function commitTurn(rows: unknown[] = committed) {
+      chatApi.rows[0].content = { settings: { model: 'llm' }, messages: rows };
+      await act(async () => {
+        voiceSessions.at(-1)!.args.onAudioDone();
+      });
+    }
+
+    describe('when it is offered', () => {
+      it('is capable when the thread chats and a transcription and a speech model stream', async () => {
+        await renderVoice();
+
+        expect(text('voice-offered')).toBe('true');
+        expect(text('voice-capable')).toBe('true');
+        expect(text('voice-gap')).toBe('');
+        // The candidates are the catalogue's audio models -- never the thread's own chat model.
+        const asked = chatApi.spies.modelTranscriptionStreaming.mock.calls.map(([name]) => name);
+        expect(asked).toEqual(['asr-a', 'asr-b']);
+        expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalledWith('tts-a');
+      });
+
+      it('is closed (checking) until the gateway has answered, and open after', async () => {
+        chatApi = makeChatApi([voiceThread()]);
+        // One lookup per transcription candidate, each waiting for its answer.
+        const answers: ((streams: boolean) => void)[] = [];
+        chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+          () => new Promise<boolean>((resolve) => answers.push(resolve)),
+        );
+        chatApi.spies.modelSpeechStreaming.mockResolvedValue(streams);
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+
+        // A switch that opens before the gateway has said yes would promise a session it
+        // refuses a ticket for.
+        await waitFor(() => expect(text('voice-gap')).toBe('checking'));
+        expect(text('voice-capable')).toBe('false');
+        click('voice-start');
+        expect(voiceSessions).toHaveLength(0);
+
+        await act(async () => answers.forEach((answer) => answer(true)));
+        await waitFor(() => expect(text('voice-capable')).toBe('true'));
+      });
+
+      it.each<{ missing: string; asrStreams: boolean; ttsStreams: boolean; gap: string }>([
+        { missing: 'no transcription model', asrStreams: false, ttsStreams: true, gap: 'asr' },
+        { missing: 'no speech model', asrStreams: true, ttsStreams: false, gap: 'tts' },
+      ])('names the missing leg when $missing streams', async ({ asrStreams, ttsStreams, gap }) => {
+        chatApi = makeChatApi([voiceThread()]);
+        gates(() => asrStreams, ttsStreams);
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+
+        await waitFor(() => expect(text('voice-gap')).toBe(gap));
+        expect(text('voice-capable')).toBe('false');
+        // Still OFFERED: the switch is there, closed, with the reason.
+        expect(text('voice-offered')).toBe('true');
+      });
+
+      it('fails closed when the gateway cannot say', async () => {
+        chatApi = makeChatApi([voiceThread()]);
+        chatApi.spies.modelTranscriptionStreaming.mockRejectedValue(new Error('unreachable'));
+        chatApi.spies.modelSpeechStreaming.mockRejectedValue(new Error('unreachable'));
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+
+        await waitFor(() => expect(text('voice-gap')).toBe('asr'));
+        expect(text('voice-capable')).toBe('false');
+      });
+
+      it('is not offered on a catalogue with no audio model, and asks the gateway about none', async () => {
+        chatApi = makeChatApi([voiceThread()]);
+        gates();
+        renderProvider([], { models: [voiceLlm] });
+        await waitForReady();
+
+        await waitFor(() => expect(text('voice-gap')).toBe('asr'));
+        expect(text('voice-offered')).toBe('false');
+        expect(text('voice-capable')).toBe('false');
+        expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+      });
+
+      it('is not offered on a thread that is not a text thread, and asks the gateway nothing', async () => {
+        // A speech thread: its model synthesizes, it does not chat.
+        chatApi = makeChatApi([voiceThread('c1', [], { model: 'tts-a', kind: 'speech' })]);
+        gates();
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+
+        expect(text('chat-kind')).toBe('speech');
+        expect(text('voice-offered')).toBe('false');
+        expect(text('voice-capable')).toBe('false');
+        expect(text('voice-gap')).toBe('llm');
+        expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+      });
+
+      it('is not capable when the thread model is not reachable', async () => {
+        chatApi = makeChatApi([voiceThread('c1', earlier, { model: 'ghost' })]);
+        gates();
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+
+        expect(text('model-available')).toBe('false');
+        expect(text('voice-gap')).toBe('llm');
+        expect(text('voice-capable')).toBe('false');
+        expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+      });
+
+      it('is not capable for a thread whose model is an audio model that does not chat', async () => {
+        chatApi = makeChatApi([voiceThread('c1', earlier, { model: 'asr-a' })]);
+        gates();
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+
+        expect(text('voice-gap')).toBe('llm');
+      });
+    });
+
+    describe('starting', () => {
+      it('uses the thread model and the FIRST transcription and speech model that stream', async () => {
+        // The catalogue's first transcription model does not stream; the second does.
+        chatApi = makeChatApi([voiceThread()]);
+        gates((name) => name === 'asr-b');
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+        await waitFor(() => expect(text('voice-capable')).toBe('true'));
+
+        click('voice-start');
+
+        expect(voiceSessions).toHaveLength(1);
+        expect(voiceSessions[0].args).toMatchObject({
+          chatId: 'c1',
+          asrModel: 'asr-b',
+          llmModel: 'llm',
+          ttsModel: 'tts-a',
+        });
+        expect(voiceSessions[0].args.api).toBe(chatApi.api);
+        expect(text('voice-state')).toBe('connecting');
+        // The page's audio is readied inside the click that asks for the microphone.
+        expect(playback.prime).toHaveBeenCalled();
+      });
+
+      it('starts in the chat that is OPEN, not the one that was', async () => {
+        await renderVoice([voiceThread('c1', earlier, {}, T2), voiceThread('c2', earlier, {}, T1)]);
+        expect(text('active')).toBe('c1');
+        click('select-c2');
+        await waitFor(() => expect(text('active')).toBe('c2'));
+        await waitFor(() => expect(text('voice-capable')).toBe('true'));
+
+        click('voice-start');
+
+        expect(voiceSessions).toHaveLength(1);
+        expect(voiceSessions[0].args.chatId).toBe('c2');
+        // ...and stays: the conversation is bound to the chat it started in.
+        expect(text('voice-state')).toBe('connecting');
+      });
+
+      it("answers with the thread's own model", async () => {
+        await renderVoice([voiceThread('c1', earlier, { model: 'llm-2' })]);
+        click('voice-start');
+        expect(voiceSessions[0].args.llmModel).toBe('llm-2');
+      });
+
+      it('does not start where it is not on offer (the gateway says no transcription streams)', async () => {
+        chatApi = makeChatApi([voiceThread()]);
+        gates(() => false);
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+        await waitFor(() => expect(text('voice-gap')).toBe('asr'));
+
+        click('voice-start');
+
+        expect(voiceSessions).toHaveLength(0);
+        expect(text('voice-state')).toBe('off');
+      });
+
+      it('does not start while the chat has a run in flight, and says so', async () => {
+        chatApi = makeChatApi([voiceThread()]);
+        gates();
+        chatApi.spies.activeChatRuns.mockResolvedValue({
+          data: [{ chat_id: 'c1', run_id: 'r1', status: 'running', kind: '', elapsed_ms: 0 }],
+        });
+        renderProvider([], { models: voiceModels });
+        await waitForReady();
+        await waitFor(() => expect(text('voice-capable')).toBe('true'));
+
+        click('voice-start');
+
+        expect(voiceSessions).toHaveLength(0);
+        expect(await screen.findByText(t.chatBusy)).toBeInTheDocument();
+      });
+    });
+
+    describe('the thread after a turn', () => {
+      it('shows the turns the gateway committed, through the stored thread', async () => {
+        await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('listening'));
+        expect(text('count')).toBe('2');
+
+        await commitTurn();
+
+        await waitFor(() => expect(text('count')).toBe('4'));
+        expect(text('last')).toBe('spoken answer');
+        expect(storedMessages().map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'm4']);
+        expect(chatApi.spies.chat).toHaveBeenCalledWith('c1');
+        // The conversation is still on: a turn is not its end.
+        expect(text('voice-state')).toBe('listening');
+      });
+
+      it('does not wipe what is shown when the server holds no transcript', async () => {
+        await renderVoice();
+        click('voice-start');
+
+        await commitTurn([]);
+
+        // Nothing to adopt: the local transcript is ahead of the server's, not behind it.
+        await waitFor(() => expect(chatApi.spies.chat).toHaveBeenCalled());
+        expect(text('count')).toBe('2');
+        expect(text('last')).toBe('earlier answer');
+      });
+
+      it('lets the newest reload win when two overlap', async () => {
+        await renderVoice();
+        click('voice-start');
+        const pending: ((doc: unknown) => void)[] = [];
+        chatApi.spies.chat.mockImplementation(
+          () => new Promise((resolve) => pending.push(resolve as (doc: unknown) => void)),
+        );
+
+        // Two turns end close together: two reloads are on their way.
+        act(() => voiceSessions[0].args.onAudioDone());
+        act(() => voiceSessions[0].args.onAudioDone());
+        expect(pending).toHaveLength(2);
+        const doc = (messages: unknown[]) => ({
+          id: 'c1',
+          title: 'c1',
+          created_at: T,
+          updated_at: T,
+          content: { settings: { model: 'llm' }, messages },
+        });
+
+        // The NEWER one comes back first with the newer document; the older one's late answer
+        // (a document from before the last turn) must not put the thread back.
+        await act(async () => pending[1](doc(committed)));
+        await waitFor(() => expect(text('count')).toBe('4'));
+        await act(async () => pending[0](doc(earlier)));
+        expect(text('count')).toBe('4');
+        expect(text('last')).toBe('spoken answer');
+      });
+
+      it('says so, and goes on, when the reload fails', async () => {
+        await renderVoice();
+        click('voice-start');
+        chatApi.spies.chat.mockRejectedValue(new Error('unavailable'));
+
+        await act(async () => {
+          voiceSessions[0].args.onAudioDone();
+        });
+
+        expect(await screen.findByText(t.errorChatTranscriptStale)).toBeInTheDocument();
+        expect(text('count')).toBe('2');
+        expect(text('voice-state')).not.toBe('off');
+      });
+
+      it('reloads once more when the conversation ends in the middle of a turn', async () => {
+        // The connection dropped after the gateway committed the turn and before audio_done:
+        // the turn is on the server, and the screen must catch up with it.
+        await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('speaking'));
+        chatApi.spies.chat.mockClear();
+        chatApi.rows[0].content = { settings: { model: 'llm' }, messages: committed };
+
+        await act(async () => {
+          voiceSessions[0].args.onError('connection closed', { kind: 'dropped' });
+          voiceSessions[0].args.onState('error');
+        });
+
+        await waitFor(() => expect(text('count')).toBe('4'));
+        expect(chatApi.spies.chat).toHaveBeenCalledWith('c1');
+        expect(text('voice-state')).toBe('off');
+      });
+
+      it('does not reload for an end that follows no turn in flight', async () => {
+        await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('listening'));
+        chatApi.spies.chat.mockClear();
+
+        click('voice-stop');
+
+        expect(text('voice-state')).toBe('off');
+        expect(voiceSessions[0].stop).toHaveBeenCalled();
+        // Let any effect of the end run.
+        await act(async () => {});
+        expect(chatApi.spies.chat).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('while it runs', () => {
+      it('saves nothing of the chat, and saves what was held back when it ends', async () => {
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        try {
+          await renderVoice();
+          click('voice-start');
+          act(() => voiceSessions[0].args.onState('listening'));
+          chatApi.spies.saveChat.mockClear();
+
+          // A change that would be saved (well past the debounce): the gateway owns the
+          // thread's transcript now, and a save from here could land over a committed turn.
+          click('set-system');
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(5000);
+          });
+          expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+
+          click('voice-stop');
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(0);
+          });
+          expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1);
+          expect(chatApi.spies.saveChat.mock.calls[0][0]).toBe('c1');
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('saves nothing while the reload at the end is in flight, and saves what landed after it', async () => {
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        try {
+          await renderVoice();
+          click('voice-start');
+          act(() => voiceSessions[0].args.onState('speaking'));
+          click('set-system');
+          chatApi.spies.saveChat.mockClear();
+          let land: (doc: unknown) => void = () => {};
+          chatApi.spies.chat.mockImplementation(
+            () => new Promise((resolve) => (land = resolve as (doc: unknown) => void)),
+          );
+
+          // Ends mid-turn: the reload starts, and this tab cannot vouch for its own copy.
+          await act(async () => {
+            voiceSessions[0].args.onState('closed');
+          });
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(5000);
+          });
+          expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+
+          await act(async () => {
+            land({
+              id: 'c1',
+              title: 'c1',
+              created_at: T,
+              updated_at: T,
+              content: { settings: { model: 'llm' }, messages: committed },
+            });
+          });
+          expect(text('count')).toBe('4');
+          // The adopted thread is saveable again: the debounce runs from its arrival.
+          await act(async () => {
+            await vi.advanceTimersByTimeAsync(5000);
+          });
+          // What was saved is the thread WITH the committed turn.
+          expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1);
+          const saved = chatApi.spies.saveChat.mock.calls[0][1] as {
+            content: { messages: { id: string }[] };
+          };
+          expect(saved.content.messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'm4']);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('closes the text composer: a send is refused, with nothing started', async () => {
+        await renderVoice();
+        click('voice-start');
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'typed' } });
+
+        click('send');
+
+        expect(await screen.findByText(t.chatBusy)).toBeInTheDocument();
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(text('count')).toBe('2');
+      });
+
+      it('refuses a regenerate or an edit as well', async () => {
+        await renderVoice();
+        click('voice-start');
+
+        click('regenerate-m2');
+        click('edit-m1');
+
+        await waitFor(() => expect(screen.getAllByText(t.chatBusy).length).toBeGreaterThan(0));
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+        expect(text('count')).toBe('2');
+      });
+
+      it('lets a send through again once the conversation has ended', async () => {
+        await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('listening'));
+        click('voice-stop');
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'typed' } });
+
+        click('send');
+
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      });
+    });
+
+    describe('its ends', () => {
+      it('ends when another chat is opened', async () => {
+        await renderVoice([voiceThread('c1', earlier, {}, T2), voiceThread('c2', earlier, {}, T1)]);
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('listening'));
+
+        click('select-c2');
+
+        await waitFor(() => expect(text('active')).toBe('c2'));
+        expect(voiceSessions[0].stop).toHaveBeenCalled();
+        expect(text('voice-state')).toBe('off');
+      });
+
+      it("drops one chat's refusal when another chat is opened, so it does not close its switch", async () => {
+        await renderVoice([voiceThread('c1', earlier, {}, T2), voiceThread('c2', earlier, {}, T1)]);
+        click('voice-start');
+        await act(async () => {
+          voiceSessions[0].args.onError('refused', {
+            kind: 'refused',
+            code: 'portal.voice_chat_coload_failed',
+          });
+          voiceSessions[0].args.onState('error');
+        });
+        expect(text('voice-error')).toBe('refused:portal.voice_chat_coload_failed');
+
+        click('select-c2');
+
+        await waitFor(() => expect(text('active')).toBe('c2'));
+        expect(text('voice-error')).toBe('');
+      });
+
+      it('ends when the thread model is changed under it', async () => {
+        await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('listening'));
+
+        click('pick-llm-2');
+
+        await waitFor(() => expect(text('voice-state')).toBe('off'));
+        expect(voiceSessions[0].stop).toHaveBeenCalled();
+      });
+
+      it('releases the microphone when the provider goes away', async () => {
+        const { unmount } = await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('listening'));
+
+        unmount();
+
+        expect(voiceSessions[0].stop).toHaveBeenCalled();
       });
     });
   });
