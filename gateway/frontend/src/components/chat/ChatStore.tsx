@@ -818,6 +818,14 @@ export function ChatStoreProvider({
   const modelSpeechCapable =
     effectiveOption?.speech === true &&
     (effectiveOption.speech_clone !== true || effectiveOption.speech_clone_voices === true);
+  // Whether the effective model is a voice-CLONE model driven by its configured PRESET voices
+  // (#301), the one speech model with no text-only default voice: a send with a blank voice
+  // relies on the operator having configured a default preset, which the gateway cannot see.
+  // The voices effect below starts such a model on the first preset voice it lists.
+  const modelPresetClone =
+    effectiveOption?.speech === true &&
+    effectiveOption.speech_clone === true &&
+    effectiveOption.speech_clone_voices === true;
   // Whether the effective model TRANSCRIBES speech (drives the transcription-thread composer),
   // read as served like `speech`: the backend's own fold of the transcription verdict.
   const modelTranscriptionCapable =
@@ -1518,6 +1526,17 @@ export function ChatStoreProvider({
   // empty list, which leaves the voice field the free-text field it always was.
   // Keyed on the picked model, not the thread's kind, like the image options: the
   // composer only renders the picker for a speech thread.
+  //
+  // A preset-voice CLONE model (modelPresetClone) also gets a default voice from this answer:
+  // the first voice it lists fills a BLANK voice field, so the first send does not depend on a
+  // default preset the operator may not have configured (a plain tts model keeps its blank
+  // voice, the server's own default). The language pre-fill's shape, below: done when the
+  // answer ARRIVES -- never on the user's own edits, so a voice they cleared stays cleared --
+  // and only into a blank field of a thread that has not spoken yet, so a voice the thread
+  // already has (typed, or saved) is never overwritten, nor is the voice of a thread whose
+  // earlier answers were made without one. It runs in this model's own answer (guarded by
+  // `cancelled`), so another model's voices, still held while this fetch is in flight, are
+  // never taken for this one's.
   useEffect(() => {
     setModelVoices(NO_VOICES);
     if (!modelSpeechCapable || effectiveModel === '') return;
@@ -1525,7 +1544,17 @@ export function ChatStoreProvider({
     void apiRef.current
       .modelVoices(effectiveModel)
       .then((voices) => {
-        if (!cancelled) setModelVoices(voices);
+        if (cancelled) return;
+        setModelVoices(voices);
+        const first = voices[0];
+        if (
+          modelPresetClone &&
+          first !== undefined &&
+          chatKindRef.current === 'speech' &&
+          messagesRef.current.length === 0
+        ) {
+          setAudioSettings((s) => (s.voice === '' ? { ...s, voice: first } : s));
+        }
       })
       .catch(() => {
         if (!cancelled) setModelVoices(NO_VOICES);
@@ -1533,7 +1562,7 @@ export function ChatStoreProvider({
     return () => {
       cancelled = true;
     };
-  }, [modelSpeechCapable, effectiveModel]);
+  }, [modelSpeechCapable, modelPresetClone, effectiveModel, setAudioSettings]);
 
   // Ask the gateway whether the effective SPEECH model may be streamed (ADR-068), for the
   // composer's toggle. The voices effect above, for the streaming gate: closed up front (the

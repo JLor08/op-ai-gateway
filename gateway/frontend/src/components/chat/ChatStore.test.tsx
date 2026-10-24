@@ -415,6 +415,9 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, voice: 'bf_emma' }))}>
         set-voice
       </button>
+      <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, voice: '' }))}>
+        clear-voice
+      </button>
       {/* The language control's two edits: a typed code, and the field cleared again. */}
       <button type="button" onClick={() => c.setAudioSettings((s) => ({ ...s, language: 'fr' }))}>
         set-language
@@ -3990,6 +3993,234 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         releaseKokoro(kokoroVoices);
       });
       expect(voicesShown()).toBe(JSON.stringify(piperVoices));
+    });
+  });
+
+  // A preset-voice CLONE model (speech + speech_clone + speech_clone_voices, #301) has no
+  // text-only default voice: a send with a blank voice relies on the operator having
+  // configured a default preset, which the gateway cannot see. So the composer starts such a
+  // model on the FIRST preset voice the gateway lists, once that list arrives. A plain tts
+  // model keeps its blank voice (the server's own default is safe), and a voice the thread
+  // already has (typed, or saved) is never replaced. The language pre-fill's shape: it fills a
+  // blank field of a thread that has not spoken yet, on an ARRIVING answer, and never again
+  // on the user's own edits.
+  describe(`ChatStoreProvider preset-clone voice default [${locale}]`, () => {
+    const speechModel = (id: string, clone?: boolean, voices?: boolean): ModelOption => ({
+      id,
+      display_name: id,
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+      speech_clone: clone,
+      speech_clone_voices: voices,
+    });
+    const clone = speechModel('clone-tts', true, true);
+    const otherClone = speechModel('other-clone', true, true);
+    const plain = speechModel('kokoro', false);
+    // A model that merely carries the voices flag without being a clone: not a preset clone.
+    const plainWithFlag = speechModel('plain-flag', false, true);
+    const cloneVoices = ['Frank', 'Thorsten'];
+    // A speech thread on the clone model, optionally with saved audio settings and turns
+    // already spoken.
+    const cloneThread = (audio?: unknown, withTurn = false): ChatRow[] => [
+      {
+        id: 'c1',
+        title: 'C1',
+        created_at: T,
+        updated_at: T,
+        content: {
+          settings: { model: clone.id, kind: 'speech', ...(audio ? { audio } : {}) },
+          messages: withTurn ? [{ id: 'm1', role: 'user', content: 'hello' }] : [],
+        },
+      },
+    ];
+    const voice = () =>
+      (JSON.parse(screen.getByTestId('audio-settings').textContent!) as { voice: string }).voice;
+    const voicesShown = () => screen.getByTestId('model-voices').textContent;
+
+    it('pre-selects the first preset voice when a clone model is picked with a blank voice', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue(cloneVoices);
+      renderProvider([], { models: [clone, plain] });
+      await waitForReady();
+      expect(voice()).toBe('');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+
+      await waitFor(() => expect(voice()).toBe('Frank'));
+      expect(voicesShown()).toBe(JSON.stringify(cloneVoices));
+      // No extra fetch: the default hangs off the voices the picker already loads.
+      expect(chatApi.spies.modelVoices).toHaveBeenCalledTimes(1);
+    });
+
+    it('pre-selects for a saved empty clone thread whose voice is blank', async () => {
+      chatApi = makeChatApi(cloneThread());
+      chatApi.spies.modelVoices.mockResolvedValue(cloneVoices);
+      renderProvider([], { models: [clone] });
+      await waitForReady();
+
+      await waitFor(() => expect(voice()).toBe('Frank'));
+    });
+
+    it('keeps the voice blank for a plain tts model (the server default is safe)', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue(['af_heart']);
+      renderProvider([], { models: [clone, plain] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(['af_heart'])));
+      await act(async () => {});
+      expect(voice()).toBe('');
+    });
+
+    it('keeps the voice blank for a model that has the voices flag but is not a clone', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue(['af_heart']);
+      renderProvider([], { models: [plainWithFlag] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-plain-flag' }));
+
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(['af_heart'])));
+      await act(async () => {});
+      expect(voice()).toBe('');
+    });
+
+    it('never overwrites a saved voice', async () => {
+      chatApi = makeChatApi(cloneThread({ voice: 'Thorsten' }));
+      chatApi.spies.modelVoices.mockResolvedValue(cloneVoices);
+      renderProvider([], { models: [clone] });
+      await waitForReady();
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(cloneVoices)));
+      await act(async () => {});
+
+      expect(voice()).toBe('Thorsten');
+    });
+
+    it('never overwrites a voice typed before the clone model is picked', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue(cloneVoices);
+      renderProvider([], { models: [clone, plain] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'set-voice' }));
+      expect(voice()).toBe('bf_emma');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(cloneVoices)));
+      await act(async () => {});
+      expect(voice()).toBe('bf_emma');
+    });
+
+    it('leaves the voice blank until the voices arrive, then selects the first', async () => {
+      let release: (v: string[]) => void = () => {};
+      chatApi.spies.modelVoices.mockImplementation(
+        () =>
+          new Promise<string[]>((resolve) => {
+            release = resolve;
+          }),
+      );
+      renderProvider([], { models: [clone] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('clone-tts'));
+      expect(voice()).toBe('');
+
+      await act(async () => {
+        release(cloneVoices);
+      });
+      expect(voice()).toBe('Frank');
+    });
+
+    it('leaves the voice blank when the model lists no voices', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue([]);
+      renderProvider([], { models: [clone] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('clone-tts'));
+      await act(async () => {});
+      expect(voice()).toBe('');
+    });
+
+    it('leaves the voice blank when the voices lookup fails', async () => {
+      chatApi.spies.modelVoices.mockRejectedValue(new Error('boom'));
+      renderProvider([], { models: [clone] });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('clone-tts'));
+      await act(async () => {});
+      expect(voice()).toBe('');
+    });
+
+    it("never takes the previous model's voice for the clone model", async () => {
+      // kokoro's voices are on offer when the clone model is picked; the clone's own list is
+      // still in flight. The first voice must come from the CLONE's list, not kokoro's.
+      let releaseClone: (v: string[]) => void = () => {};
+      chatApi.spies.modelVoices.mockImplementation((name: string) =>
+        name === 'kokoro'
+          ? Promise.resolve(['af_heart'])
+          : new Promise<string[]>((resolve) => {
+              releaseClone = resolve;
+            }),
+      );
+      renderProvider([], { models: [clone, plain] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(['af_heart'])));
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+      await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('clone-tts'));
+      expect(voice()).toBe('');
+
+      await act(async () => {
+        releaseClone(cloneVoices);
+      });
+      expect(voice()).toBe('Frank');
+    });
+
+    it('does not refill a voice the user cleared', async () => {
+      chatApi.spies.modelVoices.mockResolvedValue(cloneVoices);
+      renderProvider([], { models: [clone] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+      await waitFor(() => expect(voice()).toBe('Frank'));
+
+      fireEvent.click(screen.getByRole('button', { name: 'clear-voice' }));
+      await act(async () => {});
+
+      expect(voice()).toBe('');
+    });
+
+    it('does not replace the voice again when another clone model is picked', async () => {
+      chatApi.spies.modelVoices.mockImplementation(async (name: string) =>
+        name === 'clone-tts' ? cloneVoices : ['Anna'],
+      );
+      renderProvider([], { models: [clone, otherClone] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-tts' }));
+      await waitFor(() => expect(voice()).toBe('Frank'));
+      fireEvent.click(screen.getByRole('button', { name: 'set-voice' }));
+      expect(voice()).toBe('bf_emma');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-other-clone' }));
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(['Anna'])));
+      await act(async () => {});
+
+      expect(voice()).toBe('bf_emma');
+    });
+
+    it('does not rewrite a thread that has already spoken', async () => {
+      chatApi = makeChatApi(cloneThread(undefined, true));
+      chatApi.spies.modelVoices.mockResolvedValue(cloneVoices);
+      renderProvider([], { models: [clone] });
+      await waitForReady();
+      await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(cloneVoices)));
+      await act(async () => {});
+
+      expect(voice()).toBe('');
     });
   });
 
