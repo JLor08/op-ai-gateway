@@ -3457,8 +3457,10 @@ emits the key, `{}` when empty):
   `speech_clone_voices` all true) the answer of that same fetch fills a **blank** voice with the first
   listed name, once, as it arrives, on an **empty** speech thread; it never runs on the user's own
   edit and never overwrites a typed or saved voice, and a plain tts model keeps its blank voice. The
-  chosen voice stays in the thread's settings across a later model switch, like a typed one (a known
-  staleness, [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+  **auto-selected** value does not outlive its model (issue #307): a later model switch clears the voice
+  while it still equals that pick, so it is not carried to a model that lacks it, and only a typed or saved
+  voice persists across the switch (a name the next model lacks is the free-text-voice 500 above; the two
+  accepted edges are in [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **`speed` is passed through as given** (placeholder `1.0`, no clamp: the model's own
   range applies).
 - **`language` is a free-text field shown only where the gateway says the model takes one**

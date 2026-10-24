@@ -940,6 +940,12 @@ export function ChatStoreProvider({
   // every thread pinned during the current session.
   const chatKindRef = useRef<string>(chatKind);
   chatKindRef.current = chatKind;
+  // The voice the preset-clone pre-select (the voices effect, below) wrote into a blank voice
+  // field, or '' when it has written none. A model switch clears the voice only while it still
+  // equals this value: a voice the user typed, or a saved thread carried, differs and is never
+  // taken for the pre-select's. Written from effects and loads only, never during render, so
+  // it needs no re-render of its own.
+  const autoSelectedVoiceRef = useRef<string>('');
 
   // The composer's writer of the audio settings (#281). Every edit is applied at once EXCEPT
   // a retention that would remove audio: tightening the retention of a chat whose stored audio
@@ -1194,6 +1200,10 @@ export function ChatStoreProvider({
       // value by the next save). normalizeDoc kept the persisted `audio` only for a
       // speech thread, so any other thread seeds defaults harmlessly.
       setAudioSettingsState(audioSettingsFrom(doc.settings.audio));
+      // The loaded voice is this thread's own, whatever the pre-select wrote for the chat left
+      // behind: forget that pick, or a saved voice equal to it would be cleared when this
+      // thread's model takes over (the voices effect).
+      autoSelectedVoiceRef.current = '';
       // A retention change held for another chat's confirm is not this chat's to apply.
       setHeldRetention(null);
       // The transcription knobs, seeded likewise: normalizeDoc kept the persisted
@@ -1543,8 +1553,23 @@ export function ChatStoreProvider({
   // earlier answers were made without one. It runs in this model's own answer (guarded by
   // `cancelled`), so another model's voices, still held while this fetch is in flight, are
   // never taken for this one's.
+  //
+  // That pick belongs to the model that offered it, and the no-overwrite rule above would
+  // otherwise carry it to the next model, which may not have the voice (a send then fails
+  // server-side). So the value the pre-select wrote is remembered (autoSelectedVoiceRef), and
+  // every run of this effect -- a model switch -- first clears the voice IF it still equals
+  // that value: the next preset-clone model's own answer then fills the blank, and a plain tts
+  // model keeps the blank (the server's default). Only the pre-select's own value is ever
+  // cleared, so a voice the user typed over it, or a saved thread's, survives the switch (the
+  // user's edits need no interception: a differing value is simply not the remembered one),
+  // and a voice the user cleared stays cleared.
   useEffect(() => {
     setModelVoices(NO_VOICES);
+    const autoSet = autoSelectedVoiceRef.current;
+    autoSelectedVoiceRef.current = '';
+    if (autoSet !== '') {
+      setAudioSettings((s) => (s.voice === autoSet ? { ...s, voice: '' } : s));
+    }
     if (!modelSpeechCapable || effectiveModel === '') return;
     let cancelled = false;
     void apiRef.current
@@ -1557,8 +1582,11 @@ export function ChatStoreProvider({
           modelPresetClone &&
           first !== undefined &&
           chatKindRef.current === 'speech' &&
-          messagesRef.current.length === 0
+          messagesRef.current.length === 0 &&
+          audioSettingsRef.current.voice === ''
         ) {
+          // Remember what is written, but only when it is: a voice already there is not ours.
+          autoSelectedVoiceRef.current = first;
           setAudioSettings((s) => (s.voice === '' ? { ...s, voice: first } : s));
         }
       })

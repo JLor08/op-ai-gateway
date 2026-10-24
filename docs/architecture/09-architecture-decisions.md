@@ -9042,7 +9042,10 @@ returns, so only the gateway's decision of when to ask changes.**
   voices fetch that already runs for the picked model fills a **blank** voice with the first listed name,
   once, as the answer arrives, on an **empty** speech thread: the shape of ADR-074 (e)'s language
   pre-fill, so it never runs on the user's own edit and never overwrites a typed or saved voice. A plain
-  tts model keeps its blank voice. No new string is introduced.
+  tts model keeps its blank voice. No new string is introduced. **The pick does not outlive its model
+  (issue #307):** the store remembers the value the pre-select wrote, and a model switch clears the voice
+  only while it still equals that value, so a voice the new model may lack is not carried to it (a typed
+  or saved voice differs from the remembered value and is never cleared; opening a thread forgets the pick).
 - **(g) `speech_clone` stays truthful and the routing voice filter is left as is.** There is no manual
   `(speech_clone, no)` override (it stays reserved in `reservedManualVerdicts`) and audio.cpp's task stays
   authoritative: the model is still `speech_clone: yes`, and what changes is whether it is **offered**.
@@ -9083,10 +9086,18 @@ returns, so only the gateway's decision of when to ask changes.**
   clone model stream was the follow-up with the benchmark, recorded in [Risks & Technical Debt
   §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances) and shipped as ADR-076, which
   teaches the benchmark to name a cached preset voice; a reference-only clone still has no rate.
-- **A preset voice chosen by the composer persists across a later model switch.** It sits in the thread's
-  audio settings like a typed voice, and a send to a model that lacks that name fails upstream (audio.cpp
-  answers an unknown voice with a 500). It is the same staleness as a typed voice, fixable by tracking
-  which voice the composer set by default and clearing it on a model change; follow-up, recorded in §11.4.
+- **A preset voice chosen by the composer is cleared on a later model switch; a typed or saved voice is
+  not (issue #307).** The pick sits in the thread's audio settings, and a send to a model that lacks that
+  name fails upstream (audio.cpp answers an unknown voice with a 500), so the store remembers the value the
+  pre-select wrote and every model switch clears the voice **only while it still equals that value**: on an
+  empty thread the next preset clone's own answer then fills the blank, and a plain tts model keeps the
+  blank (the server's default). A voice the user typed over the pick, or a saved thread carried, differs
+  from the remembered value, persists across the switch like any typed voice, and a name the next model
+  lacks stays the free-text-voice 500 risk (ADR-067). Two edges are accepted, recorded in §11.4: a user who
+  types the exact picked value is indistinguishable from the pick and loses it on the next switch; and the
+  clear fires on any switch while the voice is still the pick, so a **spoken** thread (which the pre-select
+  never refills) moved between two clones that list the same preset goes blank and relies on the operator's
+  `default_voice_preset`.
 - **A cross-catalog voice pick on an offered mixed-voice-catalog name can 500. Known limitation.** The
   routing voice filter (`voiceScopeFor`) classifies plain tts mappings only and never reads a clone
   mapping's cached voices (choice (g)). For an offered single name that mixes a plain tts mapping and a
