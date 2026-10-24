@@ -4754,13 +4754,59 @@ func TestRunAppHealthOnceAudioCppVoicesWriteIsChangeDetected(t *testing.T) {
 	}
 }
 
+// TestAudioCppVoicesWanted pins the verdict gate of the static voices and speech
+// language steps on its own: a model the listing states as LOADED right now and as a
+// speech model -- (speech, yes), whatever its (speech_clone) verdict. The clone verdict
+// is not a term (#301): audio.cpp's voices listing is task-independent, so a clone
+// model's configured voice_presets are worth caching, and an empty listing is what
+// keeps a reference-only clone hidden downstream.
+func TestAudioCppVoicesWanted(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	for _, tc := range []struct {
+		name string
+		v    provider.AudioCppVerdicts
+		want bool
+	}{
+		{"a loaded clone model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes}, true},
+		{"a loaded plain tts model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no}, true},
+		{"a loaded speech model whose clone verdict is unknown", provider.AudioCppVerdicts{Loaded: true, Speech: yes}, true},
+		{"a speech model that is not loaded", provider.AudioCppVerdicts{Loaded: false, Speech: yes}, false},
+		{"a clone model that is not loaded", provider.AudioCppVerdicts{Loaded: false, Speech: yes, SpeechClone: yes}, false},
+		{"a loaded model that is not a speech model", provider.AudioCppVerdicts{Loaded: true, Speech: no}, false},
+		{"a loaded model whose task is not stated", provider.AudioCppVerdicts{Loaded: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := audioCppVoicesWanted(tc.v); got != tc.want {
+				t.Fatalf("audioCppVoicesWanted(%+v) = %v, want %v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAudioCppSpeechRateWantedStillExcludesClone guards the one gate that must NOT follow
+// audioCppVoicesWanted when it admits clone models (#301): the speech rate benchmark
+// synthesizes with a plain request, which a clone model refuses without a reference voice,
+// and streaming clone models are out of scope here. A loaded, streaming clone model is
+// therefore still not a rate target, while the same listing as a plain tts model is.
+func TestAudioCppSpeechRateWantedStillExcludesClone(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	clone := provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes}
+	if audioCppSpeechRateWanted(clone) {
+		t.Fatalf("audioCppSpeechRateWanted(%+v) = true, want false: a clone model is never rate-benchmarked", clone)
+	}
+	plain := provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: yes}
+	if !audioCppSpeechRateWanted(plain) {
+		t.Fatalf("audioCppSpeechRateWanted(%+v) = false, want true (the control: a plain streaming tts model is a target)", plain)
+	}
+}
+
 // TestRunAppHealthOnceAudioCppVoicesGate pins WHICH mappings are asked: only a
 // model the listing states as LOADED right now (the server answers for the
 // model it has loaded, so asking for any other would attribute another model's
-// voices to this one) and only a plain tts one -- (speech, yes) and NOT
-// (speech_clone, yes), #252's verdict -- because a clone model takes a reference
-// recording, not a named voice. Everything else is never fetched and never
-// written, however the rest of the verdict reads.
+// voices to this one) and only a speech one -- (speech, yes), whatever its
+// (speech_clone) verdict (#301: the listing is task-independent, and a clone model
+// with configured voice_presets lists them). Everything else is never fetched and
+// never written, however the rest of the verdict reads.
 func TestRunAppHealthOnceAudioCppVoicesGate(t *testing.T) {
 	yes, no := routing.CapabilityYes, routing.CapabilityNo
 	for _, tc := range []struct {
@@ -4771,7 +4817,8 @@ func TestRunAppHealthOnceAudioCppVoicesGate(t *testing.T) {
 		{"a loaded tts model", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: no, Loaded: true}, true},
 		{"a loaded speech model whose clone verdict is unknown", provider.AudioCppVerdicts{Speech: yes, Transcription: no, Loaded: true}, true},
 		{"a tts model that is not loaded", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: no}, false},
-		{"a loaded clone model", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: yes, Loaded: true}, false},
+		{"a loaded clone model", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: yes, Loaded: true}, true},
+		{"a clone model that is not loaded", provider.AudioCppVerdicts{Speech: yes, Transcription: no, SpeechClone: yes}, false},
 		{"a loaded asr model", provider.AudioCppVerdicts{Speech: no, Transcription: yes, Loaded: true}, false},
 		{"a loaded model that is no speech and no transcription model", provider.AudioCppVerdicts{Speech: no, Transcription: no, Loaded: true}, false},
 		{"a loaded model whose task the listing does not state", provider.AudioCppVerdicts{Loaded: true}, false},
@@ -4807,9 +4854,11 @@ func TestRunAppHealthOnceAudioCppVoicesGate(t *testing.T) {
 }
 
 // TestRunAppHealthOnceAudioCppVoicesAreAttributedToTheLoadedMappingOnly: one
-// server, several mappings, one loaded tts model. The listing answers for that
-// model alone, so the voices belong to ITS mapping and to no other -- not to an
-// unloaded sibling, not to a loaded clone model beside it.
+// server, several mappings, two loaded speech models (a plain tts one and a clone
+// one) and one unloaded sibling. Each loaded model's voices belong to ITS mapping and
+// to no other: the unloaded sibling is never asked, and the clone model's presets do
+// not land on the plain tts mapping or the reverse (#301: a loaded clone model is
+// asked like any other loaded speech model).
 func TestRunAppHealthOnceAudioCppVoicesAreAttributedToTheLoadedMappingOnly(t *testing.T) {
 	cloneLoaded := provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes, Loaded: true}
 	idleTTS := audioCppLoadedTTS()
@@ -4825,14 +4874,46 @@ func TestRunAppHealthOnceAudioCppVoicesAreAttributedToTheLoadedMappingOnly(t *te
 
 	runCapabilityCycle(runner)
 
-	if got, want := prober.voicesAsked(), []string{"tts_loaded"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("voices listing asked about %v, want %v", got, want)
+	asked := prober.voicesAsked()
+	sort.Strings(asked)
+	if want := []string{"clone_loaded", "tts_loaded"}; !reflect.DeepEqual(asked, want) {
+		t.Fatalf("voices listing asked about %v, want %v", asked, want)
 	}
 	st.assertVoicesPayload(t, "m1", `["v_tts_loaded"]`)
-	for _, id := range []string{"m2", "m3"} {
-		if row, ok := st.voicesRowOf(id); ok {
-			t.Fatalf("%s has a voices row %+v, want none", id, row)
-		}
+	st.assertVoicesPayload(t, "m3", `["v_clone_loaded"]`)
+	if row, ok := st.voicesRowOf("m2"); ok {
+		t.Fatalf("m2 has a voices row %+v, want none", row)
+	}
+}
+
+// TestRunAppHealthOnceAudioCppVoicesCloneModel pins what a loaded clone model gets
+// cached (#301): the voice_presets names audio.cpp lists for it, normalized like any
+// other model's, and a genuine empty list -- written, not skipped -- for a
+// reference-only clone with no presets, because "fetched, no presets" is the fact that
+// keeps it hidden downstream, which is not the same as "never asked" (no row).
+func TestRunAppHealthOnceAudioCppVoicesCloneModel(t *testing.T) {
+	cloneLoaded := provider.AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityYes, Loaded: true}
+	for _, tc := range []struct {
+		name   string
+		voices []provider.Voice
+		want   string
+	}{
+		{"a clone model with presets", voiceList("preset_b", "preset_a"), `["preset_a","preset_b"]`},
+		{"a reference-only clone model", []provider.Voice{}, `[]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober := audioCppProbeRunner(t,
+				map[string]provider.AudioCppVerdicts{"clone_tts": cloneLoaded},
+				audioCppMapping("m1", "clone_tts"))
+			prober.acVoices["clone_tts"] = tc.voices
+
+			runCapabilityCycle(runner)
+
+			if got, want := prober.voicesAsked(), []string{"clone_tts"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("voices listing asked about %v, want %v", got, want)
+			}
+			st.assertVoicesPayload(t, "m1", tc.want)
+		})
 	}
 }
 
@@ -5174,6 +5255,18 @@ func TestCacheAudioCppSpeechParams(t *testing.T) {
 		}
 	})
 
+	t.Run("a loaded clone model has its language fact cached too", func(t *testing.T) {
+		// #301: the language step rides audioCppVoicesWanted, which no longer excludes a
+		// clone model, so a clone model that accepts language is offered the control as well.
+		r, st := newRunner()
+		v := withLanguage(audioCppLoadedTTS(), true, "de")
+		v.SpeechClone = routing.CapabilityYes
+		r.cacheAudioCppSpeechParams(context.Background(), mp, v)
+		if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":true,"default":"de"}` {
+			t.Fatalf("speech_language payload = %s, want the clone model's fact {accepts:true,default:de}", got)
+		}
+	})
+
 	t.Run("a second identical tick writes nothing", func(t *testing.T) {
 		r, st := newRunner()
 		v := withLanguage(audioCppLoadedTTS(), true, "zh")
@@ -5209,7 +5302,7 @@ func TestCacheAudioCppSpeechParams(t *testing.T) {
 		v    provider.AudioCppVerdicts
 	}{
 		{"an unloaded model", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, SpeechClone: routing.CapabilityNo, Loaded: false}},
-		{"a clone model", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, SpeechClone: routing.CapabilityYes, Loaded: true}},
+		{"a clone model that is not loaded", provider.AudioCppVerdicts{Speech: routing.CapabilityYes, SpeechClone: routing.CapabilityYes, Loaded: false}},
 		{"an asr model", provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, Loaded: true}},
 		{"a model whose speech verdict is unknown", provider.AudioCppVerdicts{Loaded: true}},
 	}
@@ -5718,10 +5811,10 @@ func TestRunAppHealthOnceVoicesAgentWithoutTheFlagNeverFetches(t *testing.T) {
 // broken per case against a fully eligible child (the control). The route is
 // Status-only, so a request for a model that is not running would only 404 --
 // and a gateway that fetched on a guess is how a cold child would get asked at
-// all -- hence loaded is strict, and only a plain tts audio.cpp child has voices
-// to offer: (speech, yes) and NOT (speech_clone, yes), from the verdicts the
-// agent reports for the child. An UNKNOWN clone verdict (no row) does not block:
-// only an affirmative clone does, the same rule as the static server's pass.
+// all -- hence loaded is strict, and only a speech audio.cpp child has voices
+// to offer: (speech, yes), from the verdicts the agent reports for the child,
+// whatever its (speech_clone) verdict -- a clone child's configured voice_presets
+// are listed too (#301), the same rule as the static server's pass.
 func TestRunAppHealthOnceVoicesAgentGate(t *testing.T) {
 	deleteCap := func(st *fakeHealthStore, capability string) { delete(st.caps["m1"], capability) }
 	for _, tc := range []struct {
@@ -5732,6 +5825,9 @@ func TestRunAppHealthOnceVoicesAgentGate(t *testing.T) {
 		{"control: a running plain tts audio.cpp child", func(*fakeHealthStore, *gateway.LoadedModelRegistry) {}, true},
 		{"the clone verdict is unknown", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
 			deleteCap(st, routing.CapabilitySpeechClone)
+		}, true},
+		{"the model is a clone model (its configured presets are listed too, #301)", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
+			st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
 		}, true},
 		{"the spec names no type but an audio.cpp binary", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
 			st.runtimeSpecs[0].Type, st.runtimeSpecs[0].Binary = "", "/opt/audio.cpp/audiocpp_server"
@@ -5744,9 +5840,6 @@ func TestRunAppHealthOnceVoicesAgentGate(t *testing.T) {
 			st.seedCapability("m1", routing.CapabilitySpeech, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
 		}, false},
 		{"the speech verdict is unknown", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) { deleteCap(st, routing.CapabilitySpeech) }, false},
-		{"the model is a clone model", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
-			st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
-		}, false},
 		{"the spec is a llama.cpp one", func(st *fakeHealthStore, _ *gateway.LoadedModelRegistry) {
 			st.runtimeSpecs[0].Type = string(routing.RuntimeSpecTypeLlamaCpp)
 		}, false},
@@ -5778,6 +5871,63 @@ func TestRunAppHealthOnceVoicesAgentGate(t *testing.T) {
 			}
 			if row, ok := st.voicesRowOf("m1"); ok {
 				t.Fatalf("m1 has a voices row %+v, want none", row)
+			}
+		})
+	}
+}
+
+// TestAgentVoiceProbeSpec pins the per-mapping eligibility decision of the agent voices
+// pass on its own: a running, active audio.cpp child whose stored verdicts say (speech,
+// yes) is asked, a clone child included (#301: the listing is task-independent, so its
+// configured voice_presets are worth caching), and the stored rows come back with the spec
+// for the speech rate step, which still excludes a clone child itself. Every other shape
+// is refused and has its back-offs cleared when it left the eligible set.
+func TestAgentVoiceProbeSpec(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	for _, tc := range []struct {
+		name          string
+		speech, clone string // "" = no row
+		want          bool
+	}{
+		{"a plain tts child", yes, no, true},
+		{"a clone child", yes, yes, true},
+		{"a speech child whose clone verdict is unknown", yes, "", true},
+		{"a child that is not a speech model", no, no, false},
+		{"a child whose speech verdict is unknown", "", yes, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mp := audioCppMapping("m1", "pocket_tts")
+			runner, st, _, _ := agentVoicesRunner(t, agentVoicesFlag, mp)
+			for capability, verdict := range map[string]string{routing.CapabilitySpeech: tc.speech, routing.CapabilitySpeechClone: tc.clone} {
+				if verdict == "" {
+					delete(st.caps["m1"], capability)
+					continue
+				}
+				st.seedCapability("m1", capability, verdict, routing.CapabilitySourceAudioCppModels)
+			}
+			specByMapping := map[string]routing.RuntimeSpec{"m1": st.runtimeSpecs[0]}
+			loadedSet := map[string]struct{}{"pocket_tts": {}}
+			runner.voicesBackoff.start("m1", time.Now(), time.Now().Add(time.Hour))
+
+			spec, rows, ask := runner.agentVoiceProbeSpec(context.Background(), mp, specByMapping, loadedSet)
+
+			if ask != tc.want {
+				t.Fatalf("agentVoiceProbeSpec ask = %v, want %v", ask, tc.want)
+			}
+			if tc.want {
+				if spec.MappingID != "m1" {
+					t.Fatalf("spec = %+v, want m1's runtime spec", spec)
+				}
+				if got := routing.CapabilityRowsByName(rows)[routing.CapabilitySpeechClone].Verdict; got != tc.clone {
+					t.Fatalf("returned rows carry speech_clone %q, want %q (the rate step reads them)", got, tc.clone)
+				}
+				if !runner.voicesBackoff.active("m1", time.Now()) {
+					t.Fatal("an eligible mapping had its voices back-off cleared, want it left alone")
+				}
+				return
+			}
+			if runner.voicesBackoff.active("m1", time.Now()) {
+				t.Fatal("an ineligible mapping kept its voices back-off, want it cleared so a reload is asked at once")
 			}
 		})
 	}
@@ -6158,6 +6308,31 @@ func TestRunAppHealthOnceSpeechParamsAgentPullsThroughTheRouterAndWrites(t *test
 	}
 	if row != want {
 		t.Fatalf("speech_language row = %+v, want %+v", row, want)
+	}
+}
+
+// TestRunAppHealthOnceAgentCloneChildCachesVoicesAndLanguageButIsNeverBenchmarked (#301):
+// a RUNNING agent-launched clone child rides the same pass as a plain tts one -- its
+// configured voice_presets are cached and its language fact pulled -- but the speech rate
+// step still refuses it, even when it is stored as streaming, because streaming clone
+// models are out of scope.
+func TestRunAppHealthOnceAgentCloneChildCachesVoicesAndLanguageButIsNeverBenchmarked(t *testing.T) {
+	runner, st, prober, _ := agentVoicesRunner(t, agentSpeechParamsFlag, audioCppMapping("m1", "clone_tts"))
+	st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	st.seedCapability("m1", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	prober.acVoices["clone_tts"] = voiceList("preset_b", "preset_a")
+	prober.acVerdicts["clone_tts"] = provider.AudioCppVerdicts{AcceptsLanguage: true, LanguageDefault: "de"}
+	rec := &speechRateRecorder{}
+	runner.speechRate = rec.trigger
+
+	runCapabilityCycle(runner)
+
+	st.assertVoicesPayload(t, "m1", `["preset_a","preset_b"]`)
+	if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":true,"default":"de"}` {
+		t.Fatalf("speech_language payload = %s, want the clone child's fact {accepts:true,default:de}", got)
+	}
+	if calls := rec.started(); len(calls) != 0 {
+		t.Fatalf("the speech rate benchmark was triggered %d times (%+v) for a clone child, want 0", len(calls), calls)
 	}
 }
 

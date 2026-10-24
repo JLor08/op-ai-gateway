@@ -705,12 +705,13 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // The clone row is the twin of the streaming row, one capability over: it says whether
 // a speech model synthesises only in a reference voice (a clone model, yes) or from
 // text alone (a plain tts model, no), the distinction the portal chat's speech picker
-// needs to keep a model it cannot drive out of the list (routing.CapabilitySpeechClone);
-// it gates no route either. It refines the speech capability, so it is written only for
-// a model whose speech verdict is yes: a model that does not synthesise speech (asr,
-// music, one the listing gives no task) carries no row on it, not even a "no", whatever
-// its clone verdict says. Same rule at the row boundary: a verdict assembled elsewhere
-// cannot put a clone chip on a model that cannot speak.
+// needs to keep a model it cannot drive (a clone model with no configured presets, #301)
+// out of the list (routing.CapabilitySpeechClone); it gates no route either. It refines
+// the speech capability, so it is written only for a model whose speech verdict is yes:
+// a model that does not synthesise speech (asr, music, one the listing gives no task)
+// carries no row on it, not even a "no", whatever its clone verdict says. Same rule at
+// the row boundary: a verdict assembled elsewhere cannot put a clone chip on a model
+// that cannot speak.
 //
 // The speech_streaming row is the streaming row's twin on the synthesiser's side
 // (routing.CapabilitySpeechStreaming): the one the speech handler reads to choose
@@ -880,14 +881,14 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 //
 // The same listing read also says whether the model is LOADED right now, and
 // that drives a second, voices step per mapping (cacheAudioCppVoices, #251): a
-// loaded plain tts model has its voices listed and cached on the mapping, which
-// is the only moment audio.cpp can say them (it answers for the model it has
-// loaded). The step runs after the capability write, on the same verdict, and
-// only through the prober's optional voices listing; its failures never touch
-// the verdicts above.
+// loaded speech model (a clone model included, #301) has its voices listed and
+// cached on the mapping, which is the only moment audio.cpp can say them (it
+// answers for the model it has loaded). The step runs after the capability
+// write, on the same verdict, and only through the prober's optional voices
+// listing; its failures never touch the verdicts above.
 //
 // A third, speech params step per mapping (cacheAudioCppSpeechParams, #282) caches the
-// `language` request param fact the same verdict carries, for the same loaded plain tts
+// `language` request param fact the same verdict carries, for the same loaded speech
 // models; unlike the voices step it asks the server for nothing more.
 //
 // A fourth step per mapping starts the speech rate benchmark (cacheAudioCppSpeechRate,
@@ -938,15 +939,22 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 
 // audioCppVoicesWanted reports whether the voices of the model this probe
 // observed are worth asking for: the listing states it LOADED right now, and it
-// is a plain tts model -- (speech, yes) and NOT (speech_clone, yes), #252's
-// verdict, taken from the same listing read.
+// is a speech model -- (speech, yes), taken from the same listing read.
 //
 // Loaded is strict because audio.cpp answers /v1/audio/voices for the model it
 // has loaded and ignores which one is asked for, so asking while the mapping's
 // model is not the loaded one would attribute another model's voices to it. A
-// clone model is left out because it is driven by a reference recording, not by
-// a named voice, so it has no voice picker to feed; a model that does not
-// synthesise speech (asr, music, an unstated task) has no voices at all.
+// model that does not synthesise speech (asr, music, an unstated task) has no
+// voices at all.
+//
+// A clone model (speech_clone, yes) is NOT excluded (#301): the listing is
+// task-independent and names the model's configured voice_presets whatever it
+// is, so a clone model that has presets gets them cached like any other. It is
+// still driven by a reference recording when it has none, and that case is
+// carried by the listing itself: a clone model with no presets caches an EMPTY
+// list, which is what keeps it hidden from the pickers (the readers offer a
+// clone model only when this list is non-empty, routing.CapabilityRowsOfferableTTS),
+// so the fetch needs no clone term here.
 //
 // The fresh verdict is the gate and not the stored capability rows: this pass
 // is the one writing them, so it reads its own tick's answer without a store
@@ -955,9 +963,10 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 //
 // The same gate also decides the speech params step (cacheAudioCppSpeechParams), not
 // only the voices one: the `language` fact is cached for exactly the models whose voices
-// are, for the same reasons (loaded, so the entry is the model the server answers for).
+// are, for the same reasons (loaded, so the entry is the model the server answers for),
+// which since #301 includes a clone model.
 func audioCppVoicesWanted(v provider.AudioCppVerdicts) bool {
-	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechClone != routing.CapabilityYes
+	return v.Loaded && v.Speech == routing.CapabilityYes
 }
 
 // mappingBackoff is a cross-tick memory of which mappings a per-mapping step of
@@ -1015,7 +1024,7 @@ func (b *mappingBackoff) clear(mappingID string) {
 
 // cacheAudioCppVoices is the voices step of probeAudioCppModels for ONE mapping,
 // run with the verdict that mapping's /v1/models probe just returned: when the
-// model is observed loaded and is a plain tts one (audioCppVoicesWanted), it
+// model is observed loaded and is a speech one (audioCppVoicesWanted), it
 // asks the server's voice listing and stores the names (fetchAndCacheVoices,
 // which holds the write policy). A mapping whose model is not observed loaded is
 // never asked, so a row is only ever written from the model the server answered
@@ -1048,7 +1057,7 @@ func (r *appHealthRunner) cacheAudioCppVoices(ctx context.Context, lister provid
 //     about the voices. It also opens a back-off for the mapping (voicesBackoff).
 //
 // The caller has already decided the mapping is worth asking (the model is
-// observed loaded and is a plain tts one); this step only skips a mapping inside
+// observed loaded and is a speech one); this step only skips a mapping inside
 // a back-off window. Best-effort: every failure is logged and the pass carries
 // on.
 func (r *appHealthRunner) fetchAndCacheVoices(ctx context.Context, lister provider.AudioCppVoicesLister, target routing.Target, mp routing.ModelMapping) {
@@ -1070,7 +1079,7 @@ func (r *appHealthRunner) fetchAndCacheVoices(ctx context.Context, lister provid
 
 // cacheAudioCppSpeechParams is the speech params step of probeAudioCppModels for ONE
 // mapping (#282), run with the verdict that mapping's /v1/models probe just returned:
-// when the model is observed loaded and is a plain tts one (audioCppVoicesWanted, the
+// when the model is observed loaded and is a speech one (audioCppVoicesWanted, the
 // voices step's gate), the `language` fact that same listing read carried
 // (AcceptsLanguage, LanguageDefault) is stored on the mapping with
 // writeSpeechLanguageCache, so the composer can offer the language control after the
@@ -1080,7 +1089,7 @@ func (r *appHealthRunner) fetchAndCacheVoices(ctx context.Context, lister provid
 // there is no fetch to fail and no back-off. A listing read that FAILS never reaches it
 // (probeAudioCppModels moves on to the next mapping), which is what keeps the row on
 // file the last fact learned while the model was loaded; a mapping whose model is not
-// observed loaded and plain tts writes nothing and leaves that row alone, because an
+// observed loaded and speech writes nothing and leaves that row alone, because an
 // unloaded model's listing entry is not the model the server answers for. Best-effort: a
 // store failure is logged and the pass carries on.
 func (r *appHealthRunner) cacheAudioCppSpeechParams(ctx context.Context, mp routing.ModelMapping, v provider.AudioCppVerdicts) {
@@ -1107,11 +1116,13 @@ func (r *appHealthRunner) cacheAudioCppSpeechParams(ctx context.Context, mp rout
 //     report), so a cold child is never asked, let alone started;
 //   - its runtime spec is of kind audio.cpp (routing.EffectiveRuntimeSpecType),
 //     because the router would forward the GET to any running child;
-//   - its stored verdicts make it a plain tts model (routing.CapabilityRowsPlainTTS:
-//     the same rule as audioCppVoicesWanted, read from the rows the agent reported
-//     (source audiocpp_models) instead of a fresh listing, because an agent-launched
-//     child is not asked for its /v1/models by the gateway; the voices endpoint
-//     applies the same rule at read time, so writer and reader cannot disagree).
+//   - its stored verdicts make it a speech model (routing.CapabilityRowsSpeech:
+//     the same rule as audioCppVoicesWanted, a clone model included (#301), read
+//     from the rows the agent reported (source audiocpp_models) instead of a fresh
+//     listing, because an agent-launched child is not asked for its /v1/models by
+//     the gateway; what the voices endpoint offers is decided at read time from
+//     the cached listing, so a clone child with no presets is cached as empty and
+//     stays hidden there).
 //
 // The caller has already required the agent's runtime_voices declaration: it is
 // fail-closed, because an older router never serves the route and answers a 404
@@ -1131,16 +1142,18 @@ func (r *appHealthRunner) cacheAudioCppSpeechParams(ctx context.Context, mp rout
 // success (a genuine empty one included) is written when it changed, a failure --
 // the router's 404 for a child that stopped after the agent's report among them
 // -- keeps the row on file and opens a back-off. A mapping leaving the loaded or
-// plain-tts set clears its back-off, so a reload is asked at once.
+// speech set clears its back-off, so a reload is asked at once.
 //
-// The same eligible set -- running, audio.cpp, plain tts -- is where two more steps for an
+// The same eligible set -- running, audio.cpp, speech -- is where two more steps for an
 // agent-launched child run. The speech-language pull (fetchAndCacheSpeechParams, #282) is
 // a second passthrough read, GET /upstream/<model>/v1/models, gated on its own
 // RuntimeModelParamsFeature (fail-closed, its own route) and folded into this loop so it
 // reuses the eligibility without a second capabilities read; it writes only the `language`
 // fact, the verdicts arriving by telemetry instead. The speech rate step
 // (cacheAgentSpeechRate, #263) has a child whose stored speech_streaming verdict is yes
-// benchmark its output byte rate when none is cached for the launch spec it runs under.
+// benchmark its output byte rate when none is cached for the launch spec it runs under;
+// it still leaves a clone child out (agentSpeechRateWanted), which the wider set here
+// admits.
 // Both start no child, for the same reason the voices route does not: only a running one
 // is asked.
 func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.AIServer, app routing.Application, lister provider.AudioCppVoicesLister) {
@@ -1239,16 +1252,18 @@ func (r *appHealthRunner) fetchAndCacheSpeechParams(ctx context.Context, prober 
 // The guard chain is strict because the agent router answers 404 for a child that is not
 // running, so a wrong guess is a wasted request or voices attributed to the wrong thing: the
 // mapping must be active with an app model name, carry an audio.cpp runtime spec, be in the
-// loaded set, and have stored verdicts that make it a plain tts model.
+// loaded set, and have stored verdicts that make it a speech model (a clone model
+// included, #301: its configured voice_presets are listed like any other model's).
 //
-// A mapping that has left the loaded set or the plain-tts set has its back-offs cleared (the
+// A mapping that has left the loaded set or the speech set has its back-offs cleared (the
 // voices one, the speech rate one and the speech params one), so a later reload is asked at
 // once. A runtime-spec miss or a capability read that FAILS leaves the mapping unasked this
 // tick without clearing a back-off: what the child is cannot be told, the same reason the
 // caller requires the agent's runtime_voices declaration.
 //
 // The capability rows it read are returned with the spec: the caller's speech rate step
-// (cacheAgentSpeechRate) needs the stored speech_streaming verdict from the same read.
+// (cacheAgentSpeechRate) needs the stored speech_streaming verdict from the same read, and
+// excludes a clone model itself (agentSpeechRateWanted).
 func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.ModelMapping, specByMapping map[string]routing.RuntimeSpec, loadedSet map[string]struct{}) (routing.RuntimeSpec, []routing.CapabilityRow, bool) {
 	if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
 		return routing.RuntimeSpec{}, nil, false
@@ -1268,7 +1283,7 @@ func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.Mo
 		slog.Debug("app health: capabilities for the agent voices pass failed", "mapping_id", mp.ID, "error", err)
 		return routing.RuntimeSpec{}, nil, false
 	}
-	if !routing.CapabilityRowsPlainTTS(rows) {
+	if !routing.CapabilityRowsSpeech(rows) {
 		r.voicesBackoff.clear(mp.ID)
 		r.speechRateBackoff.clear(mp.ID)
 		r.speechParamsBackoff.clear(mp.ID)
@@ -1393,7 +1408,9 @@ func (r *appHealthRunner) writeSpeechLanguageCache(ctx context.Context, mappingI
 // because the benchmark synthesizes, and asking a static server to synthesize with
 // a model it does not have loaded could make it swap the model another client is
 // using. A clone model is left out because the benchmark skips it (a plain request
-// 500s without a reference voice), so triggering it would only repeat a refusal.
+// 500s without a reference voice), so triggering it would only repeat a refusal; that
+// stays so although audioCppVoicesWanted admits clone models since #301 (their voices are
+// fetched, they are still not benchmarked, streaming clone models being out of scope).
 func audioCppSpeechRateWanted(v provider.AudioCppVerdicts) bool {
 	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechClone != routing.CapabilityYes && v.SpeechStreaming == routing.CapabilityYes
 }
@@ -1436,8 +1453,9 @@ func (r *appHealthRunner) cacheAgentSpeechRate(ctx context.Context, server routi
 }
 
 // agentSpeechRateWanted is audioCppSpeechRateWanted for stored rows: a plain tts model
-// (routing.CapabilityRowsPlainTTS, the voices rule) whose speech_streaming verdict is
-// yes. The caller has already required the child to be running.
+// (routing.CapabilityRowsPlainTTS, which excludes a clone model: the voices rule
+// admits one since #301, this one does not) whose speech_streaming verdict is yes. The
+// caller has already required the child to be running.
 func agentSpeechRateWanted(rows []routing.CapabilityRow) bool {
 	return routing.CapabilityRowsPlainTTS(rows) &&
 		routing.CapabilityRowsByName(rows)[routing.CapabilitySpeechStreaming].Verdict == routing.CapabilityYes
@@ -2070,7 +2088,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		// read the server's own /v1/models listing for each of its active
 		// mappings and write the speech, transcription, transcription_streaming,
 		// speech_clone and speech_streaming verdicts that listing states for that model, and, for a
-		// model it states loaded and plain tts, cache its voices (probeAudioCppModels). A separate
+		// model it states loaded and speech, cache its voices (probeAudioCppModels). A separate
 		// branch from the context probe for the same reason as the sdcpp one:
 		// audio_cpp has no context probe path, and the listing is not a
 		// ModelInfo. It shares that branch's cadence (the application's
@@ -2117,7 +2135,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 
 		// Agent-launched audio.cpp voices pass (#251): for every active
 		// server_agent application, cache the voices of each RUNNING
-		// plain-tts audio.cpp child through the agent router's
+		// speech audio.cpp child through the agent router's
 		// GET /upstream/<model>/v1/audio/voices (probeAgentVoices). It is
 		// the twin of the static audio.cpp pass above for the children
 		// that pass cannot reach, and like it depends on neither of the

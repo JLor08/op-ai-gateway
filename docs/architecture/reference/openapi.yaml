@@ -383,11 +383,14 @@ paths:
         the mappings a speech dispatch for this token could reach (the token's
         model override and a service token's allowlist applied first, then
         resource-group provisioning and the locked/group-only rule), restricted
-        to mappings that are a plain tts model NOW (`speech` yes and not
-        `speech_clone` yes, read at request time). Nothing is loaded and no
+        to mappings that are offerable NOW (`speech` yes and either not
+        `speech_clone` yes or a non-empty cached list, read at request time, so a
+        voice-clone model with configured presets lists its preset names, ADR-075).
+        Nothing is loaded and no
         upstream is contacted, so the list is available while the model is
         unloaded. Every "nothing to show" case (an unknown name, a model the
-        token cannot route to or may not use, a non-speech or clone model, one
+        token cannot route to or may not use, a non-speech model, a clone model
+        without presets, one
         with nothing cached yet) is the same 200 with an empty `voices` list,
         so the answer cannot be used to probe which models exist. A missing or
         blank `model` is 400 `model.name_required`; a store failure is 500
@@ -1518,10 +1521,13 @@ paths:
         suppression applying to the REQUESTED name only, and the members of a
         group are filtered by resource-group provisioning ONLY, never by their
         own visibility, so a locked member's voices are listed through its
-        group. Only mappings that are a plain tts model now (`speech` yes and
-        not `speech_clone` yes) contribute. Nothing is loaded and no upstream
+        group. Only mappings that are offerable now (`speech` yes and either
+        not `speech_clone` yes or a non-empty cached list, so a clone model with
+        configured presets contributes its preset names, ADR-075) contribute.
+        Nothing is loaded and no upstream
         is contacted. Every "nothing to show" case (an unknown, hidden, locked,
-        restricted, non-speech, clone or not-yet-cached model) is the same 200
+        restricted or not-yet-cached model, a non-speech model, a clone model
+        without presets) is the same 200
         with an empty `voices` list. A missing or empty `name` is 400
         `model.name_required`; a failed read is 500 `model.voices_failed`, never
         reported as an empty list. See api-surface.md and
@@ -1560,9 +1566,11 @@ paths:
         gateway model. `streaming: true` with a `sample_rate` in Hz means the
         composer may offer progressive playback; `streaming: false` means the
         buffered WAV run. The gate is open only when EVERY mapping a speech
-        request for the model could be routed to (the portal-visible plain-TTS
-        ones, the set the voice picker uses) has a `speech_streaming` verdict of
-        `yes` and a usable cached output byte rate, and they agree on it; the
+        request for the model could be routed to (the portal-visible offerable
+        ones, the voice picker's set: a plain tts model, or a configured clone
+        model with cached preset voices, which has no cached output byte rate
+        and so closes the gate for any name that can reach it, ADR-075) has a
+        `speech_streaming` verdict of `yes` and a usable cached output byte rate, and they agree on it; the
         sample rate is half the byte rate (the cache only holds a rate read from
         a mono 16-bit PCM WAV). Every other case (an unknown, hidden, locked,
         restricted, non-speech, clone, offline or not-yet-benchmarked model) is
@@ -1613,15 +1621,16 @@ paths:
         while a model is loaded (a static audio_cpp application, or an
         agent-launched child through the router's /upstream/{model}/v1/models,
         agent 0.13.0) for the mappings a speech request for the model could be
-        routed to (the portal-visible plain-TTS ones, the set the voice picker
-        and the streaming gate use). The gate opens when ANY such mapping is
+        routed to (the portal-visible offerable ones: a plain tts model, or a
+        clone model with cached preset voices, the set the voice picker offers,
+        ADR-075; the streaming gate reads the same set, where a clone model closes it for lack of a cached rate). The gate opens when ANY such mapping is
         known to accept a language, unlike /api/portal/model-speech-streaming,
         which needs every mapping to agree: audio.cpp silently drops a
         `language` a model does not take, so offering the control costs
         nothing where the request lands on another mapping. `default` is the
         first accepting mapping's, a pre-fill and not a promise. Every other
-        case (an unknown, hidden, locked, restricted, non-speech or clone
-        model, one whose language no probe has stated yet, one that declares
+        case (an unknown, hidden, locked, restricted or non-speech model, a
+        clone model without presets, one whose language no probe has stated yet, one that declares
         no such param) is the same 200 with `accepts: false`, so the answer
         cannot probe which models exist. A missing or empty `name` is 400
         `model.name_required`; a failed read is 500

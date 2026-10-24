@@ -14,6 +14,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"testing"
 	"time"
 )
@@ -179,7 +180,8 @@ func TestHandlePortalModelSpeechLanguageReconcilesMappings(t *testing.T) {
 		// None accepts: one declares no param, the other was never probed.
 		{id: "map-lm-d1", app: "a", gateway: "tts-lm-none", speech: yes},
 		{id: "map-lm-d2", app: "b", gateway: "tts-lm-none", speech: yes},
-		// The accepting mapping is a clone one: a speech request is never routed to it.
+		// The accepting mapping is a clone one with nothing to offer (no presets on
+		// file): a speech request is never routed to it.
 		{id: "map-lm-e1", app: "a", gateway: "tts-lm-clone", speech: yes},
 		{id: "map-lm-e2", app: "b", gateway: "tts-lm-clone", speech: yes, clone: yes},
 		// A corrupt row costs only its own mapping.
@@ -203,17 +205,204 @@ func TestHandlePortalModelSpeechLanguageReconcilesMappings(t *testing.T) {
 	w.setSpeechLanguage(t, "map-lm-g2", true, "zh")
 
 	for name, c := range map[string]struct{ model, want string }{
-		"accepts if one of two does":               {"tts-lm-one", speechLanguageZh},
-		"a no beside a yes is a yes":               {"tts-lm-no-then-yes", `{"accepts":true,"default":"en"}`},
-		"two yeses take the first by mapping id":   {"tts-lm-both", `{"accepts":true,"default":"de"}`},
-		"no candidate accepting is a no":           {"tts-lm-none", speechLanguageNo},
-		"a clone mapping is no candidate":          {"tts-lm-clone", speechLanguageNo},
-		"an unreadable row costs only its mapping": {"tts-lm-corrupt", speechLanguageZh},
-		"an inactive mapping is no candidate":      {"tts-lm-inactive", speechLanguageNo},
+		"accepts if one of two does":                  {"tts-lm-one", speechLanguageZh},
+		"a no beside a yes is a yes":                  {"tts-lm-no-then-yes", `{"accepts":true,"default":"en"}`},
+		"two yeses take the first by mapping id":      {"tts-lm-both", `{"accepts":true,"default":"de"}`},
+		"no candidate accepting is a no":              {"tts-lm-none", speechLanguageNo},
+		"a preset-less clone mapping is no candidate": {"tts-lm-clone", speechLanguageNo},
+		"an unreadable row costs only its mapping":    {"tts-lm-corrupt", speechLanguageZh},
+		"an inactive mapping is no candidate":         {"tts-lm-inactive", speechLanguageNo},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w.requireSpeechLanguage(t, voicesOtherSecret, c.model, c.want)
 		})
+	}
+}
+
+// A clone model that ships named presets is offerable (#301), so the language control is
+// too: that is what makes the `de` flow work for a configured Pocket-style clone. The gate
+// is the offerable resolver's (a speech model that is not a clone, or is one with a named
+// voice on file), and the clone's cached speech_language fact reads exactly as a plain
+// model's. A clone with nothing to pick -- an empty list (reference-only), never fetched, or
+// a list that does not decode -- is not offerable and stays closed, whatever its language
+// row says. A plain model is unchanged, whatever its own voices row holds.
+func TestHandlePortalModelSpeechLanguageOffersAPresetCloneModel(t *testing.T) {
+	w := newVoicesWorld(t)
+	const yes = routing.CapabilityYes
+	for _, m := range []voicesMapping{
+		// A preset clone whose language is declared, one that declares none, and one
+		// that was never probed for its language.
+		{id: "map-pc-zh", app: "a", gateway: "tts-pc-zh", speech: yes, clone: yes, voices: []string{"Thorsten"}},
+		{id: "map-pc-no", app: "a", gateway: "tts-pc-no", speech: yes, clone: yes, voices: []string{"Thorsten"}},
+		{id: "map-pc-unprobed", app: "a", gateway: "tts-pc-unprobed", speech: yes, clone: yes, voices: []string{"Thorsten"}},
+		// The clones with nothing to offer: a language row where one could exist, so
+		// only the offerable gate keeps each out.
+		{id: "map-pc-empty", app: "a", gateway: "tts-pc-empty", speech: yes, clone: yes, voices: []string{}},
+		{id: "map-pc-uncached", app: "a", gateway: "tts-pc-uncached", speech: yes, clone: yes},
+		{id: "map-pc-bad", app: "a", gateway: "tts-pc-bad", speech: yes, clone: yes, payload: `not json`},
+		{id: "map-pc-blank", app: "a", gateway: "tts-pc-blank", speech: yes, clone: yes, payload: `null`},
+		// A clone verdict of "no" is a plain model; so is a plain one whose voices row
+		// is garbage: the voices only decide a CLONE model.
+		{id: "map-pc-plain-bad", app: "a", gateway: "tts-pc-plain-bad", speech: yes, payload: `not json`},
+		{id: "map-pc-cloneno", app: "a", gateway: "tts-pc-cloneno", speech: yes, clone: routing.CapabilityNo},
+		// A preset clone that is not a speech model (any more) is never offered.
+		{id: "map-pc-nospeech", app: "a", gateway: "tts-pc-nospeech", speech: routing.CapabilityNo, clone: yes, voices: []string{"Thorsten"}},
+		// A preset clone that is inactive is no candidate.
+		{id: "map-pc-inactive", app: "a", gateway: "tts-pc-inactive", speech: yes, clone: yes, voices: []string{"Thorsten"}, disabled: true},
+	} {
+		w.addMapping(t, m)
+	}
+	w.setSpeechLanguage(t, "map-pc-zh", true, "zh")
+	w.setSpeechLanguage(t, "map-pc-no", false, "")
+	for _, id := range []string{"map-pc-empty", "map-pc-uncached", "map-pc-bad", "map-pc-blank", "map-pc-nospeech", "map-pc-inactive"} {
+		w.setSpeechLanguage(t, id, true, "zh")
+	}
+	w.setSpeechLanguage(t, "map-pc-plain-bad", true, "en")
+	w.setSpeechLanguage(t, "map-pc-cloneno", true, "fr")
+
+	for name, c := range map[string]struct{ model, want string }{
+		"a preset clone that accepts a language":     {"tts-pc-zh", speechLanguageZh},
+		"a preset clone that declares no param":      {"tts-pc-no", speechLanguageNo},
+		"a preset clone never probed for a language": {"tts-pc-unprobed", speechLanguageNo},
+		"a reference-only clone (an empty list)":     {"tts-pc-empty", speechLanguageNo},
+		"a clone never fetched (no voices row)":      {"tts-pc-uncached", speechLanguageNo},
+		"a clone whose voices do not decode":         {"tts-pc-bad", speechLanguageNo},
+		"a clone whose voices are null":              {"tts-pc-blank", speechLanguageNo},
+		"a plain model whose voices do not decode":   {"tts-pc-plain-bad", `{"accepts":true,"default":"en"}`},
+		"a model whose clone verdict is a no":        {"tts-pc-cloneno", `{"accepts":true,"default":"fr"}`},
+		"a preset clone that is not a speech model":  {"tts-pc-nospeech", speechLanguageNo},
+		"an inactive preset clone":                   {"tts-pc-inactive", speechLanguageNo},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w.requireSpeechLanguage(t, voicesOtherSecret, c.model, c.want)
+		})
+	}
+}
+
+// A name whose mappings are a plain model and a preset clone, and a group of them, offer the
+// control as soon as ANY offerable mapping accepts, the default being the first accepting
+// one's in mapping-id order: a preset clone takes part in the fold like a plain model, and a
+// clone with nothing to offer still does not.
+func TestHandlePortalModelSpeechLanguageFoldsPresetClonesWithPlainMappings(t *testing.T) {
+	w := newVoicesWorld(t)
+	const yes = routing.CapabilityYes
+	for _, m := range []voicesMapping{
+		// Only the preset clone accepts.
+		{id: "map-pf-a1", app: "a", gateway: "tts-pf-clone-only", speech: yes, voices: []string{"plain"}},
+		{id: "map-pf-a2", app: "b", gateway: "tts-pf-clone-only", speech: yes, clone: yes, voices: []string{"Thorsten"}},
+		// Both accept: the plain one is first by id.
+		{id: "map-pf-b1", app: "a", gateway: "tts-pf-both", speech: yes, voices: []string{"plain"}},
+		{id: "map-pf-b2", app: "b", gateway: "tts-pf-both", speech: yes, clone: yes, voices: []string{"Thorsten"}},
+		// Both accept: the preset clone is first by id.
+		{id: "map-pf-c1", app: "a", gateway: "tts-pf-clone-first", speech: yes, clone: yes, voices: []string{"Thorsten"}},
+		{id: "map-pf-c2", app: "b", gateway: "tts-pf-clone-first", speech: yes, voices: []string{"plain"}},
+		// The accepting clone is reference-only: the plain sibling declares no param.
+		{id: "map-pf-d1", app: "a", gateway: "tts-pf-ref-only", speech: yes, voices: []string{"plain"}},
+		{id: "map-pf-d2", app: "b", gateway: "tts-pf-ref-only", speech: yes, clone: yes, voices: []string{}},
+	} {
+		w.addMapping(t, m)
+	}
+	w.setSpeechLanguage(t, "map-pf-a1", false, "")
+	w.setSpeechLanguage(t, "map-pf-a2", true, "zh")
+	w.setSpeechLanguage(t, "map-pf-b1", true, "en")
+	w.setSpeechLanguage(t, "map-pf-b2", true, "zh")
+	w.setSpeechLanguage(t, "map-pf-c1", true, "zh")
+	w.setSpeechLanguage(t, "map-pf-c2", true, "en")
+	w.setSpeechLanguage(t, "map-pf-d1", false, "")
+	w.setSpeechLanguage(t, "map-pf-d2", true, "zh")
+	// A group's members are its candidates: a preset clone member that accepts opens it.
+	for _, name := range []string{"tts-pf-clone-only", "tts-pf-ref-only"} {
+		if err := w.routes.CreateModelGroup(context.Background(), routing.ModelGroup{ID: "grp_" + name, GatewayModelName: "grp-" + name, DisplayName: name, Status: routing.ServerStatusActive, FailoverMode: "sticky", CreatedAt: w.now, UpdatedAt: w.now}); err != nil {
+			t.Fatalf("CreateModelGroup %s: %v", name, err)
+		}
+		if err := w.routes.SetGroupMembers(context.Background(), "grp_"+name, []routing.GroupMember{{MemberGatewayName: name}}); err != nil {
+			t.Fatalf("SetGroupMembers %s: %v", name, err)
+		}
+	}
+	if err := w.srv.Groups.RefreshGroups(context.Background()); err != nil {
+		t.Fatalf("RefreshGroups: %v", err)
+	}
+
+	for name, c := range map[string]struct{ model, want string }{
+		"only the preset clone accepts":            {"tts-pf-clone-only", speechLanguageZh},
+		"both accept, the plain one first by id":   {"tts-pf-both", `{"accepts":true,"default":"en"}`},
+		"both accept, the preset clone first":      {"tts-pf-clone-first", speechLanguageZh},
+		"the accepting clone is reference-only":    {"tts-pf-ref-only", speechLanguageNo},
+		"a group with a preset clone that accepts": {"grp-tts-pf-clone-only", speechLanguageZh},
+		"a group with only a reference-only clone": {"grp-tts-pf-ref-only", speechLanguageNo},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w.requireSpeechLanguage(t, voicesOtherSecret, c.model, c.want)
+		})
+	}
+}
+
+// The resolver behind the language gate and the streaming gate keeps the mappings the portal
+// OFFERS: plain tts and a clone model with a named preset. It hands back the verdicts it read,
+// so a caller does not read them again.
+func TestPortalOfferableSpeechMappingsAddsPresetClonesToPlainTTS(t *testing.T) {
+	w := newVoicesWorld(t)
+	dev := auth.Token{UserID: "usr_dev"}
+	for name, c := range map[string]struct {
+		model         string
+		wantOfferable []string
+	}{
+		"a plain model":                         {"tts-one", []string{"map-g1"}},
+		"a preset clone":                        {"tts-clone-presets", []string{"map-clone-presets"}},
+		"a reference-only clone":                {"tts-clone", nil},
+		"a clone never fetched":                 {"tts-clone-uncached", nil},
+		"not a speech model":                    {"asr-model", nil},
+		"a model with no verdict yet":           {"tts-unprobed", nil},
+		"an unknown name":                       {"no-such-model", nil},
+		"a group: its plain and preset clones":  {"grp-clones", []string{"map-clone-presets", "map-g1"}},
+		"a plain model, one mapping unreadable": {"tts-mix", []string{"map-mix-bad", "map-mix-ok"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			offerable, verdicts, err := w.srv.portalOfferableSpeechMappings(context.Background(), dev, c.model)
+			if err != nil {
+				t.Fatalf("portalOfferableSpeechMappings: %v", err)
+			}
+			if !slices.Equal(offerable, c.wantOfferable) {
+				t.Fatalf("offerable = %v, want %v", offerable, c.wantOfferable)
+			}
+			for _, id := range offerable {
+				if !routing.CapabilityRowsSpeech(verdicts[id]) {
+					t.Fatalf("verdicts[%s] = %+v, want the speech row the resolver read", id, verdicts[id])
+				}
+			}
+		})
+	}
+}
+
+// No routing store or portal, a blank name and a name the portal hides are an empty answer
+// and no error; a store failure is an error, never an empty answer, and one in the voices
+// read is not swallowed into "no voices".
+func TestPortalOfferableSpeechMappingsEdges(t *testing.T) {
+	ctx := context.Background()
+	if ids, verdicts, err := (&Server{}).portalOfferableSpeechMappings(ctx, auth.Token{UserID: "usr_dev"}, "tts-union"); err != nil || len(ids) != 0 || verdicts != nil {
+		t.Fatalf("a bare server = (%v, %v, %v), want empty and no error", ids, verdicts, err)
+	}
+	w := newVoicesWorld(t)
+	if ids, _, err := w.srv.portalOfferableSpeechMappings(ctx, auth.Token{UserID: "usr_other"}, "  "); err != nil || len(ids) != 0 {
+		t.Fatalf("a blank name = (%v, %v), want empty and no error", ids, err)
+	}
+	// A name the portal hides to a plain user is nothing to them, a preset clone included
+	// (the positive control: the same plain user is offered it before it is hidden).
+	if ids, _, err := w.srv.portalOfferableSpeechMappings(ctx, auth.Token{UserID: "usr_other"}, "tts-clone-presets"); err != nil || !slices.Equal(ids, []string{"map-clone-presets"}) {
+		t.Fatalf("a visible preset clone for a plain user = (%v, %v), want [map-clone-presets]", ids, err)
+	}
+	if err := w.routes.UpsertModelSetting(ctx, routing.ModelSetting{GatewayModelName: "tts-clone-presets", Visibility: "hidden", CreatedAt: w.now, UpdatedAt: w.now}); err != nil {
+		t.Fatalf("UpsertModelSetting: %v", err)
+	}
+	if ids, _, err := w.srv.portalOfferableSpeechMappings(ctx, auth.Token{UserID: "usr_other"}, "tts-clone-presets"); err != nil || len(ids) != 0 {
+		t.Fatalf("a hidden preset clone for a plain user = (%v, %v), want empty and no error", ids, err)
+	}
+
+	fresh := newVoicesWorld(t)
+	deps := fresh.deps
+	deps.Routes = failingCacheTypeStore{Store: fresh.routes, cacheType: routing.ModelMappingCacheVoices}
+	if ids, _, err := New(deps).portalOfferableSpeechMappings(ctx, auth.Token{UserID: "usr_dev"}, "tts-clone-presets"); err == nil {
+		t.Fatalf("a failing voices read = (%v, nil), want the error", ids)
 	}
 }
 
@@ -245,16 +434,36 @@ func TestHandlePortalModelSpeechLanguageNeverCallsAnUpstream(t *testing.T) {
 	}
 }
 
+// failingCacheTypeStore fails the batch cache read of ONE cache type, so a test can tell
+// which of the gate's reads (the voices a clone model is offerable by, the language fact
+// itself) a failure came from.
+type failingCacheTypeStore struct {
+	routing.Store
+	cacheType string
+}
+
+func (f failingCacheTypeStore) ModelMappingCacheForMappings(ctx context.Context, ids []string, cacheType string) (map[string][]routing.ModelMappingCacheRow, error) {
+	if cacheType == f.cacheType {
+		return nil, errors.New("cache store down")
+	}
+	return f.Store.ModelMappingCacheForMappings(ctx, ids, cacheType)
+}
+
 // A store failure is the ONLY 500, with its own code and a log line, never the 200 {"accepts":
-// false} of "no": the portal's hidden/locked suppression fails closed, and so do the two
+// false} of "no": the portal's hidden/locked suppression fails closed, and so do the three
 // reads the gate makes.
 func TestHandlePortalModelSpeechLanguageAStoreFailureIsA500NotANo(t *testing.T) {
 	for name, failing := range map[string]func(routing.Store) routing.Store{
 		"the model settings": func(s routing.Store) routing.Store {
 			return settingsFailStore{Store: s, err: errors.New("settings table unavailable")}
 		},
-		"the verdicts":       func(s routing.Store) routing.Store { return failingVoicesStore{Store: s, failVerdicts: true} },
-		"the language cache": func(s routing.Store) routing.Store { return failingVoicesStore{Store: s, failCache: true} },
+		"the verdicts": func(s routing.Store) routing.Store { return failingVoicesStore{Store: s, failVerdicts: true} },
+		"the voices cache": func(s routing.Store) routing.Store {
+			return failingCacheTypeStore{Store: s, cacheType: routing.ModelMappingCacheVoices}
+		},
+		"the language cache": func(s routing.Store) routing.Store {
+			return failingCacheTypeStore{Store: s, cacheType: routing.ModelMappingCacheSpeechLanguage}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			buf := withCapturedSlogAtTheDefaultLevel(t)

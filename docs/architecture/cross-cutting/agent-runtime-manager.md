@@ -1455,8 +1455,9 @@ cold child answers `404 runtime.model_not_running`, which the gateway's agent-ch
 voices pass (`probeAgentVoices`, in app health) treats as **"no voices this tick"** —
 it keeps the row already cached and backs off for that mapping — and never as a reason
 to boot the child. The pass asks only for a mapping whose model the agent reports
-loaded, whose spec is of kind `audio_cpp` and which is a plain tts model (§7 has the
-flag it is gated on), attaches the mapping's own `routing.SpecUpstreamAuth` credential
+loaded, whose spec is of kind `audio_cpp` and which is a speech model (a clone model
+included since [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred): its configured presets are listed, and one with none
+lists nothing; §7 has the flag it is gated on), attaches the mapping's own `routing.SpecUpstreamAuth` credential
 as `/props` does, and reaches the route with the endpoint
 `<router>/upstream/<model>` to which its lister appends `/v1/audio/voices`. The
 response is the child's own `{"voices": [...]}`, relayed unmodified.
@@ -1473,7 +1474,7 @@ it as the `speech_language` fact. The agent's own collector, telemetry sample an
 those yes/no verdicts by telemetry, but a default language is a string and the verdict wire is
 yes/no by design, so the agent only gained a route and the gateway pulls the fact itself. The
 gateway side is folded into the voices pass (`probeAgentVoices`): the same eligible set (a
-running audio.cpp child whose stored verdicts make it a plain tts model, observed loaded), the
+running audio.cpp child whose stored verdicts make it a speech model, observed loaded), the
 mapping's own `routing.SpecUpstreamAuth` credential, and a back-off of its own
 (`speechParamsBackoff`) when the pull fails: a child the router finds cold (`404
 runtime.model_not_running`) keeps the last row on file, is not asked again every tick and is

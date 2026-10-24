@@ -282,6 +282,94 @@ func TestSpeechRunStreamGateStaysClosedUnlessEverythingHolds(t *testing.T) {
 	}
 }
 
+// addPresetCloneMapping adds a configured clone mapping of the gateway model on the fixture's
+// audio application: a speech model that is a clone one and ships a named preset, which the
+// portal now OFFERS (the voice picker, the language control, #301), so a speech request for
+// the name can be routed to it. The output byte rate and the speech_streaming yes verdict
+// are seeded when streams is true / byteRate is not empty, so a case can give it the facts
+// a stream candidate needs (the benchmark never learns them for a clone model today, so
+// they are the exception, not the rule).
+func addPresetCloneMapping(t *testing.T, srv *Server, id, gatewayModel string, streams bool, byteRate string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	if err := srv.Routes.CreateMapping(ctx, routing.ModelMapping{ID: id, ApplicationID: "app-audio", GatewayModelName: gatewayModel, AppModelName: "clone_" + id, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping %s: %v", id, err)
+	}
+	rows := []routing.CapabilityRow{
+		{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+		{Capability: routing.CapabilitySpeechClone, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+	}
+	if streams {
+		rows = append(rows, routing.CapabilityRow{Capability: routing.CapabilitySpeechStreaming, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now})
+	}
+	if err := srv.Routes.UpsertMappingCapabilities(ctx, id, rows); err != nil {
+		t.Fatalf("UpsertMappingCapabilities %s: %v", id, err)
+	}
+	if err := srv.Routes.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{MappingID: id, CacheType: routing.ModelMappingCacheVoices, ScopeKey: "", Payload: `["Thorsten"]`, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpsertModelMappingCache %s: %v", id, err)
+	}
+	if byteRate != "" {
+		seedSpeechOutputByteRate(t, srv, id, byteRate)
+	}
+}
+
+// The portal's STREAM gate counts every mapping a speech request could be ROUTED to, which
+// since #301 includes a configured clone model (the same offerable set the voice picker and
+// the language control read). A preset clone has no cached stream rate (the benchmark cannot
+// learn one for it), so a name that mixes a streaming plain tts mapping with a preset-clone
+// sibling closes the gate and the turn is BUFFERED, the known-good path: the pick is made per
+// request after the gate is asked, so a streamed request routed to the clone sibling would be
+// played, committed as a WAV and billed at the PLAIN mapping's rate -- corruption, not a
+// degraded mode. A name that is only plain tts still streams, and a name that is only a
+// preset clone is closed too, as a clone never streams today (it buffers).
+func TestPortalSpeechStreamRateClosesForAReachablePresetClone(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		arrange  func(t *testing.T, srv *Server)
+		model    string
+		wantRate int // 0: the gate is closed
+	}{
+		{"the plain mapping alone", func(t *testing.T, srv *Server) {}, speechGatewayModel, speechRunTestRate},
+		{"a preset clone sibling with no stream facts", func(t *testing.T, srv *Server) {
+			addPresetCloneMapping(t, srv, "route-clone", speechGatewayModel, false, "")
+		}, speechGatewayModel, 0},
+		{"a preset clone sibling with a streaming verdict but no cached rate", func(t *testing.T, srv *Server) {
+			addPresetCloneMapping(t, srv, "route-clone", speechGatewayModel, true, "")
+		}, speechGatewayModel, 0},
+		{"a preset clone sibling that would stream at another rate", func(t *testing.T, srv *Server) {
+			addPresetCloneMapping(t, srv, "route-clone", speechGatewayModel, true, "48000")
+		}, speechGatewayModel, 0},
+		{"a name that is only a preset clone", func(t *testing.T, srv *Server) {
+			addPresetCloneMapping(t, srv, "route-clone", "tts-clone-only", false, "")
+		}, "tts-clone-only", 0},
+		{"a name that is only a preset clone with a streaming verdict but no cached rate", func(t *testing.T, srv *Server) {
+			addPresetCloneMapping(t, srv, "route-clone", "tts-clone-only", true, "")
+		}, "tts-clone-only", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, _ := newSSESpeechUpstream(t, speechSSEDone, speechSSEEnd)
+			srv, owner, _, _ := newSpeechRunTestServer(t, up.URL)
+			seedStreamableSpeech(t, srv, "route-tts", speechRunTestByteRate)
+			tc.arrange(t, srv)
+
+			rate, ok, err := srv.portalSpeechStreamRate(context.Background(), owner, tc.model)
+			if err != nil {
+				t.Fatalf("portalSpeechStreamRate: %v", err)
+			}
+			if tc.wantRate == 0 {
+				if ok {
+					t.Fatalf("the gate is open at %d Hz, want it closed", rate)
+				}
+				return
+			}
+			if !ok || rate != tc.wantRate {
+				t.Fatalf("gate = (%d, %v), want (%d, true)", rate, ok, tc.wantRate)
+			}
+		})
+	}
+}
+
 // The gate judges the model the request will ROUTE for, not the thread's: a run-as token's
 // model override rewrites the requested name before the gateway resolves anything
 // (inferencePreflight), so reading the thread's own would judge a different model than the

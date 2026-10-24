@@ -517,6 +517,18 @@ export type ModelOption = {
   // too old to report the verdict) derives `speech_clone === false` and stays
   // offered — only a KNOWN clone model is hidden.
   speech_clone?: boolean;
+  // True when this voice-CLONE speech model has configured PRESET voices, so it is
+  // usable without a reference voice and the chat offers it after all (#301): the
+  // picker keeps it and the speech composer opens for it, drawing the voice from
+  // the preset list. It is the backend's own fold (ModelDTO.SpeechCloneVoices) —
+  // true only when EVERY clone-audio mapping of the model has presets, so a
+  // reference-only clone or a mixed model stays excluded — and the client never
+  // recomputes it. Meaningful only together with `speech_clone`: the offer rule is
+  // `speech && (!speech_clone || speech_clone_voices)`.
+  //
+  // OPTIONAL and fail-closed: a model that omits it derives `speech_clone_voices
+  // === false`, so a clone model stays hidden unless the backend vouches for it.
+  speech_clone_voices?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options

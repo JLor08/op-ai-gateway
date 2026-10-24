@@ -123,9 +123,11 @@ func (v *voiceScope) refine(err error) error {
 //
 // A candidate is known-present when the voice is in its mapping's cached list (exact
 // match: the name is relayed to the upstream byte for byte, so a near miss is a different
-// voice) AND the mapping is a plain tts model NOW (CapabilityRowsPlainTTS, the verdict gate
-// the voices endpoint applies at read time, so a list that outlived a tts -> clone flip is
-// not a known voice here either). A candidate whose cached list does NOT name the voice is
+// voice) AND the mapping is a plain tts model NOW (CapabilityRowsPlainTTS, so a list that
+// outlived a tts -> clone flip is not a known voice here either). The voices endpoint's own
+// read-time gate is wider since #301 (CapabilityRowsOfferableTTS: a clone model with presets
+// lists them), and this filter is deliberately left plain tts only: a clone mapping's cached
+// list is not consulted here. A candidate whose cached list does NOT name the voice is
 // known-absent and excluded; one with no cached voices row at all is unknown and kept.
 //
 // The pool is one flat set. For a group the caller passes every member's candidates,
@@ -210,9 +212,8 @@ func candidateMappingIDs(pool []MappingCandidate) []string {
 }
 
 // plainTTSMappingIDs keeps the ids whose CURRENT stored verdicts make them a plain tts
-// model (CapabilityRowsPlainTTS), the verdict gate the voices endpoint also applies at read
-// time, so a cached list that outlived a tts -> clone (or tts -> non-speech) flip is not
-// treated as a known voice here either.
+// model (CapabilityRowsPlainTTS), so a cached list that outlived a tts -> clone (or
+// tts -> non-speech) flip is not treated as a known voice here either.
 func plainTTSMappingIDs(ids []string, verdicts map[string][]CapabilityRow) []string {
 	tts := make([]string, 0, len(ids))
 	for _, id := range ids {
