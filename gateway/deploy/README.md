@@ -98,6 +98,16 @@ regardless. See [Persistence](../../docs/architecture/cross-cutting/persistence.
   body cap, a long body timeout). A custom proxy in front must not buffer that request body either. On Kubernetes
   the ingress-nginx buffering is per Ingress, so a dedicated Ingress for those two paths is the follow-up (see
   `k8s/README.md`).
+- Voice Chat adds one location to the same file: a WebSocket upgrade for `/api/portal/voice-chat`, the
+  live-transcription one again (`Host $http_host`, a 3600 s idle limit), plus two requirements that are not
+  location-level. Both server blocks set `large_client_header_buffers 4 16k`: the single-use ticket rides one
+  `Sec-WebSocket-Protocol` header line of up to 7 KiB (it seals three routing targets), and nginx's default of 8k per
+  line would leave under 1 KiB of margin. And the ticket mint, `POST /api/portal/voice-chat-ticket`, waits on the
+  model co-load gate for up to `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (120 s by default), so it is served by
+  `location /api/` on the server-level `proxy_read_timeout 3600s`; nginx's own 60 s default would cut a cold start
+  short. A custom reverse proxy in front **must** forward the original `Host` with its port, accept a header line of at
+  least 8 KiB, and allow the ticket POST at least 120 s of read time. The edge proxy configuration the
+  Certificates page generates carries the same location and header buffers.
 - `OP_AI_GATEWAY_SESSION_COOKIE_SECURE=false` (in `.env.example`) is required for
   the plain-HTTP Compose stack; set it `true` once TLS terminates in front.
 - Set `OP_AI_GATEWAY_PUBLIC_URL` to include the `/portal` segment so invite links

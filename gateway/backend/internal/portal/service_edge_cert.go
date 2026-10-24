@@ -1150,7 +1150,13 @@ server {
 
 `)
 	}
-	fmt.Fprintf(&b, `    # Streaming-safe defaults, inherited by the locations below.
+	fmt.Fprintf(&b, `    # Header buffers. The Voice Chat WebSocket presents its single-use ticket as ONE
+    # Sec-WebSocket-Protocol header line of up to 7 KiB (it seals three routing
+    # targets), and nginx caps a header line at one large_client_header_buffers
+    # buffer: 8k by default, which leaves a full-size ticket under 1 KiB of margin.
+    large_client_header_buffers 4 16k;
+
+    # Streaming-safe defaults, inherited by the locations below.
     proxy_http_version 1.1;
     proxy_set_header Connection "";
     proxy_set_header Host $host;
@@ -1200,6 +1206,31 @@ server {
     # header's host AND PORT with the Host it sees. $host drops the port, so a
     # gateway published on a non-default port would refuse every upgrade with 403.
     location = /api/portal/transcription-live {
+        proxy_pass %[1]s;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-OP-Internal-Auth "";
+        proxy_set_header X-OP-Internal-User "";
+        proxy_set_header X-OP-Server-Override "";
+        proxy_set_header X-OP-Server-Override-Force "";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+
+    # Portal Voice Chat (WebSocket): the live-transcription location above again --
+    # the same Upgrade shape, the same $http_host and the same 3600 s idle limit.
+    # The single-use ticket it redeems is minted by POST /api/portal/voice-chat-ticket,
+    # which has no location of its own (the catch-all above serves it) and blocks on
+    # the gateway's model co-load gate for up to OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT
+    # (120 s by default): keep the server-level proxy_read_timeout at 120 s or more
+    # (nginx's own default is 60 s, which would cut a cold start short). The ticket
+    # travels in a request header, which is why large_client_header_buffers is set
+    # above.
+    location = /api/portal/voice-chat {
         proxy_pass %[1]s;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;

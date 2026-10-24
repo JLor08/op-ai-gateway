@@ -41,6 +41,11 @@ const proxy = {
   // also catch /api/portal/transcription-live-ticket -- and it has to stay ahead of
   // '/api' because the first matching context wins.
   '^/api/portal/transcription-live(?:\\?|$)': { target: GATEWAY, ws: true },
+  // The Voice Chat WebSocket, for the same reasons as the live-transcription one above
+  // (`ws: true`, no changeOrigin, ahead of '/api'). The anchored regex matters here too:
+  // a plain '/api/portal/voice-chat' prefix would also catch the ticket mint,
+  // /api/portal/voice-chat-ticket, and upgrade-proxy an ordinary POST.
+  '^/api/portal/voice-chat(?:\\?|$)': { target: GATEWAY, ws: true },
   '/api': GATEWAY,
   '/v1': GATEWAY,
   '/openai': GATEWAY,

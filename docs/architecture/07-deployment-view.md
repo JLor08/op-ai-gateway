@@ -66,6 +66,17 @@ flowchart TB
   stream would be held back until it ended. Setting `nginx.ingress.kubernetes.io/proxy-request-buffering: "off"` on the
   shared Ingress would unbuffer every upload through the host, so the follow-up is a **dedicated Ingress for those two
   paths** carrying the annotation (`gateway/deploy/k8s/README.md` has the note; [ADR-073](09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once), [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **Voice Chat adds one more nginx location and two requirements that are not location-level.** The same bundled nginx
+  files carry a WebSocket-upgrade location for the portal's `/api/portal/voice-chat`, the live-transcription location
+  again (`Host $http_host`, a 3600 s idle limit); it works through the Ingress for the same reason. The two
+  requirements are server-level. **`large_client_header_buffers 4 16k`** is set in both server blocks, because the
+  single-use ticket rides one `Sec-WebSocket-Protocol` header line of up to 7 KiB (it seals three routing targets, where
+  the live-transcription ticket seals one) and nginx's 8k default would leave under 1 KiB of margin. A **read timeout of
+  at least `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT`** (120 s by default) covers the ticket mint `POST
+  /api/portal/voice-chat-ticket`, which waits on the model co-load gate: it has no location of its own and rides
+  `location /api/` on the server-level `proxy_read_timeout 3600s` (the Ingress's is 3600 s too). ingress-nginx's own
+  header buffer is a controller-global ConfigMap key, not an annotation (`gateway/deploy/k8s/README.md`).
+  `gateway/deploy/nginx-config.test.sh` pins all three ([ADR-078](09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Networking & Mesh §10](cross-cutting/networking-mesh.md#10-agentgateway-websocket-transport)).
 
 ## 7.4 Listeners
 
