@@ -199,14 +199,24 @@ func parseVoiceUpControl(data []byte) (voiceUpControl, bool) {
 // the wire minimal: a field a frame does not own is zero and omitted.
 //
 //   - state:        State
-//   - asr_partial:  Text (a provisional whole transcript, replace-not-append)
-//   - asr_final:    Text (the finalized user turn) and MessageID
+//   - asr_partial:  Text (the CURRENT chunk's provisional text, replace-not-append; not the
+//     whole turn -- across a pause-tolerant, multi-chunk turn the client shows the finalized
+//     chunks so far plus this partial)
+//   - asr_final:    Text (the finalized text of ONE chunk, which the client appends to the
+//     turn's text; nothing is persisted at a chunk boundary)
 //   - answer_delta: Text (the increment)
-//   - answer_done:  MessageID
-//   - answer_reset: nothing (the speculative run was cancelled)
+//   - answer_done:  nothing (provisional: sent when the answer text is complete, BEFORE the
+//     commit, so a later answer_reset can still void it)
+//   - answer_reset: nothing (the speculative run was cancelled because the user resumed)
 //   - audio_delta:  Seq (from 0), Rate (Hz) and Audio (base64 s16le PCM)
-//   - audio_done:   nothing
+//   - audio_done:   nothing (the audio is complete and the turn has been committed; the client
+//     then reloads the chat thread to pick up the stored user and assistant turns)
 //   - error:        Code (the stable code of the leg that failed) and Message
+//
+// No frame carries a message id. The user turn and the assistant turn are persisted together,
+// once, when the turn truly finalizes (the voice run's deferred commit), so nothing exists to
+// name earlier; MessageID is therefore never populated. It stays on the struct, omitempty, as
+// reserved wire shape the portal's parser tolerates, and it never appears on the wire today.
 type voiceDownMsg struct {
 	Type      string `json:"type"`
 	State     string `json:"state,omitempty"`
@@ -458,7 +468,7 @@ type asrEventKind int
 
 const (
 	asrKindDelta   asrEventKind = iota // an incremental transcript fragment
-	asrKindPartial                     // a provisional WHOLE transcript (replace-not-append)
+	asrKindPartial                     // the current chunk's provisional transcript (replace-not-append)
 	asrKindDone                        // the clean final transcript (after end-of-input)
 	asrKindError                       // a mid-stream upstream error
 )
@@ -864,7 +874,8 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 }
 
 // onASREvent folds one live-ASR event into the current chunk. delta/partial build the
-// provisional WHOLE transcript streamed down as asr_partial (replace-not-append); done is
+// current chunk's provisional transcript, streamed down as asr_partial (replace-not-append;
+// it is this chunk only, the client adds the finalized chunks of earlier pauses); done is
 // the clean final that ends the chunk; an error fails the turn.
 func (m *voiceMachine) onASREvent(ev asrEvent) {
 	switch ev.kind {

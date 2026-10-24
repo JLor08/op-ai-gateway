@@ -465,6 +465,112 @@ of the 30 s server deadlines applies to the adapter, and the `/v1` relay lifts t
 because audio.cpp serves one `/live` per model. See [API Compatibility & Inference §3.8](cross-cutting/compatibility-and-inference.md#38-live-transcription-the-bearer-v1-endpoint-and-the-portal-websocket), [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event) and
 [ADR-073](09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once).
 
+### 6.1.6 Voice Chat (browser WebSocket, per-chunk live ASR, speculative LLM, deferred commit, streamed TTS)
+
+Voice Chat is the portal's hands-free spoken conversation: the user talks, the gateway hears them, answers through the
+chat model and speaks the answer back, while the chat thread fills in exactly as if each turn had been typed and sent.
+It is **orchestrated entirely in the backend**: one WebSocket, `GET /api/portal/voice-chat`, behind a CSRF-protected ticket,
+whose handler is a single-owner state machine that **composes three existing `/v1` cores over loopback** (the live ASR
+relay of §6.1.5, chat completions, and the streaming speech relay of §6.1.1/§6.1.3) and spends nothing of its own. The
+guarantee that matters most, that the microphone can never feed the model's own voice back into itself, is enforced in
+that state machine, not by the browser
+([ADR-078](09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), issue #312).
+
+```mermaid
+sequenceDiagram
+    participant B as Portal (browser)
+    participant TK as Gateway (ticket endpoint + co-load gate)
+    participant AG as Agent routers (ensure, loaded set)
+    participant M as Gateway (voice WebSocket, state machine)
+    participant LV as Gateway (/v1/audio/transcriptions/live)
+    participant RN as Gateway (voice run)
+    participant CH as Gateway (/v1/chat/completions)
+    participant SP as Gateway (/v1/audio/speech)
+    participant ST as chat store
+
+    B->>TK: POST /api/portal/voice-chat-ticket {chat_id, asr_model, llm_model, tts_model} (session + X-OP-CSRF)
+    TK->>TK: read the caller's own chat (404 portal.chat_not_found), snapshot settings.audio (400 portal.voice_chat_audio_settings_invalid)
+    TK->>TK: step 1, resolve and gate all three legs WITHOUT admission (400 portal.voice_chat_asr_unavailable, _llm_unavailable, _tts_unavailable)
+    loop each agent-managed leg, one at a time
+        TK->>AG: ensure the model (runtime.admission_blocked is 409 portal.voice_chat_coload_failed)
+    end
+    TK->>AG: step 3, read each agent's LIVE loaded set after all ensures
+    TK->>TK: every agent-managed leg resident NOW, else 409 portal.voice_chat_coload_failed (bounded by OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT)
+    TK-->>B: 200 {ticket} (about 30 s, single-use, AES-256-GCM of the three targets + chat + attribution + settings + PCM shape)
+    B->>M: GET /api/portal/voice-chat, Upgrade, Sec-WebSocket-Protocol: op-voice-chat + the ticket
+    M->>M: redeem BEFORE Accept (one 401 for every failure), default same-origin check
+    M-->>B: 101 Switching Protocols, then {state: listening}
+
+    Note over B,M: the mic is piped on only in listening and, while the continuation window is open, in thinking
+    loop while the user speaks (one chunk)
+        B->>M: binary PCM, about 100 ms per frame (16 kHz mono s16le)
+        M->>LV: the first admitted frame opens a FRESH loopback live relay, the PCM is piped in as the ticket's user
+        LV-->>M: SSE delta or partial
+        M-->>B: {asr_partial, text} the CURRENT chunk's provisional text, replace
+    end
+    M->>M: silence timeout (or push_end) ends the chunk, min and max utterance guards apply
+    M->>LV: close the pipe (end-of-input)
+    LV-->>M: clean final transcript, the relay ends (one audio_second row for the chunk)
+    M-->>B: {asr_final, text} one chunk, nothing is persisted yet
+    M->>RN: start a SPECULATIVE voice run on pendingText, state thinking, the mic STAYS open
+    RN->>CH: loopback POST, history plus pendingText, streamed
+    CH-->>RN: answer deltas
+    RN-->>M: text deltas
+    M-->>B: {answer_delta, text} a preview of the answer
+    alt the user resumes speaking inside the continuation window
+        B->>M: PCM, the next chunk's first voiced partial arrives
+        M->>RN: cancel the run (it persisted nothing, tokens already produced are still billed)
+        M-->>B: {answer_reset}, then {state: listening}
+        Note over M,RN: the next chunk is appended to pendingText, and the run restarts on the longer text at the next chunk end, as often as the user pauses
+    else the window closes with no resume
+        RN->>SP: loopback POST, the WHOLE answer, streamed PCM
+        SP-->>RN: audio events
+        RN-->>M: audio events, HELD while the window is open
+        M-->>B: {answer_done} (provisional)
+        Note over M: the window closes when the answer has streamed AND the grace elapsed, OR when the run commits, whichever is first. The mic shuts.
+        M-->>B: {state: speaking}, the held audio, then {audio_delta, seq, rate, audio} as it arrives
+        RN->>ST: CommitVoiceTurn, the user turn and the assistant turn [text, audio_url...] in ONE SaveChatWithBlobs
+        RN-->>M: completed
+        M-->>B: {audio_done}, then {state: draining}
+        B->>B: reload the chat thread, which now holds the committed turns
+        B->>M: {playback_done} when the streaming player has drained
+        M->>M: end draining at min(ceiling, max(floor, signal)), then the mic-resume tail
+        M-->>B: {state: listening}
+    end
+    opt any leg fails (ASR drop, LLM or TTS error, admission_blocked, commit failure)
+        M-->>B: ONE {error, code, message} with the core's stable code, then {state: idle}, no retry
+    end
+    M->>M: on bye or a dropped socket: cancel the run, tear the ASR loopback down, join every goroutine, exactly once
+```
+
+What differs from the live-transcription and speech scenarios. **The orchestrator composes, it never re-implements.**
+Each leg is a loopback call to a public `/v1` core that resolves, admits, guards and bills for itself, so the state
+machine takes no admission, holds no route slot and writes no usage row; the three rows of a turn are listed in
+[Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event). **The ASR relay is per chunk, not per
+session**: it opens on the first admitted mic frame and is closed at every chunk end, so between chunks ASR holds no
+admission and no pinned child (on a one-GPU host a session-long relay would block the TTS child from loading), and the
+clean final comes from end-of-input, the contract the relay is tested on. **The live transcript is the current chunk's**:
+`asr_partial` replaces the previous partial of *that chunk*, and across a pause the client shows the finalized chunks so far
+plus it; no frame carries a message id, because nothing is persisted at a chunk boundary. **A pause is not the end of the
+turn.** On a chunk end the machine answers **speculatively** and leaves the mic open (the continuation window): resumed
+speech cancels the run, voids the preview (`answer_reset`) and extends the text, and a cancelled run persisted **nothing**,
+because the run commits the user turn and the assistant turn together, once, on its single un-cancelled terminal path. The
+TTS audio is **held** until the window closes, so nothing audible exists while the mic is open. **The window closes at the
+commit at the latest.** The run is non-pausable (LLM, then TTS, then commit), so a fast answer gives a shorter keep-talking
+window than the full grace, and a resume that begins once the run is committing (the commit write) is not accepted: the
+voiced chunk is discarded when the window force-closes. True barge-in, interrupting the answer, is phase 4
+([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). **The half-duplex gate is
+the server's.** Mic PCM is discarded in the machine, before any ASR loopback, in `speaking`, `draining`, `idle`, while a
+chunk finalizes and once the window has closed; `push_start` only starts a turn from `idle`. **`draining` tracks playout,
+not relay.** The machine relays audio faster than real time, so `audio_done` is "all audio sent", and the drain holds the mic
+gated until `min(ceiling, max(floor, playback_done))`, the floor being the relayed audio's own duration, so an early or
+forged `playback_done` cannot re-open the mic while the answer is audible and a missing one cannot wedge the session
+(the 30 s ceiling). **Failure is one typed error and `idle`, never a retry.** The WebSocket upgrade hijacks its
+connection, so none of the 30 s server deadlines applies to it; the ticket POST, which can wait on a cold start, lifts them
+([API Compatibility & Inference §7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle)). The frames and codes are in the
+[HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket), the knobs in
+[Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate).
+
 ## 6.2 Portal login (session + CSRF) with optional TOTP
 
 ```mermaid

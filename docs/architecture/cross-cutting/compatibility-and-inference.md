@@ -153,7 +153,7 @@ reachable that way (§9). Every body but the two multipart ones (the image edits
 and the audio transcriptions) is read with `readRawJSONUnlimited` (§7); those two
 bodies are `multipart/form-data` and each is read by its own capped reader (§3.5,
 §3.7, §10). All eight POST endpoints call `liftInferenceDeadlines` before reading
-the body (§6); the bearer live-transcription endpoint of §3.8, a ninth POST, lifts them as well, after its own gate.
+the body (§6); the bearer live-transcription endpoint of §3.8, a ninth POST, lifts them as well, after its own gate, and so does the portal's `POST /api/portal/voice-chat-ticket` ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)): its co-load gate cold-starts up to three models for as long as `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (default 120 s), which outlives the 30 s write deadline, so it lifts them once it has read the body and the chat and before the gate runs.
 
 ### 3.1 OpenAI Chat Completions
 
@@ -1462,6 +1462,8 @@ ingress-nginx buffers request bodies per Ingress and not per path; a dedicated I
 the follow-up ([Deployment View §7.3](../07-deployment-view.md#73-kubernetes), [Networking & Mesh §10](networking-mesh.md#10-agentgateway-websocket-transport)). The path is verified against mock backends and a real agent proxy and router on
 both paths, **not yet against a real audio.cpp `/live`** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)).
 
+**A second loopback client: Voice Chat.** The portal's hands-free spoken conversation ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Runtime View §6.1.6](../06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts)) is a further client of this endpoint, not a new relay: its WebSocket state machine opens a **fresh** loopback live relay for each chunk of the user's speech (on the first mic frame its half-duplex gate admits, closed with the end-of-input at the chunk end, so each chunk is admitted, takes the per-route slot, and bills one `audio_second` row on its own) and never holds one for the whole session, so between chunks the route's one live slot is free for another session and a busy slot is one `error` frame carrying `transcription.live_busy`. Its ticket carries three targets instead of one and is minted by `POST /api/portal/voice-chat-ticket`, which also runs the co-load gate; everything this section says about the relay itself holds unchanged.
+
 ## 4. Session / continuity signals
 
 `extractClientSession` (`internal/gateway/session_extract.go`) derives a
@@ -1850,7 +1852,9 @@ long but continuously-producing stream never times out. `http.ResponseController
 (`SetReadDeadline`/`SetWriteDeadline`) is used for two distinct purposes:
 `liftInferenceDeadlines` clears the connection's default 30s read/write
 deadline entirely for all eight POST inference endpoints at request start (a
-large multimodal upload can take longer than 30s to arrive), and the streaming
+large multimodal upload can take longer than 30s to arrive; the bearer live relay of §3.8 and the portal's
+`POST /api/portal/voice-chat-ticket` call it too, the latter before its co-load gate, which can wait on a cold start for up to
+`OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT`, and a write deadline left armed would drop the connection instead of delivering the ticket or the refusal), and the streaming
 handlers then re-arm just the write deadline to `now + idle` before every SSE
 write — so a stalled real socket (as opposed to an idle *upstream*) is still
 caught, without needing a second timer. **No provider `CompleteStream`

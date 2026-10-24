@@ -3991,3 +3991,50 @@ describe('portal chat transcription error i18n keys', () => {
     expect(messages.en.errorChatRunNoTranscript).toMatch(/speech|text/i);
   });
 });
+
+describe('Voice Chat (#312) i18n keys', () => {
+  // What a user can be told when a Voice Chat conversation cannot start or ends: the gateway's
+  // refusal of the ticket, by its portal.voice_chat_* code (asr, llm, tts, coload, audio settings,
+  // ticket), the generic refusal, and the failures the portal reports without a gateway code.
+  // Every one needs a sentence of its own in both languages, and none may be an untranslated copy.
+  const failureKeys = [
+    'chatVoiceErrorAsrUnavailable',
+    'chatVoiceErrorLlmUnavailable',
+    'chatVoiceErrorTtsUnavailable',
+    'chatVoiceErrorCoLoad',
+    'chatVoiceErrorAudioSettings',
+    'chatVoiceErrorTicket',
+    'chatVoiceErrorRefused',
+    'chatVoiceErrorUnsupported',
+    'chatVoiceErrorCapture',
+    'chatVoiceErrorDropped',
+    'chatVoiceErrorTurn',
+  ] as const;
+
+  it('has a distinct, non-empty sentence in de and en for every refusal and failure', () => {
+    for (const key of failureKeys) {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        const text = messages[locale][key];
+        expect(typeof text).toBe('string');
+        expect(text.length).toBeGreaterThan(0);
+      }
+      expect(messages.de[key]).not.toBe(messages.en[key]);
+    }
+  });
+
+  it('keeps the chatVoice cluster the same set of keys in both languages', () => {
+    const cluster = (locale: Locale) =>
+      Object.keys(messages[locale])
+        .filter((key) => key.startsWith('chatVoice'))
+        .sort();
+    expect(cluster('de')).toEqual(cluster('en'));
+    expect(cluster('de').length).toBeGreaterThan(failureKeys.length);
+  });
+
+  // A co-load refusal is the operator's to fix (the co-residency matrix and the GPU budgets), so
+  // the user is sent to the administrator rather than told to retry.
+  it('sends the user to the administrator when the three models cannot be loaded together', () => {
+    expect(messages.de.chatVoiceErrorCoLoad).toMatch(/Administrator/);
+    expect(messages.en.chatVoiceErrorCoLoad).toMatch(/administrator/);
+  });
+});
