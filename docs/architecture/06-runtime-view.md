@@ -238,13 +238,18 @@ gap in the sequence, which is harmless because the committed WAV is complete.
 builds (buffered and streamed alike) carries a top-level `language` when the thread's
 `settings.audio.language` is non-empty, which audio.cpp applies per model as the transcript language
 and silently drops where a model takes none; the run never consults a gate for it. What the composer
-may offer comes from the other side of the health loop: while a plain tts model is observed loaded,
-the loop caches whether it declares a `language` param and its default (`speech_language` in
+may offer comes from the other side of the health loop: while a speech model is observed loaded (a
+configured clone model included, [ADR-075](09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301), the loop caches whether it declares a `language`
+param and its default (`speech_language` in
 `model_mapping_cache`: from the verdict probe's own `GET /v1/models?include_params=true` for a static
 `audio_cpp` server, and through the agent router's `GET /upstream/{model}/v1/models` for an
 agent-launched child, only on an agent that declared `runtime_model_params`), and the composer asks
 `GET /api/portal/model-speech-language` on each speech-model change to show its `Language` field and,
-for an empty thread on a model whose default is not `auto`, pre-fill the portal's UI language.
+for an empty thread on a model whose default is not `auto`, pre-fill the portal's UI language. That gate
+reads the **offerable** speech mappings (a plain tts model, or a clone model with cached preset voices),
+while the streaming gate above still reads plain tts mappings only; and for a configured clone model the
+composer also starts the thread on the first preset voice, since such a model has no text-only default
+voice ([ADR-075](09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)).
 
 **Long answers** ([ADR-070](09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch), issue #279). A clip longer than the per-part target
 (`min(8 MiB, MaxChatBlobBytes / 2)` of PCM, about 95 seconds at 44.1 kHz mono by default) is

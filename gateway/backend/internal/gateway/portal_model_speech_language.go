@@ -88,9 +88,9 @@ func scopeLessSpeechLanguage(rows []routing.ModelMappingCacheRow) (accepts bool,
 // blank-name 400 (model.name_required, for the reason an empty name would otherwise read as
 // "no language control"), and the same no-leak rule -- every "no" (an unknown, hidden,
 // locked or restricted model, a non-speech one, a clone one with no named preset, one whose
-// language no probe has stated yet) is the same 200, so the answer cannot probe which models exist. A store
-// failure is the only 500, never read as a "no". Nothing here loads a model or contacts an
-// upstream.
+// language no probe has stated yet) is the same 200, so the answer cannot probe which models
+// exist. A store failure is the only 500, never read as a "no". Nothing here loads a model or
+// contacts an upstream.
 func (s *Server) handlePortalModelSpeechLanguage(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return

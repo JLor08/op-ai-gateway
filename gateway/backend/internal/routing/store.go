@@ -1921,10 +1921,11 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 // does not exclude: only an affirmative one does (a clone model synthesises only
 // in a reference voice it is handed, so it has no named voices to offer).
 //
-// It is the ONE definition of that rule for everything that writes or reads the
-// voices cache from stored rows: the agent-launched health pass decides from it
-// whether to ask a child for its voices, and the voices endpoint decides from it,
-// at read time, whether a cached list may still be offered.
+// It is the ONE definition of the plain-tts rule: the speech benchmark and its health-loop
+// trigger (the streamed-rate step), the portal's streaming gate and the routing voice
+// filter decide from it. Since #301 it no longer decides the voices
+// cache: the producers ask any speech model (CapabilityRowsSpeech) and the readers
+// offer a clone model's list too when it is non-empty (CapabilityRowsOfferableTTS).
 func CapabilityRowsPlainTTS(rows []CapabilityRow) bool {
 	byName := CapabilityRowsByName(rows)
 	return byName[CapabilitySpeech].Verdict == CapabilityYes &&

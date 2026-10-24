@@ -5811,7 +5811,7 @@ func TestRunAppHealthOnceVoicesAgentWithoutTheFlagNeverFetches(t *testing.T) {
 // broken per case against a fully eligible child (the control). The route is
 // Status-only, so a request for a model that is not running would only 404 --
 // and a gateway that fetched on a guess is how a cold child would get asked at
-// all -- hence loaded is strict, and only a plain tts audio.cpp child has voices
+// all -- hence loaded is strict, and only a speech audio.cpp child has voices
 // to offer: (speech, yes), from the verdicts the agent reports for the child,
 // whatever its (speech_clone) verdict -- a clone child's configured voice_presets
 // are listed too (#301), the same rule as the static server's pass.

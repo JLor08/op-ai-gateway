@@ -705,8 +705,8 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // The clone row is the twin of the streaming row, one capability over: it says whether
 // a speech model synthesises only in a reference voice (a clone model, yes) or from
 // text alone (a plain tts model, no), the distinction the portal chat's speech picker
-// needs to keep a model it cannot drive out of the list (routing.CapabilitySpeechClone);
-// it gates no route either. It refines the speech capability, so it is written only for
+// needs to keep a model it cannot drive (a clone model with no configured presets, #301)
+// out of the list (routing.CapabilitySpeechClone); it gates no route either. It refines the speech capability, so it is written only for
 // a model whose speech verdict is yes: a model that does not synthesise speech (asr,
 // music, one the listing gives no task) carries no row on it, not even a "no", whatever
 // its clone verdict says. Same rule at the row boundary: a verdict assembled elsewhere
@@ -880,11 +880,11 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 //
 // The same listing read also says whether the model is LOADED right now, and
 // that drives a second, voices step per mapping (cacheAudioCppVoices, #251): a
-// loaded speech model (a clone model included, #301) has its voices listed and cached on the mapping, which
-// is the only moment audio.cpp can say them (it answers for the model it has
-// loaded). The step runs after the capability write, on the same verdict, and
-// only through the prober's optional voices listing; its failures never touch
-// the verdicts above.
+// loaded speech model (a clone model included, #301) has its voices listed and
+// cached on the mapping, which is the only moment audio.cpp can say them (it
+// answers for the model it has loaded). The step runs after the capability
+// write, on the same verdict, and only through the prober's optional voices
+// listing; its failures never touch the verdicts above.
 //
 // A third, speech params step per mapping (cacheAudioCppSpeechParams, #282) caches the
 // `language` request param fact the same verdict carries, for the same loaded speech
@@ -951,9 +951,9 @@ func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routin
 // is, so a clone model that has presets gets them cached like any other. It is
 // still driven by a reference recording when it has none, and that case is
 // carried by the listing itself: a clone model with no presets caches an EMPTY
-// list, which is the signal that keeps it hidden from the callers' voice picker
-// downstream (routing.CapabilityRowsOfferableTTS), so the fetch needs no
-// clone term here.
+// list, which is what keeps it hidden from the pickers (the readers offer a
+// clone model only when this list is non-empty, routing.CapabilityRowsOfferableTTS),
+// so the fetch needs no clone term here.
 //
 // The fresh verdict is the gate and not the stored capability rows: this pass
 // is the one writing them, so it reads its own tick's answer without a store

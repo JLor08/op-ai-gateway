@@ -55,10 +55,11 @@ type audioVoicesResponse struct {
 // Status codes are the no-leak ones: a missing or blank model is 400
 // model.name_required, because it is a client bug that an empty list would hide,
 // and EVERY other "nothing to show" case -- an unknown name, a model the token
-// cannot route to or is not allowed to use, a non-speech or clone model, one with
-// nothing cached yet -- is the same 200 with "voices":[], so the answer cannot be
-// used to probe which models exist or which servers a token is kept away from. A
-// store failure is the only 500, and it is never read as an empty answer.
+// cannot route to or is not allowed to use, a non-speech model, a clone model
+// without presets (one WITH presets lists them, #301), one with nothing cached
+// yet -- is the same 200 with "voices":[], so the answer cannot be used to probe
+// which models exist or which servers a token is kept away from. A store failure
+// is the only 500, and it is never read as an empty answer.
 //
 // Voices are deliberately not part of /v1/models: a model list stays one cheap
 // read and a voice list is per-model detail a client asks for on demand.
@@ -108,7 +109,8 @@ func (s *Server) handleAudioVoices(w http.ResponseWriter, r *http.Request) {
 // model the token cannot dispatch to nor hides one it can:
 // routing.Resolver.ReachableCandidates (the group expansion, the locked/direct
 // rule and resource-group provisioning, dispatch's own code) over the speech
-// flavor, then the CURRENT tts verdict (cachedVoicesForMappings). It does NOT
+// flavor, then the CURRENT offerable verdict (cachedVoicesForMappings: a speech
+// model that is not a clone model, or a clone model with presets). It does NOT
 // apply the token's own model rules (override, service allowlist): those rewrite
 // or refuse the NAME a request carries, so they belong to the caller that holds
 // the request (handleAudioVoices), which hands this the effective name.

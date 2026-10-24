@@ -610,8 +610,9 @@ func (s *Server) cachedImageOptions(views []portal.ImageOptionMapping) []provide
 // A group's members are NOT filtered by their own visibility (a hidden or locked
 // model is still a full member of a group), so a locked model's voices are
 // offered through its group. Every "nothing to show"
-// case -- an unknown, hidden, locked, restricted, non-speech, clone or not-yet-
-// cached model -- is that same 200, so the answer cannot be used to probe which
+// case -- an unknown, hidden, locked, restricted, non-speech or not-yet-cached
+// model, or a clone model without presets (one WITH presets lists them, #301) -- is
+// that same 200, so the answer cannot be used to probe which
 // models exist. A store failure is the only 500 and is never read as an empty
 // answer. Nothing here loads a model or contacts an upstream.
 func (s *Server) handlePortalModelVoices(w http.ResponseWriter, r *http.Request) {

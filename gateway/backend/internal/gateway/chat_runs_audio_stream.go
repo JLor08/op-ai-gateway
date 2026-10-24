@@ -105,8 +105,9 @@ func speechStreamSampleRate(byteRate uint32) (int, bool) {
 
 // portalSpeechStreamRate is the gate of the portal's speech streaming: the sample rate the
 // composer may play gatewayModel's stream at, and true, only when EVERY mapping a speech
-// request for the model could be routed to (the portal-visible, plain-tts ones, which is
-// what the voice picker asks too: Portal.ModelVoiceMappingIDs) is
+// request for the model could be routed to (the portal-visible, plain-tts ones: the
+// visibility the voice picker asks, Portal.ModelVoiceMappingIDs, narrowed to plain tts, where
+// the picker also takes a configured clone model, #301) is
 //
 //   - (speech_streaming, yes): the gateway streams only a route its verdict says does, and
 //     answers any other buffered; and
@@ -121,8 +122,11 @@ func speechStreamSampleRate(byteRate uint32) (int, bool) {
 // flags use (fail closed), and the equality of their rates.
 //
 // A mapping that is not plain tts (not a speech model at all, or a clone one) is not a
-// candidate: a speech request is never routed to it. An empty candidate set is a closed gate.
-// A store failure is an error and is never read as an open gate.
+// candidate. A clone model is left out on purpose rather than because a speech request cannot
+// reach it (since #301 one with presets can be routed to, and is offered): it has no cached
+// stream rate, its streaming being deferred, so counting it would close the gate for a name
+// that streams today. The gate therefore speaks only for a name's plain mappings. An empty
+// candidate set is a closed gate. A store failure is an error and is never read as an open gate.
 func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Token, gatewayModel string) (int, bool, error) {
 	candidates, verdicts, err := s.portalPlainTTSMappings(ctx, principal, gatewayModel)
 	if err != nil || len(candidates) == 0 {
@@ -145,9 +149,9 @@ func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Toke
 // does not read them again. The ids are deduped and keep the portal's order (sorted), so
 // what a caller folds over them is deterministic.
 //
-// It is deliberately STRICTER than what the portal offers elsewhere
-// (portalOfferableSpeechMappings: the voice picker and the language control also take a
-// configured clone model, #301). A clone model has no cached stream rate, so taking it in
+// It is deliberately STRICTER than what the portal offers elsewhere: the voice picker
+// (cachedVoicesForMappings) and the language control (portalOfferableSpeechMappings) also take
+// a configured clone model, #301. A clone model has no cached stream rate, so taking it in
 // here would close the gate for a name that streams today (a mixed name falling from
 // streaming to buffered); the stream gate therefore stays plain tts alone.
 //
@@ -175,7 +179,9 @@ func (s *Server) portalPlainTTSMappings(ctx context.Context, principal auth.Toke
 }
 
 // plainTTSMappingIDs keeps, in order, the mappings whose capability rows say plain tts
-// (routing.CapabilityRowsPlainTTS): the only ones a speech request is ever routed to.
+// (routing.CapabilityRowsPlainTTS): the only ones the portal's streaming gate counts. A
+// configured clone model is not among them (since #301 it is offered, see
+// portalOfferableSpeechMappings, but it has no cached stream rate).
 func plainTTSMappingIDs(ids []string, verdicts map[string][]routing.CapabilityRow) []string {
 	candidates := ids[:0:0]
 	for _, id := range ids {

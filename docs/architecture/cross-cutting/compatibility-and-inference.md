@@ -866,7 +866,10 @@ what the health loop cached while the model was loaded: the persistent per-mappi
 [Data Model](../reference/data-model.md#the-per-mapping-cache-table)), filled by a gateway
 lister for a static `audio_cpp` server and through the agent router's voices route for an
 agent-launched child ([Agent-Managed Model
-Runtime §4.1](agent-runtime-manager.md#41-control-routes)).
+Runtime §4.1](agent-runtime-manager.md#41-control-routes)), for every loaded speech model: a
+**voice-clone model with configured presets is fetched too** ([ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301), because
+audio.cpp's listing names a model's `voice_presets` whatever its task; a clone model without presets
+caches an empty list.
 
 - **`GET /v1/audio/voices?model=<gateway model name>`** (alias
   `/openai/v1/audio/voices`; `handleAudioVoices`) takes the speech endpoints' auth: a bearer
@@ -879,11 +882,13 @@ Runtime §4.1](agent-runtime-manager.md#41-control-routes)).
   **routing-consistent**: the token's model override, then a service token's allowlist,
   then exactly the mappings a speech dispatch for this token could reach
   (`Resolver.ReachableCandidates`: the group and locked rule, resource-group provisioning),
-  then only mappings that are a **plain tts model now** (`(speech, yes)` and not
-  `(speech_clone, yes)`, read at request time, so a cached list that outlived a flip to a
-  clone model offers nothing). **No-leak:** every "nothing to show" case (an unknown name,
-  one the token cannot route to or is not allowed, a non-speech or clone model, nothing
-  cached) is the same `200` with `"voices": []`; a missing or blank `model` is `400`
+  then only mappings that are **offerable now** (`routing.CapabilityRowsOfferableTTS`:
+  `(speech, yes)` and either not `(speech_clone, yes)` or a non-empty cached list, read at request
+  time, so a cached list that outlived a flip to a clone model without presets offers nothing; a
+  clone model **with** presets lists its preset names, where this answered `[]` for every clone model
+  before [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)). **No-leak:** every "nothing to show" case (an unknown name,
+  one the token cannot route to or is not allowed, a non-speech model or a clone model without
+  presets, nothing cached) is the same `200` with `"voices": []`; a missing or blank `model` is `400`
   `model.name_required`; a store failure is `500` `model.voices_failed`, never an empty
   answer. Voices are not part of `/v1/models`.
 - **`GET /api/portal/model-voices?name=<gateway model name>`** is the browser's route to the
@@ -946,7 +951,8 @@ health loop retires the rate and re-runs the benchmark when the identity changes
 loop starts the benchmark for a loaded, plain-TTS mapping whose `speech_streaming` verdict is
 `yes` and that has no usable rate (an agent-launched child only while it is running, so a cold
 child is never started); a run that was started leaves the mapping alone for five minutes. A
-clone model is skipped (its synthesis needs a server-side reference WAV) and bills
+clone model is skipped (its synthesis needs a server-side reference WAV, or a preset voice the
+benchmark does not send; streaming for clone is deferred, [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)) and bills
 `audio_bytes`. The run also records a `kind=speech` history row with `ttft_ms`, `wall_ms` and
 `rtf` (migration 95): `ttft_ms` is the time to the first byte of a **non-stream** answer, so it
 is roughly synthesis plus any model cold start, not a streamed time to first audio.
@@ -962,7 +968,7 @@ text (German through `confucius4_tts`, default `zh`, comes out with a Chinese fr
 model whose default is `auto` (`qwen3_tts`) detects it. What the gateway adds is the **fact**, not a
 filter: whether the model behind a mapping declares a `language` request param and the default it
 states, read from `GET /v1/models?include_params=true`, cached as the `speech_language` row of
-`model_mapping_cache` while the model is observed loaded, for a static `audio_cpp` server and, through
+`model_mapping_cache` while the model is observed loaded (a configured clone model included), for a static `audio_cpp` server and, through
 the agent router's `/upstream/{model}/v1/models` passthrough (agent 0.13.0, `runtime_model_params`),
 for an agent-launched child ([Routing & Model Selection
 §2.6](routing-and-model-selection.md#26-the-speech-language-fact-a-composer-gate-not-a-routing-filter)).
@@ -2318,7 +2324,8 @@ DTO's `transcription` flag (`ModelDTO.Transcription`) advertises the verdict to 
 exactly as `speech`; neither `/v1/models` nor the LM Studio `capabilities` object carries
 it, and the Models-view column stays ungated the same way.
 
-**A `speech_clone` refinement hides a voice-clone model from the chat picker.** The one
+**A `speech_clone` refinement hides a voice-clone model from the chat picker (unless it has
+presets).** The one
 audio.cpp task that decides `speech` and `transcription` also decides a third row,
 `speech_clone` (`clon` → yes, `tts` → no, nothing for a non-speech model), written by
 both producers of the `audiocpp_models` source and folded into the portal DTO's
@@ -2330,6 +2337,15 @@ while `speech` stays `true` so the direct `/v1/audio/speech` endpoint still serv
 bearer client that can. It gates no route, no request requires it, and it is absent from
 `/v1/models` and the LM Studio listing, like `speech` and `transcription`
 ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (h), issue #252).
+**A clone model with configured presets is the exception** ([ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301): its
+audio.cpp child lists the presets, so a request naming one needs no reference voice. A second flag,
+`speech_clone_voices` (`ModelDTO.SpeechCloneVoices`, `speechCloneVoicesByName`, always present), is the
+offer-direction twin and the **fail-closed AND** of the pair: true only when **every** clone-audio
+mapping of the name (one that is `(speech_clone, yes)` and would serve audio) has a non-empty cached
+voices list, AND-ed across a group's offerable members and inherited by an alias. The picker offers a
+speech model when `speech && (!speech_clone || speech_clone_voices)`, so a name that mixes a preset
+clone with a reference-only clone stays hidden (a send could route to the reference-only mapping),
+and a store error reading the voices cache keeps every clone model hidden. It too gates no route.
 
 **The portal listing carries `openai_images` and `openai_audio`; `/v1/models`
 deliberately carries neither.** Every listing keeps only the coarse flavors it knows
@@ -2338,9 +2354,9 @@ that is served only under `openai_images` reaches the portal's model DTO with
 `flavors: ["openai_images"]` — which is what lets the portal chat offer it
 (§12) — and a speech-only or transcription-only model with `flavors: ["openai_audio"]`,
 which the portal chat offers when it carries `speech: true` (and not `speech_clone: true`,
-§12) **or** `transcription: true`
+unless `speech_clone_voices: true`, §12) **or** `transcription: true`
 (its rule needs `openai`, or `openai_images` with `image`, or `openai_audio` with a
-non-clone `speech` or with `transcription`), so a transcription-only model is offered as a
+non-clone or preset-clone `speech` or with `transcription`), so a transcription-only model is offered as a
 transcription turn.
 `/v1/models` keeps
 only the rows that carry `openai`, so the same models are **not** listed there (nor in
@@ -3023,15 +3039,18 @@ transcription-only model carries no `speech` flag, so the speech filter leaves i
 but the transcription filter admits it (next paragraph). A
 speech-capable model puts an empty thread into the speech composer
 (`prospectiveKind`), and a model that is both image- and speech-capable is an image
-model, image having been the kind first. A **clone**-task model is the one speech model
-the picker leaves OUT: it carries a `speech_clone: true` flag (`ModelDTO.SpeechClone`,
+model, image having been the kind first. A **clone**-task model **without presets** is the one
+speech model the picker leaves OUT: it carries a `speech_clone: true` flag (`ModelDTO.SpeechClone`,
 from the audio.cpp task's `clon` verdict, §9), and the speech filter admits a model only
-when `speech: true` **and not** `speech_clone: true`, because a clone model needs a
-reference voice this text-only composer cannot supply, so every send would fail upstream
-(the audio counterpart of the picker-offers-what-send-fails problem). It is still
-`speech: true`, so the direct `/v1/audio/speech` endpoint serves it for a bearer client
-that can supply the voice; only the chat affordance is withheld
-([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (e), (h), issue #252).
+when `speech: true` **and** (not `speech_clone: true` **or** `speech_clone_voices: true`,
+`ModelDTO.SpeechCloneVoices`, the fail-closed AND over the name's clone mappings, §9), because a
+clone model with no configured preset needs a reference voice this text-only composer cannot
+supply, so every send would fail upstream (the audio counterpart of the picker-offers-what-send-fails
+problem), while one with presets takes a preset voice from the list. The same rule gates
+`modelSpeechCapable`, which opens the speech composer. The model is still `speech: true`, so the
+direct `/v1/audio/speech` endpoint serves a clone model for a bearer client that can supply the voice;
+for one without presets only the chat affordance is withheld
+([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (e), (h), issue #252, refined by [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301).
 
 **The picker also offers a transcription model, by the twin rule.** `chatModels` keeps a
 model whose offered flavors include `openai_audio` **and** whose `transcription` flag is
@@ -3427,7 +3446,14 @@ emits the key, `{}` when empty):
   there is a list. An unknown voice still reaches audio.cpp, which answers HTTP 500
   ([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter),
   [ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
-  (f) amendment).
+  (f) amendment). **A configured clone model gets a default voice** ([ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301): it
+  has no text-only default (a blank-voice send relies on an operator-set `default_voice_preset` the
+  gateway cannot see), so when the effective model is a preset clone (`speech`, `speech_clone` and
+  `speech_clone_voices` all true) the answer of that same fetch fills a **blank** voice with the first
+  listed name, once, as it arrives, on an **empty** speech thread; it never runs on the user's own
+  edit and never overwrites a typed or saved voice, and a plain tts model keeps its blank voice. The
+  chosen voice stays in the thread's settings across a later model switch, like a typed one (a known
+  staleness, [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **`speed` is passed through as given** (placeholder `1.0`, no clamp: the model's own
   range applies).
 - **`language` is a free-text field shown only where the gateway says the model takes one**
@@ -3544,7 +3570,8 @@ verdict has gone stale.
   /api/portal/model-speech-streaming?name=<model>` (`api.modelSpeechStreaming`, fail-closed: any
   answer but a boolean `true` with a whole sample rate is "no streaming") and shows its "stream"
   checkbox only on a `yes`. The gate is open only when **every** mapping a speech request for the
-  model could be routed to (the portal-visible plain-TTS ones, the voice picker's set) has a
+  model could be routed to (the portal-visible plain-TTS ones: the voice picker's set less a configured
+  clone model, which has no cached rate) has a
   `speech_streaming` verdict of `yes` **and** a usable cached output byte rate, and they agree
   on it, the sample rate being half the byte rate (the cache holds only a mono 16-bit PCM rate,
   §3.6 item 10). A route is chosen per request after the gate is asked, so a model with two

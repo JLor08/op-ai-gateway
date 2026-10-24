@@ -975,7 +975,9 @@ type gate and open-vocabulary storage as `transcription`:
 gate capability — no endpoint requires it — but a per-mapping verdict in the same vocabulary
 that lets the portal chat's speech picker EXCLUDE a voice-clone model, which a text-only
 composer cannot give a reference voice ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs) (h),
-issue #252). It is read from audio.cpp's `/v1/models` **`task`** field — the same field the
+issue #252) **unless it has configured preset voices** ([ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301, the voices-cache block at the
+end of §2.5): the verdict stays truthful and the picker offers the model on the strength of its cached
+voices, not by overriding it. It is read from audio.cpp's `/v1/models` **`task`** field — the same field the
 `speech` verdict reads — by the **same two producers** and under the same ranking, type gate
 and open-vocabulary storage as `speech`:
 
@@ -990,9 +992,11 @@ and open-vocabulary storage as `speech`:
   `transcription_streaming` row above. It is folded into `ModelDTO.SpeechClone` by
   `speechCloneFlagsByName`, the fail-open OR inverse of the `speech` fold, but it changes no
   route: `speech` stays the authority for `/v1/audio/speech` and the unknown-model redirect,
-  so a clone model is still served to a bearer client that can supply a reference voice.
+  so a clone model is still served to a bearer client that can supply a reference voice. Its
+  offer-direction twin is `ModelDTO.SpeechCloneVoices` (`speechCloneVoicesByName`, the fail-closed
+  AND, also routing nothing), which re-opens a clone model whose every clone mapping has presets.
 - **`manual`**, the operator's `speech_clone: yes` — the override to hide a clone model the
-  listing has not classified. `(speech_clone, no)` is **reserved** in `reservedManualVerdicts`
+  listing has not classified (hidden only until it has cached presets, like a probed one). `(speech_clone, no)` is **reserved** in `reservedManualVerdicts`
   on the same terms as `(transcription_streaming, no)`: an absent row already offers the model
   (fail-open), so a manual `no` would needlessly outrank the `task` probe and permanently
   force-offer a clone model the chat cannot drive. `(speech_clone, yes)` stays writable, and
@@ -1327,8 +1331,14 @@ decides; only a MIX of a known-absent candidate and an eligible one restricts ro
 "In its cached list" means an **exact** match in the mapping's
 cached voices (`model_mapping_cache`, type `voices`) **and** the mapping is a plain
 tts model *now* (`routing.CapabilityRowsPlainTTS`: `(speech, yes)` and not
-`(speech_clone, yes)`, the same rule the voices endpoint applies at read time, so a list
-that outlived a flip to a clone model is not a known voice either). **Presence of the
+`(speech_clone, yes)`, so a list that outlived a flip to a clone model is not a known voice
+either). The voices endpoint's own read-time rule is wider since [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)
+(a clone model with presets is offerable there); **the filter was deliberately left plain tts
+only**, so a clone mapping's cached list is not consulted here, and when a voice does narrow a
+mixed pool the clone sibling is not among the mappings it allows. Relaxing it could not make a
+mixed name safe: the remaining set would all list the voice, so nothing would be known-absent and
+routing would fail open to a reference-only sibling, which is why the offer fold (below), not
+the filter, carries that safety. **Presence of the
 scope-`""` row** — not a non-empty decoded list — is what separates *known* from
 *unknown*, because an empty or null payload decodes the same as no row at all. For a single model
 the filter runs in `resolveStandard` on the pool the capability gate left, **after** the
@@ -1400,6 +1410,45 @@ local case: that mapping is treated as **unknown** voice status and **kept eligi
 (Warn, "treated as unknown voice status, kept eligible"), and the rest of the pool is
 unaffected.
 
+**Who writes the voices cache, and who reads it** ([ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301). The
+`voices` row (`model_mapping_cache`, scope `""`, a canonical JSON array of names) has one writer path and
+four readers, and since #301 it holds a **clone model's** list too:
+
+- **Writers.** `fetchAndCacheVoices` → `writeVoicesCache`, reached from the static `audio_cpp` pass
+  (`cacheAudioCppVoices`, gated by `audioCppVoicesWanted`: the listing says the model is *loaded* and
+  `(speech, yes)`) and from the agent-child pass (`probeAgentVoices`, gated by `agentVoiceProbeSpec`:
+  running, an audio.cpp spec, observed loaded, and `routing.CapabilityRowsSpeech`). **A clone model is
+  fetched like any other speech model**: audio.cpp's listing does not look at the task, so a clone model
+  with configured `voice_presets` caches its preset names, and a reference-only one caches an **empty**
+  list (written once, then left alone by the change-only writer), which is the "no presets" signal. The
+  gate is shared with the speech-language step (§2.6), which therefore runs for a clone model too; the
+  speech-rate benchmark's gates (`audioCppSpeechRateWanted`, `agentSpeechRateWanted`) still exclude it.
+- **The offerable predicate** (`routing.CapabilityRowsOfferableTTS(rows, hasNonEmptyVoices)`): `(speech,
+  yes)` and either **not** `(speech_clone, yes)` or the mapping's cached list has at least one name.
+  `CapabilityRowsPlainTTS` is unchanged and remains the strict rule for the streaming benchmark, the
+  stream gate and the voice filter above.
+- **Reader 1, the voice picker and the public listing** (`cachedVoicesForMappings`, behind
+  `GET /api/portal/model-voices` and `GET /v1/audio/voices`): it reads the voices of every speech
+  mapping and includes a clone mapping's list only when non-empty (an absent, empty or undecodable row
+  contributes nothing), so both routes now surface a preset clone's voice names.
+- **Reader 2, the chat model list** (`ModelDTO.speech_clone_voices`, `speechCloneVoicesByName`): one
+  batch read of the voices cache beside the capability batch, folded as a **fail-closed AND** over a
+  name's clone-audio mappings (a mapping is unsafe when it is `(speech_clone, yes)`, would serve audio and
+  has no cached names), AND-ed across a group's offerable members (`groupCapabilityFlags`, not the OR
+  twin used for the hide axis) and inherited by an alias. The portal offers a speech model when
+  `speech && (!speech_clone || speech_clone_voices)`, so a name that mixes a preset clone and a
+  reference-only clone, or a plain tts and a reference-only clone, stays hidden (a send could route to
+  the reference-only mapping), while a preset clone, and a plain tts with a preset clone, are offered. A
+  failed voices read leaves every clone model hidden.
+- **Reader 3, the language gate** (`portalSpeechLanguage`, §2.6): the candidate set is the **offerable**
+  one, `portalOfferableSpeechMappings` (portal-visible mappings satisfying the predicate, one batch read of
+  the voices cache).
+- **Not a reader, on purpose, the stream gate** (`portalSpeechStreamRate`): it keeps
+  `portalPlainTTSMappings`, strict plain tts. A clone model has no cached byte rate (the benchmark
+  skips it, streaming for clone being deferred, [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)),
+  so putting it in the shared set would close the gate for a name that streams today. The consequence
+  is that the stream gate speaks only for a name's **plain** mappings.
+
 ### 2.6 The speech-language fact (a composer gate, not a routing filter)
 
 Whether an audio.cpp text-to-speech model takes a `language` request field, and the default it
@@ -1431,10 +1480,10 @@ on the next loaded tick, so a fact is overwritten by the next successful loaded 
 with the mapping's other cache rows when `AppModelName` changes. It mirrors the voices cache
 ([ADR-067](../09-architecture-decisions.md#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)), not the byte-rate one.
 
-**The writer is the app-health loop, only while the model is observed loaded and a plain tts
-model** (`speech: yes` and not `speech_clone: yes`, the voices step's own gate
-`audioCppVoicesWanted`; a text speech chat is never routed to a clone model, so a clone row would
-be written and never read), through one change-only writer (`writeSpeechLanguageCache`, the voices
+**The writer is the app-health loop, only while the model is observed loaded and a speech
+model** (`speech: yes`, the voices step's own gate `audioCppVoicesWanted`; since [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)
+a **clone model is included**, because a clone model with presets is offered and so its fact is read.
+It was plain tts only, on the reasoning that a text speech chat is never routed to a clone model), through one change-only writer (`writeSpeechLanguageCache`, the voices
 writer's discipline: a pass that runs every tick costs a store read, not a write, while nothing
 changes). The two paths share **one gateway parser and one writer**, so static and agent-managed
 audio.cpp cannot disagree:
@@ -1442,11 +1491,11 @@ audio.cpp cannot disagree:
 - **Static `audio_cpp` application.** `probeAudioCppModels` already reads the application's
   `/v1/models` for the verdicts; the same body now also yields the language axis
   (`provider.AudioCppVerdicts.AcceptsLanguage` / `LanguageDefault`, from
-  `parseAudioCppLanguageParam`), and `cacheAudioCppSpeechParams` writes it for a loaded plain-tts
-  mapping. The language read is a **separate decode of the same body** from the verdict rule, so the
+  `parseAudioCppLanguageParam`), and `cacheAudioCppSpeechParams` writes it for a loaded speech
+  mapping (a clone model included). The language read is a **separate decode of the same body** from the verdict rule, so the
   `audioCppModelCases` table the agent's copy shares is untouched and an odd `params` shape costs
   only this axis. The step makes no request of its own, so it has no back-off: a listing read that
-  fails never reaches it, and a mapping whose model is not loaded and plain tts writes nothing, so
+  fails never reaches it, and a mapping whose model is not loaded and a speech model writes nothing, so
   the row on file stays the last fact learned while the model was loaded.
 - **Agent-launched child.** The gateway cannot read the child's `/v1/models` directly, and the
   agent's verdict wire is yes/no by design (a default language is a string), so the gateway pulls
@@ -1454,7 +1503,7 @@ audio.cpp cannot disagree:
   (`GET /upstream/<model>/v1/models?include_params=true`,
   [Agent-Managed Model Runtime §4.1](agent-runtime-manager.md#41-control-routes)). The pull is folded
   into `probeAgentVoices` (`fetchAndCacheSpeechParams`), so it reuses that pass's eligible set
-  (running, audio.cpp spec, stored verdicts say plain tts, observed loaded) without a second
+  (running, audio.cpp spec, stored verdicts say a speech model, observed loaded) without a second
   capability read, and it is **fail-closed on the agent's `runtime_model_params` feature**
   (`gateway.RuntimeModelParamsFeature`, checked on its own, not under `runtime_voices`, because an
   older router can serve the voices route and still 404 this one). It writes **only** the language
@@ -1468,9 +1517,10 @@ audio.cpp cannot disagree:
 (`handlePortalModelSpeechLanguage`, `internal/gateway/portal_model_speech_language.go`), answering
 `{"accepts":true,"default":"zh"}` (`default` only when the model declares one) or
 `{"accepts":false}`. It reads the cache for the mappings a speech request for the model could be
-routed to: the portal-visible, plain-tts ones, resolved by `portalPlainTTSMappings`, the one
-candidate set the streaming gate (`portalSpeechStreamRate`) and the voice picker share. Two
-properties are deliberate:
+routed to: the portal-visible, **offerable** ones, resolved by `portalOfferableSpeechMappings` (a plain
+tts model, or a clone model with cached preset voices, [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred); the candidate
+set the voice picker offers). The streaming gate (`portalSpeechStreamRate`) no longer shares it: it
+keeps `portalPlainTTSMappings`, strict plain tts. Two properties are deliberate:
 
 - **It opens when ANY candidate accepts**, where the streaming gate requires EVERY candidate to
   agree. The two differ on purpose: a `language` sent to a model without the parameter is silently
@@ -1481,7 +1531,7 @@ properties are deliberate:
 - **It is the no-leak discipline of `model-speech-streaming`.** "No fact" is not "no" (a mapping
   without a row, or with one nobody can read, was never observed loaded, which the composer cannot
   tell from a model that declares no parameter, and both offer no control), and every "no" (an
-  unknown, hidden, locked or restricted model, a non-speech or clone one, an empty candidate set,
+  unknown, hidden, locked or restricted model, a non-speech one or a clone one without presets, an empty candidate set,
   `accepts:false`, no fact yet) is the same `200 {"accepts":false}`, so the answer cannot probe
   which models exist. A blank `name` is `400 model.name_required`; a store failure is the only
   `500` (`model.speech_language_failed`), never read as a "no". Nothing loads a model or contacts an

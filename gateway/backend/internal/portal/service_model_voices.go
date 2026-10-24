@@ -40,7 +40,7 @@ func (s *Service) ModelVoiceMappingIDs(ctx context.Context, principal auth.Token
 //
 // Like its twin it decides WHICH mappings may be looked at and nothing else: the verdicts
 // (which of them transcribe, and stream) are the gateway's to read, as the voice picker's
-// narrowing to plain tts is. The ids are deduped and sorted; an unknown or blank name, or
+// narrowing to offerable speech models is. The ids are deduped and sorted; an unknown or blank name, or
 // one with no visible audio mapping, is an empty non-nil slice and not an error.
 func (s *Service) ModelTranscriptionMappingIDs(ctx context.Context, principal auth.Token, gatewayModelName string) ([]string, error) {
 	return s.visibleAudioMappingIDs(ctx, principal, gatewayModelName)

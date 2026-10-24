@@ -128,8 +128,9 @@ type speechMeasurement struct {
 // mapping's stored capability rows: "" when it is a target, else why it is skipped.
 //
 // A target is a plain text-to-speech model -- (speech, yes) and not (speech_clone,
-// yes), routing.CapabilityRowsPlainTTS, the one definition of that rule the voices
-// cache uses too. An absent speech row is unknown, which is not a speech model; an
+// yes), routing.CapabilityRowsPlainTTS, the one definition of that rule (the voices
+// cache no longer uses it since #301, which admits a clone model with presets there
+// but not here: streaming for clone is deferred). An absent speech row is unknown, which is not a speech model; an
 // absent or negative clone row does not exclude, because "unknown" is never "needs a
 // voice" (a clone model that slips through fails its synthesis, writes no rate and
 // bills audio_bytes, which is the same outcome as the skip). The other two outcomes

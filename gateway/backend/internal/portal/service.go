@@ -1407,7 +1407,8 @@ type ModelDTO struct {
 	// SpeechClone lets the portal chat picker EXCLUDE it, because a text-only
 	// speech composer has no way to supply that voice and every send would fail
 	// upstream (#252, the audio counterpart of the picker-offers-what-send-fails
-	// problem). Unlike Speech it is the INVERSE of a fail-closed fold: it answers
+	// problem), unless the model has configured presets (SpeechCloneVoices,
+	// #301). Unlike Speech it is the INVERSE of a fail-closed fold: it answers
 	// "should the picker HIDE this?", so it is an OR across a model's mappings
 	// (any clone mapping sets it, since a send could route there) and a group's
 	// offerable members, and it is fail-OPEN -- a speech model whose task is
@@ -1420,11 +1421,12 @@ type ModelDTO struct {
 	// picker: every one of the name's clone mappings has preset voices cached, so
 	// a text-only composer can drive it without supplying a reference voice. The
 	// picker offers a speech model when `speech && (!speech_clone ||
-	// speech_clone_voices)`, which re-opens exactly the clone models SpeechClone
-	// hides. Where SpeechClone is the fail-open OR ("hide if ANY mapping is a
-	// clone"), this is the fail-closed AND ("offer only if EVERY clone mapping has
-	// presets"): a name mixing a preset clone and a reference-only clone stays
-	// hidden, because a send could route to the reference-only mapping and fail.
+	// speech_clone_voices)`, which re-opens the clone models SpeechClone hides
+	// that have presets, and only those. Where SpeechClone is the fail-open OR
+	// ("hide if ANY mapping is a clone"), this is the fail-closed AND ("offer
+	// only if EVERY clone mapping has presets"): a name mixing a preset clone and
+	// a reference-only clone stays hidden, because a send could route to the
+	// reference-only mapping and fail.
 	// A name with no clone mapping is true vacuously, which is harmless because
 	// the picker reads it only when speech_clone is set. It is
 	// speechCloneVoicesByName's result and gates NO route; no request ever
