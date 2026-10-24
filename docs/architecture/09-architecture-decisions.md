@@ -9425,7 +9425,7 @@ frontend change and no new store query (the filter reuses the voices-cache read 
   candidate remains (and when every candidate is known-absent the filter stands aside, as always), and a clone that
   was **never voice-listed** is not classified at all, so it is not routed away from.
 - **What remains is the base ADR-067 free-text-voice risk, not the mixed-name misroute.** (1) A voice that **no
-  classified candidate's cache lists** leaves every candidate known-absent, so the filter fails open and the
+  classified candidate's cache lists** leaves every classified candidate known-absent, so the filter fails open and the
   upstream answers the unknown name with a 500: a clean failure, nothing played, committed or billed. (2) A clone
   with **no voices row** is unclassified and so can still be picked on a fail-open request, for instance a plain-only
   voice beside a never-listed clone narrows nothing (no candidate is known-absent), and a request for it can land on
@@ -9466,7 +9466,7 @@ no [ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-v
 over all speech" rule: it would keep a cold, never-listed clone in a narrowed pool, where it could win routing and
 500 on a voice it does not serve, choice (c)). **Relaxing `CapabilityRowsPlainTTS` itself to cover a clone model**
 (it stays the strict reference-free named-voice rule that the plain arm of the filter and
-`speechBenchmarkSkip` read; the filter widens by adding the cache-row arm, not by redefining it). **Treating a
+`speechBenchmarkPresetVoice` read; the filter widens by adding the cache-row arm, not by redefining it). **Treating a
 reference-only clone's cached `[]` as unknown** (it is a confirmed "no presets" and so *known* to lack any named
 voice; keeping it eligible would route a named voice to a mapping that cannot synthesize it). **Failing the
 request closed when no candidate lists the voice** (it would break a bearer client that sends a free-text voice the
