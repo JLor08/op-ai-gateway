@@ -1011,7 +1011,10 @@ Read shapes and store-level behaviour worth knowing:
   a refused update rolls the delete back and a no-op save drops nothing. The
   voices payload is canonical (deduplicated, bytewise sorted, blanks dropped,
   `[]` for none), which is what lets the writer compare the stored text with the
-  new text and skip an unchanged write. The `output_byte_rate` payload is a plain
+  new text and skip an unchanged write. `routing.FirstPresetVoice` reads the
+  smallest non-blank name (it does not rely on the stored order): the preset the
+  speech benchmark synthesizes a configured clone model with, and the one definition
+  of "has presets" ([ADR-076](../09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent)). The `output_byte_rate` payload is a plain
   decimal integer and nothing else (the billing path parses it with
   `routing.ParseOutputByteRate`, which also reads an **empty** payload as "no
   rate": that is how a rate known to be stale is retired without deleting the

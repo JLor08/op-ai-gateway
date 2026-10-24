@@ -890,8 +890,8 @@ scan lost, because billing a short count would be a silent under-bill):
 
 | Outcome | `billing_unit` | `billing_quantity` |
 |---|---|---|
-| Clean completion, the mapping's output byte rate cached (`model_mapping_cache`, `output_byte_rate`, learned by the speech benchmark) | `audio_second` | PCM bytes ÷ byte rate — exactly what the one-shot header would have stated |
-| Clean completion, no rate cached | `audio_bytes` | the PCM byte count |
+| Clean completion, the mapping's output byte rate cached (`model_mapping_cache`, `output_byte_rate`, learned by the speech benchmark, which names one cached preset voice for a configured clone model, [ADR-076](../09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent)) | `audio_second` | PCM bytes ÷ byte rate — exactly what the one-shot header would have stated |
+| Clean completion, no rate cached (not benchmarked yet, not mono 16-bit PCM, or a reference-only clone model, which is never benchmarked) | `audio_bytes` | the PCM byte count |
 | Any other outcome (error status, copy error, idle timeout, client gone, no terminal events, a lost count, no audio) | `audio_second` | `0` |
 
 The rule of the unit above is **preserved in the form that protects it**: every failure,

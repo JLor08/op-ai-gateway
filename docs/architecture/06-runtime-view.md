@@ -247,8 +247,9 @@ agent-launched child, only on an agent that declared `runtime_model_params`), an
 `GET /api/portal/model-speech-language` on each speech-model change to show its `Language` field and,
 for an empty thread on a model whose default is not `auto`, pre-fill the portal's UI language. That gate
 reads the **offerable** speech mappings (a plain tts model, or a clone model with cached preset voices),
-the set the streaming gate above reads too (a clone model has no cached byte rate, so a name that can
-reach one closes that gate and the turn is buffered); and for a configured clone model the
+the set the streaming gate above reads too (a preset clone streams once the speech benchmark has cached its
+byte rate, [ADR-076](09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent), and a name streams only when every one of its mappings has a rate and they agree, so a name that
+can reach a clone with no rate yet, or at another rate, closes that gate and the turn is buffered); and for a configured clone model the
 composer also starts the thread on the first preset voice, since such a model has no text-only default
 voice ([ADR-075](09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)).
 
@@ -555,7 +556,8 @@ sequenceDiagram
 ```
 
 **Speech benchmark** ([ADR-068](09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives), issue #263). `POST …/benchmark?mode=speech`, and the
-app-health loop on its own for a loaded, streaming-capable, plain text-to-speech mapping that
+app-health loop on its own for a loaded, streaming-capable text-to-speech mapping (a plain one, or
+a configured clone model that lists preset voices, [ADR-076](09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent)) that
 has no cached **output byte rate** (or one measured under another loaded model), is the one
 benchmark that runs on audio mappings and sends no chat prompt. After taking the server's
 reservation, and giving it back if the server has live requests, it synthesizes one short
@@ -564,7 +566,9 @@ reservation, and giving it back if the server has live requests, it synthesizes 
 principal for a scheduled run), reads the byte rate from the WAV `fmt` chunk, caches it (only
 from a mono 16-bit PCM WAV) in `model_mapping_cache` beside the model identity it was measured
 under, and appends a `kind=speech` history row with `ttft_ms` (roughly synthesis plus any model
-cold start, since the request does not stream), `wall_ms` and `rtf`. A clone model is skipped.
+cold start, since the request does not stream), `wall_ms` and `rtf`. A clone model is synthesized with its first cached preset voice named in the request
+(the rate is the model's output format, assumed the same for every preset), and a **reference-only** clone
+model, which lists no preset, is skipped.
 The health loop retires a rate and re-runs the benchmark when the loaded model behind the
 mapping changes, and leaves a mapping whose run produced no rate alone for five minutes.
 
