@@ -50,6 +50,7 @@ type API interface {
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
+	CommitVoiceTurn(context.Context, auth.Token, string, string, AssistantTurn, string) error
 	CompleteVendorAccountConnect(context.Context, auth.Token, string, string) (VendorAccountDTO, error)
 	ConnectVendorAccountImport(context.Context, auth.Token, string, ConnectVendorAccountImportRequest) (VendorAccountDTO, error)
 	CreateApplication(context.Context, auth.Token, string, CreateApplicationRequest) (ApplicationDTO, error)
@@ -262,6 +263,7 @@ type API interface {
 	VendorSubscriptionsEnabled(context.Context) bool
 	VisibleUserIDs(context.Context, auth.Token) (map[string]bool, error)
 	VisionProbeMode(context.Context) string
+	VoiceRunHistory(context.Context, auth.Token, string, string) ([]ChatAPIMessage, error)
 }
 
 var _ API = (*Service)(nil)

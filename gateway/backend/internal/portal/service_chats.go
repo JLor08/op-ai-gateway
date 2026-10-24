@@ -1099,6 +1099,24 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 			doc.Messages = doc.Messages[:n-1] // drop, we re-append below
 		}
 	}
+	raw, err := buildAssistantMessage(id, status, turn)
+	if err != nil {
+		return err
+	}
+	doc.Messages = append(doc.Messages, raw)
+
+	// Only the turn just built is unvetted; the messages before it were stored --
+	// and their references verified -- by an earlier commit, so a checkpoint, which
+	// runs every few seconds, does no ownership lookups for them.
+	return s.commitTurnWithRetention(ctx, chatID, row, doc, turn, status, len(doc.Messages)-1)
+}
+
+// buildAssistantMessage renders the stored assistant message JSON for turn under
+// the given id and status. A non-empty ContentParts is written as the message's
+// `content` (the image/speech/voice shape) and Content is ignored; otherwise the
+// streamed text buffer is written. Shared by writeAssistant and CommitVoiceTurn so
+// the two produce byte-identical assistant turns.
+func buildAssistantMessage(id, status string, turn AssistantTurn) (json.RawMessage, error) {
 	msg := map[string]any{
 		"id":     id,
 		"role":   "assistant",
@@ -1127,24 +1145,37 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 		// event carries the snake_case tokens_per_second separately (issue #56).
 		msg["tokensPerSecond"] = turn.TokensPerSecond
 	}
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	doc.Messages = append(doc.Messages, raw)
+	return json.Marshal(msg)
+}
 
-	// The audio answer lifecycle (#281) for a SPEECH run's terminal commit. The
-	// just-built answer's audio may not be stored at all, and that is decided HERE,
-	// before the blob extraction, so nothing is ever moved into chat_blobs for it:
-	//
-	//   - a canceled/aborted run commits the not-stored marker instead of an empty
-	//     turn, so the bubble reads "not stored" and the turn is regenerate-able; and
-	//   - under keep_last_audio = 0, a run that STREAMED its synthesis (the user heard
-	//     it live) commits the marker too -- the audio was produced only to bill
-	//     ADR-068's loud non-zero and must not be stored.
-	//
-	// Billing and the "commit nothing paid on cancel" guarantee are untouched: the
-	// marker holds no audio, so no bytes are stored; it is the only addition.
+// commitTurnWithRetention is the shared tail of writeAssistant and CommitVoiceTurn:
+// it applies the audio-answer lifecycle (#281) to the newly-built turn, extracts the
+// new turn's inline blobs into chat_blobs, prunes older audio for the thread's
+// retention, and persists doc in ONE SaveChatWithBlobs.
+//
+// newTurnFrom is the index of the FIRST message THIS commit added (the assistant
+// turn for writeAssistant, the user turn for a voice run's user+assistant pair), so
+// only those messages' blob references are verified -- the earlier ones were
+// verified when they were stored, and re-checking every one on every turn would cost
+// a query per image.
+//
+// The audio answer lifecycle, decided HERE before the blob extraction so nothing is
+// ever moved into chat_blobs for an answer that is not kept:
+//
+//   - a canceled/aborted run commits the not-stored marker instead of an empty turn,
+//     so the bubble reads "not stored" and the turn is regenerate-able; and
+//   - under keep_last_audio = 0, a run that STREAMED its synthesis (the user heard it
+//     live) commits the marker too -- the audio was produced only to bill ADR-068's
+//     loud non-zero and must not be stored.
+//
+// A generated image or a synthesized clip arrives as an inline data: part of the
+// turn just built; it is stored in chat_blobs and its url rewritten before the
+// document is sealed (and so before the 4 MiB cap). The lazy going-forward prune then
+// makes room for the answer under the thread's retention: older answers beyond
+// keep_last_audio are rewritten to the not-stored marker and their blobs deleted in
+// the very save that writes the document. A thread with no retention set (every
+// legacy one, and a voice thread) prunes nothing.
+func (s *Service) commitTurnWithRetention(ctx context.Context, chatID string, row store.ChatRow, doc chatDoc, turn AssistantTurn, status string, newTurnFrom int) error {
 	keep, keepSet := storedKeepLastAudio(doc.Settings)
 	storeNone := keepSet && keep == 0
 	aborted := turn.AudioAnswer && status == "canceled"
@@ -1154,29 +1185,10 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 			return err
 		}
 	}
-
-	// A generated image arrives as an inline data: part of the turn just built.
-	// Store it in chat_blobs and rewrite its url before the document is sealed,
-	// exactly as PrepareChatRun does for an upload (and so, too, before the 4 MiB
-	// cap: a generated image no longer has to fit in the document). Only the turn
-	// built here is unvetted; the messages before it were stored -- and their
-	// references verified -- by an earlier commit, so a checkpoint, which runs
-	// every few seconds, does no ownership lookups for them. A marker turn (above)
-	// holds no audio, so it stores nothing.
-	blobs, err := s.extractChatBlobs(ctx, chatID, &doc, len(doc.Messages)-1)
+	blobs, err := s.extractChatBlobs(ctx, chatID, &doc, newTurnFrom)
 	if err != nil {
 		return err
 	}
-
-	// The lazy going-forward prune: the answer just built makes room for itself under
-	// the thread's retention. Older answers beyond keep_last_audio are rewritten to the
-	// not-stored marker in doc, and their blobs are deleted in the very save that writes
-	// the document, so no commit leaves more answers stored than the thread keeps. A
-	// buffered-fallback answer under keep_last_audio = 0 is a special case: it is STORED
-	// (the un-heard paid audio is not lost) but keeps only itself -- every older stored
-	// answer becomes a marker -- so an N=0 thread never accumulates on a model that only
-	// sometimes falls back to buffered (keep-last-1). A thread with no retention set
-	// (every legacy one) prunes nothing.
 	var deleteBlobIDs []string
 	if turn.AudioAnswer && status == "complete" && storeNone && !turn.AudioStreamed {
 		deleteBlobIDs, err = pruneAudioBeyond(&doc, 1)
@@ -1187,4 +1199,72 @@ func (s *Service) writeAssistant(ctx context.Context, owner auth.Token, chatID s
 		return err
 	}
 	return s.commitChatRun(ctx, row, row.Title, doc, blobs, deleteBlobIDs)
+}
+
+// VoiceRunHistory returns the chat's stored history as OpenAI messages with
+// pendingText appended as the latest user message, for a voice run's LLM leg. It
+// commits NOTHING: a voice run is speculative and cancellable, so ALL of its
+// chat-document persistence is deferred to its finalize (CommitVoiceTurn) and a
+// cancelled run leaves the chat untouched (spec 6.1). The older turns' stored image
+// references are resolved to data urls (resolveChatBlobRefs), exactly as a text run's
+// history is; the system prompt is deliberately omitted (phase 2). Owner-scoped.
+func (s *Service) VoiceRunHistory(ctx context.Context, owner auth.Token, chatID, pendingText string) ([]ChatAPIMessage, error) {
+	row, err := s.chats.ChatByID(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+	if row.UserID != owner.UserID {
+		return nil, ErrChatNotFound
+	}
+	content, err := s.openChat(row)
+	if err != nil {
+		return nil, err
+	}
+	doc := parseChatDoc(content)
+	history := buildAPIHistory("", doc.Messages)
+	history, err = s.resolveChatBlobRefs(ctx, chatID, history)
+	if err != nil {
+		return nil, err
+	}
+	// The pending turn is the ASR'd text, in hand already -- no blob to resolve -- so
+	// it is appended AFTER the resolution rather than fetched back out of the store.
+	return append(history, ChatAPIMessage{Role: "user", Content: json.RawMessage(mustJSONString(pendingText))}), nil
+}
+
+// CommitVoiceTurn persists a voice turn: the user message (userText) AND the
+// assistant turn (turn) in ONE SaveChatWithBlobs. Unlike a normal chat run -- which
+// commits the user turn up front via PrepareChatRun and the assistant turn later via
+// CommitAssistant -- a voice run defers BOTH to this single commit, so a cancelled
+// speculative run (which never reaches this call) leaves the chat untouched and
+// cancel-and-extend needs no undo (spec 6.1). Both messages are freshly appended
+// (never an upsert): a voice run persisted nothing earlier, so there is no trailing
+// pending turn of its own to replace. Owner-scoped.
+func (s *Service) CommitVoiceTurn(ctx context.Context, owner auth.Token, chatID, userText string, turn AssistantTurn, status string) error {
+	row, err := s.chats.ChatByID(ctx, chatID)
+	if err != nil {
+		return err
+	}
+	if row.UserID != owner.UserID {
+		return ErrChatNotFound
+	}
+	content, err := s.openChat(row)
+	if err != nil {
+		return err
+	}
+	doc := parseChatDoc(content)
+	newTurnFrom := len(doc.Messages)
+	userMsg, err := json.Marshal(map[string]any{
+		"id":      "msg_" + compactRandomHex(8),
+		"role":    "user",
+		"content": userText,
+	})
+	if err != nil {
+		return err
+	}
+	assistantMsg, err := buildAssistantMessage("msg_"+compactRandomHex(8), status, turn)
+	if err != nil {
+		return err
+	}
+	doc.Messages = append(doc.Messages, userMsg, assistantMsg)
+	return s.commitTurnWithRetention(ctx, chatID, row, doc, turn, status, newTurnFrom)
 }
