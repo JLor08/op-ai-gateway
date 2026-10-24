@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
@@ -1116,11 +1117,7 @@ func TestVoiceTicketEndpointCapsTheChatsAudioSettings(t *testing.T) {
 		}
 		_ = json.Unmarshal(rec.Body.Bytes(), &body)
 		t.Logf("ticket at the settings cap: %d bytes", len(body.Ticket))
-		// 8 KB is the line limit; the ticket shares its line with the header name and the
-		// fixed subprotocol, so a ticket must leave them room.
-		if len(body.Ticket) > voiceTicketMaxBytes || voiceTicketMaxBytes > 7168 {
-			t.Fatalf("ticket = %d bytes with a ceiling of %d, want it under the proxy's 8 KB header line", len(body.Ticket), voiceTicketMaxBytes)
-		}
+		requireTicketFitsAProxyHeaderLine(t, body.Ticket)
 	})
 
 	for name, settings := range map[string]string{
@@ -1147,6 +1144,91 @@ func TestVoiceTicketEndpointCapsTheChatsAudioSettings(t *testing.T) {
 			requireErrorCode(t, rec.Body.String(), voiceChatAudioSettingsInvalid)
 			requireNoTicket(t, rec)
 			requireNothingStarted(t, fake)
+		})
+	}
+}
+
+// voiceProxyHeaderLineBytes is the longest header line a proxy accepts at its default (nginx's
+// large_client_header_buffers, 8 KB). The ticket rides one Sec-WebSocket-Protocol line.
+const voiceProxyHeaderLineBytes = 8 * 1024
+
+// requireTicketFitsAProxyHeaderLine fails unless the ticket is within the endpoint's own
+// ceiling AND that ceiling leaves the header name and the fixed subprotocol (and a margin) room
+// on a default proxy's header line.
+func requireTicketFitsAProxyHeaderLine(t *testing.T, ticket string) {
+	t.Helper()
+	if voiceProxyHeaderLineBytes-voiceTicketMaxBytes < 1024 {
+		t.Fatalf("voiceTicketMaxBytes = %d leaves under 1 KiB of the %d-byte proxy header line for the header name and subprotocol", voiceTicketMaxBytes, voiceProxyHeaderLineBytes)
+	}
+	if len(ticket) > voiceTicketMaxBytes {
+		t.Fatalf("ticket = %d bytes, want at most the %d-byte ceiling", len(ticket), voiceTicketMaxBytes)
+	}
+}
+
+// voiceSealedCredential is a stand-in for an application's sealed upstream credential of
+// length n ("enc:" and base64, as capture.SealSecret writes it). A real one is ~110
+// characters for an API key and 200+ for a long token; each of the three legs carries one.
+func voiceSealedCredential(n int) string {
+	return "enc:" + strings.Repeat("Q", n-len("enc:"))
+}
+
+// withSealedCredentials gives every application of the world a sealed upstream credential of n
+// characters, so each resolved target of a ticket carries one, as it does in a deployment whose
+// upstream applications are authenticated.
+func (w *voiceTicketWorld) withSealedCredentials(t *testing.T, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for _, id := range []string{"app-voice-agent", "app-voice-llm"} {
+		app, err := w.routes.ApplicationByID(ctx, id)
+		if err != nil {
+			t.Fatalf("ApplicationByID %s: %v", id, err)
+		}
+		app.APIToken = voiceSealedCredential(n)
+		if err := w.routes.UpdateApplication(ctx, app); err != nil {
+			t.Fatalf("UpdateApplication %s: %v", id, err)
+		}
+	}
+}
+
+// A deployment whose three upstream applications are authenticated seals a credential into
+// every target of the ticket, and that is the part of the ticket that varies most. Typical
+// settings mint with ~164-character credentials (an API key) and with 260-character ones (a
+// long token), and so do settings that fill the cap: the cap was chosen so the user's part can
+// never push a ticket past what a proxy header line holds, which is only discovered AFTER the
+// gate's cold start.
+func TestVoiceTicketEndpointMintsWithRealisticSealedCredentials(t *testing.T) {
+	const typicalSettings = `{"audio":{"voice":"alba","speed":1.0,"language":"de","passthrough":{"instructions":"speak calmly"}}}`
+	const voiceEnvelope = 12 // len(`{"voice":""}`)
+	atCap := `{"audio":{"voice":"` + strings.Repeat("v", voiceTicketAudioMaxBytes-voiceEnvelope) + `"}}`
+	for _, tc := range []struct {
+		name       string
+		credential int
+		settings   string
+	}{
+		{"typical settings, 164-character credentials", 164, typicalSettings},
+		{"typical settings, 260-character credentials", 260, typicalSettings},
+		{"settings at the cap, 164-character credentials", 164, atCap},
+		{"settings at the cap, 260-character credentials", 260, atCap},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newVoiceTicketWorld(t, &voiceGateFake{})
+			w.withSealedCredentials(t, tc.credential)
+			chatID := w.newChat(t, "usr_voice", tc.settings)
+
+			rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+			claims := w.redeem(t, rec)
+			for leg, target := range map[string]routing.Target{"asr": claims.ASR, "llm": claims.LLM, "tts": claims.TTS} {
+				if len(target.APIToken) != tc.credential {
+					t.Fatalf("%s target credential = %d characters, want the %d the application carries", leg, len(target.APIToken), tc.credential)
+				}
+			}
+			var body struct {
+				Ticket string `json:"ticket"`
+			}
+			_ = json.Unmarshal(rec.Body.Bytes(), &body)
+			t.Logf("ticket: %d bytes (ceiling %d)", len(body.Ticket), voiceTicketMaxBytes)
+			requireTicketFitsAProxyHeaderLine(t, body.Ticket)
 		})
 	}
 }
@@ -1201,6 +1283,112 @@ func TestVoiceTicketEndpointBoundsTheGateWithADeadline(t *testing.T) {
 	if want := []string{"whisper_voice"}; !slices.Equal(fake.ensured, want) {
 		t.Fatalf("ensured = %v, want the stalled first start only", fake.ensured)
 	}
+}
+
+// voiceGateSlowEnsure is an agent whose ensure takes delay to start a child, then succeeds: a
+// cold start that is slow but works.
+type voiceGateSlowEnsure struct {
+	voiceGateFake
+	delay time.Duration
+}
+
+func (f *voiceGateSlowEnsure) EnsureRuntimeModel(ctx context.Context, target routing.Target) error {
+	select {
+	case <-time.After(f.delay):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return f.voiceGateFake.EnsureRuntimeModel(ctx, target)
+}
+
+// postOverTheWire posts body to the ticket endpoint of a real listener as the fixture's user
+// token and returns what the CLIENT receives. A dropped connection is a fatal error here, not a
+// status: that is exactly what a server-side timeout does to a request that outlives it.
+func postOverTheWire(t *testing.T, ts *httptest.Server, body string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, ts.URL+voiceTicketPath, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+voiceTicketBearer)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("the client got no answer, the connection was dropped before it: %v", err)
+	}
+	defer resp.Body.Close()
+	var buf strings.Builder
+	if _, err := io.Copy(&buf, resp.Body); err != nil {
+		t.Fatalf("reading the answer: %v", err)
+	}
+	return resp.StatusCode, buf.String()
+}
+
+// serveWithShortTimeouts serves the world over a real listener whose read and write timeouts are
+// timeout, standing in for newHTTPServer's 30 s control-plane deadlines (armed when the headers
+// are read) at a scale a test can outlast. httptest.ResponseRecorder has no deadline at all, so
+// only a real connection can show what the server's timeouts do to a long request.
+func (w *voiceTicketWorld) serveWithShortTimeouts(t *testing.T, timeout time.Duration) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewUnstartedServer(w.srv)
+	ts.Config.ReadTimeout = timeout
+	ts.Config.WriteTimeout = timeout
+	ts.Start()
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// The gate may hold the request for a whole cold start, longer than the server's read and write
+// timeouts (30 s in newHTTPServer, armed at header read). A cold start slower than both must
+// still end in the ticket on the wire: the handler lifts the deadlines before the gate. Here the
+// timeouts are 150 ms and the two agent-managed starts take 2 x 300 ms.
+func TestVoiceTicketEndpointOutlivesTheServerTimeouts(t *testing.T) {
+	fake := &voiceGateSlowEnsure{delay: 300 * time.Millisecond}
+	w := newVoiceTicketWorld(t, fake)
+	ts := w.serveWithShortTimeouts(t, 150*time.Millisecond)
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	start := time.Now()
+	status, body := postOverTheWire(t, ts, voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+	elapsed := time.Since(start)
+
+	if elapsed < 2*150*time.Millisecond {
+		t.Fatalf("the request took %v, want it to have outlived the server's 150 ms timeouts", elapsed)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", status, body)
+	}
+	var parsed struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil || parsed.Ticket == "" {
+		t.Fatalf("response carries no ticket (%v): %s", err, body)
+	}
+	claims, err := w.srv.voiceTickets.Redeem(parsed.Ticket)
+	if err != nil {
+		t.Fatalf("the ticket does not redeem: %v", err)
+	}
+	if claims.ChatID != chatID || claims.ASR.ProviderModel != "whisper_voice" {
+		t.Fatalf("claims = chat %q, asr %+v", claims.ChatID, claims.ASR)
+	}
+}
+
+// The refusal of a gate that runs out of its own deadline is delivered the same way: the 409
+// reaches the client although the server's timeouts expired long before the gate's deadline.
+func TestVoiceTicketEndpointDeliversADeadlineRefusalPastTheServerTimeouts(t *testing.T) {
+	fake := &voiceGateStalledEnsure{}
+	w := newVoiceTicketWorld(t, fake)
+	w.srv.voiceCoLoadTimeout = 500 * time.Millisecond
+	ts := w.serveWithShortTimeouts(t, 150*time.Millisecond)
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	status, body := postOverTheWire(t, ts, voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", status, body)
+	}
+	requireErrorCode(t, body, voiceChatCoLoadFailed)
 }
 
 // voiceStalledCapabilities is a routing store whose verdict read answers nothing until its

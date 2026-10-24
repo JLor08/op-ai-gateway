@@ -37,12 +37,16 @@ const (
 // (voice, speed, language, the advanced passthrough: all of it user-typed free text). The
 // ticket is presented on a Sec-WebSocket-Protocol header, one header line, and a proxy
 // refuses a line past its limit (8 KB at nginx's default), so everything the ticket carries
-// must fit well under it. The ticket's fixed part -- three resolved routing targets and
-// their sealed upstream credentials -- is a few KB once sealed and encoded; the user's part
-// is bounded here at 2 KB, which leaves the whole token under voiceTicketMaxBytes with room
-// to spare. A speech knob is a name or a number and a passthrough a handful of keys, so 2 KB
-// is generous for any real settings.
-const voiceTicketAudioMaxBytes = 2048
+// must fit well under it. The ticket's fixed part -- three resolved routing targets, each
+// with its sealed upstream credential -- is a few KB once sealed and encoded, and a
+// credential is the part that varies most between deployments (a long token seals to
+// 200+ characters, three of them ride the ticket). The user's part is therefore kept small
+// on purpose: 1 KB, which with credentials of that size on all three legs still leaves the
+// whole token under voiceTicketMaxBytes. A speech knob is a name or a number and a
+// passthrough a handful of keys, so 1 KB is generous for any real settings; the mint fails
+// only after the gate's cold start, so a ticket that cannot fit is better prevented here
+// than discovered there.
+const voiceTicketAudioMaxBytes = 1024
 
 // voiceTicketMaxBytes is the most an encoded ticket may be handed out at. The token shares
 // its header line with the header name and the fixed subprotocol, so a 7 KB ceiling keeps
@@ -134,7 +138,9 @@ func (s *Server) voiceCoLoadBound() time.Duration {
 //     portal.voice_chat_audio_settings_invalid: the ticket rides a header line, and a
 //     proxy drops one past its limit.
 //  5. The models go through the co-load gate (voiceCoLoadGate) under a deadline of
-//     s.voiceCoLoadBound(), because the gate's ensure can block for a whole cold start. A
+//     s.voiceCoLoadBound(), because the gate's ensure can block for a whole cold start --
+//     which is why the server's 30 s read and write deadlines are lifted first
+//     (liftInferenceDeadlines), as for every other request that outlives them. A
 //     refusal is the gate's code at the status its kind maps to (voiceChatRefusal): an
 //     unavailable leg 400, models that cannot be held together 409. A gate that outlives
 //     its deadline refuses as portal.voice_chat_coload_failed whichever step the time ran
@@ -184,6 +190,13 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 	}
 
 	bound := s.voiceCoLoadBound()
+	// The gate can hold this request for the whole of bound, far longer than the 30 s the
+	// server's control-plane read and write deadlines allow (newHTTPServer arms both when the
+	// headers are read). Left armed, the read deadline cancels the request's context and the
+	// write deadline drops the connection, so a cold start past 30 s would reach the browser
+	// as a dead connection instead of the ticket or the refusal. Everything that reads the
+	// request (the body, the chat) is done by now; the deadline of this request is bound.
+	liftInferenceDeadlines(w)
 	gateCtx, cancel := context.WithTimeout(r.Context(), bound)
 	defer cancel()
 	asr, llm, tts, code, err := s.voiceCoLoadGate(gateCtx, &token, asrModel, llmModel, ttsModel)
