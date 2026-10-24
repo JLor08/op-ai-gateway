@@ -1921,8 +1921,10 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 // does not exclude: only an affirmative one does (a clone model synthesises only
 // in a reference voice it is handed, so it has no named voices to offer).
 //
-// It is the ONE definition of the plain-tts rule, which the routing voice filter decides
-// from. Since #301 it no longer decides the voices cache or the portal's streaming gate: the
+// It is the ONE definition of the plain-tts rule. The routing voice filter classifies a plain
+// tts mapping by it (whatever its cache state) and, since #305, a clone model that has a voices
+// cache row as well, so it no longer decides the filter alone. Since #301 it does not decide the
+// voices cache or the portal's streaming gate either: the
 // producers ask any speech model (CapabilityRowsSpeech), the readers offer a clone model's
 // list too when it is non-empty, and the portal streaming and language gates use the offerable
 // set (CapabilityRowsOfferableTTS). Since #306 the speech benchmark and its health-loop rate

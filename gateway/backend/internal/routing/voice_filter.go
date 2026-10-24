@@ -93,10 +93,13 @@ func hasVoicesRow(rows []ModelMappingCacheRow) bool {
 // its cached voices row) to not list it AND at least one eligible candidate remained
 // (FAIL-OPEN on unknown, see voiceScopeFor): allowed is then never empty.
 type voiceScope struct {
-	// allowed is the ids of the pool's mappings eligible to serve the voice: those whose
-	// cached voice list names it, PLUS those whose voice status is UNKNOWN (no cached row,
-	// or an unreadable one) and so stay eligible fail-open (unknown != absent). It is never
-	// empty: when every candidate is known-absent the pre-pass returns a nil scope instead.
+	// allowed is the ids of the CLASSIFIED mappings eligible to serve the voice: those whose
+	// cached voice list names it, PLUS those whose voice status is UNKNOWN (a plain-tts mapping
+	// with no cached row, or any classified mapping with an unreadable one) and so stay eligible
+	// fail-open (unknown != absent). A speech clone with no voices row is not classified at all,
+	// so it is never in allowed -- it is dropped from a narrowed pool and kept only on a nil
+	// scope, as every clone was before #305. allowed is never empty: when every classified
+	// candidate is known-absent the pre-pass returns a nil scope instead.
 	allowed map[string]struct{}
 	// narrowed reports that the voice EXCLUDED at least one candidate KNOWN (from its cached
 	// voices row) to not list it, which is what makes a later "no usable host" the voice's
@@ -151,14 +154,29 @@ func (v *voiceScope) refine(err error) error {
 // (some known-absent) with an eligible candidate left, and none of those eligible hosts is
 // usable.
 //
-// A candidate is known-present when the voice is in its mapping's cached list (exact
-// match: the name is relayed to the upstream byte for byte, so a near miss is a different
-// voice) AND the mapping is a plain tts model NOW (CapabilityRowsPlainTTS, so a list that
-// outlived a tts -> clone flip is not a known voice here either). The voices endpoint's own
-// read-time gate is wider since #301 (CapabilityRowsOfferableTTS: a clone model with presets
-// lists them), and this filter is deliberately left plain tts only: a clone mapping's cached
-// list is not consulted here. A candidate whose cached list does NOT name the voice is
-// known-absent and excluded; one with no cached voices row at all is unknown and kept.
+// The voice is classified over every speech mapping that carries voice data: a plain tts
+// model (CapabilityRowsPlainTTS, whatever its cache state) AND a clone model that has a
+// voices cache row (hasVoicesRow), so an offered gateway name that mixes a plain tts mapping
+// and a configured clone model with presets routes a named voice to the mapping whose cached
+// list names it instead of to a sibling that would answer a 500 (#305). A candidate is
+// known-present when the voice is in its mapping's cached list (exact match: the name is
+// relayed to the upstream byte for byte, so a near miss is a different voice) AND the mapping
+// is a speech model NOW (the verdicts are the CURRENT ones, so a list that outlived a flip to a
+// non-speech model is not a known voice here). A candidate whose cached list does NOT name the
+// voice is known-absent and excluded -- a plain tts model's, a clone model's preset list
+// without it, and a reference-only clone's confirmed-empty "[]" alike, which is what routes a
+// named-voice request away from a clone with no presets while an eligible candidate remains. A
+// plain tts mapping with no cached voices row at all is unknown and kept.
+//
+// A clone model with NO voices row (never voice-listed: a cold child, an older agent, a failed
+// listing) is not classified at all: it is neither known-present, known-absent nor "unknown and
+// kept", it is skipped -- left out of the allowed set, so it is dropped from a pool the voice
+// narrowed and kept whenever the filter fails open, exactly as every clone mapping was before
+// the filter consulted clone voices. Keeping it eligible in a narrowed pool would let a cold
+// clone win routing and answer a 500 on a voice it does not serve. The staleness bound is the
+// one ADR-067 already accepts for a plain tts mapping's cached voices: the voices producer
+// refreshes a loaded clone model's list on its tick, so only a clone whose configuration
+// changed while it was unloaded can briefly carry an out-of-date list.
 //
 // The pool is one flat set. For a group the caller passes every member's candidates,
 // which is what lets one answer both "does anything in the group list the voice" (the
@@ -183,19 +201,25 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 	if err != nil {
 		return nil, fmt.Errorf("voice filter: read capability verdicts: %w", err)
 	}
-	tts := plainTTSMappingIDs(ids, verdicts)
-	if len(tts) == 0 {
+	speech := speechMappingIDs(ids, verdicts)
+	if len(speech) == 0 {
 		return nil, nil
 	}
-	cached, err := r.store.ModelMappingCacheForMappings(ctx, tts, ModelMappingCacheVoices)
+	cached, err := r.store.ModelMappingCacheForMappings(ctx, speech, ModelMappingCacheVoices)
 	if err != nil {
 		// FAIL OPEN, see above: no cache, no voice information, no restriction.
 		slog.Warn("voice filter: voices cache could not be read, routing unfiltered", "voice", voice, "candidates", len(ids), "err", err)
 		return nil, nil
 	}
-	allowed := make(map[string]struct{}, len(tts))
+	classified := voiceClassifiedIDs(speech, verdicts, cached)
+	if len(classified) == 0 {
+		// No candidate carries voice data (every one is a clone model that was never
+		// voice-listed): nothing is classified, so the voice restricts nothing.
+		return nil, nil
+	}
+	allowed := make(map[string]struct{}, len(classified))
 	knownAbsent := 0
-	for _, id := range tts {
+	for _, id := range classified {
 		if voiceListsEligible(cached[id], voice, id) {
 			allowed[id] = struct{}{}
 			continue
@@ -206,7 +230,8 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 		knownAbsent++
 	}
 	if len(allowed) == 0 {
-		// Every candidate is KNOWN-absent: no cached list offers the voice. FAIL OPEN --
+		// Every CLASSIFIED candidate is KNOWN-absent: no cached list offers the voice (a skipped
+		// no-row clone is not classified, so it does not count here). FAIL OPEN --
 		// route unfiltered and let the upstream be the authority (it may accept a free-text
 		// name; if not it rejects it with a 500, the accepted free-text risk), rather than
 		// 503 a request the upstream might still serve.
@@ -241,28 +266,49 @@ func candidateMappingIDs(pool []MappingCandidate) []string {
 	return ids
 }
 
-// plainTTSMappingIDs keeps the ids whose CURRENT stored verdicts make them a plain tts
-// model (CapabilityRowsPlainTTS), so a cached list that outlived a tts -> clone (or
-// tts -> non-speech) flip is not treated as a known voice here either.
-func plainTTSMappingIDs(ids []string, verdicts map[string][]CapabilityRow) []string {
-	tts := make([]string, 0, len(ids))
+// speechMappingIDs keeps the ids whose CURRENT stored verdicts make them a speech model at all
+// (CapabilityRowsSpeech): a plain tts model and a clone model alike, the mappings whose cached
+// voices the voice filter may read. A mapping that is not a speech model NOW (flipped off
+// speech, or never one) is left out, so a cached list that outlived the flip is not treated as
+// a known voice. These are the ids voiceScopeFor reads the voices cache for, in one batch.
+func speechMappingIDs(ids []string, verdicts map[string][]CapabilityRow) []string {
+	speech := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if CapabilityRowsPlainTTS(verdicts[id]) {
-			tts = append(tts, id)
+		if CapabilityRowsSpeech(verdicts[id]) {
+			speech = append(speech, id)
 		}
 	}
-	return tts
+	return speech
 }
 
-// voiceListsEligible classifies ONE plain-tts mapping against the requested voice from its
-// cached voices rows, reporting whether it stays eligible to serve the voice. The caller
-// treats an ineligible mapping as the sole narrowing state, KNOWN-ABSENT.
+// voiceClassifiedIDs picks, of the speech mappings, the ones the voice is classified against
+// (voiceListsEligible): a plain tts model (CapabilityRowsPlainTTS, any cache state -- one with
+// no voices row is classified as unknown and kept) OR a clone model that has a voices cache row
+// (hasVoicesRow: its voices were listed at least once, a preset list or a confirmed-empty "[]").
+// A clone model with no voices row carries no voice data and is skipped here, so it is neither
+// allowed nor counted known-absent (see voiceScopeFor). The order of speech is kept.
+func voiceClassifiedIDs(speech []string, verdicts map[string][]CapabilityRow, cached map[string][]ModelMappingCacheRow) []string {
+	classified := make([]string, 0, len(speech))
+	for _, id := range speech {
+		if CapabilityRowsPlainTTS(verdicts[id]) || hasVoicesRow(cached[id]) {
+			classified = append(classified, id)
+		}
+	}
+	return classified
+}
+
+// voiceListsEligible classifies ONE classified speech mapping -- a plain tts model, or a clone
+// model with a voices row -- against the requested voice from its cached voices rows,
+// reporting whether it stays eligible to serve the voice. The caller treats an ineligible
+// mapping as the sole narrowing state, KNOWN-ABSENT.
 //
 // FAIL-OPEN on UNKNOWN: a mapping with no voices row (never voice-cached) or an undecodable
 // one has unknown voice status, which is NOT absent, so it is kept eligible and the upstream
-// stays the authority on a name it was never told about. A KNOWN-PRESENT mapping (its cached
-// list names the voice, exact match -- the name is relayed byte for byte) is eligible too.
-// Only a KNOWN-ABSENT mapping -- row present and decodable, voice not in it -- is ineligible.
+// stays the authority on a name it was never told about. (A clone model with no row never gets
+// here: voiceClassifiedIDs skips it.) A KNOWN-PRESENT mapping (its cached list names the voice,
+// exact match -- the name is relayed byte for byte) is eligible too. Only a KNOWN-ABSENT mapping
+// -- row present and decodable, voice not in it, a clone's preset list without it or its
+// confirmed-empty "[]" included -- is ineligible.
 func voiceListsEligible(rows []ModelMappingCacheRow, voice, id string) bool {
 	if !hasVoicesRow(rows) {
 		// UNKNOWN voice status: this mapping has no voices row, so nothing is known about
