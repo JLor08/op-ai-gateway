@@ -586,6 +586,10 @@ type voiceMachine struct {
 	graceElapsed   bool
 	windowClosed   bool
 	runFinished    bool
+	// answerFinished guards finishAnswer against a double invocation within one turn (the
+	// window can close and the run can finish along two paths). Reset per turn in beginAnswer,
+	// never in detachRun, so it holds for the whole turn.
+	answerFinished bool
 	audioBuf       []runAudio
 
 	// The continuation-grace timer (armed on each chunk end, disarmed on resume/commit).
@@ -836,10 +840,15 @@ func (m *voiceMachine) onVoiced() {
 		m.firstPartialAt = now
 		m.armMax()
 		// The first voiced partial of a chunk that begins WHILE a speculative run is in
-		// flight and its continuation window is still open is "resumed speech": cancel the
-		// run (nothing persisted), drop the answer preview, and fall back to listening so
-		// this chunk extends pendingText and re-runs on the next chunk end (spec 6.1).
-		if m.curRun != nil && !m.windowClosed {
+		// flight, its continuation window is still open, AND the run is still cancellable is
+		// "resumed speech": cancel the run (nothing persisted), drop the answer preview, and
+		// fall back to listening so this chunk extends pendingText and re-runs on the next
+		// chunk end (spec 6.1). The run's live status -- not just the local windowClosed flag
+		// -- is the authority: the run can commit on its own goroutine and buffer its terminal
+		// event before this partial is processed, and cancel-and-extending a run that already
+		// committed would double-commit the utterance. A committed run is handled by its
+		// terminal (force-close); this voiced input then falls through as a new chunk.
+		if m.curRun != nil && !m.windowClosed && m.curRun.statusValue() == "running" {
 			m.onResume()
 		}
 	}
@@ -953,6 +962,7 @@ func (m *voiceMachine) beginAnswer() {
 	snap, ch, unsub := run.subscribe()
 	m.curRun, m.runCh, m.runUnsub = run, ch, unsub
 	m.answerStreamed, m.answerDoneSent, m.graceElapsed, m.windowClosed, m.runFinished = false, false, false, false, false
+	m.answerFinished = false
 	m.audioBuf = nil
 	m.setState(voiceStateThinking)
 	m.armGrace()
@@ -1088,10 +1098,16 @@ func (m *voiceMachine) handleRunTerminal(status, errMsg string) {
 	m.runFinished = true
 	switch status {
 	case "completed":
-		// The answer is done; ensure answer_done is out and try to close the window. If the
-		// window is (now) closed, finish the answer; otherwise the grace is still pending and
-		// closeWindow will finish it when it fires.
-		m.markAnswerStreamed()
+		// The run has COMMITTED (persistence happened): this is the window's point of no
+		// return, so force it closed even if the grace has not yet elapsed. With Task 4's
+		// non-pausable run (LLM -> TTS -> commit in sequence) we cannot both hold the mic open
+		// for the full grace AND avoid a double commit when the whole run finishes faster than
+		// the grace; closing at commit -- a shorter keep-talking window for a fast answer -- is
+		// the accepted trade (spec 6.1). A resume past commit is then a NEW turn, never a
+		// cancel-and-extend of the already-committed one.
+		m.graceElapsed = true
+		m.markAnswerStreamed() // make sure answer_done is out
+		m.maybeCloseWindow()   // graceElapsed is set now, so a streamed answer closes the window
 		if m.windowClosed {
 			m.finishAnswer()
 		}
@@ -1106,6 +1122,10 @@ func (m *voiceMachine) handleRunTerminal(status, errMsg string) {
 // closes the audio stream, clears the committed pending text, and drains (the half-duplex
 // tail) back to listening. Only ever reached on a completed run with the window closed.
 func (m *voiceMachine) finishAnswer() {
+	if m.answerFinished {
+		return // the window close and the run terminal can both reach here; finish once
+	}
+	m.answerFinished = true
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDone})
 	m.detachRun()
 	m.pendingText = ""
@@ -1122,6 +1142,7 @@ func (m *voiceMachine) finishAnswer() {
 // this new chunk, which will extend pendingText and re-run on the next chunk end.
 func (m *voiceMachine) onResume() {
 	m.detachRun()
+	m.stopGrace()
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAnswerReset})
 	m.setState(voiceStateListening)
 }

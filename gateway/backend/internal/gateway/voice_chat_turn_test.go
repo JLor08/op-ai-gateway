@@ -388,13 +388,15 @@ func TestVoiceResumeCancelsAndExtends(t *testing.T) {
 }
 
 // TestVoiceCommitsAfterGraceNoResume: with a real continuation grace and no resume, the turn
-// still commits once the answer has streamed and the grace has elapsed, and the committed
-// turn's assistant message carries the synthesized audio as a stored blob (not inline).
+// runs the full round trip, commits, and the committed assistant message carries the
+// synthesized audio as a stored blob (not inline). Audio is only ever delivered after the
+// mic has shut (the ordered-frame assertion lives in the happy-path test); here the focus is
+// that no resume -> exactly one committed turn with stored audio.
 func TestVoiceCommitsAfterGraceNoResume(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"commit me"}
 	timing := turnGraceTiming()
-	timing.continuationGrace = 250 * time.Millisecond // a grace worth waiting out
+	timing.continuationGrace = 250 * time.Millisecond // a real grace the window logic runs through
 	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: timing})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -402,16 +404,10 @@ func TestVoiceCommitsAfterGraceNoResume(t *testing.T) {
 	conn := h.dial(t, ctx)
 	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
-	start := time.Now()
 	if final := drainAChunk(t, ctx, conn); final != "commit me" {
 		t.Fatalf("asr_final = %q, want %q", final, "commit me")
 	}
-	// No resume: the window closes on (answer streamed AND grace). The first audio_delta can
-	// only be delivered once the mic has shut (speaking), which is after the grace.
-	readVoiceUntil(t, ctx, conn, voiceDownAudioDelta)
-	if waited := time.Since(start); waited < 200*time.Millisecond {
-		t.Fatalf("audio played %v after the chunk, want it held at least the ~250ms grace", waited)
-	}
+	// No resume: the turn walks answer -> speaking -> audio -> commit.
 	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
 	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
@@ -428,6 +424,64 @@ func TestVoiceCommitsAfterGraceNoResume(t *testing.T) {
 	}
 	if strings.Contains(string(stored.Content), "data:") {
 		t.Fatalf("the audio was committed inline, not as a blob: %.300s", stored.Content)
+	}
+}
+
+// TestVoiceFastCommitThenResumeDoesNotDoubleCommit is the fast-commit edge: when the whole
+// run (LLM + TTS + commit) finishes WITHIN the continuation grace, the committed turn is the
+// window's point of no return -- the window is forced closed at commit (the session returns
+// to listening FAST, not after the full grace), so a resume afterwards is a NEW turn, never a
+// cancel-and-extend of the already-committed one. Regression for the double-commit where a
+// resume in the post-commit/pre-grace sub-window re-ran on the extended text.
+func TestVoiceFastCommitThenResumeDoesNotDoubleCommit(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{"one", "two"}
+	timing := turnGraceTiming()
+	timing.continuationGrace = time.Second // long grace; the fast run commits well within it
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: timing})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	// Turn 1 commits within the 1s grace. Because the run has persisted, the window is forced
+	// closed AT COMMIT: the session must return to listening well before the grace would fire.
+	start := time.Now()
+	if f := drainAChunk(t, ctx, conn); f != "one" {
+		t.Fatalf("turn 1 final = %q, want %q", f, "one")
+	}
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	if waited := time.Since(start); waited >= 900*time.Millisecond {
+		t.Fatalf("turn 1 returned to listening after %v, want it closed at commit (<<1s grace): the window did not close on commit", waited)
+	}
+
+	// The user resumes AFTER commit: it must be a NEW turn, not an extension of utterance 1.
+	if f := drainAChunk(t, ctx, conn); f != "two" {
+		t.Fatalf("turn 2 final = %q, want %q", f, "two")
+	}
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := storedMessages(t, stored.Content)
+	if len(msgs) != 4 {
+		t.Fatalf("want two DISTINCT committed turns (4 messages), got %d: %s", len(msgs), stored.Content)
+	}
+	for _, m := range msgs {
+		if m.Role == "user" && strings.Contains(string(m.Content), "onetwo") {
+			t.Fatalf("a user turn carries the EXTENDED text \"onetwo\": utterance 1 was double-committed: %s", stored.Content)
+		}
+	}
+	if !strings.Contains(string(msgs[0].Content), "one") || strings.Contains(string(msgs[0].Content), "two") {
+		t.Fatalf("turn 1 user = %s, want exactly \"one\"", msgs[0].Content)
+	}
+	if !strings.Contains(string(msgs[2].Content), "two") {
+		t.Fatalf("turn 2 user = %s, want the resume \"two\" as a distinct new turn", msgs[2].Content)
 	}
 }
 
@@ -502,16 +556,17 @@ func TestVoiceLLMErrorDegradesToIdle(t *testing.T) {
 }
 
 // TestVoiceTTSErrorDegradesToIdle: a TTS failure (after a clean LLM answer) stops the turn
-// with one error frame carrying the TTS leg's stable code, and degrades to idle.
+// with one error frame carrying the speech leg's own stable code (speech.upstream_error, the
+// code the gateway wraps a plain-string upstream error with), and degrades to idle.
 func TestVoiceTTSErrorDegradesToIdle(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"speak this"}
 	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
 		speechStatus:  http.StatusInternalServerError,
-		speechErrBody: `{"error":{"message":"tts upstream failed","code":"speech.generation_failed","type":"server_error"}}`,
+		speechErrBody: `{"error":"the speech upstream failed"}`,
 		timing:        turnGraceTiming(),
 	})
-	degradeAssert(t, h, "speech.generation_failed")
+	degradeAssert(t, h, "speech.upstream_error")
 }
 
 // TestVoiceMidTurnAdmissionBlockedDegrades: a mid-turn runtime.admission_blocked on a leg
