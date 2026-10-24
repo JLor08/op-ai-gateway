@@ -39,6 +39,12 @@ import (
 // response and writes its stored WAV on the assumption that the rate it finds is that
 // format's (errSpeechFormatNotStreamable).
 //
+// The rate is a property of the model's output format and not of the voice, so a
+// configured clone model (one that lists preset voices) is benchmarked as well, with its
+// first preset named in the request (#306): without a rate it could never stream, and the
+// portal would play it buffered. A clone model with no preset cannot be synthesized
+// without a reference and stays skipped.
+//
 // The same call yields the audio perf metrics -- the time to the first byte, the wall
 // time and the real-time factor -- recorded as a kind=="speech" history row
 // (routing.BenchmarkRun, migration 95).
@@ -105,12 +111,19 @@ var errBenchmarkNoNativeProxy = errors.New("benchmark: provider does not support
 
 // speechBenchmarkRequest is the plain non-stream synthesis the benchmark sends: the
 // model (the application's own id for it, which is what the gateway's relay would
-// rewrite the client's name to) and the text, and nothing else. A voice, a speed and
+// rewrite the client's name to) and the text, and nothing else -- except, for a
+// configured clone model, the one preset voice it is told to clone (#306). A speed and
 // every other field stay on the model's own defaults, and response_format and stream
 // are absent so audio.cpp answers its one-shot WAV.
+//
+// Voice is empty, and so omitted from the body, for a plain model: it speaks in its own
+// default voice, and naming one would only make the request depend on a cache the model
+// does not need. A clone model answers a voiceless request with HTTP 500 (it needs a
+// reference), so the benchmark names one of the presets the model lists.
 type speechBenchmarkRequest struct {
 	Model string `json:"model"`
 	Input string `json:"input"`
+	Voice string `json:"voice,omitempty"`
 }
 
 // speechMeasurement is what one successful benchmark synthesis measured.
@@ -125,28 +138,61 @@ type speechMeasurement struct {
 }
 
 // speechBenchmarkSkip is the speech benchmark's per-mapping decision from the
-// mapping's stored capability rows: "" when it is a target, else why it is skipped.
+// mapping's stored capability rows and the preset voice the caller found for it: ""
+// when it is a target, else why it is skipped.
 //
-// A target is a plain text-to-speech model -- (speech, yes) and not (speech_clone,
-// yes), routing.CapabilityRowsPlainTTS, the one definition of that rule (the voices
-// cache no longer uses it since #301, which admits a clone model with presets there
-// but not here: streaming for clone is deferred). An absent speech row is unknown,
-// which is not a speech model; an absent or negative clone row does not exclude,
-// because "unknown" is never "needs a voice" (a clone model that slips through fails
-// its synthesis, writes no rate and bills audio_bytes, which is the same outcome as
-// the skip). The other two outcomes
-// are the closed values of BenchmarkResult.Skipped: benchmarkSkippedSpeechClone for a
-// clone model, whose synthesis needs a server-side reference WAV and its text that a
-// plain model-and-input request cannot supply (it answers HTTP 500), and
+// A target is a speech model the benchmark can synthesize a clip with: a plain
+// text-to-speech model -- (speech, yes) and not (speech_clone, yes) -- or, since #306,
+// a clone model that has a preset voice to name (presetVoice != ""), which is
+// routing.CapabilityRowsOfferableTTS, the one definition of that rule (the voice
+// pickers and the portal's streaming gate decide by it, and so does the health loop's
+// rate trigger, so a mapping that is offered is a mapping that can be benchmarked and
+// streamed). An absent speech row is unknown, which is not a speech model; an absent or
+// negative clone row does not exclude, because "unknown" is never "needs a voice" (a
+// clone model that slips through fails its synthesis, writes no rate and bills
+// audio_bytes, which is the same outcome as the skip).
+//
+// presetVoice is the caller's answer for a CLONE model alone (the partition reads the
+// voices cache for a clone row only, speechBenchmarkPresetVoice), and "" for every other
+// model: a plain model is a target without one. The other two outcomes are the closed
+// values of BenchmarkResult.Skipped: benchmarkSkippedSpeechClone for a clone model with
+// no preset to name, whose synthesis needs a server-side reference WAV and its text that
+// a model-and-input request cannot supply (it answers HTTP 500), and
 // benchmarkSkippedNotSpeech for everything else.
-func speechBenchmarkSkip(rows []routing.CapabilityRow) string {
-	if routing.CapabilityRowsPlainTTS(rows) {
+func speechBenchmarkSkip(rows []routing.CapabilityRow, presetVoice string) string {
+	if routing.CapabilityRowsOfferableTTS(rows, presetVoice != "") {
 		return ""
 	}
-	if routing.CapabilityRowsByName(rows)[routing.CapabilitySpeech].Verdict != routing.CapabilityYes {
+	if !routing.CapabilityRowsSpeech(rows) {
 		return benchmarkSkippedNotSpeech
 	}
 	return benchmarkSkippedSpeechClone
+}
+
+// speechBenchmarkPresetVoice is the preset voice the speech benchmark synthesizes a
+// mapping's clip with (#306): "" for every model that is not a configured clone model,
+// else the first of the presets its voices cache lists (routing.FirstPresetVoice), "" when
+// it lists none. It is decided here, once per mapping, and rides on the benchmarkTarget, so
+// the manual run and the health loop's trigger (both go through the partition) send the
+// same request for the same cache.
+//
+// The voices cache is read ONLY for a clone row (speech yes, speech_clone yes: not the
+// plain-tts rule): a plain model needs no voice, so it pays no read and a failing cache
+// cannot take it out of the run. A failed read is an error, never "no presets": whether a
+// clone model can be benchmarked is then unknown, and the caller records it as unreadable
+// instead of skipping it on a guess.
+//
+// The byte rate this run learns is a property of the model's output format, not of the
+// voice, so any preset gives the model's true rate -- which is why the first one will do.
+func (s *Server) speechBenchmarkPresetVoice(ctx context.Context, mappingID string, rows []routing.CapabilityRow) (string, error) {
+	if routing.CapabilityRowsPlainTTS(rows) || !routing.CapabilityRowsSpeech(rows) {
+		return "", nil
+	}
+	cached, err := s.Routes.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheVoices)
+	if err != nil {
+		return "", err
+	}
+	return routing.FirstPresetVoice(cached), nil
 }
 
 // partitionSpeechBenchmarkViews is partitionBenchmarkViews for the speech
@@ -155,13 +201,16 @@ func speechBenchmarkSkip(rows []routing.CapabilityRow) string {
 // skipped. The chat modes keep partitionBenchmarkViews, which still refuses audio.
 //
 // Each view's runtime spec is read once (mappingRuntimeSpec) and its capability rows
-// once (MappingCapabilities). A view is runnable when speechBenchmarkSkip says so and
+// once (MappingCapabilities); a clone model's voices cache is read once too, for the
+// preset voice its target will synthesize with (speechBenchmarkPresetVoice, #306), and
+// no other model's is. A view is runnable when speechBenchmarkSkip says so and
 // the mapping is one the gateway would route a speech request to
 // (routing.MappingServesAPIFlavor for openai_audio, on the effective flavors); it is
 // skipped, with the reason as its recorded result and no history row, when it is not;
 // and it is unreadable when either read failed, which is recorded as an error and
-// logged -- whether it is a target is then unknown, and is not guessed at. A runnable
-// target is built from the spec that was read.
+// logged -- whether it is a target is then unknown, and is not guessed at (the voices
+// cache of a clone model included: whether it has a preset is part of the decision). A
+// runnable target is built from the spec that was read and carries its preset voice.
 func (s *Server) partitionSpeechBenchmarkViews(ctx context.Context, views []portal.BenchmarkTargetView) benchmarkViewPartition {
 	var p benchmarkViewPartition
 	unreadable := func(v portal.BenchmarkTargetView, what string, err error) {
@@ -183,13 +232,20 @@ func (s *Server) partitionSpeechBenchmarkViews(ctx context.Context, views []port
 			unreadable(v, "capability", err)
 			continue
 		}
-		switch why := speechBenchmarkSkip(rows); {
+		voice, err := s.speechBenchmarkPresetVoice(ctx, v.Mapping.ID, rows)
+		if err != nil {
+			unreadable(v, "voices cache", err)
+			continue
+		}
+		switch why := speechBenchmarkSkip(rows, voice); {
 		case why != "":
 			skipped(v, why)
 		case !routing.MappingServesAPIFlavor(v.App, routing.EffectiveFields(v.App, spec, hasSpec), routing.APIFlavorOpenAIAudio):
 			skipped(v, benchmarkSkippedNotSpeech)
 		default:
-			p.runnable = append(p.runnable, s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec))
+			tgt := s.benchmarkTargetFor(ctx, v.Server, v.App, v.Mapping, spec, hasSpec)
+			tgt.voice = voice
+			p.runnable = append(p.runnable, tgt)
 		}
 	}
 	return p
@@ -359,7 +415,7 @@ func (s *Server) measureSpeechTarget(ctx context.Context, tgt benchmarkTarget) (
 		return speechMeasurement{}, errBenchmarkNoNativeProxy
 	}
 	target, _ := benchmarkTargetReq(tgt)
-	body, err := json.Marshal(speechBenchmarkRequest{Model: tgt.mapping.AppModelName, Input: speechBenchmarkInput})
+	body, err := json.Marshal(speechBenchmarkRequest{Model: tgt.mapping.AppModelName, Input: speechBenchmarkInput, Voice: tgt.voice})
 	if err != nil {
 		return speechMeasurement{}, fmt.Errorf("speech benchmark: build request: %w", err)
 	}

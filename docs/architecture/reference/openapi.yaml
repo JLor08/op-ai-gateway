@@ -1568,12 +1568,13 @@ paths:
         buffered WAV run. The gate is open only when EVERY mapping a speech
         request for the model could be routed to (the portal-visible offerable
         ones, the voice picker's set: a plain tts model, or a configured clone
-        model with cached preset voices, which has no cached output byte rate
-        and so closes the gate for any name that can reach it, ADR-075) has a
+        model with cached preset voices, which is rate-benchmarked with a preset
+        voice since ADR-076 and so streams once its rate is cached, and until
+        then closes the gate for any name that can reach it, ADR-075) has a
         `speech_streaming` verdict of `yes` and a usable cached output byte rate, and they agree on it; the
         sample rate is half the byte rate (the cache only holds a rate read from
         a mono 16-bit PCM WAV). Every other case (an unknown, hidden, locked,
-        restricted, non-speech, clone, offline or not-yet-benchmarked model) is
+        restricted, non-speech, reference-only-clone, offline or not-yet-benchmarked model) is
         the same 200 with `streaming: false`, so the answer cannot probe which
         models exist. A missing or empty `name` is 400 `model.name_required`; a
         failed read is 500 `model.speech_streaming_failed`, never reported as
@@ -1623,7 +1624,7 @@ paths:
         agent 0.13.0) for the mappings a speech request for the model could be
         routed to (the portal-visible offerable ones: a plain tts model, or a
         clone model with cached preset voices, the set the voice picker offers,
-        ADR-075; the streaming gate reads the same set, where a clone model closes it for lack of a cached rate). The gate opens when ANY such mapping is
+        ADR-075; the streaming gate reads the same set, where a clone model closes it while it has no cached rate, ADR-076). The gate opens when ANY such mapping is
         known to accept a language, unlike /api/portal/model-speech-streaming,
         which needs every mapping to agree: audio.cpp silently drops a
         `language` a model does not take, so offering the control costs

@@ -940,7 +940,10 @@ server's reservation, which excludes the server from routing, a scheduled or hea
 has no principal, and the relay forwards none of audio.cpp's `X-AudioCPP-*` headers), reads the
 byte rate from the WAV `fmt` chunk and caches it in the generic per-mapping cache
 (`output_byte_rate`, a plain decimal; [Data
-Model](../reference/data-model.md#the-per-mapping-cache-table)). Only a **mono, 16-bit integer
+Model](../reference/data-model.md#the-per-mapping-cache-table)). A **configured clone model that lists preset
+voices** is benchmarked too, with its first cached preset named in the request's `voice`
+([ADR-076](../09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent)); the rate is the model's output format, not the voice's, so the one rate cached per mapping
+is **assumed the same for every preset**. Only a **mono, 16-bit integer
 PCM** WAV is cached, because a byte rate alone cannot say what format it belongs to and a
 stream is played and stored as exactly that, so `sampleRate = byteRate ÷ 2` wherever a rate
 exists; a non-conforming model stays on `audio_bytes` and plays buffered. The design assumes
@@ -948,12 +951,14 @@ the **streamed rate equals the buffered WAV's** (verified for the probed model, 
 for any client to play headerless PCM). The rate is a property of the **model**, so a companion
 row (`output_byte_rate_model`) records the loaded-model identity it was measured under, and the
 health loop retires the rate and re-runs the benchmark when the identity changes. The health
-loop starts the benchmark for a loaded, plain-TTS mapping whose `speech_streaming` verdict is
-`yes` and that has no usable rate (an agent-launched child only while it is running, so a cold
+loop starts the benchmark for a loaded mapping that is plain tts, or a clone model with cached presets
+(`CapabilityRowsOfferableTTS`; the loop reads the voices cache for a streaming clone alone), whose
+`speech_streaming` verdict is `yes` and that has no usable rate (an agent-launched child only while it is running, so a cold
 child is never started); a run that was started leaves the mapping alone for five minutes. A
-clone model is skipped (its synthesis needs a server-side reference WAV, or a preset voice the
-benchmark does not send; streaming for clone is deferred, [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)) and bills
-`audio_bytes`. The run also records a `kind=speech` history row with `ttft_ms`, `wall_ms` and
+**reference-only** clone model, which lists no preset, is skipped (its synthesis needs a server-side reference WAV and its
+text, which a `{model, input}` request cannot carry) and bills `audio_bytes`; a preset clone is rate-cached and bills
+seconds like a plain model. A voices cache that cannot be read is neither "has presets" nor "has none": the loop does
+nothing that tick, and a mapping-scope run answers `500 benchmark.request_failed`. The run also records a `kind=speech` history row with `ttft_ms`, `wall_ms` and
 `rtf` (migration 95): `ttft_ms` is the time to the first byte of a **non-stream** answer, so it
 is roughly synthesis plus any model cold start, not a streamed time to first audio.
 
@@ -3571,13 +3576,15 @@ verdict has gone stale.
   answer but a boolean `true` with a whole sample rate is "no streaming") and shows its "stream"
   checkbox only on a `yes`. The gate is open only when **every** mapping a speech request for the
   model could be routed to (the portal-visible **offerable** ones, the voice picker's set: a plain tts
-  model, or a configured clone model with cached presets, which has no cached byte rate and so closes the
-  gate for any name that can reach it) has a
+  model, or a configured clone model with cached presets, which is rate-benchmarked with a preset voice since
+  [ADR-076](../09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent) and so streams once its rate is cached; until then, or for one that is not mono 16-bit
+  PCM, it has no rate and closes the gate for any name that can reach it) has a
   `speech_streaming` verdict of `yes` **and** a usable cached output byte rate, and they agree
   on it, the sample rate being half the byte rate (the cache holds only a mono 16-bit PCM rate,
   §3.6 item 10). A route is chosen per request after the gate is asked, so a model with two
   mappings streams only if it makes no difference which serves it (a mixed name with a preset clone
-  is buffered, never streamed at the plain mapping's rate to a route that may be the clone,
+  streams only when both mappings have a rate and the rates agree, and is otherwise buffered, never streamed at the plain
+  mapping's rate to a route that may be the clone,
   [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred) (e)). The run evaluates the gate
   **again server-side** (`speechRunStreamRate`, for the model the request will route for, the
   run-as token's override applied) and never takes the client's word: the toggle is a choice,

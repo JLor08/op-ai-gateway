@@ -61,6 +61,7 @@ type fakeHealthStore struct {
 	cache         map[string]map[modelMappingCacheKey]routing.ModelMappingCacheRow
 	cacheWrites   int
 	cacheWritesBy map[string]int // the same count split by cache type
+	cacheReadsBy  map[string]int // ModelMappingCache calls by cache type, a failing one included
 	cacheReadErr  bool
 	cacheWriteErr bool
 }
@@ -233,6 +234,10 @@ func (f *fakeHealthStore) assertCapability(t *testing.T, mappingID, capability, 
 func (f *fakeHealthStore) ModelMappingCache(_ context.Context, mappingID, cacheType string) ([]routing.ModelMappingCacheRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.cacheReadsBy == nil {
+		f.cacheReadsBy = map[string]int{}
+	}
+	f.cacheReadsBy[cacheType]++
 	if f.cacheReadErr {
 		return nil, fmt.Errorf("model mapping cache: boom")
 	}
@@ -292,6 +297,14 @@ func (f *fakeHealthStore) cacheWriteCountOf(cacheType string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cacheWritesBy[cacheType]
+}
+
+// cacheReadCountOf returns how many times ModelMappingCache was called for ONE cache type: the
+// spy that tells a step that reads the voices cache from one that does not.
+func (f *fakeHealthStore) cacheReadCountOf(cacheType string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cacheReadsBy[cacheType]
 }
 
 // seedVoicesCache puts a voices row on file, standing in for an earlier write.
@@ -4783,20 +4796,106 @@ func TestAudioCppVoicesWanted(t *testing.T) {
 	}
 }
 
-// TestAudioCppSpeechRateWantedStillExcludesClone guards the one gate that must NOT follow
-// audioCppVoicesWanted when it admits clone models (#301): the speech rate benchmark
-// synthesizes with a plain request, which a clone model refuses without a reference voice,
-// and streaming clone models are out of scope here. A loaded, streaming clone model is
-// therefore still not a rate target, while the same listing as a plain tts model is.
-func TestAudioCppSpeechRateWantedStillExcludesClone(t *testing.T) {
+// TestAudioCppSpeechRateWanted pins the static rate-target rule (#263, widened by #306): a
+// LOADED speech model that STREAMS is a target when it is a plain tts model, or a clone model
+// that has a preset voice on file -- the benchmark can synthesize both, a clone model by naming
+// the preset; a reference-only clone (no preset) is still left out, its plain request would 500.
+// hasPresets is the voices cache's answer (routing.FirstPresetVoice != ""), and it matters to a
+// clone model alone.
+func TestAudioCppSpeechRateWanted(t *testing.T) {
 	yes, no := routing.CapabilityYes, routing.CapabilityNo
-	clone := provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes}
-	if audioCppSpeechRateWanted(clone) {
-		t.Fatalf("audioCppSpeechRateWanted(%+v) = true, want false: a clone model is never rate-benchmarked", clone)
+	for _, tc := range []struct {
+		name       string
+		v          provider.AudioCppVerdicts
+		hasPresets bool
+		want       bool
+	}{
+		{"a plain streaming tts model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: yes}, false, true},
+		{"a plain streaming tts model whose clone verdict is unknown", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechStreaming: yes}, false, true},
+		{"presets on file do not matter to a plain model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: yes}, true, true},
+		{"a streaming clone model with presets", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes}, true, true},
+		{"a streaming clone model with no presets (reference-only)", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes}, false, false},
+		{"a non-streaming clone model with presets", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: no}, true, false},
+		{"a clone model whose streaming verdict is unknown", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes}, true, false},
+		{"a plain model that does not stream", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: no}, false, false},
+		{"a clone model that is not loaded", provider.AudioCppVerdicts{Loaded: false, Speech: yes, SpeechClone: yes, SpeechStreaming: yes}, true, false},
+		{"a plain model that is not loaded", provider.AudioCppVerdicts{Loaded: false, Speech: yes, SpeechClone: no, SpeechStreaming: yes}, false, false},
+		{"a loaded streaming model that is not a speech model", provider.AudioCppVerdicts{Loaded: true, Speech: no, SpeechClone: yes, SpeechStreaming: yes}, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := audioCppSpeechRateWanted(tc.v, tc.hasPresets); got != tc.want {
+				t.Fatalf("audioCppSpeechRateWanted(%+v, hasPresets %v) = %v, want %v", tc.v, tc.hasPresets, got, tc.want)
+			}
+		})
 	}
-	plain := provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: yes}
-	if !audioCppSpeechRateWanted(plain) {
-		t.Fatalf("audioCppSpeechRateWanted(%+v) = false, want true (the control: a plain streaming tts model is a target)", plain)
+}
+
+// TestAudioCppStreamingClone pins which verdicts make the rate step read the voices cache: a
+// loaded, streaming speech CLONE model and nothing else, so a plain model pays no extra read.
+func TestAudioCppStreamingClone(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	for _, tc := range []struct {
+		name string
+		v    provider.AudioCppVerdicts
+		want bool
+	}{
+		{"a loaded streaming clone model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes}, true},
+		{"a plain streaming model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: yes}, false},
+		{"a clone verdict that is unknown", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechStreaming: yes}, false},
+		{"a non-streaming clone model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: no}, false},
+		{"a clone model that is not loaded", provider.AudioCppVerdicts{Loaded: false, Speech: yes, SpeechClone: yes, SpeechStreaming: yes}, false},
+		{"a clone verdict on a model that is not speech", provider.AudioCppVerdicts{Loaded: true, Speech: no, SpeechClone: yes, SpeechStreaming: yes}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := audioCppStreamingClone(tc.v); got != tc.want {
+				t.Fatalf("audioCppStreamingClone(%+v) = %v, want %v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAgentSpeechRateWanted is TestAudioCppSpeechRateWanted for stored rows: a streaming speech
+// mapping is a target when it is offerable (routing.CapabilityRowsOfferableTTS: plain, or a clone
+// model with presets), and agentStreamingClone names the one shape that needs the voices cache.
+func TestAgentSpeechRateWanted(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	rows := func(speech, clone, streaming string) []routing.CapabilityRow {
+		var out []routing.CapabilityRow
+		for _, c := range []struct{ name, verdict string }{
+			{routing.CapabilitySpeech, speech}, {routing.CapabilitySpeechClone, clone}, {routing.CapabilitySpeechStreaming, streaming},
+		} {
+			if c.verdict != "" {
+				out = append(out, routing.CapabilityRow{Capability: c.name, Verdict: c.verdict, Source: routing.CapabilitySourceAudioCppModels})
+			}
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name       string
+		rows       []routing.CapabilityRow
+		hasPresets bool
+		want       bool
+		wantClone  bool
+	}{
+		{"a plain streaming model", rows(yes, no, yes), false, true, false},
+		{"a plain streaming model, clone verdict unknown", rows(yes, "", yes), false, true, false},
+		{"presets on file do not matter to a plain model", rows(yes, no, yes), true, true, false},
+		{"a streaming clone model with presets", rows(yes, yes, yes), true, true, true},
+		{"a streaming clone model with no presets", rows(yes, yes, yes), false, false, true},
+		{"a non-streaming clone model with presets", rows(yes, yes, no), true, false, false},
+		{"a clone model whose streaming verdict is unknown", rows(yes, yes, ""), true, false, false},
+		{"a plain model that does not stream", rows(yes, no, no), false, false, false},
+		{"a streaming model that is not speech", rows(no, yes, yes), true, false, false},
+		{"no rows at all", nil, true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agentSpeechRateWanted(tc.rows, tc.hasPresets); got != tc.want {
+				t.Fatalf("agentSpeechRateWanted(%+v, hasPresets %v) = %v, want %v", tc.rows, tc.hasPresets, got, tc.want)
+			}
+			if got := agentStreamingClone(tc.rows); got != tc.wantClone {
+				t.Fatalf("agentStreamingClone(%+v) = %v, want %v", tc.rows, got, tc.wantClone)
+			}
+		})
 	}
 }
 
@@ -5880,8 +5979,9 @@ func TestRunAppHealthOnceVoicesAgentGate(t *testing.T) {
 // pass on its own: a running, active audio.cpp child whose stored verdicts say (speech,
 // yes) is asked, a clone child included (#301: the listing is task-independent, so its
 // configured voice_presets are worth caching), and the stored rows come back with the spec
-// for the speech rate step, which still excludes a clone child itself. Every other shape
-// is refused and has its back-offs cleared when it left the eligible set.
+// for the speech rate step, which since #306 benchmarks a preset clone child too (excluding
+// only a reference-only one). Every other shape is refused and has its back-offs cleared when
+// it left the eligible set.
 func TestAgentVoiceProbeSpec(t *testing.T) {
 	yes, no := routing.CapabilityYes, routing.CapabilityNo
 	for _, tc := range []struct {
@@ -6311,28 +6411,41 @@ func TestRunAppHealthOnceSpeechParamsAgentPullsThroughTheRouterAndWrites(t *test
 	}
 }
 
-// TestRunAppHealthOnceAgentCloneChildCachesVoicesAndLanguageButIsNeverBenchmarked (#301):
-// a RUNNING agent-launched clone child rides the same pass as a plain tts one -- its
-// configured voice_presets are cached and its language fact pulled -- but the speech rate
-// step still refuses it, even when it is stored as streaming, because streaming clone
-// models are out of scope.
-func TestRunAppHealthOnceAgentCloneChildCachesVoicesAndLanguageButIsNeverBenchmarked(t *testing.T) {
-	runner, st, prober, _ := agentVoicesRunner(t, agentSpeechParamsFlag, audioCppMapping("m1", "clone_tts"))
-	st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
-	st.seedCapability("m1", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
-	prober.acVoices["clone_tts"] = voiceList("preset_b", "preset_a")
-	prober.acVerdicts["clone_tts"] = provider.AudioCppVerdicts{AcceptsLanguage: true, LanguageDefault: "de"}
-	rec := &speechRateRecorder{}
-	runner.speechRate = rec.trigger
+// TestRunAppHealthOnceAgentCloneChildCachesVoicesAndLanguageAndIsBenchmarkedOnlyWithPresets
+// (#301, #306): a RUNNING agent-launched clone child rides the same pass as a plain tts one --
+// its configured voice_presets are cached and its language fact pulled -- and, stored as
+// streaming, the speech rate step asks for its benchmark exactly when that pass cached presets for
+// it (the benchmark then synthesizes with one of them). A clone child that lists none is
+// reference-only: it is never benchmarked, as before.
+func TestRunAppHealthOnceAgentCloneChildCachesVoicesAndLanguageAndIsBenchmarkedOnlyWithPresets(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		voices      []provider.Voice
+		wantPayload string
+		wantCalls   int
+	}{
+		{"with presets", voiceList("preset_b", "preset_a"), `["preset_a","preset_b"]`, 1},
+		{"reference-only, no presets", []provider.Voice{}, `[]`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, prober, _ := agentVoicesRunner(t, agentSpeechParamsFlag, audioCppMapping("m1", "clone_tts"))
+			st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+			st.seedCapability("m1", routing.CapabilitySpeechStreaming, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+			prober.acVoices["clone_tts"] = tc.voices
+			prober.acVerdicts["clone_tts"] = provider.AudioCppVerdicts{AcceptsLanguage: true, LanguageDefault: "de"}
+			rec := &speechRateRecorder{}
+			runner.speechRate = rec.trigger
 
-	runCapabilityCycle(runner)
+			runCapabilityCycle(runner)
 
-	st.assertVoicesPayload(t, "m1", `["preset_a","preset_b"]`)
-	if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":true,"default":"de"}` {
-		t.Fatalf("speech_language payload = %s, want the clone child's fact {accepts:true,default:de}", got)
-	}
-	if calls := rec.started(); len(calls) != 0 {
-		t.Fatalf("the speech rate benchmark was triggered %d times (%+v) for a clone child, want 0", len(calls), calls)
+			st.assertVoicesPayload(t, "m1", tc.wantPayload)
+			if got, _ := st.cachePayloadOf("m1", routing.ModelMappingCacheSpeechLanguage); got != `{"accepts":true,"default":"de"}` {
+				t.Fatalf("speech_language payload = %s, want the clone child's fact {accepts:true,default:de}", got)
+			}
+			if calls := rec.started(); len(calls) != tc.wantCalls {
+				t.Fatalf("the speech rate benchmark was triggered %d times (%+v) for a clone child %s, want %d", len(calls), calls, tc.name, tc.wantCalls)
+			}
+		})
 	}
 }
 
@@ -6620,8 +6733,9 @@ func TestHealthSpeechRateIdentityChangeIgnoresAnOpenBackoff(t *testing.T) {
 }
 
 // The trigger's gate: a mapping is a target only while its model is observed LOADED,
-// plain (not a clone) and streaming. Each case below breaks exactly one of those on an
-// otherwise eligible mapping with no rate, and none of them may start the benchmark or
+// streaming, and plain or a clone model with presets (#306). Each case below breaks exactly
+// one of those on an otherwise eligible mapping with no rate (the listing's voices are empty,
+// so a clone case here is a reference-only one), and none of them may start the benchmark or
 // touch the cache.
 func TestHealthSpeechRateGateRefusesIneligibleMappings(t *testing.T) {
 	for _, tc := range []struct {
@@ -6631,7 +6745,10 @@ func TestHealthSpeechRateGateRefusesIneligibleMappings(t *testing.T) {
 		{"the model is not loaded", func(v *provider.AudioCppVerdicts) { v.Loaded = false }},
 		{"speech_streaming is no (an offline model)", func(v *provider.AudioCppVerdicts) { v.SpeechStreaming = routing.CapabilityNo }},
 		{"speech_streaming is unknown", func(v *provider.AudioCppVerdicts) { v.SpeechStreaming = "" }},
-		{"a clone model, which the benchmark cannot synthesize", func(v *provider.AudioCppVerdicts) { v.SpeechClone = routing.CapabilityYes }},
+		{"a clone model with no presets, which the benchmark cannot synthesize", func(v *provider.AudioCppVerdicts) { v.SpeechClone = routing.CapabilityYes }},
+		{"a non-streaming clone model, presets or not", func(v *provider.AudioCppVerdicts) {
+			v.SpeechClone, v.SpeechStreaming = routing.CapabilityYes, routing.CapabilityNo
+		}},
 		{"a transcriber", func(v *provider.AudioCppVerdicts) {
 			*v = provider.AudioCppVerdicts{Speech: routing.CapabilityNo, Transcription: routing.CapabilityYes, TranscriptionStreaming: routing.CapabilityYes, Loaded: true, Path: "/m/a"}
 		}},
@@ -6838,6 +6955,187 @@ func TestHealthSpeechRateStoreFailuresAreBestEffort(t *testing.T) {
 	})
 }
 
+// ---- a configured clone model with presets (#306) ----
+//
+// A clone model that streams and lists preset voices is a rate target like a plain one: the
+// benchmark synthesizes it with a preset, learns the output byte rate and the portal then
+// streams it. "Has presets" is read from the VOICES CACHE -- the same thing the benchmark's
+// partition reads to pick the preset -- and never from the list the voices step fetched this
+// tick (that step skips under its back-off and writes nothing on a failed listing), so the loop
+// and the partition cannot disagree about which mappings are targets.
+
+// makeStreamingClone turns the env's loaded plain streaming model into a streaming clone model.
+func (e *speechRateEnv) makeStreamingClone() {
+	e.setListing(func(v *provider.AudioCppVerdicts) { v.SpeechClone = routing.CapabilityYes })
+}
+
+func TestHealthSpeechRateStreamingCloneWithPresetsIsATarget(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.makeStreamingClone()
+	// The voices step runs first in the same tick: it lists the presets and caches them.
+	env.prober.acVoices["tts_stream"] = voiceList("Thorsten", "Frank")
+
+	env.tick()
+	env.wantCalls(t, "a streaming clone model with presets and no rate", speechRateCallA)
+	if payload, ok := env.ratePayload(); ok {
+		t.Fatalf("the health loop wrote a rate row %q itself, want none: it only asks the gateway to benchmark", payload)
+	}
+
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "inside the back-off", speechRateCallA)
+
+	env.benchmarkCompletes("88200", "/m/a")
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "the rate is cached for the loaded model", speechRateCallA)
+}
+
+// The decision reads the voices CACHE, not what this tick fetched: a listing that fails (and
+// opens the voices back-off, so the next ticks do not even ask) leaves the last known list on
+// file, and a clone model with presets on file is still a target. A fetch-driven gate would
+// drop it on every such tick and reset its rate back-off.
+func TestHealthSpeechRateCloneTargetFollowsTheVoicesCacheNotTheFetch(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.makeStreamingClone()
+	env.st.seedVoicesCache("m1", `["Frank","Thorsten"]`)
+	env.prober.acVoicesErr["tts_stream"] = fmt.Errorf("%w: status 503", provider.ErrUnavailable)
+
+	env.tick()
+	env.wantCalls(t, "the listing failed, the cache has presets", speechRateCallA)
+	env.advance(30 * time.Second)
+	env.tick() // the voices step is now inside its back-off and asks nothing
+	env.wantCalls(t, "the voices back-off is open, the cache still has presets", speechRateCallA)
+	if !env.runner.speechRateBackoff.active("m1", env.clock) {
+		t.Fatal("the rate back-off was reset on a tick whose voices fetch failed: the loop is deciding on the fetch, not the cache")
+	}
+	if got := len(env.prober.voicesAsked()); got != 1 {
+		t.Fatalf("voices listing asked %d times over two ticks, want 1 (the back-off holds the second off)", got)
+	}
+}
+
+// A clone model with nothing usable on file stays out -- no row at all (never listed), a
+// listing that came back empty, only blank names, a payload that does not decode: it is
+// reference-only, the benchmark would skip it, so the loop must not ask for it.
+func TestHealthSpeechRateStreamingCloneWithoutPresetsIsNotATarget(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*speechRateEnv)
+	}{
+		{"never listed", func(e *speechRateEnv) {
+			e.prober.acVoicesErr["tts_stream"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+		}},
+		{"listed, and empty", func(e *speechRateEnv) { e.prober.acVoices["tts_stream"] = []provider.Voice{} }},
+		{"listed blank names only", func(e *speechRateEnv) { e.prober.acVoices["tts_stream"] = voiceList(" ", "") }},
+		{"an undecodable cache row", func(e *speechRateEnv) {
+			e.st.seedVoicesCache("m1", `{not json`)
+			e.prober.acVoicesErr["tts_stream"] = fmt.Errorf("%w: status 503", provider.ErrUnavailable)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newSpeechRateEnv(t)
+			env.makeStreamingClone()
+			tc.setup(env)
+			env.tick()
+			env.wantCalls(t, "a clone model with no presets")
+			if _, ok := env.ratePayload(); ok {
+				t.Fatal("a rate row appeared for a reference-only clone model")
+			}
+		})
+	}
+}
+
+// A clone model that LOSES its presets (the listing now comes back empty) leaves the target
+// set: the rate back-off it had open is cleared, like any mapping that stops being a target.
+func TestHealthSpeechRateCloneLosingItsPresetsClearsTheBackoff(t *testing.T) {
+	env := newSpeechRateEnv(t)
+	env.makeStreamingClone()
+	env.prober.acVoices["tts_stream"] = voiceList("Frank")
+	env.tick()
+	env.wantCalls(t, "with presets", speechRateCallA)
+	if !env.runner.speechRateBackoff.active("m1", env.clock) {
+		t.Fatal("no back-off after the trigger started a run")
+	}
+
+	env.prober.acVoices["tts_stream"] = []provider.Voice{}
+	env.advance(time.Second)
+	env.tick()
+	if env.runner.speechRateBackoff.active("m1", env.clock) {
+		t.Fatal("the back-off survived the clone model leaving the target set")
+	}
+	env.wantCalls(t, "after the presets are gone", speechRateCallA)
+}
+
+// The rate step reads the voices cache ONLY for a loaded, streaming clone model -- the one shape
+// whose target-ness depends on it -- so a plain model, a clone model that cannot be a target
+// anyway and a model that is not loaded pay no extra read. The step is called directly (the voices
+// step of a full tick reads the same cache for every loaded speech mapping, which would drown it).
+func TestCacheAudioCppSpeechRateReadsTheVoicesCacheOnlyForAStreamingClone(t *testing.T) {
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	server, app, mp := routing.AIServer{ID: "s1"}, audioCppApp("a1", "s1", 8001), audioCppMapping("m1", "tts_stream")
+	for _, tc := range []struct {
+		name      string
+		v         provider.AudioCppVerdicts
+		presets   string // the voices cache payload on file; "" is no row
+		wantReads int
+		wantCalls int
+	}{
+		{"a plain streaming model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: yes, Path: "/m/a"}, "", 0, 1},
+		{"a plain streaming model, whatever is on file", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: yes, Path: "/m/a"}, `[]`, 0, 1},
+		{"a streaming clone model with presets", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes, Path: "/m/a"}, `["Frank"]`, 1, 1},
+		{"a streaming clone model with an empty list", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes, Path: "/m/a"}, `[]`, 1, 0},
+		{"a streaming clone model never listed", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes, Path: "/m/a"}, "", 1, 0},
+		{"a non-streaming clone model", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: no, Path: "/m/a"}, `["Frank"]`, 0, 0},
+		{"a clone model that is not loaded", provider.AudioCppVerdicts{Loaded: false, Speech: yes, SpeechClone: yes, SpeechStreaming: yes, Path: "/m/a"}, `["Frank"]`, 0, 0},
+		{"a plain model that does not stream", provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: no, SpeechStreaming: no, Path: "/m/a"}, "", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, _ := audioCppProbeRunner(t, nil, mp)
+			rec := &speechRateRecorder{}
+			runner.speechRate = rec.trigger
+			if tc.presets != "" {
+				st.seedVoicesCache("m1", tc.presets)
+			}
+			before := st.cacheReadCountOf(routing.ModelMappingCacheVoices)
+
+			runner.cacheAudioCppSpeechRate(context.Background(), server, app, mp, tc.v)
+
+			if got := st.cacheReadCountOf(routing.ModelMappingCacheVoices) - before; got != tc.wantReads {
+				t.Fatalf("voices cache read %d times, want %d", got, tc.wantReads)
+			}
+			if got := len(rec.started()); got != tc.wantCalls {
+				t.Fatalf("speech rate benchmark started %d times, want %d", got, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// A voices cache that cannot be read is neither "has presets" nor "has none": the clone model's
+// status is unknown this tick, so the step does nothing -- it starts no benchmark and leaves the
+// rate back-off exactly as it was (a clone model that stays a target must not have it reset by a
+// store hiccup).
+func TestCacheAudioCppSpeechRateVoicesReadFailureLeavesTheBackoffAlone(t *testing.T) {
+	yes := routing.CapabilityYes
+	server, app, mp := routing.AIServer{ID: "s1"}, audioCppApp("a1", "s1", 8001), audioCppMapping("m1", "tts_stream")
+	runner, st, _ := audioCppProbeRunner(t, nil, mp)
+	rec := &speechRateRecorder{}
+	runner.speechRate = rec.trigger
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return now }
+	runner.speechRateBackoff.start("m1", now, now.Add(speechRateRetryBackoff))
+	st.cacheReadErr = true
+
+	runner.cacheAudioCppSpeechRate(context.Background(), server, app, mp,
+		provider.AudioCppVerdicts{Loaded: true, Speech: yes, SpeechClone: yes, SpeechStreaming: yes, Path: "/m/a"})
+
+	if got := rec.started(); len(got) != 0 {
+		t.Fatalf("speech rate benchmark started %+v on an unreadable voices cache, want none", got)
+	}
+	if !runner.speechRateBackoff.active("m1", now) {
+		t.Fatal("an unreadable voices cache reset the rate back-off, want it left as it was")
+	}
+}
+
 // ---- the agent-launched child ----
 
 // agentSpeechRateRunner is agentVoicesRunner for the speech rate trigger: ONE running
@@ -6904,8 +7202,13 @@ func TestHealthSpeechRateAgentChildGate(t *testing.T) {
 			delete(e.st.caps["m1"], routing.CapabilitySpeechStreaming)
 			e.st.mu.Unlock()
 		}},
-		{"a clone model", func(e *speechRateEnv) {
+		{"a clone model with no presets", func(e *speechRateEnv) {
 			e.st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+		}},
+		{"a non-streaming clone model", func(e *speechRateEnv) {
+			e.st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+			e.st.seedCapability("m1", routing.CapabilitySpeechStreaming, routing.CapabilityNo, routing.CapabilitySourceAudioCppModels)
+			e.prober.acVoices["tts_stream"] = voiceList("Frank")
 		}},
 		{"the child is not running", func(e *speechRateEnv) {
 			e.runner.loaded.SetGatewayProbe("a1", nil)
@@ -6921,6 +7224,107 @@ func TestHealthSpeechRateAgentChildGate(t *testing.T) {
 			env.wantCalls(t, "an ineligible child")
 		})
 	}
+}
+
+// An agent-launched clone child with presets is a target like a static one: the stored rows say
+// streaming clone, the voices cache (written by the voices fetch the same pass just ran) says it
+// has presets. The identity is the launch fingerprint, as for any agent child.
+func TestHealthSpeechRateAgentChildCloneWithPresets(t *testing.T) {
+	env := agentSpeechRateRunner(t)
+	env.st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+	env.prober.acVoices["tts_stream"] = voiceList("Thorsten", "Frank")
+	env.setSpec(func(sp *routing.RuntimeSpec) { sp.Binary, sp.Args = "audio-server", `["--model","/m/clone.gguf"]` })
+	identity := agentSpecIdentity(routing.RuntimeSpec{Binary: "audio-server", Args: `["--model","/m/clone.gguf"]`})
+
+	env.tick()
+	env.wantCalls(t, "a running streaming clone child with presets", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: identity})
+	env.advance(30 * time.Second)
+	env.tick()
+	env.wantCalls(t, "inside the back-off", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: identity})
+}
+
+// The agent twin of the static cache-not-fetch rule: presets on file keep a clone child a target
+// on a tick whose listing failed, and a clone child whose cache lists none stays out.
+func TestHealthSpeechRateAgentCloneFollowsTheVoicesCache(t *testing.T) {
+	t.Run("presets on file, the listing failed", func(t *testing.T) {
+		env := agentSpeechRateRunner(t)
+		env.st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+		env.st.seedVoicesCache("m1", `["Frank"]`)
+		env.prober.acVoicesErr["tts_stream"] = fmt.Errorf("%w: status 404", provider.ErrUnavailable)
+		env.tick()
+		env.wantCalls(t, "the cache has presets", speechRateCall{serverID: "s1", appID: "a1", mappingID: "m1", identity: agentSpecIdentity(routing.RuntimeSpec{})})
+	})
+	t.Run("a cached-empty list", func(t *testing.T) {
+		env := agentSpeechRateRunner(t)
+		env.st.seedCapability("m1", routing.CapabilitySpeechClone, routing.CapabilityYes, routing.CapabilitySourceAudioCppModels)
+		env.prober.acVoices["tts_stream"] = []provider.Voice{}
+		env.tick()
+		env.wantCalls(t, "a reference-only clone child")
+	})
+}
+
+// The agent step reads the voices cache only for a streaming clone child, and an unreadable cache
+// starts nothing and leaves the back-off alone, like the static step.
+func TestCacheAgentSpeechRateReadsTheVoicesCacheOnlyForAStreamingClone(t *testing.T) {
+	rowsOf := func(clone, streaming string) []routing.CapabilityRow {
+		return []routing.CapabilityRow{
+			{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels},
+			{Capability: routing.CapabilitySpeechClone, Verdict: clone, Source: routing.CapabilitySourceAudioCppModels},
+			{Capability: routing.CapabilitySpeechStreaming, Verdict: streaming, Source: routing.CapabilitySourceAudioCppModels},
+		}
+	}
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	server, app, mp := routing.AIServer{ID: "s1"}, serverAgentApp("a1", "s1", 8001), audioCppMapping("m1", "tts_stream")
+	for _, tc := range []struct {
+		name      string
+		rows      []routing.CapabilityRow
+		presets   string
+		wantReads int
+		wantCalls int
+	}{
+		{"a plain streaming child", rowsOf(no, yes), "", 0, 1},
+		{"a streaming clone child with presets", rowsOf(yes, yes), `["Frank"]`, 1, 1},
+		{"a streaming clone child with none", rowsOf(yes, yes), `[]`, 1, 0},
+		{"a non-streaming clone child", rowsOf(yes, no), `["Frank"]`, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, st, _, _ := agentVoicesRunner(t, agentVoicesFlag, mp)
+			rec := &speechRateRecorder{}
+			runner.speechRate = rec.trigger
+			if tc.presets != "" {
+				st.seedVoicesCache("m1", tc.presets)
+			}
+			before := st.cacheReadCountOf(routing.ModelMappingCacheVoices)
+
+			runner.cacheAgentSpeechRate(context.Background(), server, app, mp, routing.RuntimeSpec{}, tc.rows)
+
+			if got := st.cacheReadCountOf(routing.ModelMappingCacheVoices) - before; got != tc.wantReads {
+				t.Fatalf("voices cache read %d times, want %d", got, tc.wantReads)
+			}
+			if got := len(rec.started()); got != tc.wantCalls {
+				t.Fatalf("speech rate benchmark started %d times, want %d", got, tc.wantCalls)
+			}
+		})
+	}
+
+	t.Run("an unreadable voices cache leaves the back-off alone", func(t *testing.T) {
+		runner, st, _, _ := agentVoicesRunner(t, agentVoicesFlag, mp)
+		rec := &speechRateRecorder{}
+		runner.speechRate = rec.trigger
+		now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+		runner.now = func() time.Time { return now }
+		runner.speechRateBackoff.start("m1", now, now.Add(speechRateRetryBackoff))
+		st.cacheReadErr = true
+
+		runner.cacheAgentSpeechRate(context.Background(), server, app, mp, routing.RuntimeSpec{}, rowsOf(yes, yes))
+
+		if got := rec.started(); len(got) != 0 {
+			t.Fatalf("speech rate benchmark started %+v on an unreadable voices cache, want none", got)
+		}
+		if !runner.speechRateBackoff.active("m1", now) {
+			t.Fatal("an unreadable voices cache reset the rate back-off, want it left as it was")
+		}
+	})
 }
 
 // agentSpecIdentity fingerprints what the gateway launches: the launch spec's binary,
@@ -7035,5 +7439,130 @@ func TestBuildGatewayServerBindsTheSpeechRateTrigger(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for srv.Benchmarks.Status("s1").Running && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestSpeechRateLoopGateAgreesWithTheBenchmarkPartition is the invariant of #306 over the real
+// wiring (the runner is the production one, its trigger is bound to the real gateway Server and so
+// to partitionSpeechBenchmarkViews): for every mapping the loop's gate and the partition's gate
+// must give the same answer, because they decide the same thing from the same voices cache.
+//
+// A mapping the loop treats as a target that the partition then refuses is asked about again on
+// every tick and never benchmarked; one the loop leaves out that the partition would run is never
+// benchmarked, and has its rate back-off reset every tick. Streaming narrows the loop's gate below
+// the partition's (the rate is read only by a streamed call's billing), so the loop must ask
+// exactly when the model streams AND the partition accepts it. Both loop paths are checked, the
+// static step on a fresh verdict and the agent step on the stored rows.
+func TestSpeechRateLoopGateAgreesWithTheBenchmarkPartition(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_DEV_TOKEN", "dev-secret")
+	var runner *appHealthRunner
+	orig := startAppHealthLoop
+	startAppHealthLoop = func(r *appHealthRunner, _ <-chan string) context.CancelFunc {
+		runner = r
+		return func() {}
+	}
+	t.Cleanup(func() { startAppHealthLoop = orig })
+
+	srv, cleanup, err := buildGatewayServer(config.Config{
+		Addr: "127.0.0.1:8080", DBDriver: "memory", AppHealthProbeTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("buildGatewayServer returned %v", err)
+	}
+	t.Cleanup(func() { _ = cleanup() })
+	if runner == nil || runner.speechRate == nil {
+		t.Fatal("the app-health loop was started with no speech rate trigger")
+	}
+	trigger := runner.speechRate
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	runner.now = func() time.Time { return now }
+
+	ctx := context.Background()
+	// A closed port: a run the trigger starts fails fast on connection refused.
+	server := routing.AIServer{ID: "s1", Name: "S1", Domain: "127.0.0.1", Provider: routing.ProviderAudioCpp, Endpoint: "http://127.0.0.1:1", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}
+	app := routing.Application{ID: "a1", ServerID: "s1", Type: routing.ProviderAudioCpp, Port: 1, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAIAudio}, Priority: 1, Weight: 1, TimeoutMS: 1000, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+	if err := srv.Routes.CreateAIServer(ctx, server); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	if err := srv.Routes.CreateApplication(ctx, app); err != nil {
+		t.Fatalf("create application: %v", err)
+	}
+
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	for i, tc := range []struct {
+		name      string
+		clone     string
+		streaming string
+		voices    string // the voices cache payload; "" is no row
+	}{
+		{"plain, streaming", no, yes, ""},
+		{"plain, streaming, a list on file", no, yes, `["Frank"]`},
+		{"plain, not streaming", no, no, ""},
+		{"clone, streaming, presets", yes, yes, `["Thorsten","Frank"]`},
+		{"clone, streaming, a cached-empty list", yes, yes, `[]`},
+		{"clone, streaming, never listed", yes, yes, ""},
+		{"clone, streaming, only blank names", yes, yes, `[" ",""]`},
+		{"clone, streaming, an undecodable row", yes, yes, `{not json`},
+		{"clone, not streaming, presets", yes, no, `["Frank"]`},
+		{"clone, streaming unknown, presets", yes, "", `["Frank"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := fmt.Sprintf("m%d", i)
+			mp := routing.ModelMapping{ID: id, ApplicationID: "a1", GatewayModelName: "tts-" + id, AppModelName: "model_" + id, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}
+			if err := srv.Routes.CreateMapping(ctx, mp); err != nil {
+				t.Fatalf("create mapping: %v", err)
+			}
+			caps := []routing.CapabilityRow{
+				{Capability: routing.CapabilitySpeech, Verdict: yes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+				{Capability: routing.CapabilitySpeechClone, Verdict: tc.clone, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+			}
+			if tc.streaming != "" {
+				caps = append(caps, routing.CapabilityRow{Capability: routing.CapabilitySpeechStreaming, Verdict: tc.streaming, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now})
+			}
+			if err := srv.Routes.UpsertMappingCapabilities(ctx, id, caps); err != nil {
+				t.Fatalf("seed capabilities: %v", err)
+			}
+			if tc.voices != "" {
+				if err := srv.Routes.UpsertModelMappingCache(ctx, routing.ModelMappingCacheRow{MappingID: id, CacheType: routing.ModelMappingCacheVoices, Payload: tc.voices, UpdatedAt: now}); err != nil {
+					t.Fatalf("seed voices cache: %v", err)
+				}
+			}
+
+			// The partition's answer: does the trigger start a run for it (the manual run's own
+			// decision)? Wait the run out, so the next mapping finds the server's slot free.
+			runnable := trigger(ctx, server, app, mp, "/m/a")
+			deadline := time.Now().Add(5 * time.Second)
+			for srv.Benchmarks.Status("s1").Running && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// The loop's answer, on both paths, with a trigger that only records the ask.
+			var asked int
+			runner.speechRate = func(context.Context, routing.AIServer, routing.Application, routing.ModelMapping, string) bool {
+				asked++
+				return false
+			}
+			t.Cleanup(func() { runner.speechRate = trigger })
+			streams := tc.streaming == yes
+			runner.cacheAudioCppSpeechRate(ctx, server, app, mp, provider.AudioCppVerdicts{
+				Loaded: true, Speech: yes, SpeechClone: tc.clone, SpeechStreaming: tc.streaming, Path: "/m/a",
+			})
+			staticAsked := asked
+			rows, err := runner.store.MappingCapabilities(ctx, id)
+			if err != nil {
+				t.Fatalf("read capabilities: %v", err)
+			}
+			asked = 0
+			runner.cacheAgentSpeechRate(ctx, server, app, mp, routing.RuntimeSpec{}, rows)
+			agentAsked := asked
+
+			want := 0
+			if streams && runnable {
+				want = 1
+			}
+			if staticAsked != want || agentAsked != want {
+				t.Fatalf("the loop asked static %d / agent %d times, want %d: the partition runnable = %v and the model streams = %v, so the two gates disagree", staticAsked, agentAsked, want, runnable, streams)
+			}
+		})
 	}
 }

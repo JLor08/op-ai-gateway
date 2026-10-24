@@ -42,6 +42,36 @@ func TestVoiceNamesFromCacheRows(t *testing.T) {
 	}
 }
 
+// FirstPresetVoice is the one place a preset voice is picked for a model that has presets
+// (the speech benchmark's voice for a preset clone, the health loop's "does it have any"):
+// the first bytewise-sorted non-blank name of the voices cache, or "" when there is none.
+func TestFirstPresetVoice(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []ModelMappingCacheRow
+		want string
+	}{
+		{name: "no rows", rows: nil, want: ""},
+		{name: "a cached-empty list", rows: []ModelMappingCacheRow{{Payload: `[]`}}, want: ""},
+		{name: "the bytewise first of the writer's sorted list", rows: []ModelMappingCacheRow{{Payload: `["Frank","Thorsten"]`}}, want: "Frank"},
+		{name: "the bytewise first, whatever order the row was written in", rows: []ModelMappingCacheRow{{Payload: `["Thorsten","Frank"]`}}, want: "Frank"},
+		{name: "bytewise: an upper-case name sorts before a lower-case one", rows: []ModelMappingCacheRow{{Payload: `["alba","Zed"]`}}, want: "Zed"},
+		{name: "blank names are skipped", rows: []ModelMappingCacheRow{{Payload: `[" ","","Frank"]`}}, want: "Frank"},
+		{name: "only blank names", rows: []ModelMappingCacheRow{{Payload: `[" ",""]`}}, want: ""},
+		{name: "the name is kept verbatim, not trimmed", rows: []ModelMappingCacheRow{{Payload: `[" a ","b"]`}}, want: " a "},
+		{name: "another scope is not the voices list", rows: []ModelMappingCacheRow{{ScopeKey: "de", Payload: `["hans"]`}}, want: ""},
+		{name: "an empty payload", rows: []ModelMappingCacheRow{{Payload: ``}}, want: ""},
+		{name: "JSON null", rows: []ModelMappingCacheRow{{Payload: `null`}}, want: ""},
+		{name: "an undecodable row is no presets", rows: []ModelMappingCacheRow{{Payload: `{not json`}}, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FirstPresetVoice(tc.rows); got != tc.want {
+				t.Fatalf("FirstPresetVoice(%+v) = %q, want %q", tc.rows, got, tc.want)
+			}
+		})
+	}
+}
+
 // voiceScope's two methods are the identity on a nil scope, which is what a request
 // without a known voice threads through the resolver.
 func TestVoiceScopeNilIsTheIdentity(t *testing.T) {

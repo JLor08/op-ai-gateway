@@ -121,16 +121,17 @@ func speechStreamSampleRate(byteRate uint32) (int, bool) {
 // which serves it -- hence the fold over all of them, the AND the portal's other capability
 // flags use (fail closed), and the equality of their rates.
 //
-// The candidate set is the OFFERABLE one on purpose, and not plain tts alone. A preset clone
-// model is reachable by a speech request, and the benchmark cannot learn a byte rate for it
-// (its bare request is a 500 for a clone model), so it has none cached: it CLOSES the gate
-// (agreedSpeechStreamRate), and the turn is buffered, the known-good path. Leaving it out
-// would let a name that mixes a streaming plain tts mapping with a preset clone one stream
-// at the plain mapping's rate while a request routed to the clone sibling: that PCM would be
-// played, committed as a WAV, and billed at the wrong rate. A name that is only plain tts
-// streams as before; a name that is only a clone model is buffered (streaming for a clone
-// is deferred). An empty candidate set is a closed gate. A store failure is an error and is
-// never read as an open gate.
+// The candidate set is the OFFERABLE one on purpose, and not plain tts alone: every mapping a
+// speech request could be routed to is folded, so the gate opens only when they all agree on a
+// rate. Since #306 the benchmark learns a byte rate for a preset clone too (it synthesizes with
+// a configured preset voice), so a preset clone that streams and has an agreed rate STREAMS; a
+// preset clone not yet benchmarked has no cached rate and closes the gate (buffered) until it
+// is. This fold keeps a name that mixes a streaming plain tts mapping with a preset-clone
+// sibling honest: it streams only if their rates agree, and otherwise buffers -- never a request
+// routed to one sibling played, committed as a WAV and billed at the other's rate. A name that
+// is only plain tts streams as before; a reference-only clone has no preset, so it is not
+// offerable here at all and never reaches this gate. An empty candidate set is a closed gate. A
+// store failure is an error and is never read as an open gate.
 func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Token, gatewayModel string) (int, bool, error) {
 	candidates, verdicts, err := s.portalOfferableSpeechMappings(ctx, principal, gatewayModel)
 	if err != nil || len(candidates) == 0 {
@@ -157,9 +158,11 @@ func (s *Server) portalSpeechStreamRate(ctx context.Context, principal auth.Toke
 // (portalSpeechLanguage) and of the streaming gate (portalSpeechStreamRate), the counterpart
 // of what the voice picker offers (cachedVoicesForMappings).
 //
-// The streaming gate shares it ON PURPOSE: a clone model it contains has no cached stream
-// rate, so it closes the gate and the turn is buffered, rather than a streamed request routed
-// to the clone being played, stored and billed at a sibling plain mapping's rate.
+// The streaming gate shares it ON PURPOSE: a preset clone it contains is a routable speech
+// candidate, so folding it in makes the gate open only when every candidate agrees on a rate.
+// Since #306 a preset clone has its own benchmarked stream rate, so it streams when the rates
+// agree and buffers (fail closed) when they do not or when it is not yet benchmarked -- never a
+// streamed request routed to a sibling played, stored and billed at another's rate.
 //
 // The voices cache is read, in one batch, for the speech mappings only (the others are
 // offerable by no row of it), and only the scope-"" row decides (routing.VoiceNamesFromCacheRows,

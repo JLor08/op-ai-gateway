@@ -892,10 +892,11 @@ func (r *appHealthRunner) probeSdcppCapabilities(ctx context.Context, server rou
 // models; unlike the voices step it asks the server for nothing more.
 //
 // A fourth step per mapping starts the speech rate benchmark (cacheAudioCppSpeechRate,
-// #263): a loaded plain model that streams speech, which has no cached output byte
-// rate for the model the listing states (its path), has the gateway benchmark it, so
-// a streamed call bills in audio seconds and not in the honest audio_bytes fallback.
-// The step only asks for the benchmark; it never synthesizes.
+// #263): a loaded model that streams speech -- a plain one, or a clone model with preset
+// voices on file (#306) -- which has no cached output byte rate for the model the listing
+// states (its path), has the gateway benchmark it, so a streamed call bills in audio
+// seconds and not in the honest audio_bytes fallback, and the portal streams it. The step
+// only asks for the benchmark; it never synthesizes.
 func (r *appHealthRunner) probeAudioCppModels(ctx context.Context, server routing.AIServer, app routing.Application, prober provider.AudioCppModelsProber) {
 	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
 	if err != nil {
@@ -1152,8 +1153,8 @@ func (r *appHealthRunner) cacheAudioCppSpeechParams(ctx context.Context, mp rout
 // fact, the verdicts arriving by telemetry instead. The speech rate step
 // (cacheAgentSpeechRate, #263) has a child whose stored speech_streaming verdict is yes
 // benchmark its output byte rate when none is cached for the launch spec it runs under;
-// it still leaves a clone child out (agentSpeechRateWanted), which the wider set here
-// admits.
+// a clone child is benchmarked too once the voices step above has cached presets for it
+// (agentSpeechRateWanted, #306), and one with none stays out.
 // Both start no child, for the same reason the voices route does not: only a running one
 // is asked.
 func (r *appHealthRunner) probeAgentVoices(ctx context.Context, server routing.AIServer, app routing.Application, lister provider.AudioCppVoicesLister) {
@@ -1262,8 +1263,8 @@ func (r *appHealthRunner) fetchAndCacheSpeechParams(ctx context.Context, prober 
 // caller requires the agent's runtime_voices declaration.
 //
 // The capability rows it read are returned with the spec: the caller's speech rate step
-// (cacheAgentSpeechRate) needs the stored speech_streaming verdict from the same read, and
-// excludes a clone model itself (agentSpeechRateWanted).
+// (cacheAgentSpeechRate) needs the stored speech_streaming and clone verdicts from the same
+// read, and decides by them (agentSpeechRateWanted, with the voices cache for a clone model).
 func (r *appHealthRunner) agentVoiceProbeSpec(ctx context.Context, mp routing.ModelMapping, specByMapping map[string]routing.RuntimeSpec, loadedSet map[string]struct{}) (routing.RuntimeSpec, []routing.CapabilityRow, bool) {
 	if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
 		return routing.RuntimeSpec{}, nil, false
@@ -1398,21 +1399,51 @@ func (r *appHealthRunner) writeSpeechLanguageCache(ctx context.Context, mappingI
 
 // audioCppSpeechRateWanted reports whether the model this probe observed is a
 // target of the speech rate benchmark (#263): the listing states it LOADED right
-// now, a plain tts model -- (speech, yes) and not (speech_clone, yes) -- that
-// STREAMS speech, (speech_streaming, yes). All of it comes from the fresh verdict,
-// like audioCppVoicesWanted, without a store read.
+// now, a speech model -- (speech, yes) -- that STREAMS it, (speech_streaming, yes),
+// and that the benchmark can synthesize: a plain tts model, or (#306) a clone model
+// with a preset voice to name. hasPresets is the voices cache's answer for the mapping
+// (routing.FirstPresetVoice != ""), and it matters to a clone model alone. Everything but
+// that comes from the fresh verdict, like audioCppVoicesWanted, without a store read.
 //
 // Streaming is what narrows it below the manual benchmark: the rate is read only by
 // the streamed call's billing, so a model that answers one-shot has no use for it,
 // and the unknown verdict ("") is no statement that it streams. Loaded is strict
 // because the benchmark synthesizes, and asking a static server to synthesize with
 // a model it does not have loaded could make it swap the model another client is
-// using. A clone model is left out because the benchmark skips it (a plain request
-// 500s without a reference voice), so triggering it would only repeat a refusal; that
-// stays so although audioCppVoicesWanted admits clone models since #301 (their voices are
-// fetched, they are still not benchmarked, streaming clone models being out of scope).
-func audioCppSpeechRateWanted(v provider.AudioCppVerdicts) bool {
-	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechClone != routing.CapabilityYes && v.SpeechStreaming == routing.CapabilityYes
+// using. A clone model with no preset stays out because the benchmark skips it (a
+// request that names no voice 500s without a reference), so triggering it would only
+// repeat a refusal. This is routing.CapabilityRowsOfferableTTS, the rule the benchmark's
+// own skip decision (speechBenchmarkSkip) shares, so the loop asks exactly where the
+// benchmark will run.
+func audioCppSpeechRateWanted(v provider.AudioCppVerdicts, hasPresets bool) bool {
+	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechStreaming == routing.CapabilityYes &&
+		(v.SpeechClone != routing.CapabilityYes || hasPresets)
+}
+
+// audioCppStreamingClone reports whether the model this probe observed is the one shape whose
+// rate target-ness depends on the voices cache: loaded, speech, streaming and a clone model.
+// Nothing else needs the cache (a plain streaming model is a target without it, every other
+// model is none with or without it), so cacheAudioCppSpeechRate reads it only here and a
+// plain model pays no extra read.
+func audioCppStreamingClone(v provider.AudioCppVerdicts) bool {
+	return v.Loaded && v.Speech == routing.CapabilityYes && v.SpeechStreaming == routing.CapabilityYes &&
+		v.SpeechClone == routing.CapabilityYes
+}
+
+// cachedHasPresets reports whether a mapping's voices cache lists at least one preset voice
+// (routing.FirstPresetVoice != ""): the one answer to "does this clone model have presets" that
+// both rate gates and the benchmark's partition (speechBenchmarkPresetVoice) share. It reads the
+// CACHE, never the list a voices step fetched this tick: that step returns nothing, skips
+// itself under its back-off and writes nothing on a failed listing, so the fetched list is not
+// reliably in hand -- and a gate that followed it would disagree with the partition, which can
+// only see the cache. An error is returned as one: whether the model has presets is then unknown,
+// and the callers do nothing this tick rather than guess.
+func (r *appHealthRunner) cachedHasPresets(ctx context.Context, mappingID string) (bool, error) {
+	rows, err := r.store.ModelMappingCache(ctx, mappingID, routing.ModelMappingCacheVoices)
+	if err != nil {
+		return false, fmt.Errorf("read the voices cache: %w", err)
+	}
+	return routing.FirstPresetVoice(rows) != "", nil
 }
 
 // cacheAudioCppSpeechRate is the speech rate step of probeAudioCppModels for ONE
@@ -1421,8 +1452,23 @@ func audioCppSpeechRateWanted(v provider.AudioCppVerdicts) bool {
 // output byte rate against the model file the listing states (ensureSpeechRate). A
 // mapping that is not a target has its back-off cleared, so a reload is asked at
 // once, and nothing else is touched.
+//
+// A streaming clone model is a target only with presets on file, which the voices
+// cache says (cachedHasPresets): it is read for that shape alone. The voices step ran
+// just before on the same tick, so a model that was just listed is on file. A cache
+// that cannot be read leaves the mapping alone for this tick -- neither started nor
+// cleared: whether the model has presets is unknown, and a back-off an earlier tick
+// opened is not a store hiccup's to reset.
 func (r *appHealthRunner) cacheAudioCppSpeechRate(ctx context.Context, server routing.AIServer, app routing.Application, mp routing.ModelMapping, v provider.AudioCppVerdicts) {
-	if !audioCppSpeechRateWanted(v) {
+	hasPresets := false
+	if audioCppStreamingClone(v) {
+		var err error
+		if hasPresets, err = r.cachedHasPresets(ctx, mp.ID); err != nil {
+			slog.Debug("app health: voices cache read for the speech rate step failed", "mapping_id", mp.ID, "error", err)
+			return
+		}
+	}
+	if !audioCppSpeechRateWanted(v, hasPresets) {
 		r.speechRateBackoff.clear(mp.ID)
 		return
 	}
@@ -1440,25 +1486,47 @@ func (r *appHealthRunner) cacheAudioCppSpeechRate(ctx context.Context, server ro
 // fingerprint of the launch spec (agentSpecIdentity), the one thing the gateway can
 // see of which model a child serves.
 //
+// A streaming clone child is a target only with presets on file, which the voices cache
+// says (cachedHasPresets, read for that shape alone, and written by the voices fetch the
+// pass ran just before); a cache that cannot be read leaves the child alone this tick,
+// back-off untouched, as in the static step.
+//
 // Because it rides that pass it shares the pass's gates: the agent must declare
 // runtime_voices (gateway.RuntimeVoicesFeature) and the prober must list voices. Both
 // hold for every agent that can state a speech_streaming verdict at all, since the
 // voices route arrived with agent 0.11.0 and the verdict with 0.11.1.
 func (r *appHealthRunner) cacheAgentSpeechRate(ctx context.Context, server routing.AIServer, app routing.Application, mp routing.ModelMapping, spec routing.RuntimeSpec, rows []routing.CapabilityRow) {
-	if !agentSpeechRateWanted(rows) {
+	hasPresets := false
+	if agentStreamingClone(rows) {
+		var err error
+		if hasPresets, err = r.cachedHasPresets(ctx, mp.ID); err != nil {
+			slog.Debug("app health: voices cache read for the agent speech rate step failed", "mapping_id", mp.ID, "error", err)
+			return
+		}
+	}
+	if !agentSpeechRateWanted(rows, hasPresets) {
 		r.speechRateBackoff.clear(mp.ID)
 		return
 	}
 	r.ensureSpeechRate(ctx, server, app, mp, agentSpecIdentity(spec))
 }
 
-// agentSpeechRateWanted is audioCppSpeechRateWanted for stored rows: a plain tts model
-// (routing.CapabilityRowsPlainTTS, which excludes a clone model: the voices rule
-// admits one since #301, this one does not) whose speech_streaming verdict is yes. The
-// caller has already required the child to be running.
-func agentSpeechRateWanted(rows []routing.CapabilityRow) bool {
-	return routing.CapabilityRowsPlainTTS(rows) &&
+// agentSpeechRateWanted is audioCppSpeechRateWanted for stored rows: an offerable tts model
+// (routing.CapabilityRowsOfferableTTS: a plain one, or a clone model with presets, which
+// hasPresets says, #306) whose speech_streaming verdict is yes. The caller has already
+// required the child to be running.
+func agentSpeechRateWanted(rows []routing.CapabilityRow, hasPresets bool) bool {
+	return routing.CapabilityRowsOfferableTTS(rows, hasPresets) &&
 		routing.CapabilityRowsByName(rows)[routing.CapabilitySpeechStreaming].Verdict == routing.CapabilityYes
+}
+
+// agentStreamingClone is audioCppStreamingClone for stored rows: speech, streaming and a clone
+// model, the one shape that needs the voices cache to be told a target.
+func agentStreamingClone(rows []routing.CapabilityRow) bool {
+	byName := routing.CapabilityRowsByName(rows)
+	return byName[routing.CapabilitySpeech].Verdict == routing.CapabilityYes &&
+		byName[routing.CapabilitySpeechClone].Verdict == routing.CapabilityYes &&
+		byName[routing.CapabilitySpeechStreaming].Verdict == routing.CapabilityYes
 }
 
 // agentSpecIdentity is the identity the speech rate step records for an agent-launched
@@ -1480,8 +1548,8 @@ func agentSpecIdentity(spec routing.RuntimeSpec) string {
 }
 
 // ensureSpeechRate is the one decision of the speech rate step, shared by both audio
-// passes (#263): for a mapping that is a target (the caller checked loaded, plain,
-// streaming), start the speech rate benchmark through r.speechRate when the mapping has
+// passes (#263): for a mapping that is a target (the caller checked loaded, streaming, and
+// plain or a clone model with presets), start the speech rate benchmark through r.speechRate when the mapping has
 // no usable cached output byte rate, or has one that was measured under another model.
 // It never synthesizes itself -- r.speechRate only starts the gateway's async benchmark --
 // and with no trigger wired it does nothing at all.
