@@ -616,6 +616,27 @@ describe('createVoiceSession in a (fake) browser', () => {
       run.session.stop();
     });
 
+    it('an error frame silences what is still queued to play, as a cancel does', async () => {
+      const run = start();
+      const socket = await connected(run);
+      // A turn that degraded after some of its audio was already sent down.
+      socket.say(audioDelta(0));
+      socket.say(audioDelta(1));
+      expect(run.players).toHaveLength(1);
+      expect(run.players[0].stop).not.toHaveBeenCalled();
+
+      socket.say({ type: 'error', code: 'speech.upstream_error', message: 'degraded' });
+
+      // The queued audio is stopped, so a later push_start does not reopen the microphone into it.
+      expect(run.players[0].stop).toHaveBeenCalledTimes(1);
+      expect(run.errors).toHaveLength(1);
+      // The next answer is heard on a player of its own, not the silenced one.
+      socket.say(audioDelta(0));
+      expect(run.players).toHaveLength(2);
+      expect(run.players[1].push).toHaveBeenCalledTimes(1);
+      run.session.stop();
+    });
+
     it('an error frame without a message still says something', async () => {
       const run = start();
       const socket = await connected(run);

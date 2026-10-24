@@ -497,7 +497,10 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
         args.onAudioDone();
         break;
       case 'error':
-        // One turn failed; the gateway is back at idle and the session goes on.
+        // One turn failed; the gateway is back at idle and the session goes on. What is still
+        // queued to play (a turn that degraded after some of its audio was sent down) is silenced,
+        // as a cancel does: a later push_start would otherwise reopen the microphone into it.
+        stopPlayback();
         args.onError(frame.message || frame.code || 'the voice turn could not be completed', {
           kind: 'turn',
           ...(frame.code === undefined ? {} : { code: frame.code }),

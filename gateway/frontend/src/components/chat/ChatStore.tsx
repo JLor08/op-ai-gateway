@@ -173,6 +173,16 @@ function speechOffered(option: ModelOption | undefined): boolean {
   );
 }
 
+// Whether a catalogue model is a voice-CLONE speech model driven by its configured PRESET voices
+// (#301), the one speech model with no text-only default voice: a send with a blank voice relies
+// on the operator having configured a default preset, which the gateway cannot see. The one rule
+// of the effective model's modelPresetClone and of Voice Chat's choice of voice.
+function presetCloneOffered(option: ModelOption | undefined): boolean {
+  return (
+    option?.speech === true && option.speech_clone === true && option.speech_clone_voices === true
+  );
+}
+
 // The two models of a Voice Chat that the thread does not pick: the live transcription model
 // that hears the user and the streaming speech model that answers aloud (the thread's own model
 // is the third, the one that answers). '' is none that the gateway says streams.
@@ -894,13 +904,9 @@ export function ChatStoreProvider({
   const effectiveOption = chatModels.find((option) => option.id === effectiveModel);
   const modelSpeechCapable = speechOffered(effectiveOption);
   // Whether the effective model is a voice-CLONE model driven by its configured PRESET voices
-  // (#301), the one speech model with no text-only default voice: a send with a blank voice
-  // relies on the operator having configured a default preset, which the gateway cannot see.
-  // The voices effect below starts such a model on the first preset voice it lists.
-  const modelPresetClone =
-    effectiveOption?.speech === true &&
-    effectiveOption.speech_clone === true &&
-    effectiveOption.speech_clone_voices === true;
+  // (#301; presetCloneOffered). The voices effect below starts such a model on the first preset
+  // voice it lists.
+  const modelPresetClone = presetCloneOffered(effectiveOption);
   // Whether the effective model TRANSCRIBES speech (drives the transcription-thread composer),
   // read as served like `speech`: the backend's own fold of the transcription verdict.
   const modelTranscriptionCapable =
@@ -951,14 +957,24 @@ export function ChatStoreProvider({
     offeredFlavors(effectiveOption).includes('openai');
   // The catalogue's candidates for the other two, the same models the chat's own composers offer
   // (speechOffered, the transcription verdict). Which of them STREAM is the gateway's to say.
+  //
+  // The speech candidates are ordered PLAIN models first, preset-CLONE ones (presetCloneOffered)
+  // after, each group in the catalogue's order, since the first that streams is the one used: a
+  // conversation's text thread carries no audio settings, so a plain model speaks in its default
+  // voice while a preset clone would run with a BLANK voice and fail the first turn. A clone stays
+  // eligible, for a catalogue with no plain streaming model (its first turn then relies on the
+  // operator's default preset).
   const voiceAsrCandidates = useMemo(
     () => chatModels.filter((option) => option.transcription === true).map((option) => option.id),
     [chatModels],
   );
-  const voiceTtsCandidates = useMemo(
-    () => chatModels.filter(speechOffered).map((option) => option.id),
-    [chatModels],
-  );
+  const voiceTtsCandidates = useMemo(() => {
+    const offered = chatModels.filter(speechOffered);
+    return [
+      ...offered.filter((option) => !presetCloneOffered(option)),
+      ...offered.filter(presetCloneOffered),
+    ].map((option) => option.id);
+  }, [chatModels]);
   const voiceChatGap = voiceGapOf(voiceLlmCapable, voiceLegs);
   const voiceChatCapable = voiceChatGap === null;
   const voiceChatOffered =
@@ -1817,12 +1833,13 @@ export function ChatStoreProvider({
   // Ask the gateway which of the catalogue's transcription and speech models STREAM, for Voice
   // Chat (#312): the two gates above, asked of every candidate instead of the picked model, as the
   // conversation's ears and voice are not the thread's to pick (see voiceChatCapable). The first
-  // of each, in the catalogue's order, that the gateway says streams is used. Closed up front and
-  // asked again when the candidates change, or when the thread becomes (or stops being) one a
-  // conversation could run on; a latest-wins guard against a slow stale answer; no lookup at
-  // all for a thread that cannot chat. FAIL CLOSED: a lookup that fails is a no. The candidates
-  // are read through a ref and the effect keyed on their identity, so that a refreshed models
-  // list with the same candidates does not ask again.
+  // of each, in the catalogue's order (the speech models plain-first, see voiceTtsCandidates),
+  // that the gateway says streams is used. Closed up front and asked again when the candidates
+  // change, or when the thread becomes (or stops being) one a conversation could run on; a
+  // latest-wins guard against a slow stale answer; no lookup at all for a thread that cannot
+  // chat. FAIL CLOSED: a lookup that fails is a no. The candidates are read through a ref and the
+  // effect keyed on their identity, so that a refreshed models list with the same candidates does
+  // not ask again.
   const voiceCandidatesRef = useRef({ asr: voiceAsrCandidates, tts: voiceTtsCandidates });
   voiceCandidatesRef.current = { asr: voiceAsrCandidates, tts: voiceTtsCandidates };
   const voiceCandidatesKey = `${voiceAsrCandidates.join('\n')}\u0000${voiceTtsCandidates.join('\n')}`;

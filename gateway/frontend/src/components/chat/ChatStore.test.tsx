@@ -1622,6 +1622,125 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(screen.getByTestId('last').textContent).toBe('canonical answer'));
       expect(screen.getByTestId('last-status').textContent).toBe('complete');
     });
+
+    // The ownership rule of that adopt (useChatRuns): a finished run's refetch lands only while the
+    // run is STILL the chat's entry (its runId, and no longer running). A refetch can outlast the
+    // user's next send, and a stale document that arrives after a newer run took the chat over
+    // would otherwise overwrite that run's transcript.
+    describe('only the run that still owns the chat adopts its refetch', () => {
+      const serverDoc = (user: string, answer: string) => ({
+        settings: {},
+        messages: [
+          { id: `u_${user}`, role: 'user', content: user },
+          { id: `a_${user}`, role: 'assistant', content: answer, status: 'complete' },
+        ],
+      });
+
+      // Run `run_1` is sent and finished, its canonical refetch HELD (not yet answered). Returns
+      // the function that answers it with the document `held`, and the one that sends a second run
+      // (`runId`) on the same chat meanwhile and returns that run's event source.
+      async function finishedRunWithHeldRefetch(held: ReturnType<typeof serverDoc>) {
+        chatApi = makeChatApi([
+          {
+            id: 'c1',
+            title: 'C1',
+            created_at: T,
+            updated_at: T,
+            content: { settings: { model: 'gpt-oss-20b' }, messages: [] },
+          },
+        ]);
+        renderProvider();
+        await waitForReady();
+
+        fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'first' } });
+        fireEvent.click(screen.getByRole('button', { name: 'send' }));
+        await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+        const first = FakeEventSource.instances[0];
+
+        // The first refetch after this point is the held one; any later one reads the rows.
+        let answerHeld: () => void = () => undefined;
+        chatApi.spies.chat.mockImplementationOnce(
+          (id: string) =>
+            new Promise((resolve) => {
+              answerHeld = () =>
+                resolve({
+                  id,
+                  title: 'C1',
+                  created_at: T,
+                  updated_at: T,
+                  content: held,
+                });
+            }),
+        );
+        await act(async () => {
+          first.emit('done', { content: 'answer one', status: 'completed' });
+        });
+        await waitFor(() => expect(screen.getByTestId('streaming').textContent).toBe('false'));
+        // Held: the document of the first run has not been adopted, the buffer is the client's own.
+        expect(screen.getByTestId('last').textContent).toBe('answer one');
+
+        const sendSecond = async (runId: string) => {
+          chatApi.spies.startChatRun.mockResolvedValueOnce({
+            run_id: runId,
+            chat_id: 'c1',
+            status: 'running' as const,
+          });
+          fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'second' } });
+          fireEvent.click(screen.getByRole('button', { name: 'send' }));
+          await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+          return FakeEventSource.instances[1];
+        };
+        return { sendSecond, answerHeld: () => act(async () => answerHeld()) };
+      }
+
+      // The control: the run that is still the chat's entry, finished, adopts a late refetch.
+      it('adopts the refetch of the run that is still the chat entry, however late it arrives', async () => {
+        const run = await finishedRunWithHeldRefetch(serverDoc('first', 'canonical one'));
+
+        await run.answerHeld();
+
+        await waitFor(() => expect(screen.getByTestId('last').textContent).toBe('canonical one'));
+      });
+
+      // Still RUNNING, whatever its id: the entry is either a newer run, or the very same run
+      // subscribed again (the status alone must keep the refetch out, the ids being equal).
+      it.each([
+        { second: 'run_2', entry: 'a newer run' },
+        { second: 'run_1', entry: 'the same run, running again' },
+      ])('does not adopt a refetch while the chat entry is $entry', async ({ second }) => {
+        const run = await finishedRunWithHeldRefetch(serverDoc('stale first', 'stale answer'));
+        const secondEs = await run.sendSecond(second);
+        await act(async () => {
+          secondEs.emit('delta', { content: 'streaming two' });
+        });
+        await waitFor(() => expect(screen.getByTestId('last').textContent).toBe('streaming two'));
+
+        await run.answerHeld();
+
+        // The late document left the running transcript alone.
+        expect(screen.getByTestId('messages-json').textContent).not.toContain('stale');
+        expect(screen.getByTestId('last').textContent).toBe('streaming two');
+        expect(screen.getByTestId('streaming').textContent).toBe('true');
+      });
+
+      it('does not adopt the refetch of a run whose chat a newer, finished run has since adopted', async () => {
+        const run = await finishedRunWithHeldRefetch(serverDoc('stale first', 'stale answer'));
+        const secondEs = await run.sendSecond('run_2');
+        // run_2 commits its transcript and finishes: ITS refetch (the rows) is adopted at once.
+        chatApi.rows[0].content = serverDoc('second', 'canonical two');
+        await act(async () => {
+          secondEs.emit('done', { content: 'answer two', status: 'completed' });
+        });
+        await waitFor(() => expect(screen.getByTestId('last').textContent).toBe('canonical two'));
+        expect(screen.getByTestId('streaming').textContent).toBe('false');
+
+        await run.answerHeld();
+
+        // Not running any more, but no longer run_1's chat either: the older document is dropped.
+        expect(screen.getByTestId('messages-json').textContent).not.toContain('stale');
+        expect(screen.getByTestId('last').textContent).toBe('canonical two');
+      });
+    });
   });
 
   describe(`ChatStoreProvider run kind + elapsed anchor (Task 14) [${locale}]`, () => {
@@ -8089,6 +8208,46 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(text('voice-state')).toBe('connecting');
         // The page's audio is readied inside the click that asks for the microphone.
         expect(playback.prime).toHaveBeenCalled();
+      });
+
+      describe('which speech model speaks', () => {
+        // A voice-CLONE model driven by preset voices: with no audio settings on a text thread it
+        // would speak with a BLANK voice, where a plain model speaks in its default one.
+        const cloneTts = audioModel('tts-clone', {
+          speech: true,
+          speech_clone: true,
+          speech_clone_voices: true,
+        });
+
+        it('prefers a plain speech model over a preset-clone one that comes first in the catalogue', async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          gates();
+          renderProvider([], { models: [voiceLlm, asrA, cloneTts, ttsA] });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-capable')).toBe('true'));
+
+          click('voice-start');
+
+          // Both stream; the clone is first in the catalogue, the plain model is the one used.
+          expect(voiceSessions[0].args.ttsModel).toBe('tts-a');
+          expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalledWith('tts-clone');
+        });
+
+        it('keeps a preset-clone speech model eligible, behind the plain ones', async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          gates();
+          // The plain model does not stream: the clone, the only one that does, is used.
+          chatApi.spies.modelSpeechStreaming.mockImplementation(async (name: string) =>
+            name === 'tts-clone' ? streams : NO_SPEECH_STREAMING,
+          );
+          renderProvider([], { models: [voiceLlm, asrA, cloneTts, ttsA] });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-capable')).toBe('true'));
+
+          click('voice-start');
+
+          expect(voiceSessions[0].args.ttsModel).toBe('tts-clone');
+        });
       });
 
       it('starts in the chat that is OPEN, not the one that was', async () => {

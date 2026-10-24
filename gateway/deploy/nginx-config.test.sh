@@ -21,7 +21,8 @@
 #  useless. Fifteen blocks: server-80, server-443 and the three WebSocket locations (the
 #  agent stream, the live-transcription stream and the voice-chat stream), in each of the
 #  three deployable configurations (the two compose variants share locations.conf, so the
-#  fifteen live in ten physical text blocks).
+#  fifteen live in twelve physical text blocks: six server blocks, plus the three WebSocket
+#  locations in each of locations.conf and the ConfigMap).
 #  It also pins the structural invariants: `listen 80` and the ACME challenge location
 #  survive, `listen 443 ssl` exists, and the shared include is NOT a *.conf under
 #  conf.d/ (nginx auto-includes those at HTTP level, where `location` is illegal).

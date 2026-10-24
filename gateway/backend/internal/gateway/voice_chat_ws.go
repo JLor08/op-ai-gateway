@@ -628,14 +628,15 @@ type voiceMachine struct {
 	// The playout-aware drain bookkeeping (spec 6.2). The orchestrator relays TTS faster than
 	// real time, so audio_done (relay-done) is NOT "the user stopped hearing it." After
 	// audio_done the session stays in draining -- the mic gated -- until playout-done, which the
-	// server computes as max(FLOOR, the client's playback_done), capped by the absolute ceiling.
+	// server computes as max(FLOOR, min(CEILING, the client's playback_done)).
 	// The FLOOR = firstAudioAt + relayedPlaybackDur is the relayed audio's own real-time
 	// duration measured from when playout would have started (the first chunk relayed); it is
 	// the SERVER-AUTHORITATIVE minimum, so the mic NEVER re-opens before it, however early a
 	// (buggy or malicious) client claims playout finished. A playback_done before the floor is
 	// clamped UP to the floor; one after the floor (a slow client still playing) EXTENDS the
-	// drain to the signal; with no signal the drain ends at the floor, and the ceiling
-	// (playbackCapOrDefault) bounds how long a missing or late signal can hold it.
+	// drain to the signal; with no signal the drain waits out the CEILING (playbackCapOrDefault),
+	// the no-signal upper bound that also caps how long a late signal can hold it. A floor that
+	// is itself longer than the ceiling (a very long answer) exits at the floor.
 	//   - firstAudioAt/relayedPlaybackDur accumulate as audio is relayed; playbackRateUnknown
 	//     drops the computed floor (the ceiling is then the only bound) for a chunk with no
 	//     usable rate (defensive).
@@ -1227,14 +1228,15 @@ func (m *voiceMachine) finishAnswer() {
 }
 
 // beginPlaybackWait holds the session in draining (the mic gated) until playout-done, then
-// applies the mic-resume tail (spec 6.2). The drain ends at min(ceiling, max(floor, signal)):
+// applies the mic-resume tail (spec 6.2). The drain ends at max(floor, min(ceiling, signal)):
 //   - FLOOR = the relayed audio's real-time duration, the server-authoritative minimum -- the
-//     mic NEVER re-opens before it, so an early (buggy/malicious) playback_done cannot make the
-//     model hear the TTS still playing;
+//     mic NEVER re-opens before it, so an early (buggy/malicious) playback_done is clamped up
+//     to the floor and cannot make the model hear the TTS still playing;
 //   - a playback_done after the floor extends the drain to the signal (a slow client still
 //     playing);
-//   - the ceiling (playbackCapOrDefault) is the absolute bound so a missing or late signal
-//     cannot wedge the session.
+//   - the ceiling (playbackCapOrDefault) is the no-signal upper bound: with no playback_done
+//     the drain waits out the ceiling (not the floor), so a missing or late signal cannot
+//     wedge the session. It never cuts below the floor.
 //
 // The gate stays server-authoritative: the client signal only says WHEN playout finished, and
 // is never trusted to shorten the drain below the floor. When no audio was relayed there is

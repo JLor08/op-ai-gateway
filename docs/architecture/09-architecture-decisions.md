@@ -9645,10 +9645,11 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   extended text. The airtight version is a single compare-and-swap (the run moves `running → committing`, the machine
   moves `running → canceled`, the loser aborts). It is a recorded follow-up, not done in this change.
 - **Phase 1 chooses the models and the voice for the user.** The portal's thread model is the LLM; the ASR and TTS models
-  are the first catalogue models, in the catalogue's order, that the gateway says stream, and the co-load gate is the real
-  admission check. There is **no three-model picker yet**, and a text thread carries no speech settings, so the TTS speaks
-  in the model's default voice and language. A preset clone model with no default voice can therefore be picked with a
-  blank voice and fail its first turn (degradation, not a loop). The voice run also ignores the chat's own system prompt and
+  are the first catalogue models, in the catalogue's order, that the gateway says stream (plain speech models ahead of
+  preset-clone ones), and the co-load gate is the real admission check. There is **no three-model picker yet**, and a text
+  thread carries no speech settings, so the TTS speaks in the model's default voice and language. A preset clone model with
+  no default voice can therefore still be picked with a blank voice, but only when no plain speech model streams, and fail
+  its first turn (degradation, not a loop). The voice run also ignores the chat's own system prompt and
   sampling settings (`VoiceRunHistory` builds the history with an empty system prompt, and the run's settings carry only
   the model and the kind), which is phase 2. A picker and per-thread voice and language controls are the follow-up.
 - **A non-signaling client drains to the ceiling.** The in-tree client always sends `playback_done`, so it ends at the
