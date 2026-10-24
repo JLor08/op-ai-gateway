@@ -177,12 +177,20 @@ Both registered on `s.mux` in `server.go` beside the live-transcription routes.
 **Down (server → client):**
 - `{"type":"state","state":"idle|listening|thinking|speaking|draining"}` — the
   state machine (drives the UI and the mic gate).
-- `{"type":"asr_partial","text":<provisional>}` — replace-not-append (mirrors
-  the live-ASR `partial` contract).
-- `{"type":"asr_final","text":<final>,"message_id":<id>}` — the finalized user
-  turn (now persisted as a sent user message).
+- `{"type":"asr_partial","text":<provisional>}` — the **current chunk's**
+  provisional text, replace-not-append (mirrors the live-ASR `partial` contract).
+  It is NOT the whole turn: across a pause-tolerant multi-chunk turn the client
+  shows `pendingText` (the finalized chunks so far) **plus** this partial.
+- `{"type":"asr_final","text":<chunk final>}` — the finalized text of **one
+  chunk**, appended to `pendingText`. No `message_id`: nothing is persisted at a
+  chunk boundary. The user turn is persisted only at commit (§5.4/§6.1).
 - `{"type":"answer_delta","text":<increment>}` — LLM token stream (so the
-  answer fills in live), then `{"type":"answer_done","message_id":<id>}`.
+  answer fills in live), then `{"type":"answer_done"}`. `answer_done` is
+  **provisional** — it fires when the answer text is complete (before commit), and
+  a later `answer_reset` can still void it. No `message_id`.
+- The persisted turns are not delivered field-by-field: after `audio_done` the
+  client **refreshes the chat thread** to pick up the committed user + assistant
+  turns (text + stored audio). So no down-frame carries a `message_id`.
 - `{"type":"answer_reset"}` — the speculative LLM run was cancelled because the
   user resumed speaking (§6.1); the client discards the answer preview shown so
   far and returns to showing the growing transcript.
