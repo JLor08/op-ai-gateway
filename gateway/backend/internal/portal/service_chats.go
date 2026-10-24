@@ -1226,10 +1226,76 @@ func (s *Service) VoiceRunHistory(ctx context.Context, owner auth.Token, chatID,
 	if err != nil {
 		return nil, err
 	}
+	// Strip a prior assistant VOICE turn's audio from the LLM history. A stored voice
+	// answer is [{text},{audio_url:/api/portal/chat-blobs/...}] (or [{text},{audio_removed}]
+	// once pruned); resolveChatBlobRefs resolves image parts only and leaves audio
+	// untouched (service_chats_resolve.go), so without this the audio_url -- a
+	// gateway-relative url no upstream can fetch -- would ride verbatim into the next
+	// /v1/chat/completions body from turn 2 of every conversation. The LLM gets the
+	// clean answer TEXT (and any image, kept for a vision model); this is the voice
+	// path alone, so the text/image run history is unchanged.
+	stripVoiceAssistantAudio(history)
 	// The pending turn is the ASR'd text, in hand already -- no blob to resolve -- so
 	// it is appended AFTER the resolution rather than fetched back out of the store.
 	return append(history, ChatAPIMessage{Role: "user", Content: json.RawMessage(mustJSONString(pendingText))}), nil
 }
+
+// stripVoiceAssistantAudio removes audio content parts -- a synthesized answer's
+// audio_url, and the not-stored audio marker -- from the ASSISTANT messages of a voice
+// run's LLM history, in place. Text and every non-audio part (an image kept for a
+// vision model) are left as they are; a plain-string content (a text-only turn) has no
+// part to strip and is untouched. An assistant turn left with no parts becomes an empty
+// string rather than an empty array, which an upstream could reject.
+func stripVoiceAssistantAudio(history []ChatAPIMessage) {
+	for i := range history {
+		if history[i].Role != "assistant" {
+			continue
+		}
+		var parts []json.RawMessage
+		if json.Unmarshal(history[i].Content, &parts) != nil {
+			continue // not an array of parts (a plain-string answer): nothing to strip
+		}
+		kept := make([]json.RawMessage, 0, len(parts))
+		for _, p := range parts {
+			if !isAudioContentPart(p) {
+				kept = append(kept, p)
+			}
+		}
+		if len(kept) == len(parts) {
+			continue // no audio part was present
+		}
+		if len(kept) == 0 {
+			history[i].Content = json.RawMessage(mustJSONString(""))
+			continue
+		}
+		if raw, err := json.Marshal(kept); err == nil {
+			history[i].Content = raw
+		}
+	}
+}
+
+// isAudioContentPart reports whether a content part is an audio part -- a stored
+// answer's audio_url, or the audio_removed not-stored marker -- and so is dropped from a
+// voice run's LLM history.
+func isAudioContentPart(raw json.RawMessage) bool {
+	var p struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &p) != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Type)) {
+	case speechAudioURLPartType, removedAudioPartType:
+		return true
+	default:
+		return false
+	}
+}
+
+// speechAudioURLPartType is the `type` of a stored speech/voice answer's audio part
+// ({"type":"audio_url",...}); the gateway's speechAudioPartType is its twin on the
+// producing side.
+const speechAudioURLPartType = "audio_url"
 
 // CommitVoiceTurn persists a voice turn: the user message (userText) AND the
 // assistant turn (turn) in ONE SaveChatWithBlobs. Unlike a normal chat run -- which

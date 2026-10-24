@@ -356,6 +356,72 @@ func TestVoiceRunBillsLLMAndTTS(t *testing.T) {
 	}
 }
 
+// Multi-turn: a prior assistant voice turn's synthesized audio must NOT ride into the
+// next turn's LLM request. The committed turn is [{text},{audio_url:/api/portal/chat-blobs/…}],
+// and that gateway-relative url no upstream can fetch; the voice LLM history keeps the
+// answer TEXT and strips the audio. This is the turn-2 case the single-turn tests miss.
+func TestVoiceRunHistoryStripsPriorAnswerAudio(t *testing.T) {
+	srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+
+	// Turn 1: a committed voice turn -> [user1, assistant(text + audio_url blob)].
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, "first question")
+	if snap.Status != "completed" {
+		t.Fatalf("turn 1 status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+	wantPriorAnswer := "Mock response for qwen-coder: first question"
+
+	// Sanity: the stored prior answer really does carry the audio_url blob ref that
+	// would otherwise leak into turn 2's request -- so this test would fail without the
+	// strip, not pass vacuously.
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(stored.Content), `"type":"audio_url"`) || !strings.Contains(string(stored.Content), chatBlobRoutePrefix) {
+		t.Fatalf("precondition: the stored prior answer must carry an audio_url blob ref: %s", stored.Content)
+	}
+
+	// Turn 2: the exact /v1/chat/completions body the voice run would POST is
+	// buildChatCompletionsBody over VoiceRunHistory's result.
+	const pending2 = "second question"
+	history, err := srv.Portal.VoiceRunHistory(context.Background(), owner, chatID, pending2)
+	if err != nil {
+		t.Fatalf("VoiceRunHistory: %v", err)
+	}
+	body, err := buildChatCompletionsBody(PrepareRunResult{History: history, Settings: portal.ChatRunSettings{Model: voiceLLMTarget.Model}})
+	if err != nil {
+		t.Fatalf("buildChatCompletionsBody: %v", err)
+	}
+	s := string(body)
+	if !strings.Contains(s, wantPriorAnswer) {
+		t.Fatalf("the LLM request dropped the prior answer's text: %s", s)
+	}
+	if strings.Contains(s, "audio_url") {
+		t.Fatalf("the LLM request still carries the prior answer's audio_url part: %s", s)
+	}
+	if strings.Contains(s, chatBlobRoutePrefix) {
+		t.Fatalf("the LLM request carries a gateway-relative chat-blob url no upstream can fetch: %s", s)
+	}
+	// The pending text is the latest user message.
+	if n := len(history); n == 0 || history[n-1].Role != "user" || !strings.Contains(string(history[n-1].Content), pending2) {
+		t.Fatalf("the latest message must be the pending user turn %q: %+v", pending2, history)
+	}
+
+	// And turn 2 runs end to end: the stripped history drives a clean completion and
+	// commits, leaving four messages.
+	_, snap2 := voiceRunOutcome(t, srv, owner, chatID, pending2)
+	if snap2.Status != "completed" {
+		t.Fatalf("turn 2 status = %q (err %q), want completed", snap2.Status, snap2.Err)
+	}
+	after, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgs := storedMessages(t, after.Content); len(msgs) != 4 {
+		t.Fatalf("after two voice turns the chat has %d messages, want 4 [user, assistant, user, assistant]: %s", len(msgs), after.Content)
+	}
+}
+
 // A subscriber sees the answer's text deltas FIRST and the synthesized audio deltas
 // AFTER: the run streams the whole answer, then speaks it.
 func TestVoiceRunPublishesTextThenAudio(t *testing.T) {
