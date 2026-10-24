@@ -74,6 +74,13 @@ type Config struct {
 	CaptureEncryptionKey   string
 	CertEncryptionKey      string
 	CertEdgeOutputDir      string
+	// VoiceCoLoadTimeout bounds the Voice Chat co-load gate that runs when the mode is
+	// enabled (POST /api/portal/voice-chat-ticket): the gate cold-starts the chosen
+	// transcription, chat and speech models and proves they stay resident together, which
+	// can take minutes, so it gets its own deadline rather than waiting without bound.
+	// Default 120s; junk or <= 0 uses the default. The reverse proxy's read timeout for
+	// that route must be at least this long.
+	VoiceCoLoadTimeout time.Duration
 	// CertEdgeProbeTarget is the host:port of the gateway's OWN edge (nginx)
 	// TLS listener the synthetic self-probe dials (e.g. "web:443" in compose,
 	// the Service name+port nginx's :443 server block is reachable at in
@@ -275,6 +282,11 @@ func Load() (Config, error) {
 		SeedAppHealthMode: l.str("OP_AI_GATEWAY_SEED_APP_HEALTH_MODE", ""),
 		// Per-probe HTTP timeout for the app-health reachability loop.
 		AppHealthProbeTimeout: l.duration("OP_AI_GATEWAY_APP_HEALTH_PROBE_TIMEOUT", 3*time.Second),
+		// Deadline of the Voice Chat co-load gate (see the VoiceCoLoadTimeout field doc).
+		// 120s is the literal of gateway.DefaultVoiceCoLoadTimeout (this package cannot
+		// import gateway). Junk/0/negative -> the 120s default: an unbounded gate is not
+		// an option.
+		VoiceCoLoadTimeout: l.duration("OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT", 120*time.Second),
 		// Retention window (hours) for persisted rich telemetry samples; the
 		// prune loop drops samples older than this. Default 168 = 7 days; junk
 		// or <= 0 falls back to the default via integer().

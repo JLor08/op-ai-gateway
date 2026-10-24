@@ -1103,6 +1103,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SessionMaxAge:                   cfg.SessionMaxTTL,
 		PublicURL:                       cfg.PublicURL,
 		StreamIdleTimeout:               cfg.StreamIdleTimeout,
+		VoiceCoLoadTimeout:              cfg.VoiceCoLoadTimeout,
 		SwapProtectWindow:               time.Duration(cfg.SwapProtectWindowSeconds) * time.Second,
 		SessionReservationWindow:        time.Duration(cfg.SessionReservationWindowSeconds) * time.Second,
 		CapacityVRAMSafetyMarginPercent: cfg.CapacityVRAMSafetyMarginPercent,

@@ -5,12 +5,19 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
+	"op-ai-gateway/internal/usage"
 	"reflect"
 	"slices"
 	"strings"
@@ -582,18 +589,721 @@ func TestVoiceCoLoadGateStopsOnACancelledContext(t *testing.T) {
 	}
 }
 
-// The five codes are the portal's wire contract: the frontend and the docs key on these
+// The six codes are the portal's wire contract: the frontend and the docs key on these
 // exact strings.
 func TestVoiceChatErrorCodesAreStable(t *testing.T) {
 	for got, want := range map[string]string{
-		voiceChatASRUnavailable: "portal.voice_chat_asr_unavailable",
-		voiceChatLLMUnavailable: "portal.voice_chat_llm_unavailable",
-		voiceChatTTSUnavailable: "portal.voice_chat_tts_unavailable",
-		voiceChatCoLoadFailed:   "portal.voice_chat_coload_failed",
-		voiceChatTicketFailed:   "portal.voice_chat_ticket_failed",
+		voiceChatASRUnavailable:       "portal.voice_chat_asr_unavailable",
+		voiceChatLLMUnavailable:       "portal.voice_chat_llm_unavailable",
+		voiceChatTTSUnavailable:       "portal.voice_chat_tts_unavailable",
+		voiceChatCoLoadFailed:         "portal.voice_chat_coload_failed",
+		voiceChatTicketFailed:         "portal.voice_chat_ticket_failed",
+		voiceChatAudioSettingsInvalid: "portal.voice_chat_audio_settings_invalid",
 	} {
 		if got != want {
 			t.Fatalf("code = %q, want %q", got, want)
 		}
+	}
+}
+
+// The voice-chat ticket endpoint (POST /api/portal/voice-chat-ticket) is driven through the
+// real mux over the gate's own routing world, so the status and code a refusal reaches the
+// browser with are the ones the real gate produced, not a stub's. What the endpoint adds in
+// front of the gate -- the portal principal, the CSRF header, the chat the ticket is for --
+// is added to that world here.
+
+const (
+	voiceTicketPath = "/api/portal/voice-chat-ticket"
+
+	// The two bearers of the endpoint's fixture. The service token carries gateway:use ON
+	// PURPOSE: the portal gate refuses a service token by its KIND, so a refusal here proves
+	// the kind check and not a missing scope.
+	voiceTicketBearer        = "voice-secret"
+	voiceTicketServiceBearer = "voice-service-secret"
+)
+
+// voiceTicketWorld is the co-load gate's world plus the principals and the chat store the
+// ticket endpoint reads in front of the gate.
+type voiceTicketWorld struct {
+	*voiceGateWorld
+	directory *portal.MemoryDirectory
+	chats     *portal.Service
+}
+
+func newVoiceTicketWorld(t *testing.T, prov provider.Client) *voiceTicketWorld {
+	t.Helper()
+	w := newVoiceGateWorld(t, prov, false)
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	tokens := auth.NewTokenStore()
+	tokens.AddPlainToken(auth.Token{ID: "tok_voice", UserID: "usr_voice", ProjectID: "proj_voice", Name: "Voice", Active: true, Scopes: []string{"gateway:use"}}, voiceTicketBearer)
+	tokens.AddPlainToken(auth.Token{ID: "tok_svc", Kind: "service", ServiceID: "svc_voice", ServiceName: "Voice", Active: true, Scopes: []string{"gateway:use"}}, voiceTicketServiceBearer)
+	directory := portal.NewMemoryDirectory(tokens)
+	cipher, err := capture.New(testCaptureKey)
+	if err != nil {
+		t.Fatalf("capture.New: %v", err)
+	}
+	svc := portal.NewService(portal.ServiceDeps{
+		Users: directory, Tokens: directory, Usage: usage.NewRecorder(), Routes: w.routes,
+		Clock: func() time.Time { return now }, ModelLister: provider.NewMock(),
+		Chats: store.NewMemoryChatStore(0), Cipher: cipher,
+	})
+	w.srv.Tokens = tokens
+	w.srv.Portal = svc
+	return &voiceTicketWorld{voiceGateWorld: w, directory: directory, chats: svc}
+}
+
+// newChat creates a chat owned by owner whose stored settings are the given JSON object, and
+// returns its id.
+func (w *voiceTicketWorld) newChat(t *testing.T, owner, settings string) string {
+	t.Helper()
+	created, err := w.chats.CreateChat(context.Background(), auth.Token{UserID: owner}, portal.CreateChatRequest{
+		Content: json.RawMessage(`{"settings":` + settings + `,"messages":[]}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateChat: %v", err)
+	}
+	return created.ID
+}
+
+// voiceTicketBody is the request body for the three gateway model names.
+func voiceTicketBody(chatID, asr, llm, tts string) string {
+	body, err := json.Marshal(map[string]string{"chat_id": chatID, "asr_model": asr, "llm_model": llm, "tts_model": tts})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
+func (w *voiceTicketWorld) post(body string, hdr map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, voiceTicketPath, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	w.srv.ServeHTTP(rec, req)
+	return rec
+}
+
+// postBearer posts body as the fixture's user token.
+func (w *voiceTicketWorld) postBearer(body string) *httptest.ResponseRecorder {
+	return w.post(body, map[string]string{"Authorization": "Bearer " + voiceTicketBearer})
+}
+
+// redeem reads the ticket out of a 200 response and redeems it on the server's own store,
+// which is what the WebSocket upgrade does with it.
+func (w *voiceTicketWorld) redeem(t *testing.T, rec *httptest.ResponseRecorder) voiceTicketClaims {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Ticket == "" {
+		t.Fatalf("response carries no ticket (%v): %s", err, rec.Body.String())
+	}
+	claims, err := w.srv.voiceTickets.Redeem(body.Ticket)
+	if err != nil {
+		t.Fatalf("the minted ticket does not redeem on the server's own store: %v", err)
+	}
+	return claims
+}
+
+// requireNothingStarted fails when the fake agent was asked to start or read anything: a
+// refusal that precedes the gate must not have cost a cold start.
+func requireNothingStarted(t *testing.T, fake *voiceGateFake) {
+	t.Helper()
+	if len(fake.ensured) != 0 || len(fake.probes) != 0 {
+		t.Fatalf("the agent was touched (ensured %v, reads %+v) by a request refused before the gate", fake.ensured, fake.probes)
+	}
+}
+
+// voiceGateStalledEnsure is an agent whose ensure answers nothing until its context ends:
+// the cold start that never finishes.
+type voiceGateStalledEnsure struct{ voiceGateFake }
+
+func (f *voiceGateStalledEnsure) EnsureRuntimeModel(ctx context.Context, target routing.Target) error {
+	f.mu.Lock()
+	f.ensured = append(f.ensured, target.ProviderModel)
+	f.mu.Unlock()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A pass mints a ticket that carries what the WebSocket will need and never takes from the
+// client: the three resolved targets, the chat, who asked, the chat's stored speech settings
+// and the one PCM shape the browser streams. The response is the ticket and nothing else.
+func TestVoiceTicketEndpointMintsOnGatePass(t *testing.T) {
+	fake := &voiceGateFake{}
+	w := newVoiceTicketWorld(t, fake)
+	chatID := w.newChat(t, "usr_voice", `{"kind":"speech","model":"voice-tts","audio":{"voice":"alba","speed":1.25,"language":"de","stream":false,"passthrough":{"instructions":"calm"}}}`)
+
+	rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+	claims := w.redeem(t, rec)
+	if claims.ASR.Model != "voice-asr" || claims.ASR.ProviderModel != "whisper_voice" || claims.ASR.ServerID != voiceGateAgentServer || claims.ASR.RouteID != "route-voice-asr" {
+		t.Fatalf("ASR target = %+v", claims.ASR)
+	}
+	if claims.LLM.Model != "voice-llm" || claims.LLM.ProviderModel != "llm_voice" || claims.LLM.ServerID != voiceGateLLMServer {
+		t.Fatalf("LLM target = %+v", claims.LLM)
+	}
+	if claims.TTS.Model != "voice-tts" || claims.TTS.ProviderModel != "tts_voice" || claims.TTS.ServerID != voiceGateAgentServer || claims.TTS.RouteID != "route-voice-tts" {
+		t.Fatalf("TTS target = %+v", claims.TTS)
+	}
+	if claims.ChatID != chatID || claims.UserID != "usr_voice" || claims.TokenID != "tok_voice" || claims.ProjectID != "proj_voice" || claims.ServiceID != "" {
+		t.Fatalf("chat/user/token/project/service = %q/%q/%q/%q/%q", claims.ChatID, claims.UserID, claims.TokenID, claims.ProjectID, claims.ServiceID)
+	}
+	speed, stream := 1.25, false
+	wantAudio := portal.ChatAudioSettings{
+		Voice: "alba", Speed: &speed, Language: "de", Stream: &stream,
+		Passthrough: map[string]json.RawMessage{"instructions": json.RawMessage(`"calm"`)},
+	}
+	if !reflect.DeepEqual(claims.Audio, wantAudio) {
+		t.Fatalf("Audio = %+v, want the chat's stored speech settings %+v", claims.Audio, wantAudio)
+	}
+	if claims.SampleRate != 16000 || claims.Channels != 1 || claims.SampleFormat != "s16le" {
+		t.Fatalf("PCM = %d/%d/%q, want the 16 kHz mono s16le the browser streams", claims.SampleRate, claims.Channels, claims.SampleFormat)
+	}
+	if want := []string{"whisper_voice", "tts_voice"}; !slices.Equal(fake.ensured, want) {
+		t.Fatalf("ensured = %v, want the gate to have warmed %v", fake.ensured, want)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if len(body) != 1 || body["ticket"] == nil {
+		t.Fatalf("response = %v, want exactly one key, ticket: the claims stay encrypted inside it", body)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+// A chat that stores no speech settings (a plain text chat, which PrepareChatRun clears them
+// from) is still voice-chattable: the ticket carries the zero settings, i.e. the model's own
+// default voice.
+func TestVoiceTicketEndpointMintsDefaultAudioForAChatWithoutSpeechSettings(t *testing.T) {
+	for name, settings := range map[string]string{
+		"empty settings":   `{}`,
+		"text settings":    `{"model":"voice-llm","temperature":0.7}`,
+		"null audio":       `{"audio":null}`,
+		"null settings":    `null`,
+		"settings missing": ``,
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newVoiceTicketWorld(t, &voiceGateFake{})
+			content := `{"messages":[]}`
+			if settings != "" {
+				content = `{"settings":` + settings + `,"messages":[]}`
+			}
+			created, err := w.chats.CreateChat(context.Background(), auth.Token{UserID: "usr_voice"}, portal.CreateChatRequest{Content: json.RawMessage(content)})
+			if err != nil {
+				t.Fatalf("CreateChat: %v", err)
+			}
+
+			claims := w.redeem(t, w.postBearer(voiceTicketBody(created.ID, "voice-asr", "voice-llm", "voice-tts")))
+
+			if !reflect.DeepEqual(claims.Audio, portal.ChatAudioSettings{}) {
+				t.Fatalf("Audio = %+v, want the zero settings", claims.Audio)
+			}
+		})
+	}
+}
+
+// The model names are trimmed the way the other audio gates trim them.
+func TestVoiceTicketEndpointTrimsTheModelNames(t *testing.T) {
+	w := newVoiceTicketWorld(t, &voiceGateFake{})
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	claims := w.redeem(t, w.postBearer(voiceTicketBody("  "+chatID+"  ", "  voice-asr ", " voice-llm", "voice-tts\t")))
+
+	if claims.ASR.RouteID != "route-voice-asr" || claims.LLM.RouteID != "route-voice-llm" || claims.TTS.RouteID != "route-voice-tts" || claims.ChatID != chatID {
+		t.Fatalf("routes/chat = %q/%q/%q/%q", claims.ASR.RouteID, claims.LLM.RouteID, claims.TTS.RouteID, claims.ChatID)
+	}
+}
+
+// Every mint is its own ticket, so one cannot stand in for another.
+func TestVoiceTicketEndpointEveryMintIsDistinct(t *testing.T) {
+	w := newVoiceTicketWorld(t, &voiceGateFake{})
+	chatID := w.newChat(t, "usr_voice", `{}`)
+	body := voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts")
+
+	first, second := w.redeem(t, w.postBearer(body)), w.redeem(t, w.postBearer(body))
+
+	if first.Nonce == second.Nonce {
+		t.Fatalf("two mints share the nonce %q", first.Nonce)
+	}
+}
+
+// A gate refusal is the gate's own code at the status its kind maps to -- a leg that cannot
+// serve its role is the caller's to change (400), models that cannot be held together are a
+// conflict of the deployment (409) -- and nothing is minted. The message is worded here from
+// the code: the cause (the agent's reply, an internal model name) is for the log, never the
+// client.
+func TestVoiceTicketEndpointRefusesLeg(t *testing.T) {
+	blocked := &provider.RouterError{Code: voiceAdmissionBlockedCode, Err: fmt.Errorf("%w: upstream status 503", provider.ErrUpstreamStarting)}
+	for _, tc := range []struct {
+		name          string
+		fake          *voiceGateFake
+		asr, llm, tts string
+		wantStatus    int
+		wantCode      string
+	}{
+		{"an unknown asr model", &voiceGateFake{}, "no-such-asr", "voice-llm", "voice-tts", http.StatusBadRequest, voiceChatASRUnavailable},
+		{"an asr model that does not stream", &voiceGateFake{}, "voice-asr-offline", "voice-llm", "voice-tts", http.StatusBadRequest, voiceChatASRUnavailable},
+		{"an unknown chat model", &voiceGateFake{}, "voice-asr", "no-such-llm", "voice-tts", http.StatusBadRequest, voiceChatLLMUnavailable},
+		{"an audio model in the llm slot", &voiceGateFake{}, "voice-asr", "voice-asr", "voice-tts", http.StatusBadRequest, voiceChatLLMUnavailable},
+		{"an unknown speech model", &voiceGateFake{}, "voice-asr", "voice-llm", "no-such-tts", http.StatusBadRequest, voiceChatTTSUnavailable},
+		{"a speech model that does not stream", &voiceGateFake{}, "voice-asr", "voice-llm", "voice-tts-buffered", http.StatusBadRequest, voiceChatTTSUnavailable},
+		{"an agent that refuses to admit a child", &voiceGateFake{ensureErr: map[string]error{"tts_voice": blocked}}, "voice-asr", "voice-llm", "voice-tts", http.StatusConflict, voiceChatCoLoadFailed},
+		{"a start that evicts an earlier child", &voiceGateFake{slots: 1}, "voice-asr", "voice-llm", "voice-tts", http.StatusConflict, voiceChatCoLoadFailed},
+		{"a residency that cannot be read", &voiceGateFake{probeErr: errors.New("agent unreachable")}, "voice-asr", "voice-llm", "voice-tts", http.StatusConflict, voiceChatCoLoadFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newVoiceTicketWorld(t, tc.fake)
+			chatID := w.newChat(t, "usr_voice", `{}`)
+
+			rec := w.postBearer(voiceTicketBody(chatID, tc.asr, tc.llm, tc.tts))
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), tc.wantCode)
+			requireNoTicket(t, rec)
+			for _, leak := range []string{"admission_blocked", "evicted", "unreachable", "whisper_", "tts_voice", "llm_voice", "srv-voice"} {
+				if strings.Contains(rec.Body.String(), leak) {
+					t.Fatalf("body = %s, want the cause kept out of the client's response (found %q)", rec.Body.String(), leak)
+				}
+			}
+		})
+	}
+}
+
+// Every code the gate can refuse with has a row: the two kinds of unavailable leg are the
+// caller's (400), a pairing that cannot be held resident is a conflict (409), and a ticket
+// that could not be issued is the server's (500), as is any code nobody mapped.
+func TestVoiceTicketEndpointMapsEveryGateCodeToItsStatus(t *testing.T) {
+	for code, want := range map[string]int{
+		voiceChatASRUnavailable:       http.StatusBadRequest,
+		voiceChatLLMUnavailable:       http.StatusBadRequest,
+		voiceChatTTSUnavailable:       http.StatusBadRequest,
+		voiceChatAudioSettingsInvalid: http.StatusBadRequest,
+		voiceChatCoLoadFailed:         http.StatusConflict,
+		voiceChatTicketFailed:         http.StatusInternalServerError,
+		"portal.voice_chat_unmapped":  http.StatusInternalServerError,
+	} {
+		status, body := voiceChatRefusal(code)
+		if status != want {
+			t.Fatalf("%s: status = %d, want %d", code, status, want)
+		}
+		if body.Error.Message == "" {
+			t.Fatalf("%s: no message", code)
+		}
+		wantCode := code
+		if code == "portal.voice_chat_unmapped" {
+			wantCode = voiceChatTicketFailed // an unforeseen code is never echoed
+		}
+		if body.Error.Code != wantCode {
+			t.Fatalf("%s: body code = %q, want %q", code, body.Error.Code, wantCode)
+		}
+	}
+}
+
+// THE CSRF DEFENSE, as for the live-transcription ticket: the WebSocket upgrade cannot carry
+// X-OP-CSRF, so this POST is the only place the portal's protection is applied to the voice
+// path. A session cookie without the header (or with a wrong one) is 403 and starts nothing;
+// the same cookie with it is the positive control and mints the logged-in user's ticket.
+func TestVoiceTicketEndpointRequiresCSRF(t *testing.T) {
+	fake := &voiceGateFake{}
+	w := newVoiceTicketWorld(t, fake)
+	withLiveTicketSessions(w.srv, w.directory)
+	seedLoginUser(t, w.directory, "usr_session", "voice@example.test", "password-1", "user")
+	cookie := loginCookie(t, w.srv, "voice@example.test", "password-1")
+	cookieHeader := cookie.Name + "=" + cookie.Value
+	chatID := w.newChat(t, "usr_session", `{}`)
+	body := voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts")
+
+	for _, tc := range []struct {
+		name string
+		hdr  map[string]string
+	}{
+		{"no CSRF header", map[string]string{"Cookie": cookieHeader}},
+		{"a CSRF header that is not the portal's value", map[string]string{"Cookie": cookieHeader, csrfHeaderName: "0"}},
+		{"an empty CSRF header", map[string]string{"Cookie": cookieHeader, csrfHeaderName: ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := w.post(body, tc.hdr)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "auth.csrf_required")
+			requireNoTicket(t, rec)
+			requireNothingStarted(t, fake)
+		})
+	}
+
+	claims := w.redeem(t, w.post(body, map[string]string{"Cookie": cookieHeader, csrfHeaderName: "1"}))
+	// The session principal carries the user and no token row.
+	if claims.UserID != "usr_session" || claims.TokenID != "" || claims.ChatID != chatID {
+		t.Fatalf("UserID/TokenID/ChatID = %q/%q/%q, want usr_session, no token and the chat", claims.UserID, claims.TokenID, claims.ChatID)
+	}
+}
+
+// A service token is the gateway's "LLM-invoke only" principal and never reaches a portal
+// route, whatever scopes it carries: refused 401 before the body is read, nothing started.
+func TestVoiceTicketEndpointRejectsServiceToken(t *testing.T) {
+	fake := &voiceGateFake{}
+	w := newVoiceTicketWorld(t, fake)
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	rec := w.post(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"), map[string]string{"Authorization": "Bearer " + voiceTicketServiceBearer})
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "auth.invalid_token")
+	requireNoTicket(t, rec)
+	requireNothingStarted(t, fake)
+}
+
+// No credentials, an unknown bearer and a token without gateway:use are each refused before
+// anything is resolved or started.
+func TestVoiceTicketEndpointRequiresAuthenticationAndScope(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		hdr        map[string]string
+		wantStatus int
+		wantCode   string
+	}{
+		{"no credentials", nil, http.StatusUnauthorized, "auth.invalid_token"},
+		{"an unknown bearer", map[string]string{"Authorization": "Bearer not-a-token"}, http.StatusUnauthorized, "auth.invalid_token"},
+		{"a token without gateway:use", map[string]string{"Authorization": "Bearer invoke-secret"}, http.StatusForbidden, "auth.insufficient_scope"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &voiceGateFake{}
+			w := newVoiceTicketWorld(t, fake)
+			w.srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_invoke", UserID: "usr_voice", Active: true, Scopes: []string{"llm:invoke"}}, "invoke-secret")
+			chatID := w.newChat(t, "usr_voice", `{}`)
+
+			rec := w.post(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"), tc.hdr)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), tc.wantCode)
+			requireNoTicket(t, rec)
+			requireNothingStarted(t, fake)
+		})
+	}
+}
+
+// The ticket is minted on POST only: it creates something, and a GET is CSRF-exempt.
+func TestVoiceTicketEndpointRefusesOtherMethods(t *testing.T) {
+	w := newVoiceTicketWorld(t, &voiceGateFake{})
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		req := httptest.NewRequest(method, voiceTicketPath, nil)
+		req.Header.Set("Authorization", "Bearer "+voiceTicketBearer)
+		rec := httptest.NewRecorder()
+		w.srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s: status = %d, want 405", method, rec.Code)
+		}
+		if allow := rec.Header().Get("Allow"); allow != http.MethodPost {
+			t.Fatalf("%s: Allow = %q, want POST", method, allow)
+		}
+	}
+}
+
+// A blank model on any leg is the endpoint family's own 400 (model.name_required), before
+// the chat is read or anything is started: it is not a leg that "cannot be used".
+func TestVoiceTicketEndpointRefusesABlankModel(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		asr, llm, tts string
+	}{
+		{"asr", "", "voice-llm", "voice-tts"},
+		{"llm", "voice-asr", "   ", "voice-tts"},
+		{"tts", "voice-asr", "voice-llm", "\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &voiceGateFake{}
+			w := newVoiceTicketWorld(t, fake)
+			chatID := w.newChat(t, "usr_voice", `{}`)
+
+			rec := w.postBearer(voiceTicketBody(chatID, tc.asr, tc.llm, tc.tts))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), audioVoicesModelRequired)
+			requireNoTicket(t, rec)
+			requireNothingStarted(t, fake)
+		})
+	}
+}
+
+// A body that is not one JSON object of the right shape is the shared request.invalid_json.
+func TestVoiceTicketEndpointRefusesAMalformedBody(t *testing.T) {
+	for _, body := range []string{``, `not json`, `[]`, `{"chat_id":7}`, `{"asr_model":["a"]}`, voiceTicketBody("c", "a", "b", "c") + `{}`} {
+		w := newVoiceTicketWorld(t, &voiceGateFake{})
+
+		rec := w.postBearer(body)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%q: status = %d, want 400; body = %s", body, rec.Code, rec.Body.String())
+		}
+		requireErrorCode(t, rec.Body.String(), codeRequestInvalidJSON)
+		requireNoTicket(t, rec)
+	}
+}
+
+// The chat is owner-scoped like every portal chat read: a blank id, an unknown chat and
+// another user's chat are the same 404 portal.chat_not_found (no probe of which ids exist),
+// and the chat is read BEFORE the gate, so none of them costs a cold start.
+func TestVoiceTicketEndpointRefusesAChatThatIsNotTheCallers(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		chat  func(w *voiceTicketWorld) string
+		model string
+	}{
+		{"a blank chat id", func(*voiceTicketWorld) string { return "  " }, "voice-asr"},
+		{"an unknown chat", func(*voiceTicketWorld) string { return "chat_does_not_exist" }, "voice-asr"},
+		{"another user's chat", func(w *voiceTicketWorld) string { return w.newChat(t, "usr_someone_else", `{}`) }, "voice-asr"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &voiceGateFake{}
+			w := newVoiceTicketWorld(t, fake)
+
+			rec := w.postBearer(voiceTicketBody(tc.chat(w), tc.model, "voice-llm", "voice-tts"))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "portal.chat_not_found")
+			requireNoTicket(t, rec)
+			requireNothingStarted(t, fake)
+		})
+	}
+}
+
+// The ticket rides a Sec-WebSocket-Protocol header, which a proxy refuses past its header-line
+// limit (8 KB at nginx's default), so the chat's speech settings are capped: their JSON may be
+// voiceTicketAudioMaxBytes at most, voice and language included, because they are free text a
+// user types. At the cap the ticket mints and stays well under the proxy limit; one byte over,
+// the request is refused 400 BEFORE the gate, rather than minting a ticket the proxy would
+// drop.
+func TestVoiceTicketEndpointCapsTheChatsAudioSettings(t *testing.T) {
+	// {"voice":"..."} is len(`{"voice":""}`) = 12 bytes around the name.
+	const voiceEnvelope = 12
+	atCap := strings.Repeat("v", voiceTicketAudioMaxBytes-voiceEnvelope)
+
+	t.Run("at the cap", func(t *testing.T) {
+		w := newVoiceTicketWorld(t, &voiceGateFake{})
+		chatID := w.newChat(t, "usr_voice", `{"audio":{"voice":"`+atCap+`"}}`)
+
+		rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+		claims := w.redeem(t, rec)
+		if claims.Audio.Voice != atCap {
+			t.Fatalf("voice length = %d, want the cap-sized voice carried whole", len(claims.Audio.Voice))
+		}
+		var body struct {
+			Ticket string `json:"ticket"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &body)
+		t.Logf("ticket at the settings cap: %d bytes", len(body.Ticket))
+		// 8 KB is the line limit; the ticket shares its line with the header name and the
+		// fixed subprotocol, so a ticket must leave them room.
+		if len(body.Ticket) > voiceTicketMaxBytes || voiceTicketMaxBytes > 7168 {
+			t.Fatalf("ticket = %d bytes with a ceiling of %d, want it under the proxy's 8 KB header line", len(body.Ticket), voiceTicketMaxBytes)
+		}
+	})
+
+	for name, settings := range map[string]string{
+		"one byte over":      `{"audio":{"voice":"` + atCap + `v"}}`,
+		"an oversized value": `{"audio":{"passthrough":{"instructions":"` + strings.Repeat("x", 3*voiceTicketAudioMaxBytes) + `"}}}`,
+		"many small keys": func() string {
+			var keys []string
+			for i := 0; i < 400; i++ {
+				keys = append(keys, fmt.Sprintf(`"k%03d":%d`, i, i))
+			}
+			return `{"audio":{"passthrough":{` + strings.Join(keys, ",") + `}}}`
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := &voiceGateFake{}
+			w := newVoiceTicketWorld(t, fake)
+			chatID := w.newChat(t, "usr_voice", settings)
+
+			rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), voiceChatAudioSettingsInvalid)
+			requireNoTicket(t, rec)
+			requireNothingStarted(t, fake)
+		})
+	}
+}
+
+// Stored speech settings that do not decode as speech settings are as unusable as oversized
+// ones: the same 400, not a silent fall back to the default voice the user did not pick.
+func TestVoiceTicketEndpointRefusesUnreadableAudioSettings(t *testing.T) {
+	for name, settings := range map[string]string{
+		"audio is a string":            `{"audio":"alba"}`,
+		"speed is not a number":        `{"audio":{"speed":"fast"}}`,
+		"passthrough is not an object": `{"audio":{"passthrough":[1,2]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := &voiceGateFake{}
+			w := newVoiceTicketWorld(t, fake)
+			chatID := w.newChat(t, "usr_voice", settings)
+
+			rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), voiceChatAudioSettingsInvalid)
+			requireNoTicket(t, rec)
+			requireNothingStarted(t, fake)
+		})
+	}
+}
+
+// The gate can block for a whole cold start (it ensures models), so the endpoint bounds it
+// with its own deadline, and a gate that outlives it refuses as a co-load failure -- the models
+// could not be made resident in time -- not as an unavailable leg and not by hanging. The
+// stalled agent answers nothing until its context ends, so only the deadline ends the call.
+func TestVoiceTicketEndpointBoundsTheGateWithADeadline(t *testing.T) {
+	fake := &voiceGateStalledEnsure{}
+	w := newVoiceTicketWorld(t, fake)
+	w.srv.voiceCoLoadTimeout = 150 * time.Millisecond
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	start := time.Now()
+	rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), voiceChatCoLoadFailed)
+	requireNoTicket(t, rec)
+	if elapsed > 10*time.Second {
+		t.Fatalf("the request took %v, want the %v deadline to have ended it", elapsed, w.srv.voiceCoLoadTimeout)
+	}
+	if want := []string{"whisper_voice"}; !slices.Equal(fake.ensured, want) {
+		t.Fatalf("ensured = %v, want the stalled first start only", fake.ensured)
+	}
+}
+
+// voiceStalledCapabilities is a routing store whose verdict read answers nothing until its
+// context ends: the slow read a deadline can catch a leg in while it is still being resolved,
+// before anything is started.
+type voiceStalledCapabilities struct{ routing.Store }
+
+func (voiceStalledCapabilities) MappingCapabilities(ctx context.Context, _ string) ([]routing.CapabilityRow, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A deadline that fires while a leg is still being RESOLVED (not started) is the same
+// co-load refusal: the caller sees one answer for "the gate did not finish in time", whichever
+// step it was in when the time ran out. Left to the gate alone, the stalled verdict read here
+// is a streaming ASR "that does not stream" and answers asr_unavailable.
+func TestVoiceTicketEndpointMapsADeadlineDuringResolutionToCoLoadFailed(t *testing.T) {
+	fake := &voiceGateFake{}
+	w := newVoiceTicketWorld(t, fake)
+	w.srv.Routes = voiceStalledCapabilities{Store: w.routes}
+	w.srv.voiceCoLoadTimeout = 150 * time.Millisecond
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), voiceChatCoLoadFailed)
+	requireNoTicket(t, rec)
+	requireNothingStarted(t, fake)
+}
+
+// A server with no ticket store (a bare Server that never went through New) fails closed with
+// a 500 rather than panicking -- and before the gate, so it has not warmed three models for a
+// ticket it cannot issue.
+func TestVoiceTicketEndpointWithoutAStoreFailsClosed(t *testing.T) {
+	fake := &voiceGateFake{}
+	w := newVoiceTicketWorld(t, fake)
+	w.srv.voiceTickets = nil
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), voiceChatTicketFailed)
+	requireNoTicket(t, rec)
+	requireNothingStarted(t, fake)
+}
+
+// The same fail-closed answer for a server that has no portal service to read the chat from.
+func TestVoiceTicketEndpointWithoutAPortalFailsClosed(t *testing.T) {
+	fake := &voiceGateFake{}
+	w := newVoiceTicketWorld(t, fake)
+	w.srv.Portal = nil
+
+	rec := w.postBearer(voiceTicketBody("chat_x", "voice-asr", "voice-llm", "voice-tts"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), voiceChatTicketFailed)
+	requireNoTicket(t, rec)
+	requireNothingStarted(t, fake)
+}
+
+// A ticket that would not fit a proxy's header line is never handed out, whatever made it
+// big: here a mapping whose upstream name is pathologically long, which no limit on the
+// chat's own settings can prevent. The mint is refused 500 (the operator's to fix, and
+// logged), instead of a ticket the WebSocket upgrade could never present.
+func TestVoiceTicketEndpointRefusesATicketTooLargeForAProxyHeader(t *testing.T) {
+	w := newVoiceTicketWorld(t, &voiceGateFake{})
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	if err := w.routes.UpdateMapping(context.Background(), routing.ModelMapping{ID: "route-voice-asr", ApplicationID: "app-voice-agent", GatewayModelName: "voice-asr", AppModelName: strings.Repeat("m", 3*voiceTicketMaxBytes), Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("UpdateMapping: %v", err)
+	}
+	chatID := w.newChat(t, "usr_voice", `{}`)
+
+	rec := w.postBearer(voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), voiceChatTicketFailed)
+	requireNoTicket(t, rec)
+}
+
+// New builds the store the endpoint mints on, so a real server has one, and the gate deadline
+// defaults to the documented 120 s unless a deployment sets one.
+func TestNewServerWiresAVoiceTicketStoreAndTheCoLoadDeadline(t *testing.T) {
+	srv := NewTestServer()
+	if srv.voiceTickets == nil {
+		t.Fatal("New left voiceTickets nil, want a store")
+	}
+	if srv.voiceCoLoadTimeout != 120*time.Second || DefaultVoiceCoLoadTimeout != 120*time.Second {
+		t.Fatalf("voiceCoLoadTimeout = %v (default %v), want 120s", srv.voiceCoLoadTimeout, DefaultVoiceCoLoadTimeout)
+	}
+	if set := New(ServerDeps{VoiceCoLoadTimeout: 5 * time.Minute}); set.voiceCoLoadTimeout != 5*time.Minute {
+		t.Fatalf("voiceCoLoadTimeout = %v, want the deployment's 5m", set.voiceCoLoadTimeout)
+	}
+	if neg := New(ServerDeps{VoiceCoLoadTimeout: -time.Second}); neg.voiceCoLoadTimeout != DefaultVoiceCoLoadTimeout {
+		t.Fatalf("voiceCoLoadTimeout = %v, want the default for a non-positive value", neg.voiceCoLoadTimeout)
 	}
 }

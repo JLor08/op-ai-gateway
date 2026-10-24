@@ -45,6 +45,11 @@ const (
 	// voiceChatTicketFailed: the ticket could not be minted (no store, or the random
 	// source or the encoding failed). 500.
 	voiceChatTicketFailed = "portal.voice_chat_ticket_failed"
+	// voiceChatAudioSettingsInvalid: the chat's stored speech settings cannot ride a
+	// voice-chat ticket -- they do not decode as speech settings, or their JSON is over
+	// voiceTicketAudioMaxBytes. Raised by the ticket endpoint before the gate, never by
+	// the gate itself. 400: the user's to change in the chat's speech settings.
+	voiceChatAudioSettingsInvalid = "portal.voice_chat_audio_settings_invalid"
 )
 
 // voiceGatePath is the path of the request the gate builds for the shared inference
