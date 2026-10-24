@@ -9042,7 +9042,10 @@ returns, so only the gateway's decision of when to ask changes.**
   voices fetch that already runs for the picked model fills a **blank** voice with the first listed name,
   once, as the answer arrives, on an **empty** speech thread: the shape of ADR-074 (e)'s language
   pre-fill, so it never runs on the user's own edit and never overwrites a typed or saved voice. A plain
-  tts model keeps its blank voice. No new string is introduced.
+  tts model keeps its blank voice. No new string is introduced. **The pick does not outlive its model
+  (issue #307):** the store remembers the value the pre-select wrote, and a model switch clears the voice
+  only while it still equals that value, so a voice the new model may lack is not carried to it (a typed
+  or saved voice differs from the remembered value and is never cleared; opening a thread forgets the pick).
 - **(g) `speech_clone` stays truthful and the routing voice filter is left as is.** There is no manual
   `(speech_clone, no)` override (it stays reserved in `reservedManualVerdicts`) and audio.cpp's task stays
   authoritative: the model is still `speech_clone: yes`, and what changes is whether it is **offered**.
