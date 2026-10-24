@@ -5979,8 +5979,9 @@ func TestRunAppHealthOnceVoicesAgentGate(t *testing.T) {
 // pass on its own: a running, active audio.cpp child whose stored verdicts say (speech,
 // yes) is asked, a clone child included (#301: the listing is task-independent, so its
 // configured voice_presets are worth caching), and the stored rows come back with the spec
-// for the speech rate step, which still excludes a clone child itself. Every other shape
-// is refused and has its back-offs cleared when it left the eligible set.
+// for the speech rate step, which since #306 benchmarks a preset clone child too (excluding
+// only a reference-only one). Every other shape is refused and has its back-offs cleared when
+// it left the eligible set.
 func TestAgentVoiceProbeSpec(t *testing.T) {
 	yes, no := routing.CapabilityYes, routing.CapabilityNo
 	for _, tc := range []struct {

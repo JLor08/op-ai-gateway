@@ -315,14 +315,15 @@ func addPresetCloneMapping(t *testing.T, srv *Server, id, gatewayModel string, s
 }
 
 // The portal's STREAM gate counts every mapping a speech request could be ROUTED to, which
-// since #301 includes a configured clone model (the same offerable set the voice picker and
-// the language control read). A preset clone has no cached stream rate (the benchmark cannot
-// learn one for it), so a name that mixes a streaming plain tts mapping with a preset-clone
-// sibling closes the gate and the turn is BUFFERED, the known-good path: the pick is made per
-// request after the gate is asked, so a streamed request routed to the clone sibling would be
-// played, committed as a WAV and billed at the PLAIN mapping's rate -- corruption, not a
-// degraded mode. A name that is only plain tts still streams, and a name that is only a
-// preset clone is closed too, as a clone never streams today (it buffers).
+// since #301 includes a configured preset clone (the same offerable set the voice picker and
+// the language control read). This test pins the state BEFORE the rate benchmark has run for a
+// preset clone: with no cached stream rate yet it closes the gate, so a name that mixes a
+// streaming plain tts mapping with a not-yet-benchmarked preset-clone sibling is BUFFERED, the
+// known-good path -- the pick is made per request after the gate is asked, so a streamed request
+// routed to the clone sibling must not be played, committed as a WAV and billed at the PLAIN
+// mapping's rate. (Since #306 the benchmark learns a preset clone's rate, and it then streams
+// when the candidates agree on a rate -- see the rate-benchmark tests.) A name that is only
+// plain tts still streams; a name that is only a not-yet-benchmarked preset clone is closed too.
 func TestPortalSpeechStreamRateClosesForAReachablePresetClone(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
