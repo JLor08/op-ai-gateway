@@ -6949,8 +6949,9 @@ gave.
   capability fails closed, and an existing bearer client sending a voice the gateway never
   heard of, or hitting a cache that was never filled, must keep working as it always did.
   The rule — **unknown is not absent**: a candidate is *known-present* when its cached
-  list contains the voice (an exact match, on a mapping that is a plain tts model now; the
-  filter is left plain tts only by [ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), so a clone mapping's list is not consulted),
+  list contains the voice (an exact match, on a mapping that is a speech model now; the
+  filter classified plain tts mappings only until [ADR-077](#adr-077--the-routing-voice-filter-consults-a-clone-models-cached-voices-a-named-voice-is-classified-over-plain-tts-mappings-and-over-clone-models-that-have-a-voices-row-while-a-clone-with-no-row-stays-unclassified), issue #305, and since then also a clone
+  model that has a voices row, so a preset clone's list is consulted),
   *known-absent* when it has a cached list that does **not** contain it (a cached-empty
   list included), and of **unknown** voice status when it has no cached voices row at all
   (or an undecodable one). Routing **excludes only the known-absent candidates**;
@@ -8930,6 +8931,14 @@ without this one and would answer 404 each tick). **A gate that requires every c
 ## ADR-075 — Offering a configured voice-clone speech model: the gateway fetches a clone model's preset voices, a non-empty cached list is the offer signal for both portal pickers, a fail-closed AND covers mixed names, and streaming for clone stays deferred
 **Amended by [ADR-076](#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent) (issue #306): streaming for a preset clone is no longer deferred.** The heading stays as written because other documents link to its anchor. What changed: the speech-rate benchmark now runs for a clone model that has cached preset voices (synthesizing with one of them), so such a model gets a cached output byte rate and the portal's stream gate, which reads the offerable set (choice (e)), opens for it. The notes below that say the benchmark skips a clone model, that its gates are untouched, or that a preset clone has no cached rate describe this entry as decided and are marked where they no longer hold. A **reference-only** clone is unchanged: not benchmarked, buffered, hidden.
 
+**Amended by [ADR-077](#adr-077--the-routing-voice-filter-consults-a-clone-models-cached-voices-a-named-voice-is-classified-over-plain-tts-mappings-and-over-clone-models-that-have-a-voices-row-while-a-clone-with-no-row-stays-unclassified) (issue #305): the routing voice filter now consults a clone model's cached voices.** The
+heading stays as written. What changed: `voiceScopeFor` classifies a named voice over plain tts mappings **and**
+clone models that have a voices row, so a preset clone's list routes an offered mixed name's voice to the mapping
+that serves it. The notes below that say the filter is left plain tts only, that relaxing it would not make a mixed
+name safe, or that a cross-catalog voice pick is a known limitation describe this entry as decided and are marked
+where they no longer hold. A clone with **no** voices row is unchanged: not classified, dropped from a narrowed pool
+and kept on fail-open.
+
 **Context:** [ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
 (h), as reversed by issue #252, hid every `speech_clone: yes` model (audio.cpp task `clon`) from **both**
 portal pickers, the chat model picker and the voice picker, because a text-only composer has no reference
@@ -8983,7 +8992,9 @@ returns, so only the gateway's decision of when to ask changes.**
   that genuinely needs a reference-free named-voice tts: the streamed-rate benchmark and the routing voice
   filter (choice (g)). The portal's streaming gate does **not** use it: it reads the offerable set (choice (e)).
   (*Amended by ADR-076: the streamed-rate benchmark and its health-loop trigger moved to the offerable set,
-  so `CapabilityRowsPlainTTS` now gates the routing voice filter alone.*)
+  so `CapabilityRowsPlainTTS` now gates the routing voice filter alone. Amended by ADR-077: the filter also
+  classifies a clone model that has a voices row, so `CapabilityRowsPlainTTS`, itself unchanged, is now one of
+  the filter's two arms and no longer decides it alone.*)
 - **(b) The producers fetch voices for a loaded clone model too.** The static `audioCppVoicesWanted` is now
   "loaded and `(speech, yes)`" (the `speech_clone` exclusion is dropped), and the agent's
   `agentVoiceProbeSpec` gates on `CapabilityRowsSpeech` instead of `CapabilityRowsPlainTTS`. A clone model
@@ -9055,7 +9066,11 @@ returns, so only the gateway's decision of when to ask changes.**
   would all list the voice, `knownAbsent` would be zero and routing would fail open to the reference-only
   sibling), so safety comes from choice (d)'s AND and not from the filter. **A known limitation, owned:**
   the same filter fails open on an **offered** mixed-voice-catalog name (see the consequence below), and the
-  future fix is to relax it to consult clone mappings' cached voices.
+  future fix is to relax it to consult clone mappings' cached voices. (*Amended by [ADR-077](#adr-077--the-routing-voice-filter-consults-a-clone-models-cached-voices-a-named-voice-is-classified-over-plain-tts-mappings-and-over-clone-models-that-have-a-voices-row-while-a-clone-with-no-row-stays-unclassified), issue #305: that
+  fix shipped. The "would not make a mixed name safe" reasoning concerned the hidden reference-only case, where
+  a request that names no voice is never narrowed by a filter of any width, so the AND still carries that safety;
+  for an **offered** mixed name whose clone has cached presets, consulting the cache does route a named voice to
+  the mapping that serves it.*)
 
 **Consequence:**
 
@@ -9098,7 +9113,7 @@ returns, so only the gateway's decision of when to ask changes.**
   clear fires on any switch while the voice is still the pick, so a **spoken** thread (which the pre-select
   never refills) moved between two clones that list the same preset goes blank and relies on the operator's
   `default_voice_preset`.
-- **A cross-catalog voice pick on an offered mixed-voice-catalog name can 500. Known limitation.** The
+- **A cross-catalog voice pick on an offered mixed-voice-catalog name can 500. Known limitation, RESOLVED by [ADR-077](#adr-077--the-routing-voice-filter-consults-a-clone-models-cached-voices-a-named-voice-is-classified-over-plain-tts-mappings-and-over-clone-models-that-have-a-voices-row-while-a-clone-with-no-row-stays-unclassified) (issue #305).** What this entry decided: the
   routing voice filter (`voiceScopeFor`) classifies plain tts mappings only and never reads a clone
   mapping's cached voices (choice (g)). For an offered single name that mixes a plain tts mapping and a
   preset clone with **different** voice catalogs, a voice served by only one of them can fail open and
@@ -9108,9 +9123,12 @@ returns, so only the gateway's decision of when to ask changes.**
   mapping. The picker lists the union of both catalogs, so the user can pick a voice the sibling lacks, and
   the upstream answers an unknown voice with a 500. That is a clean failure (nothing is played, committed
   or billed), within the free-text-voice 500 risk ADR-067 already accepts, and it is owned rather than
-  fixed here. **The future fix** is to relax the routing voice filter to consult clone mappings' cached
-  voices, classifying known-present and known-absent over the offerable set instead of plain tts alone.
-  Recorded in §11.4.
+  fixed here, and the future fix was to relax the routing voice filter to consult clone mappings' cached
+  voices. [ADR-077](#adr-077--the-routing-voice-filter-consults-a-clone-models-cached-voices-a-named-voice-is-classified-over-plain-tts-mappings-and-over-clone-models-that-have-a-voices-row-while-a-clone-with-no-row-stays-unclassified) did that: the filter classifies a named voice over plain tts mappings and clone models
+  that have a voices row, so such a voice routes to the mapping that serves it and away from a clone whose cached
+  list lacks it while an eligible candidate remains. What remains is the base free-text-voice risk: a voice no
+  candidate's cache lists fails open to the upstream's 500, and a clone that was never voice-listed is not
+  classified. Recorded in §11.4.
 - **The public `/v1/audio/voices` answer changes for a preset clone model**: from `[]` to its preset names.
   Every other "nothing to show" case keeps the same empty `200`.
 - **Mixed fleets are safe.** Nothing changes on the agent wire, and an older agent still reports the
@@ -9145,7 +9163,7 @@ forever). **Keeping the stream gate on strict plain tts** (so a mixed name keeps
 routes to the preset-clone sibling would be played, committed as a WAV and billed at the plain
 mapping's rate, so the gate takes the offerable set and closes, choice (e)). **Relaxing the voice filter
 as the safety for a mixed name** (it cannot make one safe, choice (g); relaxing it to cover mixed
-voice catalogs is the owned follow-up, not this change). **A fail-open OR for `speech_clone_voices`** (a name mixing a
+voice catalogs is the owned follow-up, not this change; it shipped as [ADR-077](#adr-077--the-routing-voice-filter-consults-a-clone-models-cached-voices-a-named-voice-is-classified-over-plain-tts-mappings-and-over-clone-models-that-have-a-voices-row-while-a-clone-with-no-row-stays-unclassified), issue #305). **A fail-open OR for `speech_clone_voices`** (a name mixing a
 preset and a reference-only clone would be offered, and a send could land on the reference-only mapping).
 **Having the gateway inject a default voice for a blank one** (it cannot tell which preset the operator
 configured as the default, and a blank voice on a plain tts model is already right). **Streaming for clone
@@ -9206,7 +9224,8 @@ bump and no frontend change.**
   refused every tick; a loop-false, partition-true one (voices flaky, cache populated) would never be
   benchmarked and would have its rate back-off reset every tick. A test over the real wiring pins the
   agreement for both loop paths. `CapabilityRowsPlainTTS` is **unchanged** and is now the rule of the routing
-  voice filter alone (ADR-075 (g)).
+  voice filter alone (ADR-075 (g)). (*Amended by ADR-077: the filter also classifies a clone model that has a
+  voices row, so it is now one of the filter's two arms.*)
 - **(b) Layer 1, the health-loop gates, relax for a clone model with presets only.**
   `audioCppSpeechRateWanted(v, hasPresets)` and `agentSpeechRateWanted(rows, hasPresets)` target a loaded,
   streaming speech model that is plain **or** a clone model with presets. The voices cache is read **only for
@@ -9314,7 +9333,8 @@ only if the live check shows presets that disagree). **Falling back to the next 
 history row, and it would make the recorded voice unstable; a broken preset is a configuration fault the
 history row shows). **A voice on every benchmark request** (a plain model would then depend on a cache it does
 not need, and a stale name could turn its 200 into a 500). **Relaxing `CapabilityRowsPlainTTS` itself** (the
-routing voice filter still needs the strict rule, ADR-075 (g)). **Benchmarking a reference-only clone** (a
+routing voice filter still needs the strict rule, ADR-075 (g); [ADR-077](#adr-077--the-routing-voice-filter-consults-a-clone-models-cached-voices-a-named-voice-is-classified-over-plain-tts-mappings-and-over-clone-models-that-have-a-voices-row-while-a-clone-with-no-row-stays-unclassified) widened the filter by adding a cache-row arm
+for clone models and left the rule itself unchanged). **Benchmarking a reference-only clone** (a
 reference WAV and its mandatory `reference_text` are not something the benchmark has; it stays skipped).
 **Opening the gate for a mixed name without requiring the rates to agree** (a request routed to the sibling
 would be played, committed and billed at the wrong rate, ADR-075 (e)).
@@ -9323,4 +9343,133 @@ would be played, committed and billed at the wrong rate, ADR-075 (e)).
 [§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
 [Runtime View §6.5](06-runtime-view.md#65-model-selection-benchmark),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-077 — The routing voice filter consults a clone model's cached voices: a named voice is classified over plain tts mappings and over clone models that have a voices row, while a clone with no row stays unclassified
+**Context:** [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)
+(e) gave speech routing a **voice filter** (`voiceScopeFor`, [Routing & Model Selection
+§2.5](cross-cutting/routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open)): a candidate whose
+cached voices list does not name the requested voice is *known-absent*, the filter excludes only those, and it
+fails open on everything unknown. It classified **plain tts mappings only**.
+[ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)
+(issue #301) made a configured clone model with presets offerable and left the filter that way on purpose (its
+choice (g)), recording the price as a known limitation ([Risks & Technical Debt
+§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances), consequence (5)): on an **offered**
+single name that mixes a plain tts mapping and a preset clone with **different** voice catalogs, a voice served by
+only one of them could route to the sibling that lacks it, and the upstream answered the unknown voice with a 500.
+A plain-only voice left nothing known-absent (the clone was never classified), so it routed unfiltered; a
+clone-only voice left every classified, plain candidate known-absent, so the all-known-absent rule routed it
+unfiltered too. The picker lists the union of the catalogs, so a user could pick either. Issue #305 is the last
+open follow-up of #301.
+
+Two facts made the follow-up possible. A preset clone's voices are **in the cache**: the health loop lists a loaded
+clone model every tick and writes the list when it changed (ADR-075 (b)), and a clone model confirmed to have no
+presets caches an empty list, so a clone's cached list is its current presets and not a stale tts list. And the
+filter's capability-verdict read is the **current** one, so a mapping that flipped between plain tts and clone is
+seen as what it is now.
+
+**Decision — five choices, taken together. No schema migration, no agent change, no `ServerAgent` version bump, no
+frontend change and no new store query (the filter reuses the voices-cache read it already makes).**
+
+- **(a) The classify set is "plain tts, or a clone model that has a voices row".** `voiceScopeFor` reads the
+  capability verdicts as before, derives the pool's **speech** mapping ids (`CapabilityRowsSpeech`, the current
+  verdicts, a plain tts and a clone model alike), reads the voices cache for them in the one bulk read, and
+  classifies a mapping when it is **plain tts** (`CapabilityRowsPlainTTS`, whatever its cache state, exactly as
+  before) **or** has a scope-`""` voices row (`hasVoicesRow`): for a clone model that means its voices were listed
+  at least once, as a preset list or as a confirmed-empty `[]`. Everything classified goes through the **unchanged**
+  `voiceListsEligible` (known-present, known-absent or unknown), and `CapabilityRowsPlainTTS` itself is unchanged.
+  The helpers `speechMappingIDs` and `voiceClassifiedIDs` replace the old `plainTTSMappingIDs`.
+- **(b) What each kind of mapping now is.** A **preset clone whose cached list names the voice** is
+  *known-present*, so a clone-only voice routes to the clone and a plain-only voice, for which the clone is
+  known-absent, routes to the plain mapping. A **preset clone whose list lacks the voice** is *known-absent*, and
+  so is a **reference-only clone** (its cached `[]` names nothing): a named-voice request is routed away from either
+  **while an eligible candidate remains**, and such a clone never rescues a `voice_unavailable` (with the one
+  mapping that serves the voice down, the request is refused, not sent to the clone that is known to lack it). A
+  clone whose row **cannot be decoded** is *unknown* and kept, as an undecodable plain tts row is. As before,
+  *known-present* needs an exact match (the name is relayed byte for byte) **and** a mapping that is a speech model
+  now, so a list that outlived a flip to a non-speech model is not a known voice.
+- **(c) A clone model with no voices row stays unclassified, exactly as before #305.** A clone that was never
+  voice-listed (a cold agent-launched child, an older agent, a failed listing) carries no voice data, so it is
+  skipped: neither allowed nor counted known-absent. It is therefore **dropped from a pool the voice narrowed** and
+  **kept whenever the filter fails open**, as every clone mapping was before. **Why not "classify every speech
+  mapping" and keep a row-less clone as *unknown*** (what a plain tts mapping with no row gets): in a *narrowed*
+  pool a cold clone would then stay eligible, could win the routing and would answer a 500 for a voice it does not
+  serve, a failure the old rule, which dropped every clone from a narrowed pool, never had, so it would be a
+  regression. Only clones that carry voice data join the set. A test pins this
+  (`TestVoiceStandardACloneWithoutAVoicesRowIsDroppedWhenNarrowedAndKeptWhenFailOpen`, whose cases fail if the set
+  becomes "all speech"). The asymmetry with a plain tts mapping, which stays *unknown and kept* without a row, is
+  the long-standing ADR-067 case (a healthy, never-voice-cached sibling keeps serving as a failover and load target)
+  and is deliberately not extended to a clone.
+- **(d) Every fail-open invariant of ADR-067 (e) is preserved.** No voice, or an empty pool, restricts nothing. A
+  failure of the **capability-verdict** read is returned (the posture of the gate it belongs to), while a failure of
+  the **voices-cache** read fails open with a Warn. When **every classified candidate is known-absent** nothing is
+  known to offer the voice, so it routes unfiltered and the upstream decides, and when **none** is known-absent the
+  voice restricts nothing; only a MIX of a known-absent candidate and an eligible one narrows the pool, and
+  `voice_unavailable` arises only when that narrowing left no usable host. There is still exactly **one** bulk
+  voices read, and none for a request that names no voice. A group's pre-pass (`groupVoiceScope`) and the ladder's
+  rule that a relaxation never relaxes the voice are untouched: both call `voiceScopeFor` and inherit the new set.
+- **(e) The staleness is bounded and is the one ADR-067 already accepts.** A clone's list is re-listed on each tick
+  it is observed loaded and rewritten when it changed, and the verdict read is current, so a plain-to-clone flip is
+  seen at once. The only window is a clone model whose configuration changed **while it was unloaded**: it is
+  classified by its last list until the next loaded tick rewrites it, exactly as ADR-067 (c) accepts for a plain tts
+  mapping's cached voices. A wrong list (the several-tts-models attribution risk of §11.4, which applies to a clone
+  mapping's list as it does to a plain one) can likewise mislead the filter about a clone, with the same outcome:
+  the upstream's ordinary 500, never wrong audio.
+
+**Consequence:**
+
+- **ADR-075's mixed-name misroute is resolved.** On an offered name that mixes a plain tts mapping and a preset
+  clone, a named voice now routes to the mapping whose cached list names it, in both directions, and away from a
+  clone whose cached list lacks it **when an eligible candidate remains**. That is narrower than "never routes to a
+  reference-only clone": a clone with a cached `[]` is known-absent and is routed away from while an eligible
+  candidate remains (and when every candidate is known-absent the filter stands aside, as always), and a clone that
+  was **never voice-listed** is not classified at all, so it is not routed away from.
+- **What remains is the base ADR-067 free-text-voice risk, not the mixed-name misroute.** (1) A voice that **no
+  classified candidate's cache lists** leaves every candidate known-absent, so the filter fails open and the
+  upstream answers the unknown name with a 500: a clean failure, nothing played, committed or billed. (2) A clone
+  with **no voices row** is unclassified and so can still be picked on a fail-open request, for instance a plain-only
+  voice beside a never-listed clone narrows nothing (no candidate is known-absent), and a request for it can land on
+  the cold clone; an *offered* name does not contain one in the steady state (the fail-closed AND of ADR-075 (d) offers a
+  name only when every clone mapping has presets on file), so this is reachable by a direct API call on a name the
+  pickers hide.
+- **The offer fold, not the filter, still guards a blank voice.** A send with no voice names nothing for the filter
+  to read, so it is never narrowed, and a name that mixes a preset clone and a reference-only clone stays hidden by
+  ADR-075 (d)'s AND, which is what keeps such a send from landing on the reference-only mapping. (A *named* voice on
+  that name is routed to the preset clone, because the reference-only clone's `[]` is known-absent, choice (b).)
+  ADR-075 (g) said that relaxing the filter "would not make a mixed name safe". That sentence was about the hidden
+  reference-only case; the part of it that still holds there is that a filter of any width cannot help a request that
+  names no voice, so the fold carries that safety. It does **not** hold for an **offered** mixed name whose clone has
+  cached presets: consulting the clone's cache routes a named voice there correctly, which is this entry.
+- **No new work.** The voices read now covers the pool's speech mappings instead of its plain tts ones, still one
+  bulk read for a request that names a voice and none otherwise; the health loop, the pickers, the benchmark and the
+  composer are untouched.
+- **Verification status.** The routing-package unit tests cover the inversion of the old rule (a clone's cached voice
+  is consulted, `TestVoiceStandardConsultsAVoiceCachedOnACloneMapping`; a non-speech mapping's stray voice is still
+  ignored), the mixed catalog in both directions and both store orders for a single name and, on the group path, for
+  the member that serves the voice, a preset clone without the voice and a reference-only clone as known-absent, a
+  known-absent clone never rescuing a `voice_unavailable`, the one bulk read, every candidate known-absent failing open
+  with a clone among them, an undecodable clone row staying eligible, and the row-less clone of choice (c). A live run
+  against audio.cpp with a mixed plain-and-clone name is not claimed by this entry.
+
+**Amends:** [ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)
+((a)'s statement that `CapabilityRowsPlainTTS` gates the routing voice filter, (g)'s "the routing voice filter is
+left as is" and its "would not make a mixed name safe" reasoning, the matching "cross-catalog voice pick" consequence
+and §11.4 consequence (5), which is now resolved);
+[ADR-076](#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent)
+((a)'s statement that `CapabilityRowsPlainTTS` is now the rule of the routing voice filter alone, and its rejected
+"relaxing `CapabilityRowsPlainTTS` itself" note that the filter still needs the strict rule);
+[ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)
+(e)'s remark that the filter is plain tts only. It leaves ADR-067's fail-open rule, `voiceListsEligible`,
+`CapabilityRowsPlainTTS`, the offer logic of ADR-075 and the benchmark of ADR-076 as they are, and, like both, needs
+no [ADR-025](#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions) feature negotiation.
+**Rejected:** **Classifying every speech mapping and keeping a clone with no voices row as *unknown*** (a "voice
+over all speech" rule: it would keep a cold, never-listed clone in a narrowed pool, where it could win routing and
+500 on a voice it does not serve, choice (c)). **Relaxing `CapabilityRowsPlainTTS` itself to cover a clone model**
+(it stays the strict reference-free named-voice rule that the plain arm of the filter and
+`speechBenchmarkSkip` read; the filter widens by adding the cache-row arm, not by redefining it). **Treating a
+reference-only clone's cached `[]` as unknown** (it is a confirmed "no presets" and so *known* to lack any named
+voice; keeping it eligible would route a named voice to a mapping that cannot synthesize it). **Failing the
+request closed when no candidate lists the voice** (it would break a bearer client that sends a free-text voice the
+gateway never heard of, ADR-067's reason for a fail-open filter).
+→ [Routing & Model Selection §2.5](cross-cutting/routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
