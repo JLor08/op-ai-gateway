@@ -103,6 +103,74 @@ export type VoiceDownFrame =
   | { type: 'audio_done' }
   | { type: 'error'; message: string; code?: string };
 
+/** The fields of a down frame, before its `type` has said which frame it is. */
+type FrameFields = Record<string, unknown>;
+
+/** An optional hint field: the string, or undefined when it is missing, empty or not a string. */
+const hintField = (value: unknown): string | undefined =>
+  typeof value === 'string' && value !== '' ? value : undefined;
+
+/** A text field: absent is empty, but present it must be text. */
+const textField = (value: unknown): string | null => {
+  if (value === undefined) return '';
+  return typeof value === 'string' ? value : null;
+};
+
+/** The object a text frame holds, or null for text that is not JSON or JSON that is not an object. */
+function parseFrameObject(data: string): FrameFields | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  return parsed as FrameFields;
+}
+
+function parseStateFrame(frame: FrameFields): VoiceDownFrame | null {
+  return typeof frame.state === 'string' && SERVER_STATES.includes(frame.state)
+    ? { type: 'state', state: frame.state as VoiceServerState }
+    : null;
+}
+
+function parseTextFrame(
+  type: 'asr_partial' | 'answer_delta',
+  frame: FrameFields,
+): VoiceDownFrame | null {
+  const body = textField(frame.text);
+  return body === null ? null : { type, text: body };
+}
+
+function parseAsrFinalFrame(frame: FrameFields): VoiceDownFrame | null {
+  const body = textField(frame.text);
+  if (body === null) return null;
+  const messageId = hintField(frame.message_id);
+  return messageId === undefined
+    ? { type: 'asr_final', text: body }
+    : { type: 'asr_final', text: body, messageId };
+}
+
+function parseAnswerDoneFrame(frame: FrameFields): VoiceDownFrame {
+  const messageId = hintField(frame.message_id);
+  return messageId === undefined ? { type: 'answer_done' } : { type: 'answer_done', messageId };
+}
+
+function parseAudioDeltaFrame(frame: FrameFields): VoiceDownFrame | null {
+  const audio = textField(frame.audio);
+  if (typeof frame.seq !== 'number' || typeof frame.rate !== 'number' || audio === null) {
+    return null;
+  }
+  return { type: 'audio_delta', seq: frame.seq, rate: frame.rate, audio };
+}
+
+function parseErrorFrame(frame: FrameFields): VoiceDownFrame | null {
+  const message = textField(frame.message);
+  if (message === null) return null;
+  const code = hintField(frame.code);
+  return code === undefined ? { type: 'error', message } : { type: 'error', message, code };
+}
+
 /**
  * Reads one text frame the gateway sent down, or null for anything that is not one: text that is
  * not JSON, JSON that is not an object, an unknown `type` (or `state`), a field of the wrong
@@ -116,59 +184,25 @@ export type VoiceDownFrame =
  * the turn is committed -- so it is read for a newer gateway that does, and nothing relies on it.)
  */
 export function parseVoiceDownFrame(data: string): VoiceDownFrame | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(data);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-  const frame = parsed as Record<string, unknown>;
-  const hint = (value: unknown): string | undefined =>
-    typeof value === 'string' && value !== '' ? value : undefined;
-  // A text field: absent is empty, but present it must be text.
-  const text = (value: unknown): string | null => {
-    if (value === undefined) return '';
-    return typeof value === 'string' ? value : null;
-  };
+  const frame = parseFrameObject(data);
+  if (frame === null) return null;
   switch (frame.type) {
     case 'state':
-      return typeof frame.state === 'string' && SERVER_STATES.includes(frame.state)
-        ? { type: 'state', state: frame.state as VoiceServerState }
-        : null;
+      return parseStateFrame(frame);
     case 'asr_partial':
-    case 'answer_delta': {
-      const body = text(frame.text);
-      return body === null ? null : { type: frame.type, text: body };
-    }
-    case 'asr_final': {
-      const body = text(frame.text);
-      if (body === null) return null;
-      const messageId = hint(frame.message_id);
-      return messageId === undefined
-        ? { type: 'asr_final', text: body }
-        : { type: 'asr_final', text: body, messageId };
-    }
-    case 'answer_done': {
-      const messageId = hint(frame.message_id);
-      return messageId === undefined ? { type: 'answer_done' } : { type: 'answer_done', messageId };
-    }
+    case 'answer_delta':
+      return parseTextFrame(frame.type, frame);
+    case 'asr_final':
+      return parseAsrFinalFrame(frame);
+    case 'answer_done':
+      return parseAnswerDoneFrame(frame);
     case 'answer_reset':
     case 'audio_done':
       return { type: frame.type };
-    case 'audio_delta': {
-      const audio = text(frame.audio);
-      if (typeof frame.seq !== 'number' || typeof frame.rate !== 'number' || audio === null) {
-        return null;
-      }
-      return { type: 'audio_delta', seq: frame.seq, rate: frame.rate, audio };
-    }
-    case 'error': {
-      const message = text(frame.message);
-      if (message === null) return null;
-      const code = hint(frame.code);
-      return code === undefined ? { type: 'error', message } : { type: 'error', message, code };
-    }
+    case 'audio_delta':
+      return parseAudioDeltaFrame(frame);
+    case 'error':
+      return parseErrorFrame(frame);
     default:
       return null;
   }

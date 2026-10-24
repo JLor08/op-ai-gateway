@@ -95,6 +95,98 @@ export type VoiceChatControlProps = {
   busy?: boolean;
 };
 
+// Why the switch is closed, in words on the screen (a tooltip would not be seen on a touch
+// screen or read before the click): the missing model first, then a run in flight. The refusal
+// has its own alert, so it has no reason here, and nor does a conversation that is on.
+function closedReason(
+  {
+    on,
+    refused,
+    capable,
+    busy,
+  }: { on: boolean; refused: boolean; capable: boolean; busy: boolean },
+  gap: VoiceChatGap | null,
+  t: Translation,
+): string {
+  if (on || refused) return '';
+  if (!capable) return gap ? t[GAP_TEXT[gap]] : t.chatVoiceUnavailableChecking;
+  return busy ? t.chatBusy : '';
+}
+
+// The keys that hold the talk button down, as a press of it does: Space and Enter.
+function isTalkKey(event: KeyboardEvent<HTMLButtonElement>): boolean {
+  return event.key === ' ' || event.key === 'Enter';
+}
+
+// The release is delivered to the button even when the pointer has left it (a finger that slides
+// off a phone's button still ends the turn). Not every environment has it.
+function capturePointer(event: PointerEvent<HTMLButtonElement>) {
+  try {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  } catch {
+    /* best-effort */
+  }
+}
+
+// Push-to-talk is held: the press starts the turn, the release ends it. `held` is whether a
+// press that has begun is still going on, so a release (or a cancelled press, or the focus
+// leaving) ends a turn only once, and only a turn that this press began.
+function useHeldPushToTalk(canTalk: boolean, voice: Pick<VoiceChatApi, 'pushStart' | 'pushEnd'>) {
+  const held = useRef(false);
+  function press() {
+    if (held.current || !canTalk) return;
+    held.current = true;
+    voice.pushStart();
+  }
+  function release() {
+    if (!held.current) return;
+    held.current = false;
+    voice.pushEnd();
+  }
+  // The button closes under a press that is still held (the gateway moved the conversation on, or
+  // it ended): a release that never reaches a closed button must not leave the press standing, or
+  // the next one would be taken for a repeat of it. The gateway has left the state a push_end
+  // would be taken in, so none is sent.
+  useEffect(() => {
+    if (!canTalk) held.current = false;
+  }, [canTalk]);
+
+  function onPointerDown(event: PointerEvent<HTMLButtonElement>) {
+    capturePointer(event);
+    press();
+  }
+  function onKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (!isTalkKey(event)) return;
+    // Neither the page's scroll (Space) nor the button's own click (Enter) is wanted.
+    event.preventDefault();
+    // The key repeat of a held key is the same press.
+    if (!event.repeat) press();
+  }
+  function onKeyUp(event: KeyboardEvent<HTMLButtonElement>) {
+    if (!isTalkKey(event)) return;
+    event.preventDefault();
+    release();
+  }
+  return { release, onPointerDown, onKeyDown, onKeyUp };
+}
+
+// The control is only mounted while the chat page shows a thread that Voice Chat is offered on:
+// when it goes -- another page of the portal, another thread or model -- a conversation must not
+// stay behind with the microphone on and nothing on screen to end it. The latest state and stop
+// are read through refs, so this runs only when the control goes, not on every change.
+function useStopWhenGone(state: VoiceChatState, stop: () => void) {
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const stopRef = useRef(stop);
+  stopRef.current = stop;
+  useEffect(
+    () => () => {
+      if (stateRef.current !== 'off') stopRef.current();
+    },
+    [],
+  );
+}
+
 // The Voice Chat mode of a text thread: the switch, the indicator of whether the system is
 // listening, what is being said and answered, and push-to-talk. The conversation itself is the
 // store's (voice and its controls); this only draws it.
@@ -127,77 +219,10 @@ export function VoiceChatControl({
   // The way OUT is never closed: a conversation that is on can always be switched off, whatever
   // the catalogue or the thread are doing meanwhile.
   const toggleClosed = !on && (!capable || busy || refused);
+  const reason = closedReason({ on, refused, capable, busy }, gap, t);
 
-  // Why the switch is closed, in words on the screen (a tooltip would not be seen on a touch
-  // screen or read before the click): the missing model first, then a run in flight. The refusal
-  // has its own alert, below.
-  let reason = '';
-  if (!on && !refused) {
-    if (!capable) reason = gap ? t[GAP_TEXT[gap]] : t.chatVoiceUnavailableChecking;
-    else if (busy) reason = t.chatBusy;
-  }
-
-  // Push-to-talk is held: the press starts the turn, the release ends it. `held` is whether a
-  // press that has begun is still going on, so a release (or a cancelled press, or the focus
-  // leaving) ends a turn only once, and only a turn that this press began.
-  const held = useRef(false);
-  function press() {
-    if (held.current || !canTalk) return;
-    held.current = true;
-    voice.pushStart();
-  }
-  function release() {
-    if (!held.current) return;
-    held.current = false;
-    voice.pushEnd();
-  }
-  // The button closes under a press that is still held (the gateway moved the conversation on, or
-  // it ended): a release that never reaches a closed button must not leave the press standing, or
-  // the next one would be taken for a repeat of it. The gateway has left the state a push_end
-  // would be taken in, so none is sent.
-  useEffect(() => {
-    if (!canTalk) held.current = false;
-  }, [canTalk]);
-
-  function onPointerDown(event: PointerEvent<HTMLButtonElement>) {
-    // The release is delivered to the button even when the pointer has left it (a finger that
-    // slides off a phone's button still ends the turn). Not every environment has it.
-    try {
-      event.currentTarget.setPointerCapture?.(event.pointerId);
-    } catch {
-      /* best-effort */
-    }
-    press();
-  }
-  function onKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
-    if (event.key !== ' ' && event.key !== 'Enter') return;
-    // Neither the page's scroll (Space) nor the button's own click (Enter) is wanted.
-    event.preventDefault();
-    // The key repeat of a held key is the same press.
-    if (!event.repeat) press();
-  }
-  function onKeyUp(event: KeyboardEvent<HTMLButtonElement>) {
-    if (event.key !== ' ' && event.key !== 'Enter') return;
-    event.preventDefault();
-    release();
-  }
-
-  // The control is only mounted while the chat page shows a thread that Voice Chat is offered on:
-  // when it goes -- another page of the portal, another thread or model -- a conversation must not
-  // stay behind with the microphone on and nothing on screen to end it. The latest state and stop
-  // are read through refs, so this runs only when the control goes, not on every change.
-  const stateRef = useRef(state);
-  stateRef.current = state;
-  const stopRef = useRef(voice.stop);
-  stopRef.current = voice.stop;
-  useEffect(
-    () => () => {
-      if (stateRef.current !== 'off') stopRef.current();
-    },
-    [],
-  );
-
-  const detail = detailText(state, t);
+  const talk = useHeldPushToTalk(canTalk, voice);
+  useStopWhenGone(state, voice.stop);
 
   return (
     <Box
@@ -239,59 +264,7 @@ export function VoiceChatControl({
         )}
       </Box>
 
-      <Box
-        role="status"
-        aria-live="polite"
-        aria-label={t.chatVoiceIndicator}
-        sx={{ display: 'flex', alignItems: 'center', gap: 1.5, minHeight: on ? 56 : 32 }}
-      >
-        <Box
-          aria-hidden
-          sx={{
-            flex: '0 0 auto',
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: on ? 48 : 32,
-            height: on ? 48 : 32,
-            borderRadius: '50%',
-            // Active: the hot microphone, in the colour of a recording, and pulsing (unless the
-            // user asked for no motion). Not listening: the same circle, grey and still.
-            bgcolor: listening ? 'error.main' : 'action.disabledBackground',
-            color: listening ? 'error.contrastText' : 'text.disabled',
-            '@keyframes op-voice-pulse': {
-              '0%': { boxShadow: '0 0 0 0 rgba(211, 47, 47, 0.55)' },
-              '70%': { boxShadow: '0 0 0 14px rgba(211, 47, 47, 0)' },
-              '100%': { boxShadow: '0 0 0 0 rgba(211, 47, 47, 0)' },
-            },
-            '@media (prefers-reduced-motion: no-preference)': listening
-              ? { animation: 'op-voice-pulse 1.6s ease-out infinite' }
-              : {},
-          }}
-        >
-          {listening ? (
-            <MicIcon fontSize={on ? 'medium' : 'small'} />
-          ) : (
-            <MicOffIcon fontSize={on ? 'medium' : 'small'} />
-          )}
-        </Box>
-        <Box sx={{ minWidth: 0 }}>
-          <Typography
-            sx={{
-              fontWeight: 700,
-              fontSize: on ? '1.1rem' : undefined,
-              color: listening ? 'error.main' : 'text.secondary',
-            }}
-          >
-            {t[STATE_LABEL[state]]}
-          </Typography>
-          {detail !== '' && (
-            <Typography variant="caption" color="text.secondary" component="p" sx={{ m: 0 }}>
-              {detail}
-            </Typography>
-          )}
-        </Box>
-      </Box>
+      <ListeningIndicator state={state} t={t} />
 
       {on && voice.liveTranscript !== '' && (
         <TurnText
@@ -313,12 +286,12 @@ export function VoiceChatControl({
             size="small"
             startIcon={<MicIcon />}
             disabled={!canTalk}
-            onPointerDown={onPointerDown}
-            onPointerUp={release}
-            onPointerCancel={release}
-            onKeyDown={onKeyDown}
-            onKeyUp={onKeyUp}
-            onBlur={release}
+            onPointerDown={talk.onPointerDown}
+            onPointerUp={talk.release}
+            onPointerCancel={talk.release}
+            onKeyDown={talk.onKeyDown}
+            onKeyUp={talk.onKeyUp}
+            onBlur={talk.release}
             // A long press on a phone would otherwise open the context menu under the finger.
             onContextMenu={(event) => event.preventDefault()}
             sx={{ touchAction: 'none', userSelect: 'none', WebkitTouchCallout: 'none' }}
@@ -349,6 +322,70 @@ export function VoiceChatControl({
           {errorText(error, t)}
         </Alert>
       )}
+    </Box>
+  );
+}
+
+// The indicator of whether the system hears the user (spec 7): a status region with the
+// microphone in a circle and the label of the state, and under it the detail where the state
+// needs one. Active: the hot microphone, in the colour of a recording, and pulsing (unless the
+// user asked for no motion). Not listening: the same circle, grey and still, with the muted
+// microphone and the label of what the system is doing instead.
+function ListeningIndicator({ state, t }: Readonly<{ state: VoiceChatState; t: Translation }>) {
+  const on = state !== 'off';
+  const listening = state === 'listening';
+  const detail = detailText(state, t);
+  const badgeSize = on ? 48 : 32;
+  const Icon = listening ? MicIcon : MicOffIcon;
+  return (
+    <Box
+      role="status"
+      aria-live="polite"
+      aria-label={t.chatVoiceIndicator}
+      sx={{ display: 'flex', alignItems: 'center', gap: 1.5, minHeight: on ? 56 : 32 }}
+    >
+      <Box
+        aria-hidden
+        sx={{
+          flex: '0 0 auto',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: badgeSize,
+          height: badgeSize,
+          borderRadius: '50%',
+          // Active: the hot microphone, in the colour of a recording, and pulsing (unless the
+          // user asked for no motion). Not listening: the same circle, grey and still.
+          bgcolor: listening ? 'error.main' : 'action.disabledBackground',
+          color: listening ? 'error.contrastText' : 'text.disabled',
+          '@keyframes op-voice-pulse': {
+            '0%': { boxShadow: '0 0 0 0 rgba(211, 47, 47, 0.55)' },
+            '70%': { boxShadow: '0 0 0 14px rgba(211, 47, 47, 0)' },
+            '100%': { boxShadow: '0 0 0 0 rgba(211, 47, 47, 0)' },
+          },
+          '@media (prefers-reduced-motion: no-preference)': listening
+            ? { animation: 'op-voice-pulse 1.6s ease-out infinite' }
+            : {},
+        }}
+      >
+        <Icon fontSize={on ? 'medium' : 'small'} />
+      </Box>
+      <Box sx={{ minWidth: 0 }}>
+        <Typography
+          sx={{
+            fontWeight: 700,
+            fontSize: on ? '1.1rem' : undefined,
+            color: listening ? 'error.main' : 'text.secondary',
+          }}
+        >
+          {t[STATE_LABEL[state]]}
+        </Typography>
+        {detail !== '' && (
+          <Typography variant="caption" color="text.secondary" component="p" sx={{ m: 0 }}>
+            {detail}
+          </Typography>
+        )}
+      </Box>
     </Box>
   );
 }

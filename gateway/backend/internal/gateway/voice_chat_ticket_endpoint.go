@@ -166,24 +166,11 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 		writeVoiceChatRefusal(w, voiceChatTicketFailed)
 		return
 	}
-	raw, ok := readRawJSON(w, r)
+	req, ok := readVoiceChatTicketRequest(w, r)
 	if !ok {
 		return
 	}
-	var req voiceChatTicketRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
-		return
-	}
-	asrModel, llmModel, ttsModel := strings.TrimSpace(req.ASRModel), strings.TrimSpace(req.LLMModel), strings.TrimSpace(req.TTSModel)
-	for _, leg := range []struct{ field, model string }{{"asr_model", asrModel}, {"llm_model", llmModel}, {"tts_model", ttsModel}} {
-		if leg.model == "" {
-			writeJSON(w, http.StatusBadRequest, apierror.Response(audioVoicesModelRequired, leg.field+" is required", ""))
-			return
-		}
-	}
-
-	chatID := strings.TrimSpace(req.ChatID)
+	chatID := req.ChatID
 	audio, ok := s.voiceChatAudioSettings(w, r, token, chatID)
 	if !ok {
 		return
@@ -199,18 +186,9 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 	liftInferenceDeadlines(w)
 	gateCtx, cancel := context.WithTimeout(r.Context(), bound)
 	defer cancel()
-	asr, llm, tts, code, err := s.voiceCoLoadGate(gateCtx, &token, asrModel, llmModel, ttsModel)
+	asr, llm, tts, code, err := s.voiceCoLoadGate(gateCtx, &token, req.ASRModel, req.LLMModel, req.TTSModel)
 	if code != "" {
-		// The deadline is the endpoint's own, so it owns the answer for it: a deadline that
-		// hit while a leg was still being resolved reads there as an unavailable leg. A
-		// browser that went away is not a deadline, and nobody reads that response anyway.
-		if r.Context().Err() == nil && errors.Is(gateCtx.Err(), context.DeadlineExceeded) {
-			slog.Warn("voice chat ticket refused: the models were not resident together within the deadline", "deadline", bound, "chat", chatID, "gate_code", code, "err", err)
-			code = voiceChatCoLoadFailed
-		} else {
-			slog.Debug("voice chat ticket refused", "code", code, "chat", chatID, "err", err)
-		}
-		writeVoiceChatRefusal(w, code)
+		s.writeVoiceCoLoadRefusal(gateCtx, w, r, chatID, code, err)
 		return
 	}
 
@@ -241,6 +219,46 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, voiceChatTicketResponse{Ticket: ticket})
+}
+
+// readVoiceChatTicketRequest reads and validates the body of the ticket request, and
+// returns it with the chat id and the three models trimmed. On any refusal it writes the
+// response and returns ok == false: a body that is not one JSON object of this shape is
+// 400 request.invalid_json, and a blank model is 400 model.name_required naming the field
+// (asr_model, then llm_model, then tts_model).
+func readVoiceChatTicketRequest(w http.ResponseWriter, r *http.Request) (voiceChatTicketRequest, bool) {
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return voiceChatTicketRequest{}, false
+	}
+	var req voiceChatTicketRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+		return voiceChatTicketRequest{}, false
+	}
+	req.ChatID = strings.TrimSpace(req.ChatID)
+	req.ASRModel, req.LLMModel, req.TTSModel = strings.TrimSpace(req.ASRModel), strings.TrimSpace(req.LLMModel), strings.TrimSpace(req.TTSModel)
+	for _, leg := range []struct{ field, model string }{{"asr_model", req.ASRModel}, {"llm_model", req.LLMModel}, {"tts_model", req.TTSModel}} {
+		if leg.model == "" {
+			writeJSON(w, http.StatusBadRequest, apierror.Response(audioVoicesModelRequired, leg.field+" is required", ""))
+			return voiceChatTicketRequest{}, false
+		}
+	}
+	return req, true
+}
+
+// writeVoiceCoLoadRefusal answers a refused co-load gate with code and logs why.
+func (s *Server) writeVoiceCoLoadRefusal(gateCtx context.Context, w http.ResponseWriter, r *http.Request, chatID, code string, err error) {
+	// The deadline is the endpoint's own, so it owns the answer for it: a deadline that
+	// hit while a leg was still being resolved reads there as an unavailable leg. A
+	// browser that went away is not a deadline, and nobody reads that response anyway.
+	if r.Context().Err() == nil && errors.Is(gateCtx.Err(), context.DeadlineExceeded) {
+		slog.Warn("voice chat ticket refused: the models were not resident together within the deadline", "deadline", s.voiceCoLoadBound(), "chat", chatID, "gate_code", code, "err", err)
+		code = voiceChatCoLoadFailed
+	} else {
+		slog.Debug("voice chat ticket refused", "code", code, "chat", chatID, "err", err)
+	}
+	writeVoiceChatRefusal(w, code)
 }
 
 // voiceChatAudioSettings reads the speech settings of the caller's chat for the ticket. On

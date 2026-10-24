@@ -168,7 +168,7 @@ func newVoiceRunTestServer(t *testing.T, mockDelay time.Duration) (*Server, auth
 // its terminal snapshot.
 func voiceRunOutcome(t *testing.T, srv *Server, owner auth.Token, chatID, pendingText string) (*ChatRun, runEvent) {
 	t.Helper()
-	run, err := srv.startVoiceRun(context.Background(), owner, chatID, pendingText, voiceASRTarget, voiceLLMTarget, voiceTTSTarget, portal.ChatAudioSettings{})
+	run, err := srv.startVoiceRun(context.Background(), voiceRunRequest{owner: owner, chatID: chatID, pendingText: pendingText, asr: voiceASRTarget, llm: voiceLLMTarget, tts: voiceTTSTarget})
 	if err != nil {
 		t.Fatalf("startVoiceRun: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestVoiceRunCancelledPersistsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	run, err := srv.startVoiceRun(context.Background(), owner, chatID, "keep talking", voiceASRTarget, voiceLLMTarget, voiceTTSTarget, portal.ChatAudioSettings{})
+	run, err := srv.startVoiceRun(context.Background(), voiceRunRequest{owner: owner, chatID: chatID, pendingText: "keep talking", asr: voiceASRTarget, llm: voiceLLMTarget, tts: voiceTTSTarget})
 	if err != nil {
 		t.Fatalf("startVoiceRun: %v", err)
 	}

@@ -348,30 +348,40 @@ func (s *Server) ensureVoiceLegs(ctx context.Context, legs []voiceGateLeg) (stri
 				return voiceChatCoLoadFailed, fmt.Errorf("voice chat %s leg: %w", l.leg, errVoiceNoRuntimeEnsure)
 			}
 		}
-		// The spec only words the failure (its start timeout); a failed read is no reason
-		// to refuse to start the model.
-		var spec routing.RuntimeSpec
-		if s.Routes != nil {
-			spec, _, _ = s.Routes.RuntimeSpecByMapping(ctx, l.target.RouteID)
+		if code, err := s.ensureVoiceLeg(ctx, ensurer, l); err != nil {
+			return code, err
 		}
-		err := s.ensureLoadAttempt(ensurer, l.target, spec)(ctx, s.newLoadBound(l.target))
-		if err == nil {
-			continue
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			// The caller went away mid-start; the failure says nothing about the leg.
-			return voiceChatCoLoadFailed, fmt.Errorf("voice chat %s leg: %w", l.leg, ctxErr)
-		}
-		wrapped := fmt.Errorf("voice chat %s leg: %w", l.leg, err)
-		var routerErr *provider.RouterError
-		if errors.As(err, &routerErr) && routerErr.Code == voiceAdmissionBlockedCode {
-			slog.Warn("voice chat gate: the agent did not admit a leg", "leg", l.leg, "model", l.target.ProviderModel, "server", s.serverName(l.target.ServerID), "err", err)
-			return voiceChatCoLoadFailed, wrapped
-		}
-		slog.Warn("voice chat gate: a leg could not be started", "leg", l.leg, "model", l.target.ProviderModel, "server", s.serverName(l.target.ServerID), "err", err)
-		return l.unavailable, wrapped
 	}
 	return "", nil
+}
+
+// ensureVoiceLeg starts one agent-managed leg through the ensure route and returns, on a
+// failure, the code to refuse with and the cause. A caller that went away mid-start, or an
+// agent that did not admit the leg, is a co-load failure; any other start failure is the
+// leg's own unavailable code.
+func (s *Server) ensureVoiceLeg(ctx context.Context, ensurer provider.RuntimeEnsurer, l voiceGateLeg) (string, error) {
+	// The spec only words the failure (its start timeout); a failed read is no reason
+	// to refuse to start the model.
+	var spec routing.RuntimeSpec
+	if s.Routes != nil {
+		spec, _, _ = s.Routes.RuntimeSpecByMapping(ctx, l.target.RouteID)
+	}
+	err := s.ensureLoadAttempt(ensurer, l.target, spec)(ctx, s.newLoadBound(l.target))
+	if err == nil {
+		return "", nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// The caller went away mid-start; the failure says nothing about the leg.
+		return voiceChatCoLoadFailed, fmt.Errorf("voice chat %s leg: %w", l.leg, ctxErr)
+	}
+	wrapped := fmt.Errorf("voice chat %s leg: %w", l.leg, err)
+	var routerErr *provider.RouterError
+	if errors.As(err, &routerErr) && routerErr.Code == voiceAdmissionBlockedCode {
+		slog.Warn("voice chat gate: the agent did not admit a leg", "leg", l.leg, "model", l.target.ProviderModel, "server", s.serverName(l.target.ServerID), "err", err)
+		return voiceChatCoLoadFailed, wrapped
+	}
+	slog.Warn("voice chat gate: a leg could not be started", "leg", l.leg, "model", l.target.ProviderModel, "server", s.serverName(l.target.ServerID), "err", err)
+	return l.unavailable, wrapped
 }
 
 // voiceLoadedKey identifies one loaded-set read: the server, and the path and format it
@@ -384,12 +394,7 @@ type voiceLoadedKey struct{ serverID, path, format string }
 // legs that are missing) when starting a later leg evicted an earlier one, and any other
 // error when the set could not be read -- a residency that cannot be read is not assumed.
 func (s *Server) verifyVoiceCoResidency(ctx context.Context, legs []voiceGateLeg) error {
-	var agentLegs []voiceGateLeg
-	for _, l := range legs {
-		if l.agentManaged() {
-			agentLegs = append(agentLegs, l)
-		}
-	}
+	agentLegs := agentManagedVoiceLegs(legs)
 	if len(agentLegs) == 0 {
 		return nil
 	}
@@ -400,18 +405,9 @@ func (s *Server) verifyVoiceCoResidency(ctx context.Context, legs []voiceGateLeg
 	snapshots := map[voiceLoadedKey][]string{}
 	var missing []string
 	for _, l := range agentLegs {
-		path, format, err := s.voiceLoadedModelsProbe(ctx, l.target)
+		loaded, err := s.voiceLegLoadedModels(ctx, lister, snapshots, l)
 		if err != nil {
-			return fmt.Errorf("voice chat %s leg: %w", l.leg, err)
-		}
-		key := voiceLoadedKey{serverID: l.target.ServerID, path: path, format: format}
-		loaded, seen := snapshots[key]
-		if !seen {
-			loaded, err = lister.LoadedModels(s.upstreamAuthCtx(ctx, l.target), l.target, path, format)
-			if err != nil {
-				return fmt.Errorf("voice chat %s leg: read the models the agent has loaded: %w", l.leg, err)
-			}
-			snapshots[key] = loaded
+			return err
 		}
 		if !slices.Contains(loaded, l.target.ProviderModel) {
 			missing = append(missing, fmt.Sprintf("%s (%s)", l.leg, l.target.ProviderModel))
@@ -421,6 +417,38 @@ func (s *Server) verifyVoiceCoResidency(ctx context.Context, legs []voiceGateLeg
 		return fmt.Errorf("voice chat: %s not resident after all legs were started: %w", strings.Join(missing, ", "), errVoiceNotCoResident)
 	}
 	return nil
+}
+
+// agentManagedVoiceLegs is the legs that run on an agent-managed server, in order: the
+// only ones whose residency the gate verifies.
+func agentManagedVoiceLegs(legs []voiceGateLeg) []voiceGateLeg {
+	var agentLegs []voiceGateLeg
+	for _, l := range legs {
+		if l.agentManaged() {
+			agentLegs = append(agentLegs, l)
+		}
+	}
+	return agentLegs
+}
+
+// voiceLegLoadedModels is the set of models the agent of one leg has loaded now. Two legs
+// that read the same server with the same path and format share one read: snapshots holds
+// the sets already read, keyed by what they were read with, and a fresh read is added to it.
+func (s *Server) voiceLegLoadedModels(ctx context.Context, lister provider.LoadedModelLister, snapshots map[voiceLoadedKey][]string, l voiceGateLeg) ([]string, error) {
+	path, format, err := s.voiceLoadedModelsProbe(ctx, l.target)
+	if err != nil {
+		return nil, fmt.Errorf("voice chat %s leg: %w", l.leg, err)
+	}
+	key := voiceLoadedKey{serverID: l.target.ServerID, path: path, format: format}
+	if loaded, seen := snapshots[key]; seen {
+		return loaded, nil
+	}
+	loaded, err := lister.LoadedModels(s.upstreamAuthCtx(ctx, l.target), l.target, path, format)
+	if err != nil {
+		return nil, fmt.Errorf("voice chat %s leg: read the models the agent has loaded: %w", l.leg, err)
+	}
+	snapshots[key] = loaded
+	return loaded, nil
 }
 
 // voiceLoadedModelsProbe resolves the loaded-models path and format an agent-managed

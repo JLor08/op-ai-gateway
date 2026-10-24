@@ -1251,27 +1251,38 @@ func stripVoiceAssistantAudio(history []ChatAPIMessage) {
 		if history[i].Role != "assistant" {
 			continue
 		}
-		var parts []json.RawMessage
-		if json.Unmarshal(history[i].Content, &parts) != nil {
-			continue // not an array of parts (a plain-string answer): nothing to strip
-		}
-		kept := make([]json.RawMessage, 0, len(parts))
-		for _, p := range parts {
-			if !isAudioContentPart(p) {
-				kept = append(kept, p)
-			}
-		}
-		if len(kept) == len(parts) {
-			continue // no audio part was present
-		}
-		if len(kept) == 0 {
-			history[i].Content = json.RawMessage(mustJSONString(""))
-			continue
-		}
-		if raw, err := json.Marshal(kept); err == nil {
-			history[i].Content = raw
+		if content, changed := withoutAudioParts(history[i].Content); changed {
+			history[i].Content = content
 		}
 	}
+}
+
+// withoutAudioParts is the content of one assistant message with its audio parts dropped,
+// and whether that differs from content. A content that is not an array of parts (a
+// plain-string answer) and one with no audio part are unchanged; one whose every part was
+// audio becomes an empty string rather than an empty array.
+func withoutAudioParts(content json.RawMessage) (json.RawMessage, bool) {
+	var parts []json.RawMessage
+	if json.Unmarshal(content, &parts) != nil {
+		return nil, false // not an array of parts (a plain-string answer): nothing to strip
+	}
+	kept := make([]json.RawMessage, 0, len(parts))
+	for _, p := range parts {
+		if !isAudioContentPart(p) {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) == len(parts) {
+		return nil, false // no audio part was present
+	}
+	if len(kept) == 0 {
+		return json.RawMessage(mustJSONString("")), true
+	}
+	raw, err := json.Marshal(kept)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
 }
 
 // isAudioContentPart reports whether a content part is an audio part -- a stored

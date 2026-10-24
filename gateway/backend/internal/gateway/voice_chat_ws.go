@@ -1019,7 +1019,15 @@ func (m *voiceMachine) beginAnswer() {
 		ServiceID: m.claims.ServiceID,
 		ProjectID: m.claims.ProjectID,
 	}
-	run, err := m.s.startVoiceRun(m.ctx, owner, m.claims.ChatID, m.pendingText, m.claims.ASR, m.claims.LLM, m.claims.TTS, m.claims.Audio)
+	run, err := m.s.startVoiceRun(m.ctx, voiceRunRequest{
+		owner:       owner,
+		chatID:      m.claims.ChatID,
+		pendingText: m.pendingText,
+		asr:         m.claims.ASR,
+		llm:         m.claims.LLM,
+		tts:         m.claims.TTS,
+		audio:       m.claims.Audio,
+	})
 	if err != nil {
 		// The run could not even be reserved/launched (no slot, a history read failure):
 		// degrade exactly as a leg error would, no retry.

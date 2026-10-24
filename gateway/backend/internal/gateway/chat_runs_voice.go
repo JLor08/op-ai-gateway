@@ -57,6 +57,23 @@ type voiceRunParams struct {
 	audio portal.ChatAudioSettings
 }
 
+// voiceRunRequest is what startVoiceRun is asked to run: the principal and the chat, the
+// ASR'd user text of the turn, the three resolved targets of the loop, and the chat's
+// speech settings.
+type voiceRunRequest struct {
+	owner       auth.Token
+	chatID      string
+	pendingText string
+	// asr is accepted for symmetry -- the orchestrator resolves all three legs together --
+	// but the run acts only on llm and tts: the per-turn ASR relay is the orchestrator's
+	// own (spec 5.4), not the run's.
+	asr routing.Target
+	llm routing.Target
+	tts routing.Target
+	// audio is the chat's speech settings (voice/language, #282).
+	audio portal.ChatAudioSettings
+}
+
 // startVoiceRun reserves a run and launches the voice executor for one turn. It reads
 // the chat's history and appends pendingText in-memory for the LLM leg, but commits
 // NOTHING up front (VoiceRunHistory is a read): persistence is deferred so a cancelled
@@ -67,33 +84,28 @@ type voiceRunParams struct {
 //
 // The returned run is cancellable through the registry (s.ChatRuns.cancelChat): the
 // orchestrator cancels it on resumed speech, and a cancelled run commits nothing.
-//
-// asr is accepted for signature symmetry -- the orchestrator resolves all three legs
-// together -- but this run acts only on llm and tts: the per-turn ASR relay is the
-// orchestrator's own (spec 5.4), not the run's.
-func (s *Server) startVoiceRun(ctx context.Context, owner auth.Token, chatID, pendingText string, asr, llm, tts routing.Target, audio portal.ChatAudioSettings) (*ChatRun, error) {
-	_ = asr
-	history, err := s.Portal.VoiceRunHistory(ctx, owner, chatID, pendingText)
+func (s *Server) startVoiceRun(ctx context.Context, req voiceRunRequest) (*ChatRun, error) {
+	history, err := s.Portal.VoiceRunHistory(ctx, req.owner, req.chatID, req.pendingText)
 	if err != nil {
 		return nil, err
 	}
-	run, runCtx, err := s.reserveRun(owner, chatID)
+	run, runCtx, err := s.reserveRun(req.owner, req.chatID)
 	if err != nil {
 		return nil, err
 	}
 	prep := PrepareRunResult{
 		History: history,
 		Settings: portal.ChatRunSettings{
-			Model: llm.Model,
+			Model: req.llm.Model,
 			Kind:  chatRunKindVoice,
 		},
 		Voice: &voiceRunParams{
-			pendingText: pendingText,
-			tts:         tts,
-			audio:       audio,
+			pendingText: req.pendingText,
+			tts:         req.tts,
+			audio:       req.audio,
 		},
 	}
-	s.launchRun(runCtx, owner, run, prep)
+	s.launchRun(runCtx, req.owner, run, prep)
 	return run, nil
 }
 
