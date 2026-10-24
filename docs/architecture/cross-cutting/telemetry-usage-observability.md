@@ -987,7 +987,7 @@ no slot and writes no row; neither does the ticket endpoint (a gate) or the WebS
 | **Voice** (TTS) | `/v1/audio/speech` (streamed) | one per run that reached the TTS leg | `audio_second` over the benchmark-learned byte rate, or `audio_bytes` while that rate is uncached ([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)); a run cancelled mid-synthesis is the streamed call's client-disconnect row, an error row with quantity 0 (above) |
 
 What is deferred in a voice run is **persistence**, not metering: a speculative run that is cancelled writes nothing to the
-chat, but its tokens and any audio it synthesized were produced upstream and are billed by their cores. The three rows read in the
+chat, but the LLM tokens it produced are billed by the chat core. TTS audio is billed only when the synthesis completed before the cancel: a speech stream cut mid-synthesis is the speech core's client-disconnect error row with quantity 0 (the table above). The three rows read in the
 usage views and the energy tiers as ordinary transcription, chat and speech usage of the user (§8.4.4); no new unit and no
 new metering model was introduced, and there is no per-conversation grouping column, so the rows of one conversation are tied
 only by user, route and time.

@@ -534,7 +534,7 @@ sequenceDiagram
         M-->>B: {audio_done}, then {state: draining}
         B->>B: reload the chat thread, which now holds the committed turns
         B->>M: {playback_done} when the streaming player has drained
-        M->>M: end draining at min(ceiling, max(floor, signal)), then the mic-resume tail
+        M->>M: end draining at max(floor, min(ceiling, signal)), then the mic-resume tail
         M-->>B: {state: listening}
     end
     opt any leg fails (ASR drop, LLM or TTS error, admission_blocked, commit failure)
@@ -547,9 +547,12 @@ What differs from the live-transcription and speech scenarios. **The orchestrato
 Each leg is a loopback call to a public `/v1` core that resolves, admits, guards and bills for itself, so the state
 machine takes no admission, holds no route slot and writes no usage row; the three rows of a turn are listed in
 [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event). **The ASR relay is per chunk, not per
-session**: it opens on the first admitted mic frame and is closed at every chunk end, so between chunks ASR holds no
-admission and no pinned child (on a one-GPU host a session-long relay would block the TTS child from loading), and the
-clean final comes from end-of-input, the contract the relay is tested on. **The live transcript is the current chunk's**:
+session**: it opens on the first admitted mic frame (no check for speech) and is closed at every chunk end, so a relay
+exists whenever the mic gate is open, in `listening` and, until the window closes, in `thinking`, and is reopened about
+100 ms after each chunk end. While it exists it holds its admission and the route's live slot and pins the ASR child
+(including during the continuation window, when the speculative LLM and TTS run); it is absent only in `idle`, `speaking`
+and `draining`. A session-long relay would hold them there too, and the clean final comes from end-of-input, the contract
+the relay is tested on. **The live transcript is the current chunk's**:
 `asr_partial` replaces the previous partial of *that chunk*, and across a pause the client shows the finalized chunks so far
 plus it; no frame carries a message id, because nothing is persisted at a chunk boundary. **A pause is not the end of the
 turn.** On a chunk end the machine answers **speculatively** and leaves the mic open (the continuation window): resumed
@@ -561,11 +564,13 @@ window than the full grace, and a resume that begins once the run is committing 
 voiced chunk is discarded when the window force-closes. True barge-in, interrupting the answer, is phase 4
 ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). **The half-duplex gate is
 the server's.** Mic PCM is discarded in the machine, before any ASR loopback, in `speaking`, `draining`, `idle`, while a
-chunk finalizes and once the window has closed; `push_start` only starts a turn from `idle`. **`draining` tracks playout,
+chunk finalizes and once the window has closed; `push_start` only starts a turn from `idle`, and the one control that returns
+to `listening` from any state is `cancel`, the user's own immediate stop (the client stops its playback first; true barge-in
+is phase 4). **`draining` tracks playout,
 not relay.** The machine relays audio faster than real time, so `audio_done` is "all audio sent", and the drain holds the mic
-gated until `min(ceiling, max(floor, playback_done))`, the floor being the relayed audio's own duration, so an early or
-forged `playback_done` cannot re-open the mic while the answer is audible and a missing one cannot wedge the session
-(the 30 s ceiling). **Failure is one typed error and `idle`, never a retry.** The WebSocket upgrade hijacks its
+gated until `max(floor, min(ceiling, playback_done))`, the floor being the relayed audio's own duration and the ceiling (30 s)
+never cutting below it, so an early or
+forged `playback_done` cannot re-open the mic while the answer is audible and a missing one cannot wedge the session. **Failure is one typed error and `idle`, never a retry.** The WebSocket upgrade hijacks its
 connection, so none of the 30 s server deadlines applies to it; the ticket POST, which can wait on a cold start, lifts them
 ([API Compatibility & Inference §7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle)). The frames and codes are in the
 [HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket), the knobs in

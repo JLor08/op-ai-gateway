@@ -19,8 +19,8 @@ import (
 )
 
 // This file is the Voice Chat run kind (spec 5.4, 6.1) -- "the one genuinely new
-// chat-run behaviour". The orchestrator (a later task) starts one per turn with the
-// ASR'd user text and three resolved targets; this run:
+// chat-run behaviour". The orchestrator (voiceMachine, voice_chat_ws.go) starts one per
+// chunk end with the accumulated ASR'd user text and three resolved targets; this run:
 //
 //  1. runs a text completion on the chosen LLM over the chat's history plus the
 //     pending text, streaming its answer deltas to subscribers (runVoiceLLM);

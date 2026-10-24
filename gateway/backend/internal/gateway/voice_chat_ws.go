@@ -93,7 +93,8 @@ const (
 //   - VoiceMicResumeTailMs: after draining, the mic stays gated this much longer before
 //     it re-opens (the half-duplex tail).
 //   - VoiceContinuationGraceMs: the speculative-run grace window before a turn commits.
-//     Defined now; the continuation window that uses it is wired in Task 7.
+//     It is the continuation window (the mic stays open and the TTS audio is held until
+//     it closes), which the state machine's beginAnswer arms on each chunk end.
 const (
 	VoiceSilenceTimeoutMs    = 900
 	VoiceMinUtteranceMs      = 300
@@ -960,8 +961,8 @@ func (m *voiceMachine) finalizeChunk() {
 
 // finishChunk completes a chunk once its clean final arrives: it emits asr_final, APPENDS
 // the final to pendingText (the accumulating turn text), tears the per-turn loopback down,
-// and begins the (placeholder) answer so the session walks the speak/drain states and
-// returns to listening.
+// and begins the answer (beginAnswer): a speculative voice run on the accumulated text and
+// the continuation window, which ends in the speak/drain states and a return to listening.
 func (m *voiceMachine) finishChunk(final string) {
 	m.stopFinalize()
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownASRFinal, Text: final})
