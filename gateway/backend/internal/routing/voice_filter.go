@@ -93,10 +93,13 @@ func hasVoicesRow(rows []ModelMappingCacheRow) bool {
 // its cached voices row) to not list it AND at least one eligible candidate remained
 // (FAIL-OPEN on unknown, see voiceScopeFor): allowed is then never empty.
 type voiceScope struct {
-	// allowed is the ids of the pool's mappings eligible to serve the voice: those whose
-	// cached voice list names it, PLUS those whose voice status is UNKNOWN (no cached row,
-	// or an unreadable one) and so stay eligible fail-open (unknown != absent). It is never
-	// empty: when every candidate is known-absent the pre-pass returns a nil scope instead.
+	// allowed is the ids of the CLASSIFIED mappings eligible to serve the voice: those whose
+	// cached voice list names it, PLUS those whose voice status is UNKNOWN (a plain-tts mapping
+	// with no cached row, or any classified mapping with an unreadable one) and so stay eligible
+	// fail-open (unknown != absent). A speech clone with no voices row is not classified at all,
+	// so it is never in allowed -- it is dropped from a narrowed pool and kept only on a nil
+	// scope, as every clone was before #305. allowed is never empty: when every classified
+	// candidate is known-absent the pre-pass returns a nil scope instead.
 	allowed map[string]struct{}
 	// narrowed reports that the voice EXCLUDED at least one candidate KNOWN (from its cached
 	// voices row) to not list it, which is what makes a later "no usable host" the voice's
@@ -227,7 +230,8 @@ func (r *Resolver) voiceScopeFor(ctx context.Context, voice string, pool []Mappi
 		knownAbsent++
 	}
 	if len(allowed) == 0 {
-		// Every candidate is KNOWN-absent: no cached list offers the voice. FAIL OPEN --
+		// Every CLASSIFIED candidate is KNOWN-absent: no cached list offers the voice (a skipped
+		// no-row clone is not classified, so it does not count here). FAIL OPEN --
 		// route unfiltered and let the upstream be the authority (it may accept a free-text
 		// name; if not it rejects it with a 500, the accepted free-text risk), rather than
 		// 503 a request the upstream might still serve.
