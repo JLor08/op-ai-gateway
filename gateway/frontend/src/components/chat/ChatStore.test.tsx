@@ -52,7 +52,6 @@ const playback = vi.hoisted(() => ({
   abort: vi.fn(),
   stopAll: vi.fn(),
   isLive: vi.fn(() => false),
-  isPlayingOut: vi.fn(() => false),
   setMuted: vi.fn(),
   onDrained: vi.fn(),
 }));
@@ -4472,11 +4471,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
     });
 
-    it('clears the run-live mark at once for a completed BUFFERED run (nothing played out)', async () => {
-      // A buffered run never streams a chunk, so it is never live; its drain fires at once from
-      // end(), and the mark is false throughout.
+    // Finding 1: deleting the chat (or cancelling a following run) while the tail is still draining
+    // must route to playback.end('c1', false) so the tail is actually cut -- the playback layer's
+    // own test proves end(false) silences an already-draining session.
+    it('still silences the audio when the chat is deleted during the draining tail', async () => {
       const { es } = await startRun();
-      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+      act(() => es.emit('audio', chunk(0)));
       act(() =>
         es.emit('done', {
           content: '',
@@ -4485,9 +4485,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           content_parts: [{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } }],
         }),
       );
-      expect(playback.end).toHaveBeenCalledWith('c1', true);
-      fireDrain('c1'); // the stand-in's end() would have drained immediately
-      expect(screen.getByTestId('run-audio-live').textContent).toBe('false');
+      expect(screen.getByTestId('run-audio-live').textContent).toBe('true'); // tail draining
+      playback.end.mockClear();
+      fireEvent.click(screen.getByRole('button', { name: 'delete-c1' }));
+      await waitFor(() => expect(playback.end).toHaveBeenCalledWith('c1', false));
     });
 
     // Abort once the run is already done and only the tail is playing (issue #281): it silences

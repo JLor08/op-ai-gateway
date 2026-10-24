@@ -58,7 +58,6 @@ const playback = vi.hoisted(() => ({
   abort: vi.fn(),
   stopAll: vi.fn(),
   isLive: vi.fn(() => false),
-  isPlayingOut: vi.fn(() => false),
   setMuted: vi.fn(),
   onDrained: vi.fn(),
 }));
@@ -1233,14 +1232,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       emitCompleted(es);
       // The saved player has appeared...
       expect(await screen.findByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
-      // ...and the Mute/Stop controls are still there (the tail is still playing out).
-      expect(screen.getByRole('button', { name: t.chatAudioAbort })).toBeInTheDocument();
+      // ...and the Mute/Stop controls are still there (the tail is still playing out). The Stop
+      // now reads "Stop playback" -- the run has committed, so it is no longer the cancel.
+      expect(screen.getByRole('button', { name: t.chatAudioStopPlayback })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull();
 
       // The tail drains: only now do the controls go, and the player stays.
       fireTailDrain('chat_1');
       await waitFor(() =>
-        expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull(),
+        expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull(),
       );
       expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
     });
@@ -1252,12 +1253,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await screen.findByLabelText(t.chatGeneratedAudio);
       playback.abort.mockClear();
 
-      fireEvent.click(screen.getByRole('button', { name: t.chatAudioAbort }));
+      fireEvent.click(screen.getByRole('button', { name: t.chatAudioStopPlayback }));
       expect(playback.abort).toHaveBeenCalledWith('chat_1');
       // It is the tail-stop, not the run's cancel: the run already committed.
       expect(chatApi.spies.cancelChatRun).not.toHaveBeenCalled();
       await waitFor(() =>
-        expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull(),
+        expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull(),
       );
     });
   });

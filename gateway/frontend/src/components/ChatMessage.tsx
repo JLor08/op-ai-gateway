@@ -406,22 +406,25 @@ function ChatMessageComponent({
           />
         )}
         {audioUrls.length > 0 && <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />}
-        {/* The streamed tail may still be playing out after the run has committed and its saved
-            player above has appeared (#281): while it is (audioLive), the Mute/Stop controls ride
-            beside the player so the user can still silence it, exactly as the live pending bubble
-            offered them before the commit. They are gone once the tail has drained (audioLive
-            false), and a buffered answer -- never live -- never shows them. Abort here is the
-            tail-stop, not a cancel (the run is already done). */}
-        {audioUrls.length > 0 && audioLive === true && (
+        {audioRemoved && (
+          <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />
+        )}
+        {/* The streamed tail may still be playing out after the run has committed (#281): while it
+            is (audioLive), the Mute/Stop controls ride beside whichever of the two the answer
+            shows -- the saved player, OR the not-stored placeholder of a retention-0 answer, which
+            still streamed audio and so still has a tail to silence -- so the user can always stop
+            it. They are gone once the tail has drained (audioLive false), and a buffered answer --
+            never live -- never shows them. Stop here only ends the playback (the run is already
+            done and the answer, or its not-stored marker, is untouched), so it reads "Stop
+            playback", not "Abort generation". */}
+        {audioLive === true && (audioUrls.length > 0 || audioRemoved) && (
           <AudioTailControls
             t={t}
             muted={audioMuted === true}
             onMute={onMuteAudio}
             onAbort={onAbortAudio}
+            abortLabel={t.chatAudioStopPlayback}
           />
-        )}
-        {audioRemoved && (
-          <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />
         )}
         <Stack direction="row" sx={{ flexWrap: 'wrap', alignItems: 'center', gap: 0.5, mt: 1.25 }}>
           {/* The not-stored placeholder carries its own regenerate (the same handler), so the

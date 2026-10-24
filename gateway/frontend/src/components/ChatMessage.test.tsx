@@ -398,10 +398,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               onAbortAudio={vi.fn()}
             />,
           );
-          // The saved player is there AND the live controls are beside it.
+          // The saved player is there AND the live controls are beside it. The tail-window Stop
+          // reads "Stop playback" (it only ends playback), not "Abort generation".
           expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
           expect(screen.getByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
-          expect(screen.getByRole('button', { name: t.chatAudioAbort })).toBeInTheDocument();
+          expect(screen.getByRole('button', { name: t.chatAudioStopPlayback })).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull();
         });
 
         it('calls the handlers: Mute toggles, Stop silences the tail', () => {
@@ -421,7 +423,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           );
           fireEvent.click(screen.getByRole('button', { name: t.chatAudioMute }));
           expect(onMuteAudio).toHaveBeenCalledWith(true);
-          fireEvent.click(screen.getByRole('button', { name: t.chatAudioAbort }));
+          fireEvent.click(screen.getByRole('button', { name: t.chatAudioStopPlayback }));
           expect(onAbortAudio).toHaveBeenCalledTimes(1);
         });
 
@@ -456,7 +458,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           );
           expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
           expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
-          expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull();
+          expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull();
         });
 
         it('shows no tail controls for a completed buffered answer (never played out live)', () => {
@@ -465,7 +467,49 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           render(<ChatMessage t={t} role="assistant" turnId="msg_a1" content={stored} />);
           expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
           expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
-          expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull();
+          expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull();
+        });
+
+        // Finding 2: a streamed retention-0 answer commits the `audio_removed` marker and NO
+        // audio_url parts, so AudioNotStoredTurn renders -- but its streamed tail is still playing
+        // out, so the controls must ride beside the placeholder too, not only beside a saved player.
+        it('shows the tail controls beside the not-stored placeholder of a retention-0 answer', () => {
+          const removed = [{ type: 'audio_removed' as const }];
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={removed}
+              audioLive
+              audioMuted={false}
+              onMuteAudio={vi.fn()}
+              onAbortAudio={vi.fn()}
+            />,
+          );
+          // The not-stored placeholder is shown (no player), AND the tail controls are beside it.
+          expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+          expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+          expect(screen.getByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
+          expect(screen.getByRole('button', { name: t.chatAudioStopPlayback })).toBeInTheDocument();
+        });
+
+        it('drops the placeholder tail controls once the retention-0 tail has drained', () => {
+          const removed = [{ type: 'audio_removed' as const }];
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={removed}
+              audioLive={false}
+              onMuteAudio={vi.fn()}
+              onAbortAudio={vi.fn()}
+            />,
+          );
+          expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
+          expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull();
         });
       });
 

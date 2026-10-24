@@ -19,6 +19,7 @@ export function AudioTailControls({
   muted = false,
   onMute,
   onAbort,
+  abortLabel,
 }: Readonly<{
   t: Translation;
   // Whether the playback is muted (the Mute control then reads Unmute).
@@ -27,6 +28,10 @@ export function AudioTailControls({
   onMute?: (muted: boolean) => void;
   // Stop the audio (cancel the run while it runs, or silence the drained tail afterwards).
   onAbort?: () => void;
+  // The Abort/Stop button's label. While the run is still generating it is the run's cancel
+  // ("Abort generation", the default); once the run has committed and only its streamed tail is
+  // still playing, the caller passes "Stop playback" since nothing is cancelled any more.
+  abortLabel?: string;
 }>) {
   if (!onMute && !onAbort) return null;
   return (
@@ -38,7 +43,7 @@ export function AudioTailControls({
       )}
       {onAbort && (
         <Button variant="outlined" size="small" color="error" onClick={onAbort}>
-          {t.chatAudioAbort}
+          {abortLabel ?? t.chatAudioAbort}
         </Button>
       )}
     </Stack>

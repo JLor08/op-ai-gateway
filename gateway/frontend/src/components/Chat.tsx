@@ -1013,6 +1013,13 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               // OR the audio is still live)", not on `rowStreaming` alone.
               const rowPlayingOut =
                 isLast && message.role === 'assistant' && (c.streaming || c.runAudioLive);
+              // Abort depends on where the run is: the composer's own Stop (the cancel) while it
+              // still generates, the tail-stop once it has committed and only its tail plays out,
+              // and absent otherwise. A plain if/else-if rather than a nested ternary (Sonar
+              // S3358).
+              let onRowAbortAudio: (() => void) | undefined;
+              if (rowStreaming) onRowAbortAudio = c.stop;
+              else if (rowPlayingOut) onRowAbortAudio = onAbortAudio;
               return (
                 <ChatMessage
                   key={message.id}
@@ -1058,7 +1065,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   // only its tail is draining it is `abortAudio`, which just silences the tail and
                   // leaves the stored answer and billing untouched. Both are stable references.
                   onMuteAudio={rowPlayingOut ? onMuteAudio : undefined}
-                  onAbortAudio={rowStreaming ? c.stop : rowPlayingOut ? onAbortAudio : undefined}
+                  onAbortAudio={onRowAbortAudio}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
                   // The refine of a generated image: only where it can run. attachMode

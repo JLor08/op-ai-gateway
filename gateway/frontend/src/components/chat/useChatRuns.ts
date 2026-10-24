@@ -361,11 +361,12 @@ export function useChatRuns(
       // appear beside it); anything else -- a Stop, an error -- goes silent now.
       const completed = status === 'completed';
       playback.end(chatId, completed);
-      // Leave the live mark SET for a completed run: its tail is still playing out, and the live
-      // controls must persist until it drains (#281). The playback's onDrained callback clears the
-      // mark (and the mute mark) when the tail finishes -- which, for a run with nothing queued
-      // (a buffered answer), it does synchronously from the end() above. A Stop or an error has no
-      // tail to play out, so it clears immediately.
+      // Leave the live mark SET for a completed run that was playing live: its tail is still
+      // playing out, and the live controls must persist until it drains (#281). The playback's
+      // onDrained callback clears the mark (and the mute mark) when the tail finishes. A run that
+      // was never live -- a buffered answer (no playback session at all) or one abandoned at a gap
+      // -- has no mark to clear: it was already false, so leaving it is a no-op. A Stop or an error
+      // has no tail to play out, so it clears immediately here instead.
       if (!completed) markAudioLive(chatId, false);
       const run = runsRef.current.get(chatId);
       if (run) {

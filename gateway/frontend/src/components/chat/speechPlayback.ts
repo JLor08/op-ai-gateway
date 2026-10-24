@@ -306,11 +306,9 @@ export type SpeechPlayback = {
    * chat with no session is a no-op. */
   setMuted(chatId: string, muted: boolean): void;
   /** Whether the chat's run is playing live right now (its chunks arriving and scheduled). False
-   * the moment the run ends, even while its tail is still draining -- use `isPlayingOut` for that. */
+   * the moment the run ends, even while its tail is still draining: a completed run's draining tail
+   * is tracked by its render mirror (runAudioLive, kept set until onDrained fires), not here. */
   isLive(chatId: string): boolean;
-  /** Whether the chat is still producing sound: playing live, OR draining a completed run's tail
-   * that has not finished yet. True from the first chunk until the tail has fully played out. */
-  isPlayingOut(chatId: string): boolean;
   /** Register the one callback fired with a chatId when that chat's audio has fully drained (a
    * completed run's tail finished, or a run was silenced): the signal that `runAudioLive` may be
    * cleared. Last registration wins. */
@@ -381,10 +379,13 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
     push(chatId, runId, chunk) {
       let session = sessions.get(chatId);
       if (session?.runId !== runId) {
-        // A new run of this chat: stop the previous one's tail (whether it was still live or
-        // already draining a completed run) so it cannot overlap this answer or outlive the
-        // chat. No drain signal here -- THIS run's own push, below, sets the chat's live state.
-        if (session) silence(session);
+        // A new run of this chat replaces the previous one (still live, or draining a completed
+        // run's tail): drain the old session -- stop its audio so it cannot overlap this answer
+        // or outlive the chat, drop it, AND signal its drain, so the old run's live/mute marks
+        // clear. Without that signal a mute left on the draining tail would carry over and
+        // mislabel this new run (it starts unmuted). THIS run's own push, below, then sets the
+        // chat live again.
+        if (session) drain(chatId, session);
         const ctx = getContext();
         if (!ctx) return false;
         resume(ctx);
@@ -424,7 +425,15 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
 
     end(chatId, completed) {
       const session = sessions.get(chatId);
-      if (!session || session.ended) return;
+      if (!session) return;
+      // A second end for a session already draining a completed run's tail: a clean one is
+      // redundant (the drain is already wired), but a Stop, an error, or a chat-delete (forget's
+      // `end(false)`) must still cut the tail that is playing out NOW -- otherwise it stays
+      // audible with no controls, and outlives a deleted chat.
+      if (session.ended) {
+        if (!completed) drain(chatId, session);
+        return;
+      }
       session.ended = true;
       // Anything but a clean end on a running clock goes silent at once: a Stop, an error, or a
       // context whose frozen queue would otherwise play stale when something resumed it. The
@@ -471,15 +480,6 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
     isLive(chatId) {
       const session = sessions.get(chatId);
       return session !== undefined && !session.ended && session.state.phase === 'live';
-    },
-
-    isPlayingOut(chatId) {
-      const session = sessions.get(chatId);
-      if (!session) return false;
-      // While the run is live, "playing out" is just "live". Once it has ended, the tail is
-      // playing out for as long as the player still holds scheduled sources.
-      if (!session.ended) return session.state.phase === 'live';
-      return session.player.pending > 0;
     },
 
     onDrained(cb) {
