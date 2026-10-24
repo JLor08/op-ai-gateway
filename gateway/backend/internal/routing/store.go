@@ -1922,10 +1922,11 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 // in a reference voice it is handed, so it has no named voices to offer).
 //
 // It is the ONE definition of the plain-tts rule: the speech benchmark and its health-loop
-// trigger (the streamed-rate step), the portal's streaming gate and the routing voice
-// filter decide from it. Since #301 it no longer decides the voices
-// cache: the producers ask any speech model (CapabilityRowsSpeech) and the readers
-// offer a clone model's list too when it is non-empty (CapabilityRowsOfferableTTS).
+// trigger (the streamed-rate step) and the routing voice filter decide from it. Since #301
+// it no longer decides the voices cache or the portal's streaming gate: the producers ask
+// any speech model (CapabilityRowsSpeech), the readers offer a clone model's list too when
+// it is non-empty, and the portal streaming and language gates use the offerable set
+// (CapabilityRowsOfferableTTS).
 func CapabilityRowsPlainTTS(rows []CapabilityRow) bool {
 	byName := CapabilityRowsByName(rows)
 	return byName[CapabilitySpeech].Verdict == CapabilityYes &&
