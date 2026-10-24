@@ -4583,38 +4583,87 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
     });
 
+    // speech_clone marks a voice-CLONE model: it keeps speech:true (the direct
+    // endpoint serves it) but a text-only chat composer cannot supply the
+    // reference voice it needs, so the picker drops it (#252) -- UNLESS the model
+    // has configured preset voices (speech_clone_voices, #301), which make a clone
+    // model usable without a reference voice. A speech model with no speech_clone
+    // flag is fail-open (offered), and a clone model that ALSO transcribes is
+    // still offered via the transcription half.
+    const cloneAudio = (
+      id: string,
+      speech?: boolean,
+      speech_clone?: boolean,
+      transcription?: boolean,
+      speech_clone_voices?: boolean,
+    ): ModelOption => ({
+      id,
+      display_name: id,
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech,
+      speech_clone,
+      speech_clone_voices,
+      transcription,
+    });
+
     it('excludes a clone-task speech model from the picker, keeping plain tts (#252)', async () => {
-      // speech_clone marks a voice-CLONE model: it keeps speech:true (the direct
-      // endpoint serves it) but a text-only chat composer cannot supply the
-      // reference voice it needs, so the picker drops it. A speech model with no
-      // speech_clone flag is fail-open (offered), and a clone model that ALSO
-      // transcribes is still offered via the transcription half.
-      const audio = (
-        id: string,
-        speech?: boolean,
-        speech_clone?: boolean,
-        transcription?: boolean,
-      ): ModelOption => ({
-        id,
-        display_name: id,
-        flavors: ['openai_audio'],
-        loading_on_count: 0,
-        speech,
-        speech_clone,
-        transcription,
-      });
       renderProvider([], {
         models: [
-          audio('tts-plain', true, false),
-          audio('tts-unclassified', true), // no speech_clone row -> fail-open, offered
-          audio('voice-clone', true, true), // clone -> excluded from the speech picker
-          audio('clone-and-asr', true, true, true), // still offered via transcription
+          cloneAudio('tts-plain', true, false),
+          cloneAudio('tts-unclassified', true), // no speech_clone row -> fail-open, offered
+          cloneAudio('voice-clone', true, true), // clone -> excluded from the speech picker
+          cloneAudio('clone-and-asr', true, true, true), // still offered via transcription
         ],
       });
       await waitForReady();
       expect(screen.getByTestId('model-options').textContent).toBe(
         'tts-plain,tts-unclassified,clone-and-asr',
       );
+    });
+
+    it('offers a clone speech model that has configured preset voices (#301)', async () => {
+      renderProvider([], {
+        models: [
+          cloneAudio('tts-plain', true, false),
+          cloneAudio('clone-with-voices', true, true, false, true), // presets -> offered
+          cloneAudio('clone-voices-false', true, true, false, false), // explicit false -> excluded
+          cloneAudio('clone-voices-unset', true, true), // reference-only clone -> excluded
+          cloneAudio('clone-voices-and-asr', true, true, true, true), // offered either way
+          cloneAudio('plain-with-voices-flag', true, false, false, true), // not a clone: unchanged
+        ],
+      });
+      await waitForReady();
+      expect(screen.getByTestId('model-options').textContent).toBe(
+        'tts-plain,clone-with-voices,clone-voices-and-asr,plain-with-voices-flag',
+      );
+    });
+
+    it('opens the speech composer for a preset-voice clone model only (#301)', async () => {
+      renderProvider([], {
+        models: [
+          cloneAudio('tts-plain', true, false),
+          cloneAudio('clone-with-voices', true, true, false, true),
+          // Offered only through its transcription verdict: it must NOT open the
+          // speech composer (the kind precedence would otherwise pick speech).
+          cloneAudio('clone-and-asr', true, true, true, false),
+        ],
+      });
+      await waitForReady();
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-with-voices' }));
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('true');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('speech');
+
+      fireEvent.click(screen.getByRole('button', { name: 'pick-clone-and-asr' }));
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('false');
+      expect(screen.getByTestId('model-transcription-capable').textContent).toBe('true');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('transcription');
+
+      // Plain tts is unchanged.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-tts-plain' }));
+      expect(screen.getByTestId('model-speech-capable').textContent).toBe('true');
+      expect(screen.getByTestId('chat-kind').textContent).toBe('speech');
     });
 
     it('leaves the offered text and image models exactly as they were', async () => {

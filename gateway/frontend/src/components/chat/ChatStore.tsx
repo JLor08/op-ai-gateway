@@ -715,10 +715,13 @@ export function ChatStoreProvider({
           // An openai_audio model is offered behind a speech OR transcription
           // verdict — except a voice-CLONE speech model (speech_clone), which the
           // text-only speech composer cannot drive (it needs a reference voice),
-          // so it is excluded from the speech half (#252). A clone model that also
-          // transcribes is still offered via the transcription half.
+          // so it is excluded from the speech half (#252) UNLESS it has configured
+          // preset voices (speech_clone_voices), which make it usable without a
+          // reference voice (#301). A clone model that also transcribes is still
+          // offered via the transcription half.
           (offered.includes('openai_audio') &&
-            ((option.speech === true && option.speech_clone !== true) ||
+            ((option.speech === true &&
+              (option.speech_clone !== true || option.speech_clone_voices === true)) ||
               option.transcription === true))
         );
       }),
@@ -807,12 +810,14 @@ export function ChatStoreProvider({
   // Whether the effective model SYNTHESIZES speech (drives the speech-thread composer),
   // read as served like `image`: the backend's own fold of the speech verdict, minus a
   // voice-CLONE model (speech_clone), which the text-only speech composer cannot drive —
-  // the same exclusion the picker applies (#252). A clone model admitted to the picker only
-  // by a manual transcription override would otherwise open the speech composer here (the
-  // kind precedence is image → speech → transcription).
+  // the same exclusion the picker applies (#252) — unless it has configured preset voices
+  // (speech_clone_voices), the same exception the picker makes (#301). A clone model admitted
+  // to the picker only by a manual transcription override would otherwise open the speech
+  // composer here (the kind precedence is image → speech → transcription).
+  const effectiveOption = chatModels.find((option) => option.id === effectiveModel);
   const modelSpeechCapable =
-    chatModels.find((option) => option.id === effectiveModel)?.speech === true &&
-    chatModels.find((option) => option.id === effectiveModel)?.speech_clone !== true;
+    effectiveOption?.speech === true &&
+    (effectiveOption.speech_clone !== true || effectiveOption.speech_clone_voices === true);
   // Whether the effective model TRANSCRIBES speech (drives the transcription-thread composer),
   // read as served like `speech`: the backend's own fold of the transcription verdict.
   const modelTranscriptionCapable =
