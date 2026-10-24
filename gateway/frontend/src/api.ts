@@ -27,6 +27,7 @@ import { netbirdApi } from './api/netbird';
 import { chatApi } from './api/chat';
 import { runtimeApi } from './api/runtime';
 import { vendorAccountsApi } from './api/vendorAccounts';
+import { voiceChatApi } from './api/voiceChat';
 
 export { PortalApiError, buildQueryString } from './api/transport';
 
@@ -45,6 +46,7 @@ export * from './api/netbird';
 export * from './api/chat';
 export * from './api/runtime';
 export * from './api/vendorAccounts';
+export * from './api/voiceChat';
 
 export function createPortalApi(fetcher: Fetcher = fetch) {
   return {
@@ -63,6 +65,7 @@ export function createPortalApi(fetcher: Fetcher = fetch) {
     ...chatApi(fetcher),
     ...runtimeApi(fetcher),
     ...vendorAccountsApi(fetcher),
+    ...voiceChatApi(fetcher),
   };
 }
 

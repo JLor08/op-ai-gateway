@@ -45,17 +45,17 @@ export const LIVE_FINALIZE_GRACE_MS = 10_000;
 // How long stop() waits for the worklet to hand over the last batch of audio before sending the
 // end of input without it, in ms: the worklet answers within a render quantum (a few ms) unless
 // it has died.
-const FLUSH_WAIT_MS = 500;
+export const FLUSH_WAIT_MS = 500;
 
 // The audio captured while the connection is still being made (the ticket, the handshake) is
 // kept, so that the first words are not lost to it. Each entry is ~100 ms; a connection that
 // takes longer than the cap drops the oldest.
-const MAX_PENDING_BATCHES = 100;
+export const MAX_PENDING_BATCHES = 100;
 
 // How long the session waits for a context that was resumed in the user's gesture to be running
 // before giving up on it, in ms: a browser answers within a few ms, so a context that is still
 // suspended after this has been refused (or has no gesture to run under).
-const CONTEXT_RUN_WAIT_MS = 1_000;
+export const CONTEXT_RUN_WAIT_MS = 1_000;
 
 // The WebSocket close code of a server that is busy ("try again later"), and the gateway's own
 // code for the same refusal on its other transports.
@@ -164,8 +164,11 @@ export type LiveSession = {
   abort(): void;
 };
 
+// What follows (down to settleWithin), and the three timing constants above, are exported for the
+// Voice Chat session (voiceSession.ts), which captures the microphone and fails in the same ways.
+
 // The page's AudioContext constructor: the standard one, or Safari's prefixed one before 14.1.
-function audioContextConstructor(): typeof AudioContext | undefined {
+export function audioContextConstructor(): typeof AudioContext | undefined {
   if (typeof window === 'undefined') return undefined;
   return (
     window.AudioContext ??
@@ -173,7 +176,7 @@ function audioContextConstructor(): typeof AudioContext | undefined {
   );
 }
 
-function describeError(error: unknown): string {
+export function describeError(error: unknown): string {
   if (error instanceof Error) return error.message || error.name;
   return String(error);
 }
@@ -182,14 +185,14 @@ function describeError(error: unknown): string {
 // name, PermissionDeniedError the old one, SecurityError a page the browser will not give the
 // microphone to). Read by `name`, never `instanceof`: the rejection is a DOMException, which is
 // not an Error of this realm in every environment.
-function isPermissionDenied(error: unknown): boolean {
+export function isPermissionDenied(error: unknown): boolean {
   const name =
     typeof error === 'object' && error !== null && 'name' in error ? String(error.name) : '';
   return name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError';
 }
 
 // A failure with its kind, thrown inside start() so that the one catch there can report it.
-class LiveFailure extends Error {
+export class LiveFailure extends Error {
   readonly detail: LiveErrorDetail;
   constructor(message: string, detail: LiveErrorDetail) {
     super(message);
@@ -199,7 +202,7 @@ class LiveFailure extends Error {
 
 // What a failed ticket request means: a 4xx is the gateway refusing this session (the same
 // request is refused again); anything else -- a network failure, a 5xx -- did not get an answer.
-function ticketFailure(error: unknown): LiveFailure {
+export function ticketFailure(error: unknown): LiveFailure {
   const status = (error as { status?: unknown } | null)?.status;
   const code = (error as { code?: unknown } | null)?.code;
   const refused = typeof status === 'number' && status >= 400 && status < 500;
@@ -210,7 +213,7 @@ function ticketFailure(error: unknown): LiveFailure {
 }
 
 // Waits for `promise`, but not longer than `ms`; the timer does not outlive the wait.
-async function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
+export async function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, ms);
