@@ -23,15 +23,21 @@
 //     discards it while the answer is being spoken (it is half-duplex, enforced there, so that
 //     the answer can never be heard as speech).
 //   - DOWN: text frames, parsed by parseVoiceDownFrame below. `state` is the gateway's state
-//     machine; `asr_partial` is the provisional transcript of the whole of what is being said
-//     (it REPLACES the last one), `asr_final` the finished user turn; `answer_delta` is a piece
-//     of the answer's text (it is APPENDED), `answer_done` its end; `answer_reset` says the
-//     answer so far is void, because the user went on talking; `audio_delta` is a chunk of the
-//     spoken answer and `audio_done` its end; `error` is a turn that failed.
+//     machine; `asr_partial` is the provisional transcript of the CURRENT CHUNK only (it
+//     REPLACES the last partial, not the turn's transcript), and `asr_final` the finished text
+//     of that one chunk. A turn can span several chunks -- a pause the user goes on from ends a
+//     chunk, not the turn -- so the caller accumulates the finals and shows them plus the
+//     current partial. `answer_delta` is a piece of the answer's text (it is APPENDED),
+//     `answer_done` its end, which is provisional: it comes before the turn is committed, and
+//     `answer_reset` says the answer so far is void, because the user went on talking.
+//     `audio_delta` is a chunk of the spoken answer and `audio_done` its end, which is when the
+//     turn has been committed; `error` is a turn that failed.
 //
-// Display is provisional: the gateway persists the turns, so nothing here commits one. What is
-// shown from `asr_partial` and `answer_delta` is a preview, and what the chat shows once the
-// turn is committed (`audio_done`) is the stored thread.
+// Display is provisional: the gateway persists the turns, and does so once, when the turn is
+// committed (the user's words and the answer, text and audio, together), so nothing here commits
+// one. What is shown from `asr_partial` and `answer_delta` is a preview; at `audio_done` the
+// caller reloads the chat's thread, and the stored turns replace it. No frame carries the id of
+// a stored message, which is why the thread is reloaded rather than patched.
 //
 // A session is made with createVoiceSession and ended with stop(). This file is the glue between
 // that and the browser's audio and WebSocket, which cannot be run in a test; what can be tested
@@ -106,7 +112,8 @@ export type VoiceDownFrame =
  * The gateway leaves an empty field out of its frames, so a missing `text`, `message` or `audio`
  * is the empty string. A `message_id` or an error's `code` is an optional hint: it is left off
  * the parsed frame when it is missing, empty or not a string, and a frame must stay the frame it
- * is whatever it says.
+ * is whatever it says. (The gateway sends no `message_id` today -- nothing is persisted before
+ * the turn is committed -- so it is read for a newer gateway that does, and nothing relies on it.)
  */
 export function parseVoiceDownFrame(data: string): VoiceDownFrame | null {
   let parsed: unknown;
@@ -196,21 +203,34 @@ export type VoiceErrorDetail = {
   code?: string;
 };
 
-/** The user's words: the gateway's live transcript of the turn, or the finished turn. */
+/**
+ * The user's words, one chunk of them. A turn is one or more chunks (a pause that the user goes
+ * on from ends a chunk, not the turn), so this is never the whole turn: the caller accumulates
+ * the finals, and shows them plus the current partial. Provisional all the same -- the turn is
+ * persisted by the gateway, only once it is committed (`onAudioDone`).
+ */
 export type VoiceTranscript = {
-  /** The whole turn so far (it replaces the transcript shown), or all of it when `final`. */
+  /**
+   * The current chunk so far, which replaces the last partial (not what the earlier chunks said),
+   * or the finished text of the chunk when `final`.
+   */
   text: string;
-  /** The turn is finished, and the gateway has persisted it as a user message (`messageId`). */
+  /** The chunk is finished: its `text` is final, and the caller keeps it. The turn is not over. */
   final: boolean;
+  /** An id the gateway may send for a stored message: it sends none today, and nothing uses it. */
   messageId?: string;
 };
 
-/** The answer as the model writes it. */
+/** The answer as the model writes it. Provisional until the turn is committed (`onAudioDone`). */
 export type VoiceAnswer = {
   /** A piece of the answer (it is appended to what is shown); empty when `done`. */
   text: string;
-  /** The answer is complete, and persisted as an assistant message (`messageId`). */
+  /**
+   * The answer's text is complete. That is provisional: it comes before the turn is committed,
+   * and a later `onAnswerReset` can still void it (the user went on talking).
+   */
   done: boolean;
+  /** An id the gateway may send for a stored message: it sends none today, and nothing uses it. */
   messageId?: string;
 };
 
@@ -230,13 +250,19 @@ export type VoiceSessionArgs = {
   asrModel: string;
   llmModel: string;
   ttsModel: string;
-  /** The turn as it is being said (a partial replaces the last) and as it was finished. */
+  /**
+   * One chunk of the turn as it is being said (a partial replaces the last partial) and as the
+   * chunk finished (the caller accumulates the finals; the turn may have more chunks).
+   */
   onTranscript(transcript: VoiceTranscript): void;
-  /** The answer's text as it streams, and its end. */
+  /** The answer's text as it streams, and its provisional end. */
   onAnswer(answer: VoiceAnswer): void;
   /** The answer so far is void (the user went on talking): drop the preview of it. */
   onAnswerReset(): void;
-  /** The spoken answer is all sent (the turn is committed): the stored thread has the turn. */
+  /**
+   * The spoken answer is all sent: the turn is committed, and the gateway's stored thread has the
+   * user's turn and the answer. The caller reloads the thread (no frame names a stored message).
+   */
   onAudioDone(): void;
   /** Every state the session is in, `connecting` (made before createVoiceSession returns) first. */
   onState(state: VoiceSessionState): void;

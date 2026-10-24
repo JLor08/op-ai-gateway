@@ -280,13 +280,14 @@ describe('createVoiceSession in a (fake) browser', () => {
     socket.say({ type: 'audio_done' });
     socket.say({ type: 'state', state: 'draining' });
 
-    // The transcript: a partial replaces, the final carries the persisted message's id.
+    // The transcript, one chunk: a partial replaces the last partial, and the final is the
+    // chunk's. (The gateway sends no message_id today; one that comes is passed on as a hint.)
     expect(run.transcripts).toEqual([
       { text: 'hello wor', final: false },
       { text: 'hello world', final: false },
       { text: 'hello world', final: true, messageId: 'msg_1' },
     ]);
-    // The answer: deltas are increments, the done carries the id.
+    // The answer: deltas are increments, and the done is provisional (it has no text of its own).
     expect(run.answers).toEqual([
       { text: 'Hi ', done: false },
       { text: 'there', done: false },
