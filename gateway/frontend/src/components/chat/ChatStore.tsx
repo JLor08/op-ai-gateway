@@ -408,6 +408,11 @@ export type ChatStore = {
   // Mute or unmute a chat's live speech playback (the Mute control; reversible). It is NOT
   // the abort: aborting a live speech run is `stop`, the ordinary cancel.
   muteAudio: (chatId: string, muted: boolean) => void;
+  // Stop a chat's streamed audio once the run itself is already done and only its tail is still
+  // playing out (#281): the Abort of the live controls after the run committed. It silences the
+  // tail and clears the live mark, and touches neither the run nor the stored answer. While the
+  // run is still running, Abort is `stop` (the cancel) instead.
+  abortAudio: (chatId: string) => void;
   // Multi-chat layer.
   chats: ChatSummary[];
   activeChatId: string | null;
@@ -1022,6 +1027,7 @@ export function ChatStoreProvider({
     audioLiveChatIds,
     audioMutedChatIds,
     muteAudio,
+    abortAudio,
     isRunning,
     statusOf: runStatusOf,
     runIdIfRunning,
@@ -2622,6 +2628,7 @@ export function ChatStoreProvider({
     runAudioLive,
     runAudioMuted,
     muteAudio,
+    abortAudio,
     chats,
     activeChatId,
     chatsLoading,

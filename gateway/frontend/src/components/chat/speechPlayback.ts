@@ -166,6 +166,13 @@ export type PlaybackContext = {
 // once, as latency, at the start.
 const DEFAULT_LEAD_SECONDS = 0.12;
 
+// The margin, in ms, added to a draining tail's own remaining duration before the fallback
+// timer declares it drained (see createSpeechPlayback's `end`). The primary drain signal is the
+// last source's `onended`; this fallback only fires when that never arrives (a context frozen
+// mid-tail, a stand-in that does not call onended), and the margin keeps it from racing the real
+// end of audio by a few ms of scheduling slack.
+const DRAIN_FALLBACK_MARGIN_MS = 250;
+
 /**
  * Plays the decoded chunks of ONE stream back to back on an AudioContext's own clock: each
  * chunk becomes a buffer source started exactly where the previous one ends, so there is no
@@ -185,6 +192,10 @@ export class StreamingPcmPlayer {
   // first chunk, and shared by every chunk after it.
   private gain: PlaybackGain | null = null;
   private readonly sources = new Set<PlaybackSource>();
+  // Called whenever the last scheduled source ends and the queue becomes empty. The session
+  // (createSpeechPlayback) wires this to its drain signal ONLY after the run has ended, so a
+  // queue that empties mid-stream (between chunks of a run still going) never fires it.
+  onEmpty: (() => void) | null = null;
 
   constructor(
     private readonly ctx: PlaybackContext,
@@ -213,7 +224,12 @@ export class StreamingPcmPlayer {
     }
     const now = this.ctx.currentTime;
     const startAt = this.nextTime > now ? this.nextTime : now + this.lead;
-    source.onended = () => this.sources.delete(source);
+    source.onended = () => {
+      this.sources.delete(source);
+      // The last scheduled source has ended: tell whoever is draining this player (nothing,
+      // while the run is still live).
+      if (this.sources.size === 0) this.onEmpty?.();
+    };
     this.sources.add(source);
     source.start(startAt);
     this.nextTime = startAt + duration;
@@ -244,6 +260,7 @@ export class StreamingPcmPlayer {
   /** Silence everything scheduled and ignore every later chunk. */
   stop(): void {
     this.stopped = true;
+    this.onEmpty = null;
     for (const source of this.sources) {
       try {
         source.stop();
@@ -252,6 +269,17 @@ export class StreamingPcmPlayer {
       }
     }
     this.sources.clear();
+  }
+
+  /** How many scheduled sources have not yet ended: the length of the audio still to play out. */
+  get pending(): number {
+    return this.sources.size;
+  }
+
+  /** The seconds of audio still scheduled past "now" -- the queued tail's own remaining length,
+   * used to bound the drain fallback timer. Zero once the queue has caught up to the clock. */
+  remainingSeconds(): number {
+    return Math.max(0, this.nextTime - this.ctx.currentTime);
   }
 }
 
@@ -262,17 +290,29 @@ export type SpeechPlayback = {
   prime(): void;
   /** Take one chunk of the chat's run. True when the run is playing live after it. */
   push(chatId: string, runId: string, chunk: AudioChunk): boolean;
-  /** The run ended. A completed one plays out what is queued; anything else (a Stop, an
-   * error) goes silent at once. */
+  /** The run ended. A completed one on a running clock KEEPS its session alive and lets what is
+   * queued play OUT (the draining tail) -- so Mute and `abort` can still reach it, and `onDrained`
+   * fires when the last source ends. Anything else -- a Stop, an error, or a context that is not
+   * producing sound -- goes silent at once and drains immediately. */
   end(chatId: string, completed: boolean): void;
+  /** Stop a chat's audio now, draining tail and all, and drop its session: the tail-stop of the
+   * live controls once the run itself is already done (it touches neither the run nor what is
+   * stored of it). A chat with no session is a no-op. */
+  abort(chatId: string): void;
   /** Silence every chat and forget them all. */
   stopAll(): void;
   /** Mute or unmute the chat's run: local playback only (the run itself, and what is saved of
-   * it, is untouched), reversible, and gone with the run's session. A chat with no run is a
-   * no-op. */
+   * it, is untouched), reversible, and reachable through the draining tail of a completed run. A
+   * chat with no session is a no-op. */
   setMuted(chatId: string, muted: boolean): void;
-  /** Whether the chat's run is playing live right now. */
+  /** Whether the chat's run is playing live right now (its chunks arriving and scheduled). False
+   * the moment the run ends, even while its tail is still draining: a completed run's draining tail
+   * is tracked by its render mirror (runAudioLive, kept set until onDrained fires), not here. */
   isLive(chatId: string): boolean;
+  /** Register the one callback fired with a chatId when that chat's audio has fully drained (a
+   * completed run's tail finished, or a run was silenced): the signal that `runAudioLive` may be
+   * cleared. Last registration wins. */
+  onDrained(cb: (chatId: string) => void): void;
 };
 
 type Session = {
@@ -280,6 +320,12 @@ type Session = {
   state: LiveState;
   player: StreamingPcmPlayer;
   ctx: PlaybackContext;
+  // Whether the run has ended and the player is draining its tail (or has been silenced). Set by
+  // `end`; a fresh run's session starts false.
+  ended: boolean;
+  // The fallback timer that declares the tail drained if the last source's `onended` never fires
+  // (a context frozen mid-tail). Cleared when the real drain lands, or the session is discarded.
+  drainTimer: ReturnType<typeof setTimeout> | null;
 };
 
 // Whether the context is producing sound: it says it is running, or (a stand-in that keeps
@@ -297,9 +343,31 @@ function isRunning(ctx: PlaybackContext): boolean {
  */
 export function createSpeechPlayback(getContext: () => PlaybackContext | null): SpeechPlayback {
   const sessions = new Map<string, Session>();
+  let onDrainedCb: ((chatId: string) => void) | null = null;
 
   const resume = (ctx: PlaybackContext) => {
     if (ctx.state === 'suspended') void ctx.resume?.()?.catch(() => undefined);
+  };
+
+  // Silence a session's player and tear down its drain plumbing, WITHOUT signalling the drain or
+  // removing it from the map. The one place that actually stops a player, so a pending fallback
+  // timer and the onEmpty hook never outlive it.
+  const silence = (session: Session) => {
+    if (session.drainTimer !== null) {
+      clearTimeout(session.drainTimer);
+      session.drainTimer = null;
+    }
+    session.player.stop(); // also nulls onEmpty
+  };
+
+  // A chat's audio has fully drained: silence what is left, drop the session, and signal the
+  // drain so its render mirror (runAudioLive) can clear. Guarded against a session a newer run
+  // has already replaced -- a stale fallback timer must never delete the current session.
+  const drain = (chatId: string, session: Session) => {
+    if (sessions.get(chatId) !== session) return;
+    silence(session);
+    sessions.delete(chatId);
+    onDrainedCb?.(chatId);
   };
 
   return {
@@ -311,12 +379,24 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
     push(chatId, runId, chunk) {
       let session = sessions.get(chatId);
       if (session?.runId !== runId) {
-        // A new run of this chat: the previous one's session (if it was somehow left) is over.
-        session?.player.stop();
+        // A new run of this chat replaces the previous one (still live, or draining a completed
+        // run's tail): drain the old session -- stop its audio so it cannot overlap this answer
+        // or outlive the chat, drop it, AND signal its drain, so the old run's live/mute marks
+        // clear. Without that signal a mute left on the draining tail would carry over and
+        // mislabel this new run (it starts unmuted). THIS run's own push, below, then sets the
+        // chat live again.
+        if (session) drain(chatId, session);
         const ctx = getContext();
         if (!ctx) return false;
         resume(ctx);
-        session = { runId, state: { phase: 'waiting' }, player: new StreamingPcmPlayer(ctx), ctx };
+        session = {
+          runId,
+          state: { phase: 'waiting' },
+          player: new StreamingPcmPlayer(ctx),
+          ctx,
+          ended: false,
+          drainTimer: null,
+        };
         sessions.set(chatId, session);
       }
       // Live playback needs a context that is running NOW. A tab that re-adopts a speech run
@@ -346,16 +426,50 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
     end(chatId, completed) {
       const session = sessions.get(chatId);
       if (!session) return;
-      // A completed run's queued audio is left to finish by itself: the session is
-      // forgotten, and the sources it scheduled play out on the audio clock -- provided the
-      // clock is running. On a suspended context the queue is frozen, and would play stale
-      // when something resumed it, so it is silenced like a run that did not complete.
-      if (!completed || !isRunning(session.ctx)) session.player.stop();
-      sessions.delete(chatId);
+      // A second end for a session already draining a completed run's tail: a clean one is
+      // redundant (the drain is already wired), but a Stop, an error, or a chat-delete (forget's
+      // `end(false)`) must still cut the tail that is playing out NOW -- otherwise it stays
+      // audible with no controls, and outlives a deleted chat.
+      if (session.ended) {
+        if (!completed) drain(chatId, session);
+        return;
+      }
+      session.ended = true;
+      // Anything but a clean end on a running clock goes silent at once: a Stop, an error, or a
+      // context whose frozen queue would otherwise play stale when something resumed it. The
+      // chat's audio has drained immediately.
+      if (!completed || !isRunning(session.ctx)) {
+        drain(chatId, session);
+        return;
+      }
+      // A clean end with the clock running: let the queued tail play OUT. The session is KEPT so
+      // Mute and `abort` can still reach it while its saved player appears beside it; it is
+      // dropped, and the drain signalled, when the tail finishes.
+      if (session.player.pending === 0) {
+        drain(chatId, session);
+        return;
+      }
+      // Primary signal: the last scheduled source's `onended`. Fallback: a timer bounded by the
+      // tail's own remaining length, in case `onended` never arrives (a context suspended
+      // mid-tail), so the live controls can never hang on screen forever.
+      session.player.onEmpty = () => drain(chatId, session);
+      session.drainTimer = setTimeout(
+        () => drain(chatId, session),
+        session.player.remainingSeconds() * 1000 + DRAIN_FALLBACK_MARGIN_MS,
+      );
+    },
+
+    abort(chatId) {
+      const session = sessions.get(chatId);
+      if (!session) return;
+      drain(chatId, session);
     },
 
     stopAll() {
-      for (const session of sessions.values()) session.player.stop();
+      for (const [chatId, session] of sessions) {
+        silence(session);
+        onDrainedCb?.(chatId);
+      }
       sessions.clear();
     },
 
@@ -364,7 +478,12 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
     },
 
     isLive(chatId) {
-      return sessions.get(chatId)?.state.phase === 'live';
+      const session = sessions.get(chatId);
+      return session !== undefined && !session.ended && session.state.phase === 'live';
+    },
+
+    onDrained(cb) {
+      onDrainedCb = cb;
     },
   };
 }

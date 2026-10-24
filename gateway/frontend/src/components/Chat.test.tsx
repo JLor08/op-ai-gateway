@@ -55,9 +55,11 @@ const playback = vi.hoisted(() => ({
   prime: vi.fn(),
   push: vi.fn((..._args: unknown[]) => false),
   end: vi.fn(),
+  abort: vi.fn(),
   stopAll: vi.fn(),
   isLive: vi.fn(() => false),
   setMuted: vi.fn(),
+  onDrained: vi.fn(),
 }));
 vi.mock('./chat/speechPlayback', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./chat/speechPlayback')>()),
@@ -1195,7 +1197,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(chatApi.spies.cancelChatRun).toHaveBeenCalledWith('chat_1', 'run_1');
     });
 
-    it('drops the controls when the run ends', async () => {
+    it('drops the controls when the run ends in a Stop (no tail to play out)', async () => {
       const es = await startLiveRun();
       await screen.findByRole('button', { name: t.chatAudioAbort });
       act(() => es.emit('done', { content: '', status: 'canceled', error: '', kind: 'speech' }));
@@ -1204,6 +1206,60 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       );
       expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
       expect(screen.queryByRole('button', { name: t.chatAudioUnmute })).toBeNull();
+    });
+
+    // Issue #281's bug: the controls vanished the instant the run committed, while the Web-Audio
+    // tail was still audibly playing. They must stay, beside the saved player, until it drains.
+    const emitCompleted = (es: FakeEventSource) =>
+      act(() =>
+        es.emit('done', {
+          content: '',
+          status: 'completed',
+          error: '',
+          kind: 'speech',
+          content_parts: [{ type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } }],
+        }),
+      );
+
+    const fireTailDrain = (chatId: string) => {
+      const cb = playback.onDrained.mock.calls.at(-1)?.[0] as ((id: string) => void) | undefined;
+      act(() => cb?.(chatId));
+    };
+
+    it('keeps the controls beside the saved player while the committed tail drains', async () => {
+      const es = await startLiveRun();
+      await screen.findByRole('button', { name: t.chatAudioAbort });
+      emitCompleted(es);
+      // The saved player has appeared...
+      expect(await screen.findByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+      // ...and the Mute/Stop controls are still there (the tail is still playing out). The Stop
+      // now reads "Stop playback" -- the run has committed, so it is no longer the cancel.
+      expect(screen.getByRole('button', { name: t.chatAudioStopPlayback })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull();
+
+      // The tail drains: only now do the controls go, and the player stays.
+      fireTailDrain('chat_1');
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull(),
+      );
+      expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+    });
+
+    it('Stop during the drained tail silences it without cancelling the run', async () => {
+      const es = await startLiveRun();
+      await screen.findByRole('button', { name: t.chatAudioAbort });
+      emitCompleted(es);
+      await screen.findByLabelText(t.chatGeneratedAudio);
+      playback.abort.mockClear();
+
+      fireEvent.click(screen.getByRole('button', { name: t.chatAudioStopPlayback }));
+      expect(playback.abort).toHaveBeenCalledWith('chat_1');
+      // It is the tail-stop, not the run's cancel: the run already committed.
+      expect(chatApi.spies.cancelChatRun).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull(),
+      );
     });
   });
 

@@ -9,6 +9,7 @@
 
 import {
   useCallback,
+  useEffect,
   useRef,
   useState,
   type Dispatch,
@@ -148,6 +149,10 @@ export type ChatRunsApi = {
   // Mute or unmute the chat's live speech playback. Silences this tab's speakers only: the
   // run is not stopped and what is stored of it is unchanged (Abort is `stop`, the cancel).
   muteAudio: (chatId: string, muted: boolean) => void;
+  // Stop the chat's streamed audio once the run itself is already done and only its tail is still
+  // playing out (#281): silences the tail (playback.abort) and clears the live mark. It touches
+  // neither the run nor the stored answer -- while the run is still running, the cancel is `stop`.
+  abortAudio: (chatId: string) => void;
   // Synchronous, always-current "is this chat's run live" check (reads the
   // backing ref directly, never stale). Use this for gating (send / edit /
   // save), never `runningChatIds`.
@@ -281,6 +286,25 @@ export function useChatRuns(
     [playback, markAudioMuted],
   );
 
+  // Stop a chat's streamed audio once the run is already done and only its tail is still playing
+  // (#281): silence the tail and clear the live mark. The run and the stored answer are untouched
+  // -- this is the Abort of the live controls AFTER the run committed, not a cancel.
+  const abortAudio = useCallback(
+    (chatId: string) => {
+      playback.abort(chatId);
+      markAudioLive(chatId, false);
+    },
+    [playback, markAudioLive],
+  );
+
+  // The playback signals a drained chat (a completed run's tail has fully played out, or a run was
+  // silenced): only THEN does the live mark clear, so the controls persist through the tail rather
+  // than vanishing the instant the run commits (#281). markAudioLive(false) also resets the mute
+  // mark. Registered once -- both deps are stable.
+  useEffect(() => {
+    playback.onDrained((chatId) => markAudioLive(chatId, false));
+  }, [playback, markAudioLive]);
+
   // Apply an updater to a chat's transcript, keyed by chatId. The active chat's
   // transcript is the visible `messages`; a background chat's lives only in its
   // buffer. Both stay mirrored so switching to a chat shows its latest state.
@@ -333,10 +357,17 @@ export function useChatRuns(
   // left by an error/cancel before any output), and refresh tokens/models.
   const finishRun = useCallback(
     (chatId: string, status: ChatRunStatus, error?: string) => {
-      // A completed speech run plays out the audio it has queued (the finished clip is
-      // about to appear beside it); anything else -- a Stop, an error -- goes silent now.
-      playback.end(chatId, status === 'completed');
-      markAudioLive(chatId, false);
+      // A completed speech run plays out the audio it has queued (the finished clip is about to
+      // appear beside it); anything else -- a Stop, an error -- goes silent now.
+      const completed = status === 'completed';
+      playback.end(chatId, completed);
+      // Leave the live mark SET for a completed run that was playing live: its tail is still
+      // playing out, and the live controls must persist until it drains (#281). The playback's
+      // onDrained callback clears the mark (and the mute mark) when the tail finishes. A run that
+      // was never live -- a buffered answer (no playback session at all) or one abandoned at a gap
+      // -- has no mark to clear: it was already false, so leaving it is a no-op. A Stop or an error
+      // has no tail to play out, so it clears immediately here instead.
+      if (!completed) markAudioLive(chatId, false);
       const run = runsRef.current.get(chatId);
       if (run) {
         run.es?.close();
@@ -710,6 +741,7 @@ export function useChatRuns(
     audioLiveChatIds,
     audioMutedChatIds,
     muteAudio,
+    abortAudio,
     isRunning,
     statusOf,
     runIdIfRunning,

@@ -377,6 +377,142 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.queryByText(t.chatAudioStreamLive)).toBeNull();
       });
 
+      // The draining tail (#281): once the run has committed (streaming false) its saved player
+      // appears, but the streamed tail may still be playing out. While it is (audioLive), the
+      // Mute/Stop controls ride alongside AudioTurn so the user can still silence it.
+      describe('the controls while the tail plays out alongside the saved player', () => {
+        const stored = [
+          { type: 'audio_url' as const, audio_url: { url: 'data:audio/wav;base64,AAAA' } },
+        ];
+
+        it('shows Mute and Stop next to the saved player while the tail plays out', () => {
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={stored}
+              audioLive
+              audioMuted={false}
+              onMuteAudio={vi.fn()}
+              onAbortAudio={vi.fn()}
+            />,
+          );
+          // The saved player is there AND the live controls are beside it. The tail-window Stop
+          // reads "Stop playback" (it only ends playback), not "Abort generation".
+          expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+          expect(screen.getByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
+          expect(screen.getByRole('button', { name: t.chatAudioStopPlayback })).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatAudioAbort })).toBeNull();
+        });
+
+        it('calls the handlers: Mute toggles, Stop silences the tail', () => {
+          const onMuteAudio = vi.fn();
+          const onAbortAudio = vi.fn();
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={stored}
+              audioLive
+              audioMuted={false}
+              onMuteAudio={onMuteAudio}
+              onAbortAudio={onAbortAudio}
+            />,
+          );
+          fireEvent.click(screen.getByRole('button', { name: t.chatAudioMute }));
+          expect(onMuteAudio).toHaveBeenCalledWith(true);
+          fireEvent.click(screen.getByRole('button', { name: t.chatAudioStopPlayback }));
+          expect(onAbortAudio).toHaveBeenCalledTimes(1);
+        });
+
+        it('shows Unmute while the tail is muted', () => {
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={stored}
+              audioLive
+              audioMuted
+              onMuteAudio={vi.fn()}
+              onAbortAudio={vi.fn()}
+            />,
+          );
+          expect(screen.getByRole('button', { name: t.chatAudioUnmute })).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
+        });
+
+        it('drops the controls once the tail has drained (audioLive false)', () => {
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={stored}
+              audioLive={false}
+              onMuteAudio={vi.fn()}
+              onAbortAudio={vi.fn()}
+            />,
+          );
+          expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
+          expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull();
+        });
+
+        it('shows no tail controls for a completed buffered answer (never played out live)', () => {
+          // A buffered answer is never live: no audioLive prop reaches it, so no controls, just
+          // the saved player.
+          render(<ChatMessage t={t} role="assistant" turnId="msg_a1" content={stored} />);
+          expect(screen.getByLabelText(t.chatGeneratedAudio)).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
+          expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull();
+        });
+
+        // Finding 2: a streamed retention-0 answer commits the `audio_removed` marker and NO
+        // audio_url parts, so AudioNotStoredTurn renders -- but its streamed tail is still playing
+        // out, so the controls must ride beside the placeholder too, not only beside a saved player.
+        it('shows the tail controls beside the not-stored placeholder of a retention-0 answer', () => {
+          const removed = [{ type: 'audio_removed' as const }];
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={removed}
+              audioLive
+              audioMuted={false}
+              onMuteAudio={vi.fn()}
+              onAbortAudio={vi.fn()}
+            />,
+          );
+          // The not-stored placeholder is shown (no player), AND the tail controls are beside it.
+          expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+          expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+          expect(screen.getByRole('button', { name: t.chatAudioMute })).toBeInTheDocument();
+          expect(screen.getByRole('button', { name: t.chatAudioStopPlayback })).toBeInTheDocument();
+        });
+
+        it('drops the placeholder tail controls once the retention-0 tail has drained', () => {
+          const removed = [{ type: 'audio_removed' as const }];
+          render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="msg_a1"
+              content={removed}
+              audioLive={false}
+              onMuteAudio={vi.fn()}
+              onAbortAudio={vi.fn()}
+            />,
+          );
+          expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
+          expect(screen.queryByRole('button', { name: t.chatAudioStopPlayback })).toBeNull();
+        });
+      });
+
       it('does not show the pending state once the audio has arrived, even while still streaming', () => {
         render(
           <ChatMessage

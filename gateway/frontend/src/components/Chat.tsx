@@ -161,15 +161,21 @@ function textOf(content: ChatContent): string | undefined {
 // flag stay here.
 export function Chat({ t }: Readonly<{ t: Translation }>) {
   const c = useChatStore();
-  // The live speech bubble's Mute, for the active chat: a stable reference (the store's
-  // muteAudio is) so it never defeats a row's memo.
-  const { activeChatId, muteAudio } = c;
+  // The live speech bubble's Mute and tail-Stop, for the active chat: stable references (the
+  // store's muteAudio/abortAudio are) so they never defeat a row's memo. Mute is the reversible
+  // silence; onAbortAudio is the tail-stop used once the run has already committed and only its
+  // streamed tail is still playing out -- while the run is still running, Abort is the composer's
+  // own `stop` (the cancel) instead.
+  const { activeChatId, muteAudio, abortAudio } = c;
   const onMuteAudio = useCallback(
     (muted: boolean) => {
       if (activeChatId) muteAudio(activeChatId, muted);
     },
     [activeChatId, muteAudio],
   );
+  const onAbortAudio = useCallback(() => {
+    if (activeChatId) abortAudio(activeChatId);
+  }, [activeChatId, abortAudio]);
   const [showSettings, setShowSettings] = useState(false);
   // The advanced (sd-server) image knobs are collapsed by default: they are
   // power-user controls below the common size/count/format settings.
@@ -1000,6 +1006,20 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   ? textOf(previous.content)
                   : undefined;
               const rowStreaming = c.streaming && isLast && message.role === 'assistant';
+              // The audio controls outlive `streaming`: a completed streamed speech answer commits
+              // (streaming goes false) while its Web-Audio tail is still playing out, and the Mute/
+              // Stop controls must persist until it drains (#281, runAudioLive stays true through
+              // the tail). So gate them on "the last assistant row AND still playing out (streaming
+              // OR the audio is still live)", not on `rowStreaming` alone.
+              const rowPlayingOut =
+                isLast && message.role === 'assistant' && (c.streaming || c.runAudioLive);
+              // Abort depends on where the run is: the composer's own Stop (the cancel) while it
+              // still generates, the tail-stop once it has committed and only its tail plays out,
+              // and absent otherwise. A plain if/else-if rather than a nested ternary (Sonar
+              // S3358).
+              let onRowAbortAudio: (() => void) | undefined;
+              if (rowStreaming) onRowAbortAudio = c.stop;
+              else if (rowPlayingOut) onRowAbortAudio = onAbortAudio;
               return (
                 <ChatMessage
                   key={message.id}
@@ -1033,16 +1053,19 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   // state while the run itself reports a text kind".
                   kind={rowStreaming ? c.runKind : undefined}
                   elapsedMs={rowStreaming ? c.runElapsedMs : undefined}
-                  // Gated into the streaming row like kind/elapsedMs, for the same memo
-                  // reason: only that row's pending turn reads it.
-                  audioLive={rowStreaming ? c.runAudioLive : undefined}
-                  audioMuted={rowStreaming ? c.runAudioMuted : undefined}
-                  // Mute is local playback only (reversible); Abort is the composer's own
-                  // Stop -- the run's ordinary cancel, whose canceled `done` ends the bubble
-                  // as a not-stored answer. Both are stable references, and only the
-                  // streaming row gets them.
-                  onMuteAudio={rowStreaming ? onMuteAudio : undefined}
-                  onAbortAudio={rowStreaming ? c.stop : undefined}
+                  // Gated into the one row that owns the audio, while it is still playing out
+                  // (through the committed tail, not just while streaming): the pending bubble
+                  // reads it before the commit, the saved player's tail controls after it. Every
+                  // other row keeps a stable `undefined`, so this never defeats their memo.
+                  audioLive={rowPlayingOut ? c.runAudioLive : undefined}
+                  audioMuted={rowPlayingOut ? c.runAudioMuted : undefined}
+                  // Mute is local playback only (reversible). Abort depends on where the run is:
+                  // while it still runs it is the composer's own Stop -- the cancel, whose canceled
+                  // `done` ends the bubble as a not-stored answer; once the run has committed and
+                  // only its tail is draining it is `abortAudio`, which just silences the tail and
+                  // leaves the stored answer and billing untouched. Both are stable references.
+                  onMuteAudio={rowPlayingOut ? onMuteAudio : undefined}
+                  onAbortAudio={onRowAbortAudio}
                   onEdit={message.role === 'user' ? handlers.onEdit : undefined}
                   onRegenerate={message.role === 'assistant' ? handlers.onRegenerate : undefined}
                   // The refine of a generated image: only where it can run. attachMode

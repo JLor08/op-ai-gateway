@@ -8177,9 +8177,25 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
     saved player. It is a "listen no more" control, not a cancel.
   - **Abort**, the composer's own `stop()`: cancel the chat run, which closes the live stream,
     and, by (h), nothing is stored and the bubble ends in the not-stored state with regenerate.
-  - Both exist **only while `live`**: with no audio playing there is nothing to mute, and a
-    buffered run's cancel is the composer's Stop. A control whose handler is not supplied is not
-    drawn. The user explicitly asked for both, as distinct controls.
+  - Both exist **whenever the chat is still producing sound** — through the live run AND through the
+    streamed tail that plays on after it commits (below) — never for a run with nothing playing: with
+    no audio there is nothing to mute, and a buffered run's cancel is the composer's Stop. A control
+    whose handler is not supplied is not drawn. The user explicitly asked for both, as distinct
+    controls.
+  - The controls **persist until the streamed tail has fully played out**, not just until the run
+    commits (issue #281): a completed streaming run commits (`streaming` goes false and the saved
+    `AudioTurn` player, or the retention-0 `AudioNotStoredTurn` placeholder, appears) while its
+    Web-Audio tail is still audible for several seconds. The playback keeps the completed run's
+    session in a **draining** state instead of dropping it, so Mute and a tail-stop still reach it;
+    `runAudioLive` stays true across the tail and the controls ride beside the player (or the
+    placeholder) until `SpeechPlayback.onDrained` fires. `onDrained` is signalled when the last
+    scheduled source ends, immediately when a Stop / error / chat-delete (`end(_, false)`) or a
+    non-running context silences the tail, when a **new run of the same chat** cuts the old tail
+    (its `push` drains the replaced session, so a mute left on it never carries over), and by a
+    bounded fallback timer for a context frozen mid-tail (so the controls can never hang). In this
+    phase Abort is `abortAudio` — it silences the tail only, the stored answer and billing are
+    untouched, so the control reads **"Stop playback"** (`chatAudioStopPlayback`), not "Abort
+    generation"; while the run is still generating it stays the run's cancel.
 - **(j) The not-stored bubble: one placeholder and a regenerate, nothing else.** A finished
   answer that carries the marker (`hasRemovedAudio`) and no audio renders `AudioNotStoredTurn`: a
   "the audio for this answer is not stored" line plus **regenerate**, with no player and no
