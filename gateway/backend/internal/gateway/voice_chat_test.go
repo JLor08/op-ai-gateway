@@ -473,6 +473,71 @@ func TestVoiceCoLoadGateRefusesWhenTheProviderCannotEnsure(t *testing.T) {
 	requireVoiceGateRefused(t, asr, llm, tts, code, err, voiceChatCoLoadFailed)
 }
 
+// What the SHARED inference gate refuses -- a service token whose model allowlist excludes
+// a leg's model (403 model.not_allowed), a token server override its owner may no longer
+// manage (403 server_override.forbidden) -- happens inside inferenceGate, which answers by
+// writing to a ResponseWriter. The gate has no client to answer, so it captures that
+// answer from the writer it builds and the request it synthesizes from ctx; these cases
+// are the only ones that run that path end to end (every refusal in the unroutable table
+// above is the resolver's or the mapping's). Each refusal is that leg's *Unavailable code,
+// carries the status and the gate's own stable code, hands back no target, and has not
+// touched the agent.
+func TestVoiceCoLoadGateRefusesWhatTheInferenceGateRefuses(t *testing.T) {
+	serviceToken := func(allowed ...string) auth.Token {
+		return auth.Token{ID: "tok_svc", Kind: "service", ServiceID: "svc_voice", ServiceName: "Voice", Active: true, AllowedModels: allowed}
+	}
+	all := []string{"voice-asr", "voice-llm", "voice-tts"}
+	cases := []struct {
+		name     string
+		token    auth.Token
+		stubAuth bool // install a portal that rejects every server override
+		want     string
+		wantCode string
+	}{
+		{name: "allowlist excludes the asr model", token: serviceToken("voice-llm", "voice-tts"), want: voiceChatASRUnavailable, wantCode: "model.not_allowed"},
+		{name: "allowlist excludes the llm model", token: serviceToken("voice-asr", "voice-tts"), want: voiceChatLLMUnavailable, wantCode: "model.not_allowed"},
+		{name: "allowlist excludes the tts model", token: serviceToken("voice-asr", "voice-llm"), want: voiceChatTTSUnavailable, wantCode: "model.not_allowed"},
+		{
+			name:     "token server override the owner may not manage",
+			token:    auth.Token{ID: "tok_pinned", UserID: "usr_voice", Active: true, ServerOverride: voiceGateAgentServer},
+			stubAuth: true, want: voiceChatASRUnavailable, wantCode: "server_override.forbidden",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &voiceGateFake{}
+			w := newVoiceGateWorld(t, fake, false)
+			w.token = tc.token
+			stub := &fakePortalServerOverrideAuth{allow: map[string]bool{}}
+			if tc.stubAuth {
+				w.srv.Portal = stub
+			}
+
+			asr, llm, tts, code, err := w.gate("voice-asr", "voice-llm", "voice-tts")
+			requireVoiceGateRefused(t, asr, llm, tts, code, err, tc.want)
+			if !strings.Contains(err.Error(), "HTTP 403") || !strings.Contains(err.Error(), tc.wantCode) {
+				t.Fatalf("err = %q, want the gate's HTTP 403 and its code %s", err, tc.wantCode)
+			}
+			if tc.stubAuth && stub.calls != 1 {
+				t.Fatalf("AuthorizeServerManage calls = %d, want 1: the refusal must be the gate's re-authorization", stub.calls)
+			}
+			if len(fake.ensured) != 0 || len(fake.probes) != 0 {
+				t.Fatalf("a refused leg still touched the agent: ensured %v, reads %+v", fake.ensured, fake.probes)
+			}
+		})
+	}
+
+	// The positive control: the same service token with every model allowed passes, so the
+	// refusals above are the allowlist's and not the token kind's.
+	t.Run("allowlist naming all three models passes", func(t *testing.T) {
+		w := newVoiceGateWorld(t, &voiceGateFake{}, false)
+		w.token = serviceToken(all...)
+		if _, _, _, code, err := w.gate("voice-asr", "voice-llm", "voice-tts"); code != "" || err != nil {
+			t.Fatalf("gate = (%q, %v), want a pass", code, err)
+		}
+	})
+}
+
 // The gate resolves and gates without spending the principal's admission: each /v1 core
 // the loop calls spends its own, per turn. A principal allowed one request a minute passes
 // the gate repeatedly, and its one request is still unspent afterwards.
