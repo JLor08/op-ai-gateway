@@ -1921,12 +1921,13 @@ func CapabilityRowsByName(rows []CapabilityRow) map[string]CapabilityRow {
 // does not exclude: only an affirmative one does (a clone model synthesises only
 // in a reference voice it is handed, so it has no named voices to offer).
 //
-// It is the ONE definition of the plain-tts rule: the speech benchmark and its health-loop
-// trigger (the streamed-rate step) and the routing voice filter decide from it. Since #301
-// it no longer decides the voices cache or the portal's streaming gate: the producers ask
-// any speech model (CapabilityRowsSpeech), the readers offer a clone model's list too when
-// it is non-empty, and the portal streaming and language gates use the offerable set
-// (CapabilityRowsOfferableTTS).
+// It is the ONE definition of the plain-tts rule, which the routing voice filter decides
+// from. Since #301 it no longer decides the voices cache or the portal's streaming gate: the
+// producers ask any speech model (CapabilityRowsSpeech), the readers offer a clone model's
+// list too when it is non-empty, and the portal streaming and language gates use the offerable
+// set (CapabilityRowsOfferableTTS). Since #306 the speech benchmark and its health-loop rate
+// trigger use the offerable set as well, so a clone model with presets is benchmarked (with a
+// preset voice) and then streams.
 func CapabilityRowsPlainTTS(rows []CapabilityRow) bool {
 	byName := CapabilityRowsByName(rows)
 	return byName[CapabilitySpeech].Verdict == CapabilityYes &&
@@ -1957,10 +1958,11 @@ func CapabilityRowsSpeech(rows []CapabilityRow) bool {
 // offerable only once it has named presets to pick instead. An absent speech row
 // is unknown, so an unstated speech verdict is never offerable.
 //
-// It is the reader rule for the voice picker and the language gate.
+// It is the reader rule for the voice picker, the language gate and the portal's
+// streaming gate, and (#306) the target rule of the speech benchmark and its health-loop
+// rate trigger, so every mapping the portal may stream is one whose rate can be benchmarked.
 // CapabilityRowsPlainTTS keeps its narrower meaning -- reference-free named-voice
-// tts, still the gate for the streamed-rate benchmark -- and is not changed by
-// this.
+// tts -- and is not changed by this.
 func CapabilityRowsOfferableTTS(rows []CapabilityRow, hasNonEmptyVoices bool) bool {
 	byName := CapabilityRowsByName(rows)
 	return byName[CapabilitySpeech].Verdict == CapabilityYes &&

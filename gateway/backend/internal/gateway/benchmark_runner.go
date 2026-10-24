@@ -107,6 +107,12 @@ type benchmarkTarget struct {
 	// current". Empty on every other target -- a manual speech run knows none -- and
 	// then no identity is recorded.
 	rateIdentity string
+	// voice is the preset voice the speech benchmark synthesizes this target's clip with
+	// (#306): the first preset of a configured clone model's voices cache, decided once in
+	// partitionSpeechBenchmarkViews (speechBenchmarkPresetVoice) so the manual run and the
+	// health loop's trigger send the same request. Empty on every other target -- a plain
+	// speech model speaks in its own default voice -- and then the request names none.
+	voice string
 }
 
 // streamOnce issues one streaming request and returns time-to-first-token + the

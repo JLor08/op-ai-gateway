@@ -37,6 +37,36 @@ func VoiceNamesFromCacheRows(rows []ModelMappingCacheRow) ([]string, error) {
 	return nil, nil
 }
 
+// FirstPresetVoice is the preset voice a caller may ask a model for when it has to name
+// one itself: the first bytewise-sorted non-blank name of the mapping's voices cache, or ""
+// when the cache lists none -- no row, an empty or null list, only blank names, or a payload
+// that does not decode. "Has presets" is therefore FirstPresetVoice(rows) != "", and it is
+// the one definition of it: the speech benchmark picks the voice it synthesizes a configured
+// clone model's clip with from here, and the app-health loop decides whether such a model is
+// a benchmark target by the same answer, so the two cannot disagree about which mappings
+// have presets.
+//
+// The writers keep the list sorted and without blanks, but this does not rely on that: the
+// smallest name is found directly, so a row written in another layout still yields a stable
+// pick (the benchmark's voice is the same one tick after tick). Names are returned verbatim
+// -- audio.cpp matches a voice name exactly -- so a non-blank name is never trimmed.
+func FirstPresetVoice(rows []ModelMappingCacheRow) string {
+	names, err := VoiceNamesFromCacheRows(rows)
+	if err != nil {
+		return ""
+	}
+	first := ""
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		if first == "" || name < first {
+			first = name
+		}
+	}
+	return first
+}
+
 // hasVoicesRow reports whether a mapping has the scope-"" voices row the writers keep --
 // the signal that its voice status is KNOWN (the voices were fetched at least once), as
 // opposed to never cached. Row PRESENCE is read directly here, because

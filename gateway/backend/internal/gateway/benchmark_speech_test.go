@@ -4,17 +4,22 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -659,5 +664,389 @@ func TestSpeechBenchmarkModeAndRefusalAreStable(t *testing.T) {
 	}
 	if rec.Code != http.StatusConflict || body.Error.Code != "benchmark.speech_unavailable" || body.Error.Message != msgBenchmarkSpeechUnavailable {
 		t.Fatalf("writeBenchmarkError(errBenchmarkSpeechUnavailable) = %d %q %q, want 409 benchmark.speech_unavailable", rec.Code, body.Error.Code, body.Error.Message)
+	}
+}
+
+// ---- a configured clone model with presets (#306) ----
+//
+// A clone model that lists preset voices (speech_clone yes + a non-empty voices cache) can be
+// synthesized by naming one: audio.cpp answers {model, input, voice:"<preset>"} with the
+// preset's reference cloned, while a voiceless request 500s. The speech benchmark therefore
+// runs for such a model -- the preset voice picked ONCE, in the partition, and carried on the
+// target -- so its output byte rate is learned and the portal streams it. A clone model with no
+// presets (a reference-only one) stays skipped, exactly as before.
+
+const (
+	sbPresetModel = "preset_model"
+	// sbPresetGateway is the gateway model name of the fixture's preset clone mapping.
+	sbPresetGateway = "preset-bench"
+)
+
+// addSpeechBenchPresetClone adds one audio-only mapping to the speech fixture that is a streaming
+// clone model whose voices cache holds voicesPayload (nothing is cached when it is empty). It is
+// added by the test that needs it, not by newSpeechBenchFixture, so the fixture's four-mapping
+// totals the older tests assert stay as they are.
+func addSpeechBenchPresetClone(t *testing.T, s *Server, voicesPayload string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	if err := s.Routes.CreateMapping(ctx, routing.ModelMapping{ID: "sb_preset", ApplicationID: sbApp, GatewayModelName: sbPresetGateway, AppModelName: sbPresetModel, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateMapping sb_preset: %v", err)
+	}
+	if err := s.Routes.UpsertMappingCapabilities(ctx, "sb_preset", []routing.CapabilityRow{
+		sbCap(routing.CapabilitySpeech, routing.CapabilityYes, now),
+		sbCap(routing.CapabilitySpeechClone, routing.CapabilityYes, now),
+		sbCap(routing.CapabilitySpeechStreaming, routing.CapabilityYes, now),
+	}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities sb_preset: %v", err)
+	}
+	if voicesPayload != "" {
+		seedSpeechBenchVoices(t, s, "sb_preset", voicesPayload)
+	}
+}
+
+// seedSpeechBenchVoices writes a mapping's scope-"" voices cache row, as the health loop's voices
+// step does.
+func seedSpeechBenchVoices(t *testing.T, s *Server, mappingID, payload string) {
+	t.Helper()
+	if err := s.Routes.UpsertModelMappingCache(context.Background(), routing.ModelMappingCacheRow{
+		MappingID: mappingID, CacheType: routing.ModelMappingCacheVoices, Payload: payload, UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed voices cache of %s: %v", mappingID, err)
+	}
+}
+
+// voicelessCloneIs500Upstream answers like audio.cpp does for a clone model: the WAV when the
+// request names a voice, the 500 the model gives a request with no reference ("reference_text is
+// required") when it does not. Every other model gets the WAV whatever it is sent. It records the
+// requests like newSpeechBenchUpstream; it is its own handler because the decision needs the body.
+func voicelessCloneIs500Upstream(t *testing.T, wav []byte) *speechBenchUpstream {
+	t.Helper()
+	up := &speechBenchUpstream{}
+	up.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		call := speechBenchCall{method: r.Method, path: r.URL.Path, raw: raw}
+		_ = json.Unmarshal(raw, &call.body)
+		up.mu.Lock()
+		up.calls = append(up.calls, call)
+		up.mu.Unlock()
+		model, _ := call.body["model"].(string)
+		if voice, _ := call.body["voice"].(string); model == sbPresetModel && voice == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"reference_text is required"}}`))
+			return
+		}
+		answerWAV(wav, true)(w, model)
+	}))
+	t.Cleanup(up.Close)
+	return up
+}
+
+// A preset clone's manual benchmark synthesizes with a preset voice -- the bytewise first of its
+// cached list, whatever order the row holds -- learns the output byte rate of the model's own
+// format (44.1 kHz mono 16-bit here), caches it under the mapping id and opens the portal's gate
+// at that sample rate: the mapping now streams, where before the benchmark skipped it and the
+// portal buffered it. The request is the plain one plus exactly the voice, and the history row is
+// the speech one every benchmark writes. A mapping-scope run on it is accepted (it was a 409).
+func TestSpeechBenchmarkRunsAPresetCloneWithAPresetVoice(t *testing.T) {
+	up := voicelessCloneIs500Upstream(t, buildPCMWav(t, 44100, 1, 16, 88200))
+	s := newSpeechBenchFixture(t, up)
+	addSpeechBenchPresetClone(t, s, `["Thorsten","Frank"]`)
+
+	status, code, body := postSpeechBenchmark(t, s, "/api/portal/mappings/sb_preset/benchmark?mode=speech")
+	if status != http.StatusAccepted {
+		t.Fatalf("speech benchmark of a preset clone = %d %q (%s), want 202", status, code, body)
+	}
+	st := finishedSpeechRun(t, s)
+	res := speechBenchResult(t, st, "sb_preset")
+	if res.Skipped != "" || res.Error != "" || res.OutputByteRate != 88200 {
+		t.Fatalf("result = %+v, want a measured, unskipped result with rate 88200", res)
+	}
+	calls := up.received()
+	if len(calls) != 1 {
+		t.Fatalf("upstream calls = %+v, want exactly one synthesis", calls)
+	}
+	c := calls[0]
+	if c.body["model"] != sbPresetModel || c.body["voice"] != "Frank" {
+		t.Fatalf("upstream body = %s, want the application's own model id and the first preset voice %q", c.raw, "Frank")
+	}
+	if in, _ := c.body["input"].(string); in == "" {
+		t.Fatalf("upstream input is empty: %s", c.raw)
+	}
+	if len(c.body) != 3 {
+		t.Fatalf("upstream body = %s, want exactly model, input and voice (a plain non-stream synthesis plus the preset)", c.raw)
+	}
+	if rate, ok := s.cachedOutputByteRate(context.Background(), "sb_preset"); !ok || rate != 88200 {
+		t.Fatalf("cachedOutputByteRate(sb_preset) = (%d, %v), want (88200, true)", rate, ok)
+	}
+	if runs := speechBenchRuns(t, s, "sb_preset"); len(runs) != 1 || runs[0].Kind != "speech" || runs[0].Error != "" {
+		t.Fatalf("history = %+v, want one successful kind=speech row", runs)
+	}
+	rate, open, err := s.portalSpeechStreamRate(context.Background(), auth.Token{UserID: "usr_a"}, sbPresetGateway)
+	if err != nil || !open || rate != 44100 {
+		t.Fatalf("portal gate for the preset clone = (%d, %v, %v), want open at 44100 Hz: it streams", rate, open, err)
+	}
+}
+
+// The request body is the plain two-field one for a plain model -- an empty voice is omitted, not
+// sent as "" -- and carries the voice for a clone target.
+func TestSpeechBenchmarkRequestBody(t *testing.T) {
+	plain, err := json.Marshal(speechBenchmarkRequest{Model: "m", Input: "hi"})
+	if err != nil || string(plain) != `{"model":"m","input":"hi"}` {
+		t.Fatalf("plain body = %s (%v), want exactly model and input", plain, err)
+	}
+	clone, err := json.Marshal(speechBenchmarkRequest{Model: "m", Input: "hi", Voice: "Frank"})
+	if err != nil || string(clone) != `{"model":"m","input":"hi","voice":"Frank"}` {
+		t.Fatalf("clone body = %s (%v), want model, input and the voice", clone, err)
+	}
+}
+
+// An application-scope run measures a preset clone beside the plain models and still skips a
+// reference-only clone (no presets cached) and a transcriber: the preset voice is asked for only
+// the mapping that has one, and every other request is the plain two-field one.
+func TestSpeechBenchmarkApplicationScopeRunsPresetClonesAndSkipsReferenceOnlyOnes(t *testing.T) {
+	up := voicelessCloneIs500Upstream(t, buildPCMWav(t, 24000, 1, 16, 48000))
+	s := newSpeechBenchFixture(t, up)
+	addSpeechBenchPresetClone(t, s, `["Frank"]`)
+
+	if status, code, body := postSpeechBenchmark(t, s, "/api/portal/applications/"+sbApp+"/benchmark?mode=speech"); status != http.StatusAccepted {
+		t.Fatalf("application-scope speech benchmark = %d %q (%s), want 202", status, code, body)
+	}
+	st := finishedSpeechRun(t, s)
+	if st.Total != 5 || st.Done != 5 {
+		t.Fatalf("run total/done = %d/%d, want 5/5", st.Total, st.Done)
+	}
+	for id, want := range map[string]string{"sb_clone": benchmarkSkippedSpeechClone, "sb_asr": benchmarkSkippedNotSpeech} {
+		if res := speechBenchResult(t, st, id); res.Skipped != want || res.Error != "" {
+			t.Fatalf("%s result = %+v, want Skipped %q only", id, res, want)
+		}
+	}
+	for _, id := range []string{"sb_tts", "sb_unknown", "sb_preset"} {
+		if res := speechBenchResult(t, st, id); res.Skipped != "" || res.Error != "" || res.OutputByteRate != 48000 {
+			t.Fatalf("%s result = %+v, want a measured result with rate 48000", id, res)
+		}
+	}
+	voiceByModel := map[string]any{}
+	for _, c := range up.received() {
+		model, _ := c.body["model"].(string)
+		voiceByModel[model] = c.body["voice"]
+		if _, has := c.body["voice"]; has != (model == sbPresetModel) {
+			t.Fatalf("request for %s = %s: a voice is sent exactly for the preset clone", model, c.raw)
+		}
+	}
+	if len(voiceByModel) != 3 || voiceByModel[sbPresetModel] != "Frank" {
+		t.Fatalf("models synthesized = %v, want the two plain models and the preset clone with voice Frank", voiceByModel)
+	}
+}
+
+// A clone model whose voices cache lists nothing usable -- no row, an empty list, only blank
+// names, or a payload that does not decode -- has no preset to synthesize with and stays skipped,
+// whatever its other verdicts say (streaming included): a mapping-scope run is the 409, nothing is
+// reserved or sent, and the health loop's trigger starts nothing.
+func TestSpeechBenchmarkSkipsACloneWithNoUsablePreset(t *testing.T) {
+	for _, tc := range []struct{ name, payload string }{
+		{"no voices row", ""},
+		{"an empty list", `[]`},
+		{"only blank names", `[" ",""]`},
+		{"an undecodable payload", `{not json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := voicelessCloneIs500Upstream(t, buildPCMWav(t, 24000, 1, 16, 48000))
+			s := newSpeechBenchFixture(t, up)
+			addSpeechBenchPresetClone(t, s, tc.payload)
+
+			if status, code, _ := postSpeechBenchmark(t, s, "/api/portal/mappings/sb_preset/benchmark?mode=speech"); status != http.StatusConflict || code != codeBenchmarkSpeechUnavailable {
+				t.Fatalf("speech benchmark of a clone with %s = %d %q, want 409 %s", tc.name, status, code, codeBenchmarkSpeechUnavailable)
+			}
+			if speechTrigger(t, s, "sb_preset", "/models/preset") {
+				t.Fatalf("the health loop's trigger started a run for a clone with %s", tc.name)
+			}
+			if s.Benchmarks.ServerBusy(sbServer) {
+				t.Fatal("a refused speech benchmark left the server reserved")
+			}
+			if calls := up.received(); len(calls) != 0 {
+				t.Fatalf("upstream calls = %+v, want none", calls)
+			}
+		})
+	}
+}
+
+// speechBenchmarkSkip is the one skip rule: a plain model is a target, a clone model is one only
+// with a preset to name, and everything that does not synthesize speech is not_speech. The
+// preset is the caller's answer (the partition reads it for a clone row alone), so a clone's
+// verdict changes with it and a plain model's never does.
+func TestSpeechBenchmarkSkip(t *testing.T) {
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	rows := func(speech, clone string) []routing.CapabilityRow {
+		var out []routing.CapabilityRow
+		if speech != "" {
+			out = append(out, sbCap(routing.CapabilitySpeech, speech, now))
+		}
+		if clone != "" {
+			out = append(out, sbCap(routing.CapabilitySpeechClone, clone, now))
+		}
+		return out
+	}
+	yes, no := routing.CapabilityYes, routing.CapabilityNo
+	for _, tc := range []struct {
+		name   string
+		rows   []routing.CapabilityRow
+		preset string
+		want   string
+	}{
+		{"a plain tts model", rows(yes, no), "", ""},
+		{"a speech model whose clone verdict is unknown", rows(yes, ""), "", ""},
+		{"a clone model with a preset", rows(yes, yes), "Frank", ""},
+		{"a clone model with no preset", rows(yes, yes), "", benchmarkSkippedSpeechClone},
+		{"a transcriber", rows(no, ""), "", benchmarkSkippedNotSpeech},
+		{"a model with no speech verdict", rows("", ""), "", benchmarkSkippedNotSpeech},
+		{"a clone verdict on a model that is not speech", rows(no, yes), "Frank", benchmarkSkippedNotSpeech},
+		{"an unknown-speech model with a preset on file", rows("", yes), "Frank", benchmarkSkippedNotSpeech},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := speechBenchmarkSkip(tc.rows, tc.preset); got != tc.want {
+				t.Fatalf("speechBenchmarkSkip(%+v, %q) = %q, want %q", tc.rows, tc.preset, got, tc.want)
+			}
+		})
+	}
+}
+
+// voicesCacheSpy wraps the route store, counting the reads of the voices cache per mapping and
+// failing them on demand: what the partition reads, and when, is the contract under test.
+type voicesCacheSpy struct {
+	routing.Store
+	mu      sync.Mutex
+	reads   []string
+	failFor map[string]bool
+}
+
+func (v *voicesCacheSpy) ModelMappingCache(ctx context.Context, mappingID, cacheType string) ([]routing.ModelMappingCacheRow, error) {
+	if cacheType == routing.ModelMappingCacheVoices {
+		v.mu.Lock()
+		v.reads = append(v.reads, mappingID)
+		fail := v.failFor[mappingID]
+		v.mu.Unlock()
+		if fail {
+			return nil, errors.New("voices cache: boom")
+		}
+	}
+	return v.Store.ModelMappingCache(ctx, mappingID, cacheType)
+}
+
+func (v *voicesCacheSpy) voicesReads() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]string(nil), v.reads...)
+}
+
+// speechBenchViews builds the partition's input for the named fixture mappings, the way a
+// manual run's scope resolution does.
+func speechBenchViews(t *testing.T, s *Server, ids ...string) []portal.BenchmarkTargetView {
+	t.Helper()
+	var views []portal.BenchmarkTargetView
+	for _, id := range ids {
+		server, app, mp := speechTriggerEntities(t, s, id)
+		views = append(views, portal.BenchmarkTargetView{Server: server, App: app, Mapping: mp})
+	}
+	return views
+}
+
+// The partition decides the preset voice ONCE per mapping and carries it on the target, so the
+// manual run and the health loop's trigger (both go through it) synthesize identically; and it
+// reads the voices cache only for a clone row, so a plain model costs no extra read.
+func TestPartitionSpeechBenchmarkViewsDecidesThePresetVoice(t *testing.T) {
+	up := voicelessCloneIs500Upstream(t, buildPCMWav(t, 24000, 1, 16, 48000))
+	s := newSpeechBenchFixture(t, up)
+	addSpeechBenchPresetClone(t, s, `["Thorsten","Frank"]`)
+	spy := &voicesCacheSpy{Store: s.Routes}
+	s.Routes = spy
+
+	p := s.partitionSpeechBenchmarkViews(context.Background(), speechBenchViews(t, s, "sb_tts", "sb_unknown", "sb_clone", "sb_asr", "sb_preset"))
+
+	voices := map[string]string{}
+	for _, tgt := range p.runnable {
+		voices[tgt.mapping.ID] = tgt.voice
+	}
+	want := map[string]string{"sb_tts": "", "sb_unknown": "", "sb_preset": "Frank"}
+	if len(voices) != len(want) {
+		t.Fatalf("runnable = %v, want exactly %v (plain models voiceless, the preset clone with its first preset)", voices, want)
+	}
+	for id, voice := range want {
+		if got, ok := voices[id]; !ok || got != voice {
+			t.Fatalf("runnable voice of %s = (%q, %v), want %q", id, got, ok, voice)
+		}
+	}
+	skipped := map[string]string{}
+	for _, r := range p.recorded {
+		skipped[r.MappingID] = r.Skipped
+	}
+	if skipped["sb_clone"] != benchmarkSkippedSpeechClone || skipped["sb_asr"] != benchmarkSkippedNotSpeech || len(skipped) != 2 || p.unreadable != 0 {
+		t.Fatalf("recorded = %v (unreadable %d), want the reference-only clone and the transcriber skipped with their reasons", skipped, p.unreadable)
+	}
+	// Only the two clone rows read the voices cache.
+	if got := spy.voicesReads(); len(got) != 2 || got[0] != "sb_clone" || got[1] != "sb_preset" {
+		t.Fatalf("voices cache reads = %v, want only the clone rows [sb_clone sb_preset]", got)
+	}
+}
+
+// A voices cache that cannot be read for a CLONE row is unreadable -- whether it has presets is
+// unknown, which is not guessed at -- recorded as an error and counted, like the capability and
+// runtime-spec reads; a mapping-scope run for it is the 500, not the 409. A plain model never
+// reads the cache, so the same failure leaves it a target.
+func TestPartitionSpeechBenchmarkViewsVoicesReadErrorIsUnreadable(t *testing.T) {
+	// The partition logs each unreadable read (a warning, so an operator sees why the mapping
+	// was not benchmarked): captured, and asserted, so it is not noise on the test output.
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	up := voicelessCloneIs500Upstream(t, buildPCMWav(t, 24000, 1, 16, 48000))
+	s := newSpeechBenchFixture(t, up)
+	addSpeechBenchPresetClone(t, s, `["Frank"]`)
+	s.Routes = &voicesCacheSpy{Store: s.Routes, failFor: map[string]bool{"sb_preset": true, "sb_tts": true}}
+
+	p := s.partitionSpeechBenchmarkViews(context.Background(), speechBenchViews(t, s, "sb_tts", "sb_preset"))
+	if len(p.runnable) != 1 || p.runnable[0].mapping.ID != "sb_tts" || p.runnable[0].voice != "" {
+		t.Fatalf("runnable = %+v, want only the plain model, voiceless (it never reads the voices cache)", p.runnable)
+	}
+	if p.unreadable != 1 || len(p.recorded) != 1 || p.recorded[0].MappingID != "sb_preset" || p.recorded[0].Skipped != "" ||
+		!strings.Contains(p.recorded[0].Error, "voices") || !strings.Contains(p.recorded[0].Error, "unreadable") {
+		t.Fatalf("unreadable = %d, recorded = %+v, want the preset clone recorded as an unreadable voices cache", p.unreadable, p.recorded)
+	}
+
+	if status, code, _ := postSpeechBenchmark(t, s, "/api/portal/mappings/sb_preset/benchmark?mode=speech"); status != http.StatusInternalServerError || code != "benchmark.request_failed" {
+		t.Fatalf("mapping-scope run with an unreadable voices cache = %d %q, want 500 benchmark.request_failed", status, code)
+	}
+	if s.Benchmarks.ServerBusy(sbServer) {
+		t.Fatal("a refused speech benchmark left the server reserved")
+	}
+	if !strings.Contains(logged.String(), "voices cache read failed") {
+		t.Fatalf("log = %q, want the unreadable voices cache warned about", logged.String())
+	}
+}
+
+// The health loop's trigger runs a preset clone like the manual run does -- it goes through the
+// same partition -- and the voice rides to the upstream; the identity the loop observed is
+// recorded beside the rate it cached, exactly as for a plain model.
+func TestTriggerSpeechRateBenchmarkRunsAPresetClone(t *testing.T) {
+	up := voicelessCloneIs500Upstream(t, buildPCMWav(t, 44100, 1, 16, 88200))
+	s := newSpeechBenchFixture(t, up)
+	addSpeechBenchPresetClone(t, s, `["Thorsten","Frank"]`)
+
+	if !speechTrigger(t, s, "sb_preset", "launch:abc") {
+		t.Fatal("TriggerSpeechRateBenchmark = false for a streaming clone with cached presets, want true")
+	}
+	st := finishedSpeechRun(t, s)
+	if st.Scope != "speech-rate" || st.Error != "" || st.Total != 1 {
+		t.Fatalf("run = %+v, want a finished one-mapping speech-rate run", st)
+	}
+	if res := speechBenchResult(t, st, "sb_preset"); res.Error != "" || res.OutputByteRate != 88200 {
+		t.Fatalf("result = %+v, want a measured 88200 B/s", res)
+	}
+	if calls := up.received(); len(calls) != 1 || calls[0].body["voice"] != "Frank" {
+		t.Fatalf("upstream calls = %+v, want one synthesis with voice Frank", calls)
+	}
+	if rows := speechIdentityRows(t, s, "sb_preset"); len(rows) != 1 || rows[0].Payload != "launch:abc" {
+		t.Fatalf("identity rows = %+v, want the observed identity recorded beside the rate", rows)
 	}
 }

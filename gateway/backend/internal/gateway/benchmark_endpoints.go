@@ -63,8 +63,10 @@ func (s *Server) handlePortalBenchmarksActive(w http.ResponseWriter, r *http.Req
 // read is not measured either, because the answer is unknown and is not
 // guessed at. The speech benchmark inverts the audio half of that split
 // (partitionSpeechBenchmarkViews): it synthesizes a clip on each plain
-// text-to-speech mapping, the audio-only ones included, and skips every
-// mapping that does not synthesize speech or that clones a voice; a scope with
+// text-to-speech mapping, the audio-only ones included, and on each configured
+// clone model that lists a preset voice (with that preset named in the request,
+// #306), and skips every mapping that does not synthesize speech or that clones
+// a voice from a reference alone; a scope with
 // no such mapping answers 409 benchmark.speech_unavailable
 // (refuseNothingRunnableSpeech). Nothing else about the starter differs. A scope with no runnable view reserves nothing and answers 409
 // benchmark.images_only when every view serves only images (or images and

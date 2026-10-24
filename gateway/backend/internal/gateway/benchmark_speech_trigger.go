@@ -36,9 +36,11 @@ type SpeechRateTrigger func(ctx context.Context, server routing.AIServer, app ro
 // tick and none of which writes anything:
 //
 //   - the mapping is not a target. The decision is the manual benchmark's own
-//     (partitionSpeechBenchmarkViews): a plain text-to-speech mapping the gateway routes
-//     speech to, from its stored capability rows. A clone model, a transcriber and a mapping
-//     with no speech verdict are refused, so the trigger is never wider than the manual run;
+//     (partitionSpeechBenchmarkViews): a text-to-speech mapping the gateway routes speech to,
+//     from its stored capability rows -- a plain one, or a clone model with a cached preset
+//     voice, which is then synthesized with that preset (#306). A reference-only clone model
+//     (no preset), a transcriber and a mapping with no speech verdict are refused, so the
+//     trigger is never wider than the manual run;
 //   - another run holds the server's one slot (BenchmarkRegistry.TryStart), a manual run, a
 //     scheduled one or an earlier trigger still in flight;
 //   - the server has in-flight requests. Like the scheduled benchmark it never competes with

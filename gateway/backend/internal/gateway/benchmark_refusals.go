@@ -45,9 +45,9 @@ const (
 	// codeBenchmarkSpeechUnavailable: the SPEECH benchmark (?mode=speech) has no
 	// target in the run's scope. It is the speech benchmark's own refusal, the twin of
 	// the two above for the one mode that inverts their audio-only rule: it runs on
-	// plain text-to-speech mappings, so what it refuses is a scope with none -- a
-	// mapping that does not synthesize speech, or a voice-cloning model that cannot
-	// without a reference voice (speechBenchmarkSkip). An application- or server-scope
+	// text-to-speech mappings, so what it refuses is a scope with none -- a mapping
+	// that does not synthesize speech, or a voice-cloning model that lists no preset
+	// voice and so cannot synthesize without a reference voice (speechBenchmarkSkip). An application- or server-scope
 	// run answers it too when every mapping in its scope is skipped.
 	codeBenchmarkSpeechUnavailable = "benchmark.speech_unavailable"
 	msgBenchmarkSpeechUnavailable  = "this model, or every model in the run's scope, cannot be benchmarked for speech: it does not synthesize speech, or it clones a voice and needs a reference"
@@ -110,8 +110,8 @@ const benchmarkSkippedAudioOnly = "audio_only"
 // for a mapping an application- or server-scope run did not measure
 // (partitionSpeechBenchmarkViews): benchmarkSkippedNotSpeech when it does not
 // synthesize speech (a chat model, a transcriber, an unprobed model), and
-// benchmarkSkippedSpeechClone when it is a voice-cloning model, whose synthesis
-// needs a reference voice the benchmark does not have.
+// benchmarkSkippedSpeechClone when it is a voice-cloning model with no preset voice
+// to name (#306), whose synthesis needs a reference voice the benchmark does not have.
 const (
 	benchmarkSkippedNotSpeech   = "not_speech"
 	benchmarkSkippedSpeechClone = "speech_clone"
