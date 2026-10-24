@@ -223,19 +223,256 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
-// A voice cached on a mapping whose model is NOT a plain tts one any more (it became a
-// clone model after the cache was written) is not a known voice: the same read-side
-// verdict gate the voices endpoint applies. map_b would be the only match, so were the
-// stale row honored the request would be forced onto srv_b.
-func TestVoiceStandardIgnoresAVoiceCachedOnANonTTSMapping(t *testing.T) {
+// markClone turns a seeded speech mapping into a configured clone model: its (speech, yes)
+// verdict stays and a (speech_clone, yes) one is added, the pair the prober writes for a model
+// that synthesises only in a reference voice or a named preset. The other mappings of the
+// fixture stay plain tts.
+func markClone(t *testing.T, mem *MemoryStore, mappingID string) {
+	t.Helper()
+	if err := mem.UpsertMappingCapabilities(context.Background(), mappingID, []CapabilityRow{{Capability: CapabilitySpeechClone, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: voiceNow}}); err != nil {
+		t.Fatalf("flip %s to a clone model: %v", mappingID, err)
+	}
+}
+
+// #305, the inversion of the plain-tts-only rule this test used to pin
+// (TestVoiceStandardIgnoresAVoiceCachedOnANonTTSMapping asserted the clone's cached voice was
+// IGNORED). Since #301 a configured clone model with presets is offered and its presets are in
+// the voices cache, so a mapping that is a clone model NOW but has a voices row is CONSULTED:
+// bella is cached only on map_b, which is a clone model, so it is known-present there and
+// known-absent on map_a, and the request is routed to the clone instead of the first plain
+// sibling that would 500 on it.
+func TestVoiceStandardConsultsAVoiceCachedOnACloneMapping(t *testing.T) {
 	mem := voiceModelStore(t, []string{"alba"}, []string{"bella"})
-	if err := mem.UpsertMappingCapabilities(context.Background(), "map_b", []CapabilityRow{{Capability: CapabilitySpeechClone, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: voiceNow}}); err != nil {
-		t.Fatalf("flip map_b to a clone model: %v", err)
+	markClone(t, mem, "map_b")
+	r := NewResolver(mem, voiceClock(), nil)
+	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
+		t.Fatalf("server = %q, want srv_b: bella is cached on the clone mapping map_b, which the filter now consults", got.ServerID)
+	}
+}
+
+// The voice filter classifies a mapping that is no speech model at all by nothing: a stray
+// voices row on a mapping whose CURRENT verdicts say it does not synthesise speech (flipped
+// to no, or never a speech model) is not a known voice and does not narrow. Such a mapping is
+// not in a speech request's pool in practice (the capability gate drops it first), so this
+// pins voiceScopeFor itself: map_a lists alba (known-absent for bella) and the non-speech
+// map_b caches bella, yet nothing is classified as listing it, so every classified candidate
+// is known-absent and the voice fails open (a nil scope) instead of narrowing to map_b.
+func TestVoiceScopeForIgnoresAVoiceCachedOnANonSpeechMapping(t *testing.T) {
+	ctx := context.Background()
+	for name, setup := range map[string]func(t *testing.T, mem *MemoryStore){
+		"its speech verdict is no": func(t *testing.T, mem *MemoryStore) {
+			if err := mem.UpsertMappingCapabilities(ctx, "map_b", []CapabilityRow{{Capability: CapabilitySpeech, Verdict: CapabilityNo, Source: CapabilitySourceManual, CheckedAt: voiceNow}}); err != nil {
+				t.Fatalf("flip map_b off speech: %v", err)
+			}
+		},
+		"it has no speech verdict (a transcription model)": func(t *testing.T, mem *MemoryStore) {
+			if err := mem.DeleteMappingCapability(ctx, "map_b", CapabilitySpeech); err != nil {
+				t.Fatalf("clear map_b's speech verdict: %v", err)
+			}
+			if err := mem.UpsertMappingCapabilities(ctx, "map_b", []CapabilityRow{{Capability: CapabilityTranscription, Verdict: CapabilityYes, Source: CapabilitySourceManual, CheckedAt: voiceNow}}); err != nil {
+				t.Fatalf("make map_b a transcription model: %v", err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mem := voiceModelStore(t, []string{"alba"}, []string{"bella"})
+			setup(t, mem)
+			r := NewResolver(mem, voiceClock(), nil)
+			pool := []MappingCandidate{{Mapping: ModelMapping{ID: "map_a"}}, {Mapping: ModelMapping{ID: "map_b"}}}
+			scope, err := r.voiceScopeFor(ctx, "bella", pool)
+			if err != nil {
+				t.Fatalf("voiceScopeFor: %v", err)
+			}
+			if scope != nil {
+				t.Fatalf("scope = %+v, want nil: the non-speech map_b's cached bella is not a known voice", scope)
+			}
+		})
+	}
+}
+
+// --- a clone model among the candidates (#305) --------------------------------------
+
+// An offered gateway name that mixes a plain tts mapping and a configured clone model with
+// presets: a named voice routes to the mapping whose cached list names it, and away from the
+// one whose cached list does not -- both ways round, and in both store orders, because the
+// first mapping in store order wins when nothing narrows, so a "route to the first" answer
+// proves nothing. The ask that only the clone lists used to route to the plain sibling (the
+// filter classified plain tts only, left the clone out of its pool arithmetic and so
+// narrowed nothing) and the upstream answered 500; a clone with a cached row is classified
+// now, over the same cache read.
+func TestVoiceStandardRoutesAMixedCatalogNameToTheMappingThatServesTheVoice(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		cloneID          string // the clone model; the other mapping stays plain tts
+		voicesA, voicesB []string
+		ask              string
+		wantServer       string
+	}{
+		{"a clone-only voice routes to the clone (clone second)", "map_b", []string{"alba"}, []string{"bella"}, "bella", "srv_b"},
+		{"a plain-only voice routes to the plain mapping (clone first)", "map_a", []string{"bella"}, []string{"alba"}, "alba", "srv_b"},
+		{"a clone-only voice keeps the clone (clone first)", "map_a", []string{"bella"}, []string{"alba"}, "bella", "srv_a"},
+		{"a plain-only voice keeps the plain mapping (plain first)", "map_b", []string{"alba"}, []string{"bella"}, "alba", "srv_a"},
+		{"a voice both list narrows nothing", "map_a", []string{"bella"}, []string{"bella", "alba"}, "bella", "srv_a"},
+		// The preset clone has a cached list and it does not name the voice: known-absent.
+		{"a preset clone whose presets lack the voice is known-absent", "map_a", []string{"ciao"}, []string{"bella"}, "bella", "srv_b"},
+		// A reference-only clone caches the confirmed-empty list "[]": known-absent for any voice.
+		{"a reference-only clone (cached []) is routed away from", "map_a", []string{}, []string{"bella"}, "bella", "srv_b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := voiceModelStore(t, tc.voicesA, tc.voicesB)
+			markClone(t, mem, tc.cloneID)
+			r := NewResolver(mem, voiceClock(), nil)
+			if got := resolveVoice(t, r, voiceReq("tts", tc.ask)); got.ServerID != tc.wantServer {
+				t.Fatalf("server = %q, want %q", got.ServerID, tc.wantServer)
+			}
+		})
+	}
+}
+
+// The mixed pool costs exactly one voices-cache read (the batch is over the pool's speech
+// mappings, not one per mapping or per kind), and the narrowed scope is what refuses: with
+// the plain sibling that serves bella down, the request is voice_unavailable -- the clone
+// that is known to lack bella (it lists other presets) does not rescue it, as no known-absent
+// sibling ever does.
+func TestVoiceStandardAKnownAbsentCloneDoesNotRescueTheVoice(t *testing.T) {
+	newStore := func(t *testing.T) *MemoryStore {
+		mem := voiceModelStore(t, []string{"ciao"}, []string{"bella"})
+		markClone(t, mem, "map_a")
+		return mem
+	}
+	t.Run("one bulk cache read for the mixed pool", func(t *testing.T) {
+		counting := &voiceCacheStore{resolverStore: newStore(t)}
+		r := NewResolver(counting, voiceClock(), nil)
+		if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
+			t.Fatalf("server = %q, want srv_b", got.ServerID)
+		}
+		if counting.cacheReads != 1 {
+			t.Fatalf("cache reads = %d, want exactly 1 bulk read for the mixed pool", counting.cacheReads)
+		}
+	})
+	t.Run("the voice's plain server is down: voice_unavailable", func(t *testing.T) {
+		r := NewResolver(newStore(t), voiceClock(), fakeReachability{unreachable: map[string]bool{"app_b": true}})
+		_, err := r.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "bella"))
+		if !errors.Is(err, ErrVoiceUnavailable) {
+			t.Fatalf("err = %v, want ErrVoiceUnavailable (the clone is known to lack bella)", err)
+		}
+	})
+}
+
+// FAIL-OPEN when EVERY candidate is known-absent, now with a clone among them: nothing is
+// known to offer the voice, so it routes unfiltered (the upstream decides) and is never
+// refused. Both the standard path and, with the first server down, the target the walk falls
+// to match a request without a voice.
+func TestVoiceStandardEveryCandidateKnownAbsentFailsOpenWithACloneAmongThem(t *testing.T) {
+	newStore := func(t *testing.T) *MemoryStore {
+		mem := voiceModelStore(t, []string{"alba"}, []string{"ciao"})
+		markClone(t, mem, "map_b")
+		return mem
+	}
+	logs := captureSlog(t)
+	r := NewResolver(newStore(t), voiceClock(), nil)
+	want := resolveVoice(t, r, voiceReq("tts", ""))
+	if got := resolveVoice(t, r, voiceReq("tts", "nobody-has-this")); got.ServerID != want.ServerID || got.RouteID != want.RouteID {
+		t.Fatalf("target = %+v, want today's %+v", got, want)
+	}
+	if out := logs.String(); out != "" {
+		t.Fatalf("log = %q, want nothing at the default level", out)
+	}
+	down := NewResolver(newStore(t), voiceClock(), fakeReachability{unreachable: map[string]bool{"app_a": true}})
+	got, err := down.Resolve(context.Background(), voicePrincipal, voiceReq("tts", "nobody-has-this"))
+	if err != nil {
+		t.Fatalf("err = %v, want the unfiltered request served by the reachable clone, never voice_unavailable", err)
+	}
+	if got.ServerID != "srv_b" {
+		t.Fatalf("server = %q, want srv_b", got.ServerID)
+	}
+}
+
+// A clone whose voices row cannot be decoded is UNKNOWN, not absent: it stays eligible
+// (fail open, logged at Warn) exactly as an undecodable plain-tts row does. map_a is plain tts
+// and known-absent for bella, so the corrupt-but-eligible clone map_b is where bella routes.
+func TestVoiceStandardUndecodableCloneRowStaysEligible(t *testing.T) {
+	logs := captureSlog(t)
+	mem := voiceModelStore(t, []string{"alba"}, nil)
+	markClone(t, mem, "map_b")
+	if err := mem.UpsertModelMappingCache(context.Background(), ModelMappingCacheRow{MappingID: "map_b", CacheType: ModelMappingCacheVoices, Payload: `{not json`, UpdatedAt: voiceNow}); err != nil {
+		t.Fatalf("seed corrupt row: %v", err)
 	}
 	r := NewResolver(mem, voiceClock(), nil)
-	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_a" {
-		t.Fatalf("server = %q, want srv_a: bella is only cached on a mapping that is a clone model now, so it is unknown", got.ServerID)
+	if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
+		t.Fatalf("server = %q, want srv_b (the clone's row is undecodable, so it is kept eligible)", got.ServerID)
 	}
+	if out := logs.String(); !strings.Contains(out, "undecodable") || !strings.Contains(out, "mapping_id=map_b") {
+		t.Fatalf("log = %q, want a warning naming the undecodable row of map_b", out)
+	}
+}
+
+// UNCHANGED BY #305, pinned so widening the classify set cannot regress it: a clone model
+// with NO voices row (a cold child, an old agent, a failed listing) is not classified at all.
+// It is not known-present, not known-absent, and not "unknown and kept" -- it is left out of
+// the allowed set, so it is DROPPED from a pool the voice narrowed and KEPT whenever the
+// filter fails open. Keeping it eligible in a narrowed pool would let a cold clone win routing
+// and answer a 500 on a voice it does not serve.
+//
+// The clone is first in store order and equal in score, so it is what an unfiltered request
+// serves; a narrowed pool that served it would mean it had been kept.
+func TestVoiceStandardACloneWithoutAVoicesRowIsDroppedWhenNarrowedAndKeptWhenFailOpen(t *testing.T) {
+	ctx := context.Background()
+	// map_a: clone, NO row. map_b: plain tts listing bella. map_c: plain tts listing alba.
+	newStore := func(t *testing.T) *MemoryStore {
+		mem := voiceModelStore(t, nil, []string{"bella"})
+		markClone(t, mem, "map_a")
+		addSpeechMapping(t, mem, "srv_c", "app_c", "map_c", "tts")
+		cacheVoices(t, mem, "map_c", []string{"alba"})
+		return mem
+	}
+	r := NewResolver(newStore(t), voiceClock(), nil)
+	if got := resolveVoice(t, r, voiceReq("tts", "")); got.ServerID != "srv_a" {
+		t.Fatalf("control: no voice served by %q, want the first mapping, the cold clone srv_a", got.ServerID)
+	}
+
+	t.Run("dropped from a pool the voice narrowed", func(t *testing.T) {
+		// map_c is known-absent for bella, map_b lists it: narrowed to {map_b}, the cold clone
+		// is not among the allowed.
+		if got := resolveVoice(t, r, voiceReq("tts", "bella")); got.ServerID != "srv_b" {
+			t.Fatalf("server = %q, want srv_b: the row-less clone is dropped from the narrowed pool", got.ServerID)
+		}
+		// With that one eligible server down the narrowed pool has no usable host and is
+		// refused, instead of the cold clone being kept as a fallback.
+		down := NewResolver(newStore(t), voiceClock(), fakeReachability{unreachable: map[string]bool{"app_b": true}})
+		if _, err := down.Resolve(ctx, voicePrincipal, voiceReq("tts", "bella")); !errors.Is(err, ErrVoiceUnavailable) {
+			t.Fatalf("err = %v, want ErrVoiceUnavailable: the cold clone is not an eligible fallback", err)
+		}
+	})
+	t.Run("kept when every classified candidate is known-absent", func(t *testing.T) {
+		// Nothing lists "ciao": map_b and map_c are known-absent, the clone is not classified,
+		// so no candidate is known to offer the voice and it routes as without one.
+		if got := resolveVoice(t, r, voiceReq("tts", "ciao")); got.ServerID != "srv_a" {
+			t.Fatalf("server = %q, want srv_a: fail-open keeps the row-less clone", got.ServerID)
+		}
+	})
+	t.Run("kept when nothing is known to lack the voice", func(t *testing.T) {
+		// A pool of the cold clone and one plain mapping that lists the voice: nothing is
+		// known-absent, so the voice restricts nothing and the clone stays a candidate.
+		mem := voiceModelStore(t, nil, []string{"bella"})
+		markClone(t, mem, "map_a")
+		if got := resolveVoice(t, NewResolver(mem, voiceClock(), nil), voiceReq("tts", "bella")); got.ServerID != "srv_a" {
+			t.Fatalf("server = %q, want srv_a: nothing is known to lack bella, so nothing narrows", got.ServerID)
+		}
+	})
+	t.Run("a lone row-less clone routes as without a voice", func(t *testing.T) {
+		mem := NewMemoryStore()
+		addSpeechMapping(t, mem, "srv_a", "app_a", "map_a", "tts")
+		markClone(t, mem, "map_a")
+		lone := NewResolver(mem, voiceClock(), nil)
+		if got := resolveVoice(t, lone, voiceReq("tts", "bella")); got.ServerID != "srv_a" {
+			t.Fatalf("server = %q, want srv_a", got.ServerID)
+		}
+		scope, err := lone.voiceScopeFor(ctx, "bella", []MappingCandidate{{Mapping: ModelMapping{ID: "map_a"}}})
+		if err != nil || scope != nil {
+			t.Fatalf("voiceScopeFor = (%+v, %v), want (nil, nil): nothing is classified", scope, err)
+		}
+	})
 }
 
 // The voice only exists on a server the principal is not provisioned for: it is not a
@@ -802,6 +1039,28 @@ func TestVoiceGroupFailureMapping(t *testing.T) {
 			t.Fatalf("err = %v, want ErrNoHealthyHost and not ErrVoiceUnavailable", err)
 		}
 	})
+}
+
+// The mixed-catalog case on the group path (#305): coder-a (first in priority) is a preset
+// clone listing bella, coder-b a plain tts mapping listing alba. The group pre-pass classifies
+// the flattened pool, so alba -- which the first, healthy member does not list -- routes past it
+// to coder-b, and bella stays with the clone.
+func TestVoiceGroupRoutesAMixedCatalogToTheMemberThatServesTheVoice(t *testing.T) {
+	mem := voiceGroupStore(t, []string{"bella"}, []string{"alba"})
+	markClone(t, mem, "map_a")
+	r := NewResolver(mem, voiceClock(), nil)
+	r.SetGroupResolver(voiceGroup(GroupPolicy{FailoverMode: "sticky"}))
+	for _, tc := range []struct{ name, voice, wantServer string }{
+		{"no voice keeps the priority order", "", "srv_a"},
+		{"a plain-only voice routes past the first member, the clone", "alba", "srv_b"},
+		{"a clone-only voice stays with the clone member", "bella", "srv_a"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveVoice(t, r, voiceReq("tts-group", tc.voice)); got.ServerID != tc.wantServer {
+				t.Fatalf("server = %q, want %q", got.ServerID, tc.wantServer)
+			}
+		})
+	}
 }
 
 // A request without a voice reads no voices cache on the group path either.
