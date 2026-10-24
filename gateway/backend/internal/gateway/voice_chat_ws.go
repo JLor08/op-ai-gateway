@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"strings"
 	"sync"
@@ -505,10 +506,16 @@ func voiceASRRelay(turnCtx context.Context, body io.Reader, asrCh chan<- asrEven
 // mic PCM and controls from the read loop, ASR SSE events from the per-turn relay, and the
 // turn timers it arms itself.
 //
-// TODO(Task 7): the speculative voice run + continuation window attaches at the chunk
-// boundary (see beginAnswerPlaceholder); this task delivers the states, the per-turn ASR
-// loopback, the chunk detection + pendingText accumulation, the timers and the half-duplex
-// mic gate, with the run/TTS/commit left as a placeholder.
+// On a chunk end the machine starts a SPECULATIVE voice run (startVoiceRun) on the
+// accumulated pendingText and subscribes to it, folding the run's text/audio deltas into
+// the session as answer_*/audio_* down-frames. While the run is in flight and before any
+// TTS audio plays -- the continuation window (spec 6.1) -- the mic STAYS OPEN (micOpen is
+// true in thinking too), so resumed speech is captured: a resumed voiced chunk cancels the
+// speculative run (nothing is persisted), emits answer_reset, extends pendingText and
+// re-runs on the next chunk end. The window closes -- the mic shuts and the audio plays --
+// only once the answer has streamed AND the continuation grace has elapsed with no resume;
+// then the run commits (user + assistant together) and the session speaks/drains. Any leg
+// failure degrades to idle with one error frame (spec 6.6), no retry.
 type voiceMachine struct {
 	s      *Server
 	ctx    context.Context
@@ -550,6 +557,40 @@ type voiceMachine struct {
 	tailC         <-chan time.Time
 	finalizeTimer *time.Timer
 	finalizeC     <-chan time.Time
+
+	// The in-flight speculative voice run and its subscription. run/runUnsub are nil when
+	// no run is open; runCh is nil whenever the run's events must not be selected (no run,
+	// or after the run went terminal), which disables its select case. The machine is the
+	// SOLE reader of runCh and the sole mutator of every field below, so the run's events
+	// reach the state machine only as channel values folded in run()'s single select --
+	// never a cross-goroutine write of machine state.
+	curRun   *ChatRun
+	runCh    <-chan runEvent
+	runUnsub func()
+
+	// The continuation-window bookkeeping for the current speculative run.
+	//   - answerStreamed: the LLM answer text finished (the first audio event, or a
+	//     completed terminal) -- one of the two window-close conditions.
+	//   - answerDoneSent: answer_done already emitted (emitted once, when the answer text
+	//     finishes, before any audio_delta).
+	//   - graceElapsed: the continuation grace has fired -- the other window-close condition.
+	//   - windowClosed: the window is closed (we have committed to this turn): the mic is
+	//     shut and buffered audio plays. Set exactly when the machine leaves thinking for
+	//     speaking; no resume is accepted past it.
+	//   - runFinished: the run has reported its single terminal outcome.
+	//   - audioBuf: audio chunks held while the window is still open (before speaking), so
+	//     no TTS audio is ever delivered -- and so could never play while the mic is open --
+	//     until the window closes. Flushed in order when the window closes.
+	answerStreamed bool
+	answerDoneSent bool
+	graceElapsed   bool
+	windowClosed   bool
+	runFinished    bool
+	audioBuf       []runAudio
+
+	// The continuation-grace timer (armed on each chunk end, disarmed on resume/commit).
+	graceTimer *time.Timer
+	graceC     <-chan time.Time
 }
 
 // voiceFinalizeTimeout bounds the wait for the clean final transcript after the pipe is
@@ -557,6 +598,23 @@ type voiceMachine struct {
 // but a stalled or truncated upstream must not wedge the turn, so after this the machine
 // finalizes with whatever provisional text it has.
 const voiceFinalizeTimeout = 5 * time.Second
+
+// The gateway-side stable codes for a voice turn that failed before (or without) any core
+// returning its own code. A leg that failed WITH a code (an LLM/TTS error, a mid-turn
+// runtime.admission_blocked) degrades on THAT code; these are the fallbacks for the thin
+// orchestration failures the cores never saw.
+const (
+	// voiceRunStartFailedCode: the speculative run could not be reserved or launched.
+	voiceRunStartFailedCode = "gateway.voice_run_start_failed"
+	// voiceRunClosedCode: the run's subscription ended with no terminal event (defensive).
+	voiceRunClosedCode = "gateway.voice_run_closed"
+	// voiceRunFailedCode: the run reported an error status but carried no code to surface.
+	voiceRunFailedCode = "gateway.voice_run_failed"
+)
+
+// voiceTurnFailedMessage is the human half of every degradation error frame; the stable
+// code is the machine-readable half the client switches on.
+const voiceTurnFailedMessage = "the voice turn could not be completed"
 
 // newVoiceMachine builds the state machine for a session. The timing is the Server's
 // resolved voiceTiming (defaults filled in New; a test may override s.voiceTiming).
@@ -579,6 +637,7 @@ func (m *voiceMachine) run() {
 	for {
 		select {
 		case <-m.ctx.Done():
+			m.detachRun()
 			m.teardownTurn()
 			m.stopAllTimers()
 			return
@@ -592,10 +651,18 @@ func (m *voiceMachine) run() {
 			} else {
 				m.onASRClosed()
 			}
+		case ev, ok := <-m.runCh:
+			if ok {
+				m.onRunEvent(ev)
+			} else {
+				m.onRunClosed()
+			}
 		case <-m.silenceC:
 			m.onSilence()
 		case <-m.maxC:
 			m.onMaxUtterance()
+		case <-m.graceC:
+			m.onGrace()
 		case <-m.tailC:
 			m.onTailDone()
 		case <-m.finalizeC:
@@ -614,13 +681,28 @@ func (m *voiceMachine) setState(state string) {
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownState, State: state})
 }
 
-// micOpen reports whether inbound PCM is piped to the ASR this turn. ONLY listening feeds
-// the ASR; idle, thinking, speaking and draining all discard -- and while finalizing a
-// chunk (the pipe is closing) listening discards too. This is the whole half-duplex
-// guarantee: speaking/draining can never route TTS-era audio into the ASR, enforced
+// micOpen reports whether inbound PCM is piped to the ASR this turn. The mic feeds the ASR
+// in listening AND in thinking while the continuation window is open (spec 6.1) -- during
+// that window no TTS audio has played yet (audio is held, audioBuf), so capturing resumed
+// speech cannot feed the model its own voice. It is CLOSED in idle, in speaking and in
+// draining, once the window has closed (windowClosed), and while finalizing a chunk (the
+// pipe is closing). The speaking/draining closure is the whole half-duplex guarantee:
+// once any TTS audio can play, the mic can never route it into the ASR, enforced
 // server-side regardless of client behaviour.
 func (m *voiceMachine) micOpen() bool {
-	return m.state == voiceStateListening && !m.finalizing
+	if m.finalizing {
+		return false
+	}
+	switch m.state {
+	case voiceStateListening:
+		return true
+	case voiceStateThinking:
+		// The continuation window: open until we commit to the answer (windowClosed), at
+		// which point the state moves to speaking anyway.
+		return !m.windowClosed
+	default:
+		return false // idle, speaking, draining
+	}
 }
 
 // onPCM applies the half-duplex mic gate and, when the mic is open, feeds the frame to the
@@ -709,13 +791,16 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 			m.finalizeChunk()
 		}
 	case voiceUpCancel:
-		// Abandon the in-flight turn and return to listening. Task 7 extends this to stop
-		// the speculative run / TTS; here it tears the ASR loopback down and resets the
-		// chunk. pendingText is left to Task 7's turn/commit semantics.
+		// Abandon the in-flight turn and return to listening (spec 5.3): cancel the
+		// speculative run (nothing persisted), tear the ASR loopback down, drop the pending
+		// text (the turn is abandoned, never silently re-run) and disarm every turn timer.
+		m.detachRun()
 		m.teardownTurn()
 		m.resetChunk()
 		m.stopChunkTimers()
+		m.stopGrace()
 		m.stopTail()
+		m.pendingText = ""
 		m.setState(voiceStateListening)
 	}
 }
@@ -750,6 +835,13 @@ func (m *voiceMachine) onVoiced() {
 		m.chunkActive = true
 		m.firstPartialAt = now
 		m.armMax()
+		// The first voiced partial of a chunk that begins WHILE a speculative run is in
+		// flight and its continuation window is still open is "resumed speech": cancel the
+		// run (nothing persisted), drop the answer preview, and fall back to listening so
+		// this chunk extends pendingText and re-runs on the next chunk end (spec 6.1).
+		if m.curRun != nil && !m.windowClosed {
+			m.onResume()
+		}
 	}
 	m.lastPartialAt = now
 	m.armSilence()
@@ -805,7 +897,7 @@ func (m *voiceMachine) finishChunk(final string) {
 	}
 	m.teardownTurn()
 	m.resetChunk()
-	m.beginAnswerPlaceholder()
+	m.beginAnswer()
 }
 
 // onASRClosed handles the turn relay ending (the SSE body closed). If we were finalizing,
@@ -832,19 +924,240 @@ func (m *voiceMachine) onFinalizeTimeout() {
 	m.finishChunk(m.chunkText)
 }
 
-// beginAnswerPlaceholder walks the turn's answer states. TODO(Task 7): this is the seam
-// where the speculative voice run + continuation window attaches -- start the LLM on
-// pendingText, keep the mic live during the grace (VoiceContinuationGrace), cancel-and-
-// extend on resumed speech, then commit (persist the user+assistant turn, clear
-// pendingText) and stream the answer's TTS as audio_delta. This task has no run or TTS, so
-// it walks thinking -> speaking -> draining as placeholders (the half-duplex mic gate holds
-// across all three) and arms the real mic-resume tail; pendingText is intentionally NOT
-// cleared here (Task 7's commit clears it), so chunks accumulate across the turn.
-func (m *voiceMachine) beginAnswerPlaceholder() {
+// beginAnswer starts the speculative voice run for the accumulated pendingText and opens
+// the continuation window (spec 6.1). A chunk that produced no text is NOT a turn: it does
+// not start a run and does not walk the answer states (this also swallows a blip-then-
+// silence spurious turn), the session simply keeps listening. Otherwise the run is started
+// and subscribed, the machine enters thinking (mic still open -- the window), the grace
+// timer is armed, and any answer text the run already buffered before we subscribed is
+// relayed so no delta is lost.
+func (m *voiceMachine) beginAnswer() {
+	if strings.TrimSpace(m.pendingText) == "" {
+		m.pendingText = ""
+		m.setState(voiceStateListening)
+		return
+	}
+	owner := auth.Token{
+		UserID:    m.claims.UserID,
+		ID:        m.claims.TokenID,
+		ServiceID: m.claims.ServiceID,
+		ProjectID: m.claims.ProjectID,
+	}
+	run, err := m.s.startVoiceRun(m.ctx, owner, m.claims.ChatID, m.pendingText, m.claims.ASR, m.claims.LLM, m.claims.TTS, m.claims.Audio)
+	if err != nil {
+		// The run could not even be reserved/launched (no slot, a history read failure):
+		// degrade exactly as a leg error would, no retry.
+		m.degrade(voiceRunStartFailedCode)
+		return
+	}
+	snap, ch, unsub := run.subscribe()
+	m.curRun, m.runCh, m.runUnsub = run, ch, unsub
+	m.answerStreamed, m.answerDoneSent, m.graceElapsed, m.windowClosed, m.runFinished = false, false, false, false, false
+	m.audioBuf = nil
 	m.setState(voiceStateThinking)
+	m.armGrace()
+	// Relay whatever the run buffered between launch and subscribe (usually nothing); the
+	// snapshot carries no audio, which only ever arrives after the text, long after here.
+	if snap.Content != "" {
+		m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAnswerDelta, Text: snap.Content})
+	}
+	// Defensive: a run that was already terminal at subscribe (it cannot be in practice --
+	// the LLM leg is a loopback round trip -- but the snapshot is the source of truth).
+	if snap.Status != "running" {
+		m.handleRunTerminal(snap.Status, snap.Err)
+	}
+}
+
+// onRunEvent folds one event from the speculative run's subscription into the session. A
+// text delta becomes answer_delta; an audio chunk is held or relayed by the window logic;
+// the terminal `done` drives the commit/degrade decision. The snapshot event never arrives
+// here (beginAnswer consumed it).
+func (m *voiceMachine) onRunEvent(ev runEvent) {
+	switch ev.Event {
+	case "delta":
+		if ev.Content != "" {
+			m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAnswerDelta, Text: ev.Content})
+		}
+	case "audio":
+		m.onRunAudio(ev.Audio)
+	case "done":
+		m.handleRunTerminal(ev.Status, ev.Err)
+	}
+}
+
+// onRunClosed handles the run's subscription channel closing (the run is terminal). The
+// terminal `done` event always precedes the close, so by here handleRunTerminal has run;
+// we only disable the select case. A close with no prior terminal is a defensive failure.
+func (m *voiceMachine) onRunClosed() {
+	if m.curRun != nil && !m.runFinished {
+		m.degrade(voiceRunClosedCode)
+		return
+	}
+	m.runCh = nil
+}
+
+// onRunAudio consumes one TTS audio chunk from the run. The first audio means the LLM
+// answer text has finished, so answer_done is emitted (markAnswerStreamed). While the
+// continuation window is still open the chunk is HELD (audioBuf) so no audio ever plays
+// before the mic shuts; once the window has closed the chunk is relayed straight down.
+func (m *voiceMachine) onRunAudio(a *runAudio) {
+	if a == nil {
+		return
+	}
+	m.markAnswerStreamed()
+	if m.windowClosed {
+		m.relayAudio(*a)
+		return
+	}
+	m.audioBuf = append(m.audioBuf, *a)
+	m.maybeCloseWindow()
+}
+
+// markAnswerStreamed records that the LLM answer text has finished (the first audio event,
+// or a completed run) and emits answer_done exactly once, before any audio_delta. It is one
+// of the two conditions that close the continuation window.
+func (m *voiceMachine) markAnswerStreamed() {
+	if !m.answerDoneSent {
+		m.answerDoneSent = true
+		m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAnswerDone})
+	}
+	if m.answerStreamed {
+		return
+	}
+	m.answerStreamed = true
+	m.maybeCloseWindow()
+}
+
+// onGrace fires when the continuation grace elapses: it is the other window-close
+// condition. Because the LLM runs during the grace, the grace is usually already hidden
+// behind generation -- this only matters when the answer streamed faster than the grace.
+func (m *voiceMachine) onGrace() {
+	m.stopGrace()
+	m.graceElapsed = true
+	m.maybeCloseWindow()
+}
+
+// maybeCloseWindow closes the continuation window once the answer has streamed AND the
+// grace has elapsed with no resume. Idempotent and cheap to call from either condition.
+func (m *voiceMachine) maybeCloseWindow() {
+	if m.windowClosed || !m.answerStreamed || !m.graceElapsed {
+		return
+	}
+	m.closeWindow()
+}
+
+// closeWindow commits the session to the current turn: the mic shuts (half-duplex), the
+// held audio plays, and -- if the run has already finished -- the answer is finished off.
+// From here no resume is accepted; the speculative run is left to commit (user + assistant).
+func (m *voiceMachine) closeWindow() {
+	m.windowClosed = true
+	m.stopGrace()
+	// Tear down any ASR loopback opened in the window on pre-voiced input (a voiced one
+	// would have resumed); we are committing to the answer now.
+	m.teardownTurn()
+	m.resetChunk()
+	m.stopChunkTimers()
 	m.setState(voiceStateSpeaking)
+	m.flushAudioBuf()
+	if m.runFinished {
+		m.finishAnswer()
+	}
+}
+
+// flushAudioBuf relays every held audio chunk in order, then clears the buffer.
+func (m *voiceMachine) flushAudioBuf() {
+	for _, a := range m.audioBuf {
+		m.relayAudio(a)
+	}
+	m.audioBuf = nil
+}
+
+// relayAudio sends one TTS chunk as an audio_delta (seq from 0, one rate), the shape the
+// browser's StreamingPcmPlayer reads.
+func (m *voiceMachine) relayAudio(a runAudio) {
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Rate: a.Rate, Audio: a.Data})
+}
+
+// handleRunTerminal records the run's single terminal outcome and acts on it: a completed
+// run drives the commit/speak flow (finished once the window is closed), a cancelled run is
+// our own resume (already handled, ignored here), and any other status degrades (spec 6.6).
+func (m *voiceMachine) handleRunTerminal(status, errMsg string) {
+	if m.runFinished {
+		return
+	}
+	m.runFinished = true
+	switch status {
+	case "completed":
+		// The answer is done; ensure answer_done is out and try to close the window. If the
+		// window is (now) closed, finish the answer; otherwise the grace is still pending and
+		// closeWindow will finish it when it fires.
+		m.markAnswerStreamed()
+		if m.windowClosed {
+			m.finishAnswer()
+		}
+	case "canceled":
+		// Our own resume/cancel already emitted answer_reset and moved on; nothing to do.
+	default:
+		m.degrade(firstNonEmptyVoice(errMsg, voiceRunFailedCode))
+	}
+}
+
+// finishAnswer ends the spoken turn after the run has committed (user + assistant): it
+// closes the audio stream, clears the committed pending text, and drains (the half-duplex
+// tail) back to listening. Only ever reached on a completed run with the window closed.
+func (m *voiceMachine) finishAnswer() {
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDone})
+	m.detachRun()
+	m.pendingText = ""
+	if m.s.voiceOnPending != nil {
+		m.s.voiceOnPending(m.pendingText)
+	}
 	m.setState(voiceStateDraining)
 	m.armTail()
+}
+
+// onResume handles resumed speech inside the continuation window (spec 6.1): cancel the
+// speculative run (it persists nothing), tell the client to drop the answer preview, and
+// fall back to listening. The resumed chunk's ASR loopback is LEFT OPEN -- it is capturing
+// this new chunk, which will extend pendingText and re-run on the next chunk end.
+func (m *voiceMachine) onResume() {
+	m.detachRun()
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAnswerReset})
+	m.setState(voiceStateListening)
+}
+
+// degrade surfaces a recoverable leg failure (spec 6.6): one typed error frame carrying the
+// core's stable code, the turn stopped (run cancelled, loopback torn down, pending dropped),
+// and a fall back to idle with the mic re-enabled -- no silent retry. The client re-engages
+// with push_start.
+func (m *voiceMachine) degrade(code string) {
+	m.emitError(code, voiceTurnFailedMessage)
+	m.detachRun()
+	m.teardownTurn()
+	m.resetChunk()
+	m.stopChunkTimers()
+	m.stopGrace()
+	m.stopTail()
+	m.pendingText = ""
+	m.setState(voiceStateIdle)
+}
+
+// detachRun ends the current speculative run and clears every window field. It unsubscribes
+// (so no further event is delivered), cancels the run's context (a cancelled run persists
+// nothing) and removes it from the registry synchronously so the NEXT chunk's run can
+// reserve the chat's slot without racing the cancelled run's own async retirement. Safe to
+// call when no run is open; idempotent on an already-finished run.
+func (m *voiceMachine) detachRun() {
+	if m.runUnsub != nil {
+		m.runUnsub()
+	}
+	if m.curRun != nil {
+		m.curRun.cancelContext()
+		m.s.ChatRuns.remove(m.curRun)
+	}
+	m.curRun, m.runCh, m.runUnsub = nil, nil, nil
+	m.answerStreamed, m.answerDoneSent, m.graceElapsed, m.windowClosed, m.runFinished = false, false, false, false, false
+	m.audioBuf = nil
 }
 
 // onTailDone fires when the mic-resume tail elapses: the half-duplex window is over, so the
@@ -935,6 +1248,14 @@ func (m *voiceMachine) armFinalize() {
 	m.finalizeC = m.finalizeTimer.C
 }
 
+func (m *voiceMachine) armGrace() {
+	if m.graceTimer != nil {
+		m.graceTimer.Stop()
+	}
+	m.graceTimer = time.NewTimer(m.timing.continuationGrace)
+	m.graceC = m.graceTimer.C
+}
+
 func (m *voiceMachine) stopSilence() {
 	if m.silenceTimer != nil {
 		m.silenceTimer.Stop()
@@ -967,6 +1288,14 @@ func (m *voiceMachine) stopFinalize() {
 	m.finalizeC = nil
 }
 
+func (m *voiceMachine) stopGrace() {
+	if m.graceTimer != nil {
+		m.graceTimer.Stop()
+		m.graceTimer = nil
+	}
+	m.graceC = nil
+}
+
 // stopChunkTimers disarms the silence and max-utterance timers (a chunk ended).
 func (m *voiceMachine) stopChunkTimers() {
 	m.stopSilence()
@@ -978,6 +1307,7 @@ func (m *voiceMachine) stopAllTimers() {
 	m.stopChunkTimers()
 	m.stopTail()
 	m.stopFinalize()
+	m.stopGrace()
 }
 
 // firstNonEmptyVoice returns a when it has non-space content, else b. It picks the clean

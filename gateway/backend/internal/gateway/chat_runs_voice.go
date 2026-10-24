@@ -205,7 +205,10 @@ func (s *Server) runVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun
 		case sseDone:
 			goto finish
 		case sseError:
-			status, errMsg = "error", ev.ErrMsg
+			// Prefer the upstream's STABLE code (what the voice orchestrator surfaces as the
+			// degradation error frame's code, spec 6.6) over the human message, falling back
+			// to the message when the stream carried no code.
+			status, errMsg = "error", firstNonEmptyVoice(ev.ErrCode, ev.ErrMsg)
 			goto finish
 		case sseDelta:
 			timings.observeDelta(run, ev)

@@ -10,7 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/auth"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -110,38 +111,14 @@ func (c *fakeVoiceASRChild) snapshot() (conns int, bytes int64) {
 	return c.conns, c.bytes
 }
 
-// voiceMachineHarness is the full loopback chain for a voice session: the
-// transcription-capable routing fixtures (asr-model -> route-asr -> whisper_x, streaming
-// yes) pointed at the fake ASR child, with selfBaseURL wired to the gateway's own address
-// so the per-turn loopback is a real in-process HTTP call. returned receives one value each
-// time the voice WebSocket handler returns (so a test can observe a single clean teardown).
-type voiceMachineHarness struct {
-	srv      *Server
-	url      string
-	child    *fakeVoiceASRChild
-	returned chan struct{}
-}
-
-func newVoiceMachineHarness(t *testing.T, child *fakeVoiceASRChild, timing voiceTiming) *voiceMachineHarness {
+// newVoiceMachineHarness builds the full three-leg voice loopback (see newVoiceTurnHarness):
+// the ASR chunking tests run against the SAME harness the turn tests do, so a chunk end
+// starts a real speculative run rather than a placeholder -- these tests simply assert the
+// ASR-side behaviour (partials, finals, the mic gate) and leave the answer to run in the
+// background. The chunk-timing is the only knob they vary.
+func newVoiceMachineHarness(t *testing.T, child *fakeVoiceASRChild, timing voiceTiming) *voiceTurnHarness {
 	t.Helper()
-	srv, _ := newTranscriptionCapableTestServer(t, child.server.URL)
-	srv.SetBaseContext(context.Background())
-	srv.voiceTiming = timing
-	h := &voiceMachineHarness{srv: srv, child: child, returned: make(chan struct{}, 16)}
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		isWS := r.URL.Path == "/api/portal/voice-chat"
-		srv.ServeHTTP(w, r)
-		if isWS {
-			select {
-			case h.returned <- struct{}{}:
-			default:
-			}
-		}
-	}))
-	t.Cleanup(ts.Close)
-	srv.selfBaseURL = ts.URL
-	h.url = ts.URL
-	return h
+	return newVoiceTurnHarness(t, child, voiceTurnOpts{timing: timing})
 }
 
 // fastVoiceTiming is a short timing for the chunk tests; a test overrides the fields it
@@ -154,24 +131,6 @@ func fastVoiceTiming() voiceTiming {
 		micResumeTail:     30 * time.Millisecond,
 		continuationGrace: time.Second,
 	}
-}
-
-func (h *voiceMachineHarness) dial(t *testing.T, ctx context.Context) *websocket.Conn {
-	t.Helper()
-	c := sampleVoiceTicketClaims()
-	c.ASR = routing.Target{Model: "asr-model"}
-	c.SampleRate, c.Channels, c.SampleFormat = 16000, 1, "s16le"
-	c.UserID = "usr_dev"
-	c.TokenID, c.ServiceID, c.ProjectID = "", "", ""
-	ticket := mustMintVoiceTicket(t, h.srv.voiceTickets, c)
-	conn, _, err := websocket.Dial(ctx, wsURL(h.url, "/api/portal/voice-chat"), &websocket.DialOptions{
-		Subprotocols: []string{"op-voice-chat", ticket},
-	})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.CloseNow() })
-	return conn
 }
 
 func sendVoicePCM(t *testing.T, ctx context.Context, conn *websocket.Conn, n int) {
@@ -204,23 +163,37 @@ func readVoiceUntilState(t *testing.T, ctx context.Context, conn *websocket.Conn
 	}
 }
 
-// TestVoiceMicGateOnlyOpenWhenListening pins the half-duplex guarantee at the unit level:
-// the mic feeds the ASR ONLY in listening, and never while finalizing a chunk. idle,
-// thinking, speaking and draining all discard -- which is what makes it impossible for
-// speaking/draining audio to reach the ASR, regardless of client behaviour.
-func TestVoiceMicGateOnlyOpenWhenListening(t *testing.T) {
+// TestVoiceMicGateOpenInListeningAndWindow pins the half-duplex guarantee at the unit level:
+// the mic feeds the ASR in listening AND in thinking while the continuation window is open
+// (spec 6.1) -- and never in idle, speaking or draining, never once the window has closed,
+// and never while finalizing a chunk. The speaking/draining closure is what makes it
+// impossible for TTS-era audio to reach the ASR, regardless of client behaviour.
+func TestVoiceMicGateOpenInListeningAndWindow(t *testing.T) {
 	m := &voiceMachine{}
-	for _, st := range []string{voiceStateIdle, voiceStateThinking, voiceStateSpeaking, voiceStateDraining} {
-		m.state, m.finalizing = st, false
+	// The mic is CLOSED in idle, speaking and draining.
+	for _, st := range []string{voiceStateIdle, voiceStateSpeaking, voiceStateDraining} {
+		m.state, m.finalizing, m.windowClosed = st, false, false
 		if m.micOpen() {
-			t.Fatalf("micOpen in %q = true, want the mic gated (not listening)", st)
+			t.Fatalf("micOpen in %q = true, want the mic gated", st)
 		}
 	}
-	m.state, m.finalizing = voiceStateListening, false
+	// Open in listening.
+	m.state, m.finalizing, m.windowClosed = voiceStateListening, false, false
 	if !m.micOpen() {
 		t.Fatal("micOpen in listening = false, want the mic open")
 	}
-	m.finalizing = true
+	// Open in thinking while the continuation window is open.
+	m.state, m.finalizing, m.windowClosed = voiceStateThinking, false, false
+	if !m.micOpen() {
+		t.Fatal("micOpen in thinking (window open) = false, want the mic open for resumed speech")
+	}
+	// Closed in thinking once the window has closed (we are committing to the answer).
+	m.windowClosed = true
+	if m.micOpen() {
+		t.Fatal("micOpen in thinking after the window closed = true, want it gated")
+	}
+	// Closed while finalizing a chunk, in any mic-open state.
+	m.state, m.finalizing, m.windowClosed = voiceStateListening, true, false
 	if m.micOpen() {
 		t.Fatal("micOpen while finalizing a chunk = true, want it gated (the pipe is closing)")
 	}
@@ -298,58 +271,45 @@ func TestVoiceChunkEndsOnPushEnd(t *testing.T) {
 	}
 }
 
-// TestVoicePendingTextAccumulatesAcrossChunks: two chunks in a session append to pendingText
-// in order, so the buffer is chunk1 + chunk2 (the substrate the Task-7 continuation window
-// sends to the LLM).
-func TestVoicePendingTextAccumulatesAcrossChunks(t *testing.T) {
+// TestVoiceTwoTurnsEachCommit: two separate spoken turns each run to completion and commit
+// their own [user, assistant] pair, so the document ends with four messages. This pins the
+// per-turn clearing of pendingText: a committed turn does not leak into the next (the
+// within-a-turn accumulation is the resume case, TestVoiceResumeCancelsAndExtends).
+func TestVoiceTwoTurnsEachCommit(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
-	child.finals = []string{"one", "two"}
-	timing := fastVoiceTiming()
-	timing.silenceTimeout = 10 * time.Second // end each chunk with push_end, deterministically
-	timing.micResumeTail = 20 * time.Millisecond
-	h := newVoiceMachineHarness(t, child, timing)
+	child.finals = []string{"first turn", "second turn"}
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
 
-	var mu sync.Mutex
-	var lastPending string
-	h.srv.voiceOnPending = func(p string) { mu.Lock(); lastPending = p; mu.Unlock() }
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
 	conn := h.dial(t, ctx)
 	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
-	// Chunk 1.
-	sendVoicePCM(t, ctx, conn, 320)
-	readVoiceUntil(t, ctx, conn, voiceDownASRPartial)
-	sendVoiceControl(t, ctx, conn, "push_end")
-	if f := readVoiceUntil(t, ctx, conn, voiceDownASRFinal); f.Text != "one" {
-		t.Fatalf("chunk 1 final = %q, want %q", f.Text, "one")
+	// Turn 1: chunk -> run -> commit -> back to listening.
+	if f := drainAChunk(t, ctx, conn); f != "first turn" {
+		t.Fatalf("turn 1 final = %q, want %q", f, "first turn")
 	}
-
-	// The placeholder answer walks thinking -> speaking -> draining -> listening.
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
 	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
-	// Chunk 2 (a fresh loopback).
-	sendVoicePCM(t, ctx, conn, 320)
-	readVoiceUntil(t, ctx, conn, voiceDownASRPartial)
-	sendVoiceControl(t, ctx, conn, "push_end")
-	if f := readVoiceUntil(t, ctx, conn, voiceDownASRFinal); f.Text != "two" {
-		t.Fatalf("chunk 2 final = %q, want %q", f.Text, "two")
+	// Turn 2: a fresh chunk -> a fresh run on only the second turn's text.
+	if f := drainAChunk(t, ctx, conn); f != "second turn" {
+		t.Fatalf("turn 2 final = %q, want %q", f, "second turn")
 	}
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		got := lastPending
-		mu.Unlock()
-		if got == "onetwo" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("pendingText = %q, want it accumulated to %q across the two chunks", got, "onetwo")
-		}
-		time.Sleep(5 * time.Millisecond)
+	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := storedMessages(t, stored.Content)
+	if len(msgs) != 4 {
+		t.Fatalf("after two turns the chat has %d messages, want 4 [user, assistant, user, assistant]: %s", len(msgs), stored.Content)
+	}
+	if !strings.Contains(string(msgs[0].Content), "first turn") || !strings.Contains(string(msgs[2].Content), "second turn") {
+		t.Fatalf("the two user turns did not each carry their own text: %s", stored.Content)
 	}
 }
 
@@ -393,30 +353,30 @@ func TestVoiceSubMinUtteranceIgnored(t *testing.T) {
 }
 
 // TestVoiceMicDroppedWhileSpeaking is the loop guarantee: binary PCM sent while the session
-// is speaking/draining never reaches the ASR loopback. With a long mic-resume tail the
-// machine holds in draining; PCM sent there opens no new loopback and adds no bytes to the
-// child, so the child's connection count and byte total are exactly what the one real chunk
-// produced.
+// is speaking/draining never reaches the ASR loopback. The turn runs end to end (the real
+// run commits) and holds in draining under a long mic-resume tail; PCM sent there opens no
+// new ASR loopback and adds no bytes to the child, so the child's connection count and byte
+// total are exactly what the one real chunk produced before the answer began.
 func TestVoiceMicDroppedWhileSpeaking(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"turn one"}
-	timing := fastVoiceTiming()
-	timing.silenceTimeout = 10 * time.Second // end the chunk with push_end only
-	timing.micResumeTail = 3 * time.Second   // hold in draining across the whole assertion
-	h := newVoiceMachineHarness(t, child, timing)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	timing := turnGraceTiming()
+	timing.micResumeTail = 3 * time.Second // hold in draining across the whole assertion
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: timing})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
 	conn := h.dial(t, ctx)
 	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
-	// One real chunk: 320 bytes reach the ASR (connection #1).
-	sendVoicePCM(t, ctx, conn, 320)
-	readVoiceUntil(t, ctx, conn, voiceDownASRPartial)
-	sendVoiceControl(t, ctx, conn, "push_end")
-	readVoiceUntil(t, ctx, conn, voiceDownASRFinal)
+	// One real chunk: its 320 bytes reach the ASR (connection #1). No PCM is sent during the
+	// continuation window, so there is no resume and the turn commits.
+	if f := drainAChunk(t, ctx, conn); f != "turn one" {
+		t.Fatalf("asr_final = %q, want %q", f, "turn one")
+	}
 
-	// Walk into draining and stay there (long tail).
+	// Walk into draining and stay there (long tail). The window closed, the answer spoke, the
+	// run committed; now the mic is gated.
 	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
 	beforeConns, beforeBytes := child.snapshot()
 
