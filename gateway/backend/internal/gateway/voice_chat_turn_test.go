@@ -20,6 +20,7 @@ import (
 	"op-ai-gateway/internal/usage"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,13 +99,15 @@ type voiceTurnHarness struct {
 	returned     chan struct{}
 }
 
-// voiceTurnOpts tune one harness: the LLM pacing/failure, a TTS failure, and the timing.
+// voiceTurnOpts tune one harness: the LLM pacing/failure, a TTS failure, the timing, and an
+// optional chat store seam (to drive a resume during the commit write).
 type voiceTurnOpts struct {
 	llmDelay      time.Duration
 	llmErr        error
 	speechStatus  int
 	speechErrBody string
 	timing        voiceTiming
+	chatStore     portal.ChatStore // defaults to a plain in-memory store
 }
 
 func newVoiceTurnHarness(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnOpts) *voiceTurnHarness {
@@ -120,7 +123,10 @@ func newVoiceTurnHarness(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnO
 		speechErrBody: opts.speechErrBody,
 	}
 
-	chats := store.NewMemoryChatStore(0)
+	var chats portal.ChatStore = store.NewMemoryChatStore(0)
+	if opts.chatStore != nil {
+		chats = opts.chatStore
+	}
 	cipher, err := capture.New(testCaptureKey)
 	if err != nil {
 		t.Fatalf("capture.New: %v", err)
@@ -541,6 +547,123 @@ func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string) {
 	}
 	if n := len(storedMessages(t, stored.Content)); n != 0 {
 		t.Fatalf("a degraded turn committed %d messages, want none: %s", n, stored.Content)
+	}
+}
+
+// slowCommitChatStore is a chat store that blocks the FIRST SaveChatWithBlobs (a voice turn's
+// deferred commit) so a test can act -- here, resume -- while the run is inside its commit
+// write: markCommitting has run, the context is WithoutCancel, but status is still "running"
+// and the window still open. It signals commitStarted, then waits for release.
+type slowCommitChatStore struct {
+	*store.MemoryChatStore
+	once          sync.Once
+	commitStarted chan struct{}
+	release       chan struct{}
+}
+
+func newSlowCommitChatStore() *slowCommitChatStore {
+	return &slowCommitChatStore{
+		MemoryChatStore: store.NewMemoryChatStore(0),
+		commitStarted:   make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+}
+
+func (s *slowCommitChatStore) SaveChatWithBlobs(ctx context.Context, chat store.Chat, blobs []store.ChatBlob, del []string) error {
+	s.once.Do(func() {
+		close(s.commitStarted)
+		<-s.release
+	})
+	return s.MemoryChatStore.SaveChatWithBlobs(ctx, chat, blobs, del)
+}
+
+// TestVoiceResumeDuringCommitWriteDoesNotExtend is the residual double-commit regression: a
+// resume that lands WHILE the run is inside its commit write (status still "running", window
+// still open, but past the point of no return) must NOT cancel-and-extend -- no answer_reset,
+// and exactly ONE committed turn carrying the first utterance alone. The committing flag, not
+// the run status, is what closes this.
+func TestVoiceResumeDuringCommitWriteDoesNotExtend(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{"one", "two"}
+	slow := newSlowCommitChatStore()
+	timing := turnGraceTiming()
+	timing.continuationGrace = 5 * time.Second // keep the window open across the blocked write
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: timing, chatStore: slow})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	// Turn 1: the run reaches commit and BLOCKS in SaveChatWithBlobs. markCommitting has run.
+	if f := drainAChunk(t, ctx, conn); f != "one" {
+		t.Fatalf("turn 1 final = %q, want %q", f, "one")
+	}
+	select {
+	case <-slow.commitStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the commit write never started")
+	}
+
+	// Resume DURING the commit write: must NOT be treated as cancel-and-extend (no reset). The
+	// resumed chunk's own partial confirms it was captured but left as an in-progress chunk.
+	sendVoicePCM(t, ctx, conn, 320)
+	for {
+		m, _ := readVoiceFrame(t, ctx, conn)
+		if m.Type == voiceDownAnswerReset {
+			t.Fatal("answer_reset during the commit write: a committing run was cancel-and-extended (double-commit)")
+		}
+		if m.Type == voiceDownASRPartial {
+			break
+		}
+	}
+
+	// Release the commit; the run finishes and the force-close discards the resumed chunk.
+	close(slow.release)
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := storedMessages(t, stored.Content)
+	if len(msgs) != 2 {
+		t.Fatalf("want exactly ONE committed turn [user, assistant], got %d: %s", len(msgs), stored.Content)
+	}
+	if strings.Contains(string(msgs[0].Content), "two") {
+		t.Fatalf("turn 1 user = %s, want exactly \"one\" (not extended by the resume): %s", msgs[0].Content, stored.Content)
+	}
+}
+
+// TestVoiceRunResumableGuard pins the guard that closes the residual at the unit level: a run
+// that is committing (past its point of no return) is NOT resumable even though its status is
+// still "running" for the whole WithoutCancel commit write.
+func TestVoiceRunResumableGuard(t *testing.T) {
+	run := newChatRun("run_x", "chat_x", "usr_x", func() {})
+	m := &voiceMachine{curRun: run}
+	if !m.runResumable() {
+		t.Fatal("a running run in an open window must be resumable")
+	}
+	run.markCommitting()
+	if run.statusValue() != "running" {
+		t.Fatalf("precondition: status = %q, want still \"running\" while committing", run.statusValue())
+	}
+	if m.runResumable() {
+		t.Fatal("a committing run must NOT be resumable: a resume would double-commit")
+	}
+
+	// A completed run, a closed window, and no run are all non-resumable too.
+	done := newChatRun("run_done", "chat_x", "usr_x", func() {})
+	done.finish("completed", "", nil)
+	if (&voiceMachine{curRun: done}).runResumable() {
+		t.Fatal("a completed run must not be resumable")
+	}
+	if (&voiceMachine{curRun: newChatRun("r", "c", "u", func() {}), windowClosed: true}).runResumable() {
+		t.Fatal("a closed window must not be resumable")
+	}
+	if (&voiceMachine{}).runResumable() {
+		t.Fatal("no run must not be resumable")
 	}
 }
 

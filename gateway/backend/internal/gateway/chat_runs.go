@@ -19,6 +19,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -239,7 +240,24 @@ type ChatRun struct {
 	cancel       func()
 	subscribers  map[chan runEvent]struct{}
 	endedAt      time.Time
+
+	// committing marks a voice run's true point of no return: it is set by executeVoiceRun
+	// the instant it passes the final cancellation gate, BEFORE the (context.WithoutCancel)
+	// commit write begins -- so from here cancelling the run's context no longer prevents
+	// persistence. The voice orchestrator reads it to refuse a resume-driven cancel-and-extend
+	// of a run that is already committing (status is still "running" throughout the write, so
+	// status alone is not enough). It is an atomic flag, read race-free from the orchestrator
+	// goroutine without taking r.mu.
+	committing atomic.Bool
 }
+
+// markCommitting records that a (voice) run has passed its final cancellation gate and is
+// about to persist: a cancel after this no longer un-does the commit. Idempotent.
+func (r *ChatRun) markCommitting() { r.committing.Store(true) }
+
+// isCommitting reports whether the run has passed its point of no return (markCommitting).
+// Race-free (atomic load); safe to call from a goroutine that does not hold r.mu.
+func (r *ChatRun) isCommitting() bool { return r.committing.Load() }
 
 // newChatRun stamps startedAt from time.Now() directly rather than from the
 // service Clock most of this package's timestamps come from. A ChatRun has no

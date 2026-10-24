@@ -839,16 +839,16 @@ func (m *voiceMachine) onVoiced() {
 		m.chunkActive = true
 		m.firstPartialAt = now
 		m.armMax()
-		// The first voiced partial of a chunk that begins WHILE a speculative run is in
-		// flight, its continuation window is still open, AND the run is still cancellable is
-		// "resumed speech": cancel the run (nothing persisted), drop the answer preview, and
-		// fall back to listening so this chunk extends pendingText and re-runs on the next
-		// chunk end (spec 6.1). The run's live status -- not just the local windowClosed flag
-		// -- is the authority: the run can commit on its own goroutine and buffer its terminal
-		// event before this partial is processed, and cancel-and-extending a run that already
-		// committed would double-commit the utterance. A committed run is handled by its
-		// terminal (force-close); this voiced input then falls through as a new chunk.
-		if m.curRun != nil && !m.windowClosed && m.curRun.statusValue() == "running" {
+		// The first voiced partial of a chunk that begins while the speculative run is still
+		// cancel-and-extendable (runResumable) is "resumed speech": cancel the run (nothing
+		// persisted), drop the answer preview, and fall back to listening so this chunk
+		// extends pendingText and re-runs on the next chunk end (spec 6.1). Once the run has
+		// passed its point of no return -- committing or committed -- the resume is NOT
+		// accepted: this voiced input stays an in-progress chunk, which the run's terminal
+		// force-close (closeWindow -> teardownTurn -> resetChunk) then DISCARDS. On that narrow
+		// fast-answer edge the resumed utterance is dropped, which keeps the turn single-
+		// committed and the state consistent (true barge-in is deferred to phase 4).
+		if m.runResumable() {
 			m.onResume()
 		}
 	}
@@ -1145,6 +1145,19 @@ func (m *voiceMachine) onResume() {
 	m.stopGrace()
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAnswerReset})
 	m.setState(voiceStateListening)
+}
+
+// runResumable reports whether a resumed voiced chunk may cancel-and-extend the in-flight
+// speculative run: there IS a run, the continuation window is still open, the run is still
+// running, AND it has not passed its commit point of no return (isCommitting). The committing
+// check closes the window the status check alone leaves: executeVoiceRun commits under
+// context.WithoutCancel, so the run's status stays "running" for the whole store write while a
+// cancel would no longer un-do it -- a resume there would persist the first turn AND re-run on
+// the extended text, double-committing the utterance. All reads are race-free from this
+// goroutine: machine state plus the run's own atomic/locked accessors.
+func (m *voiceMachine) runResumable() bool {
+	return m.curRun != nil && !m.windowClosed &&
+		m.curRun.statusValue() == "running" && !m.curRun.isCommitting()
 }
 
 // degrade surfaces a recoverable leg failure (spec 6.6): one typed error frame carrying the

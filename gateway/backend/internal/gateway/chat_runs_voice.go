@@ -148,6 +148,13 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 		return
 	}
 
+	// Point of no return: past the final cancellation gate the commit below runs under
+	// context.WithoutCancel, so a cancel can no longer un-do it. Mark it BEFORE the commit so
+	// the voice orchestrator stops accepting a resume-driven cancel-and-extend from here --
+	// the run's status stays "running" for the whole write, so status alone would leave a
+	// window in which a resume double-commits the utterance.
+	run.markCommitting()
+
 	// The un-cancelled finish: commit the user turn and the assistant turn together.
 	s.commitVoiceTurn(ctx, owner, run, vp.pendingText, answer, audioParts, streamed)
 }
