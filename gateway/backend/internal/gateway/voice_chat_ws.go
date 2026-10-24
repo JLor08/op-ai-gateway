@@ -51,6 +51,11 @@ const (
 	voiceUpPushEnd   = "push_end"
 	voiceUpCancel    = "cancel"
 	voiceUpBye       = "bye"
+	// voiceUpPlaybackDone: the client's audio player finished playing the answer out (its
+	// StreamingPcmPlayer drained). It is what lets the server end `draining` at true
+	// playout-done rather than relay-done (spec 6.2); the server still owns the gate and
+	// applies its own fallback, so a missing or late signal cannot wedge the session.
+	voiceUpPlaybackDone = "playback_done"
 )
 
 // The down-frame types the gateway sends to the browser (spec 5.2).
@@ -96,6 +101,14 @@ const (
 	VoiceMicResumeTailMs     = 300
 	VoiceContinuationGraceMs = 1500
 )
+
+// VoicePlaybackFallbackMs bounds the playout-aware drain (spec 6.2) when the relayed audio's
+// real-time duration cannot be computed -- a defensive case, since the streamed TTS always
+// carries a sample rate. In the normal path the fallback is the relayed audio's own duration
+// (pcmBytes / byteRate); this generous fixed cap is the net for the rare rate-unknown chunk,
+// so a missing playback_done can never wedge the session, while the drain still never ends at
+// relay-done.
+const VoicePlaybackFallbackMs = 30000
 
 // VoiceTiming is the operator-tunable turn-detection and half-duplex timing of a Voice
 // Chat session (set from config via ServerDeps; the OP_AI_GATEWAY_VOICE_* knobs). A zero
@@ -152,25 +165,24 @@ func resolveVoiceTiming(d VoiceTiming) voiceTiming {
 }
 
 // voiceUpControl is the only text (non-binary) message the browser sends up: a control
-// frame whose Type is one of push_start, push_end, cancel or bye.
+// frame whose Type is one of push_start, push_end, cancel, bye or playback_done.
 type voiceUpControl struct {
 	Type string `json:"type"`
 }
 
 // parseVoiceUpControl decodes a text frame into a control message. It reports false for
-// anything that is not a JSON object naming one of the four known controls: a malformed
-// frame, an unknown or differently-cased type (including live transcription's "end"),
-// a non-string type. Unknown extra fields are tolerated, so a newer client can add
-// detail to a control without breaking an older gateway. The caller ignores a frame that
-// does not parse: a control is advice to the state machine, never something a session
-// can be wedged by.
+// anything that is not a JSON object naming one of the known controls: a malformed frame, an
+// unknown or differently-cased type (including live transcription's "end"), a non-string
+// type. Unknown extra fields are tolerated, so a newer client can add detail to a control
+// without breaking an older gateway. The caller ignores a frame that does not parse: a
+// control is advice to the state machine, never something a session can be wedged by.
 func parseVoiceUpControl(data []byte) (voiceUpControl, bool) {
 	var c voiceUpControl
 	if err := json.Unmarshal(data, &c); err != nil {
 		return voiceUpControl{}, false
 	}
 	switch c.Type {
-	case voiceUpPushStart, voiceUpPushEnd, voiceUpCancel, voiceUpBye:
+	case voiceUpPushStart, voiceUpPushEnd, voiceUpCancel, voiceUpBye, voiceUpPlaybackDone:
 		return c, true
 	}
 	return voiceUpControl{}, false
@@ -595,6 +607,23 @@ type voiceMachine struct {
 	// The continuation-grace timer (armed on each chunk end, disarmed on resume/commit).
 	graceTimer *time.Timer
 	graceC     <-chan time.Time
+
+	// The playout-aware drain bookkeeping (spec 6.2). The orchestrator relays TTS faster than
+	// real time, so audio_done (relay-done) is NOT "the user stopped hearing it": after
+	// audio_done the session stays in draining -- the mic gated -- until the client's
+	// playback_done arrives OR a server-side fallback bound elapses, only then applying the
+	// mic-resume tail. firstAudioAt/relayedPlaybackDur accumulate as audio is relayed, so the
+	// fallback is the relayed audio's real-time duration measured from when playout would have
+	// started (the first chunk relayed); playbackRateUnknown falls back to the fixed cap for a
+	// chunk that carried no usable rate. awaitingPlayback is set for the whole drain wait. All
+	// are reset per turn in beginAnswer. The mic STAYS discarded for the whole draining period
+	// regardless (micOpen); only the EXIT moment moves from relay-done to playout-done.
+	firstAudioAt        time.Time
+	relayedPlaybackDur  time.Duration
+	playbackRateUnknown bool
+	awaitingPlayback    bool
+	playbackTimer       *time.Timer
+	playbackC           <-chan time.Time
 }
 
 // voiceFinalizeTimeout bounds the wait for the clean final transcript after the pipe is
@@ -667,6 +696,8 @@ func (m *voiceMachine) run() {
 			m.onMaxUtterance()
 		case <-m.graceC:
 			m.onGrace()
+		case <-m.playbackC:
+			m.onPlaybackFallback()
 		case <-m.tailC:
 			m.onTailDone()
 		case <-m.finalizeC:
@@ -804,8 +835,14 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 		m.stopChunkTimers()
 		m.stopGrace()
 		m.stopTail()
+		m.resetPlaybackWait()
 		m.pendingText = ""
 		m.setState(voiceStateListening)
+	case voiceUpPlaybackDone:
+		// The client's audio player finished playing the answer out. If we are draining and
+		// waiting on it, this is the signal to end the drain (spec 6.2); otherwise it is a
+		// stray or late frame and cannot move a session that is not awaiting playout.
+		m.onPlaybackDone()
 	}
 }
 
@@ -964,6 +1001,9 @@ func (m *voiceMachine) beginAnswer() {
 	m.answerStreamed, m.answerDoneSent, m.graceElapsed, m.windowClosed, m.runFinished = false, false, false, false, false
 	m.answerFinished = false
 	m.audioBuf = nil
+	// The playout-drain accounting is per turn: no audio relayed yet, no drain wait pending.
+	m.firstAudioAt, m.relayedPlaybackDur, m.playbackRateUnknown = time.Time{}, 0, false
+	m.resetPlaybackWait()
 	m.setState(voiceStateThinking)
 	m.armGrace()
 	// Relay whatever the run buffered between launch and subscribe (usually nothing); the
@@ -1083,9 +1123,28 @@ func (m *voiceMachine) flushAudioBuf() {
 }
 
 // relayAudio sends one TTS chunk as an audio_delta (seq from 0, one rate), the shape the
-// browser's StreamingPcmPlayer reads.
+// browser's StreamingPcmPlayer reads, and records the real-time playout it adds so the drain
+// fallback can bound the wait.
 func (m *voiceMachine) relayAudio(a runAudio) {
+	m.accountPlayback(a)
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Rate: a.Rate, Audio: a.Data})
+}
+
+// accountPlayback adds the relayed chunk's real-time duration to the running total used by the
+// playout fallback (beginPlaybackWait). The byte rate of s16le mono audio is rate x 2, so the
+// chunk plays for pcmBytes / byteRate seconds; firstAudioAt marks when playout would have
+// started (the first chunk relayed). A chunk with no usable rate falls the fallback back to
+// the fixed cap rather than under-counting the wait.
+func (m *voiceMachine) accountPlayback(a runAudio) {
+	if m.firstAudioAt.IsZero() {
+		m.firstAudioAt = time.Now()
+	}
+	byteRate := a.Rate * speechStreamBytesPerFrame
+	if a.Rate <= 0 || byteRate <= 0 {
+		m.playbackRateUnknown = true
+		return
+	}
+	m.relayedPlaybackDur += time.Duration(voicePCMBytes(a.Data)) * time.Second / time.Duration(byteRate)
 }
 
 // handleRunTerminal records the run's single terminal outcome and acts on it: a completed
@@ -1119,8 +1178,10 @@ func (m *voiceMachine) handleRunTerminal(status, errMsg string) {
 }
 
 // finishAnswer ends the spoken turn after the run has committed (user + assistant): it
-// closes the audio stream, clears the committed pending text, and drains (the half-duplex
-// tail) back to listening. Only ever reached on a completed run with the window closed.
+// closes the audio stream, clears the committed pending text, and enters draining. The drain
+// holds the mic gated until playout-done (beginPlaybackWait) before the half-duplex tail
+// returns the session to listening. Only ever reached on a completed run with the window
+// closed.
 func (m *voiceMachine) finishAnswer() {
 	if m.answerFinished {
 		return // the window close and the run terminal can both reach here; finish once
@@ -1133,6 +1194,66 @@ func (m *voiceMachine) finishAnswer() {
 		m.s.voiceOnPending(m.pendingText)
 	}
 	m.setState(voiceStateDraining)
+	m.beginPlaybackWait()
+}
+
+// beginPlaybackWait holds the session in draining (the mic gated) until the client reports
+// playout finished (playback_done) OR the server-side fallback bound elapses, then applies the
+// mic-resume tail (spec 6.2). The gate stays server-authoritative: the client signal only says
+// WHEN playout finished; the server decides when the drain ends, and the fallback -- the
+// relayed audio's own real-time duration -- is the net so a missing or late signal cannot
+// wedge the session. When no audio was relayed there is nothing to play out, so it falls
+// straight through to the tail.
+func (m *voiceMachine) beginPlaybackWait() {
+	m.awaitingPlayback = true
+	remaining := m.playbackFallbackRemaining()
+	if remaining <= 0 {
+		m.endDrainWait()
+		return
+	}
+	m.armPlaybackWait(remaining)
+}
+
+// playbackFallbackRemaining is how much longer the relayed answer could still be audibly
+// playing, measured from when playout would have started (the first chunk relayed): the
+// audio's real-time duration (pcmBytes / byteRate) less the time already elapsed. It is zero
+// when no audio was relayed (nothing to play out), and the generous fixed cap when a chunk
+// carried no usable rate.
+func (m *voiceMachine) playbackFallbackRemaining() time.Duration {
+	if m.firstAudioAt.IsZero() {
+		return 0
+	}
+	if m.playbackRateUnknown {
+		return VoicePlaybackFallbackMs * time.Millisecond
+	}
+	if remaining := time.Until(m.firstAudioAt.Add(m.relayedPlaybackDur)); remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
+// onPlaybackDone ends the drain on the client's playout-done signal. Ignored unless we are
+// actually awaiting playout: a stray or late frame cannot move a session that is not draining.
+func (m *voiceMachine) onPlaybackDone() {
+	if !m.awaitingPlayback {
+		return
+	}
+	m.endDrainWait()
+}
+
+// onPlaybackFallback ends the drain when the fallback bound elapses with no playback_done.
+func (m *voiceMachine) onPlaybackFallback() {
+	if !m.awaitingPlayback {
+		m.stopPlaybackWait() // defensive: a stale fire after the wait already ended
+		return
+	}
+	m.endDrainWait()
+}
+
+// endDrainWait leaves the playout wait and applies the mic-resume tail (the half-duplex tail)
+// before the session returns to listening.
+func (m *voiceMachine) endDrainWait() {
+	m.resetPlaybackWait()
 	m.armTail()
 }
 
@@ -1172,6 +1293,7 @@ func (m *voiceMachine) degrade(code string) {
 	m.stopChunkTimers()
 	m.stopGrace()
 	m.stopTail()
+	m.resetPlaybackWait()
 	m.pendingText = ""
 	m.setState(voiceStateIdle)
 }
@@ -1211,6 +1333,7 @@ func (m *voiceMachine) failTurn(code, message string) {
 	m.resetChunk()
 	m.stopChunkTimers()
 	m.stopTail()
+	m.resetPlaybackWait()
 	m.setState(voiceStateIdle)
 }
 
@@ -1290,6 +1413,17 @@ func (m *voiceMachine) armGrace() {
 	m.graceC = m.graceTimer.C
 }
 
+// armPlaybackWait starts the playout fallback timer for d (the relayed audio's remaining
+// real-time duration, or the fixed cap). Re-arming replaces the channel the select reads, so a
+// stale fire from an old timer is never selected.
+func (m *voiceMachine) armPlaybackWait(d time.Duration) {
+	if m.playbackTimer != nil {
+		m.playbackTimer.Stop()
+	}
+	m.playbackTimer = time.NewTimer(d)
+	m.playbackC = m.playbackTimer.C
+}
+
 func (m *voiceMachine) stopSilence() {
 	if m.silenceTimer != nil {
 		m.silenceTimer.Stop()
@@ -1330,6 +1464,22 @@ func (m *voiceMachine) stopGrace() {
 	m.graceC = nil
 }
 
+// stopPlaybackWait disarms the playout fallback timer (it does NOT clear awaitingPlayback, so
+// onPlaybackFallback can tell a real wait from a stale fire).
+func (m *voiceMachine) stopPlaybackWait() {
+	if m.playbackTimer != nil {
+		m.playbackTimer.Stop()
+		m.playbackTimer = nil
+	}
+	m.playbackC = nil
+}
+
+// resetPlaybackWait ends any playout drain wait: no longer awaiting, and the fallback disarmed.
+func (m *voiceMachine) resetPlaybackWait() {
+	m.awaitingPlayback = false
+	m.stopPlaybackWait()
+}
+
 // stopChunkTimers disarms the silence and max-utterance timers (a chunk ended).
 func (m *voiceMachine) stopChunkTimers() {
 	m.stopSilence()
@@ -1342,6 +1492,26 @@ func (m *voiceMachine) stopAllTimers() {
 	m.stopTail()
 	m.stopFinalize()
 	m.stopGrace()
+	m.stopPlaybackWait()
+}
+
+// voicePCMBytes is the exact decoded length of a standard (padded) base64 audio chunk, found
+// arithmetically so no allocation or decode is needed just to time the chunk's playout. A
+// chunk whose length is not a whole quantum is degenerate (it would not decode to playable
+// audio either); the estimate it yields only feeds the drain fallback, never playback.
+func voicePCMBytes(b64 string) int {
+	n := len(b64)
+	if n < 4 {
+		return 0
+	}
+	pad := 0
+	if b64[n-1] == '=' {
+		pad++
+		if b64[n-2] == '=' {
+			pad++
+		}
+	}
+	return n/4*3 - pad
 }
 
 // firstNonEmptyVoice returns a when it has non-space content, else b. It picks the clean

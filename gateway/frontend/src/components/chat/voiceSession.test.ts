@@ -172,7 +172,9 @@ function start(
     onState: (state) => run.states.push(state),
     onError: (message, detail) => run.errors.push({ message, detail }),
     createPlayer: () => {
-      const player: FakePlayer = { push: vi.fn(() => true), stop: vi.fn() };
+      // onEmpty starts null and is wired by the session at creation (the #304 drain hook); a
+      // test drives the drain by invoking whatever the session wired.
+      const player: FakePlayer = { push: vi.fn(() => true), stop: vi.fn(), onEmpty: null };
       run.players.push(player);
       return player;
     },
@@ -329,6 +331,33 @@ describe('createVoiceSession in a (fake) browser', () => {
       [5, 0, 6, 0],
     ]);
     expect(calls.map(([, rate]) => rate)).toEqual([24000, 24000, 24000]);
+    run.session.stop();
+  });
+
+  it('sends playback_done when the answer`s player drains (the #304 hook), so the gateway can end its drain at playout-done', async () => {
+    const run = start();
+    const socket = await connected(run);
+
+    // An answer streams its audio: a player is made for it and the drain hook wired.
+    socket.say(audioDelta(0));
+    socket.say({ type: 'audio_done' });
+    expect(run.players).toHaveLength(1);
+    const player = run.players[0];
+    expect(player.onEmpty).toBeInstanceOf(Function);
+    // Nothing is said until the player actually drains: relay-done is not playout-done.
+    expect(socket.controls()).not.toContainEqual({ type: 'playback_done' });
+
+    // The player's queue plays out -> the session reports playout finished.
+    player.onEmpty!();
+    expect(socket.controls()).toContainEqual({ type: 'playback_done' });
+  });
+
+  it('requests echo cancellation and noise suppression on the microphone (belt-and-suspenders under the half-duplex gate)', async () => {
+    const run = start();
+    await connected(run);
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
     run.session.stop();
   });
 

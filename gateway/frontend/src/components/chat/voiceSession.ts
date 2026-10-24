@@ -214,8 +214,13 @@ export type VoiceAnswer = {
   messageId?: string;
 };
 
-/** What the session needs of an answer's player: the slice of StreamingPcmPlayer it uses. */
-export type VoicePlayer = Pick<StreamingPcmPlayer, 'push' | 'stop'>;
+/**
+ * What the session needs of an answer's player: the slice of StreamingPcmPlayer it uses.
+ * `onEmpty` is the #304 drain hook -- the player calls it when its queue has played out, which
+ * is how the session tells the gateway the answer finished playing (`playback_done`), so the
+ * gateway can end its half-duplex drain at true playout-done rather than relay-done (spec 6.2).
+ */
+export type VoicePlayer = Pick<StreamingPcmPlayer, 'push' | 'stop' | 'onEmpty'>;
 
 export type VoiceSessionArgs = {
   api: VoiceTicketApi;
@@ -365,7 +370,7 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     finish('error', () => args.onError(message, detail));
 
   // One text control frame, when there is a socket to send it on.
-  const sendControl = (type: 'push_start' | 'push_end' | 'cancel') => {
+  const sendControl = (type: 'push_start' | 'push_end' | 'cancel' | 'playback_done') => {
     if (over || !open || !socket) return;
     socket.send(JSON.stringify({ type }));
   };
@@ -414,7 +419,15 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     playState = verdict.state;
     if (!verdict.play) return;
     const bytes = decodeBase64(frame.audio);
-    player ??= createPlayer(context as unknown as PlaybackContext);
+    if (!player) {
+      player = createPlayer(context as unknown as PlaybackContext);
+      // The #304 drain hook: when this answer's player has played its queue out, tell the
+      // gateway playout is done so it can end its half-duplex drain at true playout-done, not
+      // relay-done (spec 6.2). A fresh player is made per answer, so it is wired per player
+      // here. The gateway ignores the signal unless it is draining and applies its own
+      // fallback, so an early or repeated call cannot move a session that is not waiting on it.
+      player.onEmpty = () => sendControl('playback_done');
+    }
     if (bytes === null || !player.push(bytes, frame.rate)) {
       playState = { phase: 'abandoned', reason: 'format' };
     }
@@ -564,7 +577,10 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     }
     const resumed = ctx.resume().catch(() => undefined);
     const [media, worklet] = await Promise.allSettled([
-      mediaDevices.getUserMedia({ audio: true }),
+      // Echo cancellation and noise suppression are a belt-and-suspenders second line under the
+      // server-authoritative half-duplex gate (spec 6.2): the gate already stops TTS-era audio
+      // from reaching the ASR, and these further damp any room echo the microphone picks up.
+      mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }),
       ctx.audioWorklet.addModule(workletUrl),
     ]);
     if (!(await bringUpCapture(media, worklet, ctx, resumed))) return;
