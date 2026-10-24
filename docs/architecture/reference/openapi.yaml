@@ -1567,9 +1567,9 @@ paths:
         composer may offer progressive playback; `streaming: false` means the
         buffered WAV run. The gate is open only when EVERY mapping a speech
         request for the model could be routed to (the portal-visible plain-TTS
-        ones: the voice picker's set less a configured clone model, which has
-        no cached rate, ADR-075) has a `speech_streaming` verdict of
-        `yes` and a usable cached output byte rate, and they agree on it; the
+        ones: the voice picker's set less a configured clone model, which is
+        left out of the strict plain-TTS stream candidate set, ADR-075) has a
+        `speech_streaming` verdict of `yes` and a usable cached output byte rate, and they agree on it; the
         sample rate is half the byte rate (the cache only holds a rate read from
         a mono 16-bit PCM WAV). Every other case (an unknown, hidden, locked,
         restricted, non-speech, clone, offline or not-yet-benchmarked model) is

@@ -130,10 +130,11 @@ type speechMeasurement struct {
 // A target is a plain text-to-speech model -- (speech, yes) and not (speech_clone,
 // yes), routing.CapabilityRowsPlainTTS, the one definition of that rule (the voices
 // cache no longer uses it since #301, which admits a clone model with presets there
-// but not here: streaming for clone is deferred). An absent speech row is unknown, which is not a speech model; an
-// absent or negative clone row does not exclude, because "unknown" is never "needs a
-// voice" (a clone model that slips through fails its synthesis, writes no rate and
-// bills audio_bytes, which is the same outcome as the skip). The other two outcomes
+// but not here: streaming for clone is deferred). An absent speech row is unknown,
+// which is not a speech model; an absent or negative clone row does not exclude,
+// because "unknown" is never "needs a voice" (a clone model that slips through fails
+// its synthesis, writes no rate and bills audio_bytes, which is the same outcome as
+// the skip). The other two outcomes
 // are the closed values of BenchmarkResult.Skipped: benchmarkSkippedSpeechClone for a
 // clone model, whose synthesis needs a server-side reference WAV and its text that a
 // plain model-and-input request cannot supply (it answers HTTP 500), and

@@ -3571,7 +3571,7 @@ verdict has gone stale.
   answer but a boolean `true` with a whole sample rate is "no streaming") and shows its "stream"
   checkbox only on a `yes`. The gate is open only when **every** mapping a speech request for the
   model could be routed to (the portal-visible plain-TTS ones: the voice picker's set less a configured
-  clone model, which has no cached rate) has a
+  clone model, which is left out of the strict plain-tts stream candidate set) has a
   `speech_streaming` verdict of `yes` **and** a usable cached output byte rate, and they agree
   on it, the sample rate being half the byte rate (the cache holds only a mono 16-bit PCM rate,
   §3.6 item 10). A route is chosen per request after the gate is asked, so a model with two

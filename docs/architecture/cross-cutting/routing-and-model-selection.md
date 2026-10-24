@@ -1420,7 +1420,8 @@ four readers, and since #301 it holds a **clone model's** list too:
   running, an audio.cpp spec, observed loaded, and `routing.CapabilityRowsSpeech`). **A clone model is
   fetched like any other speech model**: audio.cpp's listing does not look at the task, so a clone model
   with configured `voice_presets` caches its preset names, and a reference-only one caches an **empty**
-  list (written once, then left alone by the change-only writer), which is the "no presets" signal. The
+  list (the listing is requested every tick while the model is loaded and not backed off, as for a plain tts
+  mapping; only the write is change-only, so that empty list is written once), which is the "no presets" signal. The
   gate is shared with the speech-language step (§2.6), which therefore runs for a clone model too; the
   speech-rate benchmark's gates (`audioCppSpeechRateWanted`, `agentSpeechRateWanted`) still exclude it.
 - **The offerable predicate** (`routing.CapabilityRowsOfferableTTS(rows, hasNonEmptyVoices)`): `(speech,
@@ -1447,7 +1448,9 @@ four readers, and since #301 it holds a **clone model's** list too:
   `portalPlainTTSMappings`, strict plain tts. A clone model has no cached byte rate (the benchmark
   skips it, streaming for clone being deferred, [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)),
   so putting it in the shared set would close the gate for a name that streams today. The consequence
-  is that the stream gate speaks only for a name's **plain** mappings.
+  is that the stream gate speaks only for a name's **plain** mappings: on a mixed name, a streamed request
+  that routes to the clone sibling is played (and its committed WAV stamped) at the plain mapping's rate,
+  so a sibling that streams at another rate would play at the wrong speed.
 
 ### 2.6 The speech-language fact (a composer gate, not a routing filter)
 

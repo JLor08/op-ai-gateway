@@ -7077,7 +7077,7 @@ a volatile cache.
 (the portal speech language; issue #282): the cache has a third consumer, and its first reader
 that is neither a picker nor a routing filter.** `cache_type = "speech_language"`
 (`routing.ModelMappingCacheSpeechLanguage`, scope `""`, the payload the JSON object
-`{"accepts":<bool>,"default":"<code>"}`) holds whether a plain tts mapping's audio.cpp model declares
+`{"accepts":<bool>,"default":"<code>"}`) holds whether a plain tts mapping's (a speech mapping's since ADR-075) audio.cpp model declares
 a `language` request param and the default it states, written by the health loop while the model is
 loaded and read by the portal's language gate. Again no table and no migration. Unlike the byte rate
 it needs no empty-payload retirement and has the voices cache's two reader states (no row is unknown,
@@ -7444,7 +7444,7 @@ case and leaves the buffered path and every non-streaming metering byte-identica
   - *The gate: stream only where the stream is playable.* The run streams only when
     `portalSpeechStreamRate` says so: **every** mapping a speech request for the model could be
     routed to (the portal-visible plain-TTS ones, `Portal.ModelVoiceMappingIDs`, what the
-    voice picker asks) is `(speech_streaming, yes)` **and** has a usable cached rate, **and
+    voice picker asks, less a configured clone model since [ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)) is `(speech_streaming, yes)` **and** has a usable cached rate, **and
     they agree on it**, and the rate is a whole number of 16-bit frames within 8 to 192 kHz
     when halved. A route is picked per request after the gate is asked, so a model with two
     mappings streams only if it makes no difference which serves it. The gate fails closed
@@ -8921,9 +8921,9 @@ child's own `config.json`, and its names are observable **only** through audio.c
 `GET /v1/audio/voices`. A non-empty cached voices list is therefore the right offer signal, but for it to
 exist the gateway must first **fetch** voices for clone models, so the change is larger than "relax the
 picker gates": it also relaxes the two producer gates and the language gate. It completes the issue's
-intent rather than departing from it. (The pocket_tts "Frank" example in earlier notes is not a
-counter-example: that model was loaded `task: tts` with a `voice_ref` preset, so it was plain tts at read
-time and never `speech_clone: yes`.)
+intent rather than departing from it. (A model loaded as `task: tts` that carries a `voice_ref` preset is
+not a counter-example: it is plain tts at read time and never `speech_clone: yes`, so it was always
+offered. The #301 case is specifically a model that reports `task: clon`.)
 
 **The protocol fact the design rests on, read from the audio.cpp source and not exercised live by this
 entry.** `ServerState::handle_voices` (`app/server/runtime.cpp`) builds its list from the in-memory
@@ -9017,9 +9017,13 @@ returns, so only the gateway's decision of when to ask changes.**
 - **A mixed name is hidden until every one of its clone mappings has presets.** That is the fail-closed
   price of (d): one reference-only clone mapping beside a preset one hides the whole name, because the
   gateway cannot say which a send will land on.
-- **One extra request per loaded clone mapping.** The first tick that sees a clone model loaded asks for its
-  voices (and, on the agent path, its `language`); after that the writer is change-only, so a steady model
-  costs a store read per tick, and a failed read keeps the last row and opens the ADR-067 five-minute
+- **A loaded clone mapping carries the per-tick listing cost a plain tts mapping already does.** While a
+  clone model is observed loaded and not backed off, the health loop makes one `GET /v1/audio/voices`
+  listing request **per tick** for it (and, on the agent path, one `/v1/models?include_params=true` params
+  pull per tick for the language fact; the static path's language fact rides the verdict listing it already
+  reads), exactly as ADR-067 (c) describes for a plain tts mapping. Only the **write** is change-only: a
+  steady model costs that listing plus a store read per tick and no write, and a reference-only clone
+  writes its empty list once. A failed listing keeps the last row and opens the ADR-067 five-minute
   per-mapping back-off.
 - **Streaming for a clone model is deferred, deliberately.** The speech-rate benchmark would have to send
   a valid reference or preset-voice request (today it sends a bare `{model, input}`, which a clone model
@@ -9027,8 +9031,10 @@ returns, so only the gateway's decision of when to ask changes.**
   byte rate, a clone-only name has an empty stream-gate candidate set (closed), and the composer sends the
   buffered request, which works. The stream gate also speaks for the **plain** mappings of a mixed name
   only, so a streamed request that routes to the clone sibling is not covered by the rate it checked
-  (that sibling streams by its own `speech_streaming` verdict and bills `audio_bytes`, ADR-068 (e)); it is
-  a follow-up with the benchmark, recorded in [Risks & Technical Debt
+  (that sibling streams by its own `speech_streaming` verdict and bills `audio_bytes`, ADR-068 (e)): the
+  composer plays the streamed PCM, and the run stamps the committed WAV's `fmt` chunk, at the plain
+  mapping's rate, so a clone sibling that streams at another rate is played and stored at the wrong
+  speed. It is a follow-up with the benchmark, recorded in [Risks & Technical Debt
   §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 - **A preset voice chosen by the composer persists across a later model switch.** It sits in the thread's
   audio settings like a typed voice, and a send to a model that lacks that name fails upstream (audio.cpp
@@ -9048,8 +9054,9 @@ returns, so only the gateway's decision of when to ask changes.**
 picker's speech half it describes;
 [ADR-067](#adr-067--a-persistent-per-mapping-cache-first-used-for-tts-voices-fetched-while-the-model-is-loaded-change-detected-and-read-by-a-picker-and-a-fail-open-routing-filter)
 (c), (d) and (e) (the voices cache is written for a loaded clone model and read for one with presets; the
-routing filter is unchanged); and ADR-074 (b) and (d) (the language fact is written for a clone model, and
-its gate takes the offerable set while the stream gate stays plain tts). It leaves
+routing filter is unchanged); and ADR-074 (b), (c) and (d) and its Rejected entry for a clone model's fact
+row (the language fact is written for a clone model, its agent pull shares the widened eligible set, and its
+gate takes the offerable set while the stream gate stays plain tts). It leaves
 [ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
 (d)'s `speech` verdict for `clon` as it is (only the offering moved), and, unlike
 [ADR-074](#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)

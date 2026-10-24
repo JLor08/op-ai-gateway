@@ -706,11 +706,12 @@ func sdcppCapabilityRows(v provider.SdcppVerdicts, at time.Time) []routing.Capab
 // a speech model synthesises only in a reference voice (a clone model, yes) or from
 // text alone (a plain tts model, no), the distinction the portal chat's speech picker
 // needs to keep a model it cannot drive (a clone model with no configured presets, #301)
-// out of the list (routing.CapabilitySpeechClone); it gates no route either. It refines the speech capability, so it is written only for
-// a model whose speech verdict is yes: a model that does not synthesise speech (asr,
-// music, one the listing gives no task) carries no row on it, not even a "no", whatever
-// its clone verdict says. Same rule at the row boundary: a verdict assembled elsewhere
-// cannot put a clone chip on a model that cannot speak.
+// out of the list (routing.CapabilitySpeechClone); it gates no route either. It refines
+// the speech capability, so it is written only for a model whose speech verdict is yes:
+// a model that does not synthesise speech (asr, music, one the listing gives no task)
+// carries no row on it, not even a "no", whatever its clone verdict says. Same rule at
+// the row boundary: a verdict assembled elsewhere cannot put a clone chip on a model
+// that cannot speak.
 //
 // The speech_streaming row is the streaming row's twin on the synthesiser's side
 // (routing.CapabilitySpeechStreaming): the one the speech handler reads to choose
