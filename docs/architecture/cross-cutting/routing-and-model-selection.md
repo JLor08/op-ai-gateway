@@ -1338,7 +1338,16 @@ only**, so a clone mapping's cached list is not consulted here, and when a voice
 mixed pool the clone sibling is not among the mappings it allows. Relaxing it could not make a
 mixed name safe: the remaining set would all list the voice, so nothing would be known-absent and
 routing would fail open to a reference-only sibling, which is why the offer fold (below), not
-the filter, carries that safety. **Presence of the
+the filter, carries that safety. **A known limitation, owned:** on an **offered** single name that
+mixes a plain tts mapping and a preset clone with different voice catalogs, a voice served by only
+one of them can fail open and route to the sibling that lacks it (a plain-only voice leaves nothing
+known-absent among the plain candidates, and a clone-only voice leaves every plain candidate
+known-absent, so both route unfiltered). The picker lists the union of the catalogs, so such a pick
+is possible, and the upstream answers an unknown voice with a 500: a clean failure within the
+accepted free-text-voice 500 risk. The future fix is to relax this filter to consult clone mappings'
+cached voices, classifying known-present and known-absent over the offerable set instead of plain
+tts alone ([ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred),
+[Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). **Presence of the
 scope-`""` row** — not a non-empty decoded list — is what separates *known* from
 *unknown*, because an empty or null payload decodes the same as no row at all. For a single model
 the filter runs in `resolveStandard` on the pool the capability gate left, **after** the
@@ -1412,7 +1421,7 @@ unaffected.
 
 **Who writes the voices cache, and who reads it** ([ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred), issue #301). The
 `voices` row (`model_mapping_cache`, scope `""`, a canonical JSON array of names) has one writer path and
-four readers, and since #301 it holds a **clone model's** list too:
+five readers (the routing filter above, and the four below), and since #301 it holds a **clone model's** list too:
 
 - **Writers.** `fetchAndCacheVoices` → `writeVoicesCache`, reached from the static `audio_cpp` pass
   (`cacheAudioCppVoices`, gated by `audioCppVoicesWanted`: the listing says the model is *loaded* and
@@ -1426,8 +1435,8 @@ four readers, and since #301 it holds a **clone model's** list too:
   speech-rate benchmark's gates (`audioCppSpeechRateWanted`, `agentSpeechRateWanted`) still exclude it.
 - **The offerable predicate** (`routing.CapabilityRowsOfferableTTS(rows, hasNonEmptyVoices)`): `(speech,
   yes)` and either **not** `(speech_clone, yes)` or the mapping's cached list has at least one name.
-  `CapabilityRowsPlainTTS` is unchanged and remains the strict rule for the streaming benchmark, the
-  stream gate and the voice filter above.
+  `CapabilityRowsPlainTTS` is unchanged and remains the strict rule for the streaming benchmark and
+  the voice filter above.
 - **Reader 1, the voice picker and the public listing** (`cachedVoicesForMappings`, behind
   `GET /api/portal/model-voices` and `GET /v1/audio/voices`): it reads the voices of every speech
   mapping and includes a clone mapping's list only when non-empty (an absent, empty or undecodable row
@@ -1444,13 +1453,14 @@ four readers, and since #301 it holds a **clone model's** list too:
 - **Reader 3, the language gate** (`portalSpeechLanguage`, §2.6): the candidate set is the **offerable**
   one, `portalOfferableSpeechMappings` (portal-visible mappings satisfying the predicate, one batch read of
   the voices cache).
-- **Not a reader, on purpose, the stream gate** (`portalSpeechStreamRate`): it keeps
-  `portalPlainTTSMappings`, strict plain tts. A clone model has no cached byte rate (the benchmark
+- **Reader 4, the stream gate** (`portalSpeechStreamRate`): the candidate set is the same **offerable**
+  one, `portalOfferableSpeechMappings`, on purpose. A clone model has no cached byte rate (the benchmark
   skips it, streaming for clone being deferred, [Risks §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)),
-  so putting it in the shared set would close the gate for a name that streams today. The consequence
-  is that the stream gate speaks only for a name's **plain** mappings: on a mixed name, a streamed request
-  that routes to the clone sibling is played (and its committed WAV stamped) at the plain mapping's rate,
-  so a sibling that streams at another rate would play at the wrong speed.
+  so a reachable preset clone **closes** the gate (`agreedSpeechStreamRate` closes on any candidate
+  without a usable rate) and the turn is buffered. The route is picked per request after the gate is
+  asked, so a gate that saw only a mixed name's plain mapping would let a request that routes to the clone
+  sibling be played, committed as a WAV and billed at the plain mapping's rate. A plain-only name streams
+  as before; a clone-only name and a mixed name are buffered.
 
 ### 2.6 The speech-language fact (a composer gate, not a routing filter)
 
@@ -1522,8 +1532,8 @@ audio.cpp cannot disagree:
 `{"accepts":false}`. It reads the cache for the mappings a speech request for the model could be
 routed to: the portal-visible, **offerable** ones, resolved by `portalOfferableSpeechMappings` (a plain
 tts model, or a clone model with cached preset voices, [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred); the candidate
-set the voice picker offers). The streaming gate (`portalSpeechStreamRate`) no longer shares it: it
-keeps `portalPlainTTSMappings`, strict plain tts. Two properties are deliberate:
+set the voice picker offers). The streaming gate (`portalSpeechStreamRate`) shares it, so a clone model,
+which has no cached stream rate, closes that gate for the name (§2.5). Two properties are deliberate:
 
 - **It opens when ANY candidate accepts**, where the streaming gate requires EVERY candidate to
   agree. The two differ on purpose: a `language` sent to a model without the parameter is silently

@@ -337,28 +337,25 @@ func TestHandlePortalModelSpeechLanguageFoldsPresetClonesWithPlainMappings(t *te
 	}
 }
 
-// The resolver behind the language gate keeps the mappings the portal OFFERS: plain tts and
-// a clone model with a named preset. portalPlainTTSMappings, which still feeds the streaming
-// gate alone, keeps plain tts only -- the two answer differently for the same name exactly
-// where a configured clone model is involved, and agree everywhere else. Both hand back the
-// verdicts they read, so a caller does not read them again.
+// The resolver behind the language gate and the streaming gate keeps the mappings the portal
+// OFFERS: plain tts and a clone model with a named preset. It hands back the verdicts it read,
+// so a caller does not read them again.
 func TestPortalOfferableSpeechMappingsAddsPresetClonesToPlainTTS(t *testing.T) {
 	w := newVoicesWorld(t)
 	dev := auth.Token{UserID: "usr_dev"}
 	for name, c := range map[string]struct {
 		model         string
 		wantOfferable []string
-		wantPlain     []string
 	}{
-		"a plain model":                         {"tts-one", []string{"map-g1"}, []string{"map-g1"}},
-		"a preset clone":                        {"tts-clone-presets", []string{"map-clone-presets"}, nil},
-		"a reference-only clone":                {"tts-clone", nil, nil},
-		"a clone never fetched":                 {"tts-clone-uncached", nil, nil},
-		"not a speech model":                    {"asr-model", nil, nil},
-		"a model with no verdict yet":           {"tts-unprobed", nil, nil},
-		"an unknown name":                       {"no-such-model", nil, nil},
-		"a group: its plain and preset clones":  {"grp-clones", []string{"map-clone-presets", "map-g1"}, []string{"map-g1"}},
-		"a plain model, one mapping unreadable": {"tts-mix", []string{"map-mix-bad", "map-mix-ok"}, []string{"map-mix-bad", "map-mix-ok"}},
+		"a plain model":                         {"tts-one", []string{"map-g1"}},
+		"a preset clone":                        {"tts-clone-presets", []string{"map-clone-presets"}},
+		"a reference-only clone":                {"tts-clone", nil},
+		"a clone never fetched":                 {"tts-clone-uncached", nil},
+		"not a speech model":                    {"asr-model", nil},
+		"a model with no verdict yet":           {"tts-unprobed", nil},
+		"an unknown name":                       {"no-such-model", nil},
+		"a group: its plain and preset clones":  {"grp-clones", []string{"map-clone-presets", "map-g1"}},
+		"a plain model, one mapping unreadable": {"tts-mix", []string{"map-mix-bad", "map-mix-ok"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			offerable, verdicts, err := w.srv.portalOfferableSpeechMappings(context.Background(), dev, c.model)
@@ -372,13 +369,6 @@ func TestPortalOfferableSpeechMappingsAddsPresetClonesToPlainTTS(t *testing.T) {
 				if !routing.CapabilityRowsSpeech(verdicts[id]) {
 					t.Fatalf("verdicts[%s] = %+v, want the speech row the resolver read", id, verdicts[id])
 				}
-			}
-			plain, _, err := w.srv.portalPlainTTSMappings(context.Background(), dev, c.model)
-			if err != nil {
-				t.Fatalf("portalPlainTTSMappings: %v", err)
-			}
-			if !slices.Equal(plain, c.wantPlain) {
-				t.Fatalf("plain tts = %v, want %v (the stream gate's set stays plain tts only)", plain, c.wantPlain)
 			}
 		})
 	}

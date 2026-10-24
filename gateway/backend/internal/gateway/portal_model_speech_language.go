@@ -22,9 +22,9 @@ import (
 // writes) that says it accepts a `language` request field; def is the default that fact
 // declares ("" for none), and is empty whenever accepts is false.
 //
-// The streaming gate does not share this candidate set: it resolves plain tts alone
-// (portalPlainTTSMappings), since a clone model has no cached stream rate and would close it
-// for a name that streams.
+// The streaming gate (portalSpeechStreamRate) shares this candidate set: a clone model has no
+// cached stream rate, so a name that can reach one is buffered rather than streamed at a
+// sibling's rate.
 //
 // A route is picked per request, after this is asked, and the streaming gate therefore
 // requires EVERY candidate to agree. This one is the other way round, and deliberately:

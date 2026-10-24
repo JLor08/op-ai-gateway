@@ -3570,12 +3570,15 @@ verdict has gone stale.
   /api/portal/model-speech-streaming?name=<model>` (`api.modelSpeechStreaming`, fail-closed: any
   answer but a boolean `true` with a whole sample rate is "no streaming") and shows its "stream"
   checkbox only on a `yes`. The gate is open only when **every** mapping a speech request for the
-  model could be routed to (the portal-visible plain-TTS ones: the voice picker's set less a configured
-  clone model, which is left out of the strict plain-tts stream candidate set) has a
+  model could be routed to (the portal-visible **offerable** ones, the voice picker's set: a plain tts
+  model, or a configured clone model with cached presets, which has no cached byte rate and so closes the
+  gate for any name that can reach it) has a
   `speech_streaming` verdict of `yes` **and** a usable cached output byte rate, and they agree
   on it, the sample rate being half the byte rate (the cache holds only a mono 16-bit PCM rate,
   §3.6 item 10). A route is chosen per request after the gate is asked, so a model with two
-  mappings streams only if it makes no difference which serves it. The run evaluates the gate
+  mappings streams only if it makes no difference which serves it (a mixed name with a preset clone
+  is buffered, never streamed at the plain mapping's rate to a route that may be the clone,
+  [ADR-075](../09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred) (e)). The run evaluates the gate
   **again server-side** (`speechRunStreamRate`, for the model the request will route for, the
   run-as token's override applied) and never takes the client's word: the toggle is a choice,
   not an authority. Anything else is the buffered run, so the portal never plays PCM at an

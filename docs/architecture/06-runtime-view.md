@@ -247,7 +247,8 @@ agent-launched child, only on an agent that declared `runtime_model_params`), an
 `GET /api/portal/model-speech-language` on each speech-model change to show its `Language` field and,
 for an empty thread on a model whose default is not `auto`, pre-fill the portal's UI language. That gate
 reads the **offerable** speech mappings (a plain tts model, or a clone model with cached preset voices),
-while the streaming gate above still reads plain tts mappings only; and for a configured clone model the
+the set the streaming gate above reads too (a clone model has no cached byte rate, so a name that can
+reach one closes that gate and the turn is buffered); and for a configured clone model the
 composer also starts the thread on the first preset voice, since such a model has no text-only default
 voice ([ADR-075](09-architecture-decisions.md#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)).
 

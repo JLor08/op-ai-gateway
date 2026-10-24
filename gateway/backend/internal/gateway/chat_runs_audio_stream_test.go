@@ -284,11 +284,11 @@ func TestSpeechRunStreamGateStaysClosedUnlessEverythingHolds(t *testing.T) {
 
 // addPresetCloneMapping adds a configured clone mapping of the gateway model on the fixture's
 // audio application: a speech model that is a clone one and ships a named preset, which the
-// portal now OFFERS (the voice picker, the language control, #301). It is still no stream
-// candidate: a speech request is only ever routed to plain tts for streaming, and its
-// cached facts are never the stream gate's to read. The output byte rate and the
-// speech_streaming yes verdict are seeded when streams is true, so only the gate's own
-// narrowing, and not a missing fact, keeps it out of the answer.
+// portal now OFFERS (the voice picker, the language control, #301), so a speech request for
+// the name can be routed to it. The output byte rate and the speech_streaming yes verdict
+// are seeded when streams is true / byteRate is not empty, so a case can give it the facts
+// a stream candidate needs (the benchmark never learns them for a clone model today, so
+// they are the exception, not the rule).
 func addPresetCloneMapping(t *testing.T, srv *Server, id, gatewayModel string, streams bool, byteRate string) {
 	t.Helper()
 	ctx := context.Background()
@@ -314,14 +314,16 @@ func addPresetCloneMapping(t *testing.T, srv *Server, id, gatewayModel string, s
 	}
 }
 
-// The portal's STREAM gate stays strictly plain tts although its siblings (the voice picker,
-// the language control) now also take a configured clone model (#301): a clone model has no
-// cached stream rate of its own, so letting it into the candidate set would close the gate
-// for a name that streams today, the buffered regression this pins against. A preset clone
-// sibling of a streaming plain mapping is no candidate -- whether it lacks the facts a
-// candidate needs or carries them, with the same rate or another -- and a name that is ONLY
-// a preset clone has no candidate at all: a closed gate.
-func TestPortalSpeechStreamRateIgnoresPresetCloneMappings(t *testing.T) {
+// The portal's STREAM gate counts every mapping a speech request could be ROUTED to, which
+// since #301 includes a configured clone model (the same offerable set the voice picker and
+// the language control read). A preset clone has no cached stream rate (the benchmark cannot
+// learn one for it), so a name that mixes a streaming plain tts mapping with a preset-clone
+// sibling closes the gate and the turn is BUFFERED, the known-good path: the pick is made per
+// request after the gate is asked, so a streamed request routed to the clone sibling would be
+// played, committed as a WAV and billed at the PLAIN mapping's rate -- corruption, not a
+// degraded mode. A name that is only plain tts still streams, and a name that is only a
+// preset clone is closed too, as a clone never streams today (it buffers).
+func TestPortalSpeechStreamRateClosesForAReachablePresetClone(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		arrange  func(t *testing.T, srv *Server)
@@ -331,12 +333,18 @@ func TestPortalSpeechStreamRateIgnoresPresetCloneMappings(t *testing.T) {
 		{"the plain mapping alone", func(t *testing.T, srv *Server) {}, speechGatewayModel, speechRunTestRate},
 		{"a preset clone sibling with no stream facts", func(t *testing.T, srv *Server) {
 			addPresetCloneMapping(t, srv, "route-clone", speechGatewayModel, false, "")
-		}, speechGatewayModel, speechRunTestRate},
+		}, speechGatewayModel, 0},
+		{"a preset clone sibling with a streaming verdict but no cached rate", func(t *testing.T, srv *Server) {
+			addPresetCloneMapping(t, srv, "route-clone", speechGatewayModel, true, "")
+		}, speechGatewayModel, 0},
 		{"a preset clone sibling that would stream at another rate", func(t *testing.T, srv *Server) {
 			addPresetCloneMapping(t, srv, "route-clone", speechGatewayModel, true, "48000")
-		}, speechGatewayModel, speechRunTestRate},
+		}, speechGatewayModel, 0},
 		{"a name that is only a preset clone", func(t *testing.T, srv *Server) {
-			addPresetCloneMapping(t, srv, "route-clone", "tts-clone-only", true, speechRunTestByteRate)
+			addPresetCloneMapping(t, srv, "route-clone", "tts-clone-only", false, "")
+		}, "tts-clone-only", 0},
+		{"a name that is only a preset clone with a streaming verdict but no cached rate", func(t *testing.T, srv *Server) {
+			addPresetCloneMapping(t, srv, "route-clone", "tts-clone-only", true, "")
 		}, "tts-clone-only", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

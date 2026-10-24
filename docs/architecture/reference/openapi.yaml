@@ -1566,9 +1566,10 @@ paths:
         gateway model. `streaming: true` with a `sample_rate` in Hz means the
         composer may offer progressive playback; `streaming: false` means the
         buffered WAV run. The gate is open only when EVERY mapping a speech
-        request for the model could be routed to (the portal-visible plain-TTS
-        ones: the voice picker's set less a configured clone model, which is
-        left out of the strict plain-TTS stream candidate set, ADR-075) has a
+        request for the model could be routed to (the portal-visible offerable
+        ones, the voice picker's set: a plain tts model, or a configured clone
+        model with cached preset voices, which has no cached output byte rate
+        and so closes the gate for any name that can reach it, ADR-075) has a
         `speech_streaming` verdict of `yes` and a usable cached output byte rate, and they agree on it; the
         sample rate is half the byte rate (the cache only holds a rate read from
         a mono 16-bit PCM WAV). Every other case (an unknown, hidden, locked,
@@ -1622,7 +1623,7 @@ paths:
         agent 0.13.0) for the mappings a speech request for the model could be
         routed to (the portal-visible offerable ones: a plain tts model, or a
         clone model with cached preset voices, the set the voice picker offers,
-        ADR-075; the streaming gate uses plain-TTS mappings only). The gate opens when ANY such mapping is
+        ADR-075; the streaming gate reads the same set, where a clone model closes it for lack of a cached rate). The gate opens when ANY such mapping is
         known to accept a language, unlike /api/portal/model-speech-streaming,
         which needs every mapping to agree: audio.cpp silently drops a
         `language` a model does not take, so offering the control costs

@@ -8808,9 +8808,8 @@ unchanged.**
   candidate.** `handlePortalModelSpeechLanguage` answers `{"accepts":true,"default":"zh"}` (`default`
   only when declared) or `{"accepts":false}` from the cache rows of the portal-visible
   **offerable** speech mappings (`portalOfferableSpeechMappings` since [ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred): a
-  plain tts model, or a clone model that has cached preset voices; it was `portalPlainTTSMappings`, the
-  candidate set it shared with the streaming gate, which **stays plain tts** and is no longer the same
-  set). It has
+  plain tts model, or a clone model that has cached preset voices; the streaming gate reads the same set,
+  where a preset clone has no cached rate and so closes it). It has
   the streaming gate's **no-leak** discipline (every "no", including "no fact yet", is the same 200; a
   blank name is `400 model.name_required`; a store failure is the only `500
   model.speech_language_failed`; nothing loads a model or contacts an upstream), but the opposite fold:
@@ -8944,8 +8943,8 @@ returns, so only the gateway's decision of when to ask changes.**
   from the voices cache it already reads (`routing.VoiceNamesFromCacheRows`, at least one name).
   `routing.CapabilityRowsSpeech(rows)` is the producers' eligibility, `(speech, yes)` with the clone model
   included. `routing.CapabilityRowsPlainTTS` keeps its meaning unchanged and stays the gate for everything
-  that genuinely needs a reference-free named-voice tts: the streamed-rate benchmark, the portal's streaming
-  gate and the routing voice filter (choice (g)).
+  that genuinely needs a reference-free named-voice tts: the streamed-rate benchmark and the routing voice
+  filter (choice (g)). The portal's streaming gate does **not** use it: it reads the offerable set (choice (e)).
 - **(b) The producers fetch voices for a loaded clone model too.** The static `audioCppVoicesWanted` is now
   "loaded and `(speech, yes)`" (the `speech_clone` exclusion is dropped), and the agent's
   `agentVoiceProbeSpec` gates on `CapabilityRowsSpeech` instead of `CapabilityRowsPlainTTS`. A clone model
@@ -8982,14 +8981,17 @@ returns, so only the gateway's decision of when to ask changes.**
 
   A store error reading the voices cache leaves every clone mapping reading "no presets", so every clone
   model stays hidden rather than offered on voices nobody could confirm. The field gates **no** route.
-- **(e) The language gate uses the offerable set; the streaming gate stays plain tts.**
-  `portalSpeechLanguage` resolves its candidates through `portalOfferableSpeechMappings` (the portal-visible
-  mappings that satisfy `CapabilityRowsOfferableTTS`, from one batch read of the voices cache), so a preset
-  clone's `speech_language` fact opens the control. `portalSpeechStreamRate` keeps
-  `portalPlainTTSMappings`, **strict** plain tts. Adding the clone model to the shared set would close the
-  stream gate for a name that streams today (a streaming plain tts mapping beside a preset-clone sibling:
-  the clone has no cached rate, and `agreedSpeechStreamRate` closes on any candidate without one), a
-  silent regression from streaming to buffered.
+- **(e) The language gate and the streaming gate both use the offerable set.** `portalSpeechLanguage` and
+  `portalSpeechStreamRate` resolve their candidates through `portalOfferableSpeechMappings` (the
+  portal-visible mappings that satisfy `CapabilityRowsOfferableTTS`, from one batch read of the voices
+  cache), so a preset clone's `speech_language` fact opens the control. The stream gate must cover **every
+  mapping a request for the name could be routed to**, and a preset clone is now one of them: the route is
+  picked per request after the gate is asked, so a gate that saw only the plain mapping of a mixed name
+  would report the plain mapping's rate while a request routes to the clone sibling, and that PCM would be
+  played, committed as a WAV (its `fmt` chunk) and **billed** at the wrong rate: corruption, not a degraded
+  mode. A preset clone has no cached output byte rate (the benchmark skips it), so `agreedSpeechStreamRate`
+  closes on it and the turn is **buffered**, the known-good path. A plain-only name streams as before, a
+  clone-only name is buffered, and so is a name that mixes the two.
 - **(f) The composer starts a preset clone model on its first preset voice.** A plain tts model has a
   server-side default voice, so a blank `voice` is safe; a preset clone has **no text-only default**, a
   blank-voice send relying on the operator having set a named `default_voice_preset`, which the gateway
@@ -9006,7 +9008,9 @@ returns, so only the gateway's decision of when to ask changes.**
   §2.5](cross-cutting/routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open)) still
   classifies plain tts candidates only: relaxing it would not make a mixed name safe (the remaining set
   would all list the voice, `knownAbsent` would be zero and routing would fail open to the reference-only
-  sibling), so safety comes from choice (d)'s AND and not from the filter.
+  sibling), so safety comes from choice (d)'s AND and not from the filter. **A known limitation, owned:**
+  the same filter fails open on an **offered** mixed-voice-catalog name (see the consequence below), and the
+  future fix is to relax it to consult clone mappings' cached voices.
 
 **Consequence:**
 
@@ -9028,18 +9032,30 @@ returns, so only the gateway's decision of when to ask changes.**
 - **Streaming for a clone model is deferred, deliberately.** The speech-rate benchmark would have to send
   a valid reference or preset-voice request (today it sends a bare `{model, input}`, which a clone model
   answers with a 500), and the issue's acceptance is buffered German. A clone model therefore has no cached
-  byte rate, a clone-only name has an empty stream-gate candidate set (closed), and the composer sends the
-  buffered request, which works. The stream gate also speaks for the **plain** mappings of a mixed name
-  only, so a streamed request that routes to the clone sibling is not covered by the rate it checked
-  (that sibling streams by its own `speech_streaming` verdict and bills `audio_bytes`, ADR-068 (e)): the
-  composer plays the streamed PCM, and the run stamps the committed WAV's `fmt` chunk, at the plain
-  mapping's rate, so a clone sibling that streams at another rate is played and stored at the wrong
-  speed. It is a follow-up with the benchmark, recorded in [Risks & Technical Debt
+  byte rate, and because the stream gate reads the offerable set (choice (e)) a reachable preset clone
+  **closes** it: a clone-only name is buffered, and so is a name that mixes a streaming plain tts mapping
+  with a preset clone, the composer sending the buffered request, which works. No streamed request can
+  route to a clone through the portal, so nothing is played, committed or billed at a sibling's rate. The
+  price is that a mixed name never streams in the portal, even when its plain mapping alone would. Making a
+  clone model stream is a follow-up with the benchmark, recorded in [Risks & Technical Debt
   §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 - **A preset voice chosen by the composer persists across a later model switch.** It sits in the thread's
   audio settings like a typed voice, and a send to a model that lacks that name fails upstream (audio.cpp
   answers an unknown voice with a 500). It is the same staleness as a typed voice, fixable by tracking
   which voice the composer set by default and clearing it on a model change; follow-up, recorded in §11.4.
+- **A cross-catalog voice pick on an offered mixed-voice-catalog name can 500. Known limitation.** The
+  routing voice filter (`voiceScopeFor`) classifies plain tts mappings only and never reads a clone
+  mapping's cached voices (choice (g)). For an offered single name that mixes a plain tts mapping and a
+  preset clone with **different** voice catalogs, a voice served by only one of them can fail open and
+  route to the sibling that lacks it: a plain-only voice leaves nothing known-absent among the plain
+  candidates, so it routes unfiltered and can land on the clone; a clone-only voice leaves every plain
+  candidate known-absent (the all-known-absent rule), so it routes unfiltered and can land on the plain
+  mapping. The picker lists the union of both catalogs, so the user can pick a voice the sibling lacks, and
+  the upstream answers an unknown voice with a 500. That is a clean failure (nothing is played, committed
+  or billed), within the free-text-voice 500 risk ADR-067 already accepts, and it is owned rather than
+  fixed here. **The future fix** is to relax the routing voice filter to consult clone mappings' cached
+  voices, classifying known-present and known-absent over the offerable set instead of plain tts alone.
+  Recorded in §11.4.
 - **The public `/v1/audio/voices` answer changes for a preset clone model**: from `[]` to its preset names.
   Every other "nothing to show" case keeps the same empty `200`.
 - **Mixed fleets are safe.** Nothing changes on the agent wire, and an older agent still reports the
@@ -9056,7 +9072,9 @@ picker's speech half it describes;
 (c), (d) and (e) (the voices cache is written for a loaded clone model and read for one with presets; the
 routing filter is unchanged); and ADR-074 (b), (c) and (d) and its Rejected entry for a clone model's fact
 row (the language fact is written for a clone model, its agent pull shares the widened eligible set, and its
-gate takes the offerable set while the stream gate stays plain tts). It leaves
+gate takes the offerable set); and the candidate set of ADR-068's portal streaming gate, which now takes the
+same offerable set (a preset clone has no cached rate and closes the gate, so such a name is buffered). It
+leaves
 [ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)
 (d)'s `speech` verdict for `clon` as it is (only the offering moved), and, unlike
 [ADR-074](#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)
@@ -9067,9 +9085,11 @@ negotiation, because nothing on the agent wire changed.
 a clone model, so the gates would have read nothing). **A gateway-side `voice_presets` field** (the names
 are observable only through audio.cpp's listing; a copy of its config would drift from it). **A manual
 `(speech_clone, no)` override** (reserved on purpose, ADR-063 (h): it would outrank the `task` probe
-forever). **Adding the clone model to the shared plain-tts candidate set** (it would close the stream gate
-for a mixed name that streams today, choice (e)). **Relaxing the voice filter as the safety for a mixed
-name** (it cannot make one safe, choice (g)). **A fail-open OR for `speech_clone_voices`** (a name mixing a
+forever). **Keeping the stream gate on strict plain tts** (so a mixed name keeps streaming: a request that
+routes to the preset-clone sibling would be played, committed as a WAV and billed at the plain
+mapping's rate, so the gate takes the offerable set and closes, choice (e)). **Relaxing the voice filter
+as the safety for a mixed name** (it cannot make one safe, choice (g); relaxing it to cover mixed
+voice catalogs is the owned follow-up, not this change). **A fail-open OR for `speech_clone_voices`** (a name mixing a
 preset and a reference-only clone would be offered, and a send could land on the reference-only mapping).
 **Having the gateway inject a default voice for a blank one** (it cannot tell which preset the operator
 configured as the default, and a blank voice on a plain tts model is already right). **Streaming for clone
