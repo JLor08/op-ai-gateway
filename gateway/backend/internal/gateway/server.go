@@ -99,6 +99,10 @@ type ServerDeps struct {
 	// OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT). <= 0 defaults in New to
 	// DefaultVoiceCoLoadTimeout.
 	VoiceCoLoadTimeout time.Duration
+	// VoiceTiming is the Voice Chat state machine's turn-detection and half-duplex timing
+	// (config OP_AI_GATEWAY_VOICE_*). Each zero field defaults in New to its Voice*Ms
+	// default, so a bare ServerDeps gets the built-in timing.
+	VoiceTiming VoiceTiming
 	// SwapProtectWindow is the recency window for routing swap-protection: a
 	// server that served a request within this window is protected from eviction
 	// by a request for a different model. <= 0 defaults to 30s in New.
@@ -465,6 +469,15 @@ type Server struct {
 	// ServerDeps.VoiceCoLoadTimeout), defaulted in New. A bare &Server{} leaves it 0,
 	// which voiceCoLoadBound reads as the default.
 	voiceCoLoadTimeout time.Duration
+	// voiceTiming is the Voice Chat state machine's resolved turn-detection and
+	// half-duplex timing (see ServerDeps.VoiceTiming), defaults filled in New. A bare
+	// &Server{} leaves it the zero voiceTiming, which newVoiceMachine reads as the
+	// built-in defaults. A test may set it directly to drive the timers fast.
+	voiceTiming voiceTiming
+	// voiceOnPending, when non-nil, is called by the Voice Chat state machine after each
+	// chunk is appended to the session's pendingText, with the buffer's new value. It is a
+	// TEST SEAM only (pendingText is not otherwise on the wire); production leaves it nil.
+	voiceOnPending func(pending string)
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
@@ -841,6 +854,7 @@ func New(deps ServerDeps) *Server {
 	if voiceCoLoadTimeout <= 0 {
 		voiceCoLoadTimeout = DefaultVoiceCoLoadTimeout
 	}
+	voiceTiming := resolveVoiceTiming(deps.VoiceTiming)
 	serverPerf := deps.ServerPerf
 	if serverPerf == nil {
 		serverPerf = NewServerPerfRegistry()
@@ -1069,6 +1083,7 @@ func New(deps ServerDeps) *Server {
 		liveSessions:                   newLiveSessionRegistry(),
 		voiceTickets:                   newVoiceTicketStore(),
 		voiceCoLoadTimeout:             voiceCoLoadTimeout,
+		voiceTiming:                    voiceTiming,
 	}
 	if s.newMailer == nil {
 		s.newMailer = func(cfg mail.Config) Mailer { return mail.New(cfg) }

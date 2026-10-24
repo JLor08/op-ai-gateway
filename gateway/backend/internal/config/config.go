@@ -81,6 +81,20 @@ type Config struct {
 	// Default 120s; junk or <= 0 uses the default. The reverse proxy's read timeout for
 	// that route must be at least this long.
 	VoiceCoLoadTimeout time.Duration
+	// The Voice Chat turn-detection and half-duplex timings (voice-chat design
+	// §6.1/§6.2), each a Go duration string (e.g. "900ms"); junk or <= 0 uses the
+	// default. The defaults are the literals of gateway.VoiceSilenceTimeoutMs and its
+	// siblings (this package cannot import gateway):
+	//   - VoiceSilenceTimeout:    silence after a voiced partial that ends a chunk (900ms).
+	//   - VoiceMinUtterance:      a voiced span shorter than this is a blip, not a chunk (300ms).
+	//   - VoiceMaxUtterance:      hard cap on one chunk's voiced span (30s).
+	//   - VoiceMicResumeTail:     half-duplex tail kept gated after draining (300ms).
+	//   - VoiceContinuationGrace: speculative-run grace before a turn commits (1500ms).
+	VoiceSilenceTimeout    time.Duration
+	VoiceMinUtterance      time.Duration
+	VoiceMaxUtterance      time.Duration
+	VoiceMicResumeTail     time.Duration
+	VoiceContinuationGrace time.Duration
 	// CertEdgeProbeTarget is the host:port of the gateway's OWN edge (nginx)
 	// TLS listener the synthetic self-probe dials (e.g. "web:443" in compose,
 	// the Service name+port nginx's :443 server block is reachable at in
@@ -287,6 +301,14 @@ func Load() (Config, error) {
 		// import gateway). Junk/0/negative -> the 120s default: an unbounded gate is not
 		// an option.
 		VoiceCoLoadTimeout: l.duration("OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT", 120*time.Second),
+		// Voice Chat turn-detection and half-duplex timings (see the field docs). The
+		// defaults repeat gateway.Voice*Ms (this package cannot import gateway); junk/0/
+		// negative -> the default.
+		VoiceSilenceTimeout:    l.duration("OP_AI_GATEWAY_VOICE_SILENCE_TIMEOUT", 900*time.Millisecond),
+		VoiceMinUtterance:      l.duration("OP_AI_GATEWAY_VOICE_MIN_UTTERANCE", 300*time.Millisecond),
+		VoiceMaxUtterance:      l.duration("OP_AI_GATEWAY_VOICE_MAX_UTTERANCE", 30*time.Second),
+		VoiceMicResumeTail:     l.duration("OP_AI_GATEWAY_VOICE_MIC_RESUME_TAIL", 300*time.Millisecond),
+		VoiceContinuationGrace: l.duration("OP_AI_GATEWAY_VOICE_CONTINUATION_GRACE", 1500*time.Millisecond),
 		// Retention window (hours) for persisted rich telemetry samples; the
 		// prune loop drops samples older than this. Default 168 = 7 days; junk
 		// or <= 0 falls back to the default via integer().

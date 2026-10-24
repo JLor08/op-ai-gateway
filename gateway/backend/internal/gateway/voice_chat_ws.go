@@ -4,11 +4,14 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"op-ai-gateway/internal/routing"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +74,81 @@ const (
 	voiceStateSpeaking  = "speaking"
 	voiceStateDraining  = "draining"
 )
+
+// The default Voice Chat turn-detection and half-duplex timings, in milliseconds
+// (voice-chat design §6.1/§6.2). They are the defaults of the OP_AI_GATEWAY_VOICE_*
+// knobs; config cannot import this package, so it repeats the literals.
+//
+//   - VoiceSilenceTimeoutMs: after a voiced ASR partial, this much quiet (no new
+//     partial) ends the current chunk.
+//   - VoiceMinUtteranceMs: a voiced span shorter than this is a blip the silence timer
+//     ignores -- it does not end a chunk.
+//   - VoiceMaxUtteranceMs: hard cap on one chunk's voiced span; it ends regardless.
+//   - VoiceMicResumeTailMs: after draining, the mic stays gated this much longer before
+//     it re-opens (the half-duplex tail).
+//   - VoiceContinuationGraceMs: the speculative-run grace window before a turn commits.
+//     Defined now; the continuation window that uses it is wired in Task 7.
+const (
+	VoiceSilenceTimeoutMs    = 900
+	VoiceMinUtteranceMs      = 300
+	VoiceMaxUtteranceMs      = 30000
+	VoiceMicResumeTailMs     = 300
+	VoiceContinuationGraceMs = 1500
+)
+
+// VoiceTiming is the operator-tunable turn-detection and half-duplex timing of a Voice
+// Chat session (set from config via ServerDeps; the OP_AI_GATEWAY_VOICE_* knobs). A zero
+// field defaults in New to its Voice*Ms default, so a bare ServerDeps gets the defaults.
+type VoiceTiming struct {
+	SilenceTimeout    time.Duration
+	MinUtterance      time.Duration
+	MaxUtterance      time.Duration
+	MicResumeTail     time.Duration
+	ContinuationGrace time.Duration
+}
+
+// voiceTiming is the resolved (defaults-filled) timing the state machine reads. It is the
+// unexported twin of VoiceTiming so the machine's fields stay internal.
+type voiceTiming struct {
+	silenceTimeout    time.Duration
+	minUtterance      time.Duration
+	maxUtterance      time.Duration
+	micResumeTail     time.Duration
+	continuationGrace time.Duration
+}
+
+// defaultVoiceTiming is the built-in timing (the Voice*Ms defaults).
+func defaultVoiceTiming() voiceTiming {
+	return voiceTiming{
+		silenceTimeout:    VoiceSilenceTimeoutMs * time.Millisecond,
+		minUtterance:      VoiceMinUtteranceMs * time.Millisecond,
+		maxUtterance:      VoiceMaxUtteranceMs * time.Millisecond,
+		micResumeTail:     VoiceMicResumeTailMs * time.Millisecond,
+		continuationGrace: VoiceContinuationGraceMs * time.Millisecond,
+	}
+}
+
+// resolveVoiceTiming fills each non-positive field of d with its Voice*Ms default. New
+// calls it once so the Server holds a fully-resolved timing.
+func resolveVoiceTiming(d VoiceTiming) voiceTiming {
+	out := defaultVoiceTiming()
+	if d.SilenceTimeout > 0 {
+		out.silenceTimeout = d.SilenceTimeout
+	}
+	if d.MinUtterance > 0 {
+		out.minUtterance = d.MinUtterance
+	}
+	if d.MaxUtterance > 0 {
+		out.maxUtterance = d.MaxUtterance
+	}
+	if d.MicResumeTail > 0 {
+		out.micResumeTail = d.MicResumeTail
+	}
+	if d.ContinuationGrace > 0 {
+		out.continuationGrace = d.ContinuationGrace
+	}
+	return out
+}
 
 // voiceUpControl is the only text (non-binary) message the browser sends up: a control
 // frame whose Type is one of push_start, push_end, cancel or bye.
@@ -231,26 +309,43 @@ func voiceTicketRefusalCause(err error) string {
 	return "unknown"
 }
 
-// relayVoiceChat runs the browser-facing half of a voice session after the upgrade: it
-// owns the session's lifecycle, ONE context cancelled on any exit; a single writer
-// goroutine that owns every WS write (data frames, the keepalive ping, the connection
-// close); a read loop; and a teardown that can leave no goroutine blocked or leaked.
+// voiceInboundQueue bounds the read loop -> state-machine channels for PCM and controls.
+// Mic PCM arrives in ~100 ms batches, so a short queue absorbs a brief machine stall
+// (a pipe write, a loopback dial) without the read loop ever blocking the socket. A sender
+// that outruns it blocks only until the machine takes the frame or the handler context
+// ends.
+const voiceInboundQueue = 32
+
+// voiceASRQueue bounds a turn's ASR relay -> state-machine event channel. One live ASR
+// relay emits delta/partial lines at speaking cadence; a small queue is ample and a full
+// one makes the relay block on turnCtx, never past the turn.
+const voiceASRQueue = 16
+
+// errVoiceTurnDone unblocks a turn's loopback pipe on a clean turn end or teardown: the
+// loopback transport's body read (reading the pipe reader) and any pending pipe write both
+// return it. It is never surfaced to the client.
+var errVoiceTurnDone = errors.New("voice chat: turn done")
+
+// relayVoiceChat runs the browser-facing half of a voice session after the upgrade and
+// drives the Voice Chat state machine over it. It owns the session's lifecycle: ONE
+// context cancelled on any exit; a single writer goroutine that owns every WS write (data
+// frames, the keepalive ping, the connection close); the state-machine goroutine (the
+// single owner of all session state); a read loop (this goroutine) that forwards inbound
+// PCM and controls to the machine over channels; and a teardown that joins every goroutine
+// and cancels the per-turn ASR loopback, exactly once.
 //
-// This is the transport scaffold. It announces the session with an initial state frame,
-// reads the browser's control frames and ends on bye or a drop.
-//
-// TODO(voice-chat state machine, Task 6): the ASR / LLM / TTS state machine slots in
-// here. The seams are marked below: voiceReadLoop is where mic PCM becomes the per-turn
-// ASR loopback's input (and is dropped while the session is speaking or draining) and
-// where push_start, push_end and cancel drive the turn; the writer is how every frame
-// the machine produces (state, asr_*, answer_*, audio_*, error) reaches the browser.
+// The machine is the SINGLE OWNER of the state, the pendingText buffer, the per-turn ASR
+// loopback and the turn timers (voiceMachine), so no two goroutines ever touch them: the
+// half-duplex mic gate is a plain read of the machine's own state variable, race-free by
+// construction. The read loop never mutates state; it only forwards events.
 func (s *Server) relayVoiceChat(r *http.Request, conn *websocket.Conn, claims voiceTicketClaims) {
 	id := nextRequestID()
 	slog.Debug("voice chat: session started", "id", id, "chat_id", claims.ChatID)
 
-	// The one context: cancelled on any exit it stops the writer, which closes the
-	// connection, which unblocks the read loop. Derived from the request, but the read
-	// loop deliberately does NOT read on it (see voiceReadLoop).
+	// The one context: cancelled on any exit it stops the writer (which closes the
+	// connection, unblocking the read loop) and the state machine (which cancels the
+	// per-turn loopback). Derived from the request, but the read loop deliberately does
+	// NOT read on it (see voiceReadLoop).
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -261,64 +356,638 @@ func (s *Server) relayVoiceChat(r *http.Request, conn *websocket.Conn, claims vo
 	wg.Add(1)
 	go func() { defer wg.Done(); writer.run(ctx) }()
 
+	// The read loop -> machine channels. Buffered so a brief machine stall never blocks
+	// the socket read.
+	pcmCh := make(chan []byte, voiceInboundQueue)
+	ctrlCh := make(chan voiceUpControl, voiceInboundQueue)
+
+	// The state machine: the single owner of all session state.
+	m := s.newVoiceMachine(ctx, cancel, writer, claims, pcmCh, ctrlCh)
+	wg.Add(1)
+	go func() { defer wg.Done(); m.run() }()
+
 	// Teardown, DEFERRED so it is airtight even if the relay panics: cancel the one
-	// context (the writer flushes what is queued and closes the connection) and join the
-	// writer. Nothing else is left running in this scaffold.
+	// context and join every goroutine. Cancelling ctx makes the writer flush and close
+	// the connection, and makes the machine cancel the per-turn ASR loopback and join its
+	// SSE relay goroutine before it returns; wg.Wait then blocks until the writer and the
+	// machine (and, through it, any turn relay) have all returned, so nothing is left
+	// running or leaked.
 	defer func() {
 		cancel()
 		wg.Wait()
 		slog.Debug("voice chat: session ended", "id", id, "chat_id", claims.ChatID)
 	}()
 
-	// TODO(Task 6): the machine decides the initial state (idle vs listening) from the
-	// session; the scaffold opens straight into listening, the hands-free default.
-	writer.send(ctx, voiceDownMsg{Type: voiceDownState, State: voiceStateListening})
-
-	voiceReadLoop(conn, writer)
+	voiceReadLoop(ctx, conn, cancel, writer, pcmCh, ctrlCh)
 }
 
 // voiceReadLoop reads the browser's frames until the session ends and returns on the
-// first read error (a close, a drop, a frame over the read limit) or on bye.
+// first read error (a close, a drop, a frame over the read limit) or on bye. It never
+// touches session state; it forwards events to the state machine.
 //
-//   - A BINARY frame is mic PCM. The scaffold discards it.
+//   - A BINARY frame is mic PCM: a COPY is forwarded to the machine over pcmCh (the
+//     machine applies the half-duplex gate -- the read loop never decides discard-vs-pipe).
+//     A copy is made because conn.Read may reuse its buffer on the next read.
 //   - A TEXT frame is a control (parseVoiceUpControl). bye ends the session with a clean
-//     close handshake; every other text frame, including the controls the scaffold does
-//     not act on yet and anything that does not parse, is ignored.
+//     close handshake; push_start/push_end/cancel are forwarded over ctrlCh; anything that
+//     does not parse is ignored.
 //
 // The read uses context.Background(), NOT the handler context: cancelling that context
 // makes coder/websocket tear the connection down abruptly from a second site, which would
 // race the single writer. The writer's close (on its ctx.Done teardown) is what unblocks
-// this read instead.
+// this read instead. A forward blocks only until the machine takes it or ctx ends.
 //
-// On bye the loop has stopped reading before the writer closes, so the close HANDSHAKE
-// (writer.closeNormally) can take the read mutex it needs. On any other exit the peer is
-// gone or misbehaving and the writer closes abruptly.
-func voiceReadLoop(conn *websocket.Conn, writer *voiceWriter) {
+// On bye the loop stops reading before the writer closes, so the close HANDSHAKE
+// (writer.closeNormally) can take the read mutex it needs. On any other exit cancel() tears
+// the whole relay down (the machine and the writer observe ctx.Done).
+func voiceReadLoop(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, writer *voiceWriter, pcmCh chan<- []byte, ctrlCh chan<- voiceUpControl) {
 	readCtx := context.Background()
 	for {
 		typ, data, err := conn.Read(readCtx)
 		if err != nil {
+			cancel() // a drop/close/oversize frame tears the relay down
 			return
 		}
 		switch typ {
 		case websocket.MessageBinary:
-			// TODO(Task 6): mic PCM -> the per-turn ASR loopback; discarded while the
-			// session is speaking or draining (the half-duplex mic gate).
+			frame := append([]byte(nil), data...)
+			select {
+			case pcmCh <- frame:
+			case <-ctx.Done():
+				return
+			}
 		case websocket.MessageText:
 			ctl, ok := parseVoiceUpControl(data)
 			if !ok {
 				continue
 			}
-			switch ctl.Type {
-			case voiceUpBye:
+			if ctl.Type == voiceUpBye {
 				writer.closeNormally()
 				return
-			case voiceUpPushStart, voiceUpPushEnd, voiceUpCancel:
-				// TODO(Task 6): push_start / push_end bound a push-to-talk chunk and
-				// cancel abandons the turn in flight.
+			}
+			select {
+			case ctrlCh <- ctl:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}
+}
+
+// asrEventKind is the kind of one event the per-turn ASR relay forwards to the machine.
+type asrEventKind int
+
+const (
+	asrKindDelta   asrEventKind = iota // an incremental transcript fragment
+	asrKindPartial                     // a provisional WHOLE transcript (replace-not-append)
+	asrKindDone                        // the clean final transcript (after end-of-input)
+	asrKindError                       // a mid-stream upstream error
+)
+
+// asrEvent is one decoded line of the live ASR SSE, forwarded from a turn's relay goroutine
+// to the machine over the turn's asrCh.
+type asrEvent struct {
+	kind    asrEventKind
+	text    string
+	code    string
+	message string
+}
+
+// asrEventFromLive maps a decoded live-transcription down-message to an asrEvent, reusing
+// the live SSE decoder (liveDownMsgFromSSELine) so the two paths never drift. It reports
+// false for a line that carries nothing the machine consumes.
+func asrEventFromLive(m liveDownMsg) (asrEvent, bool) {
+	switch m.Type {
+	case "delta":
+		return asrEvent{kind: asrKindDelta, text: m.Text}, true
+	case "partial":
+		return asrEvent{kind: asrKindPartial, text: m.Text}, true
+	case "done":
+		return asrEvent{kind: asrKindDone, text: m.Text}, true
+	case "error":
+		return asrEvent{kind: asrKindError, message: m.Message, code: m.Code}, true
+	}
+	return asrEvent{}, false
+}
+
+// voiceASRRelay reads one turn's live-ASR SSE body and forwards each decoded event to the
+// machine over asrCh, then closes asrCh so the machine sees the relay end. It reuses the
+// exact live SSE parser; a line past the bound ends the relay (and the turn). A send blocks
+// only until the machine takes it or turnCtx ends, so the relay can never outlive the turn.
+func voiceASRRelay(turnCtx context.Context, body io.Reader, asrCh chan<- asrEvent) {
+	defer close(asrCh)
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 0, 64*1024), maxLiveSSELineBytes)
+	for sc.Scan() {
+		msg, ok := liveDownMsgFromSSELine(sc.Bytes())
+		if !ok {
+			continue
+		}
+		ev, ok := asrEventFromLive(msg)
+		if !ok {
+			continue
+		}
+		select {
+		case asrCh <- ev:
+		case <-turnCtx.Done():
+			return
+		}
+		if ev.kind == asrKindError {
+			return // a mid-stream error is terminal; stop so teardown can abort the body
+		}
+	}
+}
+
+// voiceMachine is the single-owner Voice Chat state machine. Exactly one goroutine (run)
+// ever reads or writes its fields, so the state, the pendingText buffer, the per-turn ASR
+// loopback and the turn timers need no locks, and the half-duplex mic gate (onPCM) is a
+// plain read of state -- race-free by construction. Every event reaches it over a channel:
+// mic PCM and controls from the read loop, ASR SSE events from the per-turn relay, and the
+// turn timers it arms itself.
+//
+// TODO(Task 7): the speculative voice run + continuation window attaches at the chunk
+// boundary (see beginAnswerPlaceholder); this task delivers the states, the per-turn ASR
+// loopback, the chunk detection + pendingText accumulation, the timers and the half-duplex
+// mic gate, with the run/TTS/commit left as a placeholder.
+type voiceMachine struct {
+	s      *Server
+	ctx    context.Context
+	cancel context.CancelFunc
+	writer *voiceWriter
+	claims voiceTicketClaims
+	timing voiceTiming
+
+	pcmCh  <-chan []byte
+	ctrlCh <-chan voiceUpControl
+
+	state       string
+	pendingText string
+
+	// The current turn's ASR loopback. asrCh is nil whenever no loopback is open, which
+	// disables its select case; relayWG joins the turn's SSE relay goroutine.
+	pw         *io.PipeWriter
+	turnCancel context.CancelFunc
+	respBody   io.ReadCloser
+	asrCh      chan asrEvent
+	relayWG    sync.WaitGroup
+
+	// The current chunk's accumulating transcript and the voiced-span bounds used by the
+	// min/max utterance guards. chunkActive latches on the first voiced partial; finalizing
+	// is set once the pipe is closed and we await the clean final.
+	chunkText      string
+	chunkActive    bool
+	finalizing     bool
+	firstPartialAt time.Time
+	lastPartialAt  time.Time
+
+	// The turn timers. Each is held as the *Timer (to Stop) plus its channel (nil when
+	// disarmed, which disables its select case).
+	silenceTimer  *time.Timer
+	silenceC      <-chan time.Time
+	maxTimer      *time.Timer
+	maxC          <-chan time.Time
+	tailTimer     *time.Timer
+	tailC         <-chan time.Time
+	finalizeTimer *time.Timer
+	finalizeC     <-chan time.Time
+}
+
+// voiceFinalizeTimeout bounds the wait for the clean final transcript after the pipe is
+// closed on a chunk end: audio.cpp emits transcript.text.done then [DONE] on end-of-input,
+// but a stalled or truncated upstream must not wedge the turn, so after this the machine
+// finalizes with whatever provisional text it has.
+const voiceFinalizeTimeout = 5 * time.Second
+
+// newVoiceMachine builds the state machine for a session. The timing is the Server's
+// resolved voiceTiming (defaults filled in New; a test may override s.voiceTiming).
+func (s *Server) newVoiceMachine(ctx context.Context, cancel context.CancelFunc, writer *voiceWriter, claims voiceTicketClaims, pcmCh <-chan []byte, ctrlCh <-chan voiceUpControl) *voiceMachine {
+	timing := s.voiceTiming
+	if timing == (voiceTiming{}) {
+		timing = defaultVoiceTiming()
+	}
+	return &voiceMachine{
+		s: s, ctx: ctx, cancel: cancel, writer: writer, claims: claims, timing: timing,
+		pcmCh: pcmCh, ctrlCh: ctrlCh,
+	}
+}
+
+// run is the single-owner event loop. It opens in listening (the hands-free default) and
+// serves every event source over one select until the handler context ends, then tears the
+// current turn down and joins its relay.
+func (m *voiceMachine) run() {
+	m.setState(voiceStateListening)
+	for {
+		select {
+		case <-m.ctx.Done():
+			m.teardownTurn()
+			m.stopAllTimers()
+			return
+		case frame := <-m.pcmCh:
+			m.onPCM(frame)
+		case ctl := <-m.ctrlCh:
+			m.onControl(ctl)
+		case ev, ok := <-m.asrCh:
+			if ok {
+				m.onASREvent(ev)
+			} else {
+				m.onASRClosed()
+			}
+		case <-m.silenceC:
+			m.onSilence()
+		case <-m.maxC:
+			m.onMaxUtterance()
+		case <-m.tailC:
+			m.onTailDone()
+		case <-m.finalizeC:
+			m.onFinalizeTimeout()
+		}
+	}
+}
+
+// setState records the state and, on a real change, announces it down. It is the sole
+// writer of the state, so the mic gate (onPCM) reads a value only this goroutine ever sets.
+func (m *voiceMachine) setState(state string) {
+	if m.state == state {
+		return
+	}
+	m.state = state
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownState, State: state})
+}
+
+// micOpen reports whether inbound PCM is piped to the ASR this turn. ONLY listening feeds
+// the ASR; idle, thinking, speaking and draining all discard -- and while finalizing a
+// chunk (the pipe is closing) listening discards too. This is the whole half-duplex
+// guarantee: speaking/draining can never route TTS-era audio into the ASR, enforced
+// server-side regardless of client behaviour.
+func (m *voiceMachine) micOpen() bool {
+	return m.state == voiceStateListening && !m.finalizing
+}
+
+// onPCM applies the half-duplex mic gate and, when the mic is open, feeds the frame to the
+// per-turn ASR loopback (opening it lazily on the turn's first frame). A discarded frame
+// never reaches any loopback.
+func (m *voiceMachine) onPCM(frame []byte) {
+	if !m.micOpen() {
+		return // half-duplex: discard during idle/thinking/speaking/draining (and finalizing)
+	}
+	if m.asrCh == nil {
+		if m.s.selfBaseURL == "" {
+			return // no loopback target configured (a bare/test server): discard silently
+		}
+		if !m.openTurnLoopback() {
+			return // the dial failed; openTurnLoopback emitted the error and went idle
+		}
+	}
+	if _, err := m.pw.Write(frame); err != nil {
+		m.failTurn("transcription.stream_error", "the transcription stream ended")
+	}
+}
+
+// openTurnLoopback opens a FRESH full-duplex loopback to the gateway's own
+// /v1/audio/transcriptions/live for this turn (the openLiveLoopback pattern, reused as-is
+// so the dial -- Expect: 100-continue, trusted-loopback headers, chunked io.Pipe body --
+// never drifts from the live path). It feeds the sealed ASR model name + PCM shape, which
+// /v1 re-resolves, re-gates, admits and bills per turn. On success it starts the turn's SSE
+// relay goroutine and returns true; on a dial failure or a non-2xx refusal it surfaces the
+// error and returns false.
+func (m *voiceMachine) openTurnLoopback() bool {
+	pr, pw := io.Pipe()
+	turnCtx, turnCancel := context.WithCancel(m.ctx)
+	liveClaims := liveTicketClaims{
+		Target:     routing.Target{Model: m.claims.ASR.Model},
+		SampleRate: m.claims.SampleRate,
+		Channels:   m.claims.Channels,
+		Format:     m.claims.SampleFormat,
+		UserID:     m.claims.UserID,
+	}
+	resp, err := m.s.openLiveLoopback(turnCtx, liveClaims, pr)
+	if err != nil {
+		turnCancel()
+		_ = pr.CloseWithError(err)
+		_ = pw.CloseWithError(err)
+		if m.ctx.Err() == nil {
+			m.failTurn("transcription.unavailable", "live transcription unavailable")
+		}
+		return false
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		frame := liveRefusalFrame(resp.Body)
+		_ = resp.Body.Close()
+		turnCancel()
+		_ = pr.CloseWithError(errVoiceTurnDone)
+		_ = pw.CloseWithError(errVoiceTurnDone)
+		m.emitError(frame.Code, frame.Message)
+		m.setState(voiceStateIdle)
+		return false
+	}
+	asrCh := make(chan asrEvent, voiceASRQueue)
+	m.pw, m.turnCancel, m.respBody, m.asrCh = pw, turnCancel, resp.Body, asrCh
+	m.relayWG.Add(1)
+	go func() {
+		defer m.relayWG.Done()
+		voiceASRRelay(turnCtx, resp.Body, asrCh)
+	}()
+	return true
+}
+
+// onControl handles a push-to-talk / cancel control from the client. bye never reaches
+// here (the read loop closes on it).
+func (m *voiceMachine) onControl(ctl voiceUpControl) {
+	switch ctl.Type {
+	case voiceUpPushStart:
+		// Begin listening from a rest/idle state. push_start never re-opens the mic during
+		// thinking/speaking/draining -- the half-duplex gate is server-authoritative, so a
+		// client control cannot force the mic open while the answer plays; and it does NOT
+		// reset an in-progress listening chunk.
+		if m.state == voiceStateIdle {
+			m.setState(voiceStateListening)
+		}
+	case voiceUpPushEnd:
+		// Explicit end-of-utterance: end the current chunk immediately (bypassing the
+		// min-utterance guard), but only when a voiced chunk is actually in flight.
+		if m.state == voiceStateListening && m.chunkActive && !m.finalizing {
+			m.finalizeChunk()
+		}
+	case voiceUpCancel:
+		// Abandon the in-flight turn and return to listening. Task 7 extends this to stop
+		// the speculative run / TTS; here it tears the ASR loopback down and resets the
+		// chunk. pendingText is left to Task 7's turn/commit semantics.
+		m.teardownTurn()
+		m.resetChunk()
+		m.stopChunkTimers()
+		m.stopTail()
+		m.setState(voiceStateListening)
+	}
+}
+
+// onASREvent folds one live-ASR event into the current chunk. delta/partial build the
+// provisional WHOLE transcript streamed down as asr_partial (replace-not-append); done is
+// the clean final that ends the chunk; an error fails the turn.
+func (m *voiceMachine) onASREvent(ev asrEvent) {
+	switch ev.kind {
+	case asrKindDelta:
+		m.chunkText += ev.text
+		m.onVoiced()
+	case asrKindPartial:
+		m.chunkText = ev.text
+		m.onVoiced()
+	case asrKindDone:
+		m.finishChunk(firstNonEmptyVoice(ev.text, m.chunkText))
+	case asrKindError:
+		m.failTurn(ev.code, firstNonEmptyVoice(ev.message, "live transcription error"))
+	}
+}
+
+// onVoiced records a voiced partial: it latches the chunk (arming the max-utterance cap),
+// advances the voiced-span bound, resets the silence timer and streams the provisional
+// transcript down. An empty provisional is not treated as voiced.
+func (m *voiceMachine) onVoiced() {
+	if strings.TrimSpace(m.chunkText) == "" {
+		return
+	}
+	now := time.Now()
+	if !m.chunkActive {
+		m.chunkActive = true
+		m.firstPartialAt = now
+		m.armMax()
+	}
+	m.lastPartialAt = now
+	m.armSilence()
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownASRPartial, Text: m.chunkText})
+}
+
+// onSilence fires VoiceSilenceTimeout after the last voiced partial: it ends the chunk,
+// unless the voiced span is below the min-utterance guard, in which case the blip is
+// ignored (no chunk end) and the next voiced partial re-arms the timer.
+func (m *voiceMachine) onSilence() {
+	if m.state != voiceStateListening || !m.chunkActive || m.finalizing {
+		return
+	}
+	if m.lastPartialAt.Sub(m.firstPartialAt) < m.timing.minUtterance {
+		m.stopSilence() // a sub-min blip: keep listening, do not end the chunk
+		return
+	}
+	m.finalizeChunk()
+}
+
+// onMaxUtterance fires at the hard cap: it ends the chunk regardless of the min guard.
+func (m *voiceMachine) onMaxUtterance() {
+	if m.state != voiceStateListening || !m.chunkActive || m.finalizing {
+		return
+	}
+	m.finalizeChunk()
+}
+
+// finalizeChunk ends the current chunk: it closes the loopback pipe cleanly (end-of-input
+// -> the upstream's terminating chunk -> the clean transcript.text.done), stops the chunk
+// timers and arms the finalize-timeout fallback. The machine stays in listening with
+// finalizing set (so inbound PCM is gated) until the done arrives (finishChunk) or the
+// fallback fires.
+func (m *voiceMachine) finalizeChunk() {
+	m.finalizing = true
+	m.stopChunkTimers()
+	if m.pw != nil {
+		_ = m.pw.Close() // clean EOF -> terminating chunk -> transcript.text.done
+	}
+	m.armFinalize()
+}
+
+// finishChunk completes a chunk once its clean final arrives: it emits asr_final, APPENDS
+// the final to pendingText (the accumulating turn text), tears the per-turn loopback down,
+// and begins the (placeholder) answer so the session walks the speak/drain states and
+// returns to listening.
+func (m *voiceMachine) finishChunk(final string) {
+	m.stopFinalize()
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownASRFinal, Text: final})
+	m.pendingText += final
+	if m.s.voiceOnPending != nil {
+		m.s.voiceOnPending(m.pendingText)
+	}
+	m.teardownTurn()
+	m.resetChunk()
+	m.beginAnswerPlaceholder()
+}
+
+// onASRClosed handles the turn relay ending (the SSE body closed). If we were finalizing,
+// the clean done never came through -- finish with the provisional text so the turn is not
+// wedged. Otherwise the ASR dropped mid-chunk, which is a recoverable leg error.
+func (m *voiceMachine) onASRClosed() {
+	if m.finalizing {
+		m.finishChunk(m.chunkText)
+		return
+	}
+	if m.state == voiceStateListening && m.asrCh != nil {
+		m.failTurn("transcription.stream_error", "the transcription stream ended")
+		return
+	}
+	m.asrCh = nil
+}
+
+// onFinalizeTimeout fires when the clean final did not arrive in time after end-of-input:
+// finalize with the provisional text rather than wedge the turn.
+func (m *voiceMachine) onFinalizeTimeout() {
+	if !m.finalizing {
+		return
+	}
+	m.finishChunk(m.chunkText)
+}
+
+// beginAnswerPlaceholder walks the turn's answer states. TODO(Task 7): this is the seam
+// where the speculative voice run + continuation window attaches -- start the LLM on
+// pendingText, keep the mic live during the grace (VoiceContinuationGrace), cancel-and-
+// extend on resumed speech, then commit (persist the user+assistant turn, clear
+// pendingText) and stream the answer's TTS as audio_delta. This task has no run or TTS, so
+// it walks thinking -> speaking -> draining as placeholders (the half-duplex mic gate holds
+// across all three) and arms the real mic-resume tail; pendingText is intentionally NOT
+// cleared here (Task 7's commit clears it), so chunks accumulate across the turn.
+func (m *voiceMachine) beginAnswerPlaceholder() {
+	m.setState(voiceStateThinking)
+	m.setState(voiceStateSpeaking)
+	m.setState(voiceStateDraining)
+	m.armTail()
+}
+
+// onTailDone fires when the mic-resume tail elapses: the half-duplex window is over, so the
+// session returns to listening for the next turn (its loopback opens lazily on the next
+// PCM frame).
+func (m *voiceMachine) onTailDone() {
+	m.stopTail()
+	m.setState(voiceStateListening)
+}
+
+// failTurn surfaces a recoverable leg error (spec §6.6): emit the typed error, tear the
+// turn down and return to idle with the mic no longer piping -- no silent retry that could
+// spin into a loop. The client re-engages with push_start.
+func (m *voiceMachine) failTurn(code, message string) {
+	m.emitError(code, message)
+	m.teardownTurn()
+	m.resetChunk()
+	m.stopChunkTimers()
+	m.stopTail()
+	m.setState(voiceStateIdle)
+}
+
+// emitError sends a typed error down-frame (best-effort; dropped if the session is already
+// tearing down).
+func (m *voiceMachine) emitError(code, message string) {
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownError, Code: code, Message: message})
+}
+
+// teardownTurn ends the current ASR loopback exactly once and joins its relay goroutine:
+// cancel the turn context (aborts the loopback request and the SSE read), unblock the pipe
+// from both sides, close the response body, and wait for the relay to return. It is safe to
+// call when no turn is open.
+func (m *voiceMachine) teardownTurn() {
+	if m.turnCancel != nil {
+		m.turnCancel()
+	}
+	if m.pw != nil {
+		_ = m.pw.CloseWithError(errVoiceTurnDone)
+	}
+	if m.respBody != nil {
+		_ = m.respBody.Close()
+	}
+	m.relayWG.Wait()
+	m.pw, m.turnCancel, m.respBody, m.asrCh = nil, nil, nil, nil
+	m.finalizing = false
+}
+
+// resetChunk clears the per-chunk transcript and voiced-span bounds for the next chunk.
+func (m *voiceMachine) resetChunk() {
+	m.chunkText = ""
+	m.chunkActive = false
+	m.firstPartialAt = time.Time{}
+	m.lastPartialAt = time.Time{}
+}
+
+// armSilence (re)starts the silence timer; armMax/armTail/armFinalize start theirs.
+// Re-arming replaces the channel the select reads, so a stale fire from the old timer is
+// never selected. All timer fields are touched only by the machine goroutine.
+func (m *voiceMachine) armSilence() {
+	if m.silenceTimer != nil {
+		m.silenceTimer.Stop()
+	}
+	m.silenceTimer = time.NewTimer(m.timing.silenceTimeout)
+	m.silenceC = m.silenceTimer.C
+}
+
+func (m *voiceMachine) armMax() {
+	if m.maxTimer != nil {
+		m.maxTimer.Stop()
+	}
+	m.maxTimer = time.NewTimer(m.timing.maxUtterance)
+	m.maxC = m.maxTimer.C
+}
+
+func (m *voiceMachine) armTail() {
+	if m.tailTimer != nil {
+		m.tailTimer.Stop()
+	}
+	m.tailTimer = time.NewTimer(m.timing.micResumeTail)
+	m.tailC = m.tailTimer.C
+}
+
+func (m *voiceMachine) armFinalize() {
+	if m.finalizeTimer != nil {
+		m.finalizeTimer.Stop()
+	}
+	m.finalizeTimer = time.NewTimer(voiceFinalizeTimeout)
+	m.finalizeC = m.finalizeTimer.C
+}
+
+func (m *voiceMachine) stopSilence() {
+	if m.silenceTimer != nil {
+		m.silenceTimer.Stop()
+		m.silenceTimer = nil
+	}
+	m.silenceC = nil
+}
+
+func (m *voiceMachine) stopMax() {
+	if m.maxTimer != nil {
+		m.maxTimer.Stop()
+		m.maxTimer = nil
+	}
+	m.maxC = nil
+}
+
+func (m *voiceMachine) stopTail() {
+	if m.tailTimer != nil {
+		m.tailTimer.Stop()
+		m.tailTimer = nil
+	}
+	m.tailC = nil
+}
+
+func (m *voiceMachine) stopFinalize() {
+	if m.finalizeTimer != nil {
+		m.finalizeTimer.Stop()
+		m.finalizeTimer = nil
+	}
+	m.finalizeC = nil
+}
+
+// stopChunkTimers disarms the silence and max-utterance timers (a chunk ended).
+func (m *voiceMachine) stopChunkTimers() {
+	m.stopSilence()
+	m.stopMax()
+}
+
+// stopAllTimers disarms every turn timer (teardown).
+func (m *voiceMachine) stopAllTimers() {
+	m.stopChunkTimers()
+	m.stopTail()
+	m.stopFinalize()
+}
+
+// firstNonEmptyVoice returns a when it has non-space content, else b. It picks the clean
+// final over the provisional (and a message over a fallback) without letting an empty one
+// win.
+func firstNonEmptyVoice(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 // voiceSocket is the narrow slice of *websocket.Conn the writer drives. It exists so the
