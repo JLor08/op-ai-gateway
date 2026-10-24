@@ -4331,6 +4331,28 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(voice()).toBe('Thorsten');
       });
 
+      it('keeps a saved voice that happens to equal the default pick across a model switch', async () => {
+        // An EMPTY saved clone thread whose own saved voice is the very name the pre-select
+        // would pick (the first listed). The pre-select finds the field non-blank and writes
+        // nothing, so it must not record that name as ITS pick: the saved voice is the
+        // thread's, and the switch must not clear it.
+        chatApi = makeChatApi(cloneThread({ voice: 'Frank' }));
+        chatApi.spies.modelVoices.mockImplementation(async (name: string) =>
+          name === 'clone-tts' ? cloneVoices : ['af_heart'],
+        );
+        renderProvider([], { models: [clone, plain] });
+        await waitForReady();
+        await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(cloneVoices)));
+        await act(async () => {});
+        expect(voice()).toBe('Frank');
+
+        fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+        await waitFor(() => expect(voicesShown()).toBe(JSON.stringify(['af_heart'])));
+        await act(async () => {});
+
+        expect(voice()).toBe('Frank');
+      });
+
       it('keeps a saved voice that equals the voice auto-selected for the chat left behind', async () => {
         // The first (newest) chat is an empty clone thread: "Frank" is auto-selected there.
         // The second is a spoken thread of another clone model that SAVED "Frank" itself.

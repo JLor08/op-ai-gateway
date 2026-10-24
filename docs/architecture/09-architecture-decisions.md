@@ -9086,10 +9086,17 @@ returns, so only the gateway's decision of when to ask changes.**
   clone model stream was the follow-up with the benchmark, recorded in [Risks & Technical Debt
   §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances) and shipped as ADR-076, which
   teaches the benchmark to name a cached preset voice; a reference-only clone still has no rate.
-- **A preset voice chosen by the composer persists across a later model switch.** It sits in the thread's
-  audio settings like a typed voice, and a send to a model that lacks that name fails upstream (audio.cpp
-  answers an unknown voice with a 500). It is the same staleness as a typed voice, fixable by tracking
-  which voice the composer set by default and clearing it on a model change; follow-up, recorded in §11.4.
+- **A preset voice chosen by the composer is cleared on a later model switch; a typed or saved voice is
+  not (issue #307).** The pick sits in the thread's audio settings, and a send to a model that lacks that
+  name fails upstream (audio.cpp answers an unknown voice with a 500), so the store remembers the value the
+  pre-select wrote and every model switch clears the voice **only while it still equals that value**: the
+  next preset clone's own answer fills the blank, and a plain tts model keeps the blank (the server's
+  default). A voice the user typed over the pick, or a saved thread carried, differs from the remembered
+  value, persists across the switch like any typed voice, and a name the next model lacks stays the
+  free-text-voice 500 risk (ADR-067). Two edges are accepted, recorded in §11.4: a user who types the exact
+  picked value is indistinguishable from the pick and loses it on the next switch, and the clear fires on
+  any switch, so a spoken thread moved between two clones that list the same preset goes blank and relies
+  on the operator's `default_voice_preset`.
 - **A cross-catalog voice pick on an offered mixed-voice-catalog name can 500. Known limitation.** The
   routing voice filter (`voiceScopeFor`) classifies plain tts mappings only and never reads a clone
   mapping's cached voices (choice (g)). For an offered single name that mixes a plain tts mapping and a
