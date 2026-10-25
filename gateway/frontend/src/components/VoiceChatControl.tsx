@@ -6,7 +6,15 @@ import { Alert, Box, Button, FormControlLabel, Switch, Typography } from '@mui/m
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
 import type { MessageKey, Translation } from './shared/types';
-import type { VoiceChatApi, VoiceChatError, VoiceChatGap, VoiceChatState } from './chat/ChatStore';
+import { SearchableSelect } from './shared/SearchableSelect';
+import type {
+  VoiceChatApi,
+  VoiceChatError,
+  VoiceChatGap,
+  VoiceChatModels,
+  VoiceChatState,
+  VoiceModelChoice,
+} from './chat/ChatStore';
 
 // The label of each state of the conversation. `off` and `connecting` are the portal's own; the
 // rest are the gateway's state machine (spec 5.3), mirrored as it reports them.
@@ -93,6 +101,12 @@ export type VoiceChatControlProps = {
   gap: VoiceChatGap | null;
   /** A chat run or a live recording holds the thread: a conversation cannot start now. */
   busy?: boolean;
+  /**
+   * The models of the conversation (the store's voiceChatModels): the pickers of its transcription
+   * and speech models, and the thread's own chat model, named. A conversation that is on has them
+   * closed -- its ticket holds the models it started with.
+   */
+  models: VoiceChatModels;
 };
 
 // Why the switch is closed, in words on the screen (a tooltip would not be seen on a touch
@@ -203,6 +217,7 @@ export function VoiceChatControl({
   capable,
   gap,
   busy = false,
+  models,
 }: Readonly<VoiceChatControlProps>) {
   const transcriptId = useId();
   const answerId = useId();
@@ -264,6 +279,8 @@ export function VoiceChatControl({
         )}
       </Box>
 
+      <VoiceModelPickers models={models} locked={on} t={t} />
+
       <ListeningIndicator state={state} t={t} />
 
       {on && voice.liveTranscript !== '' && (
@@ -323,6 +340,86 @@ export function VoiceChatControl({
         </Alert>
       )}
     </Box>
+  );
+}
+
+// The pickers of the conversation's two models (#317), the live transcription model that hears the
+// user and the speech model that answers aloud, one field each, and under them the third model --
+// the thread's own, which answers -- named: it is picked with the thread's model selector, so it
+// has no field here. Closed until the gateway has said which models stream (there is nothing to
+// choose from), and while a conversation is on (its ticket holds the models it started with); NOT
+// closed by a switch that is closed for another reason (a missing chat model, a run in flight):
+// the user may pick ahead.
+function VoiceModelPickers({
+  models,
+  locked,
+  t,
+}: Readonly<{ models: VoiceChatModels; locked: boolean; t: Translation }>) {
+  const closed = locked || !models.ready;
+  return (
+    <Box sx={{ display: 'grid', gap: 0.75 }}>
+      <Box
+        sx={{
+          display: 'grid',
+          gap: 1.5,
+          gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 240px), 1fr))',
+        }}
+      >
+        <VoiceModelPicker
+          id="chat-voice-asr-model"
+          label={t.chatVoiceAsrModel}
+          choice={models.asr}
+          disabled={closed}
+          t={t}
+        />
+        <VoiceModelPicker
+          id="chat-voice-tts-model"
+          label={t.chatVoiceTtsModel}
+          choice={models.tts}
+          disabled={closed}
+          t={t}
+        />
+      </Box>
+      {models.llm !== '' && (
+        <Typography variant="caption" color="text.secondary" component="p" sx={{ m: 0 }}>
+          {t.chatVoiceLlmNote(models.llm)}
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
+// One picker: "automatic" (no pick) and the models on offer, by their display names. Under an
+// automatic pick the field says which model that is.
+function VoiceModelPicker({
+  id,
+  label,
+  choice,
+  disabled,
+  t,
+}: Readonly<{
+  id: string;
+  label: string;
+  choice: VoiceModelChoice;
+  disabled: boolean;
+  t: Translation;
+}>) {
+  const options = [
+    { value: '', label: t.chatVoiceModelAuto },
+    ...choice.options.map((option) => ({ value: option.id, label: option.display_name })),
+  ];
+  const used = choice.options.find((option) => option.id === choice.used);
+  const showsUsed = choice.pick === '' && choice.used !== '';
+  return (
+    <SearchableSelect
+      id={id}
+      label={label}
+      value={choice.pick}
+      onChange={choice.set}
+      options={options}
+      disabled={disabled}
+      helperText={showsUsed ? t.chatVoiceModelUsing(used?.display_name ?? choice.used) : undefined}
+    />
   );
 }
 

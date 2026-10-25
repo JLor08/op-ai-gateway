@@ -1105,6 +1105,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               capable={c.voiceChatCapable}
               gap={c.voiceChatGap}
               busy={c.streaming}
+              models={c.voiceChatModels}
             />
           )}
 

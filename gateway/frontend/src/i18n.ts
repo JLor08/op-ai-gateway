@@ -410,6 +410,16 @@ const de = {
   chatVoiceUnavailableTts:
     'Für den Sprachchat wird ein Sprachmodell mit Streaming benötigt. Aktuell ist keines verfügbar.',
   chatVoiceUnavailableChecking: 'Die verfügbaren Sprachmodelle werden geprüft…',
+  // The pickers of the conversation's models (#317): the transcription model that hears the user and
+  // the speech model that answers aloud are the user's to pick; the chat model that answers is the
+  // thread's own (picked with the model selector above), and is only named here. "Automatic" is
+  // the default: the first available model, which the line under it names.
+  chatVoiceAsrModel: 'Transkriptionsmodell',
+  chatVoiceTtsModel: 'Sprachmodell',
+  chatVoiceModelAuto: 'Automatisch (erstes verfügbares)',
+  chatVoiceModelUsing: (model: string) => `Verwendet: ${model}`,
+  chatVoiceLlmNote: (model: string) =>
+    `Das Chat-Modell ist das Modell dieses Chats: ${model}. Wählen Sie es oben in der Modellauswahl.`,
   // Why a conversation could not start or ended, by the gateway's portal.voice_chat_* code (the
   // gate that refuses the ticket) or by the kind of failure. A refusal is the gateway's answer to
   // the very same request, so it is repeated until the configuration changes: the operator's to
@@ -3829,6 +3839,12 @@ const en: PortalMessages = {
   chatVoiceUnavailableTts:
     'Voice Chat needs a speech model with streaming. None is available right now.',
   chatVoiceUnavailableChecking: 'Checking the available voice models…',
+  chatVoiceAsrModel: 'Transcription model',
+  chatVoiceTtsModel: 'Speech model',
+  chatVoiceModelAuto: 'Automatic (first available)',
+  chatVoiceModelUsing: (model: string) => `Uses: ${model}`,
+  chatVoiceLlmNote: (model: string) =>
+    `The chat model is this chat's own model: ${model}. Pick it in the model selector above.`,
   chatVoiceErrorAsrUnavailable:
     'The transcription model cannot be used for Voice Chat (unreachable, no live streaming, or it could not be started).',
   chatVoiceErrorLlmUnavailable:

@@ -372,6 +372,31 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <button type="button" onClick={() => c.voiceChat.stop()}>
         voice-stop
       </button>
+      {/* The Voice Chat model pickers (#317): whether the gateway has said which models stream, per
+          leg the models on offer, the thread's own pick ('' = automatic) and the model a
+          conversation would use now -- and one button per pick, the automatic one ('') among them. */}
+      <span data-testid="voice-models-ready">{String(c.voiceChatModels.ready)}</span>
+      <span data-testid="voice-llm">{c.voiceChatModels.llm}</span>
+      <span data-testid="voice-asr-options">
+        {JSON.stringify(c.voiceChatModels.asr.options.map((option) => option.id))}
+      </span>
+      <span data-testid="voice-tts-options">
+        {JSON.stringify(c.voiceChatModels.tts.options.map((option) => option.id))}
+      </span>
+      <span data-testid="voice-asr-pick">{c.voiceChatModels.asr.pick}</span>
+      <span data-testid="voice-tts-pick">{c.voiceChatModels.tts.pick}</span>
+      <span data-testid="voice-asr-used">{c.voiceChatModels.asr.used}</span>
+      <span data-testid="voice-tts-used">{c.voiceChatModels.tts.used}</span>
+      {['asr-a', 'asr-b', 'asr-gone', ''].map((id) => (
+        <button key={`asr-${id}`} type="button" onClick={() => c.voiceChatModels.asr.set(id)}>
+          voice-asr-{id === '' ? 'auto' : id}
+        </button>
+      ))}
+      {['tts-a', 'tts-clone', 'tts-gone', ''].map((id) => (
+        <button key={`tts-${id}`} type="button" onClick={() => c.voiceChatModels.tts.set(id)}>
+          voice-tts-{id === '' ? 'auto' : id}
+        </button>
+      ))}
       <span data-testid="run-audio-live">{String(c.runAudioLive)}</span>
       <span data-testid="run-audio-muted">{String(c.runAudioMuted)}</span>
       <button type="button" onClick={() => c.muteAudio('c1', true)}>
@@ -8301,6 +8326,393 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // The pickers (#317): the user chooses the live-transcription model and the speech model of
+    // the conversation, instead of the automatic pick (the first of each that streams) -- the
+    // thread's own model is the third, and its picker is the thread's model selector. A pick is
+    // the THREAD's (persisted in its document, `voice_chat`), is checked against the models the
+    // gateway says stream every time, and falls back to the automatic one when it is gone.
+    describe('the model pickers', () => {
+      const cloneTts = audioModel('tts-clone', {
+        speech: true,
+        speech_clone: true,
+        speech_clone_voices: true,
+      });
+      // A transcription model that never streams, and one speech model that does not.
+      const asrSlow = audioModel('asr-slow', { transcription: true });
+      const ttsSlow = audioModel('tts-slow', { speech: true });
+      const pickerModels = [voiceLlm, asrA, asrSlow, asrB, cloneTts, ttsSlow, ttsA];
+      const idsOf = (testId: string) => JSON.parse(text(testId) ?? '[]') as string[];
+
+      // The gateway's answers for pickerModels: asr-slow and tts-slow do not stream.
+      function pickerGates() {
+        chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+          async (name) => name !== 'asr-slow',
+        );
+        chatApi.spies.modelSpeechStreaming.mockImplementation(async (name: string) =>
+          name === 'tts-slow' ? NO_SPEECH_STREAMING : streams,
+        );
+      }
+
+      async function renderPickers(rows: ChatRow[] = [voiceThread()], models = pickerModels) {
+        chatApi = makeChatApi(rows);
+        pickerGates();
+        const view = renderProvider([], { models });
+        await waitForReady();
+        await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+        return view;
+      }
+
+      // The settings of the last document the thread was saved with.
+      async function savedSettings() {
+        await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+        const body = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+          content: { settings: Record<string, unknown> };
+        };
+        return body.content.settings;
+      }
+
+      describe('what they offer', () => {
+        it('lists, per leg, only the models the gateway says stream', async () => {
+          await renderPickers();
+
+          // asr-slow and tts-slow are in the catalogue but do not stream: not on offer.
+          expect(idsOf('voice-asr-options')).toEqual(['asr-a', 'asr-b']);
+          // The speech models keep the automatic pick's order: plain first, preset clone after.
+          expect(idsOf('voice-tts-options')).toEqual(['tts-a', 'tts-clone']);
+        });
+
+        it('never offers the thread model, or a model of the other kind, as either leg', async () => {
+          await renderPickers();
+
+          for (const id of ['llm', 'tts-a', 'tts-clone']) {
+            expect(idsOf('voice-asr-options')).not.toContain(id);
+          }
+          for (const id of ['llm', 'asr-a', 'asr-b']) {
+            expect(idsOf('voice-tts-options')).not.toContain(id);
+          }
+        });
+
+        it('fails closed: a model whose lookup fails is not offered', async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          chatApi.spies.modelTranscriptionStreaming.mockImplementation(async (name) => {
+            if (name === 'asr-a') throw new Error('unreachable');
+            return true;
+          });
+          chatApi.spies.modelSpeechStreaming.mockResolvedValue(streams);
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+
+          expect(idsOf('voice-asr-options')).toEqual(['asr-slow', 'asr-b']);
+        });
+
+        it('is closed, over the capability-filtered candidates, on a thread that cannot chat', async () => {
+          chatApi = makeChatApi([voiceThread('c1', earlier, { model: 'ghost' })]);
+          pickerGates();
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+
+          // The gateway is not asked for a thread that cannot chat, so nothing is known to
+          // stream: the pickers are closed, and name only what the catalogue's capabilities allow
+          // (never the chat model), the speech models in the automatic pick's order.
+          expect(text('voice-models-ready')).toBe('false');
+          expect(idsOf('voice-asr-options')).toEqual(['asr-a', 'asr-slow', 'asr-b']);
+          expect(idsOf('voice-tts-options')).toEqual(['tts-slow', 'tts-a', 'tts-clone']);
+          expect(text('voice-asr-used')).toBe('');
+          expect(chatApi.spies.modelTranscriptionStreaming).not.toHaveBeenCalled();
+        });
+
+        it('is closed until the gateway has said which models stream, then offers those', async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          const answers: ((streams: boolean) => void)[] = [];
+          chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+            () => new Promise<boolean>((resolve) => answers.push(resolve)),
+          );
+          chatApi.spies.modelSpeechStreaming.mockResolvedValue(streams);
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(answers).toHaveLength(3));
+
+          expect(text('voice-models-ready')).toBe('false');
+          expect(text('voice-asr-used')).toBe('');
+
+          // asr-a and asr-b stream, asr-slow does not (answers come in the catalogue's order).
+          await act(async () => answers.forEach((answer, index) => answer(index !== 1)));
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+          expect(idsOf('voice-asr-options')).toEqual(['asr-a', 'asr-b']);
+        });
+      });
+
+      describe('with no pick (the automatic default)', () => {
+        it('shows no pick and uses the first model of each leg that streams', async () => {
+          await renderPickers();
+
+          expect(text('voice-asr-pick')).toBe('');
+          expect(text('voice-tts-pick')).toBe('');
+          expect(text('voice-asr-used')).toBe('asr-a');
+          expect(text('voice-tts-used')).toBe('tts-a');
+        });
+
+        it('starts a conversation with the automatic models, as before the pickers', async () => {
+          await renderPickers();
+
+          click('voice-start');
+
+          expect(voiceSessions[0].args).toMatchObject({
+            chatId: 'c1',
+            asrModel: 'asr-a',
+            llmModel: 'llm',
+            ttsModel: 'tts-a',
+          });
+        });
+
+        it("uses the first model that STREAMS when the catalogue's first one does not", async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+            async (name) => name === 'asr-b',
+          );
+          chatApi.spies.modelSpeechStreaming.mockResolvedValue(streams);
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+
+          expect(text('voice-asr-used')).toBe('asr-b');
+          click('voice-start');
+          expect(voiceSessions[0].args.asrModel).toBe('asr-b');
+        });
+      });
+
+      describe('a pick', () => {
+        it('reaches the conversation, each leg on its own', async () => {
+          await renderPickers();
+
+          click('voice-asr-asr-b');
+          click('voice-tts-tts-clone');
+          expect(text('voice-asr-pick')).toBe('asr-b');
+          expect(text('voice-tts-pick')).toBe('tts-clone');
+          expect(text('voice-asr-used')).toBe('asr-b');
+          expect(text('voice-tts-used')).toBe('tts-clone');
+          click('voice-start');
+
+          expect(voiceSessions).toHaveLength(1);
+          expect(voiceSessions[0].args).toMatchObject({
+            chatId: 'c1',
+            asrModel: 'asr-b',
+            llmModel: 'llm',
+            ttsModel: 'tts-clone',
+          });
+        });
+
+        it('overrides only the leg that was picked', async () => {
+          await renderPickers();
+
+          click('voice-asr-asr-b');
+          click('voice-start');
+
+          expect(voiceSessions[0].args).toMatchObject({ asrModel: 'asr-b', ttsModel: 'tts-a' });
+        });
+
+        it("leaves the thread's own model the one that answers, and names it for the control", async () => {
+          await renderPickers([voiceThread('c1', earlier, { model: 'llm' })]);
+
+          click('voice-tts-tts-clone');
+          expect(text('voice-llm')).toBe('llm');
+          click('voice-start');
+
+          expect(voiceSessions[0].args.llmModel).toBe('llm');
+        });
+
+        it('is cleared by choosing the automatic option, which uses the first model again', async () => {
+          await renderPickers();
+          click('voice-asr-asr-b');
+          expect(text('voice-asr-used')).toBe('asr-b');
+
+          click('voice-asr-auto');
+
+          expect(text('voice-asr-pick')).toBe('');
+          expect(text('voice-asr-used')).toBe('asr-a');
+          click('voice-start');
+          expect(voiceSessions[0].args.asrModel).toBe('asr-a');
+        });
+      });
+
+      describe('when the pick is gone', () => {
+        it('falls back to the automatic model for a pick that is no longer in the catalogue', async () => {
+          await renderPickers([
+            voiceThread('c1', earlier, { voice_chat: { asr_model: 'asr-gone' } }),
+          ]);
+
+          // The picker shows "automatic" (the pick is not on offer) and the conversation uses
+          // the first model that streams: the conversation is not stuck on a model that is gone.
+          expect(text('voice-asr-pick')).toBe('');
+          expect(text('voice-asr-used')).toBe('asr-a');
+          expect(text('voice-capable')).toBe('true');
+          click('voice-start');
+          expect(voiceSessions[0].args.asrModel).toBe('asr-a');
+        });
+
+        it('falls back for a pick that is in the catalogue but no longer streams', async () => {
+          chatApi = makeChatApi([
+            voiceThread('c1', earlier, { voice_chat: { asr_model: 'asr-b', tts_model: 'tts-a' } }),
+          ]);
+          // asr-b has stopped streaming; the speech pick still does.
+          chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+            async (name) => name !== 'asr-b',
+          );
+          chatApi.spies.modelSpeechStreaming.mockResolvedValue(streams);
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+
+          expect(text('voice-asr-used')).toBe('asr-a');
+          expect(text('voice-asr-pick')).toBe('');
+          // The other leg's pick is not touched by it.
+          expect(text('voice-tts-pick')).toBe('tts-a');
+          click('voice-start');
+          expect(voiceSessions[0].args.asrModel).toBe('asr-a');
+          expect(voiceSessions[0].args.ttsModel).toBe('tts-a');
+        });
+
+        it('keeps the pick in the thread, so it comes back with the model', async () => {
+          await renderPickers([
+            voiceThread('c1', earlier, { voice_chat: { asr_model: 'asr-gone' } }),
+          ]);
+
+          // Any later save of the thread still carries it: only the user's own choice changes it.
+          fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+          const settings = await savedSettings();
+          expect(settings.voice_chat).toEqual({ asr_model: 'asr-gone' });
+        });
+
+        it('is no longer offered once the catalogue stops listing the model', async () => {
+          const { rerenderWithModels } = await renderPickers();
+          click('voice-asr-asr-b');
+          expect(text('voice-asr-used')).toBe('asr-b');
+
+          rerenderWithModels(pickerModels.filter((option) => option.id !== 'asr-b'));
+
+          await waitFor(() => expect(idsOf('voice-asr-options')).toEqual(['asr-a']));
+          await waitFor(() => expect(text('voice-asr-used')).toBe('asr-a'));
+          expect(text('voice-asr-pick')).toBe('');
+        });
+      });
+
+      describe('persistence in the thread', () => {
+        it('writes the picks into the thread document and reads them back when it is reopened', async () => {
+          const { unmount } = await renderPickers();
+
+          click('voice-asr-asr-b');
+          click('voice-tts-tts-clone');
+          const settings = await savedSettings();
+          expect(settings.voice_chat).toEqual({ asr_model: 'asr-b', tts_model: 'tts-clone' });
+          // The rest of the text thread's settings are as they were: no new kind of thread.
+          expect(Object.keys(settings)).not.toContain('kind');
+          expect(Object.keys(settings)).not.toContain('audio');
+
+          unmount();
+          pickerGates();
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+
+          expect(text('voice-asr-pick')).toBe('asr-b');
+          expect(text('voice-tts-pick')).toBe('tts-clone');
+          click('voice-start');
+          expect(voiceSessions[0].args).toMatchObject({
+            asrModel: 'asr-b',
+            ttsModel: 'tts-clone',
+          });
+        });
+
+        it('writes no voice_chat key for a thread that has made no pick', async () => {
+          await renderPickers();
+
+          fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+
+          const settings = await savedSettings();
+          expect(Object.keys(settings)).not.toContain('voice_chat');
+        });
+
+        it('writes none again once the pick is cleared', async () => {
+          await renderPickers();
+          click('voice-asr-asr-b');
+          await savedSettings();
+          chatApi.spies.saveChat.mockClear();
+
+          click('voice-asr-auto');
+
+          const settings = await savedSettings();
+          expect(Object.keys(settings)).not.toContain('voice_chat');
+        });
+
+        it('belongs to the thread: another thread starts with none, and the first keeps its own', async () => {
+          await renderPickers([
+            voiceThread('c1', earlier, { voice_chat: { asr_model: 'asr-b' } }, T2),
+            voiceThread('c2', earlier, {}, T1),
+          ]);
+          expect(text('active')).toBe('c1');
+          expect(text('voice-asr-pick')).toBe('asr-b');
+
+          click('select-c2');
+          await waitFor(() => expect(text('active')).toBe('c2'));
+          expect(text('voice-asr-pick')).toBe('');
+          expect(text('voice-asr-used')).toBe('asr-a');
+
+          click('select-c1');
+          await waitFor(() => expect(text('active')).toBe('c1'));
+          expect(text('voice-asr-pick')).toBe('asr-b');
+        });
+
+        // A run commits the thread's settings from its own typed struct, which has no place for
+        // the picks, so the stored document loses them when the thread is sent to. The open
+        // thread still holds them, and its next save -- which the adopt of the run's transcript
+        // schedules -- writes them back; without that, the picks would be gone at the next load.
+        it('survives a text send: the run rewrites the stored settings without it, and the next save writes it back', async () => {
+          await renderPickers();
+          click('voice-asr-asr-b');
+          expect((await savedSettings()).voice_chat).toEqual({ asr_model: 'asr-b' });
+
+          chatApi.spies.startChatRun.mockImplementation(async (chatId: string) => {
+            chatApi.rows[0].content = {
+              settings: { model: 'llm' },
+              messages: [
+                ...earlier,
+                turn('m3', 'user', 'typed'),
+                turn('m4', 'assistant', 'streamed answer'),
+              ],
+            };
+            return { run_id: 'run_1', chat_id: chatId, status: 'running' as const };
+          });
+          chatApi.spies.saveChat.mockClear();
+          fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'typed' } });
+          click('send');
+          await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+          await act(async () => {
+            FakeEventSource.instances[0].emit('done', {
+              content: 'streamed answer',
+              status: 'completed',
+            });
+          });
+
+          expect((await savedSettings()).voice_chat).toEqual({ asr_model: 'asr-b' });
+        });
+
+        it("does not write the picks into a run: the run carries the thread settings, not the conversation's", async () => {
+          await renderPickers();
+          click('voice-asr-asr-b');
+
+          fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'typed' } });
+          click('send');
+
+          await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+          const body = chatApi.spies.startChatRun.mock.calls[0][1] as {
+            settings: Record<string, unknown>;
+          };
+          expect(Object.keys(body.settings)).not.toContain('voice_chat');
+        });
+      });
+    });
+
     describe('the thread after a turn', () => {
       it('shows the turns the gateway committed, through the stored thread', async () => {
         await renderVoice();
@@ -8530,7 +8942,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
         await waitFor(() => expect(text('active')).toBe('c2'));
         expect(voiceSessions[0].stop).toHaveBeenCalled();
-        expect(text('voice-state')).toBe('off');
+        // The end is the effect that follows the new chat's render: wait for it, as a loaded
+        // machine can land the assertion between the two.
+        await waitFor(() => expect(text('voice-state')).toBe('off'));
       });
 
       it("drops one chat's refusal when another chat is opened, so it does not close its switch", async () => {
@@ -8548,7 +8962,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         click('select-c2');
 
         await waitFor(() => expect(text('active')).toBe('c2'));
-        expect(text('voice-error')).toBe('');
+        await waitFor(() => expect(text('voice-error')).toBe(''));
       });
 
       it('ends when the thread model is changed under it', async () => {

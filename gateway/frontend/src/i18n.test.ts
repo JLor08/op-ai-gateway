@@ -4031,6 +4031,31 @@ describe('Voice Chat (#312) i18n keys', () => {
     expect(cluster('de').length).toBeGreaterThan(failureKeys.length);
   });
 
+  // The pickers of the conversation's transcription and speech models (#317): the labels of the
+  // two fields, the "automatic" option (the default), the line that names the model it uses, and
+  // the note that the chat model is the thread's own. Each needs its own words in both languages.
+  it('labels the two model pickers, the automatic option and the thread-model note in de and en', () => {
+    for (const key of ['chatVoiceAsrModel', 'chatVoiceTtsModel', 'chatVoiceModelAuto'] as const) {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale][key].length, `${locale} ${key}`).toBeGreaterThan(0);
+      }
+      expect(messages.de[key]).not.toBe(messages.en[key]);
+    }
+    // The two picker labels tell the two models apart.
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      expect(messages[locale].chatVoiceAsrModel).not.toBe(messages[locale].chatVoiceTtsModel);
+    }
+  });
+
+  it('names the model in the line under an automatic pick and in the thread-model note', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      expect(messages[locale].chatVoiceModelUsing('asr-a')).toContain('asr-a');
+      expect(messages[locale].chatVoiceLlmNote('llm-x')).toContain('llm-x');
+    }
+    expect(messages.de.chatVoiceModelUsing('m')).not.toBe(messages.en.chatVoiceModelUsing('m'));
+    expect(messages.de.chatVoiceLlmNote('m')).not.toBe(messages.en.chatVoiceLlmNote('m'));
+  });
+
   // A co-load refusal is the operator's to fix (the co-residency matrix and the GPU budgets), so
   // the user is sent to the administrator rather than told to retry.
   it('sends the user to the administrator when the three models cannot be loaded together', () => {

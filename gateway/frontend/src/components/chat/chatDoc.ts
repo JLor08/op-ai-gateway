@@ -16,6 +16,7 @@ import type {
   ChatSettings,
   ChatSummary,
   ChatTranscriptionSettings,
+  ChatVoiceChatSettings,
   PortalToken,
 } from '../../api';
 import {
@@ -943,6 +944,62 @@ export function transcriptionSettingsFrom(
   };
 }
 
+// The Voice Chat model picks of a thread (#317), as CONCRETE store state (every field defined,
+// unlike the all-optional wire ChatVoiceChatSettings): the live-transcription model that hears
+// the user and the streaming speech model that answers aloud. "" is "no pick" -- automatic: the
+// portal then uses the first model, in the catalogue's order, that the gateway says streams -- and
+// the default of both. A pick is a gateway model NAME; whether it is still on offer is not this
+// state's to say (the store reads it against the models the gateway says stream, and falls back
+// to the automatic one when it is gone), so a pick that is gone for a while is kept, not erased.
+export type VoiceChatSettings = {
+  asrModel: string;
+  ttsModel: string;
+};
+
+export const DEFAULT_VOICE_CHAT_SETTINGS: VoiceChatSettings = {
+  asrModel: '',
+  ttsModel: '',
+};
+
+// Whether a thread is a TEXT thread, the only one a Voice Chat runs on (the pin is "" -- the
+// settings omit it -- for text): what the picks are written for.
+function isTextKind(kind: string | undefined): boolean {
+  return kind === undefined || kind === '';
+}
+
+// The `voice_chat` entry of a settings object, as a SPREADABLE fragment in the style of audioSetting,
+// with one difference of kind: it is present ONLY on a TEXT thread (a conversation is a text
+// thread's, the speech settings `audio` are a speech thread's and the backend clears them for
+// every other kind), and ONLY when a pick is made -- so a thread that never chose stays
+// byte-identical, and the key is never an empty `voice_chat: {}`. A pick is trimmed, and a blank
+// one is no pick. Both the document writer (buildDoc) and the state seeder (normalizeDoc) go
+// through this, so neither can give the key to another kind of thread from the client side.
+export function voiceChatSetting(
+  kind: string | undefined,
+  s: VoiceChatSettings,
+): { voice_chat?: ChatVoiceChatSettings } {
+  if (!isTextKind(kind)) return {};
+  const voiceChat: ChatVoiceChatSettings = {};
+  const asr = s.asrModel.trim();
+  if (asr) voiceChat.asr_model = asr;
+  const tts = s.ttsModel.trim();
+  if (tts) voiceChat.tts_model = tts;
+  return Object.keys(voiceChat).length > 0 ? { voice_chat: voiceChat } : {};
+}
+
+// Coerce a persisted (all-optional) ChatVoiceChatSettings into the concrete store state, a
+// mistyped pick being no pick. The inverse of voiceChatSetting, used to seed the thread's picks
+// when a chat is loaded.
+export function voiceChatSettingsFrom(
+  voiceChat: ChatVoiceChatSettings | undefined,
+): VoiceChatSettings {
+  const s: ChatVoiceChatSettings = isJsonObject(voiceChat) ? voiceChat : {};
+  return {
+    asrModel: typeof s.asr_model === 'string' ? s.asr_model : DEFAULT_VOICE_CHAT_SETTINGS.asrModel,
+    ttsModel: typeof s.tts_model === 'string' ? s.tts_model : DEFAULT_VOICE_CHAT_SETTINGS.ttsModel,
+  };
+}
+
 // The picker's `accept` list: any audio, plus the extensions a file dialog matches when it has no
 // MIME type to go by (IMAGE_EDIT_SOURCE_ACCEPT's twin). A clip is converted to WAV in the browser
 // before it is attached (shared/audioToWav), so whatever the browser can decode is welcome, not a
@@ -992,6 +1049,8 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
   const doc = (content ?? {}) as { settings?: Partial<ChatSettings>; messages?: unknown };
   const s = doc.settings ?? {};
   const messages = Array.isArray(doc.messages) ? (doc.messages as ChatUiMessage[]) : [];
+  // The thread's kind, which every kind-keyed fragment below keys off.
+  const kind = typeof s.kind === 'string' ? s.kind : DEFAULTS.kind;
   return {
     settings: {
       model: typeof s.model === 'string' ? s.model : DEFAULTS.model,
@@ -1020,30 +1079,26 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
       // the server. Passed through as an opaque string (no narrowing to the
       // kinds this build knows) for exactly the same reason, and spread
       // through kindSetting so an absent/empty one stays absent.
-      ...kindSetting(typeof s.kind === 'string' ? s.kind : DEFAULTS.kind),
+      ...kindSetting(kind),
       // The image knobs, round-tripped for an image thread for the same reason
       // as kind: buildDoc rebuilds `settings` from the state this seeds, and the
       // PUT full-replaces the blob with no merge, so a knob dropped here is one
       // the next autosave erases. imageSetting keys off the kind, so a text
       // thread stays byte-identical (no image key).
-      ...imageSetting(
-        typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
-        imageSettingsFrom(s.image),
-      ),
+      ...imageSetting(kind, imageSettingsFrom(s.image)),
       // The audio knobs, round-tripped for a speech thread for the same reason as the
       // image ones above (the PUT full-replaces the blob). audioSetting keys off the
       // kind, so a text or image thread stays byte-identical (no audio key).
-      ...audioSetting(
-        typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
-        audioSettingsFrom(s.audio),
-      ),
+      ...audioSetting(kind, audioSettingsFrom(s.audio)),
       // The transcription knobs, round-tripped for a transcription thread for the same
       // reason (the PUT full-replaces the blob). transcriptionSetting keys off the kind, so
       // a text, image or speech thread stays byte-identical (no transcription key).
-      ...transcriptionSetting(
-        typeof s.kind === 'string' ? s.kind : DEFAULTS.kind,
-        transcriptionSettingsFrom(s.transcription),
-      ),
+      ...transcriptionSetting(kind, transcriptionSettingsFrom(s.transcription)),
+      // The Voice Chat model picks, round-tripped for a text thread for the same reason (the
+      // PUT full-replaces the blob). voiceChatSetting keys off the kind and writes only a pick
+      // that is made, so a text thread that never chose, and every other kind of thread,
+      // stay byte-identical (no voice_chat key).
+      ...voiceChatSetting(kind, voiceChatSettingsFrom(s.voice_chat)),
     },
     messages,
   };
