@@ -450,6 +450,23 @@ type ChatRunSettings struct {
 	// Declared last, after Audio, on purpose: a field added later must not move an
 	// existing chat's serialized bytes.
 	Transcription *ChatTranscriptionSettings `json:"transcription,omitempty"`
+	// VoiceChat is the portal's Voice Chat model picks of a text thread (issue #317):
+	// settings.voice_chat of the schema-free chat document, {asr_model, tts_model},
+	// written by the client's own save and handed to the voice-chat ticket by the
+	// client. The backend neither reads nor validates it (the ticket's co-load gate
+	// resolves the models a conversation is started with); this field exists only so
+	// that PrepareChatRun, which REPLACES the stored settings wholesale with this
+	// struct on every user-turn commit, carries the key across instead of wiping it
+	// -- the way it lifts the pinned Kind, and for the same reason: the picks would
+	// otherwise be lost whenever a thread is sent to, with no client able to write
+	// them back unless that thread is still the one it has open when the run ends.
+	// It is the STORED value that is carried, whatever the POST body (this struct)
+	// submitted, and it is held as the raw JSON so that a key this build does not
+	// know survives untouched. nil (and omitted) for a thread that has no picks, so
+	// its persisted settings stay byte-identical. Declared last, after
+	// Transcription, on purpose: a field added later must not move an existing
+	// chat's serialized bytes.
+	VoiceChat json.RawMessage `json:"voice_chat,omitempty"`
 }
 
 // ChatImageSettings are the image-generation knobs a portal "image" thread
@@ -625,6 +642,16 @@ func (d chatDoc) marshal() (json.RawMessage, error) {
 	return json.Marshal(d)
 }
 
+// liftedVoiceChat is the stored settings.voice_chat to carry across PrepareChatRun's rewrite of the
+// settings: the raw value itself, or nil when the thread has none -- the key absent, or a JSON null,
+// which would persist a `null` that nobody wrote.
+func liftedVoiceChat(stored json.RawMessage) json.RawMessage {
+	if len(stored) == 0 || string(stored) == "null" {
+		return nil
+	}
+	return stored
+}
+
 // PrepareChatRun commits the user turn (or replaces history for edit/regenerate)
 // and the settings into the chat, self-heals the settings' server_override
 // (see below), then returns the OpenAI message history the run executor will
@@ -746,8 +773,13 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	// history for a run against the images endpoint. On a genuine first send
 	// (hadPriorMessages false) nothing is forced, so the client's submitted
 	// kind -- including "image" -- establishes the pin.
+	//
+	// The Voice Chat picks are lifted out of the stored settings the same way, for the
+	// same reason, and unconditionally: they are the stored document's (see
+	// ChatRunSettings.VoiceChat), never the run body's.
 	var stored struct {
-		Kind string `json:"kind"`
+		Kind      string          `json:"kind"`
+		VoiceChat json.RawMessage `json:"voice_chat"`
 	}
 	if len(doc.Settings) > 0 {
 		_ = json.Unmarshal(doc.Settings, &stored) // best-effort: a malformed blob leaves the kind unpinned, which is the pre-feature behaviour
@@ -755,6 +787,7 @@ func (s *Service) PrepareChatRun(ctx context.Context, owner auth.Token, chatID s
 	if hadPriorMessages {
 		req.Settings.Kind = stored.Kind
 	}
+	req.Settings.VoiceChat = liftedVoiceChat(stored.VoiceChat)
 	// Image settings belong to an image thread only. Clearing them for any other
 	// kind keeps a text thread's persisted settings byte-identical even against a
 	// raw API client that submits them (ChatRunSettings is the POST body

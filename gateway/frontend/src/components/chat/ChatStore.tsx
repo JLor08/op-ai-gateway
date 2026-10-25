@@ -55,6 +55,7 @@ import {
   DEFAULT_AUDIO_SETTINGS,
   DEFAULT_IMAGE_SETTINGS,
   DEFAULT_TRANSCRIPTION_SETTINGS,
+  DEFAULT_VOICE_CHAT_SETTINGS,
   IMAGE_EDIT_SOURCE_TYPES,
   deriveTitle,
   deriveTitleFromMessages,
@@ -85,12 +86,14 @@ import {
   transcriptionSetting,
   transcriptionSettingsFrom,
   userTurnContent,
+  voiceChatSettingsFrom,
   withAudioRemoved,
   type AttachMode,
   type AudioSettings,
   type ChatUiMessage,
   type ImageSettings,
   type TranscriptionSettings,
+  type VoiceChatSettings,
 } from './chatDoc';
 import { AudioAttachError, prepareAudioClip, type AudioClip } from './audioAttach';
 import { liveSessionRunning } from './liveSession';
@@ -108,6 +111,14 @@ import {
   type VoiceChatStart,
   type VoiceChatState,
 } from './useVoiceChat';
+import {
+  thoseThatStream,
+  voiceLegsOf,
+  voiceModelChoice,
+  type VoiceChatModels,
+  type VoiceLegs,
+  type VoiceStreaming,
+} from './voiceModels';
 
 // Re-exported so existing/external imports of these types from ChatStore keep
 // working unchanged after the FA-2 extraction into chatDoc.ts.
@@ -120,6 +131,8 @@ export type { LiveTranscription, LiveTranscriptionPhase } from './useLiveTranscr
 export { liveSessionRunning } from './liveSession';
 // The Voice Chat conversation's state, for the view that shows it (VoiceChatControl).
 export type { VoiceChatApi, VoiceChatError, VoiceChatState } from './useVoiceChat';
+// ...and the pickers of its transcription and speech models (voiceModels.ts).
+export type { VoiceChatModels, VoiceModelChoice } from './voiceModels';
 
 // The speech composer's advanced-passthrough check and the settings type it edits,
 // re-exported for Chat.tsx for the same reason as the image presets below: the
@@ -183,11 +196,6 @@ function presetCloneOffered(option: ModelOption | undefined): boolean {
   );
 }
 
-// The two models of a Voice Chat that the thread does not pick: the live transcription model
-// that hears the user and the streaming speech model that answers aloud (the thread's own model
-// is the third, the one that answers). '' is none that the gateway says streams.
-type VoiceLegs = { asr: string; tts: string };
-
 // What stands between a thread and a Voice Chat: the thread's own model cannot chat (it is
 // unreachable, or no text model), no transcription model streams, no speech model streams, or the
 // gateway has not yet said which do. null when nothing does: the conversation can be offered.
@@ -199,17 +207,6 @@ function voiceGapOf(llmCapable: boolean, legs: VoiceLegs | null): VoiceChatGap |
   if (legs.asr === '') return 'asr';
   if (legs.tts === '') return 'tts';
   return null;
-}
-
-// The first of `ids`, in the catalogue's order, that `streams` says yes to ('' when none does).
-// A lookup that fails is a no -- fail closed, like every gate of the composers.
-async function firstThatStreams(
-  ids: readonly string[],
-  streams: (id: string) => Promise<boolean>,
-): Promise<string> {
-  const answers = await Promise.all(ids.map((id) => streams(id).catch(() => false)));
-  const at = answers.indexOf(true);
-  return at < 0 ? '' : ids[at];
 }
 
 // The per-message actions the transcript's rows are handed (handlersFor): the user
@@ -521,13 +518,16 @@ export type ChatStore = {
   voiceChatOffered: boolean;
   // Whether the thread can do one: its model chats and is reachable, and the gateway says that a
   // transcription model and a speech model stream. The models the conversation then uses are the
-  // thread's own, and the first transcription and speech models (in the catalogue's order) that
-  // stream; the gateway decides again when the conversation's ticket is minted (it holds all
-  // three in memory together, or refuses), which is the real admission. Equals
+  // thread's own, and the transcription and speech models the user picked (voiceChatModels) --
+  // or, for a leg with no pick or a pick that is gone, the first model (in the catalogue's order)
+  // that streams; the gateway decides again when the conversation's ticket is minted (it holds
+  // all three in memory together, or refuses), which is the real admission. Equals
   // `voiceChatGap === null`.
   voiceChatCapable: boolean;
   // What is missing when it cannot (see VoiceChatGap), null when nothing is.
   voiceChatGap: VoiceChatGap | null;
+  // The pickers of the conversation's transcription and speech models (see VoiceChatModels).
+  voiceChatModels: VoiceChatModels;
   // The mask of an image EDIT (inpainting): one PNG data url, or null. It exists
   // only beside a source image in edit mode (handleMaskFile refuses it otherwise,
   // and it is dropped with its source or when the mode changes) and is sent as a
@@ -751,10 +751,19 @@ export function ChatStoreProvider({
   // closed until the gateway says otherwise. A plain boolean: unlike the speech gate there is
   // no rate to carry, so nothing reads it between renders and it needs no ref.
   const [transcriptionStreaming, setTranscriptionStreaming] = useState(false);
-  // The ears and the voice of a Voice Chat (see VoiceLegs), as the gateway's streaming gates
-  // answered for the catalogue's transcription and speech models: null until they have (and
-  // while they are asked again), so the answer is closed until the gateway says otherwise.
-  const [voiceLegs, setVoiceLegs] = useState<VoiceLegs | null>(null);
+  // The ears and the voice of a Voice Chat: which of the catalogue's transcription and speech
+  // models stream, as the gateway's streaming gates answered, in the candidates' order. null
+  // until they have (and while they are asked again), so the answer is closed until the gateway
+  // says otherwise. Which of them a conversation uses is voiceLegs, below (see VoiceLegs): the
+  // thread's pick, or the first.
+  const [voiceStreaming, setVoiceStreaming] = useState<VoiceStreaming | null>(null);
+  // The active thread's own picks of those two models (concrete, see VoiceChatSettings): the
+  // audio settings' twin for a TEXT thread, seeded in activateChat and persisted via buildDoc --
+  // a text thread's, since a conversation is only offered on one. Not sent with a run: the
+  // ticket carries the models. '' is no pick: the automatic one.
+  const [voiceSettings, setVoiceSettings] = useState<VoiceChatSettings>(
+    DEFAULT_VOICE_CHAT_SETTINGS,
+  );
 
   // The caller's manageable servers (undefined prop -> []): drives whether the
   // server-override picker renders at all and its option list.
@@ -975,6 +984,10 @@ export function ChatStoreProvider({
       ...offered.filter(presetCloneOffered),
     ].map((option) => option.id);
   }, [chatModels]);
+  // The conversation's two legs: the thread's pick of each, or -- for a leg with no pick, or a
+  // pick that is no longer one of the models that stream -- the first model that does (the
+  // automatic pick), null until the gateway has said which stream (voiceModels.ts).
+  const voiceLegs = voiceLegsOf(voiceStreaming, voiceSettings);
   const voiceChatGap = voiceGapOf(voiceLlmCapable, voiceLegs);
   const voiceChatCapable = voiceChatGap === null;
   const voiceChatOffered =
@@ -991,6 +1004,7 @@ export function ChatStoreProvider({
   const imageSettingsRef = useRef(imageSettings);
   const audioSettingsRef = useRef(audioSettingsState);
   const transcriptionSettingsRef = useRef(transcriptionSettings);
+  const voiceSettingsRef = useRef(voiceSettings);
   const selectedTokenIdRef = useRef(selectedTokenId);
   const serverOverrideRef = useRef(serverOverride);
   const serverOverrideForceUnreachableRef = useRef(serverOverrideForceUnreachable);
@@ -1221,6 +1235,7 @@ export function ChatStoreProvider({
       imageSettingsRef,
       audioSettingsRef,
       transcriptionSettingsRef,
+      voiceSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -1240,6 +1255,7 @@ export function ChatStoreProvider({
       imageSettings,
       audioSettings: audioSettingsState,
       transcriptionSettings,
+      voiceSettings,
       selectedTokenId,
       serverOverride,
       serverOverrideForceUnreachable,
@@ -1284,6 +1300,7 @@ export function ChatStoreProvider({
     audioSettingsRef.current = audioSettingsState;
     speechStreamingRef.current = speechStreamingGate.streaming;
     transcriptionSettingsRef.current = transcriptionSettings;
+    voiceSettingsRef.current = voiceSettings;
     selectedTokenIdRef.current = selectedTokenId;
     serverOverrideRef.current = serverOverride;
     serverOverrideForceUnreachableRef.current = serverOverrideForceUnreachable;
@@ -1341,6 +1358,11 @@ export function ChatStoreProvider({
       // `transcription` only for a transcription thread, so any other thread seeds defaults
       // harmlessly, and one activateChat did not seed would be written over by the next save.
       setTranscriptionSettings(transcriptionSettingsFrom(doc.settings.transcription));
+      // The Voice Chat model picks, seeded likewise: normalizeDoc kept the persisted `voice_chat`
+      // only for a text thread, and a thread that has made no pick seeds "automatic" -- which
+      // is also what stops the previous thread's picks being carried into this one, and written
+      // over this one's by the next save.
+      setVoiceSettings(voiceChatSettingsFrom(doc.settings.voice_chat));
       // Seed the transcript from the per-chat buffer when this chat has an active
       // or recently-finished run (the server owns/owned its tail); otherwise use
       // the freshly-loaded server content. Prefer the buffer ONLY when it actually
@@ -1832,30 +1854,28 @@ export function ChatStoreProvider({
 
   // Ask the gateway which of the catalogue's transcription and speech models STREAM, for Voice
   // Chat (#312): the two gates above, asked of every candidate instead of the picked model, as the
-  // conversation's ears and voice are not the thread's to pick (see voiceChatCapable). The first
-  // of each, in the catalogue's order (the speech models plain-first, see voiceTtsCandidates),
-  // that the gateway says streams is used. Closed up front and asked again when the candidates
-  // change, or when the thread becomes (or stops being) one a conversation could run on; a
-  // latest-wins guard against a slow stale answer; no lookup at all for a thread that cannot
-  // chat. FAIL CLOSED: a lookup that fails is a no. The candidates are read through a ref and the
-  // effect keyed on their identity, so that a refreshed models list with the same candidates does
-  // not ask again.
+  // conversation's ears and voice are not the thread's model to pick (see voiceChatCapable). The
+  // models that stream, in the catalogue's order (the speech models plain-first, see
+  // voiceTtsCandidates), are the ones the user may pick from (voiceChatModels), and the first of
+  // each is the automatic pick that a conversation uses when the user has picked none (voiceLegs).
+  // Closed up front and asked again when the candidates change, or when the thread becomes (or
+  // stops being) one a conversation could run on; a latest-wins guard against a slow stale
+  // answer; no lookup at all for a thread that cannot chat. FAIL CLOSED: a lookup that fails is a
+  // no. The candidates are read through a ref and the effect keyed on their identity, so that a
+  // refreshed models list with the same candidates does not ask again.
   const voiceCandidatesRef = useRef({ asr: voiceAsrCandidates, tts: voiceTtsCandidates });
   voiceCandidatesRef.current = { asr: voiceAsrCandidates, tts: voiceTtsCandidates };
   const voiceCandidatesKey = `${voiceAsrCandidates.join('\n')}\u0000${voiceTtsCandidates.join('\n')}`;
   useEffect(() => {
-    setVoiceLegs(null);
+    setVoiceStreaming(null);
     if (!voiceLlmCapable) return;
     const { asr, tts } = voiceCandidatesRef.current;
     let cancelled = false;
     void Promise.all([
-      firstThatStreams(asr, (id) => apiRef.current.modelTranscriptionStreaming(id)),
-      firstThatStreams(
-        tts,
-        async (id) => (await apiRef.current.modelSpeechStreaming(id)).streaming,
-      ),
-    ]).then(([asrModel, ttsModel]) => {
-      if (!cancelled) setVoiceLegs({ asr: asrModel, tts: ttsModel });
+      thoseThatStream(asr, (id) => apiRef.current.modelTranscriptionStreaming(id)),
+      thoseThatStream(tts, async (id) => (await apiRef.current.modelSpeechStreaming(id)).streaming),
+    ]).then(([asrModels, ttsModels]) => {
+      if (!cancelled) setVoiceStreaming({ asr: asrModels, tts: ttsModels });
     });
     return () => {
       cancelled = true;
@@ -2343,6 +2363,48 @@ export function ChatStoreProvider({
   const { state: voiceState, stop: stopVoiceChat } = voiceChat;
   audioSessionRunningRef.current = liveSessionRunning(liveSession.state) || voiceState !== 'off';
   voiceHeldChatRef.current = voiceState === 'off' ? null : voiceChatIdRef.current;
+
+  // The pickers of the conversation's two models, over the models that stream and the thread's
+  // saved picks (see VoiceModelChoice). A pick is the thread's: saved with it, never sent with a
+  // run. Choosing a model also ENDS the conversation (stop), which is what dismisses a refused
+  // ticket: a refusal is the gateway's answer to the three models the user started with, the
+  // pickers are how they try others, and the switch stays closed on a refusal until it is
+  // dismissed. (The pickers are closed while a conversation is on, so a pick ends none in
+  // practice; one made anyway would end a conversation that is no longer the one it started as.)
+  const setVoiceAsrModel = useCallback(
+    (asrModel: string) => {
+      stopVoiceChat();
+      setVoiceSettings((current) => ({ ...current, asrModel }));
+    },
+    [stopVoiceChat],
+  );
+  const setVoiceTtsModel = useCallback(
+    (ttsModel: string) => {
+      stopVoiceChat();
+      setVoiceSettings((current) => ({ ...current, ttsModel }));
+    },
+    [stopVoiceChat],
+  );
+  const voiceChatModels: VoiceChatModels = {
+    ready: voiceStreaming !== null,
+    llm: effectiveOption?.display_name ?? effectiveModel,
+    asr: voiceModelChoice({
+      models: chatModels,
+      candidates: voiceAsrCandidates,
+      streaming: voiceStreaming?.asr ?? null,
+      saved: voiceSettings.asrModel,
+      used: voiceLegs?.asr ?? '',
+      set: setVoiceAsrModel,
+    }),
+    tts: voiceModelChoice({
+      models: chatModels,
+      candidates: voiceTtsCandidates,
+      streaming: voiceStreaming?.tts ?? null,
+      saved: voiceSettings.ttsModel,
+      used: voiceLegs?.tts ?? '',
+      set: setVoiceTtsModel,
+    }),
+  };
 
   // A conversation belongs to the chat and the model it started with (its ticket holds the three
   // models in memory together): when either changes it is no longer the conversation it was
@@ -2903,6 +2965,7 @@ export function ChatStoreProvider({
     voiceChatOffered,
     voiceChatCapable,
     voiceChatGap,
+    voiceChatModels,
     mask,
     handleMaskFile,
     removeMask,

@@ -5818,6 +5818,134 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(indicator()).getByTestId('MicOffIcon')).toBeInTheDocument();
     });
 
+    // The pickers of the conversation's models (#317), as the page offers them: each leg's models
+    // that stream, "automatic" as the default, and the choice reaching the conversation -- the
+    // store's own rules for it (persistence, the fallback for a pick that is gone) are
+    // ChatStore.test.tsx's.
+    describe('the model pickers', () => {
+      const asr2: ModelOption = { ...asr, id: 'asr-2', display_name: 'asr-2' };
+      const tts2: ModelOption = { ...tts, id: 'tts-2', display_name: 'tts-2' };
+      const tts3: ModelOption = { ...tts, id: 'tts-3', display_name: 'tts-3' };
+      const pickable = [llm, asr, asr2, tts, tts2, tts3];
+
+      const asrPicker = () => screen.getByRole('combobox', { name: t.chatVoiceAsrModel });
+      const ttsPicker = () => screen.getByRole('combobox', { name: t.chatVoiceTtsModel });
+      const listed = () => screen.getAllByRole('option').map((option) => option.textContent);
+
+      async function renderPickable() {
+        await renderVoiceChat(pickable);
+        await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      }
+
+      it('offers one picker per model of the conversation, on automatic by default', async () => {
+        await renderPickable();
+
+        expect(asrPicker()).toHaveValue(t.chatVoiceModelAuto);
+        expect(ttsPicker()).toHaveValue(t.chatVoiceModelAuto);
+        // The first model of each leg is the one automatic uses, and the page says so.
+        expect(screen.getByText(t.chatVoiceModelUsing('asr'))).toBeInTheDocument();
+        expect(screen.getByText(t.chatVoiceModelUsing('tts'))).toBeInTheDocument();
+        // The chat model is the thread's own: named, with no field of its own here.
+        expect(screen.getByText(t.chatVoiceLlmNote('llm'))).toBeInTheDocument();
+      });
+
+      it('lists, per picker, only the models of its leg that the gateway says stream', async () => {
+        // asr-2 and tts-3 are in the catalogue, but do not stream.
+        chatApi.spies.modelTranscriptionStreaming.mockImplementation(
+          async (name: string) => name !== 'asr-2',
+        );
+        chatApi.spies.modelSpeechStreaming.mockImplementation(async (name: string) => ({
+          streaming: name !== 'tts-3',
+          sampleRate: 24000,
+        }));
+        await renderPickable();
+
+        fireEvent.mouseDown(asrPicker());
+        expect(listed()).toEqual([t.chatVoiceModelAuto, 'asr']);
+        fireEvent.keyDown(asrPicker(), { key: 'Escape' });
+
+        fireEvent.mouseDown(ttsPicker());
+        expect(listed()).toEqual([t.chatVoiceModelAuto, 'tts', 'tts-2']);
+      });
+
+      it('starts the conversation with the models that were picked', async () => {
+        await renderPickable();
+
+        await pickOption(t.chatVoiceAsrModel, 'asr-2');
+        await pickOption(t.chatVoiceTtsModel, 'tts-2');
+        expect(asrPicker()).toHaveValue('asr-2');
+        expect(ttsPicker()).toHaveValue('tts-2');
+        fireEvent.click(voiceSwitch());
+
+        expect(voiceSessions).toHaveLength(1);
+        expect(voiceSessions[0].args).toMatchObject({
+          asrModel: 'asr-2',
+          llmModel: 'llm',
+          ttsModel: 'tts-2',
+        });
+      });
+
+      it('starts the conversation with the automatic models when nothing was picked', async () => {
+        await renderPickable();
+
+        fireEvent.click(voiceSwitch());
+
+        expect(voiceSessions[0].args).toMatchObject({
+          asrModel: 'asr',
+          llmModel: 'llm',
+          ttsModel: 'tts',
+        });
+      });
+
+      it('returns to automatic when the automatic option is chosen again', async () => {
+        await renderPickable();
+        await pickOption(t.chatVoiceAsrModel, 'asr-2');
+
+        await pickOption(t.chatVoiceAsrModel, t.chatVoiceModelAuto);
+        fireEvent.click(voiceSwitch());
+
+        expect(asrPicker()).toHaveValue(t.chatVoiceModelAuto);
+        expect(voiceSessions[0].args.asrModel).toBe('asr');
+      });
+
+      it('lets a new pick dismiss a refused ticket, which opens the switch for the retry', async () => {
+        await renderPickable();
+        fireEvent.click(voiceSwitch());
+        await act(async () => {
+          voiceSessions[0].args.onError('refused', {
+            kind: 'refused',
+            code: 'portal.voice_chat_coload_failed',
+          });
+          voiceSessions[0].args.onState('error');
+        });
+        expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorCoLoad);
+        expect(voiceSwitch()).toBeDisabled();
+        // The pickers are open on a refusal: they are how the user tries other models.
+        expect(asrPicker()).toBeEnabled();
+
+        await pickOption(t.chatVoiceAsrModel, 'asr-2');
+
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(voiceSwitch()).toBeEnabled();
+        fireEvent.click(voiceSwitch());
+        expect(voiceSessions).toHaveLength(2);
+        expect(voiceSessions[1].args.asrModel).toBe('asr-2');
+      });
+
+      it('closes the pickers while the conversation is on, and opens them again after', async () => {
+        await renderPickable();
+        expect(asrPicker()).toBeEnabled();
+
+        fireEvent.click(voiceSwitch());
+        expect(asrPicker()).toBeDisabled();
+        expect(ttsPicker()).toBeDisabled();
+
+        fireEvent.click(voiceSwitch());
+        expect(asrPicker()).toBeEnabled();
+        expect(ttsPicker()).toBeEnabled();
+      });
+    });
+
     it('shows nothing on a gateway with no audio model at all', async () => {
       await renderVoiceChat([llm]);
 

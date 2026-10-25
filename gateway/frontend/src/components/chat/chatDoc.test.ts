@@ -6,6 +6,7 @@ import {
   DEFAULT_AUDIO_SETTINGS,
   DEFAULT_IMAGE_SETTINGS,
   DEFAULT_TRANSCRIPTION_SETTINGS,
+  DEFAULT_VOICE_CHAT_SETTINGS,
   DEFAULTS,
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
@@ -46,6 +47,8 @@ import {
   transcriptionSetting,
   transcriptionSettingsFrom,
   userTurnContent,
+  voiceChatSetting,
+  voiceChatSettingsFrom,
   withAudioRemoved,
   type ChatUiMessage,
 } from './chatDoc';
@@ -1747,5 +1750,103 @@ describe('a transcription passthrough key that cannot be a form field name', () 
     expect(transcriptionPassthroughMessage(parseTranscriptionPassthrough('{"a\\nb": 1}'), t)).toBe(
       'bad key "a\\nb"',
     );
+  });
+});
+
+// The Voice Chat model picks (#317) are the thread's own: a conversation runs on a TEXT thread,
+// whose speech settings (`audio`) the backend clears for any other kind, so the picks have a key
+// of their own, `voice_chat`. It follows the same omitempty discipline as the other kinds' keys:
+// written only for a text thread, only for a pick that is made, so a thread that never chose
+// stays byte-identical -- and it must survive the full-replace PUT (buildDoc, normalizeDoc).
+describe('the persisted Voice Chat model picks mirror the backend omitempty', () => {
+  const picked = { asrModel: 'asr-b', ttsModel: 'tts-a' };
+
+  it('defaults to no pick for either model (the auto-pick)', () => {
+    expect(DEFAULT_VOICE_CHAT_SETTINGS).toEqual({ asrModel: '', ttsModel: '' });
+    expect(voiceChatSettingsFrom(undefined)).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
+  });
+
+  it('writes nothing for a text thread that has made no pick', () => {
+    expect(voiceChatSetting('', DEFAULT_VOICE_CHAT_SETTINGS)).toEqual({});
+    expect(voiceChatSetting(undefined, DEFAULT_VOICE_CHAT_SETTINGS)).toEqual({});
+    expect(Object.keys(voiceChatSetting('', DEFAULT_VOICE_CHAT_SETTINGS))).toHaveLength(0);
+  });
+
+  it('writes only the pick that is made', () => {
+    expect(voiceChatSetting('', { asrModel: 'asr-b', ttsModel: '' })).toEqual({
+      voice_chat: { asr_model: 'asr-b' },
+    });
+    expect(voiceChatSetting('', { asrModel: '', ttsModel: 'tts-a' })).toEqual({
+      voice_chat: { tts_model: 'tts-a' },
+    });
+    expect(voiceChatSetting(undefined, picked)).toEqual({
+      voice_chat: { asr_model: 'asr-b', tts_model: 'tts-a' },
+    });
+  });
+
+  it('trims a pick, and a blank one is no pick', () => {
+    expect(voiceChatSetting('', { asrModel: '  asr-b ', ttsModel: '   ' })).toEqual({
+      voice_chat: { asr_model: 'asr-b' },
+    });
+    expect(voiceChatSetting('', { asrModel: ' ', ttsModel: '' })).toEqual({});
+  });
+
+  it.each(['image', 'speech', 'transcription', 'video'])(
+    'writes nothing for a %s thread, which has no conversation',
+    (kind) => {
+      expect(voiceChatSetting(kind, picked)).toEqual({});
+    },
+  );
+
+  it('round-trips through voiceChatSettingsFrom', () => {
+    const wire = { asr_model: 'asr-b', tts_model: 'tts-a' };
+    expect(voiceChatSettingsFrom(wire)).toEqual(picked);
+    expect(voiceChatSetting('', voiceChatSettingsFrom(wire))).toEqual({ voice_chat: wire });
+    expect(voiceChatSettingsFrom({ tts_model: 'tts-a' })).toEqual({
+      asrModel: '',
+      ttsModel: 'tts-a',
+    });
+  });
+
+  it('reads a mistyped pick as no pick', () => {
+    expect(
+      voiceChatSettingsFrom({
+        asr_model: 7 as unknown as string,
+        tts_model: null as unknown as string,
+      }),
+    ).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
+    expect(voiceChatSettingsFrom('x' as unknown as undefined)).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
+  });
+
+  it('round-trips through the document for a text thread (normalizeDoc)', () => {
+    const settings = normalizeDoc({
+      settings: { model: 'llm', voice_chat: { asr_model: 'asr-b', tts_model: 'tts-a' } },
+      messages: [],
+    }).settings;
+    expect(settings.voice_chat).toEqual({ asr_model: 'asr-b', tts_model: 'tts-a' });
+  });
+
+  it('puts no voice_chat key on a text document that has no pick', () => {
+    expect('voice_chat' in normalizeDoc({ settings: { model: 'm' }, messages: [] }).settings).toBe(
+      false,
+    );
+    expect(
+      'voice_chat' in
+        normalizeDoc({ settings: { model: 'm', voice_chat: {} }, messages: [] }).settings,
+    ).toBe(false);
+  });
+
+  it('never puts a voice_chat key on a thread that is not a text thread', () => {
+    for (const kind of ['image', 'speech', 'transcription']) {
+      const settings = normalizeDoc({
+        settings: { model: 'm', kind, voice_chat: { asr_model: 'x' } },
+        messages: [],
+      }).settings;
+      expect('voice_chat' in settings, kind).toBe(false);
+    }
+  });
+
+  it('carries no voice_chat key on the defaults a fresh chat is created with', () => {
+    expect('voice_chat' in DEFAULTS).toBe(false);
   });
 });

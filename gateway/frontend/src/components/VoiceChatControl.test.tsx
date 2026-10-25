@@ -6,7 +6,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { VoiceChatControl, type VoiceChatControlProps } from './VoiceChatControl';
 import { messages } from '../i18n';
-import type { VoiceChatApi, VoiceChatState } from './chat/ChatStore';
+import type { ModelOption } from '../api';
+import type {
+  VoiceChatApi,
+  VoiceChatModels,
+  VoiceChatState,
+  VoiceModelChoice,
+} from './chat/ChatStore';
 
 afterEach(cleanup);
 
@@ -29,9 +35,33 @@ function makeVoice(over: Partial<VoiceChatApi> = {}): VoiceChatApi {
   };
 }
 
+// A catalogue entry of an audio model, named for display (the picker shows the display name).
+const entry = (id: string): ModelOption => ({
+  id,
+  display_name: `${id} (display)`,
+  flavors: ['openai_audio'],
+  loading_on_count: 0,
+});
+
+function makeChoice(ids: string[], over: Partial<VoiceModelChoice> = {}): VoiceModelChoice {
+  return { options: ids.map(entry), pick: '', used: ids[0] ?? '', set: vi.fn(), ...over };
+}
+
+// The store's pickers of the conversation's models, with every setter a spy: this component only
+// draws them and forwards the user's choice (the store's picks are ChatStore.test.tsx's).
+function makeModels(over: Partial<VoiceChatModels> = {}): VoiceChatModels {
+  return {
+    ready: true,
+    llm: 'llm (display)',
+    asr: makeChoice(['asr-a', 'asr-b']),
+    tts: makeChoice(['tts-a', 'tts-clone']),
+    ...over,
+  };
+}
+
 function renderControl(voice: VoiceChatApi, props: Partial<VoiceChatControlProps> = {}) {
   const ui = (next: VoiceChatApi) => (
-    <VoiceChatControl t={t} voice={next} capable gap={null} {...props} />
+    <VoiceChatControl t={t} voice={next} capable gap={null} models={makeModels()} {...props} />
   );
   const view = render(ui(voice));
   return { ...view, update: (next: VoiceChatApi) => view.rerender(ui(next)) };
@@ -358,5 +388,116 @@ describe('VoiceChatControl errors', () => {
   it('shows no alert without an error', () => {
     renderControl(makeVoice({ state: 'listening' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});
+
+// The pickers of the conversation's models (#317): the transcription model and the speech model
+// are the user's to pick (the chat model is the thread's own, only named). Each lists the models
+// that are on offer plus "automatic", which is what a thread that has picked nothing is on.
+describe('VoiceChatControl model pickers', () => {
+  const asrPicker = () => screen.getByRole('combobox', { name: t.chatVoiceAsrModel });
+  const ttsPicker = () => screen.getByRole('combobox', { name: t.chatVoiceTtsModel });
+  const open = (picker: HTMLElement) => fireEvent.mouseDown(picker);
+  const offered = () => screen.getAllByRole('option').map((option) => option.textContent);
+
+  it('has one picker for the transcription model and one for the speech model', () => {
+    renderControl(makeVoice());
+
+    expect(asrPicker()).toBeInTheDocument();
+    expect(ttsPicker()).toBeInTheDocument();
+  });
+
+  it('lists the automatic option and only the models of its own leg that are on offer', () => {
+    renderControl(makeVoice());
+
+    open(asrPicker());
+    expect(offered()).toEqual([t.chatVoiceModelAuto, 'asr-a (display)', 'asr-b (display)']);
+    fireEvent.keyDown(asrPicker(), { key: 'Escape' });
+
+    open(ttsPicker());
+    expect(offered()).toEqual([t.chatVoiceModelAuto, 'tts-a (display)', 'tts-clone (display)']);
+  });
+
+  it('shows automatic, and the model it would use, while nothing is picked', () => {
+    renderControl(makeVoice(), {
+      models: makeModels({ asr: makeChoice(['asr-a', 'asr-b'], { used: 'asr-b' }) }),
+    });
+
+    expect(asrPicker()).toHaveValue(t.chatVoiceModelAuto);
+    // The line under it names the model that is actually used (by its display name).
+    expect(screen.getByText(t.chatVoiceModelUsing('asr-b (display)'))).toBeInTheDocument();
+  });
+
+  it('shows the pick, and no "uses" line for a model the user chose', () => {
+    renderControl(makeVoice(), {
+      models: makeModels({ tts: makeChoice(['tts-a', 'tts-clone'], { pick: 'tts-clone' }) }),
+    });
+
+    expect(ttsPicker()).toHaveValue('tts-clone (display)');
+    expect(
+      screen.queryByText(t.chatVoiceModelUsing('tts-clone (display)')),
+    ).not.toBeInTheDocument();
+  });
+
+  it('hands the model id of a chosen option to the store, for the leg it belongs to', () => {
+    const models = makeModels();
+    renderControl(makeVoice(), { models });
+
+    open(asrPicker());
+    fireEvent.click(screen.getByRole('option', { name: 'asr-b (display)' }));
+    expect(models.asr.set).toHaveBeenCalledWith('asr-b');
+    expect(models.tts.set).not.toHaveBeenCalled();
+
+    open(ttsPicker());
+    fireEvent.click(screen.getByRole('option', { name: 'tts-clone (display)' }));
+    expect(models.tts.set).toHaveBeenCalledWith('tts-clone');
+  });
+
+  it('hands over an empty pick when automatic is chosen again', () => {
+    const models = makeModels({ asr: makeChoice(['asr-a', 'asr-b'], { pick: 'asr-b' }) });
+    renderControl(makeVoice(), { models });
+
+    open(asrPicker());
+    fireEvent.click(screen.getByRole('option', { name: t.chatVoiceModelAuto }));
+
+    expect(models.asr.set).toHaveBeenCalledWith('');
+  });
+
+  it('is closed until the gateway has said which models stream', () => {
+    renderControl(makeVoice(), { models: makeModels({ ready: false }) });
+
+    expect(asrPicker()).toBeDisabled();
+    expect(ttsPicker()).toBeDisabled();
+  });
+
+  it('is closed while a conversation is on: its ticket holds the models it started with', () => {
+    const { update } = renderControl(makeVoice({ state: 'listening' }));
+    expect(asrPicker()).toBeDisabled();
+    expect(ttsPicker()).toBeDisabled();
+
+    update(makeVoice({ state: 'off' }));
+    expect(asrPicker()).toBeEnabled();
+    expect(ttsPicker()).toBeEnabled();
+  });
+
+  it('is open on a switch that is closed for another reason, so the user can pick ahead', () => {
+    renderControl(makeVoice(), { capable: false, gap: 'asr', busy: true });
+
+    expect(asrPicker()).toBeEnabled();
+    expect(ttsPicker()).toBeEnabled();
+  });
+
+  it("names the thread's own model as the chat model, without a picker for it", () => {
+    renderControl(makeVoice());
+
+    expect(screen.getByText(t.chatVoiceLlmNote('llm (display)'))).toBeInTheDocument();
+    expect(screen.getAllByRole('combobox')).toHaveLength(2);
+  });
+
+  it('says nothing about a chat model when the thread has none', () => {
+    renderControl(makeVoice(), { models: makeModels({ llm: '' }) });
+
+    expect(screen.queryByText(/llm/)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.chatVoiceLlmNote(''))).not.toBeInTheDocument();
   });
 });

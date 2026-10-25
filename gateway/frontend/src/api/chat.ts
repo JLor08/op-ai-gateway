@@ -117,6 +117,24 @@ export type ChatTranscriptionSettings = {
   passthrough?: Record<string, unknown>;
 };
 
+// The Voice Chat model picks of a TEXT thread (#317), as persisted inside
+// `content.settings.voice_chat`: the live-transcription model that hears the user and the
+// streaming speech model that answers aloud (the thread's own model is the third, the LLM). Both
+// OPTIONAL: an unset pick is omitted and means "automatic" -- the portal then uses the first
+// model, in the catalogue's order, that the gateway says streams -- and the whole object is
+// omitted for a thread that has made no pick and for any thread that is not a text thread, so
+// their persisted settings stay byte-identical. It is the portal's own key, a picked name is
+// read back when the thread is opened and handed to the ticket (api/voiceChat.ts) when a
+// conversation starts; the backend neither reads nor validates it (the ticket's co-load gate
+// resolves and validates the models a conversation is started with). The settings of a run do not
+// carry it, but a run rewrites the stored settings from its own typed struct, so the backend
+// lifts the stored value forward across that rewrite (PrepareChatRun, like the pinned kind), and
+// the open thread's next save writes it again as well.
+export type ChatVoiceChatSettings = {
+  asr_model?: string;
+  tts_model?: string;
+};
+
 // The per-chat settings the frontend persists inside `content`.
 export type ChatSettings = {
   model: string;
@@ -163,6 +181,11 @@ export type ChatSettings = {
   // (chatDoc.ts) and both writers go through transcriptionSetting() so neither can
   // reintroduce the key for another kind.
   transcription?: ChatTranscriptionSettings;
+  // The Voice Chat model picks, present only on a text thread that has made one (omitted
+  // otherwise, so a text thread that never chose stays byte-identical). The store holds a
+  // concrete VoiceChatSettings (chatDoc.ts) and both writers go through voiceChatSetting() so
+  // neither can reintroduce the key for another kind.
+  voice_chat?: ChatVoiceChatSettings;
 };
 
 // The full opaque content document the frontend stores per chat. Messages are

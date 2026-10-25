@@ -28,11 +28,13 @@ import {
   pruneEmptyAssistantTail,
   SAVE_DEBOUNCE_MS,
   transcriptionSetting,
+  voiceChatSetting,
   type ActiveChatDoc,
   type AudioSettings,
   type ChatUiMessage,
   type ImageSettings,
   type TranscriptionSettings,
+  type VoiceChatSettings,
 } from './chatDoc';
 
 export type ChatPersistenceApi = {
@@ -84,6 +86,7 @@ export function useChatPersistence(
     imageSettingsRef: RefObject<ImageSettings>;
     audioSettingsRef: RefObject<AudioSettings>;
     transcriptionSettingsRef: RefObject<TranscriptionSettings>;
+    voiceSettingsRef: RefObject<VoiceChatSettings>;
     selectedTokenIdRef: RefObject<string>;
     serverOverrideRef: RefObject<string>;
     serverOverrideForceUnreachableRef: RefObject<boolean>;
@@ -114,6 +117,8 @@ export function useChatPersistence(
     audioSettings: AudioSettings;
     // And the transcription thread's speech-to-text knobs.
     transcriptionSettings: TranscriptionSettings;
+    // And the text thread's Voice Chat model picks.
+    voiceSettings: VoiceChatSettings;
     selectedTokenId: string;
     serverOverride: string;
     serverOverrideForceUnreachable: boolean;
@@ -139,6 +144,7 @@ export function useChatPersistence(
     imageSettingsRef,
     audioSettingsRef,
     transcriptionSettingsRef,
+    voiceSettingsRef,
     selectedTokenIdRef,
     serverOverrideRef,
     serverOverrideForceUnreachableRef,
@@ -158,6 +164,7 @@ export function useChatPersistence(
     imageSettings,
     audioSettings,
     transcriptionSettings,
+    voiceSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,
@@ -201,6 +208,9 @@ export function useChatPersistence(
         // The transcription knobs, likewise present only for a transcription thread (keyed
         // off the kind by transcriptionSetting): a knob this omits is erased by the next PUT.
         ...transcriptionSetting(chatKindRef.current, transcriptionSettingsRef.current),
+        // The Voice Chat model picks, likewise present only for a text thread that has made one
+        // (keyed off the kind by voiceChatSetting): a pick this omits is erased by the next PUT.
+        ...voiceChatSetting(chatKindRef.current, voiceSettingsRef.current),
       },
       messages: pruneEmptyAssistantTail(messagesRef.current),
     }),
@@ -212,6 +222,7 @@ export function useChatPersistence(
       imageSettingsRef,
       audioSettingsRef,
       transcriptionSettingsRef,
+      voiceSettingsRef,
       selectedTokenIdRef,
       serverOverrideRef,
       serverOverrideForceUnreachableRef,
@@ -285,6 +296,7 @@ export function useChatPersistence(
     imageSettings,
     audioSettings,
     transcriptionSettings,
+    voiceSettings,
     selectedTokenId,
     serverOverride,
     serverOverrideForceUnreachable,
