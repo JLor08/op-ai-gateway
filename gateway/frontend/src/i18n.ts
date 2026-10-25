@@ -432,7 +432,7 @@ const de = {
   chatVoiceErrorTtsUnavailable:
     'Das Sprachmodell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Streaming oder nicht startbar).',
   chatVoiceErrorCoLoad:
-    'Die drei Modelle (Transkription, Chat, Sprache) lassen sich nicht gleichzeitig laden. Das hängt an der Server-Konfiguration (Koresidenz-Matrix und GPU-VRAM-Budgets): Wenden Sie sich an Ihren Administrator.',
+    'Die drei Modelle (Transkription, Chat, Sprache) lassen sich nicht gleichzeitig laden. Das hängt an der Server-Konfiguration (Koresidenz-Matrix und GPU-VRAM-Budgets): Wählen Sie andere Transkriptions- oder Sprachmodelle oder wenden Sie sich an Ihren Administrator.',
   chatVoiceErrorAudioSettings:
     'Die zu diesem Chat gespeicherten Spracheinstellungen sind ungültig oder zu umfangreich. Nutzen Sie den Sprachchat in einem neuen Chat.',
   chatVoiceErrorTicket:
@@ -3852,7 +3852,7 @@ const en: PortalMessages = {
   chatVoiceErrorTtsUnavailable:
     'The speech model cannot be used for Voice Chat (unreachable, no streaming, or it could not be started).',
   chatVoiceErrorCoLoad:
-    'The three models (transcription, chat, speech) cannot be loaded at the same time. That is down to the server configuration (co-residency matrix and GPU VRAM budgets): contact your administrator.',
+    'The three models (transcription, chat, speech) cannot be loaded at the same time. That is down to the server configuration (co-residency matrix and GPU VRAM budgets): pick other transcription or speech models, or contact your administrator.',
   chatVoiceErrorAudioSettings:
     'The speech settings stored with this chat are invalid or too large. Use Voice Chat in a new chat.',
   chatVoiceErrorTicket: 'Voice Chat could not be started. Try again in a moment.',

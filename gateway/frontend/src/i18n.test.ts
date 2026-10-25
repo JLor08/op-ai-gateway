@@ -4062,4 +4062,11 @@ describe('Voice Chat (#312) i18n keys', () => {
     expect(messages.de.chatVoiceErrorCoLoad).toMatch(/Administrator/);
     expect(messages.en.chatVoiceErrorCoLoad).toMatch(/administrator/);
   });
+
+  // ...and, since the transcription and speech models are the user's pick (#317), to the pickers:
+  // a different combination is the user's own way to get past the refusal.
+  it('also suggests trying other transcription or speech models', () => {
+    expect(messages.de.chatVoiceErrorCoLoad).toMatch(/andere/);
+    expect(messages.en.chatVoiceErrorCoLoad).toMatch(/other/);
+  });
 });

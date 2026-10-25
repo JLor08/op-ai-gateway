@@ -8536,6 +8536,56 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         });
       });
 
+      // A refused ticket (the co-load gate, say) is the gateway's answer to those three models,
+      // and the pickers are how the user tries other ones: a new pick dismisses the refusal, so
+      // the switch is open again for the retry (it stays closed on a refusal until dismissed).
+      describe('after a refused ticket', () => {
+        async function refuse() {
+          click('voice-start');
+          await act(async () => {
+            voiceSessions[0].args.onError('refused', {
+              kind: 'refused',
+              code: 'portal.voice_chat_coload_failed',
+            });
+            voiceSessions[0].args.onState('error');
+          });
+          expect(text('voice-error')).toBe('refused:portal.voice_chat_coload_failed');
+        }
+
+        it.each([
+          ['transcription', 'voice-asr-asr-b'],
+          ['speech', 'voice-tts-tts-clone'],
+        ])('a new %s pick dismisses the refusal', async (_leg, pick) => {
+          await renderPickers();
+          await refuse();
+
+          click(pick);
+
+          expect(text('voice-error')).toBe('');
+          expect(text('voice-state')).toBe('off');
+        });
+
+        it('choosing automatic again dismisses it too', async () => {
+          await renderPickers([voiceThread('c1', earlier, { voice_chat: { asr_model: 'asr-b' } })]);
+          await refuse();
+
+          click('voice-asr-auto');
+
+          expect(text('voice-error')).toBe('');
+        });
+
+        it('retries with the models that were picked after it', async () => {
+          await renderPickers();
+          await refuse();
+
+          click('voice-asr-asr-b');
+          click('voice-start');
+
+          expect(voiceSessions).toHaveLength(2);
+          expect(voiceSessions[1].args).toMatchObject({ asrModel: 'asr-b', ttsModel: 'tts-a' });
+        });
+      });
+
       describe('when the pick is gone', () => {
         it('falls back to the automatic model for a pick that is no longer in the catalogue', async () => {
           await renderPickers([
@@ -8663,11 +8713,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           expect(text('voice-asr-pick')).toBe('asr-b');
         });
 
-        // A run commits the thread's settings from its own typed struct, which has no place for
-        // the picks, so the stored document loses them when the thread is sent to. The open
-        // thread still holds them, and its next save -- which the adopt of the run's transcript
-        // schedules -- writes them back; without that, the picks would be gone at the next load.
-        it('survives a text send: the run rewrites the stored settings without it, and the next save writes it back', async () => {
+        // The backend lifts the stored picks forward when a run rewrites the thread's settings
+        // (PrepareChatRun, its own tests), so a send does not lose them. This is the client's half
+        // of the belt and braces: should the stored document come back without them anyway, the
+        // open thread still holds the picks, and the next save -- which the adopt of the run's
+        // transcript schedules -- writes them back.
+        it('writes the picks back after a text send, even if the run left the stored settings without them', async () => {
           await renderPickers();
           click('voice-asr-asr-b');
           expect((await savedSettings()).voice_chat).toEqual({ asr_model: 'asr-b' });

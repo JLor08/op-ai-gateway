@@ -5908,6 +5908,30 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(voiceSessions[0].args.asrModel).toBe('asr');
       });
 
+      it('lets a new pick dismiss a refused ticket, which opens the switch for the retry', async () => {
+        await renderPickable();
+        fireEvent.click(voiceSwitch());
+        await act(async () => {
+          voiceSessions[0].args.onError('refused', {
+            kind: 'refused',
+            code: 'portal.voice_chat_coload_failed',
+          });
+          voiceSessions[0].args.onState('error');
+        });
+        expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorCoLoad);
+        expect(voiceSwitch()).toBeDisabled();
+        // The pickers are open on a refusal: they are how the user tries other models.
+        expect(asrPicker()).toBeEnabled();
+
+        await pickOption(t.chatVoiceAsrModel, 'asr-2');
+
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(voiceSwitch()).toBeEnabled();
+        fireEvent.click(voiceSwitch());
+        expect(voiceSessions).toHaveLength(2);
+        expect(voiceSessions[1].args.asrModel).toBe('asr-2');
+      });
+
       it('closes the pickers while the conversation is on, and opens them again after', async () => {
         await renderPickable();
         expect(asrPicker()).toBeEnabled();

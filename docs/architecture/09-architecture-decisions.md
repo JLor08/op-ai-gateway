@@ -9648,13 +9648,13 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   the LLM (its own model selector is the LLM picker). The ASR and TTS models are the **user's to pick** since issue #317:
   the Voice Chat control has one picker each, listing the catalogue models the gateway says stream (plain speech models
   ahead of preset-clone ones), with **Automatic** as the default. The pick belongs to the thread and is saved with it,
-  in `settings.voice_chat` (`asr_model`, `tts_model`) of the schema-free chat document, with no migration and no backend
-  change: the key is written only for a text thread that has made a pick (so every other thread stays byte-identical),
+  in `settings.voice_chat` (`asr_model`, `tts_model`) of the schema-free chat document, with no migration and no agent
+  change (the backend never reads it, it only preserves it, below): the key is written only for a text thread that has made a pick (so every other thread stays byte-identical),
   the ticket request carries the models, and the co-load gate still resolves and validates all three, which is the real
   admission check (a combination it cannot hold is refused at the ticket). The **auto-pick** (the first model of each leg,
   in the catalogue's order, that the gateway says streams) is the default and the fallback: it serves a leg with no pick
   and a pick that is gone (the model left the catalogue, is unreachable or no longer streams), which falls back instead of
-  blocking the conversation, while the name stays in the thread so it applies again when the model returns. The pickers
+  blocking the conversation, while the name stays in the thread so it applies again when the model returns. The picks persist: `PrepareChatRun`, which rewrites the stored settings from its typed struct on every user-turn commit, lifts the stored raw `voice_chat` value forward (as it does the pinned `kind`; it never reads it), so a send, an edit or a regenerate cannot wipe them whichever thread the client has open. The pickers
   are closed until the gateway has said which models stream and while a conversation is on (its ticket holds the three
   models it started with). A text thread carries no speech settings, so the TTS speaks in the model's default voice and
   language. A preset clone model with no default voice can therefore still be used with a blank voice, when the user

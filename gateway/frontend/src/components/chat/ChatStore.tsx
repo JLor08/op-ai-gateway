@@ -1882,38 +1882,6 @@ export function ChatStoreProvider({
     };
   }, [voiceCandidatesKey, voiceLlmCapable]);
 
-  // The pickers of the conversation's two models, over the models that stream and the thread's
-  // saved picks (see VoiceModelChoice). A pick is the thread's: saved with it, never sent with a
-  // run.
-  const setVoiceAsrModel = useCallback(
-    (asrModel: string) => setVoiceSettings((current) => ({ ...current, asrModel })),
-    [],
-  );
-  const setVoiceTtsModel = useCallback(
-    (ttsModel: string) => setVoiceSettings((current) => ({ ...current, ttsModel })),
-    [],
-  );
-  const voiceChatModels: VoiceChatModels = {
-    ready: voiceStreaming !== null,
-    llm: effectiveOption?.display_name ?? effectiveModel,
-    asr: voiceModelChoice({
-      models: chatModels,
-      candidates: voiceAsrCandidates,
-      streaming: voiceStreaming?.asr ?? null,
-      saved: voiceSettings.asrModel,
-      used: voiceLegs?.asr ?? '',
-      set: setVoiceAsrModel,
-    }),
-    tts: voiceModelChoice({
-      models: chatModels,
-      candidates: voiceTtsCandidates,
-      streaming: voiceStreaming?.tts ?? null,
-      saved: voiceSettings.ttsModel,
-      used: voiceLegs?.tts ?? '',
-      set: setVoiceTtsModel,
-    }),
-  };
-
   // Ready the browser's audio from inside the user's gesture, for a turn that will stream.
   // A page may only make sound once the user has acted on it, and Safari wants the audio
   // context created and resumed INSIDE the handler of the click that sends: by the time the
@@ -2395,6 +2363,48 @@ export function ChatStoreProvider({
   const { state: voiceState, stop: stopVoiceChat } = voiceChat;
   audioSessionRunningRef.current = liveSessionRunning(liveSession.state) || voiceState !== 'off';
   voiceHeldChatRef.current = voiceState === 'off' ? null : voiceChatIdRef.current;
+
+  // The pickers of the conversation's two models, over the models that stream and the thread's
+  // saved picks (see VoiceModelChoice). A pick is the thread's: saved with it, never sent with a
+  // run. Choosing a model also ENDS the conversation (stop), which is what dismisses a refused
+  // ticket: a refusal is the gateway's answer to the three models the user started with, the
+  // pickers are how they try others, and the switch stays closed on a refusal until it is
+  // dismissed. (The pickers are closed while a conversation is on, so a pick ends none in
+  // practice; one made anyway would end a conversation that is no longer the one it started as.)
+  const setVoiceAsrModel = useCallback(
+    (asrModel: string) => {
+      stopVoiceChat();
+      setVoiceSettings((current) => ({ ...current, asrModel }));
+    },
+    [stopVoiceChat],
+  );
+  const setVoiceTtsModel = useCallback(
+    (ttsModel: string) => {
+      stopVoiceChat();
+      setVoiceSettings((current) => ({ ...current, ttsModel }));
+    },
+    [stopVoiceChat],
+  );
+  const voiceChatModels: VoiceChatModels = {
+    ready: voiceStreaming !== null,
+    llm: effectiveOption?.display_name ?? effectiveModel,
+    asr: voiceModelChoice({
+      models: chatModels,
+      candidates: voiceAsrCandidates,
+      streaming: voiceStreaming?.asr ?? null,
+      saved: voiceSettings.asrModel,
+      used: voiceLegs?.asr ?? '',
+      set: setVoiceAsrModel,
+    }),
+    tts: voiceModelChoice({
+      models: chatModels,
+      candidates: voiceTtsCandidates,
+      streaming: voiceStreaming?.tts ?? null,
+      saved: voiceSettings.ttsModel,
+      used: voiceLegs?.tts ?? '',
+      set: setVoiceTtsModel,
+    }),
+  };
 
   // A conversation belongs to the chat and the model it started with (its ticket holds the three
   // models in memory together): when either changes it is no longer the conversation it was

@@ -125,10 +125,11 @@ export type ChatTranscriptionSettings = {
 // omitted for a thread that has made no pick and for any thread that is not a text thread, so
 // their persisted settings stay byte-identical. It is the portal's own key, a picked name is
 // read back when the thread is opened and handed to the ticket (api/voiceChat.ts) when a
-// conversation starts; the backend neither validates nor forwards it (the ticket's co-load gate
-// resolves and validates the models a conversation is started with), and the settings of a run
-// do not carry it (the run rewrites the stored settings from its own typed struct, so the next
-// save of the open thread writes it again).
+// conversation starts; the backend neither reads nor validates it (the ticket's co-load gate
+// resolves and validates the models a conversation is started with). The settings of a run do not
+// carry it, but a run rewrites the stored settings from its own typed struct, so the backend
+// lifts the stored value forward across that rewrite (PrepareChatRun, like the pinned kind), and
+// the open thread's next save writes it again as well.
 export type ChatVoiceChatSettings = {
   asr_model?: string;
   tts_model?: string;
