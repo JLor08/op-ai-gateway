@@ -350,6 +350,22 @@ built by `server-agent/internal/client/ws.go`'s `WSSender` and served by
   the stream); **a Kubernetes Ingress in front buffers request bodies per Ingress, not per path**, so the shipped
   `ingress.yaml` does not stream that endpoint full-duplex, and a dedicated Ingress for the two paths is the follow-up
   ([ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once), [Deployment View §7.3](../07-deployment-view.md#73-kubernetes)).
+- **Voice Chat's WebSocket is a third copy of the same location, with two requirements that are not location-level.**
+  The portal's `GET /api/portal/voice-chat` is upgraded by its own `location = /api/portal/voice-chat` block (in
+  `gateway/deploy/nginx/locations.conf`, the mirrored k8s `nginx-configmap.yaml` and the edge-proxy configuration the
+  Certificates page generates): the live-transcription block again, directive for directive. That is `Upgrade`/`Connection:
+  upgrade`, the `X-OP-*` directives re-declared verbatim (six in the static `locations.conf` and ConfigMap, four in the
+  generated edge configuration, which carries no `X-OP-Edge-Self-Probe` or `X-OP-Edge-Scheme`), `Host $http_host` for
+  the same same-origin reason, `proxy_buffering off` and `proxy_read_timeout 3600s`. The ticket rides the upgrade as a
+  `Sec-WebSocket-Protocol` value, which is one header line, and a voice ticket seals three routing targets (up to 7 KiB;
+  the mint refuses a larger one). nginx caps one header line at one `large_client_header_buffers` buffer, 8k by default,
+  so every server block sets **`large_client_header_buffers 4 16k`**, a directive that is valid only at `http` and
+  `server` level, which is why it is not in the location. The ticket mint `POST /api/portal/voice-chat-ticket` blocks on the co-load gate for up to
+  `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (120 s by default) and has no location of its own: it rides `location /api/` and
+  inherits the server-level 3600 s read timeout, which nginx's 60 s default would otherwise cut short. The Vite dev and
+  preview proxy gets a `ws: true` context for the path, anchored (`^/api/portal/voice-chat(?:\?|$)`) so it does not also
+  catch the ticket path. The portal-side loopbacks of the orchestration stay inside the gateway process and never pass
+  through nginx ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Deployment View §7.3](../07-deployment-view.md#73-kubernetes)).
 
 **One registration table, two muxes.** Every agent endpoint — including the
 three the [agent-managed model runtime](agent-runtime-manager.md) adds

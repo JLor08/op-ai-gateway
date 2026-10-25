@@ -215,6 +215,32 @@ func TestLoadStreamIdleTimeoutOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadVoiceCoLoadTimeoutDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT", "")
+	if cfg := mustLoad(t); cfg.VoiceCoLoadTimeout != 120*time.Second {
+		t.Fatalf("voice co-load timeout = %v, want 120s", cfg.VoiceCoLoadTimeout)
+	}
+}
+
+func TestLoadVoiceCoLoadTimeoutOverrides(t *testing.T) {
+	cases := []struct {
+		value string
+		want  time.Duration
+	}{
+		{"5m", 5 * time.Minute},
+		{"90s", 90 * time.Second},
+		{"0s", 120 * time.Second},      // non-positive -> default: an unbounded gate is not an option
+		{"-5s", 120 * time.Second},     // negative -> default
+		{"garbage", 120 * time.Second}, // invalid -> default
+	}
+	for _, tc := range cases {
+		t.Setenv("OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT", tc.value)
+		if got := mustLoad(t).VoiceCoLoadTimeout; got != tc.want {
+			t.Fatalf("value %q: got %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
 func TestLoadAppHealthProbeTimeoutDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_APP_HEALTH_PROBE_TIMEOUT", "")
 	if cfg := mustLoad(t); cfg.AppHealthProbeTimeout != 3*time.Second {

@@ -29,6 +29,7 @@ import { AudioRetentionControl } from './AudioRetentionControl';
 import { ChatMessage } from './ChatMessage';
 import { SpeechVoiceField } from './SpeechVoiceField';
 import { TranscriptionComposer } from './TranscriptionComposer';
+import { VoiceChatControl } from './VoiceChatControl';
 import {
   IMAGE_EDIT_SOURCE_ACCEPT,
   IMAGE_LOSSY_FORMATS,
@@ -253,6 +254,16 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
   // reply is text.
   const isTranscriptionThread = c.chatKind === 'transcription';
   const isTextThread = !isImageThread && !isSpeechThread && !isTranscriptionThread;
+
+  // Voice Chat: a spoken conversation with the thread's model, offered on a text thread of a
+  // gateway that has any transcription or speech model (the switch says what is missing when the
+  // models cannot do it). A conversation that is on keeps its control on screen whatever the
+  // catalogue does meanwhile -- it is the way to end it, and the indicator of whether the system
+  // hears the user -- and so does a failure, until it has been read. The control ends the
+  // conversation itself when it goes (another page, another thread). While one is on, the text
+  // composer's Send is closed: the gateway commits the thread's turns itself then.
+  const voiceChatOn = c.voiceChat.state !== 'off';
+  const showVoiceChat = c.voiceChatOffered || voiceChatOn || c.voiceChat.error !== null;
 
   // The advanced passthrough is the one speech or transcription setting the store REFUSES a send
   // (and a regenerate) for when it is not a JSON object or names a field the run owns
@@ -1087,6 +1098,16 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
             })}
           </Box>
 
+          {showVoiceChat && (
+            <VoiceChatControl
+              t={t}
+              voice={c.voiceChat}
+              capable={c.voiceChatCapable}
+              gap={c.voiceChatGap}
+              busy={c.streaming}
+            />
+          )}
+
           {/* A transcription thread's turn is an audio clip, not text: its composer is a
             component of its own (the attach and record controls, the clip, Send). Every other
             thread keeps the text composer below, unchanged. */}
@@ -1127,7 +1148,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   // store's send() guards too, but the key handler must not even try).
                   if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                     event.preventDefault();
-                    if (!c.streaming && c.modelAvailable) c.send();
+                    if (!c.streaming && c.modelAvailable && !voiceChatOn) c.send();
                   }
                 }}
                 disabled={c.streaming}
@@ -1295,7 +1316,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   <Button
                     type="submit"
                     variant="contained"
-                    disabled={c.streaming || !c.modelAvailable}
+                    disabled={c.streaming || !c.modelAvailable || voiceChatOn}
                   >
                     {t.send}
                   </Button>

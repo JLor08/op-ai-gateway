@@ -972,6 +972,26 @@ session, an idle reap and a post-`200` SSE error stay `success`, the way an inco
 (the streamed-transcription paragraph above). The ticket endpoint and the WebSocket handler record **no row** of
 their own: the first is a gate and the second a loopback adapter.
 
+**Voice Chat is not a new producer: each spoken turn inherits three rows from three existing ones, and the orchestrator
+records none of its own** ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Runtime View §6.1.6](../06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts), issue #312). The
+Voice Chat state machine composes three loopback calls to public `/v1` cores, each of which resolves, admits, guards and
+bills for itself, so the usage rows are exactly the rows those endpoints always write, attributed to the **loopback user**
+(a token-less session principal: `UserID`, `RouteID` and `ServerID`, with no `TokenID`, `ServiceID` or `ProjectID`, as a
+portal chat run's loopback call and a portal live-transcription session are). The orchestrator spends no admission, holds
+no slot and writes no row; neither does the ticket endpoint (a gate) or the WebSocket handler (an orchestrator).
+
+| Leg | Core (the row's `req_path`) | How many rows | Unit and quantity |
+|---|---|---|---|
+| **Ears** (live ASR) | `/v1/audio/transcriptions/live` | **one per chunk** the user speaks: the relay is opened on the first admitted mic frame and closed at the chunk end, so a pause-tolerant turn of several chunks writes several | `audio_second`: the PCM piped into that chunk's relay over the byte rate of the sealed 16 kHz mono `s16le` shape, on a clean end (the end-of-input the machine sends at the chunk end); a relay torn down without it (a cancel, a leg failure, the continuation window closing on a relay that opened on silence, a dropped session) is a truncated session and bills `(audio_second, 0)` with the `Error` log line of the live section above |
+| **Brain** (LLM) | `/v1/chat/completions` | one per speculative run that reached the LLM leg: **a run the user's resumed speech cancelled still bills** the tokens it produced | token-metered, exactly a portal chat run's row (the token counts, with `billing_unit` empty) |
+| **Voice** (TTS) | `/v1/audio/speech` (streamed) | one per run that reached the TTS leg | `audio_second` over the benchmark-learned byte rate, or `audio_bytes` while that rate is uncached ([ADR-068](../09-architecture-decisions.md#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)); a run cancelled mid-synthesis is the streamed call's client-disconnect row, an error row with quantity 0 (above) |
+
+What is deferred in a voice run is **persistence**, not metering: a speculative run that is cancelled writes nothing to the
+chat, but the LLM tokens it produced are billed by the chat core. TTS audio is billed only when the synthesis completed before the cancel: a speech stream cut mid-synthesis is the speech core's client-disconnect error row with quantity 0 (the table above). The three rows read in the
+usage views and the energy tiers as ordinary transcription, chat and speech usage of the user (§8.4.4); no new unit and no
+new metering model was introduced, and there is no per-conversation grouping column, so the rows of one conversation are tied
+only by user, route and time.
+
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
 the response, because a zero `provider.Response` on a failed request would

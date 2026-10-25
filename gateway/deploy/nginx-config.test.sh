@@ -18,13 +18,18 @@
 #  could keep an armed plaintext gate extinguished against the attacker) -- and
 #  X-OP-Edge-Scheme. The sixth is SET from $scheme and never blanked -- it is the
 #  gateway's only unforgeable statement about the last hop, and a "" would make it
-#  useless. Twelve blocks: server-80, server-443 and the two WebSocket locations (the
-#  agent stream and the live-transcription stream), in each of the three deployable
-#  configurations (the two compose variants share locations.conf, so the twelve live in
-#  ten physical text blocks).
+#  useless. Fifteen blocks: server-80, server-443 and the three WebSocket locations (the
+#  agent stream, the live-transcription stream and the voice-chat stream), in each of the
+#  three deployable configurations (the two compose variants share locations.conf, so the
+#  fifteen live in twelve physical text blocks: six server blocks, plus the three WebSocket
+#  locations in each of locations.conf and the ConfigMap).
 #  It also pins the structural invariants: `listen 80` and the ACME challenge location
 #  survive, `listen 443 ssl` exists, and the shared include is NOT a *.conf under
 #  conf.d/ (nginx auto-includes those at HTTP level, where `location` is illegal).
+#  And the two Voice Chat requirements that are NOT location-level: both server blocks
+#  carry `large_client_header_buffers` of at least 16k (the WebSocket ticket is one header
+#  line of up to 7 KiB), and no `proxy_read_timeout` anywhere is shorter than the co-load
+#  gate's 120 s default (the ticket-mint POST rides the server-level value).
 #
 #  PART 2 (needs docker + openssl): `nginx -t` in the real nginx image for each of the
 #  three configurations, with dummy certificates in place so the run tests SYNTAX and
@@ -173,15 +178,15 @@ for entry in $CONFIGURATIONS; do
     done < "$work/hb.txt"
   done
   note "$name: $blocks header-setting block(s), all six directives present"
-  [ "$blocks" -eq 4 ] \
-    || bad "$name: expected 4 header-setting blocks (server-80, server-443, the agent and live-transcription WebSocket locations), found $blocks"
+  [ "$blocks" -eq 5 ] \
+    || bad "$name: expected 5 header-setting blocks (server-80, server-443, the agent, live-transcription and voice-chat WebSocket locations), found $blocks"
   total_blocks=$((total_blocks + blocks))
   IFS='
 '
 done
 IFS=$old_ifs
-note "total across the three configurations: $total_blocks (expected 12)"
-[ "$total_blocks" -eq 12 ] || bad "expected 12 header-setting blocks in total, found $total_blocks"
+note "total across the three configurations: $total_blocks (expected 15)"
+[ "$total_blocks" -eq 15 ] || bad "expected 15 header-setting blocks in total, found $total_blocks"
 
 # A blanked X-OP-Edge-Scheme anywhere is fatal, however it is written.
 for f in nginx/default.conf nginx/default.no-netbird.conf nginx/locations.conf "$CONFIGMAP"; do
@@ -221,6 +226,8 @@ for f in nginx/locations.conf "$work/k8s-locations.conf"; do
     || bad "$f: the agent WebSocket location is gone -- the agent transport depends on it"
   grep -q 'location = /api/portal/transcription-live ' "$f" \
     || bad "$f: the live-transcription WebSocket location is gone -- the portal's live mode depends on it"
+  grep -q 'location = /api/portal/voice-chat ' "$f" \
+    || bad "$f: the voice-chat WebSocket location is gone -- the portal's Voice Chat mode depends on it"
   # The live-transcription WebSocket forwards the browser's Host AS SENT ($http_host), NOT
   # $host like the agent stream just above it: the gateway's same-origin check on the
   # upgrade compares the Origin header's host AND PORT with the Host it sees, and $host
@@ -232,6 +239,22 @@ for f in nginx/locations.conf "$work/k8s-locations.conf"; do
        inb && /^[ \t]*}/ { inb = 0 }
        END { exit ok ? 0 : 1 }' "$f" \
     || bad "$f: the live-transcription WebSocket location does not set 'proxy_set_header Host \$http_host;' -- \$host drops the port and the gateway's same-origin check would 403 every upgrade on a non-default port"
+  # The voice-chat WebSocket is the live-transcription one again (a browser upgrade guarded
+  # by the same same-origin check), so the same pin applies -- and, since its location is
+  # a copy of that one, that it still upgrades the connection at all.
+  awk '/^[ \t]*location[ \t]+=[ \t]+\/api\/portal\/voice-chat[ \t]/ { inb = 1 }
+       inb { line = $0; sub(/#.*/, "", line) }
+       inb && line ~ /proxy_set_header[ \t]+Host[ \t]+\$http_host[ \t]*;/ { ok = 1 }
+       inb && /^[ \t]*}/ { inb = 0 }
+       END { exit ok ? 0 : 1 }' "$f" \
+    || bad "$f: the voice-chat WebSocket location does not set 'proxy_set_header Host \$http_host;' -- \$host drops the port and the gateway's same-origin check would 403 every upgrade on a non-default port"
+  awk '/^[ \t]*location[ \t]+=[ \t]+\/api\/portal\/voice-chat[ \t]/ { inb = 1 }
+       inb { line = $0; sub(/#.*/, "", line) }
+       inb && line ~ /proxy_set_header[ \t]+Upgrade[ \t]+\$http_upgrade[ \t]*;/ { up = 1 }
+       inb && line ~ /proxy_set_header[ \t]+Connection[ \t]+"upgrade"[ \t]*;/ { conn = 1 }
+       inb && /^[ \t]*}/ { inb = 0 }
+       END { exit (up && conn) ? 0 : 1 }' "$f" \
+    || bad "$f: the voice-chat WebSocket location does not send 'Upgrade \$http_upgrade' and 'Connection \"upgrade\"' -- the upgrade would never reach the gateway"
   # The bearer live endpoint is a chunked FULL-DUPLEX POST: without an unbuffered request
   # body nginx holds the PCM until the speaker stops and no transcript ever comes back.
   awk '/^[ \t]*location[ \t]+~[ \t]+\^\/\(\?:openai\/\)\?v1\/audio\/transcriptions\/live\$/ { inb = 1 }
@@ -239,6 +262,49 @@ for f in nginx/locations.conf "$work/k8s-locations.conf"; do
        inb && /^[ \t]*}/ { inb = 0 }
        END { exit ok ? 0 : 1 }' "$f" \
     || bad "$f: the bearer live-transcription location is gone or no longer sets 'proxy_request_buffering off' -- full-duplex streaming depends on it"
+done
+
+# Voice Chat's two requirements that are not location-level (see the voice-chat location in
+# locations.conf for the whole story):
+#  * Header size. The WebSocket ticket is ONE Sec-WebSocket-Protocol header line of up to
+#    7 KiB; nginx's default of 8k per line leaves under 1 KiB of margin, so BOTH server
+#    blocks of each configuration set large_client_header_buffers with at least 16k per
+#    buffer. The directive is illegal in a location, so only a server-block copy counts.
+#  * Read timeout. The ticket-mint POST has no location of its own (`location /api/` serves
+#    it) and blocks on the co-load gate for up to OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT (120 s
+#    by default), so every proxy_read_timeout must be at least 120 s, and the server blocks
+#    must set one (nginx's default is 60 s).
+for f in nginx/default.conf nginx/default.no-netbird.conf "$work/k8s-default.conf"; do
+  n=$(awk '{ line = $0; sub(/#.*/, "", line) }
+           match(line, /large_client_header_buffers[ \t]+[0-9]+[ \t]+[0-9]+[kKmM];/) {
+             split(substr(line, RSTART, RLENGTH), p, /[ \t;]+/)
+             size = p[3] + 0
+             if (p[3] ~ /[mM]$/) size = size * 1024
+             if (size >= 16) ok++
+           }
+           END { print ok + 0 }' "$f")
+  [ "$n" -eq 2 ] \
+    || bad "$f: $n server block(s) set 'large_client_header_buffers' of at least 16k, expected 2 -- the Voice Chat WebSocket ticket (one header line of up to 7 KiB) would not fit"
+done
+for f in nginx/default.conf nginx/default.no-netbird.conf nginx/locations.conf \
+         "$work/k8s-default.conf" "$work/k8s-locations.conf"; do
+  # Each proxy_read_timeout, converted to seconds (units: ms, s (the default), m, h).
+  short=$(awk '{ line = $0; sub(/#.*/, "", line) }
+               match(line, /proxy_read_timeout[ \t]+[0-9]+(ms|s|m|h)?;/) {
+                 split(substr(line, RSTART, RLENGTH), p, /[ \t;]+/)
+                 v = p[2] + 0
+                 if (p[2] ~ /ms$/) v = v / 1000
+                 else if (p[2] ~ /m$/) v = v * 60
+                 else if (p[2] ~ /h$/) v = v * 3600
+                 if (v < 120) printf "line %d: %s\n", NR, p[2]
+               }' "$f")
+  [ -z "$short" ] \
+    || bad "$f: a proxy_read_timeout under 120 s would cut the Voice Chat ticket mint (it waits on the co-load gate): $short"
+done
+for f in nginx/default.conf nginx/default.no-netbird.conf "$work/k8s-default.conf"; do
+  n=$(grep -c '^[[:space:]]*proxy_read_timeout[[:space:]]\{1,\}[0-9]' "$f" || true)
+  [ "$n" -eq 2 ] \
+    || bad "$f: $n server block(s) set proxy_read_timeout, expected 2 -- the Voice Chat ticket mint would fall back to nginx's 60 s default"
 done
 grep -q '/etc/nginx/op-locations.conf' Dockerfile.frontend \
   || bad "Dockerfile.frontend: locations.conf is not installed at /etc/nginx/op-locations.conf"

@@ -8,6 +8,7 @@ import { heicTo } from 'heic-to';
 
 import { Chat } from './Chat';
 import { createLiveSession, type LiveSessionArgs } from './chat/liveTranscription';
+import { createVoiceSession, type VoiceSessionArgs } from './chat/voiceSession';
 import {
   ChatStoreProvider,
   useChatStore,
@@ -72,6 +73,14 @@ vi.mock('./chat/speechPlayback', async (importOriginal) => ({
 vi.mock('./chat/liveTranscription', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./chat/liveTranscription')>()),
   createLiveSession: vi.fn(),
+}));
+
+// ...nor a Voice Chat session (microphone, WebSocket, speakers): a recording stand-in again,
+// driven by hand from the tests of the Voice Chat control, which are about what the chat page
+// shows of the conversation (the session has its own tests: voiceSession.test.ts).
+vi.mock('./chat/voiceSession', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./chat/voiceSession')>()),
+  createVoiceSession: vi.fn(),
 }));
 
 // Captured before any spy is installed, so a mocked createElement can build a
@@ -211,6 +220,10 @@ function makeChatApi() {
     createLiveTranscriptionTicket: vi.fn(async (_body: { model: string; language?: string }) => ({
       ticket: 'tkt',
     })),
+    // The Voice Chat ticket POST: no test in this file starts a conversation, but the store holds
+    // a real reference to this method (the conversation's session reads it) so the mock must
+    // provide one.
+    createVoiceChatTicket: vi.fn(async (_body: unknown) => ({ ticket: 'tkt' })),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.
@@ -5737,6 +5750,237 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await pickOption(t.chatRunAsTokenLabel, t.chatRunAsNone);
 
       await waitFor(() => expect(serverSelect).not.toBeDisabled());
+    });
+  });
+
+  // Voice Chat (#312) on the chat page: the control is offered on a text thread of a gateway that
+  // has audio models, closed (with the reason) while they cannot do it, absent where there is no
+  // audio at all; and it makes the state of the conversation visible -- above all whether the
+  // system is LISTENING -- as the gateway reports it. The store's side of it (what a
+  // conversation starts with, the reload of the thread) is ChatStore.test.tsx's; the control's own
+  // states are VoiceChatControl.test.tsx's.
+  describe(`Chat: Voice Chat [${locale}]`, () => {
+    const llm: ModelOption = {
+      id: 'llm',
+      display_name: 'llm',
+      flavors: ['openai'],
+      loading_on_count: 0,
+    };
+    const asr: ModelOption = {
+      id: 'asr',
+      display_name: 'asr',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      transcription: true,
+    };
+    const tts: ModelOption = {
+      id: 'tts',
+      display_name: 'tts',
+      flavors: ['openai_audio'],
+      loading_on_count: 0,
+      speech: true,
+    };
+    const audioModels = [llm, asr, tts];
+
+    type FakeVoice = { args: VoiceSessionArgs; stop: Mock<() => void> };
+    let voiceSessions: FakeVoice[];
+    beforeEach(() => {
+      voiceSessions = [];
+      vi.mocked(createVoiceSession).mockImplementation((args) => {
+        const session: FakeVoice = { args, stop: vi.fn() };
+        voiceSessions.push(session);
+        args.onState('connecting');
+        return { pushStart: vi.fn(), pushEnd: vi.fn(), cancel: vi.fn(), stop: session.stop };
+      });
+      chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+      chatApi.spies.modelSpeechStreaming.mockResolvedValue({ streaming: true, sampleRate: 24000 });
+    });
+    afterEach(() => vi.mocked(createVoiceSession).mockReset());
+
+    const voiceSwitch = () => screen.getByRole('switch', { name: t.chatVoice });
+    const indicator = () => screen.getByRole('status', { name: t.chatVoiceIndicator });
+
+    // The chat page on a text thread (the model picked), and Voice Chat on offer once the
+    // gateway has said which models stream.
+    async function renderVoiceChat(catalogue: ModelOption[] = audioModels) {
+      renderChat(tokens, catalogue);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'llm');
+    }
+
+    it('offers the switch on a text thread when a transcription and a speech model stream', async () => {
+      await renderVoiceChat();
+
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      expect(voiceSwitch()).not.toBeChecked();
+      // Off: the indicator is there, muted, saying so.
+      expect(within(indicator()).getByText(t.chatVoiceStateOff)).toBeInTheDocument();
+      expect(within(indicator()).getByTestId('MicOffIcon')).toBeInTheDocument();
+    });
+
+    it('shows nothing on a gateway with no audio model at all', async () => {
+      await renderVoiceChat([llm]);
+
+      expect(screen.queryByRole('switch', { name: t.chatVoice })).not.toBeInTheDocument();
+    });
+
+    it('shows the switch closed, with the reason, while no transcription model streams', async () => {
+      chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(false);
+      await renderVoiceChat();
+
+      expect(await screen.findByText(t.chatVoiceUnavailableAsr)).toBeInTheDocument();
+      expect(voiceSwitch()).toBeDisabled();
+    });
+
+    it('is not offered where the thread is not a text thread', async () => {
+      renderChat(tokens, audioModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'asr');
+
+      // A transcription thread has its own composer, and no conversation.
+      await screen.findByRole('group', { name: t.chatTranscriptionInputLabel });
+      expect(screen.queryByRole('switch', { name: t.chatVoice })).not.toBeInTheDocument();
+    });
+
+    it('makes the state of the conversation visible, listening above all, and closes Send', async () => {
+      await renderVoiceChat();
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+
+      fireEvent.click(voiceSwitch());
+      expect(voiceSessions).toHaveLength(1);
+      expect(voiceSwitch()).toBeChecked();
+      // Connecting: the models are being loaded, and nobody hears anything yet.
+      expect(within(indicator()).getByText(t.chatVoiceStateConnecting)).toBeInTheDocument();
+      expect(within(indicator()).getByTestId('MicOffIcon')).toBeInTheDocument();
+      // The gateway commits the thread's turns now: the text composer's Send is closed.
+      expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
+
+      // LISTENING: the active microphone, its label, and what is being said.
+      await act(async () => voiceSessions[0].args.onState('listening'));
+      expect(within(indicator()).getByText(t.chatVoiceStateListening)).toBeInTheDocument();
+      expect(within(indicator()).getByTestId('MicIcon')).toBeInTheDocument();
+      await act(async () =>
+        voiceSessions[0].args.onTranscript({ text: 'what is the wea', final: false }),
+      );
+      expect(screen.getByRole('region', { name: t.chatVoiceTranscript })).toHaveTextContent(
+        'what is the wea',
+      );
+
+      // NOT listening: the answer is written, then spoken.
+      await act(async () => voiceSessions[0].args.onState('thinking'));
+      await act(async () => voiceSessions[0].args.onAnswer({ text: 'It is sunny', done: false }));
+      expect(within(indicator()).getByText(t.chatVoiceStateThinking)).toBeInTheDocument();
+      expect(within(indicator()).getByTestId('MicOffIcon')).toBeInTheDocument();
+      expect(screen.getByRole('region', { name: t.chatVoiceAnswer })).toHaveTextContent(
+        'It is sunny',
+      );
+      await act(async () => voiceSessions[0].args.onState('speaking'));
+      expect(within(indicator()).getByText(t.chatVoiceStateSpeaking)).toBeInTheDocument();
+      expect(within(indicator()).getByText(t.chatVoiceMicPaused)).toBeInTheDocument();
+      expect(within(indicator()).queryByTestId('MicIcon')).not.toBeInTheDocument();
+    });
+
+    it("shows the turn the gateway committed as the thread's own turns", async () => {
+      await renderVoiceChat();
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      fireEvent.click(voiceSwitch());
+      await act(async () => voiceSessions[0].args.onState('listening'));
+      expect(screen.getByText(t.emptyChatMessage)).toBeInTheDocument();
+
+      // The gateway stores the user's words and the answer together; the page learns of it from
+      // the session's audio_done, and reloads the thread.
+      chatApi.rows[0].content = {
+        settings: { model: 'llm' },
+        messages: [
+          { id: 'm1', role: 'user', content: 'what is the weather' },
+          { id: 'm2', role: 'assistant', content: 'It is sunny', status: 'complete' },
+        ],
+      };
+      await act(async () => {
+        voiceSessions[0].args.onTranscript({ text: 'what is the weather', final: true });
+        voiceSessions[0].args.onAnswer({ text: 'It is sunny', done: false });
+        voiceSessions[0].args.onAudioDone();
+      });
+
+      const log = await screen.findByRole('log', { name: t.chatStreamLabel });
+      await waitFor(() => expect(within(log).getByText('It is sunny')).toBeInTheDocument());
+      expect(within(log).getByText('what is the weather')).toBeInTheDocument();
+      expect(screen.queryByText(t.emptyChatMessage)).not.toBeInTheDocument();
+      // The provisional lines are gone: the thread has the turn now.
+      expect(screen.queryByRole('region', { name: t.chatVoiceAnswer })).not.toBeInTheDocument();
+    });
+
+    it('shows a refused ticket by its code and keeps the switch closed until it is dismissed', async () => {
+      await renderVoiceChat();
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      fireEvent.click(voiceSwitch());
+
+      await act(async () => {
+        voiceSessions[0].args.onError('refused', {
+          kind: 'refused',
+          code: 'portal.voice_chat_coload_failed',
+        });
+        voiceSessions[0].args.onState('error');
+      });
+
+      expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorCoLoad);
+      expect(voiceSwitch()).not.toBeChecked();
+      expect(voiceSwitch()).toBeDisabled();
+
+      fireEvent.click(screen.getByRole('button', { name: t.chatVoiceDismiss }));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(voiceSwitch()).toBeEnabled();
+    });
+
+    it('switching it off ends the conversation', async () => {
+      await renderVoiceChat();
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      fireEvent.click(voiceSwitch());
+      await act(async () => voiceSessions[0].args.onState('listening'));
+
+      fireEvent.click(voiceSwitch());
+
+      expect(voiceSessions[0].stop).toHaveBeenCalledTimes(1);
+      expect(voiceSwitch()).not.toBeChecked();
+      expect(within(indicator()).getByText(t.chatVoiceStateOff)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.send })).toBeEnabled();
+    });
+
+    it('lets go of the microphone when the chat page goes away', async () => {
+      function Page() {
+        const [shown, setShown] = useState(true);
+        return (
+          <>
+            <button type="button" onClick={() => setShown(false)}>
+              leave-chat
+            </button>
+            {shown && <Chat t={t} />}
+          </>
+        );
+      }
+      render(
+        <ToastProvider>
+          <ChatStoreProvider
+            api={chatApi.api}
+            models={audioModels}
+            tokens={tokens}
+            onRefresh={vi.fn(async () => {})}
+            t={t}
+            locale={locale}
+          >
+            <Page />
+          </ChatStoreProvider>
+        </ToastProvider>,
+      );
+      await waitForChatReady();
+      await pickOption(t.chatModel, 'llm');
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      fireEvent.click(voiceSwitch());
+      await act(async () => voiceSessions[0].args.onState('listening'));
+
+      fireEvent.click(screen.getByRole('button', { name: 'leave-chat' }));
+
+      expect(voiceSessions[0].stop).toHaveBeenCalled();
     });
   });
 }

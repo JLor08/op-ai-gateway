@@ -19,6 +19,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -239,7 +240,24 @@ type ChatRun struct {
 	cancel       func()
 	subscribers  map[chan runEvent]struct{}
 	endedAt      time.Time
+
+	// committing marks a voice run's true point of no return: it is set by executeVoiceRun
+	// the instant it passes the final cancellation gate, BEFORE the (context.WithoutCancel)
+	// commit write begins -- so from here cancelling the run's context no longer prevents
+	// persistence. The voice orchestrator reads it to refuse a resume-driven cancel-and-extend
+	// of a run that is already committing (status is still "running" throughout the write, so
+	// status alone is not enough). It is an atomic flag, read race-free from the orchestrator
+	// goroutine without taking r.mu.
+	committing atomic.Bool
 }
+
+// markCommitting records that a (voice) run has passed its final cancellation gate and is
+// about to persist: a cancel after this no longer un-does the commit. Idempotent.
+func (r *ChatRun) markCommitting() { r.committing.Store(true) }
+
+// isCommitting reports whether the run has passed its point of no return (markCommitting).
+// Race-free (atomic load); safe to call from a goroutine that does not hold r.mu.
+func (r *ChatRun) isCommitting() bool { return r.committing.Load() }
 
 // newChatRun stamps startedAt from time.Now() directly rather than from the
 // service Clock most of this package's timestamps come from. A ChatRun has no
@@ -564,6 +582,13 @@ const (
 	chatRunKindImage         = "image"
 	chatRunKindSpeech        = "speech"
 	chatRunKindTranscription = "transcription"
+	// chatRunKindVoice is the Voice Chat run: a speculative text completion whose
+	// answer is streamed and then synthesized to speech, with ALL chat-document
+	// persistence deferred to a single finalize so a cancelled run leaves nothing to
+	// undo. See chat_runs_voice.go. It is NOT a thread pin a client can submit: it is
+	// set by startVoiceRun for the orchestrator's per-turn run, never by
+	// PrepareChatRun, and no chat thread persists it.
+	chatRunKindVoice = "voice"
 )
 
 // imageRunDeadline bounds an IMAGE run end to end. It exists because such a run
@@ -770,6 +795,11 @@ const runEvictionDelay = 30 * time.Second
 type PrepareRunResult struct {
 	History  []portal.ChatAPIMessage
 	Settings portal.ChatRunSettings
+	// Voice carries a voice run's extra inputs beyond the LLM leg's History/Settings
+	// -- the ASR'd user text to persist on a true finalize, and the TTS leg's target
+	// and voice/language settings. nil for every non-voice run, so no other path is
+	// affected. See chat_runs_voice.go.
+	Voice *voiceRunParams
 }
 
 func (r *ChatRun) statusValue() string {
@@ -884,6 +914,15 @@ func (s *Server) executeRun(ctx context.Context, owner auth.Token, run *ChatRun,
 	// that the run fills the turn in from. See chat_runs_transcription.go.
 	if prep.Settings.Kind == chatRunKindTranscription {
 		s.executeTranscriptionRun(ctx, owner, run, prep)
+		return
+	}
+	// The voice kind is the one genuinely new chat-run behaviour (spec 5.4): a text
+	// completion whose whole answer is then synthesized to speech, committed as one
+	// assistant turn, and -- unlike every kind above -- persisted ONLY on an
+	// un-cancelled finalize (the user turn with it), so a cancelled speculative run
+	// stores nothing. See chat_runs_voice.go.
+	if prep.Settings.Kind == chatRunKindVoice {
+		s.executeVoiceRun(ctx, owner, run, prep)
 		return
 	}
 

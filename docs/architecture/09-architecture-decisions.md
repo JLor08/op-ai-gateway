@@ -9473,3 +9473,241 @@ request closed when no candidate lists the voice** (it would break a bearer clie
 gateway never heard of, ADR-067's reason for a fail-open filter).
 → [Routing & Model Selection §2.5](cross-cutting/routing-and-model-selection.md#25-the-voice-filter-speech-only-fail-open),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-078 — Voice Chat: one orchestration WebSocket composes the three /v1 cores as a server-side state machine with a pause-tolerant continuation window, a deferred commit and a playout-aware half-duplex gate
+**Context:** the portal already had every leg of a spoken conversation, but a human drove each one by hand: start a live
+transcription ([ADR-072](#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input),
+[ADR-073](#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)),
+read the committed text, press send, wait for the answer, press "speak"
+([ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs),
+[ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)),
+listen. Issue #312 asks for that loop to be **hands-free and continuous**, with the whole linking done in the backend,
+and for the one property that matters most, *the microphone can never feed the model's own voice back into itself*,
+to be a property of the **server** and not of a cooperative browser. Four forces shaped the design:
+
+- **A browser WebSocket cannot carry `X-OP-CSRF`**, so the orchestration socket needs the ticket pattern of ADR-072.
+- **ADR-073's lesson:** a second copy of the resolve, admit, guard and bill logic drifts. The three cores under a spoken
+  turn (the live ASR relay, chat completions, streaming speech) already own their admission, per-route guard, billing
+  row and verdict gates, so the orchestrator must **sequence** them and never re-implement them.
+- **A pause is ambiguous.** The user may be done or merely drawing breath. Answering at the first silence loses the
+  second half of the sentence; waiting long enough to be sure makes every turn slow.
+- **Three models must live together for a conversation to be fast.** Three sequential `/ensure` calls do not prove
+  that: each can "succeed" by *evicting* the one before it, so a naive gate passes while the three are not resident and
+  the first turn reloads.
+
+**Decision — eight choices, taken together. No schema migration, no agent change and no `ServerAgent` version bump**
+(the feature composes existing agent routes and rides the schema-free chat document).
+
+- **(a) Two portal-only routes and one ticket, the twin of the live-transcription pair.** `POST
+  /api/portal/voice-chat-ticket` (`handlePortalVoiceChatTicket`, `internal/gateway/voice_chat_ticket_endpoint.go`) is
+  CSRF-protected (`requireWebScope(gateway:use)`: a session cookie needs `X-OP-CSRF`, a service token is refused). It
+  validates the three model names, reads the caller's own chat (owner-scoped, `404 portal.chat_not_found`), snapshots the
+  chat's stored speech settings (`settings.audio` of the chat document, capped at 1 KiB of JSON because the ticket rides
+  one header line), runs the co-load gate (f) and mints a ticket: AES-256-GCM, about 30 s, single-use, a per-process key,
+  carrying the **three resolved targets**, the chat, the principal's attribution, the settings and the fixed PCM shape
+  (16 kHz mono `s16le`, which the WebSocket never takes from the client). `GET /api/portal/voice-chat`
+  (`handleVoiceChat`, `voice_chat_ws.go`) redeems it as the second `Sec-WebSocket-Protocol` value (the first is the fixed
+  `op-voice-chat`) **before** `websocket.Accept`, under the default same-origin check; every ticket failure (absent,
+  forged, expired, replayed) is the **same** `401` with no upgrade and the cause is only logged. The ticket store is a
+  typed parallel twin of the live one, not a shared generic, and the WebSocket keeps the same single-writer, ping/pong,
+  one-context, airtight-teardown discipline. There is **no bearer API** for orchestration: Voice Chat is a portal
+  feature, and the three cores under it keep their own public APIs.
+- **(b) The orchestrator composes the three `/v1` cores over loopback and spends nothing itself.**
+  - *Ears: one loopback live-ASR relay per chunk.* On the first mic frame the gate admits, the state machine opens a
+    fresh full-duplex loopback to `POST /v1/audio/transcriptions/live` (`openLiveLoopback`: the trusted-loopback pair as
+    the ticket's user, `Expect: 100-continue`, an `io.Pipe` body, exactly the dial of ADR-073 (b) and (d)), maps its
+    `delta`/`partial` SSE lines to `asr_partial` frames, and at a chunk end closes the pipe, which makes the relay emit
+    the clean final transcript and end, releasing that chunk's admission and per-route slot; the next mic frame opens a
+    fresh one about 100 ms later. The relay therefore exists **whenever the mic gate is open**, in `listening` and, until
+    the window closes, in `thinking` (the frame that opens it is not checked for speech), and is absent only in `idle`,
+    `speaking` and `draining`. While it exists it holds its admission and the route's live slot and pins the ASR child,
+    and that includes the continuation window in which the speculative LLM and TTS run, so the three models genuinely
+    coexist there (which is what the co-load gate verifies). It deliberately does **not** hold one relay for the whole
+    session: that would also hold them through `speaking` and `draining`, and it would lean on a per-utterance
+    `transcript.text.done` mid-stream, which ADR-072 left unconfirmed, where end-of-input → final is the contract the
+    relay is tested on.
+  - *Brain and voice: a new voice run kind.* `executeVoiceRun` (`internal/gateway/chat_runs_voice.go`), started by
+    `startVoiceRun` at each chunk end, runs the LLM leg over `/v1/chat/completions` (the chat's history plus
+    `pendingText`, answer deltas streamed to subscribers), then synthesizes the **whole answer** over
+    `/v1/audio/speech` through the speech run's own `generateSpeechTurn` (streaming, the audio events published to
+    subscribers), then commits (d). It is the one genuinely new chat-run behaviour: text-LLM-then-TTS on one assistant
+    turn, run speculatively. `voice` is a run kind only: no thread pins it, `PrepareChatRun` never sets it and a client
+    cannot submit it.
+  - Both legs loop back as the ticket's user and re-resolve each leg **by gateway model name** with the run's own
+    identity, as every chat run does, so each core admits, guards and bills its own call. The orchestrator takes **no
+    admission, holds no slot and writes no usage row** of its own.
+- **(c) A single-owner state machine decides the turn, server-side.** `voiceMachine` is one goroutine that owns the
+  state, the `pendingText` buffer, the per-chunk ASR loopback and every timer; the read loop only forwards copies of
+  frames over channels, so the half-duplex gate is a plain read of the machine's own state variable. The states are
+  `idle`, `listening`, `thinking` (the continuation window), `speaking` and `draining`; a session opens in `listening`.
+  A **chunk** ends on the server's say-so: `OP_AI_GATEWAY_VOICE_SILENCE_TIMEOUT` with no new partial after a voiced one,
+  or an explicit `push_end`; `VOICE_MIN_UTTERANCE` keeps a sub-threshold blip from ending one and `VOICE_MAX_UTTERANCE`
+  caps a chunk. A chunk end appends the clean final to `pendingText`; a chunk that yields no text is not a turn. The
+  **live transcript** is `asr_partial` frames carrying the *current chunk's* provisional text (replace, not append), so
+  the client shows the finalized chunks so far plus the current partial; `asr_final` carries one chunk's final text, and
+  no frame carries a message id, because nothing is persisted at a chunk boundary.
+- **(d) Speculative start, a pause-tolerant continuation window and a deferred commit.** On each chunk end the machine
+  starts a **speculative voice run** on the accumulated `pendingText` and enters `thinking`, but **keeps the mic open**:
+  the continuation window, safe to leave open because no TTS audio has played yet (the run's audio events are **held**
+  in the machine until the window closes). The answer streams down as `answer_delta`, a preview. If voiced speech
+  resumes inside the window, the machine **cancels the run, emits `answer_reset`, extends `pendingText` with the next
+  chunk and returns to `listening`**; that repeats across as many pauses as the user takes. **Persistence is deferred
+  to a true finalize.** The run writes nothing while it works (`VoiceRunHistory` only *reads* the chat, appends
+  `pendingText` in memory and strips the audio parts of earlier voice answers from the LLM history), and calls into
+  persistence exactly once, on its single un-cancelled terminal path: `CommitVoiceTurn` appends the user turn and the
+  assistant turn (`[text, audio_url…]` parts) in **one** `SaveChatWithBlobs`, through the same retention and blob
+  internals as every assistant commit. A cancelled or failed run therefore persists **nothing**, so cancel-and-extend
+  needs no undo. (Metering is not deferred: the LLM tokens a cancelled run produced are billed by the chat core, but a
+  speech stream cut mid-synthesis is the speech core's client-disconnect error row with quantity 0, so TTS audio is
+  billed only when the synthesis completed before the cancel.) The window closes once the answer has streamed (the first audio event:
+  the LLM is done and TTS is under way) **and** `OP_AI_GATEWAY_VOICE_CONTINUATION_GRACE` has elapsed since the last
+  chunk end with no resume, **or at the run's commit, whichever comes first**. Closing shuts the mic, moves to
+  `speaking` and flushes the held audio; the grace usually hides behind generation, so it adds latency only when the
+  model is faster than the grace. After the commit the client reloads the chat thread (`audio_done` is its cue) to pick
+  up the stored turns.
+- **(e) The half-duplex loop guarantee is the server's, and `draining` tracks playout, not relay.** In `idle`,
+  `speaking` and `draining`, while a chunk is being finalized, and in `thinking` once the window has closed, inbound PCM
+  is **discarded in the machine before it reaches any ASR loopback**; `push_start` is honored only from `idle` and
+  `playback_done` can only lengthen a drain. That is the loop guarantee: the machine itself never re-opens the mic while
+  the answer can be heard, whatever the browser does, and it needs no acoustic echo cancellation (a non-goal; the portal
+  still asks the browser for its own echo cancellation and noise suppression as a second line). The one deliberate
+  exception is `cancel`, the user's immediate stop: it abandons the turn and returns to `listening` from **any** state,
+  including `speaking` and `draining`, so it re-opens the mic at once. The server relies on the client to stop its own
+  playback before sending it (the in-tree client does), which makes `cancel` the user's own act and not a loop path;
+  true barge-in, with the echo handling it needs, is phase 4. The machine relays TTS **faster than real time**, so `audio_done` means "all audio was
+  sent", not "the user stopped hearing it", and ending the gate there would re-open the mic on a speaker setup while the
+  answer is still audible. So the client sends `{"type":"playback_done"}` when its streaming player drains, and the
+  server stays authoritative about what to do with it: `draining` ends at `max(floor, min(ceiling, playback_done))`, a
+  signal that never comes counting as infinitely late. The **floor** is the relayed audio's own real-time duration (PCM
+  bytes over the byte rate, from the first chunk relayed); the **ceiling** is a fixed 30 s from the same start, and it
+  **never cuts below the floor** (an answer whose audio is longer than the ceiling exits at the floor). An early or
+  forged `playback_done` is clamped *up* to the floor, so the mic never re-opens before the audio could have finished
+  playing; a later one extends the drain for a slow client, up to the ceiling; a client that never signals holds the
+  drain to the ceiling, which bounds it so a missing signal cannot wedge the session. Then the `OP_AI_GATEWAY_VOICE_MIC_RESUME_TAIL` tail passes and the machine returns to
+  `listening`. The half-duplex gate keeps the legs apart only in `speaking` and `draining`: in the continuation window
+  the ASR relay, the speculative LLM and the TTS can all be active, so the three models need to be resident together for
+  a turn to run at all (a TTS that cannot be admitted is a degradation, not a slower turn). That is what the co-load gate
+  is for; it protects the speed and the working of the loop, and the loop guarantee does not depend on it.
+- **(f) An ensure-then-verify co-load gate at enable.** The ticket mint runs `voiceCoLoadGate` under the deadline
+  `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (default 120 s, a deadline of its own because the gate can cold-start three
+  models; the server's 30 s read and write deadlines are lifted for this route first, as for every request that outlives
+  them). **(1) Resolve and gate** each leg for the shape it will be called on, *without* spending admission (the shared
+  `inferenceGate`, never the preflight): ASR as the live relay is gated (the `transcription` capability, the
+  effective-served flavor, a `transcription_streaming = yes` verdict and, behind an agent, a declared `fullduplex_proxy`),
+  the LLM as chat completions is (`resolveTranslateTarget`, which refuses an audio- or images-only target), the TTS as
+  the streaming speech relay is (the `speech` capability, a `speech_streaming = yes` verdict and an offerable model: a
+  clone model only with a named preset voice). A refusal is that leg's `portal.voice_chat_asr_unavailable`,
+  `_llm_unavailable` or `_tts_unavailable` and nothing has been started. **(2) Ensure** each *agent-managed* leg through
+  the agent router's ensure route, one at a time in leg order (starts race on the agent's admission): a
+  `runtime.admission_blocked` is the agent saying it will not admit the child, which is `portal.voice_chat_coload_failed`;
+  any other start failure is that leg's `*_unavailable`. **(3) Verify residency:** read each agent's *live* loaded set
+  (the router's own `/running`, or the application's `loaded_models_path`, once per server) **after** all ensures and
+  require every agent-managed leg's model to be in it **now**. If starting the third evicted the first, it is missing
+  and the gate refuses `portal.voice_chat_coload_failed`; a residency that cannot be read is not assumed, so that
+  refuses too, and a deadline that runs out in any step is `coload_failed`. The gate **reuses the agent's own admission
+  outcome** and deliberately does *not* re-derive the co-residency matrix, the process-count limit and the per-GPU VRAM
+  arithmetic gateway-side ([Agent-Managed Model Runtime §5.2](cross-cutting/agent-runtime-manager.md#52-the-three-gates) warns that the
+  arithmetic is subtle, test-pinned and direction-sensitive). It is **topology-agnostic**: an LLM on another server is
+  trivially resident there while ASR and TTS must both be resident on the audio host; a non-agent (direct) leg has no
+  ensure route and takes step 1 only. The mapping from a refusal to a status is `400` for the three `*_unavailable`
+  codes and `audio_settings_invalid`, `409` for `coload_failed`, `500` for `ticket_failed`.
+- **(g) Billing is inherited; no new metering.** Each leg bills through its own core, attributed to the loopback user
+  (a token-less session principal, as a portal chat run is): ASR `audio_second` at `/v1/audio/transcriptions/live`, LLM
+  tokens at `/v1/chat/completions`, TTS `audio_second` (or `audio_bytes` while the byte rate is uncached) at
+  `/v1/audio/speech`. The per-chunk relay makes ASR billing one honest row per chunk; the rows of one voice turn are
+  listed in [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event).
+- **(h) Degradation: one typed error, back to `idle`, no retry.** Any leg that fails, an ASR drop, an LLM or TTS error,
+  a mid-conversation `runtime.admission_blocked` or a commit failure, makes the machine emit **one** `{"type":"error",
+  "code",…}` frame carrying the core's own stable code (gateway-side fallbacks `gateway.voice_run_start_failed`,
+  `_run_closed`, `_run_failed` only where no core returned one), stop the turn (the run cancelled, the loopback torn
+  down, `pendingText` dropped, the timers disarmed) and return to `idle`. The session stays open and the client
+  re-engages with `push_start`; nothing retries on its own, so a failure cannot spin into a loop. `bye` or a dropped
+  socket tears the session down exactly once.
+
+**Consequence:**
+
+- **No agent bump and no migration.** The agent's wire contract is unchanged (the feature rides `/ensure`, the loaded-set
+  read, `fullduplex_proxy` and the existing speech and transcription routes), so `ServerAgent` stays at its current
+  version, and the migration history is unchanged: a voice turn is two ordinary messages appended to the schema-free chat
+  document, its audio is the existing `chat_blobs` rows, and the TTS settings are the document's existing
+  `ChatAudioSettings` ([Data Model](reference/data-model.md)).
+- **The window closes at the commit, so a fast answer gives a shorter keep-talking window, and a resume during the commit
+  write is dropped.** The run is non-pausable (LLM, then TTS, then commit in one sequence), so the machine cannot both
+  keep the mic open for the full grace *and* avoid a double commit when the whole run finishes inside the grace: a resume
+  after the commit would cancel nothing and re-run on the extended text, persisting the first utterance twice. The commit
+  is therefore the window's **point of no return**, marked on the run (`ChatRun.committing`, set after the final cancel
+  gate and before the write, because the run's status stays `running` for the whole write). A resume that begins past
+  it is not a cancel-and-extend and not a new turn: the voiced chunk is discarded when the window force-closes. True
+  barge-in is phase 4. Accepted ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **One sub-microsecond race is parked, with a known airtight shape.** Between the run's final cancellation check and
+  the instruction that marks it committing there is a window of a few instructions with no I/O and no scheduling point.
+  A resume's cancel that lands exactly there would leave the run committing anyway while the machine re-runs on the
+  extended text. The airtight version is a single compare-and-swap (the run moves `running → committing`, the machine
+  moves `running → canceled`, the loser aborts). It is a recorded follow-up, not done in this change.
+- **Phase 1 chooses the models and the voice for the user.** The portal's thread model is the LLM; the ASR and TTS models
+  are the first catalogue models, in the catalogue's order, that the gateway says stream (plain speech models ahead of
+  preset-clone ones), and the co-load gate is the real admission check. There is **no three-model picker yet**, and a text
+  thread carries no speech settings, so the TTS speaks in the model's default voice and language. A preset clone model with
+  no default voice can therefore still be picked with a blank voice, but only when no plain speech model streams, and fail
+  its first turn (degradation, not a loop). The voice run also ignores the chat's own system prompt and
+  sampling settings (`VoiceRunHistory` builds the history with an empty system prompt, and the run's settings carry only
+  the model and the kind), which is phase 2. A picker and per-thread voice and language controls are the follow-up.
+- **A non-signaling client drains to the ceiling.** The in-tree client always sends `playback_done`, so it ends at the
+  floor; a client that never does holds every turn's drain to the 30 s ceiling (or, for an answer whose audio is longer
+  than the ceiling, to the floor). Intentional: it is the anti-wedge bound.
+- **`cancel` re-opens the mic from any state, and after the commit it does not undo the turn.** It is the user's immediate
+  stop and the one control that returns the session to `listening` from `speaking` or `draining`; the server relies on the
+  client to stop its own playback first. The run it cancels persists nothing only if it has not reached its commit: in
+  `speaking` it can still be synthesizing (then nothing is stored), but a session is in `draining` only after the commit,
+  so a `cancel` there leaves the stored turn in place.
+- **The gate proves what it resolved at enable, not what a later turn will reach.** Per-turn hops re-resolve by name through
+  normal routing, so on a name with several candidate servers a turn can land on a different one than the one verified; a
+  leg that was idle-unloaded or evicted by an outside load surfaces as a re-admit failure on the next turn and degrades
+  (h). A leg with no ensure route (a non-agent mapping) is not residency-verified at all and relies on step 1 plus
+  degradation. A follow-up pre-flight could compute the three admission gates gateway-side to refuse *before* any
+  eviction churn and name the reason more precisely.
+- **Voice Chat holds the ASR route's one live slot whenever its mic gate is open.** Each chunk's relay takes the per-route
+  live session slot that audio.cpp's one `/live` per model requires and releases it at the chunk end, but a fresh relay
+  opens on the next mic frame, so the slot is held throughout `listening` and the continuation window and is free only in
+  `idle`, `speaking` and `draining`. Two users on one ASR route therefore collide on `transcription.live_busy` (an `error`
+  frame) continuously while a mic is open, not only while one of them is speaking. A relay torn down without its end-of-input (a cancel,
+  a leg failure, the window closing on a relay that opened on silence) is a truncated session and bills the loud zero.
+- **Deployment has the live-transcription requirements, again.** The upgrade route needs the same dedicated nginx
+  WebSocket location as `/api/portal/transcription-live` (`Host $http_host`, a long read timeout), and the ticket POST a
+  proxy read timeout of at least `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT`, with a header buffer that holds a ticket of up to 7 KiB
+  (three sealed targets). The ticket is per process, like the live one (issue #285).
+- **Verification status.** The state machine, the half-duplex gate (mic frames dropped in `speaking` and `draining`), the
+  floor and ceiling of the drain, cancel-and-extend with nothing persisted, the fast-commit double-commit guards, the gate's
+  refusals (including an agent that evicts a sibling), the ticket's misuse cases and degradation on each leg are pinned by
+  mock-backed tests with the three cores faked over loopback. A conversation against real models is outside what this
+  entry claims.
+
+**Builds on:** [ADR-072](#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)
+and [ADR-073](#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)
+(the ticket, the single-writer WebSocket and the loopback relay it composes),
+[ADR-063](#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs)
+(a run kind that loops back to a `/v1` core), [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+(streamed speech and its metering),
+[ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)
+(the stored audio and the atomic commit) and
+[ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump)
+(the retention a voice answer rides). It changes none of them.
+**Rejected:** **One live-ASR relay for the whole session** (it would hold its admission, the route's live slot and the pinned ASR
+child through `speaking` and `draining` as well, bill one lump at the end and lean on an unconfirmed mid-stream `done`). **Orchestrating in
+the browser** (the loop guarantee would depend on a cooperative client, which is the anti-goal; and the backend would
+orchestrate only nominally). **A second copy of the resolve, admit and billing logic** (ADR-073's drift). **Committing the
+user turn up front, as `PrepareChatRun` does** (a cancelled speculative run would then need an undo; deferring the whole
+commit to the finalize makes cancel-and-extend free). **Three sequential `/ensure` calls as the gate** (each can evict the
+last; only the live loaded-set read proves residency). **Re-deriving the matrix, process-count and VRAM gates gateway-side
+for the gate** (drift against the agent's test-pinned, direction-sensitive arithmetic; recorded as a follow-up
+pre-flight). **Ending `draining` at relay-done** (the mic would re-open while the answer is audible), **or at the
+client's `playback_done` alone** (an early or forged signal would re-open it early; the floor makes the gate the server's).
+**Acoustic echo cancellation** (loop prevention is half-duplex gating, not signal-level removal). **A pausable run that
+holds the TTS until the grace ends** (it would give a fast answer the full keep-talking window, at the price of a larger
+change to the run; deferred with barge-in).
+→ [Runtime View §6.1.6](06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts),
+[HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket),
+[Configuration & Environment Variables](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate),
+[Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[Data Model](reference/data-model.md),
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).

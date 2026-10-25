@@ -1600,16 +1600,30 @@ func TestEdgeProxyConfigCarriesTheStreamingAndHeaderRules(t *testing.T) {
 		"proxy_set_header Host $http_host;",
 		`location ~ ^/(?:openai/)?v1/audio/transcriptions/live$`,
 		"proxy_request_buffering off;",
+		// Voice Chat (the live-transcription pair's twin): its own WebSocket upgrade
+		// location, and the larger header buffers its single-use ticket needs -- the
+		// ticket is one Sec-WebSocket-Protocol header line of up to 7 KiB, and nginx's
+		// default of 8k per header line would leave under 1 KiB of margin.
+		"location = /api/portal/voice-chat {",
+		"large_client_header_buffers 4 16k;",
 	} {
 		if !strings.Contains(cfg, want) {
 			t.Fatalf("missing %q:\n%s", want, cfg)
 		}
 	}
 	// The four internal headers must be blanked in the server block AND in each
-	// WebSocket location (the agent stream and the portal live transcription), since
-	// a location with any proxy_set_header resets the inherited set.
-	if n := strings.Count(cfg, `proxy_set_header X-OP-Internal-Auth "";`); n != 3 {
-		t.Fatalf("X-OP-Internal-Auth blanked %d times, want 3 (server block + agent + portal WebSocket locations)", n)
+	// WebSocket location (the agent stream and the portal live transcription and
+	// voice chat), since a location with any proxy_set_header resets the inherited set.
+	if n := strings.Count(cfg, `proxy_set_header X-OP-Internal-Auth "";`); n != 4 {
+		t.Fatalf("X-OP-Internal-Auth blanked %d times, want 4 (server block + agent + portal live-transcription and voice-chat WebSocket locations)", n)
+	}
+	// The ticket mint (POST /api/portal/voice-chat-ticket) blocks on the model co-load
+	// gate for up to 120 s by default and has no location of its own: the catch-all
+	// serves it, on the SERVER-level read timeout. So that long timeout has to be
+	// declared before (outside) the catch-all, or nginx's 60 s default would cut a
+	// cold start short.
+	if tmo, catchAll := strings.Index(cfg, "proxy_read_timeout 3600s;"), strings.Index(cfg, "location / {"); tmo < 0 || catchAll < 0 || tmo > catchAll {
+		t.Fatalf("the server-level proxy_read_timeout (at %d) must precede the catch-all location (at %d) that serves the voice-chat ticket mint:\n%s", tmo, catchAll, cfg)
 	}
 }
 

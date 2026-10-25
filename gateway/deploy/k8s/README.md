@@ -455,3 +455,27 @@ locations, and the Ingress caveat below is the only thing left to you.
   is a known follow-up; until it exists the portal's live mode is unaffected and only programmatic bearer
   clients of the live endpoint need it. The reasoning is `docs/architecture/09-architecture-decisions.md` ADR-073
   and `docs/architecture/07-deployment-view.md` §7.3.
+
+## Voice Chat (portal WebSocket and ticket)
+
+Voice Chat (the portal's hands-free spoken conversation, issue #312, ADR-078) is two routes: the ticket mint
+`POST /api/portal/voice-chat-ticket` and the WebSocket `GET /api/portal/voice-chat`. The `op-gateway-web` nginx
+(`nginx-configmap.yaml`, mirroring `../nginx/locations.conf`) already carries what both need; the points below are
+what is left to you when something sits in front of it. None of this was exercised against a cluster here.
+
+- **The WebSocket works through the shipped Ingress**, like the live-transcription one above. Its nginx block is the
+  same upgrade block (`Host` is `$http_host`, so a proxy in front of the Ingress must forward the original `Host`
+  with its port), and the Ingress already upgrades WebSockets with a `proxy-read-timeout` of 3600 s.
+- **The ticket rides one request header line of up to 7 KiB.** The browser presents its single-use ticket as a
+  `Sec-WebSocket-Protocol` value, and a voice ticket seals three routing targets (the live-transcription ticket seals
+  one). nginx caps a header line at one `large_client_header_buffers` buffer, 8k by default, so both server blocks of
+  the web pod's nginx set `large_client_header_buffers 4 16k`. ingress-nginx in front has the same limit, but it is a
+  **global key of the controller's ConfigMap** (`large-client-header-buffers`, `4 8k` by default; there is no
+  per-Ingress annotation for it): a ticket at its cap still fits that default with under 1 KiB to spare, so set the
+  key to `4 16k` if you want the same margin there. Any other proxy in front needs a header line of at least 8 KiB
+  as well.
+- **The ticket mint can take up to `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (120 s by default).** It runs the co-load
+  gate, which cold-starts the three models and waits until they are resident together. The web pod's nginx serves it
+  on `location /api/` with the server-level `proxy_read_timeout 3600s`, and `ingress.yaml` sets
+  `proxy-read-timeout: "3600"`, so neither cuts it short; a proxy of your own in front must allow it at least that
+  read time (nginx's own default is 60 s). Do not give that path a location with a shorter timeout.

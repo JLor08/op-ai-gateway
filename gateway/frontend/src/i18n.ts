@@ -372,6 +372,70 @@ const de = {
     'Live-Transkription ist hier nicht verfügbar (Browser oder Modell). Nehmen Sie stattdessen einen Clip auf oder hängen Sie eine Audiodatei an.',
   chatTranscriptionLiveBusy:
     'Das Modell transkribiert gerade eine andere Live-Aufnahme. Versuchen Sie es in einem Moment erneut.',
+  // Voice Chat (#312): a spoken conversation with the model on a text thread. The mode's switch
+  // and what it is. The hint says that the microphone is paused while the answer is spoken: the
+  // system cannot hear the user then, and the indicator below is how they SEE that.
+  chatVoice: 'Sprachchat',
+  chatVoiceHint:
+    'Sprechen Sie mit dem Modell: Ihre Worte werden live transkribiert, die Antwort wird vorgelesen. Solange die Antwort gesprochen wird, ist das Mikrofon pausiert.',
+  // The indicator of whether the system is listening: the region's name for assistive
+  // technology, then one label per state of the conversation. Only "listening" is heard; every
+  // other label says what the system is doing instead. While the answer is spoken the microphone
+  // is paused (half-duplex), which the detail line says; idle is the state after a failed turn,
+  // which the push-to-talk button gets the conversation out of.
+  chatVoiceIndicator: 'Sprachchat-Status',
+  chatVoiceStateOff: 'Aus',
+  chatVoiceStateConnecting: 'Verbinde… Die Modelle werden geladen.',
+  chatVoiceStateListening: 'Höre zu…',
+  chatVoiceStateThinking: 'Denke nach…',
+  chatVoiceStateSpeaking: 'Spreche…',
+  chatVoiceStateDraining: 'Antwort wird zu Ende gesprochen…',
+  chatVoiceStateIdle: 'Höre nicht zu',
+  chatVoiceMicPaused:
+    'Das Mikrofon ist pausiert, bis die Antwort zu Ende gesprochen ist. Sie werden gerade nicht gehört.',
+  chatVoiceIdleHint: 'Halten Sie die Sprechtaste, um zu sprechen.',
+  // The controls: push-to-talk (held while talking), stopping an answer, dismissing a refusal; and
+  // the names of the two regions of the turn in progress (what was said, and the answer so far).
+  chatVoicePushToTalk: 'Zum Sprechen gedrückt halten',
+  chatVoiceCancel: 'Antwort abbrechen',
+  chatVoiceDismiss: 'Schließen',
+  chatVoiceTranscript: 'Ihre Worte',
+  chatVoiceAnswer: 'Antwort',
+  // Why the switch is closed: the thread cannot do a spoken conversation (the chat model, or a
+  // streaming transcription or speech model, is missing), or the models are still being checked.
+  chatVoiceUnavailableLlm:
+    'Wählen Sie ein verfügbares Chat-Modell (eines, das chatten kann), um den Sprachchat zu nutzen.',
+  chatVoiceUnavailableAsr:
+    'Für den Sprachchat wird ein Transkriptionsmodell mit Live-Streaming benötigt. Aktuell ist keines verfügbar.',
+  chatVoiceUnavailableTts:
+    'Für den Sprachchat wird ein Sprachmodell mit Streaming benötigt. Aktuell ist keines verfügbar.',
+  chatVoiceUnavailableChecking: 'Die verfügbaren Sprachmodelle werden geprüft…',
+  // Why a conversation could not start or ended, by the gateway's portal.voice_chat_* code (the
+  // gate that refuses the ticket) or by the kind of failure. A refusal is the gateway's answer to
+  // the very same request, so it is repeated until the configuration changes: the operator's to
+  // fix for the co-load one (co-residency matrix and GPU budgets), the user's for the stored
+  // speech settings (a text thread carries none of its own, so a new chat gets past it).
+  chatVoiceErrorAsrUnavailable:
+    'Das Transkriptionsmodell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Live-Streaming oder nicht startbar).',
+  chatVoiceErrorLlmUnavailable:
+    'Das Chat-Modell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Chat-Modell oder nicht startbar).',
+  chatVoiceErrorTtsUnavailable:
+    'Das Sprachmodell ist für den Sprachchat nicht nutzbar (nicht erreichbar, kein Streaming oder nicht startbar).',
+  chatVoiceErrorCoLoad:
+    'Die drei Modelle (Transkription, Chat, Sprache) lassen sich nicht gleichzeitig laden. Das hängt an der Server-Konfiguration (Koresidenz-Matrix und GPU-VRAM-Budgets): Wenden Sie sich an Ihren Administrator.',
+  chatVoiceErrorAudioSettings:
+    'Die zu diesem Chat gespeicherten Spracheinstellungen sind ungültig oder zu umfangreich. Nutzen Sie den Sprachchat in einem neuen Chat.',
+  chatVoiceErrorTicket:
+    'Der Sprachchat konnte nicht gestartet werden. Versuchen Sie es in einem Moment erneut.',
+  chatVoiceErrorRefused: 'Das Gateway hat den Sprachchat abgelehnt.',
+  chatVoiceErrorUnsupported:
+    'Der Sprachchat ist in diesem Browser nicht verfügbar: Er braucht einen aktuellen Browser, Zugriff auf das Mikrofon und eine sichere Verbindung (HTTPS).',
+  chatVoiceErrorCapture:
+    'Das Mikrofon oder die Audioverarbeitung ist ausgefallen. Schalten Sie den Sprachchat erneut ein.',
+  chatVoiceErrorDropped:
+    'Die Verbindung wurde unterbrochen. Schalten Sie den Sprachchat erneut ein.',
+  chatVoiceErrorTurn:
+    'Diese Antwort ist fehlgeschlagen. Halten Sie die Sprechtaste, um es erneut zu versuchen.',
   // Why a clip could not be attached (the picker's `accept` is only a hint, so the type is
   // checked again): a file that is not audio, its size (the backend stores up to 20 MB per
   // clip, counted on the WAV the browser converts it to), an empty file, audio the browser
@@ -3740,6 +3804,49 @@ const en: PortalMessages = {
     'Live transcription is not available here (browser or model). Record a clip or attach an audio file instead.',
   chatTranscriptionLiveBusy:
     'The model is already transcribing another live recording. Try again in a moment.',
+  chatVoice: 'Voice Chat',
+  chatVoiceHint:
+    'Talk to the model: your words are transcribed live and the answer is read out. The microphone is paused while the answer is spoken.',
+  chatVoiceIndicator: 'Voice Chat status',
+  chatVoiceStateOff: 'Off',
+  chatVoiceStateConnecting: 'Connecting… Loading the models.',
+  chatVoiceStateListening: 'Listening…',
+  chatVoiceStateThinking: 'Thinking…',
+  chatVoiceStateSpeaking: 'Speaking…',
+  chatVoiceStateDraining: 'Finishing the answer…',
+  chatVoiceStateIdle: 'Not listening',
+  chatVoiceMicPaused:
+    'The microphone is paused until the answer has been spoken. You are not being heard right now.',
+  chatVoiceIdleHint: 'Hold the talk button to speak.',
+  chatVoicePushToTalk: 'Hold to talk',
+  chatVoiceCancel: 'Stop answer',
+  chatVoiceDismiss: 'Dismiss',
+  chatVoiceTranscript: 'Your words',
+  chatVoiceAnswer: 'Answer',
+  chatVoiceUnavailableLlm: 'Select an available chat model (one that can chat) to use Voice Chat.',
+  chatVoiceUnavailableAsr:
+    'Voice Chat needs a transcription model with live streaming. None is available right now.',
+  chatVoiceUnavailableTts:
+    'Voice Chat needs a speech model with streaming. None is available right now.',
+  chatVoiceUnavailableChecking: 'Checking the available voice models…',
+  chatVoiceErrorAsrUnavailable:
+    'The transcription model cannot be used for Voice Chat (unreachable, no live streaming, or it could not be started).',
+  chatVoiceErrorLlmUnavailable:
+    'The chat model cannot be used for Voice Chat (unreachable, not a chat model, or it could not be started).',
+  chatVoiceErrorTtsUnavailable:
+    'The speech model cannot be used for Voice Chat (unreachable, no streaming, or it could not be started).',
+  chatVoiceErrorCoLoad:
+    'The three models (transcription, chat, speech) cannot be loaded at the same time. That is down to the server configuration (co-residency matrix and GPU VRAM budgets): contact your administrator.',
+  chatVoiceErrorAudioSettings:
+    'The speech settings stored with this chat are invalid or too large. Use Voice Chat in a new chat.',
+  chatVoiceErrorTicket: 'Voice Chat could not be started. Try again in a moment.',
+  chatVoiceErrorRefused: 'The gateway refused Voice Chat.',
+  chatVoiceErrorUnsupported:
+    'Voice Chat is not available in this browser: it needs a current browser, microphone access and a secure connection (HTTPS).',
+  chatVoiceErrorCapture:
+    'The microphone or the audio processing failed. Switch Voice Chat on again.',
+  chatVoiceErrorDropped: 'The connection was interrupted. Switch Voice Chat on again.',
+  chatVoiceErrorTurn: 'That answer failed. Hold the talk button to try again.',
   chatAudioError: 'Could not attach the audio.',
   chatAudioErrorType:
     'Unsupported file type. Attach an audio file, for example WAV, MP3, M4A, OGG or WEBM.',

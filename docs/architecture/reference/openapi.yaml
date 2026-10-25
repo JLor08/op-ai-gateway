@@ -1859,6 +1859,169 @@ paths:
         '403':
           description: A cross-origin upgrade, refused by the same-origin check.
         '405': { description: 'Any method other than GET.' }
+  /api/portal/voice-chat-ticket:
+    post:
+      tags: [portal]
+      summary: Run the Voice Chat co-load gate and mint a single-use ticket for the Voice Chat WebSocket (scope gateway:use, CSRF on a session)
+      description: >
+        Step one of the portal's Voice Chat (ADR-078, issue #312): the authenticated,
+        CSRF-protected request that decides what the WebSocket (GET /api/portal/voice-chat)
+        then redeems, because a browser WebSocket cannot send X-OP-CSRF. A session
+        cookie needs X-OP-CSRF, a bearer does not, and a service token is refused 401.
+        In order: a server with no ticket store or no portal service is 500
+        `portal.voice_chat_ticket_failed`; the body is validated (a body that is not one
+        JSON object of this shape is 400 `request.invalid_json`; a blank `asr_model`,
+        `llm_model` or `tts_model` is 400 `model.name_required`, naming the field; models
+        are trimmed); the caller's OWN chat is read (a blank id, an unknown chat and
+        another user's chat are all 404 `portal.chat_not_found`, before any model is
+        started) and its stored speech settings (`settings.audio`) are snapshotted into
+        the ticket (settings that do not decode, or whose JSON is over 1 KiB, are 400
+        `portal.voice_chat_audio_settings_invalid`: the ticket rides one header line);
+        then the CO-LOAD GATE runs under the deadline OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT
+        (default 120 s; the server's 30 s read and write deadlines are lifted first).
+        Step 1 resolves and gates each leg for the shape it will be called on WITHOUT
+        spending admission: the transcription model as the live relay is gated (the
+        transcription capability, a transcription_streaming = yes verdict, and for an
+        agent target a declared fullduplex_proxy), the chat model as chat completions is
+        (an audio- or images-only target is refused), the speech model as the streaming
+        speech relay is (the speech capability, a speech_streaming = yes verdict and an
+        offerable model: a clone model only with a named preset voice); a refusal is 400
+        `portal.voice_chat_asr_unavailable`, `portal.voice_chat_llm_unavailable` or
+        `portal.voice_chat_tts_unavailable`, naming no internal model or server. Step 2
+        ensures each agent-managed leg one at a time (a start failure is that leg's
+        unavailable code; an agent that will not admit the model,
+        runtime.admission_blocked, is 409 `portal.voice_chat_coload_failed`). Step 3
+        reads each agent's LIVE loaded set after all the ensures and requires every
+        agent-managed leg's model to be in it at once: a start that evicted another
+        leg, or a residency that cannot be read, is 409 `portal.voice_chat_coload_failed`,
+        as is a gate that outlives its deadline. A mint that fails, or a token over 7 KiB
+        (it would not fit a proxy's header line), is 500 `portal.voice_chat_ticket_failed`.
+        The ticket lives about 30 seconds, is single-use, is AES-256-GCM encrypted under
+        a per-process key (it carries the three resolved targets, the chat, the
+        attribution, the speech settings and the fixed PCM shape, none of which the
+        browser can read or alter) and opens only on the gateway process that minted it.
+        It is a gate, not a relay: no admission, no usage row, no capture. Any method but
+        POST is 405. See api-surface.md and 06-runtime-view.md section 6.1.6.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VoiceChatTicketRequest' }
+      responses:
+        '200':
+          description: The opaque ticket, and nothing of the decision it carries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket]
+                properties:
+                  ticket:
+                    type: string
+                    description: >
+                      Unpadded URL-safe base64, a valid Sec-WebSocket-Protocol
+                      value. Present it as the second offered subprotocol on the
+                      upgrade (the first is `op-voice-chat`); never put it in a URL.
+        '400':
+          description: >
+            The Error envelope: `request.invalid_json`, `model.name_required`,
+            `portal.voice_chat_asr_unavailable`, `portal.voice_chat_llm_unavailable`,
+            `portal.voice_chat_tts_unavailable` or
+            `portal.voice_chat_audio_settings_invalid`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: >
+            The Error envelope: `auth.csrf_required` (a session cookie without
+            X-OP-CSRF) or `auth.insufficient_scope` (no gateway:use).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: The Error envelope with code `portal.chat_not_found`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '409':
+          description: >
+            The Error envelope with code `portal.voice_chat_coload_failed`: the three
+            models cannot be held resident together (an agent refused to admit one,
+            starting one evicted another, residency could not be verified, or the gate
+            outlived its deadline). The remedy is the operator's: the pairwise
+            co-residency matrix and the GPU VRAM budgets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: The Error envelope with code `portal.voice_chat_ticket_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /api/portal/voice-chat:
+    get:
+      tags: [portal]
+      summary: Voice Chat WebSocket (ticket-authenticated, same-origin; PCM and controls up, typed state, transcript, answer and audio frames down)
+      description: >
+        Step two of the portal's Voice Chat (ADR-078, issue #312): a WebSocket upgrade
+        whose ONLY credential is the single-use ticket minted by POST
+        /api/portal/voice-chat-ticket, offered as a `Sec-WebSocket-Protocol` value
+        (`new WebSocket(url, ['op-voice-chat', ticket])`) and never in the URL. The
+        ticket is redeemed BEFORE the upgrade: an absent, malformed, expired, replayed or
+        foreign-process ticket is 401 with ONE body and NO upgrade (the cause is only
+        logged); the upgrade keeps the library's default same-origin check (it compares
+        Origin with Host, so a reverse proxy must preserve the original Host), so a
+        cross-origin request is 403; any method but GET is 405. No cookie and no CSRF
+        header is read, and the handler takes no model, chat or rate from the client.
+        After 101 the subprotocol `op-voice-chat` is selected and the session opens in
+        `listening`. The browser sends BINARY frames of raw s16le mono 16 kHz PCM (about
+        100 ms each, at most 1 MiB; a larger frame closes the socket 1009) and TEXT
+        control frames `{"type":"push_start"}`, `{"type":"push_end"}`,
+        `{"type":"cancel"}`, `{"type":"playback_done"}` and `{"type":"bye"}`; anything
+        else is ignored. The gateway sends TEXT frames of JSON: `state` (`idle`,
+        `listening`, `thinking`, `speaking` or `draining`), `asr_partial` (the CURRENT
+        chunk's provisional text, replace), `asr_final` (one chunk's final text, append),
+        `answer_delta` (append), `answer_done` (provisional, before the commit),
+        `answer_reset` (the speculative run was cancelled because the user resumed),
+        `audio_delta` (`seq` from 0, `rate`, base64 s16le PCM), `audio_done` (the audio is
+        complete and the turn is committed: reload the chat thread) and `error` (`code`
+        is the failing core's stable code; the session stays open and returns to `idle`).
+        No frame carries a message id. The handler is a server-side state machine that
+        loops back, as the ticket's user, to three /v1 cores: the live ASR relay (one
+        fresh relay per chunk), chat completions and streaming speech, each of which
+        admits, guards and bills for itself; the handler takes no admission and writes no
+        usage row. Mic PCM is discarded in the state machine, before any ASR relay, in
+        `speaking`, `draining` and `idle`, while a chunk finalizes and once the
+        continuation window has closed (half-duplex, enforced server-side), and
+        `draining` ends at max(the relayed audio's own duration, min(30 s ceiling, the
+        client's playback_done)) plus the mic-resume tail (the ceiling never cuts below
+        the audio's own duration). `cancel` is the user's immediate stop: it abandons the
+        turn and returns the session to `listening` from ANY state, including `speaking`
+        and `draining`, so a client stops its own playback before sending it. A user turn and its answer are
+        persisted together, once, when the turn is committed; a speculative run that the
+        user's resumed speech cancels persists nothing. The upgrade hijacks the connection,
+        so the server's 30 s deadlines do not apply. See api-surface.md and
+        06-runtime-view.md section 6.1.6.
+      security: []
+      parameters:
+        - name: Sec-WebSocket-Protocol
+          in: header
+          required: true
+          description: >
+            `op-voice-chat, <ticket>`: the fixed subprotocol name and the ticket, in
+            either order (the ticket is the one value that is not the fixed name).
+          schema: { type: string }
+      responses:
+        '101':
+          description: Switching Protocols; the WebSocket is open and `op-voice-chat` is the selected subprotocol.
+        '401':
+          description: No valid ticket (absent, malformed, expired, replayed or minted by another process); one plain-text body for every cause, no upgrade.
+        '403':
+          description: A cross-origin upgrade, refused by the same-origin check.
+        '405': { description: 'Any method other than GET.' }
   /api/portal/model-group-servers:
     get:
       tags: [portal]
@@ -4163,6 +4326,38 @@ components:
           maxLength: 64
           pattern: '^[A-Za-z0-9_-]*$'
           description: Optional language tag or name; empty lets the backend detect the language.
+    VoiceChatTicketRequest:
+      type: object
+      description: The body of POST /api/portal/voice-chat-ticket.
+      required: [chat_id, asr_model, llm_model, tts_model]
+      properties:
+        chat_id:
+          type: string
+          description: >
+            The portal chat the spoken turns are committed to. It must be the caller's
+            own (owner-scoped): a blank, unknown or another user's chat is 404
+            `portal.chat_not_found`, before any model is started. The chat's stored
+            speech settings (`settings.audio`) are snapshotted into the ticket; a text
+            thread carries none, so the speech model speaks in its default voice and
+            language.
+        asr_model:
+          type: string
+          minLength: 1
+          description: >
+            The gateway model name (trimmed) of the live-transcription leg; blank is 400
+            `model.name_required`. It must be a streaming transcription model.
+        llm_model:
+          type: string
+          minLength: 1
+          description: >
+            The gateway model name (trimmed) of the chat leg; blank is 400
+            `model.name_required`. It must serve chat.
+        tts_model:
+          type: string
+          minLength: 1
+          description: >
+            The gateway model name (trimmed) of the speech leg; blank is 400
+            `model.name_required`. It must be an offerable streaming speech model.
     ModelCapabilities:
       type: object
       description: >
