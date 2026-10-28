@@ -241,23 +241,60 @@ type ChatRun struct {
 	subscribers  map[chan runEvent]struct{}
 	endedAt      time.Time
 
-	// committing marks a voice run's true point of no return: it is set by executeVoiceRun
-	// the instant it passes the final cancellation gate, BEFORE the (context.WithoutCancel)
-	// commit write begins -- so from here cancelling the run's context no longer prevents
-	// persistence. The voice orchestrator reads it to refuse a resume-driven cancel-and-extend
-	// of a run that is already committing (status is still "running" throughout the write, so
-	// status alone is not enough). It is an atomic flag, read race-free from the orchestrator
-	// goroutine without taking r.mu.
-	committing atomic.Bool
+	// commitState is the ONE atomic word a voice run's commit and every cancel of it
+	// arbitrate on (see voiceRunRunning). Zero is voiceRunRunning, so a run is born
+	// undecided. It is an atomic, not an r.mu field, so the run goroutine (which claims
+	// the commit) and the orchestrator goroutine (which claims the cancel) decide the
+	// race without sharing a lock; every other kind of run never reads it.
+	commitState atomic.Int32
 }
 
-// markCommitting records that a (voice) run has passed its final cancellation gate and is
-// about to persist: a cancel after this no longer un-does the commit. Idempotent.
-func (r *ChatRun) markCommitting() { r.committing.Store(true) }
+// The states of a voice run's commit-vs-cancel arbitration (ChatRun.commitState). The
+// word only ever leaves voiceRunRunning, exactly once, by a compare-and-swap -- so the
+// run's commit and a cancel can never BOTH win:
+//
+//   - voiceRunRunning: undecided. The run has not yet claimed its commit and nothing has
+//     claimed its cancel; either may still win.
+//   - voiceRunCommitting: the run claimed its commit (claimCommit) -- its true point of
+//     no return. The commit write runs under context.WithoutCancel, so from here a cancel
+//     can no longer un-do it, and a resume must NOT cancel-and-extend (it would
+//     double-commit the utterance). The run's status stays "running" for the whole write,
+//     so status alone cannot tell the orchestrator this.
+//   - voiceRunCanceled: a cancel claimed the run first (claimCancel, via cancelContext).
+//     The run's own claimCommit now fails, so it commits NOTHING.
+const (
+	voiceRunRunning    int32 = 0
+	voiceRunCommitting int32 = 1
+	voiceRunCanceled   int32 = 2
+)
 
-// isCommitting reports whether the run has passed its point of no return (markCommitting).
+// claimCommit is the voice run's point of no return: it atomically moves
+// running->committing and reports whether the run won. true means no cancel got there
+// first, so the caller may now commit under context.WithoutCancel; false means a cancel
+// already claimed the run, so the caller must commit NOTHING. Only the run goroutine
+// calls it, once.
+func (r *ChatRun) claimCommit() bool {
+	return r.commitState.CompareAndSwap(voiceRunRunning, voiceRunCommitting)
+}
+
+// claimCancel atomically moves running->canceled and reports whether the cancel won.
+// true means the run had not committed and now never will (its claimCommit fails);
+// false means the run is already committing (or was already canceled), so the cancel
+// cannot un-do the commit. cancelContext calls it before cancelling the context, so every
+// cancel path claims; the orchestrator's resume calls it directly because the claim, not
+// the cancel, is the decision to cancel-and-extend.
+func (r *ChatRun) claimCancel() bool {
+	return r.commitState.CompareAndSwap(voiceRunRunning, voiceRunCanceled)
+}
+
+// isCommitting reports whether the run claimed its commit (the point of no return).
 // Race-free (atomic load); safe to call from a goroutine that does not hold r.mu.
-func (r *ChatRun) isCommitting() bool { return r.committing.Load() }
+func (r *ChatRun) isCommitting() bool { return r.commitState.Load() == voiceRunCommitting }
+
+// commitUndecided reports whether neither the commit nor a cancel has claimed the run
+// yet, i.e. a cancel could still win. A READ for the resume pre-check only; the decision
+// itself is claimCancel's CAS, never this load.
+func (r *ChatRun) commitUndecided() bool { return r.commitState.Load() == voiceRunRunning }
 
 // newChatRun stamps startedAt from time.Now() directly rather than from the
 // service Clock most of this package's timestamps come from. A ChatRun has no
@@ -325,7 +362,16 @@ func (r *ChatRun) listView() (status, kind string, elapsedMs int64) {
 // cancelContext invokes the run's context cancel func under r.mu (the field is
 // mu-guarded) and never while holding it. Cancel funcs are idempotent, so
 // calling this on an already-cancelled or already-finished run is a no-op.
+//
+// It first claims the cancel on the voice commit/cancel word (claimCancel), BEFORE
+// cancelling the context, so a voice run that observes its context cancelled is
+// guaranteed to find the word already decided: its claimCommit then fails and it commits
+// nothing. The claim's result is deliberately ignored here -- a run that has already
+// claimed its commit stays committing (its write is under context.WithoutCancel, exactly
+// as before); callers that must know who won (the voice resume) call claimCancel
+// themselves. For every non-voice run the word is never read, so this is inert.
 func (r *ChatRun) cancelContext() {
+	r.claimCancel()
 	r.mu.Lock()
 	cancel := r.cancel
 	r.mu.Unlock()

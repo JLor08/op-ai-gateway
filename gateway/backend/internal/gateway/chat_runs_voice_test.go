@@ -295,6 +295,36 @@ func TestVoiceRunCancelledPersistsNothing(t *testing.T) {
 	}
 }
 
+// A cancel that lands in EXACTLY the window between the run finishing its TTS leg and its
+// commit claim must persist NOTHING. This is the check-then-act gap the commit CAS closes:
+// with a ctx.Err() read followed by a separate "committing" flag, a cancel here slipped past
+// the read, the WithoutCancel commit then proceeded, and a resume that had already been
+// accepted double-committed. voiceBeforeCommitClaim is the test seam that lands the cancel
+// deterministically in that window.
+func TestVoiceRunCancelBetweenFinalGateAndCommitClaimPersistsNothing(t *testing.T) {
+	srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+	srv.voiceBeforeCommitClaim = func(run *ChatRun) { run.cancelContext() }
+
+	before, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, snap := voiceRunOutcome(t, srv, owner, chatID, "keep talking")
+	if snap.Status != "canceled" {
+		t.Fatalf("status = %q (err %q), want canceled: a cancel in the commit-claim window must win", snap.Status, snap.Err)
+	}
+	if run.isCommitting() {
+		t.Fatal("a run cancelled in the window must never have claimed its commit")
+	}
+	after, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before.Content) != string(after.Content) {
+		t.Fatalf("a cancel in the commit-claim window still persisted:\nbefore %s\nafter  %s", before.Content, after.Content)
+	}
+}
+
 // The committed assistant turn carries the synthesized audio as an audio_url blob:
 // SaveChatWithBlobs moved the WAV into chat_blobs, and the stored turn references it by
 // the gateway blob path, not inline.
@@ -419,6 +449,69 @@ func TestVoiceRunHistoryStripsPriorAnswerAudio(t *testing.T) {
 	}
 	if msgs := storedMessages(t, after.Content); len(msgs) != 4 {
 		t.Fatalf("after two voice turns the chat has %d messages, want 4 [user, assistant, user, assistant]: %s", len(msgs), after.Content)
+	}
+}
+
+// A MIXED thread: an earlier speech-run turn holds only audio (a TTS-only answer), so
+// stripping it leaves nothing. The /v1/chat/completions body the voice run POSTs must carry NO
+// assistant message with empty content -- a strict upstream (native Anthropic) rejects one on a
+// non-final message -- must still alternate roles, and a normal voice turn (text + audio) must
+// keep its text. The turn then runs end to end on that history.
+func TestVoiceRunBodyHasNoEmptyAssistantContentInAMixedThread(t *testing.T) {
+	srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+
+	// Seed the mixed thread by saving the whole document: [speech user, audio-only
+	// assistant, voice user, text+audio assistant].
+	audio := `{"type":"audio_removed"}`
+	doc := `{"settings":{},"messages":[` +
+		`{"id":"u1","role":"user","content":"say hello"},` +
+		`{"id":"a1","role":"assistant","status":"complete","content":[` + audio + `]},` +
+		`{"id":"u2","role":"user","content":"what is two plus two"},` +
+		`{"id":"a2","role":"assistant","status":"complete","content":[{"type":"text","text":"four"},` + audio + `]}]}`
+	content := json.RawMessage(doc)
+	if _, err := srv.Portal.SaveChat(context.Background(), owner, chatID, portal.UpdateChatRequest{Content: &content}); err != nil {
+		t.Fatalf("seed the mixed thread: %v", err)
+	}
+
+	const pending = "and three plus three"
+	history, err := srv.Portal.VoiceRunHistory(context.Background(), owner, chatID, pending)
+	if err != nil {
+		t.Fatalf("VoiceRunHistory: %v", err)
+	}
+	body, err := buildChatCompletionsBody(PrepareRunResult{History: history, Settings: portal.ChatRunSettings{Model: voiceLLMTarget.Model}})
+	if err != nil {
+		t.Fatalf("buildChatCompletionsBody: %v", err)
+	}
+	var req struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("request body is not JSON: %v (%s)", err, body)
+	}
+	for i, m := range req.Messages {
+		if m.Role == "assistant" && (len(m.Content) == 0 || string(m.Content) == `""` || string(m.Content) == "[]" || string(m.Content) == "null") {
+			t.Fatalf("messages[%d] is an assistant message with empty content: %s", i, body)
+		}
+		if i > 0 && req.Messages[i-1].Role == m.Role {
+			t.Fatalf("messages[%d] and messages[%d] are both %q: roles must alternate: %s", i-1, i, m.Role, body)
+		}
+	}
+	if !strings.Contains(string(body), "four") {
+		t.Fatalf("the voice turn's answer text was dropped: %s", body)
+	}
+	if strings.Contains(string(body), "audio") {
+		t.Fatalf("an audio part reached the LLM request: %s", body)
+	}
+	if n := len(req.Messages); n == 0 || req.Messages[n-1].Role != "user" || !strings.Contains(string(req.Messages[n-1].Content), pending) {
+		t.Fatalf("the last message must be the pending user turn: %s", body)
+	}
+
+	// The turn runs cleanly on that history.
+	if _, snap := voiceRunOutcome(t, srv, owner, chatID, pending); snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
 	}
 }
 

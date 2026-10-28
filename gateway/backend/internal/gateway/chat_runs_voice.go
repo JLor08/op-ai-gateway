@@ -151,21 +151,27 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 		return
 	}
 
-	// The final cancellation gate: a cancel that arrived while the TTS leg finished
-	// (the continuation window could in principle close on the very last frame) must
-	// still leave the chat untouched. Checked against the PARENT ctx -- cancelTTS's
-	// own DeadlineExceeded cause is a TTS timeout, already handled above.
-	if ctx.Err() != nil {
+	// The point of no return: ONE compare-and-swap (running->committing) that is both the
+	// final cancellation gate and the commit claim, so a cancel and this commit arbitrate on
+	// a single atomic word and exactly one wins. A cancel that arrived while the TTS leg
+	// finished -- the continuation window can close on the very last frame -- has already
+	// claimed the run (cancelContext claims BEFORE it cancels the context, and so does the
+	// orchestrator's resume), so the claim fails and the chat stays untouched. A claim that
+	// succeeds means no cancel won; from here the commit below runs under
+	// context.WithoutCancel, and the orchestrator's own claimCancel fails, so it stops
+	// accepting a resume-driven cancel-and-extend (the run's status stays "running" for the
+	// whole write, so status alone would leave a window in which a resume double-commits).
+	//
+	// There is deliberately NO separate ctx.Err() read before this: such a check is a
+	// read, and a cancel landing between it and the claim would still commit -- the
+	// check-then-act gap the single CAS closes.
+	if s.voiceBeforeCommitClaim != nil {
+		s.voiceBeforeCommitClaim(run)
+	}
+	if !run.claimCommit() {
 		s.finishVoiceRunNoCommit(run, "canceled", "")
 		return
 	}
-
-	// Point of no return: past the final cancellation gate the commit below runs under
-	// context.WithoutCancel, so a cancel can no longer un-do it. Mark it BEFORE the commit so
-	// the voice orchestrator stops accepting a resume-driven cancel-and-extend from here --
-	// the run's status stays "running" for the whole write, so status alone would leave a
-	// window in which a resume double-commits the utterance.
-	run.markCommitting()
 
 	// The un-cancelled finish: commit the user turn and the assistant turn together.
 	s.commitVoiceTurn(ctx, owner, run, vp.pendingText, answer, audioParts, streamed)

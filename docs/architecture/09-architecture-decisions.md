@@ -9553,7 +9553,9 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   resumes inside the window, the machine **cancels the run, emits `answer_reset`, extends `pendingText` with the next
   chunk and returns to `listening`**; that repeats across as many pauses as the user takes. **Persistence is deferred
   to a true finalize.** The run writes nothing while it works (`VoiceRunHistory` only *reads* the chat, appends
-  `pendingText` in memory and strips the audio parts of earlier voice answers from the LLM history), and calls into
+  `pendingText` in memory and strips the audio parts of earlier voice answers from the LLM history; an earlier assistant turn
+  that held only audio, such as a speech-run answer in a mixed thread, is omitted rather than sent with empty content, and the
+  user turns on either side of it are merged so the roles still alternate), and calls into
   persistence exactly once, on its single un-cancelled terminal path: `CommitVoiceTurn` appends the user turn and the
   assistant turn (`[text, audio_url…]` parts) in **one** `SaveChatWithBlobs`, through the same retention and blob
   internals as every assistant commit. A cancelled or failed run therefore persists **nothing**, so cancel-and-extend
@@ -9635,15 +9637,17 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   write is dropped.** The run is non-pausable (LLM, then TTS, then commit in one sequence), so the machine cannot both
   keep the mic open for the full grace *and* avoid a double commit when the whole run finishes inside the grace: a resume
   after the commit would cancel nothing and re-run on the extended text, persisting the first utterance twice. The commit
-  is therefore the window's **point of no return**, marked on the run (`ChatRun.committing`, set after the final cancel
-  gate and before the write, because the run's status stays `running` for the whole write). A resume that begins past
-  it is not a cancel-and-extend and not a new turn: the voiced chunk is discarded when the window force-closes. True
+  is therefore the window's **point of no return**, claimed on the run (one atomic commit/cancel word on `ChatRun`, moved
+  `running → committing` by a compare-and-swap before the write, because the run's status stays `running` for the whole
+  write). A resume that begins past it is not a cancel-and-extend and not a new turn: the voiced chunk is discarded when the window force-closes. True
   barge-in is phase 4. Accepted ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
-- **One sub-microsecond race is parked, with a known airtight shape.** Between the run's final cancellation check and
-  the instruction that marks it committing there is a window of a few instructions with no I/O and no scheduling point.
-  A resume's cancel that lands exactly there would leave the run committing anyway while the machine re-runs on the
-  extended text. The airtight version is a single compare-and-swap (the run moves `running → committing`, the machine
-  moves `running → canceled`, the loser aborts). It is a recorded follow-up, not done in this change.
+- **The commit and a cancel arbitrate on one compare-and-swap, so they can never both win.** The run's final
+  cancellation check and its commit claim are a single operation: the run moves the word `running → committing`, and every
+  cancel (the machine's resume, a user cancel, the Stop endpoint, all through `cancelContext`) moves it `running →
+  canceled` before it cancels the context. Whichever swap lands first wins and the other aborts: a run that loses commits
+  nothing, and a resume that loses is not accepted, exactly as for a run already committing. This
+  replaced a check of the context followed by a separate committing flag, whose few-instruction gap (no I/O, no scheduling
+  point) could in principle let a cancel land between the two and double-commit the utterance (issue #318).
 - **Phase 1 lets the user pick the ASR and TTS models and the voice, each defaulting to an automatic choice.** The portal's thread model is
   the LLM (its own model selector is the LLM picker). The ASR and TTS models are the **user's to pick** since issue #317:
   the Voice Chat control has one picker each, listing the catalogue models the gateway says stream (plain speech models

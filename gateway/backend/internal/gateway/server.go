@@ -478,6 +478,11 @@ type Server struct {
 	// chunk is appended to the session's pendingText, with the buffer's new value. It is a
 	// TEST SEAM only (pendingText is not otherwise on the wire); production leaves it nil.
 	voiceOnPending func(pending string)
+	// voiceBeforeCommitClaim, when non-nil, is called by executeVoiceRun immediately before
+	// it claims its commit (the running->committing CAS). It is a TEST SEAM only: it lets a
+	// test land a cancel in exactly the window between the run finishing its TTS leg and its
+	// commit claim, deterministically. Production leaves it nil.
+	voiceBeforeCommitClaim func(run *ChatRun)
 	// capacity* tune the CP2 capacity ramp engine (set from ServerDeps in New,
 	// each defaulted from a non-positive value).
 	capacityVRAMMarginPct  int
