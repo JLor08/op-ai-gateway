@@ -422,11 +422,13 @@ const de = {
     `Das Chat-Modell ist das Modell dieses Chats: ${model}. Wählen Sie es oben in der Modellauswahl.`,
   // The voice system prompt of the thread (#314): the instruction a spoken conversation's runs
   // start from, pre-filled with the built-in one. It is the voice twin of the thread's own system
-  // prompt (chatSystemPrompt, which a spoken conversation does not use), so its label says whose it
-  // is. Emptying the field means the built-in prompt again.
+  // prompt (chatSystemPrompt), so its label says whose it is. The two are combined on a spoken
+  // conversation's runs: the thread's own prompt leads (the persona and context) and this one is
+  // added after it (the form of a spoken answer), which the hint says. Emptying the field means
+  // the built-in prompt again.
   chatVoiceSystemPrompt: 'System-Prompt für den Sprachchat',
   chatVoiceSystemPromptHint:
-    'Gilt für die Antworten des Sprachchats in diesem Chat. Der Standard verlangt zuerst eine kurze gesprochene Zusammenfassung und danach die ausführliche Antwort als Text. Leer lassen, um den Standard zu verwenden.',
+    'Gilt für die Antworten des Sprachchats in diesem Chat. Dieser Prompt wird an den System-Prompt dieses Chats angehängt, der weiterhin Rolle und Kontext vorgibt. Der Standard verlangt kurze gesprochene Zusammenfassungen in Abschnitten (einen bei kurzen, mehrere bei langen Antworten) und die ausführliche Antwort als Text. Leer lassen, um den Standard zu verwenden.',
   // Puts the built-in prompt back into the field (the thread then stores no prompt of its own).
   chatVoiceSystemPromptReset: 'Auf Standard zurücksetzen',
   // The collapsed block of a spoken answer's summary (#314): the short part the user heard, kept
@@ -3859,7 +3861,7 @@ const en: PortalMessages = {
     `The chat model is this chat's own model: ${model}. Pick it in the model selector above.`,
   chatVoiceSystemPrompt: 'Voice Chat system prompt',
   chatVoiceSystemPromptHint:
-    'Used for the answers of Voice Chat in this chat. The default asks for a short spoken summary first, then the full answer as text. Leave empty to use the default.',
+    "Used for the answers of Voice Chat in this chat. This prompt is appended to the chat's system prompt, which still sets the persona and context. The default asks for short spoken summaries in sections (one for a short answer, several for a long one) and the full answer as text. Leave empty to use the default.",
   chatVoiceSystemPromptReset: 'Reset to default',
   chatVoiceSpokenSummary: 'Spoken summary',
   chatVoiceErrorAsrUnavailable:

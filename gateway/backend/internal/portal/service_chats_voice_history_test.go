@@ -235,9 +235,10 @@ func TestVoiceRunHistoryOmitsAnAudioOnlyAssistantTurnInAMixedThread(t *testing.T
 }
 
 // A voice run carries ONE system message: the voice system prompt the user stored in
-// settings.voice_chat.system_prompt, or the built-in default when none is stored (or the stored
-// value is blank). The voice run reads it from the stored chat document, never from the ticket,
-// so a client cannot plant one per request.
+// settings.voice_chat.system_prompt (or the built-in default when none is stored, or the stored
+// value is blank), led by the thread's own system prompt (settings.system_prompt) when that is
+// non-blank. The voice run reads both from the stored chat document, never from the ticket, so a
+// client cannot plant one per request.
 
 func TestVoiceSystemPrompt_DefaultWhenAbsent(t *testing.T) {
 	for name, settings := range map[string]json.RawMessage{
@@ -265,6 +266,52 @@ func TestVoiceSystemPrompt_Override(t *testing.T) {
 		"trimmed":                {"{\"voice_chat\":{\"system_prompt\":\"  Be terse.\\n\"}}", "Be terse."},
 		"multi-line is kept":     {`{"voice_chat":{"system_prompt":"Be terse.\nNo lists."}}`, "Be terse.\nNo lists."},
 		"beside the model picks": {`{"model":"llama","voice_chat":{"asr_model":"asr-b","system_prompt":"Be terse."}}`, "Be terse."},
+	} {
+		if got := voiceSystemPrompt(json.RawMessage(tc.settings)); got != tc.want {
+			t.Errorf("%s: voiceSystemPrompt = %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
+// The built-in voice prompt describes the phase-3 behaviour the scanner relies on: spoken parts in
+// their own <speak lang="..."> tags -- one for a short answer, several for a long one -- with the
+// detail left outside the tags.
+func TestDefaultVoiceSystemPromptAsksForSeveralSpokenSections(t *testing.T) {
+	for _, want := range []string{
+		"`<speak lang=\"…\">…</speak>`",
+		"its own `<speak",
+		"ONE section",
+		"use several",
+		"two-letter code",
+		"outside the tags",
+		"shown but not spoken",
+	} {
+		if !strings.Contains(defaultVoiceSystemPrompt, want) {
+			t.Errorf("defaultVoiceSystemPrompt does not contain %q", want)
+		}
+	}
+}
+
+// The thread's own system prompt (settings.system_prompt: the persona/context) leads the voice
+// prompt (the form), separated by one blank line, as the ONE system message. A blank, absent or
+// mistyped thread prompt leaves the voice prompt alone, and a malformed top-level knob must not
+// switch the voice prompt off.
+func TestVoiceSystemPrompt_ComposesThreadAndVoicePrompts(t *testing.T) {
+	for name, tc := range map[string]struct{ settings, want string }{
+		"thread and voice":            {`{"system_prompt":"Persona.","voice_chat":{"system_prompt":"Voice."}}`, "Persona.\n\nVoice."},
+		"thread only: voice default":  {`{"system_prompt":"Persona."}`, "Persona.\n\n" + defaultVoiceSystemPrompt},
+		"thread beside picks only":    {`{"system_prompt":"Persona.","voice_chat":` + storedVoiceChatPicks + `}`, "Persona.\n\n" + defaultVoiceSystemPrompt},
+		"thread, blank voice":         {`{"system_prompt":"Persona.","voice_chat":{"system_prompt":"  "}}`, "Persona.\n\n" + defaultVoiceSystemPrompt},
+		"thread, mistyped voice":      {`{"system_prompt":"Persona.","voice_chat":{"system_prompt":42}}`, "Persona.\n\n" + defaultVoiceSystemPrompt},
+		"both are trimmed":            {"{\"system_prompt\":\"  Persona.\\n\",\"voice_chat\":{\"system_prompt\":\"\\nVoice.  \"}}", "Persona.\n\nVoice."},
+		"multi-line thread is kept":   {`{"system_prompt":"You are Ada.\nBe kind.","voice_chat":{"system_prompt":"Voice."}}`, "You are Ada.\nBe kind.\n\nVoice."},
+		"voice only":                  {`{"voice_chat":{"system_prompt":"Voice."}}`, "Voice."},
+		"neither":                     {`{"model":"llama"}`, defaultVoiceSystemPrompt},
+		"blank thread, voice":         {`{"system_prompt":"   ","voice_chat":{"system_prompt":"Voice."}}`, "Voice."},
+		"empty thread, no voice":      {`{"system_prompt":""}`, defaultVoiceSystemPrompt},
+		"null thread":                 {`{"system_prompt":null,"voice_chat":{"system_prompt":"Voice."}}`, "Voice."},
+		"mistyped thread, voice kept": {`{"system_prompt":42,"voice_chat":{"system_prompt":"Voice."}}`, "Voice."},
+		"mistyped thread, no voice":   {`{"system_prompt":["x"]}`, defaultVoiceSystemPrompt},
 	} {
 		if got := voiceSystemPrompt(json.RawMessage(tc.settings)); got != tc.want {
 			t.Errorf("%s: voiceSystemPrompt = %q, want %q", name, got, tc.want)
@@ -340,26 +387,32 @@ func TestVoiceRunHistory_DefaultSystemMessage(t *testing.T) {
 	}
 }
 
-// The thread's own (typed-chat) system prompt, stored in settings.system_prompt, must NEVER
-// reach a voice run -- not even when it sits BESIDE settings.voice_chat in the same stored
-// document. A voice run's one system message is voice_chat.system_prompt (the stored override)
-// or the built-in default; the typed prompt belongs to the typed run alone (#322).
-func TestVoiceRunHistory_ThreadSystemPromptDoesNotReachAVoiceRun(t *testing.T) {
+// The thread's own (typed-chat) system prompt, stored in settings.system_prompt, is the PERSONA
+// layer of a voice run: the run's one system message is that prompt, a blank line, then the voice
+// prompt (the stored override, else the built-in default). It is COMBINED into that one message,
+// never emitted as a second system message, and a thread without one is unchanged.
+func TestVoiceRunHistory_ThreadSystemPromptLeadsTheVoicePrompt(t *testing.T) {
 	const threadPrompt = "THREAD-ONLY: answer like a pirate."
 	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
 
 	for name, tc := range map[string]struct{ settings, want string }{
 		"voice override beside the thread prompt": {
-			`{"system_prompt":"` + threadPrompt + `","voice_chat":{"system_prompt":"Be terse."}}`, "Be terse.",
+			`{"system_prompt":"` + threadPrompt + `","voice_chat":{"system_prompt":"Be terse."}}`, threadPrompt + "\n\nBe terse.",
 		},
 		"voice default (picks only) beside the thread prompt": {
-			`{"system_prompt":"` + threadPrompt + `","voice_chat":` + storedVoiceChatPicks + `}`, defaultVoiceSystemPrompt,
+			`{"system_prompt":"` + threadPrompt + `","voice_chat":` + storedVoiceChatPicks + `}`, threadPrompt + "\n\n" + defaultVoiceSystemPrompt,
 		},
 		"voice default (blank override) beside the thread prompt": {
-			`{"system_prompt":"` + threadPrompt + `","voice_chat":{"system_prompt":"  "}}`, defaultVoiceSystemPrompt,
+			`{"system_prompt":"` + threadPrompt + `","voice_chat":{"system_prompt":"  "}}`, threadPrompt + "\n\n" + defaultVoiceSystemPrompt,
 		},
 		"thread prompt alone, no voice_chat at all": {
-			`{"system_prompt":"` + threadPrompt + `"}`, defaultVoiceSystemPrompt,
+			`{"system_prompt":"` + threadPrompt + `"}`, threadPrompt + "\n\n" + defaultVoiceSystemPrompt,
+		},
+		"blank thread prompt beside a voice override": {
+			`{"system_prompt":"   ","voice_chat":{"system_prompt":"Be terse."}}`, "Be terse.",
+		},
+		"no thread prompt: the voice prompt alone": {
+			`{"voice_chat":{"system_prompt":"Be terse."}}`, "Be terse.",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -368,19 +421,21 @@ func TestVoiceRunHistory_ThreadSystemPromptDoesNotReachAVoiceRun(t *testing.T) {
 			if err != nil {
 				t.Fatalf("VoiceRunHistory: %v", err)
 			}
+			// ONE system message, the composed text (and no second one anywhere in the history).
 			assertSoleSystemMessage(t, history, tc.want)
-			// Nowhere in the run's history: not as a second system message (asserted above), and
-			// not folded into any other message either.
-			if body, _ := json.Marshal(history); strings.Contains(string(body), threadPrompt) {
-				t.Fatalf("the thread's typed-chat system prompt reached the voice run: %s", body)
+			// Combined into that message, not folded into any other message of the run.
+			for i, m := range history[1:] {
+				if strings.Contains(string(m.Content), threadPrompt) {
+					t.Fatalf("history[%d] carries the thread prompt outside the system message: %s", i+1, m.Content)
+				}
 			}
 		})
 	}
 
-	// Positive control: the very same stored prompt DOES lead a typed run's history when the
-	// typed run carries it, so the assertions above are not vacuously true of a prompt no run
-	// ever reads.
-	t.Run("control: a typed run does carry the thread prompt", func(t *testing.T) {
+	// Typed runs are unchanged: the same stored prompt is a typed run's ONE system message ON ITS
+	// OWN (no voice prompt joins it), so the combination above is the voice run's alone and the
+	// assertions are not vacuously true of a prompt no run ever reads.
+	t.Run("control: a typed run carries the thread prompt alone", func(t *testing.T) {
 		created, err := svc.CreateChat(context.Background(), chatToken("usr_a"), CreateChatRequest{Content: json.RawMessage(`{"settings":{"system_prompt":"` + threadPrompt + `"},"messages":[]}`)})
 		if err != nil {
 			t.Fatal(err)

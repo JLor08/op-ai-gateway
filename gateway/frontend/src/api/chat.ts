@@ -131,13 +131,14 @@ export type ChatTranscriptionSettings = {
 // key, a picked name is read back when the thread is opened and handed to the ticket
 // (api/voiceChat.ts) when a conversation starts; the backend neither reads nor validates the
 // picks (the ticket's co-load gate resolves and validates the models a conversation is started
-// with, and the ticket's speech settings take the voice from the request). The one member it does
-// read is `system_prompt`: a voice run takes it from the STORED document, trimmed, as its system
-// message (the built-in prompt when it is absent or blank), never from the ticket or a request
-// field. The settings of a run do not carry it, but a run rewrites the stored settings from its
-// own typed struct, so the backend lifts the stored value forward across that rewrite
-// (PrepareChatRun, like the pinned kind), and the open thread's next save writes it again as
-// well.
+// with, and the ticket's speech settings take the voice from the request). The one member of it
+// the backend does read is `system_prompt`: a voice run takes it from the STORED document,
+// trimmed, as the voice half of its ONE system message (the built-in prompt when it is absent or
+// blank), after the thread's own top-level `system_prompt` when that is non-blank, and never from
+// the ticket or a request field. The settings of a run do not carry it, but a run rewrites the
+// stored settings from its own typed struct, so the backend lifts the stored value forward across
+// that rewrite (PrepareChatRun, like the pinned kind), and the open thread's next save writes it
+// again as well.
 export type ChatVoiceChatSettings = {
   asr_model?: string;
   tts_model?: string;

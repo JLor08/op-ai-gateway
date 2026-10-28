@@ -1277,43 +1277,69 @@ func (s *Service) commitTurnWithRetention(ctx context.Context, chatID string, ro
 	return s.commitChatRun(ctx, row, row.Title, doc, blobs, deleteBlobIDs)
 }
 
-// defaultVoiceSystemPrompt is the built-in voice system prompt: the one a voice run carries as
-// its sole system message when the thread stores none (or a blank one). It asks the model to
-// open every answer with a short <speak lang="..."> summary -- the part that is spoken -- and to
-// write the fuller answer after it as text that is shown but not spoken. It is language-agnostic
+// defaultVoiceSystemPrompt is the built-in voice system prompt: the voice half of the one system
+// message a voice run carries when the thread stores no voice prompt of its own (or a blank one).
+// It asks the model to put the spoken part of its answer in short `<speak lang="...">` sections
+// -- ONE for a short answer, several (roughly one per key point) for a long one -- and to write
+// the fuller detail as text outside the tags that is shown but not spoken. It is language-agnostic
 // on purpose: the model uses the language the user is speaking.
 //
 // The portal keeps a copy of this text (DEFAULT_VOICE_SYSTEM_PROMPT in
 // gateway/frontend/src/components/chat/chatDoc.ts) to pre-fill the editable field and to store
 // nothing when the user leaves it unchanged; the two must stay identical, character for
 // character (a frontend test reads this file and compares them).
-const defaultVoiceSystemPrompt = "You are in a spoken conversation. Begin every answer with ONE short, natural " +
-	"spoken summary of the essential point, wrapped in a single " +
-	"`<speak lang=\"…\">…</speak>` tag, using the language the user is speaking (set " +
-	"`lang` to its two-letter code). Keep what is inside `<speak>` brief enough to " +
-	"listen to — a sentence or two, the gist only. After the closing `</speak>`, " +
-	"write the fuller answer (detail, lists, code, caveats) as normal text; that " +
-	"part is shown but not spoken. Do not put anything before the `<speak>` tag."
+const defaultVoiceSystemPrompt = "You are in a spoken conversation. Summarize the essentials as short spoken " +
+	"sections, each wrapped in its own `<speak lang=\"…\">…</speak>` tag, using the " +
+	"language the user is speaking (set `lang` to its two-letter code). For a " +
+	"short answer use ONE section; for a long answer use several — roughly one per " +
+	"key point, each placed after the written detail it summarizes — each a brief " +
+	"spoken summary of that part, so the spoken sections together are a fuller but " +
+	"still concise summary. Keep each `<speak>` short enough to listen to — a " +
+	"sentence or two. Write the fuller detail (explanations, lists, code, caveats) " +
+	"as normal text outside the tags; that text is shown but not spoken. Do not " +
+	"put anything before the first `<speak>` tag."
 
-// voiceSystemPrompt is the system prompt of a voice run, read from the chat document's
-// settings: settings.voice_chat.system_prompt trimmed, or defaultVoiceSystemPrompt when the
-// thread stores none -- the key absent, blank, or not a string. The document is schema-free,
-// so this decodes the one member it needs (the picks beside it, and any unrelated malformed
-// knob, must not switch the prompt off). It is read from the STORED document, never from the
-// run ticket or a request field, so a client cannot plant a prompt for a single run.
+// voiceSystemPrompt is the system message of a voice run, read from the chat document's settings
+// and composed of two layers: the thread's own system prompt (settings.system_prompt, the
+// persona and context a typed run carries too), then the voice system prompt (the form of a
+// spoken answer: settings.voice_chat.system_prompt, or defaultVoiceSystemPrompt when the thread
+// stores none -- the key absent, blank, or not a string). Both are trimmed and joined by one
+// blank line, the thread prompt first. A blank, absent or non-string thread prompt leaves the
+// voice prompt alone. The document is schema-free, so each member is decoded on its own (the
+// picks beside voice_chat, and any unrelated malformed knob, must not switch either prompt off).
+// It is read from the STORED document, never from the run ticket or a request field, so a client
+// cannot plant a prompt for a single run.
 func voiceSystemPrompt(settings json.RawMessage) string {
-	var s struct {
-		VoiceChat *struct {
-			SystemPrompt string `json:"system_prompt"`
-		} `json:"voice_chat"`
+	var top struct {
+		SystemPrompt json.RawMessage `json:"system_prompt"`
+		VoiceChat    json.RawMessage `json:"voice_chat"`
 	}
-	if len(settings) == 0 || json.Unmarshal(settings, &s) != nil || s.VoiceChat == nil {
+	if len(settings) == 0 || json.Unmarshal(settings, &top) != nil {
 		return defaultVoiceSystemPrompt
 	}
-	if prompt := strings.TrimSpace(s.VoiceChat.SystemPrompt); prompt != "" {
-		return prompt
+	voice := defaultVoiceSystemPrompt
+	var vc struct {
+		SystemPrompt json.RawMessage `json:"system_prompt"`
 	}
-	return defaultVoiceSystemPrompt
+	if json.Unmarshal(top.VoiceChat, &vc) == nil {
+		if prompt := trimmedPromptString(vc.SystemPrompt); prompt != "" {
+			voice = prompt
+		}
+	}
+	if thread := trimmedPromptString(top.SystemPrompt); thread != "" {
+		return thread + "\n\n" + voice
+	}
+	return voice
+}
+
+// trimmedPromptString is the trimmed text of a stored prompt member, or "" when the member is
+// absent, null, blank, or not a string.
+func trimmedPromptString(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return ""
+	}
+	return strings.TrimSpace(text)
 }
 
 // VoiceRunHistory returns the chat's stored history as OpenAI messages with
@@ -1322,9 +1348,11 @@ func voiceSystemPrompt(settings json.RawMessage) string {
 // chat-document persistence is deferred to its finalize (CommitVoiceTurn) and a
 // cancelled run leaves the chat untouched (spec 6.1). The older turns' stored image
 // references are resolved to data urls (resolveChatBlobRefs), exactly as a text run's
-// history is. The history opens with ONE system message: the voice system prompt
-// (voiceSystemPrompt -- the thread's stored override, else the built-in default). The
-// thread's typed-chat system prompt never reaches a voice run. Owner-scoped.
+// history is. The history opens with ONE system message (voiceSystemPrompt): the thread's
+// own system prompt, when it has one, followed by the voice system prompt (the thread's
+// stored override, else the built-in default), combined into that single message -- never
+// a second one. A typed run carries the thread prompt alone; the combination is the voice
+// run's. Owner-scoped.
 func (s *Service) VoiceRunHistory(ctx context.Context, owner auth.Token, chatID, pendingText string) ([]ChatAPIMessage, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {

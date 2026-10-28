@@ -954,20 +954,24 @@ export function transcriptionSettingsFrom(
   };
 }
 
-// The built-in voice system prompt: what a Voice Chat run carries as its system message when the
-// thread stores no prompt of its own. A COPY of the backend's defaultVoiceSystemPrompt
+// The built-in voice system prompt: what a Voice Chat run carries after the thread's own system
+// prompt (as the voice half of its one system message) when the thread stores no voice prompt of
+// its own. A COPY of the backend's defaultVoiceSystemPrompt
 // (gateway/backend/internal/portal/service_chats.go): the two MUST stay identical, character for
 // character (a test reads the Go source and compares). The portal needs the text to pre-fill the
 // editable field and to tell an edit from an untouched default -- only an edit is stored, so the
 // default stays code-owned and an improved one reaches every thread that did not override it.
 export const DEFAULT_VOICE_SYSTEM_PROMPT =
-  'You are in a spoken conversation. Begin every answer with ONE short, natural ' +
-  'spoken summary of the essential point, wrapped in a single ' +
-  '`<speak lang="…">…</speak>` tag, using the language the user is speaking (set ' +
-  '`lang` to its two-letter code). Keep what is inside `<speak>` brief enough to ' +
-  'listen to — a sentence or two, the gist only. After the closing `</speak>`, ' +
-  'write the fuller answer (detail, lists, code, caveats) as normal text; that ' +
-  'part is shown but not spoken. Do not put anything before the `<speak>` tag.';
+  'You are in a spoken conversation. Summarize the essentials as short spoken ' +
+  'sections, each wrapped in its own `<speak lang="…">…</speak>` tag, using the ' +
+  'language the user is speaking (set `lang` to its two-letter code). For a ' +
+  'short answer use ONE section; for a long answer use several — roughly one per ' +
+  'key point, each placed after the written detail it summarizes — each a brief ' +
+  'spoken summary of that part, so the spoken sections together are a fuller but ' +
+  'still concise summary. Keep each `<speak>` short enough to listen to — a ' +
+  'sentence or two. Write the fuller detail (explanations, lists, code, caveats) ' +
+  'as normal text outside the tags; that text is shown but not spoken. Do not ' +
+  'put anything before the first `<speak>` tag.';
 
 // The Voice Chat picks of a thread (#317, #318, #314), as CONCRETE store state (every field
 // defined, unlike the all-optional wire ChatVoiceChatSettings): the live-transcription model that
