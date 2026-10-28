@@ -1010,6 +1010,56 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(block()).toHaveAttribute('open');
       });
 
+      // #322: the gateway persists the summary's RUNE offset (spoken_summary_start), so the body
+      // is sliced out by POSITION, not re-found by value. The exact case: the summary's text also
+      // appears in the leading detail, so indexOf would cut the earlier occurrence; the offset
+      // points at the real <speak> region. A multi-byte 'ä' and emoji sit before it, so a UTF-16
+      // or byte offset would also mis-cut -- the slice is code-point correct.
+      it('slices the body by the persisted offset, past a leading duplicate (rune-correct)', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Käse 🧀 Sum. Sum. Detail.', AUDIO)}
+            spokenSummary="Sum."
+            spokenSummaryStart={12}
+          />,
+        );
+
+        // One block, carrying the summary exactly once.
+        expect(document.querySelectorAll('details')).toHaveLength(1);
+        const summaryText = screen.getAllByText('Sum.');
+        expect(summaryText).toHaveLength(1);
+        expect(summaryText[0].closest('details')).toBe(block());
+        // The offset cut the SECOND "Sum.": the body keeps "Käse 🧀 Sum." (the leading duplicate)
+        // and "Detail.". indexOf would have cut the first, leaving "Käse 🧀" + "Sum. Detail.".
+        expect(screen.getByText('Käse 🧀 Sum.')).toBeInTheDocument();
+        expect(screen.getByText('Käse 🧀 Sum.').closest('details')).toBeNull();
+        expect(screen.getByText('Detail.')).toBeInTheDocument();
+      });
+
+      // Back-compat: a turn committed before #322 carries no spoken_summary_start, so the body
+      // derivation falls back to the indexOf behavior -- which cuts the FIRST occurrence. Proven
+      // on the same leading-duplicate content, where the two paths differ visibly.
+      it('falls back to the indexOf body derivation when the offset is absent (older turn)', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Käse 🧀 Sum. Sum. Detail.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        expect(document.querySelectorAll('details')).toHaveLength(1);
+        const summaryText = screen.getAllByText('Sum.');
+        expect(summaryText).toHaveLength(1);
+        expect(summaryText[0].closest('details')).toBe(block());
+        // indexOf cut the FIRST "Sum.": the body splits as "Käse 🧀" + "Sum. Detail.".
+        expect(screen.getByText('Käse 🧀')).toBeInTheDocument();
+        expect(screen.getByText('Sum. Detail.')).toBeInTheDocument();
+      });
+
       // Review focus: the summary is normally the leading text, but the model may put words
       // before its <speak> tag. The body must still exclude the summary, and keep what is around.
       it('excludes the summary even when it was not the leading text', () => {

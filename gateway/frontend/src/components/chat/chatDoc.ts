@@ -50,6 +50,11 @@ export type ChatUiMessage = {
   // portal renders it as the collapsed, replayable block. snake_case because it is the chat
   // document's own key, not one of the camelCase run metrics above.
   spoken_summary?: string;
+  // The RUNE offset of spoken_summary within the answer text (#322), written by the gateway beside
+  // it so the collapsed block's body is sliced out by POSITION rather than re-found by value --
+  // exact even when the summary's text repeats before the <speak> region. Present only on turns
+  // committed with it; an older turn omits it and the portal falls back to the by-value removal.
+  spoken_summary_start?: number;
   status?: ChatMessageStatus;
 };
 

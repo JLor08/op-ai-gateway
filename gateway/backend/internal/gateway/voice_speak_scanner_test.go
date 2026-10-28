@@ -648,3 +648,80 @@ func TestSpeakScanner_SelfClosingChunkingIsInvisible(t *testing.T) {
 		}
 	}
 }
+
+// SummaryStart reports the RUNE offset of the first <speak> region's content within the
+// accumulated clean text, so the portal can slice the spoken summary out of the full answer
+// by position rather than re-finding it by value (issue #322). It is -1 when no region was
+// captured (no tag, or a self-closing tag that opens none), and counts code points -- NOT
+// bytes -- so a multi-byte char in the leading detail does not throw the offset off.
+func TestSpeakScanner_SummaryStart(t *testing.T) {
+	t.Run("zero when the region is the leading text", func(t *testing.T) {
+		s := newSpeakScanner()
+		feedSpeakScanner(s, `<speak lang="de">Kurz.</speak> Detail.`)
+		if got := s.SummaryStart(); got != 0 {
+			t.Errorf("SummaryStart() = %d, want 0", got)
+		}
+	})
+
+	t.Run("points past leading detail, in runes not bytes", func(t *testing.T) {
+		// Leading detail "Käse 🧀 " precedes the tag: 'ä' is two bytes and '🧀' is four, so a
+		// byte offset would overshoot. The region's content starts at rune 7.
+		s := newSpeakScanner()
+		clean, _ := feedSpeakScanner(s, `Käse 🧀 <speak lang="de">Kurz.</speak> Detail.`)
+		const want = 7
+		got := s.SummaryStart()
+		if got != want {
+			t.Fatalf("SummaryStart() = %d, want %d (runes)", got, want)
+		}
+		// The offset is EXACT: slicing the clean text's runes at it yields the summary.
+		runes := []rune(clean)
+		text, _ := s.Summary()
+		if string(runes[got:got+len([]rune(text))]) != text {
+			t.Errorf("runes[%d:] = %q, want the summary %q", got, string(runes[got:]), text)
+		}
+	})
+
+	t.Run("points at the real region when the summary repeats in leading detail", func(t *testing.T) {
+		// The prompt forbids leading text, but the model may ignore it: here the summary "Kurz."
+		// appears BEFORE the tag too. The offset must point at the real <speak> region (rune 6),
+		// not the earlier verbatim occurrence (rune 0), which is where indexOf would mis-cut.
+		s := newSpeakScanner()
+		feedSpeakScanner(s, `Kurz. <speak lang="de">Kurz.</speak> Detail.`)
+		if got := s.SummaryStart(); got != 6 {
+			t.Errorf("SummaryStart() = %d, want 6 (the real region, not the leading duplicate at 0)", got)
+		}
+	})
+
+	t.Run("minus one when no tag was seen", func(t *testing.T) {
+		s := newSpeakScanner()
+		feedSpeakScanner(s, "Just plain text, no tag.")
+		if got := s.SummaryStart(); got != -1 {
+			t.Errorf("SummaryStart() = %d, want -1", got)
+		}
+	})
+
+	t.Run("minus one for a self-closing tag that opens no region", func(t *testing.T) {
+		s := newSpeakScanner()
+		feedSpeakScanner(s, `a <speak lang="de"/> b`)
+		if !s.Found() {
+			t.Fatal("Found() = false, want true: a self-closing tag was seen")
+		}
+		if got := s.SummaryStart(); got != -1 {
+			t.Errorf("SummaryStart() = %d, want -1: a self-closing tag captures no region", got)
+		}
+	})
+
+	t.Run("offset is invariant to how the stream is chunked", func(t *testing.T) {
+		const in = `Käse 🧀 before <speak lang="de">Kurz.</speak> Detail.`
+		whole := newSpeakScanner()
+		feedSpeakScanner(whole, in)
+		want := whole.SummaryStart()
+		for cut := 1; cut < len(in); cut++ {
+			s := newSpeakScanner()
+			feedSpeakScanner(s, in[:cut], in[cut:])
+			if got := s.SummaryStart(); got != want {
+				t.Errorf("split at %d: SummaryStart() = %d, want %d", cut, got, want)
+			}
+		}
+	})
+}

@@ -1042,6 +1042,7 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   reasoning={message.reasoning}
                   reasoningMs={message.reasoningMs}
                   spokenSummary={message.spoken_summary}
+                  spokenSummaryStart={message.spoken_summary_start}
                   ttftMs={message.ttftMs}
                   tps={message.tps}
                   tokensPerSecond={message.tokensPerSecond}

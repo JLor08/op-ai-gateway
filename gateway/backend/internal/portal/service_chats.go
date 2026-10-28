@@ -1100,6 +1100,13 @@ type AssistantTurn struct {
 	// when non-empty, so a turn with no summary (a phase-1 voice turn, a no-tag
 	// fallback, every non-voice turn) is stored byte for byte as before.
 	SpokenSummary string
+	// SpokenSummaryStart is the RUNE offset of SpokenSummary within the full clean answer
+	// (Content/ContentParts), so the portal can slice the summary out of the body by position
+	// rather than re-finding it by value with indexOf -- exact even when the summary's text also
+	// appears before the <speak> region (#322). It is persisted under `spoken_summary_start`, and
+	// ONLY when SpokenSummary is non-empty: a value of 0 is the common case (the summary is the
+	// leading text) and must round-trip, so the summary's presence gates the key, not the offset.
+	SpokenSummaryStart int
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -1190,6 +1197,10 @@ func buildAssistantMessage(id, status string, turn AssistantTurn) (json.RawMessa
 		// snake_case, like the chat document's other additive keys (settings.voice_chat);
 		// the portal reads it to re-render the collapsed spoken-summary block on reload.
 		msg["spoken_summary"] = turn.SpokenSummary
+		// The summary's rune offset rides ALONGSIDE it, written whenever the summary is -- 0
+		// included, since the summary is usually the leading text -- so the portal slices the
+		// body by position. A turn with no summary carries neither key (#322).
+		msg["spoken_summary_start"] = turn.SpokenSummaryStart
 	}
 	return json.Marshal(msg)
 }

@@ -3,7 +3,10 @@
 
 package gateway
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // maxSpeakTagLen bounds how many bytes the scanner will hold back while it decides
 // whether a '<' starts a <speak ...> / </speak> tag. A real tag is far shorter; a tag
@@ -38,11 +41,20 @@ type speakScanner struct {
 	lang string
 	// summary accumulates the first region's text.
 	summary strings.Builder
+	// prefix accumulates the clean text emitted BEFORE any region opens -- the leading detail,
+	// if the model wrote any. Its rune count is the first region's content offset, taken once
+	// when that region opens. It is held as bytes, not a running rune count, so a multi-byte
+	// rune split across deltas is counted once (over the reassembled whole), not twice.
+	prefix strings.Builder
+	// summaryStart is the rune offset of the first region's content within the clean stream,
+	// recorded when that region opens; -1 until then (and for a self-closing tag, which opens
+	// no region).
+	summaryStart int
 }
 
 // newSpeakScanner returns a scanner ready for the start of a stream.
 func newSpeakScanner() *speakScanner {
-	return &speakScanner{}
+	return &speakScanner{summaryStart: -1}
 }
 
 // Write feeds one raw content delta. It returns the tag-stripped text that is safe to
@@ -115,6 +127,16 @@ func (s *speakScanner) Found() bool {
 	return s.found
 }
 
+// SummaryStart returns the rune offset of the first <speak> region's content within the clean
+// text the scanner emits, or -1 when no region was captured (no tag, or a self-closing tag that
+// opens none). It is a count of code points, not bytes, so the portal can slice the summary out
+// of the full answer by position in a way the frontend can reproduce on a JS string. The offset
+// is to the region's content START even when the content is later trimmed; the caller advances it
+// past any whitespace it strips.
+func (s *speakScanner) SummaryStart() int {
+	return s.summaryStart
+}
+
 // emit publishes text to the clean stream, and also to the summary while inside the
 // first region.
 func (s *speakScanner) emit(out *strings.Builder, text string) {
@@ -122,6 +144,10 @@ func (s *speakScanner) emit(out *strings.Builder, text string) {
 		return
 	}
 	out.WriteString(text)
+	if !s.found {
+		// Still before the first region: this is leading detail, part of the offset prefix.
+		s.prefix.WriteString(text)
+	}
 	if s.inFirst {
 		s.summary.WriteString(text)
 	}
@@ -135,6 +161,11 @@ func (s *speakScanner) openTag(attrs string) {
 	}
 	s.found = true
 	s.inFirst = true
+	// The leading text (if any) is all in prefix now, so its rune count is exactly the offset at
+	// which this region's content begins in the clean stream. Counted once, over the reassembled
+	// bytes, so a rune split across deltas counts as one.
+	s.summaryStart = utf8.RuneCountInString(s.prefix.String())
+	s.prefix.Reset()
 	s.lang = parseSpeakLang(attrs)
 }
 

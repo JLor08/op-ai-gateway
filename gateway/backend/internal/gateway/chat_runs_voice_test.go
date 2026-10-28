@@ -808,6 +808,22 @@ func storedSpokenSummary(t *testing.T, content json.RawMessage) (string, bool) {
 	return summary, true
 }
 
+// storedSpokenSummaryStart returns the assistant message's spoken_summary_start (the summary's
+// rune offset into the full answer) and whether the key is present at all (a turn with no summary
+// omits it).
+func storedSpokenSummaryStart(t *testing.T, content json.RawMessage) (int, bool) {
+	t.Helper()
+	raw, ok := storedAssistantMsg(t, content)["spoken_summary_start"]
+	if !ok {
+		return 0, false
+	}
+	var start int
+	if err := json.Unmarshal(raw, &start); err != nil {
+		t.Fatalf("spoken_summary_start is not an int: %s", raw)
+	}
+	return start, true
+}
+
 // seedVoiceSpeechLanguage writes the TTS mapping's scope-"" speech_language fact, as the
 // health loop does, so the voice run's capability lookup finds the model accepts (or not) a
 // `language` field.
@@ -908,6 +924,47 @@ func TestVoiceRun_NoTagSpeaksWholeAnswer(t *testing.T) {
 	}
 	if _, ok := storedSpokenSummary(t, stored.Content); ok {
 		t.Fatalf("a no-tag turn must persist no spoken_summary: %s", stored.Content)
+	}
+	if start, ok := storedSpokenSummaryStart(t, stored.Content); ok {
+		t.Fatalf("a no-tag turn must persist no spoken_summary_start, got %d: %s", start, stored.Content)
+	}
+}
+
+// The spoken summary's RUNE offset into the full answer is persisted as spoken_summary_start, so
+// the portal slices the summary out by position, exactly (#322). The scripted answer puts the
+// summary's text in the leading detail too, and a multi-byte 'ä' and emoji before the tag, so a
+// byte offset or an indexOf would land on the WRONG occurrence; the persisted offset points at
+// the real <speak> region.
+func TestVoiceRun_PersistsSpokenSummaryStart(t *testing.T) {
+	prov := defaultVoiceProvider()
+	prov.llmScript = []scriptedLLMDelta{
+		{text: `Käse 🧀 Kurz. <speak lang="de">Kurz.</speak> Detail.`},
+	}
+	srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, "unused")
+	if snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Clean answer: "Käse 🧀 Kurz. Kurz. Detail." -- the region's content ("Kurz.") begins at
+	// rune 13, past the leading "Käse 🧀 Kurz. " (which itself contains the summary verbatim).
+	const wantStart = 13
+	start, ok := storedSpokenSummaryStart(t, stored.Content)
+	if !ok || start != wantStart {
+		t.Fatalf("spoken_summary_start = %d (present %v), want %d", start, ok, wantStart)
+	}
+	// Exactness: slicing the full answer's runes at the offset yields the stored summary -- the
+	// property the portal relies on, proven against the real committed document.
+	summary, _ := storedSpokenSummary(t, stored.Content)
+	full := voiceTextPart(t, storedAssistantMsg(t, stored.Content)["content"])
+	runes := []rune(full)
+	if start+len([]rune(summary)) > len(runes) || string(runes[start:start+len([]rune(summary))]) != summary {
+		t.Fatalf("runes[%d:]=%q of %q does not start with the summary %q", start, string(runes[start:]), full, summary)
 	}
 }
 

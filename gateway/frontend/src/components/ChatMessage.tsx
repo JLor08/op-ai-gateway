@@ -34,20 +34,48 @@ function contentText(content: ChatContent): string {
 
 // The answer's text with a voice answer's spoken summary taken out: the body shown beneath the
 // summary block (#314). `content` holds the FULL clean answer -- summary and detail -- while the
-// summary has a block of its own, so leaving it in the body would show it twice. The gateway
-// stores the summary as a verbatim slice of that text (only the <speak> tags are stripped from
-// it), so it is found as one. It is normally the leading text, but the model may have put words
-// before its tag, so the FIRST occurrence is cut wherever it sits and what surrounds it is kept,
-// joined by a paragraph break. A summary that cannot be found (not expected) leaves the text
-// whole: showing it twice beats dropping part of the answer.
+// summary has a block of its own, so leaving it in the body would show it twice.
+//
+// The gateway now persists the summary's RUNE offset (spoken_summary_start), so the body is sliced
+// out by POSITION, which is exact even when the summary's text also appears in the detail before
+// the <speak> region -- see bodyAt (#322). For a turn committed BEFORE that (no offset), it falls
+// back to withoutSummary, which re-finds the summary by value with indexOf.
+
+// bodyAt removes the summary from the full answer by its persisted rune offset: the code points in
+// [start, start + len(summary)) are the summary, so the slice is exact wherever the region sits --
+// unlike indexOf, which would cut an earlier verbatim occurrence. Code points (Array.from), not
+// UTF-16 units, so a multi-byte char (an umlaut, an emoji) in the detail does not shift the cut. A
+// start that does not line up (out of range, or the slice is not the summary) falls back to the
+// by-value removal rather than corrupting the body.
+function bodyAt(text: string, summary: string, start: number): string {
+  const chars = Array.from(text);
+  const end = start + Array.from(summary).length;
+  if (start < 0 || end > chars.length || chars.slice(start, end).join('') !== summary) {
+    return withoutSummary(text, summary);
+  }
+  return joinSummaryGap(chars.slice(0, start).join(''), chars.slice(end).join(''));
+}
+
+// withoutSummary removes the summary by VALUE: the gateway stores it as a verbatim slice of the
+// answer (only the <speak> tags are stripped), so it is found as one. It is normally the leading
+// text, but the model may have put words before its tag, so the FIRST occurrence is cut wherever
+// it sits. A summary that cannot be found (not expected) leaves the text whole: showing it twice
+// beats dropping part of the answer. Kept as the back-compat path for turns with no stored offset.
 function withoutSummary(text: string, summary: string): string {
   const at = text.indexOf(summary);
   if (at < 0) return text;
-  const before = text.slice(0, at).trimEnd();
-  const after = dropLeadingBlank(text.slice(at + summary.length));
-  if (before.trim() === '') return after;
-  if (after.trim() === '') return before;
-  return `${before}\n\n${after}`;
+  return joinSummaryGap(text.slice(0, at), text.slice(at + summary.length));
+}
+
+// joinSummaryGap stitches the text before and after the removed summary back together: the lead-in
+// loses its trailing space, the tail its leading blank lines, and the two are joined by a paragraph
+// break -- unless one side is empty, in which case the other stands alone.
+function joinSummaryGap(before: string, after: string): string {
+  const head = before.trimEnd();
+  const tail = dropLeadingBlank(after);
+  if (head.trim() === '') return tail;
+  if (tail.trim() === '') return head;
+  return `${head}\n\n${tail}`;
 }
 
 // The text without its leading blank space: whole blank lines go, but the indentation of the
@@ -88,6 +116,7 @@ function ChatMessageComponent({
   reasoning,
   reasoningMs,
   spokenSummary,
+  spokenSummaryStart,
   streaming,
   kind,
   elapsedMs,
@@ -126,6 +155,11 @@ function ChatMessageComponent({
   // in its summary line -- that audio IS the summary's -- and the body is the answer without it.
   // Absent or empty, the row renders as it always has: the full text, the one player below it.
   spokenSummary?: string;
+  // The RUNE offset of spokenSummary within `content`'s text (#322), so the body is sliced out by
+  // POSITION -- exact even when the summary's text also appears before the <speak> region, which
+  // indexOf would mis-cut. Present only on turns committed WITH the offset; absent (an older turn)
+  // the body falls back to the by-value indexOf removal. Only meaningful with a non-empty summary.
+  spokenSummaryStart?: number;
   streaming?: boolean;
   // The kind of the RUN this row is streaming ("" text | "image" | "speech" | "transcription") --
   // ChatStore's runKind, read from the run's own reports (its 201, an
@@ -273,7 +307,16 @@ function ChatMessageComponent({
     // itself only when it is all there is (a short answer with no detail to read after it).
     const summaryText = spokenSummary?.trim() ?? '';
     const hasSummaryBlock = summaryText !== '';
-    const body = hasSummaryBlock ? withoutSummary(text, summaryText) : text;
+    let body = text;
+    if (hasSummaryBlock) {
+      // Slice by the persisted offset when the turn carries one (#322); fall back to the by-value
+      // removal for a turn committed before it. 0 is a valid offset (the summary leads the answer),
+      // so the presence of the field, not its value, selects the path.
+      body =
+        spokenSummaryStart === undefined
+          ? withoutSummary(text, summaryText)
+          : bodyAt(text, summaryText, spokenSummaryStart);
+    }
     let audioNode: ReactNode = null;
     if (audioUrls.length > 0) {
       audioNode = <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />;
