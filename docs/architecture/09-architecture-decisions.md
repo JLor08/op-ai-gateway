@@ -9495,6 +9495,12 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   that: each can "succeed" by *evicting* the one before it, so a naive gate passes while the three are not resident and
   the first turn reloads.
 
+**Phase 2 ([ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language))
+changes two things this entry describes in their phase-1 form:** *what* is spoken (a short `<speak>` summary instead of
+the whole answer) and the *order* of the legs (the speech leg starts at `</speak>` while the LLM is still streaming the
+detail). Where a sentence below describes the phase-1 flow, it says so; the state machine, the continuation window, the
+half-duplex gate and the drain are otherwise as described here.
+
 **Decision — eight choices, taken together. No schema migration, no agent change and no `ServerAgent` version bump**
 (the feature composes existing agent routes and rides the schema-free chat document).
 
@@ -9528,9 +9534,11 @@ to be a property of the **server** and not of a cooperative browser. Four forces
     relay is tested on.
   - *Brain and voice: a new voice run kind.* `executeVoiceRun` (`internal/gateway/chat_runs_voice.go`), started by
     `startVoiceRun` at each chunk end, runs the LLM leg over `/v1/chat/completions` (the chat's history plus
-    `pendingText`, answer deltas streamed to subscribers), then synthesizes the **whole answer** over
-    `/v1/audio/speech` through the speech run's own `generateSpeechTurn` (streaming, the audio events published to
-    subscribers), then commits (d). It is the one genuinely new chat-run behaviour: text-LLM-then-TTS on one assistant
+    `pendingText`, answer deltas streamed to subscribers), then synthesizes the **whole answer** (phase 1; since phase 2
+    the `<speak>` summary, started concurrently with the LLM leg, with the whole answer only as the fallback when the
+    model emits no usable region, [ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language))
+    over `/v1/audio/speech` through the speech run's own `generateSpeechTurn` (streaming, the audio events published to
+    subscribers), then commits (d). It is the one genuinely new chat-run behaviour: text-LLM-and-TTS on one assistant
     turn, run speculatively. `voice` is a run kind only: no thread pins it, `PrepareChatRun` never sets it and a client
     cannot submit it.
   - Both legs loop back as the ticket's user and re-resolve each leg **by gateway model name** with the run's own
@@ -9558,11 +9566,14 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   user turns on either side of it are merged so the roles still alternate), and calls into
   persistence exactly once, on its single un-cancelled terminal path: `CommitVoiceTurn` appends the user turn and the
   assistant turn (`[text, audio_url…]` parts) in **one** `SaveChatWithBlobs`, through the same retention and blob
-  internals as every assistant commit. A cancelled or failed run therefore persists **nothing**, so cancel-and-extend
-  needs no undo. (Metering is not deferred: the LLM tokens a cancelled run produced are billed by the chat core, but a
+  internals as every assistant commit. A cancelled run therefore persists **nothing**, so cancel-and-extend
+  needs no undo, and in phase 1 neither did a failed one (since phase 2 a run that fails *after* its speech has started
+  commits the text turn it has, [ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language)
+  (c)). (Metering is not deferred: the LLM tokens a cancelled run produced are billed by the chat core, but a
   speech stream cut mid-synthesis is the speech core's client-disconnect error row with quantity 0, so TTS audio is
   billed only when the synthesis completed before the cancel.) The window closes once the answer has streamed (the first audio event:
-  the LLM is done and TTS is under way) **and** `OP_AI_GATEWAY_VOICE_CONTINUATION_GRACE` has elapsed since the last
+  in phase 1 the LLM was done and TTS was under way; since phase 2 it is the summary's first audio chunk, which can
+  precede the end of the LLM stream) **and** `OP_AI_GATEWAY_VOICE_CONTINUATION_GRACE` has elapsed since the last
   chunk end with no resume, **or at the run's commit, whichever comes first**. Closing shuts the mic, moves to
   `speaking` and flushes the held audio; the grace usually hides behind generation, so it adds latency only when the
   model is faster than the grace. After the commit the client reloads the chat thread (`audio_done` is its cue) to pick
@@ -9624,7 +9635,9 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   `_run_closed`, `_run_failed` only where no core returned one), stop the turn (the run cancelled, the loopback torn
   down, `pendingText` dropped, the timers disarmed) and return to `idle`. The session stays open and the client
   re-engages with `push_start`; nothing retries on its own, so a failure cannot spin into a loop. `bye` or a dropped
-  socket tears the session down exactly once.
+  socket tears the session down exactly once. (Phase 1 persisted nothing on any failure; since phase 2 a speech-leg
+  failure, or an LLM failure after the summary was spoken, still ends in this one error frame and `idle`, but the run
+  commits the text turn it has first, [ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language) (c).)
 
 **Consequence:**
 
@@ -9634,9 +9647,10 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   document, its audio is the existing `chat_blobs` rows, and the TTS settings are the document's existing
   `ChatAudioSettings` ([Data Model](reference/data-model.md)).
 - **The window closes at the commit, so a fast answer gives a shorter keep-talking window, and a resume during the commit
-  write is dropped.** The run is non-pausable (LLM, then TTS, then commit in one sequence), so the machine cannot both
-  keep the mic open for the full grace *and* avoid a double commit when the whole run finishes inside the grace: a resume
-  after the commit would cancel nothing and re-run on the extended text, persisting the first utterance twice. The commit
+  write is dropped.** The run is non-pausable (the LLM and TTS legs, overlapped since phase 2, then one commit), so the
+  machine cannot both keep the mic open for the full grace *and* avoid a double commit when the whole run finishes inside
+  the grace: a resume after the commit would cancel nothing and re-run on the extended text, persisting the first
+  utterance twice. The commit
   is therefore the window's **point of no return**, claimed on the run (one atomic commit/cancel word on `ChatRun`, moved
   `running → committing` by a compare-and-swap before the write, because the run's status stays `running` for the whole
   write). A resume that begins past it is not a cancel-and-extend and not a new turn: the voiced chunk is discarded when the window force-closes. True
@@ -9652,8 +9666,10 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   the LLM (its own model selector is the LLM picker). The ASR and TTS models are the **user's to pick** since issue #317:
   the Voice Chat control has one picker each, listing the catalogue models the gateway says stream (plain speech models
   ahead of preset-clone ones), with **Automatic** as the default. The pick belongs to the thread and is saved with it,
-  in `settings.voice_chat` (`asr_model`, `tts_model`, `voice`) of the schema-free chat document, with no migration and no agent
-  change (the backend never reads it, it only preserves it, below): the key is written only for a text thread that has made a pick (so every other thread stays byte-identical),
+  in `settings.voice_chat` (`asr_model`, `tts_model`, `voice`, and since phase 2 `system_prompt`) of the schema-free chat
+  document, with no migration and no agent change (in phase 1 the backend never read it and only preserved it, below;
+  since phase 2 it reads one member, `system_prompt`, from the stored document when a voice run starts,
+  [ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language) (a)): the key is written only for a text thread that has made a pick or edited the voice prompt (so every other thread stays byte-identical),
   the ticket request carries the models, and the co-load gate still resolves and validates all three, which is the real
   admission check (a combination it cannot hold is refused at the ticket). The **auto-pick** (the first model of each leg,
   in the catalogue's order, that the gateway says streams) is the default and the fallback: it serves a leg with no pick
@@ -9670,18 +9686,20 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   request body and the mint sets the ticket's `Audio.Voice` from it (over a stored one, counted in the 1 KiB cap); a
   clone leg with no voice named by then is defaulted to its first preset by the mint as well (`routing.FirstPresetVoice`),
   for a request made before the voices loaded. The preset is the cache's first, not an operator-configured default,
-  which the gateway cannot see. A text thread carries no other speech settings, so the TTS speaks in the model's default
-  language. The voice run also
-  ignores the chat's own system prompt and sampling settings (`VoiceRunHistory` builds the history with an empty system
-  prompt, and the run's settings carry only the model and the kind), which is phase 2. A language control in voice mode
-  is the follow-up.
+  which the gateway cannot see. A text thread carries no other speech settings, so in phase 1 the TTS spoke in the
+  model's default language; since phase 2 the language follows each answer where the speech model can take one
+  ([ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language) (d)), which supersedes the language control that phase 1 named as the follow-up.
+  The voice run still ignores the chat's own typed-chat system prompt and sampling settings (the run's settings carry only
+  the model and the kind); in phase 1 its history had no system message at all, and since phase 2 it opens with the voice
+  system prompt instead (ADR-079 (a)).
 - **A non-signaling client drains to the ceiling.** The in-tree client always sends `playback_done`, so it ends at the
   floor; a client that never does holds every turn's drain to the 30 s ceiling (or, for an answer whose audio is longer
   than the ceiling, to the floor). Intentional: it is the anti-wedge bound.
 - **`cancel` re-opens the mic from any state, and after the commit it does not undo the turn.** It is the user's immediate
   stop and the one control that returns the session to `listening` from `speaking` or `draining`; the server relies on the
   client to stop its own playback first. The run it cancels persists nothing only if it has not reached its commit: in
-  `speaking` it can still be synthesizing (then nothing is stored), but a session is in `draining` only after the commit,
+  `speaking` it can still be synthesizing, or since phase 2 still streaming the detail (then nothing is stored), but a
+  session is in `draining` only after the commit,
   so a `cancel` there leaves the stored turn in place.
 - **The gate proves what it resolved at enable, not what a later turn will reach.** Per-turn hops re-resolve by name through
   normal routing, so on a name with several candidate servers a turn can land on a different one than the one verified; a
@@ -9733,4 +9751,147 @@ change to the run; deferred with barge-in).
 [Configuration & Environment Variables](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate),
 [Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
 [Data Model](reference/data-model.md),
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances);
+phase 2 (a spoken summary, an editable voice prompt, a per-answer language) is
+[ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language).
+
+## ADR-079 — Voice Chat phase 2: a spoken summary, marked by a `speak` tag in the stream, is spoken concurrently while the detail streams, under an editable per-thread voice prompt, with a per-answer language
+**Context:** phase 1 ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate))
+speaks the **whole** answer. In a spoken conversation a long, detailed answer read out verbatim is a monologue nobody wants to
+sit through; what a listener wants is the gist, with the detail left to read. Issue #314 (phase 2 of epic #312) makes the
+spoken part a short, self-contained **summary** and keeps the fuller detail in the transcript as text that is shown but not
+spoken. Four forces shaped the design:
+
+- **Only the model can choose what is worth saying aloud,** so it is asked, by a system prompt, to mark that part, and the
+  gateway extracts it from the token stream.
+- **The speech endpoint takes its whole input in one request body** (there is no streaming-input path,
+  [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)),
+  so a summary can be spoken only once it is complete. It is complete long before the answer is, because the prompt puts it
+  first, and waiting for the whole answer would waste exactly that head start.
+- **The prompt has to be the user's to see and change, without becoming a way to plant instructions into a run.**
+- **A model that ignores the instruction, a malformed tag or a language the voice cannot speak must degrade to the phase-1
+  behaviour, never to silence or an error turn;** typed turns in the same thread must not change; and `<speak>` markup must
+  never reach the stored text, the live transcript or a later LLM context (a strict upstream may reject it).
+
+**Decision — six choices, taken together. No schema migration, no agent change and no `ServerAgent` version bump** (the
+feature rides the schema-free chat document and the speech request's existing top-level `language`).
+
+- **(a) An editable, pre-filled voice system prompt, per thread, read server-side at run time.** A built-in default
+  (`defaultVoiceSystemPrompt`, `internal/portal/service_chats.go`) tells the model to open every answer with one short,
+  natural spoken summary wrapped in a single `<speak lang="…">…</speak>` tag, in the language the user is speaking, and to
+  write the fuller answer after the closing tag as normal text, with nothing before the tag. The portal holds an identical
+  copy (`DEFAULT_VOICE_SYSTEM_PROMPT`, pinned equal to the backend's by a test that reads the Go source) so the field can be
+  **pre-filled** with it. The user's override is `settings.voice_chat.system_prompt` of the chat document, written by the
+  portal only when the trimmed text is non-blank **and** differs from the default, so an unedited thread stays
+  byte-identical; a blank, absent or non-string value means the default. The voice run reads it from the **stored chat
+  document** when `VoiceRunHistory` builds the LLM history (trimmed, else the default) and makes it the history's **sole
+  system message**. It applies to voice runs only: typed turns in the same thread are unaffected, and the thread's own
+  typed-chat system prompt still does not reach a voice run (phase 1 sent no system message at all). It deliberately
+  travels **neither on the ticket nor as a request field**: the ticket caps the settings snapshot at 1 KiB and the whole
+  ticket at about 7 KiB (one header line), so a multi-line prompt could fail the mint, and a stored value is one a client
+  cannot plant for a single run. The voice run does not go through `PrepareChatRun`, which is why it reads the document
+  itself; the `PrepareChatRun` lift of the whole `voice_chat` value ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate))
+  already keeps the field across text sends. The portal shows a multi-line field beside the model and voice pickers, locked
+  while a conversation is on, and starting a conversation first flushes a pending edit to the stored thread (the autosave
+  is debounced, and the run would otherwise answer on the previous prompt).
+- **(b) A `<speak lang>` stream scanner in the voice run's LLM loop.** The scanner (`voice_speak_scanner.go`, used by
+  `runVoiceLLM`) watches the content deltas for the first `<speak …>` open tag and its `</speak>`. The tag name is
+  case-insensitive, `lang` may be quoted or bare, a tag may span any number of token boundaries, and only the bytes of a
+  tag it is still parsing are held back; `<speaker>`, `<b>`, `a < b` and `List<String>` pass through as text. A tag that is
+  not complete within 512 bytes is plain text, so a stray `<speak ` cannot stall the published stream. Only the **first**
+  region is the summary: a later `<speak>` tag is stripped but its text stays in the answer (several regions are phase 3).
+  The scanner sits on the **publish path** as well as the speech path: every content delta is tag-stripped **before** it is
+  buffered or fanned out, so the live `answer_delta` frames, the run's text, the stored turn and every later LLM history
+  carry no markup, and the live transcript never flashes a tag. **Fallbacks never fail a turn:** no tag, a malformed tag or
+  an empty region speaks the **whole answer** after the LLM finishes (the phase-1 flow); an **unclosed** region at the end
+  of the stream speaks what was captured inside it; the full text always renders.
+- **(c) Two overlapping legs and one commit.** On the exact delta that completes the first `</speak>` the run launches the
+  speech leg, in its own goroutine, on the **complete captured summary** (trimmed) and its language, while the LLM loop goes
+  on streaming the detail. The speech leg is the speech run's own streaming `generateSpeechTurn`: it keeps its own
+  first-chunk deadline, bills as an ordinary streamed speech call and derives its context from the run's, so a resume's
+  cancel ends both legs. When the LLM stream ends the run **joins** the speech leg and commits **once**, through the
+  compare-and-swap that already arbitrates the commit against a cancel ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
+  (d)): the full clean text, the summary's audio and the summary text, in one `SaveChatWithBlobs`. The window logic is
+  unchanged in kind (the audio is held while it is open; it closes at the first audio event once the grace has elapsed, or at
+  the commit), but the first audio event is now the summary's. The failure paths degrade without leaving a half-turn: an LLM
+  failure **before** `</speak>` fires no speech and persists nothing (phase 1); an LLM failure **after** it commits the turn
+  with what exists (the summary text and its audio, the detail cut off); a speech failure commits the **text** turn with no
+  audio. In the last two the run still ends as an error, so the machine emits its one `error` frame and returns to `idle`
+  ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
+  (h)); the commit is claimed before that terminal event, so the machine's later cancel is a no-op and never a double
+  commit. During the overlap the LLM leg is the **only** writer of the run's performance metrics (the speech leg no longer
+  stamps its first-chunk time), so the stored `ttftMs` and rates are deterministic.
+- **(d) A per-answer language, best-effort.** The region's `lang` becomes the speech request's top-level `language`
+  ([ADR-074](#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)'s
+  field, so there is no new transport), but only when the speech model **accepts** one: the same cached `speech_language`
+  fact that gates the portal composer's control decides, and a lookup that fails counts as "does not accept". Otherwise the
+  field is omitted and the model speaks its own default language. A missing `lang` is omitted too, and the whole-answer
+  fallback speaks with none. The code is passed **verbatim** (`de-DE` is not turned into `de`: which spellings a model
+  honours is the model's business), and it replaces whatever language the ticket carried for the spoken summary. The
+  default prompt also tells the model to use the user's language, so a mismatch is rare, and it can never fail the turn.
+- **(e) One stored turn, a `spoken_summary` key, a collapsed replayable block.** The assistant turn is still **one** turn
+  whose `content` parts are `[text, audio_url…]` with `text` the **full** clean answer (summary and detail, no markup);
+  new beside them is a top-level string `spoken_summary`, the spoken region's text, written only when audio was committed
+  with it and omitted otherwise (the no-tag fallback, a failed speech leg, every typed turn). It is metadata only: it is
+  never sent to an LLM. The portal renders a turn that carries one as a **collapsed `<details>` block** (the label *Spoken
+  summary*), like the reasoning block, whose summary line holds the turn's audio player (so play replays the stored audio
+  and expanding reads the text), or the not-stored placeholder when the audio was removed by retention; the answer body
+  below it is the stored text with the first occurrence of the summary cut out (if it cannot be found the whole text is
+  shown, never less). The block is **collapsed when there is a detail body and expanded when there is none** (a short
+  answer's text is visible without a click). A turn with no `spoken_summary` renders exactly as in phase 1, the live
+  preview has no block (it appears when the thread is reloaded at `audio_done`), and Copy still copies the whole answer.
+- **(f) Scope.** Exactly one spoken region per answer; several regions, spoken one after another (#315), barge-in
+  (#316) and a re-synthesis of a summary whose audio was removed are later phases.
+
+**Consequence:**
+
+- **No agent bump and no migration.** The prompt is one more member of the existing `settings.voice_chat` value, the summary
+  is one more key of a stored message, and the language rides a request field that already existed ([Data Model](reference/data-model.md)).
+- **Every voice run now carries a system prompt** (phase 1 sent none), so a model starts to emit `<speak>` tags the moment
+  the run is built; the scanner is what keeps them out of every other place. A user who clears the field gets the default,
+  not no prompt, and a prompt edited so that the model stops emitting the tag simply gets the phase-1 whole-answer speech.
+- **The first audio can arrive while the LLM is still streaming, and the mic stays gated until the commit.** The machine's
+  `answer_done` is emitted at the first audio event, so `answer_delta` frames of the detail can follow it (the portal appends
+  them regardless); `audio_done` and `draining` follow the **commit**, which waits for both legs; the drain's floor still
+  counts from the first audio chunk, and the client's `playback_done` is honoured only in `draining`
+  ([Runtime View §6.1.6](06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts),
+  [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **A voice run's stored `ttftMs` is now the text leg's time to its first LLM token.** In phase 1 the ordered LLM-then-TTS
+  sequence made it effectively the audio's first-chunk time; a standalone speech run is unchanged.
+- **The TTS row meters the summary, not the answer,** when the answer carries a region, and the leg can start (and, when a
+  resume cancels the run, be cut) while the LLM is still streaming; the rows are otherwise those of phase 1
+  ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
+- **Per-answer language is best-effort and the summary rides a model-emitted tag.** A speech model that takes no `language`
+  speaks its own language whatever the answer's, a `lang` the voice cannot speak is the model's problem and not the
+  gateway's, and a model that ignores the prompt gets the whole answer spoken
+  ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **A degraded turn that was committed is not announced by `audio_done`,** the portal's cue to reload the thread, so it
+  appears at the next reload (the next successful turn's, or the user's).
+- **Verification status.** The scanner (chunking is invisible: whole, byte-at-a-time and every two-way split agree), the
+  overlap (a scripted LLM that blocks after `</speak>` until the speech request arrives, so a non-overlapped run would
+  deadlock), the commit-against-cancel arbitration during the overlap, the three failure paths, the language pass and omit,
+  the prompt's read from the stored document, and the portal's field and block are pinned by mock-backed tests. It is not
+  claimed against a real model and a real audio.cpp: whether a model follows the prompt, and speaks the requested language,
+  is for an operator to confirm.
+
+**Builds on:** [ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
+(the state machine, the continuation window, the deferred commit and the drain it keeps),
+[ADR-074](#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough)
+(the `language` field and its capability fact),
+[ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+(the streamed speech leg it reuses) and
+[ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch),
+[ADR-071](#adr-071--audio-answer-lifecycle-a-per-chat-retention-knob-keep-all-keep-the-last-n-or-do-not-store-one-atomic-delete-that-leaves-an-audio_removed-marker-a-lazy-and-a-confirmed-retroactive-prune-a-manual-per-answer-delete-and-live-mute-and-abort-with-no-migration-and-no-agent-bump)
+(the stored audio and its retention, which the summary's audio rides unchanged). It changes none of them.
+**Rejected:** **Speaking after the whole answer is done** (simpler, but the first audio would wait for the full generation,
+which defeats a short spoken summary; the legs overlap instead). **Feeding the speech model token by token** (the endpoint
+has no streaming-input path, so the one request carries the complete summary). **Carrying the prompt on the ticket or as a
+request field** (the size caps above, and a client could plant one for a single run). **A global default prompt** (a
+different data model; the prompt belongs to the thread, like the pickers). **Augmenting a thread prompt** (a voice run has
+none: it is the sole system message). **Stripping the tags only when the turn is committed** (they would flash in the live
+transcript). **Failing the turn on a missing or malformed tag or an unspeakable language** (every such case degrades to the
+whole answer or to the voice's own language). **Several regions, a re-synthesis on replay** (deferred, above).
+→ [Runtime View §6.1.6](06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts),
+[Data Model](reference/data-model.md),
+[HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
