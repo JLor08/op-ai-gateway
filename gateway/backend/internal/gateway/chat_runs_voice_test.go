@@ -578,8 +578,8 @@ func TestVoiceRunPublishesTextThenAudio(t *testing.T) {
 // the voice run asks for; the other voice-run tests set no audio, so this link was unpinned.
 func TestVoiceSpeechPrepCarriesTheTicketsVoiceIntoTheSpeechRequestBody(t *testing.T) {
 	speed := 1.25
-	audio := portal.ChatAudioSettings{Voice: "marius", Speed: &speed, Language: "de"}
-	prep := voiceSpeechPrep("the spoken answer", routing.Target{Model: "voice-tts"}, audio)
+	audio := portal.ChatAudioSettings{Voice: "marius", Speed: &speed}
+	prep := voiceSpeechPrep("the spoken answer", routing.Target{Model: "voice-tts"}, audio, "de")
 
 	for name, build := range map[string]func(PrepareRunResult) ([]byte, error){
 		"the buffered body":  buildSpeechBody,
@@ -603,7 +603,7 @@ func TestVoiceSpeechPrepCarriesTheTicketsVoiceIntoTheSpeechRequestBody(t *testin
 
 // A ticket that names no voice sends none: the model's own default voice speaks.
 func TestVoiceSpeechPrepSendsNoVoiceWhenTheTicketHasNone(t *testing.T) {
-	prep := voiceSpeechPrep("answer", routing.Target{Model: "voice-tts"}, portal.ChatAudioSettings{})
+	prep := voiceSpeechPrep("answer", routing.Target{Model: "voice-tts"}, portal.ChatAudioSettings{}, "")
 
 	fields, err := speechBodyFields(prep)
 	if err != nil {
@@ -611,5 +611,64 @@ func TestVoiceSpeechPrepSendsNoVoiceWhenTheTicketHasNone(t *testing.T) {
 	}
 	if _, present := fields["voice"]; present {
 		t.Fatalf("body = %v, want no voice member for a ticket with no voice", fields)
+	}
+}
+
+// The per-answer language the LLM picks via <speak lang> reaches the speech leg only when the
+// TTS model can take a `language` parameter: a model that cannot gets none, so the field is
+// omitted rather than sent to be silently dropped (or rejected) upstream. The requested code is
+// passed verbatim, never normalized.
+func TestEffectiveSpeechLanguage(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		requested    string
+		modelAccepts bool
+		want         string
+	}{
+		{"accepted language passes through", "de", true, "de"},
+		{"a model that cannot take it omits it", "de", false, ""},
+		{"nothing requested stays empty", "", true, ""},
+		{"nothing requested and unsupported stays empty", "", false, ""},
+		{"verbatim, not normalized", "de-DE", true, "de-DE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveSpeechLanguage(tc.requested, tc.modelAccepts); got != tc.want {
+				t.Fatalf("effectiveSpeechLanguage(%q, %v) = %q, want %q", tc.requested, tc.modelAccepts, got, tc.want)
+			}
+		})
+	}
+}
+
+// voiceSpeechPrep carries the per-answer language onto the speech leg's audio settings, where
+// speechBodyFields turns it into the request body's top-level `language`.
+func TestVoiceSpeechPrep_SetsLanguage(t *testing.T) {
+	prep := voiceSpeechPrep("hi", routing.Target{Model: "voice-tts"}, portal.ChatAudioSettings{}, "de")
+
+	if prep.Settings.Audio == nil || prep.Settings.Audio.Language != "de" {
+		t.Fatalf("prep.Settings.Audio = %+v, want Language %q", prep.Settings.Audio, "de")
+	}
+	fields, err := speechBodyFields(prep)
+	if err != nil {
+		t.Fatalf("speechBodyFields: %v", err)
+	}
+	if fields["language"] != "de" {
+		t.Fatalf("body = %v, want language %q", fields, "de")
+	}
+}
+
+// An empty language leaves the audio settings' Language unset, so the request body carries no
+// `language` member and the model speaks in its own default.
+func TestVoiceSpeechPrep_EmptyLanguageUnset(t *testing.T) {
+	prep := voiceSpeechPrep("hi", routing.Target{Model: "voice-tts"}, portal.ChatAudioSettings{}, "")
+
+	if prep.Settings.Audio == nil || prep.Settings.Audio.Language != "" {
+		t.Fatalf("prep.Settings.Audio = %+v, want an unset Language", prep.Settings.Audio)
+	}
+	fields, err := speechBodyFields(prep)
+	if err != nil {
+		t.Fatalf("speechBodyFields: %v", err)
+	}
+	if _, present := fields["language"]; present {
+		t.Fatalf("body = %v, want no language member for an empty language", fields)
 	}
 }

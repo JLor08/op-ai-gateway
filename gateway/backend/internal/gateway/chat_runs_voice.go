@@ -142,7 +142,9 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 	liftDeadline := armRunDeadline(chatRunKindSpeech, cancelTTS)
 	defer liftDeadline()
 
-	ttsPrep := voiceSpeechPrep(answer, vp.tts, vp.audio)
+	// The per-answer language is not wired in yet: "" leaves the leg on the model's own
+	// default until the <speak lang> extraction supplies one.
+	ttsPrep := voiceSpeechPrep(answer, vp.tts, vp.audio, "")
 	audioParts, ttsStatus, ttsErr, streamed := s.generateSpeechTurn(ttsCtx, owner, run, ttsPrep, liftDeadline)
 	if ttsStatus != "completed" {
 		// Same rule as the LLM leg: a cancel or a TTS failure persists nothing. Any
@@ -256,11 +258,15 @@ finish:
 // voiceSpeechPrep builds the speech run's prep for the TTS leg: the model is the tts
 // target's gateway name, the input is the LLM ANSWER (the last user message's text is
 // what speechBodyFields reads as the input, so the answer rides as a single user
-// message), and the audio settings are the ticket's voice/language. The kind is
+// message), and the audio settings are the ticket's voice and speed with the per-answer
+// language. The language is the one the caller already resolved (see
+// effectiveSpeechLanguage), set verbatim: "" leaves Language unset so speechBodyFields
+// sends no `language` member and the model speaks in its own default. The kind is
 // speech so generateSpeechTurn's streaming gate and billing behave exactly as a
 // standalone speech run's.
-func voiceSpeechPrep(answer string, tts routing.Target, audio portal.ChatAudioSettings) PrepareRunResult {
+func voiceSpeechPrep(answer string, tts routing.Target, audio portal.ChatAudioSettings, language string) PrepareRunResult {
 	settingsAudio := audio
+	settingsAudio.Language = language
 	return PrepareRunResult{
 		History: []portal.ChatAPIMessage{{Role: "user", Content: jsonStringRaw(answer)}},
 		Settings: portal.ChatRunSettings{
@@ -269,6 +275,19 @@ func voiceSpeechPrep(answer string, tts routing.Target, audio portal.ChatAudioSe
 			Audio: &settingsAudio,
 		},
 	}
+}
+
+// effectiveSpeechLanguage is the language the speech leg is actually asked to speak: the
+// per-answer language the LLM requested via <speak lang>, but only when the TTS model can
+// take a `language` parameter (modelAccepts, the cached portalSpeechLanguage lookup). A model
+// that cannot gets "" so the field is omitted rather than sent to be dropped or rejected
+// upstream, and nothing requested stays "". The code is returned verbatim -- "de-DE" is not
+// normalized to "de" -- since which spellings a model honors is the model's business.
+func effectiveSpeechLanguage(requested string, modelAccepts bool) string {
+	if !modelAccepts {
+		return ""
+	}
+	return requested
 }
 
 // commitVoiceTurn is the voice run's single terminal commit: it builds the assistant
