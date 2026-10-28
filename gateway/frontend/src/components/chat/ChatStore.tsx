@@ -1004,9 +1004,11 @@ export function ChatStoreProvider({
     ].map((option) => option.id);
   }, [chatModels]);
   // The conversation's two legs: the thread's pick of each, or -- for a leg with no pick, or a
-  // pick that is no longer one of the models that stream -- the first model that does (the
-  // automatic pick), null until the gateway has said which stream (voiceModels.ts).
-  const voiceLegs = voiceLegsOf(voiceStreaming, voiceSettings);
+  // pick that is no longer one of the models that stream -- the first model that does and is
+  // loaded, else the first that streams (the automatic pick), null until the gateway has said
+  // which stream (voiceModels.ts). The catalogue is what says which are loaded, the same flag the
+  // pickers' green dot shows, so the dot and the automatic pick agree.
+  const voiceLegs = voiceLegsOf(voiceStreaming, voiceSettings, chatModels);
   const voiceChatGap = voiceGapOf(voiceLlmCapable, voiceLegs);
   const voiceChatCapable = voiceChatGap === null;
   const voiceChatOffered =
@@ -2429,9 +2431,11 @@ export function ChatStoreProvider({
   const setVoiceTtsModel = useCallback(
     (ttsModel: string) => {
       stopVoiceChat();
-      setVoiceSettings((current) => withTtsModel(current, ttsModel, voiceTtsStreaming ?? []));
+      setVoiceSettings((current) =>
+        withTtsModel(current, ttsModel, voiceTtsStreaming ?? [], chatModels),
+      );
     },
-    [stopVoiceChat, voiceTtsStreaming],
+    [stopVoiceChat, voiceTtsStreaming, chatModels],
   );
   const setVoiceVoice = useCallback(
     (voice: string) => {

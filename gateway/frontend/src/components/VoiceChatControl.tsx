@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useId, useRef, type KeyboardEvent, type PointerEvent } from 'react';
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
 import { Alert, Box, Button, FormControlLabel, Switch, TextField, Typography } from '@mui/material';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
@@ -22,6 +22,7 @@ import type {
   VoiceChatModels,
   VoiceChatState,
   VoiceModelChoice,
+  VoicePromptChoice,
 } from './chat/ChatStore';
 
 // The label of each state of the conversation. `off` and `connecting` are the portal's own; the
@@ -466,11 +467,12 @@ function PlaybackControls({ voice, t }: Readonly<{ voice: VoiceChatApi; t: Trans
 // closed by a switch that is closed for another reason (a missing chat model, a run in flight):
 // the user may pick ahead.
 //
-// Beside them, the thread's voice system prompt (#314): a multi-line field, pre-filled with the
-// built-in prompt, that the user may edit for this thread. It has nothing to do with which models
-// stream, so it is not waiting for the gateway; it is closed while a conversation is on, so a
-// conversation runs on the prompt it began with. It is bounded in length, and the control under it
-// puts the built-in prompt back (closed with the field, and when the field already holds it).
+// Under them, the thread's voice system prompt (#314), in a collapsed section (VoicePromptSection):
+// a multi-line field, pre-filled with the built-in prompt, that the user may edit for this thread.
+// It has nothing to do with which models stream, so it is not waiting for the gateway; it is closed
+// while a conversation is on, so a conversation runs on the prompt it began with. It is bounded in
+// length, and the control under it puts the built-in prompt back (closed with the field, and when
+// the field already holds it).
 function VoiceModelPickers({
   models,
   locked,
@@ -520,37 +522,72 @@ function VoiceModelPickers({
           {t.chatVoiceLlmNote(models.llm)}
         </Typography>
       )}
-      <TextField
-        id="chat-voice-system-prompt"
-        label={t.chatVoiceSystemPrompt}
-        helperText={t.chatVoiceSystemPromptHint}
-        multiline
-        minRows={3}
-        maxRows={12}
-        fullWidth
-        value={models.systemPrompt.value}
-        onChange={(event) => models.systemPrompt.set(event.target.value)}
-        disabled={locked}
-        slotProps={{ htmlInput: { maxLength: SYSTEM_PROMPT_MAX_LENGTH } }}
-        sx={{ mt: 0.75 }}
-      />
-      <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
-        <Button
-          size="small"
-          color="inherit"
-          startIcon={<RestartAltIcon />}
-          disabled={locked || models.systemPrompt.value === DEFAULT_VOICE_SYSTEM_PROMPT}
-          onClick={() => models.systemPrompt.set(DEFAULT_VOICE_SYSTEM_PROMPT)}
-        >
-          {t.chatVoiceSystemPromptReset}
-        </Button>
-      </Box>
+      <VoicePromptSection prompt={models.systemPrompt} locked={locked} t={t} />
     </Box>
   );
 }
 
-// One picker: "automatic" (no pick) and the models on offer, by their display names. Under an
-// automatic pick the field says which model that is.
+// The thread's voice system prompt (#314) and the control that puts the built-in one back, in a
+// section that is COLLAPSED until its heading is clicked: the prompt is a tuning knob few
+// conversations touch, and a field of several lines would otherwise crowd the pickers and the
+// indicator that matter while talking. The same toggle as the thread's settings (Chat.tsx): a text
+// button with `aria-expanded`, the content not mounted while it is shut. The heading stays usable
+// while a conversation is on -- the field under it is what is closed then, so a run keeps the
+// prompt it began with, but it may still be read.
+function VoicePromptSection({
+  prompt,
+  locked,
+  t,
+}: Readonly<{ prompt: VoicePromptChoice; locked: boolean; t: Translation }>) {
+  const [open, setOpen] = useState(false);
+  const regionId = useId();
+  return (
+    <Box sx={{ display: 'grid', gap: 0.75 }}>
+      <Button
+        variant="text"
+        size="small"
+        aria-expanded={open}
+        aria-controls={open ? regionId : undefined}
+        onClick={() => setOpen((wasOpen) => !wasOpen)}
+        sx={{ justifySelf: 'start' }}
+      >
+        {t.chatVoiceSystemPrompt}
+      </Button>
+      {open && (
+        <Box id={regionId} sx={{ display: 'grid', gap: 0.75 }}>
+          <TextField
+            id="chat-voice-system-prompt"
+            label={t.chatVoiceSystemPrompt}
+            helperText={t.chatVoiceSystemPromptHint}
+            multiline
+            minRows={3}
+            maxRows={12}
+            fullWidth
+            value={prompt.value}
+            onChange={(event) => prompt.set(event.target.value)}
+            disabled={locked}
+            slotProps={{ htmlInput: { maxLength: SYSTEM_PROMPT_MAX_LENGTH } }}
+            sx={{ mt: 0.75 }}
+          />
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Button
+              size="small"
+              color="inherit"
+              startIcon={<RestartAltIcon />}
+              disabled={locked || prompt.value === DEFAULT_VOICE_SYSTEM_PROMPT}
+              onClick={() => prompt.set(DEFAULT_VOICE_SYSTEM_PROMPT)}
+            >
+              {t.chatVoiceSystemPromptReset}
+            </Button>
+          </Box>
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+// One picker: "automatic" (no pick) and the models on offer, by their display names, a loaded one
+// marked with a green dot. Under an automatic pick the field says which model that is.
 function VoiceModelPicker({
   id,
   label,
@@ -566,7 +603,18 @@ function VoiceModelPicker({
 }>) {
   const options = [
     { value: '', label: t.chatVoiceModelAuto },
-    ...choice.options.map((option) => ({ value: option.id, label: option.display_name })),
+    // A loaded model carries the green dot of the chat's own model picker (SearchableSelect draws
+    // it from `loaded`, in the list and, once picked, in the field), titled by the servers it is
+    // loaded on when the catalogue names them.
+    ...choice.options.map((option) => ({
+      value: option.id,
+      label: option.display_name,
+      loaded: option.loaded,
+      loadedTitle:
+        option.loaded_on && option.loaded_on.length > 0
+          ? `${t.chatModelLoadedOn}: ${option.loaded_on.join(', ')}`
+          : t.chatModelLoaded,
+    })),
   ];
   const used = choice.options.find((option) => option.id === choice.used);
   const showsUsed = choice.pick === '' && choice.used !== '';

@@ -8516,6 +8516,42 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           click('voice-start');
           expect(voiceSessions[0].args.asrModel).toBe('asr-b');
         });
+
+        // The catalogue's `loaded` flag is what the pickers draw their green dot from: the model
+        // that is loaded on a server answers at once, so it is the one that is used, and the one
+        // the conversation is started with, ahead of an earlier one that would have to be loaded.
+        const loadedIds = (ids: string[]) =>
+          pickerModels.map((option) =>
+            ids.includes(option.id) ? { ...option, loaded: true, loaded_on: ['gpu-1'] } : option,
+          );
+
+        it('prefers a LOADED model of each leg to an earlier one that is not, and starts with it', async () => {
+          await renderPickers([voiceThread()], loadedIds(['asr-b', 'tts-clone']));
+
+          expect(text('voice-asr-pick')).toBe('');
+          expect(text('voice-tts-pick')).toBe('');
+          expect(text('voice-asr-used')).toBe('asr-b');
+          expect(text('voice-tts-used')).toBe('tts-clone');
+          click('voice-start');
+
+          expect(voiceSessions[0].args).toMatchObject({ asrModel: 'asr-b', ttsModel: 'tts-clone' });
+        });
+
+        it('ignores a loaded model that does not stream: only the models on offer are chosen from', async () => {
+          await renderPickers([voiceThread()], loadedIds(['asr-slow', 'tts-slow']));
+
+          expect(text('voice-asr-used')).toBe('asr-a');
+          expect(text('voice-tts-used')).toBe('tts-a');
+        });
+
+        it('lets a pick of the model that is not loaded win over the loaded one', async () => {
+          await renderPickers([voiceThread()], loadedIds(['asr-b']));
+
+          click('voice-asr-asr-a');
+          click('voice-start');
+
+          expect(voiceSessions[0].args.asrModel).toBe('asr-a');
+        });
       });
 
       describe('a pick', () => {
@@ -8702,11 +8738,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         async function renderWithVoices(
           rows: ChatRow[] = [voiceThread()],
           overrides: Record<string, string[]> = {},
+          models = pickerModels,
         ) {
           chatApi = makeChatApi(rows);
           sayVoices(overrides);
           pickerGates();
-          const view = renderProvider([], { models: pickerModels });
+          const view = renderProvider([], { models });
           await waitForReady();
           await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
           return view;
@@ -8816,6 +8853,23 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           click('voice-tts-tts-a');
 
           expect(text('voice-voice')).toBe('marius');
+        });
+
+        // "Automatic" is the loaded model when one is, so the model that would speak anyway is that
+        // one: choosing it changes nothing about the voice, choosing the other one does.
+        it('follows the loaded model that automatic speaks with when a pick keeps or drops the voice', async () => {
+          const cloneLoaded = pickerModels.map((option) =>
+            option.id === 'tts-clone' ? { ...option, loaded: true } : option,
+          );
+          await renderWithVoices([voiceThread()], {}, cloneLoaded);
+          await waitFor(() => expect(listed()).toEqual(['luna', 'zeta']));
+          click('voice-say-zeta');
+
+          click('voice-tts-tts-clone');
+          expect(text('voice-voice')).toBe('zeta');
+
+          click('voice-tts-tts-a');
+          await waitFor(() => expect(text('voice-voice')).toBe(''));
         });
 
         it('sends a saved voice the list does not hold: the list is an offer, not a constraint', async () => {

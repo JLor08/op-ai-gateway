@@ -49,15 +49,22 @@ function makeVoice(over: Partial<VoiceChatApi> = {}): VoiceChatApi {
 }
 
 // A catalogue entry of an audio model, named for display (the picker shows the display name).
-const entry = (id: string): ModelOption => ({
+const entry = (id: string, over: Partial<ModelOption> = {}): ModelOption => ({
   id,
   display_name: `${id} (display)`,
   flavors: ['openai_audio'],
   loading_on_count: 0,
+  ...over,
 });
 
 function makeChoice(ids: string[], over: Partial<VoiceModelChoice> = {}): VoiceModelChoice {
-  return { options: ids.map(entry), pick: '', used: ids[0] ?? '', set: vi.fn(), ...over };
+  return {
+    options: ids.map((id) => entry(id)),
+    pick: '',
+    used: ids[0] ?? '',
+    set: vi.fn(),
+    ...over,
+  };
 }
 
 // The speech model's voice field: the voices it offers and the one that would be spoken in.
@@ -571,6 +578,75 @@ describe('VoiceChatControl model pickers', () => {
     expect(screen.queryByText(/llm/)).not.toBeInTheDocument();
     expect(screen.queryByText(t.chatVoiceLlmNote(''))).not.toBeInTheDocument();
   });
+
+  // The same green dot as the chat's own model picker: a model that is loaded on a server answers
+  // at once, one that is not has to be loaded first, which is worth knowing before the pick.
+  describe('loaded-model dot', () => {
+    // The dot is the span with the title the option carries; the option's own text stays the bare
+    // display name.
+    const dotOf = (option: HTMLElement) => option.querySelector('span[aria-hidden][title]');
+    const loadedAsr = makeChoice([], {
+      options: [
+        entry('asr-a'),
+        entry('asr-b', { loaded: true, loaded_on: ['gpu-1', 'gpu-2'] }),
+        entry('asr-c', { loaded: false, loaded_on: [] }),
+      ],
+      used: 'asr-b',
+    });
+
+    it('marks the loaded models of the transcription picker, and only those', () => {
+      renderControl(makeVoice(), { models: makeModels({ asr: loadedAsr }) });
+
+      open(asrPicker());
+      const option = (name: string) => screen.getByRole('option', { name });
+      expect(dotOf(option('asr-b (display)'))).toHaveAttribute(
+        'title',
+        `${t.chatModelLoadedOn}: gpu-1, gpu-2`,
+      );
+      expect(dotOf(option('asr-a (display)'))).toBeNull();
+      expect(dotOf(option('asr-c (display)'))).toBeNull();
+      expect(dotOf(option(t.chatVoiceModelAuto))).toBeNull();
+    });
+
+    it('marks the loaded models of the speech picker, with the plain title when no server is named', () => {
+      const tts = makeChoice([], {
+        options: [entry('tts-a'), entry('tts-clone', { loaded: true })],
+      });
+      renderControl(makeVoice(), { models: makeModels({ tts }) });
+
+      open(ttsPicker());
+      expect(dotOf(screen.getByRole('option', { name: 'tts-clone (display)' }))).toHaveAttribute(
+        'title',
+        t.chatModelLoaded,
+      );
+      expect(dotOf(screen.getByRole('option', { name: 'tts-a (display)' }))).toBeNull();
+    });
+
+    it('shows the dot in the field once a loaded model is picked, and in that picker only', () => {
+      renderControl(makeVoice(), { models: makeModels({ asr: { ...loadedAsr, pick: 'asr-b' } }) });
+
+      // The speech picker has no loaded model, so the one dot there is is the transcription one's.
+      const dot = screen.getByTestId('searchable-select-loaded-dot');
+      expect(asrPicker().closest('.MuiFormControl-root')).toContainElement(dot);
+      expect(dot).toHaveAttribute('title', `${t.chatModelLoadedOn}: gpu-1, gpu-2`);
+    });
+
+    it('shows no dot in the field for a pick that is not loaded', () => {
+      renderControl(makeVoice(), { models: makeModels({ asr: { ...loadedAsr, pick: 'asr-c' } }) });
+
+      expect(screen.queryByTestId('searchable-select-loaded-dot')).not.toBeInTheDocument();
+    });
+
+    it('shows no dot at all while no model is loaded', () => {
+      renderControl(makeVoice(), {
+        models: makeModels({ asr: makeChoice(['asr-a', 'asr-b'], { pick: 'asr-a' }) }),
+      });
+
+      open(asrPicker());
+      expect(screen.queryByTestId('searchable-select-loaded-dot')).not.toBeInTheDocument();
+      expect(screen.getAllByRole('option').every((option) => dotOf(option) === null)).toBe(true);
+    });
+  });
 });
 
 // The voice of the speech model (#318): a combobox under the speech model's picker, over the voices
@@ -642,10 +718,59 @@ describe('VoiceChatControl voice field', () => {
 // while a conversation is on.
 describe('VoiceChatControl system prompt field', () => {
   const promptField = () => screen.getByRole('textbox', { name: t.chatVoiceSystemPrompt });
+  const queryPromptField = () => screen.queryByRole('textbox', { name: t.chatVoiceSystemPrompt });
+  // The field sits in a section that is collapsed until its heading is clicked (like the thread's
+  // settings); the tests that are about the field open it first.
+  const toggle = () => screen.getByRole('button', { name: t.chatVoiceSystemPrompt });
+  const openPrompt = () => fireEvent.click(toggle());
+  const renderOpen = (...args: Parameters<typeof renderControl>) => {
+    const view = renderControl(...args);
+    openPrompt();
+    return view;
+  };
+
+  describe('collapsed section', () => {
+    it('is collapsed by default: neither the field nor its reset are shown', () => {
+      renderControl(makeVoice());
+
+      expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+      expect(queryPromptField()).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: t.chatVoiceSystemPromptReset }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(t.chatVoiceSystemPromptHint)).not.toBeInTheDocument();
+    });
+
+    it('expands on a click, and collapses again on the next', () => {
+      renderControl(makeVoice(), { models: makeModels({ systemPrompt: makePromptChoice('Hi.') }) });
+
+      openPrompt();
+      expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+      expect(promptField()).toHaveValue('Hi.');
+      expect(
+        screen.getByRole('button', { name: t.chatVoiceSystemPromptReset }),
+      ).toBeInTheDocument();
+
+      openPrompt();
+      expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+      expect(queryPromptField()).not.toBeInTheDocument();
+    });
+
+    it('can be opened on a switch that is closed, and before the gateway has said anything', () => {
+      renderControl(makeVoice(), {
+        models: makeModels({ ready: false }),
+        capable: false,
+        gap: 'asr',
+        busy: true,
+      });
+
+      expect(toggle()).toBeEnabled();
+    });
+  });
 
   it('shows the prompt field pre-filled and calls set on edit', () => {
     const systemPrompt = makePromptChoice('Speak briefly.');
-    renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+    renderOpen(makeVoice(), { models: makeModels({ systemPrompt }) });
 
     expect(promptField()).toHaveValue('Speak briefly.');
     expect(promptField().tagName).toBe('TEXTAREA');
@@ -656,13 +781,13 @@ describe('VoiceChatControl system prompt field', () => {
   });
 
   it('says what the prompt is for and what an empty one means', () => {
-    renderControl(makeVoice());
+    renderOpen(makeVoice());
 
     expect(screen.getByText(t.chatVoiceSystemPromptHint)).toBeInTheDocument();
   });
 
   it('disables the prompt field while the conversation is live (locked)', () => {
-    const { update } = renderControl(makeVoice({ state: 'listening' }));
+    const { update } = renderOpen(makeVoice({ state: 'listening' }));
     expect(promptField()).toBeDisabled();
 
     update(makeVoice({ state: 'off' }));
@@ -670,7 +795,7 @@ describe('VoiceChatControl system prompt field', () => {
   });
 
   it('is open before the gateway has said which models stream, and on a switch closed for another reason', () => {
-    renderControl(makeVoice(), {
+    renderOpen(makeVoice(), {
       models: makeModels({ ready: false }),
       capable: false,
       gap: 'asr',
@@ -683,7 +808,7 @@ describe('VoiceChatControl system prompt field', () => {
   // The prompt is the one free-text field of the control: a paste of a whole document would be
   // carried into every run of the conversation, so the field is bounded.
   it('bounds the length of the prompt', () => {
-    renderControl(makeVoice());
+    renderOpen(makeVoice());
 
     expect(promptField()).toHaveAttribute('maxlength', '4000');
   });
@@ -693,7 +818,7 @@ describe('VoiceChatControl system prompt field', () => {
 
     it('puts the built-in prompt back into the field', () => {
       const systemPrompt = makePromptChoice('Be terse.');
-      renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+      renderOpen(makeVoice(), { models: makeModels({ systemPrompt }) });
 
       fireEvent.click(resetButton());
 
@@ -703,7 +828,7 @@ describe('VoiceChatControl system prompt field', () => {
 
     it('is open for an emptied field too: the default is what the empty field means, spelled out', () => {
       const systemPrompt = makePromptChoice('');
-      renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+      renderOpen(makeVoice(), { models: makeModels({ systemPrompt }) });
 
       expect(resetButton()).toBeEnabled();
       fireEvent.click(resetButton());
@@ -712,7 +837,7 @@ describe('VoiceChatControl system prompt field', () => {
     });
 
     it('is closed while the field already holds the built-in prompt: there is nothing to reset', () => {
-      renderControl(makeVoice(), {
+      renderOpen(makeVoice(), {
         models: makeModels({ systemPrompt: makePromptChoice(DEFAULT_VOICE_SYSTEM_PROMPT) }),
       });
 
@@ -722,7 +847,7 @@ describe('VoiceChatControl system prompt field', () => {
     it('is closed while the conversation is live, like the field it resets', () => {
       const systemPrompt = makePromptChoice('Be terse.');
       const models = makeModels({ systemPrompt });
-      const { update } = renderControl(makeVoice({ state: 'listening' }), { models });
+      const { update } = renderOpen(makeVoice({ state: 'listening' }), { models });
       expect(resetButton()).toBeDisabled();
 
       fireEvent.click(resetButton());
@@ -733,7 +858,7 @@ describe('VoiceChatControl system prompt field', () => {
     });
 
     it('is open before the gateway has said which models stream, like the field', () => {
-      renderControl(makeVoice(), {
+      renderOpen(makeVoice(), {
         models: makeModels({ ready: false, systemPrompt: makePromptChoice('Be terse.') }),
       });
 

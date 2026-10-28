@@ -432,10 +432,11 @@ const de = {
   // The pickers of the conversation's models (#317): the transcription model that hears the user and
   // the speech model that answers aloud are the user's to pick; the chat model that answers is the
   // thread's own (picked with the model selector above), and is only named here. "Automatic" is
-  // the default: the first available model, which the line under it names.
+  // the default: a loaded model if one is on offer (it answers at once), else the first available
+  // one -- the model, in either case, that the line under it names.
   chatVoiceAsrModel: 'Transkriptionsmodell',
   chatVoiceTtsModel: 'Sprachmodell',
-  chatVoiceModelAuto: 'Automatisch (erstes verfügbares)',
+  chatVoiceModelAuto: 'Automatisch (geladenes Modell bevorzugt)',
   chatVoiceModelUsing: (model: string) => `Verwendet: ${model}`,
   chatVoiceLlmNote: (model: string) =>
     `Das Chat-Modell ist das Modell dieses Chats: ${model}. Wählen Sie es oben in der Modellauswahl.`,
@@ -3886,7 +3887,7 @@ const en: PortalMessages = {
   chatVoiceUnavailableChecking: 'Checking the available voice models…',
   chatVoiceAsrModel: 'Transcription model',
   chatVoiceTtsModel: 'Speech model',
-  chatVoiceModelAuto: 'Automatic (first available)',
+  chatVoiceModelAuto: 'Automatic (loaded model preferred)',
   chatVoiceModelUsing: (model: string) => `Uses: ${model}`,
   chatVoiceLlmNote: (model: string) =>
     `The chat model is this chat's own model: ${model}. Pick it in the model selector above.`,
