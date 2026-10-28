@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
@@ -32,6 +32,33 @@ function contentText(content: ChatContent): string {
     .join('\n');
 }
 
+// The answer's text with a voice answer's spoken summary taken out: the body shown beneath the
+// summary block (#314). `content` holds the FULL clean answer -- summary and detail -- while the
+// summary has a block of its own, so leaving it in the body would show it twice. The gateway
+// stores the summary as a verbatim slice of that text (only the <speak> tags are stripped from
+// it), so it is found as one. It is normally the leading text, but the model may have put words
+// before its tag, so the FIRST occurrence is cut wherever it sits and what surrounds it is kept,
+// joined by a paragraph break. A summary that cannot be found (not expected) leaves the text
+// whole: showing it twice beats dropping part of the answer.
+function withoutSummary(text: string, summary: string): string {
+  const at = text.indexOf(summary);
+  if (at < 0) return text;
+  const before = text.slice(0, at).trimEnd();
+  const after = dropLeadingBlank(text.slice(at + summary.length));
+  if (before.trim() === '') return after;
+  if (after.trim() === '') return before;
+  return `${before}\n\n${after}`;
+}
+
+// The text without its leading blank space: whole blank lines go, but the indentation of the
+// first line with content stays (it can be a markdown code block).
+function dropLeadingBlank(text: string): string {
+  const lead = text.length - text.trimStart().length;
+  if (lead === 0) return text;
+  const lineBreak = text.lastIndexOf('\n', lead - 1);
+  return text.slice(lineBreak >= 0 ? lineBreak + 1 : lead);
+}
+
 type ImagePart = Extract<ChatContentPart, { type: 'image_url' }>;
 
 function imageParts(content: ChatContent): ImagePart[] {
@@ -60,6 +87,7 @@ function ChatMessageComponent({
   promptText,
   reasoning,
   reasoningMs,
+  spokenSummary,
   streaming,
   kind,
   elapsedMs,
@@ -92,6 +120,12 @@ function ChatMessageComponent({
   promptText?: string;
   reasoning?: string;
   reasoningMs?: number;
+  // The spoken summary of a VOICE answer (#314): the text the user heard, which `content` also
+  // holds as the start of the full clean answer. When non-empty the assistant row shows it as a
+  // collapsed block (open when nothing else is left to read) with the answer's one audio player
+  // in its summary line -- that audio IS the summary's -- and the body is the answer without it.
+  // Absent or empty, the row renders as it always has: the full text, the one player below it.
+  spokenSummary?: string;
   streaming?: boolean;
   // The kind of the RUN this row is streaming ("" text | "image" | "speech" | "transcription") --
   // ChatStore's runKind, read from the run's own reports (its 201, an
@@ -233,6 +267,20 @@ function ChatMessageComponent({
     // a failed run and keeps rendering its error, not this.
     const audioRemoved = !streaming && audioUrls.length === 0 && hasRemovedAudio(content);
 
+    // The spoken summary's block (#314), and the body beneath it. The block carries the answer's
+    // audio -- the player, or the not-stored placeholder that stands in for it -- so the audio is
+    // placed once, in the block when there is one and below the body otherwise. It opens by
+    // itself only when it is all there is (a short answer with no detail to read after it).
+    const summaryText = spokenSummary?.trim() ?? '';
+    const hasSummaryBlock = summaryText !== '';
+    const body = hasSummaryBlock ? withoutSummary(text, summaryText) : text;
+    let audioNode: ReactNode = null;
+    if (audioUrls.length > 0) {
+      audioNode = <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />;
+    } else if (audioRemoved) {
+      audioNode = <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />;
+    }
+
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
     const reasoningText = reasoning ?? '';
     let summary: string;
@@ -303,6 +351,54 @@ function ChatMessageComponent({
             </Box>
           </Box>
         )}
+        {hasSummaryBlock && (
+          <Box
+            component="details"
+            open={body.trim() === ''}
+            sx={{
+              mt: 1.25,
+              mb: 1.25,
+              border: '1px solid var(--line)',
+              bgcolor: 'var(--page)',
+              borderRadius: '8px',
+              fontSize: 13,
+              '& > summary': {
+                cursor: 'pointer',
+                p: '8px 12px',
+                listStyle: 'none',
+                display: 'flex',
+                flexWrap: 'wrap',
+                alignItems: 'center',
+                gap: 1,
+                color: 'var(--muted)',
+                fontWeight: 700,
+                '&::-webkit-details-marker': { display: 'none' },
+                // The marker a flex summary loses: a caret that says whether it is open.
+                '&::before': { content: '"\\25B8"' },
+              },
+              '&[open] > summary::before': { content: '"\\25BE"' },
+              // The player (or the not-stored line) rides the summary line; its own bottom
+              // margin is for the stack it normally sits in.
+              '& > summary > div': { mb: 0 },
+            }}
+          >
+            <summary>
+              <span>{t.chatVoiceSpokenSummary}</span>
+              {audioNode}
+            </summary>
+            <Box
+              sx={{
+                p: '10px 12px',
+                color: 'var(--text)',
+                lineHeight: 1.5,
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+              }}
+            >
+              {summaryText}
+            </Box>
+          </Box>
+        )}
         <Box
           sx={{
             color: 'var(--text)',
@@ -370,7 +466,7 @@ function ChatMessageComponent({
                 fontSize: 13,
               }}
             >
-              {text}
+              {body}
             </Box>
           ) : (
             <ReactMarkdown
@@ -378,7 +474,7 @@ function ChatMessageComponent({
               rehypePlugins={[rehypeHighlight]}
               components={{ a: markdownLinkComponent }}
             >
-              {text}
+              {body}
             </ReactMarkdown>
           )}
           {streaming && (
@@ -405,10 +501,7 @@ function ChatMessageComponent({
             onRefine={onRefine}
           />
         )}
-        {audioUrls.length > 0 && <AudioTurn t={t} urls={audioUrls} turnId={turnId ?? ''} />}
-        {audioRemoved && (
-          <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />
-        )}
+        {!hasSummaryBlock && audioNode}
         {/* The streamed tail may still be playing out after the run has committed (#281): while it
             is (audioLive), the Mute/Stop controls ride beside whichever of the two the answer
             shows -- the saved player, OR the not-stored placeholder of a retention-0 answer, which

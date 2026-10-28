@@ -45,6 +45,11 @@ export type ChatUiMessage = {
   // tokens/sec, present only once a turn has completed (issue #56).
   tps?: number;
   tokensPerSecond?: number;
+  // The text of a VOICE answer's spoken summary (#314), written by the gateway beside the full
+  // clean answer in `content` (summary and detail both) and omitted when there was none. The
+  // portal renders it as the collapsed, replayable block. snake_case because it is the chat
+  // document's own key, not one of the camelCase run metrics above.
+  spoken_summary?: string;
   status?: ChatMessageStatus;
 };
 
