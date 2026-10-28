@@ -1026,7 +1026,14 @@ func readTestSpeechStream(body string, partBytes int, maxAudioBytes int64) strea
 	defer unsub()
 	src := &drainTrackingReader{src: strings.NewReader(body)}
 	var got streamRead
-	got.parts, got.overCap, got.complete, got.err = readSpeechEvents(run, src, partsTestRate, time.Now(), func() { got.lifted++ }, partBytes, maxAudioBytes, true)
+	got.parts, got.overCap, got.complete, got.err = readSpeechEvents(run, src, speechEventReaderConfig{
+		sampleRate:    partsTestRate,
+		dispatchedAt:  time.Now(),
+		liftDeadline:  func() { got.lifted++ },
+		partBytes:     partBytes,
+		maxAudioBytes: maxAudioBytes,
+		stampTTFT:     true,
+	})
 	got.drained = src.eof
 	for len(events) > 0 {
 		if ev := <-events; ev.Event == "audio" && ev.Audio != nil {

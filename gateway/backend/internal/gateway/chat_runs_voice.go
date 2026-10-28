@@ -185,10 +185,20 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 			// The speech leg failed: the text turn STILL commits (no audio block) and the
 			// degrade is surfaced (spec 5.5). Any audio synthesized before the failure was
 			// billed on the /v1/audio/speech leg.
-			s.finalizeVoiceCommit(ctx, owner, run, vp, answer, "", nil, false, "error", firstNonEmptyVoice(res.errMsg, voiceRunFailedCode))
+			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
+				answer:      answer,
+				finalStatus: "error",
+				finalErr:    firstNonEmptyVoice(res.errMsg, voiceRunFailedCode),
+			})
 			return
 		}
-		s.finalizeVoiceCommit(ctx, owner, run, vp, answer, commitSummary, res.parts, res.streamed, "completed", "")
+		s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
+			answer:      answer,
+			summary:     commitSummary,
+			audioParts:  res.parts,
+			streamed:    res.streamed,
+			finalStatus: "completed",
+		})
 
 	case status == "error" && speechFired:
 		// The LLM failed AFTER </speak> (spec 5.5): the summary was already spoken, so the
@@ -197,9 +207,20 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 		// the speech leg also failed there is no audio to commit, only the truncated text.
 		res := <-speechResult
 		if res.status == "completed" {
-			s.finalizeVoiceCommit(ctx, owner, run, vp, answer, commitSummary, res.parts, res.streamed, "error", errMsg)
+			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
+				answer:      answer,
+				summary:     commitSummary,
+				audioParts:  res.parts,
+				streamed:    res.streamed,
+				finalStatus: "error",
+				finalErr:    errMsg,
+			})
 		} else {
-			s.finalizeVoiceCommit(ctx, owner, run, vp, answer, "", nil, false, "error", errMsg)
+			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
+				answer:      answer,
+				finalStatus: "error",
+				finalErr:    errMsg,
+			})
 		}
 
 	default:
@@ -258,6 +279,22 @@ func (s *Server) voiceSpeechLanguage(ctx context.Context, owner auth.Token, ttsM
 	return effectiveSpeechLanguage(requested, accepts)
 }
 
+// voiceTurnOutcome is the committed voice turn's content and terminal status -- the payload
+// finalizeVoiceCommit hands commitVoiceTurn, grouping the inputs that describe the turn being
+// stored (as opposed to who/where it is stored for). answer is the FULL clean answer text
+// (summary and detail); summary is the spoken <speak> part ("" when there is none); audioParts
+// are the synthesized audio parts (nil when none) and streamed records how they were delivered;
+// finalStatus/finalErr are the run's terminal outcome on a SUCCESSFUL store ("completed", or
+// "error" with a degrade code for a committed-but-degraded turn).
+type voiceTurnOutcome struct {
+	answer      string
+	summary     string
+	audioParts  json.RawMessage
+	streamed    bool
+	finalStatus string
+	finalErr    string
+}
+
 // finalizeVoiceCommit is the voice run's point of no return: ONE compare-and-swap
 // (running->committing) that is both the final cancellation gate and the commit claim, so a
 // cancel and this commit arbitrate on a single atomic word and exactly one wins. A cancel
@@ -277,7 +314,7 @@ func (s *Server) voiceSpeechLanguage(ctx context.Context, owner auth.Token, ttsM
 // the happy path, or "error" with the degrade code for a committed-but-degraded turn (the LLM
 // cut off after the summary, or the speech leg failed). A failed STORE write overrides either
 // to its own mapped error code (commitVoiceTurn).
-func (s *Server) finalizeVoiceCommit(ctx context.Context, owner auth.Token, run *ChatRun, vp *voiceRunParams, answer, summary string, audioParts json.RawMessage, streamed bool, finalStatus, finalErr string) {
+func (s *Server) finalizeVoiceCommit(ctx context.Context, owner auth.Token, run *ChatRun, vp *voiceRunParams, outcome voiceTurnOutcome) {
 	if s.voiceBeforeCommitClaim != nil {
 		s.voiceBeforeCommitClaim(run)
 	}
@@ -285,7 +322,7 @@ func (s *Server) finalizeVoiceCommit(ctx context.Context, owner auth.Token, run 
 		s.finishVoiceRunNoCommit(run, "canceled", "")
 		return
 	}
-	s.commitVoiceTurn(ctx, owner, run, vp.pendingText, answer, summary, audioParts, streamed, finalStatus, finalErr)
+	s.commitVoiceTurn(ctx, owner, run, vp.pendingText, outcome)
 }
 
 // runVoiceLLM runs the voice run's LLM leg: it POSTs the chat-completions body to the
@@ -308,75 +345,93 @@ func (s *Server) finalizeVoiceCommit(ctx context.Context, owner auth.Token, run 
 // answer is the clean buffered text, including on an error path (a truncated answer the
 // error-after-close commit needs), with the scanner's tail flushed only on a clean finish.
 func (s *Server) runVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, speak *speakScanner, onSummaryClosed func()) (answer, status, errMsg string) {
+	resp, status, errMsg := s.dispatchVoiceLLM(ctx, owner, run, prep)
+	if resp == nil {
+		return "", status, errMsg
+	}
+	defer resp.Body.Close()
+	return consumeVoiceLLMStream(ctx, run, resp.Body, speak, onSummaryClosed)
+}
+
+// dispatchVoiceLLM POSTs the chat-completions body to the gateway's own
+// /v1/chat/completions (the shared loopback header set) and returns the streaming response
+// to consume. On any failure before the stream it returns a nil response and the run's
+// terminal (status, errMsg): "canceled" on the orchestrator's cancel (an empty message), the
+// timed-out message on a deadline (a deadline is NOT a cancel -- the voice kind arms none of
+// its own here, but a future one might), or "error" with the upstream's code. A non-200
+// closes the body before returning, exactly as the happy path's deferred close does.
+func (s *Server) dispatchVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult) (resp *http.Response, status, errMsg string) {
 	body, err := buildChatCompletionsBody(prep)
 	if err != nil {
-		return "", "error", err.Error()
+		return nil, "error", err.Error()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", "error", err.Error()
+		return nil, "error", err.Error()
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			// A deadline is NOT a cancel (the voice kind arms none of its own here,
-			// but a future one might), and reporting one as the other would tell the
-			// user they pressed Stop when they pressed nothing.
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return "", "error", runTimedOutMessage
+				return nil, "error", runTimedOutMessage
 			}
-			return "", "canceled", ""
+			return nil, "canceled", ""
 		}
-		return "", "error", err.Error()
+		return nil, "error", err.Error()
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// Bounded exactly as executeRun bounds a non-200 error body, and the
 		// gateway's own error code is pulled out of its envelope.
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, int64(s.captureMaxBytes)))
-		return "", "error", upstreamErrorCode(b, resp.Status)
+		resp.Body.Close()
+		return nil, "error", upstreamErrorCode(b, resp.Status)
 	}
+	return resp, "completed", ""
+}
 
+// consumeVoiceLLMStream reads the voice run's LLM SSE to its end, tapping it through the
+// speak scanner (voice_speak_scanner.go): each content delta is tag-stripped before it is
+// published and buffered, and the first </speak> fires onSummaryClosed so the caller can
+// start the speech leg concurrently (see relayVoiceDelta). It measures the run's metrics but
+// does NOT checkpoint or commit. It returns the clean buffered answer (including a truncated
+// one on an error path, the error-after-close commit needs it) and the run's terminal
+// (status, errMsg), flushing the scanner's held-back tail only on a clean finish.
+func consumeVoiceLLMStream(ctx context.Context, run *ChatRun, body io.Reader, speak *speakScanner, onSummaryClosed func()) (answer, status, errMsg string) {
 	timings := runStreamTimings{start: time.Now()}
 	status, errMsg = "completed", ""
-	sse := bufio.NewScanner(resp.Body)
+	sse := bufio.NewScanner(body)
 	sse.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	stopped := false
 	for sse.Scan() {
 		ev, kind := parseChatSSELine(sse.Text())
 		switch kind {
 		case sseDone:
-			goto finish
+			stopped = true
 		case sseError:
 			// Prefer the upstream's STABLE code (what the voice orchestrator surfaces as the
 			// degradation error frame's code, spec 6.6) over the human message, falling back
 			// to the message when the stream carried no code.
 			status, errMsg = "error", firstNonEmptyVoice(ev.ErrCode, ev.ErrMsg)
-			goto finish
+			stopped = true
 		case sseDelta:
-			// Tag-strip the content before it is published: the scanner returns the clean
-			// text to fan out (and to buffer) and whether the first <speak> region just
-			// closed. Reasoning rides through unchanged. An all-held-back delta (clean "",
-			// no reasoning) is not published at all, so no empty delta and no <speak> prefix
-			// ever reaches a subscriber.
-			clean, closed := speak.Write(ev.Content)
-			if clean != "" || ev.Reasoning != "" {
-				scanned := ev
-				scanned.Content = clean
-				timings.observeDelta(run, scanned)
-			}
-			if closed && onSummaryClosed != nil {
-				onSummaryClosed()
-			}
+			relayVoiceDelta(run, speak, onSummaryClosed, ev, &timings)
 		case sseUsage:
 			timings.outputTokens = ev.OutputTokens
 		}
+		if stopped {
+			break
+		}
 	}
-	if err := sse.Err(); err != nil {
-		status, errMsg = runStreamReadFailure(ctx, err)
+	// A clean end of the loop (no [DONE] and no error frame) is a read outcome: a read
+	// error or a cut stream. Reached only when the loop was NOT stopped by a terminal frame,
+	// mirroring the original goto that skipped this on [DONE]/error.
+	if !stopped {
+		if err := sse.Err(); err != nil {
+			status, errMsg = runStreamReadFailure(ctx, err)
+		}
 	}
-finish:
 	if status == "completed" {
 		// Flush any bytes the scanner held back for a tag that never completed (an unclosed
 		// "<spea" at EOF): they are plain text and belong in the clean answer. Only on a
@@ -388,6 +443,23 @@ finish:
 	timings.recordFinalRates(run)
 	_, content := run.buffered()
 	return content, status, errMsg
+}
+
+// relayVoiceDelta taps one content delta through the speak scanner: the scanner returns the
+// clean text to fan out (and to buffer) and whether the first <speak> region just closed.
+// Reasoning rides through unchanged. An all-held-back delta (clean "", no reasoning) is not
+// published at all, so no empty delta and no <speak> prefix ever reaches a subscriber; the
+// first </speak> fires onSummaryClosed so the caller can start the speech leg concurrently.
+func relayVoiceDelta(run *ChatRun, speak *speakScanner, onSummaryClosed func(), ev sseDeltaEvent, timings *runStreamTimings) {
+	clean, closed := speak.Write(ev.Content)
+	if clean != "" || ev.Reasoning != "" {
+		scanned := ev
+		scanned.Content = clean
+		timings.observeDelta(run, scanned)
+	}
+	if closed && onSummaryClosed != nil {
+		onSummaryClosed()
+	}
 }
 
 // voiceSpeechPrep builds the speech run's prep for the TTS leg: the model is the tts
@@ -450,8 +522,8 @@ func effectiveSpeechLanguage(requested string, modelAccepts bool) string {
 // committed-but-degraded turn (the LLM cut off after the summary, or the speech leg failed --
 // spec 5.5). A FAILED store write ignores both and reports its own mapped code instead, and
 // withholds the parts, exactly as finishRunWithParts does for every other kind.
-func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *ChatRun, pendingText, answer, summary string, audioParts json.RawMessage, streamed bool, finalStatus, finalErr string) {
-	parts, err := voiceContentParts(answer, audioParts)
+func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *ChatRun, pendingText string, outcome voiceTurnOutcome) {
+	parts, err := voiceContentParts(outcome.answer, outcome.audioParts)
 	if err != nil {
 		log.Printf("voice run %s: build content parts failed: %v", run.ID, err)
 		s.finishVoiceRunNoCommit(run, "error", chatRunCommitFailedMessage)
@@ -468,17 +540,17 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 	// retention never acts on a turn that has no audio. A voice thread sets no keep_last_audio,
 	// so with audio present it is stored (never the N=0 marker); should a future voice thread
 	// set it, retention then applies to the right turns. streamed records how it was delivered.
-	audioAnswer := len(audioParts) > 0
+	audioAnswer := len(outcome.audioParts) > 0
 	if err := s.Portal.CommitVoiceTurn(commitCtx, owner, run.ChatID, pendingText, portal.AssistantTurn{
-		Content:         answer,
+		Content:         outcome.answer,
 		ContentParts:    parts,
 		TTFTMs:          m.TTFTMs,
 		ReasoningMs:     m.ReasoningMs,
 		CharsPerSecond:  m.CharsPerSecond,
 		TokensPerSecond: m.TokensPerSecond,
-		SpokenSummary:   summary,
+		SpokenSummary:   outcome.summary,
 		AudioAnswer:     audioAnswer,
-		AudioStreamed:   streamed && audioAnswer,
+		AudioStreamed:   outcome.streamed && audioAnswer,
 	}, "complete"); err != nil {
 		// A failed store write withholds the parts from the terminal event (nothing
 		// was stored to render) and surfaces a mapped code, exactly as
@@ -488,7 +560,7 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 		s.ChatRuns.retire(run)
 		return
 	}
-	run.finish(finalStatus, finalErr, parts)
+	run.finish(outcome.finalStatus, outcome.finalErr, parts)
 	s.ChatRuns.retire(run)
 }
 

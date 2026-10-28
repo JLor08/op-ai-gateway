@@ -169,40 +169,64 @@ func matchSpeakTag(b string) (kind speakTagKind, n int, attrs string) {
 		partial = speakTagNone
 	}
 
-	pos := 1
-	closing := len(b) > 1 && b[1] == '/'
+	pos, closing, verdict, ok := scanSpeakName(b, partial)
+	if !ok {
+		return verdict, 0, ""
+	}
+	if closing {
+		kind, n = scanSpeakClose(b, pos, partial)
+		return kind, n, ""
+	}
+	return scanSpeakOpen(b, pos, partial)
+}
+
+// scanSpeakName matches a leading '<' or '</' followed by the tag name "speak"
+// (case-insensitive). On success it returns the index just past the name, whether the tag is
+// a closing one, and ok=true. When the bytes are not "<speak"/"</speak" it returns ok=false
+// with the verdict to report: partial (a prefix that may still complete) or speakTagNone (a
+// different name such as <speaker>, decided already); closing is still reported either way.
+func scanSpeakName(b string, partial speakTagKind) (pos int, closing bool, verdict speakTagKind, ok bool) {
+	pos = 1
+	closing = len(b) > 1 && b[1] == '/'
 	if closing {
 		pos = 2
 	}
 	const name = "speak"
 	for i := range len(name) {
 		if pos+i >= len(b) {
-			return partial, 0, ""
+			return 0, closing, partial, false
 		}
 		if asciiLower(b[pos+i]) != name[i] {
-			return speakTagNone, 0, ""
+			return 0, closing, speakTagNone, false
 		}
 	}
 	pos += len(name)
 	if pos >= len(b) {
-		return partial, 0, ""
+		return 0, closing, partial, false
 	}
+	return pos, closing, speakTagNone, true
+}
 
-	if closing {
-		// </speak> with optional whitespace before the '>'.
-		for ; pos < len(b); pos++ {
-			switch {
-			case b[pos] == '>':
-				return speakTagClose, pos + 1, ""
-			case !isSpeakSpace(b[pos]):
-				return speakTagNone, 0, ""
-			}
+// scanSpeakClose matches the tail of a </speak ...> tag from pos (just past the name):
+// optional whitespace before the '>'. partial is the verdict for bytes that run out before
+// resolving.
+func scanSpeakClose(b string, pos int, partial speakTagKind) (kind speakTagKind, n int) {
+	for ; pos < len(b); pos++ {
+		switch {
+		case b[pos] == '>':
+			return speakTagClose, pos + 1
+		case !isSpeakSpace(b[pos]):
+			return speakTagNone, 0
 		}
-		return partial, 0, ""
 	}
+	return partial, 0
+}
 
-	// <speak> or <speak attr...>. Anything else after the name is a longer tag name
-	// such as <speaker>.
+// scanSpeakOpen matches the tail of a <speak ...> tag from pos (just past the name): '>'
+// immediately, or whitespace then attributes up to '>'. Anything else after the name is a
+// longer tag name such as <speaker>. attrs is the raw attribute text between the name and
+// the closing '>'; partial is the verdict for bytes that run out before resolving.
+func scanSpeakOpen(b string, pos int, partial speakTagKind) (kind speakTagKind, n int, attrs string) {
 	switch {
 	case b[pos] == '>':
 		return speakTagOpen, pos + 1, ""
@@ -232,50 +256,60 @@ func matchSpeakTag(b string) (kind speakTagKind, n int, attrs string) {
 // case-insensitive, the value may be double-quoted, single-quoted or bare, whitespace is
 // allowed around '=', and any other attribute is skipped.
 func parseSpeakLang(attrs string) string {
-	i := 0
-	skipSpace := func() {
-		for i < len(attrs) && isSpeakSpace(attrs[i]) {
-			i++
-		}
-	}
-	for i < len(attrs) {
-		skipSpace()
-		nameStart := i
-		for i < len(attrs) && !isSpeakSpace(attrs[i]) && attrs[i] != '=' {
-			i++
-		}
-		attrName := attrs[nameStart:i]
-		skipSpace()
+	for i := 0; i < len(attrs); {
+		i = skipSpeakSpace(attrs, i)
+		name, next := readSpeakAttrName(attrs, i)
+		i = skipSpeakSpace(attrs, next)
 		if i >= len(attrs) || attrs[i] != '=' {
 			// A valueless attribute (or trailing junk): nothing to read, move on.
 			continue
 		}
-		i++ // '='
-		skipSpace()
-
-		var value string
-		switch {
-		case i < len(attrs) && (attrs[i] == '"' || attrs[i] == '\''):
-			quote := attrs[i]
-			i++
-			end := strings.IndexByte(attrs[i:], quote)
-			if end < 0 {
-				end = len(attrs) - i
-			}
-			value = attrs[i : i+end]
-			i += end + 1
-		default:
-			valueStart := i
-			for i < len(attrs) && !isSpeakSpace(attrs[i]) {
-				i++
-			}
-			value = attrs[valueStart:i]
-		}
-		if strings.EqualFold(attrName, "lang") {
+		i = skipSpeakSpace(attrs, i+1) // past '='
+		value, next := readSpeakAttrValue(attrs, i)
+		i = next
+		if strings.EqualFold(name, "lang") {
 			return value
 		}
 	}
 	return ""
+}
+
+// skipSpeakSpace returns the index of the first non-whitespace byte at or after i.
+func skipSpeakSpace(attrs string, i int) int {
+	for i < len(attrs) && isSpeakSpace(attrs[i]) {
+		i++
+	}
+	return i
+}
+
+// readSpeakAttrName reads an attribute name starting at i (already past whitespace): the run
+// up to the next whitespace or '='. It returns the name and the index just past it.
+func readSpeakAttrName(attrs string, i int) (name string, next int) {
+	start := i
+	for i < len(attrs) && !isSpeakSpace(attrs[i]) && attrs[i] != '=' {
+		i++
+	}
+	return attrs[start:i], i
+}
+
+// readSpeakAttrValue reads an attribute value starting at i (already past '=' and any
+// whitespace): a double- or single-quoted string (an unterminated quote runs to the end), or
+// a bare run up to the next whitespace. It returns the value and the index just past it.
+func readSpeakAttrValue(attrs string, i int) (value string, next int) {
+	if i < len(attrs) && (attrs[i] == '"' || attrs[i] == '\'') {
+		quote := attrs[i]
+		i++
+		end := strings.IndexByte(attrs[i:], quote)
+		if end < 0 {
+			end = len(attrs) - i
+		}
+		return attrs[i : i+end], i + end + 1
+	}
+	start := i
+	for i < len(attrs) && !isSpeakSpace(attrs[i]) {
+		i++
+	}
+	return attrs[start:i], i
 }
 
 // asciiLower lower-cases an ASCII letter and leaves every other byte alone.

@@ -374,9 +374,9 @@ function ChatMessageComponent({
                 fontWeight: 700,
                 '&::-webkit-details-marker': { display: 'none' },
                 // The marker a flex summary loses: a caret that says whether it is open.
-                '&::before': { content: '"\\25B8"' },
+                '&::before': { content: String.raw`"\25B8"` },
               },
-              '&[open] > summary::before': { content: '"\\25BE"' },
+              '&[open] > summary::before': { content: String.raw`"\25BE"` },
               // The player (or the not-stored line) rides the summary line; its own bottom
               // margin is for the stack it normally sits in.
               '& > summary > div': { mb: 0 },

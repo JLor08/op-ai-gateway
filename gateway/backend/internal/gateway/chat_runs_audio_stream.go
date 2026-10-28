@@ -475,7 +475,14 @@ type speechStreamEvent struct {
 // cap (Server.maxChatBlobBytes) so that each passes the chat store's per-blob check alone.
 func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func(), stampTTFT bool) (json.RawMessage, string, string) {
 	audioCap, blobCap := s.chatAudioCaps()
-	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, sampleRate, dispatchedAt, liftDeadline, speechPartBytes(blobCap), audioCap, stampTTFT)
+	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, speechEventReaderConfig{
+		sampleRate:    sampleRate,
+		dispatchedAt:  dispatchedAt,
+		liftDeadline:  liftDeadline,
+		partBytes:     speechPartBytes(blobCap),
+		maxAudioBytes: audioCap,
+		stampTTFT:     stampTTFT,
+	})
 	if !complete {
 		// A deadline or a cancel lands here as a read error on the cancelled request, and
 		// reporting either as a broken stream -- or a deadline as a cancel -- would tell the
@@ -524,12 +531,25 @@ func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *ht
 // relayed, so the stream is NOT complete however it ends. The line bound is the relay's own
 // (speechStreamMaxLine): a line past it ends the read (bufio.ErrTooLong), which is the same
 // incomplete stream.
-func readSpeechEvents(run *ChatRun, body io.Reader, sampleRate int, dispatchedAt time.Time, liftDeadline func(), partBytes int, maxAudioBytes int64, stampTTFT bool) (parts []speechAudioPart, overCap, complete bool, readErr error) {
+// speechEventReaderConfig groups readSpeechEvents' reader inputs beyond the stream itself
+// (run and body): the sample rate, the dispatch instant the TTFT is measured from, the
+// deadline lift, the per-part and total PCM caps, and whether this reader stamps the TTFT.
+// These are the fields the speechEventReader is built from.
+type speechEventReaderConfig struct {
+	sampleRate    int
+	dispatchedAt  time.Time
+	liftDeadline  func()
+	partBytes     int
+	maxAudioBytes int64
+	stampTTFT     bool
+}
+
+func readSpeechEvents(run *ChatRun, body io.Reader, cfg speechEventReaderConfig) (parts []speechAudioPart, overCap, complete bool, readErr error) {
 	r := &speechEventReader{
-		run: run, sampleRate: sampleRate, dispatchedAt: dispatchedAt, liftDeadline: liftDeadline,
-		partBytes:     max(partBytes-partBytes%speechStreamBytesPerFrame, speechStreamBytesPerFrame),
-		maxAudioBytes: maxAudioBytes,
-		stampTTFT:     stampTTFT,
+		run: run, sampleRate: cfg.sampleRate, dispatchedAt: cfg.dispatchedAt, liftDeadline: cfg.liftDeadline,
+		partBytes:     max(cfg.partBytes-cfg.partBytes%speechStreamBytesPerFrame, speechStreamBytesPerFrame),
+		maxAudioBytes: cfg.maxAudioBytes,
+		stampTTFT:     cfg.stampTTFT,
 	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), speechStreamMaxLine)
