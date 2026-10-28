@@ -13,6 +13,7 @@ import type {
   VoiceChatState,
   VoiceChoice,
   VoiceModelChoice,
+  VoicePromptChoice,
 } from './chat/ChatStore';
 
 afterEach(cleanup);
@@ -53,6 +54,15 @@ function makeVoiceChoice(voices: string[] = [], over: Partial<VoiceChoice> = {})
   return { voices, value: '', set: vi.fn(), ...over };
 }
 
+// The thread's voice system prompt: the text the field shows (the built-in default, pre-filled,
+// unless the thread has its own).
+function makePromptChoice(
+  value = 'The built-in prompt.',
+  over: Partial<VoicePromptChoice> = {},
+): VoicePromptChoice {
+  return { value, set: vi.fn(), ...over };
+}
+
 // The store's pickers of the conversation's models, with every setter a spy: this component only
 // draws them and forwards the user's choice (the store's picks are ChatStore.test.tsx's).
 function makeModels(over: Partial<VoiceChatModels> = {}): VoiceChatModels {
@@ -62,6 +72,7 @@ function makeModels(over: Partial<VoiceChatModels> = {}): VoiceChatModels {
     asr: makeChoice(['asr-a', 'asr-b']),
     tts: makeChoice(['tts-a', 'tts-clone']),
     voice: makeVoiceChoice(),
+    systemPrompt: makePromptChoice(),
     ...over,
   };
 }
@@ -607,5 +618,50 @@ describe('VoiceChatControl voice field', () => {
     cleanup();
     renderControl(makeVoice(), { models: { ...models, ready: false } });
     expect(voiceField()).toBeDisabled();
+  });
+});
+
+// The voice system prompt (#314): a multi-line field beside the pickers, the thread's own, shown
+// pre-filled with the text a run would carry. Unlike the pickers it does not wait for the gateway
+// to say which models stream (the prompt has nothing to do with them), but like them it is closed
+// while a conversation is on.
+describe('VoiceChatControl system prompt field', () => {
+  const promptField = () => screen.getByRole('textbox', { name: t.chatVoiceSystemPrompt });
+
+  it('shows the prompt field pre-filled and calls set on edit', () => {
+    const systemPrompt = makePromptChoice('Speak briefly.');
+    renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+
+    expect(promptField()).toHaveValue('Speak briefly.');
+    expect(promptField().tagName).toBe('TEXTAREA');
+
+    fireEvent.change(promptField(), { target: { value: 'Be terse.\nNo lists.' } });
+    expect(systemPrompt.set).toHaveBeenCalledWith('Be terse.\nNo lists.');
+    expect(systemPrompt.set).toHaveBeenCalledTimes(1);
+  });
+
+  it('says what the prompt is for and what an empty one means', () => {
+    renderControl(makeVoice());
+
+    expect(screen.getByText(t.chatVoiceSystemPromptHint)).toBeInTheDocument();
+  });
+
+  it('disables the prompt field while the conversation is live (locked)', () => {
+    const { update } = renderControl(makeVoice({ state: 'listening' }));
+    expect(promptField()).toBeDisabled();
+
+    update(makeVoice({ state: 'off' }));
+    expect(promptField()).toBeEnabled();
+  });
+
+  it('is open before the gateway has said which models stream, and on a switch closed for another reason', () => {
+    renderControl(makeVoice(), {
+      models: makeModels({ ready: false }),
+      capable: false,
+      gap: 'asr',
+      busy: true,
+    });
+
+    expect(promptField()).toBeEnabled();
   });
 });

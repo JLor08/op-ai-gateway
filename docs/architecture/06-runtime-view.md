@@ -513,23 +513,33 @@ sequenceDiagram
     LV-->>M: clean final transcript, the relay ends (one audio_second row for the chunk)
     M-->>B: {asr_final, text} one chunk, nothing is persisted yet
     M->>RN: start a SPECULATIVE voice run on pendingText, state thinking, the mic STAYS open
-    RN->>CH: loopback POST, history plus pendingText, streamed
-    CH-->>RN: answer deltas
-    RN-->>M: text deltas
-    M-->>B: {answer_delta, text} a preview of the answer
+    RN->>ST: read the chat (a read, nothing is written): the history opens with the voice system prompt, settings.voice_chat.system_prompt else the built-in default
+    RN->>CH: loopback POST, that history plus pendingText, streamed
+    CH-->>RN: answer deltas, the answer opens with a short summary inside a speak tag
+    RN->>RN: the speak scanner strips the tags from every delta BEFORE it is buffered or fanned out
+    RN-->>M: clean text deltas
+    M-->>B: {answer_delta, text} a preview of the answer, never any markup
     alt the user resumes speaking inside the continuation window
         B->>M: PCM, the next chunk's first voiced partial arrives
         M->>RN: cancel the run (it persisted nothing, tokens already produced are still billed)
         M-->>B: {answer_reset}, then {state: listening}
         Note over M,RN: the next chunk is appended to pendingText, and the run restarts on the longer text at the next chunk end, as often as the user pauses
     else the window closes with no resume
-        RN->>SP: loopback POST, the WHOLE answer, streamed PCM
-        SP-->>RN: audio events
-        RN-->>M: audio events, HELD while the window is open
-        M-->>B: {answer_done} (provisional)
-        Note over M: the window closes when the answer has streamed AND the grace elapsed, OR when the run commits, whichever is first. The mic shuts.
+        RN->>RN: the closing speak tag is seen: the summary and its lang are complete
+        RN->>SP: loopback POST, the complete SUMMARY only, streamed PCM, language only when the TTS model accepts one, CONCURRENT with the LLM
+        par the LLM keeps streaming the detail
+            CH-->>RN: detail deltas
+            RN-->>M: clean text deltas
+            M-->>B: {answer_delta, text}
+        and the speech leg synthesizes the summary
+            SP-->>RN: audio events
+            RN-->>M: audio events, HELD while the window is open
+        end
+        M-->>B: {answer_done} (provisional, at the first audio event)
+        Note over M: the window closes when the first audio has arrived AND the grace elapsed, OR when the run commits, whichever is first. The mic shuts.
         M-->>B: {state: speaking}, the held audio, then {audio_delta, seq, rate, audio} as it arrives
-        RN->>ST: CommitVoiceTurn, the user turn and the assistant turn [text, audio_url...] in ONE SaveChatWithBlobs
+        RN->>RN: JOIN, the LLM stream has ended AND the speech leg has finished
+        RN->>ST: CommitVoiceTurn, the user turn and the assistant turn [text (the full clean answer), audio_url...] plus the spoken_summary key in ONE SaveChatWithBlobs
         RN-->>M: completed
         M-->>B: {audio_done}, then {state: draining}
         B->>B: reload the chat thread, which now holds the committed turns
@@ -537,6 +547,7 @@ sequenceDiagram
         M->>M: end draining at max(floor, min(ceiling, signal)), then the mic-resume tail
         M-->>B: {state: listening}
     end
+    Note over RN,SP: no usable summary (no tag, a malformed tag, an empty region): the WHOLE answer is synthesized AFTER the LLM stream ends, the phase-1 ordered flow
     opt any leg fails (ASR drop, LLM or TTS error, admission_blocked, commit failure)
         M-->>B: ONE {error, code, message} with the core's stable code, then {state: idle}, no retry
     end
@@ -559,7 +570,7 @@ turn.** On a chunk end the machine answers **speculatively** and leaves the mic 
 speech cancels the run, voids the preview (`answer_reset`) and extends the text, and a cancelled run persisted **nothing**,
 because the run commits the user turn and the assistant turn together, once, on its single un-cancelled terminal path. The
 TTS audio is **held** until the window closes, so nothing audible exists while the mic is open. **The window closes at the
-commit at the latest.** The run is non-pausable (LLM, then TTS, then commit), so a fast answer gives a shorter keep-talking
+commit at the latest.** The run is non-pausable (the LLM and TTS legs overlap, then one commit), so a fast answer gives a shorter keep-talking
 window than the full grace, and a resume that begins once the run is committing (the commit write) is not accepted: the
 voiced chunk is discarded when the window force-closes. True barge-in, interrupting the answer, is phase 4
 ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). **The half-duplex gate is
@@ -575,6 +586,40 @@ connection, so none of the 30 s server deadlines applies to it; the ticket POST,
 ([API Compatibility & Inference §7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle)). The frames and codes are in the
 [HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket), the knobs in
 [Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate).
+
+**Phase 2: what is spoken is a short summary, and the two legs overlap** ([ADR-079](09-architecture-decisions.md#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language), issue #314). *What the model
+is told.* The voice run's LLM history opens with the **voice system prompt**: the thread's `settings.voice_chat.system_prompt`,
+read from the **stored** chat when the run starts (a blank, absent or non-string value means the built-in default; it is never
+on the ticket and never a request field), as the history's sole system message and for voice runs only, so typed turns in the
+same thread are untouched. The prompt asks the model to open each answer with one short summary wrapped in
+`<speak lang="...">...</speak>`, in the language the user is speaking, and to put the detail after the tag. The gateway never
+relies on that: no tag, a malformed tag or an empty region speaks the **whole answer** after the LLM finishes (the phase-1
+ordered flow), an unclosed region speaks what it captured, and a tag problem is never an error turn. *Scanning.* A scanner
+sits in the run's LLM SSE loop and strips the tags from every content delta **before** it is buffered or fanned out, so the
+`answer_delta` preview, the run's text, the stored turn and the next turn's LLM history never carry markup (a tag split across
+tokens is held back only while it is being parsed, and only the first region is the summary). *Concurrency.* On the delta that
+completes the first closing tag the run fires the one speech request, with the **complete** captured summary (the speech
+endpoint takes its whole input in one body) and the tag's `lang` as the request's top-level `language`, **kept only when the
+TTS model accepts a `language`** (the cached fact of [ADR-074](09-architecture-decisions.md#adr-074--portal-speech-language-a-per-thread-composer-control-injected-as-a-top-level-language-gated-by-a-cached-include_params-fact-with-a-fail-closed-agent-v1models-passthrough);
+otherwise the field is omitted and the model speaks its own default), **while the LLM keeps streaming the detail**. The
+summary's audio is held like any audio until the window closes, which now happens at the first audio event (the summary's) once
+the grace has elapsed, or at the commit. `answer_done` goes out at that first audio event, so `answer_delta` frames of the
+detail can still follow it (the portal appends them regardless). *One commit joins both legs.* The run joins the speech leg
+when the LLM stream ends and commits **once**, through the same compare-and-swap that arbitrates it against a cancel: the full
+clean text, the summary's audio and the summary text as the stored turn's `spoken_summary`, which the portal renders as a
+collapsed, replayable block above the detail ([Data Model](reference/data-model.md)). `audio_done` and `draining` follow
+that commit, so the mic stays gated from the window's close through the commit and then the drain (the drain's floor still
+counts from the first audio chunk, and the summary's audio is relayed early, so the client's one `playback_done` can arrive while the session is still `speaking`: the machine remembers it whenever it arrives and clears it on every relayed audio chunk, so only a signal with no audio relayed after it (the genuine end of audio) ends the drain at the floor instead of the 30 s ceiling, and the floor still always clamps it,
+[Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). *Degrading.* An LLM failure
+**before** the closing tag fires no speech and stores nothing (phase 1). An LLM failure **after** it commits the turn with
+what exists (the summary, its audio and the cut-off detail), and a speech failure commits the **text** turn with no audio; in
+both the run still ends as an error, so the machine emits its one `error` frame and returns to `idle`, and because the turn
+*was* stored but no `audio_done` follows (the portal's cue to reload the thread), it shows at the next reload. A resume
+before the window closes cancels both legs and persists nothing, as in phase 1; the tokens and any completed audio were
+billed by their cores. **Product-visible change:** a voice run's stored time-to-first-token is now the **text** leg's (time to
+the first LLM token, as for any text run). In phase 1 the ordered LLM-then-TTS sequence made it effectively the audio's first
+chunk; with the legs overlapped the speech leg no longer writes the run's performance metrics, so the LLM leg is their only
+writer and the stored values are deterministic.
 
 ## 6.2 Portal login (session + CSRF) with optional TOTP
 

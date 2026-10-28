@@ -1026,7 +1026,14 @@ func readTestSpeechStream(body string, partBytes int, maxAudioBytes int64) strea
 	defer unsub()
 	src := &drainTrackingReader{src: strings.NewReader(body)}
 	var got streamRead
-	got.parts, got.overCap, got.complete, got.err = readSpeechEvents(run, src, partsTestRate, time.Now(), func() { got.lifted++ }, partBytes, maxAudioBytes)
+	got.parts, got.overCap, got.complete, got.err = readSpeechEvents(run, src, speechEventReaderConfig{
+		sampleRate:    partsTestRate,
+		dispatchedAt:  time.Now(),
+		liftDeadline:  func() { got.lifted++ },
+		partBytes:     partBytes,
+		maxAudioBytes: maxAudioBytes,
+		stampTTFT:     true,
+	})
 	got.drained = src.eof
 	for len(events) > 0 {
 		if ev := <-events; ev.Event == "audio" && ev.Audio != nil {
@@ -1061,7 +1068,7 @@ func partWAVs(t *testing.T, parts []speechAudioPart) [][]byte {
 func consumeTestSpeechStream(srv *Server, body io.Reader) (parts json.RawMessage, status, msg string, lifted int) {
 	run := newChatRun("run_consume", "chat_consume", "usr_consume", func() {})
 	resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(body)}
-	parts, status, msg = srv.consumeSpeechStream(context.Background(), run, resp, partsTestRate, time.Now(), func() { lifted++ })
+	parts, status, msg = srv.consumeSpeechStream(context.Background(), run, resp, partsTestRate, time.Now(), func() { lifted++ }, true)
 	return parts, status, msg, lifted
 }
 

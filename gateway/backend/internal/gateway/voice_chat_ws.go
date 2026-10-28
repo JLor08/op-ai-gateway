@@ -598,10 +598,12 @@ type voiceMachine struct {
 	runUnsub func()
 
 	// The continuation-window bookkeeping for the current speculative run.
-	//   - answerStreamed: the LLM answer text finished (the first audio event, or a
-	//     completed terminal) -- one of the two window-close conditions.
-	//   - answerDoneSent: answer_done already emitted (emitted once, when the answer text
-	//     finishes, before any audio_delta).
+	//   - answerStreamed: the first audio event (the summary spoken at </speak>, in the
+	//     concurrent flow while the detail text is still streaming), or a completed terminal --
+	//     one of the two window-close conditions.
+	//   - answerDoneSent: answer_done already emitted (emitted once, on that first audio --
+	//     before any audio_delta, and typically before the detail text has finished; the client
+	//     ignores answer_done's terminal flag).
 	//   - graceElapsed: the continuation grace has fired -- the other window-close condition.
 	//   - windowClosed: the window is closed (we have committed to this turn): the mic is
 	//     shut and buffered audio plays. Set exactly when the machine leaves thinking for
@@ -640,8 +642,11 @@ type voiceMachine struct {
 	//   - firstAudioAt/relayedPlaybackDur accumulate as audio is relayed; playbackRateUnknown
 	//     drops the computed floor (the ceiling is then the only bound) for a chunk with no
 	//     usable rate (defensive).
-	//   - awaitingPlayback is set for the whole wait; playbackSignaled records a playback_done
-	//     seen during it; playbackFloorPassed latches when the floor elapses (then the timer is
+	//   - awaitingPlayback is set for the whole wait; playbackSignaled records that a playback_done
+	//     has been seen (at ANY time, including while still speaking in the concurrent flow) with
+	//     no chunk relayed since -- it is cleared per turn (beginAnswer) AND on every relayed chunk
+	//     (relayAudio), so only a signal after the last chunk, the genuine end of audio, survives
+	//     to end the drain; playbackFloorPassed latches when the floor elapses (then the timer is
 	//     re-armed to the ceiling to wait out a slow or absent signal).
 	// All are reset per turn in beginAnswer. The mic STAYS discarded for the whole draining
 	// period regardless (micOpen); only the EXIT moment moves from relay-done to playout-done.
@@ -868,9 +873,11 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 		m.pendingText = ""
 		m.setState(voiceStateListening)
 	case voiceUpPlaybackDone:
-		// The client's audio player finished playing the answer out. If we are draining and
-		// waiting on it, this is the signal to end the drain (spec 6.2); otherwise it is a
-		// stray or late frame and cannot move a session that is not awaiting playout.
+		// The client's audio player reported its queue drained. In the concurrent flow this can
+		// arrive while still speaking (the summary drained before the detail committed) or in a
+		// gap between chunks, so it is REMEMBERED, not dropped -- a later relayed chunk clears it,
+		// so only the genuine end-of-audio signal survives to end the drain (spec 6.2). It still
+		// never shortens the drain below the floor.
 		m.onPlaybackDone()
 	}
 }
@@ -1085,10 +1092,12 @@ func (m *voiceMachine) onRunClosed() {
 	m.runCh = nil
 }
 
-// onRunAudio consumes one TTS audio chunk from the run. The first audio means the LLM
-// answer text has finished, so answer_done is emitted (markAnswerStreamed). While the
-// continuation window is still open the chunk is HELD (audioBuf) so no audio ever plays
-// before the mic shuts; once the window has closed the chunk is relayed straight down.
+// onRunAudio consumes one TTS audio chunk from the run. In the concurrent flow the first audio
+// is the SUMMARY spoken at </speak> while the LLM detail is still streaming, so answer_done is
+// emitted now (markAnswerStreamed) even though more answer text follows -- the client ignores
+// answer_done's terminal flag. While the continuation window is still open the chunk is HELD
+// (audioBuf) so no audio ever plays before the mic shuts; once the window has closed the chunk
+// is relayed straight down.
 func (m *voiceMachine) onRunAudio(a *runAudio) {
 	if a == nil {
 		return
@@ -1102,9 +1111,11 @@ func (m *voiceMachine) onRunAudio(a *runAudio) {
 	m.maybeCloseWindow()
 }
 
-// markAnswerStreamed records that the LLM answer text has finished (the first audio event,
-// or a completed run) and emits answer_done exactly once, before any audio_delta. It is one
-// of the two conditions that close the continuation window.
+// markAnswerStreamed records the first audio event (the summary spoken at </speak>, which in the
+// concurrent flow arrives while the LLM detail is still streaming) or a completed run, and emits
+// answer_done exactly once, before any audio_delta. answer_done thus fires while more answer text
+// may still follow -- harmless, as the client ignores its terminal flag. It is one of the two
+// conditions that close the continuation window.
 func (m *voiceMachine) markAnswerStreamed() {
 	if !m.answerDoneSent {
 		m.answerDoneSent = true
@@ -1166,6 +1177,13 @@ func (m *voiceMachine) flushAudioBuf() {
 // fallback can bound the wait.
 func (m *voiceMachine) relayAudio(a runAudio) {
 	m.accountPlayback(a)
+	// A newly relayed chunk invalidates any end-of-playout signal remembered so far. The client's
+	// onEmpty fires on EVERY queue drain -- including an inter-chunk gap when TTS lags real time,
+	// not just the true end -- so a playback_done seen before this chunk was NOT the end of audio.
+	// Only a signal with no chunk relayed after it is the genuine end (in the concurrent flow the
+	// post-summary signal, since the detail is text-only), so clearing here keeps a mid-stream gap
+	// signal from ending the drain while later audio is still playing (half-duplex echo exposure).
+	m.playbackSignaled = false
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Rate: a.Rate, Audio: a.Data})
 }
 
@@ -1252,7 +1270,12 @@ func (m *voiceMachine) finishAnswer() {
 // nothing to play out, so the drain falls straight through to the tail.
 func (m *voiceMachine) beginPlaybackWait() {
 	m.awaitingPlayback = true
-	m.playbackSignaled = false
+	// playbackSignaled is deliberately NOT reset here: a playback_done the client already sent
+	// while the session was still speaking -- the summary audio drained before the detail
+	// finished, the concurrent flow -- must be honored now, not clobbered back to false. The
+	// per-turn reset lives in beginAnswer (resetPlaybackWait), so the flag is already fresh for a
+	// turn that saw no early signal. The floor still clamps a remembered early signal:
+	// onPlaybackFloorReached ends the drain only once the floor has passed, never before.
 	m.playbackFloorPassed = false
 	if m.firstAudioAt.IsZero() {
 		m.endDrainWait() // no audio was relayed: nothing to play out
@@ -1297,16 +1320,18 @@ func (m *voiceMachine) onPlaybackTimer() {
 	m.endDrainWait() // the ceiling elapsed with no playback_done
 }
 
-// onPlaybackDone records the client's playout-done signal and ends the drain only when the
-// floor has already passed (so the signal extends, never shortens, the drain). An early signal
-// is remembered and the floor timer ends the drain when the floor elapses. Ignored unless we
-// are awaiting playout: a stray or late frame cannot move a session that is not draining.
+// onPlaybackDone records the client's playout-done signal. In the concurrent flow the summary
+// audio drains -- and the client sends its single playback_done -- while the session is still
+// SPEAKING: the LLM detail is still streaming, so the drain wait has not begun (awaitingPlayback
+// is false). The signal is therefore remembered REGARDLESS of awaitingPlayback, to be honored
+// once the drain begins (beginPlaybackWait/onPlaybackFloorReached); the flag is cleared per turn
+// in beginAnswer, so a stray frame can never leak across turns. The signal only ENDS the drain
+// here when we are already awaiting playout AND the floor has passed (a slow client still
+// playing). It can NEVER shorten the drain below the floor -- that stays the server-authoritative
+// minimum, so a remembered early (or forged) signal is still clamped up to the floor.
 func (m *voiceMachine) onPlaybackDone() {
-	if !m.awaitingPlayback {
-		return
-	}
 	m.playbackSignaled = true
-	if m.playbackFloorPassed {
+	if m.awaitingPlayback && m.playbackFloorPassed {
 		m.endDrainWait()
 	}
 }

@@ -926,6 +926,254 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // A VOICE answer carries a spoken summary (#314): the text the user heard, stored beside the
+    // full clean answer. It renders as a collapsed block (label + the one audio player in its
+    // summary line, the summary text on expand) and the body is the answer WITHOUT it, so the
+    // summary is never shown twice. A turn with no summary renders exactly as before.
+    describe('a voice answer with a spoken summary', () => {
+      const AUDIO = {
+        type: 'audio_url' as const,
+        audio_url: { url: 'data:audio/wav;base64,AAAA' },
+      };
+      const MARKER = { type: 'audio_removed' as const };
+      const answer = (text: string, ...rest: Array<typeof AUDIO | typeof MARKER>) => [
+        { type: 'text' as const, text },
+        ...rest,
+      ];
+      // The block is the <details> that carries the label in its summary line.
+      const block = () => screen.getByText(t.chatVoiceSpokenSummary).closest('details');
+
+      it('renders a collapsed block with the player in its summary line', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="a1"
+            content={answer('Sum.\n\nThe detail.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        const details = block();
+        expect(details).not.toBeNull();
+        expect(details).not.toHaveAttribute('open');
+        // The one player of the turn lives in the block's summary line.
+        const players = screen.getAllByLabelText(t.chatGeneratedAudio);
+        expect(players).toHaveLength(1);
+        const summaryLine = details?.querySelector('summary') ?? null;
+        expect(summaryLine).not.toBeNull();
+        expect(summaryLine).toContainElement(players[0]);
+        expect(summaryLine).toHaveTextContent(t.chatVoiceSpokenSummary);
+      });
+
+      it('shows the summary text only in the block, not again in the body', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.\n\nThe detail.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        const summaryText = screen.getAllByText('Sum.');
+        expect(summaryText).toHaveLength(1);
+        expect(summaryText[0].closest('details')).toBe(block());
+        // The detail is the body, outside the block.
+        expect(screen.getByText('The detail.').closest('details')).toBeNull();
+      });
+
+      it('opens the block when the answer has no detail body', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        expect(block()).toHaveAttribute('open');
+        expect(screen.getByText('Sum.').closest('details')).toBe(block());
+      });
+
+      it('opens the block when the body is only whitespace around the summary', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('  Sum.\n\n  ', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        expect(block()).toHaveAttribute('open');
+      });
+
+      // Review focus: the summary is normally the leading text, but the model may put words
+      // before its <speak> tag. The body must still exclude the summary, and keep what is around.
+      it('excludes the summary even when it was not the leading text', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Before.\n\nSum.\n\nAfter.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        const summaryText = screen.getAllByText('Sum.');
+        expect(summaryText).toHaveLength(1);
+        expect(summaryText[0].closest('details')).toBe(block());
+        expect(screen.getByText('Before.').closest('details')).toBeNull();
+        expect(screen.getByText('After.').closest('details')).toBeNull();
+        expect(block()).not.toHaveAttribute('open');
+      });
+
+      it('excludes a summary that sits inline in the middle of a paragraph', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Before. Sum. After.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        expect(screen.getAllByText('Sum.')).toHaveLength(1);
+        expect(screen.getByText('Before.')).toBeInTheDocument();
+        expect(screen.getByText('After.')).toBeInTheDocument();
+      });
+
+      // Review focus: the backend captures ONLY the first <speak> region as the summary; a later
+      // region's text stays in the answer as ordinary detail. Exactly one block renders, and the
+      // later region's text is in the body, not in a second block.
+      it('renders exactly one block when the answer had two <speak> regions', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('First.\n\nThe middle.\n\nSecond region.', AUDIO)}
+            spokenSummary="First."
+          />,
+        );
+
+        expect(screen.getAllByText(t.chatVoiceSpokenSummary)).toHaveLength(1);
+        expect(document.querySelectorAll('details')).toHaveLength(1);
+        expect(screen.getByText('The middle.').closest('details')).toBeNull();
+        expect(screen.getByText('Second region.').closest('details')).toBeNull();
+        expect(screen.getAllByText('First.')).toHaveLength(1);
+        expect(screen.getAllByLabelText(t.chatGeneratedAudio)).toHaveLength(1);
+      });
+
+      it('keeps the whole text as the body when the summary cannot be found in it', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Something else entirely.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        // Nothing is lost: the answer is shown in full, and the block still carries the summary.
+        expect(screen.getByText('Something else entirely.').closest('details')).toBeNull();
+        expect(screen.getByText('Sum.').closest('details')).toBe(block());
+        expect(block()).not.toHaveAttribute('open');
+      });
+
+      it('falls back to the phase-1 layout when the summary is empty or absent', () => {
+        for (const spokenSummary of [undefined, '', '   ']) {
+          const { unmount } = render(
+            <ChatMessage
+              t={t}
+              role="assistant"
+              turnId="a1"
+              content={answer('Everything spoken.', AUDIO)}
+              spokenSummary={spokenSummary}
+            />,
+          );
+
+          expect(screen.queryByText(t.chatVoiceSpokenSummary)).toBeNull();
+          expect(document.querySelector('details')).toBeNull();
+          // The full text, and the one player outside any block.
+          expect(screen.getByText('Everything spoken.')).toBeInTheDocument();
+          expect(screen.getAllByLabelText(t.chatGeneratedAudio)).toHaveLength(1);
+          unmount();
+        }
+      });
+
+      it('shows the not-stored state in the block when the summary audio was removed', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.\n\nThe detail.', MARKER)}
+            spokenSummary="Sum."
+            onRegenerate={() => {}}
+          />,
+        );
+
+        const details = block();
+        const placeholder = screen.getByRole('group', { name: t.chatAudioNotStored });
+        // The placeholder takes the player's place in the summary line; there is no player.
+        expect(details?.querySelector('summary')).toContainElement(placeholder);
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+        // Expanding still shows the summary text, and the detail stays the body.
+        expect(screen.getByText('Sum.').closest('details')).toBe(details);
+        expect(screen.getByText('The detail.').closest('details')).toBeNull();
+        // One regenerate, the placeholder's: not a second one in the action stack.
+        expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+      });
+
+      it('does not render a second player below the body', () => {
+        const { container } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.\n\nThe detail.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        expect(container.querySelectorAll('audio')).toHaveLength(1);
+      });
+
+      it('still copies the whole answer, summary included', () => {
+        const writeText = vi.fn().mockResolvedValue(undefined);
+        vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.\n\nThe detail.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatCopy }));
+
+        expect(writeText).toHaveBeenCalledWith('Sum.\n\nThe detail.');
+      });
+
+      it('shows the body without the summary in the raw view too', () => {
+        const { container } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.\n\nThe detail.', AUDIO)}
+            spokenSummary="Sum."
+          />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatViewRaw }));
+
+        const raw = container.querySelector('pre');
+        expect(raw).toHaveTextContent('The detail.');
+        expect(raw).not.toHaveTextContent('Sum.');
+      });
+    });
+
     // The delete of a stored speech answer's audio (#281): a trash icon on the answer's action
     // stack that asks INLINE first (a confirm in the stack itself, no dialog), because the
     // audio is gone for good once the gateway has removed it -- regenerate is the way back.

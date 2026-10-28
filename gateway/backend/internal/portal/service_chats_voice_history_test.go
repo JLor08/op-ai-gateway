@@ -194,8 +194,9 @@ func TestStripVoiceAssistantAudioNeverLosesAnUnmergeableTurn(t *testing.T) {
 }
 
 // End to end through VoiceRunHistory over a MIXED thread (a speech-run turn with audio only,
-// then a voice turn with text and audio): the history the LLM leg is handed has no empty
-// assistant content, alternates, keeps the voice turn's text and ends in the pending text.
+// then a voice turn with text and audio): the history the LLM leg is handed opens with the
+// voice system prompt, then has no empty assistant content, alternates, keeps the voice turn's
+// text and ends in the pending text.
 func TestVoiceRunHistoryOmitsAnAudioOnlyAssistantTurnInAMixedThread(t *testing.T) {
 	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
 	owner := chatToken("usr_a")
@@ -209,10 +210,12 @@ func TestVoiceRunHistoryOmitsAnAudioOnlyAssistantTurnInAMixedThread(t *testing.T
 		t.Fatal(err)
 	}
 
-	history, err := svc.VoiceRunHistory(context.Background(), owner, created.ID, "and three plus three")
+	full, err := svc.VoiceRunHistory(context.Background(), owner, created.ID, "and three plus three")
 	if err != nil {
 		t.Fatalf("VoiceRunHistory: %v", err)
 	}
+	assertSoleSystemMessage(t, full, defaultVoiceSystemPrompt)
+	history := full[1:] // the conversation after the voice system prompt
 	assertValidVoiceHistory(t, history)
 	if r := voiceHistoryRoles(history); r != "user,assistant,user" {
 		t.Fatalf("roles = %s, want user,assistant,user", r)
@@ -228,5 +231,111 @@ func TestVoiceRunHistoryOmitsAnAudioOnlyAssistantTurnInAMixedThread(t *testing.T
 	}
 	if body, _ := json.Marshal(history); strings.Contains(string(body), "audio") {
 		t.Fatalf("an audio part reached the LLM history: %s", body)
+	}
+}
+
+// A voice run carries ONE system message: the voice system prompt the user stored in
+// settings.voice_chat.system_prompt, or the built-in default when none is stored (or the stored
+// value is blank). The voice run reads it from the stored chat document, never from the ticket,
+// so a client cannot plant one per request.
+
+func TestVoiceSystemPrompt_DefaultWhenAbsent(t *testing.T) {
+	for name, settings := range map[string]json.RawMessage{
+		"nil settings":          nil,
+		"empty object":          json.RawMessage(`{}`),
+		"null":                  json.RawMessage(`null`),
+		"voice_chat absent":     json.RawMessage(`{"model":"llama"}`),
+		"voice_chat null":       json.RawMessage(`{"voice_chat":null}`),
+		"voice_chat empty":      json.RawMessage(`{"voice_chat":{}}`),
+		"prompt blank":          json.RawMessage(`{"voice_chat":{"system_prompt":"  "}}`),
+		"prompt empty":          json.RawMessage(`{"voice_chat":{"system_prompt":""}}`),
+		"prompt not a string":   json.RawMessage(`{"voice_chat":{"system_prompt":42}}`),
+		"malformed settings":    json.RawMessage(`{"voice_chat":`),
+		"picks only, no prompt": json.RawMessage(`{"voice_chat":` + storedVoiceChatPicks + `}`),
+	} {
+		if got := voiceSystemPrompt(settings); got != defaultVoiceSystemPrompt {
+			t.Errorf("%s: voiceSystemPrompt = %q, want the default %q", name, got, defaultVoiceSystemPrompt)
+		}
+	}
+}
+
+func TestVoiceSystemPrompt_Override(t *testing.T) {
+	for name, tc := range map[string]struct{ settings, want string }{
+		"plain":                  {`{"voice_chat":{"system_prompt":"Be terse."}}`, "Be terse."},
+		"trimmed":                {"{\"voice_chat\":{\"system_prompt\":\"  Be terse.\\n\"}}", "Be terse."},
+		"multi-line is kept":     {`{"voice_chat":{"system_prompt":"Be terse.\nNo lists."}}`, "Be terse.\nNo lists."},
+		"beside the model picks": {`{"model":"llama","voice_chat":{"asr_model":"asr-b","system_prompt":"Be terse."}}`, "Be terse."},
+	} {
+		if got := voiceSystemPrompt(json.RawMessage(tc.settings)); got != tc.want {
+			t.Errorf("%s: voiceSystemPrompt = %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
+// voiceHistoryThread creates a chat whose stored settings are the given raw JSON and whose
+// messages are a one-question exchange, the way the client creates one, by content.
+func voiceHistoryThread(t *testing.T, svc *Service, settings string) string {
+	t.Helper()
+	created, err := svc.CreateChat(context.Background(), chatToken("usr_a"), CreateChatRequest{Content: json.RawMessage(`{"settings":` + settings + `,"messages":[
+		{"id":"u1","role":"user","content":"what is two plus two"},
+		{"id":"a1","role":"assistant","content":"four","status":"complete"}
+	]}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created.ID
+}
+
+// assertSoleSystemMessage pins that history opens with the one system message, whose string
+// content is want, and that no other message in it has the system role.
+func assertSoleSystemMessage(t *testing.T, history []ChatAPIMessage, want string) {
+	t.Helper()
+	if len(history) == 0 || history[0].Role != "system" {
+		t.Fatalf("history[0] is not the system message: %+v", history)
+	}
+	var got string
+	if err := json.Unmarshal(history[0].Content, &got); err != nil {
+		t.Fatalf("the system message content is not a string: %s", history[0].Content)
+	}
+	if got != want {
+		t.Errorf("system message = %q, want %q", got, want)
+	}
+	for i, m := range history[1:] {
+		if m.Role == "system" {
+			t.Fatalf("history[%d] is a second system message: %+v", i+1, history)
+		}
+	}
+}
+
+func TestVoiceRunHistory_InjectsSystemMessage(t *testing.T) {
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	chatID := voiceHistoryThread(t, svc, `{"voice_chat":{"system_prompt":"Be terse."}}`)
+
+	history, err := svc.VoiceRunHistory(context.Background(), chatToken("usr_a"), chatID, "and three plus three")
+	if err != nil {
+		t.Fatalf("VoiceRunHistory: %v", err)
+	}
+	assertSoleSystemMessage(t, history, "Be terse.")
+	if r := voiceHistoryRoles(history); r != "system,user,assistant,user" {
+		t.Fatalf("roles = %s, want system,user,assistant,user", r)
+	}
+	if !strings.Contains(string(history[len(history)-1].Content), "and three plus three") {
+		t.Fatalf("the last message must be the pending text: %s", history[len(history)-1].Content)
+	}
+}
+
+func TestVoiceRunHistory_DefaultSystemMessage(t *testing.T) {
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	for name, settings := range map[string]string{
+		"no voice_chat":    `{}`,
+		"blank prompt":     `{"voice_chat":{"system_prompt":"   "}}`,
+		"picks, no prompt": `{"voice_chat":` + storedVoiceChatPicks + `}`,
+	} {
+		chatID := voiceHistoryThread(t, svc, settings)
+		history, err := svc.VoiceRunHistory(context.Background(), chatToken("usr_a"), chatID, "and three plus three")
+		if err != nil {
+			t.Fatalf("%s: VoiceRunHistory: %v", name, err)
+		}
+		assertSoleSystemMessage(t, history, defaultVoiceSystemPrompt)
 	}
 }

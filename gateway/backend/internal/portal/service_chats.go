@@ -1092,6 +1092,14 @@ type AssistantTurn struct {
 	// stored), while a buffered-fallback answer is STORED so the un-heard paid
 	// audio is not lost -- see writeAssistant.
 	AudioStreamed bool
+	// SpokenSummary is the text of a VOICE answer's spoken summary -- the leading
+	// <speak> part the user hears -- recorded so the portal can re-render it as the
+	// collapsed block when the thread is reloaded. It is ADDITIONAL metadata: the
+	// answer's text in Content/ContentParts stays the full clean answer, summary and
+	// detail both. It is persisted under the message's `spoken_summary` key and only
+	// when non-empty, so a turn with no summary (a phase-1 voice turn, a no-tag
+	// fallback, every non-voice turn) is stored byte for byte as before.
+	SpokenSummary string
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -1178,6 +1186,11 @@ func buildAssistantMessage(id, status string, turn AssistantTurn) (json.RawMessa
 		// event carries the snake_case tokens_per_second separately (issue #56).
 		msg["tokensPerSecond"] = turn.TokensPerSecond
 	}
+	if turn.SpokenSummary != "" {
+		// snake_case, like the chat document's other additive keys (settings.voice_chat);
+		// the portal reads it to re-render the collapsed spoken-summary block on reload.
+		msg["spoken_summary"] = turn.SpokenSummary
+	}
 	return json.Marshal(msg)
 }
 
@@ -1234,13 +1247,54 @@ func (s *Service) commitTurnWithRetention(ctx context.Context, chatID string, ro
 	return s.commitChatRun(ctx, row, row.Title, doc, blobs, deleteBlobIDs)
 }
 
+// defaultVoiceSystemPrompt is the built-in voice system prompt: the one a voice run carries as
+// its sole system message when the thread stores none (or a blank one). It asks the model to
+// open every answer with a short <speak lang="..."> summary -- the part that is spoken -- and to
+// write the fuller answer after it as text that is shown but not spoken. It is language-agnostic
+// on purpose: the model uses the language the user is speaking.
+//
+// The portal keeps a copy of this text (DEFAULT_VOICE_SYSTEM_PROMPT in
+// gateway/frontend/src/components/chat/chatDoc.ts) to pre-fill the editable field and to store
+// nothing when the user leaves it unchanged; the two must stay identical, character for
+// character (a frontend test reads this file and compares them).
+const defaultVoiceSystemPrompt = "You are in a spoken conversation. Begin every answer with ONE short, natural " +
+	"spoken summary of the essential point, wrapped in a single " +
+	"`<speak lang=\"…\">…</speak>` tag, using the language the user is speaking (set " +
+	"`lang` to its two-letter code). Keep what is inside `<speak>` brief enough to " +
+	"listen to — a sentence or two, the gist only. After the closing `</speak>`, " +
+	"write the fuller answer (detail, lists, code, caveats) as normal text; that " +
+	"part is shown but not spoken. Do not put anything before the `<speak>` tag."
+
+// voiceSystemPrompt is the system prompt of a voice run, read from the chat document's
+// settings: settings.voice_chat.system_prompt trimmed, or defaultVoiceSystemPrompt when the
+// thread stores none -- the key absent, blank, or not a string. The document is schema-free,
+// so this decodes the one member it needs (the picks beside it, and any unrelated malformed
+// knob, must not switch the prompt off). It is read from the STORED document, never from the
+// run ticket or a request field, so a client cannot plant a prompt for a single run.
+func voiceSystemPrompt(settings json.RawMessage) string {
+	var s struct {
+		VoiceChat *struct {
+			SystemPrompt string `json:"system_prompt"`
+		} `json:"voice_chat"`
+	}
+	if len(settings) == 0 || json.Unmarshal(settings, &s) != nil || s.VoiceChat == nil {
+		return defaultVoiceSystemPrompt
+	}
+	if prompt := strings.TrimSpace(s.VoiceChat.SystemPrompt); prompt != "" {
+		return prompt
+	}
+	return defaultVoiceSystemPrompt
+}
+
 // VoiceRunHistory returns the chat's stored history as OpenAI messages with
 // pendingText appended as the latest user message, for a voice run's LLM leg. It
 // commits NOTHING: a voice run is speculative and cancellable, so ALL of its
 // chat-document persistence is deferred to its finalize (CommitVoiceTurn) and a
 // cancelled run leaves the chat untouched (spec 6.1). The older turns' stored image
 // references are resolved to data urls (resolveChatBlobRefs), exactly as a text run's
-// history is; the system prompt is deliberately omitted (phase 2). Owner-scoped.
+// history is. The history opens with ONE system message: the voice system prompt
+// (voiceSystemPrompt -- the thread's stored override, else the built-in default). The
+// thread's typed-chat system prompt never reaches a voice run. Owner-scoped.
 func (s *Service) VoiceRunHistory(ctx context.Context, owner auth.Token, chatID, pendingText string) ([]ChatAPIMessage, error) {
 	row, err := s.chats.ChatByID(ctx, chatID)
 	if err != nil {
@@ -1254,7 +1308,7 @@ func (s *Service) VoiceRunHistory(ctx context.Context, owner auth.Token, chatID,
 		return nil, err
 	}
 	doc := parseChatDoc(content)
-	history := buildAPIHistory("", doc.Messages)
+	history := buildAPIHistory(voiceSystemPrompt(doc.Settings), doc.Messages)
 	history, err = s.resolveChatBlobRefs(ctx, chatID, history)
 	if err != nil {
 		return nil, err

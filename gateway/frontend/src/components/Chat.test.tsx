@@ -2607,6 +2607,54 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  // The spoken summary of a voice answer (#314): the stored message carries it as a top-level
+  // `spoken_summary` key, and the store hands it to the row, which renders the collapsed block.
+  describe(`Chat: the spoken summary of a stored voice answer [${locale}]`, () => {
+    const wav = { type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklG' } };
+
+    function seedVoiceAnswer(message: Record<string, unknown>) {
+      chatApi.rows.push({
+        id: 'c_voice_summary',
+        title: 'Spoken',
+        created_at: '2026-07-22T12:00:00Z',
+        updated_at: '2026-07-22T12:00:00Z',
+        content: {
+          settings: { model: 'gpt-oss-20b' },
+          messages: [
+            { id: 'u1', role: 'user', content: 'tell me' },
+            { id: 'a1', role: 'assistant', status: 'complete', ...message },
+          ],
+        },
+      });
+    }
+
+    it('renders the stored spoken_summary as a collapsed block above the detail body', async () => {
+      seedVoiceAnswer({
+        content: [{ type: 'text', text: 'Sum.\n\nThe detail.' }, wav],
+        spoken_summary: 'Sum.',
+      });
+      renderChat();
+
+      const label = await screen.findByText(t.chatVoiceSpokenSummary);
+      const details = label.closest('details');
+      expect(details).not.toBeNull();
+      expect(details).not.toHaveAttribute('open');
+      expect(screen.getAllByText('Sum.')).toHaveLength(1);
+      expect(screen.getByText('Sum.').closest('details')).toBe(details);
+      expect(screen.getByText('The detail.').closest('details')).toBeNull();
+      expect(screen.getAllByLabelText(t.chatGeneratedAudio)).toHaveLength(1);
+    });
+
+    it('renders a voice answer with no spoken_summary exactly as before', async () => {
+      seedVoiceAnswer({ content: [{ type: 'text', text: 'Everything spoken.' }, wav] });
+      renderChat();
+
+      expect(await screen.findByText('Everything spoken.')).toBeInTheDocument();
+      expect(screen.queryByText(t.chatVoiceSpokenSummary)).toBeNull();
+      expect(screen.getAllByLabelText(t.chatGeneratedAudio)).toHaveLength(1);
+    });
+  });
+
   // The per-answer delete of a stored spoken answer's audio (#281). The answer's own id is bound
   // by the store's handlersFor, so the request names THAT answer; the control asks inline first,
   // and an answer whose audio is already gone offers none.

@@ -420,6 +420,16 @@ const de = {
   chatVoiceModelUsing: (model: string) => `Verwendet: ${model}`,
   chatVoiceLlmNote: (model: string) =>
     `Das Chat-Modell ist das Modell dieses Chats: ${model}. Wählen Sie es oben in der Modellauswahl.`,
+  // The voice system prompt of the thread (#314): the instruction a spoken conversation's runs
+  // start from, pre-filled with the built-in one. It is the voice twin of the thread's own system
+  // prompt (chatSystemPrompt, which a spoken conversation does not use), so its label says whose it
+  // is. Emptying the field means the built-in prompt again.
+  chatVoiceSystemPrompt: 'System-Prompt für den Sprachchat',
+  chatVoiceSystemPromptHint:
+    'Gilt für die Antworten des Sprachchats in diesem Chat. Der Standard verlangt zuerst eine kurze gesprochene Zusammenfassung und danach die ausführliche Antwort als Text. Leer lassen, um den Standard zu verwenden.',
+  // The collapsed block of a spoken answer's summary (#314): the short part the user heard, kept
+  // above the written detail and replayable from its own player. The label names what it holds.
+  chatVoiceSpokenSummary: 'Gesprochene Zusammenfassung',
   // Why a conversation could not start or ended, by the gateway's portal.voice_chat_* code (the
   // gate that refuses the ticket) or by the kind of failure. A refusal is the gateway's answer to
   // the very same request, so it is repeated until the configuration changes: the operator's to
@@ -3845,6 +3855,10 @@ const en: PortalMessages = {
   chatVoiceModelUsing: (model: string) => `Uses: ${model}`,
   chatVoiceLlmNote: (model: string) =>
     `The chat model is this chat's own model: ${model}. Pick it in the model selector above.`,
+  chatVoiceSystemPrompt: 'Voice Chat system prompt',
+  chatVoiceSystemPromptHint:
+    'Used for the answers of Voice Chat in this chat. The default asks for a short spoken summary first, then the full answer as text. Leave empty to use the default.',
+  chatVoiceSpokenSummary: 'Spoken summary',
   chatVoiceErrorAsrUnavailable:
     'The transcription model cannot be used for Voice Chat (unreachable, no live streaming, or it could not be started).',
   chatVoiceErrorLlmUnavailable:

@@ -19,6 +19,7 @@ import { formatPortalError } from '../shared/format';
 import { AudioDecodeError, audioBlobToWav } from '../shared/audioToWav';
 import { createLiveSession, type LiveSessionArgs } from './liveTranscription';
 import { createVoiceSession, type VoiceSessionArgs } from './voiceSession';
+import { DEFAULT_VOICE_SYSTEM_PROMPT } from './chatDoc';
 import {
   NO_SPEECH_LANGUAGE,
   NO_SPEECH_STREAMING,
@@ -392,6 +393,21 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           button per voice -- the default ('') among them. */}
       <span data-testid="voice-voices">{JSON.stringify(c.voiceChatModels.voice.voices)}</span>
       <span data-testid="voice-voice">{c.voiceChatModels.voice.value}</span>
+      {/* The voice system prompt (#314): the text the field holds (the built-in prompt until the
+          thread has its own), and one button per edit -- an edit, the built-in text, and none. */}
+      <span data-testid="voice-system-prompt">{c.voiceChatModels.systemPrompt.value}</span>
+      <button type="button" onClick={() => c.voiceChatModels.systemPrompt.set('Be terse.')}>
+        voice-prompt-edit
+      </button>
+      <button
+        type="button"
+        onClick={() => c.voiceChatModels.systemPrompt.set(DEFAULT_VOICE_SYSTEM_PROMPT)}
+      >
+        voice-prompt-builtin
+      </button>
+      <button type="button" onClick={() => c.voiceChatModels.systemPrompt.set('')}>
+        voice-prompt-empty
+      </button>
       {['alba', 'marius', 'zeta', ''].map((name) => (
         <button key={`say-${name}`} type="button" onClick={() => c.voiceChatModels.voice.set(name)}>
           voice-say-{name === '' ? 'default' : name}
@@ -8941,6 +8957,105 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
           const settings = await savedSettings();
           expect(Object.keys(settings)).not.toContain('voice_chat');
+        });
+
+        // The voice system prompt (#314): the field is pre-filled with the built-in text, and
+        // only an edit is written (the backend applies the built-in one when none is stored).
+        describe('the voice system prompt', () => {
+          it('is pre-filled with the built-in prompt, and a thread that kept it stores nothing', async () => {
+            await renderPickers();
+            expect(text('voice-system-prompt')).toBe(DEFAULT_VOICE_SYSTEM_PROMPT);
+
+            fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+
+            expect(Object.keys(await savedSettings())).not.toContain('voice_chat');
+          });
+
+          it('writes an edit into the thread document and reads it back when it is reopened', async () => {
+            const { unmount } = await renderPickers();
+
+            click('voice-prompt-edit');
+            expect(text('voice-system-prompt')).toBe('Be terse.');
+            expect((await savedSettings()).voice_chat).toEqual({ system_prompt: 'Be terse.' });
+
+            unmount();
+            await renderPickers([
+              voiceThread('c1', earlier, { voice_chat: { system_prompt: 'Be terse.' } }),
+            ]);
+            expect(text('voice-system-prompt')).toBe('Be terse.');
+          });
+
+          it('keeps the edit when a model is picked afterwards, and the picks when it is edited', async () => {
+            await renderPickers();
+
+            click('voice-prompt-edit');
+            click('voice-asr-asr-b');
+            click('voice-tts-tts-clone');
+
+            expect((await savedSettings()).voice_chat).toEqual({
+              asr_model: 'asr-b',
+              tts_model: 'tts-clone',
+              system_prompt: 'Be terse.',
+            });
+          });
+
+          it('writes none again once the prompt is the built-in one, or empty', async () => {
+            await renderPickers();
+            click('voice-prompt-edit');
+            await savedSettings();
+
+            chatApi.spies.saveChat.mockClear();
+            click('voice-prompt-builtin');
+            expect(Object.keys(await savedSettings())).not.toContain('voice_chat');
+
+            click('voice-prompt-edit');
+            await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(2), {
+              timeout: 3000,
+            });
+            chatApi.spies.saveChat.mockClear();
+            click('voice-prompt-empty');
+            expect(text('voice-system-prompt')).toBe('');
+            expect(Object.keys(await savedSettings())).not.toContain('voice_chat');
+          });
+
+          it('belongs to the thread: another thread starts with the built-in prompt', async () => {
+            await renderPickers([
+              voiceThread('c1', earlier, { voice_chat: { system_prompt: 'Be terse.' } }, T2),
+              voiceThread('c2', earlier, {}, T1),
+            ]);
+            expect(text('voice-system-prompt')).toBe('Be terse.');
+
+            click('select-c2');
+            await waitFor(() => expect(text('active')).toBe('c2'));
+            expect(text('voice-system-prompt')).toBe(DEFAULT_VOICE_SYSTEM_PROMPT);
+          });
+
+          // The backend reads the prompt from the STORED thread when a run starts, and a save is
+          // refused once the conversation holds the chat: an edit made less than the debounce ago
+          // must go out when the conversation starts, or the first answer would not follow it.
+          it('saves a pending edit when a conversation starts, not after the debounce', async () => {
+            await renderPickers();
+            chatApi.spies.saveChat.mockClear();
+
+            click('voice-prompt-edit');
+            expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+            click('voice-start');
+
+            expect(chatApi.spies.saveChat).toHaveBeenCalledTimes(1);
+            const body = chatApi.spies.saveChat.mock.calls[0][1] as {
+              content: { settings: { voice_chat?: unknown } };
+            };
+            expect(body.content.settings.voice_chat).toEqual({ system_prompt: 'Be terse.' });
+            expect(voiceSessions).toHaveLength(1);
+          });
+
+          it('is not part of what a conversation is started with', async () => {
+            await renderPickers();
+            click('voice-prompt-edit');
+            click('voice-start');
+
+            expect(JSON.stringify(voiceSessions[0].args)).not.toContain('Be terse.');
+          });
         });
 
         it('belongs to the thread: another thread starts with none, and the first keeps its own', async () => {

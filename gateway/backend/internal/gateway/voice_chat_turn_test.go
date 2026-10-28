@@ -49,9 +49,36 @@ type voiceLoopProvider struct {
 	speechFrames string
 	speechBodies chan []byte
 
+	// speechChunkFrames / speechTrailer / speechGate drive a GATED speech body: when speechGate is
+	// non-nil the TTS leg streams the FIRST frame immediately and holds the rest until the gate
+	// closes, so a test can relay a second audio chunk at a controlled time (e.g. after a
+	// mid-stream playback_done). With no gate the body is the whole speechFrames string at once.
+	speechChunkFrames []string
+	speechTrailer     string
+	speechGate        <-chan struct{}
+
 	llmErr        error  // when set, the LLM leg fails
 	speechStatus  int    // when non-zero, the TTS leg answers this status with speechErrBody
 	speechErrBody string // the error envelope the TTS leg returns under speechStatus
+}
+
+// gatedSpeechBody streams a speech event body with the first frame sent immediately and the rest
+// held until gate closes. Writes go through an io.Pipe (synchronous), so each frame is produced
+// only once the reader has consumed the previous one -- a deterministic inter-chunk gap for a test.
+func gatedSpeechBody(frames []string, trailer string, gate <-chan struct{}) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		if len(frames) > 0 {
+			_, _ = io.WriteString(pw, frames[0])
+		}
+		<-gate
+		for _, f := range frames[1:] {
+			_, _ = io.WriteString(pw, f)
+		}
+		_, _ = io.WriteString(pw, trailer)
+		_ = pw.Close()
+	}()
+	return pr
 }
 
 func (p voiceLoopProvider) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit provider.StreamEmit) error {
@@ -74,10 +101,14 @@ func (p voiceLoopProvider) ProxyNative(ctx context.Context, target routing.Targe
 				Body:       io.NopCloser(strings.NewReader(p.speechErrBody)),
 			}, nil
 		}
+		body := io.NopCloser(strings.NewReader(p.speechFrames))
+		if p.speechGate != nil {
+			body = gatedSpeechBody(p.speechChunkFrames, p.speechTrailer, p.speechGate)
+		}
 		return &provider.ProxyResponse{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body:       io.NopCloser(strings.NewReader(p.speechFrames)),
+			Body:       body,
 		}, nil
 	}
 	return p.Mock.ProxyNative(ctx, target, path, body, contentType)
@@ -111,6 +142,9 @@ type voiceTurnOpts struct {
 	timing        voiceTiming
 	chatStore     portal.ChatStore // defaults to a plain in-memory store
 	speechPCM     [][]byte         // the PCM chunks the TTS stream carries; defaults to voiceTestPCM
+	// speechGate, when non-nil, holds every speech frame AFTER the first until the channel closes,
+	// so a test can relay a second audio chunk at a controlled time. Needs speechPCM with >= 2 chunks.
+	speechGate <-chan struct{}
 }
 
 func newVoiceTurnHarness(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnOpts) *voiceTurnHarness {
@@ -120,19 +154,23 @@ func newVoiceTurnHarness(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnO
 	if len(opts.speechPCM) > 0 {
 		chunks = opts.speechPCM
 	}
-	frames := ""
+	frameList := make([]string, 0, len(chunks))
 	for _, c := range chunks {
-		frames += speechFrameDelta(c)
+		frameList = append(frameList, speechFrameDelta(c))
 	}
-	frames += speechSSEDone + speechSSEEnd
+	trailer := speechSSEDone + speechSSEEnd
+	frames := strings.Join(frameList, "") + trailer
 	prov := voiceLoopProvider{
-		Mock:          provider.Mock{Delay: opts.llmDelay},
-		duplex:        provider.NewOpenAICompatibleClient(http.DefaultClient),
-		speechFrames:  frames,
-		speechBodies:  make(chan []byte, 8),
-		llmErr:        opts.llmErr,
-		speechStatus:  opts.speechStatus,
-		speechErrBody: opts.speechErrBody,
+		Mock:              provider.Mock{Delay: opts.llmDelay},
+		duplex:            provider.NewOpenAICompatibleClient(http.DefaultClient),
+		speechFrames:      frames,
+		speechChunkFrames: frameList,
+		speechTrailer:     trailer,
+		speechGate:        opts.speechGate,
+		speechBodies:      make(chan []byte, 8),
+		llmErr:            opts.llmErr,
+		speechStatus:      opts.speechStatus,
+		speechErrBody:     opts.speechErrBody,
 	}
 
 	var chats portal.ChatStore = store.NewMemoryChatStore(0)
@@ -516,7 +554,15 @@ func TestVoiceFastCommitThenResumeDoesNotDoubleCommit(t *testing.T) {
 // degradeAssert runs one turn against a harness whose leg fails and asserts the single
 // error frame carries wantCode (when non-empty) and that the session degrades to idle with
 // no retry (no answer_delta follows the error).
-func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string) {
+// degradeAssert drives a turn whose leg fails, and asserts the degrade-to-idle flow: one
+// typed error frame carrying wantCode, a fall back to idle, and no silent retry.
+//
+// wantTextCommitted splits the two phase-2 persistence contracts (spec 5.5):
+//   - false: the LLM failed BEFORE any <speak> summary, so no speech fired and the turn
+//     persists NOTHING -- the chat document is left empty.
+//   - true: the SPEECH leg failed (after a clean LLM answer), so the text turn STILL commits
+//     with no audio block and no spoken_summary, and only the degrade is surfaced.
+func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string, wantTextCommitted bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -562,13 +608,28 @@ func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string) {
 		}
 	}
 
-	// Nothing committed: the failed turn leaves the document empty.
 	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(storedMessages(t, stored.Content)); n != 0 {
-		t.Fatalf("a degraded turn committed %d messages, want none: %s", n, stored.Content)
+	msgs := storedMessages(t, stored.Content)
+	if !wantTextCommitted {
+		// The LLM failed before any summary: nothing fired, nothing persists.
+		if n := len(msgs); n != 0 {
+			t.Fatalf("a degraded turn committed %d messages, want none: %s", n, stored.Content)
+		}
+		return
+	}
+	// The speech leg failed: the text turn still commits (spec 5.5), with NO audio and NO
+	// spoken_summary -- nothing was spoken -- and the degrade is surfaced separately above.
+	if n := len(msgs); n != 2 {
+		t.Fatalf("a speech-failed turn committed %d messages, want [user, assistant]: %s", n, stored.Content)
+	}
+	if strings.Contains(string(stored.Content), `"type":"audio_url"`) || strings.Contains(string(stored.Content), "data:") {
+		t.Fatalf("a speech-failed turn must commit no audio: %s", stored.Content)
+	}
+	if _, ok := storedSpokenSummary(t, stored.Content); ok {
+		t.Fatalf("a speech-failed turn must persist no spoken_summary: %s", stored.Content)
 	}
 }
 
@@ -841,12 +902,14 @@ func TestVoiceLLMErrorDegradesToIdle(t *testing.T) {
 	// provider.ErrUnavailable is mapped to the stable completion code provider.unavailable,
 	// which the degradation error frame must carry (spec 6.6).
 	h := newVoiceTurnHarness(t, child, voiceTurnOpts{llmErr: provider.ErrUnavailable, timing: turnGraceTiming()})
-	degradeAssert(t, h, "provider.unavailable")
+	// The LLM failed before any <speak> summary: nothing fired, nothing persists.
+	degradeAssert(t, h, "provider.unavailable", false)
 }
 
 // TestVoiceTTSErrorDegradesToIdle: a TTS failure (after a clean LLM answer) stops the turn
 // with one error frame carrying the speech leg's own stable code (speech.upstream_error, the
-// code the gateway wraps a plain-string upstream error with), and degrades to idle.
+// code the gateway wraps a plain-string upstream error with), and degrades to idle. Under
+// phase 2 the text turn STILL commits (no audio); only the degrade is surfaced (spec 5.5).
 func TestVoiceTTSErrorDegradesToIdle(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"speak this"}
@@ -855,7 +918,7 @@ func TestVoiceTTSErrorDegradesToIdle(t *testing.T) {
 		speechErrBody: `{"error":"the speech upstream failed"}`,
 		timing:        turnGraceTiming(),
 	})
-	degradeAssert(t, h, "speech.upstream_error")
+	degradeAssert(t, h, "speech.upstream_error", true)
 }
 
 // TestVoiceMidTurnAdmissionBlockedDegrades: a mid-turn runtime.admission_blocked on a leg
@@ -868,7 +931,8 @@ func TestVoiceMidTurnAdmissionBlockedDegrades(t *testing.T) {
 		speechErrBody: `{"error":{"message":"no capacity","code":"runtime.admission_blocked","type":"server_error"}}`,
 		timing:        turnGraceTiming(),
 	})
-	degradeAssert(t, h, voiceAdmissionBlockedCode)
+	// A speech-leg admission block is a speech-leg failure: the text turn commits, degrade surfaced.
+	degradeAssert(t, h, voiceAdmissionBlockedCode, true)
 }
 
 // drainBurstDiscarded sends a mic PCM burst and asserts, after a short settle, that NONE of it
@@ -1014,6 +1078,183 @@ func TestVoiceDrainFallbackEndsWithoutSignal(t *testing.T) {
 		"mid-drain PCM reached the ASR: the drain ended before the ceiling")
 
 	// NOT never: with no playback_done, the absolute ceiling (~900ms) re-opens the session.
+	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer lcancel()
+	readVoiceUntilState(t, lctx, conn, voiceStateListening)
+}
+
+// concurrentSpeakFinal is an ASR'd user text that carries a <speak> region. The mock LLM echoes
+// its prompt, so the voice run's answer stream closes a <speak> summary MID-stream and the speech
+// leg fires CONCURRENTLY (the phase-2 overlap, spec 5.5) while the detail text keeps streaming.
+// The summary text is in the user turn only because the mock has no other way to put <speak> in
+// its output; the orchestrator strips the tags from the ANSWER, which is all these tests need.
+const concurrentSpeakFinal = "<speak>hi</speak> and here is the longer written detail"
+
+// TestVoiceConcurrentEarlyPlaybackDoneHonoredAtFloor is the phase-2 mic re-open regression: when
+// the LLM detail OUTLASTS the summary audio's real-time playout, the client sends its single
+// playback_done when the SUMMARY queue drains -- which happens while the server is still SPEAKING
+// (the detail is not yet committed, so the drain wait has not begun). That early signal must be
+// REMEMBERED, so the post-commit drain ends at the FLOOR (the summary audio's duration, already
+// elapsed) and the mic re-opens promptly -- NOT after the 30s ceiling (dead air with the mic shut).
+// It stays loop-safe: the mic only ever re-opens LATER than the floor, never earlier.
+func TestVoiceConcurrentEarlyPlaybackDoneHonoredAtFloor(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{concurrentSpeakFinal}
+	timing := turnGraceTiming()
+	timing.micResumeTail = 30 * time.Millisecond
+	// A SHORT summary audio (~0.25s floor at the 88200 B/s fixture rate) that the client plays
+	// out and reports drained long before the (held-open) detail commits.
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+		timing:    timing,
+		speechPCM: [][]byte{speechPCM(88200/4, 1)},
+	})
+	// Hold the run at its commit point: the summary audio is relayed and the session enters
+	// speaking, but the turn does not commit (runFinished stays false) until the test releases it
+	// -- standing in for an LLM detail leg that outlasts the summary's playout.
+	release := make(chan struct{})
+	h.srv.voiceBeforeCommitClaim = func(_ *ChatRun) { <-release }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	conn.SetReadLimit(1 << 21) // the relayed audio_delta is large; read it whole
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	if f := drainAChunk(t, ctx, conn); !strings.Contains(f, "hi") {
+		t.Fatalf("asr_final = %q, want it to carry the spoken summary text", f)
+	}
+	// The window closes on the summary audio -> speaking, and the summary is relayed. (Reading
+	// the audio_delta confirms speaking, since audio is relayed only after the mic shuts.)
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDelta)
+
+	// The client plays the SUMMARY out and reports it drained -- while the server is still
+	// speaking (awaitingPlayback is false). The pre-fix server DROPPED this signal.
+	sendVoiceControl(t, ctx, conn, "playback_done")
+
+	// Let the ~0.25s summary floor elapse in real time while still speaking, so by the time the
+	// detail commits the drain's only remaining bound is the floor, which has already passed.
+	time.Sleep(600 * time.Millisecond)
+
+	// The detail finishes and the turn commits -> the post-commit drain begins with the floor
+	// already passed and the early playback_done remembered, so it ends at the FLOOR (promptly,
+	// plus the mic-resume tail), NOT after the 30s ceiling.
+	released := time.Now()
+	close(release)
+
+	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer lcancel()
+	readVoiceUntilState(t, lctx, conn, voiceStateListening)
+	if waited := time.Since(released); waited > 2*time.Second {
+		t.Fatalf("returned to listening %v after commit, want the floor (early playback_done honored), not the ~30s ceiling", waited)
+	}
+}
+
+// TestVoiceConcurrentEarlyPlaybackDoneClampedToFloor is the anti-cheat for the remembered-signal
+// path: an early playback_done seen while SPEAKING is remembered, but it must STILL NOT re-open
+// the mic before the floor. Here the detail commits BEFORE the (longer) summary floor elapses, so
+// the drain must hold the mic gated past the commit until the floor, then end at the floor (the
+// remembered signal honored once the floor passes) -- never instantly at commit, never the ceiling.
+func TestVoiceConcurrentEarlyPlaybackDoneClampedToFloor(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{concurrentSpeakFinal}
+	timing := turnGraceTiming()
+	timing.micResumeTail = 30 * time.Millisecond
+	// A LONGER summary audio (~1s floor) so the floor is still pending when the detail commits.
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+		timing:    timing,
+		speechPCM: [][]byte{speechPCM(88200, 1)},
+	})
+	release := make(chan struct{})
+	h.srv.voiceBeforeCommitClaim = func(_ *ChatRun) { <-release }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	conn.SetReadLimit(1 << 21)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	if f := drainAChunk(t, ctx, conn); !strings.Contains(f, "hi") {
+		t.Fatalf("asr_final = %q, want it to carry the spoken summary text", f)
+	}
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDelta) // speaking: the summary was relayed
+
+	// Early playback_done while speaking -- remembered by the fix. Settle so the orchestrator
+	// folds it in BEFORE the commit (the remembered-during-speaking path), while well under the
+	// ~1s floor.
+	sendVoiceControl(t, ctx, conn, "playback_done")
+	time.Sleep(150 * time.Millisecond)
+
+	// The detail commits while the floor is NOT yet passed -> the post-commit drain arms the
+	// floor, and the remembered signal must NOT short-circuit it.
+	close(release)
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
+	beforeConns, beforeBytes := child.snapshot()
+	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+		"a remembered early playback_done re-opened the mic before the floor: the floor clamp was lost")
+
+	// It still ends at the floor (the remembered signal is honored once the floor passes), not at
+	// the 30s ceiling.
+	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer lcancel()
+	readVoiceUntilState(t, lctx, conn, voiceStateListening)
+}
+
+// TestVoiceConcurrentMidStreamGapSignalDoesNotEndDrainEarly guards the half-duplex loop against
+// the remembered-signal fix itself. The client's player fires onEmpty -- and sends playback_done
+// -- on EVERY queue drain, including a gap between TTS chunks when TTS lags real time, not only at
+// the true end. A gap signal remembered mid-stream must NOT end the drain while later audio is
+// still playing. Here chunk A is relayed, a gap playback_done arrives, THEN chunk B is relayed
+// (which clears the remembered signal) and the turn commits; the mic must stay gated until the
+// genuine end-of-audio signal, never re-opening on the stale gap signal (echo exposure).
+func TestVoiceConcurrentMidStreamGapSignalDoesNotEndDrainEarly(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{concurrentSpeakFinal}
+	timing := turnGraceTiming()
+	timing.micResumeTail = 30 * time.Millisecond
+	// Two summary chunks (~0.1s floor each, ~0.2s total). The gate holds chunk B until the test
+	// releases it -- after a gap playback_done -- so B is relayed AFTER the gap signal is seen.
+	gate := make(chan struct{})
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+		timing:     timing,
+		speechPCM:  [][]byte{speechPCM(88200/10, 1), speechPCM(88200/10, 2)},
+		speechGate: gate,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	conn.SetReadLimit(1 << 21)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	if f := drainAChunk(t, ctx, conn); !strings.Contains(f, "hi") {
+		t.Fatalf("asr_final = %q, want it to carry the spoken summary text", f)
+	}
+	// Chunk A is relayed at window close -> speaking.
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDelta)
+
+	// A GAP playback_done (the player's queue drained between chunks) arrives while speaking --
+	// remembered by the fix. Let the ~0.2s floor elapse so a stale signal would be able to end the
+	// drain the moment the turn commits.
+	sendVoiceControl(t, ctx, conn, "playback_done")
+	time.Sleep(500 * time.Millisecond)
+
+	// Release chunk B: relaying it CLEARS the remembered gap signal, then the turn commits. B is
+	// published before the run's terminal, so it is relayed -- and the signal cleared -- before the
+	// post-commit drain begins.
+	close(gate)
+	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
+
+	// Past the mic-resume tail: with the fix the mic is still gated (the gap signal was cleared, so
+	// the drain waits for the genuine end-of-audio signal); without it the stale gap signal has
+	// already re-opened the mic. A burst now must be discarded.
+	beforeConns, beforeBytes := child.snapshot()
+	time.Sleep(150 * time.Millisecond)
+	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+		"a mid-stream gap playback_done re-opened the mic before the genuine end-of-audio signal (echo exposure)")
+
+	// The genuine end-of-audio signal (nothing relayed after it) ends the drain.
+	sendVoiceControl(t, ctx, conn, "playback_done")
 	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
 	defer lcancel()
 	readVoiceUntilState(t, lctx, conn, voiceStateListening)

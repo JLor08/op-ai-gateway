@@ -473,9 +473,16 @@ type speechStreamEvent struct {
 // stops KEEPING audio at the cap but not READING it, so the listener hears the whole clip
 // and the call is billed as delivered. The parts are cut at speechPartBytes of the per-blob
 // cap (Server.maxChatBlobBytes) so that each passes the chat store's per-blob check alone.
-func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func()) (json.RawMessage, string, string) {
+func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func(), stampTTFT bool) (json.RawMessage, string, string) {
 	audioCap, blobCap := s.chatAudioCaps()
-	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, sampleRate, dispatchedAt, liftDeadline, speechPartBytes(blobCap), audioCap)
+	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, speechEventReaderConfig{
+		sampleRate:    sampleRate,
+		dispatchedAt:  dispatchedAt,
+		liftDeadline:  liftDeadline,
+		partBytes:     speechPartBytes(blobCap),
+		maxAudioBytes: audioCap,
+		stampTTFT:     stampTTFT,
+	})
 	if !complete {
 		// A deadline or a cancel lands here as a read error on the cancelled request, and
 		// reporting either as a broken stream -- or a deadline as a cancel -- would tell the
@@ -524,11 +531,25 @@ func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *ht
 // relayed, so the stream is NOT complete however it ends. The line bound is the relay's own
 // (speechStreamMaxLine): a line past it ends the read (bufio.ErrTooLong), which is the same
 // incomplete stream.
-func readSpeechEvents(run *ChatRun, body io.Reader, sampleRate int, dispatchedAt time.Time, liftDeadline func(), partBytes int, maxAudioBytes int64) (parts []speechAudioPart, overCap, complete bool, readErr error) {
+// speechEventReaderConfig groups readSpeechEvents' reader inputs beyond the stream itself
+// (run and body): the sample rate, the dispatch instant the TTFT is measured from, the
+// deadline lift, the per-part and total PCM caps, and whether this reader stamps the TTFT.
+// These are the fields the speechEventReader is built from.
+type speechEventReaderConfig struct {
+	sampleRate    int
+	dispatchedAt  time.Time
+	liftDeadline  func()
+	partBytes     int
+	maxAudioBytes int64
+	stampTTFT     bool
+}
+
+func readSpeechEvents(run *ChatRun, body io.Reader, cfg speechEventReaderConfig) (parts []speechAudioPart, overCap, complete bool, readErr error) {
 	r := &speechEventReader{
-		run: run, sampleRate: sampleRate, dispatchedAt: dispatchedAt, liftDeadline: liftDeadline,
-		partBytes:     max(partBytes-partBytes%speechStreamBytesPerFrame, speechStreamBytesPerFrame),
-		maxAudioBytes: maxAudioBytes,
+		run: run, sampleRate: cfg.sampleRate, dispatchedAt: cfg.dispatchedAt, liftDeadline: cfg.liftDeadline,
+		partBytes:     max(cfg.partBytes-cfg.partBytes%speechStreamBytesPerFrame, speechStreamBytesPerFrame),
+		maxAudioBytes: cfg.maxAudioBytes,
+		stampTTFT:     cfg.stampTTFT,
 	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), speechStreamMaxLine)
@@ -551,6 +572,14 @@ type speechEventReader struct {
 	sampleRate   int
 	dispatchedAt time.Time
 	liftDeadline func()
+	// stampTTFT is whether the first delta stamps the audio TTFT onto the run's metrics.
+	// A standalone speech run (its only metric is the audio first-chunk) sets it; a VOICE
+	// run's speech leg does NOT, because its LLM leg is streaming into the same run.metrics
+	// concurrently and the two cross-call read-modify-writes would clobber each other's
+	// fields (a non-deterministic persisted TTFTMs/tps). For a voice run the LLM leg is thus
+	// the sole metrics writer, so the persisted perf metrics stay deterministic. The deadline
+	// lift below is unconditional -- it is how the run learns the first chunk arrived.
+	stampTTFT bool
 
 	// partBytes is the PCM one part holds, in whole samples (so a cut of it is one too);
 	// maxAudioBytes is the most PCM the clip may have in all.
@@ -615,9 +644,11 @@ func (r *speechEventReader) consumeDelta(audio string) {
 	if !r.sawDelta {
 		r.sawDelta = true
 		r.liftDeadline()
-		m := r.run.currentMetrics()
-		m.TTFTMs = time.Since(r.dispatchedAt).Milliseconds()
-		r.run.setMetrics(m)
+		if r.stampTTFT {
+			m := r.run.currentMetrics()
+			m.TTFTMs = time.Since(r.dispatchedAt).Milliseconds()
+			r.run.setMetrics(m)
+		}
 	}
 	r.run.publishAudio(runAudio{Seq: r.seq, Rate: r.sampleRate, Data: audio})
 	r.seq++
