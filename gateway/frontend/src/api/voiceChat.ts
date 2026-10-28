@@ -7,14 +7,16 @@
 
 import { type Fetcher, request } from './transport';
 
-// What a Voice Chat ticket is minted for: the chat the spoken turns belong to and the three
-// gateway models of the loop, by the name the portal lists them under -- the live-transcription
-// model (ears), the chat model (brain) and the streaming speech model (voice).
+// What a Voice Chat ticket is minted for: the chat the spoken turns belong to, the three gateway
+// models of the loop, by the name the portal lists them under -- the live-transcription model
+// (ears), the chat model (brain) and the streaming speech model (voice) -- and the voice the
+// speech model answers in ('' is the model's own default voice).
 export type VoiceChatTicketArgs = {
   chatId: string;
   asrModel: string;
   llmModel: string;
   ttsModel: string;
+  voice: string;
 };
 
 export function voiceChatApi(fetcher: Fetcher) {
@@ -28,7 +30,9 @@ export function voiceChatApi(fetcher: Fetcher) {
     // answers; the PCM the browser then streams is fixed by the capture, not chosen here. A
     // refusal -- an unusable model (400), models that cannot be held together (409
     // portal.voice_chat_coload_failed), an unknown chat (404) -- is a PortalApiError carrying the
-    // gateway's code.
+    // gateway's code. The voice rides in the body like the models, and the ticket's speech
+    // settings take it (it wins over the chat's stored settings.audio voice, which a text thread
+    // has none of).
     createVoiceChatTicket: (args: VoiceChatTicketArgs) =>
       request<{ ticket: string }>(fetcher, '/api/portal/voice-chat-ticket', {
         method: 'POST',
@@ -37,6 +41,7 @@ export function voiceChatApi(fetcher: Fetcher) {
           asr_model: args.asrModel,
           llm_model: args.llmModel,
           tts_model: args.ttsModel,
+          voice: args.voice,
         },
       }),
   };

@@ -123,7 +123,8 @@ export type LiveTicketApi = Pick<PortalApi, 'createLiveTranscriptionTicket'>;
  * Why a session failed, which is what tells the caller whether trying again can help.
  *
  *  - `dropped`: the connection ended without the gateway saying why, or the ticket request did
- *    not get through (a network failure, a 5xx). The same request may well work next time.
+ *    not get through (a network failure, a 5xx). The same request may well work next time. A
+ *    5xx of the Voice Chat endpoint carries its own `code` (portal.voice_chat_ticket_failed).
  *  - `refused`: the gateway said no -- an error frame, a ticket it refused (a 4xx, with its
  *    `code`), a busy close. The same request would be refused again.
  *  - `denied`: the user, or the browser's policy, refused the microphone.
@@ -200,15 +201,31 @@ export class LiveFailure extends Error {
   }
 }
 
+// The prefix of the codes the Voice Chat endpoint answers with (portal.voice_chat_*).
+const VOICE_CHAT_CODE_PREFIX = 'portal.voice_chat_';
+
+// The gateway's code that a failed ticket request carries, '' for none: the code of a 4xx (the
+// gateway refusing this session), and the code of a 5xx that the Voice Chat endpoint answers with
+// a code of its own (portal.voice_chat_ticket_failed, a mint that failed). Any other 5xx -- the
+// live transcription's own included -- carries none, as before.
+function carriedCode(status: unknown, code: unknown): string {
+  if (typeof status !== 'number' || typeof code !== 'string' || code === '') return '';
+  if (status >= 400 && status < 500) return code;
+  return status >= 500 && code.startsWith(VOICE_CHAT_CODE_PREFIX) ? code : '';
+}
+
 // What a failed ticket request means: a 4xx is the gateway refusing this session (the same
-// request is refused again); anything else -- a network failure, a 5xx -- did not get an answer.
+// request is refused again); anything else -- a network failure, a 5xx -- did not get an answer,
+// and is worth trying again. A 5xx from the Voice Chat endpoint is still "dropped" -- the switch
+// stays open for the retry -- but it names itself (see carriedCode), so that the control can say
+// what it is (its own sentence) instead of the generic one.
 export function ticketFailure(error: unknown): LiveFailure {
   const status = (error as { status?: unknown } | null)?.status;
-  const code = (error as { code?: unknown } | null)?.code;
+  const code = carriedCode(status, (error as { code?: unknown } | null)?.code);
   const refused = typeof status === 'number' && status >= 400 && status < 500;
   return new LiveFailure(describeError(error), {
     kind: refused ? 'refused' : 'dropped',
-    ...(refused && typeof code === 'string' && code !== '' ? { code } : {}),
+    ...(code === '' ? {} : { code }),
   });
 }
 

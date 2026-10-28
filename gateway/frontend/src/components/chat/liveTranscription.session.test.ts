@@ -228,7 +228,9 @@ describe('createLiveSession in a (fake) browser', () => {
           ),
       );
       await vi.waitFor(() => expect(server.errors).toHaveLength(1));
-      expect(server.errors[0].detail.kind).toBe('dropped');
+      // The live transcription's own 5xx keeps the plain "dropped": only a Voice Chat code
+      // (portal.voice_chat_*) is carried along, so the live recording's behavior is unchanged.
+      expect(server.errors[0].detail).toEqual({ kind: 'dropped' });
     });
 
     it('an error frame is "refused": the gateway said no', async () => {

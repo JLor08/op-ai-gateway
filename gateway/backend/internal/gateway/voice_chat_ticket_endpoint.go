@@ -12,6 +12,7 @@ import (
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/routing"
 	"strings"
 	"time"
 )
@@ -57,13 +58,16 @@ const voiceTicketAudioMaxBytes = 1024
 const voiceTicketMaxBytes = 7 * 1024
 
 // voiceChatTicketRequest is the body of POST /api/portal/voice-chat-ticket: the chat the
-// turns belong to and the three gateway models of the loop -- the live-transcription model,
-// the chat model and the streaming speech model.
+// turns belong to, the three gateway models of the loop -- the live-transcription model,
+// the chat model and the streaming speech model -- and, optionally, the voice the speech
+// model answers in (the portal's voice dropdown; blank leaves the chat's stored voice, or
+// the model's default).
 type voiceChatTicketRequest struct {
 	ChatID   string `json:"chat_id"`
 	ASRModel string `json:"asr_model"`
 	LLMModel string `json:"llm_model"`
 	TTSModel string `json:"tts_model"`
+	Voice    string `json:"voice,omitempty"`
 }
 
 // voiceChatTicketResponse is the 200 body: the opaque ticket and nothing of the decision it
@@ -120,7 +124,7 @@ func (s *Server) voiceCoLoadBound() time.Duration {
 // X-OP-CSRF header (403 auth.csrf_required), a bearer token does not, and a service token is
 // refused 401 whatever it carries. The method is POST for the reason the header is required.
 //
-// The body is {chat_id, asr_model, llm_model, tts_model}. In order:
+// The body is {chat_id, asr_model, llm_model, tts_model, voice?}. In order:
 //
 //  1. A server with no ticket store or no portal service fails closed, 500
 //     portal.voice_chat_ticket_failed, before anything is spent on the request.
@@ -136,7 +140,9 @@ func (s *Server) voiceCoLoadBound() time.Duration {
 //     model's default voice) are snapshotted into the ticket. They must decode, and their
 //     JSON must be at most voiceTicketAudioMaxBytes, else 400
 //     portal.voice_chat_audio_settings_invalid: the ticket rides a header line, and a
-//     proxy drops one past its limit.
+//     proxy drops one past its limit. The request's voice, when it names one, is the
+//     ticket's Audio.Voice (over a stored one -- a text thread has none, a speech
+//     thread's is its own), and counts against that cap like the rest.
 //  5. The models go through the co-load gate (voiceCoLoadGate) under a deadline of
 //     s.voiceCoLoadBound(), because the gate's ensure can block for a whole cold start --
 //     which is why the server's 30 s read and write deadlines are lifted first
@@ -147,7 +153,9 @@ func (s *Server) voiceCoLoadBound() time.Duration {
 //     out in -- the models could not be made resident in time -- unless the browser itself
 //     went away.
 //  6. The ticket is minted with the three resolved targets, the chat, the principal's
-//     attribution, the settings and the PCM shape, and answered 200 {"ticket": "..."}. A
+//     attribution, the settings and the PCM shape, and answered 200 {"ticket": "..."}.
+//     A preset-clone speech leg with no voice named by now (the request's, or the chat's
+//     stored one) speaks its first preset, never a blank voice (withCloneDefaultVoice). A
 //     mint that fails, or a token longer than voiceTicketMaxBytes, is 500
 //     portal.voice_chat_ticket_failed.
 //
@@ -171,7 +179,7 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	chatID := req.ChatID
-	audio, ok := s.voiceChatAudioSettings(w, r, token, chatID)
+	audio, ok := s.voiceChatAudioSettings(w, r, token, chatID, req.Voice)
 	if !ok {
 		return
 	}
@@ -191,6 +199,8 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 		s.writeVoiceCoLoadRefusal(gateCtx, w, r, chatID, code, err)
 		return
 	}
+
+	audio = s.withCloneDefaultVoice(r.Context(), tts, audio)
 
 	ticket, err := s.voiceTickets.Mint(voiceTicketClaims{
 		ASR:    asr,
@@ -222,7 +232,7 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 }
 
 // readVoiceChatTicketRequest reads and validates the body of the ticket request, and
-// returns it with the chat id and the three models trimmed. On any refusal it writes the
+// returns it with the chat id, the three models and the voice trimmed. On any refusal it writes the
 // response and returns ok == false: a body that is not one JSON object of this shape is
 // 400 request.invalid_json, and a blank model is 400 model.name_required naming the field
 // (asr_model, then llm_model, then tts_model).
@@ -238,6 +248,7 @@ func readVoiceChatTicketRequest(w http.ResponseWriter, r *http.Request) (voiceCh
 	}
 	req.ChatID = strings.TrimSpace(req.ChatID)
 	req.ASRModel, req.LLMModel, req.TTSModel = strings.TrimSpace(req.ASRModel), strings.TrimSpace(req.LLMModel), strings.TrimSpace(req.TTSModel)
+	req.Voice = strings.TrimSpace(req.Voice)
 	for _, leg := range []struct{ field, model string }{{"asr_model", req.ASRModel}, {"llm_model", req.LLMModel}, {"tts_model", req.TTSModel}} {
 		if leg.model == "" {
 			writeJSON(w, http.StatusBadRequest, apierror.Response(audioVoicesModelRequired, leg.field+" is required", ""))
@@ -261,12 +272,13 @@ func (s *Server) writeVoiceCoLoadRefusal(gateCtx context.Context, w http.Respons
 	writeVoiceChatRefusal(w, code)
 }
 
-// voiceChatAudioSettings reads the speech settings of the caller's chat for the ticket. On
-// any refusal it writes the response and returns ok == false: a chat that is not the
-// caller's or does not exist is the portal's own 404 (the owner-scoped GetChat, no leak of
-// which ids exist), and settings that cannot ride a ticket are
-// voiceChatAudioSettingsInvalid.
-func (s *Server) voiceChatAudioSettings(w http.ResponseWriter, r *http.Request, token auth.Token, chatID string) (portal.ChatAudioSettings, bool) {
+// voiceChatAudioSettings reads the speech settings of the caller's chat for the ticket, with
+// the voice the request names (blank: none) laid over the stored one. On any refusal it
+// writes the response and returns ok == false: a chat that is not the caller's or does not
+// exist is the portal's own 404 (the owner-scoped GetChat, no leak of which ids exist), and
+// settings that cannot ride a ticket -- the requested voice included, which is measured with
+// the rest -- are voiceChatAudioSettingsInvalid.
+func (s *Server) voiceChatAudioSettings(w http.ResponseWriter, r *http.Request, token auth.Token, chatID, voice string) (portal.ChatAudioSettings, bool) {
 	if chatID == "" {
 		writePortalChatError(w, portal.ErrChatNotFound)
 		return portal.ChatAudioSettings{}, false
@@ -281,6 +293,9 @@ func (s *Server) voiceChatAudioSettings(w http.ResponseWriter, r *http.Request, 
 		slog.Debug("voice chat ticket refused: the chat's speech settings do not decode", "chat", chatID, "err", err)
 		writeVoiceChatRefusal(w, voiceChatAudioSettingsInvalid)
 		return portal.ChatAudioSettings{}, false
+	}
+	if voice != "" {
+		audio.Voice = voice
 	}
 	// The ticket carries what the settings marshal to, so that is what the cap measures.
 	encoded, err := json.Marshal(audio)
@@ -317,4 +332,43 @@ func chatDocAudioSettings(content json.RawMessage) (portal.ChatAudioSettings, er
 		return portal.ChatAudioSettings{}, err
 	}
 	return audio, nil
+}
+
+// withCloneDefaultVoice names a voice for a preset-clone speech leg that has none: a clone model
+// has no default voice of its own to fall back on (it synthesises in a reference voice it is
+// handed, or a named preset), so a ticket that names none for it speaks its first preset --
+// routing.FirstPresetVoice of the mapping's voices cache, the one definition of "the preset a
+// caller may ask for". The portal pre-selects that same voice in its dropdown; this is for the
+// request that could not (the voices were still loading, an older portal). A voice that is
+// already named, and a leg that is not a clone model, are left as they are, and so is a ticket
+// whose cache cannot be read: the mint is not worth failing over a default, so it falls back to
+// what it did before, the blank voice (logged).
+func (s *Server) withCloneDefaultVoice(ctx context.Context, tts routing.Target, audio portal.ChatAudioSettings) portal.ChatAudioSettings {
+	if audio.Voice != "" || s.Routes == nil {
+		return audio
+	}
+	voice, err := s.cloneDefaultVoice(ctx, tts.RouteID)
+	if err != nil {
+		slog.Warn("voice chat ticket: the clone model's first preset could not be read, so it keeps a blank voice", "route", tts.RouteID, "err", err)
+		return audio
+	}
+	audio.Voice = voice
+	return audio
+}
+
+// cloneDefaultVoice is the first preset voice of the mapping routeID when it is a voice-clone
+// model (speech_clone yes), and "" otherwise or when its voices cache lists none.
+func (s *Server) cloneDefaultVoice(ctx context.Context, routeID string) (string, error) {
+	rows, err := s.Routes.MappingCapabilities(ctx, routeID)
+	if err != nil {
+		return "", err
+	}
+	if routing.CapabilityRowsByName(rows)[routing.CapabilitySpeechClone].Verdict != routing.CapabilityYes {
+		return "", nil
+	}
+	cached, err := s.Routes.ModelMappingCacheForMappings(ctx, []string{routeID}, routing.ModelMappingCacheVoices)
+	if err != nil {
+		return "", err
+	}
+	return routing.FirstPresetVoice(cached[routeID]), nil
 }

@@ -4338,8 +4338,8 @@ components:
             own (owner-scoped): a blank, unknown or another user's chat is 404
             `portal.chat_not_found`, before any model is started. The chat's stored
             speech settings (`settings.audio`) are snapshotted into the ticket; a text
-            thread carries none, so the speech model speaks in its default voice and
-            language.
+            thread carries none, so the speech model speaks in its default language (and
+            in the voice the request names, or its own default voice).
         asr_model:
           type: string
           minLength: 1
@@ -4358,6 +4358,16 @@ components:
           description: >
             The gateway model name (trimmed) of the speech leg; blank is 400
             `model.name_required`. It must be an offerable streaming speech model.
+        voice:
+          type: string
+          description: >
+            Optional (issue #318): the voice the speech model answers in, trimmed; blank
+            or absent is none. When it names one it becomes the ticket's speech voice,
+            over the stored `settings.audio` voice, and counts against the 1 KiB cap on
+            the ticket's speech settings (over it is 400
+            `portal.voice_chat_audio_settings_invalid`). With none, a preset-clone speech
+            model is minted on its first preset voice (it has no default of its own) and
+            any other model speaks in its own default voice.
     ModelCapabilities:
       type: object
       description: >

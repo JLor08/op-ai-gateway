@@ -11,6 +11,7 @@ import type {
   VoiceChatApi,
   VoiceChatModels,
   VoiceChatState,
+  VoiceChoice,
   VoiceModelChoice,
 } from './chat/ChatStore';
 
@@ -47,6 +48,11 @@ function makeChoice(ids: string[], over: Partial<VoiceModelChoice> = {}): VoiceM
   return { options: ids.map(entry), pick: '', used: ids[0] ?? '', set: vi.fn(), ...over };
 }
 
+// The speech model's voice field: the voices it offers and the one that would be spoken in.
+function makeVoiceChoice(voices: string[] = [], over: Partial<VoiceChoice> = {}): VoiceChoice {
+  return { voices, value: '', set: vi.fn(), ...over };
+}
+
 // The store's pickers of the conversation's models, with every setter a spy: this component only
 // draws them and forwards the user's choice (the store's picks are ChatStore.test.tsx's).
 function makeModels(over: Partial<VoiceChatModels> = {}): VoiceChatModels {
@@ -55,6 +61,7 @@ function makeModels(over: Partial<VoiceChatModels> = {}): VoiceChatModels {
     llm: 'llm (display)',
     asr: makeChoice(['asr-a', 'asr-b']),
     tts: makeChoice(['tts-a', 'tts-clone']),
+    voice: makeVoiceChoice(),
     ...over,
   };
 }
@@ -183,6 +190,21 @@ describe('VoiceChatControl listening indicator', () => {
       expect(within(indicator()).getByTestId('MicOffIcon'), state).toBeInTheDocument();
       expect(within(indicator()).queryByTestId('MicIcon'), state).not.toBeInTheDocument();
       expect(screen.queryByText(t.chatVoiceStateListening), state).not.toBeInTheDocument();
+    }
+  });
+
+  // The indicator is what tells the user whether they are heard, so it must not scroll away
+  // under a long thread or a long answer (#318): it sticks to the viewport's edge, on the page's
+  // own background so that what scrolls under it does not show through. (jsdom has no layout, so
+  // this pins the style, not the scrolling.)
+  it('is sticky, on the page background, in every state', () => {
+    const { update } = renderControl(makeVoice({ state: 'listening' }));
+    for (const state of ['listening', 'thinking', 'idle', 'off'] as const) {
+      update(makeVoice({ state }));
+      const style = getComputedStyle(indicator());
+      expect(style.position, state).toBe('sticky');
+      expect(style.bottom, state).toBe('0px');
+      expect(style.backgroundColor, state).toBe('var(--page)');
     }
   });
 
@@ -362,6 +384,29 @@ describe('VoiceChatControl errors', () => {
     expect(screen.queryByText('raw')).not.toBeInTheDocument();
   });
 
+  // The gateway's own 500 (portal.voice_chat_ticket_failed) reaches the control as a failure a
+  // retry can get past ("dropped") that carries its code: it has a sentence of its own, and the
+  // switch stays open. A "dropped" with no code (a lost connection) keeps the generic sentence.
+  it('says "could not be started" for a dropped ticket that carries the gateway code, with the toggle open', () => {
+    renderControl(
+      makeVoice({
+        error: { kind: 'dropped', code: 'portal.voice_chat_ticket_failed', message: 'raw' },
+      }),
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorTicket);
+    expect(screen.getByRole('alert')).not.toHaveTextContent(t.chatVoiceErrorDropped);
+    expect(screen.getByRole('switch', { name: t.chatVoice })).toBeEnabled();
+  });
+
+  it('keeps the generic sentence for a dropped connection, and for a dropped code it has no sentence for', () => {
+    const { update } = renderControl(makeVoice({ error: { kind: 'dropped', message: 'raw' } }));
+    expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorDropped);
+
+    update(makeVoice({ error: { kind: 'dropped', code: 'proxy.bad_gateway', message: 'raw' } }));
+    expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorDropped);
+  });
+
   it('keeps the toggle open after a failure a retry can get past', () => {
     for (const kind of ['dropped', 'denied', 'unsupported', 'capture'] as const) {
       const voice = makeVoice({ error: { kind, message: 'raw' } });
@@ -499,5 +544,68 @@ describe('VoiceChatControl model pickers', () => {
 
     expect(screen.queryByText(/llm/)).not.toBeInTheDocument();
     expect(screen.queryByText(t.chatVoiceLlmNote(''))).not.toBeInTheDocument();
+  });
+});
+
+// The voice of the speech model (#318): a combobox under the speech model's picker, over the voices
+// the gateway has cached for it -- the composer's own field (SpeechVoiceField), shown only when
+// the model has voices to offer.
+describe('VoiceChatControl voice field', () => {
+  const voiceField = () => screen.getByRole('combobox', { name: t.chatSpeechVoice });
+  const queryVoiceField = () => screen.queryByRole('combobox', { name: t.chatSpeechVoice });
+  const voices = ['alba', 'marius', 'zeta'];
+
+  it('is not shown when the speech model has no voices: its own default voice speaks', () => {
+    renderControl(makeVoice());
+
+    expect(queryVoiceField()).not.toBeInTheDocument();
+    expect(screen.queryByText(t.chatSpeechVoiceHint)).not.toBeInTheDocument();
+  });
+
+  it('lists the voices of the speech model, under its picker', () => {
+    renderControl(makeVoice(), { models: makeModels({ voice: makeVoiceChoice(voices) }) });
+
+    // After the speech model's picker, and so after the transcription one that precedes it.
+    expect(screen.getAllByRole('combobox').map((box) => box.getAttribute('id'))).toEqual([
+      'chat-voice-asr-model',
+      'chat-voice-tts-model',
+      'chat-voice-tts-voice',
+    ]);
+
+    fireEvent.mouseDown(voiceField());
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(voices);
+  });
+
+  it('shows the voice that would be spoken in (the pre-selected preset of a clone, or the pick)', () => {
+    renderControl(makeVoice(), {
+      models: makeModels({ voice: makeVoiceChoice(voices, { value: 'alba' }) }),
+    });
+
+    expect(voiceField()).toHaveValue('alba');
+  });
+
+  it('hands a listed voice, and a typed one, to the store', () => {
+    const voice = makeVoiceChoice(voices);
+    renderControl(makeVoice(), { models: makeModels({ voice }) });
+
+    fireEvent.mouseDown(voiceField());
+    fireEvent.click(screen.getByRole('option', { name: 'marius' }));
+    expect(voice.set).toHaveBeenLastCalledWith('marius');
+
+    fireEvent.change(voiceField(), { target: { value: 'my_voice' } });
+    expect(voice.set).toHaveBeenLastCalledWith('my_voice');
+  });
+
+  it('is closed while a conversation is on, and until the gateway has said which models stream', () => {
+    const models = makeModels({ voice: makeVoiceChoice(voices, { value: 'alba' }) });
+    const { update } = renderControl(makeVoice({ state: 'listening' }), { models });
+    expect(voiceField()).toBeDisabled();
+
+    update(makeVoice({ state: 'off' }));
+    expect(voiceField()).toBeEnabled();
+
+    cleanup();
+    renderControl(makeVoice(), { models: { ...models, ready: false } });
+    expect(voiceField()).toBeDisabled();
   });
 });

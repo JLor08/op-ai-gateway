@@ -9644,11 +9644,11 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   A resume's cancel that lands exactly there would leave the run committing anyway while the machine re-runs on the
   extended text. The airtight version is a single compare-and-swap (the run moves `running → committing`, the machine
   moves `running → canceled`, the loser aborts). It is a recorded follow-up, not done in this change.
-- **Phase 1 chooses the voice for the user, and the ASR and TTS models only by default.** The portal's thread model is
+- **Phase 1 lets the user pick the ASR and TTS models and the voice, each defaulting to an automatic choice.** The portal's thread model is
   the LLM (its own model selector is the LLM picker). The ASR and TTS models are the **user's to pick** since issue #317:
   the Voice Chat control has one picker each, listing the catalogue models the gateway says stream (plain speech models
   ahead of preset-clone ones), with **Automatic** as the default. The pick belongs to the thread and is saved with it,
-  in `settings.voice_chat` (`asr_model`, `tts_model`) of the schema-free chat document, with no migration and no agent
+  in `settings.voice_chat` (`asr_model`, `tts_model`, `voice`) of the schema-free chat document, with no migration and no agent
   change (the backend never reads it, it only preserves it, below): the key is written only for a text thread that has made a pick (so every other thread stays byte-identical),
   the ticket request carries the models, and the co-load gate still resolves and validates all three, which is the real
   admission check (a combination it cannot hold is refused at the ticket). The **auto-pick** (the first model of each leg,
@@ -9656,12 +9656,21 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   and a pick that is gone (the model left the catalogue, is unreachable or no longer streams), which falls back instead of
   blocking the conversation, while the name stays in the thread so it applies again when the model returns. The picks persist: `PrepareChatRun`, which rewrites the stored settings from its typed struct on every user-turn commit, lifts the stored raw `voice_chat` value forward (as it does the pinned `kind`; it never reads it), so a send, an edit or a regenerate cannot wipe them whichever thread the client has open. The pickers
   are closed until the gateway has said which models stream and while a conversation is on (its ticket holds the three
-  models it started with). A text thread carries no speech settings, so the TTS speaks in the model's default voice and
-  language. A preset clone model with no default voice can therefore still be used with a blank voice, when the user
-  picks it or when no plain speech model streams, and fail its first turn (degradation, not a loop). The voice run also
+  models it started with). The **voice** (issue #318) is the speech composer's voice field, under the speech model's
+  picker, over the voices the gateway has cached for the speech model that would speak (`api.modelVoices`); it is shown
+  only when that model has voices to offer, and a name that is typed is kept (the list is an offer, not a constraint).
+  The voice sent is the user's pick; else, for a **preset clone** model (no default voice of its own), its **first
+  preset**, so it never speaks blank; else none, the model's own default. The pre-select is computed when read, not
+  saved (only a chosen voice is written to `voice_chat.voice`), so a change of model needs no clean-up, and choosing
+  another speech model drops the voice (a voice belongs to the model that offered it). The voice rides the ticket
+  request body and the mint sets the ticket's `Audio.Voice` from it (over a stored one, counted in the 1 KiB cap); a
+  clone leg with no voice named by then is defaulted to its first preset by the mint as well (`routing.FirstPresetVoice`),
+  for a request made before the voices loaded. The preset is the cache's first, not an operator-configured default,
+  which the gateway cannot see. A text thread carries no other speech settings, so the TTS speaks in the model's default
+  language. The voice run also
   ignores the chat's own system prompt and sampling settings (`VoiceRunHistory` builds the history with an empty system
-  prompt, and the run's settings carry only the model and the kind), which is phase 2. Per-thread voice and language
-  controls are the follow-up.
+  prompt, and the run's settings carry only the model and the kind), which is phase 2. A language control in voice mode
+  is the follow-up.
 - **A non-signaling client drains to the ceiling.** The in-tree client always sends `playback_done`, so it ends at the
   floor; a client that never does holds every turn's drain to the 30 s ceiling (or, for an answer whose audio is longer
   than the ceiling, to the floor). Intentional: it is the anti-wedge bound.

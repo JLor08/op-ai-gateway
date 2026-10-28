@@ -1759,10 +1759,10 @@ describe('a transcription passthrough key that cannot be a form field name', () 
 // written only for a text thread, only for a pick that is made, so a thread that never chose
 // stays byte-identical -- and it must survive the full-replace PUT (buildDoc, normalizeDoc).
 describe('the persisted Voice Chat model picks mirror the backend omitempty', () => {
-  const picked = { asrModel: 'asr-b', ttsModel: 'tts-a' };
+  const picked = { asrModel: 'asr-b', ttsModel: 'tts-a', voice: '' };
 
-  it('defaults to no pick for either model (the auto-pick)', () => {
-    expect(DEFAULT_VOICE_CHAT_SETTINGS).toEqual({ asrModel: '', ttsModel: '' });
+  it('defaults to no pick for either model or the voice (the auto-pick)', () => {
+    expect(DEFAULT_VOICE_CHAT_SETTINGS).toEqual({ asrModel: '', ttsModel: '', voice: '' });
     expect(voiceChatSettingsFrom(undefined)).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
   });
 
@@ -1773,10 +1773,10 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
   });
 
   it('writes only the pick that is made', () => {
-    expect(voiceChatSetting('', { asrModel: 'asr-b', ttsModel: '' })).toEqual({
+    expect(voiceChatSetting('', { asrModel: 'asr-b', ttsModel: '', voice: '' })).toEqual({
       voice_chat: { asr_model: 'asr-b' },
     });
-    expect(voiceChatSetting('', { asrModel: '', ttsModel: 'tts-a' })).toEqual({
+    expect(voiceChatSetting('', { asrModel: '', ttsModel: 'tts-a', voice: '' })).toEqual({
       voice_chat: { tts_model: 'tts-a' },
     });
     expect(voiceChatSetting(undefined, picked)).toEqual({
@@ -1785,10 +1785,10 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
   });
 
   it('trims a pick, and a blank one is no pick', () => {
-    expect(voiceChatSetting('', { asrModel: '  asr-b ', ttsModel: '   ' })).toEqual({
+    expect(voiceChatSetting('', { asrModel: '  asr-b ', ttsModel: '   ', voice: ' ' })).toEqual({
       voice_chat: { asr_model: 'asr-b' },
     });
-    expect(voiceChatSetting('', { asrModel: ' ', ttsModel: '' })).toEqual({});
+    expect(voiceChatSetting('', { asrModel: ' ', ttsModel: '', voice: '' })).toEqual({});
   });
 
   it.each(['image', 'speech', 'transcription', 'video'])(
@@ -1805,7 +1805,32 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
     expect(voiceChatSettingsFrom({ tts_model: 'tts-a' })).toEqual({
       asrModel: '',
       ttsModel: 'tts-a',
+      voice: '',
     });
+  });
+
+  // The voice (#318) is the third pick, the speech model's voice: it follows the same discipline
+  // as the two model picks -- written only when chosen, trimmed, and never an empty `voice` key.
+  it('writes the chosen voice beside the models, trimmed, and nothing for a blank one', () => {
+    expect(voiceChatSetting('', { asrModel: '', ttsModel: '', voice: 'alba' })).toEqual({
+      voice_chat: { voice: 'alba' },
+    });
+    expect(voiceChatSetting('', { asrModel: 'asr-b', ttsModel: 'tts-a', voice: ' alba ' })).toEqual(
+      { voice_chat: { asr_model: 'asr-b', tts_model: 'tts-a', voice: 'alba' } },
+    );
+    expect(voiceChatSetting('', { asrModel: '', ttsModel: '', voice: '   ' })).toEqual({});
+    expect(voiceChatSetting('speech', { asrModel: '', ttsModel: '', voice: 'alba' })).toEqual({});
+  });
+
+  it('reads the voice back, and a mistyped one as no pick', () => {
+    expect(voiceChatSettingsFrom({ voice: 'alba' })).toEqual({
+      asrModel: '',
+      ttsModel: '',
+      voice: 'alba',
+    });
+    expect(voiceChatSettingsFrom({ voice: 3 as unknown as string }).voice).toBe('');
+    const wire = { asr_model: 'asr-b', tts_model: 'tts-a', voice: 'alba' };
+    expect(voiceChatSetting('', voiceChatSettingsFrom(wire))).toEqual({ voice_chat: wire });
   });
 
   it('reads a mistyped pick as no pick', () => {

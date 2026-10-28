@@ -944,21 +944,26 @@ export function transcriptionSettingsFrom(
   };
 }
 
-// The Voice Chat model picks of a thread (#317), as CONCRETE store state (every field defined,
+// The Voice Chat picks of a thread (#317, #318), as CONCRETE store state (every field defined,
 // unlike the all-optional wire ChatVoiceChatSettings): the live-transcription model that hears
-// the user and the streaming speech model that answers aloud. "" is "no pick" -- automatic: the
-// portal then uses the first model, in the catalogue's order, that the gateway says streams -- and
-// the default of both. A pick is a gateway model NAME; whether it is still on offer is not this
-// state's to say (the store reads it against the models the gateway says stream, and falls back
-// to the automatic one when it is gone), so a pick that is gone for a while is kept, not erased.
+// the user, the streaming speech model that answers aloud, and that speech model's voice. "" is
+// "no pick" -- automatic: the portal then uses the first model, in the catalogue's order, that
+// the gateway says streams, and the speech model's own default voice (a preset-clone model, which
+// has none, is pre-selected on its first preset at READ time, never written here) -- and the
+// default of all three. A pick is a gateway model NAME (a voice a name the model offers, or one
+// that was typed); whether a model is still on offer is not this state's to say (the store reads
+// it against the models the gateway says stream, and falls back to the automatic one when it is
+// gone), so a pick that is gone for a while is kept, not erased.
 export type VoiceChatSettings = {
   asrModel: string;
   ttsModel: string;
+  voice: string;
 };
 
 export const DEFAULT_VOICE_CHAT_SETTINGS: VoiceChatSettings = {
   asrModel: '',
   ttsModel: '',
+  voice: '',
 };
 
 // Whether a thread is a TEXT thread, the only one a Voice Chat runs on (the pin is "" -- the
@@ -984,6 +989,8 @@ export function voiceChatSetting(
   if (asr) voiceChat.asr_model = asr;
   const tts = s.ttsModel.trim();
   if (tts) voiceChat.tts_model = tts;
+  const voice = s.voice.trim();
+  if (voice) voiceChat.voice = voice;
   return Object.keys(voiceChat).length > 0 ? { voice_chat: voiceChat } : {};
 }
 
@@ -997,6 +1004,7 @@ export function voiceChatSettingsFrom(
   return {
     asrModel: typeof s.asr_model === 'string' ? s.asr_model : DEFAULT_VOICE_CHAT_SETTINGS.asrModel,
     ttsModel: typeof s.tts_model === 'string' ? s.tts_model : DEFAULT_VOICE_CHAT_SETTINGS.ttsModel,
+    voice: typeof s.voice === 'string' ? s.voice : DEFAULT_VOICE_CHAT_SETTINGS.voice,
   };
 }
 

@@ -14,7 +14,10 @@
 //     pick that is gone (the model left the catalogue, is unreachable, or no longer streams) is
 //     a graceful fallback, never a stuck conversation (`effectiveVoiceModel`);
 //   - the pickers show exactly that: the models on offer, the pick that is on offer, and the model
-//     that would be used (`voiceModelChoice`).
+//     that would be used (`voiceModelChoice`);
+//   - the speech model's VOICE (#318) is the user's pick, else -- for a preset-clone model, which
+//     has no default voice of its own -- its first preset, else none: the model's own default
+//     (`effectiveVoice`).
 
 import type { ModelOption } from '../../api';
 import type { VoiceChatSettings } from './chatDoc';
@@ -52,12 +55,29 @@ export function effectiveVoiceModel(pick: string, streaming: readonly string[]):
 }
 
 /**
+ * The thread's picks after the user chooses the speech model `ttsModel` (among the models that
+ * `streaming` says stream): the pick is recorded, and the VOICE is cleared when another model
+ * would now speak -- a voice is one the model that offered it has, and must not be carried to
+ * one that may not (the conversation would then fail on a voice it does not know). Choosing the
+ * model that would speak anyway (the automatic pick, or the explicit pick of it) leaves it.
+ */
+export function withTtsModel(
+  current: VoiceChatSettings,
+  ttsModel: string,
+  streaming: readonly string[],
+): VoiceChatSettings {
+  const sameModel =
+    effectiveVoiceModel(current.ttsModel, streaming) === effectiveVoiceModel(ttsModel, streaming);
+  return { ...current, ttsModel, voice: sameModel ? current.voice : '' };
+}
+
+/**
  * Both legs of a conversation, or null while the gateway has not yet said which models stream
  * (the switch is then closed: it must not promise a session it would refuse a ticket for).
  */
 export function voiceLegsOf(
   streaming: VoiceStreaming | null,
-  picks: VoiceChatSettings,
+  picks: Pick<VoiceChatSettings, 'asrModel' | 'ttsModel'>,
 ): VoiceLegs | null {
   if (streaming === null) return null;
   return {
@@ -65,6 +85,43 @@ export function voiceLegsOf(
     tts: effectiveVoiceModel(picks.ttsModel, streaming.tts),
   };
 }
+
+/**
+ * The voice a conversation speaks in (#318), given the user's `pick` ('' for none), the `voices`
+ * the gateway has cached for the speech model that would speak, and whether that model is a
+ * preset-clone one:
+ *
+ *   - no voices -> '' (the field is not shown then, so what is sent is what is shown: the
+ *     model's own default speaks, and a pick that belonged to another model is not carried to it);
+ *   - the user's pick, trimmed, when there is one -- also a typed name the list does not hold
+ *     (the list is an offer, never a constraint, as in the speech composer);
+ *   - a preset-clone model with no pick -> its first preset, so it never speaks with a blank
+ *     voice (it has no default of its own to fall back on; the speech composer pre-selects the
+ *     same one);
+ *   - otherwise '' -- a plain model keeps its own default voice.
+ */
+export function effectiveVoice(
+  pick: string,
+  voices: readonly string[],
+  presetClone: boolean,
+): string {
+  if (voices.length === 0) return '';
+  const chosen = pick.trim();
+  if (chosen !== '') return chosen;
+  return presetClone ? (voices[0] ?? '') : '';
+}
+
+/**
+ * The voice field of a Voice Chat (#318), as the control shows it: the voices the gateway has
+ * cached for the speech model that would speak (none: the field is not shown), the voice that
+ * would be spoken in (`effectiveVoice`), and the way to choose one ('' clears the pick). The
+ * choice is saved with the thread; a pre-selected preset is not, only a voice that was chosen.
+ */
+export type VoiceChoice = {
+  voices: readonly string[];
+  value: string;
+  set: (voice: string) => void;
+};
 
 /**
  * One of the two models of a Voice Chat that the thread does not pick for itself, the live
@@ -97,17 +154,18 @@ export type VoiceModelChoice = {
 };
 
 /**
- * The models of a Voice Chat as the control shows them: the two pickers, whether the gateway has
- * said which models stream (until it has, there is nothing to choose from and the pickers are
- * closed), and the third model, the thread's own -- the one that answers, by its display name ('' when
- * the thread has none). The control only SHOWS that one: it is picked with the thread's model
- * selector, which is the LLM picker of the conversation.
+ * The models of a Voice Chat as the control shows them: the two pickers and the speech model's
+ * voice field, whether the gateway has said which models stream (until it has, there is nothing
+ * to choose from and the pickers are closed), and the third model, the thread's own -- the one
+ * that answers, by its display name ('' when the thread has none). The control only SHOWS that
+ * one: it is picked with the thread's model selector, which is the LLM picker of the conversation.
  */
 export type VoiceChatModels = {
   ready: boolean;
   llm: string;
   asr: VoiceModelChoice;
   tts: VoiceModelChoice;
+  voice: VoiceChoice;
 };
 
 /** What the picker of one leg is built from (see voiceModelChoice). */

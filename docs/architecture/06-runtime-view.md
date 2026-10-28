@@ -488,8 +488,8 @@ sequenceDiagram
     participant SP as Gateway (/v1/audio/speech)
     participant ST as chat store
 
-    B->>TK: POST /api/portal/voice-chat-ticket {chat_id, asr_model, llm_model, tts_model} (session + X-OP-CSRF)
-    TK->>TK: read the caller's own chat (404 portal.chat_not_found), snapshot settings.audio (400 portal.voice_chat_audio_settings_invalid)
+    B->>TK: POST /api/portal/voice-chat-ticket {chat_id, asr_model, llm_model, tts_model, voice} (session + X-OP-CSRF)
+    TK->>TK: read the caller's own chat (404 portal.chat_not_found), snapshot settings.audio with the request's voice laid over it (400 portal.voice_chat_audio_settings_invalid)
     TK->>TK: step 1, resolve and gate all three legs WITHOUT admission (400 portal.voice_chat_asr_unavailable, _llm_unavailable, _tts_unavailable)
     loop each agent-managed leg, one at a time
         TK->>AG: ensure the model (runtime.admission_blocked is 409 portal.voice_chat_coload_failed)

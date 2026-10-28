@@ -478,3 +478,45 @@ func TestVoiceRunPublishesTextThenAudio(t *testing.T) {
 		t.Fatalf("a text delta (index %d) came at or after the first audio delta (index %d): text must stream before audio", lastText, firstAudio)
 	}
 }
+
+// The last link of the voice dropdown (#318): the ticket's Audio is what the voice run's TTS leg
+// synthesizes with. voiceSpeechPrep must carry the ticket's voice (and the rest of its speech
+// settings) into the /v1/audio/speech request body, both the buffered body and the streaming one
+// the voice run asks for; the other voice-run tests set no audio, so this link was unpinned.
+func TestVoiceSpeechPrepCarriesTheTicketsVoiceIntoTheSpeechRequestBody(t *testing.T) {
+	speed := 1.25
+	audio := portal.ChatAudioSettings{Voice: "marius", Speed: &speed, Language: "de"}
+	prep := voiceSpeechPrep("the spoken answer", routing.Target{Model: "voice-tts"}, audio)
+
+	for name, build := range map[string]func(PrepareRunResult) ([]byte, error){
+		"the buffered body":  buildSpeechBody,
+		"the streaming body": buildSpeechStreamBody,
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := build(prep)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("body is not JSON: %v", err)
+			}
+			if body["voice"] != "marius" || body["model"] != "voice-tts" || body["input"] != "the spoken answer" || body["speed"] != 1.25 || body["language"] != "de" {
+				t.Fatalf("body = %v, want the ticket's voice, speed and language with the model and the answer as the input", body)
+			}
+		})
+	}
+}
+
+// A ticket that names no voice sends none: the model's own default voice speaks.
+func TestVoiceSpeechPrepSendsNoVoiceWhenTheTicketHasNone(t *testing.T) {
+	prep := voiceSpeechPrep("answer", routing.Target{Model: "voice-tts"}, portal.ChatAudioSettings{})
+
+	fields, err := speechBodyFields(prep)
+	if err != nil {
+		t.Fatalf("speechBodyFields: %v", err)
+	}
+	if _, present := fields["voice"]; present {
+		t.Fatalf("body = %v, want no voice member for a ticket with no voice", fields)
+	}
+}

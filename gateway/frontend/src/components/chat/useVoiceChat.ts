@@ -73,6 +73,8 @@ export type VoiceChatStart = {
   asrModel: string;
   llmModel: string;
   ttsModel: string;
+  /** The voice the speech model answers in; '' is the model's own default voice. */
+  voice: string;
 };
 
 /**
@@ -222,6 +224,7 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       asrModel: target.asrModel,
       llmModel: target.llmModel,
       ttsModel: target.ttsModel,
+      voice: target.voice,
       onState: (next) => {
         if (!current()) return;
         // A session that ended without saying why (a failure says it, through onError, first and
