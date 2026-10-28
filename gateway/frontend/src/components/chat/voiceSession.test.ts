@@ -137,6 +137,7 @@ type FakePlayer = VoicePlayer & {
   stop: Mock<VoicePlayer['stop']>;
   pause: Mock<VoicePlayer['pause']>;
   resume: Mock<VoicePlayer['resume']>;
+  setMuted: Mock<VoicePlayer['setMuted']>;
   // How many chunks the player still has to play out; a test sets it, as the real one counts.
   pending: number;
 };
@@ -152,6 +153,8 @@ type Run = {
   // Every change of the pause the session reports, and every section its audio moved to.
   paused: boolean[];
   sections: VoiceAudioSection[];
+  // Every change of whether the answer is being heard (its player has audio left to play).
+  playing: boolean[];
   ticket: Mock<TicketFn>;
   // Every player the session made, in order (it makes one per stream, and a fresh one after a
   // cancel silenced the last).
@@ -172,6 +175,7 @@ function start(
     onAudioDone: vi.fn(),
     paused: [],
     sections: [],
+    playing: [],
     ticket,
     players: [],
   };
@@ -190,6 +194,7 @@ function start(
     onError: (message, detail) => run.errors.push({ message, detail }),
     onPausedChange: (paused) => run.paused.push(paused),
     onAudioSection: (section) => run.sections.push(section),
+    onPlayingChange: (playing) => run.playing.push(playing),
     createPlayer: () => {
       // onEmpty starts null and is wired by the session at creation (the #304 drain hook); a
       // test drives the drain by invoking whatever the session wired.
@@ -203,6 +208,7 @@ function start(
         stop: vi.fn(),
         pause: vi.fn(),
         resume: vi.fn(),
+        setMuted: vi.fn(),
         pending: 0,
         onEmpty: null,
       };
@@ -1039,6 +1045,327 @@ describe('createVoiceSession in a (fake) browser', () => {
 
       // The microphone was released with the session: nothing is touched again.
       expect(track.enabled).toBe(true);
+    });
+  });
+
+  describe('muting the spoken answer', () => {
+    // The answer is being spoken: the gateway says so, and its audio is arriving at the player.
+    async function speaking(run: Run): Promise<FakeSocket> {
+      const socket = await connected(run);
+      socket.say({ type: 'state', state: 'speaking' });
+      socket.say(audioDelta(0));
+      expect(run.players).toHaveLength(1);
+      return socket;
+    }
+
+    it('mutes the player of the answer being spoken, and unmutes it', async () => {
+      const run = start();
+      await speaking(run);
+
+      run.session.setMuted(true);
+      expect(run.players[0].setMuted).toHaveBeenLastCalledWith(true);
+
+      run.session.setMuted(false);
+      expect(run.players[0].setMuted).toHaveBeenLastCalledWith(false);
+      expect(run.players[0].setMuted).toHaveBeenCalledTimes(2);
+      run.session.stop();
+    });
+
+    it('is the session`s, so it holds for the next answer: its new player is made muted, before its first chunk', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      run.session.setMuted(true);
+
+      // The next answer (chunk 0) is a fresh stream on a fresh player: it must not be audible.
+      socket.say(audioDelta(0));
+
+      expect(run.players).toHaveLength(2);
+      expect(run.players[1].setMuted).toHaveBeenCalledWith(true);
+      expect(run.players[1].setMuted.mock.invocationCallOrder[0]).toBeLessThan(
+        run.players[1].push.mock.invocationCallOrder[0],
+      );
+      run.session.stop();
+    });
+
+    it('holds across a stop of the answer and across several answers', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      run.session.setMuted(true);
+
+      run.session.stopSpeaking();
+      socket.say(audioDelta(0));
+      socket.say(audioDelta(0));
+
+      expect(run.players).toHaveLength(3);
+      expect(run.players[1].setMuted).toHaveBeenCalledWith(true);
+      expect(run.players[2].setMuted).toHaveBeenCalledWith(true);
+      run.session.stop();
+    });
+
+    it('a mute asked for before any audio arrived holds for the first answer', async () => {
+      const run = start();
+      const socket = await connected(run);
+
+      run.session.setMuted(true);
+      socket.say({ type: 'state', state: 'speaking' });
+      socket.say(audioDelta(0));
+
+      expect(run.players[0].setMuted).toHaveBeenCalledWith(true);
+      run.session.stop();
+    });
+
+    it('an unmute holds too: the next answer is made audible, not muted', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      run.session.setMuted(true);
+      run.session.setMuted(false);
+
+      socket.say(audioDelta(0));
+
+      expect(run.players[1].setMuted).not.toHaveBeenCalledWith(true);
+      run.session.stop();
+    });
+
+    it('an answer that was never muted is made as it is, with no mute applied', async () => {
+      const run = start();
+      await speaking(run);
+
+      expect(run.players[0].setMuted).not.toHaveBeenCalled();
+      run.session.stop();
+    });
+
+    it('is idempotent: a repeat asks the player for nothing more', async () => {
+      const run = start();
+      await speaking(run);
+
+      run.session.setMuted(false); // already audible
+      run.session.setMuted(true);
+      run.session.setMuted(true);
+
+      expect(run.players[0].setMuted).toHaveBeenCalledTimes(1);
+      run.session.stop();
+    });
+
+    it('silences only the speakers: nothing is sent, the answer goes on, and the microphone is not touched', async () => {
+      const run = start();
+      const socket = await speaking(run);
+
+      run.session.setMuted(true);
+      socket.say(audioDelta(1));
+
+      expect(socket.controls()).toEqual([]);
+      expect(run.players[0].push).toHaveBeenCalledTimes(2);
+      expect(run.players[0].stop).not.toHaveBeenCalled();
+      expect(run.players[0].pause).not.toHaveBeenCalled();
+      expect(track.enabled).toBe(true);
+      expect(run.paused).toEqual([]);
+      run.session.stop();
+    });
+
+    it('is ignored once the session is over', async () => {
+      const run = start();
+      await speaking(run);
+      run.session.stop();
+      run.players[0].setMuted.mockClear();
+
+      run.session.setMuted(true);
+
+      expect(run.players[0].setMuted).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('whether the answer is being heard', () => {
+    async function speaking(run: Run): Promise<FakeSocket> {
+      const socket = await connected(run);
+      socket.say({ type: 'state', state: 'speaking' });
+      return socket;
+    }
+
+    it('starts with the first chunk that is played, once, and not for the chunks after it', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      // The gateway says it is speaking before any audio has arrived: nothing is playing yet.
+      expect(run.playing).toEqual([]);
+
+      socket.say(audioDelta(0));
+      socket.say(audioDelta(1));
+
+      expect(run.playing).toEqual([true]);
+      run.session.stop();
+    });
+
+    it('is not started by a chunk that could not be played: nothing is heard', async () => {
+      const run = start();
+      const socket = await speaking(run);
+
+      socket.say({ type: 'audio_delta', seq: 0, rate: 24000, audio: '!!not base64!!' });
+
+      expect(run.playing).toEqual([]);
+      run.session.stop();
+    });
+
+    it('goes on through a gap between chunks of an answer that is still being spoken', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+
+      // TTS lags real time: the queue runs dry before the next chunk arrives. The drain hook
+      // fires (it reports the gap), but the answer is not over.
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+
+      expect(run.playing).toEqual([true]);
+      run.session.stop();
+    });
+
+    it('ends when the queue plays out after the answer was finished (draining): the rest is the gateway`s tail', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      socket.say({ type: 'audio_done' });
+      socket.say({ type: 'state', state: 'draining' });
+      expect(run.playing).toEqual([true]); // audio is still left to play
+
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+
+      expect(run.playing).toEqual([true, false]);
+      run.session.stop();
+    });
+
+    it('ends at once when the gateway reports draining and everything has already played out', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      // The whole answer played during the run: the gap signal came in the speaking state.
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+      expect(run.playing).toEqual([true]);
+
+      socket.say({ type: 'audio_done' });
+      socket.say({ type: 'state', state: 'draining' });
+
+      expect(run.playing).toEqual([true, false]);
+      run.session.stop();
+    });
+
+    it('stays through draining while there is audio left to play', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      socket.say(audioDelta(1));
+
+      socket.say({ type: 'audio_done' });
+      socket.say({ type: 'state', state: 'draining' });
+
+      expect(run.playing).toEqual([true]);
+      run.session.stop();
+    });
+
+    it('stays while paused, whatever the queue holds: a pause is not a drain', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      socket.say({ type: 'audio_done' });
+      socket.say({ type: 'state', state: 'draining' });
+
+      run.session.pause();
+      run.players[0].pending = 0;
+      socket.say({ type: 'state', state: 'draining' });
+
+      expect(run.playing).toEqual([true]);
+      run.session.stop();
+    });
+
+    it('ends when a resume finds nothing left to play while draining (the drain a pause swallowed)', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      socket.say({ type: 'audio_done' });
+      socket.say({ type: 'state', state: 'draining' });
+      run.session.pause();
+      run.players[0].pending = 0; // everything it held had already been heard
+
+      run.session.resume();
+
+      expect(run.playing).toEqual([true, false]);
+      run.session.stop();
+    });
+
+    it('stays after a resume with audio left to play', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      run.session.pause();
+
+      run.session.resume();
+
+      expect(run.playing).toEqual([true]);
+      run.session.stop();
+    });
+
+    it('ends when the answer is stopped, cancelled, or fails', async () => {
+      const run = start();
+      const socket = await speaking(run);
+
+      socket.say(audioDelta(0));
+      run.session.stopSpeaking();
+      socket.say(audioDelta(0));
+      run.session.cancel();
+      socket.say(audioDelta(0));
+      socket.say({ type: 'error', code: 'speech.upstream_error', message: 'degraded' });
+
+      expect(run.playing).toEqual([true, false, true, false, true, false]);
+      run.session.stop();
+    });
+
+    it('ends when the gateway goes back to listening: the answer is over, whatever the player holds', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+
+      socket.say({ type: 'state', state: 'listening' });
+
+      expect(run.playing).toEqual([true, false]);
+      run.session.stop();
+    });
+
+    it('starts again with the next answer', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      socket.say({ type: 'state', state: 'listening' });
+
+      socket.say({ type: 'state', state: 'speaking' });
+      socket.say(audioDelta(0));
+
+      expect(run.playing).toEqual([true, false, true]);
+      run.session.stop();
+    });
+
+    it('a new answer on the heels of the last one (chunk 0) does not report a gap in between', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+
+      // The chunk 0 silences what is left of the last answer and starts its own: the display
+      // sees the end and the start, in that order, never a missing end.
+      socket.say(audioDelta(0));
+
+      expect(run.playing).toEqual([true, false, true]);
+      run.session.stop();
+    });
+
+    it('is not reported once the session is over', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      expect(run.playing).toEqual([true]);
+
+      run.session.stop();
+
+      // The session's own teardown silences the player, which is not a change anyone is told of.
+      expect(run.playing).toEqual([true]);
     });
   });
 

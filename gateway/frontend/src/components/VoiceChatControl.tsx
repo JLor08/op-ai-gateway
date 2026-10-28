@@ -5,7 +5,12 @@ import { useEffect, useId, useRef, type KeyboardEvent, type PointerEvent } from 
 import { Alert, Box, Button, FormControlLabel, Switch, TextField, Typography } from '@mui/material';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
+import PauseIcon from '@mui/icons-material/Pause';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
+import StopIcon from '@mui/icons-material/Stop';
+import VolumeOffIcon from '@mui/icons-material/VolumeOff';
+import VolumeUpIcon from '@mui/icons-material/VolumeUp';
 import type { MessageKey, Translation } from './shared/types';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { SpeechVoiceField } from './SpeechVoiceField';
@@ -81,20 +86,42 @@ function errorText(error: VoiceChatError, t: Translation): string {
   }
 }
 
+// What the user has done to the conversation that the gateway's state does not say: the answer
+// is paused, or their own microphone is muted. Both change what the indicator must tell them.
+type UserHolds = { paused: boolean; micMuted: boolean };
+
+// The states in which the answer's audio is played out, which is where it can be paused.
+function playsAnswer(state: VoiceChatState): boolean {
+  return state === 'speaking' || state === 'draining';
+}
+
+// The label of the indicator: the gateway's state, except where the user's own doing makes it
+// untrue. A paused answer is not "speaking", and a muted microphone never "listens" -- the
+// indicator is how the user SEES whether they are heard, so it must not say they are.
+function labelKey(state: VoiceChatState, { paused, micMuted }: UserHolds): MessageKey {
+  if (paused && playsAnswer(state)) return 'chatVoiceStatePaused';
+  if (micMuted && state === 'listening') return 'chatVoiceStateMicMuted';
+  return STATE_LABEL[state];
+}
+
 // The detail line under a state's label, where the state needs more than its label to be read
 // right. While the answer is spoken the gateway discards the microphone (half-duplex, spec 6.2),
-// and saying so is the point of the indicator: the user must not talk into a void.
-function detailText(state: VoiceChatState, t: Translation): string {
-  if (state === 'speaking' || state === 'draining') return t.chatVoiceMicPaused;
+// and saying so is the point of the indicator: the user must not talk into a void. A muted
+// microphone is the same void, by the user's own hand, and says so in every other state of a
+// conversation that is on (push-to-talk is closed under it, so the idle hint would mislead).
+function detailText(state: VoiceChatState, { micMuted }: UserHolds, t: Translation): string {
+  if (playsAnswer(state)) return t.chatVoiceMicPaused;
+  if (micMuted && state !== 'off') return t.chatVoiceMicMutedDetail;
   if (state === 'idle') return t.chatVoiceIdleHint;
   return '';
 }
 
 // The two states the gateway takes push-to-talk in: it starts a turn from `idle` (what is left
 // after a failed turn), and in `listening` it ends the turn now instead of waiting for a pause.
-// In every other state it ignores both, so the button is closed.
-function takesPushToTalk(state: VoiceChatState): boolean {
-  return state === 'listening' || state === 'idle';
+// In every other state it ignores both, so the button is closed. It is closed under a muted
+// microphone as well: a turn started with nothing to hear would end empty.
+function takesPushToTalk(state: VoiceChatState, micMuted: boolean): boolean {
+  return !micMuted && (state === 'listening' || state === 'idle');
 }
 
 // The longest voice system prompt the field takes. Generous -- the built-in prompt is about a
@@ -240,7 +267,7 @@ export function VoiceChatControl({
   const { state, error } = voice;
   const on = state !== 'off';
   const listening = state === 'listening';
-  const canTalk = takesPushToTalk(state);
+  const canTalk = takesPushToTalk(state, voice.micMuted);
 
   // A refused ticket is the gateway's answer to this very request, and it is the same next time
   // (a model it will not use, models it cannot hold together): the switch stays closed on it, and
@@ -297,7 +324,11 @@ export function VoiceChatControl({
 
       <VoiceModelPickers models={models} locked={on} t={t} />
 
-      <ListeningIndicator state={state} t={t} />
+      <ListeningIndicator
+        state={state}
+        holds={{ paused: voice.paused, micMuted: voice.micMuted }}
+        t={t}
+      />
 
       {on && voice.liveTranscript !== '' && (
         <TurnText
@@ -331,6 +362,17 @@ export function VoiceChatControl({
           >
             {t.chatVoicePushToTalk}
           </Button>
+          {/* The user's own microphone: there whenever the conversation is on, in every state. */}
+          <Button
+            variant={voice.micMuted ? 'contained' : 'outlined'}
+            size="small"
+            color={voice.micMuted ? 'warning' : 'inherit'}
+            startIcon={voice.micMuted ? <MicOffIcon /> : <MicIcon />}
+            aria-pressed={voice.micMuted}
+            onClick={() => voice.toggleMicMute()}
+          >
+            {voice.micMuted ? t.chatVoiceMicUnmute : t.chatVoiceMicMute}
+          </Button>
           {hasAnswerInFlight(state) && (
             <Button variant="outlined" size="small" color="inherit" onClick={() => voice.cancel()}>
               {t.chatVoiceCancel}
@@ -338,6 +380,8 @@ export function VoiceChatControl({
           )}
         </Box>
       )}
+
+      {on && voice.audioPlaying && playsAnswer(state) && <PlaybackControls voice={voice} t={t} />}
 
       {error && (
         <Alert
@@ -355,6 +399,59 @@ export function VoiceChatControl({
           {errorText(error, t)}
         </Alert>
       )}
+    </Box>
+  );
+}
+
+// The controls of the answer while it is heard (#315): pause and resume it, mute its speakers,
+// and stop the playback. It is only drawn while audio is being heard (`audioPlaying`), so a pause
+// is never offered before the first chunk or in the gateway's tail after the audio is over, where
+// it would do nothing. Stop is `stopSpeaking`: it cuts the answer short and the conversation goes
+// on -- `stop` ends the conversation, and Cancel (beside push-to-talk) abandons the turn.
+function PlaybackControls({ voice, t }: Readonly<{ voice: VoiceChatApi; t: Translation }>) {
+  return (
+    <Box
+      role="group"
+      aria-label={t.chatVoicePlayback}
+      sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1 }}
+    >
+      {voice.paused ? (
+        <Button
+          variant="contained"
+          size="small"
+          startIcon={<PlayArrowIcon />}
+          onClick={() => voice.resume()}
+        >
+          {t.chatVoiceResume}
+        </Button>
+      ) : (
+        <Button
+          variant="outlined"
+          size="small"
+          startIcon={<PauseIcon />}
+          onClick={() => voice.pause()}
+        >
+          {t.chatVoicePause}
+        </Button>
+      )}
+      <Button
+        variant="outlined"
+        size="small"
+        startIcon={voice.muted ? <VolumeOffIcon /> : <VolumeUpIcon />}
+        aria-pressed={voice.muted}
+        onClick={() => voice.toggleMute()}
+      >
+        {voice.muted ? t.chatVoiceUnmute : t.chatVoiceMute}
+      </Button>
+      <Button
+        variant="outlined"
+        size="small"
+        color="error"
+        startIcon={<StopIcon />}
+        onClick={() => voice.stopSpeaking()}
+      >
+        {t.chatVoiceStopPlayback}
+      </Button>
     </Box>
   );
 }
@@ -491,10 +588,15 @@ function VoiceModelPicker({
 // needs one. Active: the hot microphone, in the colour of a recording, and pulsing (unless the
 // user asked for no motion). Not listening: the same circle, grey and still, with the muted
 // microphone and the label of what the system is doing instead.
-function ListeningIndicator({ state, t }: Readonly<{ state: VoiceChatState; t: Translation }>) {
+function ListeningIndicator({
+  state,
+  holds,
+  t,
+}: Readonly<{ state: VoiceChatState; holds: UserHolds; t: Translation }>) {
   const on = state !== 'off';
-  const listening = state === 'listening';
-  const detail = detailText(state, t);
+  // Only a microphone that is on, in the one state that takes the user's voice, hears them.
+  const listening = state === 'listening' && !holds.micMuted;
+  const detail = detailText(state, holds, t);
   const badgeSize = on ? 48 : 32;
   const Icon = listening ? MicIcon : MicOffIcon;
   return (
@@ -552,7 +654,7 @@ function ListeningIndicator({ state, t }: Readonly<{ state: VoiceChatState; t: T
             color: listening ? 'error.main' : 'text.secondary',
           }}
         >
-          {t[STATE_LABEL[state]]}
+          {t[labelKey(state, holds)]}
         </Typography>
         {detail !== '' && (
           <Typography variant="caption" color="text.secondary" component="p" sx={{ m: 0 }}>

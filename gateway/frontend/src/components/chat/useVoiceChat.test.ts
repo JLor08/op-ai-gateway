@@ -28,6 +28,7 @@ type FakeSession = {
   resume: Mock<() => void>;
   stopSpeaking: Mock<() => void>;
   setMicMuted: Mock<(muted: boolean) => void>;
+  setMuted: Mock<(muted: boolean) => void>;
   stop: Mock<() => void>;
 };
 
@@ -46,6 +47,7 @@ const emit = {
   paused: (s: FakeSession, paused: boolean) => act(() => s.args.onPausedChange?.(paused)),
   audioSection: (s: FakeSession, attribution: VoiceAudioSection) =>
     act(() => s.args.onAudioSection?.(attribution)),
+  playing: (s: FakeSession, playing: boolean) => act(() => s.args.onPlayingChange?.(playing)),
   turnError: (s: FakeSession, code?: string, message = 'the turn failed') =>
     act(() => s.args.onError(message, { kind: 'turn', ...(code === undefined ? {} : { code }) })),
   failed: (s: FakeSession, detail: VoiceErrorDetail, message = 'the session failed') =>
@@ -75,6 +77,7 @@ beforeEach(() => {
       resume: vi.fn(),
       stopSpeaking: vi.fn(),
       setMicMuted: vi.fn(),
+      setMuted: vi.fn(),
       stop: vi.fn(),
     };
     sessions.push(session);
@@ -131,6 +134,7 @@ function setup(
     resume: () => act(() => view.result.current.resume()),
     stopSpeaking: () => act(() => view.result.current.stopSpeaking()),
     toggleMicMute: () => act(() => view.result.current.toggleMicMute()),
+    toggleMute: () => act(() => view.result.current.toggleMute()),
   };
 }
 
@@ -215,6 +219,8 @@ describe('useVoiceChat', () => {
         error: null,
         paused: false,
         micMuted: false,
+        muted: false,
+        audioPlaying: false,
         audioSection: null,
       });
     });
@@ -431,9 +437,15 @@ describe('useVoiceChat', () => {
   });
 
   describe('playback controls: pause, resume and stopping the spoken answer', () => {
-    it('start with nothing paused or muted', () => {
+    it('start with nothing paused, muted or playing', () => {
       const h = setup();
-      expect(h.voice()).toMatchObject({ paused: false, micMuted: false, audioSection: null });
+      expect(h.voice()).toMatchObject({
+        paused: false,
+        micMuted: false,
+        muted: false,
+        audioPlaying: false,
+        audioSection: null,
+      });
     });
 
     it('pause and resume go to the session', () => {
@@ -539,9 +551,15 @@ describe('useVoiceChat', () => {
       h.resume();
       h.stopSpeaking();
       h.toggleMicMute();
+      h.toggleMute();
 
       expect(sessions).toHaveLength(0);
-      expect(h.voice()).toMatchObject({ state: 'off', paused: false, micMuted: false });
+      expect(h.voice()).toMatchObject({
+        state: 'off',
+        paused: false,
+        micMuted: false,
+        muted: false,
+      });
       expect(h.refreshThread).not.toHaveBeenCalled();
     });
 
@@ -660,6 +678,135 @@ describe('useVoiceChat', () => {
       emit.turnError(session, 'speech.upstream_error');
 
       expect(h.voice().micMuted).toBe(true);
+    });
+  });
+
+  describe('the answer mute (the speakers)', () => {
+    it('toggleMute mutes the session`s speakers, and unmutes them the next time', () => {
+      const h = setup();
+      const session = listening(h);
+
+      h.toggleMute();
+      expect(session.setMuted).toHaveBeenLastCalledWith(true);
+      expect(h.voice().muted).toBe(true);
+
+      h.toggleMute();
+      expect(session.setMuted).toHaveBeenLastCalledWith(false);
+      expect(h.voice().muted).toBe(false);
+      expect(session.setMuted).toHaveBeenCalledTimes(2);
+    });
+
+    it('is available whenever the conversation is on: the mute is the session`s, and holds for the answers to come', () => {
+      const h = setup();
+      const session = listening(h);
+
+      for (const state of ['thinking', 'speaking', 'draining', 'idle'] as const) {
+        emit.state(session, state);
+        h.toggleMute();
+      }
+
+      expect(session.setMuted.mock.calls).toEqual([[true], [false], [true], [false]]);
+    });
+
+    it('is not the microphone mute, and does not touch the answer', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+
+      h.toggleMute();
+
+      expect(h.voice().micMuted).toBe(false);
+      expect(session.setMicMuted).not.toHaveBeenCalled();
+      expect(session.pause).not.toHaveBeenCalled();
+      expect(session.stopSpeaking).not.toHaveBeenCalled();
+    });
+
+    it('the microphone mute is not this one', () => {
+      const h = setup();
+      const session = listening(h);
+
+      h.toggleMicMute();
+
+      expect(h.voice().muted).toBe(false);
+      expect(session.setMuted).not.toHaveBeenCalled();
+    });
+
+    it('is cleared by the end of the conversation: the next one is audible', () => {
+      const h = setup();
+      const first = listening(h);
+      h.toggleMute();
+      expect(h.voice().muted).toBe(true);
+
+      h.stop();
+      expect(h.voice().muted).toBe(false);
+
+      h.start();
+      expect(h.voice().muted).toBe(false);
+      // And the toggle is a mute again, not an unmute of a mute that is gone.
+      const second = sessions[1];
+      emit.state(second, 'listening');
+      h.toggleMute();
+      expect(second.setMuted).toHaveBeenCalledWith(true);
+      expect(first.setMuted).toHaveBeenCalledTimes(1);
+    });
+
+    it('is cleared when the conversation fails', () => {
+      const h = setup();
+      const session = listening(h);
+      h.toggleMute();
+
+      emit.failed(session, { kind: 'capture' });
+
+      expect(h.voice().muted).toBe(false);
+    });
+
+    it('survives a failed turn: the conversation is still on, and so is the mute', () => {
+      const h = setup();
+      const session = listening(h);
+      h.toggleMute();
+
+      emit.turnError(session, 'speech.upstream_error');
+
+      expect(h.voice().muted).toBe(true);
+    });
+  });
+
+  describe('whether the answer is being heard', () => {
+    it('follows the session', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+
+      emit.playing(session, true);
+      expect(h.voice().audioPlaying).toBe(true);
+
+      emit.playing(session, false);
+      expect(h.voice().audioPlaying).toBe(false);
+    });
+
+    it('does not outlive the conversation, nor start the next one playing', () => {
+      const h = setup();
+      const first = listening(h);
+      emit.playing(first, true);
+
+      h.stop();
+      expect(h.voice().audioPlaying).toBe(false);
+      // The session that was let go of is deaf, and cannot start the display again.
+      emit.playing(first, true);
+      expect(h.voice().audioPlaying).toBe(false);
+
+      h.start();
+      expect(h.voice().audioPlaying).toBe(false);
+    });
+
+    it('is cleared when the conversation fails', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.playing(session, true);
+
+      emit.failed(session, { kind: 'dropped' });
+
+      expect(h.voice().audioPlaying).toBe(false);
     });
   });
 

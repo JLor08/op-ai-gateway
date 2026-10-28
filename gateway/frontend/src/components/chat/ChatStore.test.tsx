@@ -8074,6 +8074,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       pause: Mock<() => void>;
       resume: Mock<() => void>;
       stopSpeaking: Mock<() => void>;
+      setMuted: Mock<(muted: boolean) => void>;
       setMicMuted: Mock<(muted: boolean) => void>;
       stop: Mock<() => void>;
     };
@@ -8090,6 +8091,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           pause: vi.fn(),
           resume: vi.fn(),
           stopSpeaking: vi.fn(),
+          setMuted: vi.fn(),
           setMicMuted: vi.fn(),
           stop: vi.fn(),
         };

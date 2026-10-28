@@ -5872,23 +5872,35 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     };
     const audioModels = [llm, asr, tts];
 
-    type FakeVoice = { args: VoiceSessionArgs; stop: Mock<() => void> };
+    type FakeVoice = {
+      args: VoiceSessionArgs;
+      pause: Mock<() => void>;
+      resume: Mock<() => void>;
+      stopSpeaking: Mock<() => void>;
+      setMuted: Mock<(muted: boolean) => void>;
+      setMicMuted: Mock<(muted: boolean) => void>;
+      stop: Mock<() => void>;
+    };
     let voiceSessions: FakeVoice[];
     beforeEach(() => {
       voiceSessions = [];
       vi.mocked(createVoiceSession).mockImplementation((args) => {
-        const session: FakeVoice = { args, stop: vi.fn() };
+        const session: FakeVoice = {
+          args,
+          pause: vi.fn(),
+          resume: vi.fn(),
+          stopSpeaking: vi.fn(),
+          setMuted: vi.fn(),
+          setMicMuted: vi.fn(),
+          stop: vi.fn(),
+        };
         voiceSessions.push(session);
         args.onState('connecting');
         return {
           pushStart: vi.fn(),
           pushEnd: vi.fn(),
           cancel: vi.fn(),
-          pause: vi.fn(),
-          resume: vi.fn(),
-          stopSpeaking: vi.fn(),
-          setMicMuted: vi.fn(),
-          stop: session.stop,
+          ...session,
         };
       });
       chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
@@ -6105,6 +6117,74 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(indicator()).getByText(t.chatVoiceStateSpeaking)).toBeInTheDocument();
       expect(within(indicator()).getByText(t.chatVoiceMicPaused)).toBeInTheDocument();
       expect(within(indicator()).queryByTestId('MicIcon')).not.toBeInTheDocument();
+    });
+
+    it('shows the playback controls only while the answer is heard, and drives the session with them (#315)', async () => {
+      await renderVoiceChat();
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      fireEvent.click(voiceSwitch());
+      const session = voiceSessions[0];
+      const playback = () => screen.queryByRole('group', { name: t.chatVoicePlayback });
+      const press = (name: string) => fireEvent.click(screen.getByRole('button', { name }));
+
+      // Speaking, but nothing is heard yet: no controls to pause what is not playing.
+      await act(async () => session.args.onState('speaking'));
+      expect(playback()).not.toBeInTheDocument();
+
+      // The first chunk is played: the controls are there, and each goes to the session.
+      await act(async () => session.args.onPlayingChange?.(true));
+      expect(playback()).toBeInTheDocument();
+      press(t.chatVoicePause);
+      expect(session.pause).toHaveBeenCalledTimes(1);
+
+      // The session says the pause took: the button becomes the resume.
+      await act(async () => session.args.onPausedChange?.(true));
+      expect(within(indicator()).getByText(t.chatVoiceStatePaused)).toBeInTheDocument();
+      press(t.chatVoiceResume);
+      expect(session.resume).toHaveBeenCalledTimes(1);
+      await act(async () => session.args.onPausedChange?.(false));
+
+      // The mute of the answer is the session's, and reads as pressed once it is on.
+      press(t.chatVoiceMute);
+      expect(session.setMuted).toHaveBeenLastCalledWith(true);
+      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+
+      // Stop cuts the answer short: not the end of the conversation.
+      press(t.chatVoiceStopPlayback);
+      expect(session.stopSpeaking).toHaveBeenCalledTimes(1);
+      expect(session.stop).not.toHaveBeenCalled();
+      expect(voiceSwitch()).toBeChecked();
+
+      // The answer has played out: the controls are gone, and the mute stays for the next one.
+      await act(async () => session.args.onPlayingChange?.(false));
+      expect(playback()).not.toBeInTheDocument();
+      expect(session.setMuted).toHaveBeenCalledTimes(1);
+    });
+
+    it('mutes the microphone from the page: the session is told, push-to-talk closes and the indicator says so (#315)', async () => {
+      await renderVoiceChat();
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      fireEvent.click(voiceSwitch());
+      const session = voiceSessions[0];
+      await act(async () => session.args.onState('listening'));
+      const talk = () => screen.getByRole('button', { name: t.chatVoicePushToTalk });
+      expect(talk()).toBeEnabled();
+
+      fireEvent.click(screen.getByRole('button', { name: t.chatVoiceMicMute }));
+
+      expect(session.setMicMuted).toHaveBeenLastCalledWith(true);
+      expect(talk()).toBeDisabled();
+      expect(within(indicator()).getByText(t.chatVoiceStateMicMuted)).toBeInTheDocument();
+      expect(within(indicator()).getByTestId('MicOffIcon')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.chatVoiceMicUnmute }));
+
+      expect(session.setMicMuted).toHaveBeenLastCalledWith(false);
+      expect(talk()).toBeEnabled();
+      expect(within(indicator()).getByText(t.chatVoiceStateListening)).toBeInTheDocument();
     });
 
     it("shows the turn the gateway committed as the thread's own turns", async () => {

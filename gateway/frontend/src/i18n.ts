@@ -401,6 +401,23 @@ const de = {
   chatVoiceDismiss: 'Schließen',
   chatVoiceTranscript: 'Ihre Worte',
   chatVoiceAnswer: 'Antwort',
+  // The controls of the answer while it is heard (#315): pause and resume it, mute its speakers
+  // (it plays on, silently), or stop the playback (the answer is cut short, the conversation goes
+  // on). Stopping the playback is not cancelling the turn (chatVoiceCancel), so it is worded as
+  // what it does. Beside them the mute of the user's own microphone, which is there whenever the
+  // conversation is on, with the indicator's words for a user who is not heard because of it.
+  chatVoicePlayback: 'Wiedergabe der Antwort',
+  chatVoicePause: 'Pausieren',
+  chatVoiceResume: 'Fortsetzen',
+  chatVoiceMute: 'Antwort stumm schalten',
+  chatVoiceUnmute: 'Antwort-Ton einschalten',
+  chatVoiceStopPlayback: 'Wiedergabe stoppen',
+  chatVoiceMicMute: 'Mikrofon stumm schalten',
+  chatVoiceMicUnmute: 'Mikrofon einschalten',
+  chatVoiceStatePaused: 'Antwort pausiert',
+  chatVoiceStateMicMuted: 'Mikrofon stumm',
+  chatVoiceMicMutedDetail:
+    'Ihr Mikrofon ist stumm geschaltet, Sie werden nicht gehört. Schalten Sie es wieder ein, um zu sprechen.',
   // Why the switch is closed: the thread cannot do a spoken conversation (the chat model, or a
   // streaming transcription or speech model, is missing), or the models are still being checked.
   chatVoiceUnavailableLlm:
@@ -3847,6 +3864,18 @@ const en: PortalMessages = {
   chatVoiceDismiss: 'Dismiss',
   chatVoiceTranscript: 'Your words',
   chatVoiceAnswer: 'Answer',
+  chatVoicePlayback: 'Answer playback',
+  chatVoicePause: 'Pause',
+  chatVoiceResume: 'Resume',
+  chatVoiceMute: 'Mute answer',
+  chatVoiceUnmute: 'Unmute answer',
+  chatVoiceStopPlayback: 'Stop playback',
+  chatVoiceMicMute: 'Mute microphone',
+  chatVoiceMicUnmute: 'Unmute microphone',
+  chatVoiceStatePaused: 'Answer paused',
+  chatVoiceStateMicMuted: 'Microphone muted',
+  chatVoiceMicMutedDetail:
+    'Your microphone is muted, so you are not being heard. Unmute it to talk.',
   chatVoiceUnavailableLlm: 'Select an available chat model (one that can chat) to use Voice Chat.',
   chatVoiceUnavailableAsr:
     'Voice Chat needs a transcription model with live streaming. None is available right now.',

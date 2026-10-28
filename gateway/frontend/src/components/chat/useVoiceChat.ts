@@ -37,10 +37,13 @@
 //
 // The answer being spoken has controls of its own, which are NOT the conversation's: pause and
 // resume hold and continue it, and stopSpeaking cuts it short (the gateway goes back to listening
-// and the conversation goes on), where `stop` ends the whole conversation. The microphone has a
-// mute, which is the user's alone -- the gateway is told nothing, it simply hears nothing -- and
-// lasts as long as the conversation does. `paused` is the session's to say, not this hook's: a
-// pause that the answer ending clears must not stay on screen into the next one.
+// and the conversation goes on), where `stop` ends the whole conversation. Its speakers have a
+// mute (`muted`), and the microphone has one of its own (`micMuted`): both the user's alone -- the
+// gateway is told nothing, the one plays nothing and the other hears nothing -- and each lasts as
+// long as the conversation does (the speakers' also over every answer in it). `paused` and
+// `audioPlaying` are the session's to say, not this hook's: a pause that the answer ending clears
+// must not stay on screen into the next one, and the controls are shown only for audio that is
+// being heard.
 //
 // Errors are the session's: a TURN that failed (a model errored, an admission was refused) leaves
 // the gateway at `idle` with the conversation still open, so it is surfaced, the preview is
@@ -124,6 +127,15 @@ export type VoiceChatApi = {
   paused: boolean;
   /** The user's own microphone is muted (by `toggleMicMute`): the gateway hears nothing, so no turn. */
   micMuted: boolean;
+  /** The spoken answer is muted (by `toggleMute`): it plays on, silently, and so does each next one. */
+  muted: boolean;
+  /**
+   * The answer's audio is being heard: it has started playing and has not played out or been
+   * ended. A pause is still being heard (the held audio is yet to be). The controls of the
+   * playback are for this, and for nothing else -- not before the first chunk, nor in the
+   * gateway's tail after the audio is over, where a pause would do nothing.
+   */
+  audioPlaying: boolean;
   /**
    * The section of the spoken answer whose audio is arriving, or null when there is none (see
    * VoiceAudioSection: its `ordinal` is its block's place in the stored turn, whatever gaps the
@@ -152,6 +164,8 @@ export type VoiceChatApi = {
   stopSpeaking: () => void;
   /** Mute the user's microphone, or unmute it: the conversation stays on, but no turn is heard. */
   toggleMicMute: () => void;
+  /** Mute the spoken answer, or unmute it: it keeps playing, silently, and so do the next ones. */
+  toggleMute: () => void;
 };
 
 // The turn in flight, as shown: the finished chunks, the chunk being said, the answer, and the
@@ -215,11 +229,14 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
   const [error, setError] = useState<VoiceChatError | null>(null);
   const [paused, setPaused] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [audioPlaying, setAudioPlaying] = useState(false);
   // What the render last saw of them, for the controls below (which are stable, and are called
-  // between renders): the gateway's state, and the mute that the next toggle reverses.
+  // between renders): the gateway's state, and the mutes that the next toggles reverse.
   const stateRef = useRef<VoiceChatState>('off');
   stateRef.current = state;
   const micMutedRef = useRef(false);
+  const mutedRef = useRef(false);
 
   // The conversation's session (null when there is none), and which session that is
   // (`generation`: every callback of a session that was let go of finds it moved on, and is
@@ -238,12 +255,15 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
   }, []);
 
   // The controls' own state starts over with each conversation: a pause belongs to the answer it
-  // paused, and the microphone of a new conversation is live (a mute is not carried into a
-  // conversation the user starts afresh).
+  // paused, and the microphone and the speakers of a new conversation are live (a mute is not
+  // carried into a conversation the user starts afresh).
   const resetControls = useCallback(() => {
     micMutedRef.current = false;
+    mutedRef.current = false;
     setPaused(false);
     setMicMuted(false);
+    setMuted(false);
+    setAudioPlaying(false);
   }, []);
 
   // The conversation is over: nothing of it is shown any more, `failure` is why (null for the
@@ -321,6 +341,9 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       },
       onAudioSection: (attribution) => {
         if (current()) dispatch({ type: 'audioSection', attribution });
+      },
+      onPlayingChange: (next) => {
+        if (current()) setAudioPlaying(next);
       },
       onError: (message, detail) => {
         if (!current()) return;
@@ -403,6 +426,15 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
     session.setMicMuted(next);
   }, []);
 
+  const toggleMute = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const next = !mutedRef.current;
+    mutedRef.current = next;
+    setMuted(next);
+    session.setMuted(next);
+  }, []);
+
   // A conversation belongs to the chat it started in: it does not follow the user to another
   // chat (with the microphone still open), and has nowhere to go when no chat is open.
   const { activeChatId } = deps;
@@ -421,6 +453,8 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       error,
       paused,
       micMuted,
+      muted,
+      audioPlaying,
       audioSection: turn.audioSection,
       start,
       stop,
@@ -431,6 +465,7 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       resume,
       stopSpeaking,
       toggleMicMute,
+      toggleMute,
     }),
     [
       state,
@@ -438,6 +473,8 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       error,
       paused,
       micMuted,
+      muted,
+      audioPlaying,
       start,
       stop,
       pushStart,
@@ -447,6 +484,7 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       resume,
       stopSpeaking,
       toggleMicMute,
+      toggleMute,
     ],
   );
 }
