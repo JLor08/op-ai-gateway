@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 import { PortalApiError } from '../../api';
 import { StreamingPcmPlayer, type PlaybackContext } from './speechPlayback';
 import {
+  PLAYING_GAP_MS,
   VOICE_WS_PATH,
   VOICE_WS_SUBPROTOCOL,
   createVoiceSession,
@@ -1204,17 +1205,175 @@ describe('createVoiceSession in a (fake) browser', () => {
       run.session.stop();
     });
 
-    it('goes on through a gap between chunks of an answer that is still being spoken', async () => {
+    it('goes on through a gap between chunks of an answer that is still being spoken: the next chunk, within the window, keeps it', async () => {
       const run = start();
       const socket = await speaking(run);
       socket.say(audioDelta(0));
+      vi.useFakeTimers();
 
-      // TTS lags real time: the queue runs dry before the next chunk arrives. The drain hook
-      // fires (it reports the gap), but the answer is not over.
+      // TTS lags real time: the queue runs dry before the next section's audio arrives. The drain
+      // hook fires (it reports the gap), but the answer may not be over.
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+      expect(run.playing).toEqual([true]);
+      vi.advanceTimersByTime(PLAYING_GAP_MS - 1);
+      expect(run.playing).toEqual([true]);
+
+      // The next section arrives inside the window: the pending end is void, however long it
+      // would have taken.
+      socket.say(audioDelta(1));
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(PLAYING_GAP_MS * 3);
+
+      expect(run.playing).toEqual([true]);
+      run.session.stop();
+    });
+
+    it('a second drain restarts the window: it is counted from the last one, not the first', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      vi.useFakeTimers();
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+      vi.advanceTimersByTime(PLAYING_GAP_MS - 200);
+
+      // The queue is reported dry again inside the window (a pause and its resume, a stale
+      // signal): the clock starts over, and only one window is ever open.
+      run.players[0].onEmpty!();
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(PLAYING_GAP_MS - 1);
+      expect(run.playing).toEqual([true]);
+      vi.advanceTimersByTime(1);
+
+      expect(run.playing).toEqual([true, false]);
+      run.session.stop();
+    });
+
+    it('ends after the window when the queue stays dry in speaking: the last section has played out while the gateway still writes the detail', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      vi.useFakeTimers();
+
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+      expect(run.playing).toEqual([true]);
+      vi.advanceTimersByTime(PLAYING_GAP_MS - 1);
+      expect(run.playing).toEqual([true]);
+      vi.advanceTimersByTime(1);
+
+      // Nothing audible is left, and the gateway is still `speaking`: the controls go, so that
+      // "Stop playback" is not offered for an answer whose audio is over.
+      expect(run.playing).toEqual([true, false]);
+      // The session itself goes on, and says nothing more.
+      expect(run.states.at(-1)).toBe('speaking');
+      run.session.stop();
+    });
+
+    it('a later section after the window re-asserts it: the controls come back for it', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      vi.useFakeTimers();
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+      vi.advanceTimersByTime(PLAYING_GAP_MS);
+      expect(run.playing).toEqual([true, false]);
+
+      socket.say(audioDelta(1, [1, 0, 2, 0], 24000, 1));
+
+      expect(run.playing).toEqual([true, false, true]);
+      // ... and that one's own drain starts a window again.
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+      vi.advanceTimersByTime(PLAYING_GAP_MS);
+      expect(run.playing).toEqual([true, false, true, false]);
+      run.session.stop();
+    });
+
+    it('does not end the audio while it is paused, nor at the window if a chunk is still queued', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      vi.useFakeTimers();
       run.players[0].pending = 0;
       run.players[0].onEmpty!();
 
+      // A pause taken inside the window holds the audio: a pause is not a drain.
+      run.session.pause();
+      vi.advanceTimersByTime(PLAYING_GAP_MS * 2);
       expect(run.playing).toEqual([true]);
+
+      // Audio still queued at the window's end is still to be heard.
+      run.session.resume();
+      socket.say(audioDelta(1));
+      run.players[0].onEmpty!();
+      run.players[0].pending = 1;
+      vi.advanceTimersByTime(PLAYING_GAP_MS);
+      expect(run.playing).toEqual([true]);
+      run.session.stop();
+    });
+
+    it('the window is cleaned up with the answer: a stop, a cancel, a next answer and the end of the session leave no timer to fire late', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      vi.useFakeTimers();
+      const dry = () => {
+        run.players.at(-1)!.pending = 0;
+        run.players.at(-1)!.onEmpty!();
+      };
+
+      // stopSpeaking and cancel: the end is reported at once, and nothing is left pending.
+      socket.say(audioDelta(0));
+      dry();
+      expect(vi.getTimerCount()).toBe(1);
+      run.session.stopSpeaking();
+      expect(vi.getTimerCount()).toBe(0);
+      socket.say(audioDelta(0));
+      dry();
+      run.session.cancel();
+      expect(vi.getTimerCount()).toBe(0);
+
+      // The next answer (chunk 0) while a window of the last is open: it is not ended by it.
+      socket.say(audioDelta(0));
+      dry();
+      socket.say(audioDelta(0));
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(PLAYING_GAP_MS * 2);
+      expect(run.playing.at(-1)).toBe(true);
+
+      // The end of the session.
+      dry();
+      expect(vi.getTimerCount()).toBe(1);
+      const before = [...run.playing];
+      run.session.stop();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(PLAYING_GAP_MS * 2);
+      expect(run.playing).toEqual(before);
+    });
+
+    it('the gateway moving on within the window ends it at once, and leaves no timer: draining with all played out, and listening', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      vi.useFakeTimers();
+      run.players[0].pending = 0;
+      run.players[0].onEmpty!();
+      expect(vi.getTimerCount()).toBe(1);
+
+      socket.say({ type: 'audio_done' });
+      socket.say({ type: 'state', state: 'draining' });
+
+      expect(run.playing).toEqual([true, false]);
+      expect(vi.getTimerCount()).toBe(0);
+
+      socket.say(audioDelta(0));
+      run.players[1].pending = 0;
+      run.players[1].onEmpty!();
+      socket.say({ type: 'state', state: 'listening' });
+      expect(run.playing).toEqual([true, false, true, false]);
+      expect(vi.getTimerCount()).toBe(0);
       run.session.stop();
     });
 
@@ -1289,6 +1448,48 @@ describe('createVoiceSession in a (fake) browser', () => {
       run.session.resume();
 
       expect(run.playing).toEqual([true, false]);
+      run.session.stop();
+    });
+
+    it('a resume that finds nothing queued while still speaking sends the drain, and keeps the controls for the window (more audio may follow)', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      socket.say(audioDelta(1));
+      run.session.pause();
+      run.players[0].pending = 0; // everything it held had already been heard
+      vi.useFakeTimers();
+
+      run.session.resume();
+
+      // The drain signal comes after the resume frame, in speaking as in draining ...
+      expect(socket.controls()).toEqual([
+        { type: 'pause' },
+        { type: 'resume' },
+        { type: 'playback_done', played_through: 2 },
+      ]);
+      // ... but the answer is not over: the gateway may still send the next section, so the
+      // controls stay (unlike the same resume while draining, which ends them at once).
+      expect(run.playing).toEqual([true]);
+      // Nothing came: after the window the audio is over, though the gateway still speaks.
+      vi.advanceTimersByTime(PLAYING_GAP_MS);
+      expect(run.playing).toEqual([true, false]);
+      run.session.stop();
+    });
+
+    it('a chunk after such a resume keeps the controls', async () => {
+      const run = start();
+      const socket = await speaking(run);
+      socket.say(audioDelta(0));
+      run.session.pause();
+      run.players[0].pending = 0;
+      vi.useFakeTimers();
+      run.session.resume();
+
+      socket.say(audioDelta(1));
+      vi.advanceTimersByTime(PLAYING_GAP_MS * 2);
+
+      expect(run.playing).toEqual([true]);
       run.session.stop();
     });
 

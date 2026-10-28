@@ -1019,6 +1019,20 @@ describe('the words of the playback controls and the microphone mute', () => {
     expect(messages.de[key]).not.toBe(messages.en[key]);
   });
 
+  // Cancel (the whole answer) and Stop (its speech) are on screen together while the answer is
+  // spoken, and one abandons what the other only silences: the words must not read as synonyms.
+  it('words cancelling the whole answer and stopping its speech apart: no word in common', () => {
+    for (const locale of ['en', 'de'] as const) {
+      const words = (text: string) => new Set(text.toLowerCase().split(/[\s-]+/));
+      const cancel = words(messages[locale].chatVoiceCancel);
+      const stop = words(messages[locale].chatVoiceStopPlayback);
+      expect(
+        [...cancel].filter((word) => stop.has(word)),
+        locale,
+      ).toEqual([]);
+    }
+  });
+
   it('gives every control of one row a name of its own, so a screen reader tells them apart', () => {
     for (const locale of ['en', 'de'] as const) {
       const names = [

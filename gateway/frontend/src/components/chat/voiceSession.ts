@@ -358,9 +358,11 @@ export type VoiceSessionArgs = {
   /**
    * Whether the answer's audio is being heard (`true`) or not (`false`): it is, from the first
    * chunk that is played until the answer has played out -- the queue running dry once the answer
-   * has been sent in full (the gateway draining), whatever the gateway's own tail does after it --
-   * and it is not once something else ends the answer (a stop, a cancel, a failed turn, the next
-   * answer, the gateway going back to listening). A pause does not end it: held audio is still
+   * has been sent in full (the gateway draining), whatever the gateway's own tail does after it,
+   * or running dry while the gateway is still speaking and staying dry for PLAYING_GAP_MS (the
+   * last spoken section is over and the gateway goes on writing; a later section brings it back)
+   * -- and it is not once something else ends the answer (a stop, a cancel, a failed turn, the
+   * next answer, the gateway going back to listening). A pause does not end it: held audio is still
    * to be heard. It is what the controls of the playback are shown for.
    */
   onPlayingChange?(playing: boolean): void;
@@ -409,6 +411,17 @@ export type VoiceSession = {
 };
 
 const defaultCreatePlayer = (ctx: PlaybackContext): VoicePlayer => new StreamingPcmPlayer(ctx);
+
+/**
+ * How long the answer's queue must stay dry, while the gateway is still `speaking`, before its
+ * audio is taken as played out (see onPlayingChange). The gateway only says the answer is over
+ * (`audio_done`, then `draining`) when the whole run has finished, and with spoken summaries the
+ * model goes on writing the detail long after the last summary has been heard: nothing audible is
+ * left then, yet the state is still `speaking`. A gap between two sections -- the synthesis of the
+ * next one not yet caught up -- is shorter than this, so the next chunk arrives inside the window
+ * and keeps the audio going; a real end has no next chunk.
+ */
+export const PLAYING_GAP_MS = 1200;
 
 /**
  * Start a Voice Chat session: the microphone, the connection, and the conversation.
@@ -497,6 +510,26 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     if (!over) args.onPlayingChange?.(next);
   };
 
+  // The window of a queue that ran dry in `speaking` (PLAYING_GAP_MS): when it runs out with
+  // nothing queued and nothing held by a pause, the audio is over.
+  let playingGapTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearPlayingGap = () => {
+    clearTimeout(playingGapTimer);
+    playingGapTimer = undefined;
+  };
+  const armPlayingGap = () => {
+    clearPlayingGap();
+    playingGapTimer = setTimeout(() => {
+      playingGapTimer = undefined;
+      if (playedOut()) setPlaying(false);
+    }, PLAYING_GAP_MS);
+  };
+  // The audio is over now: no window is left to end it again, or to end the next answer's.
+  const endPlaying = () => {
+    clearPlayingGap();
+    setPlaying(false);
+  };
+
   // Silence what is playing and forget the stream it was part of -- and with it a pause: the
   // answer it was a pause of is gone, and the next one starts playing.
   const stopPlayback = () => {
@@ -506,12 +539,14 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     heardSections = [];
     currentOrdinal = -1;
     setPaused(false);
-    setPlaying(false);
+    endPlaying();
   };
 
   // Nothing of the answer is left to hear: not held by a pause, and nothing queued. (No player at
   // all -- no audio came -- is nothing to hear as well.)
-  const playedOut = () => !paused && (player?.pending ?? 0) === 0;
+  function playedOut(): boolean {
+    return !paused && (player?.pending ?? 0) === 0;
+  }
 
   // Ends the session for good: everything is released first, then `notify` (the onError that says
   // why) and the final state are delivered. The first call wins.
@@ -655,8 +690,11 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       player.onEmpty = () => {
         sendControl('playback_done', { played_through: receivedChunks });
         // Once the answer has been sent in full (the gateway is draining) a queue that runs dry is
-        // the answer played out; before that it is only a gap between chunks of one still coming.
-        if (state === 'draining') setPlaying(false);
+        // the answer played out. Before that it is a gap between chunks of one still coming, or
+        // the last section played out while the gateway goes on writing: the next chunk, if
+        // there is one, arrives within the window and keeps the audio going.
+        if (state === 'draining') endPlaying();
+        else if (state === 'speaking') armPlayingGap();
       };
     }
     if (bytes === null || !player.push(bytes, frame.rate)) {
@@ -666,6 +704,8 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     // there is nothing live to attribute (the stored turn's audio is what is replayed).
     if (playState.phase !== 'abandoned') {
       attributeSection(frame.section ?? 0);
+      // More audio: a window of a dry queue that is open is void.
+      clearPlayingGap();
       setPlaying(true);
     }
   };
@@ -682,8 +722,8 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
         if (paused && frame.state !== 'speaking' && frame.state !== 'draining') stopPlayback();
         // The answer is only heard in these two states. In `draining` it is sent in full: what
         // has already played out (all of it, during the run) leaves nothing more to hear.
-        if (frame.state !== 'speaking' && frame.state !== 'draining') setPlaying(false);
-        else if (frame.state === 'draining' && playedOut()) setPlaying(false);
+        if (frame.state !== 'speaking' && frame.state !== 'draining') endPlaying();
+        else if (frame.state === 'draining' && playedOut()) endPlaying();
         setState(frame.state);
         break;
       case 'asr_partial':
@@ -908,7 +948,10 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       // shut until the gateway's ceiling.
       if (player.pending === 0) {
         sendControl('playback_done', { played_through: receivedChunks });
-        if (state === 'draining') setPlaying(false);
+        // As for a queue that ran dry (onEmpty): in draining it is the end; still speaking, the
+        // next section may follow, so the end is only taken once the window has run out.
+        if (state === 'draining') endPlaying();
+        else if (state === 'speaking') armPlayingGap();
       }
     },
     stopSpeaking() {

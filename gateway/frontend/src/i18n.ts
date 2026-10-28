@@ -394,24 +394,26 @@ const de = {
   chatVoiceMicPaused:
     'Das Mikrofon ist pausiert, bis die Antwort zu Ende gesprochen ist. Sie werden gerade nicht gehört.',
   chatVoiceIdleHint: 'Halten Sie die Sprechtaste, um zu sprechen.',
-  // The controls: push-to-talk (held while talking), stopping an answer, dismissing a refusal; and
-  // the names of the two regions of the turn in progress (what was said, and the answer so far).
+  // The controls: push-to-talk (held while talking), cancelling the whole answer, dismissing a
+  // refusal; and the names of the two regions of the turn in progress (what was said, and the
+  // answer so far). Cancelling the answer and stopping its speech (chatVoiceStopPlayback, below)
+  // are on screen together while it is spoken, and are worded apart: one abandons the whole
+  // answer, the other only stops it being read aloud.
   chatVoicePushToTalk: 'Zum Sprechen gedrückt halten',
-  chatVoiceCancel: 'Antwort abbrechen',
+  chatVoiceCancel: 'Ganze Antwort abbrechen',
   chatVoiceDismiss: 'Schließen',
   chatVoiceTranscript: 'Ihre Worte',
   chatVoiceAnswer: 'Antwort',
   // The controls of the answer while it is heard (#315): pause and resume it, mute its speakers
-  // (it plays on, silently), or stop the playback (the answer is cut short, the conversation goes
-  // on). Stopping the playback is not cancelling the turn (chatVoiceCancel), so it is worded as
-  // what it does. Beside them the mute of the user's own microphone, which is there whenever the
+  // (it plays on, silently), or stop its speech (it is cut short and the microphone reopens).
+  // That is not cancelling the whole answer (chatVoiceCancel), so it is worded as what it does. Beside them the mute of the user's own microphone, which is there whenever the
   // conversation is on, with the indicator's words for a user who is not heard because of it.
   chatVoicePlayback: 'Wiedergabe der Antwort',
   chatVoicePause: 'Pausieren',
   chatVoiceResume: 'Fortsetzen',
   chatVoiceMute: 'Antwort stumm schalten',
   chatVoiceUnmute: 'Antwort-Ton einschalten',
-  chatVoiceStopPlayback: 'Wiedergabe stoppen',
+  chatVoiceStopPlayback: 'Vorlesen beenden',
   chatVoiceMicMute: 'Mikrofon stumm schalten',
   chatVoiceMicUnmute: 'Mikrofon einschalten',
   chatVoiceStatePaused: 'Antwort pausiert',
@@ -3860,7 +3862,7 @@ const en: PortalMessages = {
     'The microphone is paused until the answer has been spoken. You are not being heard right now.',
   chatVoiceIdleHint: 'Hold the talk button to speak.',
   chatVoicePushToTalk: 'Hold to talk',
-  chatVoiceCancel: 'Stop answer',
+  chatVoiceCancel: 'Cancel whole answer',
   chatVoiceDismiss: 'Dismiss',
   chatVoiceTranscript: 'Your words',
   chatVoiceAnswer: 'Answer',
@@ -3869,7 +3871,7 @@ const en: PortalMessages = {
   chatVoiceResume: 'Resume',
   chatVoiceMute: 'Mute answer',
   chatVoiceUnmute: 'Unmute answer',
-  chatVoiceStopPlayback: 'Stop playback',
+  chatVoiceStopPlayback: 'Stop speaking',
   chatVoiceMicMute: 'Mute microphone',
   chatVoiceMicUnmute: 'Unmute microphone',
   chatVoiceStatePaused: 'Answer paused',
