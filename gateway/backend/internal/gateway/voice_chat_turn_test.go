@@ -49,9 +49,36 @@ type voiceLoopProvider struct {
 	speechFrames string
 	speechBodies chan []byte
 
+	// speechChunkFrames / speechTrailer / speechGate drive a GATED speech body: when speechGate is
+	// non-nil the TTS leg streams the FIRST frame immediately and holds the rest until the gate
+	// closes, so a test can relay a second audio chunk at a controlled time (e.g. after a
+	// mid-stream playback_done). With no gate the body is the whole speechFrames string at once.
+	speechChunkFrames []string
+	speechTrailer     string
+	speechGate        <-chan struct{}
+
 	llmErr        error  // when set, the LLM leg fails
 	speechStatus  int    // when non-zero, the TTS leg answers this status with speechErrBody
 	speechErrBody string // the error envelope the TTS leg returns under speechStatus
+}
+
+// gatedSpeechBody streams a speech event body with the first frame sent immediately and the rest
+// held until gate closes. Writes go through an io.Pipe (synchronous), so each frame is produced
+// only once the reader has consumed the previous one -- a deterministic inter-chunk gap for a test.
+func gatedSpeechBody(frames []string, trailer string, gate <-chan struct{}) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		if len(frames) > 0 {
+			_, _ = io.WriteString(pw, frames[0])
+		}
+		<-gate
+		for _, f := range frames[1:] {
+			_, _ = io.WriteString(pw, f)
+		}
+		_, _ = io.WriteString(pw, trailer)
+		_ = pw.Close()
+	}()
+	return pr
 }
 
 func (p voiceLoopProvider) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit provider.StreamEmit) error {
@@ -74,10 +101,14 @@ func (p voiceLoopProvider) ProxyNative(ctx context.Context, target routing.Targe
 				Body:       io.NopCloser(strings.NewReader(p.speechErrBody)),
 			}, nil
 		}
+		body := io.NopCloser(strings.NewReader(p.speechFrames))
+		if p.speechGate != nil {
+			body = gatedSpeechBody(p.speechChunkFrames, p.speechTrailer, p.speechGate)
+		}
 		return &provider.ProxyResponse{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body:       io.NopCloser(strings.NewReader(p.speechFrames)),
+			Body:       body,
 		}, nil
 	}
 	return p.Mock.ProxyNative(ctx, target, path, body, contentType)
@@ -111,6 +142,9 @@ type voiceTurnOpts struct {
 	timing        voiceTiming
 	chatStore     portal.ChatStore // defaults to a plain in-memory store
 	speechPCM     [][]byte         // the PCM chunks the TTS stream carries; defaults to voiceTestPCM
+	// speechGate, when non-nil, holds every speech frame AFTER the first until the channel closes,
+	// so a test can relay a second audio chunk at a controlled time. Needs speechPCM with >= 2 chunks.
+	speechGate <-chan struct{}
 }
 
 func newVoiceTurnHarness(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnOpts) *voiceTurnHarness {
@@ -120,19 +154,23 @@ func newVoiceTurnHarness(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnO
 	if len(opts.speechPCM) > 0 {
 		chunks = opts.speechPCM
 	}
-	frames := ""
+	frameList := make([]string, 0, len(chunks))
 	for _, c := range chunks {
-		frames += speechFrameDelta(c)
+		frameList = append(frameList, speechFrameDelta(c))
 	}
-	frames += speechSSEDone + speechSSEEnd
+	trailer := speechSSEDone + speechSSEEnd
+	frames := strings.Join(frameList, "") + trailer
 	prov := voiceLoopProvider{
-		Mock:          provider.Mock{Delay: opts.llmDelay},
-		duplex:        provider.NewOpenAICompatibleClient(http.DefaultClient),
-		speechFrames:  frames,
-		speechBodies:  make(chan []byte, 8),
-		llmErr:        opts.llmErr,
-		speechStatus:  opts.speechStatus,
-		speechErrBody: opts.speechErrBody,
+		Mock:              provider.Mock{Delay: opts.llmDelay},
+		duplex:            provider.NewOpenAICompatibleClient(http.DefaultClient),
+		speechFrames:      frames,
+		speechChunkFrames: frameList,
+		speechTrailer:     trailer,
+		speechGate:        opts.speechGate,
+		speechBodies:      make(chan []byte, 8),
+		llmErr:            opts.llmErr,
+		speechStatus:      opts.speechStatus,
+		speechErrBody:     opts.speechErrBody,
 	}
 
 	var chats portal.ChatStore = store.NewMemoryChatStore(0)
@@ -1157,6 +1195,66 @@ func TestVoiceConcurrentEarlyPlaybackDoneClampedToFloor(t *testing.T) {
 
 	// It still ends at the floor (the remembered signal is honored once the floor passes), not at
 	// the 30s ceiling.
+	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer lcancel()
+	readVoiceUntilState(t, lctx, conn, voiceStateListening)
+}
+
+// TestVoiceConcurrentMidStreamGapSignalDoesNotEndDrainEarly guards the half-duplex loop against
+// the remembered-signal fix itself. The client's player fires onEmpty -- and sends playback_done
+// -- on EVERY queue drain, including a gap between TTS chunks when TTS lags real time, not only at
+// the true end. A gap signal remembered mid-stream must NOT end the drain while later audio is
+// still playing. Here chunk A is relayed, a gap playback_done arrives, THEN chunk B is relayed
+// (which clears the remembered signal) and the turn commits; the mic must stay gated until the
+// genuine end-of-audio signal, never re-opening on the stale gap signal (echo exposure).
+func TestVoiceConcurrentMidStreamGapSignalDoesNotEndDrainEarly(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{concurrentSpeakFinal}
+	timing := turnGraceTiming()
+	timing.micResumeTail = 30 * time.Millisecond
+	// Two summary chunks (~0.1s floor each, ~0.2s total). The gate holds chunk B until the test
+	// releases it -- after a gap playback_done -- so B is relayed AFTER the gap signal is seen.
+	gate := make(chan struct{})
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+		timing:     timing,
+		speechPCM:  [][]byte{speechPCM(88200/10, 1), speechPCM(88200/10, 2)},
+		speechGate: gate,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	conn.SetReadLimit(1 << 21)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	if f := drainAChunk(t, ctx, conn); !strings.Contains(f, "hi") {
+		t.Fatalf("asr_final = %q, want it to carry the spoken summary text", f)
+	}
+	// Chunk A is relayed at window close -> speaking.
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDelta)
+
+	// A GAP playback_done (the player's queue drained between chunks) arrives while speaking --
+	// remembered by the fix. Let the ~0.2s floor elapse so a stale signal would be able to end the
+	// drain the moment the turn commits.
+	sendVoiceControl(t, ctx, conn, "playback_done")
+	time.Sleep(500 * time.Millisecond)
+
+	// Release chunk B: relaying it CLEARS the remembered gap signal, then the turn commits. B is
+	// published before the run's terminal, so it is relayed -- and the signal cleared -- before the
+	// post-commit drain begins.
+	close(gate)
+	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
+
+	// Past the mic-resume tail: with the fix the mic is still gated (the gap signal was cleared, so
+	// the drain waits for the genuine end-of-audio signal); without it the stale gap signal has
+	// already re-opened the mic. A burst now must be discarded.
+	beforeConns, beforeBytes := child.snapshot()
+	time.Sleep(150 * time.Millisecond)
+	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+		"a mid-stream gap playback_done re-opened the mic before the genuine end-of-audio signal (echo exposure)")
+
+	// The genuine end-of-audio signal (nothing relayed after it) ends the drain.
+	sendVoiceControl(t, ctx, conn, "playback_done")
 	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
 	defer lcancel()
 	readVoiceUntilState(t, lctx, conn, voiceStateListening)

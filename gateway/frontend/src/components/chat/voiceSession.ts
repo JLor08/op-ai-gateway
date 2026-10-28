@@ -486,9 +486,11 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       player = createPlayer(context as unknown as PlaybackContext);
       // The #304 drain hook: when this answer's player has played its queue out, tell the
       // gateway playout is done so it can end its half-duplex drain at true playout-done, not
-      // relay-done (spec 6.2). A fresh player is made per answer, so it is wired per player
-      // here. The gateway ignores the signal unless it is draining and applies its own
-      // fallback, so an early or repeated call cannot move a session that is not waiting on it.
+      // relay-done (spec 6.2). A fresh player is made per answer, so it is wired per player here.
+      // onEmpty fires on EVERY queue drain -- including a gap between chunks when TTS lags real
+      // time, and while the gateway is still speaking in the concurrent flow -- so the gateway
+      // remembers the latest signal and clears it whenever it relays another chunk, keeping only
+      // the genuine end-of-audio signal, and never ends the drain below its server-side floor.
       player.onEmpty = () => sendControl('playback_done');
     }
     if (bytes === null || !player.push(bytes, frame.rate)) {

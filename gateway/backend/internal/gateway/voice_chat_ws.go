@@ -642,8 +642,11 @@ type voiceMachine struct {
 	//   - firstAudioAt/relayedPlaybackDur accumulate as audio is relayed; playbackRateUnknown
 	//     drops the computed floor (the ceiling is then the only bound) for a chunk with no
 	//     usable rate (defensive).
-	//   - awaitingPlayback is set for the whole wait; playbackSignaled records a playback_done
-	//     seen during it; playbackFloorPassed latches when the floor elapses (then the timer is
+	//   - awaitingPlayback is set for the whole wait; playbackSignaled records that a playback_done
+	//     has been seen (at ANY time, including while still speaking in the concurrent flow) with
+	//     no chunk relayed since -- it is cleared per turn (beginAnswer) AND on every relayed chunk
+	//     (relayAudio), so only a signal after the last chunk, the genuine end of audio, survives
+	//     to end the drain; playbackFloorPassed latches when the floor elapses (then the timer is
 	//     re-armed to the ceiling to wait out a slow or absent signal).
 	// All are reset per turn in beginAnswer. The mic STAYS discarded for the whole draining
 	// period regardless (micOpen); only the EXIT moment moves from relay-done to playout-done.
@@ -870,9 +873,11 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 		m.pendingText = ""
 		m.setState(voiceStateListening)
 	case voiceUpPlaybackDone:
-		// The client's audio player finished playing the answer out. If we are draining and
-		// waiting on it, this is the signal to end the drain (spec 6.2); otherwise it is a
-		// stray or late frame and cannot move a session that is not awaiting playout.
+		// The client's audio player reported its queue drained. In the concurrent flow this can
+		// arrive while still speaking (the summary drained before the detail committed) or in a
+		// gap between chunks, so it is REMEMBERED, not dropped -- a later relayed chunk clears it,
+		// so only the genuine end-of-audio signal survives to end the drain (spec 6.2). It still
+		// never shortens the drain below the floor.
 		m.onPlaybackDone()
 	}
 }
@@ -1172,6 +1177,13 @@ func (m *voiceMachine) flushAudioBuf() {
 // fallback can bound the wait.
 func (m *voiceMachine) relayAudio(a runAudio) {
 	m.accountPlayback(a)
+	// A newly relayed chunk invalidates any end-of-playout signal remembered so far. The client's
+	// onEmpty fires on EVERY queue drain -- including an inter-chunk gap when TTS lags real time,
+	// not just the true end -- so a playback_done seen before this chunk was NOT the end of audio.
+	// Only a signal with no chunk relayed after it is the genuine end (in the concurrent flow the
+	// post-summary signal, since the detail is text-only), so clearing here keeps a mid-stream gap
+	// signal from ending the drain while later audio is still playing (half-duplex echo exposure).
+	m.playbackSignaled = false
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Rate: a.Rate, Audio: a.Data})
 }
 
