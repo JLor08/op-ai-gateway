@@ -29,11 +29,18 @@ function makeVoice(over: Partial<VoiceChatApi> = {}): VoiceChatApi {
     liveTranscript: '',
     answerPreview: '',
     error: null,
+    paused: false,
+    micMuted: false,
+    audioSection: null,
     start: vi.fn(),
     stop: vi.fn(),
     pushStart: vi.fn(),
     pushEnd: vi.fn(),
     cancel: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    stopSpeaking: vi.fn(),
+    toggleMicMute: vi.fn(),
     ...over,
   };
 }

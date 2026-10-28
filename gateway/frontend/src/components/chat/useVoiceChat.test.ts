@@ -4,6 +4,7 @@
 import { act, cleanup, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type {
+  VoiceAudioSection,
   VoiceErrorDetail,
   VoiceSessionArgs,
   VoiceSessionState,
@@ -23,6 +24,10 @@ type FakeSession = {
   pushStart: Mock<() => void>;
   pushEnd: Mock<() => void>;
   cancel: Mock<() => void>;
+  pause: Mock<() => void>;
+  resume: Mock<() => void>;
+  stopSpeaking: Mock<() => void>;
+  setMicMuted: Mock<(muted: boolean) => void>;
   stop: Mock<() => void>;
 };
 
@@ -38,6 +43,9 @@ const emit = {
   answerDone: (s: FakeSession) => act(() => s.args.onAnswer({ text: '', done: true })),
   answerReset: (s: FakeSession) => act(() => s.args.onAnswerReset()),
   audioDone: (s: FakeSession) => act(() => s.args.onAudioDone()),
+  paused: (s: FakeSession, paused: boolean) => act(() => s.args.onPausedChange?.(paused)),
+  audioSection: (s: FakeSession, attribution: VoiceAudioSection) =>
+    act(() => s.args.onAudioSection?.(attribution)),
   turnError: (s: FakeSession, code?: string, message = 'the turn failed') =>
     act(() => s.args.onError(message, { kind: 'turn', ...(code === undefined ? {} : { code }) })),
   failed: (s: FakeSession, detail: VoiceErrorDetail, message = 'the session failed') =>
@@ -63,6 +71,10 @@ beforeEach(() => {
       pushStart: vi.fn(),
       pushEnd: vi.fn(),
       cancel: vi.fn(),
+      pause: vi.fn(),
+      resume: vi.fn(),
+      stopSpeaking: vi.fn(),
+      setMicMuted: vi.fn(),
       stop: vi.fn(),
     };
     sessions.push(session);
@@ -115,6 +127,10 @@ function setup(
     pushStart: () => act(() => view.result.current.pushStart()),
     pushEnd: () => act(() => view.result.current.pushEnd()),
     cancel: () => act(() => view.result.current.cancel()),
+    pause: () => act(() => view.result.current.pause()),
+    resume: () => act(() => view.result.current.resume()),
+    stopSpeaking: () => act(() => view.result.current.stopSpeaking()),
+    toggleMicMute: () => act(() => view.result.current.toggleMicMute()),
   };
 }
 
@@ -197,6 +213,9 @@ describe('useVoiceChat', () => {
         liveTranscript: '',
         answerPreview: '',
         error: null,
+        paused: false,
+        micMuted: false,
+        audioSection: null,
       });
     });
   });
@@ -408,6 +427,292 @@ describe('useVoiceChat', () => {
 
       expect(sessions).toHaveLength(0);
       expect(h.voice().state).toBe('off');
+    });
+  });
+
+  describe('playback controls: pause, resume and stopping the spoken answer', () => {
+    it('start with nothing paused or muted', () => {
+      const h = setup();
+      expect(h.voice()).toMatchObject({ paused: false, micMuted: false, audioSection: null });
+    });
+
+    it('pause and resume go to the session', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+
+      h.pause();
+      h.resume();
+
+      expect(session.pause).toHaveBeenCalledTimes(1);
+      expect(session.resume).toHaveBeenCalledTimes(1);
+    });
+
+    it('paused is what the session reports: set by a pause, cleared by whatever ends it', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+
+      emit.paused(session, true);
+      expect(h.voice().paused).toBe(true);
+
+      emit.paused(session, false);
+      expect(h.voice().paused).toBe(false);
+    });
+
+    it('does not claim a pause the session has not confirmed (the session drops a pause when nothing plays)', () => {
+      const h = setup();
+      const session = listening(h);
+
+      h.pause();
+
+      expect(session.pause).toHaveBeenCalledTimes(1);
+      expect(h.voice().paused).toBe(false);
+    });
+
+    it('stopSpeaking tells the session to cut the answer short, and the conversation goes on', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+
+      h.stopSpeaking();
+
+      expect(session.stopSpeaking).toHaveBeenCalledTimes(1);
+      // Not the hook's own stop: the conversation is not torn down.
+      expect(session.stop).not.toHaveBeenCalled();
+      expect(h.voice().state).toBe('speaking'); // the gateway says when it is listening again
+    });
+
+    it('stopSpeaking drops what was shown of the turn that was cut short, and reloads the thread', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.final(session, 'Tell me a story.');
+      emit.state(session, 'speaking');
+      emit.delta(session, 'Once upon');
+      emit.audioSection(session, { section: 0, ordinal: 0 });
+
+      h.stopSpeaking();
+
+      // The gateway cancels the turn or lets its commit finish, and says nothing either way:
+      // the preview of it goes, and the thread is reloaded as it is for a turn that failed.
+      expect(h.voice()).toMatchObject({
+        liveTranscript: '',
+        answerPreview: '',
+        audioSection: null,
+      });
+      expect(h.refreshThread).toHaveBeenCalledTimes(1);
+      expect(h.refreshThread).toHaveBeenCalledWith('c1');
+    });
+
+    it('stopSpeaking while listening leaves what the user is saying alone', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.partial(session, 'still talking');
+
+      h.stopSpeaking();
+
+      // The session is told (it is safe at any time, and the gateway ignores it), but there is
+      // no answer being spoken whose preview could be dropped.
+      expect(session.stopSpeaking).toHaveBeenCalledTimes(1);
+      expect(h.voice().liveTranscript).toBe('still talking');
+      expect(h.refreshThread).not.toHaveBeenCalled();
+    });
+
+    it('stopSpeaking after the turn is committed (draining) reloads nothing: audio_done already did', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+      emit.audioDone(session);
+      emit.state(session, 'draining');
+      h.refreshThread.mockClear();
+
+      h.stopSpeaking();
+
+      expect(session.stopSpeaking).toHaveBeenCalledTimes(1);
+      expect(h.refreshThread).not.toHaveBeenCalled();
+    });
+
+    it('do nothing without a session', () => {
+      const h = setup();
+
+      h.pause();
+      h.resume();
+      h.stopSpeaking();
+      h.toggleMicMute();
+
+      expect(sessions).toHaveLength(0);
+      expect(h.voice()).toMatchObject({ state: 'off', paused: false, micMuted: false });
+      expect(h.refreshThread).not.toHaveBeenCalled();
+    });
+
+    it('a pause does not outlive the conversation, nor start the next one paused', () => {
+      const h = setup();
+      const first = listening(h);
+      emit.paused(first, true);
+      expect(h.voice().paused).toBe(true);
+
+      h.stop();
+      expect(h.voice().paused).toBe(false);
+      // The session that was let go of is deaf, and cannot pause the display again.
+      emit.paused(first, true);
+      expect(h.voice().paused).toBe(false);
+
+      h.start();
+      expect(h.voice().paused).toBe(false);
+    });
+
+    it('a pause is cleared when the conversation fails', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.paused(session, true);
+
+      emit.failed(session, { kind: 'dropped' });
+
+      expect(h.voice().paused).toBe(false);
+    });
+
+    it('stop is still the end of the conversation, not a control of the answer', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+
+      h.stop();
+
+      expect(session.stop).toHaveBeenCalledTimes(1);
+      expect(session.stopSpeaking).not.toHaveBeenCalled();
+      expect(h.voice().state).toBe('off');
+    });
+  });
+
+  describe('the microphone mute', () => {
+    it('toggleMicMute mutes the session`s microphone, and unmutes it the next time', () => {
+      const h = setup();
+      const session = listening(h);
+
+      h.toggleMicMute();
+      expect(session.setMicMuted).toHaveBeenLastCalledWith(true);
+      expect(h.voice().micMuted).toBe(true);
+
+      h.toggleMicMute();
+      expect(session.setMicMuted).toHaveBeenLastCalledWith(false);
+      expect(h.voice().micMuted).toBe(false);
+      expect(session.setMicMuted).toHaveBeenCalledTimes(2);
+    });
+
+    it('is available whenever the conversation is on, whatever the gateway is doing', () => {
+      const h = setup();
+      const session = listening(h);
+
+      for (const state of ['thinking', 'speaking', 'draining', 'idle'] as const) {
+        emit.state(session, state);
+        h.toggleMicMute();
+      }
+
+      expect(session.setMicMuted.mock.calls).toEqual([[true], [false], [true], [false]]);
+    });
+
+    it('is a mute of the microphone only: the turn on screen and the answer are untouched', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.partial(session, 'half a sentence');
+
+      h.toggleMicMute();
+
+      expect(h.voice()).toMatchObject({ liveTranscript: 'half a sentence', state: 'listening' });
+      expect(session.cancel).not.toHaveBeenCalled();
+      expect(session.pause).not.toHaveBeenCalled();
+    });
+
+    it('is cleared by the end of the conversation: the next one starts with a live microphone', () => {
+      const h = setup();
+      const first = listening(h);
+      h.toggleMicMute();
+      expect(h.voice().micMuted).toBe(true);
+
+      h.stop();
+      expect(h.voice().micMuted).toBe(false);
+
+      h.start();
+      expect(h.voice().micMuted).toBe(false);
+      // And the toggle is a mute again, not an unmute of a mute that is gone.
+      const second = sessions[1];
+      emit.state(second, 'listening');
+      h.toggleMicMute();
+      expect(second.setMicMuted).toHaveBeenCalledWith(true);
+      expect(first.setMicMuted).toHaveBeenCalledTimes(1);
+    });
+
+    it('is cleared when the conversation fails', () => {
+      const h = setup();
+      const session = listening(h);
+      h.toggleMicMute();
+
+      emit.failed(session, { kind: 'capture' });
+
+      expect(h.voice().micMuted).toBe(false);
+    });
+
+    it('survives a failed turn: the conversation is still on, and so is the mute', () => {
+      const h = setup();
+      const session = listening(h);
+      h.toggleMicMute();
+
+      emit.turnError(session, 'speech.upstream_error');
+
+      expect(h.voice().micMuted).toBe(true);
+    });
+  });
+
+  describe('the section the live audio belongs to', () => {
+    it('follows the session, including across a gap in the gateway`s section indices', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.state(session, 'speaking');
+
+      emit.audioSection(session, { section: 0, ordinal: 0 });
+      expect(h.voice().audioSection).toEqual({ section: 0, ordinal: 0 });
+
+      // Section 1's speech failed, so the next one the gateway tags is 2: the second block.
+      emit.audioSection(session, { section: 2, ordinal: 1 });
+      expect(h.voice().audioSection).toEqual({ section: 2, ordinal: 1 });
+    });
+
+    it('is dropped with the turn: at its commit, at a cancel, and at a failed turn', () => {
+      const h = setup();
+      const session = listening(h);
+
+      emit.audioSection(session, { section: 0, ordinal: 0 });
+      emit.audioDone(session);
+      expect(h.voice().audioSection).toBeNull();
+
+      emit.audioSection(session, { section: 0, ordinal: 0 });
+      h.cancel();
+      expect(h.voice().audioSection).toBeNull();
+
+      emit.audioSection(session, { section: 0, ordinal: 0 });
+      emit.turnError(session);
+      expect(h.voice().audioSection).toBeNull();
+    });
+
+    it('ignores a session that was let go of', () => {
+      const h = setup();
+      const first = listening(h);
+      h.stop();
+
+      emit.audioSection(first, { section: 0, ordinal: 0 });
+
+      expect(h.voice().audioSection).toBeNull();
+    });
+
+    it('keeps the same object when the section did not change, so nothing re-renders for it', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.audioSection(session, { section: 1, ordinal: 0 });
+      const before = h.voice();
+
+      emit.audioSection(session, { section: 1, ordinal: 0 });
+
+      expect(h.voice()).toBe(before);
     });
   });
 

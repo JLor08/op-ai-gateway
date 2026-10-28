@@ -5880,7 +5880,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         const session: FakeVoice = { args, stop: vi.fn() };
         voiceSessions.push(session);
         args.onState('connecting');
-        return { pushStart: vi.fn(), pushEnd: vi.fn(), cancel: vi.fn(), stop: session.stop };
+        return {
+          pushStart: vi.fn(),
+          pushEnd: vi.fn(),
+          cancel: vi.fn(),
+          pause: vi.fn(),
+          resume: vi.fn(),
+          stopSpeaking: vi.fn(),
+          setMicMuted: vi.fn(),
+          stop: session.stop,
+        };
       });
       chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
       chatApi.spies.modelSpeechStreaming.mockResolvedValue({ streaming: true, sampleRate: 24000 });

@@ -35,6 +35,13 @@
 //     A turn error reloads it as well: a turn can degrade after its commit (#322), and the error
 //     frame is then the only signal that the stored turn is there to be shown.
 //
+// The answer being spoken has controls of its own, which are NOT the conversation's: pause and
+// resume hold and continue it, and stopSpeaking cuts it short (the gateway goes back to listening
+// and the conversation goes on), where `stop` ends the whole conversation. The microphone has a
+// mute, which is the user's alone -- the gateway is told nothing, it simply hears nothing -- and
+// lasts as long as the conversation does. `paused` is the session's to say, not this hook's: a
+// pause that the answer ending clears must not stay on screen into the next one.
+//
 // Errors are the session's: a TURN that failed (a model errored, an admission was refused) leaves
 // the gateway at `idle` with the conversation still open, so it is surfaced, the preview is
 // dropped, and the user re-engages with pushStart; every other kind ends the conversation, and
@@ -54,6 +61,7 @@ import { joinTranscript } from './liveSession';
 import { speechPlayback, type SpeechPlayback } from './speechPlayback';
 import {
   createVoiceSession,
+  type VoiceAudioSection,
   type VoiceErrorDetail,
   type VoiceServerState,
   type VoiceSession,
@@ -112,6 +120,17 @@ export type VoiceChatApi = {
   answerPreview: string;
   /** The failure that last ended, or interrupted, the conversation. */
   error: VoiceChatError | null;
+  /** The spoken answer is paused (by `pause`, until `resume`, a stop, or the answer ending). */
+  paused: boolean;
+  /** The user's own microphone is muted (by `toggleMicMute`): the gateway hears nothing, so no turn. */
+  micMuted: boolean;
+  /**
+   * The section of the spoken answer whose audio is arriving, or null when there is none (see
+   * VoiceAudioSection: its `ordinal` is its block's place in the stored turn, whatever gaps the
+   * gateway's own `section` indices have). It is the section being received, which can run ahead
+   * of what is audible.
+   */
+  audioSection: VoiceAudioSection | null;
   /** Turn Voice Chat on. Call it from the user's gesture: the microphone is asked for inside it. */
   start: () => void;
   /** Turn it off: the conversation ends, and an error that was shown is dismissed. */
@@ -122,18 +141,36 @@ export type VoiceChatApi = {
   pushEnd: () => void;
   /** Abandon the turn in progress: its answer is silenced and listening resumes. */
   cancel: () => void;
+  /** Pause the spoken answer: a no-op unless it is being heard (`paused` says whether it took). */
+  pause: () => void;
+  /** Continue a paused answer from where it stopped. */
+  resume: () => void;
+  /**
+   * Cut the spoken answer short and let the user talk: the gateway drops the rest of it and goes
+   * back to listening, and the conversation goes on. (`stop` is the end of the conversation.)
+   */
+  stopSpeaking: () => void;
+  /** Mute the user's microphone, or unmute it: the conversation stays on, but no turn is heard. */
+  toggleMicMute: () => void;
 };
 
-// The turn in flight, as shown: the finished chunks, the chunk being said, and the answer.
-type VoiceTurn = { pending: string; partial: string; answer: string };
+// The turn in flight, as shown: the finished chunks, the chunk being said, the answer, and the
+// section of it whose audio is arriving.
+type VoiceTurn = {
+  pending: string;
+  partial: string;
+  answer: string;
+  audioSection: VoiceAudioSection | null;
+};
 
-const NO_TURN: VoiceTurn = { pending: '', partial: '', answer: '' };
+const NO_TURN: VoiceTurn = { pending: '', partial: '', answer: '', audioSection: null };
 
 type TurnAction =
   | { type: 'partial'; text: string }
   | { type: 'final'; text: string }
   | { type: 'delta'; text: string }
   | { type: 'answerReset' }
+  | { type: 'audioSection'; attribution: VoiceAudioSection }
   | { type: 'clear' };
 
 function turnReducer(turn: VoiceTurn, action: TurnAction): VoiceTurn {
@@ -151,8 +188,19 @@ function turnReducer(turn: VoiceTurn, action: TurnAction): VoiceTurn {
       return action.text === '' ? turn : { ...turn, answer: turn.answer + action.text };
     case 'answerReset':
       return turn.answer === '' ? turn : { ...turn, answer: '' };
+    case 'audioSection': {
+      const { section, ordinal } = action.attribution;
+      return turn.audioSection?.section === section && turn.audioSection.ordinal === ordinal
+        ? turn
+        : { ...turn, audioSection: action.attribution };
+    }
     case 'clear':
-      return turn.pending === '' && turn.partial === '' && turn.answer === '' ? turn : NO_TURN;
+      return turn.pending === '' &&
+        turn.partial === '' &&
+        turn.answer === '' &&
+        turn.audioSection === null
+        ? turn
+        : NO_TURN;
   }
 }
 
@@ -165,6 +213,13 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
   const [state, setState] = useState<VoiceChatState>('off');
   const [turn, dispatch] = useReducer(turnReducer, NO_TURN);
   const [error, setError] = useState<VoiceChatError | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [micMuted, setMicMuted] = useState(false);
+  // What the render last saw of them, for the controls below (which are stable, and are called
+  // between renders): the gateway's state, and the mute that the next toggle reverses.
+  const stateRef = useRef<VoiceChatState>('off');
+  stateRef.current = state;
+  const micMutedRef = useRef(false);
 
   // The conversation's session (null when there is none), and which session that is
   // (`generation`: every callback of a session that was let go of finds it moved on, and is
@@ -182,16 +237,26 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
     session?.stop();
   }, []);
 
+  // The controls' own state starts over with each conversation: a pause belongs to the answer it
+  // paused, and the microphone of a new conversation is live (a mute is not carried into a
+  // conversation the user starts afresh).
+  const resetControls = useCallback(() => {
+    micMutedRef.current = false;
+    setPaused(false);
+    setMicMuted(false);
+  }, []);
+
   // The conversation is over: nothing of it is shown any more, `failure` is why (null for the
   // user's own end).
   const end = useCallback(
     (failure: VoiceChatError | null) => {
       release();
       dispatch({ type: 'clear' });
+      resetControls();
       setState('off');
       setError(failure);
     },
-    [release],
+    [release, resetControls],
   );
 
   // The gateway has committed the turn: reload the chat's thread, so that the stored turns are
@@ -218,6 +283,7 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
     const current = () => generationRef.current === generation;
     chatRef.current = target.chatId;
     dispatch({ type: 'clear' });
+    resetControls();
     setError(null);
     setState('connecting');
 
@@ -250,6 +316,12 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
         dispatch({ type: 'clear' });
         refreshThread(target.chatId);
       },
+      onPausedChange: (next) => {
+        if (current()) setPaused(next);
+      },
+      onAudioSection: (attribution) => {
+        if (current()) dispatch({ type: 'audioSection', attribution });
+      },
       onError: (message, detail) => {
         if (!current()) return;
         const failure: VoiceChatError = { ...detail, message };
@@ -273,7 +345,7 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       },
     });
     if (current()) sessionRef.current = session;
-  }, [end, refreshThread]);
+  }, [end, refreshThread, resetControls]);
 
   const stop = useCallback(() => end(null), [end]);
 
@@ -295,6 +367,42 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
     sessionRef.current.cancel();
   }, []);
 
+  // `paused` is not set here: the session says whether the pause took (it drops one when nothing
+  // is being heard), and clears it when the answer ends.
+  const pause = useCallback(() => {
+    sessionRef.current?.pause();
+  }, []);
+
+  const resume = useCallback(() => {
+    sessionRef.current?.resume();
+  }, []);
+
+  const stopSpeaking = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const cutShort = stateRef.current === 'speaking';
+    session.stopSpeaking();
+    // An answer cut short before it ended has no `audio_done` to say what became of its turn: the
+    // gateway either cancels it (nothing is stored) or lets the commit it already won finish, and
+    // sends nothing either way. What was shown of it is void, and the thread is reloaded as it
+    // is for a turn that failed, so that a stored turn shows. (Once the turn is committed -- the
+    // answer is only draining -- audio_done has done both, and a user who is already talking
+    // keeps their transcript.)
+    if (!cutShort) return;
+    dispatch({ type: 'clear' });
+    const chatId = chatRef.current;
+    if (chatId !== null) refreshThread(chatId);
+  }, [refreshThread]);
+
+  const toggleMicMute = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const next = !micMutedRef.current;
+    micMutedRef.current = next;
+    setMicMuted(next);
+    session.setMicMuted(next);
+  }, []);
+
   // A conversation belongs to the chat it started in: it does not follow the user to another
   // chat (with the microphone still open), and has nowhere to go when no chat is open.
   const { activeChatId } = deps;
@@ -311,12 +419,34 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
       liveTranscript: joinTranscript(turn.pending, turn.partial),
       answerPreview: turn.answer,
       error,
+      paused,
+      micMuted,
+      audioSection: turn.audioSection,
       start,
       stop,
       pushStart,
       pushEnd,
       cancel,
+      pause,
+      resume,
+      stopSpeaking,
+      toggleMicMute,
     }),
-    [state, turn, error, start, stop, pushStart, pushEnd, cancel],
+    [
+      state,
+      turn,
+      error,
+      paused,
+      micMuted,
+      start,
+      stop,
+      pushStart,
+      pushEnd,
+      cancel,
+      pause,
+      resume,
+      stopSpeaking,
+      toggleMicMute,
+    ],
   );
 }

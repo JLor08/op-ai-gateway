@@ -8071,6 +8071,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       pushStart: Mock<() => void>;
       pushEnd: Mock<() => void>;
       cancel: Mock<() => void>;
+      pause: Mock<() => void>;
+      resume: Mock<() => void>;
+      stopSpeaking: Mock<() => void>;
+      setMicMuted: Mock<(muted: boolean) => void>;
       stop: Mock<() => void>;
     };
     let voiceSessions: FakeVoice[];
@@ -8083,6 +8087,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           pushStart: vi.fn(),
           pushEnd: vi.fn(),
           cancel: vi.fn(),
+          pause: vi.fn(),
+          resume: vi.fn(),
+          stopSpeaking: vi.fn(),
+          setMicMuted: vi.fn(),
           stop: vi.fn(),
         };
         voiceSessions.push(session);
