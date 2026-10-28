@@ -26,6 +26,7 @@ import {
   type ChatContent,
   type ChatContentPart,
 } from '../shared/chatContent';
+import type { SpokenSection } from '../shared/spokenSections';
 
 // The persisted status of an assistant turn (mirrors the backend transcript
 // vocabulary). `pending` is written by a server checkpoint while a run is live;
@@ -45,10 +46,19 @@ export type ChatUiMessage = {
   // tokens/sec, present only once a turn has completed (issue #56).
   tps?: number;
   tokensPerSecond?: number;
+  // The spoken sections of a VOICE answer (#315), written by the gateway beside the full clean
+  // answer in `content` and omitted when there were none: an ordered list of spans into the
+  // answer's text (RUNE offsets `start`/`len`; `text` is the spoken text, kept beside the span and
+  // optional). Each renders as its own collapsed, replayable block at its position; its audio is
+  // the section's parts in `content`, paired by order (the committed list holds only sections
+  // that were spoken). Turns committed before sections existed carry the scalar spoken_summary
+  // below instead, and the portal reads these over it when both are there.
+  spoken_sections?: SpokenSection[];
   // The text of a VOICE answer's spoken summary (#314), written by the gateway beside the full
   // clean answer in `content` (summary and detail both) and omitted when there was none. The
-  // portal renders it as the collapsed, replayable block. snake_case because it is the chat
-  // document's own key, not one of the camelCase run metrics above.
+  // portal renders it as the collapsed, replayable block. Only turns committed before spoken
+  // sections (#315) carry it; newer turns write spoken_sections instead. snake_case because it is
+  // the chat document's own key, not one of the camelCase run metrics above.
   spoken_summary?: string;
   // The RUNE offset of spoken_summary within the answer text (#322), written by the gateway beside
   // it so the collapsed block's body is sliced out by POSITION rather than re-found by value --

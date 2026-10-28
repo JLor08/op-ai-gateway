@@ -2645,6 +2645,48 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getAllByLabelText(t.chatGeneratedAudio)).toHaveLength(1);
     });
 
+    // #315: a long voice answer is stored with `spoken_sections` (spans into the full text) and one
+    // audio part per section in order; each section is its own block at its position.
+    it('renders the stored spoken_sections as one collapsed block each, around the body', async () => {
+      const wavB = { type: 'audio_url', audio_url: { url: 'data:audio/wav;base64,UklH' } };
+      seedVoiceAnswer({
+        content: [{ type: 'text', text: 'Sum one.\n\nThe middle.\n\nSum two.' }, wav, wavB],
+        spoken_sections: [
+          { text: 'Sum one.', start: 0, len: 8 },
+          { text: 'Sum two.', start: 23, len: 8 },
+        ],
+      });
+      renderChat();
+
+      expect(await screen.findAllByText(t.chatVoiceSpokenSummary)).toHaveLength(2);
+      const blocks = Array.from(document.querySelectorAll('details'));
+      expect(blocks).toHaveLength(2);
+      for (const details of blocks) expect(details).not.toHaveAttribute('open');
+      expect(screen.getByText('Sum one.').closest('details')).toBe(blocks[0]);
+      expect(screen.getByText('Sum two.').closest('details')).toBe(blocks[1]);
+      expect(screen.getByText('The middle.').closest('details')).toBeNull();
+      const players = screen.getAllByLabelText(t.chatGeneratedAudio);
+      expect(players.map((player) => player.getAttribute('src'))).toEqual([
+        'data:audio/wav;base64,UklG',
+        'data:audio/wav;base64,UklH',
+      ]);
+    });
+
+    it('prefers spoken_sections over a stored scalar spoken_summary', async () => {
+      seedVoiceAnswer({
+        content: [{ type: 'text', text: 'Sum.\n\nThe detail.' }, wav],
+        spoken_sections: [{ text: 'Sum.', start: 0, len: 4 }],
+        spoken_summary: 'The detail.',
+        spoken_summary_start: 6,
+      });
+      renderChat();
+
+      const label = await screen.findByText(t.chatVoiceSpokenSummary);
+      expect(screen.getAllByText('Sum.')).toHaveLength(1);
+      expect(screen.getByText('Sum.').closest('details')).toBe(label.closest('details'));
+      expect(screen.getByText('The detail.').closest('details')).toBeNull();
+    });
+
     it('renders a voice answer with no spoken_summary exactly as before', async () => {
       seedVoiceAnswer({ content: [{ type: 'text', text: 'Everything spoken.' }, wav] });
       renderChat();

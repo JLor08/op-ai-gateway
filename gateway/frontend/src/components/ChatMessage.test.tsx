@@ -1224,6 +1224,420 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // A long voice answer is spoken in SEVERAL sections (#315): the gateway stores the full clean
+    // answer once, the sections as spans into it (`spoken_sections`, RUNE offsets) and each
+    // section's audio as content parts in section order. Every section renders as its own
+    // collapsed, replayable block AT ITS POSITION in the answer, the rest of the text is the body
+    // around them. A turn committed before this (the scalar `spoken_summary`) renders as before.
+    describe('a voice answer with several spoken sections', () => {
+      const AUDIO_A = {
+        type: 'audio_url' as const,
+        audio_url: { url: 'data:audio/wav;base64,AAAA' },
+      };
+      const AUDIO_B = {
+        type: 'audio_url' as const,
+        audio_url: { url: 'data:audio/wav;base64,BBBB' },
+      };
+      const MARKER = { type: 'audio_removed' as const };
+      const BLOB_A = '/api/portal/chat-blobs/6f1c2a52-0f43-4d0b-bb0d-8c7a3a1d9e10';
+      const BLOB_B = '/api/portal/chat-blobs/0a9d3f3e-2b0c-4f55-8f55-6d6f1c5a7a11';
+      const blobPart = (url: string) => ({ type: 'audio_url' as const, audio_url: { url } });
+
+      // 'Sum one.' is code points 0-8 and 'Sum two.' 30-38 of TEXT.
+      const TEXT = 'Sum one.\n\nThe middle detail.\n\nSum two.\n\nThe closing detail.';
+      const SECTIONS = [
+        { text: 'Sum one.', start: 0, len: 8 },
+        { text: 'Sum two.', start: 30, len: 8 },
+      ];
+      const answer = (
+        text: string,
+        ...rest: Array<ReturnType<typeof blobPart> | typeof MARKER>
+      ) => [{ type: 'text' as const, text }, ...rest];
+      const blocks = () => Array.from(document.querySelectorAll('details'));
+      // The transcript's pieces in document order: a block as [its text], body as its text.
+      const layout = (container: HTMLElement) =>
+        Array.from(container.querySelectorAll('details, p')).map((el) =>
+          el.tagName === 'DETAILS' ? `[${el.lastElementChild?.textContent}]` : el.textContent,
+        );
+
+      it('renders a collapsed block per section at its span, with the body between and around', () => {
+        const { container } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="a1"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        expect(layout(container)).toEqual([
+          '[Sum one.]',
+          'The middle detail.',
+          '[Sum two.]',
+          'The closing detail.',
+        ]);
+        expect(blocks()).toHaveLength(2);
+        for (const details of blocks()) expect(details).not.toHaveAttribute('open');
+        // Nothing is shown twice: each section's text is in its block only.
+        expect(screen.getAllByText('Sum one.')).toHaveLength(1);
+        expect(screen.getAllByText('Sum two.')).toHaveLength(1);
+      });
+
+      it('keeps the words before the first section as body above its block', () => {
+        const text = 'Before.\n\nSum one.\n\nAfter.';
+        const { container } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(text, AUDIO_A)}
+            spokenSections={[{ text: 'Sum one.', start: 9, len: 8 }]}
+          />,
+        );
+
+        expect(layout(container)).toEqual(['Before.', '[Sum one.]', 'After.']);
+      });
+
+      it('numbers the blocks so they can be told apart', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        expect(screen.getAllByText(t.chatVoiceSpokenSummary)).toHaveLength(2);
+        const [first, second] = blocks();
+        expect(first.querySelector('summary')).toHaveTextContent(
+          new RegExp(`${t.chatVoiceSpokenSummary}\\s*1`),
+        );
+        expect(second.querySelector('summary')).toHaveTextContent(
+          new RegExp(`${t.chatVoiceSpokenSummary}\\s*2`),
+        );
+      });
+
+      it('gives each block the audio of its own section, in its summary line', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        const players = screen.getAllByLabelText(t.chatGeneratedAudio);
+        expect(players).toHaveLength(2);
+        const [first, second] = blocks();
+        expect(first.querySelector('summary')).toContainElement(players[0]);
+        expect(second.querySelector('summary')).toContainElement(players[1]);
+        expect(players[0]).toHaveAttribute('src', 'data:audio/wav;base64,AAAA');
+        expect(players[1]).toHaveAttribute('src', 'data:audio/wav;base64,BBBB');
+        // No second set of players below the body.
+        expect(document.querySelectorAll('audio')).toHaveLength(2);
+      });
+
+      it('replays each stored section as its own clip', async () => {
+        // The clip a url serves is told apart by its size, and its object URL by that size.
+        const SIZE_OF: Record<string, number> = { [BLOB_A]: 1, [BLOB_B]: 2 };
+        const fetchMock = vi.fn(async (url: string) => ({
+          ok: true,
+          status: 200,
+          blob: async () => new Blob(['x'.repeat(SIZE_OF[url])], { type: 'audio/wav' }),
+        }));
+        vi.stubGlobal('fetch', fetchMock);
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn((blob: Blob) => `blob:clip-${blob.size}`),
+          revokeObjectURL: vi.fn(),
+        });
+
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, blobPart(BLOB_A), blobPart(BLOB_B))}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        await waitFor(() => {
+          const players = screen.getAllByLabelText(t.chatGeneratedAudio);
+          expect(players.map((player) => player.getAttribute('src'))).toEqual([
+            'blob:clip-1',
+            'blob:clip-2',
+          ]);
+        });
+        // Each section's url was fetched once, for its own block.
+        expect(fetchMock.mock.calls.map(([url]) => url).sort()).toEqual([BLOB_A, BLOB_B].sort());
+      });
+
+      it('names the downloads of the blocks apart, so one save does not become "(1)"', async () => {
+        const names: string[] = [];
+        vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+          const el = nativeCreateElement(tag, options as ElementCreationOptions);
+          if (tag === 'a') {
+            const anchor = el as HTMLAnchorElement;
+            anchor.click = () => names.push(anchor.download);
+          }
+          return el;
+        });
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => 'blob:stub'),
+          revokeObjectURL: vi.fn(),
+        });
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="a1"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        for (const details of blocks()) {
+          fireEvent.click(within(details).getByRole('button', { name: t.chatDownloadAudio }));
+        }
+
+        await waitFor(() => expect(names).toHaveLength(2));
+        expect(names).toEqual(['generated-audio-a1-s1.wav', 'generated-audio-a1-s2.wav']);
+      });
+
+      it('opens every block when the answer is nothing but its sections', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('One.\n\nTwo.', AUDIO_A, AUDIO_B)}
+            spokenSections={[
+              { text: 'One.', start: 0, len: 4 },
+              { text: 'Two.', start: 6, len: 4 },
+            ]}
+          />,
+        );
+
+        expect(blocks()).toHaveLength(2);
+        for (const details of blocks()) expect(details).toHaveAttribute('open');
+        expect(screen.getByText('One.').closest('details')).toBe(blocks()[0]);
+        expect(screen.getByText('Two.').closest('details')).toBe(blocks()[1]);
+      });
+
+      // N=1 is the phase-2 render: one block with the player in its summary line (the label
+      // carries no number), the body beneath.
+      it('renders a single section as the phase-2 block', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="a1"
+            content={answer('Sum.\n\nThe detail.', AUDIO_A)}
+            spokenSections={[{ text: 'Sum.', start: 0, len: 4 }]}
+          />,
+        );
+
+        const details = screen.getByText(t.chatVoiceSpokenSummary).closest('details');
+        expect(details).not.toBeNull();
+        expect(details).not.toHaveAttribute('open');
+        expect(details?.querySelector('summary')).toHaveTextContent(
+          new RegExp(`^${t.chatVoiceSpokenSummary}$`),
+        );
+        const players = screen.getAllByLabelText(t.chatGeneratedAudio);
+        expect(players).toHaveLength(1);
+        expect(details?.querySelector('summary')).toContainElement(players[0]);
+        expect(screen.getAllByText('Sum.')).toHaveLength(1);
+        expect(screen.getByText('Sum.').closest('details')).toBe(details);
+        expect(screen.getByText('The detail.').closest('details')).toBeNull();
+        expect(document.querySelectorAll('audio')).toHaveLength(1);
+      });
+
+      it('opens the single block when the answer has no body', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.', AUDIO_A)}
+            spokenSections={[{ text: 'Sum.', start: 0, len: 4 }]}
+          />,
+        );
+
+        expect(blocks()).toHaveLength(1);
+        expect(blocks()[0]).toHaveAttribute('open');
+      });
+
+      it('keeps the single block download named by the turn alone, as in phase 2', async () => {
+        const names: string[] = [];
+        vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: unknown) => {
+          const el = nativeCreateElement(tag, options as ElementCreationOptions);
+          if (tag === 'a') {
+            const anchor = el as HTMLAnchorElement;
+            anchor.click = () => names.push(anchor.download);
+          }
+          return el;
+        });
+        vi.stubGlobal('URL', {
+          ...URL,
+          createObjectURL: vi.fn(() => 'blob:stub'),
+          revokeObjectURL: vi.fn(),
+        });
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            turnId="a1"
+            content={answer('Sum.\n\nThe detail.', AUDIO_A)}
+            spokenSections={[{ text: 'Sum.', start: 0, len: 4 }]}
+          />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatDownloadAudio }));
+
+        await waitFor(() => expect(names).toEqual(['generated-audio-a1.wav']));
+      });
+
+      it('reads spoken_sections over the scalar summary when a turn carries both', () => {
+        const { container } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+            spokenSummary="The middle detail."
+            spokenSummaryStart={10}
+          />,
+        );
+
+        expect(layout(container)).toEqual([
+          '[Sum one.]',
+          'The middle detail.',
+          '[Sum two.]',
+          'The closing detail.',
+        ]);
+      });
+
+      it('falls back to the scalar summary when the section list is empty', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.\n\nThe detail.', AUDIO_A)}
+            spokenSections={[]}
+            spokenSummary="Sum."
+            spokenSummaryStart={0}
+          />,
+        );
+
+        expect(blocks()).toHaveLength(1);
+        expect(screen.getByText('Sum.').closest('details')).toBe(blocks()[0]);
+        expect(screen.getByText('The detail.').closest('details')).toBeNull();
+      });
+
+      it('shows the not-stored state in every block when the audio was removed, with ONE regenerate', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, MARKER)}
+            spokenSections={SECTIONS}
+            onRegenerate={() => {}}
+          />,
+        );
+
+        const [first, second] = blocks();
+        const placeholders = screen.getAllByRole('group', { name: t.chatAudioNotStored });
+        expect(placeholders).toHaveLength(2);
+        expect(first.querySelector('summary')).toContainElement(placeholders[0]);
+        expect(second.querySelector('summary')).toContainElement(placeholders[1]);
+        expect(document.querySelector('audio')).toBeNull();
+        // The text stays, in its blocks and around them.
+        expect(screen.getByText('Sum one.').closest('details')).toBe(first);
+        expect(screen.getByText('Sum two.').closest('details')).toBe(second);
+        expect(screen.getByText('The middle detail.').closest('details')).toBeNull();
+        // One regenerate for the answer -- the first placeholder's -- not one per block, and not
+        // another in the action stack.
+        expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+        expect(within(first).getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+      });
+
+      it('shows text only when the sections have no audio and none is marked removed', () => {
+        render(
+          <ChatMessage t={t} role="assistant" content={answer(TEXT)} spokenSections={SECTIONS} />,
+        );
+
+        expect(blocks()).toHaveLength(2);
+        expect(screen.getByText('Sum one.').closest('details')).toBe(blocks()[0]);
+        expect(document.querySelector('audio')).toBeNull();
+        expect(screen.queryByRole('group', { name: t.chatAudioNotStored })).toBeNull();
+      });
+
+      // The audio is paired to the sections by ORDER, which needs one clip per section. A section
+      // long enough to be saved as several parts breaks that count, and a clip cannot be
+      // attributed to a block by guessing: the blocks are then text only and the answer's
+      // audio is ONE stitched player below the body, in order.
+      it('plays one stitched player below the body when the parts cannot be paired by order', () => {
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(() => new Promise(() => {})),
+        );
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(
+              TEXT,
+              blobPart(BLOB_A),
+              blobPart(BLOB_B),
+              blobPart('/api/portal/chat-blobs/3c7e9d10-5a41-4b8e-9f27-1d2c3b4a5e6f'),
+            )}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        expect(blocks()).toHaveLength(2);
+        const players = screen.getAllByLabelText(t.chatGeneratedAudio);
+        expect(players).toHaveLength(1);
+        expect(players[0].closest('details')).toBeNull();
+        expect(screen.getAllByRole('button', { name: t.chatDownloadAudio })).toHaveLength(1);
+      });
+
+      it('still copies the whole answer, every section included', () => {
+        const writeText = vi.fn().mockResolvedValue(undefined);
+        vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatCopy }));
+
+        expect(writeText).toHaveBeenCalledWith(TEXT);
+      });
+
+      it('shows the body without any section in the raw view too', () => {
+        const { container } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+          />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatViewRaw }));
+
+        const raw = Array.from(container.querySelectorAll('pre')).map((pre) => pre.textContent);
+        expect(raw).toEqual(['The middle detail.', 'The closing detail.']);
+        expect(blocks()).toHaveLength(2);
+      });
+    });
+
     // The delete of a stored speech answer's audio (#281): a trash icon on the answer's action
     // stack that asks INLINE first (a confirm in the stack itself, no dialog), because the
     // audio is gone for good once the gateway has removed it -- regenerate is the way back.

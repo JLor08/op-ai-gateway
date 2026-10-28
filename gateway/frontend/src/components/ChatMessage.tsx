@@ -2,9 +2,6 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { memo, useEffect, useRef, useState, type ReactNode } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
-import rehypeHighlight from 'rehype-highlight';
-import remarkGfm from 'remark-gfm';
 import { Box, Button, IconButton, Stack, TextField, Tooltip, Typography } from '@mui/material';
 import ReplayIcon from '@mui/icons-material/Replay';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
@@ -15,6 +12,7 @@ import type { ChatContent, ChatContentPart } from './shared/chatContent';
 import { audioUrlsOf, hasRemovedAudio, imageUrlsOf, isMaskPart } from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
+import { dropLeadingBlank, segmentAnswer, type SpokenSection } from './shared/spokenSections';
 import { keyedUrls } from './shared/urlKeys';
 import { ImageTurn } from './ImageTurn';
 import { ImagePendingTurn } from './ImagePendingTurn';
@@ -22,6 +20,8 @@ import { AudioTurn } from './AudioTurn';
 import { AudioPendingTurn } from './AudioPendingTurn';
 import { AudioTailControls } from './AudioTailControls';
 import { AudioNotStoredTurn } from './AudioNotStoredTurn';
+import { AnswerBody } from './AnswerBody';
+import { SpokenAnswer, SpokenBlock, audioPairsBySection } from './SpokenAnswer';
 import { TranscriptionPendingTurn } from './TranscriptionPendingTurn';
 
 function contentText(content: ChatContent): string {
@@ -74,15 +74,6 @@ function joinSummaryGap(before: string, after: string): string {
   return `${head}\n\n${tail}`;
 }
 
-// The text without its leading blank space: whole blank lines go, but the indentation of the
-// first line with content stays (it can be a markdown code block).
-function dropLeadingBlank(text: string): string {
-  const lead = text.length - text.trimStart().length;
-  if (lead === 0) return text;
-  const lineBreak = text.lastIndexOf('\n', lead - 1);
-  return text.slice(lineBreak >= 0 ? lineBreak + 1 : lead);
-}
-
 type ImagePart = Extract<ChatContentPart, { type: 'image_url' }>;
 
 function imageParts(content: ChatContent): ImagePart[] {
@@ -96,13 +87,6 @@ function contentMask(content: ChatContent): string | undefined {
   return imageParts(content).find(isMaskPart)?.image_url.url;
 }
 
-// Rendered markdown links always open in a new tab. A stable module-level
-// component (rather than an inline arrow defined per-render) so ReactMarkdown
-// doesn't see a new `a` component identity on every ChatMessage render.
-const markdownLinkComponent: Components['a'] = (props) => (
-  <a {...props} target="_blank" rel="noopener noreferrer" />
-);
-
 function ChatMessageComponent({
   t,
   role,
@@ -111,6 +95,7 @@ function ChatMessageComponent({
   promptText,
   reasoning,
   reasoningMs,
+  spokenSections,
   spokenSummary,
   spokenSummaryStart,
   streaming,
@@ -145,6 +130,13 @@ function ChatMessageComponent({
   promptText?: string;
   reasoning?: string;
   reasoningMs?: number;
+  // The spoken sections of a VOICE answer (#315): the parts of the full clean answer `content`
+  // holds that the user heard, as spans into its text (RUNE offsets, in document order). Each
+  // renders as its own collapsed block AT ITS POSITION, replaying its own audio -- the Nth section
+  // takes the Nth audio part -- and the rest of the answer is the body around the blocks. Present
+  // and non-empty it takes the place of spokenSummary/spokenSummaryStart below, which only turns
+  // committed before sections existed carry.
+  spokenSections?: readonly SpokenSection[];
   // The spoken summary of a VOICE answer (#314): the text the user heard, which `content` also
   // holds as the start of the full clean answer. When non-empty the assistant row shows it as a
   // collapsed block (open when nothing else is left to read) with the answer's one audio player
@@ -214,8 +206,9 @@ function ChatMessageComponent({
   // A speech turn's reply is one audio part when short and SEVERAL ordered parts when long;
   // the ASSISTANT turn renders them all as ONE player (AudioTurn stitches them into one
   // gapless clip), and the presence of any is what tells a finished speech turn from a
-  // pending one. A USER turn's audio parts are a transcription turn's input clips and are
-  // rendered one player per clip (the user branch below).
+  // pending one. (A voice answer with spoken sections plays one clip per section instead, each
+  // in its own block -- SpokenAnswer.) A USER turn's audio parts are a transcription turn's
+  // input clips and are rendered one player per clip (the user branch below).
   const mask = contentMask(content);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
@@ -297,11 +290,23 @@ function ChatMessageComponent({
     // a failed run and keeps rendering its error, not this.
     const audioRemoved = !streaming && audioUrls.length === 0 && hasRemovedAudio(content);
 
-    // The spoken summary's block (#314), and the body beneath it. The block carries the answer's
-    // audio -- the player, or the not-stored placeholder that stands in for it -- so the audio is
-    // placed once, in the block when there is one and below the body otherwise. It opens by
-    // itself only when it is all there is (a short answer with no detail to read after it).
-    const summaryText = spokenSummary?.trim() ?? '';
+    // The spoken sections' blocks (#315): a voice answer lays out as [body][block][body][block]...
+    // with each section cut out of the full text at its span, and every block carries its own
+    // section's audio (SpokenAnswer). Only when no section can be shown at all (none recorded, or
+    // none placeable) is the answer laid out the older way below.
+    const sectionSegments =
+      spokenSections && spokenSections.length > 0 ? segmentAnswer(text, spokenSections) : null;
+    const sectionLayout = sectionSegments?.some((segment) => segment.kind === 'section')
+      ? sectionSegments
+      : null;
+    const sectionCount = spokenSections?.length ?? 0;
+
+    // The spoken summary's block (#314), and the body beneath it: a turn committed before sections
+    // existed carries ONE summary as scalar keys. The block carries the answer's audio -- the
+    // player, or the not-stored placeholder that stands in for it -- so the audio is placed once,
+    // in the block when there is one and below the body otherwise. It opens by itself only when
+    // it is all there is (a short answer with no detail to read after it).
+    const summaryText = sectionLayout ? '' : (spokenSummary?.trim() ?? '');
     const hasSummaryBlock = summaryText !== '';
     let body = text;
     if (hasSummaryBlock) {
@@ -319,6 +324,14 @@ function ChatMessageComponent({
     } else if (audioRemoved) {
       audioNode = <AudioNotStoredTurn t={t} onRegenerate={onRegenerate} disabled={!canRun} />;
     }
+
+    // The answer's one player (or its not-stored placeholder) goes below the body unless a block
+    // carries it: the summary block, or the section blocks -- each with its own clip. Sections
+    // whose clips cannot be paired by order (see audioPairsBySection) play none of them, so the
+    // whole answer, stitched in order, is below.
+    const audioBelow = sectionLayout
+      ? audioUrls.length > 0 && !audioPairsBySection(audioUrls.length, sectionCount)
+      : !hasSummaryBlock;
 
     const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
     const reasoningText = reasoning ?? '';
@@ -390,147 +403,26 @@ function ChatMessageComponent({
             </Box>
           </Box>
         )}
-        {hasSummaryBlock && (
-          <Box
-            component="details"
-            open={body.trim() === ''}
-            sx={{
-              mt: 1.25,
-              mb: 1.25,
-              border: '1px solid var(--line)',
-              bgcolor: 'var(--page)',
-              borderRadius: '8px',
-              fontSize: 13,
-              '& > summary': {
-                cursor: 'pointer',
-                p: '8px 12px',
-                listStyle: 'none',
-                display: 'flex',
-                flexWrap: 'wrap',
-                alignItems: 'center',
-                gap: 1,
-                color: 'var(--muted)',
-                fontWeight: 700,
-                '&::-webkit-details-marker': { display: 'none' },
-                // The marker a flex summary loses: a caret that says whether it is open.
-                '&::before': { content: String.raw`"\25B8"` },
-              },
-              '&[open] > summary::before': { content: String.raw`"\25BE"` },
-              // The player (or the not-stored line) rides the summary line; its own bottom
-              // margin is for the stack it normally sits in.
-              '& > summary > div': { mb: 0 },
-            }}
-          >
-            <summary>
-              <span>{t.chatVoiceSpokenSummary}</span>
-              {audioNode}
-            </summary>
-            <Box
-              sx={{
-                p: '10px 12px',
-                color: 'var(--text)',
-                lineHeight: 1.5,
-                whiteSpace: 'pre-wrap',
-                overflowWrap: 'anywhere',
-              }}
-            >
-              {summaryText}
-            </Box>
-          </Box>
+        {sectionLayout ? (
+          <SpokenAnswer
+            t={t}
+            segments={sectionLayout}
+            sectionCount={sectionCount}
+            audioUrls={audioUrls}
+            audioRemoved={audioRemoved}
+            turnId={turnId ?? ''}
+            raw={showRaw}
+            onRegenerate={onRegenerate}
+            canRun={canRun}
+          />
+        ) : (
+          <>
+            {hasSummaryBlock && (
+              <SpokenBlock t={t} open={body.trim() === ''} text={summaryText} audio={audioNode} />
+            )}
+            <AnswerBody text={body} raw={showRaw} streaming={streaming} />
+          </>
         )}
-        <Box
-          sx={{
-            color: 'var(--text)',
-            lineHeight: 1.55,
-            overflowWrap: 'anywhere',
-            '& > :first-of-type': { mt: 0 },
-            '& > :last-child': { mb: 0 },
-            '& p': { m: '0 0 10px' },
-            '& ul, & ol': { m: '0 0 10px', pl: '22px' },
-            '& li': { m: '2px 0' },
-            '& li > p': { m: 0 },
-            '& h1, & h2, & h3, & h4': { m: '16px 0 8px', lineHeight: 1.25 },
-            '& h1': { fontSize: 22 },
-            '& h2': { fontSize: 19 },
-            '& h3': { fontSize: 16 },
-            '& a': { color: 'var(--brand-primary)', textDecoration: 'underline' },
-            '& blockquote': {
-              m: '0 0 10px',
-              p: '2px 14px',
-              borderLeft: '3px solid var(--line)',
-              color: 'var(--muted)',
-            },
-            '& hr': { border: 0, borderTop: '1px solid var(--line)', m: '14px 0' },
-            '& img': { maxWidth: '100%', height: 'auto', borderRadius: '8px' },
-            // Keep GFM tables contained in the bubble: block layout, no min-width,
-            // horizontal scroll, and explicit cell borders/padding (the MUI Table
-            // defaults do not apply to react-markdown's raw <table> output).
-            '& table': {
-              display: 'block',
-              width: 'auto',
-              minWidth: 0,
-              maxWidth: '100%',
-              overflowX: 'auto',
-              borderCollapse: 'collapse',
-              m: '0 0 12px',
-            },
-            '& th, & td': {
-              border: '1px solid var(--line)',
-              p: '6px 10px',
-              fontSize: 14,
-              fontWeight: 600,
-              textAlign: 'left',
-              textTransform: 'none',
-            },
-            '& th': { bgcolor: 'var(--page)', color: 'var(--text)' },
-            '& pre': { overflowX: 'auto' },
-            '& code': { fontFamily: 'monospace' },
-            '& :not(pre) > code': {
-              bgcolor: 'var(--accent-soft)',
-              color: 'var(--brand-primary)',
-              p: '1px 5px',
-              borderRadius: '4px',
-              fontSize: '0.9em',
-            },
-          }}
-        >
-          {showRaw ? (
-            <Box
-              component="pre"
-              sx={{
-                m: 0,
-                whiteSpace: 'pre-wrap',
-                overflowWrap: 'anywhere',
-                fontFamily: 'monospace',
-                fontSize: 13,
-              }}
-            >
-              {body}
-            </Box>
-          ) : (
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeHighlight]}
-              components={{ a: markdownLinkComponent }}
-            >
-              {body}
-            </ReactMarkdown>
-          )}
-          {streaming && (
-            <Box
-              component="span"
-              data-testid="chat-stream-cursor"
-              sx={{
-                display: 'inline-block',
-                width: '8px',
-                height: '1em',
-                ml: '2px',
-                bgcolor: 'var(--brand-primary)',
-                verticalAlign: 'text-bottom',
-              }}
-            />
-          )}
-        </Box>
         {images.length > 0 && (
           <ImageTurn
             t={t}
@@ -540,7 +432,7 @@ function ChatMessageComponent({
             onRefine={onRefine}
           />
         )}
-        {!hasSummaryBlock && audioNode}
+        {audioBelow && audioNode}
         {/* The streamed tail may still be playing out after the run has committed (#281): while it
             is (audioLive), the Mute/Stop controls ride beside whichever of the two the answer
             shows -- the saved player, OR the not-stored placeholder of a retention-0 answer, which
