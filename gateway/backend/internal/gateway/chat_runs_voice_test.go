@@ -295,6 +295,36 @@ func TestVoiceRunCancelledPersistsNothing(t *testing.T) {
 	}
 }
 
+// A cancel that lands in EXACTLY the window between the run finishing its TTS leg and its
+// commit claim must persist NOTHING. This is the check-then-act gap the commit CAS closes:
+// with a ctx.Err() read followed by a separate "committing" flag, a cancel here slipped past
+// the read, the WithoutCancel commit then proceeded, and a resume that had already been
+// accepted double-committed. voiceBeforeCommitClaim is the test seam that lands the cancel
+// deterministically in that window.
+func TestVoiceRunCancelBetweenFinalGateAndCommitClaimPersistsNothing(t *testing.T) {
+	srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+	srv.voiceBeforeCommitClaim = func(run *ChatRun) { run.cancelContext() }
+
+	before, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, snap := voiceRunOutcome(t, srv, owner, chatID, "keep talking")
+	if snap.Status != "canceled" {
+		t.Fatalf("status = %q (err %q), want canceled: a cancel in the commit-claim window must win", snap.Status, snap.Err)
+	}
+	if run.isCommitting() {
+		t.Fatal("a run cancelled in the window must never have claimed its commit")
+	}
+	after, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before.Content) != string(after.Content) {
+		t.Fatalf("a cancel in the commit-claim window still persisted:\nbefore %s\nafter  %s", before.Content, after.Content)
+	}
+}
+
 // The committed assistant turn carries the synthesized audio as an audio_url blob:
 // SaveChatWithBlobs moved the WAV into chat_blobs, and the stored turn references it by
 // the gateway blob path, not inline.
@@ -422,6 +452,69 @@ func TestVoiceRunHistoryStripsPriorAnswerAudio(t *testing.T) {
 	}
 }
 
+// A MIXED thread: an earlier speech-run turn holds only audio (a TTS-only answer), so
+// stripping it leaves nothing. The /v1/chat/completions body the voice run POSTs must carry NO
+// assistant message with empty content -- a strict upstream (native Anthropic) rejects one on a
+// non-final message -- must still alternate roles, and a normal voice turn (text + audio) must
+// keep its text. The turn then runs end to end on that history.
+func TestVoiceRunBodyHasNoEmptyAssistantContentInAMixedThread(t *testing.T) {
+	srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+
+	// Seed the mixed thread by saving the whole document: [speech user, audio-only
+	// assistant, voice user, text+audio assistant].
+	audio := `{"type":"audio_removed"}`
+	doc := `{"settings":{},"messages":[` +
+		`{"id":"u1","role":"user","content":"say hello"},` +
+		`{"id":"a1","role":"assistant","status":"complete","content":[` + audio + `]},` +
+		`{"id":"u2","role":"user","content":"what is two plus two"},` +
+		`{"id":"a2","role":"assistant","status":"complete","content":[{"type":"text","text":"four"},` + audio + `]}]}`
+	content := json.RawMessage(doc)
+	if _, err := srv.Portal.SaveChat(context.Background(), owner, chatID, portal.UpdateChatRequest{Content: &content}); err != nil {
+		t.Fatalf("seed the mixed thread: %v", err)
+	}
+
+	const pending = "and three plus three"
+	history, err := srv.Portal.VoiceRunHistory(context.Background(), owner, chatID, pending)
+	if err != nil {
+		t.Fatalf("VoiceRunHistory: %v", err)
+	}
+	body, err := buildChatCompletionsBody(PrepareRunResult{History: history, Settings: portal.ChatRunSettings{Model: voiceLLMTarget.Model}})
+	if err != nil {
+		t.Fatalf("buildChatCompletionsBody: %v", err)
+	}
+	var req struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("request body is not JSON: %v (%s)", err, body)
+	}
+	for i, m := range req.Messages {
+		if m.Role == "assistant" && (len(m.Content) == 0 || string(m.Content) == `""` || string(m.Content) == "[]" || string(m.Content) == "null") {
+			t.Fatalf("messages[%d] is an assistant message with empty content: %s", i, body)
+		}
+		if i > 0 && req.Messages[i-1].Role == m.Role {
+			t.Fatalf("messages[%d] and messages[%d] are both %q: roles must alternate: %s", i-1, i, m.Role, body)
+		}
+	}
+	if !strings.Contains(string(body), "four") {
+		t.Fatalf("the voice turn's answer text was dropped: %s", body)
+	}
+	if strings.Contains(string(body), "audio") {
+		t.Fatalf("an audio part reached the LLM request: %s", body)
+	}
+	if n := len(req.Messages); n == 0 || req.Messages[n-1].Role != "user" || !strings.Contains(string(req.Messages[n-1].Content), pending) {
+		t.Fatalf("the last message must be the pending user turn: %s", body)
+	}
+
+	// The turn runs cleanly on that history.
+	if _, snap := voiceRunOutcome(t, srv, owner, chatID, pending); snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+}
+
 // A subscriber sees the answer's text deltas FIRST and the synthesized audio deltas
 // AFTER: the run streams the whole answer, then speaks it.
 func TestVoiceRunPublishesTextThenAudio(t *testing.T) {
@@ -476,5 +569,47 @@ func TestVoiceRunPublishesTextThenAudio(t *testing.T) {
 	}
 	if lastText >= firstAudio {
 		t.Fatalf("a text delta (index %d) came at or after the first audio delta (index %d): text must stream before audio", lastText, firstAudio)
+	}
+}
+
+// The last link of the voice dropdown (#318): the ticket's Audio is what the voice run's TTS leg
+// synthesizes with. voiceSpeechPrep must carry the ticket's voice (and the rest of its speech
+// settings) into the /v1/audio/speech request body, both the buffered body and the streaming one
+// the voice run asks for; the other voice-run tests set no audio, so this link was unpinned.
+func TestVoiceSpeechPrepCarriesTheTicketsVoiceIntoTheSpeechRequestBody(t *testing.T) {
+	speed := 1.25
+	audio := portal.ChatAudioSettings{Voice: "marius", Speed: &speed, Language: "de"}
+	prep := voiceSpeechPrep("the spoken answer", routing.Target{Model: "voice-tts"}, audio)
+
+	for name, build := range map[string]func(PrepareRunResult) ([]byte, error){
+		"the buffered body":  buildSpeechBody,
+		"the streaming body": buildSpeechStreamBody,
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := build(prep)
+			if err != nil {
+				t.Fatalf("build: %v", err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("body is not JSON: %v", err)
+			}
+			if body["voice"] != "marius" || body["model"] != "voice-tts" || body["input"] != "the spoken answer" || body["speed"] != 1.25 || body["language"] != "de" {
+				t.Fatalf("body = %v, want the ticket's voice, speed and language with the model and the answer as the input", body)
+			}
+		})
+	}
+}
+
+// A ticket that names no voice sends none: the model's own default voice speaks.
+func TestVoiceSpeechPrepSendsNoVoiceWhenTheTicketHasNone(t *testing.T) {
+	prep := voiceSpeechPrep("answer", routing.Target{Model: "voice-tts"}, portal.ChatAudioSettings{})
+
+	fields, err := speechBodyFields(prep)
+	if err != nil {
+		t.Fatalf("speechBodyFields: %v", err)
+	}
+	if _, present := fields["voice"]; present {
+		t.Fatalf("body = %v, want no voice member for a ticket with no voice", fields)
 	}
 }

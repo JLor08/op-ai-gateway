@@ -47,7 +47,13 @@ const emit = {
     }),
 };
 
-const START: VoiceChatStart = { chatId: 'c1', asrModel: 'asr', llmModel: 'llm', ttsModel: 'tts' };
+const START: VoiceChatStart = {
+  chatId: 'c1',
+  asrModel: 'asr',
+  llmModel: 'llm',
+  ttsModel: 'tts',
+  voice: 'alba',
+};
 
 beforeEach(() => {
   sessions = [];
@@ -122,7 +128,7 @@ function listening(h: ReturnType<typeof setup>): FakeSession {
 
 describe('useVoiceChat', () => {
   describe('starting', () => {
-    it('start opens a session for the chat and its three models, and reflects its state', () => {
+    it('start opens a session for the chat, its three models and the voice, and reflects its state', () => {
       const h = setup();
       expect(h.voice().state).toBe('off');
 
@@ -135,6 +141,7 @@ describe('useVoiceChat', () => {
         asrModel: 'asr',
         llmModel: 'llm',
         ttsModel: 'tts',
+        voice: 'alba',
         api: h.api,
       });
       expect(h.voice().state).toBe('connecting');

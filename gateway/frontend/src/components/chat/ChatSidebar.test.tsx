@@ -113,6 +113,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
       llm: '',
       asr: { options: [], pick: '', used: '', set: vi.fn() },
       tts: { options: [], pick: '', used: '', set: vi.fn() },
+      voice: { voices: [], value: '', set: vi.fn() },
     },
     mask: null,
     handleMaskFile: vi.fn(async () => {}),

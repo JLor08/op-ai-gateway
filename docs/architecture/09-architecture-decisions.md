@@ -9553,7 +9553,9 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   resumes inside the window, the machine **cancels the run, emits `answer_reset`, extends `pendingText` with the next
   chunk and returns to `listening`**; that repeats across as many pauses as the user takes. **Persistence is deferred
   to a true finalize.** The run writes nothing while it works (`VoiceRunHistory` only *reads* the chat, appends
-  `pendingText` in memory and strips the audio parts of earlier voice answers from the LLM history), and calls into
+  `pendingText` in memory and strips the audio parts of earlier voice answers from the LLM history; an earlier assistant turn
+  that held only audio, such as a speech-run answer in a mixed thread, is omitted rather than sent with empty content, and the
+  user turns on either side of it are merged so the roles still alternate), and calls into
   persistence exactly once, on its single un-cancelled terminal path: `CommitVoiceTurn` appends the user turn and the
   assistant turn (`[text, audio_url…]` parts) in **one** `SaveChatWithBlobs`, through the same retention and blob
   internals as every assistant commit. A cancelled or failed run therefore persists **nothing**, so cancel-and-extend
@@ -9635,20 +9637,22 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   write is dropped.** The run is non-pausable (LLM, then TTS, then commit in one sequence), so the machine cannot both
   keep the mic open for the full grace *and* avoid a double commit when the whole run finishes inside the grace: a resume
   after the commit would cancel nothing and re-run on the extended text, persisting the first utterance twice. The commit
-  is therefore the window's **point of no return**, marked on the run (`ChatRun.committing`, set after the final cancel
-  gate and before the write, because the run's status stays `running` for the whole write). A resume that begins past
-  it is not a cancel-and-extend and not a new turn: the voiced chunk is discarded when the window force-closes. True
+  is therefore the window's **point of no return**, claimed on the run (one atomic commit/cancel word on `ChatRun`, moved
+  `running → committing` by a compare-and-swap before the write, because the run's status stays `running` for the whole
+  write). A resume that begins past it is not a cancel-and-extend and not a new turn: the voiced chunk is discarded when the window force-closes. True
   barge-in is phase 4. Accepted ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
-- **One sub-microsecond race is parked, with a known airtight shape.** Between the run's final cancellation check and
-  the instruction that marks it committing there is a window of a few instructions with no I/O and no scheduling point.
-  A resume's cancel that lands exactly there would leave the run committing anyway while the machine re-runs on the
-  extended text. The airtight version is a single compare-and-swap (the run moves `running → committing`, the machine
-  moves `running → canceled`, the loser aborts). It is a recorded follow-up, not done in this change.
-- **Phase 1 chooses the voice for the user, and the ASR and TTS models only by default.** The portal's thread model is
+- **The commit and a cancel arbitrate on one compare-and-swap, so they can never both win.** The run's final
+  cancellation check and its commit claim are a single operation: the run moves the word `running → committing`, and every
+  cancel (the machine's resume, a user cancel, the Stop endpoint, all through `cancelContext`) moves it `running →
+  canceled` before it cancels the context. Whichever swap lands first wins and the other aborts: a run that loses commits
+  nothing, and a resume that loses is not accepted, exactly as for a run already committing. This
+  replaced a check of the context followed by a separate committing flag, whose few-instruction gap (no I/O, no scheduling
+  point) could in principle let a cancel land between the two and double-commit the utterance (issue #318).
+- **Phase 1 lets the user pick the ASR and TTS models and the voice, each defaulting to an automatic choice.** The portal's thread model is
   the LLM (its own model selector is the LLM picker). The ASR and TTS models are the **user's to pick** since issue #317:
   the Voice Chat control has one picker each, listing the catalogue models the gateway says stream (plain speech models
   ahead of preset-clone ones), with **Automatic** as the default. The pick belongs to the thread and is saved with it,
-  in `settings.voice_chat` (`asr_model`, `tts_model`) of the schema-free chat document, with no migration and no agent
+  in `settings.voice_chat` (`asr_model`, `tts_model`, `voice`) of the schema-free chat document, with no migration and no agent
   change (the backend never reads it, it only preserves it, below): the key is written only for a text thread that has made a pick (so every other thread stays byte-identical),
   the ticket request carries the models, and the co-load gate still resolves and validates all three, which is the real
   admission check (a combination it cannot hold is refused at the ticket). The **auto-pick** (the first model of each leg,
@@ -9656,12 +9660,21 @@ to be a property of the **server** and not of a cooperative browser. Four forces
   and a pick that is gone (the model left the catalogue, is unreachable or no longer streams), which falls back instead of
   blocking the conversation, while the name stays in the thread so it applies again when the model returns. The picks persist: `PrepareChatRun`, which rewrites the stored settings from its typed struct on every user-turn commit, lifts the stored raw `voice_chat` value forward (as it does the pinned `kind`; it never reads it), so a send, an edit or a regenerate cannot wipe them whichever thread the client has open. The pickers
   are closed until the gateway has said which models stream and while a conversation is on (its ticket holds the three
-  models it started with). A text thread carries no speech settings, so the TTS speaks in the model's default voice and
-  language. A preset clone model with no default voice can therefore still be used with a blank voice, when the user
-  picks it or when no plain speech model streams, and fail its first turn (degradation, not a loop). The voice run also
+  models it started with). The **voice** (issue #318) is the speech composer's voice field, under the speech model's
+  picker, over the voices the gateway has cached for the speech model that would speak (`api.modelVoices`); it is shown
+  only when that model has voices to offer, and a name that is typed is kept (the list is an offer, not a constraint).
+  The voice sent is the user's pick; else, for a **preset clone** model (no default voice of its own), its **first
+  preset**, so it never speaks blank; else none, the model's own default. The pre-select is computed when read, not
+  saved (only a chosen voice is written to `voice_chat.voice`), so a change of model needs no clean-up, and choosing
+  another speech model drops the voice (a voice belongs to the model that offered it). The voice rides the ticket
+  request body and the mint sets the ticket's `Audio.Voice` from it (over a stored one, counted in the 1 KiB cap); a
+  clone leg with no voice named by then is defaulted to its first preset by the mint as well (`routing.FirstPresetVoice`),
+  for a request made before the voices loaded. The preset is the cache's first, not an operator-configured default,
+  which the gateway cannot see. A text thread carries no other speech settings, so the TTS speaks in the model's default
+  language. The voice run also
   ignores the chat's own system prompt and sampling settings (`VoiceRunHistory` builds the history with an empty system
-  prompt, and the run's settings carry only the model and the kind), which is phase 2. Per-thread voice and language
-  controls are the follow-up.
+  prompt, and the run's settings carry only the model and the kind), which is phase 2. A language control in voice mode
+  is the follow-up.
 - **A non-signaling client drains to the ceiling.** The in-tree client always sends `playback_done`, so it ends at the
   floor; a client that never does holds every turn's drain to the 30 s ceiling (or, for an answer whose audio is longer
   than the ceiling, to the floor). Intentional: it is the anti-wedge bound.

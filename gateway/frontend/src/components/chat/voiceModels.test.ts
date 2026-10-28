@@ -7,8 +7,10 @@ import {
   autoVoiceModel,
   effectiveVoiceModel,
   thoseThatStream,
+  effectiveVoice,
   voiceLegsOf,
   voiceModelChoice,
+  withTtsModel,
   type VoiceStreaming,
 } from './voiceModels';
 
@@ -164,5 +166,60 @@ describe('voiceModelChoice', () => {
     expect(got.used).toBe('asr-b');
     got.set('asr-b');
     expect(set).toHaveBeenCalledWith('asr-b');
+  });
+});
+
+// The voice a conversation speaks in (#318): what the dropdown shows is what the ticket carries.
+describe('effectiveVoice', () => {
+  const voices = ['alba', 'marius'];
+
+  it("is the user's pick, for a plain model and a preset-clone one alike", () => {
+    expect(effectiveVoice('marius', voices, false)).toBe('marius');
+    expect(effectiveVoice('marius', voices, true)).toBe('marius');
+  });
+
+  it('keeps a typed name the list does not hold: the list is an offer, never a constraint', () => {
+    expect(effectiveVoice('typed-by-hand', voices, true)).toBe('typed-by-hand');
+  });
+
+  it('pre-selects the first preset of a preset-clone model that has no pick, so it never runs blank', () => {
+    expect(effectiveVoice('', voices, true)).toBe('alba');
+    expect(effectiveVoice('   ', voices, true)).toBe('alba');
+  });
+
+  it('leaves a plain model that has no pick on its own default voice', () => {
+    expect(effectiveVoice('', voices, false)).toBe('');
+  });
+
+  it('is none while the model has no voices to show -- the field is hidden, so a stale pick is not sent', () => {
+    expect(effectiveVoice('alba', [], false)).toBe('');
+    expect(effectiveVoice('alba', [], true)).toBe('');
+    expect(effectiveVoice('', [], true)).toBe('');
+  });
+});
+
+// A voice is a voice of the model that offered it: choosing another speech model must not carry it
+// there (#318) -- but choosing the model that would speak anyway changes nothing about it.
+describe('withTtsModel', () => {
+  const streaming = ['tts-a', 'tts-clone'];
+  const current = { asrModel: 'asr-b', ttsModel: '', voice: 'marius' };
+
+  it('records the pick and clears the voice when another model would now speak', () => {
+    expect(withTtsModel(current, 'tts-clone', streaming)).toEqual({
+      asrModel: 'asr-b',
+      ttsModel: 'tts-clone',
+      voice: '',
+    });
+    expect(withTtsModel({ ...current, ttsModel: 'tts-clone' }, '', streaming).voice).toBe('');
+  });
+
+  it('keeps the voice when the model that would speak is the same one (automatic vs. the pick of it)', () => {
+    expect(withTtsModel(current, 'tts-a', streaming)).toEqual({ ...current, ttsModel: 'tts-a' });
+    expect(withTtsModel({ ...current, ttsModel: 'tts-a' }, '', streaming).voice).toBe('marius');
+    expect(withTtsModel(current, 'tts-clone', streaming).asrModel).toBe('asr-b');
+  });
+
+  it('treats a pick that is gone as the automatic one, as the conversation does', () => {
+    expect(withTtsModel(current, 'tts-gone', streaming).voice).toBe('marius');
   });
 });

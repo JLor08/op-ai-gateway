@@ -387,6 +387,16 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       <span data-testid="voice-tts-pick">{c.voiceChatModels.tts.pick}</span>
       <span data-testid="voice-asr-used">{c.voiceChatModels.asr.used}</span>
       <span data-testid="voice-tts-used">{c.voiceChatModels.tts.used}</span>
+      {/* The speech model's voice (#318): the voices on offer for the model a conversation would
+          use, the voice it would speak in (the pick, or a preset clone's first preset), and one
+          button per voice -- the default ('') among them. */}
+      <span data-testid="voice-voices">{JSON.stringify(c.voiceChatModels.voice.voices)}</span>
+      <span data-testid="voice-voice">{c.voiceChatModels.voice.value}</span>
+      {['alba', 'marius', 'zeta', ''].map((name) => (
+        <button key={`say-${name}`} type="button" onClick={() => c.voiceChatModels.voice.set(name)}>
+          voice-say-{name === '' ? 'default' : name}
+        </button>
+      ))}
       {['asr-a', 'asr-b', 'asr-gone', ''].map((id) => (
         <button key={`asr-${id}`} type="button" onClick={() => c.voiceChatModels.asr.set(id)}>
           voice-asr-{id === '' ? 'auto' : id}
@@ -8644,6 +8654,244 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           await waitFor(() => expect(idsOf('voice-asr-options')).toEqual(['asr-a']));
           await waitFor(() => expect(text('voice-asr-used')).toBe('asr-a'));
           expect(text('voice-asr-pick')).toBe('');
+        });
+      });
+
+      // The voice (#318): the speech model's voices are looked up for the model a conversation
+      // would use, a preset-clone model with no pick is pre-selected on its first preset (it has
+      // no default voice of its own to fall back on), and the voice reaches the conversation.
+      describe('the voice', () => {
+        const voicesOf: Record<string, string[]> = {
+          'tts-a': ['alba', 'marius'],
+          'tts-clone': ['luna', 'zeta'],
+        };
+        // The gateway's voices cache, by model (overrides replace a model's list).
+        const sayVoices = (overrides: Record<string, string[]> = {}) => {
+          const cached = { ...voicesOf, ...overrides };
+          chatApi.spies.modelVoices.mockImplementation(async (name: string) => cached[name] ?? []);
+        };
+        const listed = () => JSON.parse(text('voice-voices') ?? '[]') as string[];
+
+        // renderPickers builds the api itself, so the voices are said BEFORE the provider asks.
+        async function renderWithVoices(
+          rows: ChatRow[] = [voiceThread()],
+          overrides: Record<string, string[]> = {},
+        ) {
+          chatApi = makeChatApi(rows);
+          sayVoices(overrides);
+          pickerGates();
+          const view = renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+          return view;
+        }
+
+        it('lists the voices of the speech model the conversation would use', async () => {
+          await renderWithVoices();
+
+          // tts-a is the automatic pick (plain models come first).
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+          expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('tts-a');
+
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(listed()).toEqual(['luna', 'zeta']));
+        });
+
+        it('has nothing to list, and nothing to pre-select, for a model with no cached voices', async () => {
+          await renderWithVoices([voiceThread()], { 'tts-clone': [] });
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('tts-clone'));
+
+          expect(listed()).toEqual([]);
+          expect(text('voice-voice')).toBe('');
+          click('voice-start');
+          expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-clone', voice: '' });
+        });
+
+        it('leaves a plain model that has no pick on its own default voice', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+
+          expect(text('voice-voice')).toBe('');
+          click('voice-start');
+          expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-a', voice: '' });
+        });
+
+        it('pre-selects the first preset of a preset-clone model, so it never speaks blank', async () => {
+          await renderWithVoices();
+          click('voice-tts-tts-clone');
+
+          await waitFor(() => expect(text('voice-voice')).toBe('luna'));
+          click('voice-start');
+
+          expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-clone', voice: 'luna' });
+        });
+
+        it('pre-selects a clone that is the AUTOMATIC pick, when nothing else streams', async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          sayVoices();
+          chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+          chatApi.spies.modelSpeechStreaming.mockImplementation(async (name: string) =>
+            name === 'tts-clone' ? streams : NO_SPEECH_STREAMING,
+          );
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-capable')).toBe('true'));
+          expect(text('voice-tts-pick')).toBe('');
+          expect(text('voice-tts-used')).toBe('tts-clone');
+
+          await waitFor(() => expect(text('voice-voice')).toBe('luna'));
+          click('voice-start');
+
+          expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-clone', voice: 'luna' });
+        });
+
+        it("sends the user's voice instead of the pre-selected one, and a plain model's pick too", async () => {
+          await renderWithVoices();
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(text('voice-voice')).toBe('luna'));
+
+          click('voice-say-zeta');
+          expect(text('voice-voice')).toBe('zeta');
+          click('voice-start');
+
+          expect(voiceSessions[0].args.voice).toBe('zeta');
+        });
+
+        it('keeps a clone on its first preset when the voice is cleared (it is never blank)', async () => {
+          await renderWithVoices();
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(text('voice-voice')).toBe('luna'));
+          click('voice-say-zeta');
+
+          click('voice-say-default');
+
+          expect(text('voice-voice')).toBe('luna');
+        });
+
+        it('belongs to the speech model: choosing another model starts over on that one', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+          click('voice-say-marius');
+          expect(text('voice-voice')).toBe('marius');
+
+          click('voice-tts-tts-clone');
+          // marius is tts-a's voice: it is not carried to a model that does not list it.
+          await waitFor(() => expect(text('voice-voice')).toBe('luna'));
+          click('voice-tts-tts-a');
+          await waitFor(() => expect(text('voice-voice')).toBe(''));
+        });
+
+        it('keeps choosing the same model from wiping the voice', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+          click('voice-say-marius');
+
+          click('voice-tts-tts-a');
+
+          expect(text('voice-voice')).toBe('marius');
+        });
+
+        it('sends a saved voice the list does not hold: the list is an offer, not a constraint', async () => {
+          await renderWithVoices([voiceThread('c1', earlier, { voice_chat: { voice: 'typed' } })]);
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+
+          expect(text('voice-voice')).toBe('typed');
+          click('voice-start');
+          expect(voiceSessions[0].args.voice).toBe('typed');
+        });
+
+        it('does not send a saved voice while the model has no voices on offer (the field is hidden)', async () => {
+          await renderWithVoices([voiceThread('c1', earlier, { voice_chat: { voice: 'ghost' } })], {
+            'tts-a': [],
+          });
+          await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('tts-a'));
+
+          expect(listed()).toEqual([]);
+          click('voice-start');
+          expect(voiceSessions[0].args.voice).toBe('');
+        });
+
+        it('treats a failed lookup as no voices: the field stays hidden and the default speaks', async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          chatApi.spies.modelVoices.mockRejectedValue(new Error('boom'));
+          pickerGates();
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('tts-a'));
+
+          expect(listed()).toEqual([]);
+          click('voice-start');
+          expect(voiceSessions[0].args.voice).toBe('');
+        });
+
+        it("does not take another model's late answer for the current one's", async () => {
+          let releaseA: (voices: string[]) => void = () => {};
+          chatApi = makeChatApi([voiceThread()]);
+          chatApi.spies.modelVoices.mockImplementation((name: string) =>
+            name === 'tts-a'
+              ? new Promise<string[]>((resolve) => {
+                  releaseA = resolve;
+                })
+              : Promise.resolve(voicesOf[name] ?? []),
+          );
+          pickerGates();
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+          await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('tts-a'));
+
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(listed()).toEqual(['luna', 'zeta']));
+          await act(async () => {
+            releaseA(['alba', 'marius']);
+          });
+
+          expect(listed()).toEqual(['luna', 'zeta']);
+        });
+
+        it("is the thread's: written beside the models, read back when it is reopened, and sent", async () => {
+          const { unmount } = await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+          click('voice-say-marius');
+
+          const settings = await savedSettings();
+          expect(settings.voice_chat).toEqual({ voice: 'marius' });
+
+          unmount();
+          await renderWithVoices([
+            voiceThread('c1', earlier, { voice_chat: { tts_model: 'tts-clone', voice: 'zeta' } }),
+          ]);
+          await waitFor(() => expect(listed()).toEqual(['luna', 'zeta']));
+
+          expect(text('voice-voice')).toBe('zeta');
+          click('voice-start');
+          expect(voiceSessions.at(-1)!.args).toMatchObject({
+            ttsModel: 'tts-clone',
+            voice: 'zeta',
+          });
+        });
+
+        it('does not write the pre-selected preset into the thread: only a voice that was chosen', async () => {
+          await renderWithVoices();
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(text('voice-voice')).toBe('luna'));
+
+          const settings = await savedSettings();
+
+          expect(settings.voice_chat).toEqual({ tts_model: 'tts-clone' });
+        });
+
+        it('writes none again once the voice is cleared', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+          click('voice-say-marius');
+          await savedSettings();
+          chatApi.spies.saveChat.mockClear();
+
+          click('voice-say-default');
+
+          expect(Object.keys(await savedSettings())).not.toContain('voice_chat');
         });
       });
 

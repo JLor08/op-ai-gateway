@@ -123,6 +123,7 @@ type TicketFn = (args: {
   asrModel: string;
   llmModel: string;
   ttsModel: string;
+  voice: string;
 }) => Promise<{ ticket: string }>;
 
 type FakePlayer = VoicePlayer & {
@@ -165,6 +166,7 @@ function start(
     asrModel: 'asr',
     llmModel: 'llm',
     ttsModel: 'tts',
+    voice: 'alba',
     onTranscript: (update) => run.transcripts.push(update),
     onAnswer: (update) => run.answers.push(update),
     onAnswerReset: run.onAnswerReset,
@@ -202,7 +204,7 @@ function audioDelta(seq: number, bytes: number[] = [1, 0, 2, 0], rate = 24000) {
 }
 
 describe('createVoiceSession in a (fake) browser', () => {
-  it('starts connecting, mints the ticket for the chat and its three models, and offers the ticket as a subprotocol', async () => {
+  it('starts connecting, mints the ticket for the chat, its three models and the voice, and offers the ticket as a subprotocol', async () => {
     const run = start();
     expect(run.states).toEqual(['connecting']);
 
@@ -213,6 +215,7 @@ describe('createVoiceSession in a (fake) browser', () => {
       asrModel: 'asr',
       llmModel: 'llm',
       ttsModel: 'tts',
+      voice: 'alba',
     });
     expect(VOICE_WS_SUBPROTOCOL).toBe('op-voice-chat');
     expect(socket.protocols).toEqual(['op-voice-chat', 'tkt']);
@@ -701,6 +704,18 @@ describe('createVoiceSession in a (fake) browser', () => {
       await vi.waitFor(() => expect(network.errors).toHaveLength(1));
       expect(network.errors[0].detail).toEqual({ kind: 'dropped' });
 
+      // A 5xx that is not the gateway's own Voice Chat answer stays the plain "dropped".
+      const proxy = start(
+        vi.fn<TicketFn>().mockRejectedValue(new PortalApiError(502, 'proxy.bad_gateway', 'oops')),
+      );
+      await vi.waitFor(() => expect(proxy.errors).toHaveLength(1));
+      expect(proxy.errors[0].detail).toEqual({ kind: 'dropped' });
+    });
+
+    // The gateway's own 500 for a mint that failed (portal.voice_chat_ticket_failed) is still a
+    // failure worth trying again -- so "dropped", the switch stays open -- but it carries its
+    // code, so the control can say what it is (its own sentence) instead of the generic one.
+    it('a 5xx the gateway answers with its own Voice Chat code is "dropped" and carries that code', async () => {
       const server = start(
         vi
           .fn<TicketFn>()
@@ -709,7 +724,11 @@ describe('createVoiceSession in a (fake) browser', () => {
           ),
       );
       await vi.waitFor(() => expect(server.errors).toHaveLength(1));
-      expect(server.errors[0].detail).toEqual({ kind: 'dropped' });
+      expect(server.errors[0].detail).toEqual({
+        kind: 'dropped',
+        code: 'portal.voice_chat_ticket_failed',
+      });
+      expect(FakeSocket.last).toBeUndefined();
     });
 
     it('a refused microphone is "denied", and no ticket is minted', async () => {

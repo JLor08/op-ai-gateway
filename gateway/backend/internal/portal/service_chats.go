@@ -1259,6 +1259,9 @@ func (s *Service) VoiceRunHistory(ctx context.Context, owner auth.Token, chatID,
 	if err != nil {
 		return nil, err
 	}
+	// The pending turn is the ASR'd text, in hand already -- no blob to resolve -- so
+	// it is appended AFTER the resolution rather than fetched back out of the store.
+	history = append(history, ChatAPIMessage{Role: "user", Content: json.RawMessage(mustJSONString(pendingText))})
 	// Strip a prior assistant VOICE turn's audio from the LLM history. A stored voice
 	// answer is [{text},{audio_url:/api/portal/chat-blobs/...}] (or [{text},{audio_removed}]
 	// once pruned); resolveChatBlobRefs resolves image parts only and leaves audio
@@ -1266,38 +1269,115 @@ func (s *Service) VoiceRunHistory(ctx context.Context, owner auth.Token, chatID,
 	// gateway-relative url no upstream can fetch -- would ride verbatim into the next
 	// /v1/chat/completions body from turn 2 of every conversation. The LLM gets the
 	// clean answer TEXT (and any image, kept for a vision model); this is the voice
-	// path alone, so the text/image run history is unchanged.
-	stripVoiceAssistantAudio(history)
-	// The pending turn is the ASR'd text, in hand already -- no blob to resolve -- so
-	// it is appended AFTER the resolution rather than fetched back out of the store.
-	return append(history, ChatAPIMessage{Role: "user", Content: json.RawMessage(mustJSONString(pendingText))}), nil
+	// path alone, so the text/image run history is unchanged. It runs over the history
+	// INCLUDING the pending turn: an audio-only turn at the tail is dropped, and the
+	// pending user text must then be merged into the user turn before it.
+	return stripVoiceAssistantAudio(history), nil
 }
 
-// stripVoiceAssistantAudio removes audio content parts -- a synthesized answer's
-// audio_url, and the not-stored audio marker -- from the ASSISTANT messages of a voice
-// run's LLM history, in place. Text and every non-audio part (an image kept for a
-// vision model) are left as they are; a plain-string content (a text-only turn) has no
-// part to strip and is untouched. An assistant turn left with no parts becomes an empty
-// string rather than an empty array, which an upstream could reject.
-func stripVoiceAssistantAudio(history []ChatAPIMessage) {
-	for i := range history {
-		if history[i].Role != "assistant" {
-			continue
+// stripVoiceAssistantAudio returns a voice run's LLM history with the audio content
+// parts -- a synthesized answer's audio_url, and the not-stored audio marker -- removed
+// from the ASSISTANT messages. Text and every non-audio part (an image kept for a vision
+// model) are left as they are; a plain-string content (a text-only turn) has no part to
+// strip and is untouched.
+//
+// An assistant turn that held ONLY audio (a TTS-only speech-run answer in a mixed
+// thread) has nothing left for the LLM, and is OMITTED rather than sent with an empty
+// content: a strict upstream (native Anthropic) rejects an empty assistant content on a
+// non-final message. Omitting it alone would leave two same-role turns adjacent (user,
+// user), which a strict-alternation chat template (several local models') rejects just as
+// firmly, so the two neighbours are MERGED into one turn -- valid on every upstream, and
+// with no invented placeholder text for the model to imitate. Only turns that the
+// omission made adjacent are merged; same-role neighbours that were already adjacent in
+// the stored thread are left exactly as stored. The input is not modified.
+func stripVoiceAssistantAudio(history []ChatAPIMessage) []ChatAPIMessage {
+	out := make([]ChatAPIMessage, 0, len(history))
+	omitted := false // a turn was omitted since the last kept one
+	for _, msg := range history {
+		if msg.Role == "assistant" {
+			content, changed, empty := withoutAudioParts(msg.Content)
+			if empty {
+				omitted = true
+				continue
+			}
+			if changed {
+				msg.Content = content
+			}
 		}
-		if content, changed := withoutAudioParts(history[i].Content); changed {
-			history[i].Content = content
+		out = appendVoiceHistoryTurn(out, msg, omitted)
+		omitted = false
+	}
+	return out
+}
+
+// appendVoiceHistoryTurn appends msg to turns, first merging it into the last kept turn
+// when an omitted audio-only turn between them left the two with the same role (afterOmit).
+// A pair whose content cannot be merged losslessly stays two turns: an adjacent same-role
+// pair is a smaller fault than a lost message.
+func appendVoiceHistoryTurn(turns []ChatAPIMessage, msg ChatAPIMessage, afterOmit bool) []ChatAPIMessage {
+	if n := len(turns); afterOmit && n > 0 && turns[n-1].Role == msg.Role {
+		if merged, ok := mergeMessageContent(turns[n-1].Content, msg.Content); ok {
+			turns[n-1].Content = merged
+			return turns
 		}
 	}
+	return append(turns, msg)
+}
+
+// mergeMessageContent joins the content of two same-role messages into one: two plain
+// strings become one string separated by a blank line; otherwise the content is joined as
+// a parts array (a string becoming one text part), so images and other parts survive. ok
+// is false when either content is neither a string nor an array of parts.
+func mergeMessageContent(a, b json.RawMessage) (json.RawMessage, bool) {
+	var sa, sb string
+	if json.Unmarshal(a, &sa) == nil && json.Unmarshal(b, &sb) == nil {
+		return json.RawMessage(mustJSONString(strings.TrimSpace(sa + "\n\n" + sb))), true
+	}
+	pa, okA := contentAsParts(a)
+	pb, okB := contentAsParts(b)
+	if !okA || !okB {
+		return nil, false
+	}
+	raw, err := json.Marshal(append(pa, pb...))
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
+// contentAsParts is a message content as a parts array: an array as stored, a string as
+// one text part (none when empty). ok is false for anything else.
+func contentAsParts(content json.RawMessage) ([]json.RawMessage, bool) {
+	var parts []json.RawMessage
+	if json.Unmarshal(content, &parts) == nil {
+		return parts, true
+	}
+	var s string
+	if json.Unmarshal(content, &s) != nil {
+		return nil, false
+	}
+	if s == "" {
+		return nil, true
+	}
+	part, err := json.Marshal(struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{Type: "text", Text: s})
+	if err != nil {
+		return nil, false
+	}
+	return []json.RawMessage{part}, true
 }
 
 // withoutAudioParts is the content of one assistant message with its audio parts dropped,
-// and whether that differs from content. A content that is not an array of parts (a
-// plain-string answer) and one with no audio part are unchanged; one whose every part was
-// audio becomes an empty string rather than an empty array.
-func withoutAudioParts(content json.RawMessage) (json.RawMessage, bool) {
+// whether that differs from content, and whether NOTHING is left (every part was audio, so
+// the turn carries no text or image for the LLM). A content that is not an array of parts
+// (a plain-string answer) and one with no audio part are unchanged (changed false, empty
+// false); on empty the returned content is nil and the caller omits the turn.
+func withoutAudioParts(content json.RawMessage) (stripped json.RawMessage, changed, empty bool) {
 	var parts []json.RawMessage
 	if json.Unmarshal(content, &parts) != nil {
-		return nil, false // not an array of parts (a plain-string answer): nothing to strip
+		return nil, false, false // not an array of parts (a plain-string answer): nothing to strip
 	}
 	kept := make([]json.RawMessage, 0, len(parts))
 	for _, p := range parts {
@@ -1306,16 +1386,16 @@ func withoutAudioParts(content json.RawMessage) (json.RawMessage, bool) {
 		}
 	}
 	if len(kept) == len(parts) {
-		return nil, false // no audio part was present
+		return nil, false, false // no audio part was present
 	}
 	if len(kept) == 0 {
-		return json.RawMessage(mustJSONString("")), true
+		return nil, true, true
 	}
 	raw, err := json.Marshal(kept)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
-	return raw, true
+	return raw, true, false
 }
 
 // isAudioContentPart reports whether a content part is an audio part -- a stored

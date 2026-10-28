@@ -675,6 +675,15 @@ func voiceTicketBody(chatID, asr, llm, tts string) string {
 	return string(body)
 }
 
+// voiceTicketBodyVoice is voiceTicketBody with the voice the speech model is to answer in.
+func voiceTicketBodyVoice(chatID, asr, llm, tts, voice string) string {
+	body, err := json.Marshal(map[string]string{"chat_id": chatID, "asr_model": asr, "llm_model": llm, "tts_model": tts, "voice": voice})
+	if err != nil {
+		panic(err)
+	}
+	return string(body)
+}
+
 func (w *voiceTicketWorld) post(body string, hdr map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, voiceTicketPath, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -808,6 +817,136 @@ func TestVoiceTicketEndpointMintsDefaultAudioForAChatWithoutSpeechSettings(t *te
 
 			if !reflect.DeepEqual(claims.Audio, portal.ChatAudioSettings{}) {
 				t.Fatalf("Audio = %+v, want the zero settings", claims.Audio)
+			}
+		})
+	}
+}
+
+// The voice the speech model answers in rides the request (#318): the portal's voice dropdown
+// picks it, the chat's stored settings.audio (a speech thread's own) has none of it for a text
+// thread. The ticket's speech settings -- which the voice run's TTS leg reads -- take it, over a
+// stored voice, and keep everything else of the stored settings.
+func TestVoiceTicketEndpointMintsTheRequestedVoice(t *testing.T) {
+	fake := &voiceGateFake{}
+	w := newVoiceTicketWorld(t, fake)
+	chatID := w.newChat(t, "usr_voice", `{"audio":{"voice":"stored","speed":1.25,"language":"de"}}`)
+
+	claims := w.redeem(t, w.postBearer(voiceTicketBodyVoice(chatID, "voice-asr", "voice-llm", "voice-tts", "marius")))
+
+	speed := 1.25
+	if want := (portal.ChatAudioSettings{Voice: "marius", Speed: &speed, Language: "de"}); !reflect.DeepEqual(claims.Audio, want) {
+		t.Fatalf("Audio = %+v, want the requested voice over the stored one and the rest as stored (%+v)", claims.Audio, want)
+	}
+}
+
+// A chat with no speech settings (a text thread) gets the requested voice and nothing else.
+func TestVoiceTicketEndpointMintsTheRequestedVoiceForAChatWithoutSpeechSettings(t *testing.T) {
+	w := newVoiceTicketWorld(t, &voiceGateFake{})
+	chatID := w.newChat(t, "usr_voice", `{"model":"voice-llm"}`)
+
+	claims := w.redeem(t, w.postBearer(voiceTicketBodyVoice(chatID, "voice-asr", "voice-llm", "voice-tts", "marius")))
+
+	if want := (portal.ChatAudioSettings{Voice: "marius"}); !reflect.DeepEqual(claims.Audio, want) {
+		t.Fatalf("Audio = %+v, want %+v", claims.Audio, want)
+	}
+}
+
+// No voice in the request (an older portal, or a plain model left on its own default) changes
+// nothing: the stored settings stand, and a blank or whitespace-only voice is no voice.
+func TestVoiceTicketEndpointKeepsTheStoredVoiceWhenNoneIsRequested(t *testing.T) {
+	for name, body := range map[string]func(chatID string) string{
+		"no voice member": func(chatID string) string { return voiceTicketBody(chatID, "voice-asr", "voice-llm", "voice-tts") },
+		"an empty voice": func(chatID string) string {
+			return voiceTicketBodyVoice(chatID, "voice-asr", "voice-llm", "voice-tts", "")
+		},
+		"a blank voice": func(chatID string) string {
+			return voiceTicketBodyVoice(chatID, "voice-asr", "voice-llm", "voice-tts", " \t ")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newVoiceTicketWorld(t, &voiceGateFake{})
+			chatID := w.newChat(t, "usr_voice", `{"audio":{"voice":"stored"}}`)
+
+			claims := w.redeem(t, w.postBearer(body(chatID)))
+
+			if claims.Audio.Voice != "stored" {
+				t.Fatalf("voice = %q, want the stored voice", claims.Audio.Voice)
+			}
+		})
+	}
+}
+
+// The requested voice is user-typed free text like the stored one, so it counts against the
+// same cap: a voice that would push the ticket's speech settings past voiceTicketAudioMaxBytes
+// is refused as unusable settings BEFORE the gate's cold start, and one at the cap mints.
+func TestVoiceTicketEndpointCapsTheRequestedVoice(t *testing.T) {
+	const voiceEnvelope = 12 // len(`{"voice":""}`)
+	atCap := strings.Repeat("v", voiceTicketAudioMaxBytes-voiceEnvelope)
+
+	t.Run("at the cap", func(t *testing.T) {
+		w := newVoiceTicketWorld(t, &voiceGateFake{})
+		chatID := w.newChat(t, "usr_voice", `{}`)
+
+		claims := w.redeem(t, w.postBearer(voiceTicketBodyVoice(chatID, "voice-asr", "voice-llm", "voice-tts", atCap)))
+
+		if claims.Audio.Voice != atCap {
+			t.Fatalf("voice length = %d, want the cap-sized voice carried whole", len(claims.Audio.Voice))
+		}
+	})
+	t.Run("one byte over", func(t *testing.T) {
+		fake := &voiceGateFake{}
+		w := newVoiceTicketWorld(t, fake)
+		chatID := w.newChat(t, "usr_voice", `{}`)
+
+		rec := w.postBearer(voiceTicketBodyVoice(chatID, "voice-asr", "voice-llm", "voice-tts", atCap+"v"))
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+		requireErrorCode(t, rec.Body.String(), voiceChatAudioSettingsInvalid)
+		requireNoTicket(t, rec)
+		requireNothingStarted(t, fake)
+	})
+}
+
+// A preset-clone speech model has no default voice of its own, so a ticket that names none for it
+// is minted on its first preset (routing.FirstPresetVoice, the voices cache's smallest named
+// voice): the portal pre-selects that one itself, and this is the belt for a request that could
+// not (the voices were still loading, or an older portal). A voice that IS named, or a stored
+// one, wins; a plain model keeps its own default voice, whatever its cache lists.
+func TestVoiceTicketEndpointDefaultsAPresetCloneToItsFirstPreset(t *testing.T) {
+	const clone, plain = "voice-tts-clone", "voice-tts"
+	cache := func(w *voiceTicketWorld, mappingID, payload string) {
+		t.Helper()
+		row := routing.ModelMappingCacheRow{MappingID: mappingID, CacheType: routing.ModelMappingCacheVoices, Payload: payload, UpdatedAt: time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)}
+		if err := w.routes.UpsertModelMappingCache(context.Background(), row); err != nil {
+			t.Fatalf("UpsertModelMappingCache %s: %v", mappingID, err)
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		tts       string
+		settings  string
+		requested string
+		want      string
+	}{
+		{"a clone with no voice named", clone, `{}`, "", "alba"},
+		{"a clone with a blank voice named", clone, `{}`, "  ", "alba"},
+		{"a clone with a requested voice", clone, `{}`, "zeta", "zeta"},
+		{"a clone with a stored voice", clone, `{"audio":{"voice":"stored"}}`, "", "stored"},
+		{"a plain model with voices cached", plain, `{}`, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newVoiceTicketWorld(t, &voiceGateFake{})
+			// Unsorted on purpose: the first preset is the smallest name, not the first listed.
+			cache(w, "route-voice-tts-clone", `["zeta","alba"]`)
+			cache(w, "route-voice-tts", `["marius","alba"]`)
+			chatID := w.newChat(t, "usr_voice", tc.settings)
+
+			claims := w.redeem(t, w.postBearer(voiceTicketBodyVoice(chatID, "voice-asr", "voice-llm", tc.tts, tc.requested)))
+
+			if claims.Audio.Voice != tc.want {
+				t.Fatalf("voice = %q, want %q", claims.Audio.Voice, tc.want)
 			}
 		})
 	}

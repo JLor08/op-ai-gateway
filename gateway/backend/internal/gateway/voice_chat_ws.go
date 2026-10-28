@@ -907,15 +907,16 @@ func (m *voiceMachine) onVoiced() {
 		m.firstPartialAt = now
 		m.armMax()
 		// The first voiced partial of a chunk that begins while the speculative run is still
-		// cancel-and-extendable (runResumable) is "resumed speech": cancel the run (nothing
-		// persisted), drop the answer preview, and fall back to listening so this chunk
-		// extends pendingText and re-runs on the next chunk end (spec 6.1). Once the run has
-		// passed its point of no return -- committing or committed -- the resume is NOT
-		// accepted: this voiced input stays an in-progress chunk, which the run's terminal
-		// force-close (closeWindow -> teardownTurn -> resetChunk) then DISCARDS. On that narrow
-		// fast-answer edge the resumed utterance is dropped, which keeps the turn single-
-		// committed and the state consistent (true barge-in is deferred to phase 4).
-		if m.runResumable() {
+		// cancel-and-extendable (tryResume: the cancel CAS beats the run's commit CAS) is
+		// "resumed speech": cancel the run (nothing persisted), drop the answer preview, and
+		// fall back to listening so this chunk extends pendingText and re-runs on the next chunk
+		// end (spec 6.1). Once the run has passed its point of no return -- committing or
+		// committed -- the resume is NOT accepted: this voiced input stays an in-progress
+		// chunk, which the run's terminal force-close (closeWindow -> teardownTurn ->
+		// resetChunk) then DISCARDS. On that narrow fast-answer edge the resumed utterance is
+		// dropped, which keeps the turn single-committed and the state consistent (true
+		// barge-in is deferred to phase 4).
+		if m.tryResume() {
 			m.onResume()
 		}
 	}
@@ -1367,17 +1368,31 @@ func (m *voiceMachine) onResume() {
 	m.setState(voiceStateListening)
 }
 
-// runResumable reports whether a resumed voiced chunk may cancel-and-extend the in-flight
+// runResumable reports whether a resumed voiced chunk MAY cancel-and-extend the in-flight
 // speculative run: there IS a run, the continuation window is still open, the run is still
-// running, AND it has not passed its commit point of no return (isCommitting). The committing
-// check closes the window the status check alone leaves: executeVoiceRun commits under
-// context.WithoutCancel, so the run's status stays "running" for the whole store write while a
-// cancel would no longer un-do it -- a resume there would persist the first turn AND re-run on
-// the extended text, double-committing the utterance. All reads are race-free from this
-// goroutine: machine state plus the run's own atomic/locked accessors.
+// running, AND neither its commit nor a cancel has claimed it yet (commitUndecided: the one
+// commit/cancel word is still voiceRunRunning). The word check closes the window the status
+// check alone leaves: executeVoiceRun commits under context.WithoutCancel, so the run's
+// status stays "running" for the whole store write while a cancel would no longer un-do it --
+// a resume there would persist the first turn AND re-run on the extended text,
+// double-committing the utterance. It is a pre-check (a READ): the decision to resume is
+// tryResume's claimCancel CAS, which is what makes it race-free against the run's own
+// claimCommit. All reads are safe from this goroutine: machine state plus the run's own
+// atomic/locked accessors.
 func (m *voiceMachine) runResumable() bool {
 	return m.curRun != nil && !m.windowClosed &&
-		m.curRun.statusValue() == "running" && !m.curRun.isCommitting()
+		m.curRun.statusValue() == "running" && m.curRun.commitUndecided()
+}
+
+// tryResume decides a resume: it reports true only when the run was resumable AND this call
+// won the cancel -- claimCancel is a compare-and-swap on the same word the run's claimCommit
+// uses, so exactly one of "the run commits" and "the resume cancels it" can happen. true
+// means the run will now commit NOTHING (its claimCommit fails) and the caller proceeds to
+// cancel-and-extend (onResume). false means the run is committing (or committed) -- the
+// resume is NOT accepted and the voiced input stays an in-progress chunk, i.e. a new turn.
+// The claim is the decision; the read before it (runResumable) only skips a pointless CAS.
+func (m *voiceMachine) tryResume() bool {
+	return m.runResumable() && m.curRun.claimCancel()
 }
 
 // degrade surfaces a recoverable leg failure (spec 6.6): one typed error frame carrying the
@@ -1400,8 +1415,12 @@ func (m *voiceMachine) degrade(code string) {
 // detachRun ends the current speculative run and clears every window field. It unsubscribes
 // (so no further event is delivered), cancels the run's context (a cancelled run persists
 // nothing) and removes it from the registry synchronously so the NEXT chunk's run can
-// reserve the chat's slot without racing the cancelled run's own async retirement. Safe to
-// call when no run is open; idempotent on an already-finished run.
+// reserve the chat's slot without racing the cancelled run's own async retirement. The
+// cancel goes through ChatRun.cancelContext, which claims the run's commit/cancel word
+// BEFORE cancelling the context -- so a run still short of its commit claim can never
+// commit afterwards. A run that already claimed its commit stays committing (its write is
+// under context.WithoutCancel); a RESUME never reaches here for such a run (tryResume).
+// Safe to call when no run is open; idempotent on an already-finished run.
 func (m *voiceMachine) detachRun() {
 	if m.runUnsub != nil {
 		m.runUnsub()

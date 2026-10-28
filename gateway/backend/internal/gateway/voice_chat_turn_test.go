@@ -574,7 +574,7 @@ func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string) {
 
 // slowCommitChatStore is a chat store that blocks the FIRST SaveChatWithBlobs (a voice turn's
 // deferred commit) so a test can act -- here, resume -- while the run is inside its commit
-// write: markCommitting has run, the context is WithoutCancel, but status is still "running"
+// write: the commit is claimed, the context is WithoutCancel, but status is still "running"
 // and the window still open. It signals commitStarted, then waits for release.
 type slowCommitChatStore struct {
 	*store.MemoryChatStore
@@ -602,8 +602,8 @@ func (s *slowCommitChatStore) SaveChatWithBlobs(ctx context.Context, chat store.
 // TestVoiceResumeDuringCommitWriteDoesNotExtend is the residual double-commit regression: a
 // resume that lands WHILE the run is inside its commit write (status still "running", window
 // still open, but past the point of no return) must NOT cancel-and-extend -- no answer_reset,
-// and exactly ONE committed turn carrying the first utterance alone. The committing flag, not
-// the run status, is what closes this.
+// and exactly ONE committed turn carrying the first utterance alone. The commit claim (the
+// run's commit/cancel word), not the run status, is what closes this.
 func TestVoiceResumeDuringCommitWriteDoesNotExtend(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"one", "two"}
@@ -617,7 +617,7 @@ func TestVoiceResumeDuringCommitWriteDoesNotExtend(t *testing.T) {
 	conn := h.dial(t, ctx)
 	readVoiceUntilState(t, ctx, conn, voiceStateListening)
 
-	// Turn 1: the run reaches commit and BLOCKS in SaveChatWithBlobs. markCommitting has run.
+	// Turn 1: the run reaches commit and BLOCKS in SaveChatWithBlobs. The commit is claimed.
 	if f := drainAChunk(t, ctx, conn); f != "one" {
 		t.Fatalf("turn 1 final = %q, want %q", f, "one")
 	}
@@ -666,7 +666,9 @@ func TestVoiceRunResumableGuard(t *testing.T) {
 	if !m.runResumable() {
 		t.Fatal("a running run in an open window must be resumable")
 	}
-	run.markCommitting()
+	if !run.claimCommit() {
+		t.Fatal("claimCommit on an undecided run must win")
+	}
 	if run.statusValue() != "running" {
 		t.Fatalf("precondition: status = %q, want still \"running\" while committing", run.statusValue())
 	}
@@ -686,6 +688,149 @@ func TestVoiceRunResumableGuard(t *testing.T) {
 	if (&voiceMachine{}).runResumable() {
 		t.Fatal("no run must not be resumable")
 	}
+}
+
+// TestVoiceRunCommitStateTransitions pins the commit/cancel word's state machine: the word
+// leaves "running" exactly once, so the run's commit claim and a cancel claim are mutually
+// exclusive in BOTH orders, and a second claim of the same kind never wins (no double-commit).
+func TestVoiceRunCommitStateTransitions(t *testing.T) {
+	t.Run("commit first: the cancel loses", func(t *testing.T) {
+		run := newChatRun("run_a", "chat_a", "usr_a", func() {})
+		if !run.commitUndecided() || run.isCommitting() {
+			t.Fatal("a fresh run must be undecided and not committing")
+		}
+		if !run.claimCommit() {
+			t.Fatal("running->committing must succeed on an undecided run")
+		}
+		if run.claimCancel() {
+			t.Fatal("a cancel must NOT win once the run has claimed its commit")
+		}
+		if run.claimCommit() {
+			t.Fatal("a second commit claim must not win (double-commit)")
+		}
+		if !run.isCommitting() || run.commitUndecided() {
+			t.Fatal("the run must stay committing after the lost cancel")
+		}
+	})
+	t.Run("cancel first: the commit loses", func(t *testing.T) {
+		run := newChatRun("run_b", "chat_b", "usr_b", func() {})
+		if !run.claimCancel() {
+			t.Fatal("running->canceled must succeed on an undecided run")
+		}
+		if run.claimCommit() {
+			t.Fatal("the commit must NOT be claimable once a cancel claimed the run: it would persist a cancelled run")
+		}
+		if run.claimCancel() {
+			t.Fatal("a second cancel claim must not win")
+		}
+		if run.isCommitting() || run.commitUndecided() {
+			t.Fatal("a canceled run is neither committing nor undecided")
+		}
+	})
+	t.Run("cancelContext claims the cancel before cancelling", func(t *testing.T) {
+		var run *ChatRun
+		var sawClaimed bool
+		run = newChatRun("run_c", "chat_c", "usr_c", func() {
+			// By the time the context is cancelled the word must already be decided, so a run
+			// that observes its cancelled context can never win the commit claim afterwards.
+			sawClaimed = !run.commitUndecided()
+		})
+		run.cancelContext()
+		if !sawClaimed {
+			t.Fatal("cancelContext cancelled the context before claiming the cancel")
+		}
+		if run.claimCommit() {
+			t.Fatal("a run cancelled through cancelContext must not be able to claim its commit")
+		}
+	})
+	t.Run("cancelContext leaves a committing run committing", func(t *testing.T) {
+		cancelled := false
+		run := newChatRun("run_d", "chat_d", "usr_d", func() { cancelled = true })
+		if !run.claimCommit() {
+			t.Fatal("claimCommit on an undecided run must win")
+		}
+		run.cancelContext()
+		if !run.isCommitting() {
+			t.Fatal("a cancel after the commit claim must not flip the word away from committing")
+		}
+		if !cancelled {
+			t.Fatal("the context cancel still fires (the commit write is under WithoutCancel)")
+		}
+	})
+}
+
+// TestVoiceTryResumeArbitratesWithCommit is the orchestrator-side arbitration: a resume is
+// accepted only by winning the cancel claim, so it can never be accepted for a run that has
+// claimed its commit -- and, once accepted, the run can never claim its commit.
+func TestVoiceTryResumeArbitratesWithCommit(t *testing.T) {
+	t.Run("resume wins: the run then cannot commit", func(t *testing.T) {
+		run := newChatRun("run_e", "chat_e", "usr_e", func() {})
+		m := &voiceMachine{curRun: run}
+		if !m.tryResume() {
+			t.Fatal("a resume of an undecided run in an open window must be accepted")
+		}
+		if run.claimCommit() {
+			t.Fatal("after an accepted resume the run must NOT be able to claim its commit (it would double-commit)")
+		}
+	})
+	t.Run("commit wins: the resume is rejected", func(t *testing.T) {
+		run := newChatRun("run_f", "chat_f", "usr_f", func() {})
+		m := &voiceMachine{curRun: run}
+		if !run.claimCommit() {
+			t.Fatal("claimCommit on an undecided run must win")
+		}
+		if m.tryResume() {
+			t.Fatal("a resume of a committing run must be rejected: it is a new turn, never a cancel-and-extend")
+		}
+	})
+	t.Run("a pre-check pass cannot be turned into a win by the claim alone", func(t *testing.T) {
+		// runResumable is only a pre-check: when the run commits between it and the claim, the
+		// CAS -- not the stale read -- rejects the resume.
+		run := newChatRun("run_g", "chat_g", "usr_g", func() {})
+		m := &voiceMachine{curRun: run}
+		if !m.runResumable() {
+			t.Fatal("precondition: the run is resumable by the pre-check")
+		}
+		if !run.claimCommit() { // the run commits in the gap after the pre-check
+			t.Fatal("claimCommit on an undecided run must win")
+		}
+		if run.claimCancel() {
+			t.Fatal("the claim must fail for a run that committed after the pre-check")
+		}
+	})
+}
+
+// TestVoiceCommitRacingCancelHasExactlyOneWinner hammers the arbitration under -race: the
+// run's commit claim and the orchestrator's resume claim run concurrently, and in every
+// iteration EXACTLY ONE wins and the word agrees with the winner -- never both (a double
+// commit / a persisted cancelled run) and never neither (a run that neither commits nor yields).
+// The scheduler decides who wins each time; the assertion holds for either order.
+func TestVoiceCommitRacingCancelHasExactlyOneWinner(t *testing.T) {
+	commits, resumes := 0, 0
+	for i := 0; i < 5000; i++ {
+		run := newChatRun("run_race", "chat_race", "usr_race", func() {})
+		m := &voiceMachine{curRun: run}
+		var commitWon, resumeWon bool
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; commitWon = run.claimCommit() }()
+		go func() { defer wg.Done(); <-start; resumeWon = m.tryResume() }()
+		close(start)
+		wg.Wait()
+		if commitWon == resumeWon {
+			t.Fatalf("iteration %d: commitWon=%v resumeWon=%v, want exactly one winner", i, commitWon, resumeWon)
+		}
+		if commitWon != run.isCommitting() {
+			t.Fatalf("iteration %d: commitWon=%v but isCommitting=%v: the word disagrees with the winner", i, commitWon, run.isCommitting())
+		}
+		if commitWon {
+			commits++
+		} else {
+			resumes++
+		}
+	}
+	t.Logf("5000 races: run committed %d, resume cancelled %d", commits, resumes)
 }
 
 // TestVoiceLLMErrorDegradesToIdle: an LLM failure stops the turn with one error frame and a

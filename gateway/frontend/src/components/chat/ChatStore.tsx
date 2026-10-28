@@ -111,10 +111,13 @@ import {
   type VoiceChatStart,
   type VoiceChatState,
 } from './useVoiceChat';
+import { useVoiceChatVoices } from './useVoiceChatVoices';
 import {
+  effectiveVoice,
   thoseThatStream,
   voiceLegsOf,
   voiceModelChoice,
+  withTtsModel,
   type VoiceChatModels,
   type VoiceLegs,
   type VoiceStreaming,
@@ -131,8 +134,9 @@ export type { LiveTranscription, LiveTranscriptionPhase } from './useLiveTranscr
 export { liveSessionRunning } from './liveSession';
 // The Voice Chat conversation's state, for the view that shows it (VoiceChatControl).
 export type { VoiceChatApi, VoiceChatError, VoiceChatState } from './useVoiceChat';
-// ...and the pickers of its transcription and speech models (voiceModels.ts).
-export type { VoiceChatModels, VoiceModelChoice } from './voiceModels';
+// ...and the pickers of its transcription and speech models and the speech model's voice
+// (voiceModels.ts).
+export type { VoiceChatModels, VoiceChoice, VoiceModelChoice } from './voiceModels';
 
 // The speech composer's advanced-passthrough check and the settings type it edits,
 // re-exported for Chat.tsx for the same reason as the image presets below: the
@@ -187,9 +191,10 @@ function speechOffered(option: ModelOption | undefined): boolean {
 }
 
 // Whether a catalogue model is a voice-CLONE speech model driven by its configured PRESET voices
-// (#301), the one speech model with no text-only default voice: a send with a blank voice relies
-// on the operator having configured a default preset, which the gateway cannot see. The one rule
-// of the effective model's modelPresetClone and of Voice Chat's choice of voice.
+// (#301), the one speech model with no text-only default voice: left blank it would rely on an
+// operator-configured default preset that the gateway cannot see, so the speech composer and Voice
+// Chat each pre-select its first preset voice. The one rule of the effective model's
+// modelPresetClone and of Voice Chat's choice of voice.
 function presetCloneOffered(option: ModelOption | undefined): boolean {
   return (
     option?.speech === true && option.speech_clone === true && option.speech_clone_voices === true
@@ -969,10 +974,11 @@ export function ChatStoreProvider({
   //
   // The speech candidates are ordered PLAIN models first, preset-CLONE ones (presetCloneOffered)
   // after, each group in the catalogue's order, since the first that streams is the one used: a
-  // conversation's text thread carries no audio settings, so a plain model speaks in its default
-  // voice while a preset clone would run with a BLANK voice and fail the first turn. A clone stays
-  // eligible, for a catalogue with no plain streaming model (its first turn then relies on the
-  // operator's default preset).
+  // plain model speaks in its own default voice, so it is the safer automatic default, while a
+  // preset clone has no default voice of its own and speaks one of its presets. A clone stays
+  // eligible, for a catalogue with no plain streaming model, and is never blank: the voice field
+  // pre-selects its first preset (voiceVoice, below), and the ticket mint defaults it to that same
+  // preset for a request that names none.
   const voiceAsrCandidates = useMemo(
     () => chatModels.filter((option) => option.transcription === true).map((option) => option.id),
     [chatModels],
@@ -2341,6 +2347,20 @@ export function ChatStoreProvider({
   // stored audio, together), and the thread is reloaded from it (refreshTranscript) when the turn
   // is over, which is how the stored turns reach the transcript, through the same rows as any
   // other turn.
+  // The voice the conversation speaks in (#318): the voices the gateway has cached for the speech
+  // model that would speak, and the voice -- the user's pick; else, for a preset-clone model
+  // (which has no default voice of its own), its first preset; else none, the model's own default
+  // (see effectiveVoice). Computed here, not written into the thread's settings: the pre-select
+  // follows the model that offered it, so a model switch needs no clean-up, and only a voice the
+  // user chose is saved.
+  const voiceTtsModel = voiceLegs?.tts ?? '';
+  const voiceTtsVoices = useVoiceChatVoices(apiRef, voiceTtsModel);
+  const voiceVoice = effectiveVoice(
+    voiceSettings.voice,
+    voiceTtsVoices,
+    presetCloneOffered(chatModels.find((option) => option.id === voiceTtsModel)),
+  );
+
   const voiceChat = useVoiceChat({
     apiRef,
     activeChatId,
@@ -2356,7 +2376,13 @@ export function ChatStoreProvider({
         return null;
       }
       voiceChatIdRef.current = chatId;
-      return { chatId, asrModel: voiceLegs.asr, llmModel: effectiveModel, ttsModel: voiceLegs.tts };
+      return {
+        chatId,
+        asrModel: voiceLegs.asr,
+        llmModel: effectiveModel,
+        ttsModel: voiceLegs.tts,
+        voice: voiceVoice,
+      };
     },
     refreshThread: refreshTranscript,
   });
@@ -2364,13 +2390,14 @@ export function ChatStoreProvider({
   audioSessionRunningRef.current = liveSessionRunning(liveSession.state) || voiceState !== 'off';
   voiceHeldChatRef.current = voiceState === 'off' ? null : voiceChatIdRef.current;
 
-  // The pickers of the conversation's two models, over the models that stream and the thread's
-  // saved picks (see VoiceModelChoice). A pick is the thread's: saved with it, never sent with a
-  // run. Choosing a model also ENDS the conversation (stop), which is what dismisses a refused
-  // ticket: a refusal is the gateway's answer to the three models the user started with, the
-  // pickers are how they try others, and the switch stays closed on a refusal until it is
-  // dismissed. (The pickers are closed while a conversation is on, so a pick ends none in
-  // practice; one made anyway would end a conversation that is no longer the one it started as.)
+  // The pickers of the conversation's two models and the speech model's voice, over the models
+  // that stream and the thread's saved picks (see VoiceModelChoice). A pick is the thread's: saved
+  // with it, never sent with a run. Choosing a model or a voice also ENDS the conversation (stop),
+  // which is what dismisses a refused ticket: a refusal is the gateway's answer to the models and
+  // the voice the user started with, the pickers are how they try others, and the switch stays
+  // closed on a refusal until it is dismissed. (The pickers are closed while a conversation is on,
+  // so a pick ends none in practice; one made anyway would end a conversation that is no longer
+  // the one it started as.) Choosing another speech model also drops the voice (withTtsModel).
   const setVoiceAsrModel = useCallback(
     (asrModel: string) => {
       stopVoiceChat();
@@ -2378,10 +2405,18 @@ export function ChatStoreProvider({
     },
     [stopVoiceChat],
   );
+  const voiceTtsStreaming = voiceStreaming?.tts;
   const setVoiceTtsModel = useCallback(
     (ttsModel: string) => {
       stopVoiceChat();
-      setVoiceSettings((current) => ({ ...current, ttsModel }));
+      setVoiceSettings((current) => withTtsModel(current, ttsModel, voiceTtsStreaming ?? []));
+    },
+    [stopVoiceChat, voiceTtsStreaming],
+  );
+  const setVoiceVoice = useCallback(
+    (voice: string) => {
+      stopVoiceChat();
+      setVoiceSettings((current) => ({ ...current, voice }));
     },
     [stopVoiceChat],
   );
@@ -2404,6 +2439,7 @@ export function ChatStoreProvider({
       used: voiceLegs?.tts ?? '',
       set: setVoiceTtsModel,
     }),
+    voice: { voices: voiceTtsVoices, value: voiceVoice, set: setVoiceVoice },
   };
 
   // A conversation belongs to the chat and the model it started with (its ticket holds the three

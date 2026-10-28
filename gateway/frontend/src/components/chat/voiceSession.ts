@@ -224,7 +224,8 @@ export type VoiceTicketApi = Pick<PortalApi, 'createVoiceChatTicket'>;
  *    is the stable code of the leg that failed.
  *  - Every other kind ends the session, with the same meaning as for a live transcription
  *    (LiveErrorKind): `dropped` -- the connection ended without the gateway saying why, or the
- *    ticket request did not get through (a retry may work); `refused` -- the gateway said no, a
+ *    ticket request did not get through (a retry may work; a 5xx of the ticket endpoint carries
+ *    its own `code`, portal.voice_chat_ticket_failed); `refused` -- the gateway said no, a
  *    ticket it refused, with its `code` (the same request is refused again); `denied` -- the
  *    microphone was refused; `unsupported` -- this browser cannot capture audio this way;
  *    `capture` -- the microphone or the audio pipeline failed.
@@ -284,6 +285,8 @@ export type VoiceSessionArgs = {
   asrModel: string;
   llmModel: string;
   ttsModel: string;
+  /** The voice the speech model answers in; '' is the model's own default voice. */
+  voice: string;
   /**
    * One chunk of the turn as it is being said (a partial replaces the last partial) and as the
    * chunk finished (the caller accumulates the finals; the turn may have more chunks).
@@ -654,6 +657,7 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
         asrModel: args.asrModel,
         llmModel: args.llmModel,
         ttsModel: args.ttsModel,
+        voice: args.voice,
       }));
     } catch (error) {
       throw ticketFailure(error);

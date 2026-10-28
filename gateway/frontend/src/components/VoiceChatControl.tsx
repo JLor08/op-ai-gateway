@@ -7,6 +7,7 @@ import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
 import type { MessageKey, Translation } from './shared/types';
 import { SearchableSelect } from './shared/SearchableSelect';
+import { SpeechVoiceField } from './SpeechVoiceField';
 import type {
   VoiceChatApi,
   VoiceChatError,
@@ -37,7 +38,9 @@ const GAP_TEXT = {
 } satisfies Record<VoiceChatGap, MessageKey>;
 
 // What the gateway says when it refuses a ticket, by its code (the gate's portal.voice_chat_*).
-// Any other refusal (an unknown chat, a request it cannot read) is the generic sentence.
+// Any other refusal (an unknown chat, a request it cannot read) is the generic sentence. The same
+// table words the one 5xx the endpoint answers with a code of its own (the mint failed,
+// portal.voice_chat_ticket_failed), which reaches the control as a dropped failure that carries it.
 const REFUSAL_TEXT: Partial<Record<string, MessageKey>> = {
   'portal.voice_chat_asr_unavailable': 'chatVoiceErrorAsrUnavailable',
   'portal.voice_chat_llm_unavailable': 'chatVoiceErrorLlmUnavailable',
@@ -46,6 +49,12 @@ const REFUSAL_TEXT: Partial<Record<string, MessageKey>> = {
   'portal.voice_chat_audio_settings_invalid': 'chatVoiceErrorAudioSettings',
   'portal.voice_chat_ticket_failed': 'chatVoiceErrorTicket',
 };
+
+// The sentence of ours for a gateway code, or undefined where none says more than the code does.
+function sentenceForCode(code: string | undefined, t: Translation): string | undefined {
+  const key = code ? REFUSAL_TEXT[code] : undefined;
+  return key ? t[key] : undefined;
+}
 
 // The sentence for a failure, by what kind it is and the gateway's code. `message` is the
 // session's diagnostic English and is never shown; the code is, where no sentence of ours says
@@ -60,13 +69,13 @@ function errorText(error: VoiceChatError, t: Translation): string {
     case 'capture':
       return t.chatVoiceErrorCapture;
     case 'dropped':
-      return t.chatVoiceErrorDropped;
+      // A failure a retry can get past; one that carries the gateway's code (a ticket the mint
+      // failed to issue) is worded by it, and any other (a lost connection) is the generic one.
+      return sentenceForCode(error.code, t) ?? t.chatVoiceErrorDropped;
     case 'turn':
       return withCode(t.chatVoiceErrorTurn);
-    case 'refused': {
-      const key = error.code ? REFUSAL_TEXT[error.code] : undefined;
-      return key ? t[key] : withCode(t.chatVoiceErrorRefused);
-    }
+    case 'refused':
+      return sentenceForCode(error.code, t) ?? withCode(t.chatVoiceErrorRefused);
   }
 }
 
@@ -344,7 +353,9 @@ export function VoiceChatControl({
 }
 
 // The pickers of the conversation's two models (#317), the live transcription model that hears the
-// user and the speech model that answers aloud, one field each, and under them the third model --
+// user and the speech model that answers aloud, one field each, the speech model's voice (#318)
+// under its picker -- the speech composer's own voice field, shown only when the model has voices
+// to offer (a model with none speaks in its own default) -- and under them the third model --
 // the thread's own, which answers -- named: it is picked with the thread's model selector, so it
 // has no field here. Closed until the gateway has said which models stream (there is nothing to
 // choose from), and while a conversation is on (its ticket holds the models it started with); NOT
@@ -372,13 +383,27 @@ function VoiceModelPickers({
           disabled={closed}
           t={t}
         />
-        <VoiceModelPicker
-          id="chat-voice-tts-model"
-          label={t.chatVoiceTtsModel}
-          choice={models.tts}
-          disabled={closed}
-          t={t}
-        />
+        {/* The speech model's picker and, under it, its voice: one column, so the voice reads as
+            the speech model's and not the transcription model's. */}
+        <Box sx={{ display: 'grid', gap: 1.5, alignContent: 'start' }}>
+          <VoiceModelPicker
+            id="chat-voice-tts-model"
+            label={t.chatVoiceTtsModel}
+            choice={models.tts}
+            disabled={closed}
+            t={t}
+          />
+          {models.voice.voices.length > 0 && (
+            <SpeechVoiceField
+              id="chat-voice-tts-voice"
+              value={models.voice.value}
+              voices={models.voice.voices}
+              onChange={models.voice.set}
+              disabled={closed}
+              t={t}
+            />
+          )}
+        </Box>
       </Box>
       {models.llm !== '' && (
         <Typography variant="caption" color="text.secondary" component="p" sx={{ m: 0 }}>
@@ -439,7 +464,21 @@ function ListeningIndicator({ state, t }: Readonly<{ state: VoiceChatState; t: T
       role="status"
       aria-live="polite"
       aria-label={t.chatVoiceIndicator}
-      sx={{ display: 'flex', alignItems: 'center', gap: 1.5, minHeight: on ? 56 : 32 }}
+      sx={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 1.5,
+        minHeight: on ? 56 : 32,
+        // It must not scroll out of sight under a long thread, or a long transcript and answer
+        // (#318): it sticks to the edge of the viewport it would leave, within the control, on the
+        // page's own background so that what scrolls under it does not show through.
+        position: 'sticky',
+        top: 0,
+        bottom: 0,
+        zIndex: 1,
+        py: 0.5,
+        bgcolor: 'var(--page)',
+      }}
     >
       <Box
         aria-hidden

@@ -22,6 +22,7 @@ describe('voiceChatApi createVoiceChatTicket', () => {
       asrModel: 'org/asr one',
       llmModel: 'chat-model',
       ttsModel: 'speech-model',
+      voice: 'alba',
     });
 
     expect(result).toEqual({ ticket: 'tkt_voice' });
@@ -37,7 +38,22 @@ describe('voiceChatApi createVoiceChatTicket', () => {
       asr_model: 'org/asr one',
       llm_model: 'chat-model',
       tts_model: 'speech-model',
+      voice: 'alba',
     });
+  });
+
+  it('sends the voice as an empty string when none is chosen (the speech model default)', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ ticket: 'tkt_voice' }));
+
+    await createPortalApi(fetcher).createVoiceChatTicket({
+      chatId: 'chat_1',
+      asrModel: 'asr',
+      llmModel: 'llm',
+      ttsModel: 'tts',
+      voice: '',
+    });
+
+    expect(JSON.parse(fetcher.mock.calls[0][1].body).voice).toBe('');
   });
 
   // The gateway's refusals of a Voice Chat ticket: a leg it cannot use (400), models it cannot
@@ -64,6 +80,7 @@ describe('voiceChatApi createVoiceChatTicket', () => {
           asrModel: 'asr',
           llmModel: 'llm',
           ttsModel: 'tts',
+          voice: '',
         }),
       ).rejects.toMatchObject({ status, code });
     },
