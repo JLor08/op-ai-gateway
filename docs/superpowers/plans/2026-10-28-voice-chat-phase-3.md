@@ -56,7 +56,7 @@
 **Interfaces (produces, consumed by Tasks 4/6):**
 - `AssistantTurn` gains `SpokenSections []SpokenSection` where `type SpokenSection struct { Text string; Start int; Len int }` (rune offset+length into the clean answer text; audio rides `ContentParts` in section order).
 - `buildAssistantMessage` **always** writes a top-level `spoken_sections` array (each `{text?,start,len}`) for a voice turn with ≥1 section, and **stops** writing the scalar `spoken_summary`/`spoken_summary_start` going forward. The renderer (Task 6) reads `spoken_sections` when present and falls back to the scalar keys only for turns committed before phase 3.
-- `voiceContentParts(answer, audioPartsBySection [][]json.RawMessage)` orders audio as `[text, sec0 audio…, sec1 audio…]`.
+- `voiceContentParts(answer string, audioBySection []json.RawMessage)` — each element is one section's audio array (a `json.RawMessage`, as `generateSpeechTurn` returns it); orders audio as `[text, sec0 audio…, sec1 audio…]`; nil/`null`/`[]` entries skipped, a non-array entry errors. (Implemented in Task 2; Task 4 passes per-section `audioParts` straight through.)
 
 - [ ] **Step 1: failing tests** — commit a voice turn with 2 sections → stored message has `spoken_sections` with correct spans + audio parts in order; a 1-section turn still carries the phase-2 shape (back-compat); empty → no section keys. Reload via `parseChatDoc`.
 - [ ] **Step 2-4: TDD** (`go test ./internal/portal/`).
