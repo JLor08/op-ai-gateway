@@ -115,6 +115,17 @@ func sendVoiceControl(t *testing.T, ctx context.Context, conn *websocket.Conn, t
 	}
 }
 
+// sendVoicePlaybackDone sends a playback_done control carrying the client's monotonic playout
+// counter (played_through): the total audio chunks it has RECEIVED for the turn. The server
+// honors the signal as the end of audio only when the counter accounts for all it has relayed.
+func sendVoicePlaybackDone(t *testing.T, ctx context.Context, conn *websocket.Conn, playedThrough int) {
+	t.Helper()
+	frame := fmt.Sprintf(`{"type":%q,"played_through":%d}`, voiceUpPlaybackDone, playedThrough)
+	if err := conn.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+		t.Fatalf("send playback_done(played_through=%d): %v", playedThrough, err)
+	}
+}
+
 // requireNoUpgrade asserts a dial was refused before any upgrade with the given status.
 func requireNoUpgrade(t *testing.T, conn *websocket.Conn, resp *http.Response, err error, wantStatus int) {
 	t.Helper()
@@ -501,6 +512,17 @@ func TestParseVoiceUpControl(t *testing.T) {
 		if got, ok := parseVoiceUpControl([]byte(raw)); !ok || got.Type != "bye" {
 			t.Errorf("parseVoiceUpControl(%q) = (%+v, %v), want (bye, true)", raw, got, ok)
 		}
+	}
+
+	// playback_done carries the optional playout counter (#322): present it is read, absent it is
+	// nil (an older client, which falls back to the remembered-signal path).
+	if got, ok := parseVoiceUpControl([]byte(`{"type":"playback_done","played_through":3}`)); !ok ||
+		got.Type != voiceUpPlaybackDone || got.PlayedThrough == nil || *got.PlayedThrough != 3 {
+		t.Errorf("parseVoiceUpControl(playback_done+counter) = (%+v, %v), want played_through=3", got, ok)
+	}
+	if got, ok := parseVoiceUpControl([]byte(`{"type":"playback_done"}`)); !ok ||
+		got.Type != voiceUpPlaybackDone || got.PlayedThrough != nil {
+		t.Errorf("parseVoiceUpControl(playback_done, no counter) = (%+v, %v), want a nil counter", got, ok)
 	}
 
 	invalid := map[string]string{
