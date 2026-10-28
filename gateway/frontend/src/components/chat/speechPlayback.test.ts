@@ -320,6 +320,315 @@ describe('StreamingPcmPlayer', () => {
       expect(gains[0].gain.value).toBe(0);
     });
   });
+
+  // Pause / resume (#315): the timeline of THIS player is halted -- its scheduled sources are
+  // stopped and what has not yet been heard is held -- and resumed by scheduling the rest
+  // anew on the live clock. The page's AudioContext is shared by every chat and every other
+  // player, so it is never suspended; nothing here may touch anything but this player's nodes.
+  describe('pause and resume', () => {
+    const RATE = 44100;
+    // 0.1 s of PCM whose every sample is `value`, so a chunk can be told apart by its content.
+    const tenth = (value: number) => new Uint8Array(pcm(new Array(4410).fill(value)));
+    // What a scheduled entry holds, as one comparable value: [rate, sample count, first value].
+    const shape = (s: { samples: Float32Array; rate: number }) => [
+      s.rate,
+      s.samples.length,
+      Math.round(s.samples[0] * 32768),
+    ];
+
+    // Three 0.1 s chunks valued 1, 2, 3, scheduled at 0.1-0.2, 0.2-0.3 and 0.3-0.4.
+    function threeChunks(lead = 0.1) {
+      const fake = fakeContext(0);
+      const player = new StreamingPcmPlayer(fake.ctx, lead);
+      for (const v of [1, 2, 3]) player.push(tenth(v), RATE);
+      return { ...fake, player };
+    }
+
+    it('halts the playout: every scheduled source is stopped and nothing new is scheduled', () => {
+      const { ctx, scheduled, sources, player } = threeChunks();
+      ctx.currentTime = 0.25;
+      player.pause();
+      expect(sources.every((s) => s.stopped)).toBe(true);
+      ctx.currentTime = 9;
+      expect(scheduled).toHaveLength(3);
+    });
+
+    it('fires no onEmpty: a pause is not a drain, not even from a halted source ending late', () => {
+      const { ctx, sources, player } = threeChunks();
+      const onEmpty = vi.fn();
+      player.onEmpty = onEmpty;
+      // The browser dispatches `ended` for a source asked to stop; keep each source's handler
+      // as the browser would have it, and deliver it after the pause.
+      const lateEnded = sources.map((s) => s.ended);
+      ctx.currentTime = 0.25;
+      player.pause();
+      for (const ended of lateEnded) ended?.();
+      expect(onEmpty).not.toHaveBeenCalled();
+    });
+
+    it('resumes from where it paused: the finished chunk is not replayed, the playing one continues', () => {
+      const { ctx, scheduled, player } = threeChunks();
+      ctx.currentTime = 0.25; // chunk 1 (0.2-0.3) is 0.05 s in; chunk 0 is over; chunk 2 unstarted
+      player.pause();
+      ctx.currentTime = 4; // time passes while paused: the resumed audio is placed on the LIVE clock
+      player.resume();
+      // 3 original + the remainder of chunk 1 (2205 samples left) + all of chunk 2.
+      expect(scheduled).toHaveLength(5);
+      expect(scheduled.slice(3).map(shape)).toEqual([
+        [RATE, 2205, 2],
+        [RATE, 4410, 3],
+      ]);
+      expect(scheduled[3].start).toBeCloseTo(4.1, 6); // the lead ahead of "now", as after a stall
+      expect(scheduled[4].start).toBeCloseTo(4.15, 6); // gapless behind the remainder
+      // The remainder is the TAIL of the chunk, not its head.
+      expect(scheduled[3].samples.every((s) => s === 2 / 32768)).toBe(true);
+    });
+
+    it('re-anchors on resume even straight away: not behind the old timeline it halted', () => {
+      const { ctx, scheduled, player } = threeChunks(); // the old timeline runs to 0.4
+      ctx.currentTime = 0.25;
+      player.pause();
+      player.resume(); // no time has passed: "now" is still inside the halted timeline
+      expect(scheduled[3].start).toBeCloseTo(0.35, 6); // now + lead, not 0.4 (a gap of silence)
+      expect(scheduled[4].start).toBeCloseTo(0.4, 6);
+    });
+
+    it('holds a chunk that had not started yet whole, and one that has just ended not at all', () => {
+      const { ctx, scheduled, player } = threeChunks();
+      ctx.currentTime = 0.05; // nothing has started (the first chunk starts at 0.1)
+      player.pause();
+      ctx.currentTime = 1;
+      player.resume();
+      expect(scheduled.slice(3).map(shape)).toEqual([
+        [RATE, 4410, 1],
+        [RATE, 4410, 2],
+        [RATE, 4410, 3],
+      ]);
+
+      const second = threeChunks();
+      second.ctx.currentTime = 0.45; // every chunk is over, though no `ended` was delivered yet
+      second.player.pause();
+      second.ctx.currentTime = 1;
+      second.player.resume();
+      expect(second.scheduled).toHaveLength(3); // nothing replayed
+    });
+
+    it('keeps the order and drops or duplicates nothing across repeated pauses', () => {
+      const { ctx, scheduled, player } = threeChunks();
+      ctx.currentTime = 0.25;
+      player.pause();
+      ctx.currentTime = 1;
+      player.resume(); // remainder of chunk 1 at 1.1-1.15, chunk 2 at 1.15-1.25
+      ctx.currentTime = 1.12; // 0.02 s (882 samples) into the remainder
+      player.pause();
+      ctx.currentTime = 2;
+      player.resume();
+      expect(scheduled.slice(5).map(shape)).toEqual([
+        [RATE, 1323, 2], // 2205 - 882: the rest of chunk 1
+        [RATE, 4410, 3], // chunk 2, whole
+      ]);
+      expect(scheduled.slice(5).map((s) => s.start)).toEqual([
+        expect.closeTo(2.1, 6),
+        expect.closeTo(2.1 + 1323 / RATE, 6),
+      ]);
+    });
+
+    it('holds what is pushed while paused, in order, and schedules none of it until resume', () => {
+      const { ctx, scheduled, player } = threeChunks();
+      ctx.currentTime = 0.25;
+      player.pause();
+      expect(player.push(tenth(4), RATE)).toBe(true);
+      expect(player.push(tenth(5), RATE)).toBe(true);
+      expect(scheduled).toHaveLength(3);
+      ctx.currentTime = 2;
+      player.resume();
+      expect(scheduled.slice(3).map(shape)).toEqual([
+        [RATE, 2205, 2],
+        [RATE, 4410, 3],
+        [RATE, 4410, 4],
+        [RATE, 4410, 5],
+      ]);
+      // ...and a chunk pushed AFTER the resume joins the end of the same gapless timeline.
+      player.push(tenth(6), RATE);
+      expect(scheduled[7].start).toBeCloseTo(scheduled[6].start + 0.1, 6);
+    });
+
+    it('still refuses a chunk the browser cannot make a buffer of while paused', () => {
+      const { ctx, player } = threeChunks();
+      player.pause();
+      vi.spyOn(ctx, 'createBuffer').mockImplementationOnce(() => {
+        throw new Error('unsupported rate');
+      });
+      expect(player.push(tenth(4), RATE)).toBe(false);
+    });
+
+    it('counts what is held as pending and as audio still to play while paused', () => {
+      const { ctx, player } = threeChunks();
+      ctx.currentTime = 0.25;
+      player.pause();
+      expect(player.pending).toBe(2); // the rest of chunk 1 and chunk 2
+      expect(player.remainingSeconds()).toBeCloseTo(0.15, 6);
+      player.push(tenth(4), RATE);
+      expect(player.pending).toBe(3);
+      expect(player.remainingSeconds()).toBeCloseTo(0.25, 6);
+      ctx.currentTime = 100; // the clock running on does not drain a held queue
+      expect(player.remainingSeconds()).toBeCloseTo(0.25, 6);
+      player.resume();
+      expect(player.pending).toBe(3);
+      expect(player.remainingSeconds()).toBeCloseTo(0.1 + 0.25, 6); // lead + the held audio
+    });
+
+    it('is idempotent: a second pause, or a resume that is not paused, does nothing', () => {
+      const { ctx, scheduled, sources, player } = threeChunks();
+      player.resume(); // not paused
+      expect(scheduled).toHaveLength(3);
+      expect(sources.some((s) => s.stopped)).toBe(false);
+      ctx.currentTime = 0.25;
+      player.pause();
+      ctx.currentTime = 3;
+      player.pause(); // already paused: must not re-measure the offset from the later "now"
+      player.resume();
+      player.resume(); // a second resume must not schedule the remainder twice
+      expect(scheduled.slice(3).map(shape)).toEqual([
+        [RATE, 2205, 2],
+        [RATE, 4410, 3],
+      ]);
+    });
+
+    it('pause then resume on a player that has nothing is a safe no-op: no nodes, no onEmpty', () => {
+      const { ctx, sources, gains } = fakeContext(0);
+      const player = new StreamingPcmPlayer(ctx, 0.1);
+      const onEmpty = vi.fn();
+      player.onEmpty = onEmpty;
+      player.pause();
+      player.resume();
+      expect(sources).toHaveLength(0);
+      expect(gains).toHaveLength(0);
+      expect(player.pending).toBe(0);
+      expect(onEmpty).not.toHaveBeenCalled();
+    });
+
+    it('a pause made before the first chunk holds that chunk until resume', () => {
+      const fake = fakeContext(0);
+      const { ctx, scheduled } = fake;
+      const player = new StreamingPcmPlayer(ctx, 0.1);
+      const onEmpty = vi.fn();
+      player.onEmpty = onEmpty;
+      player.pause(); // nothing scheduled yet
+      player.push(tenth(1), RATE);
+      expect(scheduled).toHaveLength(0);
+      expect(player.pending).toBe(1);
+      ctx.currentTime = 1;
+      player.resume();
+      expect(scheduled.map(shape)).toEqual([[RATE, 4410, 1]]);
+      expect(scheduled[0].start).toBeCloseTo(1.1, 6);
+      expect(onEmpty).not.toHaveBeenCalled();
+    });
+
+    it('resumed with nothing held: no sources, no onEmpty', () => {
+      const { ctx, scheduled, sources, player } = threeChunks();
+      ctx.currentTime = 0.45; // all played
+      player.pause();
+      const onEmpty = vi.fn();
+      player.onEmpty = onEmpty;
+      player.resume();
+      expect(scheduled).toHaveLength(3);
+      expect(sources).toHaveLength(3);
+      expect(player.pending).toBe(0);
+      expect(onEmpty).not.toHaveBeenCalled();
+    });
+
+    it('drains after a resume and fires onEmpty once, at the true end', () => {
+      const { ctx, sources, player } = threeChunks();
+      const onEmpty = vi.fn();
+      player.onEmpty = onEmpty;
+      ctx.currentTime = 0.25;
+      player.pause();
+      ctx.currentTime = 1;
+      player.resume();
+      expect(sources).toHaveLength(5);
+      sources[3].ended?.(); // the remainder of chunk 1
+      expect(onEmpty).not.toHaveBeenCalled();
+      sources[4].ended?.(); // chunk 2: the last one
+      expect(onEmpty).toHaveBeenCalledTimes(1);
+      expect(player.pending).toBe(0);
+    });
+
+    it('ignores a halted source that reports ended after the resume, keeping the new ones', () => {
+      const { ctx, sources, player } = threeChunks();
+      const onEmpty = vi.fn();
+      player.onEmpty = onEmpty;
+      const staleEnded = sources.map((s) => s.ended);
+      ctx.currentTime = 0.25;
+      player.pause();
+      ctx.currentTime = 1;
+      player.resume();
+      for (const ended of staleEnded) ended?.();
+      expect(onEmpty).not.toHaveBeenCalled();
+      expect(player.pending).toBe(2); // the two resumed sources are still tracked
+    });
+
+    it('leaves another player on the same context, and the context itself, alone', () => {
+      const fake = fakeContext(0);
+      const suspend = vi.fn();
+      Object.assign(fake.ctx, { suspend });
+      const mine = new StreamingPcmPlayer(fake.ctx, 0.1);
+      const other = new StreamingPcmPlayer(fake.ctx, 0.1);
+      mine.push(tenth(1), RATE); // sources[0]
+      other.push(tenth(7), RATE); // sources[1]
+      other.push(tenth(8), RATE); // sources[2]
+      const otherEmpty = vi.fn();
+      other.onEmpty = otherEmpty;
+      fake.ctx.currentTime = 0.15;
+      mine.pause();
+      expect(fake.sources[0].stopped).toBe(true);
+      expect(fake.sources[1].stopped).toBe(false);
+      expect(fake.sources[2].stopped).toBe(false);
+      expect(suspend).not.toHaveBeenCalled();
+      expect(other.pending).toBe(2);
+      // The other player still plays out and drains on its own.
+      fake.sources[1].ended?.();
+      fake.sources[2].ended?.();
+      expect(otherEmpty).toHaveBeenCalledTimes(1);
+      // ...and resuming mine neither touches it nor needs the context to be resumed.
+      mine.resume();
+      expect(fake.sources[1].stopped).toBe(false);
+      expect(suspend).not.toHaveBeenCalled();
+    });
+
+    it('keeps the mute through a pause: the same gain node, still at the mute', () => {
+      const { ctx, sources, gains, player } = threeChunks();
+      player.setMuted(true);
+      ctx.currentTime = 0.25;
+      player.pause();
+      expect(gains[0].gain.value).toBe(0); // pausing is not an unmute
+      ctx.currentTime = 1;
+      player.resume();
+      expect(gains).toHaveLength(1);
+      expect(sources[3].connected).toEqual([gains[0]]);
+      expect(gains[0].gain.value).toBe(0);
+    });
+
+    it('stop() while paused discards what was held, and a resume afterwards plays nothing', () => {
+      const { ctx, scheduled, player } = threeChunks();
+      ctx.currentTime = 0.25;
+      player.pause();
+      player.stop();
+      expect(player.pending).toBe(0);
+      player.resume();
+      expect(player.push(tenth(4), RATE)).toBe(false);
+      expect(scheduled).toHaveLength(3);
+    });
+
+    it('pause after stop() is a no-op', () => {
+      const { scheduled, player } = threeChunks();
+      player.stop();
+      player.pause();
+      player.resume();
+      expect(scheduled).toHaveLength(3);
+      expect(player.pending).toBe(0);
+    });
+  });
 });
 
 describe('createSpeechPlayback', () => {
