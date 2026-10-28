@@ -1092,21 +1092,41 @@ type AssistantTurn struct {
 	// stored), while a buffered-fallback answer is STORED so the un-heard paid
 	// audio is not lost -- see writeAssistant.
 	AudioStreamed bool
-	// SpokenSummary is the text of a VOICE answer's spoken summary -- the leading
-	// <speak> part the user hears -- recorded so the portal can re-render it as the
-	// collapsed block when the thread is reloaded. It is ADDITIONAL metadata: the
-	// answer's text in Content/ContentParts stays the full clean answer, summary and
-	// detail both. It is persisted under the message's `spoken_summary` key and only
-	// when non-empty, so a turn with no summary (a phase-1 voice turn, a no-tag
-	// fallback, every non-voice turn) is stored byte for byte as before.
-	SpokenSummary string
-	// SpokenSummaryStart is the RUNE offset of SpokenSummary within the full clean answer
-	// (Content/ContentParts), so the portal can slice the summary out of the body by position
-	// rather than re-finding it by value with indexOf -- exact even when the summary's text also
-	// appears before the <speak> region (#322). It is persisted under `spoken_summary_start`, and
-	// ONLY when SpokenSummary is non-empty: a value of 0 is the common case (the summary is the
-	// leading text) and must round-trip, so the summary's presence gates the key, not the offset.
-	SpokenSummaryStart int
+	// SpokenSections is the ordered list of the VOICE answer's spoken sections -- the
+	// <speak> regions the user hears, in document order -- recorded so the portal can
+	// re-render each one as its own collapsed block when the thread is reloaded. It is
+	// ADDITIONAL metadata: the answer's text in Content/ContentParts stays the full clean
+	// answer, every section and the detail between them. Each section's audio rides
+	// ContentParts, as audio parts after the text part, in this same order.
+	//
+	// It is persisted under the message's top-level `spoken_sections` key whenever there is at
+	// least one section, and a turn with none (a no-tag fallback, a speech-failed turn, every
+	// non-voice turn) carries no such key -- stored byte for byte as before. It replaces the
+	// phase-2 scalar `spoken_summary`/`spoken_summary_start` keys, which are no longer written
+	// (turns already stored with them stay readable, see SpokenSection).
+	SpokenSections []SpokenSection
+}
+
+// SpokenSection locates one spoken <speak> region within a voice answer's full clean text.
+// It is persisted as an element of the message's `spoken_sections` array:
+//
+//	{"text":"...","start":0,"len":4}
+//
+// Start and Len are RUNE (not byte) counts into the full clean answer (Content/ContentParts'
+// text part), so the portal slices the section out of the body by position rather than
+// re-finding it by value -- exact even when the section's text also appears elsewhere in the
+// answer (#322). Text is the section's spoken text (whitespace-trimmed), stored beside the span
+// so a renderer can show it without slicing; the span is authoritative. Start is written even
+// when 0 -- the common case of a leading section -- and Text is dropped when empty.
+//
+// This generalizes phase 2's single summary: a one-section turn is the N=1 case, stored as a
+// one-element array. Turns committed before phase 3 carry the scalar `spoken_summary` +
+// `spoken_summary_start` keys instead and are never rewritten; the renderer reads
+// `spoken_sections` when present and falls back to those scalars only for such old turns.
+type SpokenSection struct {
+	Text  string `json:"text,omitempty"`
+	Start int    `json:"start"`
+	Len   int    `json:"len"`
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -1193,14 +1213,13 @@ func buildAssistantMessage(id, status string, turn AssistantTurn) (json.RawMessa
 		// event carries the snake_case tokens_per_second separately (issue #56).
 		msg["tokensPerSecond"] = turn.TokensPerSecond
 	}
-	if turn.SpokenSummary != "" {
+	if len(turn.SpokenSections) > 0 {
 		// snake_case, like the chat document's other additive keys (settings.voice_chat);
-		// the portal reads it to re-render the collapsed spoken-summary block on reload.
-		msg["spoken_summary"] = turn.SpokenSummary
-		// The summary's rune offset rides ALONGSIDE it, written whenever the summary is -- 0
-		// included, since the summary is usually the leading text -- so the portal slices the
-		// body by position. A turn with no summary carries neither key (#322).
-		msg["spoken_summary_start"] = turn.SpokenSummaryStart
+		// the portal reads it to re-render each spoken section as its own collapsed block on
+		// reload. This is the ONLY spoken-text key written: the phase-2 scalar
+		// spoken_summary/spoken_summary_start are gone, so even a single section is a
+		// one-element array. A turn with no section carries no key at all.
+		msg["spoken_sections"] = turn.SpokenSections
 	}
 	return json.Marshal(msg)
 }

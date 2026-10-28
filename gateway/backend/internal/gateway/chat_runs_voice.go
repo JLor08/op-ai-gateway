@@ -526,11 +526,11 @@ func effectiveSpeechLanguage(requested string, modelAccepts bool) string {
 
 // commitVoiceTurn is the voice run's single terminal commit: it builds the assistant
 // turn's content as [text, audio...] -- the answer text AND its synthesized audio
-// parts, so one turn carries both -- and persists it together with the user turn
-// (pendingText) via CommitVoiceTurn, in one SaveChatWithBlobs. On success the run's
-// `done` event carries the committed parts; on a store failure the run ends an error
-// turn with a mapped code and the parts are withheld, exactly as finishRunWithParts
-// does for every other kind.
+// parts (each section's, in section order), so one turn carries both -- and persists it
+// together with the user turn (pendingText) via CommitVoiceTurn, in one
+// SaveChatWithBlobs. On success the run's `done` event carries the committed parts; on a
+// store failure the run ends an error turn with a mapped code and the parts are
+// withheld, exactly as finishRunWithParts does for every other kind.
 //
 // The commit context is FRESH (WithoutCancel + a bound), like every other run's
 // terminal commit (finishRunWithParts): once the un-cancelled finish is reached, the
@@ -539,10 +539,12 @@ func effectiveSpeechLanguage(requested string, modelAccepts bool) string {
 // cancellation gates, which never let a cancelled run reach this call.
 //
 // summary is the text of the answer's spoken summary (the <speak> part), recorded on the
-// assistant turn as additional metadata so the portal can re-render it on reload; answer
-// stays the FULL clean text, summary and detail both. "" -- no summary -- leaves the stored
-// turn exactly as a turn without one (the no-tag fallback, and every commit that carries no
-// audio, passes "").
+// assistant turn as its one spoken section (text, rune offset and rune length into answer) so
+// the portal can re-render it on reload; answer stays the FULL clean text, summary and detail
+// both. "" -- no summary -- records no section and leaves the stored turn exactly as a turn
+// without one (the no-tag fallback, and every commit that carries no audio, passes ""). The
+// audio is handed to voiceContentParts as ONE section's for now; the multi-section run
+// executor supplies one entry per section.
 //
 // finalStatus/finalErr are the run's terminal outcome on a SUCCESSFUL store write:
 // "completed" with no error on the happy path, or "error" with a degrade code for a
@@ -550,7 +552,7 @@ func effectiveSpeechLanguage(requested string, modelAccepts bool) string {
 // spec 5.5). A FAILED store write ignores both and reports its own mapped code instead, and
 // withholds the parts, exactly as finishRunWithParts does for every other kind.
 func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *ChatRun, pendingText string, outcome voiceTurnOutcome) {
-	parts, err := voiceContentParts(outcome.answer, outcome.audioParts)
+	parts, err := voiceContentParts(outcome.answer, []json.RawMessage{outcome.audioParts})
 	if err != nil {
 		log.Printf("voice run %s: build content parts failed: %v", run.ID, err)
 		s.finishVoiceRunNoCommit(run, "error", chatRunCommitFailedMessage)
@@ -568,17 +570,24 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 	// so with audio present it is stored (never the N=0 marker); should a future voice thread
 	// set it, retention then applies to the right turns. streamed records how it was delivered.
 	audioAnswer := len(outcome.audioParts) > 0
+	var sections []portal.SpokenSection
+	if outcome.summary != "" {
+		sections = []portal.SpokenSection{{
+			Text:  outcome.summary,
+			Start: outcome.summaryStart,
+			Len:   utf8.RuneCountInString(outcome.summary),
+		}}
+	}
 	if err := s.Portal.CommitVoiceTurn(commitCtx, owner, run.ChatID, pendingText, portal.AssistantTurn{
-		Content:            outcome.answer,
-		ContentParts:       parts,
-		TTFTMs:             m.TTFTMs,
-		ReasoningMs:        m.ReasoningMs,
-		CharsPerSecond:     m.CharsPerSecond,
-		TokensPerSecond:    m.TokensPerSecond,
-		SpokenSummary:      outcome.summary,
-		SpokenSummaryStart: outcome.summaryStart,
-		AudioAnswer:        audioAnswer,
-		AudioStreamed:      outcome.streamed && audioAnswer,
+		Content:         outcome.answer,
+		ContentParts:    parts,
+		TTFTMs:          m.TTFTMs,
+		ReasoningMs:     m.ReasoningMs,
+		CharsPerSecond:  m.CharsPerSecond,
+		TokensPerSecond: m.TokensPerSecond,
+		SpokenSections:  sections,
+		AudioAnswer:     audioAnswer,
+		AudioStreamed:   outcome.streamed && audioAnswer,
 	}, "complete"); err != nil {
 		// A failed store write withholds the parts from the terminal event (nothing
 		// was stored to render) and surfaces a mapped code, exactly as
@@ -601,11 +610,17 @@ func (s *Server) finishVoiceRunNoCommit(run *ChatRun, status, errMsg string) {
 }
 
 // voiceContentParts assembles a voice turn's content: the answer as a text part,
-// followed by the synthesized audio parts (one or more audio_url parts from the TTS
-// leg). One assistant turn thus carries BOTH the answer text and its audio, the shape
-// the blob extraction (the audio_url parts become chat_blobs) and the portal renderer
-// read. audioParts is the json array generateSpeechTurn returned.
-func voiceContentParts(answer string, audioParts json.RawMessage) (json.RawMessage, error) {
+// followed by each spoken section's synthesized audio parts IN SECTION ORDER --
+// [text, sec0 audio..., sec1 audio..., ...]. One assistant turn thus carries BOTH the
+// answer text and all its audio, the shape the blob extraction (the audio_url parts
+// become chat_blobs) and the portal renderer read; the renderer pairs the audio back to
+// its section by that order (the sections themselves are recorded as spoken_sections).
+//
+// audioBySection has one entry per section: the json array generateSpeechTurn returned
+// for that section's leg (one or more audio_url parts). A section with no audio (nil,
+// empty, JSON null, or an empty array) contributes nothing and leaves its neighbours'
+// order intact; an entry that is not a JSON array is an error.
+func voiceContentParts(answer string, audioBySection []json.RawMessage) (json.RawMessage, error) {
 	type textPart struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
@@ -614,13 +629,17 @@ func voiceContentParts(answer string, audioParts json.RawMessage) (json.RawMessa
 	if err != nil {
 		return nil, err
 	}
-	var audio []json.RawMessage
-	if len(audioParts) > 0 {
-		if err := json.Unmarshal(audioParts, &audio); err != nil {
+	combined := []json.RawMessage{json.RawMessage(text)}
+	for _, sectionAudio := range audioBySection {
+		if len(sectionAudio) == 0 {
+			continue
+		}
+		var audio []json.RawMessage
+		if err := json.Unmarshal(sectionAudio, &audio); err != nil {
 			return nil, err
 		}
+		combined = append(combined, audio...)
 	}
-	combined := append([]json.RawMessage{json.RawMessage(text)}, audio...)
 	return json.Marshal(combined)
 }
 

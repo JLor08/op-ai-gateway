@@ -10,39 +10,34 @@ import (
 	"testing"
 )
 
-// A voice answer opens with a short spoken summary (the <speak> part); the thread must record
-// WHICH text that was, so the portal can re-render it as the collapsed block on reload. The
-// summary rides the assistant message as a spoken_summary key of the schema-free chat document,
-// additional metadata beside the unchanged full answer in `content`.
+// A voice answer carries one or more spoken sections (the <speak> regions the user hears); the
+// thread must record WHERE each one sits in the full clean answer, so the portal can re-render it
+// as its own collapsed block on reload. They ride the assistant message as an ordered
+// `spoken_sections` array of the schema-free chat document, additional metadata beside the
+// unchanged full answer in `content`. The phase-2 scalar spoken_summary / spoken_summary_start
+// keys are no longer written.
 
 const voiceFullAnswer = "Sum. Detail."
 
 // voiceAnswerTurn is the assistant turn a voice run commits: the FULL answer text and one
-// synthesized audio part, as [text, audio], with summary as the recorded spoken summary.
-func voiceAnswerTurn(summary string) AssistantTurn {
+// synthesized audio part, as [text, audio], with sections as the recorded spoken sections.
+func voiceAnswerTurn(sections ...SpokenSection) AssistantTurn {
 	text, _ := json.Marshal(map[string]string{"type": "text", "text": voiceFullAnswer})
 	audio, _ := json.Marshal(map[string]any{
 		"type":      "audio_url",
 		"audio_url": map[string]string{"url": dataURL("audio/wav", wavLike(64))},
 	})
 	return AssistantTurn{
-		Content:       voiceFullAnswer,
-		ContentParts:  json.RawMessage("[" + string(text) + "," + string(audio) + "]"),
-		AudioAnswer:   true,
-		AudioStreamed: true,
-		SpokenSummary: summary,
+		Content:        voiceFullAnswer,
+		ContentParts:   json.RawMessage("[" + string(text) + "," + string(audio) + "]"),
+		AudioAnswer:    true,
+		AudioStreamed:  true,
+		SpokenSections: sections,
 	}
 }
 
-// commitVoiceAnswer commits one voice turn to a fresh in-memory thread and returns the stored
+// commitVoiceAnswerTurn commits one voice turn to a fresh in-memory thread and returns the stored
 // assistant message as a raw key->value map, read back through GetChat the way a reload does.
-func commitVoiceAnswer(t *testing.T, summary string) map[string]json.RawMessage {
-	t.Helper()
-	return commitVoiceAnswerTurn(t, voiceAnswerTurn(summary))
-}
-
-// commitVoiceAnswerTurn is commitVoiceAnswer for a caller-built turn, so a test can set fields
-// (SpokenSummaryStart) the summary-only helper does not expose.
 func commitVoiceAnswerTurn(t *testing.T, turn AssistantTurn) map[string]json.RawMessage {
 	t.Helper()
 	ctx := context.Background()
@@ -89,79 +84,150 @@ func textPartOf(t *testing.T, content json.RawMessage) string {
 	return ""
 }
 
-func TestCommitVoiceTurn_PersistsSpokenSummary(t *testing.T) {
-	msg := commitVoiceAnswer(t, "Sum.")
+// assertNoScalarSummaryKeys fails when the message carries either phase-2 scalar key: the writer
+// emits only spoken_sections now, even for a single section.
+func assertNoScalarSummaryKeys(t *testing.T, msg map[string]json.RawMessage) {
+	t.Helper()
+	for _, key := range []string{"spoken_summary", "spoken_summary_start"} {
+		if raw, ok := msg[key]; ok {
+			t.Fatalf("%s = %s, want the phase-2 scalar key no longer written", key, raw)
+		}
+	}
+}
 
-	raw, ok := msg["spoken_summary"]
+// Two sections persist as an ordered array of {text,start,len} spans (rune offsets into the full
+// clean answer), in document order -- and the scalar phase-2 keys are not written.
+func TestCommitVoiceTurn_PersistsSpokenSections(t *testing.T) {
+	msg := commitVoiceAnswerTurn(t, voiceAnswerTurn(
+		SpokenSection{Text: "Sum.", Start: 0, Len: 4},
+		SpokenSection{Text: "Detail.", Start: 5, Len: 7},
+	))
+
+	raw, ok := msg["spoken_sections"]
 	if !ok {
 		stored, _ := json.Marshal(msg)
-		t.Fatalf("assistant message has no spoken_summary key: %s", stored)
+		t.Fatalf("assistant message has no spoken_sections key: %s", stored)
 	}
-	var summary string
-	if err := json.Unmarshal(raw, &summary); err != nil || summary != "Sum." {
-		t.Fatalf("spoken_summary = %s, want %q", raw, "Sum.")
+	// The exact persisted shape, which the renderer and the run executor depend on.
+	const want = `[{"text":"Sum.","start":0,"len":4},{"text":"Detail.","start":5,"len":7}]`
+	if string(raw) != want {
+		t.Fatalf("spoken_sections = %s, want %s", raw, want)
 	}
-	// The summary is ADDITIONAL metadata: the text content stays the full clean answer,
-	// summary and detail both.
-	if got := textPartOf(t, msg["content"]); got != voiceFullAnswer {
-		t.Fatalf("text content = %q, want the full answer %q", got, voiceFullAnswer)
+	var got []SpokenSection
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("spoken_sections does not decode as []SpokenSection: %v", err)
+	}
+	if len(got) != 2 || got[0] != (SpokenSection{Text: "Sum.", Start: 0, Len: 4}) || got[1] != (SpokenSection{Text: "Detail.", Start: 5, Len: 7}) {
+		t.Fatalf("spoken_sections = %+v, want the two sections in order", got)
+	}
+	assertNoScalarSummaryKeys(t, msg)
+	// The sections are ADDITIONAL metadata: the text content stays the full clean answer.
+	if text := textPartOf(t, msg["content"]); text != voiceFullAnswer {
+		t.Fatalf("text content = %q, want the full answer %q", text, voiceFullAnswer)
+	}
+	// And the spans are exact: the runes at [start, start+len) are the section's text.
+	runes := []rune(voiceFullAnswer)
+	for i, sec := range got {
+		if sec.Start+sec.Len > len(runes) || string(runes[sec.Start:sec.Start+sec.Len]) != sec.Text {
+			t.Fatalf("section %d span [%d,%d) of %q does not equal its text %q", i, sec.Start, sec.Start+sec.Len, voiceFullAnswer, sec.Text)
+		}
 	}
 }
 
-func TestCommitVoiceTurn_EmptySummaryOmitted(t *testing.T) {
-	msg := commitVoiceAnswer(t, "")
+// A single section is the N=1 case: a ONE-element spoken_sections array, never the phase-2
+// scalar shape.
+func TestCommitVoiceTurn_OneSectionIsAOneElementArray(t *testing.T) {
+	msg := commitVoiceAnswerTurn(t, voiceAnswerTurn(SpokenSection{Text: "Sum.", Start: 0, Len: 4}))
 
-	if raw, ok := msg["spoken_summary"]; ok {
-		t.Fatalf("spoken_summary = %s, want the key omitted for a no-tag turn (the phase-1 shape)", raw)
-	}
-	if got := textPartOf(t, msg["content"]); got != voiceFullAnswer {
-		t.Fatalf("text content = %q, want %q", got, voiceFullAnswer)
-	}
-}
-
-// The spoken summary's rune offset rides the turn under spoken_summary_start, so the portal can
-// slice the summary out of the full answer by position rather than re-finding it by value (#322).
-func TestCommitVoiceTurn_PersistsSpokenSummaryStart(t *testing.T) {
-	turn := voiceAnswerTurn("Sum.")
-	turn.SpokenSummaryStart = 7
-	msg := commitVoiceAnswerTurn(t, turn)
-
-	raw, ok := msg["spoken_summary_start"]
+	raw, ok := msg["spoken_sections"]
 	if !ok {
 		stored, _ := json.Marshal(msg)
-		t.Fatalf("assistant message has no spoken_summary_start key: %s", stored)
+		t.Fatalf("assistant message has no spoken_sections key: %s", stored)
 	}
-	var start int
-	if err := json.Unmarshal(raw, &start); err != nil || start != 7 {
-		t.Fatalf("spoken_summary_start = %s, want 7", raw)
+	if want := `[{"text":"Sum.","start":0,"len":4}]`; string(raw) != want {
+		t.Fatalf("spoken_sections = %s, want %s", raw, want)
+	}
+	assertNoScalarSummaryKeys(t, msg)
+}
+
+// No sections (a no-tag fallback, a speech-failed turn): neither the array nor either scalar
+// key is written, exactly the phase-1 shape.
+func TestCommitVoiceTurn_NoSectionsOmitsEveryKey(t *testing.T) {
+	msg := commitVoiceAnswerTurn(t, voiceAnswerTurn())
+
+	if raw, ok := msg["spoken_sections"]; ok {
+		t.Fatalf("spoken_sections = %s, want the key omitted for a no-section turn (the phase-1 shape)", raw)
+	}
+	assertNoScalarSummaryKeys(t, msg)
+	if text := textPartOf(t, msg["content"]); text != voiceFullAnswer {
+		t.Fatalf("text content = %q, want %q", text, voiceFullAnswer)
 	}
 }
 
-// An offset of 0 is the common case (the summary IS the leading text), so it must be written,
-// not dropped as a zero value -- the presence of a summary is what gates the key, not the offset.
-func TestCommitVoiceTurn_PersistsZeroSpokenSummaryStart(t *testing.T) {
-	turn := voiceAnswerTurn("Sum.")
-	turn.SpokenSummaryStart = 0
-	msg := commitVoiceAnswerTurn(t, turn)
+// A start of 0 is the common case (the section IS the leading text), so it must be written,
+// not dropped as a zero value -- the span is only meaningful as a pair.
+func TestCommitVoiceTurn_PersistsZeroSectionStart(t *testing.T) {
+	msg := commitVoiceAnswerTurn(t, voiceAnswerTurn(SpokenSection{Text: "Sum.", Start: 0, Len: 4}))
 
-	raw, ok := msg["spoken_summary_start"]
-	if !ok {
-		stored, _ := json.Marshal(msg)
-		t.Fatalf("a zero offset must still be persisted beside the summary: %s", stored)
+	var got []map[string]json.RawMessage
+	if err := json.Unmarshal(msg["spoken_sections"], &got); err != nil || len(got) != 1 {
+		t.Fatalf("spoken_sections = %s, want one element", msg["spoken_sections"])
 	}
-	var start int
-	if err := json.Unmarshal(raw, &start); err != nil || start != 0 {
-		t.Fatalf("spoken_summary_start = %s, want 0", raw)
+	if start, ok := got[0]["start"]; !ok || string(start) != "0" {
+		t.Fatalf("start = %s (present %v), want an explicit 0", start, ok)
 	}
 }
 
-// No summary, no offset: a no-tag turn carries neither key, exactly as the phase-1 shape.
-func TestCommitVoiceTurn_OmitsSummaryStartWithoutSummary(t *testing.T) {
-	turn := voiceAnswerTurn("")
-	turn.SpokenSummaryStart = 5 // set but must be dropped: there is no summary to anchor it
-	msg := commitVoiceAnswerTurn(t, turn)
+// The text is optional beside the authoritative span: an empty text is dropped from the element
+// (start and len stay).
+func TestCommitVoiceTurn_SectionTextIsOptional(t *testing.T) {
+	msg := commitVoiceAnswerTurn(t, voiceAnswerTurn(SpokenSection{Start: 5, Len: 7}))
 
-	if raw, ok := msg["spoken_summary_start"]; ok {
-		t.Fatalf("spoken_summary_start = %s, want the key omitted when there is no summary", raw)
+	if want := `[{"start":5,"len":7}]`; string(msg["spoken_sections"]) != want {
+		t.Fatalf("spoken_sections = %s, want %s", msg["spoken_sections"], want)
 	}
+}
+
+// A turn committed before phase 3 carries the scalar spoken_summary + spoken_summary_start keys.
+// Those are never rewritten: a later commit on the same thread leaves the old turn byte for byte
+// as stored, so the renderer's fallback still finds them.
+func TestCommitVoiceTurn_LeavesPhaseTwoTurnsReadable(t *testing.T) {
+	ctx := context.Background()
+	owner := chatToken("usr_a")
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	const oldTurn = `{"id":"msg_old","role":"assistant","status":"complete","content":[{"type":"text","text":"Sum. Detail."}],"spoken_summary":"Sum.","spoken_summary_start":0}`
+	created, err := svc.CreateChat(ctx, owner, CreateChatRequest{Content: json.RawMessage(
+		`{"messages":[{"id":"msg_u","role":"user","content":"hi"},` + oldTurn + `]}`)})
+	if err != nil {
+		t.Fatalf("CreateChat: %v", err)
+	}
+	turn := voiceAnswerTurn(SpokenSection{Text: "Sum.", Start: 0, Len: 4})
+	if err := svc.CommitVoiceTurn(ctx, owner, created.ID, "and now?", turn, "complete"); err != nil {
+		t.Fatalf("CommitVoiceTurn: %v", err)
+	}
+	got, err := svc.GetChat(ctx, owner, created.ID)
+	if err != nil {
+		t.Fatalf("GetChat: %v", err)
+	}
+	doc := parseChatDoc(got.Content)
+	if len(doc.Messages) != 4 {
+		t.Fatalf("stored %d messages, want the old pair and the new pair", len(doc.Messages))
+	}
+	var old, fresh map[string]json.RawMessage
+	if err := json.Unmarshal(doc.Messages[1], &old); err != nil {
+		t.Fatalf("old assistant message: %v", err)
+	}
+	if string(old["spoken_summary"]) != `"Sum."` || string(old["spoken_summary_start"]) != "0" {
+		t.Fatalf("old turn lost its phase-2 keys: %s", doc.Messages[1])
+	}
+	if _, ok := old["spoken_sections"]; ok {
+		t.Fatalf("old turn gained spoken_sections: %s", doc.Messages[1])
+	}
+	if err := json.Unmarshal(doc.Messages[3], &fresh); err != nil {
+		t.Fatalf("new assistant message: %v", err)
+	}
+	if _, ok := fresh["spoken_sections"]; !ok {
+		t.Fatalf("new turn has no spoken_sections: %s", doc.Messages[3])
+	}
+	assertNoScalarSummaryKeys(t, fresh)
 }
