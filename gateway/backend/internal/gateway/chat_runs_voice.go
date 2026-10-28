@@ -176,7 +176,7 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 	}
 
 	// The un-cancelled finish: commit the user turn and the assistant turn together.
-	s.commitVoiceTurn(ctx, owner, run, vp.pendingText, answer, audioParts, streamed)
+	s.commitVoiceTurn(ctx, owner, run, vp.pendingText, answer, "", audioParts, streamed)
 }
 
 // runVoiceLLM runs the voice run's LLM leg: it POSTs the chat-completions body to the
@@ -303,7 +303,12 @@ func effectiveSpeechLanguage(requested string, modelAccepts bool) string {
 // turn must be saved even though everything that makes the run terminal is below the
 // commit. The "cancelled persists nothing" guarantee is enforced by the caller's
 // cancellation gates, which never let a cancelled run reach this call.
-func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *ChatRun, pendingText, answer string, audioParts json.RawMessage, streamed bool) {
+//
+// summary is the text of the answer's spoken summary (the <speak> part), recorded on the
+// assistant turn as additional metadata so the portal can re-render it on reload; answer
+// stays the FULL clean text, summary and detail both. "" -- no summary -- leaves the stored
+// turn exactly as a turn without one.
+func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *ChatRun, pendingText, answer, summary string, audioParts json.RawMessage, streamed bool) {
 	parts, err := voiceContentParts(answer, audioParts)
 	if err != nil {
 		log.Printf("voice run %s: build content parts failed: %v", run.ID, err)
@@ -322,6 +327,7 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 		ReasoningMs:     m.ReasoningMs,
 		CharsPerSecond:  m.CharsPerSecond,
 		TokensPerSecond: m.TokensPerSecond,
+		SpokenSummary:   summary,
 		// A voice answer IS an audio answer: it rides the #281 retention the same way
 		// a speech turn does, and streamed records how it was delivered. A voice
 		// thread sets no keep_last_audio, so the audio is stored (never the N=0

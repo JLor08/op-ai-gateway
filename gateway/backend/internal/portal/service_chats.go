@@ -1092,6 +1092,14 @@ type AssistantTurn struct {
 	// stored), while a buffered-fallback answer is STORED so the un-heard paid
 	// audio is not lost -- see writeAssistant.
 	AudioStreamed bool
+	// SpokenSummary is the text of a VOICE answer's spoken summary -- the leading
+	// <speak> part the user hears -- recorded so the portal can re-render it as the
+	// collapsed block when the thread is reloaded. It is ADDITIONAL metadata: the
+	// answer's text in Content/ContentParts stays the full clean answer, summary and
+	// detail both. It is persisted under the message's `spoken_summary` key and only
+	// when non-empty, so a turn with no summary (a phase-1 voice turn, a no-tag
+	// fallback, every non-voice turn) is stored byte for byte as before.
+	SpokenSummary string
 }
 
 func (s *Service) CheckpointAssistant(ctx context.Context, owner auth.Token, chatID string, turn AssistantTurn) error {
@@ -1177,6 +1185,11 @@ func buildAssistantMessage(id, status string, turn AssistantTurn) (json.RawMessa
 		// reasoningMs) so the portal reads it by a direct cast; the SSE metrics
 		// event carries the snake_case tokens_per_second separately (issue #56).
 		msg["tokensPerSecond"] = turn.TokensPerSecond
+	}
+	if turn.SpokenSummary != "" {
+		// snake_case, like the chat document's other additive keys (settings.voice_chat);
+		// the portal reads it to re-render the collapsed spoken-summary block on reload.
+		msg["spoken_summary"] = turn.SpokenSummary
 	}
 	return json.Marshal(msg)
 }
