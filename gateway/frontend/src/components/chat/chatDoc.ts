@@ -944,26 +944,46 @@ export function transcriptionSettingsFrom(
   };
 }
 
-// The Voice Chat picks of a thread (#317, #318), as CONCRETE store state (every field defined,
-// unlike the all-optional wire ChatVoiceChatSettings): the live-transcription model that hears
-// the user, the streaming speech model that answers aloud, and that speech model's voice. "" is
-// "no pick" -- automatic: the portal then uses the first model, in the catalogue's order, that
-// the gateway says streams, and the speech model's own default voice (a preset-clone model, which
-// has none, is pre-selected on its first preset at READ time, never written here) -- and the
-// default of all three. A pick is a gateway model NAME (a voice a name the model offers, or one
-// that was typed); whether a model is still on offer is not this state's to say (the store reads
-// it against the models the gateway says stream, and falls back to the automatic one when it is
-// gone), so a pick that is gone for a while is kept, not erased.
+// The built-in voice system prompt: what a Voice Chat run carries as its system message when the
+// thread stores no prompt of its own. A COPY of the backend's defaultVoiceSystemPrompt
+// (gateway/backend/internal/portal/service_chats.go): the two MUST stay identical, character for
+// character (a test reads the Go source and compares). The portal needs the text to pre-fill the
+// editable field and to tell an edit from an untouched default -- only an edit is stored, so the
+// default stays code-owned and an improved one reaches every thread that did not override it.
+export const DEFAULT_VOICE_SYSTEM_PROMPT =
+  'You are in a spoken conversation. Begin every answer with ONE short, natural ' +
+  'spoken summary of the essential point, wrapped in a single ' +
+  '`<speak lang="…">…</speak>` tag, using the language the user is speaking (set ' +
+  '`lang` to its two-letter code). Keep what is inside `<speak>` brief enough to ' +
+  'listen to — a sentence or two, the gist only. After the closing `</speak>`, ' +
+  'write the fuller answer (detail, lists, code, caveats) as normal text; that ' +
+  'part is shown but not spoken. Do not put anything before the `<speak>` tag.';
+
+// The Voice Chat picks of a thread (#317, #318, #314), as CONCRETE store state (every field
+// defined, unlike the all-optional wire ChatVoiceChatSettings): the live-transcription model that
+// hears the user, the streaming speech model that answers aloud, that speech model's voice, and
+// the system prompt of the conversation's runs. For the three picks "" is "no pick" --
+// automatic: the portal then uses the first model, in the catalogue's order, that the gateway says
+// streams, and the speech model's own default voice (a preset-clone model, which has none, is
+// pre-selected on its first preset at READ time, never written here) -- and the default of all
+// three. A pick is a gateway model NAME (a voice a name the model offers, or one that was typed);
+// whether a model is still on offer is not this state's to say (the store reads it against the
+// models the gateway says stream, and falls back to the automatic one when it is gone), so a pick
+// that is gone for a while is kept, not erased. The prompt is different in kind: it is never
+// "unset" in the state but pre-filled with DEFAULT_VOICE_SYSTEM_PROMPT (what the field shows), and
+// is written only when it differs from that.
 export type VoiceChatSettings = {
   asrModel: string;
   ttsModel: string;
   voice: string;
+  systemPrompt: string;
 };
 
 export const DEFAULT_VOICE_CHAT_SETTINGS: VoiceChatSettings = {
   asrModel: '',
   ttsModel: '',
   voice: '',
+  systemPrompt: DEFAULT_VOICE_SYSTEM_PROMPT,
 };
 
 // Whether a thread is a TEXT thread, the only one a Voice Chat runs on (the pin is "" -- the
@@ -977,8 +997,13 @@ function isTextKind(kind: string | undefined): boolean {
 // thread's, the speech settings `audio` are a speech thread's and the backend clears them for
 // every other kind), and ONLY when a pick is made -- so a thread that never chose stays
 // byte-identical, and the key is never an empty `voice_chat: {}`. A pick is trimmed, and a blank
-// one is no pick. Both the document writer (buildDoc) and the state seeder (normalizeDoc) go
-// through this, so neither can give the key to another kind of thread from the client side.
+// one is no pick. The system prompt is trimmed too (the backend does the same), and is written
+// only when it is non-empty and differs from DEFAULT_VOICE_SYSTEM_PROMPT: a blank or unedited
+// prompt writes nothing, and the backend then applies the built-in one. Every member must be in
+// this fragment: buildDoc full-replaces `settings` with no merge, so a member left out here is
+// erased by the next save. Both the document writer (buildDoc) and the state seeder
+// (normalizeDoc) go through this, so neither can give the key to another kind of thread from the
+// client side.
 export function voiceChatSetting(
   kind: string | undefined,
   s: VoiceChatSettings,
@@ -991,12 +1016,17 @@ export function voiceChatSetting(
   if (tts) voiceChat.tts_model = tts;
   const voice = s.voice.trim();
   if (voice) voiceChat.voice = voice;
+  const systemPrompt = s.systemPrompt.trim();
+  if (systemPrompt && systemPrompt !== DEFAULT_VOICE_SYSTEM_PROMPT) {
+    voiceChat.system_prompt = systemPrompt;
+  }
   return Object.keys(voiceChat).length > 0 ? { voice_chat: voiceChat } : {};
 }
 
 // Coerce a persisted (all-optional) ChatVoiceChatSettings into the concrete store state, a
-// mistyped pick being no pick. The inverse of voiceChatSetting, used to seed the thread's picks
-// when a chat is loaded.
+// mistyped pick being no pick, and an absent, blank or mistyped prompt the built-in one (what the
+// backend runs with in those cases). The inverse of voiceChatSetting, used to seed the thread's
+// picks when a chat is loaded.
 export function voiceChatSettingsFrom(
   voiceChat: ChatVoiceChatSettings | undefined,
 ): VoiceChatSettings {
@@ -1005,6 +1035,10 @@ export function voiceChatSettingsFrom(
     asrModel: typeof s.asr_model === 'string' ? s.asr_model : DEFAULT_VOICE_CHAT_SETTINGS.asrModel,
     ttsModel: typeof s.tts_model === 'string' ? s.tts_model : DEFAULT_VOICE_CHAT_SETTINGS.ttsModel,
     voice: typeof s.voice === 'string' ? s.voice : DEFAULT_VOICE_CHAT_SETTINGS.voice,
+    systemPrompt:
+      typeof s.system_prompt === 'string' && s.system_prompt.trim() !== ''
+        ? s.system_prompt
+        : DEFAULT_VOICE_CHAT_SETTINGS.systemPrompt,
   };
 }
 
@@ -1102,10 +1136,10 @@ export function normalizeDoc(content: unknown): ActiveChatDoc {
       // reason (the PUT full-replaces the blob). transcriptionSetting keys off the kind, so
       // a text, image or speech thread stays byte-identical (no transcription key).
       ...transcriptionSetting(kind, transcriptionSettingsFrom(s.transcription)),
-      // The Voice Chat model picks, round-tripped for a text thread for the same reason (the
-      // PUT full-replaces the blob). voiceChatSetting keys off the kind and writes only a pick
-      // that is made, so a text thread that never chose, and every other kind of thread,
-      // stay byte-identical (no voice_chat key).
+      // The Voice Chat picks and system prompt, round-tripped for a text thread for the same
+      // reason (the PUT full-replaces the blob). voiceChatSetting keys off the kind and writes
+      // only a pick that is made and a prompt that is not the default, so a text thread that
+      // never chose, and every other kind of thread, stay byte-identical (no voice_chat key).
       ...voiceChatSetting(kind, voiceChatSettingsFrom(s.voice_chat)),
     },
     messages,

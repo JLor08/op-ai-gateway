@@ -1253,9 +1253,10 @@ func (s *Service) commitTurnWithRetention(ctx context.Context, chatID string, ro
 // write the fuller answer after it as text that is shown but not spoken. It is language-agnostic
 // on purpose: the model uses the language the user is speaking.
 //
-// The portal keeps a copy of this text (DEFAULT_VOICE_SYSTEM_PROMPT in the frontend) to pre-fill
-// the editable field and to store nothing when the user leaves it unchanged; the two must stay
-// identical.
+// The portal keeps a copy of this text (DEFAULT_VOICE_SYSTEM_PROMPT in
+// gateway/frontend/src/components/chat/chatDoc.ts) to pre-fill the editable field and to store
+// nothing when the user leaves it unchanged; the two must stay identical, character for
+// character (a frontend test reads this file and compares them).
 const defaultVoiceSystemPrompt = "You are in a spoken conversation. Begin every answer with ONE short, natural " +
 	"spoken summary of the essential point, wrapped in a single " +
 	"`<speak lang=\"…\">…</speak>` tag, using the language the user is speaking (set " +

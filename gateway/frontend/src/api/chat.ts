@@ -117,26 +117,32 @@ export type ChatTranscriptionSettings = {
   passthrough?: Record<string, unknown>;
 };
 
-// The Voice Chat picks of a TEXT thread (#317, #318), as persisted inside
+// The Voice Chat picks of a TEXT thread (#317, #318, #314), as persisted inside
 // `content.settings.voice_chat`: the live-transcription model that hears the user and the
-// streaming speech model that answers aloud (the thread's own model is the third, the LLM), and
-// the speech model's voice. All OPTIONAL: an unset model pick is omitted and means "automatic" --
-// the portal then uses the first model, in the catalogue's order, that the gateway says streams --
-// and an unset voice means the model's own default (a preset-clone model, which has none, is
-// pre-selected on its first preset by the portal and that is NOT written: only a voice that was
-// chosen is). The whole object is omitted for a thread that has made no pick and for any thread
-// that is not a text thread, so their persisted settings stay byte-identical. It is the portal's
-// own key, a picked name is read back when the thread is opened and handed to the ticket
-// (api/voiceChat.ts) when a conversation starts; the backend neither reads nor validates it (the
-// ticket's co-load gate resolves and validates the models a conversation is started with, and
-// the ticket's speech settings take the voice from the request). The settings of a run do not
-// carry it, but a run rewrites the stored settings from its own typed struct, so the backend
-// lifts the stored value forward across that rewrite (PrepareChatRun, like the pinned kind), and
-// the open thread's next save writes it again as well.
+// streaming speech model that answers aloud (the thread's own model is the third, the LLM), the
+// speech model's voice, and the system prompt of the conversation's runs. All OPTIONAL: an unset
+// model pick is omitted and means "automatic" -- the portal then uses the first model, in the
+// catalogue's order, that the gateway says streams -- and an unset voice means the model's own
+// default (a preset-clone model, which has none, is pre-selected on its first preset by the
+// portal and that is NOT written: only a voice that was chosen is). An unset system prompt means
+// the built-in one: the backend applies it, and the portal writes a prompt only when it differs
+// from it. The whole object is omitted for a thread that has made no pick and for any thread that
+// is not a text thread, so their persisted settings stay byte-identical. It is the portal's own
+// key, a picked name is read back when the thread is opened and handed to the ticket
+// (api/voiceChat.ts) when a conversation starts; the backend neither reads nor validates the
+// picks (the ticket's co-load gate resolves and validates the models a conversation is started
+// with, and the ticket's speech settings take the voice from the request). The one member it does
+// read is `system_prompt`: a voice run takes it from the STORED document, trimmed, as its system
+// message (the built-in prompt when it is absent or blank), never from the ticket or a request
+// field. The settings of a run do not carry it, but a run rewrites the stored settings from its
+// own typed struct, so the backend lifts the stored value forward across that rewrite
+// (PrepareChatRun, like the pinned kind), and the open thread's next save writes it again as
+// well.
 export type ChatVoiceChatSettings = {
   asr_model?: string;
   tts_model?: string;
   voice?: string;
+  system_prompt?: string;
 };
 
 // The per-chat settings the frontend persists inside `content`.

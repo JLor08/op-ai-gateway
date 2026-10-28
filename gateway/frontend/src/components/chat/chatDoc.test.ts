@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_AUDIO_SETTINGS,
   DEFAULT_IMAGE_SETTINGS,
   DEFAULT_TRANSCRIPTION_SETTINGS,
   DEFAULT_VOICE_CHAT_SETTINGS,
+  DEFAULT_VOICE_SYSTEM_PROMPT,
   DEFAULTS,
   IMAGE_SAMPLERS,
   IMAGE_SCHEDULERS,
@@ -51,6 +55,7 @@ import {
   voiceChatSettingsFrom,
   withAudioRemoved,
   type ChatUiMessage,
+  type VoiceChatSettings,
 } from './chatDoc';
 import {
   audioUrlsOf,
@@ -1759,10 +1764,21 @@ describe('a transcription passthrough key that cannot be a form field name', () 
 // written only for a text thread, only for a pick that is made, so a thread that never chose
 // stays byte-identical -- and it must survive the full-replace PUT (buildDoc, normalizeDoc).
 describe('the persisted Voice Chat model picks mirror the backend omitempty', () => {
-  const picked = { asrModel: 'asr-b', ttsModel: 'tts-a', voice: '' };
+  // The state a thread is in, with the picks that differ from the defaults (a thread that has
+  // made no pick is on DEFAULT_VOICE_CHAT_SETTINGS, the built-in prompt included).
+  const settings = (over: Partial<VoiceChatSettings> = {}): VoiceChatSettings => ({
+    ...DEFAULT_VOICE_CHAT_SETTINGS,
+    ...over,
+  });
+  const picked = settings({ asrModel: 'asr-b', ttsModel: 'tts-a' });
 
-  it('defaults to no pick for either model or the voice (the auto-pick)', () => {
-    expect(DEFAULT_VOICE_CHAT_SETTINGS).toEqual({ asrModel: '', ttsModel: '', voice: '' });
+  it('defaults to no pick for either model or the voice (the auto-pick), and the built-in prompt', () => {
+    expect(DEFAULT_VOICE_CHAT_SETTINGS).toEqual({
+      asrModel: '',
+      ttsModel: '',
+      voice: '',
+      systemPrompt: DEFAULT_VOICE_SYSTEM_PROMPT,
+    });
     expect(voiceChatSettingsFrom(undefined)).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
   });
 
@@ -1773,10 +1789,10 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
   });
 
   it('writes only the pick that is made', () => {
-    expect(voiceChatSetting('', { asrModel: 'asr-b', ttsModel: '', voice: '' })).toEqual({
+    expect(voiceChatSetting('', settings({ asrModel: 'asr-b' }))).toEqual({
       voice_chat: { asr_model: 'asr-b' },
     });
-    expect(voiceChatSetting('', { asrModel: '', ttsModel: 'tts-a', voice: '' })).toEqual({
+    expect(voiceChatSetting('', settings({ ttsModel: 'tts-a' }))).toEqual({
       voice_chat: { tts_model: 'tts-a' },
     });
     expect(voiceChatSetting(undefined, picked)).toEqual({
@@ -1785,16 +1801,19 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
   });
 
   it('trims a pick, and a blank one is no pick', () => {
-    expect(voiceChatSetting('', { asrModel: '  asr-b ', ttsModel: '   ', voice: ' ' })).toEqual({
+    expect(
+      voiceChatSetting('', settings({ asrModel: '  asr-b ', ttsModel: '   ', voice: ' ' })),
+    ).toEqual({
       voice_chat: { asr_model: 'asr-b' },
     });
-    expect(voiceChatSetting('', { asrModel: ' ', ttsModel: '', voice: '' })).toEqual({});
+    expect(voiceChatSetting('', settings({ asrModel: ' ' }))).toEqual({});
   });
 
   it.each(['image', 'speech', 'transcription', 'video'])(
     'writes nothing for a %s thread, which has no conversation',
     (kind) => {
       expect(voiceChatSetting(kind, picked)).toEqual({});
+      expect(voiceChatSetting(kind, settings({ systemPrompt: 'Be terse.' }))).toEqual({});
     },
   );
 
@@ -1802,32 +1821,24 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
     const wire = { asr_model: 'asr-b', tts_model: 'tts-a' };
     expect(voiceChatSettingsFrom(wire)).toEqual(picked);
     expect(voiceChatSetting('', voiceChatSettingsFrom(wire))).toEqual({ voice_chat: wire });
-    expect(voiceChatSettingsFrom({ tts_model: 'tts-a' })).toEqual({
-      asrModel: '',
-      ttsModel: 'tts-a',
-      voice: '',
-    });
+    expect(voiceChatSettingsFrom({ tts_model: 'tts-a' })).toEqual(settings({ ttsModel: 'tts-a' }));
   });
 
   // The voice (#318) is the third pick, the speech model's voice: it follows the same discipline
   // as the two model picks -- written only when chosen, trimmed, and never an empty `voice` key.
   it('writes the chosen voice beside the models, trimmed, and nothing for a blank one', () => {
-    expect(voiceChatSetting('', { asrModel: '', ttsModel: '', voice: 'alba' })).toEqual({
+    expect(voiceChatSetting('', settings({ voice: 'alba' }))).toEqual({
       voice_chat: { voice: 'alba' },
     });
-    expect(voiceChatSetting('', { asrModel: 'asr-b', ttsModel: 'tts-a', voice: ' alba ' })).toEqual(
-      { voice_chat: { asr_model: 'asr-b', tts_model: 'tts-a', voice: 'alba' } },
-    );
-    expect(voiceChatSetting('', { asrModel: '', ttsModel: '', voice: '   ' })).toEqual({});
-    expect(voiceChatSetting('speech', { asrModel: '', ttsModel: '', voice: 'alba' })).toEqual({});
+    expect(
+      voiceChatSetting('', settings({ asrModel: 'asr-b', ttsModel: 'tts-a', voice: ' alba ' })),
+    ).toEqual({ voice_chat: { asr_model: 'asr-b', tts_model: 'tts-a', voice: 'alba' } });
+    expect(voiceChatSetting('', settings({ voice: '   ' }))).toEqual({});
+    expect(voiceChatSetting('speech', settings({ voice: 'alba' }))).toEqual({});
   });
 
   it('reads the voice back, and a mistyped one as no pick', () => {
-    expect(voiceChatSettingsFrom({ voice: 'alba' })).toEqual({
-      asrModel: '',
-      ttsModel: '',
-      voice: 'alba',
-    });
+    expect(voiceChatSettingsFrom({ voice: 'alba' })).toEqual(settings({ voice: 'alba' }));
     expect(voiceChatSettingsFrom({ voice: 3 as unknown as string }).voice).toBe('');
     const wire = { asr_model: 'asr-b', tts_model: 'tts-a', voice: 'alba' };
     expect(voiceChatSetting('', voiceChatSettingsFrom(wire))).toEqual({ voice_chat: wire });
@@ -1843,12 +1854,105 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
     expect(voiceChatSettingsFrom('x' as unknown as undefined)).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
   });
 
+  // The voice system prompt (#314) is the fourth member: the thread's own, pre-filled with the
+  // built-in text for display. The built-in text is code-owned (the backend applies it when the
+  // stored prompt is blank), so only a prompt that DIFFERS from it is written.
+  it('persists a non-default system prompt under voice_chat.system_prompt', () => {
+    const s = voiceChatSetting('', settings({ systemPrompt: 'Be terse.' }));
+    expect(s.voice_chat?.system_prompt).toBe('Be terse.');
+    expect(s).toEqual({ voice_chat: { system_prompt: 'Be terse.' } });
+  });
+
+  it('omits the system prompt when it equals the default', () => {
+    const s = voiceChatSetting('', settings({ systemPrompt: DEFAULT_VOICE_SYSTEM_PROMPT }));
+    expect(s.voice_chat?.system_prompt).toBeUndefined();
+    expect(s).toEqual({});
+  });
+
+  it('omits a blank system prompt: the backend applies the default to it', () => {
+    expect(voiceChatSetting('', settings({ systemPrompt: '' }))).toEqual({});
+    expect(voiceChatSetting('', settings({ systemPrompt: '  \n ' }))).toEqual({});
+  });
+
+  it('trims the system prompt, and the default with stray whitespace is still the default', () => {
+    expect(voiceChatSetting('', settings({ systemPrompt: '  Be terse.\n' }))).toEqual({
+      voice_chat: { system_prompt: 'Be terse.' },
+    });
+    expect(
+      voiceChatSetting('', settings({ systemPrompt: `${DEFAULT_VOICE_SYSTEM_PROMPT}\n` })),
+    ).toEqual({});
+  });
+
+  it('writes the system prompt beside the other picks', () => {
+    expect(
+      voiceChatSetting(
+        '',
+        settings({ asrModel: 'asr-b', voice: 'alba', systemPrompt: 'Be terse.' }),
+      ),
+    ).toEqual({ voice_chat: { asr_model: 'asr-b', voice: 'alba', system_prompt: 'Be terse.' } });
+  });
+
+  it('seeds systemPrompt from the stored doc', () => {
+    expect(voiceChatSettingsFrom({ system_prompt: 'X' }).systemPrompt).toBe('X');
+    const wire = { asr_model: 'asr-b', system_prompt: 'Be terse.' };
+    expect(voiceChatSetting('', voiceChatSettingsFrom(wire))).toEqual({ voice_chat: wire });
+  });
+
+  it('seeds the built-in prompt when none is stored, or the stored one is blank or mistyped', () => {
+    for (const stored of [undefined, '', '   ', 7, null] as const) {
+      expect(
+        voiceChatSettingsFrom({ system_prompt: stored as unknown as string }).systemPrompt,
+        String(stored),
+      ).toBe(DEFAULT_VOICE_SYSTEM_PROMPT);
+    }
+    expect(voiceChatSettingsFrom({ voice: 'alba' }).systemPrompt).toBe(DEFAULT_VOICE_SYSTEM_PROMPT);
+  });
+
+  // The frontend keeps a copy of the backend's built-in text (to pre-fill the field and to store
+  // nothing for an unedited one). The two halves of ONE build must not disagree: a drifted copy
+  // would pre-fill a prompt the backend does not apply, and store the real default as an edit.
+  // Fails closed: a renamed or moved constant is an error, not an empty comparison.
+  it('is the backend defaultVoiceSystemPrompt, byte for byte', () => {
+    const goFile = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../../backend/internal/portal/service_chats.go',
+    );
+    const source = fs.readFileSync(goFile, 'utf8');
+    const declaration =
+      /const defaultVoiceSystemPrompt = ((?:"(?:[^"\\\n]|\\.)*"(?: \+)?\s*)+)/.exec(source);
+    expect(declaration, `no defaultVoiceSystemPrompt constant in ${goFile}`).not.toBeNull();
+    // A Go interpreted string literal of this text is also a JSON string (the same \" escape).
+    const pieces = [...(declaration?.[1] ?? '').matchAll(/"(?:[^"\\\n]|\\.)*"/g)].map(
+      (m) => JSON.parse(m[0]) as string,
+    );
+    expect(pieces.length).toBeGreaterThan(1);
+    expect(DEFAULT_VOICE_SYSTEM_PROMPT).toBe(pieces.join(''));
+  });
+
   it('round-trips through the document for a text thread (normalizeDoc)', () => {
     const settings = normalizeDoc({
       settings: { model: 'llm', voice_chat: { asr_model: 'asr-b', tts_model: 'tts-a' } },
       messages: [],
     }).settings;
     expect(settings.voice_chat).toEqual({ asr_model: 'asr-b', tts_model: 'tts-a' });
+  });
+
+  it('keeps a stored system prompt across normalizeDoc, and writes none for a default one', () => {
+    // buildDoc rebuilds `settings` from the state and the PUT full-replaces the blob, so a
+    // prompt this drops is one the next autosave erases.
+    expect(
+      normalizeDoc({
+        settings: { model: 'llm', voice_chat: { system_prompt: 'Be terse.' } },
+        messages: [],
+      }).settings.voice_chat,
+    ).toEqual({ system_prompt: 'Be terse.' });
+    expect(
+      'voice_chat' in
+        normalizeDoc({
+          settings: { model: 'llm', voice_chat: { system_prompt: DEFAULT_VOICE_SYSTEM_PROMPT } },
+          messages: [],
+        }).settings,
+    ).toBe(false);
   });
 
   it('puts no voice_chat key on a text document that has no pick', () => {

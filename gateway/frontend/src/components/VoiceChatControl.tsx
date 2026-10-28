@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useId, useRef, type KeyboardEvent, type PointerEvent } from 'react';
-import { Alert, Box, Button, FormControlLabel, Switch, Typography } from '@mui/material';
+import { Alert, Box, Button, FormControlLabel, Switch, TextField, Typography } from '@mui/material';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
 import type { MessageKey, Translation } from './shared/types';
@@ -361,6 +361,11 @@ export function VoiceChatControl({
 // choose from), and while a conversation is on (its ticket holds the models it started with); NOT
 // closed by a switch that is closed for another reason (a missing chat model, a run in flight):
 // the user may pick ahead.
+//
+// Beside them, the thread's voice system prompt (#314): a multi-line field, pre-filled with the
+// built-in prompt, that the user may edit for this thread. It has nothing to do with which models
+// stream, so it is not waiting for the gateway; it is closed while a conversation is on, so a
+// conversation runs on the prompt it began with.
 function VoiceModelPickers({
   models,
   locked,
@@ -410,6 +415,19 @@ function VoiceModelPickers({
           {t.chatVoiceLlmNote(models.llm)}
         </Typography>
       )}
+      <TextField
+        id="chat-voice-system-prompt"
+        label={t.chatVoiceSystemPrompt}
+        helperText={t.chatVoiceSystemPromptHint}
+        multiline
+        minRows={3}
+        maxRows={12}
+        fullWidth
+        value={models.systemPrompt.value}
+        onChange={(event) => models.systemPrompt.set(event.target.value)}
+        disabled={locked}
+        sx={{ mt: 0.75 }}
+      />
     </Box>
   );
 }

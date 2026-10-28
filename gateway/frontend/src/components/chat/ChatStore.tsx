@@ -134,9 +134,14 @@ export type { LiveTranscription, LiveTranscriptionPhase } from './useLiveTranscr
 export { liveSessionRunning } from './liveSession';
 // The Voice Chat conversation's state, for the view that shows it (VoiceChatControl).
 export type { VoiceChatApi, VoiceChatError, VoiceChatState } from './useVoiceChat';
-// ...and the pickers of its transcription and speech models and the speech model's voice
-// (voiceModels.ts).
-export type { VoiceChatModels, VoiceChoice, VoiceModelChoice } from './voiceModels';
+// ...and the pickers of its transcription and speech models, the speech model's voice and the
+// system prompt (voiceModels.ts).
+export type {
+  VoiceChatModels,
+  VoiceChoice,
+  VoiceModelChoice,
+  VoicePromptChoice,
+} from './voiceModels';
 
 // The speech composer's advanced-passthrough check and the settings type it edits,
 // re-exported for Chat.tsx for the same reason as the image presets below: the
@@ -531,7 +536,8 @@ export type ChatStore = {
   voiceChatCapable: boolean;
   // What is missing when it cannot (see VoiceChatGap), null when nothing is.
   voiceChatGap: VoiceChatGap | null;
-  // The pickers of the conversation's transcription and speech models (see VoiceChatModels).
+  // The pickers of the conversation's transcription and speech models, and the field of its
+  // system prompt (see VoiceChatModels).
   voiceChatModels: VoiceChatModels;
   // The mask of an image EDIT (inpainting): one PNG data url, or null. It exists
   // only beside a source image in edit mode (handleMaskFile refuses it otherwise,
@@ -762,10 +768,12 @@ export function ChatStoreProvider({
   // says otherwise. Which of them a conversation uses is voiceLegs, below (see VoiceLegs): the
   // thread's pick, or the first.
   const [voiceStreaming, setVoiceStreaming] = useState<VoiceStreaming | null>(null);
-  // The active thread's own picks of those two models (concrete, see VoiceChatSettings): the
-  // audio settings' twin for a TEXT thread, seeded in activateChat and persisted via buildDoc --
-  // a text thread's, since a conversation is only offered on one. Not sent with a run: the
-  // ticket carries the models. '' is no pick: the automatic one.
+  // The active thread's own picks of those two models, the voice and the system prompt (concrete,
+  // see VoiceChatSettings): the audio settings' twin for a TEXT thread, seeded in activateChat and
+  // persisted via buildDoc -- a text thread's, since a conversation is only offered on one. Not
+  // sent with a run: the ticket carries the models, and the backend reads the prompt from the
+  // stored thread. '' is no pick: the automatic one (the prompt is pre-filled with the built-in
+  // one instead).
   const [voiceSettings, setVoiceSettings] = useState<VoiceChatSettings>(
     DEFAULT_VOICE_CHAT_SETTINGS,
   );
@@ -2375,6 +2383,11 @@ export function ChatStoreProvider({
         showErrorRef.current(tRef.current.chatBusy);
         return null;
       }
+      // The backend reads the voice system prompt from the STORED thread when a turn starts, and a
+      // save is refused once the conversation holds the chat (isTranscriptHeld): an edit made less
+      // than a debounce ago would not be the prompt the first answer follows. So what is unsaved
+      // goes out now, before the ticket is asked for (a no-op when nothing is).
+      void flushSave();
       voiceChatIdRef.current = chatId;
       return {
         chatId,
@@ -2420,6 +2433,12 @@ export function ChatStoreProvider({
     },
     [stopVoiceChat],
   );
+  // The system prompt is not part of the ticket (the backend reads it from the stored thread when
+  // a run starts), so editing it neither ends a conversation nor dismisses a refusal -- the
+  // field is closed while one is on, which is what keeps a run on the prompt it began with.
+  const setVoiceSystemPrompt = useCallback((systemPrompt: string) => {
+    setVoiceSettings((current) => ({ ...current, systemPrompt }));
+  }, []);
   const voiceChatModels: VoiceChatModels = {
     ready: voiceStreaming !== null,
     llm: effectiveOption?.display_name ?? effectiveModel,
@@ -2440,6 +2459,7 @@ export function ChatStoreProvider({
       set: setVoiceTtsModel,
     }),
     voice: { voices: voiceTtsVoices, value: voiceVoice, set: setVoiceVoice },
+    systemPrompt: { value: voiceSettings.systemPrompt, set: setVoiceSystemPrompt },
   };
 
   // A conversation belongs to the chat and the model it started with (its ticket holds the three

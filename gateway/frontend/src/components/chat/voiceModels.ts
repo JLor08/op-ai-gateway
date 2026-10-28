@@ -124,6 +124,18 @@ export type VoiceChoice = {
 };
 
 /**
+ * The voice system prompt of a Voice Chat (#314), as the control shows it: the text the field
+ * holds -- the built-in prompt, pre-filled, until the thread has its own -- and the way to edit
+ * it. It is saved with the thread (only when it differs from the built-in one, see
+ * voiceChatSetting) and read by the backend from the stored thread when a run starts, so it is
+ * never sent with a run or a ticket.
+ */
+export type VoicePromptChoice = {
+  value: string;
+  set: (prompt: string) => void;
+};
+
+/**
  * One of the two models of a Voice Chat that the thread does not pick for itself, the live
  * transcription model that hears the user (asr) and the streaming speech model that answers aloud
  * (tts), as the conversation's picker shows it (#317). The thread's own model is the third, the
@@ -154,8 +166,9 @@ export type VoiceModelChoice = {
 };
 
 /**
- * The models of a Voice Chat as the control shows them: the two pickers and the speech model's
- * voice field, whether the gateway has said which models stream (until it has, there is nothing
+ * The models of a Voice Chat as the control shows them: the two pickers, the speech model's voice
+ * field and the thread's voice system prompt (not a model, but a pick of the same thread, shown
+ * with them), whether the gateway has said which models stream (until it has, there is nothing
  * to choose from and the pickers are closed), and the third model, the thread's own -- the one
  * that answers, by its display name ('' when the thread has none). The control only SHOWS that
  * one: it is picked with the thread's model selector, which is the LLM picker of the conversation.
@@ -166,6 +179,7 @@ export type VoiceChatModels = {
   asr: VoiceModelChoice;
   tts: VoiceModelChoice;
   voice: VoiceChoice;
+  systemPrompt: VoicePromptChoice;
 };
 
 /** What the picker of one leg is built from (see voiceModelChoice). */

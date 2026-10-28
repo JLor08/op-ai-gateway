@@ -202,13 +202,15 @@ describe('effectiveVoice', () => {
 // there (#318) -- but choosing the model that would speak anyway changes nothing about it.
 describe('withTtsModel', () => {
   const streaming = ['tts-a', 'tts-clone'];
-  const current = { asrModel: 'asr-b', ttsModel: '', voice: 'marius' };
+  // The thread's own system prompt rides along: a speech model switch is not its business.
+  const current = { asrModel: 'asr-b', ttsModel: '', voice: 'marius', systemPrompt: 'Be terse.' };
 
   it('records the pick and clears the voice when another model would now speak', () => {
     expect(withTtsModel(current, 'tts-clone', streaming)).toEqual({
       asrModel: 'asr-b',
       ttsModel: 'tts-clone',
       voice: '',
+      systemPrompt: 'Be terse.',
     });
     expect(withTtsModel({ ...current, ttsModel: 'tts-clone' }, '', streaming).voice).toBe('');
   });
