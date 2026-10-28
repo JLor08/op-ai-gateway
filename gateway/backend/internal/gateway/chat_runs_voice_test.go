@@ -7,17 +7,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/capture"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -45,6 +48,26 @@ type voiceTestProvider struct {
 	speechFrames string
 	speechWAV    []byte
 	speechBodies chan []byte
+	// speechArrived is closed (once, via speechOnce) the first time a speech request
+	// reaches ProxyNative, so a scripted LLM leg can rendezvous with the speech leg firing
+	// at </speak>. nil disables the rendezvous (the default, for the non-ordering tests).
+	speechArrived chan struct{}
+	speechOnce    *sync.Once
+	// speechFail makes the speech leg's loopback answer a 500, to drive the speech-leg
+	// failure path (the text turn still commits, no audio, degrade surfaced).
+	speechFail bool
+	// llmScript, when non-nil, REPLACES the mock's echoed answer with these scripted
+	// deltas: a delta with waitSpeech blocks after it is emitted until the speech request
+	// arrives (or ctx ends), and a delta with failAfter returns an error instead of
+	// completing the stream (the LLM-failure path). nil leaves the plain mock answer.
+	llmScript []scriptedLLMDelta
+}
+
+// scriptedLLMDelta is one step of voiceTestProvider.llmScript.
+type scriptedLLMDelta struct {
+	text       string
+	waitSpeech bool
+	failAfter  bool
 }
 
 func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*provider.ProxyResponse, error) {
@@ -52,6 +75,16 @@ func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Targe
 		select {
 		case p.speechBodies <- append([]byte(nil), body...):
 		default:
+		}
+		if p.speechArrived != nil && p.speechOnce != nil {
+			p.speechOnce.Do(func() { close(p.speechArrived) })
+		}
+		if p.speechFail {
+			return &provider.ProxyResponse{
+				StatusCode: http.StatusInternalServerError,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"gateway.mock_speech_failed","message":"boom"}}`)),
+			}, nil
 		}
 		if speechBodyWantsStream(body) {
 			return &provider.ProxyResponse{
@@ -67,6 +100,35 @@ func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Targe
 		}, nil
 	}
 	return p.Mock.ProxyNative(ctx, target, path, body, contentType)
+}
+
+// CompleteStream drives the LLM leg. With no llmScript it is the plain mock (the answer
+// echoes the pending text); with one it emits the scripted deltas, optionally blocking after
+// the </speak> delta until the speech leg fires (the rendezvous the ordering test needs) or
+// returning an error to drive the LLM-failure-after-close path.
+func (p voiceTestProvider) CompleteStream(ctx context.Context, target routing.Target, req inference.Request, emit provider.StreamEmit) error {
+	if p.llmScript == nil {
+		return p.Mock.CompleteStream(ctx, target, req, emit)
+	}
+	for _, d := range p.llmScript {
+		if d.text != "" {
+			if err := emit(inference.StreamEvent{Type: inference.StreamEventTextDelta, Text: d.text}); err != nil {
+				return err
+			}
+		}
+		if d.waitSpeech {
+			select {
+			case <-p.speechArrived:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if d.failAfter {
+			return errors.New("gateway.mock_llm_failed")
+		}
+	}
+	u := inference.Usage{OutputTokens: 3, TotalTokens: 3}
+	return emit(inference.StreamEvent{Type: inference.StreamEventCompleted, Usage: &u})
 }
 
 // voiceTestTargets are the resolved legs a voice run takes. Only the gateway model
@@ -91,15 +153,33 @@ func voiceTestPCM() (first, second []byte) {
 // the run's loopback calls route and bill for real. The seeded chat is EMPTY, so a
 // committed turn leaves exactly [user, assistant]. mockDelay paces the chat leg (a
 // cancel test needs the LLM in flight when it cancels).
-func newVoiceRunTestServer(t *testing.T, mockDelay time.Duration) (*Server, auth.Token, string, *usage.Recorder, <-chan []byte) {
-	t.Helper()
+// defaultVoiceProvider is the baseline voiceTestProvider the voice-run tests share: the
+// canned streaming speech frames and one-shot WAV, with no rendezvous, no speech failure and
+// the plain echoed LLM answer. A test that needs the overlap rendezvous, a speech failure or
+// a scripted LLM answer starts here, sets the fields it needs, and passes it to
+// newVoiceRunTestServerProv.
+func defaultVoiceProvider() voiceTestProvider {
 	first, second := voiceTestPCM()
-	prov := voiceTestProvider{
-		Mock:         provider.Mock{Delay: mockDelay},
+	return voiceTestProvider{
+		Mock:         provider.Mock{},
 		speechFrames: speechFrameDelta(first) + speechFrameDelta(second) + speechSSEDone + speechSSEEnd,
 		speechWAV:    speechTestWAV(),
 		speechBodies: make(chan []byte, 8),
 	}
+}
+
+func newVoiceRunTestServer(t *testing.T, mockDelay time.Duration) (*Server, auth.Token, string, *usage.Recorder, <-chan []byte) {
+	t.Helper()
+	prov := defaultVoiceProvider()
+	prov.Mock.Delay = mockDelay
+	return newVoiceRunTestServerProv(t, prov)
+}
+
+// newVoiceRunTestServerProv wires the gateway exactly as newVoiceRunTestServer does, but over
+// a caller-supplied provider so a test can inject the rendezvous / failure / scripted-answer
+// seams above.
+func newVoiceRunTestServerProv(t *testing.T, prov voiceTestProvider) (*Server, auth.Token, string, *usage.Recorder, <-chan []byte) {
+	t.Helper()
 
 	chats := store.NewMemoryChatStore(0)
 	cipher, err := capture.New(testCaptureKey)
@@ -670,5 +750,350 @@ func TestVoiceSpeechPrep_EmptyLanguageUnset(t *testing.T) {
 	}
 	if _, present := fields["language"]; present {
 		t.Fatalf("body = %v, want no language member for an empty language", fields)
+	}
+}
+
+// --- Phase 2: concurrent two-leg flow + live-delta tag stripping (spec 5.5) ---
+
+// storedAssistantMsg returns the chat document's assistant message as a raw-field map, so a
+// test can read both its content parts and its top-level spoken_summary key.
+func storedAssistantMsg(t *testing.T, content json.RawMessage) map[string]json.RawMessage {
+	t.Helper()
+	var doc struct {
+		Messages []map[string]json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(content, &doc); err != nil {
+		t.Fatalf("stored document is not JSON: %v", err)
+	}
+	for _, m := range doc.Messages {
+		if string(m["role"]) == `"assistant"` {
+			return m
+		}
+	}
+	t.Fatalf("stored document has no assistant message: %s", content)
+	return nil
+}
+
+// voiceTextPart is the text of the first {"type":"text"} part of a stored message's content.
+func voiceTextPart(t *testing.T, content json.RawMessage) string {
+	t.Helper()
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(content, &parts); err != nil {
+		t.Fatalf("content is not a parts array: %s", content)
+	}
+	for _, p := range parts {
+		if p.Type == "text" {
+			return p.Text
+		}
+	}
+	t.Fatalf("content has no text part: %s", content)
+	return ""
+}
+
+// storedSpokenSummary returns the assistant message's spoken_summary and whether the key is
+// present at all (a no-tag / no-audio turn omits it).
+func storedSpokenSummary(t *testing.T, content json.RawMessage) (string, bool) {
+	t.Helper()
+	raw, ok := storedAssistantMsg(t, content)["spoken_summary"]
+	if !ok {
+		return "", false
+	}
+	var summary string
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		t.Fatalf("spoken_summary is not a string: %s", raw)
+	}
+	return summary, true
+}
+
+// seedVoiceSpeechLanguage writes the TTS mapping's scope-"" speech_language fact, as the
+// health loop does, so the voice run's capability lookup finds the model accepts (or not) a
+// `language` field.
+func seedVoiceSpeechLanguage(t *testing.T, srv *Server, accepts bool, def string) {
+	t.Helper()
+	row := routing.ModelMappingCacheRow{
+		MappingID: "route-tts",
+		CacheType: routing.ModelMappingCacheSpeechLanguage,
+		ScopeKey:  "",
+		Payload:   routing.SpeechLanguagePayload(accepts, def),
+		UpdatedAt: time.Now(),
+	}
+	if err := srv.Routes.UpsertModelMappingCache(context.Background(), row); err != nil {
+		t.Fatalf("UpsertModelMappingCache: %v", err)
+	}
+}
+
+// The speech leg fires at </speak>, while the LLM is still streaming the detail (spec 5.5).
+// The scripted LLM leg BLOCKS after </speak> until the speech request arrives, so a run that
+// synthesized only after the LLM finished (phase-1 ordering) would deadlock and never go
+// terminal within waitFor's window -- the ordering is proven by the run completing at all,
+// and by the TTS input being the captured summary.
+func TestVoiceRun_FiresSpeechAtCloseTag(t *testing.T) {
+	prov := defaultVoiceProvider()
+	prov.speechArrived = make(chan struct{})
+	prov.speechOnce = &sync.Once{}
+	prov.llmScript = []scriptedLLMDelta{
+		{text: `<speak lang="de">Kurz.`},
+		{text: `</speak>`, waitSpeech: true},
+		{text: ` Ausfuehrliche Details.`},
+	}
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServerProv(t, prov)
+
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, "unused")
+	if snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed: the LLM leg blocks after </speak> until the speech leg fires, so a non-overlapped run never finishes", snap.Status, snap.Err)
+	}
+	if got := takeSpeechBody(t, speechBodies)["input"]; got != "Kurz." {
+		t.Fatalf("TTS input = %q, want the captured summary %q (fired at </speak>)", got, "Kurz.")
+	}
+}
+
+// The committed turn carries the FULL clean text (summary + detail, tags stripped) as its
+// content, the summary region as spoken_summary, and the synthesized audio -- end to end,
+// through the real gateway (the forwarding Task 4 could not test on its own).
+func TestVoiceRun_CommitsFullTextAndSummary(t *testing.T) {
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
+
+	const pending = `<speak lang="de">Kurz zusammengefasst.</speak> Ausfuehrliche Details.`
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+	if snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+
+	const wantSummary = "Kurz zusammengefasst."
+	const wantContent = "Mock response for qwen-coder: Kurz zusammengefasst. Ausfuehrliche Details."
+
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(stored.Content), "<speak") || strings.Contains(string(stored.Content), "</speak") {
+		t.Fatalf("stored turn still carries <speak markup: %s", stored.Content)
+	}
+	msg := storedAssistantMsg(t, stored.Content)
+	if got := voiceTextPart(t, msg["content"]); got != wantContent {
+		t.Fatalf("text content = %q, want the full clean answer %q", got, wantContent)
+	}
+	if summary, ok := storedSpokenSummary(t, stored.Content); !ok || summary != wantSummary {
+		t.Fatalf("spoken_summary = %q (present %v), want %q", summary, ok, wantSummary)
+	}
+	if !strings.Contains(string(stored.Content), `"type":"audio_url"`) {
+		t.Fatalf("assistant turn has no audio part: %s", stored.Content)
+	}
+	// The TTS leg synthesized the SUMMARY, not the whole answer.
+	if got := takeSpeechBody(t, speechBodies)["input"]; got != wantSummary {
+		t.Fatalf("TTS input = %q, want the summary %q", got, wantSummary)
+	}
+}
+
+// No <speak> tag: the whole answer is synthesized after the LLM finishes (the phase-1 ordered
+// fallback) and the committed turn persists no spoken_summary key.
+func TestVoiceRun_NoTagSpeaksWholeAnswer(t *testing.T) {
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
+
+	const pending = "plain question"
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+	if snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+	wantAnswer := "Mock response for qwen-coder: " + pending
+	if got := takeSpeechBody(t, speechBodies)["input"]; got != wantAnswer {
+		t.Fatalf("TTS input = %q, want the whole answer %q", got, wantAnswer)
+	}
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := storedSpokenSummary(t, stored.Content); ok {
+		t.Fatalf("a no-tag turn must persist no spoken_summary: %s", stored.Content)
+	}
+}
+
+// Live-delta tag stripping: NO published delta carries <speak> markup -- the scanner strips
+// the tags before run.publish fans the clean text out (and buffers it).
+func TestVoiceRun_LiveDeltasAreTagStripped(t *testing.T) {
+	srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+
+	const pending = `<speak lang="de">Kurz.</speak> Details.`
+	history, err := srv.Portal.VoiceRunHistory(context.Background(), owner, chatID, pending)
+	if err != nil {
+		t.Fatalf("VoiceRunHistory: %v", err)
+	}
+	run, runCtx, err := srv.reserveRun(owner, chatID)
+	if err != nil {
+		t.Fatalf("reserveRun: %v", err)
+	}
+	_, ch, unsub := run.subscribe()
+	defer unsub()
+	srv.launchRun(runCtx, owner, run, PrepareRunResult{
+		History:  history,
+		Settings: portal.ChatRunSettings{Model: voiceLLMTarget.Model, Kind: chatRunKindVoice},
+		Voice:    &voiceRunParams{pendingText: pending, tts: voiceTTSTarget},
+	})
+
+	var clean strings.Builder
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case ev, open := <-ch:
+			if !open {
+				goto collected
+			}
+			if ev.Event == "delta" {
+				if strings.Contains(ev.Content, "<speak") || strings.Contains(ev.Content, "</speak") {
+					t.Fatalf("a published delta carried speak markup: %q", ev.Content)
+				}
+				clean.WriteString(ev.Content)
+			}
+		case <-timeout:
+			t.Fatal("the run published no terminal event within 10s")
+		}
+	}
+collected:
+	got := clean.String()
+	if !strings.Contains(got, "Kurz.") || !strings.Contains(got, "Details.") || strings.Contains(got, "speak") {
+		t.Fatalf("clean delta stream = %q, want the tag-stripped text", got)
+	}
+}
+
+// The per-answer language reaches the speech leg only when the TTS model can take a
+// `language` field: the default harness seeds no speech_language fact, so the model cannot,
+// and the speech body omits language even though the LLM asked for <speak lang="de">.
+func TestVoiceRun_LanguageOmittedWhenModelCannot(t *testing.T) {
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
+
+	const pending = `<speak lang="de">Kurz.</speak> Details.`
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+	if snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+	body := takeSpeechBody(t, speechBodies)
+	if lang, present := body["language"]; present {
+		t.Fatalf("speech body carries language %v, want it omitted for a model without the capability", lang)
+	}
+	if body["input"] != "Kurz." {
+		t.Fatalf("TTS input = %v, want the summary %q", body["input"], "Kurz.")
+	}
+}
+
+// The positive control: when the TTS model's cached fact says it accepts a `language` field,
+// the per-answer language the LLM requested via <speak lang> rides onto the speech body.
+func TestVoiceRun_LanguagePassedWhenModelAccepts(t *testing.T) {
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
+	seedVoiceSpeechLanguage(t, srv, true, "de")
+
+	const pending = `<speak lang="de">Kurz.</speak> Details.`
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+	if snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+	if lang := takeSpeechBody(t, speechBodies)["language"]; lang != "de" {
+		t.Fatalf("speech body language = %v, want %q when the model accepts it", lang, "de")
+	}
+}
+
+// A cancel that lands in the commit-claim window wins even after the overlap: the speech leg
+// fired at </speak> (the overlap really happened), but the CAS claim loses to the cancel and
+// NOTHING is persisted.
+func TestVoiceRun_CancelDuringOverlapPersistsNothing(t *testing.T) {
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
+	srv.voiceBeforeCommitClaim = func(run *ChatRun) { run.cancelContext() }
+
+	before, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const pending = `<speak lang="de">Kurz.</speak> Details.`
+	run, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+	if snap.Status != "canceled" {
+		t.Fatalf("status = %q (err %q), want canceled: a cancel in the commit-claim window must win even after the speech leg fired", snap.Status, snap.Err)
+	}
+	if run.isCommitting() {
+		t.Fatal("a run cancelled in the window must never have claimed its commit")
+	}
+	// The overlap really happened: the speech leg fired at </speak> on the summary.
+	if got := takeSpeechBody(t, speechBodies)["input"]; got != "Kurz." {
+		t.Fatalf("TTS input = %q, want the summary %q (the speech leg must have fired during the overlap)", got, "Kurz.")
+	}
+	after, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before.Content) != string(after.Content) {
+		t.Fatalf("a cancel in the commit-claim window still persisted:\nbefore %s\nafter  %s", before.Content, after.Content)
+	}
+}
+
+// The LLM fails AFTER </speak> (summary spoken, detail cut off): the turn is still committed
+// with the summary text + its audio (detail truncated), and the degrade is surfaced on the
+// run's terminal (spec 5.5).
+func TestVoiceRun_LLMFailsAfterCloseCommitsSummary(t *testing.T) {
+	prov := defaultVoiceProvider()
+	prov.llmScript = []scriptedLLMDelta{
+		{text: `<speak lang="de">Kurz.`},
+		{text: `</speak> Teil`},
+		{failAfter: true},
+	}
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServerProv(t, prov)
+
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, "unused")
+	if snap.Status == "completed" || snap.Status == "canceled" {
+		t.Fatalf("status = %q, want an error status surfacing the LLM degrade", snap.Status)
+	}
+
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgs := storedMessages(t, stored.Content); len(msgs) != 2 {
+		t.Fatalf("want [user, assistant], got %d messages: %s", len(msgs), stored.Content)
+	}
+	if summary, ok := storedSpokenSummary(t, stored.Content); !ok || summary != "Kurz." {
+		t.Fatalf("spoken_summary = %q (present %v), want %q", summary, ok, "Kurz.")
+	}
+	if !strings.Contains(string(stored.Content), `"type":"audio_url"`) {
+		t.Fatalf("committed turn has no audio part: %s", stored.Content)
+	}
+	// The detail is truncated: the content is only the clean text captured before the failure.
+	if got := voiceTextPart(t, storedAssistantMsg(t, stored.Content)["content"]); got != "Kurz. Teil" {
+		t.Fatalf("text content = %q, want the truncated clean text %q", got, "Kurz. Teil")
+	}
+	if got := takeSpeechBody(t, speechBodies)["input"]; got != "Kurz." {
+		t.Fatalf("TTS input = %q, want the summary %q", got, "Kurz.")
+	}
+}
+
+// The speech leg fails: the text turn still commits (no audio block, no spoken_summary) and
+// the degrade is surfaced on the run's terminal (spec 5.5).
+func TestVoiceRun_SpeechFailsCommitsTextOnly(t *testing.T) {
+	prov := defaultVoiceProvider()
+	prov.speechFail = true
+	srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+
+	const pending = `<speak lang="de">Kurz.</speak> Details.`
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+	if snap.Status == "completed" || snap.Status == "canceled" {
+		t.Fatalf("status = %q, want an error status surfacing the speech degrade", snap.Status)
+	}
+
+	stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgs := storedMessages(t, stored.Content); len(msgs) != 2 {
+		t.Fatalf("want [user, assistant], got %d messages: %s", len(msgs), stored.Content)
+	}
+	const wantContent = "Mock response for qwen-coder: Kurz. Details."
+	if got := voiceTextPart(t, storedAssistantMsg(t, stored.Content)["content"]); got != wantContent {
+		t.Fatalf("text content = %q, want the full clean answer %q", got, wantContent)
+	}
+	if strings.Contains(string(stored.Content), `"type":"audio_url"`) || strings.Contains(string(stored.Content), "data:") {
+		t.Fatalf("a failed speech leg must leave no audio: %s", stored.Content)
+	}
+	if _, ok := storedSpokenSummary(t, stored.Content); ok {
+		t.Fatalf("a failed speech leg must persist no spoken_summary: %s", stored.Content)
 	}
 }

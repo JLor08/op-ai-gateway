@@ -516,7 +516,15 @@ func TestVoiceFastCommitThenResumeDoesNotDoubleCommit(t *testing.T) {
 // degradeAssert runs one turn against a harness whose leg fails and asserts the single
 // error frame carries wantCode (when non-empty) and that the session degrades to idle with
 // no retry (no answer_delta follows the error).
-func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string) {
+// degradeAssert drives a turn whose leg fails, and asserts the degrade-to-idle flow: one
+// typed error frame carrying wantCode, a fall back to idle, and no silent retry.
+//
+// wantTextCommitted splits the two phase-2 persistence contracts (spec 5.5):
+//   - false: the LLM failed BEFORE any <speak> summary, so no speech fired and the turn
+//     persists NOTHING -- the chat document is left empty.
+//   - true: the SPEECH leg failed (after a clean LLM answer), so the text turn STILL commits
+//     with no audio block and no spoken_summary, and only the degrade is surfaced.
+func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string, wantTextCommitted bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -562,13 +570,28 @@ func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string) {
 		}
 	}
 
-	// Nothing committed: the failed turn leaves the document empty.
 	stored, err := h.srv.Portal.GetChat(context.Background(), auth.Token{UserID: "usr_dev"}, h.chatID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(storedMessages(t, stored.Content)); n != 0 {
-		t.Fatalf("a degraded turn committed %d messages, want none: %s", n, stored.Content)
+	msgs := storedMessages(t, stored.Content)
+	if !wantTextCommitted {
+		// The LLM failed before any summary: nothing fired, nothing persists.
+		if n := len(msgs); n != 0 {
+			t.Fatalf("a degraded turn committed %d messages, want none: %s", n, stored.Content)
+		}
+		return
+	}
+	// The speech leg failed: the text turn still commits (spec 5.5), with NO audio and NO
+	// spoken_summary -- nothing was spoken -- and the degrade is surfaced separately above.
+	if n := len(msgs); n != 2 {
+		t.Fatalf("a speech-failed turn committed %d messages, want [user, assistant]: %s", n, stored.Content)
+	}
+	if strings.Contains(string(stored.Content), `"type":"audio_url"`) || strings.Contains(string(stored.Content), "data:") {
+		t.Fatalf("a speech-failed turn must commit no audio: %s", stored.Content)
+	}
+	if _, ok := storedSpokenSummary(t, stored.Content); ok {
+		t.Fatalf("a speech-failed turn must persist no spoken_summary: %s", stored.Content)
 	}
 }
 
@@ -841,12 +864,14 @@ func TestVoiceLLMErrorDegradesToIdle(t *testing.T) {
 	// provider.ErrUnavailable is mapped to the stable completion code provider.unavailable,
 	// which the degradation error frame must carry (spec 6.6).
 	h := newVoiceTurnHarness(t, child, voiceTurnOpts{llmErr: provider.ErrUnavailable, timing: turnGraceTiming()})
-	degradeAssert(t, h, "provider.unavailable")
+	// The LLM failed before any <speak> summary: nothing fired, nothing persists.
+	degradeAssert(t, h, "provider.unavailable", false)
 }
 
 // TestVoiceTTSErrorDegradesToIdle: a TTS failure (after a clean LLM answer) stops the turn
 // with one error frame carrying the speech leg's own stable code (speech.upstream_error, the
-// code the gateway wraps a plain-string upstream error with), and degrades to idle.
+// code the gateway wraps a plain-string upstream error with), and degrades to idle. Under
+// phase 2 the text turn STILL commits (no audio); only the degrade is surfaced (spec 5.5).
 func TestVoiceTTSErrorDegradesToIdle(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{"speak this"}
@@ -855,7 +880,7 @@ func TestVoiceTTSErrorDegradesToIdle(t *testing.T) {
 		speechErrBody: `{"error":"the speech upstream failed"}`,
 		timing:        turnGraceTiming(),
 	})
-	degradeAssert(t, h, "speech.upstream_error")
+	degradeAssert(t, h, "speech.upstream_error", true)
 }
 
 // TestVoiceMidTurnAdmissionBlockedDegrades: a mid-turn runtime.admission_blocked on a leg
@@ -868,7 +893,8 @@ func TestVoiceMidTurnAdmissionBlockedDegrades(t *testing.T) {
 		speechErrBody: `{"error":{"message":"no capacity","code":"runtime.admission_blocked","type":"server_error"}}`,
 		timing:        turnGraceTiming(),
 	})
-	degradeAssert(t, h, voiceAdmissionBlockedCode)
+	// A speech-leg admission block is a speech-leg failure: the text turn commits, degrade surfaced.
+	degradeAssert(t, h, voiceAdmissionBlockedCode, true)
 }
 
 // drainBurstDiscarded sends a mic PCM burst and asserts, after a short settle, that NONE of it

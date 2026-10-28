@@ -68,6 +68,34 @@ func TestSpeakScanner_TagSplitAcrossWrites(t *testing.T) {
 	}
 }
 
+// The close signal is reported on the EXACT delta that completes </speak>, not before and
+// not after -- Task 5 fires the speech leg on that delta, so the timing is load-bearing when
+// the close tag is split across writes.
+func TestSpeakScanner_CloseReportedOnTheCompletingDelta(t *testing.T) {
+	s := newSpeakScanner()
+	// Open and summary, then the close tag arrives split as "</spe" + "ak>".
+	if _, closed := s.Write(`<speak lang="de">Sum.`); closed {
+		t.Fatal("closed = true on the open+summary delta, want false")
+	}
+	if clean, closed := s.Write("</spe"); closed || clean != "" {
+		t.Fatalf("partial close delta: clean = %q, closed = %v, want \"\" and false (the tag is incomplete)", clean, closed)
+	}
+	clean, closed := s.Write("ak> rest")
+	if !closed {
+		t.Fatal("closed = false on the delta that completes </speak>, want true")
+	}
+	if clean != " rest" {
+		t.Fatalf("clean = %q, want %q (the detail after the close tag)", clean, " rest")
+	}
+	// A later delta never re-reports the (already closed) first region.
+	if _, closed := s.Write(" more"); closed {
+		t.Fatal("closed = true on a post-close delta, want false (the first region closes once)")
+	}
+	if text, lang := s.Summary(); text != "Sum." || lang != "de" {
+		t.Fatalf("Summary() = (%q, %q), want (%q, %q)", text, lang, "Sum.", "de")
+	}
+}
+
 func TestSpeakScanner_HoldsBackOnlyTheTagBytes(t *testing.T) {
 	s := newSpeakScanner()
 	// Text up to the '<' is published right away; only the possible-tag bytes wait.
