@@ -456,12 +456,14 @@ func consumeVoiceLLMStream(ctx context.Context, run *ChatRun, body io.Reader, sp
 }
 
 // relayVoiceDelta taps one content delta through the speak scanner: the scanner returns the
-// clean text to fan out (and to buffer) and whether the first <speak> region just closed.
+// clean text to fan out (and to buffer) and whether a <speak> region just closed.
 // Reasoning rides through unchanged. An all-held-back delta (clean "", no reasoning) is not
 // published at all, so no empty delta and no <speak> prefix ever reaches a subscriber; the
 // first </speak> fires onSummaryClosed so the caller can start the speech leg concurrently.
 func relayVoiceDelta(run *ChatRun, speak *speakScanner, onSummaryClosed func(), ev sseDeltaEvent, timings *runStreamTimings) {
-	clean, closed := speak.Write(ev.Content)
+	// closedIdx is not used yet: onSummaryClosed still reads only the first region (Summary), so
+	// a later region closing re-enters it harmlessly (speechFired, or an empty first region).
+	clean, _, closed := speak.Write(ev.Content)
 	if clean != "" || ev.Reasoning != "" {
 		scanned := ev
 		scanned.Content = clean
