@@ -966,12 +966,12 @@ export const DEFAULT_VOICE_SYSTEM_PROMPT =
   'sections, each wrapped in its own `<speak lang="…">…</speak>` tag, using the ' +
   'language the user is speaking (set `lang` to its two-letter code). For a ' +
   'short answer use ONE section; for a long answer use several — roughly one per ' +
-  'key point, each placed after the written detail it summarizes — each a brief ' +
-  'spoken summary of that part, so the spoken sections together are a fuller but ' +
-  'still concise summary. Keep each `<speak>` short enough to listen to — a ' +
-  'sentence or two. Write the fuller detail (explanations, lists, code, caveats) ' +
-  'as normal text outside the tags; that text is shown but not spoken. Do not ' +
-  'put anything before the first `<speak>` tag.';
+  'key point — each a brief spoken summary of that part, so the spoken sections ' +
+  'together are a fuller but still concise summary. Keep each `<speak>` short ' +
+  'enough to listen to — a sentence or two. Write the fuller detail ' +
+  '(explanations, lists, code, caveats) as normal text outside the tags; that ' +
+  'text is shown but not spoken. Do not put anything before the first `<speak>` ' +
+  'tag.';
 
 // The Voice Chat picks of a thread (#317, #318, #314), as CONCRETE store state (every field
 // defined, unlike the all-optional wire ChatVoiceChatSettings): the live-transcription model that

@@ -285,10 +285,16 @@ func TestDefaultVoiceSystemPromptAsksForSeveralSpokenSections(t *testing.T) {
 		"two-letter code",
 		"outside the tags",
 		"shown but not spoken",
+		"Do not put anything before the first `<speak>` tag",
 	} {
 		if !strings.Contains(defaultVoiceSystemPrompt, want) {
 			t.Errorf("defaultVoiceSystemPrompt does not contain %q", want)
 		}
+	}
+	// The first section must lead for a fast first audio, so no later instruction may place a
+	// section after written detail (that would contradict "nothing before the first <speak>").
+	if strings.Contains(defaultVoiceSystemPrompt, "placed after") {
+		t.Errorf("defaultVoiceSystemPrompt places a section after written detail, contradicting the first-section-leads rule")
 	}
 }
 

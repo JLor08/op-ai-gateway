@@ -1292,12 +1292,12 @@ const defaultVoiceSystemPrompt = "You are in a spoken conversation. Summarize th
 	"sections, each wrapped in its own `<speak lang=\"…\">…</speak>` tag, using the " +
 	"language the user is speaking (set `lang` to its two-letter code). For a " +
 	"short answer use ONE section; for a long answer use several — roughly one per " +
-	"key point, each placed after the written detail it summarizes — each a brief " +
-	"spoken summary of that part, so the spoken sections together are a fuller but " +
-	"still concise summary. Keep each `<speak>` short enough to listen to — a " +
-	"sentence or two. Write the fuller detail (explanations, lists, code, caveats) " +
-	"as normal text outside the tags; that text is shown but not spoken. Do not " +
-	"put anything before the first `<speak>` tag."
+	"key point — each a brief spoken summary of that part, so the spoken sections " +
+	"together are a fuller but still concise summary. Keep each `<speak>` short " +
+	"enough to listen to — a sentence or two. Write the fuller detail " +
+	"(explanations, lists, code, caveats) as normal text outside the tags; that " +
+	"text is shown but not spoken. Do not put anything before the first `<speak>` " +
+	"tag."
 
 // voiceSystemPrompt is the system message of a voice run, read from the chat document's settings
 // and composed of two layers: the thread's own system prompt (settings.system_prompt, the
@@ -1306,9 +1306,9 @@ const defaultVoiceSystemPrompt = "You are in a spoken conversation. Summarize th
 // stores none -- the key absent, blank, or not a string). Both are trimmed and joined by one
 // blank line, the thread prompt first. A blank, absent or non-string thread prompt leaves the
 // voice prompt alone. The document is schema-free, so each member is decoded on its own (the
-// picks beside voice_chat, and any unrelated malformed knob, must not switch either prompt off).
-// It is read from the STORED document, never from the run ticket or a request field, so a client
-// cannot plant a prompt for a single run.
+// picks beside voice_chat.system_prompt, and any unrelated malformed knob, must not switch either
+// prompt off). It is read from the STORED document, never from the run ticket or a request
+// field, so a client cannot plant a prompt for a single run.
 func voiceSystemPrompt(settings json.RawMessage) string {
 	var top struct {
 		SystemPrompt json.RawMessage `json:"system_prompt"`
