@@ -236,7 +236,11 @@ func (s *Server) launchVoiceSpeech(ctx context.Context, owner auth.Token, run *C
 		liftDeadline := armRunDeadline(chatRunKindSpeech, cancelTTS)
 		defer liftDeadline()
 		prep := voiceSpeechPrep(text, vp.tts, vp.audio, language)
-		parts, status, errMsg, streamed := s.generateSpeechTurn(ttsCtx, owner, run, prep, liftDeadline)
+		// stampTTFT=false: the LLM leg is streaming into the same run.metrics concurrently, so
+		// the speech leg must NOT also write it (a lost-update on the perf metrics). The LLM
+		// leg is the sole metrics writer for a voice run, keeping the persisted metrics
+		// deterministic.
+		parts, status, errMsg, streamed := s.generateSpeechTurn(ttsCtx, owner, run, prep, liftDeadline, false)
 		result <- voiceSpeechResult{parts: parts, status: status, errMsg: errMsg, streamed: streamed}
 	}()
 }
@@ -458,6 +462,13 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 	defer cancelCommit()
 
 	m := run.currentMetrics()
+	// AudioAnswer is whether this turn actually carries synthesized audio. It is true on the
+	// happy path and false on a degraded commit that carries only text (the speech leg failed,
+	// or the LLM was cut off after </speak> with no usable audio) -- so the #281 audio-answer
+	// retention never acts on a turn that has no audio. A voice thread sets no keep_last_audio,
+	// so with audio present it is stored (never the N=0 marker); should a future voice thread
+	// set it, retention then applies to the right turns. streamed records how it was delivered.
+	audioAnswer := len(audioParts) > 0
 	if err := s.Portal.CommitVoiceTurn(commitCtx, owner, run.ChatID, pendingText, portal.AssistantTurn{
 		Content:         answer,
 		ContentParts:    parts,
@@ -466,12 +477,8 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 		CharsPerSecond:  m.CharsPerSecond,
 		TokensPerSecond: m.TokensPerSecond,
 		SpokenSummary:   summary,
-		// A voice answer IS an audio answer: it rides the #281 retention the same way
-		// a speech turn does, and streamed records how it was delivered. A voice
-		// thread sets no keep_last_audio, so the audio is stored (never the N=0
-		// marker); should a future voice thread set it, retention applies correctly.
-		AudioAnswer:   true,
-		AudioStreamed: streamed,
+		AudioAnswer:     audioAnswer,
+		AudioStreamed:   streamed && audioAnswer,
 	}, "complete"); err != nil {
 		// A failed store write withholds the parts from the terminal event (nothing
 		// was stored to render) and surfaces a mapped code, exactly as

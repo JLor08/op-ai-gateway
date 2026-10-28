@@ -165,7 +165,9 @@ func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *Cha
 	liftDeadline := armRunDeadline(chatRunKindSpeech, cancel)
 	defer liftDeadline()
 
-	parts, status, errMsg, streamed := s.generateSpeechTurn(ctx, owner, run, prep, liftDeadline)
+	// A standalone speech run is the sole writer of its own metrics, so it stamps the audio
+	// first-chunk TTFT (its only perf metric).
+	parts, status, errMsg, streamed := s.generateSpeechTurn(ctx, owner, run, prep, liftDeadline, true)
 	s.finishRunWithParts(ctx, owner, run, status, errMsg, parts, streamed)
 }
 
@@ -193,7 +195,10 @@ func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *Cha
 // lifecycle (#281) needs it: a streamed answer under keep_last_audio=0 was heard live
 // and is committed as the not-stored marker, while a buffered-fallback one is stored.
 // Every failure before the branch, and the buffered branch, is not-streamed.
-func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func()) (json.RawMessage, string, string, bool) {
+// stampTTFT is whether a streamed answer stamps the audio first-chunk TTFT onto the run's
+// metrics. A standalone speech run sets it; a VOICE run's speech leg does not, so its
+// concurrently-running LLM leg stays the sole writer of run.metrics (see speechEventReader).
+func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool) (json.RawMessage, string, string, bool) {
 	sampleRate, streaming := s.speechRunStreamRate(ctx, owner, prep)
 	build := buildSpeechBody
 	if streaming {
@@ -231,7 +236,7 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	// comes. (Only a 2xx can be one; anything else, and a one-shot WAV, is read whole
 	// below.) This is the one branch that ACTUALLY streamed.
 	if streaming && resp.StatusCode >= 200 && resp.StatusCode <= 299 && isSpeechEventStream(resp.Header) {
-		parts, status, msg := s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline)
+		parts, status, msg := s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline, stampTTFT)
 		return parts, status, msg, true
 	}
 	parts, status, msg := s.bufferedSpeechTurn(ctx, run, resp)

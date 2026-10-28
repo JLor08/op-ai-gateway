@@ -1097,3 +1097,115 @@ func TestVoiceRun_SpeechFailsCommitsTextOnly(t *testing.T) {
 		t.Fatalf("a failed speech leg must persist no spoken_summary: %s", stored.Content)
 	}
 }
+
+// --- Phase 2 review fixes: metrics determinism + AudioAnswer ---
+
+// recordingVoicePortal wraps the real portal.API and captures the AssistantTurn handed to
+// CommitVoiceTurn, so a test can assert fields (AudioAnswer, TTFTMs, SpokenSummary) that the
+// stored chat document does not expose as keys.
+type recordingVoicePortal struct {
+	portal.API
+	mu       sync.Mutex
+	last     portal.AssistantTurn
+	captured bool
+}
+
+func (p *recordingVoicePortal) CommitVoiceTurn(ctx context.Context, owner auth.Token, chatID, userText string, turn portal.AssistantTurn, status string) error {
+	p.mu.Lock()
+	p.last = turn
+	p.captured = true
+	p.mu.Unlock()
+	return p.API.CommitVoiceTurn(ctx, owner, chatID, userText, turn, status)
+}
+
+func (p *recordingVoicePortal) committed() (portal.AssistantTurn, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.last, p.captured
+}
+
+// The voice run's speech leg must NOT write run.metrics (stampTTFT=false): its LLM leg streams
+// into the same metrics concurrently, and two cross-call read-modify-writes would clobber each
+// other non-deterministically. The LLM leg is the sole writer, so the committed perf metrics
+// are deterministic. The standalone speech path (stampTTFT=true) still stamps the audio TTFT.
+func TestVoiceRun_SpeechLegDoesNotStampMetricsForVoice(t *testing.T) {
+	srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+	sentinel := runMetrics{TTFTMs: 777, ReasoningMs: 123, CharsPerSecond: 55, TokensPerSecond: 99}
+	prep := voiceSpeechPrep("speak this", voiceTTSTarget, portal.ChatAudioSettings{}, "")
+
+	// Voice leg: stampTTFT=false leaves the sentinel (the LLM leg's metrics) untouched.
+	run, _, err := srv.reserveRun(owner, chatID)
+	if err != nil {
+		t.Fatalf("reserveRun: %v", err)
+	}
+	run.setMetrics(sentinel)
+	if _, status, _, streamed := srv.generateSpeechTurn(context.Background(), owner, run, prep, func() {}, false); status != "completed" || !streamed {
+		t.Fatalf("voice speech leg status=%q streamed=%v, want completed and streamed", status, streamed)
+	}
+	if got := run.currentMetrics(); got != sentinel {
+		t.Fatalf("the voice speech leg clobbered run metrics: got %+v, want the sentinel %+v untouched", got, sentinel)
+	}
+	srv.releaseRun(run)
+
+	// Standalone speech leg: stampTTFT=true still stamps the audio first-chunk TTFT.
+	run2, _, err := srv.reserveRun(owner, chatID)
+	if err != nil {
+		t.Fatalf("reserveRun: %v", err)
+	}
+	run2.setMetrics(sentinel)
+	if _, status, _, _ := srv.generateSpeechTurn(context.Background(), owner, run2, prep, func() {}, true); status != "completed" {
+		t.Fatalf("standalone speech leg status=%q, want completed", status)
+	}
+	if run2.currentMetrics().TTFTMs == sentinel.TTFTMs {
+		t.Fatal("stampTTFT=true must stamp the audio TTFT, overwriting the sentinel")
+	}
+	srv.releaseRun(run2)
+}
+
+// AudioAnswer reflects whether the committed turn actually carries audio: true on the happy
+// path, false on a degraded text-only commit (so the #281 audio-answer retention never acts on
+// a turn with no audio).
+func TestVoiceRun_AudioAnswerReflectsCommittedAudio(t *testing.T) {
+	const pending = `<speak lang="de">Kurz.</speak> Details.`
+
+	t.Run("happy path commits AudioAnswer true", func(t *testing.T) {
+		srv, owner, chatID, _, _ := newVoiceRunTestServer(t, 0)
+		rec := &recordingVoicePortal{API: srv.Portal}
+		srv.Portal = rec
+
+		_, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+		if snap.Status != "completed" {
+			t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+		}
+		turn, ok := rec.committed()
+		if !ok {
+			t.Fatal("no voice commit was captured")
+		}
+		if !turn.AudioAnswer {
+			t.Fatal("AudioAnswer = false on a turn committed WITH audio, want true")
+		}
+	})
+
+	t.Run("speech-failed commit has AudioAnswer false", func(t *testing.T) {
+		prov := defaultVoiceProvider()
+		prov.speechFail = true
+		srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+		rec := &recordingVoicePortal{API: srv.Portal}
+		srv.Portal = rec
+
+		_, snap := voiceRunOutcome(t, srv, owner, chatID, pending)
+		if snap.Status == "completed" || snap.Status == "canceled" {
+			t.Fatalf("status = %q, want an error status (speech degrade)", snap.Status)
+		}
+		turn, ok := rec.committed()
+		if !ok {
+			t.Fatal("the text turn must still commit on a speech-leg failure")
+		}
+		if turn.AudioAnswer {
+			t.Fatal("AudioAnswer = true on a no-audio degraded commit, want false")
+		}
+		if turn.SpokenSummary != "" {
+			t.Fatalf("SpokenSummary = %q on a no-audio commit, want empty", turn.SpokenSummary)
+		}
+	})
+}
