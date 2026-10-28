@@ -1044,3 +1044,120 @@ func TestVoiceDrainFallbackEndsWithoutSignal(t *testing.T) {
 	defer lcancel()
 	readVoiceUntilState(t, lctx, conn, voiceStateListening)
 }
+
+// concurrentSpeakFinal is an ASR'd user text that carries a <speak> region. The mock LLM echoes
+// its prompt, so the voice run's answer stream closes a <speak> summary MID-stream and the speech
+// leg fires CONCURRENTLY (the phase-2 overlap, spec 5.5) while the detail text keeps streaming.
+// The summary text is in the user turn only because the mock has no other way to put <speak> in
+// its output; the orchestrator strips the tags from the ANSWER, which is all these tests need.
+const concurrentSpeakFinal = "<speak>hi</speak> and here is the longer written detail"
+
+// TestVoiceConcurrentEarlyPlaybackDoneHonoredAtFloor is the phase-2 mic re-open regression: when
+// the LLM detail OUTLASTS the summary audio's real-time playout, the client sends its single
+// playback_done when the SUMMARY queue drains -- which happens while the server is still SPEAKING
+// (the detail is not yet committed, so the drain wait has not begun). That early signal must be
+// REMEMBERED, so the post-commit drain ends at the FLOOR (the summary audio's duration, already
+// elapsed) and the mic re-opens promptly -- NOT after the 30s ceiling (dead air with the mic shut).
+// It stays loop-safe: the mic only ever re-opens LATER than the floor, never earlier.
+func TestVoiceConcurrentEarlyPlaybackDoneHonoredAtFloor(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{concurrentSpeakFinal}
+	timing := turnGraceTiming()
+	timing.micResumeTail = 30 * time.Millisecond
+	// A SHORT summary audio (~0.25s floor at the 88200 B/s fixture rate) that the client plays
+	// out and reports drained long before the (held-open) detail commits.
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+		timing:    timing,
+		speechPCM: [][]byte{speechPCM(88200/4, 1)},
+	})
+	// Hold the run at its commit point: the summary audio is relayed and the session enters
+	// speaking, but the turn does not commit (runFinished stays false) until the test releases it
+	// -- standing in for an LLM detail leg that outlasts the summary's playout.
+	release := make(chan struct{})
+	h.srv.voiceBeforeCommitClaim = func(_ *ChatRun) { <-release }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	conn.SetReadLimit(1 << 21) // the relayed audio_delta is large; read it whole
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	if f := drainAChunk(t, ctx, conn); !strings.Contains(f, "hi") {
+		t.Fatalf("asr_final = %q, want it to carry the spoken summary text", f)
+	}
+	// The window closes on the summary audio -> speaking, and the summary is relayed. (Reading
+	// the audio_delta confirms speaking, since audio is relayed only after the mic shuts.)
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDelta)
+
+	// The client plays the SUMMARY out and reports it drained -- while the server is still
+	// speaking (awaitingPlayback is false). The pre-fix server DROPPED this signal.
+	sendVoiceControl(t, ctx, conn, "playback_done")
+
+	// Let the ~0.25s summary floor elapse in real time while still speaking, so by the time the
+	// detail commits the drain's only remaining bound is the floor, which has already passed.
+	time.Sleep(600 * time.Millisecond)
+
+	// The detail finishes and the turn commits -> the post-commit drain begins with the floor
+	// already passed and the early playback_done remembered, so it ends at the FLOOR (promptly,
+	// plus the mic-resume tail), NOT after the 30s ceiling.
+	released := time.Now()
+	close(release)
+
+	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer lcancel()
+	readVoiceUntilState(t, lctx, conn, voiceStateListening)
+	if waited := time.Since(released); waited > 2*time.Second {
+		t.Fatalf("returned to listening %v after commit, want the floor (early playback_done honored), not the ~30s ceiling", waited)
+	}
+}
+
+// TestVoiceConcurrentEarlyPlaybackDoneClampedToFloor is the anti-cheat for the remembered-signal
+// path: an early playback_done seen while SPEAKING is remembered, but it must STILL NOT re-open
+// the mic before the floor. Here the detail commits BEFORE the (longer) summary floor elapses, so
+// the drain must hold the mic gated past the commit until the floor, then end at the floor (the
+// remembered signal honored once the floor passes) -- never instantly at commit, never the ceiling.
+func TestVoiceConcurrentEarlyPlaybackDoneClampedToFloor(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{concurrentSpeakFinal}
+	timing := turnGraceTiming()
+	timing.micResumeTail = 30 * time.Millisecond
+	// A LONGER summary audio (~1s floor) so the floor is still pending when the detail commits.
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+		timing:    timing,
+		speechPCM: [][]byte{speechPCM(88200, 1)},
+	})
+	release := make(chan struct{})
+	h.srv.voiceBeforeCommitClaim = func(_ *ChatRun) { <-release }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	conn.SetReadLimit(1 << 21)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	if f := drainAChunk(t, ctx, conn); !strings.Contains(f, "hi") {
+		t.Fatalf("asr_final = %q, want it to carry the spoken summary text", f)
+	}
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDelta) // speaking: the summary was relayed
+
+	// Early playback_done while speaking -- remembered by the fix. Settle so the orchestrator
+	// folds it in BEFORE the commit (the remembered-during-speaking path), while well under the
+	// ~1s floor.
+	sendVoiceControl(t, ctx, conn, "playback_done")
+	time.Sleep(150 * time.Millisecond)
+
+	// The detail commits while the floor is NOT yet passed -> the post-commit drain arms the
+	// floor, and the remembered signal must NOT short-circuit it.
+	close(release)
+	readVoiceUntil(t, ctx, conn, voiceDownAudioDone)
+	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
+	beforeConns, beforeBytes := child.snapshot()
+	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+		"a remembered early playback_done re-opened the mic before the floor: the floor clamp was lost")
+
+	// It still ends at the floor (the remembered signal is honored once the floor passes), not at
+	// the 30s ceiling.
+	lctx, lcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer lcancel()
+	readVoiceUntilState(t, lctx, conn, voiceStateListening)
+}
