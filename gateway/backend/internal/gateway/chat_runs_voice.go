@@ -16,6 +16,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -129,117 +130,185 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 		return
 	}
 
-	// The two legs OVERLAP (spec 5.5). A <speak> scanner (voice_speak_scanner.go) taps the
-	// LLM stream: the clean, tag-stripped text is what is buffered and fanned out, and the
-	// moment the first <speak> region closes, the speech leg is fired CONCURRENTLY on the
-	// captured summary (onSummaryClosed below) while the LLM keeps streaming the detail.
-	// Both legs then join before the single commit. Nothing is checkpointed or committed
-	// during either leg -- a cancelled speculative run must leave no trace.
+	// The legs OVERLAP the LLM (spec 5.5), and a multi-<speak> answer fires ONE speech leg PER
+	// region in document order (spec 5.1 Model A). A <speak> scanner (voice_speak_scanner.go)
+	// taps the LLM stream: the clean, tag-stripped text is buffered and fanned out, and each time
+	// a region closes its leg is launched CONCURRENTLY while the LLM keeps streaming. The legs
+	// synthesize concurrently, but their audio is RELAYED strictly in document order -- section
+	// k+1 waits for section k to finish relaying -- renumbered into ONE monotonic seq and
+	// section-tagged by relayVoiceSections, so the client never sees seq restart mid-turn. ALL
+	// legs then join before the single commit. Nothing is checkpointed or committed during the
+	// run -- a cancelled speculative run must leave no trace.
 	speak := newSpeakScanner()
-	speechResult := make(chan voiceSpeechResult, 1)
-	var speechFired bool
-	var commitSummary string
-	var commitSummaryStart int
+	legsCh := make(chan *voiceSpeechLeg, voiceSectionQueue)
+	var relayWG sync.WaitGroup
+	relayWG.Add(1)
+	go func() { defer relayWG.Done(); relayVoiceSections(run, legsCh) }()
 
-	// onSummaryClosed fires the speech leg at </speak>. It runs in the LLM loop's OWN
-	// goroutine (runVoiceLLM calls it synchronously from the SSE loop), so reading the
-	// scanner and setting these shared flags here races nothing -- the speech goroutine it
-	// launches never touches either the scanner or the flags. An empty <speak></speak>
-	// region speaks nothing early and falls through to the whole-answer fallback (spec 5.6).
-	onSummaryClosed := func() {
-		if speechFired {
-			return
-		}
-		summaryText, summaryLang := speak.Summary()
-		trimmed := strings.TrimSpace(summaryText)
-		if trimmed == "" {
-			return
-		}
-		commitSummary = trimmed
-		commitSummaryStart = trimmedSummaryStart(speak, summaryText)
-		speechFired = true
-		lang := s.voiceSpeechLanguage(ctx, owner, vp.tts.Model, summaryLang)
-		s.launchVoiceSpeech(ctx, owner, run, vp, trimmed, lang, speechResult)
+	var legs []*voiceSpeechLeg
+	// launchSection launches one section's speech leg: it takes the next section index, is handed
+	// to the ordered relay (legsCh) and synthesizes concurrently. hasSection=false is the no-tag
+	// whole-answer fallback -- it carries audio but records no spoken section.
+	launchSection := func(text, lang string, hasSection bool, start, length int) {
+		leg := newVoiceSpeechLeg(len(legs), text, hasSection, start, length)
+		legs = append(legs, leg)
+		legsCh <- leg
+		s.launchVoiceSpeech(ctx, owner, run, vp, text, lang, leg)
 	}
 
-	// Leg 1: the speculative text completion, scanned and tag-stripped. answer is the FULL
-	// clean text (summary + detail), even on an error path (a truncated answer).
-	answer, status, errMsg := s.runVoiceLLM(ctx, owner, run, prep, speak, onSummaryClosed)
+	// onRegionsClosed launches a leg for every region the scanner has closed but not yet handed to
+	// a leg. ONE delta can close SEVERAL regions, so it iterates from the first unhandled region;
+	// it runs in the LLM loop's OWN goroutine (runVoiceLLM calls it synchronously from the SSE
+	// loop), so reading the scanner and the handled/legs state here races nothing -- the speech
+	// goroutines it launches touch neither. An empty <speak></speak> region speaks nothing and
+	// opens no section (spec 5.6); if NO region ever opens one, the whole answer is spoken by the
+	// no-tag fallback below.
+	handled := 0
+	onRegionsClosed := func() {
+		regions := speak.Regions()
+		for ; handled < len(regions); handled++ {
+			r := regions[handled]
+			trimmed := strings.TrimSpace(r.Text)
+			if trimmed == "" {
+				continue
+			}
+			lang := s.voiceSpeechLanguage(ctx, owner, vp.tts.Model, r.Lang)
+			launchSection(trimmed, lang, true, trimmedRegionStart(r), utf8.RuneCountInString(trimmed))
+		}
+	}
+
+	// Leg 1: the speculative text completion, scanned and tag-stripped. answer is the FULL clean
+	// text (every section + detail), even on an error path (a truncated answer). Each region
+	// closing fires its leg above, concurrently with the still-streaming LLM.
+	answer, status, errMsg := s.runVoiceLLM(ctx, owner, run, prep, speak, onRegionsClosed)
+
+	// On a clean finish the scanner's Close() captured any UNCLOSED trailing region (spec 5.6);
+	// fire its leg now so the captured part is spoken too. On an error/cancel Close() was not
+	// called, so there is no new region and this is a no-op.
+	onRegionsClosed()
+
+	// No <speak> region produced speech on a completed answer: synthesize the WHOLE clean answer
+	// (the phase-1/2 no-tag fallback), recorded with NO spoken section.
+	if status == "completed" && len(legs) == 0 {
+		launchSection(answer, "", false, 0, 0)
+	}
+
+	// Every leg is launched; close the relay feed and JOIN all legs (and the relay goroutine)
+	// before the single commit/cancel arbitration. Joining is UNCONDITIONAL so a cancelled or
+	// failed run never leaks a leg goroutine (each leg's context is derived from the run's, so a
+	// cancel ends it promptly). The claimCommit CAS inside finalizeVoiceCommit stays the sole
+	// arbitration point, now fired only after the LLM AND every leg have finished.
+	close(legsCh)
+	outcomes := joinVoiceLegs(legs)
+	relayWG.Wait()
 
 	switch {
 	case status == "completed":
-		if !speechFired {
-			// The region never closed WITH content, so nothing fired early. A captured-
-			// but-unclosed summary is still spoken (spec 5.6); otherwise -- no tag, or an
-			// empty region -- the whole answer is (the phase-1 ordered fallback).
-			summaryText, summaryLang := speak.Summary()
-			trimmed := strings.TrimSpace(summaryText)
-			speechFired = true
-			if trimmed != "" {
-				commitSummary = trimmed
-				commitSummaryStart = trimmedSummaryStart(speak, summaryText)
-				lang := s.voiceSpeechLanguage(ctx, owner, vp.tts.Model, summaryLang)
-				s.launchVoiceSpeech(ctx, owner, run, vp, trimmed, lang, speechResult)
-			} else {
-				commitSummary = ""
-				s.launchVoiceSpeech(ctx, owner, run, vp, answer, "", speechResult)
-			}
-		}
-		res := <-speechResult
-		if res.status != "completed" {
-			// The speech leg failed: the text turn STILL commits (no audio block) and the
-			// degrade is surfaced (spec 5.5). Any audio synthesized before the failure was
-			// billed on the /v1/audio/speech leg.
-			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
-				answer:      answer,
-				finalStatus: "error",
-				finalErr:    firstNonEmptyVoice(res.errMsg, voiceRunFailedCode),
-			})
-			return
+		finalStatus, finalErr := "completed", ""
+		if code, failed := firstLegFailure(outcomes); failed {
+			// A section's speech leg failed: the text turn STILL commits (with whatever sections
+			// DID synthesize, their audio and spans), and the degrade is surfaced (spec 5.5). Any
+			// audio synthesized before a failure was billed on the /v1/audio/speech leg.
+			finalStatus, finalErr = "error", firstNonEmptyVoice(code, voiceRunFailedCode)
 		}
 		s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
-			answer:       answer,
-			summary:      commitSummary,
-			summaryStart: commitSummaryStart,
-			audioParts:   res.parts,
-			streamed:     res.streamed,
-			finalStatus:  "completed",
+			answer: answer, sections: outcomes, finalStatus: finalStatus, finalErr: finalErr,
 		})
 
-	case status == "error" && speechFired:
-		// The LLM failed AFTER </speak> (spec 5.5): the summary was already spoken, so the
-		// turn is committed with what exists -- the summary text + its audio, the detail
-		// truncated -- and the LLM degrade is surfaced rather than leaving a half-turn. If
-		// the speech leg also failed there is no audio to commit, only the truncated text.
-		res := <-speechResult
-		if res.status == "completed" {
-			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
-				answer:       answer,
-				summary:      commitSummary,
-				summaryStart: commitSummaryStart,
-				audioParts:   res.parts,
-				streamed:     res.streamed,
-				finalStatus:  "error",
-				finalErr:     errMsg,
-			})
-		} else {
-			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
-				answer:      answer,
-				finalStatus: "error",
-				finalErr:    errMsg,
-			})
-		}
+	case status == "error" && len(legs) > 0:
+		// The LLM failed AFTER at least one </speak> (spec 5.5): the sections that closed were
+		// already spoken, so the turn commits with what exists -- their text + audio, the detail
+		// truncated -- and the LLM degrade is surfaced rather than leaving a half-turn.
+		s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
+			answer: answer, sections: outcomes, finalStatus: "error", finalErr: errMsg,
+		})
 
 	default:
-		// A cancel (the orchestrator's resume), or an LLM error BEFORE </speak> (no speech
-		// fired): persist nothing, exactly as phase 1. The LLM tokens were still billed on
-		// the /v1/chat/completions leg. Join any in-flight speech leg first (its context is
-		// derived from the run's, so a cancel ends it promptly) to avoid a goroutine leak.
-		if speechFired {
-			<-speechResult
-		}
+		// A cancel (the orchestrator's resume), or an LLM error BEFORE any region closed (no leg
+		// fired): persist nothing, exactly as phase 1. The LLM tokens were still billed on the
+		// /v1/chat/completions leg; any in-flight legs were already joined above.
 		s.finishVoiceRunNoCommit(run, status, errMsg)
 	}
+}
+
+// voiceSectionQueue bounds how many section legs can be queued for the ordered relay before the
+// LLM loop (which launches them as regions close) applies backpressure -- far more than any real
+// answer's <speak> count, so in practice the LLM never blocks handing a leg to the relay.
+const voiceSectionQueue = 64
+
+// voiceSectionAudioQueue bounds one section leg's audio handoff to the ordered relay. A leg that is
+// not yet the relay's current section buffers up to this many chunks (so it can synthesize ahead --
+// "ready early") before it applies backpressure to its own upstream read. Comfortably larger than a
+// short section's chunk count, so the common case never blocks.
+const voiceSectionAudioQueue = 64
+
+// voiceSpeechLeg is one section's speech leg: its section index and spoken-section metadata (known
+// at launch), its ordered audio handoff to relayVoiceSections (audioCh), and its terminal outcome
+// (resultCh, buffered to one so the leg goroutine never blocks sending it). hasSection is false for
+// the no-tag whole-answer fallback, which carries audio but records no spoken section.
+type voiceSpeechLeg struct {
+	section    int
+	text       string
+	start      int
+	length     int
+	hasSection bool
+	audioCh    chan runAudio
+	resultCh   chan voiceSpeechResult
+}
+
+// newVoiceSpeechLeg builds a section leg with its buffered audio and result channels.
+func newVoiceSpeechLeg(section int, text string, hasSection bool, start, length int) *voiceSpeechLeg {
+	return &voiceSpeechLeg{
+		section: section, text: text, hasSection: hasSection, start: start, length: length,
+		audioCh:  make(chan runAudio, voiceSectionAudioQueue),
+		resultCh: make(chan voiceSpeechResult, 1),
+	}
+}
+
+// relayVoiceSections is the single ordered relay for a voice run's sections (spec 5.1 Model A): it
+// drains each leg's audio IN DOCUMENT ORDER -- section k+1's audio is held in its buffer until
+// section k's leg has finished relaying (its audioCh closed) -- assigning ONE monotonic seq across
+// every leg and tagging each chunk with its section, then publishing it onto the run. Numbering the
+// seq here, BEFORE the lossy fan-out, keeps a dropped chunk a visible gap (the client then stops
+// live playback and falls back to the committed WAV), exactly as a single leg's reader did. It runs
+// in its own goroutine, started before any leg, and returns once legsCh is closed and every leg's
+// audio has drained.
+func relayVoiceSections(run *ChatRun, legsCh <-chan *voiceSpeechLeg) {
+	seq := 0
+	for leg := range legsCh {
+		for a := range leg.audioCh {
+			a.Seq = seq
+			a.Section = leg.section
+			seq++
+			run.publishAudio(a)
+		}
+	}
+}
+
+// joinVoiceLegs waits for every section leg to finish, in order, and gathers the ordered section
+// outcomes (metadata + the leg's audio and terminal status). It blocks until the last leg reports,
+// so it is the barrier that holds the commit until the LLM AND all legs have finished.
+func joinVoiceLegs(legs []*voiceSpeechLeg) []sectionOutcome {
+	outcomes := make([]sectionOutcome, 0, len(legs))
+	for _, leg := range legs {
+		res := <-leg.resultCh
+		outcomes = append(outcomes, sectionOutcome{
+			text: leg.text, start: leg.start, length: leg.length, hasSection: leg.hasSection,
+			audioParts: res.parts, streamed: res.streamed, status: res.status, errMsg: res.errMsg,
+		})
+	}
+	return outcomes
+}
+
+// firstLegFailure reports the first section leg that did not complete, and its error code, so a
+// completed LLM with a failed speech leg degrades on that code (spec 5.5).
+func firstLegFailure(outcomes []sectionOutcome) (code string, failed bool) {
+	for _, o := range outcomes {
+		if o.status != "completed" {
+			return o.errMsg, true
+		}
+	}
+	return "", false
 }
 
 // voiceSpeechResult is the outcome of the speech leg launched by launchVoiceSpeech, joined
@@ -251,25 +320,37 @@ type voiceSpeechResult struct {
 	streamed bool
 }
 
-// launchVoiceSpeech runs the TTS leg CONCURRENTLY with the still-streaming LLM leg: it
-// synthesizes text -- the captured <speak> summary, or, on the no-tag fallback, the whole
-// answer -- on the voice run's TTS target, streaming the audio to subscribers, and sends its
-// outcome on result (buffered to one, so the goroutine never blocks). The leg carries its
-// own first-chunk deadline, exactly like a standalone streaming speech run (executeAudioRun),
-// and derives its context from the run's so a cancel ends it too.
-func (s *Server) launchVoiceSpeech(ctx context.Context, owner auth.Token, run *ChatRun, vp *voiceRunParams, text, language string, result chan<- voiceSpeechResult) {
+// launchVoiceSpeech runs ONE section's TTS leg CONCURRENTLY with the still-streaming LLM leg and the
+// other sections' legs: it synthesizes the section's text (a captured <speak> region, or, on the
+// no-tag fallback, the whole answer) on the voice run's TTS target, routing the audio through the
+// leg's ordered channel (drained in document order by relayVoiceSections) and sending its outcome on
+// leg.resultCh (buffered to one, so the goroutine never blocks). The leg carries its own first-chunk
+// deadline, exactly like a standalone streaming speech run (executeAudioRun), and derives its
+// context from the run's so a cancel ends it too.
+func (s *Server) launchVoiceSpeech(ctx context.Context, owner auth.Token, run *ChatRun, vp *voiceRunParams, text, language string, leg *voiceSpeechLeg) {
 	go func() {
 		ttsCtx, cancelTTS := context.WithCancelCause(ctx)
 		defer cancelTTS(nil)
 		liftDeadline := armRunDeadline(chatRunKindSpeech, cancelTTS)
 		defer liftDeadline()
 		prep := voiceSpeechPrep(text, vp.tts, vp.audio, language)
-		// stampTTFT=false: the LLM leg is streaming into the same run.metrics concurrently, so
-		// the speech leg must NOT also write it (a lost-update on the perf metrics). The LLM
-		// leg is the sole metrics writer for a voice run, keeping the persisted metrics
-		// deterministic.
-		parts, status, errMsg, streamed := s.generateSpeechTurn(ttsCtx, owner, run, prep, liftDeadline, false)
-		result <- voiceSpeechResult{parts: parts, status: status, errMsg: errMsg, streamed: streamed}
+		// The leg hands each audio chunk to its ordered channel rather than straight onto the run,
+		// so relayVoiceSections can serialize the sections into ONE monotonic stream. A send that
+		// cannot be taken before the leg is cancelled is dropped (the live relay is best-effort --
+		// the committed WAV is authoritative). stampTTFT=false: the LLM leg is streaming into the
+		// same run.metrics concurrently, so the speech leg must NOT also write it (a lost update on
+		// the perf metrics); the LLM leg is the sole metrics writer, keeping them deterministic.
+		sink := func(a runAudio) {
+			select {
+			case leg.audioCh <- a:
+			case <-ttsCtx.Done():
+			}
+		}
+		parts, status, errMsg, streamed := s.generateSpeechTurn(ttsCtx, owner, run, prep, liftDeadline, false, sink)
+		// Close the audio channel first (ending the relay's drain of this leg so it advances to the
+		// next section), then report the terminal outcome.
+		close(leg.audioCh)
+		leg.resultCh <- voiceSpeechResult{parts: parts, status: status, errMsg: errMsg, streamed: streamed}
 	}()
 }
 
@@ -286,23 +367,33 @@ func (s *Server) voiceSpeechLanguage(ctx context.Context, owner auth.Token, ttsM
 	return effectiveSpeechLanguage(requested, accepts)
 }
 
+// sectionOutcome is one spoken section's committed result: its spoken text and rune span into the
+// clean answer (known at launch) plus its leg's synthesized audio and terminal outcome (known at
+// join). hasSection is false for the no-tag whole-answer fallback -- it carries audio but records
+// no spoken section. A section whose leg produced no audio (status != completed, or an empty clip)
+// has audioParts empty and contributes neither a spoken section nor an audio part at commit time.
+type sectionOutcome struct {
+	text       string
+	start      int
+	length     int
+	hasSection bool
+	audioParts json.RawMessage
+	streamed   bool
+	status     string
+	errMsg     string
+}
+
 // voiceTurnOutcome is the committed voice turn's content and terminal status -- the payload
 // finalizeVoiceCommit hands commitVoiceTurn, grouping the inputs that describe the turn being
-// stored (as opposed to who/where it is stored for). answer is the FULL clean answer text
-// (summary and detail); summary is the spoken <speak> part ("" when there is none); summaryStart
-// is the rune offset of summary within answer (so the portal slices it out by position, meaningful
-// only with a non-empty summary); audioParts
-// are the synthesized audio parts (nil when none) and streamed records how they were delivered;
-// finalStatus/finalErr are the run's terminal outcome on a SUCCESSFUL store ("completed", or
-// "error" with a degrade code for a committed-but-degraded turn).
+// stored (as opposed to who/where it is stored for). answer is the FULL clean answer text (every
+// section and the detail between them); sections are the turn's spoken sections IN DOCUMENT ORDER,
+// each with its audio and span; finalStatus/finalErr are the run's terminal outcome on a SUCCESSFUL
+// store ("completed", or "error" with a degrade code for a committed-but-degraded turn).
 type voiceTurnOutcome struct {
-	answer       string
-	summary      string
-	summaryStart int
-	audioParts   json.RawMessage
-	streamed     bool
-	finalStatus  string
-	finalErr     string
+	answer      string
+	sections    []sectionOutcome
+	finalStatus string
+	finalErr    string
 }
 
 // finalizeVoiceCommit is the voice run's point of no return: ONE compare-and-swap
@@ -351,16 +442,16 @@ func (s *Server) finalizeVoiceCommit(ctx context.Context, owner auth.Token, run 
 // through the scanner and only the clean, tag-stripped text is published (so run.content
 // buffers the clean full text and NO <speak> markup is fanned out to subscribers);
 // reasoning deltas are untouched. When the first <speak> region closes on a delta it calls
-// onSummaryClosed, which the caller uses to fire the speech leg concurrently. The returned
+// onRegionsClosed, which the caller uses to fire the speech leg concurrently. The returned
 // answer is the clean buffered text, including on an error path (a truncated answer the
 // error-after-close commit needs), with the scanner's tail flushed only on a clean finish.
-func (s *Server) runVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, speak *speakScanner, onSummaryClosed func()) (answer, status, errMsg string) {
+func (s *Server) runVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, speak *speakScanner, onRegionsClosed func()) (answer, status, errMsg string) {
 	resp, status, errMsg := s.dispatchVoiceLLM(ctx, owner, run, prep)
 	if resp == nil {
 		return "", status, errMsg
 	}
 	defer resp.Body.Close()
-	return consumeVoiceLLMStream(ctx, run, resp.Body, speak, onSummaryClosed)
+	return consumeVoiceLLMStream(ctx, run, resp.Body, speak, onRegionsClosed)
 }
 
 // dispatchVoiceLLM POSTs the chat-completions body to the gateway's own
@@ -403,12 +494,12 @@ func (s *Server) dispatchVoiceLLM(ctx context.Context, owner auth.Token, run *Ch
 
 // consumeVoiceLLMStream reads the voice run's LLM SSE to its end, tapping it through the
 // speak scanner (voice_speak_scanner.go): each content delta is tag-stripped before it is
-// published and buffered, and the first </speak> fires onSummaryClosed so the caller can
+// published and buffered, and the first </speak> fires onRegionsClosed so the caller can
 // start the speech leg concurrently (see relayVoiceDelta). It measures the run's metrics but
 // does NOT checkpoint or commit. It returns the clean buffered answer (including a truncated
 // one on an error path, the error-after-close commit needs it) and the run's terminal
 // (status, errMsg), flushing the scanner's held-back tail only on a clean finish.
-func consumeVoiceLLMStream(ctx context.Context, run *ChatRun, body io.Reader, speak *speakScanner, onSummaryClosed func()) (answer, status, errMsg string) {
+func consumeVoiceLLMStream(ctx context.Context, run *ChatRun, body io.Reader, speak *speakScanner, onRegionsClosed func()) (answer, status, errMsg string) {
 	timings := runStreamTimings{start: time.Now()}
 	status, errMsg = "completed", ""
 	sse := bufio.NewScanner(body)
@@ -426,7 +517,7 @@ func consumeVoiceLLMStream(ctx context.Context, run *ChatRun, body io.Reader, sp
 			status, errMsg = "error", firstNonEmptyVoice(ev.ErrCode, ev.ErrMsg)
 			stopped = true
 		case sseDelta:
-			relayVoiceDelta(run, speak, onSummaryClosed, ev, &timings)
+			relayVoiceDelta(run, speak, onRegionsClosed, ev, &timings)
 		case sseUsage:
 			timings.outputTokens = ev.OutputTokens
 		}
@@ -458,19 +549,20 @@ func consumeVoiceLLMStream(ctx context.Context, run *ChatRun, body io.Reader, sp
 // relayVoiceDelta taps one content delta through the speak scanner: the scanner returns the
 // clean text to fan out (and to buffer) and whether a <speak> region just closed.
 // Reasoning rides through unchanged. An all-held-back delta (clean "", no reasoning) is not
-// published at all, so no empty delta and no <speak> prefix ever reaches a subscriber; the
-// first </speak> fires onSummaryClosed so the caller can start the speech leg concurrently.
-func relayVoiceDelta(run *ChatRun, speak *speakScanner, onSummaryClosed func(), ev sseDeltaEvent, timings *runStreamTimings) {
-	// closedIdx is not used yet: onSummaryClosed still reads only the first region (Summary), so
-	// a later region closing re-enters it harmlessly (speechFired, or an empty first region).
+// published at all, so no empty delta and no <speak> prefix ever reaches a subscriber; whenever a
+// </speak> closes on this delta it fires onRegionsClosed so the caller can launch the newly-closed
+// sections' speech legs concurrently.
+func relayVoiceDelta(run *ChatRun, speak *speakScanner, onRegionsClosed func(), ev sseDeltaEvent, timings *runStreamTimings) {
+	// closedIdx is unused: onRegionsClosed reads speak.Regions() itself and launches a leg for every
+	// region closed since its last call, so ONE delta closing several regions is handled in order.
 	clean, _, closed := speak.Write(ev.Content)
 	if clean != "" || ev.Reasoning != "" {
 		scanned := ev
 		scanned.Content = clean
 		timings.observeDelta(run, scanned)
 	}
-	if closed && onSummaryClosed != nil {
-		onSummaryClosed()
+	if closed && onRegionsClosed != nil {
+		onRegionsClosed()
 	}
 }
 
@@ -511,6 +603,16 @@ func trimmedSummaryStart(speak *speakScanner, raw string) int {
 	return start + leading
 }
 
+// trimmedRegionStart is trimmedSummaryStart generalized to ANY region: the rune offset of the
+// region's TRIMMED text within the clean answer. The scanner records where the region's content
+// begins (RuneOffset), but each spoken section is persisted TrimSpace'd, so the offset is advanced
+// past the leading whitespace the trim removed -- so answer_runes[start : start+runeLen(trimmed)] is
+// exactly the persisted section text, wherever the region sits in a multi-section answer.
+func trimmedRegionStart(r speakRegion) int {
+	leading := utf8.RuneCountInString(r.Text) - utf8.RuneCountInString(strings.TrimLeftFunc(r.Text, unicode.IsSpace))
+	return r.RuneOffset + leading
+}
+
 // effectiveSpeechLanguage is the language the speech leg is actually asked to speak: the
 // per-answer language the LLM requested via <speak lang>, but only when the TTS model can
 // take a `language` parameter (modelAccepts, the cached portalSpeechLanguage lookup). A model
@@ -538,21 +640,48 @@ func effectiveSpeechLanguage(requested string, modelAccepts bool) string {
 // commit. The "cancelled persists nothing" guarantee is enforced by the caller's
 // cancellation gates, which never let a cancelled run reach this call.
 //
-// summary is the text of the answer's spoken summary (the <speak> part), recorded on the
-// assistant turn as its one spoken section (text, rune offset and rune length into answer) so
-// the portal can re-render it on reload; answer stays the FULL clean text, summary and detail
-// both. "" -- no summary -- records no section and leaves the stored turn exactly as a turn
-// without one (the no-tag fallback, and every commit that carries no audio, passes ""). The
-// audio is handed to voiceContentParts as ONE section's for now; the multi-section run
-// executor supplies one entry per section.
+// outcome.sections are the turn's spoken sections IN DOCUMENT ORDER, each with its synthesized
+// audio and span. The audio parts and the spoken-section spans are built TOGETHER so they stay
+// aligned: the portal renderer pairs the n-th audio part to the n-th spoken section, so a section
+// that produced no audio contributes NEITHER (never an audioless section wedged between audio-bearing
+// ones). The no-tag fallback is the sole audio-without-section case: its whole-answer audio rides as
+// the turn's only audio with no spoken_sections, exactly as a phase-1/2 turn. answer stays the FULL
+// clean text (every section and the detail between them).
 //
 // finalStatus/finalErr are the run's terminal outcome on a SUCCESSFUL store write:
 // "completed" with no error on the happy path, or "error" with a degrade code for a
-// committed-but-degraded turn (the LLM cut off after the summary, or the speech leg failed --
+// committed-but-degraded turn (the LLM cut off after a section, or a speech leg failed --
 // spec 5.5). A FAILED store write ignores both and reports its own mapped code instead, and
 // withholds the parts, exactly as finishRunWithParts does for every other kind.
 func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *ChatRun, pendingText string, outcome voiceTurnOutcome) {
-	parts, err := voiceContentParts(outcome.answer, []json.RawMessage{outcome.audioParts})
+	// AudioAnswer is whether this turn actually carries synthesized audio. It is true on the
+	// happy path and false on a degraded commit that carries only text (every speech leg failed,
+	// or the LLM was cut off before any usable audio) -- so the #281 audio-answer retention never
+	// acts on a turn that has no audio. AudioStreamed is true only when every audio-bearing section
+	// streamed (a buffered-fallback section makes it false), so the lifecycle stores a not-heard
+	// clip. A voice thread sets no keep_last_audio, so with audio present it is stored.
+	var sections []portal.SpokenSection
+	audioBySection := make([]json.RawMessage, 0, len(outcome.sections))
+	audioAnswer, allStreamed := false, true
+	for _, sec := range outcome.sections {
+		if len(sec.audioParts) == 0 {
+			continue // a section with no audio records no span either, keeping audio<->section aligned
+		}
+		audioBySection = append(audioBySection, sec.audioParts)
+		audioAnswer = true
+		if !sec.streamed {
+			allStreamed = false
+		}
+		if sec.hasSection {
+			sections = append(sections, portal.SpokenSection{
+				Text:  sec.text,
+				Start: sec.start,
+				Len:   sec.length,
+			})
+		}
+	}
+
+	parts, err := voiceContentParts(outcome.answer, audioBySection)
 	if err != nil {
 		log.Printf("voice run %s: build content parts failed: %v", run.ID, err)
 		s.finishVoiceRunNoCommit(run, "error", chatRunCommitFailedMessage)
@@ -563,21 +692,6 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 	defer cancelCommit()
 
 	m := run.currentMetrics()
-	// AudioAnswer is whether this turn actually carries synthesized audio. It is true on the
-	// happy path and false on a degraded commit that carries only text (the speech leg failed,
-	// or the LLM was cut off after </speak> with no usable audio) -- so the #281 audio-answer
-	// retention never acts on a turn that has no audio. A voice thread sets no keep_last_audio,
-	// so with audio present it is stored (never the N=0 marker); should a future voice thread
-	// set it, retention then applies to the right turns. streamed records how it was delivered.
-	audioAnswer := len(outcome.audioParts) > 0
-	var sections []portal.SpokenSection
-	if outcome.summary != "" {
-		sections = []portal.SpokenSection{{
-			Text:  outcome.summary,
-			Start: outcome.summaryStart,
-			Len:   utf8.RuneCountInString(outcome.summary),
-		}}
-	}
 	if err := s.Portal.CommitVoiceTurn(commitCtx, owner, run.ChatID, pendingText, portal.AssistantTurn{
 		Content:         outcome.answer,
 		ContentParts:    parts,
@@ -587,7 +701,7 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 		TokensPerSecond: m.TokensPerSecond,
 		SpokenSections:  sections,
 		AudioAnswer:     audioAnswer,
-		AudioStreamed:   outcome.streamed && audioAnswer,
+		AudioStreamed:   allStreamed && audioAnswer,
 	}, "complete"); err != nil {
 		// A failed store write withholds the parts from the terminal event (nothing
 		// was stored to render) and surfaces a mapped code, exactly as

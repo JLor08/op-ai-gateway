@@ -233,10 +233,15 @@ type voiceDownMsg struct {
 	Text      string `json:"text,omitempty"`
 	MessageID string `json:"message_id,omitempty"`
 	Seq       int    `json:"seq,omitempty"`
-	Rate      int    `json:"rate,omitempty"`
-	Audio     string `json:"audio,omitempty"`
-	Code      string `json:"code,omitempty"`
-	Message   string `json:"message,omitempty"`
+	// Section is the spoken section an audio_delta belongs to (spec 5.1 Model A), for live
+	// transcript attribution ONLY -- Seq is the single monotonic order across all sections. It
+	// is additive: 0 (the common single-section case) is omitted, so an older client is never
+	// regressed; a later section carries its index. No other frame owns it.
+	Section int    `json:"section,omitempty"`
+	Rate    int    `json:"rate,omitempty"`
+	Audio   string `json:"audio,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // MarshalJSON keeps `seq` on the wire for an audio_delta even when it is 0. The chunks
@@ -1206,7 +1211,11 @@ func (m *voiceMachine) relayAudio(a runAudio) {
 	// clear-on-relay is belt-and-suspenders that keeps the counter-less (older-client) path correct
 	// for a non-reordering client by invalidating any signal remembered before this chunk.
 	m.playbackSignaled = false
-	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Rate: a.Rate, Audio: a.Data})
+	// Seq is the ONE monotonic stream the executor already numbered across every section's leg (so
+	// the client never sees it restart mid-turn); Section only attributes this chunk to its
+	// transcript block. The machine passes both straight through -- it neither renumbers nor
+	// reorders (the executor relays strictly in document order).
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Section: a.Section, Rate: a.Rate, Audio: a.Data})
 }
 
 // accountPlayback adds the relayed chunk's real-time duration to the running total used by the

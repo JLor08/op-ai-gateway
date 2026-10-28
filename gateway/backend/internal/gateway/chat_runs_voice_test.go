@@ -69,6 +69,22 @@ type voiceTestProvider struct {
 	// still streaming when the run is cancelled), and a delta with failAfter returns an error
 	// instead of completing the stream (the LLM-failure path). nil leaves the plain mock answer.
 	llmScript []scriptedLLMDelta
+	// speechHoldByInput HOLDS one SECTION's speech response by its synthesized `input` text: a
+	// request whose input is a key blocks until that key's channel is closed (or ctx ends), so a
+	// multi-section ordering test can hold section k's leg while section k+1's leg synthesizes
+	// and finishes early, then release k and watch the relay stay in document order. A request
+	// whose input is not a key answers at once. nil disables the per-section hold (the default).
+	speechHoldByInput map[string]chan struct{}
+}
+
+// speechInputOf extracts the `input` field (the synthesized text) from a speech request body, so
+// a test can tell one section's speech leg from another's.
+func speechInputOf(body []byte) string {
+	var fields struct {
+		Input string `json:"input"`
+	}
+	_ = json.Unmarshal(body, &fields)
+	return fields.Input
 }
 
 // scriptedLLMDelta is one step of voiceTestProvider.llmScript.
@@ -84,6 +100,13 @@ func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Targe
 		select {
 		case p.speechBodies <- append([]byte(nil), body...):
 		default:
+		}
+		if gate, ok := p.speechHoldByInput[speechInputOf(body)]; ok {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		if p.speechArrived != nil && p.speechOnce != nil {
 			p.speechOnce.Do(func() { close(p.speechArrived) })
@@ -1513,7 +1536,7 @@ func TestVoiceRun_SpeechLegDoesNotStampMetricsForVoice(t *testing.T) {
 		t.Fatalf("reserveRun: %v", err)
 	}
 	run.setMetrics(sentinel)
-	if _, status, _, streamed := srv.generateSpeechTurn(context.Background(), owner, run, prep, func() {}, false); status != "completed" || !streamed {
+	if _, status, _, streamed := srv.generateSpeechTurn(context.Background(), owner, run, prep, func() {}, false, nil); status != "completed" || !streamed {
 		t.Fatalf("voice speech leg status=%q streamed=%v, want completed and streamed", status, streamed)
 	}
 	if got := run.currentMetrics(); got != sentinel {
@@ -1527,7 +1550,7 @@ func TestVoiceRun_SpeechLegDoesNotStampMetricsForVoice(t *testing.T) {
 		t.Fatalf("reserveRun: %v", err)
 	}
 	run2.setMetrics(sentinel)
-	if _, status, _, _ := srv.generateSpeechTurn(context.Background(), owner, run2, prep, func() {}, true); status != "completed" {
+	if _, status, _, _ := srv.generateSpeechTurn(context.Background(), owner, run2, prep, func() {}, true, nil); status != "completed" {
 		t.Fatalf("standalone speech leg status=%q, want completed", status)
 	}
 	if run2.currentMetrics().TTFTMs == sentinel.TTFTMs {

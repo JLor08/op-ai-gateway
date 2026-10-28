@@ -54,9 +54,14 @@ import (
 // chunks only while their seq is unbroken and, at the first gap, stops live playback -- the
 // terminal event carries the assembled WAV, which is complete whatever a subscriber missed.
 type runAudio struct {
-	Seq  int    `json:"seq"`
-	Rate int    `json:"rate"`
-	Data string `json:"data"`
+	Seq int `json:"seq"`
+	// Section is the index of the spoken <speak> section this chunk belongs to, used ONLY to
+	// attribute live audio to the right transcript block (NOT for ordering -- Seq is the one
+	// monotonic order). A voice run with several sections tags each chunk with its section; a
+	// standalone speech run leaves it 0 (and omits it on the wire). See the voice run executor.
+	Section int    `json:"section,omitempty"`
+	Rate    int    `json:"rate"`
+	Data    string `json:"data"`
 }
 
 // publishAudio fans one audio chunk out to the run's subscribers. It buffers nothing: the
@@ -473,7 +478,7 @@ type speechStreamEvent struct {
 // stops KEEPING audio at the cap but not READING it, so the listener hears the whole clip
 // and the call is billed as delivered. The parts are cut at speechPartBytes of the per-blob
 // cap (Server.maxChatBlobBytes) so that each passes the chat store's per-blob check alone.
-func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func(), stampTTFT bool) (json.RawMessage, string, string) {
+func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) (json.RawMessage, string, string) {
 	audioCap, blobCap := s.chatAudioCaps()
 	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, speechEventReaderConfig{
 		sampleRate:    sampleRate,
@@ -482,6 +487,7 @@ func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *ht
 		partBytes:     speechPartBytes(blobCap),
 		maxAudioBytes: audioCap,
 		stampTTFT:     stampTTFT,
+		audioSink:     audioSink,
 	})
 	if !complete {
 		// A deadline or a cancel lands here as a read error on the cancelled request, and
@@ -542,14 +548,24 @@ type speechEventReaderConfig struct {
 	partBytes     int
 	maxAudioBytes int64
 	stampTTFT     bool
+	// audioSink relays one chunk of synthesized audio. A standalone speech run leaves it nil and
+	// the audio is published straight onto the run (run.publishAudio); a VOICE run's section leg
+	// supplies a sink that routes the chunk through its ordered, section-serialized relay so the
+	// client sees one monotonic stream across all sections (see the voice run executor).
+	audioSink func(runAudio)
 }
 
 func readSpeechEvents(run *ChatRun, body io.Reader, cfg speechEventReaderConfig) (parts []speechAudioPart, overCap, complete bool, readErr error) {
+	sink := cfg.audioSink
+	if sink == nil {
+		sink = run.publishAudio
+	}
 	r := &speechEventReader{
 		run: run, sampleRate: cfg.sampleRate, dispatchedAt: cfg.dispatchedAt, liftDeadline: cfg.liftDeadline,
 		partBytes:     max(cfg.partBytes-cfg.partBytes%speechStreamBytesPerFrame, speechStreamBytesPerFrame),
 		maxAudioBytes: cfg.maxAudioBytes,
 		stampTTFT:     cfg.stampTTFT,
+		audioSink:     sink,
 	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), speechStreamMaxLine)
@@ -572,6 +588,9 @@ type speechEventReader struct {
 	sampleRate   int
 	dispatchedAt time.Time
 	liftDeadline func()
+	// audioSink relays one audio chunk (defaulting to run.publishAudio for a standalone speech
+	// run; a voice section leg supplies its ordered sink). Never nil: readSpeechEvents fills it.
+	audioSink func(runAudio)
 	// stampTTFT is whether the first delta stamps the audio TTFT onto the run's metrics.
 	// A standalone speech run (its only metric is the audio first-chunk) sets it; a VOICE
 	// run's speech leg does NOT, because its LLM leg is streaming into the same run.metrics
@@ -650,7 +669,7 @@ func (r *speechEventReader) consumeDelta(audio string) {
 			r.run.setMetrics(m)
 		}
 	}
-	r.run.publishAudio(runAudio{Seq: r.seq, Rate: r.sampleRate, Data: audio})
+	r.audioSink(runAudio{Seq: r.seq, Rate: r.sampleRate, Data: audio})
 	r.seq++
 	r.keep(chunk)
 }
