@@ -70,6 +70,9 @@ func (s *speakScanner) Write(delta string) (clean string, closed bool) {
 		case speakTagOpen:
 			s.openTag(attrs)
 			in = in[n:]
+		case speakTagSelfClosing:
+			s.selfClosingTag(attrs)
+			in = in[n:]
 		case speakTagClose:
 			if s.closeTag() {
 				closed = true
@@ -86,11 +89,17 @@ func (s *speakScanner) Write(delta string) (clean string, closed bool) {
 }
 
 // Close flushes the scanner at the end of the stream. Bytes held back for a tag that
-// never completed are emitted as plain text.
+// never completed are emitted as plain text. The one exception is the spoken summary: a
+// half-written </speak> at the end of a still-open first region is markup, not speech, so
+// those bytes reach the clean stream but are kept out of the captured summary.
 func (s *speakScanner) Close() (clean string) {
-	var out strings.Builder
-	s.emit(&out, s.pending)
+	pending := s.pending
 	s.pending = ""
+	if s.inFirst && isPartialSpeakClose(pending) {
+		return pending
+	}
+	var out strings.Builder
+	s.emit(&out, pending)
 	return out.String()
 }
 
@@ -101,7 +110,7 @@ func (s *speakScanner) Summary() (text string, lang string) {
 	return s.summary.String(), s.lang
 }
 
-// Found reports whether any <speak> open tag was seen.
+// Found reports whether any <speak> open tag was seen, a self-closing one included.
 func (s *speakScanner) Found() bool {
 	return s.found
 }
@@ -129,6 +138,18 @@ func (s *speakScanner) openTag(attrs string) {
 	s.lang = parseSpeakLang(attrs)
 }
 
+// selfClosingTag handles a <speak .../> tag. It is stripped and counts as a speak tag that
+// was seen (Found, lang), but it opens no region: there is no text to capture and the rest of
+// the stream stays ordinary text. Like any open tag, only the first one seen records its lang,
+// so a self-closing tag after the first region is merely stripped.
+func (s *speakScanner) selfClosingTag(attrs string) {
+	if s.found {
+		return
+	}
+	s.found = true
+	s.lang = parseSpeakLang(attrs)
+}
+
 // closeTag handles a </speak> tag and reports whether it closed the first region.
 func (s *speakScanner) closeTag() bool {
 	if !s.inFirst {
@@ -149,11 +170,14 @@ const (
 	speakTagOpen
 	// speakTagClose: a complete </speak> tag.
 	speakTagClose
+	// speakTagSelfClosing: a complete <speak .../> tag, whose '>' directly follows a '/'.
+	speakTagSelfClosing
 )
 
 // matchSpeakTag classifies the text at the start of b, which must begin with '<'. For a
-// complete tag n is its length in bytes and, for an open tag, attrs is the raw attribute
-// text between the tag name and the closing '>'. Tag names match case-insensitively.
+// complete tag n is its length in bytes and, for an open or self-closing tag, attrs is the
+// raw attribute text between the tag name and the closing '>' (without the self-closing
+// '/'). Tag names match case-insensitively.
 //
 // Only the first maxSpeakTagLen bytes are ever examined, so the verdict for a given tag
 // does not depend on how the stream was cut into deltas.
@@ -223,13 +247,23 @@ func scanSpeakClose(b string, pos int, partial speakTagKind) (kind speakTagKind,
 }
 
 // scanSpeakOpen matches the tail of a <speak ...> tag from pos (just past the name): '>'
-// immediately, or whitespace then attributes up to '>'. Anything else after the name is a
-// longer tag name such as <speaker>. attrs is the raw attribute text between the name and
-// the closing '>'; partial is the verdict for bytes that run out before resolving.
+// immediately, '/>' (self-closing), or whitespace then attributes up to '>'. Anything else
+// after the name is a longer tag name such as <speaker>. A tag whose '>' is directly preceded
+// by '/' is self-closing and reported as speakTagSelfClosing. attrs is the raw attribute text
+// between the name and the closing '>' (minus the self-closing '/'); partial is the verdict
+// for bytes that run out before resolving.
 func scanSpeakOpen(b string, pos int, partial speakTagKind) (kind speakTagKind, n int, attrs string) {
 	switch {
 	case b[pos] == '>':
 		return speakTagOpen, pos + 1, ""
+	case b[pos] == '/':
+		if pos+1 >= len(b) {
+			return partial, 0, ""
+		}
+		if b[pos+1] == '>' {
+			return speakTagSelfClosing, pos + 2, ""
+		}
+		return speakTagNone, 0, ""
 	case !isSpeakSpace(b[pos]):
 		return speakTagNone, 0, ""
 	}
@@ -245,10 +279,24 @@ func scanSpeakOpen(b string, pos int, partial speakTagKind) (kind speakTagKind, 
 		case c == '"' || c == '\'':
 			quote = c
 		case c == '>':
+			if b[pos-1] == '/' {
+				return speakTagSelfClosing, pos + 1, b[attrStart : pos-1]
+			}
 			return speakTagOpen, pos + 1, b[attrStart:pos]
 		}
 	}
 	return partial, 0, ""
+}
+
+// isPartialSpeakClose reports whether b is the unfinished start of a </speak> tag: "</"
+// followed by a prefix of the name, or the whole name and then whitespace, with the '>' still
+// missing. A lone '<' is not enough, since it may equally begin an open tag.
+func isPartialSpeakClose(b string) bool {
+	if len(b) < 2 || b[1] != '/' {
+		return false
+	}
+	kind, _, _ := matchSpeakTag(b)
+	return kind == speakTagPartial
 }
 
 // parseSpeakLang returns the value of the lang attribute in the raw attribute text of an

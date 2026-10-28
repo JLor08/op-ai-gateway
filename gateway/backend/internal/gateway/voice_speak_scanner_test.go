@@ -352,9 +352,10 @@ func TestSpeakScanner_CloseFlushesPartialInsideUnclosedRegion(t *testing.T) {
 	if clean != "half </spea" {
 		t.Errorf("clean = %q, want %q", clean, "half </spea")
 	}
-	// The flushed bytes are region content too, so the summary sees them.
-	if text, _ := s.Summary(); text != "half </spea" {
-		t.Errorf("summary text = %q, want %q", text, "half </spea")
+	// The flushed bytes reach the clean stream, but a half-written close tag is markup, not
+	// speech: the summary must not see it (see TestSpeakScanner_CloseDropsPartialCloseTagFromSummary).
+	if text, _ := s.Summary(); text != "half " {
+		t.Errorf("summary text = %q, want %q", text, "half ")
 	}
 }
 
@@ -423,6 +424,203 @@ func TestSpeakScanner_ChunkingIsInvisible(t *testing.T) {
 		`no tags < here <b>x</b> <speaker>`,
 		`<speak></speak>x`,
 		`<speak lang="de" ` + strings.Repeat("x", maxSpeakTagLen) + `>over the bound</speak> tail`,
+	}
+	for _, in := range inputs {
+		whole := newSpeakScanner()
+		wantClean, wantClosed := feedSpeakScanner(whole, in)
+		wantText, wantLang := whole.Summary()
+
+		check := func(label string, deltas []string) {
+			t.Helper()
+			s := newSpeakScanner()
+			clean, closed := feedSpeakScanner(s, deltas...)
+			text, lang := s.Summary()
+			if clean != wantClean || closed != wantClosed || text != wantText || lang != wantLang || s.Found() != whole.Found() {
+				t.Errorf("%s on %q: got (%q, %v, %q, %q, %v), want (%q, %v, %q, %q, %v)", label, in,
+					clean, closed, text, lang, s.Found(), wantClean, wantClosed, wantText, wantLang, whole.Found())
+			}
+		}
+
+		bytewise := make([]string, 0, len(in))
+		for i := range len(in) {
+			bytewise = append(bytewise, in[i:i+1])
+		}
+		check("byte-at-a-time", bytewise)
+		for cut := 1; cut < len(in); cut++ {
+			check("split", []string{in[:cut], in[cut:]})
+		}
+	}
+}
+
+// A tag whose '>' is immediately preceded by '/' is self-closing: it is stripped and counts
+// as seen (Found, lang) but it opens no spoken region, so it captures nothing and never
+// swallows the rest of the stream.
+func TestSpeakScanner_SelfClosingTagOpensNoRegion(t *testing.T) {
+	tests := []struct {
+		name     string
+		tag      string
+		wantLang string
+	}{
+		{"bare", `<speak/>`, ""},
+		{"space before slash", `<speak />`, ""},
+		{"with lang", `<speak lang="de"/>`, "de"},
+		{"with lang and space before slash", `<speak lang="de" />`, "de"},
+		{"single quoted lang", `<speak lang='en'/>`, "en"},
+		{"unquoted lang", `<speak lang=de/>`, "de"},
+		{"mixed case", `<SPEAK Lang="fr"/>`, "fr"},
+		{"newline before slash", "<speak\n/>", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSpeakScanner()
+			clean, closed := feedSpeakScanner(s, "Vorab ", tc.tag, " Antwort.")
+			if clean != "Vorab  Antwort." {
+				t.Errorf("clean = %q, want %q (the self-closing tag stripped, everything else kept)", clean, "Vorab  Antwort.")
+			}
+			if closed {
+				t.Error("closed = true, want false: a self-closing tag has no region to close")
+			}
+			if !s.Found() {
+				t.Error("Found() = false, want true")
+			}
+			text, lang := s.Summary()
+			if text != "" {
+				t.Errorf("summary text = %q, want empty: no region was opened", text)
+			}
+			if lang != tc.wantLang {
+				t.Errorf("summary lang = %q, want %q", lang, tc.wantLang)
+			}
+		})
+	}
+}
+
+// A self-closing tag is not a region: it must not turn the rest of the stream into a summary,
+// and a stray </speak> after it still closes nothing.
+func TestSpeakScanner_SelfClosingTagDoesNotConsumeTheStream(t *testing.T) {
+	s := newSpeakScanner()
+	clean, closed := s.Write(`<speak />Alles bleibt Detail.</speak> Ende.`)
+	if clean != "Alles bleibt Detail. Ende." {
+		t.Errorf("clean = %q, want %q", clean, "Alles bleibt Detail. Ende.")
+	}
+	if closed {
+		t.Error("closed = true, want false")
+	}
+	if text, _ := s.Summary(); text != "" {
+		t.Errorf("summary text = %q, want empty", text)
+	}
+}
+
+// Once the first region exists a self-closing tag is irrelevant: inside the region it is
+// stripped like any nested tag and neither ends the region nor changes its lang, and after
+// the region it is stripped without touching the captured summary.
+func TestSpeakScanner_SelfClosingTagAfterFirstRegionIsIrrelevant(t *testing.T) {
+	s := newSpeakScanner()
+	clean, closed := s.Write(`<speak lang="de">a <speak lang="en"/> b</speak> c <speak/> d`)
+	if clean != "a  b c  d" {
+		t.Errorf("clean = %q, want %q", clean, "a  b c  d")
+	}
+	if !closed {
+		t.Error("closed = false, want true: the real close tag ends the region")
+	}
+	text, lang := s.Summary()
+	if text != "a  b" || lang != "de" {
+		t.Errorf("Summary() = (%q, %q), want (%q, %q)", text, lang, "a  b", "de")
+	}
+}
+
+// A '/' that is not directly followed by '>' is no self-closing marker: the lookalike stays
+// plain text, and one cut off at the end of the stream is flushed as text.
+func TestSpeakScanner_SlashNotBeforeGtIsPlainText(t *testing.T) {
+	for _, in := range []string{"a <speak/x> b", "a <speaker/> b", "a <speak/"} {
+		s := newSpeakScanner()
+		clean, closed := feedSpeakScanner(s, in)
+		if clean != in {
+			t.Errorf("clean of %q = %q, want the input unchanged", in, clean)
+		}
+		if closed || s.Found() {
+			t.Errorf("%q: closed=%v Found=%v, want both false", in, closed, s.Found())
+		}
+	}
+}
+
+// When the stream ends inside the first region while a close tag is only half written, the
+// held "</spea" is markup, not speech: the clean stream still gets it (held bytes flush as
+// plain text), but the spoken summary must not.
+func TestSpeakScanner_CloseDropsPartialCloseTagFromSummary(t *testing.T) {
+	tests := []struct {
+		name      string
+		partial   string
+		wantClean string
+	}{
+		{"lt slash", "</", "half </"},
+		{"through the name minus one", "</spea", "half </spea"},
+		{"through the name", "</speak", "half </speak"},
+		{"mixed case", "</SPEA", "half </SPEA"},
+		{"name and whitespace", "</speak ", "half </speak "},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSpeakScanner()
+			clean, closed := feedSpeakScanner(s, `<speak lang="de">half `, tc.partial)
+			if clean != tc.wantClean {
+				t.Errorf("clean = %q, want %q", clean, tc.wantClean)
+			}
+			if closed {
+				t.Error("closed = true, want false: the close tag never completed")
+			}
+			text, lang := s.Summary()
+			if text != "half " {
+				t.Errorf("summary text = %q, want %q: no close-tag fragment in the spoken text", text, "half ")
+			}
+			if lang != "de" {
+				t.Errorf("summary lang = %q, want %q", lang, "de")
+			}
+		})
+	}
+}
+
+// Only a half-written CLOSE tag is dropped from the summary at stream end: held bytes that
+// are not one (a lone '<', a half-written open tag) are still region content, and the same
+// partial close tag outside the first region never touches the summary at all.
+func TestSpeakScanner_CloseKeepsOtherPartialsInSummary(t *testing.T) {
+	for _, partial := range []string{"<", "<spea", "<speak lang=\"e"} {
+		s := newSpeakScanner()
+		clean, _ := feedSpeakScanner(s, `<speak>half `, partial)
+		if want := "half " + partial; clean != want {
+			t.Errorf("clean = %q, want %q", clean, want)
+		}
+		if text, _ := s.Summary(); text != "half "+partial {
+			t.Errorf("summary text = %q, want %q", text, "half "+partial)
+		}
+	}
+
+	// After the region closed, a trailing partial close tag is detail text, not summary.
+	s := newSpeakScanner()
+	clean, _ := feedSpeakScanner(s, `<speak>sum</speak> detail </spea`)
+	if clean != "sum detail </spea" {
+		t.Errorf("clean = %q, want %q", clean, "sum detail </spea")
+	}
+	if text, _ := s.Summary(); text != "sum" {
+		t.Errorf("summary text = %q, want %q", text, "sum")
+	}
+}
+
+// TestSpeakScanner_SelfClosingChunkingIsInvisible is the chunk-invariance proof for the
+// self-closing and stream-end-in-a-partial-close-tag paths: whole, byte-at-a-time and every
+// two-way split must agree on clean text, summary, lang, found and the close report.
+func TestSpeakScanner_SelfClosingChunkingIsInvisible(t *testing.T) {
+	inputs := []string{
+		`<speak/>x`,
+		`<speak />x`,
+		`<speak lang="de"/>x</speak> y`,
+		`<speak lang="de" />x`,
+		`a <speak/> b <speak lang="de">c</speak> d`,
+		`<speak lang="de">a <speak/> b</speak> c`,
+		`<speak/x> not a tag <speak/`,
+		`<speak lang="de">unclosed </speak`,
+		`<speak lang="de">unclosed </speak `,
+		`<speak lang="de">unclosed </`,
+		`<speak lang="de" ` + strings.Repeat("x", maxSpeakTagLen) + `/>over the bound`,
 	}
 	for _, in := range inputs {
 		whole := newSpeakScanner()
