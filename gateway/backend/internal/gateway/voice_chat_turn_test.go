@@ -1002,6 +1002,73 @@ func TestVoiceDrainWaitsForPlaybackDone(t *testing.T) {
 	}
 }
 
+// TestVoiceDrainCounterBearingEarlyPlaybackDoneIsFloorClamped: the playout counter (#322) can only
+// make a signal HONORED, never shorten the drain. A playback_done that is VALID -- its played_through
+// accounts for all the audio relayed (or claims more) -- but EARLY (sent at the very start of the
+// drain, ~2s before the floor) is remembered and still clamped up to the floor exactly like a
+// counter-less one: the mic stays gated, PCM sent before the floor is DISCARDED, and the session
+// returns to listening only at ~floor+tail (not at once, and not at the 30s ceiling either).
+func TestVoiceDrainCounterBearingEarlyPlaybackDoneIsFloorClamped(t *testing.T) {
+	for name, extra := range map[string]int{
+		"counter equals the relayed audio":     0,
+		"counter claims more than was relayed": 98, // a forged-high counter is valid too, and no less clamped
+	} {
+		t.Run(name, func(t *testing.T) {
+			child := newFakeVoiceASRChild(t)
+			child.finals = []string{"early but valid"}
+			timing := turnGraceTiming()
+			timing.micResumeTail = 30 * time.Millisecond
+			// ~2s of audio at the fixture byte rate (88200 B/s) => a ~2s floor to hold the mic past.
+			h := newVoiceTurnHarness(t, child, voiceTurnOpts{
+				timing:    timing,
+				speechPCM: [][]byte{speechPCM(88200*2, 1)},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+
+			conn := h.dial(t, ctx)
+			conn.SetReadLimit(1 << 21) // the relayed audio_delta is large; read it whole
+			readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+			if f := drainAChunk(t, ctx, conn); f != "early but valid" {
+				t.Fatalf("asr_final = %q, want %q", f, "early but valid")
+			}
+			// Count the audio chunks the server relays: the counter the client would send.
+			relayed := 0
+			for {
+				m, _ := readVoiceFrame(t, ctx, conn)
+				if m.Type == voiceDownAudioDelta {
+					relayed++
+				}
+				if m.Type == voiceDownAudioDone {
+					break
+				}
+			}
+			if relayed != 1 {
+				t.Fatalf("relayed %d audio chunks, want 1 (harness sanity: one speech frame in)", relayed)
+			}
+			readVoiceUntilState(t, ctx, conn, voiceStateDraining)
+			tDraining := time.Now()
+			beforeConns, beforeBytes := child.snapshot()
+
+			// VALID (accounts for all relayed audio) but EARLY: it must not end the drain below the floor.
+			sendVoicePlaybackDone(t, ctx, conn, relayed+extra)
+			time.Sleep(600 * time.Millisecond)
+			drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,
+				"a counter-bearing early playback_done re-opened the mic before the floor: the counter shortened the drain")
+
+			// The drain ends at ~floor+tail: the remembered valid signal is honored the moment the
+			// floor passes -- so well under the 30s ceiling, and not before the floor.
+			lctx, lcancel := context.WithTimeout(ctx, 6*time.Second)
+			defer lcancel()
+			readVoiceUntilState(t, lctx, conn, voiceStateListening)
+			if waited := time.Since(tDraining); waited < time.Second {
+				t.Fatalf("returned to listening %v after draining began, want it held to the ~2s floor despite the early counter-bearing signal", waited)
+			}
+		})
+	}
+}
+
 // TestVoiceDrainExtendsForLatePlaybackDone: a playback_done that arrives AFTER the floor (a slow
 // client still playing the answer out) EXTENDS the drain to the signal. Past the short floor,
 // with no signal yet, the mic is still gated -- it has NOT re-opened at the floor -- and only

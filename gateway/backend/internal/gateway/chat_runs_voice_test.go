@@ -21,6 +21,7 @@ import (
 	"op-ai-gateway/internal/usage"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,18 +57,26 @@ type voiceTestProvider struct {
 	// speechFail makes the speech leg's loopback answer a 500, to drive the speech-leg
 	// failure path (the text turn still commits, no audio, degrade surfaced).
 	speechFail bool
+	// speechRelease, when non-nil, HOLDS every speech response: the request is counted as
+	// arrived (speechArrived) and then blocks until speechRelease is closed or the request's
+	// context ends. It keeps the speech leg deterministically IN FLIGHT -- no audio delta yet --
+	// so a test can act (snapshot the run's metrics, cancel the run) in the middle of the
+	// overlap, then let it go. nil answers at once (the default).
+	speechRelease chan struct{}
 	// llmScript, when non-nil, REPLACES the mock's echoed answer with these scripted
 	// deltas: a delta with waitSpeech blocks after it is emitted until the speech request
-	// arrives (or ctx ends), and a delta with failAfter returns an error instead of
-	// completing the stream (the LLM-failure path). nil leaves the plain mock answer.
+	// arrives (or ctx ends), a delta with holdUntilCancel then blocks until ctx ends (the LLM
+	// still streaming when the run is cancelled), and a delta with failAfter returns an error
+	// instead of completing the stream (the LLM-failure path). nil leaves the plain mock answer.
 	llmScript []scriptedLLMDelta
 }
 
 // scriptedLLMDelta is one step of voiceTestProvider.llmScript.
 type scriptedLLMDelta struct {
-	text       string
-	waitSpeech bool
-	failAfter  bool
+	text            string
+	waitSpeech      bool
+	holdUntilCancel bool
+	failAfter       bool
 }
 
 func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*provider.ProxyResponse, error) {
@@ -78,6 +87,13 @@ func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Targe
 		}
 		if p.speechArrived != nil && p.speechOnce != nil {
 			p.speechOnce.Do(func() { close(p.speechArrived) })
+		}
+		if p.speechRelease != nil {
+			select {
+			case <-p.speechRelease:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		if p.speechFail {
 			return &provider.ProxyResponse{
@@ -122,6 +138,10 @@ func (p voiceTestProvider) CompleteStream(ctx context.Context, target routing.Ta
 			case <-ctx.Done():
 				return ctx.Err()
 			}
+		}
+		if d.holdUntilCancel {
+			<-ctx.Done()
+			return ctx.Err()
 		}
 		if d.failAfter {
 			return errors.New("gateway.mock_llm_failed")
@@ -968,6 +988,91 @@ func TestVoiceRun_PersistsSpokenSummaryStart(t *testing.T) {
 	}
 }
 
+// The persisted summary is TrimSpace'd, but the scanner's offset points at the region's UNTRIMMED
+// content start, so trimmedSummaryStart advances it past the leading whitespace the trim removed
+// (#322). The existing end-to-end offset test has no whitespace inside the tag, so that adjustment
+// went unpinned -- and the portal's slice-equality fallback would silently mask a wrong one. Here
+// whitespace sits INSIDE the tag (and a multi-byte 'ä' and emoji before it), on both call sites of
+// the adjustment: a region closed mid-stream, and a captured-but-unclosed one spoken at completion.
+func TestVoiceRun_SpokenSummaryStartSkipsWhitespaceInsideTheTag(t *testing.T) {
+	for name, tc := range map[string]struct {
+		llm         string
+		wantSummary string
+		wantStart   int
+	}{
+		// "Käse 🧀 " is 7 runes; the 2 leading spaces inside the tag are trimmed off => 9.
+		"closed region, spaces inside the tag": {`Käse 🧀 <speak lang="de">  Kurz. </speak> Detail.`, "Kurz.", 9},
+		// newline and tab count as trimmed whitespace too => 7 + 3.
+		"closed region, newline and tab":     {"Käse 🧀 <speak lang=\"de\">\n\t Kurz.\n</speak> Detail.", "Kurz.", 10},
+		"unclosed region, spaces inside":     {`Käse 🧀 <speak lang="de">  Kurz.`, "Kurz.", 9},
+		"closed region, no inner whitespace": {`Käse 🧀 <speak lang="de">Kurz.</speak> Detail.`, "Kurz.", 7},
+	} {
+		t.Run(name, func(t *testing.T) {
+			prov := defaultVoiceProvider()
+			prov.llmScript = []scriptedLLMDelta{{text: tc.llm}}
+			srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+
+			_, snap := voiceRunOutcome(t, srv, owner, chatID, "unused")
+			if snap.Status != "completed" {
+				t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+			}
+			stored, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			summary, ok := storedSpokenSummary(t, stored.Content)
+			if !ok || summary != tc.wantSummary {
+				t.Fatalf("spoken_summary = %q (present %v), want the trimmed %q", summary, ok, tc.wantSummary)
+			}
+			start, ok := storedSpokenSummaryStart(t, stored.Content)
+			if !ok || start != tc.wantStart {
+				t.Fatalf("spoken_summary_start = %d (present %v), want %d", start, ok, tc.wantStart)
+			}
+			// Exactness, against the real committed document: the runes at the offset ARE the
+			// trimmed summary (not the whitespace that preceded it inside the tag).
+			full := voiceTextPart(t, storedAssistantMsg(t, stored.Content)["content"])
+			runes := []rune(full)
+			end := start + len([]rune(summary))
+			if end > len(runes) || string(runes[start:end]) != summary {
+				t.Fatalf("runes[%d:%d] of %q do not equal the trimmed summary %q", start, end, full, summary)
+			}
+		})
+	}
+}
+
+// trimmedSummaryStart in isolation: whatever Unicode whitespace the trim removes from the front of
+// the region's content (spaces, tab, newline, NBSP, ideographic space), the advanced offset lands
+// on the first rune of the trimmed summary, counted in runes with multi-byte text before the tag.
+func TestTrimmedSummaryStartLandsOnTheTrimmedSummary(t *testing.T) {
+	const in = "Käse 🧀 <speak lang=\"de\">\u00a0\u3000\t\n  Kurz. \u00a0</speak> Detail."
+	s := newSpeakScanner()
+	clean, _ := feedSpeakScanner(s, in)
+	raw, _ := s.Summary()
+	trimmed := strings.TrimSpace(raw)
+	if trimmed != "Kurz." {
+		t.Fatalf("trimmed summary = %q, want %q (harness sanity)", trimmed, "Kurz.")
+	}
+
+	start := trimmedSummaryStart(s, raw)
+	runes := []rune(clean)
+	end := start + len([]rune(trimmed))
+	if end > len(runes) || string(runes[start:end]) != trimmed {
+		t.Fatalf("trimmedSummaryStart = %d: runes[%d:%d] of %q do not equal %q", start, start, end, clean, trimmed)
+	}
+	// 7 runes of "Käse 🧀 " plus the 6 whitespace runes the trim removed (NBSP, U+3000, tab,
+	// newline, two spaces).
+	if want := 7 + 6; start != want {
+		t.Errorf("trimmedSummaryStart = %d, want %d", start, want)
+	}
+
+	// No region at all: the scanner's -1 passes through untouched.
+	none := newSpeakScanner()
+	feedSpeakScanner(none, "plain text")
+	if got := trimmedSummaryStart(none, ""); got != -1 {
+		t.Errorf("trimmedSummaryStart with no region = %d, want -1", got)
+	}
+}
+
 // Live-delta tag stripping: NO published delta carries <speak> markup -- the scanner strips
 // the tags before run.publish fans the clean text out (and buffers it).
 func TestVoiceRun_LiveDeltasAreTagStripped(t *testing.T) {
@@ -1051,10 +1156,13 @@ func TestVoiceRun_LanguagePassedWhenModelAccepts(t *testing.T) {
 	}
 }
 
-// A cancel that lands in the commit-claim window wins even after the overlap: the speech leg
-// fired at </speak> (the overlap really happened), but the CAS claim loses to the cancel and
-// NOTHING is persisted.
-func TestVoiceRun_CancelDuringOverlapPersistsNothing(t *testing.T) {
+// A cancel that lands in the commit-claim window wins even AFTER the overlap: both legs ran to
+// completion (the speech leg fired at </speak>, so the overlap really happened) and were joined,
+// and only then does the cancel land -- at the commit CAS, via voiceBeforeCommitClaim. The claim
+// loses to the cancel and NOTHING is persisted. This pins the commit-claim gate, NOT a cancel
+// while the two legs are concurrently in flight; that one is
+// TestVoiceRun_CancelMidOverlapPersistsNothing.
+func TestVoiceRun_CancelAtCommitClaimAfterOverlapPersistsNothing(t *testing.T) {
 	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
 	srv.voiceBeforeCommitClaim = func(run *ChatRun) { run.cancelContext() }
 
@@ -1081,6 +1189,73 @@ func TestVoiceRun_CancelDuringOverlapPersistsNothing(t *testing.T) {
 	}
 	if string(before.Content) != string(after.Content) {
 		t.Fatalf("a cancel in the commit-claim window still persisted:\nbefore %s\nafter  %s", before.Content, after.Content)
+	}
+}
+
+// A cancel DURING the overlap -- the orchestrator's resume landing while the LLM is still
+// streaming the detail AND the speech leg is in flight on the summary -- persists NOTHING. Both
+// legs are held deterministically in flight: the scripted LLM emits the summary and a first piece
+// of detail, then blocks until its context ends; the speech request has arrived at the provider
+// and is held there (no audio yet). The cancel then ends both legs, the run joins the in-flight
+// speech leg and finishes canceled WITHOUT ever reaching the commit claim (it is the mid-flight
+// cancel path, not the commit-claim gate), leaving the chat document untouched.
+func TestVoiceRun_CancelMidOverlapPersistsNothing(t *testing.T) {
+	prov := defaultVoiceProvider()
+	prov.speechArrived = make(chan struct{})
+	prov.speechOnce = &sync.Once{}
+	prov.speechRelease = make(chan struct{}) // never released: the cancel is what ends the speech leg
+	prov.llmScript = []scriptedLLMDelta{
+		{text: `<speak lang="de">Kurz.</speak>`},
+		{text: ` Detail beginnt`, waitSpeech: true, holdUntilCancel: true},
+	}
+	srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+	// A safety net for the held speech request: closing it on cleanup (registered after, so run
+	// before, the server's own) can never leave the loopback server waiting on a held handler.
+	t.Cleanup(func() { close(prov.speechRelease) })
+	var claimed atomic.Bool
+	srv.voiceBeforeCommitClaim = func(*ChatRun) { claimed.Store(true) }
+
+	before, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run, err := srv.startVoiceRun(context.Background(), voiceRunRequest{owner: owner, chatID: chatID, pendingText: "keep talking", asr: voiceASRTarget, llm: voiceLLMTarget, tts: voiceTTSTarget})
+	if err != nil {
+		t.Fatalf("startVoiceRun: %v", err)
+	}
+
+	// Both legs are in flight: the speech leg fired at </speak> and its request is held at the
+	// provider, and the LLM has streamed the first piece of detail and is blocked mid-stream.
+	select {
+	case <-prov.speechArrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the speech leg never fired at </speak>")
+	}
+	waitFor(t, func() bool {
+		_, content := run.buffered()
+		return strings.Contains(content, "Detail beginnt")
+	})
+	if got := run.statusValue(); got != "running" {
+		t.Fatalf("status = %q before the cancel, want running (both legs still in flight)", got)
+	}
+
+	if !srv.ChatRuns.cancelChat(owner.UserID, chatID) {
+		t.Fatal("cancelChat found no active run to cancel")
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "canceled" {
+		t.Fatalf("status = %q, want canceled", got)
+	}
+	if claimed.Load() || run.isCommitting() {
+		t.Fatal("a run cancelled mid-overlap must never reach the commit claim")
+	}
+	after, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before.Content) != string(after.Content) {
+		t.Fatalf("a cancel mid-overlap still persisted:\nbefore %s\nafter  %s", before.Content, after.Content)
 	}
 }
 
@@ -1217,6 +1392,64 @@ func TestVoiceRun_SpeechLegDoesNotStampMetricsForVoice(t *testing.T) {
 		t.Fatal("stampTTFT=true must stamp the audio TTFT, overwriting the sentinel")
 	}
 	srv.releaseRun(run2)
+}
+
+// The test above pins generateSpeechTurn's stampTTFT=false in isolation; it would not notice
+// launchVoiceSpeech -- the one real call site -- passing true. This drives the REAL executeVoiceRun
+// path end to end and asserts the committed TTFT is the LLM leg's: with the speech leg held in
+// flight (its request has arrived but no audio delta can land), the LLM's first-content TTFT is
+// already stamped and is snapshotted; the speech leg is then released only after a measurable hold.
+// A speech leg that stamped (stampTTFT=true) would overwrite the TTFT with its own -- first audio
+// delta minus its dispatch time, necessarily >= the hold -- so the committed value would differ
+// from the snapshot. On the correct code nothing writes TTFT after the LLM's first delta, so the
+// committed TTFT equals the snapshot exactly.
+func TestVoiceRun_CommittedTTFTIsTheLLMLegsNotTheSpeechLegs(t *testing.T) {
+	const speechHold = 250 * time.Millisecond
+	prov := defaultVoiceProvider()
+	prov.speechArrived = make(chan struct{})
+	prov.speechOnce = &sync.Once{}
+	prov.speechRelease = make(chan struct{})
+	prov.llmScript = []scriptedLLMDelta{{text: `<speak lang="de">Kurz.</speak> Details.`}}
+	srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+	rec := &recordingVoicePortal{API: srv.Portal}
+	srv.Portal = rec
+
+	run, err := srv.startVoiceRun(context.Background(), voiceRunRequest{owner: owner, chatID: chatID, pendingText: "unused", asr: voiceASRTarget, llm: voiceLLMTarget, tts: voiceTTSTarget})
+	if err != nil {
+		t.Fatalf("startVoiceRun: %v", err)
+	}
+	released := false
+	t.Cleanup(func() { // never leave the loopback server waiting on a held speech handler
+		if !released {
+			close(prov.speechRelease)
+		}
+	})
+
+	// The speech leg fired at </speak>, which the scanner reports only AFTER the delta's content
+	// was observed -- so the LLM's first-content TTFT is stamped before the speech request can
+	// arrive. The held response keeps the speech leg from stamping anything yet.
+	select {
+	case <-prov.speechArrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the speech leg never fired at </speak>")
+	}
+	llmTTFT := run.currentMetrics().TTFTMs
+
+	time.Sleep(speechHold) // the speech leg's own TTFT is now at least speechHold
+	close(prov.speechRelease)
+	released = true
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "completed" {
+		t.Fatalf("status = %q, want completed", got)
+	}
+
+	turn, ok := rec.committed()
+	if !ok {
+		t.Fatal("no voice commit was captured")
+	}
+	if turn.TTFTMs != llmTTFT {
+		t.Fatalf("committed TTFTMs = %d, want the LLM leg's %d: the speech leg (>= %dms to its first audio) stamped the voice run's metrics, so launchVoiceSpeech is not passing stampTTFT=false", turn.TTFTMs, llmTTFT, speechHold.Milliseconds())
+	}
 }
 
 // AudioAnswer reflects whether the committed turn actually carries audio: true on the happy

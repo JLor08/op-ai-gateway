@@ -339,3 +339,59 @@ func TestVoiceRunHistory_DefaultSystemMessage(t *testing.T) {
 		assertSoleSystemMessage(t, history, defaultVoiceSystemPrompt)
 	}
 }
+
+// The thread's own (typed-chat) system prompt, stored in settings.system_prompt, must NEVER
+// reach a voice run -- not even when it sits BESIDE settings.voice_chat in the same stored
+// document. A voice run's one system message is voice_chat.system_prompt (the stored override)
+// or the built-in default; the typed prompt belongs to the typed run alone (#322).
+func TestVoiceRunHistory_ThreadSystemPromptDoesNotReachAVoiceRun(t *testing.T) {
+	const threadPrompt = "THREAD-ONLY: answer like a pirate."
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+
+	for name, tc := range map[string]struct{ settings, want string }{
+		"voice override beside the thread prompt": {
+			`{"system_prompt":"` + threadPrompt + `","voice_chat":{"system_prompt":"Be terse."}}`, "Be terse.",
+		},
+		"voice default (picks only) beside the thread prompt": {
+			`{"system_prompt":"` + threadPrompt + `","voice_chat":` + storedVoiceChatPicks + `}`, defaultVoiceSystemPrompt,
+		},
+		"voice default (blank override) beside the thread prompt": {
+			`{"system_prompt":"` + threadPrompt + `","voice_chat":{"system_prompt":"  "}}`, defaultVoiceSystemPrompt,
+		},
+		"thread prompt alone, no voice_chat at all": {
+			`{"system_prompt":"` + threadPrompt + `"}`, defaultVoiceSystemPrompt,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			chatID := voiceHistoryThread(t, svc, tc.settings)
+			history, err := svc.VoiceRunHistory(context.Background(), chatToken("usr_a"), chatID, "and three plus three")
+			if err != nil {
+				t.Fatalf("VoiceRunHistory: %v", err)
+			}
+			assertSoleSystemMessage(t, history, tc.want)
+			// Nowhere in the run's history: not as a second system message (asserted above), and
+			// not folded into any other message either.
+			if body, _ := json.Marshal(history); strings.Contains(string(body), threadPrompt) {
+				t.Fatalf("the thread's typed-chat system prompt reached the voice run: %s", body)
+			}
+		})
+	}
+
+	// Positive control: the very same stored prompt DOES lead a typed run's history when the
+	// typed run carries it, so the assertions above are not vacuously true of a prompt no run
+	// ever reads.
+	t.Run("control: a typed run does carry the thread prompt", func(t *testing.T) {
+		created, err := svc.CreateChat(context.Background(), chatToken("usr_a"), CreateChatRequest{Content: json.RawMessage(`{"settings":{"system_prompt":"` + threadPrompt + `"},"messages":[]}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		history, _, err := svc.PrepareChatRun(context.Background(), chatToken("usr_a"), created.ID, PrepareRunRequest{
+			UserMessage: json.RawMessage(`{"id":"u1","role":"user","content":"hello"}`),
+			Settings:    ChatRunSettings{Model: "m", SystemPrompt: threadPrompt},
+		})
+		if err != nil {
+			t.Fatalf("PrepareChatRun: %v", err)
+		}
+		assertSoleSystemMessage(t, history, threadPrompt)
+	})
+}
