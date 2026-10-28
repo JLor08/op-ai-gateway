@@ -609,7 +609,7 @@ when the LLM stream ends and commits **once**, through the same compare-and-swap
 clean text, the summary's audio and the summary text as the stored turn's `spoken_summary`, which the portal renders as a
 collapsed, replayable block above the detail ([Data Model](reference/data-model.md)). `audio_done` and `draining` follow
 that commit, so the mic stays gated from the window's close through the commit and then the drain (the drain's floor still
-counts from the first audio chunk, and a `playback_done` is honoured only in `draining`,
+counts from the first audio chunk, and the summary's audio is relayed early, so the client's one `playback_done` can arrive while the session is still `speaking`: the machine remembers it whenever it arrives and clears it on every relayed audio chunk, so only a signal with no audio relayed after it (the genuine end of audio) ends the drain at the floor instead of the 30 s ceiling, and the floor still always clamps it,
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). *Degrading.* An LLM failure
 **before** the closing tag fires no speech and stores nothing (phase 1). An LLM failure **after** it commits the turn with
 what exists (the summary, its audio and the cut-off detail), and a speech failure commits the **text** turn with no audio; in

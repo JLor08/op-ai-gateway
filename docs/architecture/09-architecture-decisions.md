@@ -9853,7 +9853,16 @@ feature rides the schema-free chat document and the speech request's existing to
 - **The first audio can arrive while the LLM is still streaming, and the mic stays gated until the commit.** The machine's
   `answer_done` is emitted at the first audio event, so `answer_delta` frames of the detail can follow it (the portal appends
   them regardless); `audio_done` and `draining` follow the **commit**, which waits for both legs; the drain's floor still
-  counts from the first audio chunk, and the client's `playback_done` is honoured only in `draining`
+  counts from the first audio chunk. The client's one `playback_done` (sent when its player's queue empties) can arrive
+  while the session is still `speaking`, because the summary's playout can end before the detail does; the machine
+  **remembers** it whenever it arrives and **clears it on every relayed audio chunk**, so a remembered signal counts only if
+  no audio was relayed after it. In phase 2 only the summary is synthesized and the detail is text-only, so the genuine
+  end-of-audio signal survives and ends the drain at the **floor** instead of waiting out the 30 s ceiling, while a
+  mid-stream gap signal (the player's queue emptying between two chunks when the TTS runs slower than real time) is
+  invalidated by the next chunk, so the mic never re-opens while audio is still being relayed. The floor always clamps: a
+  too-early or forged signal can never re-open the mic before the audio's real-time duration. The accepted residual is
+  bounded and floor-clamped: a stale gap signal still in flight that lands after the next chunk was relayed, with no later
+  chunk, can end the drain at the floor; closing it needs a client sequence or ack
   ([Runtime View §6.1.6](06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts),
   [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **A voice run's stored `ttftMs` is now the text leg's time to its first LLM token.** In phase 1 the ordered LLM-then-TTS
