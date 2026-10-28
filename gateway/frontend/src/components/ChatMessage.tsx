@@ -32,21 +32,17 @@ function contentText(content: ChatContent): string {
     .join('\n');
 }
 
-// The answer's text with a voice answer's spoken summary taken out: the body shown beneath the
-// summary block (#314). `content` holds the FULL clean answer -- summary and detail -- while the
-// summary has a block of its own, so leaving it in the body would show it twice.
+// bodyAt returns the answer's text with a voice answer's spoken summary taken out: the body shown
+// beneath the summary block (#314). `content` holds the FULL clean answer -- summary and detail --
+// while the summary has a block of its own, so leaving it in the body would show it twice.
 //
-// The gateway now persists the summary's RUNE offset (spoken_summary_start), so the body is sliced
-// out by POSITION, which is exact even when the summary's text also appears in the detail before
-// the <speak> region -- see bodyAt (#322). For a turn committed BEFORE that (no offset), it falls
-// back to withoutSummary, which re-finds the summary by value with indexOf.
-
-// bodyAt removes the summary from the full answer by its persisted rune offset: the code points in
-// [start, start + len(summary)) are the summary, so the slice is exact wherever the region sits --
-// unlike indexOf, which would cut an earlier verbatim occurrence. Code points (Array.from), not
-// UTF-16 units, so a multi-byte char (an umlaut, an emoji) in the detail does not shift the cut. A
-// start that does not line up (out of range, or the slice is not the summary) falls back to the
-// by-value removal rather than corrupting the body.
+// The gateway persists the summary's RUNE offset (spoken_summary_start, #322), so the summary is
+// removed by POSITION: the code points in [start, start + len(summary)) are the summary, which is
+// exact wherever the region sits -- unlike indexOf, which would cut an earlier verbatim occurrence
+// in the detail. Code points (Array.from), not UTF-16 units, so a multi-byte char (an umlaut, an
+// emoji) in the detail does not shift the cut. A start that does not line up (out of range, or the
+// slice is not the summary) falls back to the by-value removal (withoutSummary) rather than
+// corrupting the body, as does a turn committed before the offset existed (no start at all).
 function bodyAt(text: string, summary: string, start: number): string {
   const chars = Array.from(text);
   const end = start + Array.from(summary).length;

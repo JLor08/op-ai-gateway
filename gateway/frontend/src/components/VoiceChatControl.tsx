@@ -5,9 +5,11 @@ import { useEffect, useId, useRef, type KeyboardEvent, type PointerEvent } from 
 import { Alert, Box, Button, FormControlLabel, Switch, TextField, Typography } from '@mui/material';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
+import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import type { MessageKey, Translation } from './shared/types';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { SpeechVoiceField } from './SpeechVoiceField';
+import { DEFAULT_VOICE_SYSTEM_PROMPT } from './chat/ChatStore';
 import type {
   VoiceChatApi,
   VoiceChatError,
@@ -94,6 +96,11 @@ function detailText(state: VoiceChatState, t: Translation): string {
 function takesPushToTalk(state: VoiceChatState): boolean {
   return state === 'listening' || state === 'idle';
 }
+
+// The longest voice system prompt the field takes. Generous -- the built-in prompt is about a
+// sixth of it -- and only there so that a paste of a whole document is not carried into every run
+// of the conversation.
+const SYSTEM_PROMPT_MAX_LENGTH = 4000;
 
 // The states in which an answer is being prepared or spoken, which Stop abandons.
 function hasAnswerInFlight(state: VoiceChatState): boolean {
@@ -365,7 +372,8 @@ export function VoiceChatControl({
 // Beside them, the thread's voice system prompt (#314): a multi-line field, pre-filled with the
 // built-in prompt, that the user may edit for this thread. It has nothing to do with which models
 // stream, so it is not waiting for the gateway; it is closed while a conversation is on, so a
-// conversation runs on the prompt it began with.
+// conversation runs on the prompt it began with. It is bounded in length, and the control under it
+// puts the built-in prompt back (closed with the field, and when the field already holds it).
 function VoiceModelPickers({
   models,
   locked,
@@ -426,8 +434,20 @@ function VoiceModelPickers({
         value={models.systemPrompt.value}
         onChange={(event) => models.systemPrompt.set(event.target.value)}
         disabled={locked}
+        slotProps={{ htmlInput: { maxLength: SYSTEM_PROMPT_MAX_LENGTH } }}
         sx={{ mt: 0.75 }}
       />
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+        <Button
+          size="small"
+          color="inherit"
+          startIcon={<RestartAltIcon />}
+          disabled={locked || models.systemPrompt.value === DEFAULT_VOICE_SYSTEM_PROMPT}
+          onClick={() => models.systemPrompt.set(DEFAULT_VOICE_SYSTEM_PROMPT)}
+        >
+          {t.chatVoiceSystemPromptReset}
+        </Button>
+      </Box>
     </Box>
   );
 }

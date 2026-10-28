@@ -179,6 +179,11 @@ export {
   optionsOr,
 } from './chatDoc';
 
+// The built-in voice system prompt, which the Voice Chat control (VoiceChatControl.tsx, OUTSIDE
+// components/chat/) puts back into its prompt field on a reset and compares the field against.
+// Re-exported through this file like the image presets above (arch.test.ts enforces the boundary).
+export { DEFAULT_VOICE_SYSTEM_PROMPT } from './chatDoc';
+
 // "No voices to offer": one shared empty list, so resetting the picker's voices on every
 // model change is a no-op render (React bails out on an identical state value) instead of
 // a fresh array each time.
@@ -2387,6 +2392,8 @@ export function ChatStoreProvider({
       // save is refused once the conversation holds the chat (isTranscriptHeld): an edit made less
       // than a debounce ago would not be the prompt the first answer follows. So what is unsaved
       // goes out now, before the ticket is asked for (a no-op when nothing is).
+      // Fire-and-forget: begin() is synchronous, so the PUT is not awaited. A failed one toasts and
+      // leaves the chat dirty, as the picker saves do.
       void flushSave();
       voiceChatIdRef.current = chatId;
       return {

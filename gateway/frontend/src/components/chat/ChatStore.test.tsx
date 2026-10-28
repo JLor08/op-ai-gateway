@@ -9218,6 +9218,51 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(text('voice-state')).toBe('off');
       });
 
+      it('reloads once, and keeps the error, when a committed turn degrades (a turn error)', async () => {
+        // The gateway committed the turn, then the speech failed: the `error` frame is the only
+        // signal, the conversation goes on at idle, and the stored turn must reach the screen
+        // without the chat being opened again.
+        await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('speaking'));
+        chatApi.spies.chat.mockClear();
+        chatApi.rows[0].content = { settings: { model: 'llm' }, messages: committed };
+
+        await act(async () => {
+          voiceSessions[0].args.onError('the speech model failed', {
+            kind: 'turn',
+            code: 'speech.upstream_error',
+          });
+          voiceSessions[0].args.onState('idle');
+        });
+
+        await waitFor(() => expect(text('count')).toBe('4'));
+        expect(text('last')).toBe('spoken answer');
+        // One reload for the one failed turn, and the conversation and its error are untouched.
+        expect(chatApi.spies.chat).toHaveBeenCalledTimes(1);
+        expect(chatApi.spies.chat).toHaveBeenCalledWith('c1');
+        expect(text('voice-state')).toBe('idle');
+        expect(text('voice-error')).toBe('turn:speech.upstream_error');
+      });
+
+      it('reloads once, not twice, when the conversation ends in a failure mid-turn', async () => {
+        // The store's own reload at the end of a conversation covers a terminal failure: the hook
+        // adds none for it, so a failed reload is reported once.
+        await renderVoice();
+        click('voice-start');
+        act(() => voiceSessions[0].args.onState('thinking'));
+        chatApi.spies.chat.mockClear();
+
+        await act(async () => {
+          voiceSessions[0].args.onError('connection closed', { kind: 'dropped' });
+          voiceSessions[0].args.onState('error');
+        });
+
+        await waitFor(() => expect(chatApi.spies.chat).toHaveBeenCalled());
+        await act(async () => {});
+        expect(chatApi.spies.chat).toHaveBeenCalledTimes(1);
+      });
+
       it('does not reload for an end that follows no turn in flight', async () => {
         await renderVoice();
         click('voice-start');

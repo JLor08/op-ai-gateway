@@ -365,8 +365,10 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   // counter). It rides every playback_done as `played_through`, so the gateway can tell the genuine
   // end-of-audio signal (it accounts for everything relayed) from a stale inter-chunk gap signal
   // that lost the relay/signal race, and so never ends its half-duplex drain while later audio is
-  // still playing out here. It counts audio RECEIVED (not only played), so it matches what the
-  // gateway relayed, and resets at each answer's chunk 0.
+  // still playing out here. It counts audio RECEIVED (not only played), which keeps the count
+  // aligned with what the gateway relayed when a drain follows (an unplayable trailing chunk has no
+  // drain signal after it, so there it can stay ahead of what was signalled), and resets at each
+  // answer's chunk 0.
   let receivedChunks = 0;
 
   const setState = (next: VoiceSessionState) => {
@@ -489,8 +491,8 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       stopPlayback();
       receivedChunks = 0;
     }
-    // Count every chunk RECEIVED (before the play verdict), so the counter matches what the gateway
-    // relayed even if a trailing chunk turns out unplayable.
+    // Count every chunk RECEIVED (before the play verdict): this keeps the count aligned with what
+    // the gateway relayed when a drain follows, even if a trailing chunk turns out unplayable.
     receivedChunks += 1;
     const verdict = acceptChunk(playState, {
       seq: frame.seq,
