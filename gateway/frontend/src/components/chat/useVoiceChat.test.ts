@@ -561,6 +561,78 @@ describe('useVoiceChat', () => {
       expect(h.voice()).toMatchObject({ state: 'listening', liveTranscript: 'try again' });
     });
 
+    // A turn can fail AFTER the gateway has committed it (the speech degraded once the answer was
+    // stored): its `error` frame, not an audio_done, is then the only signal this tab gets, so it
+    // reloads the thread like the end of a turn does or the committed turn shows only on the
+    // next open of the chat.
+    it('a turn error reloads the thread, so a turn that degraded after its commit shows', () => {
+      const h = setup();
+      const session = listening(h);
+      emit.final(session, 'What is the capital of France?');
+      emit.state(session, 'thinking');
+      emit.delta(session, 'Paris.');
+      expect(h.refreshThread).not.toHaveBeenCalled();
+
+      emit.turnError(session, 'speech.upstream_error', 'the speech model failed');
+
+      expect(h.refreshThread).toHaveBeenCalledTimes(1);
+      expect(h.refreshThread).toHaveBeenCalledWith('c1');
+      // The reload does not touch what the error says, nor the conversation that goes on.
+      expect(h.voice().error).toEqual({
+        kind: 'turn',
+        code: 'speech.upstream_error',
+        message: 'the speech model failed',
+      });
+      expect(h.voice().state).toBe('idle');
+      expect(session.stop).not.toHaveBeenCalled();
+    });
+
+    it('reloads the chat the conversation started in, and once per failed turn', () => {
+      const h = setup({ begin: () => ({ ...START, chatId: 'c-voice' }), activeChatId: 'c-voice' });
+      const session = listening(h);
+
+      emit.turnError(session, 'speech.upstream_error');
+      emit.state(session, 'listening');
+      emit.turnError(session);
+
+      expect(h.refreshThread.mock.calls).toEqual([['c-voice'], ['c-voice']]);
+    });
+
+    it.each([
+      ['rejects', () => Promise.reject(new Error('offline'))],
+      [
+        'throws',
+        () => {
+          throw new Error('broken');
+        },
+      ],
+    ])(
+      'a reload after a turn error that %s leaves the error and the conversation',
+      async (_n, refreshThread) => {
+        const h = setup({ refreshThread });
+        const session = listening(h);
+
+        emit.turnError(session, 'speech.upstream_error');
+        await act(async () => undefined);
+
+        expect(h.voice()).toMatchObject({ state: 'idle', error: { kind: 'turn' } });
+        emit.state(session, 'listening');
+        emit.partial(session, 'still here');
+        expect(h.voice().liveTranscript).toBe('still here');
+      },
+    );
+
+    it('ignores the turn error of a session that was let go of: no reload either', () => {
+      const h = setup();
+      const session = listening(h);
+      h.stop();
+
+      emit.turnError(session, 'speech.upstream_error');
+
+      expect(h.refreshThread).not.toHaveBeenCalled();
+      expect(h.voice().error).toBeNull();
+    });
+
     it('a turn error without a code carries none', () => {
       const h = setup();
       const session = listening(h);
@@ -600,6 +672,9 @@ describe('useVoiceChat', () => {
 
         emit.failed(session, detail, 'it failed');
 
+        // No reload from the hook: an end of the conversation in the middle of a turn is the
+        // store's own reload (a second one here would double a failed reload's report).
+        expect(h.refreshThread).not.toHaveBeenCalled();
         expect(h.voice().error).toEqual({ ...detail, message: 'it failed' });
         expect(h.voice()).toMatchObject({ state: 'off', liveTranscript: '', answerPreview: '' });
         // Nothing is retried on its own: a new conversation is the user's call.

@@ -539,12 +539,12 @@ sequenceDiagram
         Note over M: the window closes when the first audio has arrived AND the grace elapsed, OR when the run commits, whichever is first. The mic shuts.
         M-->>B: {state: speaking}, the held audio, then {audio_delta, seq, rate, audio} as it arrives
         RN->>RN: JOIN, the LLM stream has ended AND the speech leg has finished
-        RN->>ST: CommitVoiceTurn, the user turn and the assistant turn [text (the full clean answer), audio_url...] plus the spoken_summary key in ONE SaveChatWithBlobs
+        RN->>ST: CommitVoiceTurn, the user turn and the assistant turn [text (the full clean answer), audio_url...] plus the spoken_summary and spoken_summary_start keys in ONE SaveChatWithBlobs
         RN-->>M: completed
         M-->>B: {audio_done}, then {state: draining}
         B->>B: reload the chat thread, which now holds the committed turns
-        B->>M: {playback_done} when the streaming player has drained
-        M->>M: end draining at max(floor, min(ceiling, signal)), then the mic-resume tail
+        B->>M: {playback_done, played_through} when the streaming player has drained, the count of audio chunks received
+        M->>M: honor the signal only when played_through covers every relayed chunk, then end draining at max(floor, min(ceiling, signal)), then the mic-resume tail
         M-->>B: {state: listening}
     end
     Note over RN,SP: no usable summary (no tag, a malformed tag, an empty region): the WHOLE answer is synthesized AFTER the LLM stream ends, the phase-1 ordered flow
@@ -593,7 +593,7 @@ read from the **stored** chat when the run starts (a blank, absent or non-string
 on the ticket and never a request field), as the history's sole system message and for voice runs only, so typed turns in the
 same thread are untouched. The prompt asks the model to open each answer with one short summary wrapped in
 `<speak lang="...">...</speak>`, in the language the user is speaking, and to put the detail after the tag. The gateway never
-relies on that: no tag, a malformed tag or an empty region speaks the **whole answer** after the LLM finishes (the phase-1
+relies on that: no tag, a self-closing `<speak/>` (stripped, it opens no region), a malformed tag or an empty region speaks the **whole answer** after the LLM finishes (the phase-1
 ordered flow), an unclosed region speaks what it captured, and a tag problem is never an error turn. *Scanning.* A scanner
 sits in the run's LLM SSE loop and strips the tags from every content delta **before** it is buffered or fanned out, so the
 `answer_delta` preview, the run's text, the stored turn and the next turn's LLM history never carry markup (a tag split across
@@ -606,10 +606,10 @@ summary's audio is held like any audio until the window closes, which now happen
 the grace has elapsed, or at the commit. `answer_done` goes out at that first audio event, so `answer_delta` frames of the
 detail can still follow it (the portal appends them regardless). *One commit joins both legs.* The run joins the speech leg
 when the LLM stream ends and commits **once**, through the same compare-and-swap that arbitrates it against a cancel: the full
-clean text, the summary's audio and the summary text as the stored turn's `spoken_summary`, which the portal renders as a
-collapsed, replayable block above the detail ([Data Model](reference/data-model.md)). `audio_done` and `draining` follow
+clean text, the summary's audio and the summary text as the stored turn's `spoken_summary`, with its rune offset in the full text as `spoken_summary_start`; the portal renders it as a
+collapsed, replayable block above the detail and cuts the body out by that offset ([Data Model](reference/data-model.md)). `audio_done` and `draining` follow
 that commit, so the mic stays gated from the window's close through the commit and then the drain (the drain's floor still
-counts from the first audio chunk, and the summary's audio is relayed early, so the client's one `playback_done` can arrive while the session is still `speaking`: the machine remembers it whenever it arrives and clears it on every relayed audio chunk, so only a signal with no audio relayed after it (the genuine end of audio) ends the drain at the floor instead of the 30 s ceiling, and the floor still always clamps it,
+counts from the first audio chunk, and the summary's audio is relayed early, so the client's one `playback_done` can arrive while the session is still `speaking`: the machine remembers it whenever it arrives and clears it on every relayed audio chunk, and honors it only when its `played_through` (the client's count of audio chunks received) covers every chunk relayed, so a stale gap signal that lands after the last chunk is ignored and only the genuine end of audio ends the drain at the floor instead of the 30 s ceiling; a signal without the counter takes the remembered-signal path, and the floor still always clamps it,
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). *Degrading.* An LLM failure
 **before** the closing tag fires no speech and stores nothing (phase 1). An LLM failure **after** it commits the turn with
 what exists (the summary, its audio and the cut-off detail), and a speech failure commits the **text** turn with no audio; in

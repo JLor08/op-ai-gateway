@@ -9797,7 +9797,7 @@ feature rides the schema-free chat document and the speech request's existing to
 - **(b) A `<speak lang>` stream scanner in the voice run's LLM loop.** The scanner (`voice_speak_scanner.go`, used by
   `runVoiceLLM`) watches the content deltas for the first `<speak …>` open tag and its `</speak>`. The tag name is
   case-insensitive, `lang` may be quoted or bare, a tag may span any number of token boundaries, and only the bytes of a
-  tag it is still parsing are held back; `<speaker>`, `<b>`, `a < b` and `List<String>` pass through as text. A tag that is
+  tag it is still parsing are held back; `<speaker>`, `<b>`, `a < b` and `List<String>` pass through as text. A self-closing `<speak/>` (also `<speak />` or `<speak lang="..."/>`) is stripped but opens no region, so it falls back to speaking the whole answer. A tag that is
   not complete within 512 bytes is plain text, so a stray `<speak ` cannot stall the published stream. Only the **first**
   region is the summary: a later `<speak>` tag is stripped but its text stays in the answer (several regions are phase 3).
   The scanner sits on the **publish path** as well as the speech path: every content delta is tag-stripped **before** it is
@@ -9829,15 +9829,17 @@ feature rides the schema-free chat document and the speech request's existing to
   fallback speaks with none. The code is passed **verbatim** (`de-DE` is not turned into `de`: which spellings a model
   honours is the model's business), and it replaces whatever language the ticket carried for the spoken summary. The
   default prompt also tells the model to use the user's language, so a mismatch is rare, and it can never fail the turn.
-- **(e) One stored turn, a `spoken_summary` key, a collapsed replayable block.** The assistant turn is still **one** turn
+- **(e) One stored turn, a `spoken_summary` key with its offset, a collapsed replayable block.** The assistant turn is still **one** turn
   whose `content` parts are `[text, audio_url…]` with `text` the **full** clean answer (summary and detail, no markup);
-  new beside them is a top-level string `spoken_summary`, the spoken region's text, written only when audio was committed
-  with it and omitted otherwise (the no-tag fallback, a failed speech leg, every typed turn). It is metadata only: it is
+  new beside them is a top-level string `spoken_summary`, the spoken region's text, and a top-level integer
+  `spoken_summary_start`, the summary's rune (code point) offset within the full text, both written only when audio was
+  committed with the summary and omitted otherwise (the no-tag fallback, a failed speech leg, every typed turn). It is metadata only: it is
   never sent to an LLM. The portal renders a turn that carries one as a **collapsed `<details>` block** (the label *Spoken
   summary*), like the reasoning block, whose summary line holds the turn's audio player (so play replays the stored audio
   and expanding reads the text), or the not-stored placeholder when the audio was removed by retention; the answer body
-  below it is the stored text with the first occurrence of the summary cut out (if it cannot be found the whole text is
-  shown, never less). The block is **collapsed when there is a detail body and expanded when there is none** (a short
+  below it is the stored text with the summary's span cut out **by that offset**, exact even when the same words also appear
+  before the tag (a turn committed before the offset existed falls back to the first occurrence of the summary, and if it
+  cannot be found the whole text is shown, never less). The block is **collapsed when there is a detail body and expanded when there is none** (a short
   answer's text is visible without a click). A turn with no `spoken_summary` renders exactly as in phase 1, the live
   preview has no block (it appears when the thread is reloaded at `audio_done`), and Copy still copies the whole answer.
 - **(f) Scope.** Exactly one spoken region per answer; several regions, spoken one after another (#315), barge-in
@@ -9860,9 +9862,12 @@ feature rides the schema-free chat document and the speech request's existing to
   end-of-audio signal survives and ends the drain at the **floor** instead of waiting out the 30 s ceiling, while a
   mid-stream gap signal (the player's queue emptying between two chunks when the TTS runs slower than real time) is
   invalidated by the next chunk, so the mic never re-opens while audio is still being relayed. The floor always clamps: a
-  too-early or forged signal can never re-open the mic before the audio's real-time duration. The accepted residual is
-  bounded and floor-clamped: a stale gap signal still in flight that lands after the next chunk was relayed, with no later
-  chunk, can end the drain at the floor; closing it needs a client sequence or ack
+  too-early or forged signal can never re-open the mic before the audio's real-time duration. Clearing on relay alone
+  leaves a stale gap signal that was already in flight and lands after the last chunk was relayed, so the client also
+  sends an optional `played_through` on `playback_done` (its count of audio chunks received this turn, #322) and the
+  server honors the signal only when `played_through` is at least the chunks it relayed: a smaller count is ignored (the
+  drain then waits for a matching signal or the ceiling, the mic still gated), and a missing or `null` counter takes the
+  remembered-signal path above, so an older client is not regressed; clear-on-relay stays as the secondary guard
   ([Runtime View §6.1.6](06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts),
   [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **A voice run's stored `ttftMs` is now the text leg's time to its first LLM token.** In phase 1 the ordered LLM-then-TTS

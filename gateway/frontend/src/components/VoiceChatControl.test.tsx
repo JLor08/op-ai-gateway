@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { VoiceChatControl, type VoiceChatControlProps } from './VoiceChatControl';
 import { messages } from '../i18n';
 import type { ModelOption } from '../api';
+import { DEFAULT_VOICE_SYSTEM_PROMPT } from './chat/ChatStore';
 import type {
   VoiceChatApi,
   VoiceChatModels,
@@ -663,5 +664,66 @@ describe('VoiceChatControl system prompt field', () => {
     });
 
     expect(promptField()).toBeEnabled();
+  });
+
+  // The prompt is the one free-text field of the control: a paste of a whole document would be
+  // carried into every run of the conversation, so the field is bounded.
+  it('bounds the length of the prompt', () => {
+    renderControl(makeVoice());
+
+    expect(promptField()).toHaveAttribute('maxlength', '4000');
+  });
+
+  describe('reset to default', () => {
+    const resetButton = () => screen.getByRole('button', { name: t.chatVoiceSystemPromptReset });
+
+    it('puts the built-in prompt back into the field', () => {
+      const systemPrompt = makePromptChoice('Be terse.');
+      renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+
+      fireEvent.click(resetButton());
+
+      expect(systemPrompt.set).toHaveBeenCalledTimes(1);
+      expect(systemPrompt.set).toHaveBeenCalledWith(DEFAULT_VOICE_SYSTEM_PROMPT);
+    });
+
+    it('is open for an emptied field too: the default is what the empty field means, spelled out', () => {
+      const systemPrompt = makePromptChoice('');
+      renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+
+      expect(resetButton()).toBeEnabled();
+      fireEvent.click(resetButton());
+
+      expect(systemPrompt.set).toHaveBeenCalledWith(DEFAULT_VOICE_SYSTEM_PROMPT);
+    });
+
+    it('is closed while the field already holds the built-in prompt: there is nothing to reset', () => {
+      renderControl(makeVoice(), {
+        models: makeModels({ systemPrompt: makePromptChoice(DEFAULT_VOICE_SYSTEM_PROMPT) }),
+      });
+
+      expect(resetButton()).toBeDisabled();
+    });
+
+    it('is closed while the conversation is live, like the field it resets', () => {
+      const systemPrompt = makePromptChoice('Be terse.');
+      const models = makeModels({ systemPrompt });
+      const { update } = renderControl(makeVoice({ state: 'listening' }), { models });
+      expect(resetButton()).toBeDisabled();
+
+      fireEvent.click(resetButton());
+      expect(systemPrompt.set).not.toHaveBeenCalled();
+
+      update(makeVoice({ state: 'off' }));
+      expect(resetButton()).toBeEnabled();
+    });
+
+    it('is open before the gateway has said which models stream, like the field', () => {
+      renderControl(makeVoice(), {
+        models: makeModels({ ready: false, systemPrompt: makePromptChoice('Be terse.') }),
+      });
+
+      expect(resetButton()).toBeEnabled();
+    });
   });
 });

@@ -17,6 +17,8 @@ import (
 	"op-ai-gateway/internal/routing"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // This file is the Voice Chat run kind (spec 5.4, 6.1) -- "the one genuinely new
@@ -137,6 +139,7 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 	speechResult := make(chan voiceSpeechResult, 1)
 	var speechFired bool
 	var commitSummary string
+	var commitSummaryStart int
 
 	// onSummaryClosed fires the speech leg at </speak>. It runs in the LLM loop's OWN
 	// goroutine (runVoiceLLM calls it synchronously from the SSE loop), so reading the
@@ -153,6 +156,7 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 			return
 		}
 		commitSummary = trimmed
+		commitSummaryStart = trimmedSummaryStart(speak, summaryText)
 		speechFired = true
 		lang := s.voiceSpeechLanguage(ctx, owner, vp.tts.Model, summaryLang)
 		s.launchVoiceSpeech(ctx, owner, run, vp, trimmed, lang, speechResult)
@@ -173,6 +177,7 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 			speechFired = true
 			if trimmed != "" {
 				commitSummary = trimmed
+				commitSummaryStart = trimmedSummaryStart(speak, summaryText)
 				lang := s.voiceSpeechLanguage(ctx, owner, vp.tts.Model, summaryLang)
 				s.launchVoiceSpeech(ctx, owner, run, vp, trimmed, lang, speechResult)
 			} else {
@@ -193,11 +198,12 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 			return
 		}
 		s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
-			answer:      answer,
-			summary:     commitSummary,
-			audioParts:  res.parts,
-			streamed:    res.streamed,
-			finalStatus: "completed",
+			answer:       answer,
+			summary:      commitSummary,
+			summaryStart: commitSummaryStart,
+			audioParts:   res.parts,
+			streamed:     res.streamed,
+			finalStatus:  "completed",
 		})
 
 	case status == "error" && speechFired:
@@ -208,12 +214,13 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 		res := <-speechResult
 		if res.status == "completed" {
 			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
-				answer:      answer,
-				summary:     commitSummary,
-				audioParts:  res.parts,
-				streamed:    res.streamed,
-				finalStatus: "error",
-				finalErr:    errMsg,
+				answer:       answer,
+				summary:      commitSummary,
+				summaryStart: commitSummaryStart,
+				audioParts:   res.parts,
+				streamed:     res.streamed,
+				finalStatus:  "error",
+				finalErr:     errMsg,
 			})
 		} else {
 			s.finalizeVoiceCommit(ctx, owner, run, vp, voiceTurnOutcome{
@@ -282,17 +289,20 @@ func (s *Server) voiceSpeechLanguage(ctx context.Context, owner auth.Token, ttsM
 // voiceTurnOutcome is the committed voice turn's content and terminal status -- the payload
 // finalizeVoiceCommit hands commitVoiceTurn, grouping the inputs that describe the turn being
 // stored (as opposed to who/where it is stored for). answer is the FULL clean answer text
-// (summary and detail); summary is the spoken <speak> part ("" when there is none); audioParts
+// (summary and detail); summary is the spoken <speak> part ("" when there is none); summaryStart
+// is the rune offset of summary within answer (so the portal slices it out by position, meaningful
+// only with a non-empty summary); audioParts
 // are the synthesized audio parts (nil when none) and streamed records how they were delivered;
 // finalStatus/finalErr are the run's terminal outcome on a SUCCESSFUL store ("completed", or
 // "error" with a degrade code for a committed-but-degraded turn).
 type voiceTurnOutcome struct {
-	answer      string
-	summary     string
-	audioParts  json.RawMessage
-	streamed    bool
-	finalStatus string
-	finalErr    string
+	answer       string
+	summary      string
+	summaryStart int
+	audioParts   json.RawMessage
+	streamed     bool
+	finalStatus  string
+	finalErr     string
 }
 
 // finalizeVoiceCommit is the voice run's point of no return: ONE compare-and-swap
@@ -484,6 +494,21 @@ func voiceSpeechPrep(answer string, tts routing.Target, audio portal.ChatAudioSe
 	}
 }
 
+// trimmedSummaryStart is the rune offset of the TRIMMED spoken summary within the clean answer.
+// The scanner records where the <speak> region's content begins (SummaryStart), but the persisted
+// summary is TrimSpace'd, so the offset is advanced past the leading whitespace that trim removed
+// -- so answer_runes[offset : offset+len(summary)] is exactly the persisted summary, wherever the
+// region sits. raw is the untrimmed region text (speak.Summary()); the caller only reaches here
+// when it is non-empty, so SummaryStart is >= 0.
+func trimmedSummaryStart(speak *speakScanner, raw string) int {
+	start := speak.SummaryStart()
+	if start < 0 {
+		return start
+	}
+	leading := utf8.RuneCountInString(raw) - utf8.RuneCountInString(strings.TrimLeftFunc(raw, unicode.IsSpace))
+	return start + leading
+}
+
 // effectiveSpeechLanguage is the language the speech leg is actually asked to speak: the
 // per-answer language the LLM requested via <speak lang>, but only when the TTS model can
 // take a `language` parameter (modelAccepts, the cached portalSpeechLanguage lookup). A model
@@ -542,15 +567,16 @@ func (s *Server) commitVoiceTurn(ctx context.Context, owner auth.Token, run *Cha
 	// set it, retention then applies to the right turns. streamed records how it was delivered.
 	audioAnswer := len(outcome.audioParts) > 0
 	if err := s.Portal.CommitVoiceTurn(commitCtx, owner, run.ChatID, pendingText, portal.AssistantTurn{
-		Content:         outcome.answer,
-		ContentParts:    parts,
-		TTFTMs:          m.TTFTMs,
-		ReasoningMs:     m.ReasoningMs,
-		CharsPerSecond:  m.CharsPerSecond,
-		TokensPerSecond: m.TokensPerSecond,
-		SpokenSummary:   outcome.summary,
-		AudioAnswer:     audioAnswer,
-		AudioStreamed:   outcome.streamed && audioAnswer,
+		Content:            outcome.answer,
+		ContentParts:       parts,
+		TTFTMs:             m.TTFTMs,
+		ReasoningMs:        m.ReasoningMs,
+		CharsPerSecond:     m.CharsPerSecond,
+		TokensPerSecond:    m.TokensPerSecond,
+		SpokenSummary:      outcome.summary,
+		SpokenSummaryStart: outcome.summaryStart,
+		AudioAnswer:        audioAnswer,
+		AudioStreamed:      outcome.streamed && audioAnswer,
 	}, "complete"); err != nil {
 		// A failed store write withholds the parts from the terminal event (nothing
 		// was stored to render) and surfaces a mapped code, exactly as

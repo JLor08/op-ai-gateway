@@ -173,8 +173,17 @@ func resolveVoiceTiming(d VoiceTiming) voiceTiming {
 
 // voiceUpControl is the only text (non-binary) message the browser sends up: a control
 // frame whose Type is one of push_start, push_end, cancel, bye or playback_done.
+//
+// PlayedThrough rides a playback_done only: the client's monotonic count of the audio chunks it
+// has RECEIVED for the turn (it sends one on every audio-queue drain). The server honors a
+// playback_done as the end of audio only when this count accounts for all it has relayed, so a
+// stale gap signal that lost the relay/signal race cannot end the drain while later audio is still
+// playing (#322). It is additive and OPTIONAL: an older client omits it (a nil pointer), and the
+// server then falls back to the remembered-signal path so a non-reordering client is never
+// regressed.
 type voiceUpControl struct {
-	Type string `json:"type"`
+	Type          string `json:"type"`
+	PlayedThrough *int   `json:"played_through,omitempty"`
 }
 
 // parseVoiceUpControl decodes a text frame into a control message. It reports false for
@@ -642,16 +651,26 @@ type voiceMachine struct {
 	//   - firstAudioAt/relayedPlaybackDur accumulate as audio is relayed; playbackRateUnknown
 	//     drops the computed floor (the ceiling is then the only bound) for a chunk with no
 	//     usable rate (defensive).
-	//   - awaitingPlayback is set for the whole wait; playbackSignaled records that a playback_done
-	//     has been seen (at ANY time, including while still speaking in the concurrent flow) with
-	//     no chunk relayed since -- it is cleared per turn (beginAnswer) AND on every relayed chunk
-	//     (relayAudio), so only a signal after the last chunk, the genuine end of audio, survives
-	//     to end the drain; playbackFloorPassed latches when the floor elapses (then the timer is
-	//     re-armed to the ceiling to wait out a slow or absent signal).
+	//   - relayedAudioChunks is the count of audio_delta frames relayed this turn; it is the
+	//     server half of the #322 playout counter. A playback_done carries the client's own count
+	//     of audio RECEIVED (voiceUpControl.PlayedThrough); the server honors it as the end of
+	//     audio only when that count is >= relayedAudioChunks (it accounts for everything relayed).
+	//     A stale gap signal (count below) is not the end of audio and does not end the drain. This
+	//     closes the race the clear-on-relay heuristic alone cannot -- a stale signal that arrives
+	//     AFTER the last chunk was relayed, during the drain, when no further relay happens to
+	//     clear it.
+	//   - awaitingPlayback is set for the whole wait; playbackSignaled records that a VALID
+	//     playback_done (one whose counter accounts for all relayed audio, or a counter-less signal
+	//     from an older client) has been seen with no chunk relayed since -- it is cleared per turn
+	//     (beginAnswer) AND on every relayed chunk (relayAudio, belt-and-suspenders for the
+	//     counter-less path), so only a signal after the last chunk, the genuine end of audio,
+	//     survives to end the drain; playbackFloorPassed latches when the floor elapses (then the
+	//     timer is re-armed to the ceiling to wait out a slow or absent signal).
 	// All are reset per turn in beginAnswer. The mic STAYS discarded for the whole draining
 	// period regardless (micOpen); only the EXIT moment moves from relay-done to playout-done.
 	firstAudioAt        time.Time
 	relayedPlaybackDur  time.Duration
+	relayedAudioChunks  int
 	playbackRateUnknown bool
 	awaitingPlayback    bool
 	playbackSignaled    bool
@@ -875,10 +894,11 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 	case voiceUpPlaybackDone:
 		// The client's audio player reported its queue drained. In the concurrent flow this can
 		// arrive while still speaking (the summary drained before the detail committed) or in a
-		// gap between chunks, so it is REMEMBERED, not dropped -- a later relayed chunk clears it,
-		// so only the genuine end-of-audio signal survives to end the drain (spec 6.2). It still
-		// never shortens the drain below the floor.
-		m.onPlaybackDone()
+		// gap between chunks, so a VALID signal is REMEMBERED, not dropped -- only the genuine
+		// end-of-audio signal survives to end the drain (spec 6.2). The playout counter it carries
+		// (ctl.PlayedThrough) is what tells a genuine end from a stale gap signal; it still never
+		// shortens the drain below the floor.
+		m.onPlaybackDone(ctl.PlayedThrough)
 	}
 }
 
@@ -1049,7 +1069,8 @@ func (m *voiceMachine) beginAnswer() {
 	m.audioBuf = nil
 	// The playout-drain accounting is per turn: no audio relayed yet, no drain wait pending.
 	m.firstAudioAt, m.relayedPlaybackDur, m.playbackRateUnknown = time.Time{}, 0, false
-	m.resetPlaybackWait() // clears awaitingPlayback/playbackSignaled/playbackFloorPassed + the timer
+	m.relayedAudioChunks = 0 // the #322 playout counter starts fresh each turn (audio numbers from 0)
+	m.resetPlaybackWait()    // clears awaitingPlayback/playbackSignaled/playbackFloorPassed + the timer
 	m.setState(voiceStateThinking)
 	m.armGrace()
 	// Relay whatever the run buffered between launch and subscribe (usually nothing); the
@@ -1177,12 +1198,13 @@ func (m *voiceMachine) flushAudioBuf() {
 // fallback can bound the wait.
 func (m *voiceMachine) relayAudio(a runAudio) {
 	m.accountPlayback(a)
+	m.relayedAudioChunks++ // the server half of the #322 playout counter (see onPlaybackDone)
 	// A newly relayed chunk invalidates any end-of-playout signal remembered so far. The client's
 	// onEmpty fires on EVERY queue drain -- including an inter-chunk gap when TTS lags real time,
 	// not just the true end -- so a playback_done seen before this chunk was NOT the end of audio.
-	// Only a signal with no chunk relayed after it is the genuine end (in the concurrent flow the
-	// post-summary signal, since the detail is text-only), so clearing here keeps a mid-stream gap
-	// signal from ending the drain while later audio is still playing (half-duplex echo exposure).
+	// The playout counter (onPlaybackDone) is the primary guard against a stale gap signal; this
+	// clear-on-relay is belt-and-suspenders that keeps the counter-less (older-client) path correct
+	// for a non-reordering client by invalidating any signal remembered before this chunk.
 	m.playbackSignaled = false
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Rate: a.Rate, Audio: a.Data})
 }
@@ -1323,13 +1345,25 @@ func (m *voiceMachine) onPlaybackTimer() {
 // onPlaybackDone records the client's playout-done signal. In the concurrent flow the summary
 // audio drains -- and the client sends its single playback_done -- while the session is still
 // SPEAKING: the LLM detail is still streaming, so the drain wait has not begun (awaitingPlayback
-// is false). The signal is therefore remembered REGARDLESS of awaitingPlayback, to be honored
+// is false). A VALID signal is therefore remembered REGARDLESS of awaitingPlayback, to be honored
 // once the drain begins (beginPlaybackWait/onPlaybackFloorReached); the flag is cleared per turn
 // in beginAnswer, so a stray frame can never leak across turns. The signal only ENDS the drain
 // here when we are already awaiting playout AND the floor has passed (a slow client still
 // playing). It can NEVER shorten the drain below the floor -- that stays the server-authoritative
 // minimum, so a remembered early (or forged) signal is still clamped up to the floor.
-func (m *voiceMachine) onPlaybackDone() {
+//
+// playedThrough is the client's monotonic count of the audio it has RECEIVED (#322). The client
+// sends a playback_done on every queue drain -- including an inter-chunk gap and the summary's
+// drain mid-stream -- so a signal is the genuine end of audio only when it accounts for all the
+// server has relayed. A counter BELOW relayedAudioChunks is such a stale gap signal: it is ignored
+// (not remembered), so it cannot end the drain while later audio is still playing out. A counter
+// that accounts for everything relayed is valid. A nil counter is an older client: it falls back
+// to the remembered-signal path (clear-on-relay keeps that correct for a non-reordering client),
+// so the field stays additive and no old client regresses.
+func (m *voiceMachine) onPlaybackDone(playedThrough *int) {
+	if playedThrough != nil && *playedThrough < m.relayedAudioChunks {
+		return // a stale gap signal: it does not account for all relayed audio, so it is not the end
+	}
 	m.playbackSignaled = true
 	if m.awaitingPlayback && m.playbackFloorPassed {
 		m.endDrainWait()

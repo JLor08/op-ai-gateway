@@ -32,6 +32,8 @@
 //   - `audio_done` is the turn committed. The thread is reloaded from the gateway
 //     (`refreshThread`), which is how the stored user and assistant turns reach the chat (no
 //     frame carries a message id to fetch them by), and the preview is dropped for the next turn.
+//     A turn error reloads it as well: a turn can degrade after its commit (#322), and the error
+//     frame is then the only signal that the stored turn is there to be shown.
 //
 // Errors are the session's: a TURN that failed (a model errored, an admission was refused) leaves
 // the gateway at `idle` with the conversation still open, so it is surfaced, the preview is
@@ -93,8 +95,9 @@ export type VoiceChatDeps = {
   /**
    * Reloads the chat's thread from the gateway, which has committed the turn that has just ended:
    * the stored user and assistant turns replace what was shown of it. It reports its own failure
-   * (the hook ignores it), and it is called for every turn, so it may be called while the last
-   * reload is still on its way.
+   * (the hook ignores it), and it is called for every turn -- at its end (`audio_done`) and when
+   * it fails and the conversation goes on, which it may do after the commit -- so it may be
+   * called while the last reload is still on its way, and when nothing was committed.
    */
   refreshThread: (chatId: string) => void | Promise<void>;
   /** The page's speech playback, readied inside the user's gesture (a stand-in in tests). */
@@ -255,8 +258,17 @@ export function useVoiceChat(deps: VoiceChatDeps): VoiceChatApi {
           dispatch({ type: 'clear' });
           setError(failure);
           setState('idle');
+          // The turn may have failed AFTER the gateway committed it (the speech degraded once the
+          // answer was stored), and then this frame, not an audio_done, is all this tab is told:
+          // reload the thread as the end of a turn does, or the committed turn shows only when
+          // the chat is next opened. Harmless when nothing was committed. It does not touch the
+          // error just set (the reload reports its own failure as a toast of the store's).
+          refreshThread(target.chatId);
           return;
         }
+        // No reload here: this ends the conversation, and the store reloads the thread itself
+        // when a conversation ends in the middle of a turn (a second one would double the report
+        // of a failed reload).
         end(failure);
       },
     });

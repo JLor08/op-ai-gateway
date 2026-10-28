@@ -1980,8 +1980,11 @@ paths:
         `listening`. The browser sends BINARY frames of raw s16le mono 16 kHz PCM (about
         100 ms each, at most 1 MiB; a larger frame closes the socket 1009) and TEXT
         control frames `{"type":"push_start"}`, `{"type":"push_end"}`,
-        `{"type":"cancel"}`, `{"type":"playback_done"}` and `{"type":"bye"}`; anything
-        else is ignored. The gateway sends TEXT frames of JSON: `state` (`idle`,
+        `{"type":"cancel"}`, `{"type":"playback_done"}` (with an optional integer
+        `played_through`, the count of `audio_delta` frames the client has received for the
+        turn; the server honors the signal as the end of audio only when it covers every
+        frame relayed, and an absent or null count is accepted as before) and
+        `{"type":"bye"}`; anything else is ignored. The gateway sends TEXT frames of JSON: `state` (`idle`,
         `listening`, `thinking`, `speaking` or `draining`), `asr_partial` (the CURRENT
         chunk's provisional text, replace), `asr_final` (one chunk's final text, append),
         `answer_delta` (append), `answer_done` (provisional, before the commit),

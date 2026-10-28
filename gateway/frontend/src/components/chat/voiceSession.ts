@@ -361,6 +361,15 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   // player of its own and a playback state that starts again at `waiting`.
   let player: VoicePlayer | null = null;
   let playState: LiveState = { phase: 'waiting' };
+  // How many audio chunks the current answer has RECEIVED from the gateway (the #322 playout
+  // counter). It rides every playback_done as `played_through`, so the gateway can tell the genuine
+  // end-of-audio signal (it accounts for everything relayed) from a stale inter-chunk gap signal
+  // that lost the relay/signal race, and so never ends its half-duplex drain while later audio is
+  // still playing out here. It counts audio RECEIVED (not only played), which keeps the count
+  // aligned with what the gateway relayed when a drain follows (an unplayable trailing chunk has no
+  // drain signal after it, so there it can stay ahead of what was signalled), and resets at each
+  // answer's chunk 0.
+  let receivedChunks = 0;
 
   const setState = (next: VoiceSessionState) => {
     if (state === next) return;
@@ -432,10 +441,14 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   const fail = (message: string, detail: VoiceErrorDetail) =>
     finish('error', () => args.onError(message, detail));
 
-  // One text control frame, when there is a socket to send it on.
-  const sendControl = (type: 'push_start' | 'push_end' | 'cancel' | 'playback_done') => {
+  // One text control frame, when there is a socket to send it on. `extra` carries a control's
+  // optional fields (playback_done's played_through counter); the fields stay additive on the wire.
+  const sendControl = (
+    type: 'push_start' | 'push_end' | 'cancel' | 'playback_done',
+    extra?: Record<string, number>,
+  ) => {
     if (over || !open || !socket) return;
-    socket.send(JSON.stringify({ type }));
+    socket.send(JSON.stringify({ type, ...extra }));
   };
 
   // push_end, once everything captured has been sent: the last batch from the worklet (its
@@ -472,8 +485,15 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   const playChunk = (frame: Extract<VoiceDownFrame, { type: 'audio_delta' }>) => {
     if (!context) return;
     // Every answer's audio starts at chunk 0, and a turn that was cancelled sends no end: so a
-    // chunk 0 is a new answer, which replaces what is left of the last.
-    if (frame.seq === 0) stopPlayback();
+    // chunk 0 is a new answer, which replaces what is left of the last -- and restarts the playout
+    // counter, which numbers from the gateway's own per-turn reset.
+    if (frame.seq === 0) {
+      stopPlayback();
+      receivedChunks = 0;
+    }
+    // Count every chunk RECEIVED (before the play verdict): this keeps the count aligned with what
+    // the gateway relayed when a drain follows, even if a trailing chunk turns out unplayable.
+    receivedChunks += 1;
     const verdict = acceptChunk(playState, {
       seq: frame.seq,
       rate: frame.rate,
@@ -488,10 +508,11 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       // gateway playout is done so it can end its half-duplex drain at true playout-done, not
       // relay-done (spec 6.2). A fresh player is made per answer, so it is wired per player here.
       // onEmpty fires on EVERY queue drain -- including a gap between chunks when TTS lags real
-      // time, and while the gateway is still speaking in the concurrent flow -- so the gateway
-      // remembers the latest signal and clears it whenever it relays another chunk, keeping only
-      // the genuine end-of-audio signal, and never ends the drain below its server-side floor.
-      player.onEmpty = () => sendControl('playback_done');
+      // time, and while the gateway is still speaking in the concurrent flow. Each signal carries
+      // played_through, the count of audio received so far (#322), so the gateway honors only a
+      // signal that accounts for everything it relayed as the genuine end of audio, and never ends
+      // the drain on a stale gap signal (nor below its server-side floor).
+      player.onEmpty = () => sendControl('playback_done', { played_through: receivedChunks });
     }
     if (bytes === null || !player.push(bytes, frame.rate)) {
       playState = { phase: 'abandoned', reason: 'format' };

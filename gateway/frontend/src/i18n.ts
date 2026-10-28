@@ -427,6 +427,8 @@ const de = {
   chatVoiceSystemPrompt: 'System-Prompt für den Sprachchat',
   chatVoiceSystemPromptHint:
     'Gilt für die Antworten des Sprachchats in diesem Chat. Der Standard verlangt zuerst eine kurze gesprochene Zusammenfassung und danach die ausführliche Antwort als Text. Leer lassen, um den Standard zu verwenden.',
+  // Puts the built-in prompt back into the field (the thread then stores no prompt of its own).
+  chatVoiceSystemPromptReset: 'Auf Standard zurücksetzen',
   // The collapsed block of a spoken answer's summary (#314): the short part the user heard, kept
   // above the written detail and replayable from its own player. The label names what it holds.
   chatVoiceSpokenSummary: 'Gesprochene Zusammenfassung',
@@ -3858,6 +3860,7 @@ const en: PortalMessages = {
   chatVoiceSystemPrompt: 'Voice Chat system prompt',
   chatVoiceSystemPromptHint:
     'Used for the answers of Voice Chat in this chat. The default asks for a short spoken summary first, then the full answer as text. Leave empty to use the default.',
+  chatVoiceSystemPromptReset: 'Reset to default',
   chatVoiceSpokenSummary: 'Spoken summary',
   chatVoiceErrorAsrUnavailable:
     'The transcription model cannot be used for Voice Chat (unreachable, no live streaming, or it could not be started).',

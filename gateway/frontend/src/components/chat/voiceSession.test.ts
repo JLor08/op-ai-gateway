@@ -351,9 +351,34 @@ describe('createVoiceSession in a (fake) browser', () => {
     // Nothing is said until the player actually drains: relay-done is not playout-done.
     expect(socket.controls()).not.toContainEqual({ type: 'playback_done' });
 
-    // The player's queue plays out -> the session reports playout finished.
+    // The player's queue plays out -> the session reports playout finished, carrying the count of
+    // audio received so far (one chunk) as played_through (#322).
     player.onEmpty!();
-    expect(socket.controls()).toContainEqual({ type: 'playback_done' });
+    expect(socket.controls()).toContainEqual({ type: 'playback_done', played_through: 1 });
+  });
+
+  it('played_through on playback_done counts the audio received, matching what the gateway relayed, and resets per answer (#322)', async () => {
+    const run = start();
+    const socket = await connected(run);
+
+    // First answer: three chunks received. A gap signal mid-stream carries the count so far, and
+    // the end-of-audio signal accounts for all three -- which is how the gateway tells them apart.
+    socket.say(audioDelta(0));
+    socket.say(audioDelta(1));
+    const player1 = run.players[0];
+    player1.onEmpty!(); // a gap drain after two chunks
+    socket.say(audioDelta(2));
+    player1.onEmpty!(); // the genuine end, after all three
+    expect(socket.controls()).toContainEqual({ type: 'playback_done', played_through: 2 });
+    expect(socket.controls()).toContainEqual({ type: 'playback_done', played_through: 3 });
+
+    // The next answer is a new stream numbered from 0: the counter resets, so its signal is not
+    // inflated by the previous answer's chunks.
+    socket.say(audioDelta(0));
+    run.players[1].onEmpty!();
+    expect(socket.controls()).toContainEqual({ type: 'playback_done', played_through: 1 });
+
+    run.session.stop();
   });
 
   it('requests echo cancellation and noise suppression on the microphone (belt-and-suspenders under the half-duplex gate)', async () => {
