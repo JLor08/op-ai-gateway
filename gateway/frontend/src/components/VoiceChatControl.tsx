@@ -530,10 +530,10 @@ function VoiceModelPickers({
 // The thread's voice system prompt (#314) and the control that puts the built-in one back, in a
 // section that is COLLAPSED until its heading is clicked: the prompt is a tuning knob few
 // conversations touch, and a field of several lines would otherwise crowd the pickers and the
-// indicator that matter while talking. The same toggle as the thread's settings (Chat.tsx): a text
-// button with `aria-expanded`, the content not mounted while it is shut. The heading stays usable
-// while a conversation is on -- the field under it is what is closed then, so a run keeps the
-// prompt it began with, but it may still be read.
+// indicator that matter while talking. The same toggle as the speech thread's "Advanced" toggles
+// (Chat.tsx): a text button with `aria-expanded`, the content not mounted while it is shut. The
+// heading stays usable while a conversation is on -- the field under it is what is closed then, so
+// a run keeps the prompt it began with, but it may still be read.
 function VoicePromptSection({
   prompt,
   locked,

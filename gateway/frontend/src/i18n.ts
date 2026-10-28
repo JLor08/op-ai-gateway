@@ -406,8 +406,9 @@ const de = {
   chatVoiceAnswer: 'Antwort',
   // The controls of the answer while it is heard (#315): pause and resume it, mute its speakers
   // (it plays on, silently), or stop its speech (it is cut short and the microphone reopens).
-  // That is not cancelling the whole answer (chatVoiceCancel), so it is worded as what it does. Beside them the mute of the user's own microphone, which is there whenever the
-  // conversation is on, with the indicator's words for a user who is not heard because of it.
+  // That is not cancelling the whole answer (chatVoiceCancel), so it is worded as what it does.
+  // Beside them the mute of the user's own microphone, which is there whenever the conversation is
+  // on, with the indicator's words for a user who is not heard because of it.
   chatVoicePlayback: 'Wiedergabe der Antwort',
   chatVoicePause: 'Pausieren',
   chatVoiceResume: 'Fortsetzen',

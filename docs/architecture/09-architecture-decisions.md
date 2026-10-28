@@ -9705,7 +9705,8 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
   floor; a client that never does holds every turn's drain to the 30 s ceiling (or, for an answer whose audio is longer
   than the ceiling, to the floor). Intentional: it is the anti-wedge bound.
 - **`cancel` re-opens the mic from any state, and after the commit it does not undo the turn.** It is the user's immediate
-  stop and the one control that returns the session to `listening` from `speaking` or `draining`; the server relies on the
+  stop and the broader of the two controls that return the session to `listening` from `speaking` or `draining` (phase 3's
+  narrower `stop` is the other, and `cancel` alone works from every state); the server relies on the
   client to stop its own playback first. The run it cancels persists nothing only if it has not reached its commit: in
   `speaking` it can still be synthesizing, or since phase 2 still streaming the detail (then nothing is stored), but a
   session is in `draining` only after the commit,
@@ -9806,7 +9807,7 @@ phase-2 default prompt's wording. Each is marked where it appears.
   cannot plant for a single run. The voice run does not go through `PrepareChatRun`, which is why it reads the document
   itself; the `PrepareChatRun` lift of the whole `voice_chat` value ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate))
   already keeps the field across text sends. The portal shows a multi-line field beside the model and voice pickers, locked
-  while a conversation is on, and starting a conversation first flushes a pending edit to the stored thread (the autosave
+  while a conversation is on, and starting a conversation first fires a best-effort flush of a pending edit to the stored thread (the autosave
   is debounced, and the run would otherwise answer on the previous prompt). (**Superseded in part by
   [ADR-080](#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt) (e), (g):** since phase 3 the history's one system message is the thread's own system prompt, a blank line,
   then this voice prompt, so the thread prompt does reach a voice run, and the built-in default asks for several short sections
@@ -10013,9 +10014,11 @@ flag).
   alone, and each member is decoded on its own so a malformed sibling switches neither off. `voiceSystemPrompt`, inside
   `VoiceRunHistory`, reads it from the **stored** document, so there is **no ticket or endpoint change**, a client still cannot
   plant a prompt for one run, and typed runs in the same thread carry the thread prompt alone (a typed run's sampling
-  settings still do not reach a voice run). Starting a conversation flushes the portal's pending, debounced save of the thread
-  before the ticket is asked for, so an edit of either prompt made just before starting is stored when the first answer is
-  built. This supersedes ADR-079 (a)'s "sole system message" and its rejection of augmenting a thread prompt.
+  settings still do not reach a voice run). Starting a conversation fires a flush of the portal's pending, debounced save of the thread
+  before the ticket is asked for, so an edit of either prompt made just before starting is normally stored when the first
+  answer is built. The flush is **best-effort**: it is fire-and-forget (the start is synchronous, the save is not awaited), so
+  it is not guaranteed to have completed by the time the ticket is asked for or the first answer is built, and a failed save
+  leaves the thread dirty. This supersedes ADR-079 (a)'s "sole system message" and its rejection of augmenting a thread prompt.
 - **(f) Playback controls: three up-frames and a new down field, and two mutes that never reach the server.** `pause`,
   `resume` and `stop` ([HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket)) and
   `section` on `audio_delta`. **Pause and resume are server-tracked:** a pause stops the drain's timer and records the instant,

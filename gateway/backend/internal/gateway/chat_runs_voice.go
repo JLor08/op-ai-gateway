@@ -28,14 +28,17 @@ import (
 //
 //  1. runs a text completion on the chosen LLM over the chat's history plus the
 //     pending text, streaming its TAG-STRIPPED answer deltas to subscribers while a
-//     <speak> scanner (voice_speak_scanner.go) taps the stream (runVoiceLLM);
-//  2. the MOMENT the first <speak> region closes, fires the speech leg CONCURRENTLY on
-//     the captured summary while the LLM keeps streaming the detail (launchVoiceSpeech,
-//     generateSpeechTurn reused from the speech run); with no <speak> tag it falls back
-//     to synthesizing the whole answer after the LLM finishes (spec 5.5); and
-//  3. once BOTH legs are done, persists ONE assistant turn carrying the full clean
-//     answer text, its spoken summary and its audio blobs, ALONGSIDE the user turn, in
-//     a single commit (commitVoiceTurn).
+//     <speak> scanner (voice_speak_scanner.go) taps the stream (runVoiceLLM); the
+//     answer may carry N ordered <speak> regions (spec 5.1 Model A);
+//  2. the MOMENT each <speak> region closes, fires that section's speech leg
+//     CONCURRENTLY while the LLM keeps streaming (launchVoiceSpeech,
+//     generateSpeechTurn reused from the speech run). The legs synthesize
+//     concurrently, but their audio is relayed through ONE ordered relay
+//     (relayVoiceSections) in document order; with no <speak> tag it falls back to
+//     synthesizing the whole answer after the LLM finishes (spec 5.5); and
+//  3. JOINS the LLM and EVERY section leg, then persists ONE assistant turn carrying
+//     the full clean answer text, its spoken sections (text, span, audio) in document
+//     order, ALONGSIDE the user turn, in a single commit (commitVoiceTurn).
 //
 // THE load-bearing divergence from every other run: the user turn is NOT committed
 // up front (PrepareChatRun's shape). The run is speculative and cancellable via its
@@ -441,10 +444,11 @@ func (s *Server) finalizeVoiceCommit(ctx context.Context, owner auth.Token, run 
 // It also TAPS the stream with speak (voice_speak_scanner.go): each content delta is fed
 // through the scanner and only the clean, tag-stripped text is published (so run.content
 // buffers the clean full text and NO <speak> markup is fanned out to subscribers);
-// reasoning deltas are untouched. When the first <speak> region closes on a delta it calls
-// onRegionsClosed, which the caller uses to fire the speech leg concurrently. The returned
-// answer is the clean buffered text, including on an error path (a truncated answer the
-// error-after-close commit needs), with the scanner's tail flushed only on a clean finish.
+// reasoning deltas are untouched. Whenever a delta closes one or more <speak> regions it calls
+// onRegionsClosed, which the caller uses to fire each newly closed section's speech leg
+// concurrently, in document order. The returned answer is the clean buffered text, including on
+// an error path (a truncated answer the error-after-close commit needs), with the scanner's tail
+// flushed only on a clean finish.
 func (s *Server) runVoiceLLM(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, speak *speakScanner, onRegionsClosed func()) (answer, status, errMsg string) {
 	resp, status, errMsg := s.dispatchVoiceLLM(ctx, owner, run, prep)
 	if resp == nil {
@@ -494,8 +498,8 @@ func (s *Server) dispatchVoiceLLM(ctx context.Context, owner auth.Token, run *Ch
 
 // consumeVoiceLLMStream reads the voice run's LLM SSE to its end, tapping it through the
 // speak scanner (voice_speak_scanner.go): each content delta is tag-stripped before it is
-// published and buffered, and the first </speak> fires onRegionsClosed so the caller can
-// start the speech leg concurrently (see relayVoiceDelta). It measures the run's metrics but
+// published and buffered, and each </speak> fires onRegionsClosed so the caller can
+// start that section's speech leg concurrently (see relayVoiceDelta). It measures the run's metrics but
 // does NOT checkpoint or commit. It returns the clean buffered answer (including a truncated
 // one on an error path, the error-after-close commit needs it) and the run's terminal
 // (status, errMsg), flushing the scanner's held-back tail only on a clean finish.
@@ -588,26 +592,11 @@ func voiceSpeechPrep(answer string, tts routing.Target, audio portal.ChatAudioSe
 	}
 }
 
-// trimmedSummaryStart is the rune offset of the TRIMMED spoken summary within the clean answer.
-// The scanner records where the <speak> region's content begins (SummaryStart), but the persisted
-// summary is TrimSpace'd, so the offset is advanced past the leading whitespace that trim removed
-// -- so answer_runes[offset : offset+len(summary)] is exactly the persisted summary, wherever the
-// region sits. raw is the untrimmed region text (speak.Summary()); the caller only reaches here
-// when it is non-empty, so SummaryStart is >= 0.
-func trimmedSummaryStart(speak *speakScanner, raw string) int {
-	start := speak.SummaryStart()
-	if start < 0 {
-		return start
-	}
-	leading := utf8.RuneCountInString(raw) - utf8.RuneCountInString(strings.TrimLeftFunc(raw, unicode.IsSpace))
-	return start + leading
-}
-
-// trimmedRegionStart is trimmedSummaryStart generalized to ANY region: the rune offset of the
-// region's TRIMMED text within the clean answer. The scanner records where the region's content
-// begins (RuneOffset), but each spoken section is persisted TrimSpace'd, so the offset is advanced
-// past the leading whitespace the trim removed -- so answer_runes[start : start+runeLen(trimmed)] is
-// exactly the persisted section text, wherever the region sits in a multi-section answer.
+// trimmedRegionStart is the rune offset of a region's TRIMMED text within the clean answer. The
+// scanner records where the region's content begins (RuneOffset), but each spoken section is
+// persisted TrimSpace'd, so the offset is advanced past the leading whitespace the trim removed --
+// so answer_runes[start : start+runeLen(trimmed)] is exactly the persisted section text, wherever
+// the region sits in a multi-section answer.
 func trimmedRegionStart(r speakRegion) int {
 	leading := utf8.RuneCountInString(r.Text) - utf8.RuneCountInString(strings.TrimLeftFunc(r.Text, unicode.IsSpace))
 	return r.RuneOffset + leading

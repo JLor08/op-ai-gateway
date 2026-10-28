@@ -1033,7 +1033,7 @@ func TestVoiceRun_PersistsSpokenSummaryStart(t *testing.T) {
 }
 
 // The persisted summary is TrimSpace'd, but the scanner's offset points at the region's UNTRIMMED
-// content start, so trimmedSummaryStart advances it past the leading whitespace the trim removed
+// content start, so trimmedRegionStart advances it past the leading whitespace the trim removed
 // (#322). The existing end-to-end offset test has no whitespace inside the tag, so that adjustment
 // went unpinned -- and the portal's slice-equality fallback would silently mask a wrong one. Here
 // whitespace sits INSIDE the tag (and a multi-byte 'ä' and emoji before it), on both call sites of
@@ -1084,36 +1084,32 @@ func TestVoiceRun_SpokenSummaryStartSkipsWhitespaceInsideTheTag(t *testing.T) {
 	}
 }
 
-// trimmedSummaryStart in isolation: whatever Unicode whitespace the trim removes from the front of
+// trimmedRegionStart in isolation: whatever Unicode whitespace the trim removes from the front of
 // the region's content (spaces, tab, newline, NBSP, ideographic space), the advanced offset lands
-// on the first rune of the trimmed summary, counted in runes with multi-byte text before the tag.
-func TestTrimmedSummaryStartLandsOnTheTrimmedSummary(t *testing.T) {
+// on the first rune of the trimmed section text, counted in runes with multi-byte text before the tag.
+func TestTrimmedRegionStartLandsOnTheTrimmedText(t *testing.T) {
 	const in = "Käse 🧀 <speak lang=\"de\">\u00a0\u3000\t\n  Kurz. \u00a0</speak> Detail."
 	s := newSpeakScanner()
 	clean, _ := feedSpeakScanner(s, in)
-	raw, _ := s.Summary()
-	trimmed := strings.TrimSpace(raw)
+	regions := s.Regions()
+	if len(regions) != 1 {
+		t.Fatalf("regions = %d, want 1 (harness sanity)", len(regions))
+	}
+	trimmed := strings.TrimSpace(regions[0].Text)
 	if trimmed != "Kurz." {
-		t.Fatalf("trimmed summary = %q, want %q (harness sanity)", trimmed, "Kurz.")
+		t.Fatalf("trimmed section = %q, want %q (harness sanity)", trimmed, "Kurz.")
 	}
 
-	start := trimmedSummaryStart(s, raw)
+	start := trimmedRegionStart(regions[0])
 	runes := []rune(clean)
 	end := start + len([]rune(trimmed))
 	if end > len(runes) || string(runes[start:end]) != trimmed {
-		t.Fatalf("trimmedSummaryStart = %d: runes[%d:%d] of %q do not equal %q", start, start, end, clean, trimmed)
+		t.Fatalf("trimmedRegionStart = %d: runes[%d:%d] of %q do not equal %q", start, start, end, clean, trimmed)
 	}
 	// 7 runes of "Käse 🧀 " plus the 6 whitespace runes the trim removed (NBSP, U+3000, tab,
 	// newline, two spaces).
 	if want := 7 + 6; start != want {
-		t.Errorf("trimmedSummaryStart = %d, want %d", start, want)
-	}
-
-	// No region at all: the scanner's -1 passes through untouched.
-	none := newSpeakScanner()
-	feedSpeakScanner(none, "plain text")
-	if got := trimmedSummaryStart(none, ""); got != -1 {
-		t.Errorf("trimmedSummaryStart with no region = %d, want -1", got)
+		t.Errorf("trimmedRegionStart = %d, want %d", start, want)
 	}
 }
 

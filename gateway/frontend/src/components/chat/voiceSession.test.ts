@@ -1264,7 +1264,7 @@ describe('createVoiceSession in a (fake) browser', () => {
       vi.advanceTimersByTime(1);
 
       // Nothing audible is left, and the gateway is still `speaking`: the controls go, so that
-      // "Stop playback" is not offered for an answer whose audio is over.
+      // "Stop speaking" is not offered for an answer whose audio is over.
       expect(run.playing).toEqual([true, false]);
       // The session itself goes on, and says nothing more.
       expect(run.states.at(-1)).toBe('speaking');
