@@ -135,6 +135,8 @@ export type { LiveTranscription, LiveTranscriptionPhase } from './useLiveTranscr
 export { liveSessionRunning } from './liveSession';
 // The Voice Chat conversation's state, for the view that shows it (VoiceChatControl).
 export type { VoiceChatApi, VoiceChatError, VoiceChatState } from './useVoiceChat';
+// ...and the helper that turns one of those failures into its operator-facing detail line.
+export { errorDetailText } from './voiceErrorDetail';
 // ...and the pickers of its transcription and speech models, the speech model's voice and the
 // system prompt (voiceModels.ts).
 export type {

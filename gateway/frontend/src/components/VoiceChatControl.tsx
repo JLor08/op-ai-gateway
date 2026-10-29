@@ -23,8 +23,11 @@ import VolumeUpIcon from '@mui/icons-material/VolumeUp';
 import type { MessageKey, Translation } from './shared/types';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { SpeechVoiceField } from './SpeechVoiceField';
-import { DEFAULT_VOICE_SYSTEM_PROMPT, isCustomisedVoicePrompt } from './chat/ChatStore';
-import { errorDetailText } from './chat/voiceErrorDetail';
+import {
+  DEFAULT_VOICE_SYSTEM_PROMPT,
+  errorDetailText,
+  isCustomisedVoicePrompt,
+} from './chat/ChatStore';
 import type {
   VoiceChatApi,
   VoiceChatError,
