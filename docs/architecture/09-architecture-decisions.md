@@ -10065,8 +10065,9 @@ flag).
   `begin()` puts in the ticket and that the field shows, and never writes the thread. `voice` and `voice_model` are written
   **only by the user's own pick of a voice** (recorded with the model that speaks at that moment) **or of a speech model**
   (which clears both when another model would then speak), so opening a thread never saves it, never reorders the list and
-  never destroys a voice whose model is merely not the one speaking this time: the default voice is sent meanwhile and the
-  stored voice applies again when its model returns. The voice system-prompt field is a section collapsed by default, and,
+  never destroys a voice whose model is merely not the one speaking this time: `reconcileVoice` (above) decides the voice
+  sent meanwhile — the saved one when the speaking model lists it, otherwise the default — and the stored voice applies
+  again when its model returns. The voice system-prompt field is a section collapsed by default, and,
   since #326, its toggle carries an "Edited" marker while it is shut and the thread's prompt is its own (the trimmed prompt,
   non-blank and not the built-in one: what the portal would persist). The built-in default prompt now asks for short
   `<speak lang>` sections, one for a short answer and roughly one per key point for a long one, with the fuller detail as text
