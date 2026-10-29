@@ -458,6 +458,32 @@ const (
 	voiceTTSRetryBackoffMax  = 2 * time.Second
 )
 
+// The silence a voice turn plays over a gap in its speech (#339): while the next section's audio is
+// not there yet -- the leg is still queued, synthesizing its first chunk or backing off to retry --
+// the relay feeds the client zeroed PCM at the run's output rate, so the player stays continuously
+// fed and its playback-done debounce never reads the gap as the end of the turn.
+//
+// A silence frame is voiceSilenceFrameMs long and is sent every voiceSilenceCadence. The frame is
+// deliberately LONGER than the cadence: each frame is still playing when the next arrives, so the
+// player never runs dry between two of them. Both are well under the client's playing-gap tolerance
+// (PLAYING_GAP_MS, 1200 ms): a gap in the audio longer than that is taken for the end of the turn.
+const (
+	voiceSilenceFrameMs = 200
+	voiceSilenceCadence = 150 * time.Millisecond
+)
+
+// voiceSilencePCM is ms milliseconds of silence at sampleRate Hz in the format the speech stream is
+// played in: mono signed 16-bit little-endian PCM (speechStreamBytesPerFrame bytes a sample), all
+// zero. It is nil, not an empty slice, when there is nothing to make: a sample rate or a duration
+// that is not positive. A caller that has no rate (voiceRunOutputRate returned 0) therefore gets
+// "no silence" from here and needs no check of its own.
+func voiceSilencePCM(sampleRate, ms int) []byte {
+	if sampleRate <= 0 || ms <= 0 {
+		return nil
+	}
+	return make([]byte, sampleRate*ms/1000*speechStreamBytesPerFrame)
+}
+
 // voiceTTSRetryBackoff is how long a leg waits before retry number retry (0 is the first retry).
 func voiceTTSRetryBackoff(retry int) time.Duration {
 	d := voiceTTSRetryBackoffBase
@@ -553,6 +579,22 @@ func (s *Server) voiceSpeechLanguage(ctx context.Context, owner auth.Token, ttsM
 		accepts = false
 	}
 	return effectiveSpeechLanguage(requested, accepts)
+}
+
+// voiceRunOutputRate is the sample rate, in Hz, the run's silence is generated at (voiceSilencePCM):
+// the rate the TTS model streams at, which is the one the client is already playing the turn's audio
+// in. It is the same resolution each speech leg makes (portalSpeechStreamRate: the agreed, usable
+// cached output byte rate of every mapping the model could route to, already converted to a sample
+// rate), so silence and speech can never be at different rates. 0 means unknown -- the model is
+// not benchmarked, its mappings disagree, or the lookup failed -- and the caller then plays no
+// silence rather than silence at a guessed rate. Its error is swallowed as that 0, exactly as
+// voiceSpeechLanguage degrades a failed lookup: the keepalive is a nicety and must not fail a turn.
+func (s *Server) voiceRunOutputRate(ctx context.Context, owner auth.Token, model string) int {
+	rate, ok, err := s.portalSpeechStreamRate(ctx, owner, model)
+	if err != nil || !ok {
+		return 0
+	}
+	return rate
 }
 
 // sectionOutcome is one spoken section's committed result: its spoken text and rune span into the
