@@ -424,6 +424,12 @@ const defaultCreatePlayer = (ctx: PlaybackContext): VoicePlayer => new Streaming
 export const PLAYING_GAP_MS = 1200;
 
 /**
+ * What a failed turn reports when the gateway's `error` frame carries neither a message nor a code.
+ * It says no more than the failure's headline does, so the UI does not repeat it as a detail.
+ */
+export const VOICE_TURN_FALLBACK_MESSAGE = 'the voice turn could not be completed';
+
+/**
  * Start a Voice Chat session: the microphone, the connection, and the conversation.
  *
  * Call it from inside the user's gesture (the click that turns Voice Chat on): the AudioContext
@@ -765,7 +771,7 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
         // queued to play (a turn that degraded after some of its audio was sent down) is silenced,
         // as a cancel does: a later push_start would otherwise reopen the microphone into it.
         stopPlayback();
-        args.onError(frame.message || frame.code || 'the voice turn could not be completed', {
+        args.onError(frame.message || frame.code || VOICE_TURN_FALLBACK_MESSAGE, {
           kind: 'turn',
           ...(frame.code === undefined ? {} : { code: frame.code }),
         });
