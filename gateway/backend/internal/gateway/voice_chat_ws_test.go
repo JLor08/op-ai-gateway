@@ -500,7 +500,7 @@ func TestExtractVoiceTicket(t *testing.T) {
 }
 
 func TestParseVoiceUpControl(t *testing.T) {
-	valid := []string{"push_start", "push_end", "cancel", "bye"}
+	valid := []string{"push_start", "push_end", "cancel", "bye", "mic_mute", "mic_unmute"}
 	for _, typ := range valid {
 		got, ok := parseVoiceUpControl([]byte(fmt.Sprintf(`{"type":%q}`, typ)))
 		if !ok || got.Type != typ {

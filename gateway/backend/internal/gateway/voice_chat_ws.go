@@ -65,6 +65,12 @@ const (
 	voiceUpPause  = "pause"
 	voiceUpResume = "resume"
 	voiceUpStop   = "stop"
+	// voiceUpMicMute / voiceUpMicUnmute: the client's mic mute toggle (#335). While muted the browser
+	// sends NO PCM, so the machine takes over: it feeds the open ASR loopback silence of its own so
+	// audio.cpp's body idle timeout never fires, discards what the ASR says, and tears the loopback
+	// down after the operator's mute teardown. Unmute stops all of that.
+	voiceUpMicMute   = "mic_mute"
+	voiceUpMicUnmute = "mic_unmute"
 )
 
 // The down-frame types the gateway sends to the browser (spec 5.2).
@@ -156,15 +162,20 @@ type VoiceTiming struct {
 // muted mic has held muteTeardown the loopback is torn down, unless muteKeepalive says to hold
 // it indefinitely. Read them through muteTeardownAfter, which gives the pair one meaning even
 // for a hand-built timing that never went through resolveVoiceTiming.
+//
+// muteKeepaliveEvery is how often a muted loopback is fed a silence frame. Like playbackCap it is
+// not an operator knob, only an internal default and a test seam: a machine reads it through
+// muteKeepaliveInterval, so a zero value means voiceMuteKeepaliveInterval.
 type voiceTiming struct {
-	silenceTimeout    time.Duration
-	minUtterance      time.Duration
-	maxUtterance      time.Duration
-	micResumeTail     time.Duration
-	continuationGrace time.Duration
-	playbackCap       time.Duration
-	muteTeardown      time.Duration
-	muteKeepalive     bool
+	silenceTimeout     time.Duration
+	minUtterance       time.Duration
+	maxUtterance       time.Duration
+	micResumeTail      time.Duration
+	continuationGrace  time.Duration
+	playbackCap        time.Duration
+	muteTeardown       time.Duration
+	muteKeepalive      bool
+	muteKeepaliveEvery time.Duration
 }
 
 // defaultVoiceTiming is the built-in timing (the Voice*Ms defaults).
@@ -193,6 +204,15 @@ func (t voiceTiming) muteTeardownAfter() (after time.Duration, keepalive bool) {
 		return t.muteTeardown, false
 	}
 	return VoiceMuteTeardownMs * time.Millisecond, false
+}
+
+// muteKeepaliveInterval is how often a muted loopback is fed a silence frame: the resolved
+// timing's value, or voiceMuteKeepaliveInterval when unset (a bare/test timing).
+func (t voiceTiming) muteKeepaliveInterval() time.Duration {
+	if t.muteKeepaliveEvery > 0 {
+		return t.muteKeepaliveEvery
+	}
+	return voiceMuteKeepaliveInterval
 }
 
 // resolveVoiceTiming fills each non-positive field of d with its Voice*Ms default. New
@@ -224,7 +244,8 @@ func resolveVoiceTiming(d VoiceTiming) voiceTiming {
 }
 
 // voiceUpControl is the only text (non-binary) message the browser sends up: a control
-// frame whose Type is one of push_start, push_end, cancel, bye or playback_done.
+// frame whose Type is one of push_start, push_end, cancel, bye, playback_done, pause, resume,
+// stop, mic_mute or mic_unmute.
 //
 // PlayedThrough rides a playback_done only: the client's monotonic count of the audio chunks it
 // has RECEIVED for the turn (it sends one on every audio-queue drain). The server honors a
@@ -251,7 +272,7 @@ func parseVoiceUpControl(data []byte) (voiceUpControl, bool) {
 	}
 	switch c.Type {
 	case voiceUpPushStart, voiceUpPushEnd, voiceUpCancel, voiceUpBye, voiceUpPlaybackDone,
-		voiceUpPause, voiceUpResume, voiceUpStop:
+		voiceUpPause, voiceUpResume, voiceUpStop, voiceUpMicMute, voiceUpMicUnmute:
 		return c, true
 	}
 	return voiceUpControl{}, false
@@ -710,6 +731,18 @@ type voiceMachine struct {
 	finalizeTimer *time.Timer
 	finalizeC     <-chan time.Time
 
+	// Mute state (#335). micMuted latches on mic_mute and clears on mic_unmute; it outlives the
+	// loopback, so a loopback opened while muted is filtered like the one it replaced. The two
+	// mute timers exist only while a loopback does (armed with the mute or with the loopback,
+	// stopped by mic_unmute and by teardownTurn): the keepalive ticker feeds the loopback silence
+	// and the teardown timer ends it. Like every other timer they are run-loop state, held as the
+	// Timer/Ticker (to stop) plus their channel (nil when disarmed, which disables the select case).
+	micMuted          bool
+	muteKeepTicker    *time.Ticker
+	muteKeepC         <-chan time.Time
+	muteTeardownTimer *time.Timer
+	muteTeardownC     <-chan time.Time
+
 	// The in-flight speculative voice run and its subscription. run/runUnsub are nil when
 	// no run is open; runCh is nil whenever the run's events must not be selected (no run,
 	// or after the run went terminal), which disables its select case. The machine is the
@@ -803,6 +836,16 @@ type voiceMachine struct {
 	pausedAt time.Time
 }
 
+// voiceMuteKeepaliveInterval is the cadence of the silence a muted mic's loopback is fed (#335).
+// audio.cpp aborts a live request body that sees no data within its idle timeout (reproduced at
+// about 30s), so the gap between frames must stay comfortably under that; 10s leaves two missed
+// ticks of margin and costs one tiny frame per tick.
+const voiceMuteKeepaliveInterval = 10 * time.Second
+
+// voiceMuteSilenceFrameMs is the length of one keepalive silence frame, the cadence of the
+// browser's own ~100 ms PCM batches, so the loopback sees the same frame shape muted or not.
+const voiceMuteSilenceFrameMs = 100
+
 // voiceFinalizeTimeout bounds the wait for the clean final transcript after the pipe is
 // closed on a chunk end: audio.cpp emits transcript.text.done then [DONE] on end-of-input,
 // but a stalled or truncated upstream must not wedge the turn, so after this the machine
@@ -881,6 +924,10 @@ func (m *voiceMachine) run() {
 			m.onTailDone()
 		case <-m.finalizeC:
 			m.onFinalizeTimeout()
+		case <-m.muteKeepC:
+			m.onMuteKeepalive()
+		case <-m.muteTeardownC:
+			m.onMuteTeardown()
 		}
 	}
 }
@@ -933,6 +980,12 @@ func (m *voiceMachine) onPCM(frame []byte) {
 			return // no loopback target configured (a bare/test server): discard silently
 		}
 		m.openTurnLoopback()
+		if m.micMuted {
+			// A frame the read loop forwarded just before the mute can be taken just after it
+			// (PCM and controls ride separate channels). The loopback it opens is not an orphan:
+			// it gets the same keepalive and teardown as one that was open when the mute landed.
+			m.armMuteTimers()
+		}
 	}
 	m.feedLoopback(frame)
 }
@@ -1109,8 +1162,8 @@ func (m *voiceMachine) onLoopbackEvent(ev voiceLoopbackEvent) {
 	}
 }
 
-// onControl handles a push-to-talk / cancel control from the client. bye never reaches
-// here (the read loop closes on it).
+// onControl handles a push-to-talk / cancel / playback / mute control from the client. bye
+// never reaches here (the read loop closes on it).
 func (m *voiceMachine) onControl(ctl voiceUpControl) {
 	switch ctl.Type {
 	case voiceUpPushStart:
@@ -1159,6 +1212,10 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 		// Abandon the rest of the playout, reopen the mic, and let the commit/cancel CAS decide
 		// whether the audio produced so far is committed (spec 5.7 Q2).
 		m.onPlaybackStop()
+	case voiceUpMicMute:
+		m.onMicMute()
+	case voiceUpMicUnmute:
+		m.onMicUnmute()
 	}
 }
 
@@ -1167,6 +1224,14 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 // it is this chunk only, the client adds the finalized chunks of earlier pauses); done is
 // the clean final that ends the chunk; an error fails the turn.
 func (m *voiceMachine) onASREvent(ev asrEvent) {
+	// The mute guard (#335): while the mic is muted the loopback is fed only the gateway's own
+	// silence, so any transcript the ASR returns is invented (a model can hallucinate "Thank
+	// you." on silence) and must never reach pendingText, a chunk or the client -- nor, in the
+	// continuation window, cancel the speculative run through onVoiced's resume. An upstream
+	// error is not transcript text: it still fails the turn.
+	if m.micMuted && ev.kind != asrKindError {
+		return
+	}
 	switch ev.kind {
 	case asrKindDelta:
 		m.chunkText += ev.text
@@ -1910,6 +1975,93 @@ func (m *voiceMachine) emitError(code, message string) {
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownError, Code: code, Message: message})
 }
 
+// onMicMute handles mic_mute (#335): the browser has stopped sending PCM, so an open loopback
+// would starve and be aborted by audio.cpp's body idle timeout. From here the machine keeps it fed
+// itself (the keepalive ticker) and, unless the operator chose keepalive, ends it after the mute
+// teardown (the teardown timer). Both exist only for a loopback: with none open there is nothing to
+// keep alive or to free, and one that opens while muted arms them (onPCM). A repeated mic_mute is
+// ignored, so it cannot slide the teardown clock.
+func (m *voiceMachine) onMicMute() {
+	if m.micMuted {
+		return
+	}
+	m.micMuted = true
+	if m.turnCancel != nil {
+		m.armMuteTimers()
+	}
+}
+
+// onMicUnmute handles mic_unmute: the ASR output is trusted again and both mute timers stop. A
+// loopback still open simply resumes with the browser's real PCM; one the teardown already ended
+// reopens lazily on the next real frame (onPCM), as it always has after a teardown.
+func (m *voiceMachine) onMicUnmute() {
+	m.micMuted = false
+	m.stopMuteTimers()
+}
+
+// armMuteTimers starts the muted loopback's two timers: the keepalive ticker, and -- unless the
+// operator's keepalive says never to tear down while muted -- the one-shot teardown timer. Both
+// fire into run()'s select, so their handlers run on the run loop like every other event. Re-arming
+// replaces them, so a stale fire from an old timer is never selected.
+func (m *voiceMachine) armMuteTimers() {
+	m.stopMuteTimers()
+	m.muteKeepTicker = time.NewTicker(m.timing.muteKeepaliveInterval())
+	m.muteKeepC = m.muteKeepTicker.C
+	if after, keepalive := m.timing.muteTeardownAfter(); !keepalive {
+		m.muteTeardownTimer = time.NewTimer(after)
+		m.muteTeardownC = m.muteTeardownTimer.C
+	}
+}
+
+// onMuteKeepalive fires every voiceMuteKeepaliveInterval while a muted loopback is open: it feeds
+// it one zeroed frame through the same non-blocking queue real PCM uses (feedLoopback), so the body
+// the child is reading never goes idle. The frame is generated here, from the ticket's PCM shape,
+// so nothing audio-shaped ever has to leave the browser. A loopback whose feed already ended (a
+// chunk finalizing) drops the frame, and a tick with no loopback or no mute left has nothing to keep
+// alive: it disarms the timers instead.
+func (m *voiceMachine) onMuteKeepalive() {
+	if !m.micMuted || m.turnCancel == nil {
+		m.stopMuteTimers()
+		return
+	}
+	if frame := voiceSilenceFrame(m.claims); len(frame) > 0 {
+		m.feedLoopback(frame)
+	}
+}
+
+// onMuteTeardown fires once, when the mic has stayed muted for the operator's mute teardown: the
+// loopback is torn down through the one teardownTurn -- the same graceful path every other turn end
+// takes, which frees its admission, route slot and model pin and ends its metering -- with no error
+// frame and no state change, and the mute stays latched. The chunk in progress goes with it: it can
+// no longer finalize, and its half-built text must not seed the next loopback's chunk. A loopback
+// whose chunk is already finalizing is left alone, because finishChunk is about to tear it down
+// itself with the clean final.
+func (m *voiceMachine) onMuteTeardown() {
+	m.stopMuteTeardown()
+	if !m.micMuted || m.turnCancel == nil || m.finalizing {
+		return
+	}
+	m.teardownTurn()
+	m.resetChunk()
+	m.stopChunkTimers()
+}
+
+// voiceSilenceFrame builds one keepalive frame of zeroed PCM in the ticket's fixed shape
+// (voiceMuteSilenceFrameMs of silence, a whole number of sample frames). Zeroed samples are silence in
+// both formats live transcription takes (s16le and f32le). A ticket with no usable shape yields no
+// frame, which the caller does not feed.
+func voiceSilenceFrame(c voiceTicketClaims) []byte {
+	size, ok := bytesPerSample(c.SampleFormat)
+	if !ok {
+		size = speechStreamBytesPerFrame // the s16le the portal mints; a ticket never carries another
+	}
+	samples := c.SampleRate * voiceMuteSilenceFrameMs / 1000
+	if samples <= 0 || c.Channels <= 0 {
+		return nil
+	}
+	return make([]byte, samples*c.Channels*size)
+}
+
 // teardownTurn ends the current ASR loopback exactly once and joins its goroutines: cancel
 // the turn context (aborts an in-flight dial, the loopback request and the SSE read), unblock
 // the pipe from both sides (the transport's body read and a pump write parked on it), stop
@@ -1934,6 +2086,9 @@ func (m *voiceMachine) teardownTurn() {
 	m.drainLoopbackEvents()
 	m.pw, m.turnCtx, m.turnCancel, m.respBody, m.asrCh, m.loopCh = nil, nil, nil, nil, nil, nil
 	m.finalizing = false
+	// The mute timers serve a loopback, so they end with it (the mute itself stays latched: a
+	// loopback opened while still muted arms them again).
+	m.stopMuteTimers()
 }
 
 // drainLoopbackEvents closes the response body of any dial outcome still queued on loopCh.
@@ -2076,6 +2231,30 @@ func (m *voiceMachine) resetPlaybackWait() {
 	m.stopPlaybackWait()
 }
 
+// stopMuteKeepalive disarms the muted loopback's keepalive ticker.
+func (m *voiceMachine) stopMuteKeepalive() {
+	if m.muteKeepTicker != nil {
+		m.muteKeepTicker.Stop()
+		m.muteKeepTicker = nil
+	}
+	m.muteKeepC = nil
+}
+
+// stopMuteTeardown disarms the mute teardown timer.
+func (m *voiceMachine) stopMuteTeardown() {
+	if m.muteTeardownTimer != nil {
+		m.muteTeardownTimer.Stop()
+		m.muteTeardownTimer = nil
+	}
+	m.muteTeardownC = nil
+}
+
+// stopMuteTimers disarms both mute timers (an unmute, or the loopback they served ended).
+func (m *voiceMachine) stopMuteTimers() {
+	m.stopMuteKeepalive()
+	m.stopMuteTeardown()
+}
+
 // stopChunkTimers disarms the silence and max-utterance timers (a chunk ended).
 func (m *voiceMachine) stopChunkTimers() {
 	m.stopSilence()
@@ -2089,6 +2268,7 @@ func (m *voiceMachine) stopAllTimers() {
 	m.stopFinalize()
 	m.stopGrace()
 	m.stopPlaybackWait()
+	m.stopMuteTimers()
 }
 
 // voicePCMBytes is the exact decoded length of a standard (padded) base64 audio chunk, found
