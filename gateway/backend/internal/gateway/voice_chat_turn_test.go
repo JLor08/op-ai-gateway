@@ -1417,3 +1417,131 @@ func TestVoiceDrainMissingPlaybackCounterKeepsOldBehavior(t *testing.T) {
 	defer lcancel()
 	readVoiceUntilState(t, lctx, conn, voiceStateListening)
 }
+
+// TestVoiceConcurrentLoopbackFeed is the #331 regression: the per-turn ASR loopback must be fed
+// PCM CONCURRENTLY with its dial. The dial (openLiveLoopback -> Do) only returns once the ASR
+// child accepts the request, and on a cold model that accept is slow; audio.cpp starts its idle
+// timer at the accept, so a body that stays empty through the dial idle-times-out ("live
+// request body stalled"). The state-machine run loop used to block in that dial and write the
+// first frame only after it returned, so the child saw no PCM while its accept was pending.
+//
+// The child here HOLDS its accept (acceptGate) while still reading and recording its request
+// body -- a real child waiting on its model. The test sends frames, and asserts the child
+// received them BEFORE the accept (the gate is only released afterwards, by the test, so the
+// assertion is ordering, not a race against a sleep); then it releases the accept and proves
+// the held turn still completes with the full PCM stream delivered intact and in order.
+func TestVoiceConcurrentLoopbackFeed(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{"slow but whole"}
+	child.acceptGate = make(chan struct{})
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+	// Release the held accept on any exit (registered after the harness so it runs BEFORE the
+	// servers' Close, which would otherwise wait on the held request).
+	var release sync.Once
+	releaseAccept := func() { release.Do(func() { close(child.acceptGate) }) }
+	t.Cleanup(releaseAccept)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	// Distinct, recognisable frames: frame i is 320 bytes of value i+1, so ordering and loss
+	// show up in the child's recorded stream.
+	const frames, frameLen = 6, 320
+	var want []byte
+	for i := range frames {
+		frame := make([]byte, frameLen)
+		for j := range frame {
+			frame[j] = byte(i + 1)
+		}
+		want = append(want, frame...)
+		if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+			t.Fatalf("send pcm frame %d: %v", i, err)
+		}
+	}
+
+	// The accept is held, so any PCM the child has is PCM that crossed the loopback DURING the
+	// dial. On the serial code this never happens: the run loop is parked in Do.
+	deadline := time.Now().Add(5 * time.Second)
+	for child.bytesBeforeAccept() < len(want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the ASR child received %d of %d PCM bytes while its accept was held: the loopback is not fed concurrently with the dial (the run loop is blocked in the dial)", child.bytesBeforeAccept(), len(want))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Let the child accept: the turn must still complete, with its partials and the clean final.
+	releaseAccept()
+	readVoiceUntil(t, ctx, conn, voiceDownASRPartial)
+	sendVoiceControl(t, ctx, conn, "push_end")
+	if final := readVoiceUntil(t, ctx, conn, voiceDownASRFinal); final.Text != "slow but whole" {
+		t.Fatalf("asr_final = %q, want %q", final.Text, "slow but whole")
+	}
+
+	// The child's recorded body is exactly what the browser sent: nothing dropped or
+	// reordered, all of it before the accept.
+	var got []byte
+	for _, rd := range child.bodyReads() {
+		if !rd.beforeAccept {
+			t.Fatalf("a body read of %d bytes arrived AFTER the accept; all %d PCM bytes should have been fed during the dial", len(rd.data), len(want))
+		}
+		got = append(got, rd.data...)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("the child received %d PCM bytes in the wrong shape; want the %d bytes the browser sent, in order", len(got), len(want))
+	}
+}
+
+// TestVoiceLoopbackRefusalSurfacesCodeAndMessage pins the refusal path now that the dial
+// outcome reaches the machine as an event (#331) instead of a synchronous return: when /v1
+// REFUSES the per-turn loopback (here a 409 -- the ASR route lost its streaming verdict after
+// the ticket was minted, so the loopback's own re-gate refuses), the browser gets /v1's own
+// stable code and message as the error frame, the session goes idle, and it stays usable.
+func TestVoiceLoopbackRefusalSurfacesCodeAndMessage(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+	now := time.Now()
+	if err := h.srv.Routes.UpsertMappingCapabilities(context.Background(), "route-asr", []routing.CapabilityRow{
+		{Capability: routing.CapabilityTranscription, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+		{Capability: routing.CapabilityTranscriptionStreaming, Verdict: routing.CapabilityNo, Source: routing.CapabilitySourceAudioCppModels, CheckedAt: now},
+	}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	sendVoicePCM(t, ctx, conn, 320)
+
+	errFrame := readVoiceUntil(t, ctx, conn, voiceDownError)
+	if errFrame.Code != liveTranscriptionNotStreaming || errFrame.Message == "" {
+		t.Fatalf("error frame = code %q message %q, want /v1's code %q and its message", errFrame.Code, errFrame.Message, liveTranscriptionNotStreaming)
+	}
+	readVoiceUntilState(t, ctx, conn, voiceStateIdle)
+
+	// The refusal tore the turn down cleanly: the session is alive and re-engages on push_start.
+	sendVoiceControl(t, ctx, conn, "push_start")
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+}
+
+// TestVoiceLoopbackDialErrorFailsTurn pins the dial-error path: when the loopback dial itself
+// fails (the gateway's own address refuses the connection), the machine degrades with the
+// stable transcription.unavailable code and goes idle -- no retry, no hang.
+func TestVoiceLoopbackDialErrorFailsTurn(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+	h.srv.selfBaseURL = "http://127.0.0.1:1" // nothing listens: the dial is refused at connect
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	sendVoicePCM(t, ctx, conn, 320)
+
+	if errFrame := readVoiceUntil(t, ctx, conn, voiceDownError); errFrame.Code != "transcription.unavailable" {
+		t.Fatalf("error frame code = %q, want transcription.unavailable", errFrame.Code)
+	}
+	readVoiceUntilState(t, ctx, conn, voiceStateIdle)
+}
