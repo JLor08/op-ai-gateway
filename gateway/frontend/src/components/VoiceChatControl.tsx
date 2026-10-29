@@ -14,7 +14,7 @@ import VolumeUpIcon from '@mui/icons-material/VolumeUp';
 import type { MessageKey, Translation } from './shared/types';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { SpeechVoiceField } from './SpeechVoiceField';
-import { DEFAULT_VOICE_SYSTEM_PROMPT } from './chat/ChatStore';
+import { DEFAULT_VOICE_SYSTEM_PROMPT, isCustomisedVoicePrompt } from './chat/ChatStore';
 import type {
   VoiceChatApi,
   VoiceChatError,
@@ -129,6 +129,16 @@ function takesPushToTalk(state: VoiceChatState, micMuted: boolean): boolean {
 // sixth of it -- and only there so that a paste of a whole document is not carried into every run
 // of the conversation.
 const SYSTEM_PROMPT_MAX_LENGTH = 4000;
+
+// The height the playback controls' room keeps while they are not drawn (and while they are): that
+// of a row of small buttons, which is what they are -- one line (the 1.75 line height of their
+// 0.8125rem text) plus 2 x 3px of padding and 2 x 1px of border. The line is in rem, as the buttons'
+// text is, so the room follows a user's own default font size instead of being short of the row
+// (or taller than it) for anyone whose default is not 16px. The room is what keeps the controls
+// under it, and the error, from jumping each time an answer starts or ends; a row that wraps on a
+// very narrow screen is taller than this and does move them, which is the lesser evil against a
+// room that is never needed.
+const PLAYBACK_ROOM_MIN_HEIGHT = 'calc(1.75 * 0.8125rem + 8px)';
 
 // The states in which an answer is being prepared or spoken, which Stop abandons.
 function hasAnswerInFlight(state: VoiceChatState): boolean {
@@ -363,16 +373,30 @@ export function VoiceChatControl({
           >
             {t.chatVoicePushToTalk}
           </Button>
-          {/* The user's own microphone: there whenever the conversation is on, in every state. */}
+          {/* The user's own microphone: there whenever the conversation is on, in every state. Its
+              state is told by the label, which flips with it (and by the icon), and only by that:
+              an `aria-pressed` beside a label that changes would say it twice. */}
           <Button
             variant={voice.micMuted ? 'contained' : 'outlined'}
             size="small"
             color={voice.micMuted ? 'warning' : 'inherit'}
             startIcon={voice.micMuted ? <MicOffIcon /> : <MicIcon />}
-            aria-pressed={voice.micMuted}
             onClick={() => voice.toggleMicMute()}
           >
             {voice.micMuted ? t.chatVoiceMicUnmute : t.chatVoiceMicMute}
+          </Button>
+          {/* The answer's speakers, beside it: also there whenever the conversation is on (#326), so
+              it can be set ahead of the first answer and its state is seen between answers -- it
+              holds for every answer of the conversation, not only the one that is heard now. Its
+              state is told the same way as the microphone's, by its flipping label and icon. */}
+          <Button
+            variant={voice.muted ? 'contained' : 'outlined'}
+            size="small"
+            color={voice.muted ? 'warning' : 'inherit'}
+            startIcon={voice.muted ? <VolumeOffIcon /> : <VolumeUpIcon />}
+            onClick={() => voice.toggleMute()}
+          >
+            {voice.muted ? t.chatVoiceUnmute : t.chatVoiceMute}
           </Button>
           {hasAnswerInFlight(state) && (
             <Button variant="outlined" size="small" color="inherit" onClick={() => voice.cancel()}>
@@ -382,7 +406,13 @@ export function VoiceChatControl({
         </Box>
       )}
 
-      {on && voice.audioPlaying && playsAnswer(state) && <PlaybackControls voice={voice} t={t} />}
+      {/* The room of the playback controls: there for as long as the conversation is on, whether or
+          not they are, so that they come and go inside it without moving anything around it. */}
+      {on && (
+        <Box data-testid="voice-playback-room" sx={{ minHeight: PLAYBACK_ROOM_MIN_HEIGHT }}>
+          {voice.audioPlaying && playsAnswer(state) && <PlaybackControls voice={voice} t={t} />}
+        </Box>
+      )}
 
       {error && (
         <Alert
@@ -404,11 +434,13 @@ export function VoiceChatControl({
   );
 }
 
-// The controls of the answer while it is heard (#315): pause and resume it, mute its speakers,
-// and stop the playback. It is only drawn while audio is being heard (`audioPlaying`), so a pause
-// is never offered before the first chunk or in the gateway's tail after the audio is over, where
-// it would do nothing. Stop is `stopSpeaking`: it cuts the answer short and the conversation goes
-// on -- `stop` ends the conversation, and Cancel (beside push-to-talk) abandons the turn.
+// The controls of the answer while it is heard (#315): pause and resume it, and stop the playback.
+// They are only drawn while audio is being heard (`audioPlaying`), so a pause is never offered
+// before the first chunk or in the gateway's tail after the audio is over, where it would do
+// nothing -- in a room that is kept for them (see the control). The mute of the answer's speakers is
+// not one of them: it is beside the microphone's, whenever the conversation is on (#326). Stop is
+// `stopSpeaking`: it cuts the answer short and the conversation goes on -- `stop` ends the
+// conversation, and Cancel (beside push-to-talk) abandons the turn.
 function PlaybackControls({ voice, t }: Readonly<{ voice: VoiceChatApi; t: Translation }>) {
   return (
     <Box
@@ -435,15 +467,6 @@ function PlaybackControls({ voice, t }: Readonly<{ voice: VoiceChatApi; t: Trans
           {t.chatVoicePause}
         </Button>
       )}
-      <Button
-        variant="outlined"
-        size="small"
-        startIcon={voice.muted ? <VolumeOffIcon /> : <VolumeUpIcon />}
-        aria-pressed={voice.muted}
-        onClick={() => voice.toggleMute()}
-      >
-        {voice.muted ? t.chatVoiceUnmute : t.chatVoiceMute}
-      </Button>
       <Button
         variant="outlined"
         size="small"
@@ -533,7 +556,12 @@ function VoiceModelPickers({
 // indicator that matter while talking. The same toggle as the speech thread's "Advanced" toggles
 // (Chat.tsx): a text button with `aria-expanded`, the content not mounted while it is shut. The
 // heading stays usable while a conversation is on -- the field under it is what is closed then, so
-// a run keeps the prompt it began with, but it may still be read.
+// a run keeps the prompt it began with, but it may still be read. While the section is shut and the
+// prompt is the thread's own (isCustomisedVoicePrompt, the rule the store saves by), the heading
+// carries a small "edited" marker (#326): the edit would otherwise be invisible. It is decorative
+// (aria-hidden, so it does not change the toggle's name) and the toggle is DESCRIBED by it, so a
+// screen reader says it too; open, the field is on screen and the marker is gone, so it does not
+// come and go while the user types.
 function VoicePromptSection({
   prompt,
   locked,
@@ -541,6 +569,8 @@ function VoicePromptSection({
 }: Readonly<{ prompt: VoicePromptChoice; locked: boolean; t: Translation }>) {
   const [open, setOpen] = useState(false);
   const regionId = useId();
+  const editedId = useId();
+  const showEdited = !open && isCustomisedVoicePrompt(prompt.value);
   return (
     <Box sx={{ display: 'grid', gap: 0.75 }}>
       <Button
@@ -548,10 +578,32 @@ function VoicePromptSection({
         size="small"
         aria-expanded={open}
         aria-controls={open ? regionId : undefined}
+        aria-describedby={showEdited ? editedId : undefined}
         onClick={() => setOpen((wasOpen) => !wasOpen)}
         sx={{ justifySelf: 'start' }}
       >
         {t.chatVoiceSystemPrompt}
+        {showEdited && (
+          <Box
+            component="span"
+            id={editedId}
+            aria-hidden
+            sx={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 0.5,
+              ml: 1,
+              color: 'text.secondary',
+              fontSize: 'caption.fontSize',
+            }}
+          >
+            <Box
+              component="span"
+              sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: 'warning.main' }}
+            />
+            {t.chatVoiceSystemPromptEdited}
+          </Box>
+        )}
       </Button>
       {open && (
         <Box id={regionId} sx={{ display: 'grid', gap: 0.75 }}>

@@ -8554,6 +8554,124 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         });
       });
 
+      // The automatic pick is HELD once made (#326): a model that merely becomes loaded in the
+      // background -- the catalogue refreshes -- does not take it over from the one the
+      // conversation is set up with (a voice is chosen for that one); only that model's leaving the
+      // models that stream moves it, to a fresh pick (the loaded model, else the first). The pick is
+      // held per chat, and a leg the user picks for holds none: it is picked afresh when the user
+      // returns it to automatic.
+      describe('a stable automatic pick', () => {
+        const ttsB = audioModel('tts-b', { speech: true });
+        const stickyModels = [...pickerModels, ttsB];
+        const loaded = (ids: string[], models = pickerModels) =>
+          models.map((option) => (ids.includes(option.id) ? { ...option, loaded: true } : option));
+        const without = (models: ModelOption[], ...ids: string[]) =>
+          models.filter((option) => !ids.includes(option.id));
+
+        it('holds the automatic model of each leg when another one becomes loaded', async () => {
+          const { rerenderWithModels } = await renderPickers();
+          expect(text('voice-asr-used')).toBe('asr-a');
+          expect(text('voice-tts-used')).toBe('tts-a');
+
+          rerenderWithModels(loaded(['asr-b', 'tts-clone']));
+
+          expect(text('voice-asr-used')).toBe('asr-a');
+          expect(text('voice-tts-used')).toBe('tts-a');
+          // The picker still shows "automatic": the held model is not a pick of the user's.
+          expect(text('voice-asr-pick')).toBe('');
+          click('voice-start');
+          expect(voiceSessions[0].args).toMatchObject({ asrModel: 'asr-a', ttsModel: 'tts-a' });
+        });
+
+        it('holds it across several refreshes of the catalogue, too', async () => {
+          const { rerenderWithModels } = await renderPickers();
+
+          rerenderWithModels(loaded(['tts-clone']));
+          rerenderWithModels(loaded(['tts-a', 'tts-clone']));
+          rerenderWithModels(loaded([]));
+          rerenderWithModels(loaded(['tts-clone']));
+
+          expect(text('voice-tts-used')).toBe('tts-a');
+        });
+
+        it('moves a leg to a fresh pick (the loaded model) once the held model stops streaming', async () => {
+          const { rerenderWithModels } = await renderPickers([voiceThread()], stickyModels);
+          rerenderWithModels(loaded(['asr-b', 'tts-clone'], stickyModels));
+          expect(text('voice-asr-used')).toBe('asr-a');
+          expect(text('voice-tts-used')).toBe('tts-a');
+
+          // asr-a and tts-a leave the catalogue: the gateway is asked again, and neither
+          // streams any more. The fresh pick prefers the model that is loaded to the first.
+          rerenderWithModels(
+            without(loaded(['asr-b', 'tts-clone'], stickyModels), 'asr-a', 'tts-a'),
+          );
+
+          await waitFor(() => expect(text('voice-tts-used')).toBe('tts-clone'));
+          expect(text('voice-asr-used')).toBe('asr-b');
+          click('voice-start');
+          expect(voiceSessions[0].args).toMatchObject({ asrModel: 'asr-b', ttsModel: 'tts-clone' });
+        });
+
+        it('holds the NEW model from then on, too', async () => {
+          const { rerenderWithModels } = await renderPickers([voiceThread()], stickyModels);
+          rerenderWithModels(without(stickyModels, 'tts-a'));
+          await waitFor(() => expect(text('voice-tts-used')).toBe('tts-b'));
+
+          // tts-clone becoming loaded does not take tts-b's place either.
+          rerenderWithModels(loaded(['tts-clone'], without(stickyModels, 'tts-a')));
+
+          expect(text('voice-tts-used')).toBe('tts-b');
+        });
+
+        it('is held per chat: another chat starts from a fresh automatic pick, not the last one', async () => {
+          const { rerenderWithModels } = await renderPickers([
+            voiceThread('c1', earlier, {}, T2),
+            voiceThread('c2', earlier, {}, T1),
+          ]);
+          expect(text('active')).toBe('c1');
+          expect(text('voice-tts-used')).toBe('tts-a');
+          rerenderWithModels(loaded(['tts-clone']));
+          expect(text('voice-tts-used')).toBe('tts-a');
+
+          click('select-c2');
+          await waitFor(() => expect(text('active')).toBe('c2'));
+
+          // c2 has no pick of its own to hold: the loaded model is the fresh automatic one.
+          await waitFor(() => expect(text('voice-tts-used')).toBe('tts-clone'));
+          click('voice-start');
+          expect(voiceSessions[0].args).toMatchObject({ chatId: 'c2', ttsModel: 'tts-clone' });
+        });
+
+        // Not only when the pick of the chat switched to differs from the one of the chat left: two
+        // chats that resolve alike each hold their own.
+        it('holds the pick of the chat switched to as well, when it is the same as the one left behind', async () => {
+          const { rerenderWithModels } = await renderPickers([
+            voiceThread('c1', earlier, {}, T2),
+            voiceThread('c2', earlier, {}, T1),
+          ]);
+          click('select-c2');
+          await waitFor(() => expect(text('active')).toBe('c2'));
+          await waitFor(() => expect(text('voice-tts-used')).toBe('tts-a'));
+
+          rerenderWithModels(loaded(['tts-clone']));
+
+          expect(text('voice-tts-used')).toBe('tts-a');
+        });
+
+        it('picks afresh when the user returns a leg to automatic from a pick of their own', async () => {
+          const { rerenderWithModels } = await renderPickers();
+          expect(text('voice-asr-used')).toBe('asr-a');
+
+          click('voice-asr-asr-b');
+          rerenderWithModels(loaded(['asr-b']));
+          click('voice-asr-auto');
+
+          // Nothing was held under the pick: automatic is the loaded model, not asr-a again.
+          expect(text('voice-asr-pick')).toBe('');
+          expect(text('voice-asr-used')).toBe('asr-b');
+        });
+      });
+
       describe('a pick', () => {
         it('reaches the conversation, each leg on its own', async () => {
           await renderPickers();
@@ -8733,6 +8851,22 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           chatApi.spies.modelVoices.mockImplementation(async (name: string) => cached[name] ?? []);
         };
         const listed = () => JSON.parse(text('voice-voices') ?? '[]') as string[];
+        // The `voice_chat` of the last document the thread was saved with (undefined: none).
+        const lastSavedVoiceChat = () => {
+          const call = chatApi.spies.saveChat.mock.calls.at(-1);
+          const body = call?.[1] as { content: { settings: Record<string, unknown> } } | undefined;
+          return body?.content.settings.voice_chat;
+        };
+        // Waits for a save (the thread's are debounced) whose `voice_chat` is `expected`; a thread
+        // that was never saved does not count as one saved without it.
+        const savedVoiceChat = (expected: unknown) =>
+          waitFor(
+            () => {
+              expect(chatApi.spies.saveChat).toHaveBeenCalled();
+              expect(lastSavedVoiceChat()).toEqual(expected);
+            },
+            { timeout: 3000 },
+          );
 
         // renderPickers builds the api itself, so the voices are said BEFORE the provider asks.
         async function renderWithVoices(
@@ -8872,8 +9006,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           await waitFor(() => expect(text('voice-voice')).toBe(''));
         });
 
-        it('sends a saved voice the list does not hold: the list is an offer, not a constraint', async () => {
-          await renderWithVoices([voiceThread('c1', earlier, { voice_chat: { voice: 'typed' } })]);
+        // A voice that was chosen for the model that speaks is not judged by its list (#326): the
+        // list is an offer, not a constraint, so a name that was typed stays.
+        it('sends a saved voice the list does not hold, when it was chosen for the model that speaks', async () => {
+          await renderWithVoices([
+            voiceThread('c1', earlier, { voice_chat: { voice: 'typed', voice_model: 'tts-a' } }),
+          ]);
           await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
 
           expect(text('voice-voice')).toBe('typed');
@@ -8890,6 +9028,314 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           expect(listed()).toEqual([]);
           click('voice-start');
           expect(voiceSessions[0].args.voice).toBe('');
+        });
+
+        // The voice and the model it was chosen for go together (#326: `voiceModel`).
+        it('records the model that speaks as the one the voice was chosen for', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+
+          click('voice-say-marius');
+
+          await savedVoiceChat({ voice: 'marius', voice_model: 'tts-a' });
+        });
+
+        // A name that was typed and the model's list does not hold (zeta is tts-clone's voice) is
+        // honored for the model it was chosen for: only that attribution keeps the reconciliation
+        // from judging it by the list, as it would a voice from before the attribution existed.
+        it('keeps a voice that was typed for the model that speaks, though its list does not hold it', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+
+          click('voice-say-zeta');
+
+          await savedVoiceChat({ voice: 'zeta', voice_model: 'tts-a' });
+          expect(text('voice-voice')).toBe('zeta');
+          click('voice-start');
+          expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-a', voice: 'zeta' });
+        });
+
+        it('records the speech model of a pick, not the first one, for the voice chosen with it', async () => {
+          await renderWithVoices();
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(listed()).toEqual(['luna', 'zeta']));
+
+          click('voice-say-zeta');
+
+          await savedVoiceChat({
+            tts_model: 'tts-clone',
+            voice: 'zeta',
+            voice_model: 'tts-clone',
+          });
+        });
+
+        it('drops the voice together with the model it was chosen for when the voice is cleared', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+          click('voice-say-marius');
+          await savedVoiceChat({ voice: 'marius', voice_model: 'tts-a' });
+
+          click('voice-say-default');
+
+          await savedVoiceChat(undefined);
+        });
+
+        it('drops both when another speech model is chosen', async () => {
+          await renderWithVoices();
+          await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+          click('voice-say-marius');
+          await savedVoiceChat({ voice: 'marius', voice_model: 'tts-a' });
+
+          click('voice-tts-tts-clone');
+
+          await savedVoiceChat({ tts_model: 'tts-clone' });
+        });
+
+        // "Automatic" held steady is the model that speaks; a fresh automatic pick may be another
+        // (tts-clone has become loaded since). Choosing automatic when the picker already shows it
+        // changes nothing about the model, so it must not wipe the voice either.
+        describe.each<[string, Record<string, unknown>]>([
+          ['automatic', {}],
+          ['a pick that is gone (shown as automatic)', { tts_model: 'tts-gone' }],
+        ])('choosing automatic when the picker already shows it: %s', (_name, extra) => {
+          const marius = {
+            ...extra,
+            voice: 'marius',
+            voice_model: 'tts-a',
+          };
+          const loadedClone = pickerModels.map((option) =>
+            option.id === 'tts-clone' ? { ...option, loaded: true } : option,
+          );
+
+          it('keeps the voice, and the model that speaks', async () => {
+            const { rerenderWithModels } = await renderWithVoices([
+              voiceThread('c1', earlier, { voice_chat: marius }),
+            ]);
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            rerenderWithModels(loadedClone);
+            expect(text('voice-tts-used')).toBe('tts-a');
+
+            click('voice-tts-auto');
+
+            expect(text('voice-tts-used')).toBe('tts-a');
+            expect(text('voice-voice')).toBe('marius');
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-a', voice: 'marius' });
+          });
+        });
+
+        // A saved voice is reconciled with the model that speaks (#326): when ANOTHER model speaks
+        // than the one the voice was chosen for -- here tts-a, which leaves the catalogue while
+        // tts-b is the one left -- the voice is used if the new model lists it, and not (the default
+        // speaks) if it does not, judged only once the new model's voices are known. This decides
+        // what is SPOKEN, in memory: what is saved is the user's own pick, so a thread that is merely
+        // opened is never written, never reordered, and never loses a voice whose model is just not
+        // the one speaking this time.
+        describe('reconciled with the model that speaks', () => {
+          const ttsB = audioModel('tts-b', { speech: true });
+          const twoPlain = [voiceLlm, asrA, asrB, ttsA, ttsB];
+          const withoutTtsA = twoPlain.filter((option) => option.id !== 'tts-a');
+          const loadedClone = pickerModels.map((option) =>
+            option.id === 'tts-clone' ? { ...option, loaded: true } : option,
+          );
+          const attributed = { voice: 'marius', voice_model: 'tts-a' };
+
+          // The `voice_chat` the thread is saved with once the user next changes something (the
+          // system prompt here, which has nothing to do with the voice). A conversation holds the
+          // chat, so it is ended first.
+          async function storedVoiceChat() {
+            click('voice-stop');
+            fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+            return (await savedSettings()).voice_chat;
+          }
+          // Long enough for a save of the thread, which is debounced, to have happened.
+          const pastTheSaveDebounce = () =>
+            act(async () => {
+              await new Promise((resolve) => setTimeout(resolve, 1200));
+            });
+
+          // A thread whose voice was chosen for tts-a, speaking with it; then tts-a is gone and
+          // tts-b's voices are what `answer` says (a promise the test settles, or a list that is
+          // there).
+          async function switchAway(answer: (name: string) => Promise<string[]>) {
+            const view = await renderWithVoices(
+              [voiceThread('c1', earlier, { voice_chat: attributed })],
+              {},
+              twoPlain,
+            );
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            chatApi.spies.modelVoices.mockImplementation(answer);
+            view.rerenderWithModels(withoutTtsA);
+            await waitFor(() => expect(text('voice-tts-used')).toBe('tts-b'));
+            await waitFor(() => expect(chatApi.spies.modelVoices).toHaveBeenCalledWith('tts-b'));
+            return view;
+          }
+          const bHas =
+            (...voices: string[]) =>
+            async (name: string) =>
+              name === 'tts-b' ? voices : ['alba', 'marius'];
+
+          it('speaks the voice the new model lists, and saves nothing for it', async () => {
+            await switchAway(bHas('marius', 'nova'));
+
+            await waitFor(() => expect(listed()).toEqual(['marius', 'nova']));
+            expect(text('voice-voice')).toBe('marius');
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-b', voice: 'marius' });
+            // The saved voice is still the one chosen for tts-a.
+            expect(await storedVoiceChat()).toEqual(attributed);
+          });
+
+          it('speaks the default when the new model does not list the voice, and keeps it saved', async () => {
+            await switchAway(bHas('nova'));
+
+            await waitFor(() => expect(listed()).toEqual(['nova']));
+            expect(text('voice-voice')).toBe('');
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-b', voice: '' });
+            // Not erased: it is there again when tts-a is.
+            expect(await storedVoiceChat()).toEqual(attributed);
+          });
+
+          it('speaks the default while the new voices are loading, and judges the voice once they are there', async () => {
+            let release: (voices: string[]) => void = () => {};
+            await switchAway((name) =>
+              name === 'tts-b'
+                ? new Promise<string[]>((resolve) => {
+                    release = resolve;
+                  })
+                : Promise.resolve(['alba', 'marius']),
+            );
+
+            // Not known yet: nothing is sent for the voice.
+            expect(text('voice-voice')).toBe('');
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-b', voice: '' });
+            click('voice-stop');
+
+            await act(async () => release(['marius']));
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            click('voice-start');
+            expect(voiceSessions[1].args).toMatchObject({ ttsModel: 'tts-b', voice: 'marius' });
+            expect(await storedVoiceChat()).toEqual(attributed);
+          });
+
+          it('speaks the default for a list that could not be fetched, and keeps the voice saved', async () => {
+            await switchAway(async (name) => {
+              if (name === 'tts-b') throw new Error('boom');
+              return ['alba', 'marius'];
+            });
+
+            expect(text('voice-voice')).toBe('');
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-b', voice: '' });
+            expect(await storedVoiceChat()).toEqual(attributed);
+          });
+
+          // A thread saved before the attribution existed has a voice and no model for it: it is
+          // judged like a forced switch, against the model that speaks -- in memory, like that one.
+          it('speaks a voice saved with no attribution when the speaking model lists it', async () => {
+            await renderWithVoices([
+              voiceThread('c1', earlier, { voice_chat: { voice: 'marius' } }),
+            ]);
+
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-a', voice: 'marius' });
+            expect(await storedVoiceChat()).toEqual({ voice: 'marius' });
+          });
+
+          it('speaks the default for a voice saved with no attribution that the speaking model does not list', async () => {
+            await renderWithVoices([
+              voiceThread('c1', earlier, { voice_chat: { voice: 'typed' } }),
+            ]);
+
+            await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
+            expect(text('voice-voice')).toBe('');
+            click('voice-start');
+            expect(voiceSessions[0].args.voice).toBe('');
+            expect(await storedVoiceChat()).toEqual({ voice: 'typed' });
+          });
+
+          // Opening a thread is not an edit: it is never saved and never moves in the list, not
+          // even a thread whose voice has no attribution to the model that speaks.
+          it('does not save a thread, or move it in the list, because it was opened', async () => {
+            await renderWithVoices([
+              voiceThread('c1', earlier, {}, T),
+              voiceThread('c2', earlier, { voice_chat: { voice: 'marius' } }, T1),
+            ]);
+            expect(text('chats')).toBe('c1:c1|c2:c2');
+
+            click('select-c2');
+            await waitFor(() => expect(text('active')).toBe('c2'));
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            await pastTheSaveDebounce();
+
+            expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+            expect(text('chats')).toBe('c1:c1|c2:c2');
+          });
+
+          // The automatic pick starts from the model the saved voice was chosen for while that
+          // streams, so a thread reopens on it -- whatever is loaded -- and its voice is kept.
+          it('reopens on the model its voice was chosen for, though another one is loaded', async () => {
+            await renderWithVoices(
+              [voiceThread('c1', earlier, { voice_chat: attributed })],
+              {},
+              loadedClone,
+            );
+
+            expect(text('voice-tts-used')).toBe('tts-a');
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-a', voice: 'marius' });
+            await pastTheSaveDebounce();
+            expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+          });
+
+          it('reopens on it again when the chat is left and returned to, though another one has become loaded', async () => {
+            const { rerenderWithModels } = await renderWithVoices([
+              voiceThread('c1', earlier, { voice_chat: attributed }, T2),
+              voiceThread('c2', earlier, {}, T1),
+            ]);
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            rerenderWithModels(loadedClone);
+
+            click('select-c2');
+            await waitFor(() => expect(text('active')).toBe('c2'));
+            // c2 has no voice to go with a model: it starts from the loaded one.
+            await waitFor(() => expect(text('voice-tts-used')).toBe('tts-clone'));
+            click('select-c1');
+            await waitFor(() => expect(text('active')).toBe('c1'));
+
+            await waitFor(() => expect(text('voice-tts-used')).toBe('tts-a'));
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-a', voice: 'marius' });
+            await pastTheSaveDebounce();
+            expect(chatApi.spies.saveChat).not.toHaveBeenCalled();
+          });
+
+          // The model of the voice is gone: another speaks, in the default voice. The voice stays
+          // saved, so the thread is back on it, voice and all, once its model is there again.
+          it('speaks the default when the model of the voice is gone, and is back on it when it returns', async () => {
+            const { unmount } = await renderWithVoices(
+              [voiceThread('c1', earlier, { voice_chat: attributed })],
+              { 'tts-b': ['nova'] },
+              withoutTtsA,
+            );
+            expect(text('voice-tts-used')).toBe('tts-b');
+            await waitFor(() => expect(listed()).toEqual(['nova']));
+            expect(text('voice-voice')).toBe('');
+            click('voice-start');
+            expect(voiceSessions[0].args).toMatchObject({ ttsModel: 'tts-b', voice: '' });
+            expect(await storedVoiceChat()).toEqual(attributed);
+
+            unmount();
+            await renderWithVoices(chatApi.rows, {}, twoPlain);
+
+            expect(text('voice-tts-used')).toBe('tts-a');
+            await waitFor(() => expect(text('voice-voice')).toBe('marius'));
+          });
         });
 
         it('treats a failed lookup as no voices: the field stays hidden and the default speaks', async () => {
@@ -8935,12 +9381,15 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           await waitFor(() => expect(listed()).toEqual(['alba', 'marius']));
           click('voice-say-marius');
 
+          // The voice is written with the model it was chosen for (#326).
           const settings = await savedSettings();
-          expect(settings.voice_chat).toEqual({ voice: 'marius' });
+          expect(settings.voice_chat).toEqual({ voice: 'marius', voice_model: 'tts-a' });
 
           unmount();
           await renderWithVoices([
-            voiceThread('c1', earlier, { voice_chat: { tts_model: 'tts-clone', voice: 'zeta' } }),
+            voiceThread('c1', earlier, {
+              voice_chat: { tts_model: 'tts-clone', voice: 'zeta', voice_model: 'tts-clone' },
+            }),
           ]);
           await waitFor(() => expect(listed()).toEqual(['luna', 'zeta']));
 

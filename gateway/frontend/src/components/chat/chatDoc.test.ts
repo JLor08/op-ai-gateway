@@ -31,6 +31,7 @@ import {
   imageSetting,
   imageSettingsFrom,
   isChatBlobUrl,
+  isCustomisedVoicePrompt,
   isKeepLastInvalid,
   isMaskPart,
   keepLastAudioOf,
@@ -1777,6 +1778,7 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
       asrModel: '',
       ttsModel: '',
       voice: '',
+      voiceModel: '',
       systemPrompt: DEFAULT_VOICE_SYSTEM_PROMPT,
     });
     expect(voiceChatSettingsFrom(undefined)).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
@@ -1854,6 +1856,67 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
     expect(voiceChatSettingsFrom('x' as unknown as undefined)).toEqual(DEFAULT_VOICE_CHAT_SETTINGS);
   });
 
+  // The voice's model attribution (#326): the speech model the saved voice was chosen for, kept
+  // next to the voice so the reconciliation has a reference across reloads. It is meaningful only
+  // WITH a voice (a voice is a name the model offers), so it is written only alongside one, and a
+  // model with no voice, or a voice with no model, writes no `voice_model` -- a thread that never
+  // chose a voice stays byte-identical.
+  it('writes voice_model only when both a voice and a voice model are set', () => {
+    expect(voiceChatSetting('', settings({ voice: 'alba', voiceModel: 'tts-a' }))).toEqual({
+      voice_chat: { voice: 'alba', voice_model: 'tts-a' },
+    });
+    expect(
+      voiceChatSetting('', settings({ ttsModel: 'tts-a', voice: ' alba ', voiceModel: ' tts-a ' })),
+    ).toEqual({ voice_chat: { tts_model: 'tts-a', voice: 'alba', voice_model: 'tts-a' } });
+  });
+
+  it('writes no voice_model for a voice with no model, or a model with no voice', () => {
+    expect(voiceChatSetting('', settings({ voice: 'alba' }))).toEqual({
+      voice_chat: { voice: 'alba' },
+    });
+    expect(voiceChatSetting('', settings({ voice: 'alba', voiceModel: '   ' }))).toEqual({
+      voice_chat: { voice: 'alba' },
+    });
+    expect(voiceChatSetting('', settings({ voiceModel: 'tts-a' }))).toEqual({});
+    expect(voiceChatSetting('', settings({ voice: '  ', voiceModel: 'tts-a' }))).toEqual({});
+    expect(voiceChatSetting('', settings({ ttsModel: 'tts-a', voiceModel: 'tts-a' }))).toEqual({
+      voice_chat: { tts_model: 'tts-a' },
+    });
+  });
+
+  it('stays byte-identical when nothing is chosen, and never writes voice_model for another kind', () => {
+    expect(voiceChatSetting('', DEFAULT_VOICE_CHAT_SETTINGS)).toEqual({});
+    expect(voiceChatSetting('', settings({ voiceModel: '' }))).toEqual({});
+    expect(voiceChatSetting('speech', settings({ voice: 'alba', voiceModel: 'tts-a' }))).toEqual(
+      {},
+    );
+  });
+
+  it('reads voice_model back, and a missing or mistyped one as none', () => {
+    expect(voiceChatSettingsFrom({ voice: 'alba', voice_model: 'tts-a' })).toEqual(
+      settings({ voice: 'alba', voiceModel: 'tts-a' }),
+    );
+    expect(voiceChatSettingsFrom({ voice: 'alba' }).voiceModel).toBe('');
+    expect(voiceChatSettingsFrom({}).voiceModel).toBe('');
+    for (const stored of [3, null, true, {}, ['tts-a']] as const) {
+      expect(
+        voiceChatSettingsFrom({ voice: 'alba', voice_model: stored as unknown as string })
+          .voiceModel,
+        String(stored),
+      ).toBe('');
+    }
+  });
+
+  it('round-trips voice_model through voiceChatSettingsFrom', () => {
+    const wire = { tts_model: 'tts-a', voice: 'alba', voice_model: 'tts-a' };
+    expect(voiceChatSettingsFrom(wire)).toEqual(
+      settings({ ttsModel: 'tts-a', voice: 'alba', voiceModel: 'tts-a' }),
+    );
+    expect(voiceChatSetting('', voiceChatSettingsFrom(wire))).toEqual({ voice_chat: wire });
+    const s = settings({ asrModel: 'asr-b', voice: 'alba', voiceModel: 'tts-a' });
+    expect(voiceChatSettingsFrom(voiceChatSetting('', s).voice_chat)).toEqual(s);
+  });
+
   // The voice system prompt (#314) is the fourth member: the thread's own, pre-filled with the
   // built-in text for display. The built-in text is code-owned (the backend applies it when the
   // stored prompt is blank), so only a prompt that DIFFERS from it is written.
@@ -1881,6 +1944,24 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
     expect(
       voiceChatSetting('', settings({ systemPrompt: `${DEFAULT_VOICE_SYSTEM_PROMPT}\n` })),
     ).toEqual({});
+  });
+
+  // The control marks a prompt as customised by the same rule the store saves by: they cannot drift.
+  it('tells a customised prompt by the rule that decides whether it is saved', () => {
+    const prompts: ReadonlyArray<readonly [string, boolean]> = [
+      ['Be terse.', true],
+      ['  Be terse.\n', true],
+      [DEFAULT_VOICE_SYSTEM_PROMPT, false],
+      [`  ${DEFAULT_VOICE_SYSTEM_PROMPT}\n`, false],
+      [`${DEFAULT_VOICE_SYSTEM_PROMPT} Be terse.`, true],
+      ['', false],
+      ['  \n ', false],
+    ];
+    for (const [prompt, customised] of prompts) {
+      expect(isCustomisedVoicePrompt(prompt)).toBe(customised);
+      const saved = voiceChatSetting('', settings({ systemPrompt: prompt }));
+      expect(saved.voice_chat?.system_prompt !== undefined).toBe(customised);
+    }
   });
 
   it('writes the system prompt beside the other picks', () => {
@@ -1935,6 +2016,24 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
       messages: [],
     }).settings;
     expect(settings.voice_chat).toEqual({ asr_model: 'asr-b', tts_model: 'tts-a' });
+  });
+
+  it('keeps a stored voice and its voice_model across normalizeDoc (the full-replace PUT)', () => {
+    // The attribution is a member of the fragment buildDoc writes, so the next autosave does not
+    // erase it; one with no voice is not kept (it means nothing without one).
+    expect(
+      normalizeDoc({
+        settings: { model: 'llm', voice_chat: { voice: 'alba', voice_model: 'tts-a' } },
+        messages: [],
+      }).settings.voice_chat,
+    ).toEqual({ voice: 'alba', voice_model: 'tts-a' });
+    expect(
+      'voice_chat' in
+        normalizeDoc({
+          settings: { model: 'llm', voice_chat: { voice_model: 'tts-a' } },
+          messages: [],
+        }).settings,
+    ).toBe(false);
   });
 
   it('keeps a stored system prompt across normalizeDoc, and writes none for a default one', () => {

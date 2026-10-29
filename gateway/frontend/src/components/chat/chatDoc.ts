@@ -983,6 +983,16 @@ export const DEFAULT_VOICE_SYSTEM_PROMPT =
   'text is shown but not spoken. Do not put anything before the first `<speak>` ' +
   'tag.';
 
+// Whether a voice system prompt is the thread's OWN, not the built-in one: its TRIMMED text is not
+// blank and not DEFAULT_VOICE_SYSTEM_PROMPT. A blank prompt is the built-in one (the backend applies
+// it when none is stored), and so is the built-in prompt with whitespace around it. This is the one
+// rule for both what the store writes into the thread (voiceChatSetting) and what the control marks
+// as customised, so the two cannot drift apart.
+export function isCustomisedVoicePrompt(prompt: string): boolean {
+  const trimmed = prompt.trim();
+  return trimmed !== '' && trimmed !== DEFAULT_VOICE_SYSTEM_PROMPT;
+}
+
 // The Voice Chat picks of a thread (#317, #318, #314), as CONCRETE store state (every field
 // defined, unlike the all-optional wire ChatVoiceChatSettings): the live-transcription model that
 // hears the user, the streaming speech model that answers aloud, that speech model's voice, and
@@ -995,11 +1005,18 @@ export const DEFAULT_VOICE_SYSTEM_PROMPT =
 // models the gateway says stream, and falls back to the automatic one when it is gone), so a pick
 // that is gone for a while is kept, not erased. The prompt is different in kind: it is never
 // "unset" in the state but pre-filled with DEFAULT_VOICE_SYSTEM_PROMPT (what the field shows), and
-// is written only when it differs from that.
+// is written only when it differs from that. `voiceModel` is the attribution of the voice, not a
+// pick of its own: the speech model the saved `voice` was chosen for (#326), kept beside it so the
+// reconciliation of a voice against the model in use has a reference across reloads -- a voice is
+// a name one model offers, and the model it was chosen for says whether a later change of model
+// makes it stale. "" is "not recorded". With no voice it means nothing and is never written
+// (voiceChatSetting), but a lone stored `voice_model` is read as it is (voiceChatSettingsFrom), and
+// the readers ignore a `voiceModel` that has no voice next to it.
 export type VoiceChatSettings = {
   asrModel: string;
   ttsModel: string;
   voice: string;
+  voiceModel: string;
   systemPrompt: string;
 };
 
@@ -1007,6 +1024,7 @@ export const DEFAULT_VOICE_CHAT_SETTINGS: VoiceChatSettings = {
   asrModel: '',
   ttsModel: '',
   voice: '',
+  voiceModel: '',
   systemPrompt: DEFAULT_VOICE_SYSTEM_PROMPT,
 };
 
@@ -1022,8 +1040,9 @@ function isTextKind(kind: string | undefined): boolean {
 // every other kind), and ONLY when a pick is made -- so a thread that never chose stays
 // byte-identical, and the key is never an empty `voice_chat: {}`. A pick is trimmed, and a blank
 // one is no pick. The system prompt is trimmed too (the backend does the same), and is written
-// only when it is non-empty and differs from DEFAULT_VOICE_SYSTEM_PROMPT: a blank or unedited
-// prompt writes nothing, and the backend then applies the built-in one. Every member must be in
+// only when it is customised (isCustomisedVoicePrompt: non-empty and different from
+// DEFAULT_VOICE_SYSTEM_PROMPT): a blank or unedited prompt writes nothing, and the backend then
+// applies the built-in one. Every member must be in
 // this fragment: buildDoc full-replaces `settings` with no merge, so a member left out here is
 // erased by the next save. Both the document writer (buildDoc) and the state seeder
 // (normalizeDoc) go through this, so neither can give the key to another kind of thread from the
@@ -1040,10 +1059,11 @@ export function voiceChatSetting(
   if (tts) voiceChat.tts_model = tts;
   const voice = s.voice.trim();
   if (voice) voiceChat.voice = voice;
-  const systemPrompt = s.systemPrompt.trim();
-  if (systemPrompt && systemPrompt !== DEFAULT_VOICE_SYSTEM_PROMPT) {
-    voiceChat.system_prompt = systemPrompt;
-  }
+  // The voice's model attribution means something only next to a voice: a model with no voice
+  // (or a voice that was never attributed) writes no `voice_model`.
+  const voiceModel = s.voiceModel.trim();
+  if (voice && voiceModel) voiceChat.voice_model = voiceModel;
+  if (isCustomisedVoicePrompt(s.systemPrompt)) voiceChat.system_prompt = s.systemPrompt.trim();
   return Object.keys(voiceChat).length > 0 ? { voice_chat: voiceChat } : {};
 }
 
@@ -1059,6 +1079,8 @@ export function voiceChatSettingsFrom(
     asrModel: typeof s.asr_model === 'string' ? s.asr_model : DEFAULT_VOICE_CHAT_SETTINGS.asrModel,
     ttsModel: typeof s.tts_model === 'string' ? s.tts_model : DEFAULT_VOICE_CHAT_SETTINGS.ttsModel,
     voice: typeof s.voice === 'string' ? s.voice : DEFAULT_VOICE_CHAT_SETTINGS.voice,
+    voiceModel:
+      typeof s.voice_model === 'string' ? s.voice_model : DEFAULT_VOICE_CHAT_SETTINGS.voiceModel,
     systemPrompt:
       typeof s.system_prompt === 'string' && s.system_prompt.trim() !== ''
         ? s.system_prompt

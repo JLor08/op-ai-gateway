@@ -114,8 +114,9 @@ import {
 import { useVoiceChatVoices } from './useVoiceChatVoices';
 import {
   effectiveVoice,
+  reconcileVoice,
+  stickyVoiceLegsOf,
   thoseThatStream,
-  voiceLegsOf,
   voiceModelChoice,
   withTtsModel,
   type VoiceChatModels,
@@ -180,9 +181,11 @@ export {
 } from './chatDoc';
 
 // The built-in voice system prompt, which the Voice Chat control (VoiceChatControl.tsx, OUTSIDE
-// components/chat/) puts back into its prompt field on a reset and compares the field against.
-// Re-exported through this file like the image presets above (arch.test.ts enforces the boundary).
-export { DEFAULT_VOICE_SYSTEM_PROMPT } from './chatDoc';
+// components/chat/) puts back into its prompt field on a reset and compares the field against, and
+// the rule that tells a prompt of the thread's own from it (the one the store saves by, so the
+// control's "edited" marker and what is saved agree). Re-exported through this file like the image
+// presets above (arch.test.ts enforces the boundary).
+export { DEFAULT_VOICE_SYSTEM_PROMPT, isCustomisedVoicePrompt } from './chatDoc';
 
 // "No voices to offer": one shared empty list, so resetting the picker's voices on every
 // model change is a no-op render (React bails out on an identical state value) instead of
@@ -215,6 +218,10 @@ function presetCloneOffered(option: ModelOption | undefined): boolean {
 // unreachable, or no text model), no transcription model streams, no speech model streams, or the
 // gateway has not yet said which do. null when nothing does: the conversation can be offered.
 export type VoiceChatGap = 'llm' | 'asr' | 'tts' | 'checking';
+
+// No automatic pick held yet (stickyVoiceLegsOf): one shared value, so that the held legs of a chat
+// with none are the same object on every render.
+const NO_HELD_LEGS: VoiceLegs = { asr: '', tts: '' };
 
 function voiceGapOf(llmCapable: boolean, legs: VoiceLegs | null): VoiceChatGap | null {
   if (!llmCapable) return 'llm';
@@ -1004,11 +1011,38 @@ export function ChatStoreProvider({
     ].map((option) => option.id);
   }, [chatModels]);
   // The conversation's two legs: the thread's pick of each, or -- for a leg with no pick, or a
-  // pick that is no longer one of the models that stream -- the first model that does and is
-  // loaded, else the first that streams (the automatic pick), null until the gateway has said
-  // which stream (voiceModels.ts). The catalogue is what says which are loaded, the same flag the
-  // pickers' green dot shows, so the dot and the automatic pick agree.
-  const voiceLegs = voiceLegsOf(voiceStreaming, voiceSettings, chatModels);
+  // pick that is no longer one of the models that stream -- the automatic pick, null until the
+  // gateway has said which stream (voiceModels.ts). The automatic pick is made once: for the speech
+  // leg the model the thread's saved voice was chosen for, when it still streams (a thread reopens
+  // on the model of its voice); else the first model that streams and is loaded, else the first
+  // that streams: the catalogue is what says which are loaded, the same flag the pickers' green dot
+  // shows, so the dot and the pick agree when it is made. After that it is HELD (#326): a model
+  // that merely becomes loaded in the background does not take it over (a voice is chosen for the
+  // model that speaks), only its leaving the models that stream moves it. It is held for the open
+  // chat only -- another chat, even one that was open before, starts afresh -- and a leg under the
+  // user's own pick holds none.
+  // Held state, set while rendering (the documented way to derive state from a change of props):
+  // it is only ever the pick the leg would resolve to, so it is written when that changes.
+  const [voiceHeld, setVoiceHeld] = useState<{ chatId: string | null; legs: VoiceLegs }>({
+    chatId: null,
+    legs: NO_HELD_LEGS,
+  });
+  const heldVoiceLegs = voiceHeld.chatId === activeChatId ? voiceHeld.legs : NO_HELD_LEGS;
+  const resolvedVoiceLegs = stickyVoiceLegsOf(
+    voiceStreaming,
+    voiceSettings,
+    chatModels,
+    heldVoiceLegs,
+  );
+  const voiceLegs = resolvedVoiceLegs?.legs ?? null;
+  if (
+    resolvedVoiceLegs !== null &&
+    (voiceHeld.chatId !== activeChatId ||
+      voiceHeld.legs.asr !== resolvedVoiceLegs.held.asr ||
+      voiceHeld.legs.tts !== resolvedVoiceLegs.held.tts)
+  ) {
+    setVoiceHeld({ chatId: activeChatId, legs: resolvedVoiceLegs.held });
+  }
   const voiceChatGap = voiceGapOf(voiceLlmCapable, voiceLegs);
   const voiceChatCapable = voiceChatGap === null;
   const voiceChatOffered =
@@ -2368,14 +2402,32 @@ export function ChatStoreProvider({
   // (see effectiveVoice). Computed here, not written into the thread's settings: the pre-select
   // follows the model that offered it, so a model switch needs no clean-up, and only a voice the
   // user chose is saved.
+  //
+  // The voices are on offer only once they are known (`ready`): while they are being fetched, or
+  // could not be, the field is not shown and the model's own default speaks.
   const voiceTtsModel = voiceLegs?.tts ?? '';
-  const voiceTtsVoices = useVoiceChatVoices(apiRef, voiceTtsModel);
+  const voiceTtsList = useVoiceChatVoices(apiRef, voiceTtsModel);
+  const voiceTtsVoices = voiceTtsList.status === 'ready' ? voiceTtsList.voices : NO_VOICES;
+  // The saved voice, reconciled with the model that speaks (#326). A voice is one that the model it
+  // was chosen for (`voiceSettings.voiceModel`) offered; when ANOTHER model speaks -- the model it
+  // was chosen for no longer streams, or the thread predates the attribution -- the voice is kept if
+  // the model that speaks lists it and not used if not, and judged only once the list is known
+  // (reconcileVoice). This decides what is SPOKEN, in memory, from this render on (what a
+  // conversation is started with and what the field shows) and nothing else: the saved voice and
+  // its attribution are the user's, written only by their own pick of a voice or a speech model
+  // (setVoiceVoice, setVoiceTtsModel). Opening a thread therefore never saves it, never reorders the
+  // list, and never destroys a voice whose model is merely not the one speaking this time; it is
+  // there again when that model is (the automatic pick starts from it, see stickyVoiceLegsOf).
   const voiceVoice = effectiveVoice(
-    voiceSettings.voice,
+    reconcileVoice({
+      voice: voiceSettings.voice,
+      voiceModel: voiceSettings.voiceModel,
+      effectiveModel: voiceTtsModel,
+      voices: voiceTtsList,
+    }),
     voiceTtsVoices,
     presetCloneOffered(chatModels.find((option) => option.id === voiceTtsModel)),
   );
-
   const voiceChat = useVoiceChat({
     apiRef,
     activeChatId,
@@ -2419,7 +2471,8 @@ export function ChatStoreProvider({
   // the voice the user started with, the pickers are how they try others, and the switch stays
   // closed on a refusal until it is dismissed. (The pickers are closed while a conversation is on,
   // so a pick ends none in practice; one made anyway would end a conversation that is no longer
-  // the one it started as.) Choosing another speech model also drops the voice (withTtsModel).
+  // the one it started as.) Choosing another speech model also drops the voice, with the model it
+  // was chosen for (withTtsModel).
   const setVoiceAsrModel = useCallback(
     (asrModel: string) => {
       stopVoiceChat();
@@ -2431,18 +2484,35 @@ export function ChatStoreProvider({
   const setVoiceTtsModel = useCallback(
     (ttsModel: string) => {
       stopVoiceChat();
-      setVoiceSettings((current) =>
-        withTtsModel(current, ttsModel, voiceTtsStreaming ?? [], chatModels),
-      );
+      setVoiceSettings((current) => {
+        if (ttsModel === current.ttsModel) return current;
+        const streaming = voiceTtsStreaming ?? [];
+        // The pick as the picker shows it: one that is gone shows as automatic, as the automatic
+        // pick does. Between two of those the model that speaks is the same one (the automatic pick
+        // is held), whatever a fresh automatic pick would be now, so the voice stays.
+        const shown = (pick: string) => (streaming.includes(pick) ? pick : '');
+        if (shown(ttsModel) === shown(current.ttsModel)) return { ...current, ttsModel };
+        // Re-picking the model that already speaks (automatic -> explicit -> automatic) can clear
+        // the voice when another model is loaded by then: automatic resolves afresh to the loaded
+        // one, by the picker's "loaded preferred" contract, so another model speaks and the voice
+        // of the first must not follow. That is intended; the voice that is sent is never wrong.
+        return withTtsModel(current, ttsModel, voiceTtsModel, streaming, chatModels);
+      });
     },
-    [stopVoiceChat, voiceTtsStreaming, chatModels],
+    [stopVoiceChat, voiceTtsStreaming, voiceTtsModel, chatModels],
   );
+  // A voice goes together with the model it was chosen for (`voiceModel`, #326): the one that
+  // speaks now. No voice is no model for it.
   const setVoiceVoice = useCallback(
     (voice: string) => {
       stopVoiceChat();
-      setVoiceSettings((current) => ({ ...current, voice }));
+      setVoiceSettings((current) => ({
+        ...current,
+        voice,
+        voiceModel: voice.trim() === '' ? '' : voiceTtsModel,
+      }));
     },
-    [stopVoiceChat],
+    [stopVoiceChat, voiceTtsModel],
   );
   // The system prompt is not part of the ticket (the backend reads it from the stored thread when
   // a run starts), so editing it neither ends a conversation nor dismisses a refusal -- the

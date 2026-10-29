@@ -404,11 +404,11 @@ const de = {
   chatVoiceDismiss: 'Schließen',
   chatVoiceTranscript: 'Ihre Worte',
   chatVoiceAnswer: 'Antwort',
-  // The controls of the answer while it is heard (#315): pause and resume it, mute its speakers
-  // (it plays on, silently), or stop its speech (it is cut short and the microphone reopens).
-  // That is not cancelling the whole answer (chatVoiceCancel), so it is worded as what it does.
-  // Beside them the mute of the user's own microphone, which is there whenever the conversation is
-  // on, with the indicator's words for a user who is not heard because of it.
+  // The controls of the answer while it is heard (#315): pause and resume it, or stop its speech
+  // (it is cut short and the microphone reopens). That is not cancelling the whole answer
+  // (chatVoiceCancel), so it is worded as what it does. Beside push-to-talk, whenever the
+  // conversation is on, the two mutes: the user's own microphone, with the indicator's words for a
+  // user who is not heard because of it, and the answer's speakers (it plays on, silently; #326).
   chatVoicePlayback: 'Wiedergabe der Antwort',
   chatVoicePause: 'Pausieren',
   chatVoiceResume: 'Fortsetzen',
@@ -452,6 +452,11 @@ const de = {
     'Gilt für die Antworten des Sprachchats in diesem Chat. Dieser Prompt wird an den System-Prompt dieses Chats angehängt, der weiterhin Rolle und Kontext vorgibt. Der Standard verlangt kurze gesprochene Zusammenfassungen in Abschnitten (einen bei kurzen, mehrere bei langen Antworten) und die ausführliche Antwort als Text. Leer lassen, um den Standard zu verwenden.',
   // Puts the built-in prompt back into the field (the thread then stores no prompt of its own).
   chatVoiceSystemPromptReset: 'Auf Standard zurücksetzen',
+  // The marker on the collapsed toggle of that section while the thread's voice prompt is its own,
+  // not the built-in one (#326): the section is shut by default, so without it an edit would be
+  // invisible. Short, because it sits beside the toggle's label; a screen reader says it as the
+  // toggle's description.
+  chatVoiceSystemPromptEdited: 'Angepasst',
   // The collapsed block of a spoken answer's summary (#314): the short part the user heard, kept
   // above the written detail and replayable from its own player. The label names what it holds.
   chatVoiceSpokenSummary: 'Gesprochene Zusammenfassung',
@@ -3896,6 +3901,7 @@ const en: PortalMessages = {
   chatVoiceSystemPromptHint:
     "Used for the answers of Voice Chat in this chat. This prompt is appended to the chat's system prompt, which still sets the persona and context. The default asks for short spoken summaries in sections (one for a short answer, several for a long one) and the full answer as text. Leave empty to use the default.",
   chatVoiceSystemPromptReset: 'Reset to default',
+  chatVoiceSystemPromptEdited: 'Edited',
   chatVoiceSpokenSummary: 'Spoken summary',
   chatVoiceErrorAsrUnavailable:
     'The transcription model cannot be used for Voice Chat (unreachable, no live streaming, or it could not be started).',
