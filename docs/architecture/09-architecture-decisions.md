@@ -10072,19 +10072,23 @@ flag).
   section has not been launched, or has not streamed yet). The cadence timer restarts on every real chunk and every
   hand-over to the next leg, and real audio already waiting is delivered before a timer that fired, so silence never lands
   between chunks that arrive steadily, and the relay never ends on a trailing frame. **It reuses `audio_delta`:** a silence
-  frame is an ordinary frame (zeroed PCM as base64, `rate`, the one `seq`, and the `section` of the audio last relayed, none
-  before any), so there is **no new wire frame and no portal change**: the client plays zeros inaudibly and its playing-gap
+  frame is an ordinary frame (zeroed PCM as base64, `rate`, the one `seq`, and a `section` tag: the awaited leg's own section
+  before any audio has been relayed, the section of the audio last relayed once there is some and between legs), so there is
+  **no new wire frame and no portal change**: the client plays zeros inaudibly and its playing-gap
   timer re-arms on any frame. **The rate** is that of the last real chunk relayed; else, before any real audio (only the first
   section's pre-stream wait or retry), the run's output sample rate, resolved once at run start (`voiceRunOutputRate`, the
   cached `output_byte_rate` of [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
   returned as Hz); else **none, and no rate means no silence** (fail-open: today's behavior, the gap stays empty). The
   between-legs wait uses the last-seen rate only, so there is **no fill of the pre-first-audio "thinking" gap** (the model
-  still writing before its first region closes stays as quiet as before). **It is gated on the streaming regime:** when the
+  still writing before its first region closes stays as quiet as before). **The between-legs fill does not stop after the
+  last section:** the relay's feed of legs stays open until the LLM ends, so once audio has been relayed the wait continues,
+  silence and all, through the trailing non-spoken detail the model goes on writing; the client's queue never runs dry in
+  that window, so its `playing` state holds and the half-duplex mic gate stays shut until the turn's audio is over. **It is gated on the streaming regime:** when the
   run's speech streaming is opted out (`audio.Stream` false, the same opt-out `speechRunStreamRate` honors, read through
   one helper so the two cannot disagree) there is no live audio to keep alive and the relay emits no silence. **Always on, no
   operator knob.** **Accounting is consistent and safe by construction:** because silence is a normal `audio_delta` it counts
-  toward the client's `played_through` and extends the server's drain floor by its own playout time (a gap of about 1 s adds
-  about 1 s to the floor), identically on both ends, and, like any relayed chunk, clears a remembered playback-done signal;
+  toward the client's `played_through` and extends the server's drain floor by its own playout time (a 200 ms frame every 150 ms adds
+  about a third more than the gap it fills), identically on both ends, and, like any relayed chunk, clears a remembered playback-done signal;
   and the relay is fully joined (`relayWG.Wait()`) and the run detached **before** the drain wait begins, so silence cannot
   race the drain or end a turn early. **It is never stored and never billed:** the relay's sink and the leg's own
   keep-and-commit sink are independent, silence is published to the run only, and a stored clip or an `audio_second`
@@ -10146,7 +10150,9 @@ flag).
   ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), (b)). The portal draws pause/resume and "stop speaking"
   **only while audio is actually being heard**, from the first played chunk until the answer has played out: the queue running
   dry once the gateway has sent everything, or staying dry for 1.2 s while the gateway is still `speaking` (the last section is
-  over and the model goes on writing the detail; a later section's chunk would arrive well inside that window), and not in the
+  over and the model goes on writing the detail; a later section's chunk would arrive well inside that window; *amended by
+  issue #339:* only when the gateway is not filling that wait with gap silence, since silence keeps the queue from running dry
+  and the controls stay drawn through the detail wait, (b)), and not in the
   gateway's tail, where a pause would do nothing. *Amended by issue #326:* the **output mute is not one of them any more**: it
   sits beside the microphone mute and is drawn whenever the conversation is on, in any state and before the first answer, so
   it can be set ahead of it and its state is seen between answers; the playing-only group sits inside a room of constant height
@@ -10223,6 +10229,10 @@ flag).
   chunk's rate, and the client then falls back gracefully to the committed WAV (the same cache staleness
   `speechRunStreamRate` documents). Where no rate can be resolved, or streaming is opted out, there is no silence and the gap
   is as empty as it was before #339.
+  (4) **A long gap leaves a bounded trailing-silence backlog:** the silence frame (200 ms) is deliberately longer than the
+  cadence (150 ms), a margin that keeps the player continuously fed, so a long between-legs or trailing-detail wait queues
+  about a third of the gap as extra client-side silence, which plays out before the turn ends. Negligible for the default
+  retry budget and short detail tails, and bounded; a known trade-off of the margin.
   Retrying applies to the speech leg only, not to the LLM or ASR legs. Pinned by mock-backed tests (the gate's order and cap,
   the classification table, the backoff schedule, the relayed-audio guard, a retry that keeps its slot, a cancel in the
   backoff; for #339 the relay's gap fill and its rate sources, silence that is neither stored nor billed, and a turn that
