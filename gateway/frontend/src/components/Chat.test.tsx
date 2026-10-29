@@ -6144,13 +6144,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(session.resume).toHaveBeenCalledTimes(1);
       await act(async () => session.args.onPausedChange?.(false));
 
-      // The mute of the answer is the session's, and reads as pressed once it is on.
+      // The mute of the answer is the session's, and reads as unmute once it is on.
       press(t.chatVoiceMute);
       expect(session.setMuted).toHaveBeenLastCalledWith(true);
-      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toHaveAttribute(
-        'aria-pressed',
-        'true',
-      );
+      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toBeInTheDocument();
 
       // Stop cuts the answer short: not the end of the conversation.
       press(t.chatVoiceStopPlayback);
@@ -6176,18 +6173,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(screen.getByRole('button', { name: t.chatVoiceMute }));
 
       expect(session.setMuted).toHaveBeenLastCalledWith(true);
-      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toHaveAttribute(
-        'aria-pressed',
-        'true',
-      );
-      // It holds into the first answer: still pressed when the playback controls come.
+      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toBeInTheDocument();
+      // It holds into the first answer: still reads unmute when the playback controls come.
       await act(async () => session.args.onState('speaking'));
       await act(async () => session.args.onPlayingChange?.(true));
       expect(screen.getByRole('group', { name: t.chatVoicePlayback })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toHaveAttribute(
-        'aria-pressed',
-        'true',
-      );
+      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toBeInTheDocument();
     });
 
     it('mutes the microphone from the page: the session is told, push-to-talk closes and the indicator says so (#315)', async () => {

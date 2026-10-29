@@ -25,7 +25,7 @@ const t = messages.en;
 // that an empty one says nothing to a screen reader), and the height it keeps: that of a row of
 // small buttons, which is what the controls are.
 const PLAYBACK_ROOM = 'voice-playback-room';
-const PLAYBACK_ROOM_MIN_HEIGHT = '32px';
+const PLAYBACK_ROOM_MIN_HEIGHT = 'calc(1.75 * 0.8125rem + 8px)';
 
 // The hook's output, with every control a spy: this component only draws the conversation and
 // forwards the user's gestures (useVoiceChat.test.ts is about the conversation itself).
@@ -1119,7 +1119,8 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
           renderLocale(voice);
 
           expect(outputMute()).toBeEnabled();
-          expect(outputMute()).toHaveAttribute('aria-pressed', 'false');
+          // One signal of its state, the label: no aria-pressed beside it.
+          expect(outputMute()).not.toHaveAttribute('aria-pressed');
           fireEvent.click(outputMute());
 
           expect(voice.toggleMute).toHaveBeenCalledTimes(1);
@@ -1139,14 +1140,14 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
       });
 
       it.each(onStates)(
-        'reflects the mute in %s: it reads unmute, pressed, with the silent speaker, and calls toggleMute again',
+        'reflects the mute in %s: it reads unmute, with the silent speaker, and calls toggleMute again',
         (state) => {
           const voice = makeVoice({ state, muted: true });
           renderLocale(voice);
 
           expect(screen.queryByRole('button', { name: lt.chatVoiceMute })).not.toBeInTheDocument();
           const unmute = screen.getByRole('button', { name: lt.chatVoiceUnmute });
-          expect(unmute).toHaveAttribute('aria-pressed', 'true');
+          expect(unmute).not.toHaveAttribute('aria-pressed');
           // The state is on screen between answers, not only in the words: the icon says it too.
           expect(within(unmute).getByTestId('VolumeOffIcon')).toBeInTheDocument();
           fireEvent.click(unmute);
@@ -1163,7 +1164,7 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
         expect(within(outputMute()).queryByTestId('VolumeOffIcon')).not.toBeInTheDocument();
       });
 
-      it('can be set ahead of the first answer: it is pressed before any audio has been heard', () => {
+      it('can be set ahead of the first answer: it reads unmute before any audio has been heard', () => {
         const { update } = renderLocale(makeVoice({ state: 'listening' }));
         expect(playbackGroup()).not.toBeInTheDocument();
         fireEvent.click(outputMute());
@@ -1171,16 +1172,10 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
         const muted = makeVoice({ state: 'listening', muted: true });
         update(muted);
 
-        expect(screen.getByRole('button', { name: lt.chatVoiceUnmute })).toHaveAttribute(
-          'aria-pressed',
-          'true',
-        );
-        // Its mute holds when the first answer comes: still pressed, now beside the playback.
+        expect(screen.getByRole('button', { name: lt.chatVoiceUnmute })).toBeInTheDocument();
+        // Its mute holds when the first answer comes: still reads unmute, now beside the playback.
         update(makeVoice({ state: 'speaking', audioPlaying: true, muted: true }));
-        expect(screen.getByRole('button', { name: lt.chatVoiceUnmute })).toHaveAttribute(
-          'aria-pressed',
-          'true',
-        );
+        expect(screen.getByRole('button', { name: lt.chatVoiceUnmute })).toBeInTheDocument();
         expect(playbackGroup()).toBeInTheDocument();
       });
 
@@ -1206,8 +1201,11 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
     });
 
     // The playback controls come and go with the audio, and the room they occupy does not: the
-    // surrounding layout (what is under them, the error, the indicator above) must not jump, and
-    // a control the user is on must not be taken away from under their finger or their focus.
+    // surrounding layout (what is under them, the error, the indicator above) must not jump. The
+    // room only keeps that LAYOUT still. Pause and stop themselves still unmount when the audio
+    // ends, and a focus on one of them goes with it; what stays put are the controls of the row
+    // above the room, the output mute among them, which the playback coming and going never remounts
+    // or moves, so their focus (and a press under the finger) is not lost.
     describe('the room the playback controls keep', () => {
       const room = () => screen.getByTestId(PLAYBACK_ROOM);
 
@@ -1291,7 +1289,8 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
           renderLocale(voice);
 
           expect(micMute()).toBeEnabled();
-          expect(micMute()).toHaveAttribute('aria-pressed', 'false');
+          // One signal of its state, the label: no aria-pressed beside it.
+          expect(micMute()).not.toHaveAttribute('aria-pressed');
           fireEvent.click(micMute());
 
           expect(voice.toggleMicMute).toHaveBeenCalledTimes(1);
@@ -1309,13 +1308,13 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
         ).not.toBeInTheDocument();
       });
 
-      it('reflects the mute: it reads unmute, pressed, and calls toggleMicMute again', () => {
+      it('reflects the mute: it reads unmute, and calls toggleMicMute again', () => {
         const voice = makeVoice({ state: 'listening', micMuted: true });
         renderLocale(voice);
 
         expect(screen.queryByRole('button', { name: lt.chatVoiceMicMute })).not.toBeInTheDocument();
         const unmute = screen.getByRole('button', { name: lt.chatVoiceMicUnmute });
-        expect(unmute).toHaveAttribute('aria-pressed', 'true');
+        expect(unmute).not.toHaveAttribute('aria-pressed');
         fireEvent.click(unmute);
 
         expect(voice.toggleMicMute).toHaveBeenCalledTimes(1);

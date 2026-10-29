@@ -155,19 +155,27 @@ describe('stickyAutoVoiceModel', () => {
 
   it('is none when nothing streams, whatever the previous pick was', () => {
     expect(stickyAutoVoiceModel('m1', [], [catalogued('m1', true)])).toBe('');
-    expect(stickyAutoVoiceModel('', [])).toBe('');
+    expect(stickyAutoVoiceModel('', [], [])).toBe('');
+  });
+
+  it('keeps the previous pick wherever it stands among the models that stream (not only the first)', () => {
+    // m1 comes first and is the one that is loaded: a fresh resolution would say m1, so only the
+    // kept previous pick (m2, second of the models that stream) can give m2.
+    expect(stickyAutoVoiceModel('m2', ['m1', 'm2'], [catalogued('m1', true)])).toBe('m2');
   });
 });
 
 describe('stickyVoiceLegsOf', () => {
   const streaming: VoiceStreaming = { asr: ['asr-a', 'asr-b'], tts: ['tts-a', 'tts-clone'] };
   const NOTHING_HELD = { asr: '', tts: '' };
+  // No voice saved, and so none attributed to a model.
+  const NO_VOICE = { voice: '', voiceModel: '' };
   // The legs alone, resolved with no automatic pick held yet: what a conversation starts with.
   const voiceLegsOf = (
     streams: VoiceStreaming | null,
     picks: { asrModel: string; ttsModel: string },
     models: readonly ModelOption[] = [],
-  ) => stickyVoiceLegsOf(streams, picks, models, NOTHING_HELD)?.legs ?? null;
+  ) => stickyVoiceLegsOf(streams, { ...picks, ...NO_VOICE }, models, NOTHING_HELD)?.legs ?? null;
 
   it('is null while the gateway has not said which models stream', () => {
     expect(voiceLegsOf(null, { asrModel: 'asr-b', ttsModel: '' })).toBeNull();
@@ -235,7 +243,7 @@ describe('stickyVoiceLegsOf', () => {
   // The automatic pick held steady (#326): `held` is the model each leg's automatic pick resolved
   // to until now, and the result says what to hold from now on.
   describe('holding the automatic pick', () => {
-    const picks = { asrModel: '', ttsModel: '' };
+    const picks = { asrModel: '', ttsModel: '', ...NO_VOICE };
     // asr-b and tts-clone are loaded: a fresh automatic pick would be those two.
     const models = [
       catalogued('asr-a', false),
@@ -269,10 +277,12 @@ describe('stickyVoiceLegsOf', () => {
 
     it("uses the user's pick of a leg and holds no automatic pick for it", () => {
       expect(
-        stickyVoiceLegsOf(streaming, { asrModel: 'asr-a', ttsModel: 'tts-a' }, models, {
-          asr: 'asr-b',
-          tts: 'tts-clone',
-        }),
+        stickyVoiceLegsOf(
+          streaming,
+          { asrModel: 'asr-a', ttsModel: 'tts-a', ...NO_VOICE },
+          models,
+          { asr: 'asr-b', tts: 'tts-clone' },
+        ),
       ).toEqual({
         legs: { asr: 'asr-a', tts: 'tts-a' },
         held: { asr: '', tts: '' },
@@ -280,10 +290,12 @@ describe('stickyVoiceLegsOf', () => {
     });
 
     it('picks afresh when the user returns a leg to automatic (nothing was held under the pick)', () => {
-      const underPick = stickyVoiceLegsOf(streaming, { asrModel: 'asr-a', ttsModel: '' }, models, {
-        asr: '',
-        tts: 'tts-a',
-      });
+      const underPick = stickyVoiceLegsOf(
+        streaming,
+        { asrModel: 'asr-a', ttsModel: '', ...NO_VOICE },
+        models,
+        { asr: '', tts: 'tts-a' },
+      );
       expect(underPick?.held).toEqual({ asr: '', tts: 'tts-a' });
       expect(stickyVoiceLegsOf(streaming, picks, models, underPick!.held)?.legs).toEqual({
         asr: 'asr-b',
@@ -293,7 +305,7 @@ describe('stickyVoiceLegsOf', () => {
 
     it('holds the automatic pick for a pick that is gone, which falls back to it', () => {
       expect(
-        stickyVoiceLegsOf(streaming, { asrModel: 'asr-gone', ttsModel: '' }, models, {
+        stickyVoiceLegsOf(streaming, { asrModel: 'asr-gone', ttsModel: '', ...NO_VOICE }, models, {
           asr: 'asr-a',
           tts: '',
         }),
@@ -468,18 +480,19 @@ describe('effectiveVoice', () => {
 });
 
 // A saved voice belongs to the model it was chosen for (`voiceModel`). When the model that would
-// speak is another one, the voice is kept only if that model offers it -- and only once its voice
-// list is KNOWN: a list that is still loading, or that failed, decides nothing.
+// speak is another one, the voice is used only if that model offers it -- and only once its voice
+// list is KNOWN: a list that is still loading, or that failed, decides nothing. The result is the
+// voice to speak in: the saved one as it is, or '' for "the model's own default".
 describe('reconcileVoice', () => {
   const ready = (voices: string[]): VoiceList => ({ status: 'ready', voices });
 
-  it('is no change while the voice was chosen for the model that speaks (a typed name is kept)', () => {
+  it('is the saved voice while it was chosen for the model that speaks (a typed name is kept)', () => {
     expect(
       reconcileVoice({ voice: 'alloy', voiceModel: 'm1', effectiveModel: 'm1', voices: ready([]) }),
-    ).toBeNull();
+    ).toBe('alloy');
   });
 
-  it('keeps the voice and re-attributes it to the new model when that model offers it', () => {
+  it('keeps the voice when the new model offers it', () => {
     expect(
       reconcileVoice({
         voice: 'alloy',
@@ -487,10 +500,10 @@ describe('reconcileVoice', () => {
         effectiveModel: 'm2',
         voices: ready(['alloy']),
       }),
-    ).toEqual({ voice: 'alloy', voiceModel: 'm2' });
+    ).toBe('alloy');
   });
 
-  it('clears the voice and its attribution when the new model does not offer it', () => {
+  it('is no voice when the new model does not offer it', () => {
     expect(
       reconcileVoice({
         voice: 'alloy',
@@ -498,16 +511,16 @@ describe('reconcileVoice', () => {
         effectiveModel: 'm2',
         voices: ready(['nova']),
       }),
-    ).toEqual({ voice: '', voiceModel: '' });
+    ).toBe('');
   });
 
-  it('defers while the new model voice list is not known: loading or failed is no change', () => {
+  it('defers while the new model voice list is not known: loading or failed keeps the voice', () => {
     const base = { voice: 'alloy', voiceModel: 'm1', effectiveModel: 'm2' };
-    expect(reconcileVoice({ ...base, voices: { status: 'loading' } })).toBeNull();
-    expect(reconcileVoice({ ...base, voices: { status: 'failed' } })).toBeNull();
+    expect(reconcileVoice({ ...base, voices: { status: 'loading' } })).toBe('alloy');
+    expect(reconcileVoice({ ...base, voices: { status: 'failed' } })).toBe('alloy');
   });
 
-  it('is no change without a voice, even when the attribution is stale (nothing would be sent)', () => {
+  it('is the voice as it is without a voice, even when the attribution is stale (nothing would be sent)', () => {
     expect(
       reconcileVoice({
         voice: '',
@@ -515,7 +528,7 @@ describe('reconcileVoice', () => {
         effectiveModel: 'm2',
         voices: ready(['nova']),
       }),
-    ).toBeNull();
+    ).toBe('');
     expect(
       reconcileVoice({
         voice: '   ',
@@ -523,10 +536,10 @@ describe('reconcileVoice', () => {
         effectiveModel: 'm2',
         voices: ready(['nova']),
       }),
-    ).toBeNull();
+    ).toBe('   ');
   });
 
-  it('is no change without a model that would speak', () => {
+  it('keeps the voice without a model that would speak', () => {
     expect(
       reconcileVoice({
         voice: 'alloy',
@@ -534,7 +547,7 @@ describe('reconcileVoice', () => {
         effectiveModel: '',
         voices: ready(['nova']),
       }),
-    ).toBeNull();
+    ).toBe('alloy');
   });
 
   it('treats a thread saved before the attribution existed (voiceModel empty) as a differing model', () => {
@@ -545,7 +558,7 @@ describe('reconcileVoice', () => {
         effectiveModel: 'm2',
         voices: ready(['alloy']),
       }),
-    ).toEqual({ voice: 'alloy', voiceModel: 'm2' });
+    ).toBe('alloy');
     expect(
       reconcileVoice({
         voice: 'alloy',
@@ -553,10 +566,10 @@ describe('reconcileVoice', () => {
         effectiveModel: 'm2',
         voices: ready(['nova']),
       }),
-    ).toEqual({ voice: '', voiceModel: '' });
+    ).toBe('');
   });
 
-  it('compares the voice trimmed, as the saved and the spoken voice are', () => {
+  it('compares the voice trimmed, as the saved and the spoken voice are (and returns it as saved)', () => {
     expect(
       reconcileVoice({
         voice: ' alloy ',
@@ -564,7 +577,7 @@ describe('reconcileVoice', () => {
         effectiveModel: 'm2',
         voices: ready(['alloy']),
       }),
-    ).toEqual({ voice: ' alloy ', voiceModel: 'm2' });
+    ).toBe(' alloy ');
   });
 });
 

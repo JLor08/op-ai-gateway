@@ -69,6 +69,18 @@ describe('useVoiceChatVoices', () => {
     expect(modelVoices).not.toHaveBeenCalled();
   });
 
+  it('hands out the very same list object, render after render, while there is no model (a stable effect dependency)', () => {
+    const { apiRef } = fakeApi();
+    const { result, rerender } = renderHook(() => useVoiceChatVoices(apiRef, ''));
+    const first = result.current;
+
+    rerender();
+    expect(result.current).toBe(first);
+
+    rerender();
+    expect(result.current).toBe(first);
+  });
+
   it('never hands out one model list for another: loading while the next lookup is in flight', async () => {
     const { apiRef, lookups } = fakeApi();
     const { result, rerender } = renderHook(({ model }) => useVoiceChatVoices(apiRef, model), {

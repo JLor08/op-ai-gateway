@@ -181,9 +181,11 @@ export {
 } from './chatDoc';
 
 // The built-in voice system prompt, which the Voice Chat control (VoiceChatControl.tsx, OUTSIDE
-// components/chat/) puts back into its prompt field on a reset and compares the field against.
-// Re-exported through this file like the image presets above (arch.test.ts enforces the boundary).
-export { DEFAULT_VOICE_SYSTEM_PROMPT } from './chatDoc';
+// components/chat/) puts back into its prompt field on a reset and compares the field against, and
+// the rule that tells a prompt of the thread's own from it (the one the store saves by, so the
+// control's "edited" marker and what is saved agree). Re-exported through this file like the image
+// presets above (arch.test.ts enforces the boundary).
+export { DEFAULT_VOICE_SYSTEM_PROMPT, isCustomisedVoicePrompt } from './chatDoc';
 
 // "No voices to offer": one shared empty list, so resetting the picker's voices on every
 // model change is a no-op render (React bails out on an identical state value) instead of
@@ -2416,14 +2418,13 @@ export function ChatStoreProvider({
   // (setVoiceVoice, setVoiceTtsModel). Opening a thread therefore never saves it, never reorders the
   // list, and never destroys a voice whose model is merely not the one speaking this time; it is
   // there again when that model is (the automatic pick starts from it, see stickyVoiceLegsOf).
-  const voiceReconciled = reconcileVoice({
-    voice: voiceSettings.voice,
-    voiceModel: voiceSettings.voiceModel,
-    effectiveModel: voiceTtsModel,
-    voices: voiceTtsList,
-  });
   const voiceVoice = effectiveVoice(
-    voiceReconciled?.voice ?? voiceSettings.voice,
+    reconcileVoice({
+      voice: voiceSettings.voice,
+      voiceModel: voiceSettings.voiceModel,
+      effectiveModel: voiceTtsModel,
+      voices: voiceTtsList,
+    }),
     voiceTtsVoices,
     presetCloneOffered(chatModels.find((option) => option.id === voiceTtsModel)),
   );
@@ -2491,6 +2492,10 @@ export function ChatStoreProvider({
         // is held), whatever a fresh automatic pick would be now, so the voice stays.
         const shown = (pick: string) => (streaming.includes(pick) ? pick : '');
         if (shown(ttsModel) === shown(current.ttsModel)) return { ...current, ttsModel };
+        // Re-picking the model that already speaks (automatic -> explicit -> automatic) can clear
+        // the voice when another model is loaded by then: automatic resolves afresh to the loaded
+        // one, by the picker's "loaded preferred" contract, so another model speaks and the voice
+        // of the first must not follow. That is intended; the voice that is sent is never wrong.
         return withTtsModel(current, ttsModel, voiceTtsModel, streaming, chatModels);
       });
     },

@@ -89,7 +89,7 @@ export function effectiveVoiceModel(
 export function stickyAutoVoiceModel(
   previous: string,
   streaming: readonly string[],
-  models: readonly ModelOption[] = [],
+  models: readonly ModelOption[],
 ): string {
   return previous !== '' && streaming.includes(previous)
     ? previous
@@ -119,7 +119,7 @@ export function withTtsModel(
 ): VoiceChatSettings {
   const sameModel = currentEffectiveTts === effectiveVoiceModel(ttsModel, streaming, models);
   // A voice and the model it was chosen for go together.
-  const cleared = { voice: '', voiceModel: '' };
+  const cleared: Pick<VoiceChatSettings, 'voice' | 'voiceModel'> = { voice: '', voiceModel: '' };
   return { ...current, ttsModel, ...(sameModel ? {} : cleared) };
 }
 
@@ -132,22 +132,26 @@ export type VoiceList =
   { status: 'loading' } | { status: 'failed' } | { status: 'ready'; voices: readonly string[] };
 
 /**
- * The saved voice, reconciled with the speech model that would speak now (#326), or null for "no
- * change". A saved voice is one the model it was chosen for (`voiceModel`) has, so when ANOTHER
- * model would speak (`effectiveModel`: the model changed, or the thread was saved before the
- * attribution existed and `voiceModel` is ''):
+ * The voice a conversation is to speak in, decided from the saved voice and the speech model that
+ * would speak now (#326): the saved `voice` as it is, or '' when it is not to be used -- the model
+ * then speaks with its own default voice. A saved voice is one the model it was chosen for
+ * (`voiceModel`) has, so when ANOTHER model would speak (`effectiveModel`: the model changed, or
+ * the thread was saved before the attribution existed and `voiceModel` is ''):
  *
- *   - its voice list is `ready` and holds the voice -> the voice is kept and now belongs to the
- *     new model (`voiceModel` follows);
- *   - the list is `ready` and does not hold it -> both are cleared: the model speaks with its own
- *     default voice instead of failing on one it does not know;
- *   - the list is still `loading`, or `failed` -> no change: a list that is not known cannot
- *     condemn the voice (a transient failure must not erase the user's choice); it is judged once
- *     the list is there.
+ *   - its voice list is `ready` and holds the voice -> the voice is used with the new model;
+ *   - the list is `ready` and does not hold it -> '': the model speaks with its own default voice
+ *     instead of failing on one it does not know;
+ *   - the list is still `loading`, or `failed` -> the voice as it is: a list that is not known
+ *     cannot condemn the voice (a transient failure must not drop the user's choice); it is judged
+ *     once the list is there.
+ *
+ * This is a decision made in memory, from this render on, about what is SPOKEN; nothing is
+ * written back. The saved voice and its attribution stay as they are, and change only by the
+ * user's own pick of a voice or a speech model (the voice is there again when its model speaks).
  *
  * Where the voice was chosen for the model that speaks, nothing is judged: the list is an offer,
  * never a constraint, so a name that was typed and the list does not hold stays. No voice, or no
- * model that would speak, is nothing to reconcile either. The voice is compared trimmed, as it is
+ * model that would speak, is nothing to judge either. The voice is compared trimmed, as it is
  * saved and spoken.
  */
 export function reconcileVoice({
@@ -160,13 +164,11 @@ export function reconcileVoice({
   voiceModel: string;
   effectiveModel: string;
   voices: VoiceList;
-}): { voice: string; voiceModel: string } | null {
+}): string {
   const chosen = voice.trim();
-  if (chosen === '' || effectiveModel === '' || voiceModel === effectiveModel) return null;
-  if (voices.status !== 'ready') return null;
-  return voices.voices.includes(chosen)
-    ? { voice, voiceModel: effectiveModel }
-    : { voice: '', voiceModel: '' };
+  if (chosen === '' || effectiveModel === '' || voiceModel === effectiveModel) return voice;
+  if (voices.status !== 'ready') return voice;
+  return voices.voices.includes(chosen) ? voice : '';
 }
 
 /**
@@ -190,20 +192,19 @@ export function reconcileVoice({
  */
 export function stickyVoiceLegsOf(
   streaming: VoiceStreaming | null,
-  picks: Pick<VoiceChatSettings, 'asrModel' | 'ttsModel'> &
-    Partial<Pick<VoiceChatSettings, 'voice' | 'voiceModel'>>,
+  picks: Pick<VoiceChatSettings, 'asrModel' | 'ttsModel' | 'voice' | 'voiceModel'>,
   models: readonly ModelOption[],
   held: VoiceLegs,
 ): { legs: VoiceLegs; held: VoiceLegs } | null {
   if (streaming === null) return null;
-  const voiceHasModel = (picks.voice ?? '').trim() !== '';
+  const voiceHasModel = picks.voice.trim() !== '';
   const asr = stickyLeg(picks.asrModel, streaming.asr, held.asr, models, '');
   const tts = stickyLeg(
     picks.ttsModel,
     streaming.tts,
     held.tts,
     models,
-    voiceHasModel ? (picks.voiceModel ?? '') : '',
+    voiceHasModel ? picks.voiceModel : '',
   );
   return {
     legs: { asr: asr.used, tts: tts.used },

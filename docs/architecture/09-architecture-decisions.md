@@ -10041,7 +10041,7 @@ flag).
   gateway's tail, where a pause would do nothing. *Amended by issue #326:* the **output mute is not one of them any more**: it
   sits beside the microphone mute and is drawn whenever the conversation is on, in any state and before the first answer, so
   it can be set ahead of it and its state is seen between answers; the playing-only group sits inside a room of constant height
-  (32 px, one row of small buttons) that is mounted for as long as the conversation is on, so its coming and going moves
+  (one row of small buttons, sized in `rem`) that is mounted for as long as the conversation is on, so its coming and going moves
   nothing, and the always-on controls are separate nodes that are never remounted by it. "Stop speaking" is a different
   control from "Cancel whole answer" (phase 1's `cancel`) and from switching the conversation off. `cancel` stays the one
   control that works from every state.
@@ -10075,7 +10075,9 @@ flag).
 **Consequence:**
 
 - **No agent bump and no migration.** The sections are one more optional key of a stored message, the combined prompt reads a
-  member the document already holds, and the controls are WebSocket frames ([Data Model](reference/data-model.md)); issue #326's `voice_model` is one more optional key of the schema-free `settings.voice_chat` object, which the backend never reads.
+  member the document already holds, and the controls are WebSocket frames ([Data Model](reference/data-model.md)); issue
+  #326's `voice_model` is one more optional key of the schema-free `settings.voice_chat` object, which the backend never
+  reads.
 - **A voice run writes one TTS usage row per section** (one streamed `/v1/audio/speech` call each; the no-region fallback is
   one), the LLM and ASR rows being as before ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
 - **"Stop speaking" is a cancel until the turn commits.** In `speaking` the run is, apart from one store write, still
@@ -10091,9 +10093,11 @@ flag).
   only an explicit pick was stored and the voice list is an offer, not a constraint. The pick is now made once and held while
   its model streams, and the voice is stored with its model (`voice_model`), so neither the loaded state nor a reopen moves a
   voice to a model that did not offer it. What stays by design: the hold is in memory for the open chat, so a thread with no
-  saved voice (or whose voice's model stopped streaming) can resolve to another loaded model the next time it is opened, with
-  no voice at stake; the voice list remains an offer, so a name the user typed for the model that speaks is kept as typed; and
-  a saved voice whose model is gone is not spoken (the default is) rather than erased.
+  saved voice can resolve to another loaded model the next time it is opened, with no voice at stake; where a thread's saved
+  voice belongs to a model that has stopped streaming, another model speaks and the voice is reconciled with it (the voice
+  itself is spoken if that model's list holds it, else that model's own default voice is, and the saved voice is never erased
+  and applies again when its model returns); and the voice list remains an offer, so a name the user typed for the model that
+  speaks is kept as typed.
 - **Per-block replay degrades for a very long section, and a removed clip is not re-synthesized.** A section is stored as
   several clips only when it outlasts one speech part (8 MiB of PCM, about 95 seconds at 44.1 kHz mono by default,
   [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch);

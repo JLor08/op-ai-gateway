@@ -31,6 +31,7 @@ import {
   imageSetting,
   imageSettingsFrom,
   isChatBlobUrl,
+  isCustomisedVoicePrompt,
   isKeepLastInvalid,
   isMaskPart,
   keepLastAudioOf,
@@ -1943,6 +1944,24 @@ describe('the persisted Voice Chat model picks mirror the backend omitempty', ()
     expect(
       voiceChatSetting('', settings({ systemPrompt: `${DEFAULT_VOICE_SYSTEM_PROMPT}\n` })),
     ).toEqual({});
+  });
+
+  // The control marks a prompt as customised by the same rule the store saves by: they cannot drift.
+  it('tells a customised prompt by the rule that decides whether it is saved', () => {
+    const prompts: ReadonlyArray<readonly [string, boolean]> = [
+      ['Be terse.', true],
+      ['  Be terse.\n', true],
+      [DEFAULT_VOICE_SYSTEM_PROMPT, false],
+      [`  ${DEFAULT_VOICE_SYSTEM_PROMPT}\n`, false],
+      [`${DEFAULT_VOICE_SYSTEM_PROMPT} Be terse.`, true],
+      ['', false],
+      ['  \n ', false],
+    ];
+    for (const [prompt, customised] of prompts) {
+      expect(isCustomisedVoicePrompt(prompt)).toBe(customised);
+      const saved = voiceChatSetting('', settings({ systemPrompt: prompt }));
+      expect(saved.voice_chat?.system_prompt !== undefined).toBe(customised);
+    }
   });
 
   it('writes the system prompt beside the other picks', () => {
