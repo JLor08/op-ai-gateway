@@ -4,8 +4,10 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,9 +20,11 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1544,4 +1548,599 @@ func TestVoiceLoopbackDialErrorFailsTurn(t *testing.T) {
 		t.Fatalf("error frame code = %q, want transcription.unavailable", errFrame.Code)
 	}
 	readVoiceUntilState(t, ctx, conn, voiceStateIdle)
+}
+
+// --- Teardown, overload and re-dial of the per-turn loopback (#331) -------------------------
+//
+// The pump/dial split (openTurnLoopback) leaves three goroutines per turn that the state
+// machine must start, feed and JOIN without ever blocking on them. TestVoiceConcurrentLoopbackFeed
+// pins the happy ordering; the tests below pin the edges: the session ending (or the turn being
+// cancelled) while the dial is still in flight, a flood of PCM against a pump that cannot drain,
+// and a fresh loopback after an abandoned one.
+
+// voiceLoopbackGoroutineNeedles name the functions one turn's loopback goroutines run: the PCM
+// pump, the dial (parked in openLiveLoopback until the child accepts) and the SSE relay. They
+// are the goroutines relayWG joins, so none may be left once the machine has returned.
+var voiceLoopbackGoroutineNeedles = []string{
+	"gateway.voiceLoopbackPump(",
+	"gateway.(*Server).dialTurnLoopback(",
+	"gateway.(*Server).openLiveLoopback(",
+	"gateway.voiceASRRelay(",
+}
+
+// goroutineStacks returns the stack of every live goroutine, keyed by goroutine id.
+func goroutineStacks() map[int]string {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	stacks := map[int]string{}
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		var id int
+		if _, err := fmt.Sscanf(g, "goroutine %d [", &id); err == nil {
+			stacks[id] = g
+		}
+	}
+	return stacks
+}
+
+// newRepoGoroutines returns the stacks of the goroutines that are NOT in base (a goroutineStacks
+// snapshot taken before the code under test ran) and are running this module's code -- the
+// goroutines the test itself caused. With needles it keeps only those running one of them. Counting
+// by id and by module frame, not runtime.NumGoroutine, keeps the check exact: the http transport's
+// keep-alive goroutines and the runtime's own never count, and a leak names its own stack.
+func newRepoGoroutines(base map[int]string, needles ...string) []string {
+	var found []string
+	for id, stack := range goroutineStacks() {
+		if _, old := base[id]; old || !strings.Contains(stack, "op-ai-gateway/internal/") {
+			continue
+		}
+		if len(needles) > 0 && !containsAnySubstring(stack, needles) {
+			continue
+		}
+		found = append(found, stack)
+	}
+	return found
+}
+
+func containsAnySubstring(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// voicePoll polls cond every 10ms until it holds or d elapses, reporting whether it held. It is the
+// condition poll the loopback tests use instead of a fixed sleep: it returns the moment the
+// condition is true, and d only bounds a failing run.
+func voicePoll(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
+}
+
+// voiceChildStream is the PCM the fake ASR child received on one connection (1-based), in order.
+func voiceChildStream(child *fakeVoiceASRChild, conn int) []byte {
+	var stream []byte
+	for _, rd := range child.bodyReads() {
+		if rd.conn == conn {
+			stream = append(stream, rd.data...)
+		}
+	}
+	return stream
+}
+
+// voiceIndexedFrame is a PCM frame that identifies itself: a 2-byte big-endian index, then a
+// payload derived from the index and the offset. A dropped, duplicated, reordered or split frame
+// therefore shows in a recorded stream (voiceParseIndexedStream).
+func voiceIndexedFrame(index, size int) []byte {
+	f := make([]byte, size)
+	f[0], f[1] = byte(index>>8), byte(index)
+	for j := 2; j < size; j++ {
+		f[j] = byte(index) ^ byte(j)
+	}
+	return f
+}
+
+// voiceParseIndexedStream splits a recorded stream back into its frames and returns their indexes
+// in arrival order. It fails the test unless the stream is a whole number of well-formed frames:
+// the child must never see half a frame, whatever was dropped upstream.
+func voiceParseIndexedStream(t *testing.T, stream []byte, size int) []int {
+	t.Helper()
+	if len(stream)%size != 0 {
+		t.Fatalf("the child received %d PCM bytes, not a whole number of %d-byte frames: a frame was split or truncated", len(stream), size)
+	}
+	var order []int
+	for off := 0; off < len(stream); off += size {
+		got := stream[off : off+size]
+		index := int(got[0])<<8 | int(got[1])
+		if !bytes.Equal(got, voiceIndexedFrame(index, size)) {
+			t.Fatalf("the %d-byte frame at offset %d is not a well-formed frame %d: the stream is corrupted", size, off, index)
+		}
+		order = append(order, index)
+	}
+	return order
+}
+
+// readVoiceUntilFailingOnError is readVoiceUntil, except an error frame on the way fails the
+// test: where one is waited on, an error frame can only mean an abandoned loopback leaked its
+// failure into the live session.
+func readVoiceUntilFailingOnError(t *testing.T, ctx context.Context, conn *websocket.Conn, typ string) voiceDownMsg {
+	t.Helper()
+	for {
+		m, _ := readVoiceFrame(t, ctx, conn)
+		if m.Type == voiceDownError {
+			t.Fatalf("error frame while waiting for %q: code=%q message=%q", typ, m.Code, m.Message)
+		}
+		if m.Type == typ {
+			return m
+		}
+	}
+}
+
+// TestVoiceTeardownMidDialJoinsEverything: the session ends while the turn's loopback DIAL is
+// still in flight -- the child holds its accept, so openLiveLoopback is parked in Do, the pump has
+// already fed PCM into the body, and no response has come back. Teardown must cancel that dial,
+// unblock the pipe, and JOIN the dial and pump (relayWG) before the machine returns; the handler
+// then returns promptly (well inside the child's held-accept cap, so teardown cannot be waiting
+// on the accept) and nothing the session started is left running.
+//
+// The join is asserted twice. Right after the handler returns the turn's own goroutines (pump,
+// dial, relay) must already be gone -- no polling: the machine joins them before it returns, so
+// any one still running is a missed join, not slowness. The rest of the chain (the /v1 handler
+// the dial reached, the child's request handler and its body reader) lives on the far side of
+// connections the teardown only CLOSES, so those get a bounded condition poll. And the aborted
+// dial's failure must not surface: the machine is gone, so nothing may reach the client as an
+// error frame either (the ctx.Err guard in onLoopbackEvent).
+//
+// Both ways a session ends are run: a bye (clean close handshake) and a vanished client (the
+// read loop's error cancels the handler context from the other side).
+func TestVoiceTeardownMidDialJoinsEverything(t *testing.T) {
+	cases := []struct {
+		name string
+		end  func(t *testing.T, ctx context.Context, conn *websocket.Conn)
+	}{
+		{"bye", func(t *testing.T, ctx context.Context, conn *websocket.Conn) {
+			sendVoiceControl(t, ctx, conn, "bye")
+			// The session closes cleanly, and no error frame comes down on the way out.
+			for {
+				typ, data, err := conn.Read(ctx)
+				if err != nil {
+					if websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+						t.Fatalf("after bye the close status = %v (err %v), want StatusNormalClosure", websocket.CloseStatus(err), err)
+					}
+					return
+				}
+				var m voiceDownMsg
+				if typ == websocket.MessageText && json.Unmarshal(data, &m) == nil && m.Type == voiceDownError {
+					t.Fatalf("the torn-down dial surfaced an error frame: code=%q message=%q", m.Code, m.Message)
+				}
+			}
+		}},
+		{"client drop", func(_ *testing.T, _ context.Context, conn *websocket.Conn) {
+			_ = conn.CloseNow()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newFakeVoiceASRChild(t)
+			child.acceptGate = make(chan struct{})
+			h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+			// Release the held accept on any exit, before the servers' Close waits on it.
+			var release sync.Once
+			t.Cleanup(func() { release.Do(func() { close(child.acceptGate) }) })
+
+			base := goroutineStacks() // before the session starts anything
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			conn := h.dial(t, ctx)
+			readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+			var want []byte
+			for i := range 3 {
+				frame := voiceIndexedFrame(i+1, 320)
+				want = append(want, frame...)
+				if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+					t.Fatalf("send pcm frame %d: %v", i, err)
+				}
+			}
+			// Mid-dial for certain: the PCM crossed to the child while its accept is held, and the
+			// dial and the pump are both running. Without this the test could pass on a turn that
+			// had already settled.
+			if !voicePoll(5*time.Second, func() bool {
+				return child.bytesBeforeAccept() >= len(want) &&
+					len(newRepoGoroutines(base, "gateway.(*Server).dialTurnLoopback(")) == 1 &&
+					len(newRepoGoroutines(base, "gateway.voiceLoopbackPump(")) == 1
+			}) {
+				t.Fatalf("the dial never reached the held-accept state (child saw %d of %d PCM bytes before accept)", child.bytesBeforeAccept(), len(want))
+			}
+
+			tc.end(t, ctx, conn)
+
+			select {
+			case <-h.returned:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return with the dial in flight: teardown is waiting on the dial, the pump or the held accept")
+			}
+			if left := newRepoGoroutines(base, voiceLoopbackGoroutineNeedles...); len(left) > 0 {
+				t.Fatalf("the handler returned with %d of the turn's dial/pump/relay goroutines still running: teardown did not join them\n%s", len(left), strings.Join(left, "\n\n"))
+			}
+
+			var leaked []string
+			if !voicePoll(5*time.Second, func() bool {
+				leaked = newRepoGoroutines(base)
+				return len(leaked) == 0
+			}) {
+				t.Fatalf("%d goroutine(s) the session started are still running after teardown:\n%s", len(leaked), strings.Join(leaked, "\n\n"))
+			}
+		})
+	}
+}
+
+// closeTrackingBody is a dial outcome's response body that records whether it was closed.
+type closeTrackingBody struct{ closed atomic.Bool }
+
+func (b *closeTrackingBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (b *closeTrackingBody) Close() error             { b.closed.Store(true); return nil }
+
+// TestVoiceTeardownTurnJoinsParkedPumpAndLateDial pins the join DETERMINISTICALLY, which the
+// end-to-end teardown test cannot: there a missed join is only a race the goroutines usually win
+// (a cancelled dial and a closed pipe unwind in microseconds), so it passes either way. Here the
+// turn is assembled by hand, around the REAL pump, with goroutines whose timing the test owns:
+//   - the pump is parked on its first pw.Write (nothing reads the pipe, the state a dial that
+//     never accepts leaves it in), and teardown must unblock it -- by closing the pipe with
+//     errVoiceTurnDone BEFORE it closes the queue -- without the pump mistaking that for a
+//     failure to report;
+//   - a stand-in for the dial notices the cancel but unwinds slowly, then reports a dial that
+//     completed anyway. teardownTurn must not return before it has finished (relayWG), and must
+//     close the body of the outcome the run loop never consumed instead of leaking its connection.
+func TestVoiceTeardownTurnJoinsParkedPumpAndLateDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	_, pw := io.Pipe() // nothing reads the other end: a write parks until the pipe is closed
+	queue := make(chan []byte, voiceLoopbackPCMQueue)
+	pumpEvents := make(chan voiceLoopbackEvent, 2) // the pump's own channel: it must stay empty
+	dialEvents := make(chan voiceLoopbackEvent, 2) // the machine's loopCh: the dial's late outcome lands here
+	m := &voiceMachine{ctx: ctx, pw: pw, turnCtx: turnCtx, turnCancel: turnCancel, pcmOut: queue, loopCh: dialEvents}
+
+	base := goroutineStacks()
+	queue <- []byte("pcm")
+	m.relayWG.Add(1)
+	go func() { defer m.relayWG.Done(); voiceLoopbackPump(turnCtx, queue, pw, pumpEvents) }()
+	pumpParked := func() bool {
+		for _, stack := range newRepoGoroutines(base, "gateway.voiceLoopbackPump(") {
+			if strings.Contains(stack, "io.(*PipeWriter).Write") {
+				return true
+			}
+		}
+		return false
+	}
+	if !voicePoll(5*time.Second, pumpParked) {
+		t.Fatal("the pump never parked on its pipe write")
+	}
+
+	lateBody := &closeTrackingBody{}
+	finishDial := make(chan struct{})
+	m.relayWG.Add(1)
+	go func() {
+		defer m.relayWG.Done()
+		// An in-flight dial notices the cancel, takes its time unwinding, and then reports a dial
+		// that completed anyway.
+		<-turnCtx.Done()
+		<-finishDial
+		dialEvents <- voiceLoopbackEvent{kind: loopbackDialed, body: lateBody}
+	}()
+
+	torn := make(chan struct{})
+	go func() { defer close(torn); m.teardownTurn() }()
+
+	// The pump is released by the teardown itself: it was parked and nothing else could free it.
+	if !voicePoll(5*time.Second, func() bool { return len(newRepoGoroutines(base, "gateway.voiceLoopbackPump(")) == 0 }) {
+		t.Fatal("teardownTurn did not unblock the pump parked on the pipe write")
+	}
+	// ... but the dial is still unwinding, so teardown must still be waiting for it.
+	select {
+	case <-torn:
+		t.Fatal("teardownTurn returned while the dial goroutine was still running: it does not join it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(finishDial)
+	select {
+	case <-torn:
+	case <-time.After(5 * time.Second):
+		t.Fatal("teardownTurn did not return once the dial finished")
+	}
+
+	if !lateBody.closed.Load() {
+		t.Fatal("the late dial outcome's response body was not closed: its connection leaks")
+	}
+	if len(pumpEvents) != 0 {
+		t.Fatalf("the pump reported %d event(s) for a write that teardown itself failed: it must stay silent once the turn is ending", len(pumpEvents))
+	}
+	if m.turnCancel != nil || m.pw != nil || m.loopCh != nil {
+		t.Fatal("teardownTurn left the turn's loopback fields set")
+	}
+}
+
+// TestVoiceLoopbackEventsAreFoldedByTheTurnTheyBelongTo pins which dial/pump reports the run loop
+// acts on (onLoopbackEvent), by the state each leaves the machine in. They are the reports of
+// goroutines the machine does not control, so an event can arrive late or for a turn that is already
+// ending, and acting on it would surface an error the user never caused:
+//   - a dial failure that lands while the session itself is ending is just the teardown
+//     cancelling the dial: no failure, no error frame (a live session fails the turn);
+//   - a pump failure while the dial is still pending is ignored -- a failed dial closes the pipe,
+//     which fails the pump's write first, and the dial's own outcome is the authoritative one --
+//     and so is one while finalizing, which the relay's end or the finalize timeout already settles;
+//   - a pump failure once the dial succeeded, mid-chunk, is a real stream error.
+//
+// The end-to-end teardown tests cannot pin the first case: the run loop almost always sees
+// ctx.Done before the event, so the guard is otherwise unobservable.
+func TestVoiceLoopbackEventsAreFoldedByTheTurnTheyBelongTo(t *testing.T) {
+	cases := []struct {
+		name      string
+		ev        voiceLoopbackEventKind
+		ending    bool // the session context is already cancelled
+		dialDone  bool // the dial succeeded (asrCh is set)
+		finalize  bool
+		wantState string
+		wantCode  string // the error frame the turn fails with; empty when none
+	}{
+		{name: "dial failure in a live session fails the turn", ev: loopbackDialFailed, wantState: voiceStateIdle, wantCode: "transcription.unavailable"},
+		{name: "dial failure while the session ends is inert", ev: loopbackDialFailed, ending: true, wantState: voiceStateListening},
+		{name: "pump failure while the dial is pending is inert", ev: loopbackPumpFailed, wantState: voiceStateListening},
+		{name: "pump failure while finalizing is inert", ev: loopbackPumpFailed, dialDone: true, finalize: true, wantState: voiceStateListening},
+		{name: "pump failure after the dial is a stream error", ev: loopbackPumpFailed, dialDone: true, wantState: voiceStateIdle, wantCode: "transcription.stream_error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.ending {
+				cancel()
+			}
+			m := &voiceMachine{ctx: ctx, writer: newVoiceWriter(&fakeVoiceSocket{}, func() {}), state: voiceStateListening, finalizing: tc.finalize}
+			if tc.dialDone {
+				m.asrCh = make(chan asrEvent)
+			}
+			m.onLoopbackEvent(voiceLoopbackEvent{kind: tc.ev})
+
+			if m.state != tc.wantState {
+				t.Fatalf("state after the event = %q, want %q", m.state, tc.wantState)
+			}
+			var code string
+			for len(m.writer.out) > 0 {
+				var f voiceDownMsg
+				if err := json.Unmarshal(<-m.writer.out, &f); err != nil {
+					t.Fatalf("down-frame is not JSON: %v", err)
+				}
+				if f.Type == voiceDownError {
+					code = f.Code
+				}
+			}
+			if tc.ending {
+				return // a cancelled session context makes the writer's own send racy; the state is the verdict
+			}
+			if code != tc.wantCode {
+				t.Fatalf("error frame code = %q, want %q", code, tc.wantCode)
+			}
+		})
+	}
+}
+
+// TestVoiceLoopbackDropOldestKeepsRunLoopLive pins the drop-oldest policy of the run loop ->
+// pump queue (feedLoopback) on the REAL run loop, with a loopback whose pump is parked: the
+// machine is given a loopback that exists but whose queue nothing drains, exactly the state a
+// dial that never accepts leaves the pump in (a blocked pw.Write). It is driven over the machine's
+// own inbound channels with MORE frames than the queue holds, and must
+//   - never block: every frame is taken (the inbound channel holds only voiceInboundQueue of
+//     them, so a run loop stuck on the full queue would stall the sends -- and with them the read
+//     loop and the socket);
+//   - keep serving other events afterwards: a cancel control still tears the loopback down (it
+//     closes the queue, which is how the test sees it was handled);
+//   - retain exactly the NEWEST voiceLoopbackPCMQueue frames, in order, each whole -- the oldest
+//     dropped, nothing split, reordered or duplicated.
+//
+// It is a machine-level test because it cannot be driven end to end deterministically: the fake
+// child's accept gate still lets the transport drain the pipe (that is the point of
+// TestVoiceConcurrentLoopbackFeed), so the real pump never parks long enough to fill 128 frames.
+// The end-to-end counterpart is TestVoiceLoopbackOverloadDeliversWholeFramesInOrder.
+func TestVoiceLoopbackDropOldestKeepsRunLoopLive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	queue := make(chan []byte, voiceLoopbackPCMQueue)
+	pcmCh := make(chan []byte, voiceInboundQueue)
+	ctrlCh := make(chan voiceUpControl, voiceInboundQueue)
+	m := &voiceMachine{
+		ctx: ctx, cancel: cancel, timing: fastVoiceTiming(),
+		writer: newVoiceWriter(&fakeVoiceSocket{}, cancel), // never run: the state frame just sits in its queue
+		pcmCh:  pcmCh, ctrlCh: ctrlCh,
+		turnCancel: func() {}, // a loopback exists (opening or open): onPCM feeds it, it does not dial
+		pcmOut:     queue,     // ... and its pump is parked: nothing ever drains the queue
+	}
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); m.run() }()
+
+	const frameLen = 320
+	total := voiceLoopbackPCMQueue + 40
+	frames := make([][]byte, total)
+	for i := range frames {
+		frames[i] = voiceIndexedFrame(i, frameLen)
+	}
+	sendCtx, sendCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer sendCancel()
+	for i, f := range frames {
+		select {
+		case pcmCh <- f:
+		case <-sendCtx.Done():
+			t.Fatalf("the run loop stopped taking PCM after %d of %d frames while the pump was parked: it blocked on the full loopback queue", i, total)
+		}
+	}
+	// Every frame has been taken; the last one's handler finishes before the loop selects again, so
+	// the cancel below is handled after all of them.
+	if !voicePoll(5*time.Second, func() bool { return len(pcmCh) == 0 }) {
+		t.Fatal("the run loop never took the last queued frames")
+	}
+	ctrlCh <- voiceUpControl{Type: voiceUpCancel}
+
+	// The cancel closes the queue (endLoopbackFeed): what is left in it is what the pump would have
+	// received, and the closure is the proof the run loop was still alive to handle the control.
+	var got [][]byte
+	deadline := time.After(5 * time.Second)
+	for open := true; open; {
+		select {
+		case f, ok := <-queue:
+			if ok {
+				got = append(got, f)
+			} else {
+				open = false
+			}
+		case <-deadline:
+			t.Fatal("the cancel control never tore the loopback down: the run loop is wedged")
+		}
+	}
+	if len(got) != voiceLoopbackPCMQueue {
+		t.Fatalf("the queue held %d frames, want its full capacity %d", len(got), voiceLoopbackPCMQueue)
+	}
+	for k, f := range got {
+		want := frames[total-voiceLoopbackPCMQueue+k]
+		if !bytes.Equal(f, want) {
+			t.Fatalf("queued frame %d is not frame %d: the oldest %d frames should be dropped and the newest %d kept whole and in order",
+				k, total-voiceLoopbackPCMQueue+k, total-voiceLoopbackPCMQueue, voiceLoopbackPCMQueue)
+		}
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run loop did not exit when its context ended")
+	}
+}
+
+// TestVoiceLoopbackOverloadDeliversWholeFramesInOrder is the end-to-end counterpart of the
+// drop-oldest pin: far more frames than the queue holds are flooded in while the child holds its
+// accept, through the real pump, pipe and transport. How many (if any) the pump lets the run loop
+// drop depends on how fast the transport drains, so the test asserts what must hold either way:
+// the run loop keeps taking the flood, the child receives a whole number of well-formed frames in
+// strictly increasing order, the NEWEST frame is among them (a drop only ever takes the oldest),
+// and the turn still finishes with its clean final.
+func TestVoiceLoopbackOverloadDeliversWholeFramesInOrder(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{"overloaded"}
+	child.acceptGate = make(chan struct{})
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+	var release sync.Once
+	releaseAccept := func() { release.Do(func() { close(child.acceptGate) }) }
+	t.Cleanup(releaseAccept)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	const frameLen = 320
+	total := 2*voiceLoopbackPCMQueue + 50
+	for i := range total {
+		if err := conn.Write(ctx, websocket.MessageBinary, voiceIndexedFrame(i, frameLen)); err != nil {
+			t.Fatalf("send pcm frame %d: %v", i, err)
+		}
+	}
+
+	// The accept is still held: the newest frame must reach the child anyway (it is always queued).
+	newest := voiceIndexedFrame(total-1, frameLen)
+	if !voicePoll(5*time.Second, func() bool { return bytes.HasSuffix(voiceChildStream(child, 1), newest) }) {
+		t.Fatalf("the newest of %d frames never reached the child during the held accept (it saw %d bytes): the run loop blocked or lost it", total, len(voiceChildStream(child, 1)))
+	}
+
+	releaseAccept()
+	readVoiceUntilFailingOnError(t, ctx, conn, voiceDownASRPartial)
+	sendVoiceControl(t, ctx, conn, "push_end")
+	if final := readVoiceUntilFailingOnError(t, ctx, conn, voiceDownASRFinal); final.Text != "overloaded" {
+		t.Fatalf("asr_final = %q, want %q", final.Text, "overloaded")
+	}
+
+	order := voiceParseIndexedStream(t, voiceChildStream(child, 1), frameLen)
+	for k := 1; k < len(order); k++ {
+		if order[k] <= order[k-1] {
+			t.Fatalf("frame %d arrived after frame %d: the stream is not in order", order[k], order[k-1])
+		}
+	}
+	if len(order) == 0 || order[len(order)-1] != total-1 {
+		t.Fatalf("the child's stream ends at frame %v, want the newest frame %d", order[len(order)-1:], total-1)
+	}
+	t.Logf("the child received %d of %d frames (%d dropped by the queue)", len(order), total, total-len(order))
+}
+
+// TestVoiceCancelMidDialThenRedial: a cancel control while the loopback dial is in flight tears
+// that turn down (aborts the dial, joins its pump and dial), and the next voiced frame dials a
+// FRESH loopback that works -- accepted at once, fed only the new frame, and finishing the turn
+// with its own final. The abandoned loopback must leak nothing into the new one: no stale PCM in
+// the new body, no error frame from the dial that was cancelled, no stale dial outcome folded in.
+func TestVoiceCancelMidDialThenRedial(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{"discarded", "second ok"} // connection 1 is abandoned, connection 2 completes
+	child.acceptGate = make(chan struct{})
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: turnGraceTiming()})
+	var release sync.Once
+	releaseAccept := func() { release.Do(func() { close(child.acceptGate) }) }
+	t.Cleanup(releaseAccept)
+
+	base := goroutineStacks()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+
+	// Dial #1 starts on the first frame and is held: the PCM reaches the child before its accept.
+	first := voiceIndexedFrame(1, 320)
+	if err := conn.Write(ctx, websocket.MessageBinary, first); err != nil {
+		t.Fatalf("send the first frame: %v", err)
+	}
+	if !voicePoll(5*time.Second, func() bool {
+		return bytes.Equal(voiceChildStream(child, 1), first) && len(newRepoGoroutines(base, "gateway.(*Server).dialTurnLoopback(")) == 1
+	}) {
+		t.Fatalf("dial #1 never reached the held-accept state (child saw %d bytes)", len(voiceChildStream(child, 1)))
+	}
+
+	// Cancel mid-dial. The turn's dial, pump and relay are joined by teardown, so their goroutines
+	// disappearing is the proof the cancel was handled -- and that the next frame is handled after it.
+	sendVoiceControl(t, ctx, conn, "cancel")
+	if !voicePoll(5*time.Second, func() bool { return len(newRepoGoroutines(base, voiceLoopbackGoroutineNeedles...)) == 0 }) {
+		t.Fatalf("the cancel left the in-flight dial's goroutines running:\n%s", strings.Join(newRepoGoroutines(base, voiceLoopbackGoroutineNeedles...), "\n\n"))
+	}
+
+	// A fresh loopback is accepted at once from here on. The next voiced frame dials it.
+	releaseAccept()
+	second := voiceIndexedFrame(2, 320)
+	if err := conn.Write(ctx, websocket.MessageBinary, second); err != nil {
+		t.Fatalf("send the second frame: %v", err)
+	}
+	readVoiceUntilFailingOnError(t, ctx, conn, voiceDownASRPartial)
+	sendVoiceControl(t, ctx, conn, "push_end")
+	if final := readVoiceUntilFailingOnError(t, ctx, conn, voiceDownASRFinal); final.Text != "second ok" {
+		t.Fatalf("asr_final = %q, want the fresh loopback's %q", final.Text, "second ok")
+	}
+
+	if conns, _ := child.snapshot(); conns != 2 {
+		t.Fatalf("the child saw %d loopbacks, want exactly the abandoned one and its replacement", conns)
+	}
+	if got := voiceChildStream(child, 1); !bytes.Equal(got, first) {
+		t.Fatalf("the abandoned loopback carried %d bytes, want only the first frame (%d bytes)", len(got), len(first))
+	}
+	if got := voiceChildStream(child, 2); !bytes.Equal(got, second) {
+		t.Fatalf("the fresh loopback carried %d bytes, want only the second frame (%d bytes): the abandoned turn's PCM bled into it", len(got), len(second))
+	}
 }
