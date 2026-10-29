@@ -97,6 +97,12 @@ class FakeSocket {
       .filter((data): data is string => typeof data === 'string')
       .map((data) => JSON.parse(data));
   }
+  // The binary PCM frames sent so far (the text controls are skipped).
+  audio(): ArrayBuffer[] {
+    return this.send.mock.calls
+      .map(([data]) => data)
+      .filter((data): data is ArrayBuffer => typeof data !== 'string');
+  }
 }
 
 let track: {
@@ -956,17 +962,17 @@ describe('createVoiceSession in a (fake) browser', () => {
       const socket = await connected(run);
       const worklet = FakeWorkletNode.last!;
       worklet.pcm(1, 1);
-      expect(socket.send).toHaveBeenCalledTimes(1);
+      expect(socket.audio()).toHaveLength(1);
 
       run.session.setMicMuted(true);
       worklet.pcm(2, 2);
       worklet.pcm(3, 3);
-      expect(socket.send).toHaveBeenCalledTimes(1);
+      expect(socket.audio()).toHaveLength(1);
 
       run.session.setMicMuted(false);
       worklet.pcm(4, 4);
-      expect(socket.send).toHaveBeenCalledTimes(2);
-      expect(new Uint8Array(socket.send.mock.calls[1][0])).toEqual(new Uint8Array([4, 4]));
+      expect(socket.audio()).toHaveLength(2);
+      expect(new Uint8Array(socket.audio()[1])).toEqual(new Uint8Array([4, 4]));
       run.session.stop();
     });
 
@@ -983,15 +989,46 @@ describe('createVoiceSession in a (fake) browser', () => {
       run.session.stop();
     });
 
-    it('needs no frame of its own: the gateway simply hears nothing, and detects no turn', async () => {
+    // The gateway cannot tell a muted microphone from a quiet one by the audio alone: it hears
+    // nothing either way, and an ASR stream that gets no data is aborted by its idle timeout. So
+    // it is told, and keeps its own loopback fed (and discards what it says) for as long as it is.
+    it('tells the gateway: mic_mute when muted, mic_unmute when unmuted', async () => {
       const run = start();
       const socket = await connected(run);
 
       run.session.setMicMuted(true);
-      run.session.setMicMuted(false);
-      run.session.setMicMuted(true);
+      expect(socket.controls()).toEqual([{ type: 'mic_mute' }]);
 
-      expect(socket.controls()).toEqual([]);
+      run.session.setMicMuted(false);
+      expect(socket.controls()).toEqual([{ type: 'mic_mute' }, { type: 'mic_unmute' }]);
+      run.session.stop();
+    });
+
+    it('sends the control only when the state changes, not for a toggle that is already in effect', async () => {
+      const run = start();
+      const socket = await connected(run);
+
+      run.session.setMicMuted(false); // already live
+      run.session.setMicMuted(true);
+      run.session.setMicMuted(true);
+      run.session.setMicMuted(false);
+      run.session.setMicMuted(false);
+
+      expect(socket.controls()).toEqual([{ type: 'mic_mute' }, { type: 'mic_unmute' }]);
+      run.session.stop();
+    });
+
+    it('still sends no audio while muted: the control is all the gateway gets', async () => {
+      const run = start();
+      const socket = await connected(run);
+      const worklet = FakeWorkletNode.last!;
+
+      run.session.setMicMuted(true);
+      worklet.pcm(1, 1);
+      worklet.pcm(2, 2);
+
+      expect(socket.audio()).toHaveLength(0);
+      expect(socket.controls()).toEqual([{ type: 'mic_mute' }]);
       run.session.stop();
     });
 
@@ -1031,7 +1068,7 @@ describe('createVoiceSession in a (fake) browser', () => {
       run.session.pushStart();
       socket.say(audioDelta(1));
 
-      expect(socket.controls()).toEqual([{ type: 'push_start' }]);
+      expect(socket.controls()).toEqual([{ type: 'mic_mute' }, { type: 'push_start' }]);
       expect(run.players[0].push).toHaveBeenCalledTimes(2);
       expect(run.players[0].stop).not.toHaveBeenCalled();
       run.session.stop();
@@ -1039,13 +1076,15 @@ describe('createVoiceSession in a (fake) browser', () => {
 
     it('is ignored once the session is over', async () => {
       const run = start();
-      await connected(run);
+      const socket = await connected(run);
       run.session.stop();
 
       run.session.setMicMuted(true);
 
-      // The microphone was released with the session: nothing is touched again.
+      // The microphone was released with the session: nothing is touched again, and nothing is
+      // sent on the socket that was closed.
       expect(track.enabled).toBe(true);
+      expect(socket.controls()).not.toContainEqual({ type: 'mic_mute' });
     });
   });
 

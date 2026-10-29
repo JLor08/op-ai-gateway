@@ -19,14 +19,18 @@
 //     [name, ticket]). It is single-use and good for 30 seconds, so it is used at once.
 //   - UP: binary frames of raw s16le PCM, ~100 ms each (a frame of 1 MiB or more closes the
 //     connection with 1009), and text control frames {"type": "push_start" | "push_end" |
-//     "cancel" | "bye" | "playback_done" | "pause" | "resume" | "stop"}. The microphone is sent
-//     up for as long as the session lasts, unless the user has muted it (setMicMuted: then none
-//     is sent, and the gateway hears nothing and detects no turn): the gateway discards it while
-//     the answer is being spoken (it is half-duplex, enforced there, so that the answer can
-//     never be heard as speech). `pause`/`resume` hold and release the gateway's playout drain
-//     (so the microphone cannot reopen over audio the user has paused), and `stop` cuts the
-//     spoken answer short and puts the gateway back to listening. The answer can also be muted
-//     (setMuted): a local matter of the speakers, which the gateway is told nothing of.
+//     "cancel" | "bye" | "playback_done" | "pause" | "resume" | "stop" | "mic_mute" |
+//     "mic_unmute"}. The microphone is sent up for as long as the session lasts, unless the user
+//     has muted it (setMicMuted: then none is sent, and the gateway hears nothing and detects no
+//     turn): the gateway discards it while the answer is being spoken (it is half-duplex,
+//     enforced there, so that the answer can never be heard as speech). `mic_mute`/`mic_unmute`
+//     tell the gateway about that mute, which it cannot tell from a quiet microphone: while muted
+//     it keeps its own speech recognition open and fed, so that the missing audio does not starve
+//     it, discards what it recognises, and frees it if the mute lasts. `pause`/`resume` hold and
+//     release the gateway's playout drain (so the microphone cannot reopen over audio the user
+//     has paused), and `stop` cuts the spoken answer short and puts the gateway back to
+//     listening. The answer can also be muted (setMuted): a local matter of the speakers, which
+//     the gateway is told nothing of.
 //   - DOWN: text frames, parsed by parseVoiceDownFrame below. `state` is the gateway's state
 //     machine; `asr_partial` is the provisional transcript of the CURRENT CHUNK only (it
 //     REPLACES the last partial, not the turn's transcript), and `asr_final` the finished text
@@ -402,8 +406,10 @@ export type VoiceSession = {
   setMuted(muted: boolean): void;
   /**
    * Mute or unmute the user's own microphone for the rest of the session, until it is unmuted:
-   * while muted nothing is sent up, so the gateway detects no turn. The gateway needs no frame
-   * for it, and the answer and the controls above are not affected.
+   * while muted no audio is sent up, so the gateway detects no turn. The gateway is told with a
+   * frame of its own (`mic_mute`/`mic_unmute`), only when the state changes: it has to know, to
+   * keep its speech recognition from starving on the missing audio. The answer and the controls
+   * above are not affected.
    */
   setMicMuted(muted: boolean): void;
   /** End the conversation: say goodbye, stop the microphone and the audio, and tear everything down. */
@@ -607,7 +613,16 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   // One text control frame, when there is a socket to send it on. `extra` carries a control's
   // optional fields (playback_done's played_through counter); the fields stay additive on the wire.
   const sendControl = (
-    type: 'push_start' | 'push_end' | 'cancel' | 'playback_done' | 'pause' | 'resume' | 'stop',
+    type:
+      | 'push_start'
+      | 'push_end'
+      | 'cancel'
+      | 'playback_done'
+      | 'pause'
+      | 'resume'
+      | 'stop'
+      | 'mic_mute'
+      | 'mic_unmute',
     extra?: Record<string, number>,
   ) => {
     if (over || !open || !socket) return;
@@ -981,6 +996,14 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       // What was captured for a socket that is not open yet was captured before the mute.
       if (next) pending.length = 0;
       applyMicMute(stream);
+      // No audio goes up while muted (deliverAudio), which the gateway cannot tell from a quiet
+      // microphone: left alone, the speech recognition it holds open for the turn would starve on
+      // the missing data and be aborted. Told, it keeps that open on audio of its own, discards what
+      // it recognises from the silence, and frees it if the mute lasts. The unmute ends all of that.
+      // A mute toggled before the socket is open is deliberately NOT replayed on open (sendControl
+      // no-ops without a live socket): a muted client sends no PCM, so no recognition is held to
+      // starve, and the first real toggle after the session is up resyncs the gateway.
+      sendControl(next ? 'mic_mute' : 'mic_unmute');
     },
     stop() {
       finish('closed');

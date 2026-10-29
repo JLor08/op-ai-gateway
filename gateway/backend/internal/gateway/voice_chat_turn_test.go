@@ -144,8 +144,12 @@ type voiceTurnOpts struct {
 	speechStatus  int
 	speechErrBody string
 	timing        voiceTiming
-	chatStore     portal.ChatStore // defaults to a plain in-memory store
-	speechPCM     [][]byte         // the PCM chunks the TTS stream carries; defaults to voiceTestPCM
+	// streamIdle is the gateway edge's SSE idle watchdog (ServerDeps.StreamIdleTimeout, 120s in
+	// production): it cuts a loopback whose upstream sends no SSE for this long. Zero (the default
+	// here) leaves it off, as every pre-#335 voice test ran.
+	streamIdle time.Duration
+	chatStore  portal.ChatStore // defaults to a plain in-memory store
+	speechPCM  [][]byte         // the PCM chunks the TTS stream carries; defaults to voiceTestPCM
 	// speechGate, when non-nil, holds every speech frame AFTER the first until the channel closes,
 	// so a test can relay a second audio chunk at a controlled time. Needs speechPCM with >= 2 chunks.
 	speechGate <-chan struct{}
@@ -250,6 +254,7 @@ func newVoiceTurnHarness(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnO
 	})
 	srv.SetBaseContext(context.Background())
 	srv.voiceTiming = opts.timing
+	srv.streamIdleTimeout = opts.streamIdle
 
 	h := &voiceTurnHarness{srv: srv, child: child, speechBodies: prov.speechBodies, returned: make(chan struct{}, 16)}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2166,5 +2171,997 @@ func TestVoiceCancelMidDialThenRedial(t *testing.T) {
 	}
 	if got := voiceChildStream(child, 2); !bytes.Equal(got, second) {
 		t.Fatalf("the fresh loopback carried %d bytes, want only the second frame (%d bytes): the abandoned turn's PCM bled into it", len(got), len(second))
+	}
+}
+
+// --- Mute-aware ASR loopback (#335) -------------------------------------------------------
+//
+// A muted mic sends the gateway no PCM, so an open loopback starves and audio.cpp aborts its body
+// ("live request body stalled: no data within the idle timeout"). The portal now tells the gateway
+// about the mute (mic_mute / mic_unmute); while muted the machine feeds the loopback zeroed
+// silence itself, discards what the ASR says (a model can hallucinate text on silence), and --
+// after the operator's mute teardown -- tears the loopback down gracefully. The tests below
+// drive that end to end against the idle-modelling fake child, and pin the run-loop timer
+// discipline (one owner, every timer stopped on unmute, teardown and session end) on the machine.
+
+// muteSilenceFrameBytes is the keepalive frame the machine feeds for the harness's PCM shape: 100 ms
+// of 16 kHz mono s16le, the cadence of the browser's own batches.
+const muteSilenceFrameBytes = 3200
+
+// muteTestTiming is turnGraceTiming plus a fast keepalive tick and a mute teardown no test reaches
+// unless it overrides it. Chunks end only on push_end (the silence timer is 10s).
+func muteTestTiming() voiceTiming {
+	t := turnGraceTiming()
+	t.muteKeepaliveEvery = 25 * time.Millisecond
+	t.muteTeardown = 30 * time.Second
+	return t
+}
+
+// voiceFrameLog reads every down-frame of a session on its own goroutine and records them, so a
+// test can assert what did NOT arrive: a blocking conn.Read cannot be polled, because cancelling its
+// context closes the connection. It ends with the connection.
+type voiceFrameLog struct {
+	mu     sync.Mutex
+	frames []voiceDownMsg
+}
+
+func startVoiceFrameLog(ctx context.Context, conn *websocket.Conn) *voiceFrameLog {
+	l := &voiceFrameLog{}
+	go func() {
+		for {
+			typ, data, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			var m voiceDownMsg
+			if typ != websocket.MessageText || json.Unmarshal(data, &m) != nil {
+				continue
+			}
+			l.mu.Lock()
+			l.frames = append(l.frames, m)
+			l.mu.Unlock()
+		}
+	}()
+	return l
+}
+
+// count is how many frames of typ have arrived so far.
+func (l *voiceFrameLog) count(typ string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, f := range l.frames {
+		if f.Type == typ {
+			n++
+		}
+	}
+	return n
+}
+
+// requireNone fails the test if any frame of typ has arrived, naming what the session sent.
+func (l *voiceFrameLog) requireNone(t *testing.T, typ, why string) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, f := range l.frames {
+		if f.Type == typ {
+			t.Fatalf("%s: got a %q frame %+v", why, typ, f)
+		}
+	}
+}
+
+// requireVoiceSilence asserts stream is a whole number of zeroed keepalive frames and returns how
+// many: the machine's silence is never split, never shorter than a frame and never non-zero.
+func requireVoiceSilence(t *testing.T, stream []byte) int {
+	t.Helper()
+	if len(stream)%muteSilenceFrameBytes != 0 {
+		t.Fatalf("the child received %d bytes after the real audio, not a whole number of %d-byte silence frames", len(stream), muteSilenceFrameBytes)
+	}
+	for i, b := range stream {
+		if b != 0 {
+			t.Fatalf("byte %d of the post-mute stream is %#x: keepalive silence must be zeroed PCM", i, b)
+		}
+	}
+	return len(stream) / muteSilenceFrameBytes
+}
+
+// muteSession is a harness with one session that has an open, accepted, voiced loopback: one real
+// frame sent, its asr_partial read. base is a goroutine snapshot from before the session, so the
+// loopback's goroutines can be counted as the ones the test caused.
+type muteSession struct {
+	h     *voiceTurnHarness
+	child *fakeVoiceASRChild
+	conn  *websocket.Conn
+	ctx   context.Context
+	base  map[int]string
+	real  []byte // the one real PCM frame the loopback carried before any mute
+}
+
+func newMuteSession(t *testing.T, child *fakeVoiceASRChild, timing voiceTiming) *muteSession {
+	t.Helper()
+	return newMuteSessionWith(t, child, voiceTurnOpts{timing: timing})
+}
+
+func newMuteSessionWith(t *testing.T, child *fakeVoiceASRChild, opts voiceTurnOpts) *muteSession {
+	t.Helper()
+	s := &muteSession{child: child, base: goroutineStacks(), real: voiceIndexedFrame(1, 320)}
+	s.h = newVoiceTurnHarness(t, child, opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	s.ctx = ctx
+	s.conn = s.h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, s.conn, voiceStateListening)
+	if err := s.conn.Write(ctx, websocket.MessageBinary, s.real); err != nil {
+		t.Fatalf("send the real frame: %v", err)
+	}
+	readVoiceUntil(t, ctx, s.conn, voiceDownASRPartial)
+	if len(newRepoGoroutines(s.base, "gateway.voiceLoopbackPump(")) != 1 {
+		t.Fatal("no loopback is open after the first voiced frame")
+	}
+	return s
+}
+
+// loopbackGone reports whether the loopback is fully unwound: its own goroutines (pump, dial,
+// relay) AND the far side's handlers (the /v1 live handler that holds the user's live-session slot,
+// and the child's request handler) have returned.
+func (s *muteSession) loopbackGone() bool {
+	needles := append([]string{"gateway.(*Server).handleBearerLiveTranscription(", "gateway.(*fakeVoiceASRChild).serve("}, voiceLoopbackGoroutineNeedles...)
+	return len(newRepoGoroutines(s.base, needles...)) == 0
+}
+
+// loopbackOpen reports whether the loopback's pump and the child's handler are both still running.
+func (s *muteSession) loopbackOpen() bool {
+	return len(newRepoGoroutines(s.base, "gateway.voiceLoopbackPump(")) == 1 &&
+		len(newRepoGoroutines(s.base, "gateway.(*fakeVoiceASRChild).serve(")) == 1
+}
+
+// TestVoiceMuteKeepaliveSilenceOutlivesTheChildIdleTimeout is the #335 bug itself: the mic is
+// muted, the browser sends nothing, and the child -- which aborts a body that sees no data for its
+// idle timeout -- would stall the loopback out. With mic_mute the machine feeds silence of its own,
+// so the child keeps receiving data across several idle windows, the loopback stays open on its one
+// connection, nothing audio-shaped comes from the browser, and no error frame reaches the client.
+//
+// It proves the BODY side only: the harness leaves the gateway edge's SSE idle watchdog off and the
+// child answers every read, so that watchdog never fires here. The SSE side -- a child that says
+// nothing on silence -- is TestVoiceMuteKeepaliveLoopbackCutByTheEdgeWatchdogStaysQuiet.
+func TestVoiceMuteKeepaliveSilenceOutlivesTheChildIdleTimeout(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.idleTimeout = 400 * time.Millisecond
+	s := newMuteSession(t, child, muteTestTiming())
+	log := startVoiceFrameLog(s.ctx, s.conn)
+
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+
+	// Run across three of the child's idle windows. Without the keepalive the child aborts the body
+	// at the first one and the stall comes back as an error frame.
+	deadline := time.Now().Add(3 * child.idleTimeout)
+	for time.Now().Before(deadline) {
+		log.requireNone(t, voiceDownError, "the muted loopback stalled out")
+		time.Sleep(20 * time.Millisecond)
+	}
+	log.requireNone(t, voiceDownError, "the muted loopback stalled out")
+
+	if conns, _ := child.snapshot(); conns != 1 {
+		t.Fatalf("the child saw %d loopbacks, want the one the muted session kept alive", conns)
+	}
+	if !s.loopbackOpen() {
+		t.Fatal("the loopback is gone: the keepalive did not hold it open across the child's idle windows")
+	}
+	stream := voiceChildStream(child, 1)
+	if !bytes.HasPrefix(stream, s.real) {
+		t.Fatalf("the child's stream does not start with the one real frame the browser sent")
+	}
+	// Whole zeroed frames, a few per idle window: the browser sent only the real frame.
+	if n := requireVoiceSilence(t, stream[len(s.real):]); n < 8 {
+		t.Fatalf("the child received only %d silence frames across three idle windows at a 25ms tick, want at least 8", n)
+	}
+}
+
+// TestVoiceMuteDiscardsASROutputWhileMuted pins the hallucination guard on the wire: the child
+// answers every silence frame with a partial (a model inventing text on silence), and none of it may
+// reach the client as an asr_partial/asr_final nor start a chunk (no state change).
+func TestVoiceMuteDiscardsASROutputWhileMuted(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	s := newMuteSession(t, child, muteTestTiming())
+	log := startVoiceFrameLog(s.ctx, s.conn)
+
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+	// Wait until the child has demonstrably been fed (and so answered) several silence frames.
+	if !voicePoll(5*time.Second, func() bool { return len(voiceChildStream(child, 1)) >= len(s.real)+5*muteSilenceFrameBytes }) {
+		t.Fatal("the muted loopback was not fed silence")
+	}
+	// Give the last partials time to cross the relay: a frame they produced would be in the log by now.
+	time.Sleep(150 * time.Millisecond)
+
+	log.requireNone(t, voiceDownASRPartial, "the ASR's output on silence reached the client while muted")
+	log.requireNone(t, voiceDownASRFinal, "an ASR final reached the client while muted")
+	log.requireNone(t, voiceDownError, "muting must not fail the turn")
+	log.requireNone(t, voiceDownState, "muting must not move the session out of listening")
+}
+
+// TestVoiceMuteTeardownClosesLoopbackCleanly: after the operator's mute teardown a still-muted mic
+// has its loopback torn down -- no more silence, the pump/dial/relay and both server-side handlers
+// returned, the user's live-session slot freed -- with no error frame, no state change, and no
+// redial of its own.
+func TestVoiceMuteTeardownClosesLoopbackCleanly(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	timing := muteTestTiming()
+	timing.muteTeardown = 200 * time.Millisecond
+	s := newMuteSession(t, child, timing)
+	log := startVoiceFrameLog(s.ctx, s.conn)
+
+	muted := time.Now()
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+	if !voicePoll(10*time.Second, s.loopbackGone) {
+		t.Fatalf("the loopback was not torn down after the mute teardown:\n%s", strings.Join(newRepoGoroutines(s.base, voiceLoopbackGoroutineNeedles...), "\n\n"))
+	}
+	if since := time.Since(muted); since < 150*time.Millisecond {
+		t.Fatalf("the loopback was torn down %v after the mute, well before the 200ms teardown", since)
+	}
+
+	// Nothing keeps feeding a dead loopback, nothing redials one, and the client heard nothing.
+	_, before := child.snapshot()
+	time.Sleep(200 * time.Millisecond) // eight keepalive ticks
+	if conns, after := child.snapshot(); conns != 1 || after != before {
+		t.Fatalf("after the teardown the child saw %d loopbacks and %d new bytes, want 1 and none", conns, after-before)
+	}
+	log.requireNone(t, voiceDownError, "a mute teardown is graceful")
+	log.requireNone(t, voiceDownState, "a mute teardown must leave the session where it was")
+}
+
+// TestVoiceMuteTeardownEndsWithACleanEndOfInput pins that a mute teardown is a normal end, not an
+// abort. A sustained mute is the common case (every mute past the 10s default), so an aborted body
+// would loud-zero each one (ADR-041): an ERROR "live transcription billed zero" log and a
+// zero-quantity usage row. The teardown instead closes the feed like a finished chunk does: the child
+// sees the terminating chunk (a clean end-of-input), /v1's relay completes and bills what the loopback
+// carried, and nothing is logged at Error.
+func TestVoiceMuteTeardownEndsWithACleanEndOfInput(t *testing.T) {
+	logs, restore := withCapturedSlog(t)
+	t.Cleanup(restore)
+	child := newFakeVoiceASRChild(t)
+	timing := muteTestTiming()
+	timing.muteTeardown = 150 * time.Millisecond
+	s := newMuteSession(t, child, timing)
+	log := startVoiceFrameLog(s.ctx, s.conn)
+
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+	if !voicePoll(10*time.Second, s.loopbackGone) {
+		t.Fatal("the loopback was not torn down after the mute teardown")
+	}
+
+	if got := child.cleanEnds(); got != 1 {
+		t.Fatalf("the child's request body ended cleanly %d times, want 1: the mute teardown aborted the body instead of ending its input", got)
+	}
+	// The /v1 row is recorded when its handler returns, which loopbackGone has waited for.
+	row := onlyUsageEvent(t, s.h.srv)
+	if row.BillingUnit != usage.BillingUnitAudioSecond || row.BillingQuantity <= 0 || row.Status != "success" {
+		t.Fatalf("the loopback's usage row = %v %q status %q, want the audio it carried billed as a normal end (a zero quantity is the abort's loud zero)",
+			row.BillingQuantity, row.BillingUnit, row.Status)
+	}
+	for _, rec := range errorLogs(logs) {
+		if strings.Contains(rec.Msg, "billed zero") {
+			t.Fatalf("the mute teardown was logged as a loud zero: %q", rec.Msg)
+		}
+	}
+	log.requireNone(t, voiceDownError, "a mute teardown is graceful")
+	log.requireNone(t, voiceDownState, "a mute teardown must leave the session where it was")
+}
+
+// TestVoiceMuteKeepaliveLoopbackCutByTheEdgeWatchdogStaysQuiet: the keepalive's silence satisfies
+// audio.cpp's BODY idle timeout, but the loopback goes through the gateway's own /v1, whose edge
+// watchdog (StreamIdleTimeout, 120s in production) is re-armed only by SSE from the child. A model
+// that answers silence with nothing therefore has its muted keepalive loopback cut by the gateway
+// itself. With the operator's keepalive nothing else ends it, so this is the path that used to turn
+// into a turn-killing error frame for a mic the user had muted. It must instead be a quiet teardown:
+// no error frame, no state change, and the first real frame after the unmute reopens a loopback.
+func TestVoiceMuteKeepaliveLoopbackCutByTheEdgeWatchdogStaysQuiet(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	timing := muteTestTiming()
+	timing.muteKeepalive = true // never torn down by the machine: only the edge can end it
+	s := newMuteSessionWith(t, child, voiceTurnOpts{timing: timing, streamIdle: 300 * time.Millisecond})
+	log := startVoiceFrameLog(s.ctx, s.conn)
+
+	// The first partial has been answered (it armed the edge watchdog to its idle window); from now
+	// on the ASR says nothing, whatever it is fed.
+	child.silent.Store(true)
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+	if !voicePoll(10*time.Second, s.loopbackGone) {
+		t.Fatal("the edge watchdog never cut the silent loopback (or the machine never tore it down)")
+	}
+	time.Sleep(100 * time.Millisecond) // a frame the cut produced would be on the wire by now
+	log.requireNone(t, voiceDownError, "the edge watchdog's cut of a muted loopback reached the client")
+	log.requireNone(t, voiceDownState, "the cut must leave the session where it was (listening), not idle")
+
+	// The session is intact: unmute and speak, and a fresh loopback carries it.
+	child.silent.Store(false)
+	sendVoiceControl(t, s.ctx, s.conn, "mic_unmute")
+	resumed := voiceIndexedFrame(2, 320)
+	if err := s.conn.Write(s.ctx, websocket.MessageBinary, resumed); err != nil {
+		t.Fatalf("send the resumed frame: %v", err)
+	}
+	if !voicePoll(10*time.Second, func() bool { return log.count(voiceDownASRPartial) >= 1 }) {
+		t.Fatal("no asr_partial after the unmute: the real frame did not reopen a loopback")
+	}
+	if conns, _ := child.snapshot(); conns != 2 {
+		t.Fatalf("the child saw %d loopbacks, want the cut one and its replacement", conns)
+	}
+	log.requireNone(t, voiceDownError, "the quiet teardown must not surface later either")
+}
+
+// TestVoiceMuteKeepaliveHoldsTheLoopbackOpenIndefinitely: with the operator's keepalive (the
+// knob's explicit 0) the loopback is never torn down while muted, however long. muteTeardown is set
+// SHORT on purpose: it must be ignored, and a gateway that read it would tear down at 50ms.
+func TestVoiceMuteKeepaliveHoldsTheLoopbackOpenIndefinitely(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.idleTimeout = 300 * time.Millisecond
+	timing := muteTestTiming()
+	timing.muteKeepalive = true
+	timing.muteTeardown = 50 * time.Millisecond
+	s := newMuteSession(t, child, timing)
+	log := startVoiceFrameLog(s.ctx, s.conn)
+
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+	time.Sleep(1200 * time.Millisecond) // 24x the short teardown, 4x the child's idle window
+	log.requireNone(t, voiceDownError, "the keepalive loopback stalled or was torn down")
+	if !s.loopbackOpen() {
+		t.Fatal("the loopback was torn down although the operator asked for keepalive")
+	}
+	if conns, _ := child.snapshot(); conns != 1 {
+		t.Fatalf("the child saw %d loopbacks, want the one kept alive", conns)
+	}
+
+	// Unmuting resumes real audio on that SAME loopback.
+	sendVoiceControl(t, s.ctx, s.conn, "mic_unmute")
+	resumed := voiceIndexedFrame(2, 320)
+	if err := s.conn.Write(s.ctx, websocket.MessageBinary, resumed); err != nil {
+		t.Fatalf("send the resumed frame: %v", err)
+	}
+	if !voicePoll(5*time.Second, func() bool { return bytes.HasSuffix(voiceChildStream(child, 1), resumed) }) {
+		t.Fatal("the resumed real frame never reached the kept-alive loopback")
+	}
+	if conns, _ := child.snapshot(); conns != 1 {
+		t.Fatalf("unmuting redialled: the child saw %d loopbacks, want 1", conns)
+	}
+}
+
+// TestVoiceMuteQuickUnmuteKeepsLoopbackAndStopsTimers: an unmute inside the teardown window keeps
+// the open loopback (no redial) and disarms BOTH timers -- the keepalive stops feeding silence and
+// the teardown no longer fires, however long the mic then stays unmuted with the loopback idle.
+func TestVoiceMuteQuickUnmuteKeepsLoopbackAndStopsTimers(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	timing := muteTestTiming()
+	timing.muteTeardown = 400 * time.Millisecond
+	s := newMuteSession(t, child, timing)
+	log := startVoiceFrameLog(s.ctx, s.conn)
+
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+	if !voicePoll(5*time.Second, func() bool { return len(voiceChildStream(child, 1)) >= len(s.real)+2*muteSilenceFrameBytes }) {
+		t.Fatal("the muted loopback was not fed silence")
+	}
+	sendVoiceControl(t, s.ctx, s.conn, "mic_unmute")
+
+	// Unmuted: the silence stops. A tick already queued when the unmute landed may still go out, so
+	// let the stream settle, then it must not move.
+	var settled []byte
+	if !voicePoll(5*time.Second, func() bool {
+		a := voiceChildStream(child, 1)
+		time.Sleep(100 * time.Millisecond) // four would-be ticks
+		b := voiceChildStream(child, 1)
+		settled = b
+		return bytes.Equal(a, b)
+	}) {
+		t.Fatal("the child kept receiving silence after mic_unmute: the keepalive was not stopped")
+	}
+	// Well past the 400ms teardown with the mic unmuted and the loopback idle: still open.
+	time.Sleep(700 * time.Millisecond)
+	if !s.loopbackOpen() {
+		t.Fatal("the loopback was torn down after mic_unmute: the teardown timer was not stopped")
+	}
+	if got := voiceChildStream(child, 1); !bytes.Equal(got, settled) {
+		t.Fatalf("the child received %d more bytes while unmuted and idle", len(got)-len(settled))
+	}
+
+	// And it is live: a real frame goes into the same loopback and is transcribed.
+	next := voiceIndexedFrame(2, 320)
+	if err := s.conn.Write(s.ctx, websocket.MessageBinary, next); err != nil {
+		t.Fatalf("send the next real frame: %v", err)
+	}
+	if !voicePoll(5*time.Second, func() bool { return bytes.HasSuffix(voiceChildStream(child, 1), next) }) {
+		t.Fatal("the real frame after the unmute never reached the loopback")
+	}
+	if !voicePoll(5*time.Second, func() bool { return log.count(voiceDownASRPartial) >= 1 }) {
+		t.Fatal("no asr_partial after the unmute: the ASR filter was not lifted")
+	}
+	if conns, _ := child.snapshot(); conns != 1 {
+		t.Fatalf("the child saw %d loopbacks, want the one the quick unmute kept", conns)
+	}
+	log.requireNone(t, voiceDownError, "a quick mute/unmute is invisible")
+}
+
+// TestVoiceMuteUnmuteAfterTeardownReopensLoopback: when the mute outlasted the teardown the unmute
+// does not redial by itself -- the NEXT real frame does, lazily (the existing onPCM behavior) -- and
+// the fresh loopback carries only that frame and finishes the turn with its own final.
+func TestVoiceMuteUnmuteAfterTeardownReopensLoopback(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	child.finals = []string{"unused", "resumed ok"} // connection 1 is torn down by the mute, 2 completes
+	timing := muteTestTiming()
+	timing.muteTeardown = 150 * time.Millisecond
+	s := newMuteSession(t, child, timing)
+
+	sendVoiceControl(t, s.ctx, s.conn, "mic_mute")
+	// Fully unwound, including the /v1 handler that holds the live-session slot: a redial that beats
+	// its release is refused (transcription.live_busy), as in TestVoiceCancelMidDialThenRedial.
+	if !voicePoll(10*time.Second, s.loopbackGone) {
+		t.Fatal("the loopback was not torn down after the mute teardown")
+	}
+	sendVoiceControl(t, s.ctx, s.conn, "mic_unmute")
+	if conns, _ := child.snapshot(); conns != 1 {
+		t.Fatalf("unmuting redialled by itself: the child saw %d loopbacks, want it to wait for audio", conns)
+	}
+
+	resumed := voiceIndexedFrame(2, 320)
+	if err := s.conn.Write(s.ctx, websocket.MessageBinary, resumed); err != nil {
+		t.Fatalf("send the resumed frame: %v", err)
+	}
+	readVoiceUntilFailingOnError(t, s.ctx, s.conn, voiceDownASRPartial)
+	sendVoiceControl(t, s.ctx, s.conn, "push_end")
+	if final := readVoiceUntilFailingOnError(t, s.ctx, s.conn, voiceDownASRFinal); final.Text != "resumed ok" {
+		t.Fatalf("asr_final = %q, want the fresh loopback's %q", final.Text, "resumed ok")
+	}
+	if conns, _ := child.snapshot(); conns != 2 {
+		t.Fatalf("the child saw %d loopbacks, want the torn-down one and its replacement", conns)
+	}
+	if got := voiceChildStream(child, 2); !bytes.Equal(got, resumed) {
+		t.Fatalf("the fresh loopback carried %d bytes, want only the resumed frame (%d bytes)", len(got), len(resumed))
+	}
+}
+
+// TestVoiceMuteStaleFrameOpeningALoopbackIsStillManaged: the read loop forwards PCM and controls on
+// separate channels, so a real frame sent just before the mute can be taken AFTER it. If that frame
+// opens a loopback while muted, the loopback is not an orphan: it is kept alive, its ASR output is
+// discarded, and it is torn down on the same mute teardown.
+func TestVoiceMuteStaleFrameOpeningALoopbackIsStillManaged(t *testing.T) {
+	child := newFakeVoiceASRChild(t)
+	timing := muteTestTiming()
+	timing.muteTeardown = 200 * time.Millisecond
+	base := goroutineStacks()
+	h := newVoiceTurnHarness(t, child, voiceTurnOpts{timing: timing})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn := h.dial(t, ctx)
+	readVoiceUntilState(t, ctx, conn, voiceStateListening)
+	log := startVoiceFrameLog(ctx, conn)
+
+	sendVoiceControl(t, ctx, conn, "mic_mute") // no loopback yet: nothing to keep alive or tear down
+	if err := conn.Write(ctx, websocket.MessageBinary, voiceIndexedFrame(1, 320)); err != nil {
+		t.Fatalf("send the stale frame: %v", err)
+	}
+	if !voicePoll(5*time.Second, func() bool { return len(newRepoGoroutines(base, "gateway.voiceLoopbackPump(")) == 1 }) {
+		t.Fatal("the frame did not open a loopback")
+	}
+	// Torn down by the mute teardown, armed when the loopback opened.
+	handlers := []string{"gateway.(*Server).handleBearerLiveTranscription(", "gateway.(*fakeVoiceASRChild).serve("}
+	if !voicePoll(10*time.Second, func() bool {
+		return len(newRepoGoroutines(base, append(handlers, voiceLoopbackGoroutineNeedles...)...)) == 0
+	}) {
+		t.Fatal("a loopback opened while muted was never torn down: it is an orphan")
+	}
+	log.requireNone(t, voiceDownASRPartial, "the ASR output of a frame taken while muted reached the client")
+	log.requireNone(t, voiceDownError, "the orphan guard must be graceful")
+}
+
+// --- Mute timers on the machine (#335) ----------------------------------------------------
+
+// muteUnitMachine is a bare machine with a stubbed loopback (it exists: turnCancel is set, and its
+// pump is a queue the test reads), so the mute handlers can be driven without a network. The test is
+// the machine's only goroutine, as the run loop is in production. torn counts turnCancel calls.
+func muteUnitMachine(timing voiceTiming) (m *voiceMachine, queue chan []byte, torn *int) {
+	ctx, cancel := context.WithCancel(context.Background())
+	queue = make(chan []byte, voiceLoopbackPCMQueue)
+	torn = new(int)
+	m = &voiceMachine{
+		ctx: ctx, cancel: cancel, timing: timing,
+		claims: voiceTicketClaims{SampleRate: 16000, Channels: 1, SampleFormat: "s16le"},
+		writer: newVoiceWriter(&fakeVoiceSocket{}, cancel), // never run: frames just sit in its queue
+		state:  voiceStateListening, turnCancel: func() { *torn++ }, pcmOut: queue,
+	}
+	return m, queue, torn
+}
+
+// requireMuteTimers asserts whether the machine's two mute timers are armed.
+func requireMuteTimers(t *testing.T, m *voiceMachine, keepalive, teardown bool, why string) {
+	t.Helper()
+	if got := m.muteKeepC != nil && m.muteKeepTicker != nil; got != keepalive {
+		t.Fatalf("%s: keepalive ticker armed = %v, want %v", why, got, keepalive)
+	}
+	if got := m.muteTeardownC != nil && m.muteTeardownTimer != nil; got != teardown {
+		t.Fatalf("%s: teardown timer armed = %v, want %v", why, got, teardown)
+	}
+}
+
+// TestVoiceMutedASREventsAreDiscarded: while muted every transcript event is dropped before it can
+// touch the turn -- no pendingText, no chunk, no silence/max timer, no asr_* down-frame -- in the
+// continuation window (thinking) as much as in listening, where a phantom partial would otherwise
+// cancel the speculative run. Unmuted the very same events are processed, so the guard is the mute
+// and not a broken handler. (An upstream ERROR is a loopback end, not transcript text:
+// TestVoiceMutedLoopbackEndsAreQuiet.)
+func TestVoiceMutedASREventsAreDiscarded(t *testing.T) {
+	events := []asrEvent{
+		{kind: asrKindDelta, text: "Thank you."},
+		{kind: asrKindPartial, text: "Thank you."},
+		{kind: asrKindDone, text: "Thanks for watching."},
+	}
+	for _, state := range []string{voiceStateListening, voiceStateThinking} {
+		for _, ev := range events {
+			t.Run(fmt.Sprintf("%s/kind%d", state, ev.kind), func(t *testing.T) {
+				m, _, _ := muteUnitMachine(fastVoiceTiming())
+				m.state = state
+				m.micMuted = true
+				m.onASREvent(ev)
+				if m.pendingText != "" || m.chunkText != "" || m.chunkActive || m.silenceTimer != nil || m.maxTimer != nil {
+					t.Fatalf("a muted %v event reached the turn: pendingText=%q chunkText=%q chunkActive=%v", ev.kind, m.pendingText, m.chunkText, m.chunkActive)
+				}
+				if n := len(m.writer.out); n != 0 {
+					t.Fatalf("a muted %v event produced %d down-frames, want none", ev.kind, n)
+				}
+
+				// The same event unmuted is processed. A delta/partial streams an asr_partial; a final
+				// ends the chunk into a speculative run, which needs a whole server, so the end-to-end
+				// tests carry that half and the delta/partial cases carry the contrast here.
+				m, _, _ = muteUnitMachine(fastVoiceTiming())
+				m.state = state
+				defer m.stopAllTimers()
+				if ev.kind == asrKindDone {
+					return
+				}
+				m.onASREvent(ev)
+				if m.chunkText != ev.text || len(m.writer.out) == 0 {
+					t.Fatalf("the unmuted %v event was not processed: chunkText=%q frames=%d", ev.kind, m.chunkText, len(m.writer.out))
+				}
+			})
+		}
+	}
+}
+
+// TestVoiceMuteTimersFollowTheLoopback walks the timers through their whole life on the machine:
+// armed by mic_mute only while a loopback exists, keepalive-only for the operator's keepalive, never
+// re-armed by a repeated mic_mute (the teardown clock would slide), stopped by mic_unmute and by the
+// turn's own teardown, and a keepalive tick feeding exactly the ticket-shaped zeroed frame.
+func TestVoiceMuteTimersFollowTheLoopback(t *testing.T) {
+	tick := func(t *testing.T, m *voiceMachine) {
+		t.Helper()
+		select {
+		case <-m.muteKeepC:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the keepalive ticker never fired")
+		}
+		m.onMuteKeepalive()
+	}
+	timing := fastVoiceTiming()
+	timing.muteKeepaliveEvery = 10 * time.Millisecond
+	timing.muteTeardown = time.Hour
+
+	t.Run("mute arms both, tick feeds one silence frame", func(t *testing.T) {
+		m, queue, _ := muteUnitMachine(timing)
+		defer m.stopAllTimers()
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		if !m.micMuted {
+			t.Fatal("mic_mute did not set micMuted")
+		}
+		requireMuteTimers(t, m, true, true, "after mic_mute")
+		tick(t, m)
+		select {
+		case frame := <-queue:
+			if len(frame) != muteSilenceFrameBytes {
+				t.Fatalf("keepalive frame is %d bytes, want %d (100ms of 16kHz mono s16le)", len(frame), muteSilenceFrameBytes)
+			}
+			if !bytes.Equal(frame, make([]byte, muteSilenceFrameBytes)) {
+				t.Fatal("the keepalive frame is not zeroed PCM")
+			}
+		default:
+			t.Fatal("a keepalive tick fed nothing into the loopback queue")
+		}
+	})
+
+	t.Run("operator keepalive arms no teardown", func(t *testing.T) {
+		keep := timing
+		keep.muteKeepalive = true
+		keep.muteTeardown = time.Millisecond // must be ignored
+		m, _, _ := muteUnitMachine(keep)
+		defer m.stopAllTimers()
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		requireMuteTimers(t, m, true, false, "keepalive mode")
+	})
+
+	t.Run("no loopback arms nothing", func(t *testing.T) {
+		m, _, _ := muteUnitMachine(timing)
+		m.turnCancel, m.pcmOut = nil, nil
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		if !m.micMuted {
+			t.Fatal("mic_mute did not set micMuted without a loopback")
+		}
+		requireMuteTimers(t, m, false, false, "mute with no loopback")
+	})
+
+	t.Run("a repeated mute does not slide the teardown clock", func(t *testing.T) {
+		m, _, _ := muteUnitMachine(timing)
+		defer m.stopAllTimers()
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		keepTicker, teardownTimer := m.muteKeepTicker, m.muteTeardownTimer
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		if m.muteKeepTicker != keepTicker || m.muteTeardownTimer != teardownTimer {
+			t.Fatal("a second mic_mute re-armed the timers: the mute teardown would restart")
+		}
+	})
+
+	t.Run("unmute stops both and lifts the mute", func(t *testing.T) {
+		m, queue, torn := muteUnitMachine(timing)
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		m.onControl(voiceUpControl{Type: voiceUpMicUnmute})
+		if m.micMuted {
+			t.Fatal("mic_unmute left micMuted set")
+		}
+		requireMuteTimers(t, m, false, false, "after mic_unmute")
+		if *torn != 0 || m.turnCancel == nil || len(queue) != 0 {
+			t.Fatalf("mic_unmute touched the loopback: torn=%d turnCancel set=%v queued=%d", *torn, m.turnCancel != nil, len(queue))
+		}
+		m.onControl(voiceUpControl{Type: voiceUpMicUnmute}) // an unmute with no mute is a no-op
+		requireMuteTimers(t, m, false, false, "a stray mic_unmute")
+	})
+
+	t.Run("the turn's own teardown stops them, mute persists", func(t *testing.T) {
+		m, _, _ := muteUnitMachine(timing)
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		m.teardownTurn() // e.g. the continuation window closing under a muted mic
+		requireMuteTimers(t, m, false, false, "after the turn's teardown")
+		if !m.micMuted {
+			t.Fatal("a turn teardown cleared the mute: the next loopback would not be filtered")
+		}
+	})
+
+	t.Run("a stray tick without a loopback feeds nothing and disarms itself", func(t *testing.T) {
+		m, queue, _ := muteUnitMachine(timing)
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		m.turnCancel, m.pcmOut = nil, nil
+		m.onMuteKeepalive()
+		if len(queue) != 0 {
+			t.Fatal("a tick with no loopback fed a frame")
+		}
+		requireMuteTimers(t, m, false, false, "a tick with nothing to keep alive")
+	})
+}
+
+// TestVoiceMuteTeardownTimerFires drives the machine's own teardown handler. It ends a still-muted
+// loopback CLEANLY, not by abort: the feed is closed (the pump's clean end-of-input), the keepalive
+// stops, the in-progress chunk is dropped (a half-built chunk whose loopback is going must not seed
+// the next one), and the loopback itself is torn down only once the relay reports the child's clean
+// end (onASRClosed) -- or the finalize bound expires -- all of it silent: no error frame, no state
+// change, mute kept. An unmute in the meantime tears the half-closed loopback down at once. It skips
+// a loopback whose chunk is already finalizing (finishChunk tears it down, with the clean final) and
+// is inert once the mic is unmuted.
+func TestVoiceMuteTeardownTimerFires(t *testing.T) {
+	timing := fastVoiceTiming()
+	timing.muteKeepaliveEvery = time.Hour
+	timing.muteTeardown = 10 * time.Millisecond
+	fire := func(t *testing.T, m *voiceMachine) {
+		t.Helper()
+		select {
+		case <-m.muteTeardownC:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the teardown timer never fired")
+		}
+		m.onMuteTeardown()
+	}
+	// closing builds a thinking-window machine with a half-built chunk, mutes it and fires the teardown.
+	closing := func(t *testing.T) (*voiceMachine, chan []byte, *int) {
+		t.Helper()
+		m, queue, torn := muteUnitMachine(timing)
+		m.state = voiceStateThinking // the continuation window: a resumed chunk's loopback is open
+		m.chunkActive, m.chunkText = true, "half a chunk"
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		fire(t, m)
+		t.Cleanup(m.stopAllTimers)
+		return m, queue, torn
+	}
+	requireQuiet := func(t *testing.T, m *voiceMachine, why string) {
+		t.Helper()
+		if m.state != voiceStateThinking || len(m.writer.out) != 0 || !m.micMuted {
+			t.Fatalf("%s was not silent: state=%q frames=%d micMuted=%v", why, m.state, len(m.writer.out), m.micMuted)
+		}
+	}
+
+	t.Run("closes the feed cleanly and waits for the child", func(t *testing.T) {
+		m, queue, torn := closing(t)
+		if _, open := <-queue; open {
+			t.Fatal("the loopback's feed was not closed: the pump would never end the body cleanly")
+		}
+		if *torn != 0 || m.turnCancel == nil || !m.muteClosing {
+			t.Fatalf("the teardown aborted instead of closing: torn=%d turnCancel set=%v muteClosing=%v", *torn, m.turnCancel != nil, m.muteClosing)
+		}
+		if m.muteKeepC != nil || m.muteTeardownC != nil || m.finalizeC == nil {
+			t.Fatalf("timers after the close: keepalive armed=%v teardown armed=%v finalize bound armed=%v, want only the finalize bound",
+				m.muteKeepC != nil, m.muteTeardownC != nil, m.finalizeC != nil)
+		}
+		if m.chunkActive || m.chunkText != "" {
+			t.Fatalf("the half-built chunk survived: chunkActive=%v chunkText=%q", m.chunkActive, m.chunkText)
+		}
+		requireQuiet(t, m, "closing the loopback")
+	})
+
+	t.Run("finishes quietly when the child's end arrives", func(t *testing.T) {
+		m, _, torn := closing(t)
+		// The child's closing transcript is filtered, the relay closing completes the teardown.
+		m.onASREvent(asrEvent{kind: asrKindDone, text: "Thanks for watching."})
+		if *torn != 0 || m.pendingText != "" {
+			t.Fatalf("the filtered closing transcript acted: torn=%d pendingText=%q", *torn, m.pendingText)
+		}
+		m.onASRClosed()
+		if *torn != 1 || m.turnCancel != nil || m.muteClosing || m.finalizeC != nil {
+			t.Fatalf("after the relay closed torn=%d turnCancel set=%v muteClosing=%v finalize armed=%v, want the loopback gone",
+				*torn, m.turnCancel != nil, m.muteClosing, m.finalizeC != nil)
+		}
+		requireQuiet(t, m, "the end of the mute teardown")
+	})
+
+	t.Run("a child that never answers is cut at the finalize bound", func(t *testing.T) {
+		m, _, torn := closing(t)
+		m.onFinalizeTimeout()
+		if *torn != 1 || m.turnCancel != nil || m.muteClosing {
+			t.Fatalf("after the bound torn=%d turnCancel set=%v muteClosing=%v, want the loopback gone", *torn, m.turnCancel != nil, m.muteClosing)
+		}
+		requireQuiet(t, m, "the finalize bound")
+	})
+
+	t.Run("an unmute while closing tears the half-closed loopback down", func(t *testing.T) {
+		m, _, torn := closing(t)
+		m.onControl(voiceUpControl{Type: voiceUpMicUnmute})
+		if *torn != 1 || m.turnCancel != nil || m.muteClosing || m.micMuted {
+			t.Fatalf("after the unmute torn=%d turnCancel set=%v muteClosing=%v micMuted=%v, want the loopback gone and the mic live",
+				*torn, m.turnCancel != nil, m.muteClosing, m.micMuted)
+		}
+	})
+
+	t.Run("leaves a finalizing chunk to finishChunk", func(t *testing.T) {
+		m, queue, torn := muteUnitMachine(timing)
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		m.finalizing = true
+		fire(t, m)
+		if *torn != 0 || m.turnCancel == nil || m.muteClosing || len(queue) != 0 {
+			t.Fatalf("the teardown touched a chunk that was awaiting its final: torn=%d muteClosing=%v", *torn, m.muteClosing)
+		}
+		select {
+		case _, open := <-queue:
+			if !open {
+				t.Fatal("the teardown closed the feed of a finalizing chunk")
+			}
+		default:
+		}
+	})
+
+	t.Run("is inert after the unmute", func(t *testing.T) {
+		m, queue, torn := muteUnitMachine(timing)
+		m.onControl(voiceUpControl{Type: voiceUpMicMute})
+		m.micMuted = false // an unmute whose timer fire was already in flight
+		m.onMuteTeardown()
+		if *torn != 0 || m.muteClosing || len(queue) != 0 {
+			t.Fatal("a stale teardown fire acted on an unmuted loopback")
+		}
+		m.stopAllTimers()
+	})
+}
+
+// TestVoiceMutedLoopbackEndsAreQuiet: while the mic is muted every way the loopback can end -- the
+// relay closing (the gateway edge's idle watchdog cutting a keepalive loopback whose ASR sent no
+// SSE), the request body failing under the pump, a failed or refused dial, an ASR error event -- is a
+// QUIET teardown: the loopback is torn down and the mute stays, but no error frame goes down and the
+// session does not go idle, because the user muted the mic and can neither see nor act on a loopback.
+// Unmuted the same ends fail the turn as before (the existing tests cover those), and an end that
+// is only a pending dial's pump failure stays inert. A chunk that is finalizing still finishes the
+// turn it belongs to.
+func TestVoiceMutedLoopbackEndsAreQuiet(t *testing.T) {
+	newMuted := func(t *testing.T) (*voiceMachine, *int) {
+		m, _, torn := muteUnitMachine(fastVoiceTiming())
+		m.micMuted = true
+		m.asrCh = make(chan asrEvent) // the dial succeeded: the loopback is established
+		m.chunkActive, m.chunkText = true, "half a chunk"
+		t.Cleanup(m.stopAllTimers)
+		return m, torn
+	}
+	cases := []struct {
+		name string
+		end  func(m *voiceMachine)
+	}{
+		{"relay closed (the edge idle watchdog's cut)", func(m *voiceMachine) { m.onASRClosed() }},
+		{"pump failed", func(m *voiceMachine) { m.onLoopbackEvent(voiceLoopbackEvent{kind: loopbackPumpFailed}) }},
+		{"dial failed", func(m *voiceMachine) { m.onLoopbackEvent(voiceLoopbackEvent{kind: loopbackDialFailed}) }},
+		{"dial refused", func(m *voiceMachine) {
+			m.onLoopbackEvent(voiceLoopbackEvent{kind: loopbackRefused, code: "transcription.live_busy", message: "busy"})
+		}},
+		{"asr error event", func(m *voiceMachine) {
+			m.onASREvent(asrEvent{kind: asrKindError, code: "transcription.stream_error", message: "stalled"})
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, torn := newMuted(t)
+			tc.end(m)
+			if *torn != 1 || m.turnCancel != nil {
+				t.Fatalf("the muted loopback was not torn down: torn=%d turnCancel set=%v", *torn, m.turnCancel != nil)
+			}
+			if m.state != voiceStateListening || len(m.writer.out) != 0 || !m.micMuted {
+				t.Fatalf("the end was not quiet: state=%q frames=%d micMuted=%v", m.state, len(m.writer.out), m.micMuted)
+			}
+			if m.chunkActive || m.chunkText != "" {
+				t.Fatalf("the dead loopback's half-built chunk survived: chunkActive=%v chunkText=%q", m.chunkActive, m.chunkText)
+			}
+		})
+	}
+
+	t.Run("a pump failure with the dial still pending stays inert", func(t *testing.T) {
+		m, torn := newMuted(t)
+		m.asrCh = nil // the dial's own outcome follows and is authoritative
+		m.onLoopbackEvent(voiceLoopbackEvent{kind: loopbackPumpFailed})
+		if *torn != 0 || m.turnCancel == nil {
+			t.Fatalf("a pending dial's pump failure tore the loopback down: torn=%d", *torn)
+		}
+	})
+
+	t.Run("unmuted the same relay end still fails the turn", func(t *testing.T) {
+		m, torn := newMuted(t)
+		m.micMuted = false
+		m.onASRClosed()
+		if *torn != 1 || m.state != voiceStateIdle || len(m.writer.out) == 0 {
+			t.Fatalf("unmuted relay end: torn=%d state=%q frames=%d, want the turn failed (1, idle, an error frame)", *torn, m.state, len(m.writer.out))
+		}
+	})
+
+	t.Run("an error while a chunk is finalizing still fails that turn", func(t *testing.T) {
+		m, torn := newMuted(t)
+		m.finalizing = true
+		m.onASREvent(asrEvent{kind: asrKindError, code: "transcription.stream_error", message: "stalled"})
+		if *torn != 1 || m.state != voiceStateIdle || len(m.writer.out) == 0 {
+			t.Fatalf("a finalizing chunk's error: torn=%d state=%q frames=%d, want the turn failed with an error frame", *torn, m.state, len(m.writer.out))
+		}
+	})
+}
+
+// TestVoiceMuteRunLoopOwnsTheTimers runs the REAL run loop over a stubbed loopback: mic_mute makes
+// it tick silence into the queue; mic_unmute stops that; a muted session that ends leaves no timer
+// behind (they are run-loop state, stopped by the loop's own teardown), and a mute teardown fires
+// into the loop's select, not from a timer goroutine. Run under -race, it is also the check that no
+// machine field is touched off the run loop.
+func TestVoiceMuteRunLoopOwnsTheTimers(t *testing.T) {
+	timing := fastVoiceTiming()
+	timing.muteKeepaliveEvery = 20 * time.Millisecond
+	timing.muteTeardown = 300 * time.Millisecond
+	m, queue, torn := muteUnitMachine(timing)
+	pcmCh := make(chan []byte, voiceInboundQueue)
+	ctrlCh := make(chan voiceUpControl, voiceInboundQueue)
+	m.pcmCh, m.ctrlCh = pcmCh, ctrlCh
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); m.run() }()
+
+	ctrlCh <- voiceUpControl{Type: voiceUpMicMute}
+	if !voicePoll(5*time.Second, func() bool { return len(queue) >= 3 }) {
+		t.Fatalf("the run loop fed only %d keepalive frames after mic_mute", len(queue))
+	}
+
+	// Unmute, then a real frame as the barrier: the loop handles it after the unmute's effects.
+	ctrlCh <- voiceUpControl{Type: voiceUpMicUnmute}
+	if !voicePoll(5*time.Second, func() bool { return len(ctrlCh) == 0 }) {
+		t.Fatal("the run loop never took mic_unmute")
+	}
+	marker := voiceIndexedFrame(7, 64)
+	pcmCh <- marker
+	for seen := false; !seen; {
+		select {
+		case f := <-queue:
+			seen = bytes.Equal(f, marker)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the real frame after the unmute never reached the loopback queue")
+		}
+	}
+	// Past the teardown (300ms) and several ticks (20ms): an unmuted loop feeds and tears down nothing.
+	time.Sleep(450 * time.Millisecond)
+	if len(queue) != 0 || *torn != 0 {
+		t.Fatalf("an unmuted run loop kept acting on the mute: %d frames queued, torn=%d", len(queue), *torn)
+	}
+
+	// Mute again and let the TEARDOWN fire into the loop's select.
+	ctrlCh <- voiceUpControl{Type: voiceUpMicMute}
+	if !voicePoll(5*time.Second, func() bool { return len(queue) > 0 }) { // ticking again
+		t.Fatal("the second mute never ticked")
+	}
+	select {
+	case <-drainUntilClosed(queue): // the mute teardown closes the feed (a clean end-of-input)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the mute teardown never fired into the run loop")
+	}
+	// The stub has no relay to report the child's clean end, so the loopback is still waiting for it:
+	// the teardown closed the feed but did not abort. The session ending then aborts it, once.
+	if *torn != 0 {
+		t.Fatalf("the mute teardown aborted the loopback (turnCancel called %d times) instead of closing it cleanly", *torn)
+	}
+
+	m.cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run loop did not exit when its context ended")
+	}
+	if *torn != 1 {
+		t.Fatalf("turnCancel called %d times, want once (the session's exit teardown)", *torn)
+	}
+	requireMuteTimers(t, m, false, false, "after the session ended")
+}
+
+// drainUntilClosed discards frames until the queue is closed and returns a closed channel, so a
+// test can wait for the loopback's feed to be closed (its teardown) without a sleep.
+func drainUntilClosed(queue <-chan []byte) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, ok := <-queue; !ok {
+				return
+			}
+		}
+	}()
+	return done
+}
+
+// TestVoiceMuteSessionEndWhileMutedStopsTimers: the session ends (the handler context) while muted
+// with a live loopback and both timers armed. The run loop's exit path tears the loopback down and
+// stops the timers: nothing is left ticking.
+func TestVoiceMuteSessionEndWhileMutedStopsTimers(t *testing.T) {
+	timing := fastVoiceTiming()
+	timing.muteKeepaliveEvery = 20 * time.Millisecond
+	timing.muteTeardown = time.Hour
+	m, queue, torn := muteUnitMachine(timing)
+	pcmCh := make(chan []byte, voiceInboundQueue)
+	ctrlCh := make(chan voiceUpControl, voiceInboundQueue)
+	m.pcmCh, m.ctrlCh = pcmCh, ctrlCh
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); m.run() }()
+
+	ctrlCh <- voiceUpControl{Type: voiceUpMicMute}
+	if !voicePoll(5*time.Second, func() bool { return len(queue) >= 2 }) {
+		t.Fatal("the muted loop never ticked")
+	}
+	m.cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run loop did not exit when its context ended")
+	}
+	if *torn != 1 {
+		t.Fatalf("turnCancel called %d times on exit, want once", *torn)
+	}
+	requireMuteTimers(t, m, false, false, "after the session ended while muted")
+}
+
+// TestVoiceSilenceFrameFollowsTheTicketShape: the keepalive frame is the ticket's fixed PCM shape
+// -- 100 ms of silence, whole sample frames, zero bytes -- for both formats live transcription takes.
+func TestVoiceSilenceFrameFollowsTheTicketShape(t *testing.T) {
+	cases := []struct {
+		rate, channels int
+		format         string
+		want           int
+	}{
+		{16000, 1, "s16le", 3200},
+		{48000, 2, "s16le", 19200},
+		{16000, 1, "f32le", 6400},
+		{44100, 1, "s16le", 8820},
+		{1000, 1, "s16le", 200},
+	}
+	for _, tc := range cases {
+		got := voiceSilenceFrame(voiceTicketClaims{SampleRate: tc.rate, Channels: tc.channels, SampleFormat: tc.format})
+		if len(got) != tc.want || !bytes.Equal(got, make([]byte, tc.want)) {
+			t.Errorf("silence frame for %d Hz x%d %s: %d bytes (zeroed=%v), want %d zeroed bytes",
+				tc.rate, tc.channels, tc.format, len(got), bytes.Equal(got, make([]byte, len(got))), tc.want)
+		}
+	}
+	if got := voiceSilenceFrame(voiceTicketClaims{}); len(got) != 0 {
+		t.Errorf("a claims-less silence frame is %d bytes, want none (nothing to feed)", len(got))
 	}
 }

@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,7 +57,25 @@ type fakeVoiceASRChild struct {
 	// request ends, or fakeVoiceAcceptHoldCap elapses (a safety net so a failing test can
 	// never wedge the harness teardown).
 	acceptGate chan struct{}
+
+	// idleTimeout, when positive (set BEFORE the first request), models audio.cpp's live-body
+	// idle timeout: once a connection is accepted, a request body that delivers no data for this
+	// long is aborted with the "live request body stalled" error event -- exactly what a muted mic
+	// starves the loopback into (#335). Zero means the child waits for data forever.
+	idleTimeout time.Duration
+
+	// silent, when set, makes the child read and record the request body without answering: no
+	// SSE frame at all, the way a model returns nothing for silence (#335). It can be flipped at
+	// any time, so a test lets the first frame be answered (which arms the gateway edge's SSE
+	// idle watchdog) and goes quiet after.
+	silent atomic.Bool
+	// eofs counts the connections whose request body ended with a CLEAN end-of-input (the
+	// terminating chunk), as opposed to an abort; read it through cleanEnds.
+	eofs int
 }
+
+// errFakeVoiceIdleStall is the read error the child's idle model reports (see idleTimeout).
+var errFakeVoiceIdleStall = errors.New("fake child: live request body stalled")
 
 // fakeVoiceAcceptHoldCap bounds how long a gated child holds its accept regardless of the
 // gate, so a test that fails before releasing the gate cannot hang httptest.Server.Close.
@@ -85,6 +104,7 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 	idx := c.conns
 	emitError := c.emitError
 	gate := c.acceptGate
+	idle := c.idleTimeout
 	c.mu.Unlock()
 	if emitError {
 		gate = nil // an erroring child never reads the body, so there is nothing to hold for
@@ -96,7 +116,7 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 	// accepted flips once the response headers go out; a body read before that is recorded
 	// beforeAccept. Without a gate the child accepts at once, so no read is ever before it.
 	var accepted atomic.Bool
-	next := c.bodyReader(r.Body, idx, gate, &accepted)
+	next := c.bodyReader(r.Body, idx, gate, idle, &accepted)
 
 	if gate != nil {
 		select {
@@ -122,17 +142,27 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 		n, err := next()
 		if n > 0 {
 			frame++
-			fmt.Fprintf(w, "data: {\"type\":\"transcript.text.partial\",\"text\":\"p%d\"}\n\n", frame)
-			_ = rc.Flush()
+			if !c.silent.Load() {
+				fmt.Fprintf(w, "data: {\"type\":\"transcript.text.partial\",\"text\":\"p%d\"}\n\n", frame)
+				_ = rc.Flush()
+			}
 		}
 		if err != nil {
 			readErr = err
 			break
 		}
 	}
+	if errors.Is(readErr, errFakeVoiceIdleStall) {
+		fmt.Fprint(w, "data: {\"type\":\"error\",\"error\":{\"message\":\"live request body stalled: no data within the idle timeout\"}}\n\n")
+		_ = rc.Flush()
+		return
+	}
 	if readErr != io.EOF {
 		return // truncated: no clean final
 	}
+	c.mu.Lock()
+	c.eofs++
+	c.mu.Unlock()
 	fmt.Fprintf(w, "data: {\"type\":\"transcript.text.done\",\"text\":%q}\n\n", c.finalFor(idx))
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	_ = rc.Flush()
@@ -140,12 +170,14 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 
 // bodyReader returns the func the handler pulls request-body reads through, each yielding the
 // byte count and error of one read. It records every read (c.reads, c.bytes) the moment it
-// happens. With no gate it reads the body inline. With a gate a dedicated goroutine reads the
-// body from the moment the request arrives, so the child keeps consuming (and recording) PCM
-// while its accept is held; the handler then drains the buffered results after the accept, in
-// order. The goroutine only touches the request body (never the ResponseWriter) and ends on
-// the read error the handler loops until, so it cannot outlive the handler.
-func (c *fakeVoiceASRChild) bodyReader(body io.Reader, idx int, gate chan struct{}, accepted *atomic.Bool) func() (int, error) {
+// happens. With no gate and no idle model it reads the body inline. With a gate a dedicated
+// goroutine reads the body from the moment the request arrives, so the child keeps consuming (and
+// recording) PCM while its accept is held; the handler then drains the buffered results after the
+// accept, in order. An idle model needs the same goroutine (a blocked Read cannot time out), and
+// each pull then gives up with errFakeVoiceIdleStall after idle without a read. The goroutine
+// only touches the request body (never the ResponseWriter) and ends on the read error the handler
+// loops until, or with the connection when the handler stalled out first.
+func (c *fakeVoiceASRChild) bodyReader(body io.Reader, idx int, gate chan struct{}, idle time.Duration, accepted *atomic.Bool) func() (int, error) {
 	buf := make([]byte, 4096)
 	readOnce := func() (int, error) {
 		n, err := body.Read(buf)
@@ -157,7 +189,7 @@ func (c *fakeVoiceASRChild) bodyReader(body io.Reader, idx int, gate chan struct
 		}
 		return n, err
 	}
-	if gate == nil {
+	if gate == nil && idle <= 0 {
 		return readOnce
 	}
 	type result struct {
@@ -175,8 +207,18 @@ func (c *fakeVoiceASRChild) bodyReader(body io.Reader, idx int, gate chan struct
 		}
 	}()
 	return func() (int, error) {
-		res := <-results
-		return res.n, res.err
+		if idle <= 0 {
+			res := <-results
+			return res.n, res.err
+		}
+		timer := time.NewTimer(idle)
+		defer timer.Stop()
+		select {
+		case res := <-results:
+			return res.n, res.err
+		case <-timer.C:
+			return 0, errFakeVoiceIdleStall
+		}
 	}
 }
 
@@ -193,6 +235,13 @@ func (c *fakeVoiceASRChild) snapshot() (conns int, bytes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conns, c.bytes
+}
+
+// cleanEnds is how many connections ended their request body with a clean end-of-input.
+func (c *fakeVoiceASRChild) cleanEnds() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.eofs
 }
 
 // bodyReads returns a copy of every request-body read the child has seen, in arrival order.
@@ -317,6 +366,59 @@ func TestResolveVoiceTimingDefaults(t *testing.T) {
 	set := resolveVoiceTiming(VoiceTiming{SilenceTimeout: 42 * time.Millisecond})
 	if set.silenceTimeout != 42*time.Millisecond || set.minUtterance != VoiceMinUtteranceMs*time.Millisecond {
 		t.Fatalf("resolveVoiceTiming(one field) = %+v, want only silence overridden", set)
+	}
+}
+
+// TestResolveVoiceTimingMuteTeardown pins the one knob whose zero is NOT "use the default":
+// the mute teardown. Unset resolves to the 10s default, an explicit MuteKeepalive means
+// "never tear down while muted" (the operator's 0), and a positive duration is taken as
+// given. The keepalive flag must survive resolution -- folding it into the default is the
+// bug this guards.
+func TestResolveVoiceTimingMuteTeardown(t *testing.T) {
+	const wantDefault = VoiceMuteTeardownMs * time.Millisecond
+	if wantDefault != 10*time.Second {
+		t.Fatalf("VoiceMuteTeardownMs default = %v, want 10s", wantDefault)
+	}
+	cases := []struct {
+		name          string
+		in            VoiceTiming
+		wantTeardown  time.Duration
+		wantKeepalive bool
+	}{
+		{"unset resolves to the default", VoiceTiming{}, wantDefault, false},
+		{"negative duration is junk and uses the default", VoiceTiming{MuteTeardown: -time.Second}, wantDefault, false},
+		{"positive duration is taken as given", VoiceTiming{MuteTeardown: 3 * time.Second}, 3 * time.Second, false},
+		{"keepalive is preserved, not folded into the default", VoiceTiming{MuteKeepalive: true}, wantDefault, true},
+		{"keepalive wins over a duration", VoiceTiming{MuteTeardown: 3 * time.Second, MuteKeepalive: true}, 3 * time.Second, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveVoiceTiming(tc.in)
+			if got.muteTeardown != tc.wantTeardown || got.muteKeepalive != tc.wantKeepalive {
+				t.Fatalf("resolveVoiceTiming(%+v) = {muteTeardown:%v muteKeepalive:%v}, want {%v %v}",
+					tc.in, got.muteTeardown, got.muteKeepalive, tc.wantTeardown, tc.wantKeepalive)
+			}
+			// The accessor Task 2 reads must agree with the resolved fields.
+			after, keepalive := got.muteTeardownAfter()
+			if keepalive != tc.wantKeepalive || (!keepalive && after != tc.wantTeardown) {
+				t.Fatalf("muteTeardownAfter() = (%v, %v), want (%v, %v)", after, keepalive, tc.wantTeardown, tc.wantKeepalive)
+			}
+		})
+	}
+}
+
+// TestVoiceTimingMuteTeardownAfterUnresolved: a hand-built voiceTiming (a test fixture, or the
+// bare &Server{}) that never went through resolveVoiceTiming has no teardown set; the
+// accessor reads that as the default rather than as "tear down immediately".
+func TestVoiceTimingMuteTeardownAfterUnresolved(t *testing.T) {
+	after, keepalive := fastVoiceTiming().muteTeardownAfter()
+	if keepalive || after != VoiceMuteTeardownMs*time.Millisecond {
+		t.Fatalf("unresolved muteTeardownAfter() = (%v, %v), want (%dms, false)", after, keepalive, VoiceMuteTeardownMs)
+	}
+	set := fastVoiceTiming()
+	set.muteTeardown = 40 * time.Millisecond
+	if after, keepalive := set.muteTeardownAfter(); keepalive || after != 40*time.Millisecond {
+		t.Fatalf("explicit muteTeardownAfter() = (%v, %v), want (40ms, false)", after, keepalive)
 	}
 }
 
