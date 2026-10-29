@@ -404,11 +404,11 @@ const de = {
   chatVoiceDismiss: 'Schließen',
   chatVoiceTranscript: 'Ihre Worte',
   chatVoiceAnswer: 'Antwort',
-  // The controls of the answer while it is heard (#315): pause and resume it, mute its speakers
-  // (it plays on, silently), or stop its speech (it is cut short and the microphone reopens).
-  // That is not cancelling the whole answer (chatVoiceCancel), so it is worded as what it does.
-  // Beside them the mute of the user's own microphone, which is there whenever the conversation is
-  // on, with the indicator's words for a user who is not heard because of it.
+  // The controls of the answer while it is heard (#315): pause and resume it, or stop its speech
+  // (it is cut short and the microphone reopens). That is not cancelling the whole answer
+  // (chatVoiceCancel), so it is worded as what it does. Beside push-to-talk, whenever the
+  // conversation is on, the two mutes: the user's own microphone, with the indicator's words for a
+  // user who is not heard because of it, and the answer's speakers (it plays on, silently; #326).
   chatVoicePlayback: 'Wiedergabe der Antwort',
   chatVoicePause: 'Pausieren',
   chatVoiceResume: 'Fortsetzen',

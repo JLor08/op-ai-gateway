@@ -21,6 +21,12 @@ afterEach(cleanup);
 
 const t = messages.en;
 
+// The always-mounted room of the playback controls (a data-testid: it has no role of its own, so
+// that an empty one says nothing to a screen reader), and the height it keeps: that of a row of
+// small buttons, which is what the controls are.
+const PLAYBACK_ROOM = 'voice-playback-room';
+const PLAYBACK_ROOM_MIN_HEIGHT = '32px';
+
 // The hook's output, with every control a spy: this component only draws the conversation and
 // forwards the user's gestures (useVoiceChat.test.ts is about the conversation itself).
 function makeVoice(over: Partial<VoiceChatApi> = {}): VoiceChatApi {
@@ -959,10 +965,11 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
   },
 );
 
-// The controls of the answer being spoken, and the mute of the user's own microphone (#315). Every
-// label is read from the locale under test, so a control missing its words in either one fails.
+// The controls of the answer being spoken, and the two mutes: the user's own microphone (#315) and
+// the answer's speakers (#326, always on, beside it). Every label is read from the locale under
+// test, so a control missing its words in either one fails.
 describe.each(['en', 'de'] as const satisfies readonly Locale[])(
-  'VoiceChatControl playback controls and microphone mute (%s)',
+  'VoiceChatControl playback controls and the two mutes (%s)',
   (locale) => {
     const lt = messages[locale];
     const renderLocale = (voice: VoiceChatApi) => renderControl(voice, { t: lt });
@@ -971,15 +978,19 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
       makeVoice({ state: 'speaking', audioPlaying: true, ...over });
 
     describe('the playback controls', () => {
-      it('appear while the answer is playing: pause, mute and stop', () => {
+      it('appear while the answer is playing: pause and stop, and not the mute, which is always on', () => {
         renderLocale(playing());
 
         const group = within(playbackGroup()!);
         expect(group.getByRole('button', { name: lt.chatVoicePause })).toBeEnabled();
-        expect(group.getByRole('button', { name: lt.chatVoiceMute })).toBeEnabled();
         expect(group.getByRole('button', { name: lt.chatVoiceStopPlayback })).toBeEnabled();
         // Not the resume of a pause that is not there.
         expect(group.queryByRole('button', { name: lt.chatVoiceResume })).not.toBeInTheDocument();
+        // The mute of the answer is on screen, but it is not one of these: it is there when they
+        // are not (the output mute's own tests).
+        expect(group.queryByRole('button', { name: lt.chatVoiceMute })).toBeNull();
+        expect(group.queryByRole('button', { name: lt.chatVoiceUnmute })).toBeNull();
+        expect(screen.getByRole('button', { name: lt.chatVoiceMute })).toBeInTheDocument();
       });
 
       it('appear in the tail of the answer that is still playing out (draining), too', () => {
@@ -1021,27 +1032,6 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
         expect(within(indicatorOf(lt)).getByText(lt.chatVoiceStatePaused)).toBeInTheDocument();
         expect(screen.queryByText(lt.chatVoiceStateSpeaking)).not.toBeInTheDocument();
         expect(playbackGroup()).toBeInTheDocument();
-      });
-
-      it('mute calls voice.toggleMute, and reads unmute (pressed) while the answer is muted', () => {
-        const voice = playing();
-        const { update } = renderLocale(voice);
-        const mute = screen.getByRole('button', { name: lt.chatVoiceMute });
-        expect(mute).toHaveAttribute('aria-pressed', 'false');
-
-        fireEvent.click(mute);
-        expect(voice.toggleMute).toHaveBeenCalledTimes(1);
-
-        const muted = playing({ muted: true });
-        update(muted);
-        expect(screen.queryByRole('button', { name: lt.chatVoiceMute })).not.toBeInTheDocument();
-        const unmute = screen.getByRole('button', { name: lt.chatVoiceUnmute });
-        expect(unmute).toHaveAttribute('aria-pressed', 'true');
-        fireEvent.click(unmute);
-        expect(muted.toggleMute).toHaveBeenCalledTimes(1);
-        // The mute of the answer is not the mute of the microphone.
-        expect(voice.toggleMicMute).not.toHaveBeenCalled();
-        expect(muted.toggleMicMute).not.toHaveBeenCalled();
       });
 
       it('stop cuts the spoken answer short (voice.stopSpeaking): it does not end the conversation, nor cancel the turn', () => {
@@ -1086,7 +1076,11 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
 
           expect(playbackGroup()).not.toBeInTheDocument();
           expect(screen.queryByRole('button', { name: lt.chatVoicePause })).not.toBeInTheDocument();
-          expect(screen.queryByRole('button', { name: lt.chatVoiceMute })).not.toBeInTheDocument();
+          expect(
+            screen.queryByRole('button', { name: lt.chatVoiceStopPlayback }),
+          ).not.toBeInTheDocument();
+          // The mute of the answer does not wait for audio: it can be set ahead of it.
+          expect(screen.getByRole('button', { name: lt.chatVoiceMute })).toBeInTheDocument();
         },
       );
 
@@ -1097,6 +1091,193 @@ describe.each(['en', 'de'] as const satisfies readonly Locale[])(
         update(makeVoice({ state: 'draining', audioPlaying: false }));
 
         expect(playbackGroup()).not.toBeInTheDocument();
+      });
+    });
+
+    // Every state of a conversation that is on, with and without audio being heard: the mute of the
+    // answer and the room of the playback controls must not depend on either.
+    const onStates = [
+      'connecting',
+      'listening',
+      'thinking',
+      'speaking',
+      'draining',
+      'idle',
+    ] as const;
+    const onStatesByAudio = onStates.flatMap((state) => [
+      [state, false],
+      [state, true],
+    ]) as ReadonlyArray<readonly [(typeof onStates)[number], boolean]>;
+
+    describe('the output mute', () => {
+      const outputMute = () => screen.getByRole('button', { name: lt.chatVoiceMute });
+
+      it.each(onStatesByAudio)(
+        'is there whenever the conversation is on (%s, audio heard: %s), and calls voice.toggleMute',
+        (state, audioPlaying) => {
+          const voice = makeVoice({ state, audioPlaying });
+          renderLocale(voice);
+
+          expect(outputMute()).toBeEnabled();
+          expect(outputMute()).toHaveAttribute('aria-pressed', 'false');
+          fireEvent.click(outputMute());
+
+          expect(voice.toggleMute).toHaveBeenCalledTimes(1);
+          // The mute of the answer is not the mute of the microphone, nor any other control.
+          expect(voice.toggleMicMute).not.toHaveBeenCalled();
+          expect(voice.stop).not.toHaveBeenCalled();
+          expect(voice.stopSpeaking).not.toHaveBeenCalled();
+          expect(voice.pause).not.toHaveBeenCalled();
+        },
+      );
+
+      it('is not there while the conversation is off', () => {
+        renderLocale(makeVoice({ state: 'off', audioPlaying: true }));
+
+        expect(screen.queryByRole('button', { name: lt.chatVoiceMute })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: lt.chatVoiceUnmute })).not.toBeInTheDocument();
+      });
+
+      it.each(onStates)(
+        'reflects the mute in %s: it reads unmute, pressed, with the silent speaker, and calls toggleMute again',
+        (state) => {
+          const voice = makeVoice({ state, muted: true });
+          renderLocale(voice);
+
+          expect(screen.queryByRole('button', { name: lt.chatVoiceMute })).not.toBeInTheDocument();
+          const unmute = screen.getByRole('button', { name: lt.chatVoiceUnmute });
+          expect(unmute).toHaveAttribute('aria-pressed', 'true');
+          // The state is on screen between answers, not only in the words: the icon says it too.
+          expect(within(unmute).getByTestId('VolumeOffIcon')).toBeInTheDocument();
+          fireEvent.click(unmute);
+
+          expect(voice.toggleMute).toHaveBeenCalledTimes(1);
+          expect(voice.toggleMicMute).not.toHaveBeenCalled();
+        },
+      );
+
+      it('shows the live speaker while the answer is not muted', () => {
+        renderLocale(makeVoice({ state: 'idle' }));
+
+        expect(within(outputMute()).getByTestId('VolumeUpIcon')).toBeInTheDocument();
+        expect(within(outputMute()).queryByTestId('VolumeOffIcon')).not.toBeInTheDocument();
+      });
+
+      it('can be set ahead of the first answer: it is pressed before any audio has been heard', () => {
+        const { update } = renderLocale(makeVoice({ state: 'listening' }));
+        expect(playbackGroup()).not.toBeInTheDocument();
+        fireEvent.click(outputMute());
+
+        const muted = makeVoice({ state: 'listening', muted: true });
+        update(muted);
+
+        expect(screen.getByRole('button', { name: lt.chatVoiceUnmute })).toHaveAttribute(
+          'aria-pressed',
+          'true',
+        );
+        // Its mute holds when the first answer comes: still pressed, now beside the playback.
+        update(makeVoice({ state: 'speaking', audioPlaying: true, muted: true }));
+        expect(screen.getByRole('button', { name: lt.chatVoiceUnmute })).toHaveAttribute(
+          'aria-pressed',
+          'true',
+        );
+        expect(playbackGroup()).toBeInTheDocument();
+      });
+
+      it('sits beside the microphone mute, in the row that is there whenever the conversation is on', () => {
+        renderLocale(makeVoice({ state: 'idle' }));
+
+        const micMute = screen.getByRole('button', { name: lt.chatVoiceMicMute });
+        expect(outputMute().parentElement).toBe(micMute.parentElement);
+        // The same row as push-to-talk: it is not a control of the playback group or of its room.
+        expect(outputMute().parentElement).toBe(
+          screen.getByRole('button', { name: lt.chatVoicePushToTalk }).parentElement,
+        );
+      });
+
+      it('is not one of the playback controls: it is outside their group and their room', () => {
+        renderLocale(makeVoice({ state: 'speaking', audioPlaying: true }));
+
+        expect(
+          within(playbackGroup()!).queryByRole('button', { name: lt.chatVoiceMute }),
+        ).toBeNull();
+        expect(screen.getByTestId(PLAYBACK_ROOM).contains(outputMute())).toBe(false);
+      });
+    });
+
+    // The playback controls come and go with the audio, and the room they occupy does not: the
+    // surrounding layout (what is under them, the error, the indicator above) must not jump, and
+    // a control the user is on must not be taken away from under their finger or their focus.
+    describe('the room the playback controls keep', () => {
+      const room = () => screen.getByTestId(PLAYBACK_ROOM);
+
+      it.each(onStates)(
+        'is reserved while the conversation is on (%s), with no playback controls in it',
+        (state) => {
+          renderLocale(makeVoice({ state, audioPlaying: false }));
+
+          expect(room()).toBeInTheDocument();
+          expect(room()).toBeEmptyDOMElement();
+          expect(playbackGroup()).not.toBeInTheDocument();
+        },
+      );
+
+      it('is not reserved while the conversation is off: there is no row of controls to keep', () => {
+        renderLocale(makeVoice({ state: 'off' }));
+
+        expect(screen.queryByTestId(PLAYBACK_ROOM)).not.toBeInTheDocument();
+      });
+
+      it('holds the playback controls while the answer is heard, and is still the same element', () => {
+        const { update } = renderLocale(makeVoice({ state: 'thinking' }));
+        const before = room();
+
+        update(playing());
+        expect(room()).toBe(before);
+        expect(room()).toContainElement(playbackGroup());
+
+        update(makeVoice({ state: 'draining', audioPlaying: false }));
+        expect(room()).toBe(before);
+        expect(room()).toBeEmptyDOMElement();
+      });
+
+      it('has the height of a row of the controls whether or not they are drawn, so nothing moves', () => {
+        const { update } = renderLocale(makeVoice({ state: 'thinking' }));
+        expect(room()).toHaveStyle({ minHeight: PLAYBACK_ROOM_MIN_HEIGHT });
+
+        update(playing());
+        expect(room()).toHaveStyle({ minHeight: PLAYBACK_ROOM_MIN_HEIGHT });
+      });
+
+      it('leaves the row above it and the controls in it where they are while the playback comes and goes', () => {
+        const { update } = renderLocale(makeVoice({ state: 'thinking' }));
+        const talk = screen.getByRole('button', { name: lt.chatVoicePushToTalk });
+        const micMute = screen.getByRole('button', { name: lt.chatVoiceMicMute });
+        const outputMute = screen.getByRole('button', { name: lt.chatVoiceMute });
+        const indicator = indicatorOf(lt);
+        const above = room().previousElementSibling;
+
+        update(playing());
+        update(makeVoice({ state: 'draining', audioPlaying: false }));
+
+        // The very same nodes, in the same order: React did not remount or move any of them.
+        expect(screen.getByRole('button', { name: lt.chatVoicePushToTalk })).toBe(talk);
+        expect(screen.getByRole('button', { name: lt.chatVoiceMicMute })).toBe(micMute);
+        expect(screen.getByRole('button', { name: lt.chatVoiceMute })).toBe(outputMute);
+        expect(indicatorOf(lt)).toBe(indicator);
+        expect(room().previousElementSibling).toBe(above);
+      });
+
+      it('does not take the focus from the output mute when the answer starts and ends', () => {
+        const { update } = renderLocale(makeVoice({ state: 'thinking' }));
+        screen.getByRole('button', { name: lt.chatVoiceMute }).focus();
+        expect(screen.getByRole('button', { name: lt.chatVoiceMute })).toHaveFocus();
+
+        update(playing());
+        expect(screen.getByRole('button', { name: lt.chatVoiceMute })).toHaveFocus();
+
+        update(makeVoice({ state: 'draining', audioPlaying: false }));
+        expect(screen.getByRole('button', { name: lt.chatVoiceMute })).toHaveFocus();
       });
     });
 

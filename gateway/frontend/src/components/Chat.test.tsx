@@ -6164,6 +6164,32 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(session.setMuted).toHaveBeenCalledTimes(1);
     });
 
+    it('sets the output mute before any answer is heard: it is on screen between answers, and the session is told (#326)', async () => {
+      await renderVoiceChat();
+      await waitFor(() => expect(voiceSwitch()).toBeEnabled());
+      fireEvent.click(voiceSwitch());
+      const session = voiceSessions[0];
+      await act(async () => session.args.onState('listening'));
+      // Nothing has been heard, so there are no playback controls -- and yet the mute is there.
+      expect(screen.queryByRole('group', { name: t.chatVoicePlayback })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: t.chatVoiceMute }));
+
+      expect(session.setMuted).toHaveBeenLastCalledWith(true);
+      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+      // It holds into the first answer: still pressed when the playback controls come.
+      await act(async () => session.args.onState('speaking'));
+      await act(async () => session.args.onPlayingChange?.(true));
+      expect(screen.getByRole('group', { name: t.chatVoicePlayback })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.chatVoiceUnmute })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+    });
+
     it('mutes the microphone from the page: the session is told, push-to-talk closes and the indicator says so (#315)', async () => {
       await renderVoiceChat();
       await waitFor(() => expect(voiceSwitch()).toBeEnabled());

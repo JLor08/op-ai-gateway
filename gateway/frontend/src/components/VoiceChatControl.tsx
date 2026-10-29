@@ -140,6 +140,13 @@ function isCustomisedPrompt(value: string): boolean {
   return trimmed !== '' && trimmed !== DEFAULT_VOICE_SYSTEM_PROMPT;
 }
 
+// The height the playback controls' room keeps while they are not drawn (and while they are): that
+// of a row of small buttons (22.75px of line, 2 x 3px of padding and 2 x 1px of border, rounded up),
+// which is what they are. The room is what keeps the controls under it, and the error, from
+// jumping each time an answer starts or ends; a row that wraps on a very narrow screen is taller
+// than this and does move them, which is the lesser evil against a room that is never needed.
+const PLAYBACK_ROOM_MIN_HEIGHT = 32;
+
 // The states in which an answer is being prepared or spoken, which Stop abandons.
 function hasAnswerInFlight(state: VoiceChatState): boolean {
   return state === 'thinking' || state === 'speaking' || state === 'draining';
@@ -384,6 +391,19 @@ export function VoiceChatControl({
           >
             {voice.micMuted ? t.chatVoiceMicUnmute : t.chatVoiceMicMute}
           </Button>
+          {/* The answer's speakers, beside it: also there whenever the conversation is on (#326), so
+              it can be set ahead of the first answer and its state is seen between answers -- it
+              holds for every answer of the conversation, not only the one that is heard now. */}
+          <Button
+            variant={voice.muted ? 'contained' : 'outlined'}
+            size="small"
+            color={voice.muted ? 'warning' : 'inherit'}
+            startIcon={voice.muted ? <VolumeOffIcon /> : <VolumeUpIcon />}
+            aria-pressed={voice.muted}
+            onClick={() => voice.toggleMute()}
+          >
+            {voice.muted ? t.chatVoiceUnmute : t.chatVoiceMute}
+          </Button>
           {hasAnswerInFlight(state) && (
             <Button variant="outlined" size="small" color="inherit" onClick={() => voice.cancel()}>
               {t.chatVoiceCancel}
@@ -392,7 +412,13 @@ export function VoiceChatControl({
         </Box>
       )}
 
-      {on && voice.audioPlaying && playsAnswer(state) && <PlaybackControls voice={voice} t={t} />}
+      {/* The room of the playback controls: there for as long as the conversation is on, whether or
+          not they are, so that they come and go inside it without moving anything around it. */}
+      {on && (
+        <Box data-testid="voice-playback-room" sx={{ minHeight: PLAYBACK_ROOM_MIN_HEIGHT }}>
+          {voice.audioPlaying && playsAnswer(state) && <PlaybackControls voice={voice} t={t} />}
+        </Box>
+      )}
 
       {error && (
         <Alert
@@ -414,11 +440,13 @@ export function VoiceChatControl({
   );
 }
 
-// The controls of the answer while it is heard (#315): pause and resume it, mute its speakers,
-// and stop the playback. It is only drawn while audio is being heard (`audioPlaying`), so a pause
-// is never offered before the first chunk or in the gateway's tail after the audio is over, where
-// it would do nothing. Stop is `stopSpeaking`: it cuts the answer short and the conversation goes
-// on -- `stop` ends the conversation, and Cancel (beside push-to-talk) abandons the turn.
+// The controls of the answer while it is heard (#315): pause and resume it, and stop the playback.
+// They are only drawn while audio is being heard (`audioPlaying`), so a pause is never offered
+// before the first chunk or in the gateway's tail after the audio is over, where it would do
+// nothing -- in a room that is kept for them (see the control). The mute of the answer's speakers is
+// not one of them: it is beside the microphone's, whenever the conversation is on (#326). Stop is
+// `stopSpeaking`: it cuts the answer short and the conversation goes on -- `stop` ends the
+// conversation, and Cancel (beside push-to-talk) abandons the turn.
 function PlaybackControls({ voice, t }: Readonly<{ voice: VoiceChatApi; t: Translation }>) {
   return (
     <Box
@@ -445,15 +473,6 @@ function PlaybackControls({ voice, t }: Readonly<{ voice: VoiceChatApi; t: Trans
           {t.chatVoicePause}
         </Button>
       )}
-      <Button
-        variant="outlined"
-        size="small"
-        startIcon={voice.muted ? <VolumeOffIcon /> : <VolumeUpIcon />}
-        aria-pressed={voice.muted}
-        onClick={() => voice.toggleMute()}
-      >
-        {voice.muted ? t.chatVoiceUnmute : t.chatVoiceMute}
-      </Button>
       <Button
         variant="outlined"
         size="small"
