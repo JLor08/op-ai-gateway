@@ -253,6 +253,14 @@ func scopeLessByteRate(rows []routing.ModelMappingCacheRow) (uint32, bool) {
 	return 0, false
 }
 
+// speechStreamOptedOut reports whether a thread's ChatAudioSettings.Stream says NOT to stream: an
+// explicit false. Unset (nil) is not an opt-out -- the model's own capability decides then. It is
+// the one place that reads the toggle, so the run's streaming gate (speechRunStreamRate) and the
+// voice relay's gap silence (relayVoiceSections, a streaming-only feature) cannot disagree.
+func speechStreamOptedOut(stream *bool) bool {
+	return stream != nil && !*stream
+}
+
 // speechRunStreamRate decides whether this run streams, and at what sample rate. It is the
 // run-time half of the gate (the composer's is GET /api/portal/model-speech-streaming): a
 // thread that opted out (ChatAudioSettings.Stream false) is buffered, and so is one whose
@@ -269,7 +277,7 @@ func scopeLessByteRate(rows []routing.ModelMappingCacheRow) (uint32, bool) {
 // is logged: the run is then the buffered one, which the loopback request will refuse for
 // the same reasons if it must, in its own code.
 func (s *Server) speechRunStreamRate(ctx context.Context, owner auth.Token, prep PrepareRunResult) (int, bool) {
-	if audio := prep.Settings.Audio; audio != nil && audio.Stream != nil && !*audio.Stream {
+	if audio := prep.Settings.Audio; audio != nil && speechStreamOptedOut(audio.Stream) {
 		return 0, false
 	}
 	model := prep.Settings.Model

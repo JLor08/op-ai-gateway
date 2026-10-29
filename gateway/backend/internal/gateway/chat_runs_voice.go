@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,7 +156,12 @@ func (s *Server) executeVoiceRun(ctx context.Context, owner auth.Token, run *Cha
 	legsCh := make(chan *voiceSpeechLeg, voiceSectionQueue)
 	var relayWG sync.WaitGroup
 	relayWG.Add(1)
-	go func() { defer relayWG.Done(); relayVoiceSections(run, legsCh) }()
+	silenceEnabled := !speechStreamOptedOut(vp.audio.Stream)
+	fallbackRate := 0
+	if silenceEnabled {
+		fallbackRate = s.voiceRunOutputRate(ctx, owner, vp.tts.Model)
+	}
+	go func() { defer relayWG.Done(); relayVoiceSections(run, legsCh, fallbackRate, silenceEnabled) }()
 
 	var legs []*voiceSpeechLeg
 	// launchSection launches one section's speech leg: it takes the next section index, is handed
@@ -370,14 +376,118 @@ func (t *voiceSynthTurn) release() {
 // live playback and falls back to the committed WAV), exactly as a single leg's reader did. It runs
 // in its own goroutine, started before any leg, and returns once legsCh is closed and every leg's
 // audio has drained.
-func relayVoiceSections(run *ChatRun, legsCh <-chan *voiceSpeechLeg) {
-	seq := 0
-	for leg := range legsCh {
-		for a := range leg.audioCh {
-			a.Seq = seq
-			a.Section = leg.section
+//
+// While it waits for the next real audio with the turn still going -- inside a leg (queued behind
+// the TTS cap, synthesizing its first chunk, backing off to retry) or between two legs (the next
+// section is not launched yet) -- it fills the gap with zeroed-PCM frames, one every
+// voiceSilenceCadence, so the client's player stays continuously fed and its playback-done debounce
+// never reads the gap as the end of the turn (#339). The fill is:
+//   - only for a QUIET gap: the cadence timer restarts on every real chunk and on every hand-over
+//     to the next leg, and real audio that is already waiting beats a timer that fired, so silence
+//     never lands between real chunks that are arriving steadily;
+//   - at the rate of the last real chunk, else fallbackRate (the run's own output rate, 0 when
+//     unknown: no rate, no silence). Between legs it uses the last real chunk's rate ONLY: before
+//     the first audio the turn is merely thinking, and that wait stays as quiet as it always was;
+//   - never trailing: the relay returns the moment the last leg and the feed have closed;
+//   - off altogether when silenceEnabled is false -- the run's speech is not streamed (opted out),
+//     so there is no live audio to keep alive and the relay is the plain ordered drain it was.
+//
+// Silence is published to the run only. It never passes through a leg's own bookkeeping, so it is
+// not part of what is stored or billed, and its seq is numbered like any audio_delta: the client
+// sees one unbroken stream. A silence frame carries the section of the audio last relayed (the
+// awaited leg's, before any), because the client attributes the section being heard from it:
+// tagging silence with a section that has no audio yet would claim a block for a leg that may yet
+// fail.
+//
+// The relay deliberately takes no context and never returns early: it keeps draining until legsCh
+// and every audioCh have closed. A leg goroutine blocked on its buffered audioCh would otherwise
+// never finish and joinVoiceLegs would wait for it forever; a cancel ends the legs themselves,
+// which closes their channels. (Silence published onto a run that has ended is dropped.)
+func relayVoiceSections(run *ChatRun, legsCh <-chan *voiceSpeechLeg, fallbackRate int, silenceEnabled bool) {
+	var (
+		seq         int
+		lastRate    int             // the rate of the last real chunk; 0 until audio has been relayed
+		lastSection int             // the section of the last real chunk
+		cur         *voiceSpeechLeg // the leg being drained; nil while waiting for the next one
+		fill        voiceSilenceFill
+	)
+
+	timer := time.NewTimer(voiceSilenceCadence)
+	stopTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+	defer stopTimer()
+	// tick is nil -- never ready -- when there is no silence to make, so the loop has no wakeups.
+	var tick <-chan time.Time
+	if silenceEnabled {
+		tick = timer.C
+	}
+	// restart pushes the next silence a full cadence away: a real chunk (or a new leg) has just
+	// arrived, so the gap starts over.
+	restart := func() {
+		stopTimer()
+		timer.Reset(voiceSilenceCadence)
+	}
+	// fillGap publishes one frame of silence (none for a rate of 0) and arms the next. It runs only
+	// after the timer fired and was received, so there is nothing to stop first.
+	fillGap := func(rate, section int) {
+		if data := fill.frame(rate); data != "" {
+			run.publishAudio(runAudio{Seq: seq, Section: section, Rate: rate, Data: data})
 			seq++
-			run.publishAudio(a)
+		}
+		timer.Reset(voiceSilenceCadence)
+	}
+	// deliver relays one receive from the current leg: a real chunk, or (ok false) the leg's end.
+	deliver := func(a runAudio, ok bool) {
+		if !ok {
+			cur = nil
+			restart()
+			return
+		}
+		a.Seq, a.Section = seq, cur.section
+		seq++
+		if a.Rate > 0 {
+			lastRate, lastSection = a.Rate, cur.section
+		}
+		run.publishAudio(a)
+		restart()
+	}
+
+	for {
+		if cur == nil {
+			select {
+			case leg, ok := <-legsCh:
+				if !ok {
+					return
+				}
+				cur = leg
+				restart()
+			case <-tick:
+				fillGap(lastRate, lastSection)
+			}
+			continue
+		}
+		select {
+		case a, ok := <-cur.audioCh:
+			deliver(a, ok)
+		case <-tick:
+			// A relay that was held up long enough for the timer to fire may have real chunks waiting:
+			// they are not a gap, so they go first.
+			select {
+			case a, ok := <-cur.audioCh:
+				deliver(a, ok)
+			default:
+				if lastRate > 0 {
+					fillGap(lastRate, lastSection)
+				} else {
+					fillGap(fallbackRate, cur.section)
+				}
+			}
 		}
 	}
 }
@@ -450,9 +560,9 @@ func (s *Server) launchVoiceSpeech(ctx context.Context, owner auth.Token, run *C
 // The backoff between a speech leg's retries: it starts at voiceTTSRetryBackoffBase, doubles with
 // each retry and is capped at voiceTTSRetryBackoffMax, so a generous retry count can never hang a
 // turn on one section. With the default of two retries a leg waits 250ms, then 500ms. The client's
-// playback-done debounce (about 1.2s) and the server's drain floor cover a gap this short, so a
-// retry does not end the turn early; a longer budget would need the stream kept fed with silence,
-// which is deliberately out of scope.
+// playback-done debounce (about 1.2s) and the server's drain floor cover a gap this short on their
+// own, and the relay fills the backoff with silence besides (relayVoiceSections), so a retry does not
+// end the turn early -- nor would a longer budget.
 const (
 	voiceTTSRetryBackoffBase = 250 * time.Millisecond
 	voiceTTSRetryBackoffMax  = 2 * time.Second
@@ -482,6 +592,25 @@ func voiceSilencePCM(sampleRate, ms int) []byte {
 		return nil
 	}
 	return make([]byte, sampleRate*ms/1000*speechStreamBytesPerFrame)
+}
+
+// voiceSilenceFill makes the relay's silence frames: voiceSilenceFrameMs of zeroed PCM as the base64
+// every audio frame's data is. The frame is the same every time, so it is built once per rate -- a
+// relay ticks every voiceSilenceCadence for as long as a gap lasts, and a gap on a finished run
+// (publishAudio drops it) lasts until the legs have wound down.
+type voiceSilenceFill struct {
+	rate int
+	data string
+}
+
+// frame is the encoded silence frame at rate, or "" when there is none to make (a rate that is not
+// positive).
+func (f *voiceSilenceFill) frame(rate int) string {
+	if rate != f.rate {
+		f.rate = rate
+		f.data = base64.StdEncoding.EncodeToString(voiceSilencePCM(rate, voiceSilenceFrameMs))
+	}
+	return f.data
 }
 
 // voiceTTSRetryBackoff is how long a leg waits before retry number retry (0 is the first retry).
