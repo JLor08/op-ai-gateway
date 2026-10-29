@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +34,13 @@ import (
 // this connection's configured final text, then [DONE]. A body cut WITHOUT end-of-input
 // (a non-EOF read error) ends silently. It counts connections and the total PCM bytes it
 // received, which is how a test proves the mic gate dropped speaking-era audio.
+//
+// It also RECORDS every request-body read in arrival order (reads) and can HOLD its accept
+// (acceptGate): audio.cpp starts its idle timer when it accepts the request, and a cold ASR
+// model makes that accept slow, so a gated child models the dial the per-turn loopback must
+// survive. While the accept is held the child still reads (and records) the request body,
+// exactly like a real child that is waiting on its model -- which is what lets a test assert
+// the gateway fed PCM into the loopback DURING the dial instead of only after it.
 type fakeVoiceASRChild struct {
 	server *httptest.Server
 
@@ -41,6 +49,26 @@ type fakeVoiceASRChild struct {
 	bytes     int64
 	finals    []string // done text per connection (1-based); fallback "final-N"
 	emitError bool
+	reads     []fakeVoiceBodyRead
+
+	// acceptGate, when non-nil (set BEFORE the first request), holds every connection's
+	// response -- the 200 + SSE headers, i.e. the accept -- until the channel closes, the
+	// request ends, or fakeVoiceAcceptHoldCap elapses (a safety net so a failing test can
+	// never wedge the harness teardown).
+	acceptGate chan struct{}
+}
+
+// fakeVoiceAcceptHoldCap bounds how long a gated child holds its accept regardless of the
+// gate, so a test that fails before releasing the gate cannot hang httptest.Server.Close.
+const fakeVoiceAcceptHoldCap = 15 * time.Second
+
+// fakeVoiceBodyRead is one request-body read the child saw: which connection (1-based), the
+// bytes, and whether it arrived BEFORE the child accepted that connection (its response
+// headers were sent). reads is in arrival order across connections.
+type fakeVoiceBodyRead struct {
+	conn         int
+	data         []byte
+	beforeAccept bool
 }
 
 func newFakeVoiceASRChild(t *testing.T) *fakeVoiceASRChild {
@@ -56,13 +84,31 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 	c.conns++
 	idx := c.conns
 	emitError := c.emitError
+	gate := c.acceptGate
 	c.mu.Unlock()
+	if emitError {
+		gate = nil // an erroring child never reads the body, so there is nothing to hold for
+	}
 
 	rc := http.NewResponseController(w)
 	_ = rc.EnableFullDuplex()
+
+	// accepted flips once the response headers go out; a body read before that is recorded
+	// beforeAccept. Without a gate the child accepts at once, so no read is ever before it.
+	var accepted atomic.Bool
+	next := c.bodyReader(r.Body, idx, gate, &accepted)
+
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+		case <-time.After(fakeVoiceAcceptHoldCap):
+		}
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 	_ = rc.Flush()
+	accepted.Store(true)
 
 	if emitError {
 		fmt.Fprint(w, "data: {\"type\":\"error\",\"error\":{\"message\":\"backend blew up\"}}\n\n")
@@ -70,15 +116,11 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buf := make([]byte, 4096)
 	frame := 0
 	var readErr error
 	for {
-		n, err := r.Body.Read(buf)
+		n, err := next()
 		if n > 0 {
-			c.mu.Lock()
-			c.bytes += int64(n)
-			c.mu.Unlock()
 			frame++
 			fmt.Fprintf(w, "data: {\"type\":\"transcript.text.partial\",\"text\":\"p%d\"}\n\n", frame)
 			_ = rc.Flush()
@@ -96,6 +138,48 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 	_ = rc.Flush()
 }
 
+// bodyReader returns the func the handler pulls request-body reads through, each yielding the
+// byte count and error of one read. It records every read (c.reads, c.bytes) the moment it
+// happens. With no gate it reads the body inline. With a gate a dedicated goroutine reads the
+// body from the moment the request arrives, so the child keeps consuming (and recording) PCM
+// while its accept is held; the handler then drains the buffered results after the accept, in
+// order. The goroutine only touches the request body (never the ResponseWriter) and ends on
+// the read error the handler loops until, so it cannot outlive the handler.
+func (c *fakeVoiceASRChild) bodyReader(body io.Reader, idx int, gate chan struct{}, accepted *atomic.Bool) func() (int, error) {
+	buf := make([]byte, 4096)
+	readOnce := func() (int, error) {
+		n, err := body.Read(buf)
+		if n > 0 {
+			c.mu.Lock()
+			c.bytes += int64(n)
+			c.reads = append(c.reads, fakeVoiceBodyRead{conn: idx, data: append([]byte(nil), buf[:n]...), beforeAccept: !accepted.Load()})
+			c.mu.Unlock()
+		}
+		return n, err
+	}
+	if gate == nil {
+		return readOnce
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	results := make(chan result, 1024)
+	go func() {
+		for {
+			n, err := readOnce()
+			results <- result{n, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return func() (int, error) {
+		res := <-results
+		return res.n, res.err
+	}
+}
+
 func (c *fakeVoiceASRChild) finalFor(idx int) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -109,6 +193,27 @@ func (c *fakeVoiceASRChild) snapshot() (conns int, bytes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conns, c.bytes
+}
+
+// bodyReads returns a copy of every request-body read the child has seen, in arrival order.
+func (c *fakeVoiceASRChild) bodyReads() []fakeVoiceBodyRead {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]fakeVoiceBodyRead(nil), c.reads...)
+}
+
+// bytesBeforeAccept is the PCM the child received on connections it had not yet accepted --
+// non-zero only if the gateway fed the body while the dial was still in flight.
+func (c *fakeVoiceASRChild) bytesBeforeAccept() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	total := 0
+	for _, rd := range c.reads {
+		if rd.beforeAccept {
+			total += len(rd.data)
+		}
+	}
+	return total
 }
 
 // newVoiceMachineHarness builds the full three-leg voice loopback (see newVoiceTurnHarness):

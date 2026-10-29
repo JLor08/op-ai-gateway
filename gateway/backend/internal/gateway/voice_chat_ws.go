@@ -364,16 +364,50 @@ func voiceTicketRefusalCause(err error) string {
 }
 
 // voiceInboundQueue bounds the read loop -> state-machine channels for PCM and controls.
-// Mic PCM arrives in ~100 ms batches, so a short queue absorbs a brief machine stall
-// (a pipe write, a loopback dial) without the read loop ever blocking the socket. A sender
-// that outruns it blocks only until the machine takes the frame or the handler context
-// ends.
+// Mic PCM arrives in ~100 ms batches, so a short queue absorbs a brief machine stall (a
+// turn handler, a state change) without the read loop ever blocking the socket. The machine
+// no longer stalls on the loopback dial or the pipe write -- the per-turn pump and dial own
+// those (voiceLoopbackPCMQueue). A sender that outruns it blocks only until the machine
+// takes the frame or the handler context ends.
 const voiceInboundQueue = 32
 
 // voiceASRQueue bounds a turn's ASR relay -> state-machine event channel. One live ASR
 // relay emits delta/partial lines at speaking cadence; a small queue is ample and a full
 // one makes the relay block on turnCtx, never past the turn.
 const voiceASRQueue = 16
+
+// voiceLoopbackPCMQueue bounds a turn's run loop -> pump PCM channel. While the loopback dial
+// is in flight (a cold ASR model can take many seconds to accept) the pump can be parked on
+// the pipe, and this queue is where the run loop's frames wait for it. Mic PCM arrives in
+// ~100 ms batches, so 128 frames hold roughly 13 s of audio -- comfortably longer than a
+// cold dial -- in a few hundred KB. If the pump is ever further behind than that, the run
+// loop drops the OLDEST frame to make room (feedLoopback): the mic stays live and the state
+// machine is never blocked, at the price of a gap in the oldest audio.
+const voiceLoopbackPCMQueue = 128
+
+// voiceLoopbackEventKind is the kind of one event a turn's dial or pump goroutine reports to
+// the run loop over loopCh.
+type voiceLoopbackEventKind int
+
+const (
+	loopbackDialed     voiceLoopbackEventKind = iota // the dial got a 2xx: body is the live SSE stream
+	loopbackRefused                                  // /v1 answered non-2xx: code + message are its error
+	loopbackDialFailed                               // the dial itself failed (transport error)
+	loopbackPumpFailed                               // the pump could not write the pipe (the body ended)
+)
+
+// voiceLoopbackEvent is one such report. The dial and pump goroutines never touch machine
+// state, so everything the run loop needs to act on rides here, and the run loop folds it in
+// (onLoopbackEvent) -- the same single-owner discipline as every other event source.
+type voiceLoopbackEvent struct {
+	kind voiceLoopbackEventKind
+	// body is the live SSE response body of a loopbackDialed event. Whoever receives the
+	// event owns closing it: the run loop hands it to the relay and teardownTurn, or
+	// (drainLoopbackEvents) closes one it never consumed.
+	body io.ReadCloser
+	// code and message are the gateway error of a loopbackRefused event (liveRefusalFrame).
+	code, message string
+}
 
 // errVoiceTurnDone unblocks a turn's loopback pipe on a clean turn end or teardown: the
 // loopback transport's body read (reading the pipe reader) and any pending pipe write both
@@ -556,8 +590,10 @@ func voiceASRRelay(turnCtx context.Context, body io.Reader, asrCh chan<- asrEven
 // ever reads or writes its fields, so the state, the pendingText buffer, the per-turn ASR
 // loopback and the turn timers need no locks, and the half-duplex mic gate (onPCM) is a
 // plain read of state -- race-free by construction. Every event reaches it over a channel:
-// mic PCM and controls from the read loop, ASR SSE events from the per-turn relay, and the
-// turn timers it arms itself.
+// mic PCM and controls from the read loop, ASR SSE events from the per-turn relay, the
+// loopback dial's outcome and pump failures from the per-turn dial/pump goroutines, and the
+// turn timers it arms itself. The goroutines it starts share nothing with it but channels
+// and the pipe, so no machine field is ever touched off this goroutine.
 //
 // On a chunk end the machine starts a SPECULATIVE voice run (startVoiceRun) on the
 // accumulated pendingText and subscribes to it, folding the run's text/audio deltas into
@@ -583,12 +619,32 @@ type voiceMachine struct {
 	state       string
 	pendingText string
 
-	// The current turn's ASR loopback. asrCh is nil whenever no loopback is open, which
-	// disables its select case; relayWG joins the turn's SSE relay goroutine.
+	// The current turn's ASR loopback. It is set up ASYNCHRONOUSLY (openTurnLoopback): the run
+	// loop never calls the dial or writes the pipe, because either can block for as long as a
+	// cold ASR model takes to accept (#331) and the run loop must keep serving the timers and
+	// every other event meanwhile. Three goroutines serve a turn, all started and joined by
+	// the run loop and none of which ever touches a machine field -- they share only locals,
+	// the pipe and these channels:
+	//   - the dial goroutine (openLiveLoopback -> Do) reports its outcome on loopCh;
+	//   - the pump goroutine drains pcmOut into pw, so PCM flows into the request body while
+	//     the dial is still in flight (a pump write failure is reported on loopCh too);
+	//   - the SSE relay goroutine (started by the dial-outcome handler) feeds asrCh.
+	// turnCancel is non-nil exactly while a turn's loopback exists, opening or open (it is the
+	// "is there a loopback" test); asrCh is non-nil only once the dial succeeded, so a nil asrCh
+	// with a live turnCancel means the dial is still pending. A nil asrCh/loopCh disables its
+	// select case. relayWG joins all three goroutines at teardown.
+	//
+	// pcmOut is the run loop's only way to hand the pump a frame: sent to (never blocking, see
+	// feedLoopback) and closed ONLY by the run loop, so a send can never hit a closed channel.
+	// Closing it on a chunk end (endLoopbackFeed) makes the pump flush what is buffered and
+	// close the pipe cleanly; it is then nil while turnCancel is still set (finalizing).
 	pw         *io.PipeWriter
+	turnCtx    context.Context
 	turnCancel context.CancelFunc
 	respBody   io.ReadCloser
 	asrCh      chan asrEvent
+	pcmOut     chan []byte
+	loopCh     chan voiceLoopbackEvent
 	relayWG    sync.WaitGroup
 
 	// The current chunk's accumulating transcript and the voiced-span bounds used by the
@@ -742,7 +798,7 @@ func (s *Server) newVoiceMachine(ctx context.Context, cancel context.CancelFunc,
 
 // run is the single-owner event loop. It opens in listening (the hands-free default) and
 // serves every event source over one select until the handler context ends, then tears the
-// current turn down and joins its relay.
+// current turn down and joins its goroutines.
 func (m *voiceMachine) run() {
 	m.setState(voiceStateListening)
 	for {
@@ -756,6 +812,8 @@ func (m *voiceMachine) run() {
 			m.onPCM(frame)
 		case ctl := <-m.ctrlCh:
 			m.onControl(ctl)
+		case ev := <-m.loopCh:
+			m.onLoopbackEvent(ev)
 		case ev, ok := <-m.asrCh:
 			if ok {
 				m.onASREvent(ev)
@@ -818,36 +876,89 @@ func (m *voiceMachine) micOpen() bool {
 	}
 }
 
-// onPCM applies the half-duplex mic gate and, when the mic is open, feeds the frame to the
-// per-turn ASR loopback (opening it lazily on the turn's first frame). A discarded frame
-// never reaches any loopback.
+// onPCM applies the half-duplex mic gate and, when the mic is open, hands the frame to the
+// per-turn ASR loopback, setting it up lazily on the turn's first frame. It never blocks:
+// opening the loopback only STARTS its goroutines (openTurnLoopback) and feeding it is a
+// non-blocking channel send (feedLoopback), so the run loop keeps serving its timers and
+// events however slow the dial or the pipe is. A discarded frame never reaches any loopback.
 func (m *voiceMachine) onPCM(frame []byte) {
 	if !m.micOpen() {
 		return // half-duplex: discard during idle/thinking/speaking/draining (and finalizing)
 	}
-	if m.asrCh == nil {
+	if m.turnCancel == nil {
 		if m.s.selfBaseURL == "" {
 			return // no loopback target configured (a bare/test server): discard silently
 		}
-		if !m.openTurnLoopback() {
-			return // the dial failed; openTurnLoopback emitted the error and went idle
-		}
+		m.openTurnLoopback()
 	}
-	if _, err := m.pw.Write(frame); err != nil {
-		m.failTurn("transcription.stream_error", "the transcription stream ended")
+	m.feedLoopback(frame)
+}
+
+// feedLoopback queues one frame for the turn's pump, never blocking the run loop. When the
+// queue is full -- the pump is parked on the pipe, e.g. through a very slow dial -- it drops
+// the OLDEST buffered frame to make room, so the mic stays live and the machine responsive;
+// a frame is only ever dropped whole, never split. The run loop is the queue's sole sender
+// (and sole closer) and the pump only ever removes, so once a slot is freed the second send
+// cannot fail. A nil pcmOut (the chunk's feed already ended) discards the frame.
+func (m *voiceMachine) feedLoopback(frame []byte) {
+	if m.pcmOut == nil {
+		return
+	}
+	select {
+	case m.pcmOut <- frame:
+		return
+	default:
+	}
+	select {
+	case <-m.pcmOut:
+		slog.Debug("voice chat: ASR loopback backed up; dropped the oldest buffered PCM frame")
+	default:
+	}
+	select {
+	case m.pcmOut <- frame:
+	default:
 	}
 }
 
-// openTurnLoopback opens a FRESH full-duplex loopback to the gateway's own
+// endLoopbackFeed ends the chunk's PCM feed: it closes the pump's queue, so the pump writes
+// out everything still buffered (in order) and then closes the pipe cleanly -- the clean EOF
+// the child turns into transcript.text.done. The channel is closed here and nowhere else but
+// teardown, always on the run loop, so no send can race the close. Idempotent.
+func (m *voiceMachine) endLoopbackFeed() {
+	if m.pcmOut != nil {
+		close(m.pcmOut)
+		m.pcmOut = nil
+	}
+}
+
+// openTurnLoopback starts a FRESH full-duplex loopback to the gateway's own
 // /v1/audio/transcriptions/live for this turn (the openLiveLoopback pattern, reused as-is
 // so the dial -- Expect: 100-continue, trusted-loopback headers, chunked io.Pipe body --
 // never drifts from the live path). It feeds the sealed ASR model name + PCM shape, which
-// /v1 re-resolves, re-gates, admits and bills per turn. On success it starts the turn's SSE
-// relay goroutine and returns true; on a dial failure or a non-2xx refusal it surfaces the
-// error and returns false.
-func (m *voiceMachine) openTurnLoopback() bool {
+// /v1 re-resolves, re-gates, admits and bills per turn.
+//
+// It only SETS UP and returns; it never dials. The dial can block for as long as a cold ASR
+// model takes to accept the request, and audio.cpp starts its idle timer at the accept, so
+// the request body must already be receiving PCM during the dial or the child aborts it
+// ("live request body stalled", #331). That is why the PCM pump runs on its own goroutine
+// from the first frame, concurrently with the dial goroutine -- the standalone live path's
+// liveReadLoop does the same -- instead of the run loop dialing first and writing after.
+// The dial's outcome comes back as a loopCh event (onLoopbackEvent), which is also what
+// starts the SSE relay; the run loop itself never blocks on either goroutine.
+//
+// turnCtx/turnCancel are created here, on the run loop, so teardownTurn can cancel a dial
+// that is still in flight. The goroutines use only the locals below and loopCh; every
+// machine field is set here or in onLoopbackEvent, on the run loop.
+func (m *voiceMachine) openTurnLoopback() {
 	pr, pw := io.Pipe()
 	turnCtx, turnCancel := context.WithCancel(m.ctx)
+	pcm := make(chan []byte, voiceLoopbackPCMQueue)
+	// Capacity 2 = the most the two senders can ever post (one dial outcome, at most one
+	// pump failure), so neither send can block -- which is what lets teardown join them.
+	events := make(chan voiceLoopbackEvent, 2)
+	m.pw, m.turnCtx, m.turnCancel, m.pcmOut, m.loopCh = pw, turnCtx, turnCancel, pcm, events
+
+	s := m.s
 	liveClaims := liveTicketClaims{
 		Target:     routing.Target{Model: m.claims.ASR.Model},
 		SampleRate: m.claims.SampleRate,
@@ -855,34 +966,104 @@ func (m *voiceMachine) openTurnLoopback() bool {
 		Format:     m.claims.SampleFormat,
 		UserID:     m.claims.UserID,
 	}
-	resp, err := m.s.openLiveLoopback(turnCtx, liveClaims, pr)
-	if err != nil {
-		turnCancel()
-		_ = pr.CloseWithError(err)
-		_ = pw.CloseWithError(err)
-		if m.ctx.Err() == nil {
-			m.failTurn("transcription.unavailable", "live transcription unavailable")
+	wg := &m.relayWG
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		voiceLoopbackPump(turnCtx, pcm, pw, events)
+	}()
+	go func() {
+		defer wg.Done()
+		s.dialTurnLoopback(turnCtx, liveClaims, pr, events)
+	}()
+}
+
+// voiceLoopbackPump drains one turn's PCM queue into the loopback request body (pw). It runs
+// on its own goroutine so the pipe's backpressure -- a write blocks until the transport reads
+// it, and the transport reads nothing until the dial is accepted -- parks only the pump,
+// never the run loop. It touches no machine state: it ends when the queue is closed
+// (endLoopbackFeed: it has flushed every buffered frame, so it closes the pipe cleanly -> the
+// terminating chunk -> the child's transcript.text.done), when turnCtx ends (teardown), or on
+// a write error, which it reports once on events -- unless the turn is already ending, when
+// the error is just the teardown closing the pipe under it.
+func voiceLoopbackPump(turnCtx context.Context, pcm <-chan []byte, pw *io.PipeWriter, events chan<- voiceLoopbackEvent) {
+	for {
+		select {
+		case frame, ok := <-pcm:
+			if !ok {
+				_ = pw.Close()
+				return
+			}
+			if _, err := pw.Write(frame); err != nil {
+				if turnCtx.Err() == nil {
+					events <- voiceLoopbackEvent{kind: loopbackPumpFailed}
+				}
+				return
+			}
+		case <-turnCtx.Done():
+			return
 		}
-		return false
+	}
+}
+
+// dialTurnLoopback performs one turn's loopback dial on its own goroutine and reports the
+// outcome on events (exactly once): a 2xx carries the live SSE body for the relay; a non-2xx
+// carries /v1's own error code + message (liveRefusalFrame), so the browser gets a typed
+// error rather than a bare failure; a transport error is reported bare. It closes pr on a
+// failure so the transport's body read ends at once. Like the pump it touches no machine
+// state -- it is a Server method only so it can reach openLiveLoopback without the machine.
+func (s *Server) dialTurnLoopback(turnCtx context.Context, claims liveTicketClaims, pr *io.PipeReader, events chan<- voiceLoopbackEvent) {
+	resp, err := s.openLiveLoopback(turnCtx, claims, pr)
+	if err != nil {
+		_ = pr.CloseWithError(err)
+		events <- voiceLoopbackEvent{kind: loopbackDialFailed}
+		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		frame := liveRefusalFrame(resp.Body)
 		_ = resp.Body.Close()
-		turnCancel()
 		_ = pr.CloseWithError(errVoiceTurnDone)
-		_ = pw.CloseWithError(errVoiceTurnDone)
-		m.emitError(frame.Code, frame.Message)
-		m.setState(voiceStateIdle)
-		return false
+		events <- voiceLoopbackEvent{kind: loopbackRefused, code: frame.Code, message: frame.Message}
+		return
 	}
-	asrCh := make(chan asrEvent, voiceASRQueue)
-	m.pw, m.turnCancel, m.respBody, m.asrCh = pw, turnCancel, resp.Body, asrCh
-	m.relayWG.Add(1)
-	go func() {
-		defer m.relayWG.Done()
-		voiceASRRelay(turnCtx, resp.Body, asrCh)
-	}()
-	return true
+	events <- voiceLoopbackEvent{kind: loopbackDialed, body: resp.Body}
+}
+
+// onLoopbackEvent folds one dial/pump report into the machine -- the only place the
+// loopback's asrCh and respBody are set, so they stay run-loop-owned.
+//   - dialed: start the turn's SSE relay on the response body.
+//   - refused: surface /v1's gateway error and go idle, as the synchronous dial did.
+//   - dial failed: a recoverable leg error (failTurn), unless the session is already ending.
+//   - pump failed: the request body ended under us, a stream error. Ignored while the dial is
+//     still pending (asrCh is nil until it succeeds) because the dial's own outcome follows
+//     and is authoritative -- a failed dial closes the pipe, which fails the pump's write
+//     first -- and while finalizing, where the relay's end or the finalize timeout already
+//     finishes the chunk with its provisional text.
+func (m *voiceMachine) onLoopbackEvent(ev voiceLoopbackEvent) {
+	switch ev.kind {
+	case loopbackDialed:
+		asrCh := make(chan asrEvent, voiceASRQueue)
+		m.respBody, m.asrCh = ev.body, asrCh
+		turnCtx, wg := m.turnCtx, &m.relayWG
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			voiceASRRelay(turnCtx, ev.body, asrCh)
+		}()
+	case loopbackRefused:
+		m.emitError(ev.code, ev.message)
+		m.teardownTurn()
+		m.setState(voiceStateIdle)
+	case loopbackDialFailed:
+		if m.ctx.Err() == nil {
+			m.failTurn("transcription.unavailable", "live transcription unavailable")
+		}
+	case loopbackPumpFailed:
+		if m.asrCh == nil || m.finalizing {
+			return
+		}
+		m.failTurn("transcription.stream_error", "the transcription stream ended")
+	}
 }
 
 // onControl handles a push-to-talk / cancel control from the client. bye never reaches
@@ -1010,17 +1191,19 @@ func (m *voiceMachine) onMaxUtterance() {
 	m.finalizeChunk()
 }
 
-// finalizeChunk ends the current chunk: it closes the loopback pipe cleanly (end-of-input
-// -> the upstream's terminating chunk -> the clean transcript.text.done), stops the chunk
-// timers and arms the finalize-timeout fallback. The machine stays in listening with
+// finalizeChunk ends the current chunk: it ends the PCM feed, which has the pump flush what
+// is buffered and close the loopback pipe cleanly (end-of-input -> the upstream's terminating
+// chunk -> the clean transcript.text.done), stops the chunk timers and arms the
+// finalize-timeout fallback. The machine stays in listening with
 // finalizing set (so inbound PCM is gated) until the done arrives (finishChunk) or the
 // fallback fires.
 func (m *voiceMachine) finalizeChunk() {
 	m.finalizing = true
 	m.stopChunkTimers()
-	if m.pw != nil {
-		_ = m.pw.Close() // clean EOF -> terminating chunk -> transcript.text.done
-	}
+	// Flush the buffered PCM and close the pipe cleanly (EOF -> terminating chunk ->
+	// transcript.text.done): the pump does it once its queue is closed, so the frames still
+	// in flight are written before the EOF rather than cut off by it.
+	m.endLoopbackFeed()
 	m.armFinalize()
 }
 
@@ -1052,7 +1235,10 @@ func (m *voiceMachine) onASRClosed() {
 		m.failTurn("transcription.stream_error", "the transcription stream ended")
 		return
 	}
-	m.asrCh = nil
+	// The stream ended outside listening (a resumed chunk in the continuation window): the
+	// loopback is dead, so tear it down whole -- turnCancel is the "a loopback exists" test,
+	// and the next frame must dial a fresh one rather than feed this closed pipe.
+	m.teardownTurn()
 }
 
 // onFinalizeTimeout fires when the clean final did not arrive in time after end-of-input:
@@ -1681,10 +1867,15 @@ func (m *voiceMachine) emitError(code, message string) {
 	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownError, Code: code, Message: message})
 }
 
-// teardownTurn ends the current ASR loopback exactly once and joins its relay goroutine:
-// cancel the turn context (aborts the loopback request and the SSE read), unblock the pipe
-// from both sides, close the response body, and wait for the relay to return. It is safe to
-// call when no turn is open.
+// teardownTurn ends the current ASR loopback exactly once and joins its goroutines: cancel
+// the turn context (aborts an in-flight dial, the loopback request and the SSE read), unblock
+// the pipe from both sides (the transport's body read and a pump write parked on it), stop
+// the pump, close the response body, and wait for the dial, pump and relay goroutines to
+// return. The order matters: the context and the pipe are aborted BEFORE the pump's queue is
+// closed, so a pump that wakes on the close finds the pipe already closed with
+// errVoiceTurnDone and can never turn it into a clean EOF. A dial outcome the run loop never
+// consumed is drained afterwards -- its response body is closed here, not leaked. It is safe
+// to call when no turn is open.
 func (m *voiceMachine) teardownTurn() {
 	if m.turnCancel != nil {
 		m.turnCancel()
@@ -1692,12 +1883,31 @@ func (m *voiceMachine) teardownTurn() {
 	if m.pw != nil {
 		_ = m.pw.CloseWithError(errVoiceTurnDone)
 	}
+	m.endLoopbackFeed()
 	if m.respBody != nil {
 		_ = m.respBody.Close()
 	}
 	m.relayWG.Wait()
-	m.pw, m.turnCancel, m.respBody, m.asrCh = nil, nil, nil, nil
+	m.drainLoopbackEvents()
+	m.pw, m.turnCtx, m.turnCancel, m.respBody, m.asrCh, m.loopCh = nil, nil, nil, nil, nil, nil
 	m.finalizing = false
+}
+
+// drainLoopbackEvents closes the response body of any dial outcome still queued on loopCh.
+// It runs after relayWG.Wait, when the dial and pump goroutines (the only senders) have
+// returned, so a non-blocking drain sees everything: a loopbackDialed the run loop never got
+// to (the turn was torn down while the dial completed) would otherwise leak its connection.
+func (m *voiceMachine) drainLoopbackEvents() {
+	for {
+		select {
+		case ev := <-m.loopCh:
+			if ev.body != nil {
+				_ = ev.body.Close()
+			}
+		default:
+			return
+		}
+	}
 }
 
 // resetChunk clears the per-chunk transcript and voiced-span bounds for the next chunk.

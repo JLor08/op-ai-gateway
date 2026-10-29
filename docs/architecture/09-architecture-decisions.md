@@ -9537,6 +9537,21 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
     session: that would also hold them through `speaking` and `draining`, and it would lean on a per-utterance
     `transcript.text.done` mid-stream, which ADR-072 left unconfirmed, where end-of-input → final is the contract the
     relay is tested on.
+  - *Amended by issue #331 — the loopback body is fed concurrently with the dial.* Phase 1 through
+    phase 3 fed that loopback on the state machine's single run-loop goroutine: `onPCM` ran the
+    `openLiveLoopback` dial inline and wrote the first PCM frame only **after** it returned. On a cold
+    ASR model the dial outlasts audio.cpp's request-body idle timeout, so the upstream aborts the
+    still-empty body with `live request body stalled: no data within the idle timeout` and the turn
+    fails — while the same model's standalone live relay (§6.1.5), which pumps its pipe from a
+    dedicated `liveReadLoop` goroutine, keeps the body fed through the identical cold start. The fix
+    mirrors that path: the run loop sets up the pipe and a bounded per-turn PCM channel (a
+    non-blocking **drop-oldest** feed, so it never stalls the state machine), a dedicated pump
+    goroutine drains the channel into the pipe, and the dial runs in its own goroutine whose
+    success / non-2xx refusal / dial error reaches the run loop as an event — so the single-owner
+    invariant holds (only the run loop sets `asrCh`/`respBody` and surfaces the error frame). The
+    per-chunk lifecycle, the half-duplex gate and the failure semantics are otherwise unchanged.
+    **Residual:** the per-turn dial still has no timeout of its own beyond the transport's, but it now
+    parks only its own goroutine, never the run loop.
   - *Brain and voice: a new voice run kind.* `executeVoiceRun` (`internal/gateway/chat_runs_voice.go`), started by
     `startVoiceRun` at each chunk end, runs the LLM leg over `/v1/chat/completions` (the chat's history plus
     `pendingText`, answer deltas streamed to subscribers), then synthesizes the **whole answer** (phase 1; since phase 2
