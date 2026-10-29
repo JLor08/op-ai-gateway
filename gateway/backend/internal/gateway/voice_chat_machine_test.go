@@ -422,6 +422,107 @@ func TestVoiceTimingMuteTeardownAfterUnresolved(t *testing.T) {
 	}
 }
 
+// TestResolveVoiceTimingTTSConcurrency pins the speech-synthesis concurrency cap (#337): it is
+// ALWAYS >= 1 once resolved, because a cap of 0 would admit no synthesis and stall the run.
+// Unset, zero and negative all mean the default 2; a positive value is taken as given.
+func TestResolveVoiceTimingTTSConcurrency(t *testing.T) {
+	if VoiceTTSConcurrencyDefault != 2 {
+		t.Fatalf("VoiceTTSConcurrencyDefault = %d, want 2", VoiceTTSConcurrencyDefault)
+	}
+	cases := []struct {
+		name string
+		in   VoiceTiming
+		want int
+	}{
+		{"unset resolves to the default", VoiceTiming{}, 2},
+		{"zero is not a cap and uses the default", VoiceTiming{TTSConcurrency: 0}, 2},
+		{"negative is junk and uses the default", VoiceTiming{TTSConcurrency: -3}, 2},
+		{"one is a valid cap (serialize)", VoiceTiming{TTSConcurrency: 1}, 1},
+		{"positive is taken as given", VoiceTiming{TTSConcurrency: 5}, 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveVoiceTiming(tc.in)
+			if got.ttsConcurrency != tc.want {
+				t.Fatalf("resolveVoiceTiming(%+v).ttsConcurrency = %d, want %d", tc.in, got.ttsConcurrency, tc.want)
+			}
+			if cap := got.ttsConcurrencyCap(); cap != tc.want {
+				t.Fatalf("ttsConcurrencyCap() = %d, want %d", cap, tc.want)
+			}
+		})
+	}
+}
+
+// TestVoiceTimingTTSConcurrencyCapUnresolved: a hand-built voiceTiming (a test fixture, or the
+// bare &Server{}) that never went through resolveVoiceTiming has ttsConcurrency 0; the accessor
+// reads that as the default, never as a cap of 0 (which would admit no synthesis at all).
+func TestVoiceTimingTTSConcurrencyCapUnresolved(t *testing.T) {
+	if got := fastVoiceTiming().ttsConcurrencyCap(); got != VoiceTTSConcurrencyDefault {
+		t.Fatalf("unresolved ttsConcurrencyCap() = %d, want the default %d", got, VoiceTTSConcurrencyDefault)
+	}
+	set := fastVoiceTiming()
+	set.ttsConcurrency = 4
+	if got := set.ttsConcurrencyCap(); got != 4 {
+		t.Fatalf("explicit ttsConcurrencyCap() = %d, want 4", got)
+	}
+	neg := fastVoiceTiming()
+	neg.ttsConcurrency = -1
+	if got := neg.ttsConcurrencyCap(); got != VoiceTTSConcurrencyDefault {
+		t.Fatalf("negative ttsConcurrencyCap() = %d, want the default %d", got, VoiceTTSConcurrencyDefault)
+	}
+}
+
+// TestResolveVoiceTimingTTSRetries pins the second knob whose zero is NOT "use the default":
+// the speech-leg retry count (#337). Unset resolves to the default 2, an explicit
+// TTSRetriesDisabled means "never retry" (the operator's 0) and must survive resolution -- folding
+// it into the default is the bug this guards -- and a positive count is taken as given.
+func TestResolveVoiceTimingTTSRetries(t *testing.T) {
+	if VoiceTTSRetriesDefault != 2 {
+		t.Fatalf("VoiceTTSRetriesDefault = %d, want 2", VoiceTTSRetriesDefault)
+	}
+	cases := []struct {
+		name string
+		in   VoiceTiming
+		want int
+	}{
+		{"unset resolves to the default", VoiceTiming{}, 2},
+		{"negative count is junk and uses the default", VoiceTiming{TTSRetries: -1}, 2},
+		{"positive count is taken as given", VoiceTiming{TTSRetries: 5}, 5},
+		{"disabled is preserved as zero, not folded into the default", VoiceTiming{TTSRetriesDisabled: true}, 0},
+		{"disabled wins over a count", VoiceTiming{TTSRetries: 5, TTSRetriesDisabled: true}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveVoiceTiming(tc.in)
+			if got.ttsRetries != tc.want {
+				t.Fatalf("resolveVoiceTiming(%+v).ttsRetries = %d, want %d", tc.in, got.ttsRetries, tc.want)
+			}
+			if limit := got.ttsRetryLimit(); limit != tc.want {
+				t.Fatalf("ttsRetryLimit() = %d, want %d", limit, tc.want)
+			}
+		})
+	}
+}
+
+// TestVoiceTimingTTSRetryLimitUnresolved: unlike the concurrency cap, a hand-built voiceTiming
+// reads 0 retries as "no retry" (the safe direction: nothing is retried unless a test or the
+// resolved timing says so), and a negative can never turn a retry loop into zero attempts.
+func TestVoiceTimingTTSRetryLimitUnresolved(t *testing.T) {
+	if got := fastVoiceTiming().ttsRetryLimit(); got != 0 {
+		t.Fatalf("unresolved ttsRetryLimit() = %d, want 0 (no retry)", got)
+	}
+	set := fastVoiceTiming()
+	set.ttsRetries = 3
+	if got := set.ttsRetryLimit(); got != 3 {
+		t.Fatalf("explicit ttsRetryLimit() = %d, want 3", got)
+	}
+	neg := fastVoiceTiming()
+	neg.ttsRetries = -2
+	if got := neg.ttsRetryLimit(); got != 0 {
+		t.Fatalf("negative ttsRetryLimit() = %d, want 0", got)
+	}
+}
+
 // TestVoiceChunkEndsOnSilence: after a voiced utterance, no new partial for the silence
 // timeout ends the chunk -- the gateway closes the per-turn pipe, the ASR returns the clean
 // final, and the machine emits asr_final.

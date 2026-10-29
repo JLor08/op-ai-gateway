@@ -286,6 +286,86 @@ func TestLoadVoiceMuteTeardownFromFile(t *testing.T) {
 	}
 }
 
+// The Voice Chat speech-synthesis concurrency cap (#337) follows the plain "junk or <= 0 uses the
+// default" rule: a cap of 0 would admit no synthesis, so unlike the retry knob below there is no
+// meaningful zero to preserve.
+func TestLoadVoiceTTSConcurrencyDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY", "")
+	if got := mustLoad(t).VoiceTTSConcurrency; got != 2 {
+		t.Fatalf("voice tts concurrency (absent) = %d, want the default 2", got)
+	}
+}
+
+func TestLoadVoiceTTSConcurrencyOverrides(t *testing.T) {
+	cases := []struct {
+		value string
+		want  int
+	}{
+		{"1", 1},
+		{"4", 4},
+		{" 3 ", 3},     // surrounding whitespace is trimmed
+		{"0", 2},       // not a cap -> default
+		{"-1", 2},      // negative -> default
+		{"garbage", 2}, // invalid -> default
+		{"1.5", 2},     // not an integer -> default
+	}
+	for _, tc := range cases {
+		t.Setenv("OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY", tc.value)
+		if got := mustLoad(t).VoiceTTSConcurrency; got != tc.want {
+			t.Fatalf("value %q: got %d, want %d", tc.value, got, tc.want)
+		}
+	}
+}
+
+// The speech-leg retry knob (#337) is the second voice knob where 0 is a real value (no retry), so
+// an absent variable (-> the default 2) must stay distinguishable from an explicit 0 (-> 0, kept
+// as "retries disabled").
+func TestLoadVoiceTTSRetriesDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_TTS_RETRIES", "")
+	if got := mustLoad(t).VoiceTTSRetries; got != 2 {
+		t.Fatalf("voice tts retries (absent) = %d, want the default 2", got)
+	}
+}
+
+func TestLoadVoiceTTSRetriesOverrides(t *testing.T) {
+	cases := []struct {
+		value string
+		want  int
+	}{
+		{"1", 1},
+		{"5", 5},
+		{" 3 ", 3},     // surrounding whitespace is trimmed
+		{"0", 0},       // explicit "no retry", NOT the default
+		{"-1", 2},      // negative -> default (not silently disabled)
+		{"garbage", 2}, // invalid -> default
+		{"1.5", 2},     // not an integer -> default
+	}
+	for _, tc := range cases {
+		t.Setenv("OP_AI_GATEWAY_VOICE_TTS_RETRIES", tc.value)
+		if got := mustLoad(t).VoiceTTSRetries; got != tc.want {
+			t.Fatalf("value %q: got %d, want %d", tc.value, got, tc.want)
+		}
+	}
+}
+
+// A JSON config file may carry either knob as a number; an explicit 0 there disables retries too.
+func TestLoadVoiceTTSKnobsFromFile(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY", "")
+	t.Setenv("OP_AI_GATEWAY_VOICE_TTS_RETRIES", "")
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY":3,"OP_AI_GATEWAY_VOICE_TTS_RETRIES":0}`)
+	cfg := mustLoad(t)
+	if cfg.VoiceTTSConcurrency != 3 || cfg.VoiceTTSRetries != 0 {
+		t.Fatalf("file {3, 0}: got concurrency %d retries %d, want 3 and 0 (retries disabled)",
+			cfg.VoiceTTSConcurrency, cfg.VoiceTTSRetries)
+	}
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_VOICE_TTS_RETRIES":"4"}`)
+	cfg = mustLoad(t)
+	if cfg.VoiceTTSConcurrency != 2 || cfg.VoiceTTSRetries != 4 {
+		t.Fatalf("file {absent, 4}: got concurrency %d retries %d, want 2 and 4",
+			cfg.VoiceTTSConcurrency, cfg.VoiceTTSRetries)
+	}
+}
+
 func TestLoadAppHealthProbeTimeoutDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_APP_HEALTH_PROBE_TIMEOUT", "")
 	if cfg := mustLoad(t); cfg.AppHealthProbeTimeout != 3*time.Second {

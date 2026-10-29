@@ -123,6 +123,21 @@ const (
 	VoiceMuteTeardownMs      = 10000
 )
 
+// The default Voice Chat speech-generation knobs (#337), plain counts rather than durations.
+// Like the Voice*Ms defaults they are the defaults of the OP_AI_GATEWAY_VOICE_TTS_* knobs, and
+// config cannot import this package, so it repeats the literals.
+//
+//   - VoiceTTSConcurrencyDefault: how many speech sections one run synthesizes at once. It is
+//     always at least 1 once resolved (a cap of 0 would admit no synthesis), so a configured
+//     value <= 0 means this default.
+//   - VoiceTTSRetriesDefault: how many times a speech leg is retried after a transient failure.
+//     Like the mute teardown, an explicit 0 from the operator is NOT "use the default": it means
+//     "never retry", carried as VoiceTiming.TTSRetriesDisabled.
+const (
+	VoiceTTSConcurrencyDefault = 2
+	VoiceTTSRetriesDefault     = 2
+)
+
 // VoicePlaybackFallbackMs is the drain's ABSOLUTE upper bound (spec 6.2): the most the session
 // will stay in draining before it re-opens the mic, even if no playback_done ever arrives, so a
 // missing or pathologically-late signal can never wedge the session. It is deliberately
@@ -142,14 +157,24 @@ const VoicePlaybackFallbackMs = 30000
 // explicit 0 -- keepalive, never tear the ASR loopback down while the mic is muted -- is
 // the separate MuteKeepalive flag, which the config layer sets only for a variable that is
 // present and 0 (an absent variable leaves it false and so gets the default).
+//
+// The two speech-generation knobs (#337) are counts, not durations, and have opposite zeros.
+// TTSConcurrency <= 0 means the default VoiceTTSConcurrencyDefault (a cap of 0 would admit no
+// synthesis, so there is no zero to preserve). The retry count is the second knob whose operator
+// 0 is a real value ("never retry"), so it follows the mute teardown's shape: TTSRetries <= 0
+// means the default VoiceTTSRetriesDefault, and the explicit 0 is the separate TTSRetriesDisabled
+// flag, which the config layer sets only for a variable that is present and 0.
 type VoiceTiming struct {
-	SilenceTimeout    time.Duration
-	MinUtterance      time.Duration
-	MaxUtterance      time.Duration
-	MicResumeTail     time.Duration
-	ContinuationGrace time.Duration
-	MuteTeardown      time.Duration
-	MuteKeepalive     bool
+	SilenceTimeout     time.Duration
+	MinUtterance       time.Duration
+	MaxUtterance       time.Duration
+	MicResumeTail      time.Duration
+	ContinuationGrace  time.Duration
+	MuteTeardown       time.Duration
+	MuteKeepalive      bool
+	TTSConcurrency     int
+	TTSRetries         int
+	TTSRetriesDisabled bool
 }
 
 // voiceTiming is the resolved (defaults-filled) timing the state machine reads. It is the
@@ -166,6 +191,13 @@ type VoiceTiming struct {
 // muteKeepaliveEvery is how often a muted loopback is fed a silence frame. Like playbackCap it is
 // not an operator knob, only an internal default and a test seam: a machine reads it through
 // muteKeepaliveInterval, so a zero value means voiceMuteKeepaliveInterval.
+//
+// ttsConcurrency and ttsRetries are the resolved speech-generation knobs (see VoiceTiming).
+// ttsConcurrency is the most speech sections one run synthesizes at once; read it through
+// ttsConcurrencyCap, which is always >= 1 even for a hand-built timing that left it 0.
+// ttsRetries is the most times a speech leg is retried after a transient failure, and 0 means
+// "never retry" (resolveVoiceTiming has already turned an unset knob into the default and the
+// operator's explicit 0 into this 0); read it through ttsRetryLimit.
 type voiceTiming struct {
 	silenceTimeout     time.Duration
 	minUtterance       time.Duration
@@ -176,6 +208,8 @@ type voiceTiming struct {
 	muteTeardown       time.Duration
 	muteKeepalive      bool
 	muteKeepaliveEvery time.Duration
+	ttsConcurrency     int
+	ttsRetries         int
 }
 
 // defaultVoiceTiming is the built-in timing (the Voice*Ms defaults).
@@ -188,6 +222,8 @@ func defaultVoiceTiming() voiceTiming {
 		continuationGrace: VoiceContinuationGraceMs * time.Millisecond,
 		playbackCap:       VoicePlaybackFallbackMs * time.Millisecond,
 		muteTeardown:      VoiceMuteTeardownMs * time.Millisecond,
+		ttsConcurrency:    VoiceTTSConcurrencyDefault,
+		ttsRetries:        VoiceTTSRetriesDefault,
 	}
 }
 
@@ -215,10 +251,35 @@ func (t voiceTiming) muteKeepaliveInterval() time.Duration {
 	return voiceMuteKeepaliveInterval
 }
 
+// ttsConcurrencyCap is the most speech sections one run synthesizes at once: the resolved
+// timing's value, or VoiceTTSConcurrencyDefault when it is not a positive count (a bare/test
+// timing that skipped resolveVoiceTiming). It is therefore always >= 1, because a cap of 0 would
+// admit no synthesis and stall the run, the way muteTeardownAfter never reads an unset teardown
+// as "tear down at once".
+func (t voiceTiming) ttsConcurrencyCap() int {
+	if t.ttsConcurrency > 0 {
+		return t.ttsConcurrency
+	}
+	return VoiceTTSConcurrencyDefault
+}
+
+// ttsRetryLimit is the most times a speech leg is retried after a transient failure; 0 means
+// never retry. Unlike the concurrency cap, an unset (0) value here is NOT read as the default:
+// resolveVoiceTiming is what applies VoiceTTSRetriesDefault (so the machine a Server builds is
+// always resolved), and a hand-built timing that skipped it retries nothing unless it says
+// otherwise. A negative count is clamped to 0 so it can never turn an attempts loop into zero
+// attempts.
+func (t voiceTiming) ttsRetryLimit() int {
+	return max(t.ttsRetries, 0)
+}
+
 // resolveVoiceTiming fills each non-positive field of d with its Voice*Ms default. New
 // calls it once so the Server holds a fully-resolved timing. The mute teardown follows the
 // same rule for its duration but carries MuteKeepalive through untouched: folding the
 // operator's explicit 0 into the default would silently turn "never tear down" into 10s.
+// The speech-generation knobs (#337) are resolved here too: a non-positive TTSConcurrency
+// becomes VoiceTTSConcurrencyDefault so the resolved cap is always >= 1, and the retry count
+// follows the mute teardown's rule (see below) rather than the plain one.
 func resolveVoiceTiming(d VoiceTiming) voiceTiming {
 	out := defaultVoiceTiming()
 	if d.SilenceTimeout > 0 {
@@ -240,6 +301,19 @@ func resolveVoiceTiming(d VoiceTiming) voiceTiming {
 		out.muteTeardown = d.MuteTeardown
 	}
 	out.muteKeepalive = d.MuteKeepalive
+	if d.TTSConcurrency > 0 {
+		out.ttsConcurrency = d.TTSConcurrency
+	}
+	// An explicit 0 retries is a real choice (the operator turned retries off), but VoiceTiming
+	// reads a zero TTSRetries as "unset, use the default" like every other field, so the 0 can only
+	// arrive as TTSRetriesDisabled. Folding it into the default would silently turn "never retry"
+	// into 2 retries, each of which is another billed speech call. Disabled wins over a count.
+	switch {
+	case d.TTSRetriesDisabled:
+		out.ttsRetries = 0
+	case d.TTSRetries > 0:
+		out.ttsRetries = d.TTSRetries
+	}
 	return out
 }
 
