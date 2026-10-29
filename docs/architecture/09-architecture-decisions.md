@@ -9552,6 +9552,37 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
     per-chunk lifecycle, the half-duplex gate and the failure semantics are otherwise unchanged.
     **Residual:** the per-turn dial still has no timeout of its own beyond the transport's, but it now
     parks only its own goroutine, never the run loop.
+  - *Amended by issue #335 — the loopback is mute-aware.* #331 fixed the send-pause of the dial window; a
+    **sustained** one remained. The portal's microphone mute stops the PCM and told the gateway nothing, which it
+    cannot tell from a stall, so an open loopback starved and audio.cpp aborted its body (`live request body stalled`,
+    about 30 s), ending the turn with `transcription.stream_error`. Two **portal-only up-controls**, `mic_mute` and
+    `mic_unmute` ([HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket)),
+    now make the gateway act (no `ServerAgent` bump, no schema change, nothing changes while the mic is live). The mute
+    is a latch on the single-owner machine, with run-loop timers beside the silence, grace and tail ones. While it is
+    set: **(1) the ASR's output is filtered** (delta, partial and done are discarded: no `asr_*` frame, no
+    `pendingText`, no resumed speech in the continuation window), so a model that hallucinates on silence cannot inject
+    a phantom transcript; **(2) the open loopback is fed gateway-generated keepalive silence** (a 100 ms zeroed frame
+    in the ticket's PCM shape every 10 s through the same drop-oldest queue real PCM uses), so nothing audio-shaped
+    leaves the browser and the upstream's idle timeout never fires; **(3) after `OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN`
+    (default 10 s) the loopback is torn down, unless the operator chose keepalive with an explicit `0`**. That knob is
+    the one voice timing where zero is a real value, so an absent, empty, unparseable or negative variable (the
+    default) is kept distinct from a literal `0`. The teardown is a **clean end-of-input**, not an abort: the feed is
+    closed like a finished chunk, so the relay completes and bills what it carried, where an abort would make every
+    sustained mute a truncated session that bills the loud zero (an `Error` log line and a zero-quantity row). It
+    frees the loopback's admission, the route's live slot and the model pin and ends its metering. `mic_unmute` stops
+    the filter and the timers: an open loopback carries on, a torn-down one reopens lazily on the next real frame, and
+    one still closing is torn down at once so that frame redials. **Residuals.** *Keepalive holds what teardown
+    frees*: the slot and pin stay taken and the loopback stays one open metered session (billed for the silence it
+    carries) for as long as the mute lasts, an explicit trade of capacity for an instant resume; it is still bounded,
+    because the loopback runs through the gateway's own `/v1`, whose stream-idle watchdog
+    (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, 120 s by default) only the ASR's own SSE re-arms, so a model that answers
+    silence with nothing is cut by it. *A loopback that ends while muted is quiet*: the teardown, the relay closing
+    (that watchdog included), a failed or refused dial and an ASR `error` event end it with no `error` frame and no
+    state change, the mute still latched, because the user cannot act on a loopback they muted; the cost is that a
+    **persistent** failure (the live slot taken, the ASR not admitted) surfaces as the ordinary `error` frame only on
+    the redial after the unmute. *The signal is cooperative*: a client that goes quiet without `mic_mute` gets the
+    old behavior. Pinned by end-to-end tests against a fake ASR child that models the upstream's idle timeout and the
+    edge watchdog, and by machine-level `-race` tests.
   - *Brain and voice: a new voice run kind.* `executeVoiceRun` (`internal/gateway/chat_runs_voice.go`), started by
     `startVoiceRun` at each chunk end, runs the LLM leg over `/v1/chat/completions` (the chat's history plus
     `pendingText`, answer deltas streamed to subscribers), then synthesizes the **whole answer** (phase 1; since phase 2
@@ -9736,7 +9767,9 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
 - **Voice Chat holds the ASR route's one live slot whenever its mic gate is open.** Each chunk's relay takes the per-route
   live session slot that audio.cpp's one `/live` per model requires and releases it at the chunk end, but a fresh relay
   opens on the next mic frame, so the slot is held throughout `listening` and the continuation window and is free only in
-  `idle`, `speaking` and `draining`. Two users on one ASR route therefore collide on `transcription.live_busy` (an `error`
+  `idle`, `speaking` and `draining` (and, since issue #335, while the microphone has been muted past
+  `OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN`, unless the operator chose keepalive with an explicit `0`, which holds it for the whole
+  mute). Two users on one ASR route therefore collide on `transcription.live_busy` (an `error`
   frame) continuously while a mic is open, not only while one of them is speaking. A relay torn down without its end-of-input (a cancel,
   a leg failure, the window closing on a relay that opened on silence) is a truncated session and bills the loud zero.
 - **Deployment has the live-transcription requirements, again.** The upgrade route needs the same dedicated nginx
@@ -10048,8 +10081,11 @@ flag).
   commit and no stranded run slot, and the stored turn holds every synthesized section whatever the playback position was.
   *Client only:* the **output mute** is the session's, re-applied to each answer's player (the audio plays on silently, on the
   same clock; the gateway is told nothing and drains as it would have), and the **microphone mute** disables the capture track
-  and sends no PCM (no frame: the gateway hears silence and detects no turn; push-to-talk is closed under it and the indicator
-  says the microphone is muted instead of listening). The portal draws pause/resume and "stop speaking"
+  and sends no PCM (push-to-talk is closed under it and the indicator says the microphone is muted instead of listening).
+  *Amended by issue #335:* it is no longer silent toward the gateway. It sends `mic_mute` and `mic_unmute`, because a bare
+  stop of the PCM starves an open ASR loopback and the upstream aborts it; the gateway then keeps that loopback alive on
+  silence of its own, ignores what it recognizes and frees it if the mute lasts
+  ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), (b)). The portal draws pause/resume and "stop speaking"
   **only while audio is actually being heard**, from the first played chunk until the answer has played out: the queue running
   dry once the gateway has sent everything, or staying dry for 1.2 s while the gateway is still `speaking` (the last section is
   over and the model goes on writing the detail; a later section's chunk would arrive well inside that window), and not in the
