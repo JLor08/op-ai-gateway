@@ -514,9 +514,11 @@ func TestSpeechStreamOptedOut(t *testing.T) {
 // released only once that silence has been seen on the run's own stream, so the gap is known to have
 // been filled -- not assumed from a sleep -- and the run is then taken to its end.
 
-// gapShapes are the two places a gap can fall in a two-section answer; the held section's wait is a
-// gap in both, filled by the relay at a different rate source each time: the run's own output rate
-// before any audio has played, the rate of the audio already playing between two sections.
+// gapShapes are the two places a gap can fall in a two-section answer: before any audio has played
+// and between two sections. The held section's wait is a gap in both, and the relay fills it from a
+// different source each time (the run's own output rate, the rate of the audio already playing). In
+// this harness both rates are the same 44100 Hz, so these runs do not tell the two sources apart --
+// that is a relay-level concern, covered by the relay tests above.
 var gapShapes = []struct {
 	name string
 	// held is the synthesized text of the section whose speech request is held.
