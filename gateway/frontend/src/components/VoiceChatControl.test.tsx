@@ -538,6 +538,22 @@ describe('VoiceChatControl errors', () => {
       expect(detailsToggle()).toHaveAttribute('aria-expanded', 'false');
     });
 
+    it('resets between two codeless turn errors that differ only in message (#329)', () => {
+      // The reproduced #329 frames carried no code, so a code-only remount key would leave two
+      // consecutive codeless turn errors sharing one key -- the open disclosure would persist. The
+      // key is the whole detail, so a changed message alone remounts it closed.
+      const { update } = renderControl(
+        makeVoice({ state: 'idle', error: { kind: 'turn', message: 'live request body stalled' } }),
+      );
+      fireEvent.click(detailsToggle());
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'true');
+
+      update(
+        makeVoice({ state: 'idle', error: { kind: 'turn', message: 'something else failed' } }),
+      );
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'false');
+    });
+
     it("renders no toggle for a failure that is the browser's own", () => {
       for (const kind of ['denied', 'unsupported', 'capture'] as const) {
         const { unmount } = renderControl(makeVoice({ error: { kind, message: 'raw' } }));
