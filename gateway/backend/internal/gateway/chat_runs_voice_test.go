@@ -75,6 +75,50 @@ type voiceTestProvider struct {
 	// and finishes early, then release k and watch the relay stay in document order. A request
 	// whose input is not a key answers at once. nil disables the per-section hold (the default).
 	speechHoldByInput map[string]chan struct{}
+	// speechInflight / speechPeak, when non-nil, count the speech syntheses IN FLIGHT at the
+	// provider -- a request counts from its arrival until its response body is read to the end or
+	// closed (or the request ends without one) -- and keep the high-water mark in speechPeak. A
+	// concurrency-cap test reads the peak to prove the cap held, rather than trusting a sleep. nil
+	// disables the count (the default).
+	speechInflight *atomic.Int32
+	speechPeak     *atomic.Int32
+}
+
+// enterSpeech counts one speech synthesis in flight and returns the func that ends it (safe to call
+// more than once). It is a no-op when the provider tracks nothing.
+func (p voiceTestProvider) enterSpeech() (leave func()) {
+	if p.speechInflight == nil {
+		return func() { /* not tracking */ }
+	}
+	n := p.speechInflight.Add(1)
+	for {
+		peak := p.speechPeak.Load()
+		if n <= peak || p.speechPeak.CompareAndSwap(peak, n) {
+			break
+		}
+	}
+	var once sync.Once
+	return func() { once.Do(func() { p.speechInflight.Add(-1) }) }
+}
+
+// leaveOnEnd ends a tracked synthesis when its response body is drained to the end or closed -- the
+// moment the TTS is done producing it.
+type leaveOnEnd struct {
+	io.ReadCloser
+	leave func()
+}
+
+func (b *leaveOnEnd) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.leave()
+	}
+	return n, err
+}
+
+func (b *leaveOnEnd) Close() error {
+	b.leave()
+	return b.ReadCloser.Close()
 }
 
 // speechInputOf extracts the `input` field (the synthesized text) from a speech request body, so
@@ -97,48 +141,61 @@ type scriptedLLMDelta struct {
 
 func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*provider.ProxyResponse, error) {
 	if strings.Contains(path, "/audio/speech") {
-		select {
-		case p.speechBodies <- append([]byte(nil), body...):
-		default:
+		leave := p.enterSpeech()
+		resp, err := p.speechResponse(ctx, body)
+		if err != nil || resp == nil {
+			leave()
+			return resp, err
 		}
-		if gate, ok := p.speechHoldByInput[speechInputOf(body)]; ok {
-			select {
-			case <-gate:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		if p.speechArrived != nil && p.speechOnce != nil {
-			p.speechOnce.Do(func() { close(p.speechArrived) })
-		}
-		if p.speechRelease != nil {
-			select {
-			case <-p.speechRelease:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		if p.speechFail {
-			return &provider.ProxyResponse{
-				StatusCode: http.StatusInternalServerError,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"gateway.mock_speech_failed","message":"boom"}}`)),
-			}, nil
-		}
-		if speechBodyWantsStream(body) {
-			return &provider.ProxyResponse{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:       io.NopCloser(strings.NewReader(p.speechFrames)),
-			}, nil
-		}
-		return &provider.ProxyResponse{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"audio/wav"}, speechDurationHeader: []string{"1500"}},
-			Body:       io.NopCloser(bytes.NewReader(p.speechWAV)),
-		}, nil
+		resp.Body = &leaveOnEnd{ReadCloser: resp.Body, leave: leave}
+		return resp, nil
 	}
 	return p.Mock.ProxyNative(ctx, target, path, body, contentType)
+}
+
+// speechResponse is the canned answer to one /v1/audio/speech request: it records the body, honors
+// the hold seams, and returns the stream, the one-shot WAV or the injected failure.
+func (p voiceTestProvider) speechResponse(ctx context.Context, body []byte) (*provider.ProxyResponse, error) {
+	select {
+	case p.speechBodies <- append([]byte(nil), body...):
+	default:
+	}
+	if gate, ok := p.speechHoldByInput[speechInputOf(body)]; ok {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if p.speechArrived != nil && p.speechOnce != nil {
+		p.speechOnce.Do(func() { close(p.speechArrived) })
+	}
+	if p.speechRelease != nil {
+		select {
+		case <-p.speechRelease:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if p.speechFail {
+		return &provider.ProxyResponse{
+			StatusCode: http.StatusInternalServerError,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"gateway.mock_speech_failed","message":"boom"}}`)),
+		}, nil
+	}
+	if speechBodyWantsStream(body) {
+		return &provider.ProxyResponse{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(p.speechFrames)),
+		}, nil
+	}
+	return &provider.ProxyResponse{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"audio/wav"}, speechDurationHeader: []string{"1500"}},
+		Body:       io.NopCloser(bytes.NewReader(p.speechWAV)),
+	}, nil
 }
 
 // CompleteStream drives the LLM leg. With no llmScript it is the plain mock (the answer
