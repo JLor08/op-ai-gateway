@@ -1000,6 +1000,9 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       // microphone: left alone, the speech recognition it holds open for the turn would starve on
       // the missing data and be aborted. Told, it keeps that open on audio of its own, discards what
       // it recognises from the silence, and frees it if the mute lasts. The unmute ends all of that.
+      // A mute toggled before the socket is open is deliberately NOT replayed on open (sendControl
+      // no-ops without a live socket): a muted client sends no PCM, so no recognition is held to
+      // starve, and the first real toggle after the session is up resyncs the gateway.
       sendControl(next ? 'mic_mute' : 'mic_unmute');
     },
     stop() {
