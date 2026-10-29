@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useEffect, useId, useRef, type KeyboardEvent, type PointerEvent } from 'react';
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
 import { Alert, Box, Button, FormControlLabel, Switch, TextField, Typography } from '@mui/material';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
+import PauseIcon from '@mui/icons-material/Pause';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
+import StopIcon from '@mui/icons-material/Stop';
+import VolumeOffIcon from '@mui/icons-material/VolumeOff';
+import VolumeUpIcon from '@mui/icons-material/VolumeUp';
 import type { MessageKey, Translation } from './shared/types';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { SpeechVoiceField } from './SpeechVoiceField';
@@ -17,6 +22,7 @@ import type {
   VoiceChatModels,
   VoiceChatState,
   VoiceModelChoice,
+  VoicePromptChoice,
 } from './chat/ChatStore';
 
 // The label of each state of the conversation. `off` and `connecting` are the portal's own; the
@@ -81,20 +87,42 @@ function errorText(error: VoiceChatError, t: Translation): string {
   }
 }
 
+// What the user has done to the conversation that the gateway's state does not say: the answer
+// is paused, or their own microphone is muted. Both change what the indicator must tell them.
+type UserHolds = { paused: boolean; micMuted: boolean };
+
+// The states in which the answer's audio is played out, which is where it can be paused.
+function playsAnswer(state: VoiceChatState): boolean {
+  return state === 'speaking' || state === 'draining';
+}
+
+// The label of the indicator: the gateway's state, except where the user's own doing makes it
+// untrue. A paused answer is not "speaking", and a muted microphone never "listens" -- the
+// indicator is how the user SEES whether they are heard, so it must not say they are.
+function labelKey(state: VoiceChatState, { paused, micMuted }: UserHolds): MessageKey {
+  if (paused && playsAnswer(state)) return 'chatVoiceStatePaused';
+  if (micMuted && state === 'listening') return 'chatVoiceStateMicMuted';
+  return STATE_LABEL[state];
+}
+
 // The detail line under a state's label, where the state needs more than its label to be read
 // right. While the answer is spoken the gateway discards the microphone (half-duplex, spec 6.2),
-// and saying so is the point of the indicator: the user must not talk into a void.
-function detailText(state: VoiceChatState, t: Translation): string {
-  if (state === 'speaking' || state === 'draining') return t.chatVoiceMicPaused;
+// and saying so is the point of the indicator: the user must not talk into a void. A muted
+// microphone is the same void, by the user's own hand, and says so in every other state of a
+// conversation that is on (push-to-talk is closed under it, so the idle hint would mislead).
+function detailText(state: VoiceChatState, { micMuted }: UserHolds, t: Translation): string {
+  if (playsAnswer(state)) return t.chatVoiceMicPaused;
+  if (micMuted && state !== 'off') return t.chatVoiceMicMutedDetail;
   if (state === 'idle') return t.chatVoiceIdleHint;
   return '';
 }
 
 // The two states the gateway takes push-to-talk in: it starts a turn from `idle` (what is left
 // after a failed turn), and in `listening` it ends the turn now instead of waiting for a pause.
-// In every other state it ignores both, so the button is closed.
-function takesPushToTalk(state: VoiceChatState): boolean {
-  return state === 'listening' || state === 'idle';
+// In every other state it ignores both, so the button is closed. It is closed under a muted
+// microphone as well: a turn started with nothing to hear would end empty.
+function takesPushToTalk(state: VoiceChatState, micMuted: boolean): boolean {
+  return !micMuted && (state === 'listening' || state === 'idle');
 }
 
 // The longest voice system prompt the field takes. Generous -- the built-in prompt is about a
@@ -240,7 +268,7 @@ export function VoiceChatControl({
   const { state, error } = voice;
   const on = state !== 'off';
   const listening = state === 'listening';
-  const canTalk = takesPushToTalk(state);
+  const canTalk = takesPushToTalk(state, voice.micMuted);
 
   // A refused ticket is the gateway's answer to this very request, and it is the same next time
   // (a model it will not use, models it cannot hold together): the switch stays closed on it, and
@@ -297,7 +325,11 @@ export function VoiceChatControl({
 
       <VoiceModelPickers models={models} locked={on} t={t} />
 
-      <ListeningIndicator state={state} t={t} />
+      <ListeningIndicator
+        state={state}
+        holds={{ paused: voice.paused, micMuted: voice.micMuted }}
+        t={t}
+      />
 
       {on && voice.liveTranscript !== '' && (
         <TurnText
@@ -331,6 +363,17 @@ export function VoiceChatControl({
           >
             {t.chatVoicePushToTalk}
           </Button>
+          {/* The user's own microphone: there whenever the conversation is on, in every state. */}
+          <Button
+            variant={voice.micMuted ? 'contained' : 'outlined'}
+            size="small"
+            color={voice.micMuted ? 'warning' : 'inherit'}
+            startIcon={voice.micMuted ? <MicOffIcon /> : <MicIcon />}
+            aria-pressed={voice.micMuted}
+            onClick={() => voice.toggleMicMute()}
+          >
+            {voice.micMuted ? t.chatVoiceMicUnmute : t.chatVoiceMicMute}
+          </Button>
           {hasAnswerInFlight(state) && (
             <Button variant="outlined" size="small" color="inherit" onClick={() => voice.cancel()}>
               {t.chatVoiceCancel}
@@ -338,6 +381,8 @@ export function VoiceChatControl({
           )}
         </Box>
       )}
+
+      {on && voice.audioPlaying && playsAnswer(state) && <PlaybackControls voice={voice} t={t} />}
 
       {error && (
         <Alert
@@ -359,6 +404,59 @@ export function VoiceChatControl({
   );
 }
 
+// The controls of the answer while it is heard (#315): pause and resume it, mute its speakers,
+// and stop the playback. It is only drawn while audio is being heard (`audioPlaying`), so a pause
+// is never offered before the first chunk or in the gateway's tail after the audio is over, where
+// it would do nothing. Stop is `stopSpeaking`: it cuts the answer short and the conversation goes
+// on -- `stop` ends the conversation, and Cancel (beside push-to-talk) abandons the turn.
+function PlaybackControls({ voice, t }: Readonly<{ voice: VoiceChatApi; t: Translation }>) {
+  return (
+    <Box
+      role="group"
+      aria-label={t.chatVoicePlayback}
+      sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1 }}
+    >
+      {voice.paused ? (
+        <Button
+          variant="contained"
+          size="small"
+          startIcon={<PlayArrowIcon />}
+          onClick={() => voice.resume()}
+        >
+          {t.chatVoiceResume}
+        </Button>
+      ) : (
+        <Button
+          variant="outlined"
+          size="small"
+          startIcon={<PauseIcon />}
+          onClick={() => voice.pause()}
+        >
+          {t.chatVoicePause}
+        </Button>
+      )}
+      <Button
+        variant="outlined"
+        size="small"
+        startIcon={voice.muted ? <VolumeOffIcon /> : <VolumeUpIcon />}
+        aria-pressed={voice.muted}
+        onClick={() => voice.toggleMute()}
+      >
+        {voice.muted ? t.chatVoiceUnmute : t.chatVoiceMute}
+      </Button>
+      <Button
+        variant="outlined"
+        size="small"
+        color="error"
+        startIcon={<StopIcon />}
+        onClick={() => voice.stopSpeaking()}
+      >
+        {t.chatVoiceStopPlayback}
+      </Button>
+    </Box>
+  );
+}
+
 // The pickers of the conversation's two models (#317), the live transcription model that hears the
 // user and the speech model that answers aloud, one field each, the speech model's voice (#318)
 // under its picker -- the speech composer's own voice field, shown only when the model has voices
@@ -369,11 +467,12 @@ export function VoiceChatControl({
 // closed by a switch that is closed for another reason (a missing chat model, a run in flight):
 // the user may pick ahead.
 //
-// Beside them, the thread's voice system prompt (#314): a multi-line field, pre-filled with the
-// built-in prompt, that the user may edit for this thread. It has nothing to do with which models
-// stream, so it is not waiting for the gateway; it is closed while a conversation is on, so a
-// conversation runs on the prompt it began with. It is bounded in length, and the control under it
-// puts the built-in prompt back (closed with the field, and when the field already holds it).
+// Under them, the thread's voice system prompt (#314), in a collapsed section (VoicePromptSection):
+// a multi-line field, pre-filled with the built-in prompt, that the user may edit for this thread.
+// It has nothing to do with which models stream, so it is not waiting for the gateway; it is closed
+// while a conversation is on, so a conversation runs on the prompt it began with. It is bounded in
+// length, and the control under it puts the built-in prompt back (closed with the field, and when
+// the field already holds it).
 function VoiceModelPickers({
   models,
   locked,
@@ -423,37 +522,72 @@ function VoiceModelPickers({
           {t.chatVoiceLlmNote(models.llm)}
         </Typography>
       )}
-      <TextField
-        id="chat-voice-system-prompt"
-        label={t.chatVoiceSystemPrompt}
-        helperText={t.chatVoiceSystemPromptHint}
-        multiline
-        minRows={3}
-        maxRows={12}
-        fullWidth
-        value={models.systemPrompt.value}
-        onChange={(event) => models.systemPrompt.set(event.target.value)}
-        disabled={locked}
-        slotProps={{ htmlInput: { maxLength: SYSTEM_PROMPT_MAX_LENGTH } }}
-        sx={{ mt: 0.75 }}
-      />
-      <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
-        <Button
-          size="small"
-          color="inherit"
-          startIcon={<RestartAltIcon />}
-          disabled={locked || models.systemPrompt.value === DEFAULT_VOICE_SYSTEM_PROMPT}
-          onClick={() => models.systemPrompt.set(DEFAULT_VOICE_SYSTEM_PROMPT)}
-        >
-          {t.chatVoiceSystemPromptReset}
-        </Button>
-      </Box>
+      <VoicePromptSection prompt={models.systemPrompt} locked={locked} t={t} />
     </Box>
   );
 }
 
-// One picker: "automatic" (no pick) and the models on offer, by their display names. Under an
-// automatic pick the field says which model that is.
+// The thread's voice system prompt (#314) and the control that puts the built-in one back, in a
+// section that is COLLAPSED until its heading is clicked: the prompt is a tuning knob few
+// conversations touch, and a field of several lines would otherwise crowd the pickers and the
+// indicator that matter while talking. The same toggle as the speech thread's "Advanced" toggles
+// (Chat.tsx): a text button with `aria-expanded`, the content not mounted while it is shut. The
+// heading stays usable while a conversation is on -- the field under it is what is closed then, so
+// a run keeps the prompt it began with, but it may still be read.
+function VoicePromptSection({
+  prompt,
+  locked,
+  t,
+}: Readonly<{ prompt: VoicePromptChoice; locked: boolean; t: Translation }>) {
+  const [open, setOpen] = useState(false);
+  const regionId = useId();
+  return (
+    <Box sx={{ display: 'grid', gap: 0.75 }}>
+      <Button
+        variant="text"
+        size="small"
+        aria-expanded={open}
+        aria-controls={open ? regionId : undefined}
+        onClick={() => setOpen((wasOpen) => !wasOpen)}
+        sx={{ justifySelf: 'start' }}
+      >
+        {t.chatVoiceSystemPrompt}
+      </Button>
+      {open && (
+        <Box id={regionId} sx={{ display: 'grid', gap: 0.75 }}>
+          <TextField
+            id="chat-voice-system-prompt"
+            label={t.chatVoiceSystemPrompt}
+            helperText={t.chatVoiceSystemPromptHint}
+            multiline
+            minRows={3}
+            maxRows={12}
+            fullWidth
+            value={prompt.value}
+            onChange={(event) => prompt.set(event.target.value)}
+            disabled={locked}
+            slotProps={{ htmlInput: { maxLength: SYSTEM_PROMPT_MAX_LENGTH } }}
+            sx={{ mt: 0.75 }}
+          />
+          <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Button
+              size="small"
+              color="inherit"
+              startIcon={<RestartAltIcon />}
+              disabled={locked || prompt.value === DEFAULT_VOICE_SYSTEM_PROMPT}
+              onClick={() => prompt.set(DEFAULT_VOICE_SYSTEM_PROMPT)}
+            >
+              {t.chatVoiceSystemPromptReset}
+            </Button>
+          </Box>
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+// One picker: "automatic" (no pick) and the models on offer, by their display names, a loaded one
+// marked with a green dot. Under an automatic pick the field says which model that is.
 function VoiceModelPicker({
   id,
   label,
@@ -469,7 +603,18 @@ function VoiceModelPicker({
 }>) {
   const options = [
     { value: '', label: t.chatVoiceModelAuto },
-    ...choice.options.map((option) => ({ value: option.id, label: option.display_name })),
+    // A loaded model carries the green dot of the chat's own model picker (SearchableSelect draws
+    // it from `loaded`, in the list and, once picked, in the field), titled by the servers it is
+    // loaded on when the catalogue names them.
+    ...choice.options.map((option) => ({
+      value: option.id,
+      label: option.display_name,
+      loaded: option.loaded,
+      loadedTitle:
+        option.loaded_on && option.loaded_on.length > 0
+          ? `${t.chatModelLoadedOn}: ${option.loaded_on.join(', ')}`
+          : t.chatModelLoaded,
+    })),
   ];
   const used = choice.options.find((option) => option.id === choice.used);
   const showsUsed = choice.pick === '' && choice.used !== '';
@@ -491,10 +636,15 @@ function VoiceModelPicker({
 // needs one. Active: the hot microphone, in the colour of a recording, and pulsing (unless the
 // user asked for no motion). Not listening: the same circle, grey and still, with the muted
 // microphone and the label of what the system is doing instead.
-function ListeningIndicator({ state, t }: Readonly<{ state: VoiceChatState; t: Translation }>) {
+function ListeningIndicator({
+  state,
+  holds,
+  t,
+}: Readonly<{ state: VoiceChatState; holds: UserHolds; t: Translation }>) {
   const on = state !== 'off';
-  const listening = state === 'listening';
-  const detail = detailText(state, t);
+  // Only a microphone that is on, in the one state that takes the user's voice, hears them.
+  const listening = state === 'listening' && !holds.micMuted;
+  const detail = detailText(state, holds, t);
   const badgeSize = on ? 48 : 32;
   const Icon = listening ? MicIcon : MicOffIcon;
   return (
@@ -552,7 +702,7 @@ function ListeningIndicator({ state, t }: Readonly<{ state: VoiceChatState; t: T
             color: listening ? 'error.main' : 'text.secondary',
           }}
         >
-          {t[STATE_LABEL[state]]}
+          {t[labelKey(state, holds)]}
         </Typography>
         {detail !== '' && (
           <Typography variant="caption" color="text.secondary" component="p" sx={{ m: 0 }}>

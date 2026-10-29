@@ -40,10 +40,55 @@ describe('thoseThatStream', () => {
   });
 });
 
+// A catalogue entry of an audio model, loaded on a server or not (`ModelOption.loaded`).
+const catalogued = (id: string, loaded?: boolean): ModelOption => ({
+  id,
+  display_name: `${id} (display)`,
+  flavors: ['openai_audio'],
+  loading_on_count: 0,
+  ...(loaded === undefined ? {} : { loaded, loaded_on: loaded ? ['server-1'] : [] }),
+});
+
 describe('autoVoiceModel', () => {
   it('is the first model that streams (the automatic pick), or none', () => {
     expect(autoVoiceModel(['asr-b', 'asr-a'])).toBe('asr-b');
     expect(autoVoiceModel([])).toBe('');
+  });
+
+  describe('with the catalogue to say which models are loaded', () => {
+    it('prefers a loaded model over an earlier one that is not loaded', () => {
+      const models = [catalogued('asr-a', false), catalogued('asr-b', true)];
+      expect(autoVoiceModel(['asr-a', 'asr-b'], models)).toBe('asr-b');
+    });
+
+    it('takes the first of several loaded models, in the order it was given them', () => {
+      const models = [
+        catalogued('asr-a', false),
+        catalogued('asr-b', true),
+        catalogued('asr-c', true),
+      ];
+      expect(autoVoiceModel(['asr-a', 'asr-b', 'asr-c'], models)).toBe('asr-b');
+      expect(autoVoiceModel(['asr-c', 'asr-b', 'asr-a'], models)).toBe('asr-c');
+    });
+
+    it('falls back to the first model that streams when none of them is loaded', () => {
+      const models = [catalogued('asr-a', false), catalogued('asr-b'), catalogued('asr-c', false)];
+      expect(autoVoiceModel(['asr-b', 'asr-a', 'asr-c'], models)).toBe('asr-b');
+    });
+
+    it('never picks a loaded model that does not stream: only the ones on offer are considered', () => {
+      const models = [catalogued('asr-a', false), catalogued('asr-b', true)];
+      expect(autoVoiceModel(['asr-a'], models)).toBe('asr-a');
+    });
+
+    it('treats a model the catalogue does not know as not loaded', () => {
+      expect(autoVoiceModel(['asr-a', 'asr-b'], [catalogued('asr-b', true)])).toBe('asr-b');
+      expect(autoVoiceModel(['asr-a', 'asr-b'], [])).toBe('asr-a');
+    });
+
+    it('is none when nothing streams, whatever is loaded', () => {
+      expect(autoVoiceModel([], [catalogued('asr-a', true)])).toBe('');
+    });
   });
 });
 
@@ -65,6 +110,19 @@ describe('effectiveVoiceModel', () => {
   it('is none when nothing streams, whatever was picked', () => {
     expect(effectiveVoiceModel('asr-b', [])).toBe('');
     expect(effectiveVoiceModel('', [])).toBe('');
+  });
+
+  describe('with the catalogue to say which models are loaded', () => {
+    const models = [catalogued('asr-a', false), catalogued('asr-b', true)];
+
+    it('is the loaded model while the user has chosen nothing, or a pick that is gone', () => {
+      expect(effectiveVoiceModel('', streaming, models)).toBe('asr-b');
+      expect(effectiveVoiceModel('asr-gone', streaming, models)).toBe('asr-b');
+    });
+
+    it("is still the user's pick when it is on offer, loaded or not", () => {
+      expect(effectiveVoiceModel('asr-a', streaming, models)).toBe('asr-a');
+    });
   });
 });
 
@@ -104,6 +162,33 @@ describe('voiceLegsOf', () => {
     expect(voiceLegsOf({ asr: [], tts: ['tts-a'] }, { asrModel: 'asr-a', ttsModel: '' })).toEqual({
       asr: '',
       tts: 'tts-a',
+    });
+  });
+
+  describe('with the catalogue to say which models are loaded', () => {
+    const models = [
+      catalogued('asr-a', false),
+      catalogued('asr-b', true),
+      catalogued('tts-a', false),
+      catalogued('tts-clone', true),
+    ];
+
+    it('is the loaded model of each leg that has no pick of its own', () => {
+      expect(voiceLegsOf(streaming, { asrModel: '', ttsModel: '' }, models)).toEqual({
+        asr: 'asr-b',
+        tts: 'tts-clone',
+      });
+    });
+
+    it("keeps the user's pick of a leg, and is the loaded model for the other", () => {
+      expect(voiceLegsOf(streaming, { asrModel: 'asr-a', ttsModel: '' }, models)).toEqual({
+        asr: 'asr-a',
+        tts: 'tts-clone',
+      });
+    });
+
+    it('is still null while the gateway has not said which models stream', () => {
+      expect(voiceLegsOf(null, { asrModel: '', ttsModel: '' }, models)).toBeNull();
     });
   });
 });
@@ -223,5 +308,26 @@ describe('withTtsModel', () => {
 
   it('treats a pick that is gone as the automatic one, as the conversation does', () => {
     expect(withTtsModel(current, 'tts-gone', streaming).voice).toBe('marius');
+  });
+
+  // The model that would speak under "automatic" is the loaded one, so a voice follows that rule
+  // too: choosing the loaded model changes nothing, choosing the one that is not loaded does.
+  describe('with the catalogue to say which models are loaded', () => {
+    const models = [catalogued('tts-a', false), catalogued('tts-clone', true)];
+
+    it('keeps the voice when the pick is the loaded model that automatic already speaks with', () => {
+      expect(withTtsModel(current, 'tts-clone', streaming, models)).toEqual({
+        ...current,
+        ttsModel: 'tts-clone',
+      });
+    });
+
+    it('clears the voice when the pick is the first model that is no longer the one that speaks', () => {
+      expect(withTtsModel(current, 'tts-a', streaming, models)).toEqual({
+        ...current,
+        ttsModel: 'tts-a',
+        voice: '',
+      });
+    });
   });
 });

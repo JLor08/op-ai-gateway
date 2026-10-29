@@ -14,16 +14,30 @@ import (
 // "<speak " in the model output can never stall the published stream.
 const maxSpeakTagLen = 512
 
-// speakScanner extracts the first <speak lang="..."> ... </speak> region from an LLM token
-// stream (the Voice Chat spoken summary) while stripping every speak tag from the text
-// that is published to the transcript.
+// speakRegion is one captured <speak lang="..."> ... </speak> region.
+type speakRegion struct {
+	// Text is the region's content, tags removed, exactly as streamed (not trimmed).
+	Text string
+	// Lang is the open tag's lang attribute, verbatim; "" when it had none.
+	Lang string
+	// RuneOffset is the position of the region's content START within the clean text the
+	// scanner emits, counted in runes (code points), not bytes, so the portal can slice the
+	// region out of the full answer by position in a way the frontend can reproduce on a JS
+	// string. It points at the first rune of Text even when the caller later trims Text; the
+	// caller advances it past any whitespace it strips.
+	RuneOffset int
+}
+
+// speakScanner extracts every <speak lang="..."> ... </speak> region, in order, from an LLM
+// token stream (the Voice Chat spoken sections) while stripping every speak tag from the
+// text that is published to the transcript.
 //
 // The stream is fed delta by delta through Write. Text outside a tag is published
 // immediately; only the bytes of a possible tag that is still being parsed are held back
-// until the next delta resolves them (or Close flushes them as plain text). Both the
-// summary and the detail text pass through the clean stream -- the tags are the only
-// thing removed. Only the first region is captured: later <speak> tags are stripped too,
-// but their text stays in the clean stream as ordinary detail.
+// until the next delta resolves them (or Close flushes them as plain text). The regions'
+// text and the text between them all pass through the clean stream -- the tags are the only
+// thing removed. A <speak> tag nested inside an open region and a self-closing <speak/> tag
+// are stripped but open no region.
 //
 // The scanner works on bytes. '<' is ASCII and never part of a multi-byte UTF-8 sequence,
 // so a rune split across two deltas is passed through untouched like any other text.
@@ -32,34 +46,41 @@ type speakScanner struct {
 	// pending holds the bytes of a possible tag (always starting with '<') that the last
 	// delta ended in the middle of.
 	pending string
-	// found is set once any <speak> open tag has been seen; the first one starts the
-	// captured region and later ones are only stripped.
+	// found is set once any <speak> tag has been seen, a self-closing one included.
 	found bool
-	// inFirst is true while the stream is between the first open tag and its close tag.
-	inFirst bool
-	// lang is the first open tag's lang attribute, verbatim.
-	lang string
-	// summary accumulates the first region's text.
-	summary strings.Builder
-	// prefix accumulates the clean text emitted BEFORE any region opens -- the leading detail,
-	// if the model wrote any. Its rune count is the first region's content offset, taken once
-	// when that region opens. It is held as bytes, not a running rune count, so a multi-byte
-	// rune split across deltas is counted once (over the reassembled whole), not twice.
-	prefix strings.Builder
-	// summaryStart is the rune offset of the first region's content within the clean stream,
-	// recorded when that region opens; -1 until then (and for a self-closing tag, which opens
-	// no region).
-	summaryStart int
+	// selfClosingLang is the lang of the first self-closing tag seen while no region had opened;
+	// Summary reports it when the stream ends up with no region at all.
+	selfClosingLang string
+	// regions holds every region opened so far, in order. While open is set the last entry is
+	// the region still being read: its Text is not filled in yet (it accumulates in text) and
+	// Regions leaves it out.
+	regions []speakRegion
+	// open is true while the stream is between a region's open tag and its close tag.
+	open bool
+	// text accumulates the open region's content; it moves into regions on close.
+	text strings.Builder
+	// runes counts the runes of the clean text emitted so far -- the offset the next region's
+	// content starts at. A multi-byte rune can be split across two deltas, so the bytes of an
+	// incomplete trailing sequence wait in runeCarry and are counted once, over the reassembled
+	// whole, when the rest arrives.
+	runes     int
+	runeCarry string
 }
 
 // newSpeakScanner returns a scanner ready for the start of a stream.
 func newSpeakScanner() *speakScanner {
-	return &speakScanner{summaryStart: -1}
+	return &speakScanner{}
 }
 
 // Write feeds one raw content delta. It returns the tag-stripped text that is safe to
-// publish now, and whether the first <speak> region closed on this delta.
-func (s *speakScanner) Write(delta string) (clean string, closed bool) {
+// publish now, and whether a <speak> region closed on this delta.
+//
+// When closed is true, closedIdx is the index (into Regions) of the region that closed. A
+// delta that completes more than one region -- a whole answer arriving in one chunk -- reports
+// the LAST of them: every region up to and including closedIdx is final in Regions, so a
+// caller that remembers the next index it has not handled never skips one. closedIdx is
+// meaningless when closed is false.
+func (s *speakScanner) Write(delta string) (clean string, closedIdx int, closed bool) {
 	in := s.pending + delta
 	s.pending = ""
 
@@ -78,7 +99,7 @@ func (s *speakScanner) Write(delta string) (clean string, closed bool) {
 		case speakTagPartial:
 			// The delta ended inside a possible tag: wait for the next one.
 			s.pending = in
-			return out.String(), closed
+			return out.String(), closedIdx, closed
 		case speakTagOpen:
 			s.openTag(attrs)
 			in = in[n:]
@@ -86,8 +107,8 @@ func (s *speakScanner) Write(delta string) (clean string, closed bool) {
 			s.selfClosingTag(attrs)
 			in = in[n:]
 		case speakTagClose:
-			if s.closeTag() {
-				closed = true
+			if idx, ok := s.closeTag(); ok {
+				closedIdx, closed = idx, true
 			}
 			in = in[n:]
 		default:
@@ -97,97 +118,151 @@ func (s *speakScanner) Write(delta string) (clean string, closed bool) {
 			in = in[1:]
 		}
 	}
-	return out.String(), closed
+	return out.String(), closedIdx, closed
 }
 
 // Close flushes the scanner at the end of the stream. Bytes held back for a tag that
-// never completed are emitted as plain text. The one exception is the spoken summary: a
-// half-written </speak> at the end of a still-open first region is markup, not speech, so
-// those bytes reach the clean stream but are kept out of the captured summary.
+// never completed are emitted as plain text. The one exception is the open region: a
+// half-written </speak> at the end of a still-open region is markup, not speech, so those
+// bytes reach the clean stream but are kept out of the captured region. A region still open
+// at the end is finished here, so Regions is complete after Close and includes it with the
+// text streamed so far.
 func (s *speakScanner) Close() (clean string) {
 	pending := s.pending
 	s.pending = ""
-	if s.inFirst && isPartialSpeakClose(pending) {
-		return pending
-	}
 	var out strings.Builder
-	s.emit(&out, pending)
+	if s.open && isPartialSpeakClose(pending) {
+		out.WriteString(pending)
+	} else {
+		s.emit(&out, pending)
+	}
+	s.finishRegion()
 	return out.String()
 }
 
-// Summary returns the first region's captured text and its lang attribute. When the
-// region was never closed it is the full text captured so far; when no <speak> tag was
-// seen both are empty.
-func (s *speakScanner) Summary() (text string, lang string) {
-	return s.summary.String(), s.lang
+// Regions returns the captured regions in stream order. A region is listed once its </speak>
+// has been seen: the one still being read is left out until it closes, so every entry is
+// final. After Close the list is complete, and a region left unclosed by the end of the
+// stream is its last entry. The slice must not be modified by the caller.
+func (s *speakScanner) Regions() []speakRegion {
+	n := len(s.regions)
+	if s.open {
+		n--
+	}
+	// The capacity cap keeps a caller's append from writing into the scanner's own backing array.
+	return s.regions[:n:n]
 }
 
-// Found reports whether any <speak> open tag was seen, a self-closing one included.
+// Summary returns the FIRST region's captured text and lang -- the phase-2 single-summary
+// view of the stream. A region still being read yields the text captured so far. With no
+// region it returns empty text, and the lang of a self-closing tag if one was seen; with no
+// <speak> tag at all both are empty.
+func (s *speakScanner) Summary() (text string, lang string) {
+	if len(s.regions) == 0 {
+		return "", s.selfClosingLang
+	}
+	first := s.regions[0]
+	if s.open && len(s.regions) == 1 {
+		return s.text.String(), first.Lang
+	}
+	return first.Text, first.Lang
+}
+
+// Found reports whether any <speak> tag was seen, a self-closing one included.
 func (s *speakScanner) Found() bool {
 	return s.found
 }
 
 // SummaryStart returns the rune offset of the first <speak> region's content within the clean
-// text the scanner emits, or -1 when no region was captured (no tag, or a self-closing tag that
-// opens none). It is a count of code points, not bytes, so the portal can slice the summary out
-// of the full answer by position in a way the frontend can reproduce on a JS string. The offset
-// is to the region's content START even when the content is later trimmed; the caller advances it
-// past any whitespace it strips.
+// text the scanner emits (the first region's RuneOffset), or -1 when no region was captured (no
+// tag, or only self-closing tags that open none). It is a count of code points, not bytes. The
+// offset is to the region's content START even when the content is later trimmed; the caller
+// advances it past any whitespace it strips.
 func (s *speakScanner) SummaryStart() int {
-	return s.summaryStart
+	if len(s.regions) == 0 {
+		return -1
+	}
+	return s.regions[0].RuneOffset
 }
 
-// emit publishes text to the clean stream, and also to the summary while inside the
-// first region.
+// emit publishes text to the clean stream, to the open region while inside one, and into the
+// running rune count that stamps each region's offset.
 func (s *speakScanner) emit(out *strings.Builder, text string) {
 	if text == "" {
 		return
 	}
 	out.WriteString(text)
-	if !s.found {
-		// Still before the first region: this is leading detail, part of the offset prefix.
-		s.prefix.WriteString(text)
-	}
-	if s.inFirst {
-		s.summary.WriteString(text)
+	s.countRunes(text)
+	if s.open {
+		s.text.WriteString(text)
 	}
 }
 
-// openTag handles a <speak ...> tag. Only the first one starts a captured region; any
-// later one (a second region, or a nested tag inside the first) is merely stripped.
+// countRunes adds the runes of text, a piece of the clean stream, to the running count. A
+// trailing byte sequence that is a valid but incomplete rune is held in runeCarry and counted
+// with the next piece, so a rune cut across two deltas counts once however the stream is chunked.
+func (s *speakScanner) countRunes(text string) {
+	text = s.runeCarry + text
+	cut := len(text)
+	// An incomplete rune is at most utf8.UTFMax-1 bytes: a lead byte plus continuation bytes.
+	for i := 1; i < utf8.UTFMax && i <= len(text); i++ {
+		if utf8.RuneStart(text[len(text)-i]) {
+			if !utf8.FullRuneInString(text[len(text)-i:]) {
+				cut = len(text) - i
+			}
+			break
+		}
+	}
+	s.runes += utf8.RuneCountInString(text[:cut])
+	s.runeCarry = text[cut:]
+}
+
+// openTag handles a <speak ...> tag. Outside a region it opens the next one, stamping the
+// clean-text offset its content begins at. A tag inside an already open region is merely
+// stripped: the region ends at the first close tag, and its lang stays the outer tag's.
 func (s *speakScanner) openTag(attrs string) {
-	if s.found {
+	s.found = true
+	if s.open {
 		return
 	}
-	s.found = true
-	s.inFirst = true
-	// The leading text (if any) is all in prefix now, so its rune count is exactly the offset at
-	// which this region's content begins in the clean stream. Counted once, over the reassembled
-	// bytes, so a rune split across deltas counts as one.
-	s.summaryStart = utf8.RuneCountInString(s.prefix.String())
-	s.prefix.Reset()
-	s.lang = parseSpeakLang(attrs)
+	s.open = true
+	s.regions = append(s.regions, speakRegion{
+		Lang: parseSpeakLang(attrs),
+		// A dangling incomplete rune counts as one rune here, as it would if the stream ended.
+		RuneOffset: s.runes + utf8.RuneCountInString(s.runeCarry),
+	})
 }
 
 // selfClosingTag handles a <speak .../> tag. It is stripped and counts as a speak tag that
-// was seen (Found, lang), but it opens no region: there is no text to capture and the rest of
-// the stream stays ordinary text. Like any open tag, only the first one seen records its lang,
-// so a self-closing tag after the first region is merely stripped.
+// was seen (Found), but it opens no region: there is no text to capture and the rest of the
+// stream stays ordinary text. Its lang is kept only as the fallback Summary reports when no
+// region ever opens; the first one seen wins, and one inside or after a region changes nothing.
 func (s *speakScanner) selfClosingTag(attrs string) {
-	if s.found {
-		return
+	if !s.found {
+		s.selfClosingLang = parseSpeakLang(attrs)
 	}
 	s.found = true
-	s.lang = parseSpeakLang(attrs)
 }
 
-// closeTag handles a </speak> tag and reports whether it closed the first region.
-func (s *speakScanner) closeTag() bool {
-	if !s.inFirst {
-		return false
+// closeTag handles a </speak> tag. It finishes the open region and returns its index; a
+// stray close tag with no region open does nothing and reports false.
+func (s *speakScanner) closeTag() (idx int, closed bool) {
+	if !s.open {
+		return 0, false
 	}
-	s.inFirst = false
-	return true
+	s.finishRegion()
+	return len(s.regions) - 1, true
+}
+
+// finishRegion moves the open region's accumulated text into its entry and ends it. It is a
+// no-op when no region is open.
+func (s *speakScanner) finishRegion() {
+	if !s.open {
+		return
+	}
+	s.regions[len(s.regions)-1].Text = s.text.String()
+	s.text.Reset()
+	s.open = false
 }
 
 type speakTagKind int

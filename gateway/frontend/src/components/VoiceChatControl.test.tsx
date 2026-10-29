@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { VoiceChatControl, type VoiceChatControlProps } from './VoiceChatControl';
-import { messages } from '../i18n';
+import { messages, type Locale } from '../i18n';
 import type { ModelOption } from '../api';
 import { DEFAULT_VOICE_SYSTEM_PROMPT } from './chat/ChatStore';
 import type {
@@ -29,25 +29,42 @@ function makeVoice(over: Partial<VoiceChatApi> = {}): VoiceChatApi {
     liveTranscript: '',
     answerPreview: '',
     error: null,
+    paused: false,
+    micMuted: false,
+    muted: false,
+    audioPlaying: false,
+    audioSection: null,
     start: vi.fn(),
     stop: vi.fn(),
     pushStart: vi.fn(),
     pushEnd: vi.fn(),
     cancel: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    stopSpeaking: vi.fn(),
+    toggleMicMute: vi.fn(),
+    toggleMute: vi.fn(),
     ...over,
   };
 }
 
 // A catalogue entry of an audio model, named for display (the picker shows the display name).
-const entry = (id: string): ModelOption => ({
+const entry = (id: string, over: Partial<ModelOption> = {}): ModelOption => ({
   id,
   display_name: `${id} (display)`,
   flavors: ['openai_audio'],
   loading_on_count: 0,
+  ...over,
 });
 
 function makeChoice(ids: string[], over: Partial<VoiceModelChoice> = {}): VoiceModelChoice {
-  return { options: ids.map(entry), pick: '', used: ids[0] ?? '', set: vi.fn(), ...over };
+  return {
+    options: ids.map((id) => entry(id)),
+    pick: '',
+    used: ids[0] ?? '',
+    set: vi.fn(),
+    ...over,
+  };
 }
 
 // The speech model's voice field: the voices it offers and the one that would be spoken in.
@@ -88,7 +105,11 @@ function renderControl(voice: VoiceChatApi, props: Partial<VoiceChatControlProps
 
 // The indicator is the one status region of the control that names the state of the microphone.
 function indicator() {
-  return screen.getByRole('status', { name: t.chatVoiceIndicator });
+  return indicatorOf(t);
+}
+
+function indicatorOf(translation: typeof t) {
+  return screen.getByRole('status', { name: translation.chatVoiceIndicator });
 }
 
 describe('VoiceChatControl toggle', () => {
@@ -557,6 +578,75 @@ describe('VoiceChatControl model pickers', () => {
     expect(screen.queryByText(/llm/)).not.toBeInTheDocument();
     expect(screen.queryByText(t.chatVoiceLlmNote(''))).not.toBeInTheDocument();
   });
+
+  // The same green dot as the chat's own model picker: a model that is loaded on a server answers
+  // at once, one that is not has to be loaded first, which is worth knowing before the pick.
+  describe('loaded-model dot', () => {
+    // The dot is the span with the title the option carries; the option's own text stays the bare
+    // display name.
+    const dotOf = (option: HTMLElement) => option.querySelector('span[aria-hidden][title]');
+    const loadedAsr = makeChoice([], {
+      options: [
+        entry('asr-a'),
+        entry('asr-b', { loaded: true, loaded_on: ['gpu-1', 'gpu-2'] }),
+        entry('asr-c', { loaded: false, loaded_on: [] }),
+      ],
+      used: 'asr-b',
+    });
+
+    it('marks the loaded models of the transcription picker, and only those', () => {
+      renderControl(makeVoice(), { models: makeModels({ asr: loadedAsr }) });
+
+      open(asrPicker());
+      const option = (name: string) => screen.getByRole('option', { name });
+      expect(dotOf(option('asr-b (display)'))).toHaveAttribute(
+        'title',
+        `${t.chatModelLoadedOn}: gpu-1, gpu-2`,
+      );
+      expect(dotOf(option('asr-a (display)'))).toBeNull();
+      expect(dotOf(option('asr-c (display)'))).toBeNull();
+      expect(dotOf(option(t.chatVoiceModelAuto))).toBeNull();
+    });
+
+    it('marks the loaded models of the speech picker, with the plain title when no server is named', () => {
+      const tts = makeChoice([], {
+        options: [entry('tts-a'), entry('tts-clone', { loaded: true })],
+      });
+      renderControl(makeVoice(), { models: makeModels({ tts }) });
+
+      open(ttsPicker());
+      expect(dotOf(screen.getByRole('option', { name: 'tts-clone (display)' }))).toHaveAttribute(
+        'title',
+        t.chatModelLoaded,
+      );
+      expect(dotOf(screen.getByRole('option', { name: 'tts-a (display)' }))).toBeNull();
+    });
+
+    it('shows the dot in the field once a loaded model is picked, and in that picker only', () => {
+      renderControl(makeVoice(), { models: makeModels({ asr: { ...loadedAsr, pick: 'asr-b' } }) });
+
+      // The speech picker has no loaded model, so the one dot there is is the transcription one's.
+      const dot = screen.getByTestId('searchable-select-loaded-dot');
+      expect(asrPicker().closest('.MuiFormControl-root')).toContainElement(dot);
+      expect(dot).toHaveAttribute('title', `${t.chatModelLoadedOn}: gpu-1, gpu-2`);
+    });
+
+    it('shows no dot in the field for a pick that is not loaded', () => {
+      renderControl(makeVoice(), { models: makeModels({ asr: { ...loadedAsr, pick: 'asr-c' } }) });
+
+      expect(screen.queryByTestId('searchable-select-loaded-dot')).not.toBeInTheDocument();
+    });
+
+    it('shows no dot at all while no model is loaded', () => {
+      renderControl(makeVoice(), {
+        models: makeModels({ asr: makeChoice(['asr-a', 'asr-b'], { pick: 'asr-a' }) }),
+      });
+
+      open(asrPicker());
+      expect(screen.queryByTestId('searchable-select-loaded-dot')).not.toBeInTheDocument();
+      expect(screen.getAllByRole('option').every((option) => dotOf(option) === null)).toBe(true);
+    });
+  });
 });
 
 // The voice of the speech model (#318): a combobox under the speech model's picker, over the voices
@@ -628,10 +718,59 @@ describe('VoiceChatControl voice field', () => {
 // while a conversation is on.
 describe('VoiceChatControl system prompt field', () => {
   const promptField = () => screen.getByRole('textbox', { name: t.chatVoiceSystemPrompt });
+  const queryPromptField = () => screen.queryByRole('textbox', { name: t.chatVoiceSystemPrompt });
+  // The field sits in a section that is collapsed until its heading is clicked (like the thread's
+  // settings); the tests that are about the field open it first.
+  const toggle = () => screen.getByRole('button', { name: t.chatVoiceSystemPrompt });
+  const openPrompt = () => fireEvent.click(toggle());
+  const renderOpen = (...args: Parameters<typeof renderControl>) => {
+    const view = renderControl(...args);
+    openPrompt();
+    return view;
+  };
+
+  describe('collapsed section', () => {
+    it('is collapsed by default: neither the field nor its reset are shown', () => {
+      renderControl(makeVoice());
+
+      expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+      expect(queryPromptField()).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: t.chatVoiceSystemPromptReset }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(t.chatVoiceSystemPromptHint)).not.toBeInTheDocument();
+    });
+
+    it('expands on a click, and collapses again on the next', () => {
+      renderControl(makeVoice(), { models: makeModels({ systemPrompt: makePromptChoice('Hi.') }) });
+
+      openPrompt();
+      expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+      expect(promptField()).toHaveValue('Hi.');
+      expect(
+        screen.getByRole('button', { name: t.chatVoiceSystemPromptReset }),
+      ).toBeInTheDocument();
+
+      openPrompt();
+      expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+      expect(queryPromptField()).not.toBeInTheDocument();
+    });
+
+    it('can be opened on a switch that is closed, and before the gateway has said anything', () => {
+      renderControl(makeVoice(), {
+        models: makeModels({ ready: false }),
+        capable: false,
+        gap: 'asr',
+        busy: true,
+      });
+
+      expect(toggle()).toBeEnabled();
+    });
+  });
 
   it('shows the prompt field pre-filled and calls set on edit', () => {
     const systemPrompt = makePromptChoice('Speak briefly.');
-    renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+    renderOpen(makeVoice(), { models: makeModels({ systemPrompt }) });
 
     expect(promptField()).toHaveValue('Speak briefly.');
     expect(promptField().tagName).toBe('TEXTAREA');
@@ -642,13 +781,13 @@ describe('VoiceChatControl system prompt field', () => {
   });
 
   it('says what the prompt is for and what an empty one means', () => {
-    renderControl(makeVoice());
+    renderOpen(makeVoice());
 
     expect(screen.getByText(t.chatVoiceSystemPromptHint)).toBeInTheDocument();
   });
 
   it('disables the prompt field while the conversation is live (locked)', () => {
-    const { update } = renderControl(makeVoice({ state: 'listening' }));
+    const { update } = renderOpen(makeVoice({ state: 'listening' }));
     expect(promptField()).toBeDisabled();
 
     update(makeVoice({ state: 'off' }));
@@ -656,7 +795,7 @@ describe('VoiceChatControl system prompt field', () => {
   });
 
   it('is open before the gateway has said which models stream, and on a switch closed for another reason', () => {
-    renderControl(makeVoice(), {
+    renderOpen(makeVoice(), {
       models: makeModels({ ready: false }),
       capable: false,
       gap: 'asr',
@@ -669,7 +808,7 @@ describe('VoiceChatControl system prompt field', () => {
   // The prompt is the one free-text field of the control: a paste of a whole document would be
   // carried into every run of the conversation, so the field is bounded.
   it('bounds the length of the prompt', () => {
-    renderControl(makeVoice());
+    renderOpen(makeVoice());
 
     expect(promptField()).toHaveAttribute('maxlength', '4000');
   });
@@ -679,7 +818,7 @@ describe('VoiceChatControl system prompt field', () => {
 
     it('puts the built-in prompt back into the field', () => {
       const systemPrompt = makePromptChoice('Be terse.');
-      renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+      renderOpen(makeVoice(), { models: makeModels({ systemPrompt }) });
 
       fireEvent.click(resetButton());
 
@@ -689,7 +828,7 @@ describe('VoiceChatControl system prompt field', () => {
 
     it('is open for an emptied field too: the default is what the empty field means, spelled out', () => {
       const systemPrompt = makePromptChoice('');
-      renderControl(makeVoice(), { models: makeModels({ systemPrompt }) });
+      renderOpen(makeVoice(), { models: makeModels({ systemPrompt }) });
 
       expect(resetButton()).toBeEnabled();
       fireEvent.click(resetButton());
@@ -698,7 +837,7 @@ describe('VoiceChatControl system prompt field', () => {
     });
 
     it('is closed while the field already holds the built-in prompt: there is nothing to reset', () => {
-      renderControl(makeVoice(), {
+      renderOpen(makeVoice(), {
         models: makeModels({ systemPrompt: makePromptChoice(DEFAULT_VOICE_SYSTEM_PROMPT) }),
       });
 
@@ -708,7 +847,7 @@ describe('VoiceChatControl system prompt field', () => {
     it('is closed while the conversation is live, like the field it resets', () => {
       const systemPrompt = makePromptChoice('Be terse.');
       const models = makeModels({ systemPrompt });
-      const { update } = renderControl(makeVoice({ state: 'listening' }), { models });
+      const { update } = renderOpen(makeVoice({ state: 'listening' }), { models });
       expect(resetButton()).toBeDisabled();
 
       fireEvent.click(resetButton());
@@ -719,11 +858,320 @@ describe('VoiceChatControl system prompt field', () => {
     });
 
     it('is open before the gateway has said which models stream, like the field', () => {
-      renderControl(makeVoice(), {
+      renderOpen(makeVoice(), {
         models: makeModels({ ready: false, systemPrompt: makePromptChoice('Be terse.') }),
       });
 
       expect(resetButton()).toBeEnabled();
     });
+  });
+});
+
+// The controls of the answer being spoken, and the mute of the user's own microphone (#315). Every
+// label is read from the locale under test, so a control missing its words in either one fails.
+describe.each(['en', 'de'] as const satisfies readonly Locale[])(
+  'VoiceChatControl playback controls and microphone mute (%s)',
+  (locale) => {
+    const lt = messages[locale];
+    const renderLocale = (voice: VoiceChatApi) => renderControl(voice, { t: lt });
+    const playbackGroup = () => screen.queryByRole('group', { name: lt.chatVoicePlayback });
+    const playing = (over: Partial<VoiceChatApi> = {}) =>
+      makeVoice({ state: 'speaking', audioPlaying: true, ...over });
+
+    describe('the playback controls', () => {
+      it('appear while the answer is playing: pause, mute and stop', () => {
+        renderLocale(playing());
+
+        const group = within(playbackGroup()!);
+        expect(group.getByRole('button', { name: lt.chatVoicePause })).toBeEnabled();
+        expect(group.getByRole('button', { name: lt.chatVoiceMute })).toBeEnabled();
+        expect(group.getByRole('button', { name: lt.chatVoiceStopPlayback })).toBeEnabled();
+        // Not the resume of a pause that is not there.
+        expect(group.queryByRole('button', { name: lt.chatVoiceResume })).not.toBeInTheDocument();
+      });
+
+      it('appear in the tail of the answer that is still playing out (draining), too', () => {
+        renderLocale(playing({ state: 'draining' }));
+
+        expect(
+          within(playbackGroup()!).getByRole('button', { name: lt.chatVoicePause }),
+        ).toBeInTheDocument();
+      });
+
+      it('pause calls voice.pause, and only that', () => {
+        const voice = playing();
+        renderLocale(voice);
+
+        fireEvent.click(screen.getByRole('button', { name: lt.chatVoicePause }));
+
+        expect(voice.pause).toHaveBeenCalledTimes(1);
+        expect(voice.resume).not.toHaveBeenCalled();
+        expect(voice.stopSpeaking).not.toHaveBeenCalled();
+      });
+
+      it('a paused answer offers resume instead of pause, and resume calls voice.resume', () => {
+        const voice = playing({ paused: true });
+        renderLocale(voice);
+
+        expect(screen.queryByRole('button', { name: lt.chatVoicePause })).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', { name: lt.chatVoiceResume }));
+
+        expect(voice.resume).toHaveBeenCalledTimes(1);
+        expect(voice.pause).not.toHaveBeenCalled();
+      });
+
+      it('says that the answer is paused in the indicator, and keeps the controls', () => {
+        const { update } = renderLocale(playing());
+        expect(within(indicatorOf(lt)).getByText(lt.chatVoiceStateSpeaking)).toBeInTheDocument();
+
+        update(playing({ paused: true }));
+
+        expect(within(indicatorOf(lt)).getByText(lt.chatVoiceStatePaused)).toBeInTheDocument();
+        expect(screen.queryByText(lt.chatVoiceStateSpeaking)).not.toBeInTheDocument();
+        expect(playbackGroup()).toBeInTheDocument();
+      });
+
+      it('mute calls voice.toggleMute, and reads unmute (pressed) while the answer is muted', () => {
+        const voice = playing();
+        const { update } = renderLocale(voice);
+        const mute = screen.getByRole('button', { name: lt.chatVoiceMute });
+        expect(mute).toHaveAttribute('aria-pressed', 'false');
+
+        fireEvent.click(mute);
+        expect(voice.toggleMute).toHaveBeenCalledTimes(1);
+
+        const muted = playing({ muted: true });
+        update(muted);
+        expect(screen.queryByRole('button', { name: lt.chatVoiceMute })).not.toBeInTheDocument();
+        const unmute = screen.getByRole('button', { name: lt.chatVoiceUnmute });
+        expect(unmute).toHaveAttribute('aria-pressed', 'true');
+        fireEvent.click(unmute);
+        expect(muted.toggleMute).toHaveBeenCalledTimes(1);
+        // The mute of the answer is not the mute of the microphone.
+        expect(voice.toggleMicMute).not.toHaveBeenCalled();
+        expect(muted.toggleMicMute).not.toHaveBeenCalled();
+      });
+
+      it('stop cuts the spoken answer short (voice.stopSpeaking): it does not end the conversation, nor cancel the turn', () => {
+        const voice = playing();
+        renderLocale(voice);
+
+        fireEvent.click(screen.getByRole('button', { name: lt.chatVoiceStopPlayback }));
+
+        expect(voice.stopSpeaking).toHaveBeenCalledTimes(1);
+        // voice.stop is the whole conversation's switch, and cancel is the other control.
+        expect(voice.stop).not.toHaveBeenCalled();
+        expect(voice.cancel).not.toHaveBeenCalled();
+      });
+
+      it('keep the control that cancels the turn, which is another thing than stopping the playback', () => {
+        const voice = playing();
+        renderLocale(voice);
+
+        fireEvent.click(screen.getByRole('button', { name: lt.chatVoiceCancel }));
+
+        expect(voice.cancel).toHaveBeenCalledTimes(1);
+        expect(voice.stopSpeaking).not.toHaveBeenCalled();
+      });
+
+      it.each(['off', 'connecting', 'listening', 'thinking', 'idle'] as const)(
+        'are not there while the state is %s, whatever the audio says',
+        (state) => {
+          renderLocale(makeVoice({ state, audioPlaying: true }));
+
+          expect(playbackGroup()).not.toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: lt.chatVoicePause })).not.toBeInTheDocument();
+          expect(
+            screen.queryByRole('button', { name: lt.chatVoiceStopPlayback }),
+          ).not.toBeInTheDocument();
+        },
+      );
+
+      it.each(['speaking', 'draining'] as const)(
+        'are not there while %s without audio being heard: before the first chunk, or after it played out',
+        (state) => {
+          renderLocale(makeVoice({ state, audioPlaying: false }));
+
+          expect(playbackGroup()).not.toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: lt.chatVoicePause })).not.toBeInTheDocument();
+          expect(screen.queryByRole('button', { name: lt.chatVoiceMute })).not.toBeInTheDocument();
+        },
+      );
+
+      it('go away when the answer has played out', () => {
+        const { update } = renderLocale(playing({ state: 'draining' }));
+        expect(playbackGroup()).toBeInTheDocument();
+
+        update(makeVoice({ state: 'draining', audioPlaying: false }));
+
+        expect(playbackGroup()).not.toBeInTheDocument();
+      });
+    });
+
+    describe('the microphone mute', () => {
+      const micMute = () => screen.getByRole('button', { name: lt.chatVoiceMicMute });
+
+      it.each(['connecting', 'listening', 'thinking', 'speaking', 'draining', 'idle'] as const)(
+        'is there whenever the conversation is on (%s), and calls voice.toggleMicMute',
+        (state) => {
+          const voice = makeVoice({ state });
+          renderLocale(voice);
+
+          expect(micMute()).toBeEnabled();
+          expect(micMute()).toHaveAttribute('aria-pressed', 'false');
+          fireEvent.click(micMute());
+
+          expect(voice.toggleMicMute).toHaveBeenCalledTimes(1);
+          expect(voice.toggleMute).not.toHaveBeenCalled();
+          expect(voice.stop).not.toHaveBeenCalled();
+        },
+      );
+
+      it('is not there while the conversation is off', () => {
+        renderLocale(makeVoice({ state: 'off' }));
+
+        expect(screen.queryByRole('button', { name: lt.chatVoiceMicMute })).not.toBeInTheDocument();
+        expect(
+          screen.queryByRole('button', { name: lt.chatVoiceMicUnmute }),
+        ).not.toBeInTheDocument();
+      });
+
+      it('reflects the mute: it reads unmute, pressed, and calls toggleMicMute again', () => {
+        const voice = makeVoice({ state: 'listening', micMuted: true });
+        renderLocale(voice);
+
+        expect(screen.queryByRole('button', { name: lt.chatVoiceMicMute })).not.toBeInTheDocument();
+        const unmute = screen.getByRole('button', { name: lt.chatVoiceMicUnmute });
+        expect(unmute).toHaveAttribute('aria-pressed', 'true');
+        fireEvent.click(unmute);
+
+        expect(voice.toggleMicMute).toHaveBeenCalledTimes(1);
+      });
+
+      it('stays while the answer is spoken, next to the playback controls', () => {
+        renderLocale(playing());
+
+        expect(micMute()).toBeInTheDocument();
+        expect(playbackGroup()).toBeInTheDocument();
+        // It is not one of the playback controls: it is there when they are not.
+        expect(
+          within(playbackGroup()!).queryByRole('button', { name: lt.chatVoiceMicMute }),
+        ).toBeNull();
+      });
+
+      it('closes push-to-talk while the microphone is muted: nothing would be heard, so nothing is started', () => {
+        const voice = makeVoice({ state: 'listening', micMuted: true });
+        renderLocale(voice);
+
+        const talk = screen.getByRole('button', { name: lt.chatVoicePushToTalk });
+        expect(talk).toBeDisabled();
+        fireEvent.pointerDown(talk);
+        fireEvent.keyDown(talk, { key: ' ' });
+        expect(voice.pushStart).not.toHaveBeenCalled();
+      });
+
+      it('closes the re-engaging push-to-talk of an idle conversation too, until it is unmuted', () => {
+        const { update } = renderLocale(makeVoice({ state: 'idle', micMuted: true }));
+        expect(screen.getByRole('button', { name: lt.chatVoicePushToTalk })).toBeDisabled();
+
+        const voice = makeVoice({ state: 'idle', micMuted: false });
+        update(voice);
+        const talk = screen.getByRole('button', { name: lt.chatVoicePushToTalk });
+        expect(talk).toBeEnabled();
+        fireEvent.pointerDown(talk);
+        expect(voice.pushStart).toHaveBeenCalledTimes(1);
+      });
+
+      it('says in the indicator that the user is not heard: no hot microphone, and why', () => {
+        const { update } = renderLocale(makeVoice({ state: 'listening' }));
+        expect(within(indicatorOf(lt)).getByText(lt.chatVoiceStateListening)).toBeInTheDocument();
+        expect(within(indicatorOf(lt)).getByTestId('MicIcon')).toBeInTheDocument();
+
+        update(makeVoice({ state: 'listening', micMuted: true }));
+
+        const status = within(indicatorOf(lt));
+        // A muted microphone is never labelled "listening", whatever the gateway is doing.
+        expect(status.getByText(lt.chatVoiceStateMicMuted)).toBeInTheDocument();
+        expect(status.getByText(lt.chatVoiceMicMutedDetail)).toBeInTheDocument();
+        expect(status.getByTestId('MicOffIcon')).toBeInTheDocument();
+        expect(status.queryByTestId('MicIcon')).not.toBeInTheDocument();
+        expect(screen.queryByText(lt.chatVoiceStateListening)).not.toBeInTheDocument();
+      });
+
+      it('keeps the state of the conversation as the label where it is not listening, and adds the mute as the detail', () => {
+        renderLocale(makeVoice({ state: 'thinking', micMuted: true }));
+
+        const status = within(indicatorOf(lt));
+        expect(status.getByText(lt.chatVoiceStateThinking)).toBeInTheDocument();
+        expect(status.getByText(lt.chatVoiceMicMutedDetail)).toBeInTheDocument();
+      });
+
+      it('leaves the "microphone is paused" detail while the answer is spoken: it is true either way', () => {
+        renderLocale(playing({ micMuted: true }));
+
+        expect(within(indicatorOf(lt)).getByText(lt.chatVoiceMicPaused)).toBeInTheDocument();
+        expect(screen.queryByText(lt.chatVoiceMicMutedDetail)).not.toBeInTheDocument();
+      });
+
+      it('says nothing of a mute that is not there', () => {
+        renderLocale(makeVoice({ state: 'listening' }));
+
+        expect(screen.queryByText(lt.chatVoiceMicMutedDetail)).not.toBeInTheDocument();
+        expect(screen.queryByText(lt.chatVoiceStateMicMuted)).not.toBeInTheDocument();
+      });
+    });
+  },
+);
+
+describe('the words of the playback controls and the microphone mute', () => {
+  const keys = [
+    'chatVoicePlayback',
+    'chatVoicePause',
+    'chatVoiceResume',
+    'chatVoiceMute',
+    'chatVoiceUnmute',
+    'chatVoiceStopPlayback',
+    'chatVoiceMicMute',
+    'chatVoiceMicUnmute',
+    'chatVoiceStatePaused',
+    'chatVoiceStateMicMuted',
+    'chatVoiceMicMutedDetail',
+  ] as const;
+
+  it.each(keys)('%s is worded in both languages, and in each its own', (key) => {
+    expect(messages.de[key].length).toBeGreaterThan(0);
+    expect(messages.en[key].length).toBeGreaterThan(0);
+    expect(messages.de[key]).not.toBe(messages.en[key]);
+  });
+
+  // Cancel (the whole answer) and Stop (its speech) are on screen together while the answer is
+  // spoken, and one abandons what the other only silences: the words must not read as synonyms.
+  it('words cancelling the whole answer and stopping its speech apart: no word in common', () => {
+    for (const locale of ['en', 'de'] as const) {
+      const words = (text: string) => new Set(text.toLowerCase().split(/[\s-]+/));
+      const cancel = words(messages[locale].chatVoiceCancel);
+      const stop = words(messages[locale].chatVoiceStopPlayback);
+      expect(
+        [...cancel].filter((word) => stop.has(word)),
+        locale,
+      ).toEqual([]);
+    }
+  });
+
+  it('gives every control of one row a name of its own, so a screen reader tells them apart', () => {
+    for (const locale of ['en', 'de'] as const) {
+      const names = [
+        messages[locale].chatVoicePause,
+        messages[locale].chatVoiceResume,
+        messages[locale].chatVoiceMute,
+        messages[locale].chatVoiceUnmute,
+        messages[locale].chatVoiceStopPlayback,
+        messages[locale].chatVoiceMicMute,
+        messages[locale].chatVoiceMicUnmute,
+        messages[locale].chatVoiceCancel,
+        messages[locale].chatVoicePushToTalk,
+      ];
+      expect(new Set(names).size, locale).toBe(names.length);
+    }
   });
 });

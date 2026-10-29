@@ -4069,4 +4069,14 @@ describe('Voice Chat (#312) i18n keys', () => {
     expect(messages.de.chatVoiceErrorCoLoad).toMatch(/andere/);
     expect(messages.en.chatVoiceErrorCoLoad).toMatch(/other/);
   });
+
+  // The thread's own system prompt is the persona layer of a spoken conversation (phase 3): the
+  // voice prompt is added after it, so the voice prompt's hint must say so rather than leave the
+  // thread's prompt looking unused by a spoken conversation.
+  it('says the voice prompt is added to the chat system prompt, and what the default asks for', () => {
+    expect(messages.de.chatVoiceSystemPromptHint).toMatch(/System-Prompt dieses Chats/);
+    expect(messages.en.chatVoiceSystemPromptHint).toMatch(/chat's system prompt/);
+    expect(messages.de.chatVoiceSystemPromptHint).toMatch(/Abschnitte/);
+    expect(messages.en.chatVoiceSystemPromptHint).toMatch(/sections/);
+  });
 });

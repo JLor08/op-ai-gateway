@@ -56,6 +56,15 @@ const (
 	// playout-done rather than relay-done (spec 6.2); the server still owns the gate and
 	// applies its own fallback, so a missing or late signal cannot wedge the session.
 	voiceUpPlaybackDone = "playback_done"
+	// voiceUpPause / voiceUpResume / voiceUpStop are the playback-control frames the client sends
+	// while the answer is playing out (spec 5.2 / 5.7 Q2). pause/resume server-track the playout
+	// drain so the mic can never reopen over paused audio (the floor and ceiling are shifted by the
+	// paused interval, the mic stays gated throughout); stop abandons the rest of the playout,
+	// reopens the mic, and leaves the speculative run to the commit/cancel CAS (the audio produced
+	// so far is committed iff the run already won its commit, exactly as cancel/commit arbitrate).
+	voiceUpPause  = "pause"
+	voiceUpResume = "resume"
+	voiceUpStop   = "stop"
 )
 
 // The down-frame types the gateway sends to the browser (spec 5.2).
@@ -198,7 +207,8 @@ func parseVoiceUpControl(data []byte) (voiceUpControl, bool) {
 		return voiceUpControl{}, false
 	}
 	switch c.Type {
-	case voiceUpPushStart, voiceUpPushEnd, voiceUpCancel, voiceUpBye, voiceUpPlaybackDone:
+	case voiceUpPushStart, voiceUpPushEnd, voiceUpCancel, voiceUpBye, voiceUpPlaybackDone,
+		voiceUpPause, voiceUpResume, voiceUpStop:
 		return c, true
 	}
 	return voiceUpControl{}, false
@@ -233,10 +243,15 @@ type voiceDownMsg struct {
 	Text      string `json:"text,omitempty"`
 	MessageID string `json:"message_id,omitempty"`
 	Seq       int    `json:"seq,omitempty"`
-	Rate      int    `json:"rate,omitempty"`
-	Audio     string `json:"audio,omitempty"`
-	Code      string `json:"code,omitempty"`
-	Message   string `json:"message,omitempty"`
+	// Section is the spoken section an audio_delta belongs to (spec 5.1 Model A), for live
+	// transcript attribution ONLY -- Seq is the single monotonic order across all sections. It
+	// is additive: 0 (the common single-section case) is omitted, so an older client is never
+	// regressed; a later section carries its index. No other frame owns it.
+	Section int    `json:"section,omitempty"`
+	Rate    int    `json:"rate,omitempty"`
+	Audio   string `json:"audio,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // MarshalJSON keeps `seq` on the wire for an audio_delta even when it is 0. The chunks
@@ -677,6 +692,16 @@ type voiceMachine struct {
 	playbackFloorPassed bool
 	playbackTimer       *time.Timer
 	playbackC           <-chan time.Time
+
+	// The client-driven playback pause (spec 5.2). paused latches while the client has paused
+	// playout (set in speaking or an awaiting-playback drain, cleared on resume/stop/turn reset);
+	// pausedAt is when the pause began. On pause the playout timer is stopped and the drain wait
+	// frozen; on resume firstAudioAt is shifted forward by the paused interval, so the floor AND
+	// the ceiling (both measured from firstAudioAt) extend by exactly that interval and the mic can
+	// never reopen over audio that was paused. A pause is HELD indefinitely by design -- the mic
+	// stays gated until the client resumes or stops -- so there is no auto-resume ceiling.
+	paused   bool
+	pausedAt time.Time
 }
 
 // voiceFinalizeTimeout bounds the wait for the clean final transcript after the pipe is
@@ -899,6 +924,17 @@ func (m *voiceMachine) onControl(ctl voiceUpControl) {
 		// (ctl.PlayedThrough) is what tells a genuine end from a stale gap signal; it still never
 		// shortens the drain below the floor.
 		m.onPlaybackDone(ctl.PlayedThrough)
+	case voiceUpPause:
+		// Freeze the playout drain while the client has paused the audio, so the mic cannot reopen
+		// over paused audio (spec 5.2). A no-op outside an actively-playing turn.
+		m.onPlaybackPause()
+	case voiceUpResume:
+		// Un-freeze: shift the floor/ceiling forward by the paused interval and re-arm the drain.
+		m.onPlaybackResume()
+	case voiceUpStop:
+		// Abandon the rest of the playout, reopen the mic, and let the commit/cancel CAS decide
+		// whether the audio produced so far is committed (spec 5.7 Q2).
+		m.onPlaybackStop()
 	}
 }
 
@@ -1206,7 +1242,11 @@ func (m *voiceMachine) relayAudio(a runAudio) {
 	// clear-on-relay is belt-and-suspenders that keeps the counter-less (older-client) path correct
 	// for a non-reordering client by invalidating any signal remembered before this chunk.
 	m.playbackSignaled = false
-	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Rate: a.Rate, Audio: a.Data})
+	// Seq is the ONE monotonic stream the executor already numbered across every section's leg (so
+	// the client never sees it restart mid-turn); Section only attributes this chunk to its
+	// transcript block. The machine passes both straight through -- it neither renumbers nor
+	// reorders (the executor relays strictly in document order).
+	m.writer.send(m.ctx, voiceDownMsg{Type: voiceDownAudioDelta, Seq: a.Seq, Section: a.Section, Rate: a.Rate, Audio: a.Data})
 }
 
 // accountPlayback adds the relayed chunk's real-time duration to the running total used by the
@@ -1303,6 +1343,13 @@ func (m *voiceMachine) beginPlaybackWait() {
 		m.endDrainWait() // no audio was relayed: nothing to play out
 		return
 	}
+	if m.paused {
+		// The client paused DURING speaking (before the drain began): the wait is now pending but
+		// frozen. Arm nothing -- onPlaybackResume shifts firstAudioAt and arms the floor against
+		// the shifted anchor, so the paused interval is accounted even though it straddled the
+		// speaking -> draining transition.
+		return
+	}
 	if floor := m.playbackFloorRemaining(); floor > 0 {
 		m.armPlaybackWait(floor)
 		return
@@ -1368,6 +1415,120 @@ func (m *voiceMachine) onPlaybackDone(playedThrough *int) {
 	if m.awaitingPlayback && m.playbackFloorPassed {
 		m.endDrainWait()
 	}
+}
+
+// onPlaybackPause freezes the playout drain when the client pauses the audio (spec 5.2): it stops
+// the playout timer and records the pause instant, so the floor cannot elapse while the audio is
+// paused and the mic therefore cannot reopen over it. The mic is already gated in speaking and
+// draining, so no mic state changes here. It is a NO-OP unless audio is actually playing out: the
+// speaking state, or a draining state whose drain wait is still pending (awaitingPlayback). Once the
+// floor has passed and the wait ended (the mic-resume tail), the audio has finished and there is
+// nothing to pause, so a pause there is ignored -- which also keeps the tail timer from being
+// stranded by a pause. A second pause is ignored.
+func (m *voiceMachine) onPlaybackPause() {
+	if m.paused {
+		return
+	}
+	playing := m.state == voiceStateSpeaking || (m.state == voiceStateDraining && m.awaitingPlayback)
+	if !playing || m.firstAudioAt.IsZero() {
+		return // no audio is playing out: nothing to pause
+	}
+	m.paused = true
+	m.pausedAt = time.Now()
+	m.stopPlaybackWait() // freeze the drain; awaitingPlayback/floor latches are preserved for resume
+}
+
+// onPlaybackResume un-freezes a paused playout (spec 5.2): it shifts firstAudioAt forward by the
+// paused interval, so the floor AND the ceiling (both measured from firstAudioAt) extend by exactly
+// that interval -- the mic cannot reopen any earlier than it would have without the pause -- then
+// re-arms the drain wait against the shifted anchor. During speaking the drain has not begun
+// (awaitingPlayback is false), so there is nothing to re-arm here; beginPlaybackWait reads the
+// shifted anchor when the drain later starts. A resume with no pause outstanding is a no-op.
+func (m *voiceMachine) onPlaybackResume() {
+	if !m.paused {
+		return
+	}
+	pausedFor := time.Since(m.pausedAt)
+	m.paused = false
+	m.pausedAt = time.Time{}
+	if !m.firstAudioAt.IsZero() {
+		m.firstAudioAt = m.firstAudioAt.Add(pausedFor)
+	}
+	if m.awaitingPlayback {
+		m.rearmPlaybackWait()
+	}
+}
+
+// rearmPlaybackWait re-arms the playout drain after a resume shifted firstAudioAt, resuming the wait
+// from exactly where the pause froze it: before the floor it arms the (shifted) floor; after the
+// floor it ends now if a valid playback_done is already remembered, else it waits out the (shifted)
+// ceiling for a slow or absent signal. The caller guarantees awaitingPlayback.
+func (m *voiceMachine) rearmPlaybackWait() {
+	if !m.playbackFloorPassed {
+		if floor := m.playbackFloorRemaining(); floor > 0 {
+			m.armPlaybackWait(floor)
+			return
+		}
+		m.onPlaybackFloorReached()
+		return
+	}
+	if m.playbackSignaled {
+		m.endDrainWait()
+		return
+	}
+	if ceiling := m.playbackCeilingRemaining(); ceiling > 0 {
+		m.armPlaybackWait(ceiling)
+		return
+	}
+	m.endDrainWait()
+}
+
+// onPlaybackStop abandons the rest of the answer's playout and reopens the mic (spec 5.2 / 5.7 Q2):
+// it drops the queued audio relay, stops the speculative run through the commit/cancel CAS (stopRun),
+// and resets the session to listening. A NO-OP unless audio is playing out (speaking or draining);
+// in idle/listening/thinking there is nothing to stop (the client cancels an in-flight turn).
+//
+// Whether the audio produced so far is committed is decided by the CAS, never truncated to the
+// playback position: a run still short of its commit claim is cancelled and persists nothing (as a
+// cancel does); a run that already won its commit is left to finish its WithoutCancel write and
+// commit the full synthesized sections. By the time the session is DRAINING the run has already
+// committed and been detached, so a stop there simply reopens the mic over an already-committed turn.
+func (m *voiceMachine) onPlaybackStop() {
+	if m.state != voiceStateSpeaking && m.state != voiceStateDraining {
+		return
+	}
+	m.stopRun()
+	m.teardownTurn() // no ASR loopback is open in speaking/draining, but stay airtight
+	m.resetChunk()
+	m.stopChunkTimers()
+	m.stopGrace()
+	m.stopTail()
+	m.resetPlaybackWait()
+	m.pendingText = ""
+	m.setState(voiceStateListening)
+}
+
+// stopRun ends the current speculative run on a stop, arbitrating with its commit on the one-way
+// commit/cancel word. It unsubscribes (dropping any further audio relay) and then claims the cancel:
+// when the claim WINS (the run had not committed) it cancels the run's context and removes it from
+// the registry synchronously, exactly as cancel does, so the run persists nothing and the chat slot
+// is freed at once; when the claim LOSES (the run already won its commit) the run is LEFT ALONE to
+// finish its WithoutCancel commit and retire itself -- stop never force-removes a committing run, so
+// the in-flight commit is never stranded and the slot is never double-removed. Returns whether stop
+// cancelled the run. Safe when no run is open (draining has already detached it).
+func (m *voiceMachine) stopRun() (cancelled bool) {
+	if m.runUnsub != nil {
+		m.runUnsub()
+	}
+	if run := m.curRun; run != nil && run.claimCancel() {
+		run.cancelContext() // the claim already won; this cancels the ctx so the run goroutine ends
+		m.s.ChatRuns.remove(run)
+		cancelled = true
+	}
+	m.curRun, m.runCh, m.runUnsub = nil, nil, nil
+	m.answerStreamed, m.answerDoneSent, m.graceElapsed, m.windowClosed, m.runFinished = false, false, false, false, false
+	m.audioBuf = nil
+	return cancelled
 }
 
 // playbackFloorRemaining is how much longer the relayed answer is still playing at its own
@@ -1651,12 +1812,14 @@ func (m *voiceMachine) stopPlaybackWait() {
 	m.playbackC = nil
 }
 
-// resetPlaybackWait ends any playout drain wait: no longer awaiting, its latches cleared, and
-// the timer disarmed.
+// resetPlaybackWait ends any playout drain wait: no longer awaiting, its latches cleared
+// (including the playback pause), and the timer disarmed.
 func (m *voiceMachine) resetPlaybackWait() {
 	m.awaitingPlayback = false
 	m.playbackSignaled = false
 	m.playbackFloorPassed = false
+	m.paused = false
+	m.pausedAt = time.Time{}
 	m.stopPlaybackWait()
 }
 

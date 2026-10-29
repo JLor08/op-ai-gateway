@@ -561,7 +561,7 @@ func TestVoiceFastCommitThenResumeDoesNotDoubleCommit(t *testing.T) {
 //   - false: the LLM failed BEFORE any <speak> summary, so no speech fired and the turn
 //     persists NOTHING -- the chat document is left empty.
 //   - true: the SPEECH leg failed (after a clean LLM answer), so the text turn STILL commits
-//     with no audio block and no spoken_summary, and only the degrade is surfaced.
+//     with no audio block and no spoken_sections, and only the degrade is surfaced.
 func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string, wantTextCommitted bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -621,7 +621,7 @@ func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string, wantTextC
 		return
 	}
 	// The speech leg failed: the text turn still commits (spec 5.5), with NO audio and NO
-	// spoken_summary -- nothing was spoken -- and the degrade is surfaced separately above.
+	// spoken_sections -- nothing was spoken -- and the degrade is surfaced separately above.
 	if n := len(msgs); n != 2 {
 		t.Fatalf("a speech-failed turn committed %d messages, want [user, assistant]: %s", n, stored.Content)
 	}
@@ -629,7 +629,7 @@ func degradeAssert(t *testing.T, h *voiceTurnHarness, wantCode string, wantTextC
 		t.Fatalf("a speech-failed turn must commit no audio: %s", stored.Content)
 	}
 	if _, ok := storedSpokenSummary(t, stored.Content); ok {
-		t.Fatalf("a speech-failed turn must persist no spoken_summary: %s", stored.Content)
+		t.Fatalf("a speech-failed turn must persist no spoken_sections: %s", stored.Content)
 	}
 }
 

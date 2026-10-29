@@ -19,9 +19,14 @@
 //     [name, ticket]). It is single-use and good for 30 seconds, so it is used at once.
 //   - UP: binary frames of raw s16le PCM, ~100 ms each (a frame of 1 MiB or more closes the
 //     connection with 1009), and text control frames {"type": "push_start" | "push_end" |
-//     "cancel" | "bye"}. The microphone is sent up for as long as the session lasts: the gateway
-//     discards it while the answer is being spoken (it is half-duplex, enforced there, so that
-//     the answer can never be heard as speech).
+//     "cancel" | "bye" | "playback_done" | "pause" | "resume" | "stop"}. The microphone is sent
+//     up for as long as the session lasts, unless the user has muted it (setMicMuted: then none
+//     is sent, and the gateway hears nothing and detects no turn): the gateway discards it while
+//     the answer is being spoken (it is half-duplex, enforced there, so that the answer can
+//     never be heard as speech). `pause`/`resume` hold and release the gateway's playout drain
+//     (so the microphone cannot reopen over audio the user has paused), and `stop` cuts the
+//     spoken answer short and puts the gateway back to listening. The answer can also be muted
+//     (setMuted): a local matter of the speakers, which the gateway is told nothing of.
 //   - DOWN: text frames, parsed by parseVoiceDownFrame below. `state` is the gateway's state
 //     machine; `asr_partial` is the provisional transcript of the CURRENT CHUNK only (it
 //     REPLACES the last partial, not the turn's transcript), and `asr_final` the finished text
@@ -31,7 +36,10 @@
 //     `answer_done` its end, which is provisional: it comes before the turn is committed, and
 //     `answer_reset` says the answer so far is void, because the user went on talking.
 //     `audio_delta` is a chunk of the spoken answer and `audio_done` its end, which is when the
-//     turn has been committed; `error` is a turn that failed.
+//     turn has been committed; `error` is a turn that failed. An answer may be several spoken
+//     sections: their audio is ONE stream (one `seq`, numbered from 0 once per answer), and an
+//     `audio_delta` also names the `section` it belongs to, which only says which part of the
+//     answer is being heard (see VoiceAudioSection).
 //
 // Display is provisional: the gateway persists the turns, and does so once, when the turn is
 // committed (the user's words and the answer, text and audio, together), so nothing here commits
@@ -99,7 +107,7 @@ export type VoiceDownFrame =
   | { type: 'answer_delta'; text: string }
   | { type: 'answer_done'; messageId?: string }
   | { type: 'answer_reset' }
-  | { type: 'audio_delta'; seq: number; rate: number; audio: string }
+  | { type: 'audio_delta'; seq: number; rate: number; audio: string; section?: number }
   | { type: 'audio_done' }
   | { type: 'error'; message: string; code?: string };
 
@@ -156,12 +164,21 @@ function parseAnswerDoneFrame(frame: FrameFields): VoiceDownFrame {
   return messageId === undefined ? { type: 'answer_done' } : { type: 'answer_done', messageId };
 }
 
+/** An optional section index: a whole number from 0, or undefined when it is missing or is not one. */
+const sectionField = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
+
 function parseAudioDeltaFrame(frame: FrameFields): VoiceDownFrame | null {
   const audio = textField(frame.audio);
   if (typeof frame.seq !== 'number' || typeof frame.rate !== 'number' || audio === null) {
     return null;
   }
-  return { type: 'audio_delta', seq: frame.seq, rate: frame.rate, audio };
+  // The section only attributes the audio, so a tag that is not a section index is left off and
+  // the chunk stays the audio it is: dropping it would put a hole in what is played.
+  const section = sectionField(frame.section);
+  return section === undefined
+    ? { type: 'audio_delta', seq: frame.seq, rate: frame.rate, audio }
+    : { type: 'audio_delta', seq: frame.seq, rate: frame.rate, audio, section };
 }
 
 function parseErrorFrame(frame: FrameFields): VoiceDownFrame | null {
@@ -178,10 +195,12 @@ function parseErrorFrame(frame: FrameFields): VoiceDownFrame | null {
  * that a newer gateway adding a frame type cannot break an older portal.
  *
  * The gateway leaves an empty field out of its frames, so a missing `text`, `message` or `audio`
- * is the empty string. A `message_id` or an error's `code` is an optional hint: it is left off
- * the parsed frame when it is missing, empty or not a string, and a frame must stay the frame it
- * is whatever it says. (The gateway sends no `message_id` today -- nothing is persisted before
- * the turn is committed -- so it is read for a newer gateway that does, and nothing relies on it.)
+ * is the empty string (and a missing audio `section`, which the gateway leaves out for the first
+ * section, is left off the parsed frame too). A `message_id`, an error's `code` or an audio
+ * `section` is an optional hint: it is left off the parsed frame when it is missing, empty or not
+ * of its type, and a frame must stay the frame it is whatever it says. (The gateway sends no
+ * `message_id` today -- nothing is persisted before the turn is committed -- so it is read for a
+ * newer gateway that does, and nothing relies on it.)
  */
 export function parseVoiceDownFrame(data: string): VoiceDownFrame | null {
   const frame = parseFrameObject(data);
@@ -274,8 +293,31 @@ export type VoiceAnswer = {
  * `onEmpty` is the #304 drain hook -- the player calls it when its queue has played out, which
  * is how the session tells the gateway the answer finished playing (`playback_done`), so the
  * gateway can end its half-duplex drain at true playout-done rather than relay-done (spec 6.2).
+ * `pause`/`resume` hold and continue the playout without ending the stream, and `pending` is how
+ * many chunks it has still to play out (zero after a resume means no `onEmpty` will follow it).
+ * `setMuted` silences its speakers without stopping its clock.
  */
-export type VoicePlayer = Pick<StreamingPcmPlayer, 'push' | 'stop' | 'onEmpty'>;
+export type VoicePlayer = Pick<
+  StreamingPcmPlayer,
+  'push' | 'stop' | 'onEmpty' | 'pause' | 'resume' | 'pending' | 'setMuted'
+>;
+
+/**
+ * Which section of the spoken answer the audio now arriving belongs to. An answer is spoken in
+ * one or more sections, whose audio comes down as ONE ordered stream (a later section is held
+ * until the earlier one is sent), so this changes when a new section's first chunk arrives.
+ *
+ *  - `section` is the gateway's own tag for it. It is the index the section was LAUNCHED at, so
+ *    it can skip: a section whose speech failed leaves a hole (0, then 2), and nothing here
+ *    assumes the indices are 0..n-1.
+ *  - `ordinal` is its place among the sections that have audio, from 0, in the order they were
+ *    heard. The stored turn keeps exactly those sections, in that order, so this is the index of
+ *    the section's block there, whatever the gaps in `section`.
+ *
+ * It names the section being RECEIVED: the gateway sends audio faster than it plays, so it can
+ * run ahead of what is audible.
+ */
+export type VoiceAudioSection = { section: number; ordinal: number };
 
 export type VoiceSessionArgs = {
   api: VoiceTicketApi;
@@ -306,6 +348,25 @@ export type VoiceSessionArgs = {
   /** A turn failed (`kind: 'turn'`, the session goes on) or the session failed (it is over). */
   onError(message: string, detail: VoiceErrorDetail): void;
   /**
+   * The spoken answer is paused (`true`) or not (`false`). It changes by the user's pause() and
+   * resume(), and by whatever ends the answer instead -- a stop, a cancel, a failed turn, the next
+   * answer, the gateway leaving `speaking` -- which clears a pause that was held.
+   */
+  onPausedChange?(paused: boolean): void;
+  /** The audio now arriving is for a new section of the answer (see VoiceAudioSection). */
+  onAudioSection?(section: VoiceAudioSection): void;
+  /**
+   * Whether the answer's audio is being heard (`true`) or not (`false`): it is, from the first
+   * chunk that is played until the answer has played out -- the queue running dry once the answer
+   * has been sent in full (the gateway draining), whatever the gateway's own tail does after it,
+   * or running dry while the gateway is still speaking and staying dry for PLAYING_GAP_MS (the
+   * last spoken section is over and the gateway goes on writing; a later section brings it back)
+   * -- and it is not once something else ends the answer (a stop, a cancel, a failed turn, the
+   * next answer, the gateway going back to listening). A pause does not end it: held audio is still
+   * to be heard. It is what the controls of the playback are shown for.
+   */
+  onPlayingChange?(playing: boolean): void;
+  /**
    * Makes the player of one answer's audio on the session's AudioContext. The default is a
    * StreamingPcmPlayer; a test passes a stand-in, since sound cannot be heard in jsdom.
    */
@@ -319,11 +380,48 @@ export type VoiceSession = {
   pushEnd(): void;
   /** Abandon the turn in progress: its answer is silenced here and the gateway returns to listening. */
   cancel(): void;
+  /**
+   * Pause the spoken answer: the player holds its place and the gateway holds its drain, so the
+   * microphone stays closed until resume() (or stopSpeaking()). Dropped unless an answer is
+   * actually being heard (nothing is playing before its first chunk, or after it has ended).
+   */
+  pause(): void;
+  /** Continue a paused answer from where it stopped. Dropped when nothing is paused. */
+  resume(): void;
+  /**
+   * Cut the spoken answer short: it is silenced here, and the gateway drops the rest of it and
+   * goes back to listening (the conversation goes on). Not the end of the session -- that is stop().
+   */
+  stopSpeaking(): void;
+  /**
+   * Mute or unmute the spoken answer, for the rest of the session or until it is unmuted: the
+   * speakers only, so nothing is sent, the answer goes on playing (silently, on the same clock)
+   * and the gateway drains it as it would have. It holds for the answers to come, too -- each has
+   * a player of its own, made muted while this is on.
+   */
+  setMuted(muted: boolean): void;
+  /**
+   * Mute or unmute the user's own microphone for the rest of the session, until it is unmuted:
+   * while muted nothing is sent up, so the gateway detects no turn. The gateway needs no frame
+   * for it, and the answer and the controls above are not affected.
+   */
+  setMicMuted(muted: boolean): void;
   /** End the conversation: say goodbye, stop the microphone and the audio, and tear everything down. */
   stop(): void;
 };
 
 const defaultCreatePlayer = (ctx: PlaybackContext): VoicePlayer => new StreamingPcmPlayer(ctx);
+
+/**
+ * How long the answer's queue must stay dry, while the gateway is still `speaking`, before its
+ * audio is taken as played out (see onPlayingChange). The gateway only says the answer is over
+ * (`audio_done`, then `draining`) when the whole run has finished, and with spoken summaries the
+ * model goes on writing the detail long after the last summary has been heard: nothing audible is
+ * left then, yet the state is still `speaking`. A gap between two sections -- the synthesis of the
+ * next one not yet caught up -- is shorter than this, so the next chunk arrives inside the window
+ * and keeps the audio going; a real end has no next chunk.
+ */
+export const PLAYING_GAP_MS = 1200;
 
 /**
  * Start a Voice Chat session: the microphone, the connection, and the conversation.
@@ -370,6 +468,22 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   // drain signal after it, so there it can stay ahead of what was signalled), and resets at each
   // answer's chunk 0.
   let receivedChunks = 0;
+  // The user has paused the answer being spoken: its player holds its place, and so does the
+  // gateway's drain. Cleared by anything that ends the answer (see stopPlayback).
+  let paused = false;
+  // The sections the current answer's audio has been attributed to, in the order they were heard
+  // (their gateway tags, which can skip), and which of them the latest chunk was in. Both start
+  // over with the answer, at its chunk 0.
+  let heardSections: number[] = [];
+  let currentOrdinal = -1;
+  // The user has muted their microphone: nothing it captures is sent up (see setMicMuted).
+  let micMuted = false;
+  // The user has muted the answer's speakers (see setMuted). It is the SESSION's, not a player's:
+  // each answer has a player of its own, and is made with this applied.
+  let muted = false;
+  // The current answer's audio is being heard (see onPlayingChange): its player has played a
+  // chunk and the answer has not played out or been ended.
+  let playing = false;
 
   const setState = (next: VoiceSessionState) => {
     if (state === next) return;
@@ -384,12 +498,55 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     }
   };
 
-  // Silence what is playing and forget the stream it was part of.
+  const setPaused = (next: boolean) => {
+    if (paused === next) return;
+    paused = next;
+    if (!over) args.onPausedChange?.(next);
+  };
+
+  const setPlaying = (next: boolean) => {
+    if (playing === next) return;
+    playing = next;
+    if (!over) args.onPlayingChange?.(next);
+  };
+
+  // The window of a queue that ran dry in `speaking` (PLAYING_GAP_MS): when it runs out with
+  // nothing queued and nothing held by a pause, the audio is over.
+  let playingGapTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearPlayingGap = () => {
+    clearTimeout(playingGapTimer);
+    playingGapTimer = undefined;
+  };
+  const armPlayingGap = () => {
+    clearPlayingGap();
+    playingGapTimer = setTimeout(() => {
+      playingGapTimer = undefined;
+      if (playedOut()) setPlaying(false);
+    }, PLAYING_GAP_MS);
+  };
+  // The audio is over now: no window is left to end it again, or to end the next answer's.
+  const endPlaying = () => {
+    clearPlayingGap();
+    setPlaying(false);
+  };
+
+  // Silence what is playing and forget the stream it was part of -- and with it a pause: the
+  // answer it was a pause of is gone, and the next one starts playing.
   const stopPlayback = () => {
     player?.stop();
     player = null;
     playState = { phase: 'waiting' };
+    heardSections = [];
+    currentOrdinal = -1;
+    setPaused(false);
+    endPlaying();
   };
+
+  // Nothing of the answer is left to hear: not held by a pause, and nothing queued. (No player at
+  // all -- no audio came -- is nothing to hear as well.)
+  function playedOut(): boolean {
+    return !paused && (player?.pending ?? 0) === 0;
+  }
 
   // Ends the session for good: everything is released first, then `notify` (the onError that says
   // why) and the final state are delivered. The first call wins.
@@ -444,7 +601,7 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   // One text control frame, when there is a socket to send it on. `extra` carries a control's
   // optional fields (playback_done's played_through counter); the fields stay additive on the wire.
   const sendControl = (
-    type: 'push_start' | 'push_end' | 'cancel' | 'playback_done',
+    type: 'push_start' | 'push_end' | 'cancel' | 'playback_done' | 'pause' | 'resume' | 'stop',
     extra?: Record<string, number>,
   ) => {
     if (over || !open || !socket) return;
@@ -461,6 +618,9 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
   };
 
   const deliverAudio = (pcm: ArrayBuffer) => {
+    // A muted microphone sends nothing, and keeps nothing for later either: the batch is simply
+    // not for anyone.
+    if (micMuted) return;
     if (open && socket) {
       socket.send(pcm);
       return;
@@ -476,6 +636,18 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     } else if (event.data === LIVE_FLUSHED_MESSAGE) {
       sendPushEnd();
     }
+  };
+
+  // The chunk now arriving is of section `section` of the answer. What is reported is the section's
+  // place among the ones heard (its `ordinal`) as well as the gateway's tag: the tag is the
+  // index the section was launched at and can skip, the ordinal cannot, and the stored turn's
+  // blocks are numbered by it. A change is reported once, not on every chunk of a section.
+  const attributeSection = (section: number) => {
+    let ordinal = heardSections.indexOf(section);
+    if (ordinal < 0) ordinal = heardSections.push(section) - 1;
+    if (ordinal === currentOrdinal) return;
+    currentOrdinal = ordinal;
+    args.onAudioSection?.({ section, ordinal });
   };
 
   // One chunk of the spoken answer to the player of its stream. acceptChunk is the rule of
@@ -504,6 +676,9 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     const bytes = decodeBase64(frame.audio);
     if (!player) {
       player = createPlayer(context as unknown as PlaybackContext);
+      // A mute holds for every answer, not only the one it was asked for during: the new
+      // player is made audible, so it is silenced before its first chunk.
+      if (muted) player.setMuted(true);
       // The #304 drain hook: when this answer's player has played its queue out, tell the
       // gateway playout is done so it can end its half-duplex drain at true playout-done, not
       // relay-done (spec 6.2). A fresh player is made per answer, so it is wired per player here.
@@ -512,10 +687,26 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       // played_through, the count of audio received so far (#322), so the gateway honors only a
       // signal that accounts for everything it relayed as the genuine end of audio, and never ends
       // the drain on a stale gap signal (nor below its server-side floor).
-      player.onEmpty = () => sendControl('playback_done', { played_through: receivedChunks });
+      player.onEmpty = () => {
+        sendControl('playback_done', { played_through: receivedChunks });
+        // Once the answer has been sent in full (the gateway is draining) a queue that runs dry is
+        // the answer played out. Before that it is a gap between chunks of one still coming, or
+        // the last section played out while the gateway goes on writing: the next chunk, if
+        // there is one, arrives within the window and keeps the audio going.
+        if (state === 'draining') endPlaying();
+        else if (state === 'speaking') armPlayingGap();
+      };
     }
     if (bytes === null || !player.push(bytes, frame.rate)) {
       playState = { phase: 'abandoned', reason: 'format' };
+    }
+    // Only audio that is being played live belongs to a block: once the stream is abandoned
+    // there is nothing live to attribute (the stored turn's audio is what is replayed).
+    if (playState.phase !== 'abandoned') {
+      attributeSection(frame.section ?? 0);
+      // More audio: a window of a dry queue that is open is void.
+      clearPlayingGap();
+      setPlaying(true);
     }
   };
 
@@ -525,6 +716,19 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     if (!frame) return;
     switch (frame.type) {
       case 'state':
+        // The gateway holds a pause for as long as it lasts, so a state that is not playing the
+        // answer out means the pause is void: the answer was ended under it (the microphone is
+        // open again), and what the player held must never play into that.
+        if (paused && frame.state !== 'speaking' && frame.state !== 'draining') stopPlayback();
+        // The answer is only heard in `speaking` and `draining`. Outside those two states there
+        // is nothing left to play; in `draining` it is sent in full, so once what played out
+        // covers it there is nothing more to hear either -- both cases end the playing window.
+        if (
+          (frame.state !== 'speaking' && frame.state !== 'draining') ||
+          (frame.state === 'draining' && playedOut())
+        ) {
+          endPlaying();
+        }
         setState(frame.state);
         break;
       case 'asr_partial':
@@ -569,6 +773,12 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     }
   };
 
+  // A disabled track captures silence, so a muted microphone has nothing in the worklet's batch
+  // that is filling when the user unmutes (the batches themselves are dropped in deliverAudio).
+  const applyMicMute = (media: MediaStream | null) => {
+    for (const track of media?.getAudioTracks() ?? []) track.enabled = !micMuted;
+  };
+
   // The microphone into the worklet. The audio starts flowing, into `pending`, from here.
   const connectCapture = (ctx: AudioContext, media: MediaStream) => {
     source = ctx.createMediaStreamSource(media);
@@ -594,6 +804,8 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     for (const track of media.getAudioTracks()) {
       track.onended = () => fail('the microphone stopped', { kind: 'capture' });
     }
+    // A mute asked for while the microphone was still being set up holds from its first batch.
+    applyMicMute(media);
   };
 
   const openSocket = (ticket: string) => {
@@ -714,6 +926,55 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
       // The answer already sent down and queued to play would otherwise be heard to the end.
       stopPlayback();
       sendControl('cancel');
+    },
+    pause() {
+      // Only audio that is being heard can be paused: the gateway ignores a pause in any other
+      // state (nothing is playing out), and a player paused on this side alone would hold the
+      // next answer's first chunk, with the gateway's own drain running.
+      if (over || paused || !player || (state !== 'speaking' && state !== 'draining')) return;
+      setPaused(true);
+      sendControl('pause');
+      player.pause();
+    },
+    resume() {
+      if (over || !paused) return;
+      setPaused(false);
+      // The gateway first: it re-arms its drain from the resume, and the drain signal below only
+      // counts after it.
+      sendControl('resume');
+      if (!player) return;
+      player.resume();
+      // A pause that lands as the last chunk finishes playing swallows its drain: the player
+      // drops a chunk the clock has already carried past, and so has nothing left whose ending
+      // would fire `onEmpty` -- which is what ends the gateway's drain at true playout-done. With
+      // nothing queued after a resume no drain is coming, so it is reported here; the gateway
+      // takes a signal at every drain (and ignores one that is early or does not account for all
+      // it relayed), so this is only ever a signal that is true. Without it the mic would stay
+      // shut until the gateway's ceiling.
+      if (player.pending === 0) {
+        sendControl('playback_done', { played_through: receivedChunks });
+        // As for a queue that ran dry (onEmpty): in draining it is the end; still speaking, the
+        // next section may follow, so the end is only taken once the window has run out.
+        if (state === 'draining') endPlaying();
+        else if (state === 'speaking') armPlayingGap();
+      }
+    },
+    stopSpeaking() {
+      if (over) return;
+      stopPlayback();
+      sendControl('stop');
+    },
+    setMuted(next) {
+      if (over || muted === next) return;
+      muted = next;
+      player?.setMuted(next);
+    },
+    setMicMuted(next) {
+      if (over || micMuted === next) return;
+      micMuted = next;
+      // What was captured for a socket that is not open yet was captured before the mute.
+      if (next) pending.length = 0;
+      applyMicMute(stream);
     },
     stop() {
       finish('closed');

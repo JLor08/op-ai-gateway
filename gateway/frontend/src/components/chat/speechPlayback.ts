@@ -173,6 +173,18 @@ const DEFAULT_LEAD_SECONDS = 0.12;
 // end of audio by a few ms of scheduling slack.
 const DRAIN_FALLBACK_MARGIN_MS = 250;
 
+// One decoded chunk of PCM and the rate to play it at: what a pause holds, and what a resume
+// schedules again.
+type PcmChunk = { samples: Float32Array<ArrayBuffer>; rate: number };
+
+// A chunk placed on the audio clock: its node, and where on the clock it plays, which is what
+// a pause needs to know how much of it has been heard.
+type ScheduledChunk = PcmChunk & {
+  source: PlaybackSource;
+  startAt: number;
+  duration: number;
+};
+
 /**
  * Plays the decoded chunks of ONE stream back to back on an AudioContext's own clock: each
  * chunk becomes a buffer source started exactly where the previous one ends, so there is no
@@ -180,6 +192,10 @@ const DRAIN_FALLBACK_MARGIN_MS = 250;
  * When the queue runs dry (the stream stalled, or it is simply over) the next chunk is
  * re-anchored a lead ahead of now instead of being scheduled in the past, where it would be
  * dropped or played in a burst.
+ *
+ * It can be paused and resumed (see `pause`). A pause halts THIS player's timeline by
+ * stopping its own source nodes and holding the audio they had not played yet; the
+ * AudioContext is the page's one, shared by every chat and player, and is never suspended.
  */
 export class StreamingPcmPlayer {
   private nextTime = 0;
@@ -191,10 +207,17 @@ export class StreamingPcmPlayer {
   // The persistent gain stage between the sources and the destination: made once, with the
   // first chunk, and shared by every chunk after it.
   private gain: PlaybackGain | null = null;
-  private readonly sources = new Set<PlaybackSource>();
+  // The chunks placed on the clock and not yet ended, in play order. Empty while paused.
+  private readonly scheduled: ScheduledChunk[] = [];
+  // Whether the timeline is halted, and the audio it holds while it is: what had not been
+  // heard when `pause` stopped the sources, then whatever is pushed, in play order. Empty
+  // unless paused.
+  private paused = false;
+  private readonly held: PcmChunk[] = [];
   // Called whenever the last scheduled source ends and the queue becomes empty. The session
   // (createSpeechPlayback) wires this to its drain signal ONLY after the run has ended, so a
-  // queue that empties mid-stream (between chunks of a run still going) never fires it.
+  // queue that empties mid-stream (between chunks of a run still going) never fires it. Never
+  // fired while paused: a pause is not a drain.
   onEmpty: (() => void) | null = null;
 
   constructor(
@@ -203,17 +226,36 @@ export class StreamingPcmPlayer {
   ) {}
 
   /** Queue one chunk's PCM. False when it could not be (the player is stopped, or the browser
-   * refused the buffer): the caller then stops pushing. */
+   * refused the buffer): the caller then stops pushing. While paused the chunk is held, not
+   * scheduled, until `resume`. */
   push(bytes: Uint8Array, rate: number): boolean {
     if (this.stopped) return false;
     const { samples, carry } = pcm16ToFloat32(bytes, this.carry);
     this.carry = carry;
     if (samples.length === 0) return true;
+    if (this.paused) {
+      // Nothing is scheduled, but a rate the browser cannot make a buffer of is refused now,
+      // as it would be live, rather than silently dropped when the resume reaches it.
+      try {
+        this.ctx.createBuffer(1, samples.length, rate);
+      } catch {
+        return false;
+      }
+      this.held.push({ samples, rate });
+      return true;
+    }
+    return this.schedule({ samples, rate });
+  }
+
+  // Place one chunk on the audio clock behind the previous one (or a lead ahead of now, when
+  // the queue has caught up with the clock). False when the browser refused the buffer, with
+  // nothing scheduled.
+  private schedule(chunk: PcmChunk): boolean {
     let source: PlaybackSource;
     let duration: number;
     try {
-      const buffer = this.ctx.createBuffer(1, samples.length, rate);
-      buffer.copyToChannel(samples, 0);
+      const buffer = this.ctx.createBuffer(1, chunk.samples.length, chunk.rate);
+      buffer.copyToChannel(chunk.samples, 0);
       source = this.ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(this.gainStage());
@@ -224,13 +266,19 @@ export class StreamingPcmPlayer {
     }
     const now = this.ctx.currentTime;
     const startAt = this.nextTime > now ? this.nextTime : now + this.lead;
+    const entry: ScheduledChunk = { ...chunk, source, startAt, duration };
     source.onended = () => {
-      this.sources.delete(source);
+      // A source this player has halted (a pause) is no longer its own: whatever the browser
+      // reports for it afterwards must neither count as a drain nor disturb the sources that
+      // replaced it.
+      const at = this.scheduled.indexOf(entry);
+      if (at < 0) return;
+      this.scheduled.splice(at, 1);
       // The last scheduled source has ended: tell whoever is draining this player (nothing,
       // while the run is still live).
-      if (this.sources.size === 0) this.onEmpty?.();
+      if (this.scheduled.length === 0) this.onEmpty?.();
     };
-    this.sources.add(source);
+    this.scheduled.push(entry);
     source.start(startAt);
     this.nextTime = startAt + duration;
     return true;
@@ -257,28 +305,88 @@ export class StreamingPcmPlayer {
     return this.gain;
   }
 
+  /**
+   * Halt the playout where it is. Unlike a mute, the timeline stops: this player's scheduled
+   * sources are stopped and the audio not yet heard (the unplayed tail of the chunk that was
+   * playing, and every chunk after it) is held, in order, until `resume`. Chunks pushed
+   * meanwhile are held behind it. Only this player's own nodes are touched -- the shared
+   * AudioContext keeps running for every other chat -- and `onEmpty` does not fire: a pause
+   * is not a drain. A pause on a player with nothing queued still takes effect (what is
+   * pushed next waits for `resume`); one that is already paused, or stopped, does nothing.
+   */
+  pause(): void {
+    if (this.stopped || this.paused) return;
+    this.paused = true;
+    const now = this.ctx.currentTime;
+    for (const entry of this.scheduled) {
+      // Detach the handler first: the browser reports `ended` for a stopped source too, and
+      // that is not the queue draining.
+      entry.source.onended = null;
+      try {
+        entry.source.stop();
+      } catch {
+        // A source that has not started, or already ended, has nothing to stop.
+      }
+      // The samples the clock has already carried past: none for a chunk yet to start, all
+      // of them for one that is over (though its `ended` may not have been delivered yet).
+      const played = Math.round(Math.max(0, now - entry.startAt) * entry.rate);
+      if (played < entry.samples.length) {
+        this.held.push({
+          samples: played > 0 ? entry.samples.subarray(played) : entry.samples,
+          rate: entry.rate,
+        });
+      }
+    }
+    this.scheduled.length = 0;
+    // The timeline is gone with the sources: the held audio is placed afresh, on the live
+    // clock, when resumed.
+    this.nextTime = 0;
+  }
+
+  /**
+   * Continue after `pause`: place the held audio on the clock as it is NOW, a lead ahead of
+   * the present and gapless behind itself, from the point where it stopped. The queue drains
+   * (and fires `onEmpty`) at its true end as ever. A player that is not paused, or stopped,
+   * does nothing.
+   */
+  resume(): void {
+    if (this.stopped || !this.paused) return;
+    this.paused = false;
+    for (const chunk of this.held.splice(0)) {
+      // A chunk this context already made a buffer of cannot be refused now; were it, the
+      // rest still plays rather than the whole queue being lost with it.
+      this.schedule(chunk);
+    }
+  }
+
   /** Silence everything scheduled and ignore every later chunk. */
   stop(): void {
     this.stopped = true;
     this.onEmpty = null;
-    for (const source of this.sources) {
+    for (const { source } of this.scheduled) {
       try {
         source.stop();
       } catch {
         // A source that has not started, or already ended, has nothing to stop.
       }
     }
-    this.sources.clear();
+    this.scheduled.length = 0;
+    this.held.length = 0;
   }
 
-  /** How many scheduled sources have not yet ended: the length of the audio still to play out. */
+  /** How many chunks have not yet been heard to the end: those scheduled and not ended, and
+   * those held by a pause. The length of the audio still to play out. */
   get pending(): number {
-    return this.sources.size;
+    return this.scheduled.length + this.held.length;
   }
 
-  /** The seconds of audio still scheduled past "now" -- the queued tail's own remaining length,
-   * used to bound the drain fallback timer. Zero once the queue has caught up to the clock. */
+  /** The seconds of audio still to play -- the queued tail's own remaining length, used to
+   * bound the drain fallback timer. Zero once the queue has caught up to the clock. While
+   * paused the clock does not drain anything: it is the held audio's length, whatever "now". */
   remainingSeconds(): number {
+    if (this.paused) {
+      return this.held.reduce((total, chunk) => total + chunk.samples.length / chunk.rate, 0);
+    }
     return Math.max(0, this.nextTime - this.ctx.currentTime);
   }
 }

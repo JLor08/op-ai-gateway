@@ -394,13 +394,33 @@ const de = {
   chatVoiceMicPaused:
     'Das Mikrofon ist pausiert, bis die Antwort zu Ende gesprochen ist. Sie werden gerade nicht gehört.',
   chatVoiceIdleHint: 'Halten Sie die Sprechtaste, um zu sprechen.',
-  // The controls: push-to-talk (held while talking), stopping an answer, dismissing a refusal; and
-  // the names of the two regions of the turn in progress (what was said, and the answer so far).
+  // The controls: push-to-talk (held while talking), cancelling the whole answer, dismissing a
+  // refusal; and the names of the two regions of the turn in progress (what was said, and the
+  // answer so far). Cancelling the answer and stopping its speech (chatVoiceStopPlayback, below)
+  // are on screen together while it is spoken, and are worded apart: one abandons the whole
+  // answer, the other only stops it being read aloud.
   chatVoicePushToTalk: 'Zum Sprechen gedrückt halten',
-  chatVoiceCancel: 'Antwort abbrechen',
+  chatVoiceCancel: 'Ganze Antwort abbrechen',
   chatVoiceDismiss: 'Schließen',
   chatVoiceTranscript: 'Ihre Worte',
   chatVoiceAnswer: 'Antwort',
+  // The controls of the answer while it is heard (#315): pause and resume it, mute its speakers
+  // (it plays on, silently), or stop its speech (it is cut short and the microphone reopens).
+  // That is not cancelling the whole answer (chatVoiceCancel), so it is worded as what it does.
+  // Beside them the mute of the user's own microphone, which is there whenever the conversation is
+  // on, with the indicator's words for a user who is not heard because of it.
+  chatVoicePlayback: 'Wiedergabe der Antwort',
+  chatVoicePause: 'Pausieren',
+  chatVoiceResume: 'Fortsetzen',
+  chatVoiceMute: 'Antwort stumm schalten',
+  chatVoiceUnmute: 'Antwort-Ton einschalten',
+  chatVoiceStopPlayback: 'Vorlesen beenden',
+  chatVoiceMicMute: 'Mikrofon stumm schalten',
+  chatVoiceMicUnmute: 'Mikrofon einschalten',
+  chatVoiceStatePaused: 'Antwort pausiert',
+  chatVoiceStateMicMuted: 'Mikrofon stumm',
+  chatVoiceMicMutedDetail:
+    'Ihr Mikrofon ist stumm geschaltet, Sie werden nicht gehört. Schalten Sie es wieder ein, um zu sprechen.',
   // Why the switch is closed: the thread cannot do a spoken conversation (the chat model, or a
   // streaming transcription or speech model, is missing), or the models are still being checked.
   chatVoiceUnavailableLlm:
@@ -413,20 +433,23 @@ const de = {
   // The pickers of the conversation's models (#317): the transcription model that hears the user and
   // the speech model that answers aloud are the user's to pick; the chat model that answers is the
   // thread's own (picked with the model selector above), and is only named here. "Automatic" is
-  // the default: the first available model, which the line under it names.
+  // the default: a loaded model if one is on offer (it answers at once), else the first available
+  // one -- the model, in either case, that the line under it names.
   chatVoiceAsrModel: 'Transkriptionsmodell',
   chatVoiceTtsModel: 'Sprachmodell',
-  chatVoiceModelAuto: 'Automatisch (erstes verfügbares)',
+  chatVoiceModelAuto: 'Automatisch (geladenes Modell bevorzugt)',
   chatVoiceModelUsing: (model: string) => `Verwendet: ${model}`,
   chatVoiceLlmNote: (model: string) =>
     `Das Chat-Modell ist das Modell dieses Chats: ${model}. Wählen Sie es oben in der Modellauswahl.`,
   // The voice system prompt of the thread (#314): the instruction a spoken conversation's runs
   // start from, pre-filled with the built-in one. It is the voice twin of the thread's own system
-  // prompt (chatSystemPrompt, which a spoken conversation does not use), so its label says whose it
-  // is. Emptying the field means the built-in prompt again.
+  // prompt (chatSystemPrompt), so its label says whose it is. The two are combined on a spoken
+  // conversation's runs: the thread's own prompt leads (the persona and context) and this one is
+  // added after it (the form of a spoken answer), which the hint says. Emptying the field means
+  // the built-in prompt again.
   chatVoiceSystemPrompt: 'System-Prompt für den Sprachchat',
   chatVoiceSystemPromptHint:
-    'Gilt für die Antworten des Sprachchats in diesem Chat. Der Standard verlangt zuerst eine kurze gesprochene Zusammenfassung und danach die ausführliche Antwort als Text. Leer lassen, um den Standard zu verwenden.',
+    'Gilt für die Antworten des Sprachchats in diesem Chat. Dieser Prompt wird an den System-Prompt dieses Chats angehängt, der weiterhin Rolle und Kontext vorgibt. Der Standard verlangt kurze gesprochene Zusammenfassungen in Abschnitten (einen bei kurzen, mehrere bei langen Antworten) und die ausführliche Antwort als Text. Leer lassen, um den Standard zu verwenden.',
   // Puts the built-in prompt back into the field (the thread then stores no prompt of its own).
   chatVoiceSystemPromptReset: 'Auf Standard zurücksetzen',
   // The collapsed block of a spoken answer's summary (#314): the short part the user heard, kept
@@ -3841,10 +3864,22 @@ const en: PortalMessages = {
     'The microphone is paused until the answer has been spoken. You are not being heard right now.',
   chatVoiceIdleHint: 'Hold the talk button to speak.',
   chatVoicePushToTalk: 'Hold to talk',
-  chatVoiceCancel: 'Stop answer',
+  chatVoiceCancel: 'Cancel whole answer',
   chatVoiceDismiss: 'Dismiss',
   chatVoiceTranscript: 'Your words',
   chatVoiceAnswer: 'Answer',
+  chatVoicePlayback: 'Answer playback',
+  chatVoicePause: 'Pause',
+  chatVoiceResume: 'Resume',
+  chatVoiceMute: 'Mute answer',
+  chatVoiceUnmute: 'Unmute answer',
+  chatVoiceStopPlayback: 'Stop speaking',
+  chatVoiceMicMute: 'Mute microphone',
+  chatVoiceMicUnmute: 'Unmute microphone',
+  chatVoiceStatePaused: 'Answer paused',
+  chatVoiceStateMicMuted: 'Microphone muted',
+  chatVoiceMicMutedDetail:
+    'Your microphone is muted, so you are not being heard. Unmute it to talk.',
   chatVoiceUnavailableLlm: 'Select an available chat model (one that can chat) to use Voice Chat.',
   chatVoiceUnavailableAsr:
     'Voice Chat needs a transcription model with live streaming. None is available right now.',
@@ -3853,13 +3888,13 @@ const en: PortalMessages = {
   chatVoiceUnavailableChecking: 'Checking the available voice models…',
   chatVoiceAsrModel: 'Transcription model',
   chatVoiceTtsModel: 'Speech model',
-  chatVoiceModelAuto: 'Automatic (first available)',
+  chatVoiceModelAuto: 'Automatic (loaded model preferred)',
   chatVoiceModelUsing: (model: string) => `Uses: ${model}`,
   chatVoiceLlmNote: (model: string) =>
     `The chat model is this chat's own model: ${model}. Pick it in the model selector above.`,
   chatVoiceSystemPrompt: 'Voice Chat system prompt',
   chatVoiceSystemPromptHint:
-    'Used for the answers of Voice Chat in this chat. The default asks for a short spoken summary first, then the full answer as text. Leave empty to use the default.',
+    "Used for the answers of Voice Chat in this chat. This prompt is appended to the chat's system prompt, which still sets the persona and context. The default asks for short spoken summaries in sections (one for a short answer, several for a long one) and the full answer as text. Leave empty to use the default.",
   chatVoiceSystemPromptReset: 'Reset to default',
   chatVoiceSpokenSummary: 'Spoken summary',
   chatVoiceErrorAsrUnavailable:

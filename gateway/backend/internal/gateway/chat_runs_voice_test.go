@@ -69,6 +69,22 @@ type voiceTestProvider struct {
 	// still streaming when the run is cancelled), and a delta with failAfter returns an error
 	// instead of completing the stream (the LLM-failure path). nil leaves the plain mock answer.
 	llmScript []scriptedLLMDelta
+	// speechHoldByInput HOLDS one SECTION's speech response by its synthesized `input` text: a
+	// request whose input is a key blocks until that key's channel is closed (or ctx ends), so a
+	// multi-section ordering test can hold section k's leg while section k+1's leg synthesizes
+	// and finishes early, then release k and watch the relay stay in document order. A request
+	// whose input is not a key answers at once. nil disables the per-section hold (the default).
+	speechHoldByInput map[string]chan struct{}
+}
+
+// speechInputOf extracts the `input` field (the synthesized text) from a speech request body, so
+// a test can tell one section's speech leg from another's.
+func speechInputOf(body []byte) string {
+	var fields struct {
+		Input string `json:"input"`
+	}
+	_ = json.Unmarshal(body, &fields)
+	return fields.Input
 }
 
 // scriptedLLMDelta is one step of voiceTestProvider.llmScript.
@@ -84,6 +100,13 @@ func (p voiceTestProvider) ProxyNative(ctx context.Context, target routing.Targe
 		select {
 		case p.speechBodies <- append([]byte(nil), body...):
 		default:
+		}
+		if gate, ok := p.speechHoldByInput[speechInputOf(body)]; ok {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		if p.speechArrived != nil && p.speechOnce != nil {
 			p.speechOnce.Do(func() { close(p.speechArrived) })
@@ -776,7 +799,7 @@ func TestVoiceSpeechPrep_EmptyLanguageUnset(t *testing.T) {
 // --- Phase 2: concurrent two-leg flow + live-delta tag stripping (spec 5.5) ---
 
 // storedAssistantMsg returns the chat document's assistant message as a raw-field map, so a
-// test can read both its content parts and its top-level spoken_summary key.
+// test can read both its content parts and its top-level spoken_sections key.
 func storedAssistantMsg(t *testing.T, content json.RawMessage) map[string]json.RawMessage {
 	t.Helper()
 	var doc struct {
@@ -813,35 +836,49 @@ func voiceTextPart(t *testing.T, content json.RawMessage) string {
 	return ""
 }
 
-// storedSpokenSummary returns the assistant message's spoken_summary and whether the key is
-// present at all (a no-tag / no-audio turn omits it).
-func storedSpokenSummary(t *testing.T, content json.RawMessage) (string, bool) {
+// storedSpokenSections returns the assistant message's spoken_sections array -- the ordered
+// spoken <speak> regions, each {text,start,len} -- and whether the key is present at all (a
+// no-tag / no-audio turn omits it). It also fails the test if the message still carries either
+// phase-2 scalar key: the writer emits only spoken_sections now.
+func storedSpokenSections(t *testing.T, content json.RawMessage) ([]portal.SpokenSection, bool) {
 	t.Helper()
-	raw, ok := storedAssistantMsg(t, content)["spoken_summary"]
+	msg := storedAssistantMsg(t, content)
+	for _, key := range []string{"spoken_summary", "spoken_summary_start"} {
+		if raw, ok := msg[key]; ok {
+			t.Fatalf("%s = %s, want the phase-2 scalar key no longer written", key, raw)
+		}
+	}
+	raw, ok := msg["spoken_sections"]
 	if !ok {
-		return "", false
+		return nil, false
 	}
-	var summary string
-	if err := json.Unmarshal(raw, &summary); err != nil {
-		t.Fatalf("spoken_summary is not a string: %s", raw)
+	var sections []portal.SpokenSection
+	if err := json.Unmarshal(raw, &sections); err != nil {
+		t.Fatalf("spoken_sections is not an array of sections: %s", raw)
 	}
-	return summary, true
+	return sections, true
 }
 
-// storedSpokenSummaryStart returns the assistant message's spoken_summary_start (the summary's
-// rune offset into the full answer) and whether the key is present at all (a turn with no summary
-// omits it).
+// storedSpokenSummary returns the FIRST spoken section's text -- the phase-2 "summary" -- and
+// whether the turn carries any spoken section at all (a no-tag / no-audio turn omits them).
+func storedSpokenSummary(t *testing.T, content json.RawMessage) (string, bool) {
+	t.Helper()
+	sections, ok := storedSpokenSections(t, content)
+	if !ok || len(sections) == 0 {
+		return "", false
+	}
+	return sections[0].Text, true
+}
+
+// storedSpokenSummaryStart returns the FIRST spoken section's start (its rune offset into the
+// full answer) and whether the turn carries any spoken section at all.
 func storedSpokenSummaryStart(t *testing.T, content json.RawMessage) (int, bool) {
 	t.Helper()
-	raw, ok := storedAssistantMsg(t, content)["spoken_summary_start"]
-	if !ok {
+	sections, ok := storedSpokenSections(t, content)
+	if !ok || len(sections) == 0 {
 		return 0, false
 	}
-	var start int
-	if err := json.Unmarshal(raw, &start); err != nil {
-		t.Fatalf("spoken_summary_start is not an int: %s", raw)
-	}
-	return start, true
+	return sections[0].Start, true
 }
 
 // seedVoiceSpeechLanguage writes the TTS mapping's scope-"" speech_language fact, as the
@@ -887,7 +924,7 @@ func TestVoiceRun_FiresSpeechAtCloseTag(t *testing.T) {
 }
 
 // The committed turn carries the FULL clean text (summary + detail, tags stripped) as its
-// content, the summary region as spoken_summary, and the synthesized audio -- end to end,
+// content, the summary region as its one spoken section, and the synthesized audio -- end to end,
 // through the real gateway (the forwarding Task 4 could not test on its own).
 func TestVoiceRun_CommitsFullTextAndSummary(t *testing.T) {
 	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
@@ -913,7 +950,14 @@ func TestVoiceRun_CommitsFullTextAndSummary(t *testing.T) {
 		t.Fatalf("text content = %q, want the full clean answer %q", got, wantContent)
 	}
 	if summary, ok := storedSpokenSummary(t, stored.Content); !ok || summary != wantSummary {
-		t.Fatalf("spoken_summary = %q (present %v), want %q", summary, ok, wantSummary)
+		t.Fatalf("spoken section text = %q (present %v), want %q", summary, ok, wantSummary)
+	}
+	// The span is the whole section -- it starts after the mock model's fixed prefix, runs for
+	// the summary's rune count, and slices the full answer back to the summary -- and it is the
+	// ONLY spoken-text record: storedSpokenSections also fails on a leftover phase-2 scalar key.
+	wantSpan := portal.SpokenSection{Text: wantSummary, Start: len([]rune("Mock response for qwen-coder: ")), Len: len([]rune(wantSummary))}
+	if sections, _ := storedSpokenSections(t, stored.Content); len(sections) != 1 || sections[0] != wantSpan {
+		t.Fatalf("spoken_sections = %+v, want exactly one section %+v", sections, wantSpan)
 	}
 	if !strings.Contains(string(stored.Content), `"type":"audio_url"`) {
 		t.Fatalf("assistant turn has no audio part: %s", stored.Content)
@@ -925,7 +969,7 @@ func TestVoiceRun_CommitsFullTextAndSummary(t *testing.T) {
 }
 
 // No <speak> tag: the whole answer is synthesized after the LLM finishes (the phase-1 ordered
-// fallback) and the committed turn persists no spoken_summary key.
+// fallback) and the committed turn persists no spoken_sections key.
 func TestVoiceRun_NoTagSpeaksWholeAnswer(t *testing.T) {
 	srv, owner, chatID, _, speechBodies := newVoiceRunTestServer(t, 0)
 
@@ -943,14 +987,14 @@ func TestVoiceRun_NoTagSpeaksWholeAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, ok := storedSpokenSummary(t, stored.Content); ok {
-		t.Fatalf("a no-tag turn must persist no spoken_summary: %s", stored.Content)
+		t.Fatalf("a no-tag turn must persist no spoken_sections: %s", stored.Content)
 	}
 	if start, ok := storedSpokenSummaryStart(t, stored.Content); ok {
-		t.Fatalf("a no-tag turn must persist no spoken_summary_start, got %d: %s", start, stored.Content)
+		t.Fatalf("a no-tag turn must persist no spoken section start, got %d: %s", start, stored.Content)
 	}
 }
 
-// The spoken summary's RUNE offset into the full answer is persisted as spoken_summary_start, so
+// The spoken section's RUNE offset into the full answer is persisted as its spoken_sections start, so
 // the portal slices the summary out by position, exactly (#322). The scripted answer puts the
 // summary's text in the leading detail too, and a multi-byte 'ä' and emoji before the tag, so a
 // byte offset or an indexOf would land on the WRONG occurrence; the persisted offset points at
@@ -976,7 +1020,7 @@ func TestVoiceRun_PersistsSpokenSummaryStart(t *testing.T) {
 	const wantStart = 13
 	start, ok := storedSpokenSummaryStart(t, stored.Content)
 	if !ok || start != wantStart {
-		t.Fatalf("spoken_summary_start = %d (present %v), want %d", start, ok, wantStart)
+		t.Fatalf("spoken section start = %d (present %v), want %d", start, ok, wantStart)
 	}
 	// Exactness: slicing the full answer's runes at the offset yields the stored summary -- the
 	// property the portal relies on, proven against the real committed document.
@@ -989,7 +1033,7 @@ func TestVoiceRun_PersistsSpokenSummaryStart(t *testing.T) {
 }
 
 // The persisted summary is TrimSpace'd, but the scanner's offset points at the region's UNTRIMMED
-// content start, so trimmedSummaryStart advances it past the leading whitespace the trim removed
+// content start, so trimmedRegionStart advances it past the leading whitespace the trim removed
 // (#322). The existing end-to-end offset test has no whitespace inside the tag, so that adjustment
 // went unpinned -- and the portal's slice-equality fallback would silently mask a wrong one. Here
 // whitespace sits INSIDE the tag (and a multi-byte 'ä' and emoji before it), on both call sites of
@@ -1022,11 +1066,11 @@ func TestVoiceRun_SpokenSummaryStartSkipsWhitespaceInsideTheTag(t *testing.T) {
 			}
 			summary, ok := storedSpokenSummary(t, stored.Content)
 			if !ok || summary != tc.wantSummary {
-				t.Fatalf("spoken_summary = %q (present %v), want the trimmed %q", summary, ok, tc.wantSummary)
+				t.Fatalf("spoken section text = %q (present %v), want the trimmed %q", summary, ok, tc.wantSummary)
 			}
 			start, ok := storedSpokenSummaryStart(t, stored.Content)
 			if !ok || start != tc.wantStart {
-				t.Fatalf("spoken_summary_start = %d (present %v), want %d", start, ok, tc.wantStart)
+				t.Fatalf("spoken section start = %d (present %v), want %d", start, ok, tc.wantStart)
 			}
 			// Exactness, against the real committed document: the runes at the offset ARE the
 			// trimmed summary (not the whitespace that preceded it inside the tag).
@@ -1040,36 +1084,32 @@ func TestVoiceRun_SpokenSummaryStartSkipsWhitespaceInsideTheTag(t *testing.T) {
 	}
 }
 
-// trimmedSummaryStart in isolation: whatever Unicode whitespace the trim removes from the front of
+// trimmedRegionStart in isolation: whatever Unicode whitespace the trim removes from the front of
 // the region's content (spaces, tab, newline, NBSP, ideographic space), the advanced offset lands
-// on the first rune of the trimmed summary, counted in runes with multi-byte text before the tag.
-func TestTrimmedSummaryStartLandsOnTheTrimmedSummary(t *testing.T) {
+// on the first rune of the trimmed section text, counted in runes with multi-byte text before the tag.
+func TestTrimmedRegionStartLandsOnTheTrimmedText(t *testing.T) {
 	const in = "Käse 🧀 <speak lang=\"de\">\u00a0\u3000\t\n  Kurz. \u00a0</speak> Detail."
 	s := newSpeakScanner()
 	clean, _ := feedSpeakScanner(s, in)
-	raw, _ := s.Summary()
-	trimmed := strings.TrimSpace(raw)
+	regions := s.Regions()
+	if len(regions) != 1 {
+		t.Fatalf("regions = %d, want 1 (harness sanity)", len(regions))
+	}
+	trimmed := strings.TrimSpace(regions[0].Text)
 	if trimmed != "Kurz." {
-		t.Fatalf("trimmed summary = %q, want %q (harness sanity)", trimmed, "Kurz.")
+		t.Fatalf("trimmed section = %q, want %q (harness sanity)", trimmed, "Kurz.")
 	}
 
-	start := trimmedSummaryStart(s, raw)
+	start := trimmedRegionStart(regions[0])
 	runes := []rune(clean)
 	end := start + len([]rune(trimmed))
 	if end > len(runes) || string(runes[start:end]) != trimmed {
-		t.Fatalf("trimmedSummaryStart = %d: runes[%d:%d] of %q do not equal %q", start, start, end, clean, trimmed)
+		t.Fatalf("trimmedRegionStart = %d: runes[%d:%d] of %q do not equal %q", start, start, end, clean, trimmed)
 	}
 	// 7 runes of "Käse 🧀 " plus the 6 whitespace runes the trim removed (NBSP, U+3000, tab,
 	// newline, two spaces).
 	if want := 7 + 6; start != want {
-		t.Errorf("trimmedSummaryStart = %d, want %d", start, want)
-	}
-
-	// No region at all: the scanner's -1 passes through untouched.
-	none := newSpeakScanner()
-	feedSpeakScanner(none, "plain text")
-	if got := trimmedSummaryStart(none, ""); got != -1 {
-		t.Errorf("trimmedSummaryStart with no region = %d, want -1", got)
+		t.Errorf("trimmedRegionStart = %d, want %d", start, want)
 	}
 }
 
@@ -1284,7 +1324,7 @@ func TestVoiceRun_LLMFailsAfterCloseCommitsSummary(t *testing.T) {
 		t.Fatalf("want [user, assistant], got %d messages: %s", len(msgs), stored.Content)
 	}
 	if summary, ok := storedSpokenSummary(t, stored.Content); !ok || summary != "Kurz." {
-		t.Fatalf("spoken_summary = %q (present %v), want %q", summary, ok, "Kurz.")
+		t.Fatalf("spoken section text = %q (present %v), want %q", summary, ok, "Kurz.")
 	}
 	if !strings.Contains(string(stored.Content), `"type":"audio_url"`) {
 		t.Fatalf("committed turn has no audio part: %s", stored.Content)
@@ -1298,7 +1338,7 @@ func TestVoiceRun_LLMFailsAfterCloseCommitsSummary(t *testing.T) {
 	}
 }
 
-// The speech leg fails: the text turn still commits (no audio block, no spoken_summary) and
+// The speech leg fails: the text turn still commits (no audio block, no spoken_sections) and
 // the degrade is surfaced on the run's terminal (spec 5.5).
 func TestVoiceRun_SpeechFailsCommitsTextOnly(t *testing.T) {
 	prov := defaultVoiceProvider()
@@ -1326,14 +1366,135 @@ func TestVoiceRun_SpeechFailsCommitsTextOnly(t *testing.T) {
 		t.Fatalf("a failed speech leg must leave no audio: %s", stored.Content)
 	}
 	if _, ok := storedSpokenSummary(t, stored.Content); ok {
-		t.Fatalf("a failed speech leg must persist no spoken_summary: %s", stored.Content)
+		t.Fatalf("a failed speech leg must persist no spoken_sections: %s", stored.Content)
+	}
+}
+
+// --- Phase 3: ordered per-section audio in the turn's content parts ---
+
+// audioURLPart is one {"type":"audio_url"} content part naming url, as the speech leg emits it.
+func audioURLPart(t *testing.T, url string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"type": "audio_url", "audio_url": map[string]string{"url": url}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// audioPartsJSON is a section's audio as generateSpeechTurn returns it: a JSON array of parts.
+func audioPartsJSON(t *testing.T, urls ...string) json.RawMessage {
+	t.Helper()
+	parts := make([]json.RawMessage, 0, len(urls))
+	for _, u := range urls {
+		parts = append(parts, audioURLPart(t, u))
+	}
+	b, err := json.Marshal(parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// contentPartSummary renders a content-parts array as "text:<answer>" / "audio:<url>" tokens in
+// stored order, so a test asserts the exact interleaving at a glance.
+func contentPartSummary(t *testing.T, parts json.RawMessage) []string {
+	t.Helper()
+	var decoded []struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		AudioURL struct {
+			URL string `json:"url"`
+		} `json:"audio_url"`
+	}
+	if err := json.Unmarshal(parts, &decoded); err != nil {
+		t.Fatalf("content parts are not an array: %s", parts)
+	}
+	out := make([]string, 0, len(decoded))
+	for _, p := range decoded {
+		switch p.Type {
+		case "text":
+			out = append(out, "text:"+p.Text)
+		case "audio_url":
+			out = append(out, "audio:"+p.AudioURL.URL)
+		default:
+			out = append(out, "?"+p.Type)
+		}
+	}
+	return out
+}
+
+// Each section's audio follows the answer text IN SECTION ORDER: [text, sec0 audio..., sec1
+// audio...]. A section may hold several audio parts (one leg can return more than one), and
+// they stay contiguous and in order.
+func TestVoiceContentParts_OrdersAudioBySection(t *testing.T) {
+	parts, err := voiceContentParts("Full answer.", []json.RawMessage{
+		audioPartsJSON(t, "a0", "a1"),
+		audioPartsJSON(t, "b0"),
+		audioPartsJSON(t, "c0"),
+	})
+	if err != nil {
+		t.Fatalf("voiceContentParts: %v", err)
+	}
+	want := []string{"text:Full answer.", "audio:a0", "audio:a1", "audio:b0", "audio:c0"}
+	if got := contentPartSummary(t, parts); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("content parts = %v, want %v", got, want)
+	}
+}
+
+// One section is the phase-2 shape: [text, audio...].
+func TestVoiceContentParts_SingleSection(t *testing.T) {
+	parts, err := voiceContentParts("Full answer.", []json.RawMessage{audioPartsJSON(t, "a0")})
+	if err != nil {
+		t.Fatalf("voiceContentParts: %v", err)
+	}
+	want := []string{"text:Full answer.", "audio:a0"}
+	if got := contentPartSummary(t, parts); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("content parts = %v, want %v", got, want)
+	}
+}
+
+// A section without audio (nil, empty, or a JSON null / empty array) contributes nothing and
+// does not disturb the order of the sections around it; with no audio at all the content is just
+// the text part (a degraded, text-only turn).
+func TestVoiceContentParts_SectionsWithoutAudioAreSkipped(t *testing.T) {
+	parts, err := voiceContentParts("Full answer.", []json.RawMessage{
+		nil,
+		audioPartsJSON(t, "b0"),
+		json.RawMessage(`null`),
+		json.RawMessage(`[]`),
+		audioPartsJSON(t, "e0"),
+	})
+	if err != nil {
+		t.Fatalf("voiceContentParts: %v", err)
+	}
+	want := []string{"text:Full answer.", "audio:b0", "audio:e0"}
+	if got := contentPartSummary(t, parts); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("content parts = %v, want %v", got, want)
+	}
+
+	for name, in := range map[string][]json.RawMessage{"nil": nil, "empty": {}, "only empty sections": {nil, json.RawMessage(`[]`)}} {
+		parts, err := voiceContentParts("Just text.", in)
+		if err != nil {
+			t.Fatalf("%s: voiceContentParts: %v", name, err)
+		}
+		if got := contentPartSummary(t, parts); len(got) != 1 || got[0] != "text:Just text." {
+			t.Fatalf("%s: content parts = %v, want only the text part", name, got)
+		}
+	}
+}
+
+// A section whose audio is not a JSON array is an error, not a silently dropped clip.
+func TestVoiceContentParts_RejectsMalformedSectionAudio(t *testing.T) {
+	if _, err := voiceContentParts("Full answer.", []json.RawMessage{audioPartsJSON(t, "a0"), json.RawMessage(`{"not":"an array"}`)}); err == nil {
+		t.Fatal("voiceContentParts accepted a section whose audio is not an array")
 	}
 }
 
 // --- Phase 2 review fixes: metrics determinism + AudioAnswer ---
 
 // recordingVoicePortal wraps the real portal.API and captures the AssistantTurn handed to
-// CommitVoiceTurn, so a test can assert fields (AudioAnswer, TTFTMs, SpokenSummary) that the
+// CommitVoiceTurn, so a test can assert fields (AudioAnswer, TTFTMs, SpokenSections) that the
 // stored chat document does not expose as keys.
 type recordingVoicePortal struct {
 	portal.API
@@ -1371,7 +1532,7 @@ func TestVoiceRun_SpeechLegDoesNotStampMetricsForVoice(t *testing.T) {
 		t.Fatalf("reserveRun: %v", err)
 	}
 	run.setMetrics(sentinel)
-	if _, status, _, streamed := srv.generateSpeechTurn(context.Background(), owner, run, prep, func() {}, false); status != "completed" || !streamed {
+	if _, status, _, streamed := srv.generateSpeechTurn(context.Background(), owner, run, prep, func() {}, false, nil); status != "completed" || !streamed {
 		t.Fatalf("voice speech leg status=%q streamed=%v, want completed and streamed", status, streamed)
 	}
 	if got := run.currentMetrics(); got != sentinel {
@@ -1385,7 +1546,7 @@ func TestVoiceRun_SpeechLegDoesNotStampMetricsForVoice(t *testing.T) {
 		t.Fatalf("reserveRun: %v", err)
 	}
 	run2.setMetrics(sentinel)
-	if _, status, _, _ := srv.generateSpeechTurn(context.Background(), owner, run2, prep, func() {}, true); status != "completed" {
+	if _, status, _, _ := srv.generateSpeechTurn(context.Background(), owner, run2, prep, func() {}, true, nil); status != "completed" {
 		t.Fatalf("standalone speech leg status=%q, want completed", status)
 	}
 	if run2.currentMetrics().TTFTMs == sentinel.TTFTMs {
@@ -1494,8 +1655,8 @@ func TestVoiceRun_AudioAnswerReflectsCommittedAudio(t *testing.T) {
 		if turn.AudioAnswer {
 			t.Fatal("AudioAnswer = true on a no-audio degraded commit, want false")
 		}
-		if turn.SpokenSummary != "" {
-			t.Fatalf("SpokenSummary = %q on a no-audio commit, want empty", turn.SpokenSummary)
+		if len(turn.SpokenSections) != 0 {
+			t.Fatalf("SpokenSections = %+v on a no-audio commit, want none", turn.SpokenSections)
 		}
 	})
 }

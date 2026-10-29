@@ -8,8 +8,10 @@
 //
 //   - the gateway says which of the catalogue's candidates STREAM (`thoseThatStream`), and only
 //     those are on offer, for the user to pick from and for the automatic pick to choose from;
-//   - the AUTOMATIC pick is the first of them, in the candidates' order (`autoVoiceModel`; the
-//     speech candidates are ordered plain models first, preset-clone ones after, by the store);
+//   - the AUTOMATIC pick is the first of them that is LOADED on a server -- it answers at once,
+//     where another has to be loaded first -- else simply the first, in the candidates' order
+//     (`autoVoiceModel`; the speech candidates are ordered plain models first, preset-clone ones
+//     after, by the store);
 //   - the user's pick wins while it is one of them, and otherwise the automatic pick does -- a
 //     pick that is gone (the model left the catalogue, is unreachable, or no longer streams) is
 //     a graceful fallback, never a stuck conversation (`effectiveVoiceModel`);
@@ -41,17 +43,32 @@ export async function thoseThatStream(
   return ids.filter((_id, index) => answers[index]);
 }
 
-/** The automatic pick of a leg: the first model that streams, or '' when none does. */
-export function autoVoiceModel(streaming: readonly string[]): string {
-  return streaming[0] ?? '';
+/**
+ * The automatic pick of a leg: the first model that streams AND that the catalogue (`models`) says
+ * is loaded on a server -- the same green dot as the chat's model picker -- else the first model
+ * that streams, or '' when none does. Only the models that stream are looked at, in their order:
+ * a loaded model that does not stream is never picked, and of several loaded ones the first wins.
+ * Without a catalogue (or for an id it does not hold) nothing is known to be loaded.
+ */
+export function autoVoiceModel(
+  streaming: readonly string[],
+  models: readonly ModelOption[] = [],
+): string {
+  const loaded = streaming.find((id) => models.some((option) => option.id === id && option.loaded));
+  return loaded ?? streaming[0] ?? '';
 }
 
 /**
  * The model a leg uses: the user's `pick` when it is one of the models that stream, else the
  * automatic pick (so a pick that is gone falls back, and '' -- no pick -- is the automatic one).
+ * `models` is the catalogue the automatic pick reads the loaded state from (autoVoiceModel).
  */
-export function effectiveVoiceModel(pick: string, streaming: readonly string[]): string {
-  return pick !== '' && streaming.includes(pick) ? pick : autoVoiceModel(streaming);
+export function effectiveVoiceModel(
+  pick: string,
+  streaming: readonly string[],
+  models: readonly ModelOption[] = [],
+): string {
+  return pick !== '' && streaming.includes(pick) ? pick : autoVoiceModel(streaming, models);
 }
 
 /**
@@ -60,29 +77,35 @@ export function effectiveVoiceModel(pick: string, streaming: readonly string[]):
  * would now speak -- a voice is one the model that offered it has, and must not be carried to
  * one that may not (the conversation would then fail on a voice it does not know). Choosing the
  * model that would speak anyway (the automatic pick, or the explicit pick of it) leaves it.
+ * `models` is the catalogue the automatic pick reads the loaded state from, so that "the model
+ * that would speak anyway" is the one the conversation would really use.
  */
 export function withTtsModel(
   current: VoiceChatSettings,
   ttsModel: string,
   streaming: readonly string[],
+  models: readonly ModelOption[] = [],
 ): VoiceChatSettings {
   const sameModel =
-    effectiveVoiceModel(current.ttsModel, streaming) === effectiveVoiceModel(ttsModel, streaming);
+    effectiveVoiceModel(current.ttsModel, streaming, models) ===
+    effectiveVoiceModel(ttsModel, streaming, models);
   return { ...current, ttsModel, voice: sameModel ? current.voice : '' };
 }
 
 /**
  * Both legs of a conversation, or null while the gateway has not yet said which models stream
  * (the switch is then closed: it must not promise a session it would refuse a ticket for).
+ * `models` is the catalogue the automatic pick of each leg reads the loaded state from.
  */
 export function voiceLegsOf(
   streaming: VoiceStreaming | null,
   picks: Pick<VoiceChatSettings, 'asrModel' | 'ttsModel'>,
+  models: readonly ModelOption[] = [],
 ): VoiceLegs | null {
   if (streaming === null) return null;
   return {
-    asr: effectiveVoiceModel(picks.asrModel, streaming.asr),
-    tts: effectiveVoiceModel(picks.ttsModel, streaming.tts),
+    asr: effectiveVoiceModel(picks.asrModel, streaming.asr, models),
+    tts: effectiveVoiceModel(picks.ttsModel, streaming.tts, models),
   };
 }
 
@@ -158,7 +181,8 @@ export type VoiceModelChoice = {
   pick: string;
   /**
    * The model a conversation would be started with: the pick while it is on offer, else the
-   * automatic pick (the first model that streams); '' when none streams or none is known yet.
+   * automatic pick (the first loaded model that streams, else the first that streams); '' when
+   * none streams or none is known yet.
    */
   used: string;
   /** Choose a model ('' chooses automatic). Saved with the thread. */

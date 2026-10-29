@@ -1966,7 +1966,8 @@ paths:
       tags: [portal]
       summary: Voice Chat WebSocket (ticket-authenticated, same-origin; PCM and controls up, typed state, transcript, answer and audio frames down)
       description: >
-        Step two of the portal's Voice Chat (ADR-078, issue #312): a WebSocket upgrade
+        Step two of the portal's Voice Chat (ADR-078, issue #312; phase 2 ADR-079, phase 3
+        ADR-080, issue #315): a WebSocket upgrade
         whose ONLY credential is the single-use ticket minted by POST
         /api/portal/voice-chat-ticket, offered as a `Sec-WebSocket-Protocol` value
         (`new WebSocket(url, ['op-voice-chat', ticket])`) and never in the URL. The
@@ -1983,13 +1984,16 @@ paths:
         `{"type":"cancel"}`, `{"type":"playback_done"}` (with an optional integer
         `played_through`, the count of `audio_delta` frames the client has received for the
         turn; the server honors the signal as the end of audio only when it covers every
-        frame relayed, and an absent or null count is accepted as before) and
-        `{"type":"bye"}`; anything else is ignored. The gateway sends TEXT frames of JSON: `state` (`idle`,
+        frame relayed, and an absent or null count is accepted as before),
+        `{"type":"pause"}`, `{"type":"resume"}`, `{"type":"stop"}` (the playback controls,
+        below) and `{"type":"bye"}`; anything else is ignored. The gateway sends TEXT frames of JSON: `state` (`idle`,
         `listening`, `thinking`, `speaking` or `draining`), `asr_partial` (the CURRENT
         chunk's provisional text, replace), `asr_final` (one chunk's final text, append),
         `answer_delta` (append), `answer_done` (provisional, before the commit),
         `answer_reset` (the speculative run was cancelled because the user resumed),
-        `audio_delta` (`seq` from 0, `rate`, base64 s16le PCM), `audio_done` (the audio is
+        `audio_delta` (`seq` from 0, `rate`, base64 s16le PCM, and an optional integer
+        `section`, omitted when 0: the index of the spoken section the chunk belongs to, for
+        attributing the audio to its transcript block only), `audio_done` (the audio is
         complete and the turn is committed: reload the chat thread) and `error` (`code`
         is the failing core's stable code; the session stays open and returns to `idle`).
         No frame carries a message id. The handler is a server-side state machine that
@@ -2003,7 +2007,23 @@ paths:
         client's playback_done)) plus the mic-resume tail (the ceiling never cuts below
         the audio's own duration). `cancel` is the user's immediate stop: it abandons the
         turn and returns the session to `listening` from ANY state, including `speaking`
-        and `draining`, so a client stops its own playback before sending it. A user turn and its answer are
+        and `draining`, so a client stops its own playback before sending it. An answer may be
+        spoken in SEVERAL ordered sections (ADR-080): the model's `<speak>` regions are each
+        synthesized as they close, concurrently, but their audio is relayed in document order
+        over ONE stream (one `seq` across all sections; section k+1 is sent after section k),
+        so playing chunks in `seq` order plays the sections back to back, the drain's floor is
+        the sum of their durations and `played_through` counts across all of them. The
+        playback controls: `pause` freezes the playout drain (honored only while audio is
+        playing out, in `speaking` or in a `draining` whose wait has not ended; the mic stays
+        gated for as long as the pause lasts and the gateway sets no timeout of its own) and
+        `resume` shifts the drain's floor and ceiling forward by the paused interval, so the
+        mic can never reopen over paused audio. `stop` ("stop speaking") returns the session
+        to `listening` from `speaking` or `draining` only (it is ignored elsewhere): the rest
+        of the playout is dropped, the pending text is cleared and the only reply is a `state`
+        frame; whether the turn is stored is decided by the run's one commit/cancel
+        arbitration, so a run that has not yet committed (normally the case while `speaking`)
+        is cancelled and stores nothing, as for `cancel`, while a run that already won its
+        commit is left to finish it and stores every synthesized section. A user turn and its answer are
         persisted together, once, when the turn is committed; a speculative run that the
         user's resumed speech cancels persists nothing. The upgrade hijacks the connection,
         so the server's 30 s deadlines do not apply. See api-surface.md and

@@ -1068,7 +1068,12 @@ func partWAVs(t *testing.T, parts []speechAudioPart) [][]byte {
 func consumeTestSpeechStream(srv *Server, body io.Reader) (parts json.RawMessage, status, msg string, lifted int) {
 	run := newChatRun("run_consume", "chat_consume", "usr_consume", func() {})
 	resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(body)}
-	parts, status, msg = srv.consumeSpeechStream(context.Background(), run, resp, partsTestRate, time.Now(), func() { lifted++ }, true)
+	parts, status, msg = srv.consumeSpeechStream(context.Background(), run, resp, speechStreamRead{
+		sampleRate:   partsTestRate,
+		dispatchedAt: time.Now(),
+		liftDeadline: func() { lifted++ },
+		stampTTFT:    true,
+	})
 	return parts, status, msg, lifted
 }
 
