@@ -455,6 +455,18 @@ type speechStreamEvent struct {
 	Audio string `json:"audio"`
 }
 
+// speechStreamRead carries consumeSpeechStream's per-call reading inputs -- everything
+// beyond the context, the run, and the response: the sample rate, the dispatch instant and
+// the deadline lift that sit behind the TTFT, whether this leg stamps the TTFT, and the
+// optional per-chunk audio sink.
+type speechStreamRead struct {
+	sampleRate   int
+	dispatchedAt time.Time
+	liftDeadline func()
+	stampTTFT    bool
+	audioSink    func(runAudio)
+}
+
 // consumeSpeechStream reads the gateway's event stream of a streamed synthesis and returns
 // the turn's outcome, the triple generateSpeechTurn returns. It is
 // consumeTranscriptionStream's twin (see there for the shape of the reading): the first
@@ -478,16 +490,16 @@ type speechStreamEvent struct {
 // stops KEEPING audio at the cap but not READING it, so the listener hears the whole clip
 // and the call is billed as delivered. The parts are cut at speechPartBytes of the per-blob
 // cap (Server.maxChatBlobBytes) so that each passes the chat store's per-blob check alone.
-func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, sampleRate int, dispatchedAt time.Time, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) (json.RawMessage, string, string) {
+func (s *Server) consumeSpeechStream(ctx context.Context, run *ChatRun, resp *http.Response, r speechStreamRead) (json.RawMessage, string, string) {
 	audioCap, blobCap := s.chatAudioCaps()
 	parts, overCap, complete, readErr := readSpeechEvents(run, resp.Body, speechEventReaderConfig{
-		sampleRate:    sampleRate,
-		dispatchedAt:  dispatchedAt,
-		liftDeadline:  liftDeadline,
+		sampleRate:    r.sampleRate,
+		dispatchedAt:  r.dispatchedAt,
+		liftDeadline:  r.liftDeadline,
 		partBytes:     speechPartBytes(blobCap),
 		maxAudioBytes: audioCap,
-		stampTTFT:     stampTTFT,
-		audioSink:     audioSink,
+		stampTTFT:     r.stampTTFT,
+		audioSink:     r.audioSink,
 	})
 	if !complete {
 		// A deadline or a cancel lands here as a read error on the cancelled request, and

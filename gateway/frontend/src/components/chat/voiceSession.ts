@@ -720,10 +720,15 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
         // answer out means the pause is void: the answer was ended under it (the microphone is
         // open again), and what the player held must never play into that.
         if (paused && frame.state !== 'speaking' && frame.state !== 'draining') stopPlayback();
-        // The answer is only heard in these two states. In `draining` it is sent in full: what
-        // has already played out (all of it, during the run) leaves nothing more to hear.
-        if (frame.state !== 'speaking' && frame.state !== 'draining') endPlaying();
-        else if (frame.state === 'draining' && playedOut()) endPlaying();
+        // The answer is only heard in `speaking` and `draining`. Outside those two states there
+        // is nothing left to play; in `draining` it is sent in full, so once what played out
+        // covers it there is nothing more to hear either -- both cases end the playing window.
+        if (
+          (frame.state !== 'speaking' && frame.state !== 'draining') ||
+          (frame.state === 'draining' && playedOut())
+        ) {
+          endPlaying();
+        }
         setState(frame.state);
         break;
       case 'asr_partial':

@@ -240,7 +240,13 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	// comes. (Only a 2xx can be one; anything else, and a one-shot WAV, is read whole
 	// below.) This is the one branch that ACTUALLY streamed.
 	if streaming && resp.StatusCode >= 200 && resp.StatusCode <= 299 && isSpeechEventStream(resp.Header) {
-		parts, status, msg := s.consumeSpeechStream(ctx, run, resp, sampleRate, dispatchedAt, liftDeadline, stampTTFT, audioSink)
+		parts, status, msg := s.consumeSpeechStream(ctx, run, resp, speechStreamRead{
+			sampleRate:   sampleRate,
+			dispatchedAt: dispatchedAt,
+			liftDeadline: liftDeadline,
+			stampTTFT:    stampTTFT,
+			audioSink:    audioSink,
+		})
 		return parts, status, msg, true
 	}
 	parts, status, msg := s.bufferedSpeechTurn(ctx, run, resp)
