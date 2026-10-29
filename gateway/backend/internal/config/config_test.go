@@ -241,6 +241,51 @@ func TestLoadVoiceCoLoadTimeoutOverrides(t *testing.T) {
 	}
 }
 
+// The Voice Chat mute-teardown knob is the one voice timing where 0 is a real value
+// (keepalive: never tear the ASR loopback down while muted), so an absent variable (-> the
+// 10s default) must stay distinguishable from an explicit 0 (-> 0, kept as keepalive).
+func TestLoadVoiceMuteTeardownDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN", "")
+	if got := mustLoad(t).VoiceMuteTeardown; got != 10*time.Second {
+		t.Fatalf("voice mute teardown (absent) = %v, want the 10s default", got)
+	}
+}
+
+func TestLoadVoiceMuteTeardownOverrides(t *testing.T) {
+	cases := []struct {
+		value string
+		want  time.Duration
+	}{
+		{"30s", 30 * time.Second},
+		{"2m", 2 * time.Minute},
+		{"250ms", 250 * time.Millisecond},
+		{"0", 0},                      // explicit keepalive, NOT the default
+		{"0s", 0},                     // explicit keepalive, NOT the default
+		{"-5s", 10 * time.Second},     // negative -> default (not silently keepalive)
+		{"garbage", 10 * time.Second}, // invalid -> default
+		{"10", 10 * time.Second},      // a bare number has no unit -> invalid -> default
+	}
+	for _, tc := range cases {
+		t.Setenv("OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN", tc.value)
+		if got := mustLoad(t).VoiceMuteTeardown; got != tc.want {
+			t.Fatalf("value %q: got %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+// A JSON config file may carry the knob as a number; an explicit 0 there is keepalive too.
+func TestLoadVoiceMuteTeardownFromFile(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN", "")
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN":0}`)
+	if got := mustLoad(t).VoiceMuteTeardown; got != 0 {
+		t.Fatalf("file 0: got %v, want 0 (keepalive)", got)
+	}
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN":"45s"}`)
+	if got := mustLoad(t).VoiceMuteTeardown; got != 45*time.Second {
+		t.Fatalf("file 45s: got %v, want 45s", got)
+	}
+}
+
 func TestLoadAppHealthProbeTimeoutDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_APP_HEALTH_PROBE_TIMEOUT", "")
 	if cfg := mustLoad(t); cfg.AppHealthProbeTimeout != 3*time.Second {

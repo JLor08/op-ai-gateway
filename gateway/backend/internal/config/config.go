@@ -95,6 +95,14 @@ type Config struct {
 	VoiceMaxUtterance      time.Duration
 	VoiceMicResumeTail     time.Duration
 	VoiceContinuationGrace time.Duration
+	// VoiceMuteTeardown (OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN, a Go duration string) is how long
+	// a muted mic holds the Voice Chat ASR loopback open before the gateway tears it down.
+	// Unlike the timings above, an explicit 0 is a real value and is KEPT as 0: it means
+	// keepalive (never tear down while muted). Only an absent, empty, junk or negative value
+	// falls back to the default (10s, the literal of gateway.VoiceMuteTeardownMs), so an absent
+	// variable stays distinguishable from a deliberate 0 -- cmd/gateway maps 0 onto
+	// gateway.VoiceTiming.MuteKeepalive.
+	VoiceMuteTeardown time.Duration
 	// CertEdgeProbeTarget is the host:port of the gateway's OWN edge (nginx)
 	// TLS listener the synthetic self-probe dials (e.g. "web:443" in compose,
 	// the Service name+port nginx's :443 server block is reachable at in
@@ -309,6 +317,9 @@ func Load() (Config, error) {
 		VoiceMaxUtterance:      l.duration("OP_AI_GATEWAY_VOICE_MAX_UTTERANCE", 30*time.Second),
 		VoiceMicResumeTail:     l.duration("OP_AI_GATEWAY_VOICE_MIC_RESUME_TAIL", 300*time.Millisecond),
 		VoiceContinuationGrace: l.duration("OP_AI_GATEWAY_VOICE_CONTINUATION_GRACE", 1500*time.Millisecond),
+		// The mute teardown is the exception to "0 -> the default" above: an explicit 0 is
+		// keepalive and must survive, so it is parsed with durationAllowZero.
+		VoiceMuteTeardown: l.durationAllowZero("OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN", 10*time.Second),
 		// Retention window (hours) for persisted rich telemetry samples; the
 		// prune loop drops samples older than this. Default 168 = 7 days; junk
 		// or <= 0 falls back to the default via integer().
@@ -488,6 +499,23 @@ func (l loader) duration(key string, fallback time.Duration) time.Duration {
 	}
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+// durationAllowZero is like duration but keeps an explicit 0 as a valid value instead of
+// replacing it with the fallback, for a knob where 0 has its own meaning (the Voice Chat mute
+// teardown's keepalive): empty, unparseable or negative -> fallback; 0 or a positive duration
+// -> passthrough. Unlike streamIdleTimeout a negative value is junk (fallback), not "off", so
+// a typo cannot silently disable a teardown that frees GPU-side resources.
+func (l loader) durationAllowZero(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(l.getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < 0 {
 		return fallback
 	}
 	return parsed

@@ -320,6 +320,59 @@ func TestResolveVoiceTimingDefaults(t *testing.T) {
 	}
 }
 
+// TestResolveVoiceTimingMuteTeardown pins the one knob whose zero is NOT "use the default":
+// the mute teardown. Unset resolves to the 10s default, an explicit MuteKeepalive means
+// "never tear down while muted" (the operator's 0), and a positive duration is taken as
+// given. The keepalive flag must survive resolution -- folding it into the default is the
+// bug this guards.
+func TestResolveVoiceTimingMuteTeardown(t *testing.T) {
+	const wantDefault = VoiceMuteTeardownMs * time.Millisecond
+	if wantDefault != 10*time.Second {
+		t.Fatalf("VoiceMuteTeardownMs default = %v, want 10s", wantDefault)
+	}
+	cases := []struct {
+		name          string
+		in            VoiceTiming
+		wantTeardown  time.Duration
+		wantKeepalive bool
+	}{
+		{"unset resolves to the default", VoiceTiming{}, wantDefault, false},
+		{"negative duration is junk and uses the default", VoiceTiming{MuteTeardown: -time.Second}, wantDefault, false},
+		{"positive duration is taken as given", VoiceTiming{MuteTeardown: 3 * time.Second}, 3 * time.Second, false},
+		{"keepalive is preserved, not folded into the default", VoiceTiming{MuteKeepalive: true}, wantDefault, true},
+		{"keepalive wins over a duration", VoiceTiming{MuteTeardown: 3 * time.Second, MuteKeepalive: true}, 3 * time.Second, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveVoiceTiming(tc.in)
+			if got.muteTeardown != tc.wantTeardown || got.muteKeepalive != tc.wantKeepalive {
+				t.Fatalf("resolveVoiceTiming(%+v) = {muteTeardown:%v muteKeepalive:%v}, want {%v %v}",
+					tc.in, got.muteTeardown, got.muteKeepalive, tc.wantTeardown, tc.wantKeepalive)
+			}
+			// The accessor Task 2 reads must agree with the resolved fields.
+			after, keepalive := got.muteTeardownAfter()
+			if keepalive != tc.wantKeepalive || (!keepalive && after != tc.wantTeardown) {
+				t.Fatalf("muteTeardownAfter() = (%v, %v), want (%v, %v)", after, keepalive, tc.wantTeardown, tc.wantKeepalive)
+			}
+		})
+	}
+}
+
+// TestVoiceTimingMuteTeardownAfterUnresolved: a hand-built voiceTiming (a test fixture, or the
+// bare &Server{}) that never went through resolveVoiceTiming has no teardown set; the
+// accessor reads that as the default rather than as "tear down immediately".
+func TestVoiceTimingMuteTeardownAfterUnresolved(t *testing.T) {
+	after, keepalive := fastVoiceTiming().muteTeardownAfter()
+	if keepalive || after != VoiceMuteTeardownMs*time.Millisecond {
+		t.Fatalf("unresolved muteTeardownAfter() = (%v, %v), want (%dms, false)", after, keepalive, VoiceMuteTeardownMs)
+	}
+	set := fastVoiceTiming()
+	set.muteTeardown = 40 * time.Millisecond
+	if after, keepalive := set.muteTeardownAfter(); keepalive || after != 40*time.Millisecond {
+		t.Fatalf("explicit muteTeardownAfter() = (%v, %v), want (40ms, false)", after, keepalive)
+	}
+}
+
 // TestVoiceChunkEndsOnSilence: after a voiced utterance, no new partial for the silence
 // timeout ends the chunk -- the gateway closes the per-turn pipe, the ASR returns the clean
 // final, and the machine emits asr_final.

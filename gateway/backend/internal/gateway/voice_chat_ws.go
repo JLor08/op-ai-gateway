@@ -104,12 +104,17 @@ const (
 //   - VoiceContinuationGraceMs: the speculative-run grace window before a turn commits.
 //     It is the continuation window (the mic stays open and the TTS audio is held until
 //     it closes), which the state machine's beginAnswer arms on each chunk end.
+//   - VoiceMuteTeardownMs: how long a muted mic holds the ASR loopback open before the
+//     gateway tears it down (freeing its admission, route slot and model pin). Unlike the
+//     others, an explicit 0 from the operator is NOT "use the default": it means keepalive
+//     (never tear down while muted), carried as VoiceTiming.MuteKeepalive.
 const (
 	VoiceSilenceTimeoutMs    = 900
 	VoiceMinUtteranceMs      = 300
 	VoiceMaxUtteranceMs      = 30000
 	VoiceMicResumeTailMs     = 300
 	VoiceContinuationGraceMs = 1500
+	VoiceMuteTeardownMs      = 10000
 )
 
 // VoicePlaybackFallbackMs is the drain's ABSOLUTE upper bound (spec 6.2): the most the session
@@ -124,12 +129,21 @@ const VoicePlaybackFallbackMs = 30000
 // VoiceTiming is the operator-tunable turn-detection and half-duplex timing of a Voice
 // Chat session (set from config via ServerDeps; the OP_AI_GATEWAY_VOICE_* knobs). A zero
 // field defaults in New to its Voice*Ms default, so a bare ServerDeps gets the defaults.
+//
+// The mute teardown is the one knob where the operator's 0 is a real value, so it cannot
+// ride the "zero means default" rule of the others: MuteTeardown <= 0 still means the
+// default (a bare ServerDeps tears down after VoiceMuteTeardownMs), and the operator's
+// explicit 0 -- keepalive, never tear the ASR loopback down while the mic is muted -- is
+// the separate MuteKeepalive flag, which the config layer sets only for a variable that is
+// present and 0 (an absent variable leaves it false and so gets the default).
 type VoiceTiming struct {
 	SilenceTimeout    time.Duration
 	MinUtterance      time.Duration
 	MaxUtterance      time.Duration
 	MicResumeTail     time.Duration
 	ContinuationGrace time.Duration
+	MuteTeardown      time.Duration
+	MuteKeepalive     bool
 }
 
 // voiceTiming is the resolved (defaults-filled) timing the state machine reads. It is the
@@ -137,6 +151,11 @@ type VoiceTiming struct {
 // drain's absolute upper bound (the VoicePlaybackFallbackMs const); it is deliberately NOT in
 // the exported VoiceTiming -- it is not an operator knob, only an internal default and a test
 // seam -- and a machine reads it through playbackCapOrDefault, so a zero value means the const.
+//
+// muteTeardown and muteKeepalive are the resolved mute-teardown knob (see VoiceTiming): after a
+// muted mic has held muteTeardown the loopback is torn down, unless muteKeepalive says to hold
+// it indefinitely. Read them through muteTeardownAfter, which gives the pair one meaning even
+// for a hand-built timing that never went through resolveVoiceTiming.
 type voiceTiming struct {
 	silenceTimeout    time.Duration
 	minUtterance      time.Duration
@@ -144,6 +163,8 @@ type voiceTiming struct {
 	micResumeTail     time.Duration
 	continuationGrace time.Duration
 	playbackCap       time.Duration
+	muteTeardown      time.Duration
+	muteKeepalive     bool
 }
 
 // defaultVoiceTiming is the built-in timing (the Voice*Ms defaults).
@@ -155,11 +176,29 @@ func defaultVoiceTiming() voiceTiming {
 		micResumeTail:     VoiceMicResumeTailMs * time.Millisecond,
 		continuationGrace: VoiceContinuationGraceMs * time.Millisecond,
 		playbackCap:       VoicePlaybackFallbackMs * time.Millisecond,
+		muteTeardown:      VoiceMuteTeardownMs * time.Millisecond,
 	}
 }
 
+// muteTeardownAfter says what a muted mic does to the ASR loopback: keepalive true means hold
+// it open indefinitely (the operator's explicit 0); otherwise tear it down once the mic has
+// been muted for the returned duration. A teardown that was never set (a bare/test timing that
+// skipped resolveVoiceTiming) reads as the default, not as "tear down at once", the way
+// playbackCapOrDefault reads an unset playback cap.
+func (t voiceTiming) muteTeardownAfter() (after time.Duration, keepalive bool) {
+	if t.muteKeepalive {
+		return t.muteTeardown, true
+	}
+	if t.muteTeardown > 0 {
+		return t.muteTeardown, false
+	}
+	return VoiceMuteTeardownMs * time.Millisecond, false
+}
+
 // resolveVoiceTiming fills each non-positive field of d with its Voice*Ms default. New
-// calls it once so the Server holds a fully-resolved timing.
+// calls it once so the Server holds a fully-resolved timing. The mute teardown follows the
+// same rule for its duration but carries MuteKeepalive through untouched: folding the
+// operator's explicit 0 into the default would silently turn "never tear down" into 10s.
 func resolveVoiceTiming(d VoiceTiming) voiceTiming {
 	out := defaultVoiceTiming()
 	if d.SilenceTimeout > 0 {
@@ -177,6 +216,10 @@ func resolveVoiceTiming(d VoiceTiming) voiceTiming {
 	if d.ContinuationGrace > 0 {
 		out.continuationGrace = d.ContinuationGrace
 	}
+	if d.MuteTeardown > 0 {
+		out.muteTeardown = d.MuteTeardown
+	}
+	out.muteKeepalive = d.MuteKeepalive
 	return out
 }
 
