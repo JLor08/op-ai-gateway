@@ -867,6 +867,98 @@ describe('VoiceChatControl system prompt field', () => {
   });
 });
 
+// The system prompt section is collapsed by default, which would hide that the prompt is not the
+// built-in one any more (#326): its toggle carries a small "edited" marker while the section is shut
+// and the prompt is the thread's own. "Its own" is decided as the store decides what to persist
+// (voiceChatSetting): the trimmed prompt, and a blank one is the built-in prompt again.
+describe.each(['en', 'de'] as const satisfies readonly Locale[])(
+  'VoiceChatControl customised prompt marker (%s)',
+  (locale) => {
+    const lt = messages[locale];
+    const toggle = () => screen.getByRole('button', { name: lt.chatVoiceSystemPrompt });
+    const marker = () => screen.queryByText(lt.chatVoiceSystemPromptEdited);
+    const controlWith = (value: string) => (
+      <VoiceChatControl
+        t={lt}
+        voice={makeVoice()}
+        capable
+        gap={null}
+        models={makeModels({ systemPrompt: makePromptChoice(value) })}
+      />
+    );
+    const renderPrompt = (value: string) => render(controlWith(value));
+
+    it('says the prompt is edited on the collapsed toggle, without expanding it', () => {
+      renderPrompt('Be terse.');
+
+      expect(toggle()).toHaveAttribute('aria-expanded', 'false');
+      expect(marker()).toBeInTheDocument();
+      // The marker is the toggle's own: it is inside the button, and the button is described by
+      // it, so a screen reader says it too -- without it becoming part of the button's name.
+      expect(toggle()).toContainElement(marker());
+      expect(toggle()).toHaveAccessibleDescription(lt.chatVoiceSystemPromptEdited);
+      expect(toggle()).toHaveAccessibleName(lt.chatVoiceSystemPrompt);
+    });
+
+    it('shows no marker for the built-in prompt', () => {
+      renderPrompt(DEFAULT_VOICE_SYSTEM_PROMPT);
+
+      expect(marker()).not.toBeInTheDocument();
+      expect(toggle()).not.toHaveAccessibleDescription();
+    });
+
+    it('shows no marker for the built-in prompt that differs only by surrounding whitespace', () => {
+      renderPrompt(`\n  ${DEFAULT_VOICE_SYSTEM_PROMPT} \n`);
+
+      expect(marker()).not.toBeInTheDocument();
+    });
+
+    // The store persists no prompt for a blank field and the backend runs the built-in one, as the
+    // field's own hint says ("leave empty to use the default"): nothing is customised.
+    it.each(['', '   \n\t '])('shows no marker for a blank prompt (%j)', (blank) => {
+      renderPrompt(blank);
+
+      expect(marker()).not.toBeInTheDocument();
+    });
+
+    it('follows the prompt: it appears on an edit and goes when the built-in prompt is back', () => {
+      const view = renderPrompt(DEFAULT_VOICE_SYSTEM_PROMPT);
+      expect(marker()).not.toBeInTheDocument();
+
+      view.rerender(controlWith('Be terse.'));
+      expect(marker()).toBeInTheDocument();
+
+      view.rerender(controlWith(DEFAULT_VOICE_SYSTEM_PROMPT));
+      expect(marker()).not.toBeInTheDocument();
+    });
+
+    // Expanded, the field itself is on screen: the marker is only for the shut section, and it
+    // must not appear and disappear under the user's cursor while they type.
+    it('is only for the collapsed section: it goes while the section is open', () => {
+      renderPrompt('Be terse.');
+      expect(marker()).toBeInTheDocument();
+
+      fireEvent.click(toggle());
+      expect(toggle()).toHaveAttribute('aria-expanded', 'true');
+      expect(marker()).not.toBeInTheDocument();
+      expect(toggle()).not.toHaveAccessibleDescription();
+
+      fireEvent.click(toggle());
+      expect(marker()).toBeInTheDocument();
+    });
+
+    it('marks an edited prompt while a conversation is on, too: the toggle stays readable', () => {
+      renderControl(makeVoice({ state: 'listening' }), {
+        t: lt,
+        models: makeModels({ systemPrompt: makePromptChoice('Be terse.') }),
+      });
+
+      expect(marker()).toBeInTheDocument();
+      expect(toggle()).toBeEnabled();
+    });
+  },
+);
+
 // The controls of the answer being spoken, and the mute of the user's own microphone (#315). Every
 // label is read from the locale under test, so a control missing its words in either one fails.
 describe.each(['en', 'de'] as const satisfies readonly Locale[])(

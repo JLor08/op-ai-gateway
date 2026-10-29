@@ -130,6 +130,16 @@ function takesPushToTalk(state: VoiceChatState, micMuted: boolean): boolean {
 // of the conversation.
 const SYSTEM_PROMPT_MAX_LENGTH = 4000;
 
+// Whether the field holds a prompt of the thread's own, not the built-in one: what the store writes
+// into the thread (voiceChatSetting) -- the TRIMMED prompt, when it is not blank and not the
+// built-in prompt. A blank field is the built-in prompt (the backend applies it, and the hint says
+// "leave empty to use the default"), and a built-in prompt with whitespace around it is that
+// prompt too; neither is customised.
+function isCustomisedPrompt(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed !== '' && trimmed !== DEFAULT_VOICE_SYSTEM_PROMPT;
+}
+
 // The states in which an answer is being prepared or spoken, which Stop abandons.
 function hasAnswerInFlight(state: VoiceChatState): boolean {
   return state === 'thinking' || state === 'speaking' || state === 'draining';
@@ -533,7 +543,11 @@ function VoiceModelPickers({
 // indicator that matter while talking. The same toggle as the speech thread's "Advanced" toggles
 // (Chat.tsx): a text button with `aria-expanded`, the content not mounted while it is shut. The
 // heading stays usable while a conversation is on -- the field under it is what is closed then, so
-// a run keeps the prompt it began with, but it may still be read.
+// a run keeps the prompt it began with, but it may still be read. While the section is shut and the
+// prompt is the thread's own (isCustomisedPrompt), the heading carries a small "edited" marker
+// (#326): the edit would otherwise be invisible. It is decorative (aria-hidden, so it does not
+// change the toggle's name) and the toggle is DESCRIBED by it, so a screen reader says it too; open,
+// the field is on screen and the marker is gone, so it does not come and go while the user types.
 function VoicePromptSection({
   prompt,
   locked,
@@ -541,6 +555,8 @@ function VoicePromptSection({
 }: Readonly<{ prompt: VoicePromptChoice; locked: boolean; t: Translation }>) {
   const [open, setOpen] = useState(false);
   const regionId = useId();
+  const editedId = useId();
+  const showEdited = !open && isCustomisedPrompt(prompt.value);
   return (
     <Box sx={{ display: 'grid', gap: 0.75 }}>
       <Button
@@ -548,10 +564,32 @@ function VoicePromptSection({
         size="small"
         aria-expanded={open}
         aria-controls={open ? regionId : undefined}
+        aria-describedby={showEdited ? editedId : undefined}
         onClick={() => setOpen((wasOpen) => !wasOpen)}
         sx={{ justifySelf: 'start' }}
       >
         {t.chatVoiceSystemPrompt}
+        {showEdited && (
+          <Box
+            component="span"
+            id={editedId}
+            aria-hidden
+            sx={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 0.5,
+              ml: 1,
+              color: 'text.secondary',
+              fontSize: 'caption.fontSize',
+            }}
+          >
+            <Box
+              component="span"
+              sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: 'warning.main' }}
+            />
+            {t.chatVoiceSystemPromptEdited}
+          </Box>
+        )}
       </Button>
       {open && (
         <Box id={regionId} sx={{ display: 'grid', gap: 0.75 }}>
