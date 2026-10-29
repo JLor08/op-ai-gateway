@@ -9945,7 +9945,7 @@ phase-2 default prompt's wording. Each is marked where it appears.
   [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **A voice run's stored `ttftMs` is now the text leg's time to its first LLM token.** In phase 1 the ordered LLM-then-TTS
   sequence made it effectively the audio's first-chunk time; a standalone speech run is unchanged.
-- **The TTS row meters the summary, not the answer,** when the answer carries a region (since phase 3 one row per section), and the leg can start (and, when a
+- **The TTS row meters the summary, not the answer,** when the answer carries a region (since phase 3 one row per section; since issue #337 a retried section can add zero-quantity error rows for its failed attempts, [ADR-080](#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt)), and the leg can start (and, when a
   resume cancels the run, be cut) while the LLM is still streaming; the rows are otherwise those of phase 1
   ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
 - **Per-answer language is best-effort and the summary rides a model-emitted tag.** A speech model that takes no `language`
@@ -10164,8 +10164,9 @@ flag).
   one), the LLM and ASR rows being as before ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
   *Amended by issue #337:* a section whose first attempt was refused or failed and then retried can write **more than one**:
   each failed attempt the speech endpoint answered is recorded like any refused or failed speech call (an error row with
-  quantity 0), and only the attempt that streams carries a billed quantity. A failed loopback dial never reaches the
-  endpoint and writes none.
+  quantity 0), and only the attempt that streams carries a billed quantity. Two refusals write none: a failed loopback dial
+  never reaches the endpoint, and a principal rate-limit `429` (`limit.*`, from `admitPrincipal`) is never recorded as a
+  usage event, although the leg retries it like any `429`.
 - **"Stop speaking" is a cancel until the turn commits.** In `speaking` the run is, apart from one store write, still
   uncommitted, so a stop there discards the user's utterance and the answer (the portal voids the preview and reloads the
   thread); only a stop in `draining` leaves the stored turn. A stop that loses the race to the commit write stores the turn
