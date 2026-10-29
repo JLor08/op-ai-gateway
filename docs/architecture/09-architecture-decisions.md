@@ -10071,7 +10071,7 @@ flag).
   (queued behind the concurrency cap, waiting for its first chunk, backing off to retry) and between two legs (the next
   section has not been launched, or has not streamed yet). The cadence timer restarts on every real chunk and every
   hand-over to the next leg, and real audio already waiting is delivered before a timer that fired, so silence never lands
-  between chunks that arrive steadily, and the relay never ends on a trailing frame. **It reuses `audio_delta`:** a silence
+  between chunks that arrive steadily, and the relay publishes no silence once it has observed the feed closed. **It reuses `audio_delta`:** a silence
   frame is an ordinary frame (zeroed PCM as base64, `rate`, the one `seq`, and a `section` tag: the awaited leg's own section
   before any audio has been relayed, the section of the audio last relayed once there is some and between legs), so there is
   **no new wire frame and no portal change**: the client plays zeros inaudibly and its playing-gap
