@@ -14,8 +14,10 @@
 //     after, by the store);
 //   - the automatic pick is held steady once made (`stickyAutoVoiceModel`, per leg and per chat by
 //     `stickyVoiceLegsOf`, #326): it moves only when the model stops streaming, not as models are
-//     loaded and unloaded, so a voice chosen for it stays with it; and a saved voice is reconciled
-//     with the model that would speak (`reconcileVoice`) when that model is another one;
+//     loaded and unloaded, so a voice chosen for it stays with it, and a thread reopens on the model
+//     its voice was chosen for while that streams; a saved voice is reconciled with the model that
+//     would speak (`reconcileVoice`) when that model is another one -- in memory, as what is
+//     spoken, never as what is saved;
 //   - the user's pick wins while it is one of them, and otherwise the automatic pick does -- a
 //     pick that is gone (the model left the catalogue, is unreachable, or no longer streams) is
 //     a graceful fallback, never a stuck conversation (`effectiveVoiceModel`);
@@ -177,33 +179,51 @@ export function reconcileVoice({
  * now ('' for none yet), and the `held` that is returned is what to hold from now on -- the model the
  * leg uses when it is automatic (a pick that is gone is automatic too, and holds), and '' for a leg
  * that is under the user's own pick, which holds none: when the user returns it to automatic it is
- * picked afresh (the loaded model, else the first), which is also what `withTtsModel` takes the
- * automatic choice to resolve to.
+ * picked afresh, which is also what `withTtsModel` takes the automatic choice to resolve to.
+ *
+ * A pick made afresh (nothing held, or what was held no longer streams) starts, for the speech leg,
+ * from the model the saved voice was chosen for (`picks.voiceModel`, with a `picks.voice` to speak
+ * in) when that model streams: a thread then reopens on the model its voice belongs to, whatever
+ * happens to be loaded just now, and the voice is kept. Only without such a model (no voice, none
+ * attributed, or it no longer streams) is it the first loaded model that streams, else the first
+ * that streams. The transcription leg has no such model and is picked as before.
  */
 export function stickyVoiceLegsOf(
   streaming: VoiceStreaming | null,
-  picks: Pick<VoiceChatSettings, 'asrModel' | 'ttsModel'>,
+  picks: Pick<VoiceChatSettings, 'asrModel' | 'ttsModel'> &
+    Partial<Pick<VoiceChatSettings, 'voice' | 'voiceModel'>>,
   models: readonly ModelOption[],
   held: VoiceLegs,
 ): { legs: VoiceLegs; held: VoiceLegs } | null {
   if (streaming === null) return null;
-  const asr = stickyLeg(picks.asrModel, streaming.asr, held.asr, models);
-  const tts = stickyLeg(picks.ttsModel, streaming.tts, held.tts, models);
+  const voiceHasModel = (picks.voice ?? '').trim() !== '';
+  const asr = stickyLeg(picks.asrModel, streaming.asr, held.asr, models, '');
+  const tts = stickyLeg(
+    picks.ttsModel,
+    streaming.tts,
+    held.tts,
+    models,
+    voiceHasModel ? (picks.voiceModel ?? '') : '',
+  );
   return {
     legs: { asr: asr.used, tts: tts.used },
     held: { asr: asr.held, tts: tts.held },
   };
 }
 
-// One leg of stickyVoiceLegsOf: the model it uses and the automatic pick it holds.
+// One leg of stickyVoiceLegsOf: the model it uses and the automatic pick it holds. `preferred` is
+// the model a fresh automatic pick starts from when it streams ('' for none): after the held one,
+// which stays while it streams.
 function stickyLeg(
   pick: string,
   streaming: readonly string[],
   held: string,
   models: readonly ModelOption[],
+  preferred: string,
 ): { used: string; held: string } {
   if (pick !== '' && streaming.includes(pick)) return { used: pick, held: '' };
-  const automatic = stickyAutoVoiceModel(held, streaming, models);
+  const start = [held, preferred].find((id) => id !== '' && streaming.includes(id)) ?? '';
+  const automatic = stickyAutoVoiceModel(start, streaming, models);
   return { used: automatic, held: automatic };
 }
 

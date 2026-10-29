@@ -1010,13 +1010,15 @@ export function ChatStoreProvider({
   }, [chatModels]);
   // The conversation's two legs: the thread's pick of each, or -- for a leg with no pick, or a
   // pick that is no longer one of the models that stream -- the automatic pick, null until the
-  // gateway has said which stream (voiceModels.ts). The automatic pick is made once, as the first
-  // model that streams and is loaded, else the first that streams: the catalogue is what says which
-  // are loaded, the same flag the pickers' green dot shows, so the dot and the pick agree when it
-  // is made. After that it is HELD (#326): a model that merely becomes loaded in the background
-  // does not take it over (a voice is chosen for the model that speaks), only its leaving the
-  // models that stream moves it. It is held for the open chat only -- another chat, even one that
-  // was open before, starts from a fresh pick -- and a leg under the user's own pick holds none.
+  // gateway has said which stream (voiceModels.ts). The automatic pick is made once: for the speech
+  // leg the model the thread's saved voice was chosen for, when it still streams (a thread reopens
+  // on the model of its voice); else the first model that streams and is loaded, else the first
+  // that streams: the catalogue is what says which are loaded, the same flag the pickers' green dot
+  // shows, so the dot and the pick agree when it is made. After that it is HELD (#326): a model
+  // that merely becomes loaded in the background does not take it over (a voice is chosen for the
+  // model that speaks), only its leaving the models that stream moves it. It is held for the open
+  // chat only -- another chat, even one that was open before, starts afresh -- and a leg under the
+  // user's own pick holds none.
   // Held state, set while rendering (the documented way to derive state from a change of props):
   // it is only ever the pick the leg would resolve to, so it is written when that changes.
   const [voiceHeld, setVoiceHeld] = useState<{ chatId: string | null; legs: VoiceLegs }>({
@@ -2406,10 +2408,14 @@ export function ChatStoreProvider({
   const voiceTtsVoices = voiceTtsList.status === 'ready' ? voiceTtsList.voices : NO_VOICES;
   // The saved voice, reconciled with the model that speaks (#326). A voice is one that the model it
   // was chosen for (`voiceSettings.voiceModel`) offered; when ANOTHER model speaks -- the model it
-  // was chosen for left the models that stream, or the thread predates the attribution -- the voice
-  // is kept if the model that speaks lists it and dropped if not, and judged only once the list is
-  // known (reconcileVoice). The result is used from this render on, so what a conversation is
-  // started with and what the field shows never lag behind it, and is written to the settings below.
+  // was chosen for no longer streams, or the thread predates the attribution -- the voice is kept if
+  // the model that speaks lists it and not used if not, and judged only once the list is known
+  // (reconcileVoice). This decides what is SPOKEN, in memory, from this render on (what a
+  // conversation is started with and what the field shows) and nothing else: the saved voice and
+  // its attribution are the user's, written only by their own pick of a voice or a speech model
+  // (setVoiceVoice, setVoiceTtsModel). Opening a thread therefore never saves it, never reorders the
+  // list, and never destroys a voice whose model is merely not the one speaking this time; it is
+  // there again when that model is (the automatic pick starts from it, see stickyVoiceLegsOf).
   const voiceReconciled = reconcileVoice({
     voice: voiceSettings.voice,
     voiceModel: voiceSettings.voiceModel,
@@ -2421,27 +2427,6 @@ export function ChatStoreProvider({
     voiceTtsVoices,
     presetCloneOffered(chatModels.find((option) => option.id === voiceTtsModel)),
   );
-  // Written to the settings when there is a change. Keyed on what it is made of -- the voice and
-  // model it starts from and the ones it goes to -- not on the result or the list it came from,
-  // neither of which is the same object from one render to the next. It starts from the settings of
-  // THIS render and applies only to those: a voice or model chosen in between is the user's, and so
-  // are the settings of another chat that was opened in between (activateChat moves the ref ahead
-  // of the render); the next render reconciles them afresh. It ends itself: once written, the voice
-  // is attributed to the model that speaks (or gone), which reconcileVoice has nothing to say about.
-  const savedVoice = voiceSettings.voice;
-  const savedVoiceModel = voiceSettings.voiceModel;
-  const reconciledVoice = voiceReconciled?.voice;
-  const reconciledVoiceModel = voiceReconciled?.voiceModel;
-  useEffect(() => {
-    if (reconciledVoice === undefined || reconciledVoiceModel === undefined) return;
-    if (activeChatIdRef.current !== activeChatId) return;
-    setVoiceSettings((current) =>
-      current.voice === savedVoice && current.voiceModel === savedVoiceModel
-        ? { ...current, voice: reconciledVoice, voiceModel: reconciledVoiceModel }
-        : current,
-    );
-  }, [activeChatId, savedVoice, savedVoiceModel, reconciledVoice, reconciledVoiceModel]);
-
   const voiceChat = useVoiceChat({
     apiRef,
     activeChatId,

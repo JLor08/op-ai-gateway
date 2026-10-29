@@ -312,6 +312,65 @@ describe('stickyVoiceLegsOf', () => {
       });
     });
 
+    // A pick made afresh starts, for the speech leg, from the model the saved voice was chosen for.
+    describe('with a saved voice that was chosen for a model', () => {
+      const withVoice = { asrModel: '', ttsModel: '', voice: 'marius', voiceModel: 'tts-a' };
+
+      it('starts the speech leg from that model when it streams, though another is loaded', () => {
+        expect(stickyVoiceLegsOf(streaming, withVoice, models, NOTHING_HELD)).toEqual({
+          // The transcription leg has no such model: prefer-loaded, as before.
+          legs: { asr: 'asr-b', tts: 'tts-a' },
+          held: { asr: 'asr-b', tts: 'tts-a' },
+        });
+      });
+
+      it('falls back to the fresh pick when that model no longer streams', () => {
+        const now: VoiceStreaming = { asr: ['asr-a', 'asr-b'], tts: ['tts-b', 'tts-clone'] };
+        expect(stickyVoiceLegsOf(now, withVoice, models, NOTHING_HELD)?.legs.tts).toBe('tts-clone');
+      });
+
+      it('ignores the model of a voice that is not there (no voice, or only blanks)', () => {
+        expect(
+          stickyVoiceLegsOf(streaming, { ...withVoice, voice: '' }, models, NOTHING_HELD)?.legs.tts,
+        ).toBe('tts-clone');
+        expect(
+          stickyVoiceLegsOf(streaming, { ...withVoice, voice: '  ' }, models, NOTHING_HELD)?.legs
+            .tts,
+        ).toBe('tts-clone');
+      });
+
+      it('ignores a voice that has no model recorded', () => {
+        expect(
+          stickyVoiceLegsOf(streaming, { ...withVoice, voiceModel: '' }, models, NOTHING_HELD)?.legs
+            .tts,
+        ).toBe('tts-clone');
+      });
+
+      it('keeps what is held while it streams: the voice does not move a pick that was made', () => {
+        expect(
+          stickyVoiceLegsOf(streaming, withVoice, models, { asr: '', tts: 'tts-clone' })?.legs.tts,
+        ).toBe('tts-clone');
+      });
+
+      it('goes back to that model when what was held stops streaming', () => {
+        const now: VoiceStreaming = { asr: ['asr-a', 'asr-b'], tts: ['tts-a', 'tts-clone'] };
+        expect(
+          stickyVoiceLegsOf(now, withVoice, models, { asr: '', tts: 'tts-gone' })?.legs.tts,
+        ).toBe('tts-a');
+      });
+
+      it("yields to the user's own pick of the speech model", () => {
+        expect(
+          stickyVoiceLegsOf(
+            streaming,
+            { ...withVoice, ttsModel: 'tts-clone' },
+            models,
+            NOTHING_HELD,
+          ),
+        ).toMatchObject({ legs: { tts: 'tts-clone' }, held: { tts: '' } });
+      });
+    });
+
     it('is null while the gateway has not said which models stream', () => {
       expect(stickyVoiceLegsOf(null, picks, models, { asr: 'asr-a', tts: 'tts-a' })).toBeNull();
     });
