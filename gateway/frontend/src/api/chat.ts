@@ -143,6 +143,10 @@ export type ChatVoiceChatSettings = {
   asr_model?: string;
   tts_model?: string;
   voice?: string;
+  // The speech model the saved `voice` was chosen for (#326): the portal's reference for
+  // reconciling the voice against the model in use after a reload. Written only beside a `voice`
+  // and, like the rest of this object, never read or validated by the backend.
+  voice_model?: string;
   system_prompt?: string;
 };
 

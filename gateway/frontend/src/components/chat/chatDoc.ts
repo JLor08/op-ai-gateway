@@ -995,11 +995,16 @@ export const DEFAULT_VOICE_SYSTEM_PROMPT =
 // models the gateway says stream, and falls back to the automatic one when it is gone), so a pick
 // that is gone for a while is kept, not erased. The prompt is different in kind: it is never
 // "unset" in the state but pre-filled with DEFAULT_VOICE_SYSTEM_PROMPT (what the field shows), and
-// is written only when it differs from that.
+// is written only when it differs from that. `voiceModel` is the attribution of the voice, not a
+// pick of its own: the speech model the saved `voice` was chosen for (#326), kept beside it so the
+// reconciliation of a voice against the model in use has a reference across reloads -- a voice is
+// a name one model offers, and the model it was chosen for says whether a later change of model
+// makes it stale. "" is "not recorded" (and is always the case when there is no voice).
 export type VoiceChatSettings = {
   asrModel: string;
   ttsModel: string;
   voice: string;
+  voiceModel: string;
   systemPrompt: string;
 };
 
@@ -1007,6 +1012,7 @@ export const DEFAULT_VOICE_CHAT_SETTINGS: VoiceChatSettings = {
   asrModel: '',
   ttsModel: '',
   voice: '',
+  voiceModel: '',
   systemPrompt: DEFAULT_VOICE_SYSTEM_PROMPT,
 };
 
@@ -1040,6 +1046,10 @@ export function voiceChatSetting(
   if (tts) voiceChat.tts_model = tts;
   const voice = s.voice.trim();
   if (voice) voiceChat.voice = voice;
+  // The voice's model attribution means something only next to a voice: a model with no voice
+  // (or a voice that was never attributed) writes no `voice_model`.
+  const voiceModel = s.voiceModel.trim();
+  if (voice && voiceModel) voiceChat.voice_model = voiceModel;
   const systemPrompt = s.systemPrompt.trim();
   if (systemPrompt && systemPrompt !== DEFAULT_VOICE_SYSTEM_PROMPT) {
     voiceChat.system_prompt = systemPrompt;
@@ -1059,6 +1069,8 @@ export function voiceChatSettingsFrom(
     asrModel: typeof s.asr_model === 'string' ? s.asr_model : DEFAULT_VOICE_CHAT_SETTINGS.asrModel,
     ttsModel: typeof s.tts_model === 'string' ? s.tts_model : DEFAULT_VOICE_CHAT_SETTINGS.ttsModel,
     voice: typeof s.voice === 'string' ? s.voice : DEFAULT_VOICE_CHAT_SETTINGS.voice,
+    voiceModel:
+      typeof s.voice_model === 'string' ? s.voice_model : DEFAULT_VOICE_CHAT_SETTINGS.voiceModel,
     systemPrompt:
       typeof s.system_prompt === 'string' && s.system_prompt.trim() !== ''
         ? s.system_prompt
