@@ -2,7 +2,16 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
-import { Alert, Box, Button, FormControlLabel, Switch, TextField, Typography } from '@mui/material';
+import {
+  Alert,
+  Box,
+  Button,
+  Collapse,
+  FormControlLabel,
+  Switch,
+  TextField,
+  Typography,
+} from '@mui/material';
 import MicIcon from '@mui/icons-material/Mic';
 import MicOffIcon from '@mui/icons-material/MicOff';
 import PauseIcon from '@mui/icons-material/Pause';
@@ -14,7 +23,11 @@ import VolumeUpIcon from '@mui/icons-material/VolumeUp';
 import type { MessageKey, Translation } from './shared/types';
 import { SearchableSelect } from './shared/SearchableSelect';
 import { SpeechVoiceField } from './SpeechVoiceField';
-import { DEFAULT_VOICE_SYSTEM_PROMPT, isCustomisedVoicePrompt } from './chat/ChatStore';
+import {
+  DEFAULT_VOICE_SYSTEM_PROMPT,
+  errorDetailText,
+  isCustomisedVoicePrompt,
+} from './chat/ChatStore';
 import type {
   VoiceChatApi,
   VoiceChatError,
@@ -65,10 +78,10 @@ function sentenceForCode(code: string | undefined, t: Translation): string | und
 }
 
 // The sentence for a failure, by what kind it is and the gateway's code. `message` is the
-// session's diagnostic English and is never shown; the code is, where no sentence of ours says
-// more than it does (an unmapped refusal, a failed turn), because it is what an operator looks up.
+// session's diagnostic English and is never part of the sentence, and neither is the code: both
+// are the failure's real reason, which is behind the card's "Details" (`ErrorDetails`) for the
+// user who wants it, because it is what an operator looks up.
 function errorText(error: VoiceChatError, t: Translation): string {
-  const withCode = (text: string) => (error.code ? `${text} (${error.code})` : text);
   switch (error.kind) {
     case 'denied':
       return t.chatRecordDenied;
@@ -81,10 +94,48 @@ function errorText(error: VoiceChatError, t: Translation): string {
       // failed to issue) is worded by it, and any other (a lost connection) is the generic one.
       return sentenceForCode(error.code, t) ?? t.chatVoiceErrorDropped;
     case 'turn':
-      return withCode(t.chatVoiceErrorTurn);
+      return t.chatVoiceErrorTurn;
     case 'refused':
-      return sentenceForCode(error.code, t) ?? withCode(t.chatVoiceErrorRefused);
+      return sentenceForCode(error.code, t) ?? t.chatVoiceErrorRefused;
   }
+}
+
+// The failure's real reason behind a "Details" disclosure, closed until it is asked for: the
+// headline above it is the sentence for the user, and this is the diagnostic for whoever has to look
+// into it. It is closed by default for each error -- the card keys it by the error, so that a new
+// failure remounts it closed instead of inheriting how the last one was left. The region stays
+// mounted while it is closed (`Collapse` hides it), so the toggle's `aria-controls` always names
+// something that is there.
+function ErrorDetails({ detail, t }: Readonly<{ detail: string; t: Translation }>) {
+  const [open, setOpen] = useState(false);
+  const regionId = useId();
+  return (
+    <Box sx={{ mt: 0.5 }}>
+      <Button
+        size="small"
+        color="inherit"
+        aria-expanded={open}
+        aria-controls={regionId}
+        onClick={() => setOpen((was) => !was)}
+      >
+        {t.chatVoiceErrorDetails}
+      </Button>
+      <Collapse in={open}>
+        <Typography
+          id={regionId}
+          variant="caption"
+          color="text.secondary"
+          component="p"
+          // The diagnostic is free text from the gateway: its line breaks are kept (the code on its
+          // own line, then the message) and a long token (a URL, an id) wraps instead of widening
+          // the card.
+          sx={{ m: 0, pt: 0.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
+        >
+          {detail}
+        </Typography>
+      </Collapse>
+    </Box>
+  );
 }
 
 // What the user has done to the conversation that the gateway's state does not say: the answer
@@ -276,6 +327,9 @@ export function VoiceChatControl({
   const transcriptId = useId();
   const answerId = useId();
   const { state, error } = voice;
+  // What the error card has to add to its sentence, if anything (a failure of the browser's own has
+  // nothing, nor does a failed turn that came with no reason of its own).
+  const detail = error ? errorDetailText(error) : null;
   const on = state !== 'off';
   const listening = state === 'listening';
   const canTalk = takesPushToTalk(state, voice.micMuted);
@@ -428,6 +482,10 @@ export function VoiceChatControl({
           }
         >
           {errorText(error, t)}
+          {detail !== null && (
+            // Keyed by the failure, so a new one starts closed (see `ErrorDetails`).
+            <ErrorDetails key={`${error.kind}:${detail}`} detail={detail} t={t} />
+          )}
         </Alert>
       )}
     </Box>

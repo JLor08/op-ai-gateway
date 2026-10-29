@@ -486,6 +486,7 @@ const de = {
     'Die Verbindung wurde unterbrochen. Schalten Sie den Sprachchat erneut ein.',
   chatVoiceErrorTurn:
     'Diese Antwort ist fehlgeschlagen. Halten Sie die Sprechtaste, um es erneut zu versuchen.',
+  chatVoiceErrorDetails: 'Details',
   // Why a clip could not be attached (the picker's `accept` is only a hint, so the type is
   // checked again): a file that is not audio, its size (the backend stores up to 20 MB per
   // clip, counted on the WAV the browser converts it to), an empty file, audio the browser
@@ -3921,6 +3922,7 @@ const en: PortalMessages = {
     'The microphone or the audio processing failed. Switch Voice Chat on again.',
   chatVoiceErrorDropped: 'The connection was interrupted. Switch Voice Chat on again.',
   chatVoiceErrorTurn: 'That answer failed. Hold the talk button to try again.',
+  chatVoiceErrorDetails: 'Details',
   chatAudioError: 'Could not attach the audio.',
   chatAudioErrorType:
     'Unsupported file type. Attach an audio file, for example WAV, MP3, M4A, OGG or WEBM.',

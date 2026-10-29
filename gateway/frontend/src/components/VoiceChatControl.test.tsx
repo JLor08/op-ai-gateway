@@ -8,6 +8,7 @@ import { VoiceChatControl, type VoiceChatControlProps } from './VoiceChatControl
 import { messages, type Locale } from '../i18n';
 import type { ModelOption } from '../api';
 import { DEFAULT_VOICE_SYSTEM_PROMPT } from './chat/ChatStore';
+import { VOICE_TURN_FALLBACK_MESSAGE } from './chat/voiceSession';
 import type {
   VoiceChatApi,
   VoiceChatModels,
@@ -464,9 +465,119 @@ describe('VoiceChatControl errors', () => {
       }),
     );
     expect(screen.getByRole('alert')).toHaveTextContent(t.chatVoiceErrorTurn);
-    expect(screen.getByRole('alert')).toHaveTextContent('speech.upstream_error');
     // The conversation is still on, so the toggle is on, and is the way out.
     expect(screen.getByRole('switch', { name: t.chatVoice })).toBeChecked();
+  });
+
+  // The failure's real reason (#329): the headline is the sentence alone, and the gateway's code and
+  // message are behind a "Details" disclosure that is closed until it is asked for.
+  describe('the failure details', () => {
+    const turnError = {
+      kind: 'turn',
+      code: 'speech.upstream_error',
+      message: 'the speech backend answered 502',
+    } as const;
+    const detailsToggle = () => screen.getByRole('button', { name: t.chatVoiceErrorDetails });
+    // The diagnostic is two lines (the code, then the message): matched by its code, which is
+    // enough to find it, and the whole text is asserted on the element found.
+    const diagnostic = () => screen.getByText(/speech\.upstream_error/);
+
+    it('keeps the code out of the headline and behind a closed Details toggle', () => {
+      renderControl(makeVoice({ state: 'idle', error: turnError }));
+
+      // The headline is the message div's own text: the sentence, with no "(code)" after it.
+      expect(screen.getByText(t.chatVoiceErrorTurn)).toBeInTheDocument();
+      const toggle = detailsToggle();
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      expect(diagnostic()).not.toBeVisible();
+    });
+
+    it('reveals the code and the message on click, and hides them again on a second', () => {
+      renderControl(makeVoice({ state: 'idle', error: turnError }));
+      const toggle = detailsToggle();
+
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      expect(diagnostic()).toBeVisible();
+      expect(diagnostic()).toHaveTextContent(
+        'speech.upstream_error the speech backend answered 502',
+      );
+      // The toggle names the region it opens.
+      expect(toggle).toHaveAttribute('aria-controls', diagnostic().id);
+
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('shows it for a refused ticket and a dropped connection as well, without the inline code', () => {
+      const { update } = renderControl(
+        makeVoice({
+          error: { kind: 'refused', code: 'portal.chat_not_found', message: 'no such chat' },
+        }),
+      );
+      // A refusal with no sentence of ours is the generic one, with no "(code)" after it.
+      expect(screen.getByText(t.chatVoiceErrorRefused)).toBeInTheDocument();
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'false');
+
+      update(makeVoice({ error: { kind: 'dropped', message: 'connection closed (1006)' } }));
+      expect(screen.getByText(t.chatVoiceErrorDropped)).toBeInTheDocument();
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('starts closed for each new error, not as the last one was left', () => {
+      const { update } = renderControl(makeVoice({ state: 'idle', error: turnError }));
+      fireEvent.click(detailsToggle());
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'true');
+
+      update(
+        makeVoice({
+          state: 'idle',
+          error: { kind: 'turn', code: 'speech.other_error', message: 'something else' },
+        }),
+      );
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('resets between two codeless turn errors that differ only in message (#329)', () => {
+      // The reproduced #329 frames carried no code, so a code-only remount key would leave two
+      // consecutive codeless turn errors sharing one key -- the open disclosure would persist. The
+      // key is the whole detail, so a changed message alone remounts it closed.
+      const { update } = renderControl(
+        makeVoice({ state: 'idle', error: { kind: 'turn', message: 'live request body stalled' } }),
+      );
+      fireEvent.click(detailsToggle());
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'true');
+
+      update(
+        makeVoice({ state: 'idle', error: { kind: 'turn', message: 'something else failed' } }),
+      );
+      expect(detailsToggle()).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it("renders no toggle for a failure that is the browser's own", () => {
+      for (const kind of ['denied', 'unsupported', 'capture'] as const) {
+        const { unmount } = renderControl(makeVoice({ error: { kind, message: 'raw' } }));
+        expect(screen.getByRole('alert'), kind).toBeInTheDocument();
+        expect(
+          screen.queryByRole('button', { name: t.chatVoiceErrorDetails }),
+          kind,
+        ).not.toBeInTheDocument();
+        unmount();
+      }
+    });
+
+    it('renders no toggle for a failed turn that has only the generic fallback and no code', () => {
+      renderControl(
+        makeVoice({
+          state: 'idle',
+          error: { kind: 'turn', message: VOICE_TURN_FALLBACK_MESSAGE },
+        }),
+      );
+      expect(screen.getByText(t.chatVoiceErrorTurn)).toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: t.chatVoiceErrorDetails }),
+      ).not.toBeInTheDocument();
+    });
   });
 
   it('shows no alert without an error', () => {
