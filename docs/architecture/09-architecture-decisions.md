@@ -10057,10 +10057,11 @@ flag).
   re-armed, so a shared one would charge the retry for the failed attempt and the backoff). It is **billing- and
   ordering-safe**: a pre-stream failure produced and billed nothing, and once any chunk has been relayed, in any attempt, no
   further attempt runs, so a retry cannot repeat audio the client has heard or bill a section twice; an accepted stream is
-  never classified as transient. **The permanent markers are broad and an informed guess, not yet verified against a real
-  audio.cpp bad-voice `500`:** a genuinely transient `500` whose message happens to contain one (`voice`, say) is treated
-  as permanent and not retried, which degrades the turn as it did before. The set errs that way on purpose, since a missed
-  permanent failure costs extra billed requests and a delay for nothing.
+  never classified as transient. **The permanent markers are broad but reconciled against audio.cpp's actual bad-voice `500`:** direct probing of the server
+  shows a bad reference or clone voice answers `500` whose message names the voice's reference path (so it contains `reference`),
+  which the markers catch; a built-in-voice model's bad-voice message is not separately confirmed. They stay broad on purpose:
+  a genuinely transient `500` whose message happens to contain one (`voice`, say) is treated as permanent and not retried,
+  which degrades the turn as it did before, since a missed permanent failure costs extra billed requests and a delay for nothing.
 - **(c) Every leg joins before the one commit.** After the LLM stream the run closes the relay's feed and joins **every** leg
   (`joinVoiceLegs`) and the relay goroutine **unconditionally**, so a cancelled or failed run never leaks a leg; only then does
   it claim the commit through the same compare-and-swap as before ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
@@ -10181,8 +10182,8 @@ flag).
   leaves a gap in that section's playback, and the stream is not kept fed with silence across it. The default budget (about
   750 ms of backoff in all) is covered by the server's drain floor and the portal's playback-done debounce (about 1.2 s),
   but a larger `OP_AI_GATEWAY_VOICE_TTS_RETRIES` can outlast that; streaming silence over a long gap is deferred. (2) **The permanent
-  markers are unverified against a real audio.cpp bad-voice `500`** and broad (above), so they may withhold a retry that
-  would have succeeded. (3) **Two failures are not retried:** a first-chunk-deadline timeout (it ends the attempt as the
+  markers are reconciled against audio.cpp's actual bad-voice `500`** (direct probing; a built-in-voice model's message is not
+  separately confirmed) but broad (above), so they may still withhold a retry that would have succeeded. (3) **Two failures are not retried:** a first-chunk-deadline timeout (it ends the attempt as the
   run's own cutoff and is not classified transient), and a `2xx` stream that dies before any audio delta (an accepted stream
   is never classified transient, because audio may already be relayed and billed). Both degrade the turn as before.
   Retrying applies to the speech leg only, not to the LLM or ASR legs. Pinned by mock-backed tests (the gate's order and cap, the
