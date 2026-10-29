@@ -9673,14 +9673,14 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
   the LLM (its own model selector is the LLM picker). The ASR and TTS models are the **user's to pick** since issue #317:
   the Voice Chat control has one picker each, listing the catalogue models the gateway says stream (plain speech models
   ahead of preset-clone ones), with **Automatic** as the default. The pick belongs to the thread and is saved with it,
-  in `settings.voice_chat` (`asr_model`, `tts_model`, `voice`, and since phase 2 `system_prompt`) of the schema-free chat
+  in `settings.voice_chat` (`asr_model`, `tts_model`, `voice`, since phase 2 `system_prompt`, and since #326 `voice_model`, [ADR-080](#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt) (g)) of the schema-free chat
   document, with no migration and no agent change (in phase 1 the backend never read it and only preserved it, below;
   since phase 2 it reads one member, `system_prompt`, from the stored document when a voice run starts,
   [ADR-079](#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language) (a)): the key is written only for a text thread that has made a pick or edited the voice prompt (so every other thread stays byte-identical),
   the ticket request carries the models, and the co-load gate still resolves and validates all three, which is the real
   admission check (a combination it cannot hold is refused at the ticket). The **auto-pick** (a model of each leg that the gateway
   says streams **and that is loaded**, the first such in the catalogue's order, else simply the first that streams; it was
-  the first that streams until phase 3, [ADR-080](#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt) (g)) is the default and the fallback: it serves a leg with no pick
+  the first that streams until phase 3, and since #326 it is made once and then held while its model streams, [ADR-080](#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt) (g)) is the default and the fallback: it serves a leg with no pick
   and a pick that is gone (the model left the catalogue, is unreachable or no longer streams), which falls back instead of
   blocking the conversation, while the name stays in the thread so it applies again when the model returns. The picks persist: `PrepareChatRun`, which rewrites the stored settings from its typed struct on every user-turn commit, lifts the stored raw `voice_chat` value forward (as it does the pinned `kind`; it never reads it), so a send, an edit or a regenerate cannot wipe them whichever thread the client has open. The pickers
   are closed until the gateway has said which models stream and while a conversation is on (its ticket holds the three
@@ -9690,7 +9690,7 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
   The voice sent is the user's pick; else, for a **preset clone** model (no default voice of its own), its **first
   preset**, so it never speaks blank; else none, the model's own default. The pre-select is computed when read, not
   saved (only a chosen voice is written to `voice_chat.voice`), so a change of model needs no clean-up, and choosing
-  another speech model drops the voice (a voice belongs to the model that offered it). The voice rides the ticket
+  another speech model drops the voice (a voice belongs to the model that offered it, which since #326 is recorded beside it as `voice_model`, [ADR-080](#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt) (g)). The voice rides the ticket
   request body and the mint sets the ticket's `Audio.Voice` from it (over a stored one, counted in the 1 KiB cap); a
   clone leg with no voice named by then is defaulted to its first preset by the mint as well (`routing.FirstPresetVoice`),
   for a request made before the voices loaded. The preset is the cache's first, not an operator-configured default,
@@ -10034,24 +10034,48 @@ flag).
   *Client only:* the **output mute** is the session's, re-applied to each answer's player (the audio plays on silently, on the
   same clock; the gateway is told nothing and drains as it would have), and the **microphone mute** disables the capture track
   and sends no PCM (no frame: the gateway hears silence and detects no turn; push-to-talk is closed under it and the indicator
-  says the microphone is muted instead of listening). The portal draws pause/resume, the output mute and "stop speaking"
+  says the microphone is muted instead of listening). The portal draws pause/resume and "stop speaking"
   **only while audio is actually being heard**, from the first played chunk until the answer has played out: the queue running
   dry once the gateway has sent everything, or staying dry for 1.2 s while the gateway is still `speaking` (the last section is
   over and the model goes on writing the detail; a later section's chunk would arrive well inside that window), and not in the
-  gateway's tail, where a pause would do nothing. "Stop speaking" is a different control from "Cancel whole answer" (phase 1's
-  `cancel`) and from switching the conversation off. `cancel` stays the one control that works from every state.
+  gateway's tail, where a pause would do nothing. *Amended by issue #326:* the **output mute is not one of them any more**: it
+  sits beside the microphone mute and is drawn whenever the conversation is on, in any state and before the first answer, so
+  it can be set ahead of it and its state is seen between answers; the playing-only group sits inside a room of constant height
+  (32 px, one row of small buttons) that is mounted for as long as the conversation is on, so its coming and going moves
+  nothing, and the always-on controls are separate nodes that are never remounted by it. "Stop speaking" is a different
+  control from "Cancel whole answer" (phase 1's `cancel`) and from switching the conversation off. `cancel` stays the one
+  control that works from every state.
 - **(g) Loaded-aware pickers, a collapsed prompt field and a multi-section default prompt.** The transcription and speech
   pickers draw the green "loaded" dot the chat's own model picker draws, from the same catalogue flags (`loaded`, `loaded_on`),
   and the **automatic** pick now prefers the first model that streams **and** is loaded (it answers at once; another has to be
   loaded first), else the first that streams, in the candidates' order; a loaded model that does not stream is never picked.
-  The voice system-prompt field is a section collapsed by default. The built-in default prompt now asks for short
+  *Amended by issue #326 (a stable pick, and a voice that belongs to its model):* that preference is applied **once, when a
+  pick is made, and the pick is then held**. `stickyAutoVoiceModel` keeps the model a leg resolved to for as long as it still
+  streams, per leg, held per open chat by `ChatStore` (`stickyVoiceLegsOf`; in memory, so another chat starts afresh, and a leg
+  under the user's own pick holds none), so a model that merely becomes loaded in the background no longer takes the pick
+  over, and a voice chosen for the model that speaks stays with it; only the held model's leaving the models that stream
+  moves it. The thread stores, beside the saved `voice`, the speech model it was chosen for, `settings.voice_chat.voice_model`
+  (one more optional key of the schema-free object, written only beside a non-blank voice and never read by the backend:
+  **no migration, no agent change**), and a fresh pick of the speech leg **starts from that model** when a voice is saved
+  and the model still streams, so a thread reopens on its voice's model and keeps the voice; without one it is the
+  prefer-loaded rule above. Where **another** model than the voice's speaks (the voice's model stopped streaming, or the
+  thread predates the attribution), `reconcileVoice` decides which voice is sent: the saved one when the speaking model's voice
+  list holds it, the default voice when it does not, and no judgment while the list is still loading or has failed (a list
+  that has not arrived must not condemn a voice). **The reconciliation is in memory:** it decides only the `voice` that
+  `begin()` puts in the ticket and that the field shows, and never writes the thread. `voice` and `voice_model` are written
+  **only by the user's own pick of a voice** (recorded with the model that speaks at that moment) **or of a speech model**
+  (which clears both when another model would then speak), so opening a thread never saves it, never reorders the list and
+  never destroys a voice whose model is merely not the one speaking this time: the default voice is sent meanwhile and the
+  stored voice applies again when its model returns. The voice system-prompt field is a section collapsed by default, and,
+  since #326, its toggle carries an "Edited" marker while it is shut and the thread's prompt is its own (the trimmed prompt,
+  non-blank and not the built-in one: what the portal would persist). The built-in default prompt now asks for short
   `<speak lang>` sections, one for a short answer and roughly one per key point for a long one, with the fuller detail as text
   outside the tags; the portal's copy stays byte-identical to the backend's (a test reads the Go source).
 
 **Consequence:**
 
 - **No agent bump and no migration.** The sections are one more optional key of a stored message, the combined prompt reads a
-  member the document already holds, and the controls are WebSocket frames ([Data Model](reference/data-model.md)).
+  member the document already holds, and the controls are WebSocket frames ([Data Model](reference/data-model.md)); issue #326's `voice_model` is one more optional key of the schema-free `settings.voice_chat` object, which the backend never reads.
 - **A voice run writes one TTS usage row per section** (one streamed `/v1/audio/speech` call each; the no-region fallback is
   one), the LLM and ASR rows being as before ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
 - **"Stop speaking" is a cancel until the turn commits.** In `speaking` the run is, apart from one store write, still
@@ -10062,9 +10086,14 @@ flag).
   client holds a pause, and the portal presents pause only while audio is heard so the ignored case does not surprise the
   user; the next turn can also meet a run still finishing its commit after a stop and degrade to the one `error` frame
   (`gateway.voice_run_start_failed`) in a window of milliseconds ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
-- **The auto-pick can drift.** A voice saved for an auto-picked speech model can be sent to a different model once the loaded
-  state changes, because only an explicit pick is stored and the voice list is an offer, not a constraint. A real fix needs
-  per-voice model attribution ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **The automatic pick is held, and a voice is attributed to its model (issue #326).** Phase 3's loaded-aware pick had a
+  drift: a voice saved for an auto-picked speech model could be sent to another model once the loaded state changed, because
+  only an explicit pick was stored and the voice list is an offer, not a constraint. The pick is now made once and held while
+  its model streams, and the voice is stored with its model (`voice_model`), so neither the loaded state nor a reopen moves a
+  voice to a model that did not offer it. What stays by design: the hold is in memory for the open chat, so a thread with no
+  saved voice (or whose voice's model stopped streaming) can resolve to another loaded model the next time it is opened, with
+  no voice at stake; the voice list remains an offer, so a name the user typed for the model that speaks is kept as typed; and
+  a saved voice whose model is gone is not spoken (the default is) rather than erased.
 - **Per-block replay degrades for a very long section, and a removed clip is not re-synthesized.** A section is stored as
   several clips only when it outlasts one speech part (8 MiB of PCM, about 95 seconds at 44.1 kHz mono by default,
   [ADR-070](#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch);
@@ -10073,9 +10102,11 @@ flag).
 - **Verification status.** The scanner (N regions, chunk-invariance, rune offsets), the ordered relay and the one seq stream,
   the all-legs join and the degrade paths, the persistence shape and its back-compat read, the combined prompt, pause/resume
   against the drain's floor and ceiling, both outcomes of the stop-versus-commit race under `-race`, and the portal's player,
-  session, controls, blocks and pickers are pinned by mock-backed tests. It is **not** claimed as a live spoken round-trip
-  against a real audio.cpp: whether a model follows the multi-section prompt, and how the sections sound back to back, is for
-  an operator to confirm.
+  session, controls, blocks and pickers are pinned by mock-backed tests, and so are the follow-ups of issue #326 (the held
+  pick and its seeding from the voice's model, the in-memory reconciliation and that opening a thread saves nothing, the
+  persistent output mute with its room of constant height, and the "Edited" marker; portal only, no backend test needed).
+  It is **not** claimed as a live spoken round-trip against a real audio.cpp: whether a model follows the multi-section
+  prompt, and how the sections sound back to back, is for an operator to confirm.
 
 **Builds on:** [ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
 (the state machine, the half-duplex gate, the playout-aware drain and the commit/cancel word it generalizes),
