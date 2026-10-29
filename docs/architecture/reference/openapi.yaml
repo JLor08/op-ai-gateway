@@ -1986,7 +1986,11 @@ paths:
         turn; the server honors the signal as the end of audio only when it covers every
         frame relayed, and an absent or null count is accepted as before),
         `{"type":"pause"}`, `{"type":"resume"}`, `{"type":"stop"}` (the playback controls,
-        below) and `{"type":"bye"}`; anything else is ignored. The gateway sends TEXT frames of JSON: `state` (`idle`,
+        below), `{"type":"mic_mute"}` and `{"type":"mic_unmute"}` (the user's microphone mute,
+        issue #335, ADR-078; the client sends no PCM while muted, and the gateway then discards what
+        the ASR returns, keeps an open ASR relay alive with silence of its own and, unless
+        OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN is 0, closes it after that long, 10 s by default; the HTTP
+        API Surface has the details) and `{"type":"bye"}`; anything else is ignored. The gateway sends TEXT frames of JSON: `state` (`idle`,
         `listening`, `thinking`, `speaking` or `draining`), `asr_partial` (the CURRENT
         chunk's provisional text, replace), `asr_final` (one chunk's final text, append),
         `answer_delta` (append), `answer_done` (provisional, before the commit),

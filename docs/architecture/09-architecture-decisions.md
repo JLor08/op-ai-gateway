@@ -9531,7 +9531,7 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
     the clean final transcript and end, releasing that chunk's admission and per-route slot; the next mic frame opens a
     fresh one about 100 ms later. The relay therefore exists **whenever the mic gate is open**, in `listening` and, until
     the window closes, in `thinking` (the frame that opens it is not checked for speech), and is absent only in `idle`,
-    `speaking` and `draining`. While it exists it holds its admission and the route's live slot and pins the ASR child,
+    `speaking` and `draining` (and, since issue #335, after a sustained microphone mute has torn it down, below). While it exists it holds its admission and the route's live slot and pins the ASR child,
     and that includes the continuation window in which the speculative LLM and TTS run, so the three models genuinely
     coexist there (which is what the co-load gate verifies). It deliberately does **not** hold one relay for the whole
     session: that would also hold them through `speaking` and `draining`, and it would lean on a per-utterance
@@ -9560,7 +9560,7 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
     now make the gateway act (no `ServerAgent` bump, no schema change, nothing changes while the mic is live). The mute
     is a latch on the single-owner machine, with run-loop timers beside the silence, grace and tail ones. While it is
     set: **(1) the ASR's output is filtered** (delta, partial and done are discarded: no `asr_*` frame, no
-    `pendingText`, no resumed speech in the continuation window), so a model that hallucinates on silence cannot inject
+    `pendingText`, no resumed speech in the continuation window; the one exception is a chunk already finalizing when the mute lands, whose final is discarded with the rest but which still completes from its last partial), so a model that hallucinates on silence cannot inject
     a phantom transcript; **(2) the open loopback is fed gateway-generated keepalive silence** (a 100 ms zeroed frame
     in the ticket's PCM shape every 10 s through the same drop-oldest queue real PCM uses), so nothing audio-shaped
     leaves the browser and the upstream's idle timeout never fires; **(3) after `OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN`
@@ -9576,12 +9576,14 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
     carries) for as long as the mute lasts, an explicit trade of capacity for an instant resume; it is still bounded,
     because the loopback runs through the gateway's own `/v1`, whose stream-idle watchdog
     (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, 120 s by default) only the ASR's own SSE re-arms, so a model that answers
-    silence with nothing is cut by it. *A loopback that ends while muted is quiet*: the teardown, the relay closing
+    silence with nothing is cut by it, and a cut has no end-of-input, so it bills the loud zero (the mute teardown does not). *A loopback that ends while muted is quiet toward the browser*: the teardown, the relay closing
     (that watchdog included), a failed or refused dial and an ASR `error` event end it with no `error` frame and no
-    state change, the mute still latched, because the user cannot act on a loopback they muted; the cost is that a
+    state change (a chunk already finalizing when the mute lands is the exception, above), the mute still latched, because the user cannot act on a loopback they muted; the cost is that a
     **persistent** failure (the live slot taken, the ASR not admitted) surfaces as the ordinary `error` frame only on
-    the redial after the unmute. *The signal is cooperative*: a client that goes quiet without `mic_mute` gets the
-    old behavior. Pinned by end-to-end tests against a fake ASR child that models the upstream's idle timeout and the
+    the redial after the unmute. *The filter has no in-flight barrier*: a silence-induced ASR event already in flight
+    when `mic_unmute` is processed can pass it and start a phantom chunk (bounded by one frame's latency, with no
+    sequence marker to close it exactly). *The signal is cooperative*: a client that goes quiet without `mic_mute`
+    gets the old behavior. Pinned by end-to-end tests against a fake ASR child that models the upstream's idle timeout and the
     edge watchdog, and by machine-level `-race` tests.
   - *Brain and voice: a new voice run kind.* `executeVoiceRun` (`internal/gateway/chat_runs_voice.go`), started by
     `startVoiceRun` at each chunk end, runs the LLM leg over `/v1/chat/completions` (the chat's history plus
@@ -10067,7 +10069,7 @@ flag).
   answer is built. The flush is **best-effort**: it is fire-and-forget (the start is synchronous, the save is not awaited), so
   it is not guaranteed to have completed by the time the ticket is asked for or the first answer is built, and a failed save
   leaves the thread dirty. This supersedes ADR-079 (a)'s "sole system message" and its rejection of augmenting a thread prompt.
-- **(f) Playback controls: three up-frames and a new down field, and two mutes that never reach the server.** `pause`,
+- **(f) Playback controls: three up-frames and a new down field, and an output mute that never reaches the server (the microphone mute does since issue #335, below).** `pause`,
   `resume` and `stop` ([HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket)) and
   `section` on `audio_delta`. **Pause and resume are server-tracked:** a pause stops the drain's timer and records the instant,
   a resume shifts `firstAudioAt` forward by the paused interval, so the floor and the ceiling, both measured from it, extend by
