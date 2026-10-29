@@ -1095,7 +1095,8 @@ func bufferedTestTurn(srv *Server, contentType string, body []byte) (parts json.
 		Header:     http.Header{"Content-Type": {contentType}},
 		Body:       io.NopCloser(bytes.NewReader(body)),
 	}
-	return srv.bufferedSpeechTurn(context.Background(), run, resp)
+	parts, status, msg, _ = srv.bufferedSpeechTurn(context.Background(), run, resp)
+	return parts, status, msg
 }
 
 // committedWAVs decodes the content array of a completed turn into the WAV of every part.

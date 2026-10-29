@@ -15,6 +15,7 @@ import (
 	"maps"
 	"mime"
 	"net/http"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"slices"
 	"strings"
@@ -203,6 +204,31 @@ func (s *Server) executeAudioRun(ctx context.Context, owner auth.Token, run *Cha
 // (run.publishAudio, the standalone speech run); a VOICE section leg passes its ordered sink so
 // the client sees one monotonic, section-serialized stream across all the turn's legs.
 func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) (json.RawMessage, string, string, bool) {
+	out := s.speechTurnAttempt(ctx, owner, run, prep, liftDeadline, stampTTFT, audioSink)
+	return out.parts, out.status, out.errMsg, out.streamed
+}
+
+// speechAttemptResult is the outcome of ONE speech synthesis attempt: generateSpeechTurn's four
+// results, plus whether a failure is worth another attempt. A voice section leg retries on it
+// (retryVoiceSpeech); the standalone speech run never reads it, so its behavior is unchanged.
+type speechAttemptResult struct {
+	parts    json.RawMessage
+	status   string
+	errMsg   string
+	streamed bool
+	// transient marks a FAILURE that is plausibly gone on the next attempt: the gateway or the TTS
+	// was briefly busy or unavailable, or the loopback dial itself failed. It is set only where the
+	// request was refused or never answered -- so nothing was synthesized and nothing is billed --
+	// and never for a failure that ended the run (a cancel or a deadline), a failure of our own
+	// making (a request we could not build, a response we could not read) or one that came after
+	// audio was already flowing. Whether audio already reached the relay is the caller's to judge,
+	// because only it owns the sink; this says only that the failure's CAUSE is retryable.
+	transient bool
+}
+
+// speechTurnAttempt is generateSpeechTurn's body: one loopback synthesis request and its outcome,
+// with the retry classification (speechAttemptResult.transient) generateSpeechTurn drops.
+func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, liftDeadline func(), stampTTFT bool, audioSink func(runAudio)) speechAttemptResult {
 	sampleRate, streaming := s.speechRunStreamRate(ctx, owner, prep)
 	build := buildSpeechBody
 	if streaming {
@@ -212,14 +238,14 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	if err != nil {
 		log.Printf("chat run %s: build speech body failed: %v", run.ID, err)
 		if errors.Is(err, errSpeechPassthroughReserved) {
-			return nil, "error", speechRunReservedFieldMessage, false
+			return speechAttemptResult{status: "error", errMsg: speechRunReservedFieldMessage}
 		}
-		return nil, "error", speechRunDispatchFailedMessage, false
+		return speechAttemptResult{status: "error", errMsg: speechRunDispatchFailedMessage}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.selfBaseURL+"/v1/audio/speech", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("chat run %s: build speech request failed: %v", run.ID, err)
-		return nil, "error", speechRunDispatchFailedMessage, false
+		return speechAttemptResult{status: "error", errMsg: speechRunDispatchFailedMessage}
 	}
 	s.setRunLoopbackHeaders(req, owner, run, prep)
 
@@ -227,12 +253,13 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if status, msg, ended := runContextOutcome(ctx); ended {
-			return nil, status, msg, false
+			return speechAttemptResult{status: status, errMsg: msg}
 		}
 		// The operator's copy keeps the whole Go error, internal URL and all; the
-		// user's copy is the code. See speechRunDispatchFailedMessage.
+		// user's copy is the code. See speechRunDispatchFailedMessage. The dial failed
+		// before any answer, so nothing was synthesized: a retry may well get through.
 		log.Printf("chat run %s: speech loopback request failed: %v", run.ID, err)
-		return nil, "error", speechRunDispatchFailedMessage, false
+		return speechAttemptResult{status: "error", errMsg: speechRunDispatchFailedMessage, transient: true}
 	}
 	defer resp.Body.Close()
 
@@ -247,10 +274,12 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 			stampTTFT:    stampTTFT,
 			audioSink:    audioSink,
 		})
-		return parts, status, msg, true
+		// A stream that was accepted is never "transient": audio may already have been
+		// relayed and billed, so its failure is not one a retry could take back.
+		return speechAttemptResult{parts: parts, status: status, errMsg: msg, streamed: true}
 	}
-	parts, status, msg := s.bufferedSpeechTurn(ctx, run, resp)
-	return parts, status, msg, false
+	parts, status, msg, transient := s.bufferedSpeechTurn(ctx, run, resp)
+	return speechAttemptResult{parts: parts, status: status, errMsg: msg, transient: transient}
 }
 
 // bufferedSpeechTurn is the outcome of a speech run's loopback answer that is not an
@@ -263,7 +292,10 @@ func (s *Server) generateSpeechTurn(ctx context.Context, owner auth.Token, run *
 // store's per-blob check alone, and refused as the audio-too-large error when its audio is
 // past the run's total cap, which is decided before anything is committed. See
 // splitBufferedSpeech for what is cut and what is committed as it came.
-func (s *Server) bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *http.Response) (json.RawMessage, string, string) {
+//
+// The fourth result is speechAttemptResult.transient: true only for a non-2xx answer that
+// speechFailureTransient judges retryable, from its HTTP status and upstream message.
+func (s *Server) bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *http.Response) (json.RawMessage, string, string, bool) {
 	// Read the WHOLE body: a WAV cannot be played from a prefix of it, and it is
 	// deliberately not bounded by s.captureMaxBytes (1 MiB, which an ordinary clip
 	// exceeds) -- the same call, and the same backstop, as the image path: the chat
@@ -274,36 +306,89 @@ func (s *Server) bufferedSpeechTurn(ctx context.Context, run *ChatRun, resp *htt
 		// read failure; reporting either as a generic error -- or a deadline as a
 		// cancel -- would tell the user they pressed Stop when they pressed nothing.
 		if status, msg, ended := runContextOutcome(ctx); ended {
-			return nil, status, msg
+			return nil, status, msg, false
 		}
 		log.Printf("chat run %s: speech response unreadable: %v", run.ID, err)
-		return nil, "error", speechRunResponseUnreadableMessage
+		// A refusal whose body broke is still a refusal, and its status alone can tell a
+		// busy one; a 2xx whose body broke is never transient (speechFailureTransient).
+		return nil, "error", speechRunResponseUnreadableMessage, speechFailureTransient(resp.StatusCode, nil)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, "error", upstreamErrorCode(payload, resp.Status)
+		return nil, "error", upstreamErrorCode(payload, resp.Status), speechFailureTransient(resp.StatusCode, payload)
 	}
 
 	if err := speechPayloadError(resp.Header.Get("Content-Type"), payload); err != nil {
 		log.Printf("chat run %s: speech response is not usable audio: %v (content type %q, %d bytes)", run.ID, err, resp.Header.Get("Content-Type"), len(payload))
-		return nil, "error", err.Error()
+		return nil, "error", err.Error(), false
 	}
 	wavs, overCap := s.splitBufferedSpeech(payload)
 	if overCap {
 		audioCap, _ := s.chatAudioCaps()
 		log.Printf("chat run %s: the speech response is longer than the %d byte audio cap; nothing is committed", run.ID, audioCap)
-		return nil, "error", speechRunAudioTooLargeMessage
+		return nil, "error", speechRunAudioTooLargeMessage, false
 	}
 	// No WAVs is no audio -- a clip of less than one sample -- and is refused BEFORE the
 	// commit: an empty content array would be a blank bubble.
 	if len(wavs) == 0 {
-		return nil, "error", speechRunNoAudioMessage
+		return nil, "error", speechRunNoAudioMessage, false
 	}
 	parts, err := marshalSpeechParts(wavs)
 	if err != nil {
 		log.Printf("chat run %s: marshal speech parts failed: %v", run.ID, err)
-		return nil, "error", speechRunDispatchFailedMessage
+		return nil, "error", speechRunDispatchFailedMessage, false
 	}
-	return parts, "completed", ""
+	return parts, "completed", "", false
+}
+
+// speechPermanentMessageMarkers are the case-insensitive fragments of an upstream error message
+// that say a 5xx speech failure is about the request's own voice, not the TTS's health: audio.cpp
+// answers HTTP 500 for a client error too (see validateSpeechRequest), so an unknown or unusable
+// voice arrives as a 500 whose message names the voice, its reference audio or its speaker, or says
+// something was not found. Retrying such a request only repeats the same refusal.
+//
+// The set is deliberately small and errs toward NOT retrying: a transient failure whose message
+// happens to contain one of these fragments just degrades the turn as it did before retries
+// existed, whereas a missed permanent one costs extra billed requests and a delay for nothing.
+var speechPermanentMessageMarkers = []string{
+	"voice", "reference", "speaker", "not found", "no such", "does not exist",
+}
+
+// speechFailureTransient reports whether a non-2xx speech answer is worth retrying, from its HTTP
+// status and body. The status decides first, and a 2xx is never a failure:
+//
+//   - 503 (the gateway or the TTS is busy or has no usable host -- routing.no_healthy_host, and
+//     routing.voice_unavailable, which names the voice yet is exactly the busy case) and 429
+//     (admission) are transient whatever the body says.
+//   - Any other 4xx is the request's own fault and permanent.
+//   - Any other 5xx is transient UNLESS its upstream message matches a permanent marker
+//     (speechPermanentMessageMarkers), because audio.cpp's 500 is ambiguous: it is both the
+//     transient hiccup and the answer for a bad voice or reference.
+func speechFailureTransient(status int, payload []byte) bool {
+	switch {
+	case status == http.StatusTooManyRequests, status == http.StatusServiceUnavailable:
+		return true
+	case status >= 500 && status <= 599:
+		msg := strings.ToLower(speechUpstreamMessage(payload))
+		for _, marker := range speechPermanentMessageMarkers {
+			if strings.Contains(msg, marker) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// speechUpstreamMessage is the human message of a speech error body: the OpenAI error object's
+// message (audio.cpp's own shape, which the relay passes through, and the gateway's own envelope),
+// else the body itself, bounded -- the relay hands a body of any other shape on unchanged, and its
+// text can still say what went wrong. A nil or empty body has no message.
+func speechUpstreamMessage(payload []byte) string {
+	var envelope apierror.Body
+	if json.Unmarshal(payload, &envelope) == nil && envelope.Error.Message != "" {
+		return envelope.Error.Message
+	}
+	return string(payload[:min(len(payload), 1024)])
 }
 
 // splitBufferedSpeech is the WAVs a buffered 2xx speech answer is committed as, one per

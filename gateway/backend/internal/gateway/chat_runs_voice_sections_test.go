@@ -5,9 +5,12 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/portal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -298,5 +301,398 @@ func TestVoiceRun_UnclosedTrailingRegionIsAFinalSection(t *testing.T) {
 	}
 	if len(turn.SpokenSections) != 2 || turn.SpokenSections[0].Text != twoRegionSec0 || turn.SpokenSections[1].Text != twoRegionSec1 {
 		t.Fatalf("SpokenSections = %+v, want the closed region and the unclosed trailing region", turn.SpokenSections)
+	}
+}
+
+// burstSections is how many <speak> regions the fast-LLM burst below closes in one delta -- well
+// past any cap a test sets, and still inside the audio subscriber's buffer (two chunks a section).
+const burstSections = 6
+
+// burstScript is a fast LLM: ONE delta that closes burstSections <speak> regions at once, so every
+// section's speech leg is launched inside a single scanner pass. It returns the script and the
+// sections' spoken texts in document order.
+func burstScript() ([]scriptedLLMDelta, []string) {
+	texts := make([]string, burstSections)
+	var delta strings.Builder
+	for i := range texts {
+		texts[i] = fmt.Sprintf("Satz %d.", i)
+		delta.WriteString("<speak>" + texts[i] + "</speak> ")
+	}
+	return []scriptedLLMDelta{{text: delta.String()}}, texts
+}
+
+// startSubscribedVoiceRun reserves and launches a voice run the way collectRunAudio does, but hands
+// back the run and its subscription so a test can act mid-run before draining it.
+func startSubscribedVoiceRun(t *testing.T, srv *Server, owner auth.Token, chatID, pending string) (*ChatRun, <-chan runEvent) {
+	t.Helper()
+	history, err := srv.Portal.VoiceRunHistory(context.Background(), owner, chatID, pending)
+	if err != nil {
+		t.Fatalf("VoiceRunHistory: %v", err)
+	}
+	run, runCtx, err := srv.reserveRun(owner, chatID)
+	if err != nil {
+		t.Fatalf("reserveRun: %v", err)
+	}
+	_, ch, unsub := run.subscribe()
+	t.Cleanup(unsub)
+	srv.launchRun(runCtx, owner, run, PrepareRunResult{
+		History:  history,
+		Settings: portal.ChatRunSettings{Model: voiceLLMTarget.Model, Kind: chatRunKindVoice},
+		Voice:    &voiceRunParams{pendingText: pending, tts: voiceTTSTarget},
+	})
+	return run, ch
+}
+
+// A fast LLM closes many <speak> regions in one burst, and each fires its own speech leg. The run
+// must not let them all hit the TTS at once (#337): only the run's TTS concurrency cap synthesize
+// together, the rest queue behind them, yet every section is still spoken and the relayed audio
+// stays ONE monotonic stream in document order -- the cap gates when a leg starts synthesizing,
+// never the order of the relay. A bare timing (cap 0) means the default cap, never "no synthesis".
+func TestVoiceRun_SpeechConcurrencyCapBackpressure(t *testing.T) {
+	cases := []struct {
+		name        string
+		concurrency int // the resolved timing's ttsConcurrency; 0 leaves the WHOLE timing unset
+		want        int // how many legs may synthesize at once
+	}{
+		{"cap of one serializes the legs", 1, 1},
+		{"cap of two", 2, 2},
+		{"cap of three", 3, 3},
+		{"an unset timing uses the default cap", 0, VoiceTTSConcurrencyDefault},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			script, sections := burstScript()
+			prov := defaultVoiceProvider()
+			prov.llmScript = script
+			prov.speechBodies = make(chan []byte, 2*burstSections)
+			prov.speechRelease = make(chan struct{}) // hold every response until the test lets them go
+			prov.speechInflight, prov.speechPeak = new(atomic.Int32), new(atomic.Int32)
+			srv, owner, chatID, _, speechBodies := newVoiceRunTestServerProv(t, prov)
+			if tc.concurrency > 0 {
+				srv.voiceTiming = voiceTiming{ttsConcurrency: tc.concurrency}
+			} else {
+				srv.voiceTiming = voiceTiming{}
+			}
+			rec := &recordingVoicePortal{API: srv.Portal}
+			srv.Portal = rec
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					close(prov.speechRelease)
+				}
+			}
+			// A safety net so a failing assertion never leaves the loopback server waiting on a held handler.
+			t.Cleanup(release)
+
+			run, ch := startSubscribedVoiceRun(t, srv, owner, chatID, "unused")
+
+			// The cap's worth of legs reach the TTS and are held there; the burst's other legs must be
+			// queued behind them, NOT in flight. Wait for the first batch, then give any leg that
+			// wrongly slipped past the cap time to show up.
+			if !voicePoll(10*time.Second, func() bool { return prov.speechInflight.Load() >= int32(tc.want) }) {
+				t.Fatalf("only %d syntheses reached the TTS, want %d", prov.speechInflight.Load(), tc.want)
+			}
+			if voicePoll(150*time.Millisecond, func() bool { return prov.speechInflight.Load() > int32(tc.want) }) {
+				t.Fatalf("%d syntheses in flight at once with the cap at %d: the burst of %d sections overran the TTS",
+					prov.speechInflight.Load(), tc.want, burstSections)
+			}
+
+			// The slots go out in document order: the legs in flight are the FIRST sections, not
+			// whichever goroutines happened to run first.
+			seen := map[string]int{}
+			firstBatch := map[string]bool{}
+			for range tc.want {
+				select {
+				case b := <-speechBodies:
+					in := speechInputOf(b)
+					seen[in]++
+					firstBatch[in] = true
+				case <-time.After(5 * time.Second):
+					t.Fatal("an in-flight synthesis never recorded its request")
+				}
+			}
+			for _, text := range sections[:tc.want] {
+				if !firstBatch[text] {
+					t.Fatalf("in flight = %v, want the first %d sections %v (slots are granted in document order)", firstBatch, tc.want, sections[:tc.want])
+				}
+			}
+
+			release()
+			audio := drainRunAudio(t, ch)
+
+			// Every section was still synthesized, exactly once.
+			for {
+				select {
+				case b := <-speechBodies:
+					seen[speechInputOf(b)]++
+					continue
+				default:
+				}
+				break
+			}
+			for _, text := range sections {
+				if seen[text] != 1 {
+					t.Fatalf("section %q synthesized %d times, want once (seen %v)", text, seen[text], seen)
+				}
+			}
+			if got := run.statusValue(); got != "completed" {
+				t.Fatalf("status = %q, want completed", got)
+			}
+
+			// The cap held for the whole run, was actually used, and every slot came back.
+			if peak := prov.speechPeak.Load(); peak != int32(tc.want) {
+				t.Fatalf("peak concurrent syntheses = %d, want exactly %d (the cap: never above it, and not serialized below it)", peak, tc.want)
+			}
+			if !voicePoll(2*time.Second, func() bool { return prov.speechInflight.Load() == 0 }) {
+				t.Fatalf("%d syntheses still in flight after the run ended", prov.speechInflight.Load())
+			}
+
+			// The relay is untouched: ONE monotonic stream, two chunks a section, in document order.
+			wantSections := make([]int, 0, 2*burstSections)
+			for i := range burstSections {
+				wantSections = append(wantSections, i, i)
+			}
+			assertOneMonotonicStream(t, audio, wantSections)
+			turn, ok := rec.committed()
+			if !ok {
+				t.Fatal("no voice commit was captured")
+			}
+			if len(turn.SpokenSections) != burstSections {
+				t.Fatalf("committed %d spoken sections, want %d", len(turn.SpokenSections), burstSections)
+			}
+			for i, sec := range turn.SpokenSections {
+				if sec.Text != sections[i] {
+					t.Fatalf("SpokenSections[%d] = %q, want %q (document order)", i, sec.Text, sections[i])
+				}
+			}
+		})
+	}
+}
+
+// The gate grants its slots in the order the legs were QUEUED (document order), whatever order their
+// goroutines happen to start in. Later sections taking the slots first would be a deadlock hazard
+// (they can fill their audio buffer, block on the relay, and starve the section the relay waits for).
+func TestVoiceSynthGate_GrantsSlotsInQueueOrder(t *testing.T) {
+	const legs = 8
+	gate := newVoiceSynthGate(1)
+	turns := make([]*voiceSynthTurn, legs)
+	for i := range turns {
+		turns[i] = gate.queue()
+	}
+	var mu sync.Mutex
+	var order []int
+	var wg sync.WaitGroup
+	// Start the goroutines BACKWARDS: the last queued leg runs first.
+	for i := legs - 1; i >= 0; i-- {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !turns[i].acquire(context.Background()) {
+				t.Errorf("turn %d: acquire reported a cancel on a live context", i)
+				return
+			}
+			mu.Lock()
+			order = append(order, i)
+			mu.Unlock()
+			turns[i].release()
+		}()
+	}
+	wg.Wait()
+	for i, got := range order {
+		if got != i {
+			t.Fatalf("slots were granted in order %v, want queue order 0..%d", order, legs-1)
+		}
+	}
+	if len(order) != legs {
+		t.Fatalf("%d legs got a slot, want %d", len(order), legs)
+	}
+}
+
+// No more than the limit hold a slot at once, and a released slot goes to the next leg in line.
+func TestVoiceSynthGate_CapsHoldersAndPassesSlotsOn(t *testing.T) {
+	const limit, legs = 3, 9
+	gate := newVoiceSynthGate(limit)
+	var holding, peak atomic.Int32
+	proceed := make(chan struct{})
+	var wg sync.WaitGroup
+	for range legs {
+		turn := gate.queue()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !turn.acquire(context.Background()) {
+				t.Error("acquire reported a cancel on a live context")
+				return
+			}
+			n := holding.Add(1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			<-proceed
+			holding.Add(-1)
+			turn.release()
+		}()
+	}
+	if !voicePoll(5*time.Second, func() bool { return holding.Load() == limit }) {
+		t.Fatalf("%d legs hold a slot, want the limit %d", holding.Load(), limit)
+	}
+	if voicePoll(100*time.Millisecond, func() bool { return holding.Load() > limit }) {
+		t.Fatalf("%d legs hold a slot at once, over the limit %d", holding.Load(), limit)
+	}
+	close(proceed)
+	wg.Wait()
+	if p := peak.Load(); p != limit {
+		t.Fatalf("peak holders = %d, want %d", p, limit)
+	}
+}
+
+// A cancel unblocks every queued leg (none takes a slot, all settle so nothing waits on them), a leg
+// that never held a slot cannot release one it does not own, and a context that is already done
+// takes no slot even when one is free.
+func TestVoiceSynthGate_CancelUnblocksQueuedTurns(t *testing.T) {
+	gate := newVoiceSynthGate(1)
+	holder := gate.queue()
+	if !holder.acquire(context.Background()) {
+		t.Fatal("the first leg could not take the free slot")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := []*voiceSynthTurn{gate.queue(), gate.queue(), gate.queue()}
+	results := make(chan bool, len(queued))
+	for _, turn := range queued {
+		go func() { results <- turn.acquire(ctx) }()
+	}
+	cancel()
+	for range queued {
+		select {
+		case got := <-results:
+			if got {
+				t.Fatal("a queued leg took a slot after the cancel")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a queued leg stayed blocked after the cancel (leaked goroutine)")
+		}
+	}
+	for i, turn := range queued {
+		select {
+		case <-turn.settled:
+		default:
+			t.Fatalf("queued turn %d never settled, so the leg behind it would wait forever", i)
+		}
+		turn.release() // never held: must not take the holder's slot
+	}
+	if got := len(gate.slots); got != 1 {
+		t.Fatalf("%d slots held, want exactly the holder's (a release without a hold stole or leaked one)", got)
+	}
+
+	holder.release()
+	holder.release() // idempotent
+	if got := len(gate.slots); got != 0 {
+		t.Fatalf("%d slots held after the holder released, want 0", got)
+	}
+	// Free slot, dead context: the leg gives up rather than starting a synthesis for a cancelled run.
+	late := gate.queue()
+	if late.acquire(ctx) {
+		t.Fatal("a leg took a slot on an already-cancelled context")
+	}
+	if got := len(gate.slots); got != 0 {
+		t.Fatalf("%d slots held after a refused acquire, want 0", got)
+	}
+}
+
+// A cancel while legs are queued behind a held synthesis ends the run cleanly and leaves nothing
+// behind: only the leg that held the slot ever reached the TTS (the queued ones give up instead of
+// synthesizing for a cancelled run), the slot comes back, no leg goroutine leaks, and nothing is
+// persisted.
+func TestVoiceRun_CancelWhileLegsQueuedLeavesNothingBehind(t *testing.T) {
+	script, _ := burstScript()
+	script[0].holdUntilCancel = true // the LLM is still streaming when the cancel lands
+	prov := defaultVoiceProvider()
+	prov.llmScript = script
+	prov.speechBodies = make(chan []byte, 2*burstSections)
+	prov.speechRelease = make(chan struct{}) // never released: the cancel is what ends the held leg
+	prov.speechInflight, prov.speechPeak = new(atomic.Int32), new(atomic.Int32)
+	srv, owner, chatID, _, speechBodies := newVoiceRunTestServerProv(t, prov)
+	srv.voiceTiming = voiceTiming{ttsConcurrency: 1}
+	t.Cleanup(func() { close(prov.speechRelease) })
+
+	before, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := goroutineStacks()
+	run, err := srv.startVoiceRun(context.Background(), voiceRunRequest{owner: owner, chatID: chatID, pendingText: "unused", asr: voiceASRTarget, llm: voiceLLMTarget, tts: voiceTTSTarget})
+	if err != nil {
+		t.Fatalf("startVoiceRun: %v", err)
+	}
+
+	// One leg holds the only slot at the TTS; the other five sections are queued behind it.
+	if !voicePoll(10*time.Second, func() bool { return prov.speechInflight.Load() == 1 }) {
+		t.Fatalf("%d syntheses in flight, want the one that holds the slot", prov.speechInflight.Load())
+	}
+	if voicePoll(150*time.Millisecond, func() bool { return prov.speechInflight.Load() > 1 }) {
+		t.Fatalf("%d syntheses in flight with the cap at 1", prov.speechInflight.Load())
+	}
+	if !srv.ChatRuns.cancelChat(owner.UserID, chatID) {
+		t.Fatal("cancelChat found no active run to cancel")
+	}
+	waitFor(t, func() bool { return run.statusValue() != "running" })
+	if got := run.statusValue(); got != "canceled" {
+		t.Fatalf("status = %q, want canceled", got)
+	}
+
+	if n := len(speechBodies); n != 1 {
+		t.Fatalf("%d speech requests reached the TTS, want 1: the queued legs must give up on a cancel, not synthesize", n)
+	}
+	if !voicePoll(2*time.Second, func() bool { return prov.speechInflight.Load() == 0 }) {
+		t.Fatalf("%d syntheses still in flight after the cancel", prov.speechInflight.Load())
+	}
+	var leaked []string
+	if !voicePoll(2*time.Second, func() bool {
+		leaked = newRepoGoroutines(baseline, "launchVoiceSpeech")
+		return len(leaked) == 0
+	}) {
+		t.Fatalf("speech leg goroutines leaked after the cancel:\n%s", strings.Join(leaked, "\n\n"))
+	}
+	after, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before.Content) != string(after.Content) {
+		t.Fatalf("a cancelled run persisted:\nbefore %s\nafter  %s", before.Content, after.Content)
+	}
+}
+
+// The first-chunk deadline is the SYNTHESIS's, not the queue's: a leg that waits behind an earlier
+// section's slot must not spend its deadline waiting. Section 0 hangs at the TTS until its own
+// deadline ends it (a timeout); section 1 was queued the whole time -- as long as that deadline --
+// yet then gets its own full deadline from the moment it takes the slot, and speaks.
+func TestVoiceRun_QueuedLegDeadlineStartsWhenItTakesTheSlot(t *testing.T) {
+	restore := speechRunDeadline
+	speechRunDeadline = 250 * time.Millisecond
+	t.Cleanup(func() { speechRunDeadline = restore })
+
+	prov := defaultVoiceProvider()
+	prov.llmScript = twoRegionScript
+	prov.speechHoldByInput = map[string]chan struct{}{twoRegionSec0: make(chan struct{})} // never released
+	srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+	srv.voiceTiming = voiceTiming{ttsConcurrency: 1}
+	rec := &recordingVoicePortal{API: srv.Portal}
+	srv.Portal = rec
+
+	_, snap := voiceRunOutcome(t, srv, owner, chatID, "unused")
+	if snap.Status != "error" || snap.Err != runTimedOutMessage {
+		t.Fatalf("status %q err %q, want the first section's timeout (%q) surfaced as the degrade", snap.Status, snap.Err, runTimedOutMessage)
+	}
+	turn, ok := rec.committed()
+	if !ok {
+		t.Fatal("no voice commit was captured")
+	}
+	if len(turn.SpokenSections) != 1 || turn.SpokenSections[0].Text != twoRegionSec1 {
+		t.Fatalf("SpokenSections = %+v, want only the queued section %q (it must still synthesize in its own, fresh deadline)", turn.SpokenSections, twoRegionSec1)
 	}
 }

@@ -35,6 +35,44 @@ func TestVoiceTimingFromConfigMuteTeardown(t *testing.T) {
 	}
 }
 
+// The speech-synthesis concurrency cap (#337) is a plain int: config.Load already resolved a
+// non-positive value to the default 2, so the mapping is a copy.
+func TestVoiceTimingFromConfigTTSConcurrency(t *testing.T) {
+	for _, want := range []int{1, 2, 7} {
+		got := voiceTimingFromConfig(config.Config{VoiceTTSConcurrency: want})
+		if got.TTSConcurrency != want {
+			t.Fatalf("voiceTimingFromConfig(VoiceTTSConcurrency:%d).TTSConcurrency = %d, want %d",
+				want, got.TTSConcurrency, want)
+		}
+	}
+}
+
+// The speech-leg retry count (#337) is the second voice knob whose 0 means something (no retry),
+// and config.Load keeps 0 distinct from the default 2. This pins the last hop: a positive count
+// reaches gateway.VoiceTiming as TTSRetries, and the explicit 0 as the TTSRetriesDisabled flag, so
+// "retries off" cannot be lost to the gateway's "zero means default" rule.
+func TestVoiceTimingFromConfigTTSRetries(t *testing.T) {
+	cases := []struct {
+		name         string
+		retries      int
+		wantRetries  int
+		wantDisabled bool
+	}{
+		{"configured count", 5, 5, false},
+		{"default as config loads it", 2, 2, false},
+		{"explicit zero is disabled", 0, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := voiceTimingFromConfig(config.Config{VoiceTTSRetries: tc.retries})
+			if got.TTSRetries != tc.wantRetries || got.TTSRetriesDisabled != tc.wantDisabled {
+				t.Fatalf("voiceTimingFromConfig(%d) = {TTSRetries:%d TTSRetriesDisabled:%v}, want {%d %v}",
+					tc.retries, got.TTSRetries, got.TTSRetriesDisabled, tc.wantRetries, tc.wantDisabled)
+			}
+		})
+	}
+}
+
 // The existing knobs are carried across unchanged (a non-positive config value is already
 // resolved to its default by config.Load, so the mapping is a plain copy).
 func TestVoiceTimingFromConfigCopiesTheOtherKnobs(t *testing.T) {

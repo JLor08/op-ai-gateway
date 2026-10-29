@@ -9945,7 +9945,7 @@ phase-2 default prompt's wording. Each is marked where it appears.
   [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 - **A voice run's stored `ttftMs` is now the text leg's time to its first LLM token.** In phase 1 the ordered LLM-then-TTS
   sequence made it effectively the audio's first-chunk time; a standalone speech run is unchanged.
-- **The TTS row meters the summary, not the answer,** when the answer carries a region (since phase 3 one row per section), and the leg can start (and, when a
+- **The TTS row meters the summary, not the answer,** when the answer carries a region (since phase 3 one row per section; since issue #337 a retried section can add zero-quantity error rows for its failed attempts, [ADR-080](#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt)), and the leg can start (and, when a
   resume cancels the run, be cut) while the LLM is still streaming; the rows are otherwise those of phase 1
   ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
 - **Per-answer language is best-effort and the summary rides a model-emitted tag.** A speech model that takes no `language`
@@ -10033,6 +10033,35 @@ flag).
   stream the drain keeps its phase-2 shape: its floor is the sum of all sections' durations from the first chunk relayed, the
   mic stays gated across the whole queue, and `played_through` counts across all the sections. With **no usable region** the
   whole answer is spoken as one leg after the LLM ends, recorded with no section (the phase-1/2 fallback).
+  *Amended by issue #337 (a bounded, retried speech leg):* the legs above no longer all synthesize at once, and a transient
+  failure no longer costs a section its voice. **Concurrency is capped.** A leg used to call `/v1/audio/speech` the moment
+  its region closed, bounded only by the relay's queue (`voiceSectionQueue`, 64), so a fast model that closed many regions in
+  a burst could start dozens of syntheses together and overwhelm the TTS model. Each run now owns a gate (`voiceSynthGate`)
+  of `OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY` slots (default 2, [Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate)): a leg waits for a slot before it
+  synthesizes and gives it back when its synthesis ends, before the relay has drained its audio. The cap is separate from the
+  ordered relay, whose queue stays deep: document order and the one `seq` stream are unchanged, and the gate only decides how
+  many already-queued legs are talking to the TTS. **Slots are granted in document order** (a leg queues for one only after
+  the section before it has its own), because a free-for-all would let later sections take every slot, fill their audio
+  buffers and block behind the relay while the earlier section the relay is waiting for could not start; with the grant in
+  order the relay's next-needed section always gets a slot, so nothing starves. **A leg's first-chunk deadline starts when
+  it gets its slot**, so the time it spent queued behind earlier sections is not charged to it. **A transient failure
+  before any audio is retried.** A leg whose attempt fails for a transient cause **before any audio chunk has reached its
+  relay** waits a backoff and tries again, up to `OP_AI_GATEWAY_VOICE_TTS_RETRIES` times (default 2; an explicit `0` turns it
+  off). The classification is made from the failure: `503` (gateway or TTS busy or no usable host), `429` (admission) and a
+  failed loopback dial are transient whatever their message says; any other `4xx` is permanent; and any other `5xx` is
+  decided **by its upstream message**, because audio.cpp answers `500` both for a hiccup and for a bad voice: a message
+  containing (case-insensitively) `voice`, `reference`, `speaker`, `not found`, `no such` or `does not exist` is permanent,
+  any other is transient. The retry runs **inside the slot the leg already holds** (releasing it between attempts would let
+  the next section take it and break the document-order grant), waits `250ms` doubling and capped at `2s` (so `250ms` then
+  `500ms` by default) and honors a cancel, and each attempt arms its own first-chunk deadline (an armed deadline cannot be
+  re-armed, so a shared one would charge the retry for the failed attempt and the backoff). It is **billing- and
+  ordering-safe**: a pre-stream failure produced and billed nothing, and once any chunk has been relayed, in any attempt, no
+  further attempt runs, so a retry cannot repeat audio the client has heard or bill a section twice; an accepted stream is
+  never classified as transient. **The permanent markers are broad but reconciled against audio.cpp's actual bad-voice `500`:** direct probing of the server
+  shows a bad reference or clone voice answers `500` whose message names the voice's reference path (so it contains `reference`),
+  which the markers catch; a built-in-voice model's bad-voice message is not separately confirmed. They stay broad on purpose:
+  a genuinely transient `500` whose message happens to contain one (`voice`, say) is treated as permanent and not retried,
+  which degrades the turn as it did before, since a missed permanent failure costs extra billed requests and a delay for nothing.
 - **(c) Every leg joins before the one commit.** After the LLM stream the run closes the relay's feed and joins **every** leg
   (`joinVoiceLegs`) and the relay goroutine **unconditionally**, so a cancelled or failed run never leaks a leg; only then does
   it claim the commit through the same compare-and-swap as before ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
@@ -10134,6 +10163,11 @@ flag).
   reads.
 - **A voice run writes one TTS usage row per section** (one streamed `/v1/audio/speech` call each; the no-region fallback is
   one), the LLM and ASR rows being as before ([Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)).
+  *Amended by issue #337:* a section whose first attempt was refused or failed and then retried can write **more than one**:
+  each failed attempt the speech endpoint answered is recorded like any refused or failed speech call (an error row with
+  quantity 0), and only the attempt that streams carries a billed quantity. Two refusals write none: a failed loopback dial
+  never reaches the endpoint, and a principal rate-limit `429` (`limit.*`, from `admitPrincipal`) is never recorded as a
+  usage event, although the leg retries it like any `429`.
 - **"Stop speaking" is a cancel until the turn commits.** In `speaking` the run is, apart from one store write, still
   uncommitted, so a stop there discards the user's utterance and the answer (the portal voids the preview and reloads the
   thread); only a stop in `draining` leaves the stored turn. A stop that loses the race to the commit write stores the turn
@@ -10142,6 +10176,19 @@ flag).
   client holds a pause, and the portal presents pause only while audio is heard so the ignored case does not surprise the
   user; the next turn can also meet a run still finishing its commit after a stop and degrade to the one `error` frame
   (`gateway.voice_run_start_failed`) in a window of milliseconds ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+- **Speech generation is bounded and retried, not guaranteed (issue #337).** The concurrency cap and the transient
+  pre-stream retry above make a briefly busy TTS cost a section a delay instead of its voice, and stop a burst of regions from
+  swamping it. What they do **not** cover, kept as residuals rather than fixed: (1) **no empty PCM during a retry.** A retry
+  leaves a gap in that section's playback, and the stream is not kept fed with silence across it. The default budget (about
+  750 ms of backoff in all) is covered by the server's drain floor and the portal's playback-done debounce (about 1.2 s),
+  but a larger `OP_AI_GATEWAY_VOICE_TTS_RETRIES` can outlast that; streaming silence over a long gap is deferred. (2) **The permanent
+  markers are reconciled against audio.cpp's actual bad-voice `500`** (direct probing; a built-in-voice model's message is not
+  separately confirmed) but broad (above), so they may still withhold a retry that would have succeeded. (3) **Two failures are not retried:** a first-chunk-deadline timeout (it ends the attempt as the
+  run's own cutoff and is not classified transient), and a `2xx` stream that dies before any audio delta (an accepted stream
+  is never classified transient, because audio may already be relayed and billed). Both degrade the turn as before.
+  Retrying applies to the speech leg only, not to the LLM or ASR legs. Pinned by mock-backed tests (the gate's order and cap, the
+  classification table, the backoff schedule, the relayed-audio guard, a retry that keeps its slot, a cancel in the
+  backoff); **not** claimed against a live audio.cpp.
 - **The automatic pick is held, and a voice is attributed to its model (issue #326).** Phase 3's loaded-aware pick had a
   drift: a voice saved for an auto-picked speech model could be sent to another model once the loaded state changed, because
   only an explicit pick was stored and the voice list is an offer, not a constraint. The pick is now made once and held while

@@ -103,6 +103,18 @@ type Config struct {
 	// variable stays distinguishable from a deliberate 0 -- cmd/gateway maps 0 onto
 	// gateway.VoiceTiming.MuteKeepalive.
 	VoiceMuteTeardown time.Duration
+	// VoiceTTSConcurrency (OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY, an integer) is how many speech
+	// sections one Voice Chat run synthesizes at once. A cap of 0 would admit no synthesis, so
+	// it follows the plain rule: an absent, empty, junk or <= 0 value uses the default 2 (the
+	// literal of gateway.VoiceTTSConcurrencyDefault), and the loaded value is always >= 1.
+	VoiceTTSConcurrency int
+	// VoiceTTSRetries (OP_AI_GATEWAY_VOICE_TTS_RETRIES, an integer) is how many times a Voice
+	// Chat speech leg is retried after a transient failure. Like VoiceMuteTeardown, an explicit
+	// 0 is a real value and is KEPT as 0: it means "never retry". Only an absent, empty, junk
+	// or negative value falls back to the default 2 (the literal of
+	// gateway.VoiceTTSRetriesDefault), so an absent variable stays distinguishable from a
+	// deliberate 0 -- cmd/gateway maps 0 onto gateway.VoiceTiming.TTSRetriesDisabled.
+	VoiceTTSRetries int
 	// CertEdgeProbeTarget is the host:port of the gateway's OWN edge (nginx)
 	// TLS listener the synthetic self-probe dials (e.g. "web:443" in compose,
 	// the Service name+port nginx's :443 server block is reachable at in
@@ -320,6 +332,13 @@ func Load() (Config, error) {
 		// The mute teardown is the exception to "0 -> the default" above: an explicit 0 is
 		// keepalive and must survive, so it is parsed with durationAllowZero.
 		VoiceMuteTeardown: l.durationAllowZero("OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN", 10*time.Second),
+		// Voice Chat speech generation (see the field docs). Both defaults repeat the literals
+		// of gateway.VoiceTTS*Default (this package cannot import gateway). The cap follows the
+		// plain integer rule (a cap of 0 admits nothing); the retry count is the other knob
+		// where an explicit 0 ("never retry") must survive, so it is parsed with
+		// integerAllowZero.
+		VoiceTTSConcurrency: l.integer("OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY", 2),
+		VoiceTTSRetries:     l.integerAllowZero("OP_AI_GATEWAY_VOICE_TTS_RETRIES", 2),
 		// Retention window (hours) for persisted rich telemetry samples; the
 		// prune loop drops samples older than this. Default 168 = 7 days; junk
 		// or <= 0 falls back to the default via integer().
