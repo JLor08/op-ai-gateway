@@ -12,6 +12,10 @@
 //     where another has to be loaded first -- else simply the first, in the candidates' order
 //     (`autoVoiceModel`; the speech candidates are ordered plain models first, preset-clone ones
 //     after, by the store);
+//   - the automatic pick is held steady once made (`stickyAutoVoiceModel`, #326): it moves only when
+//     the model stops streaming, not as models are loaded and unloaded, so a voice chosen for it
+//     stays with it; and a saved voice is reconciled with the model that would speak
+//     (`reconcileVoice`) when that model is another one;
 //   - the user's pick wins while it is one of them, and otherwise the automatic pick does -- a
 //     pick that is gone (the model left the catalogue, is unreachable, or no longer streams) is
 //     a graceful fallback, never a stuck conversation (`effectiveVoiceModel`);
@@ -72,24 +76,95 @@ export function effectiveVoiceModel(
 }
 
 /**
+ * The automatic pick of a leg, held steady (#326): `previous` -- the model the leg used until now --
+ * while it is still one of the models that stream, else a fresh automatic pick (`autoVoiceModel`:
+ * the first loaded model that streams, else the first that streams). Without it the automatic pick
+ * would follow the catalogue's loaded state, and so drift to another model as models are loaded and
+ * unloaded in the background, taking the voice that was chosen for the first one along with it. Only
+ * the model's leaving the models that stream (it is gone, unreachable, or no longer streams) moves
+ * the pick; a model that is merely not loaded any more is kept. '' for `previous` is no pick yet.
+ */
+export function stickyAutoVoiceModel(
+  previous: string,
+  streaming: readonly string[],
+  models: readonly ModelOption[] = [],
+): string {
+  return previous !== '' && streaming.includes(previous)
+    ? previous
+    : autoVoiceModel(streaming, models);
+}
+
+/**
  * The thread's picks after the user chooses the speech model `ttsModel` (among the models that
- * `streaming` says stream): the pick is recorded, and the VOICE is cleared when another model
- * would now speak -- a voice is one the model that offered it has, and must not be carried to
- * one that may not (the conversation would then fail on a voice it does not know). Choosing the
- * model that would speak anyway (the automatic pick, or the explicit pick of it) leaves it.
- * `models` is the catalogue the automatic pick reads the loaded state from, so that "the model
- * that would speak anyway" is the one the conversation would really use.
+ * `streaming` says stream): the pick is recorded, and the VOICE is cleared -- together with the
+ * model it was chosen for (`voiceModel`) -- when another model would now speak: a voice is one the
+ * model that offered it has, and must not be carried to one that may not (the conversation would
+ * then fail on a voice it does not know). Choosing the model that speaks anyway (the automatic
+ * pick, or the explicit pick of it) leaves it.
+ *
+ * `currentEffectiveTts` is the model that speaks NOW, as the conversation holds it (the sticky
+ * automatic pick, see stickyAutoVoiceModel); it is not recomputed here, because a fresh automatic
+ * pick may already be another model than the one speaking. It is compared with the model the
+ * choice resolves to (`effectiveVoiceModel`, over `models`, the catalogue the automatic pick reads
+ * the loaded state from).
  */
 export function withTtsModel(
   current: VoiceChatSettings,
   ttsModel: string,
+  currentEffectiveTts: string,
   streaming: readonly string[],
   models: readonly ModelOption[] = [],
 ): VoiceChatSettings {
-  const sameModel =
-    effectiveVoiceModel(current.ttsModel, streaming, models) ===
-    effectiveVoiceModel(ttsModel, streaming, models);
-  return { ...current, ttsModel, voice: sameModel ? current.voice : '' };
+  const sameModel = currentEffectiveTts === effectiveVoiceModel(ttsModel, streaming, models);
+  // A voice and the model it was chosen for go together.
+  const cleared = { voice: '', voiceModel: '' };
+  return { ...current, ttsModel, ...(sameModel ? {} : cleared) };
+}
+
+/**
+ * The voice list of the speech model that would speak, as the control knows it (#326): not yet
+ * (`loading`), not at all (`failed`), or `ready` -- possibly empty, for a model with no voices to
+ * offer. A list that is not `ready` is not a list that says "none": it decides nothing.
+ */
+export type VoiceList =
+  { status: 'loading' } | { status: 'failed' } | { status: 'ready'; voices: readonly string[] };
+
+/**
+ * The saved voice, reconciled with the speech model that would speak now (#326), or null for "no
+ * change". A saved voice is one the model it was chosen for (`voiceModel`) has, so when ANOTHER
+ * model would speak (`effectiveModel`: the model changed, or the thread was saved before the
+ * attribution existed and `voiceModel` is ''):
+ *
+ *   - its voice list is `ready` and holds the voice -> the voice is kept and now belongs to the
+ *     new model (`voiceModel` follows);
+ *   - the list is `ready` and does not hold it -> both are cleared: the model speaks with its own
+ *     default voice instead of failing on one it does not know;
+ *   - the list is still `loading`, or `failed` -> no change: a list that is not known cannot
+ *     condemn the voice (a transient failure must not erase the user's choice); it is judged once
+ *     the list is there.
+ *
+ * Where the voice was chosen for the model that speaks, nothing is judged: the list is an offer,
+ * never a constraint, so a name that was typed and the list does not hold stays. No voice, or no
+ * model that would speak, is nothing to reconcile either. The voice is compared trimmed, as it is
+ * saved and spoken.
+ */
+export function reconcileVoice({
+  voice,
+  voiceModel,
+  effectiveModel,
+  voices,
+}: {
+  voice: string;
+  voiceModel: string;
+  effectiveModel: string;
+  voices: VoiceList;
+}): { voice: string; voiceModel: string } | null {
+  const chosen = voice.trim();
+  if (chosen === '' || effectiveModel === '' || voiceModel === effectiveModel) return null;
+  if (voices.status !== 'ready') return null;
+  return voices.voices.includes(chosen)
+    ? { voice, voiceModel: effectiveModel }
+    : { voice: '', voiceModel: '' };
 }
 
 /**

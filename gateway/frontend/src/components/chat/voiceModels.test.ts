@@ -6,11 +6,14 @@ import type { ModelOption } from '../../api';
 import {
   autoVoiceModel,
   effectiveVoiceModel,
+  reconcileVoice,
+  stickyAutoVoiceModel,
   thoseThatStream,
   effectiveVoice,
   voiceLegsOf,
   voiceModelChoice,
   withTtsModel,
+  type VoiceList,
   type VoiceStreaming,
 } from './voiceModels';
 
@@ -123,6 +126,36 @@ describe('effectiveVoiceModel', () => {
     it("is still the user's pick when it is on offer, loaded or not", () => {
       expect(effectiveVoiceModel('asr-a', streaming, models)).toBe('asr-a');
     });
+  });
+});
+
+describe('stickyAutoVoiceModel', () => {
+  it('keeps a previous pick that still streams, even when another model is now loaded', () => {
+    expect(stickyAutoVoiceModel('m1', ['m1', 'm2'], [catalogued('m2', true)])).toBe('m1');
+  });
+
+  it('keeps a previous pick that streams and is itself not loaded (a cold model stays)', () => {
+    expect(
+      stickyAutoVoiceModel('m1', ['m1', 'm2'], [catalogued('m1', false), catalogued('m2', true)]),
+    ).toBe('m1');
+  });
+
+  it('re-resolves (prefer-loaded) when the previous pick no longer streams', () => {
+    expect(stickyAutoVoiceModel('m1', ['m2', 'm3'], [catalogued('m3', true)])).toBe('m3');
+  });
+
+  it('is a fresh resolution when there is no previous pick', () => {
+    expect(stickyAutoVoiceModel('', ['m2', 'm3'], [])).toBe('m2');
+    expect(stickyAutoVoiceModel('', ['m2', 'm3'], [catalogued('m3', true)])).toBe('m3');
+  });
+
+  it('never reads an empty previous pick as a model, whatever an (impossible) empty id would say', () => {
+    expect(stickyAutoVoiceModel('', ['', 'm2'], [catalogued('m2', true)])).toBe('m2');
+  });
+
+  it('is none when nothing streams, whatever the previous pick was', () => {
+    expect(stickyAutoVoiceModel('m1', [], [catalogued('m1', true)])).toBe('');
+    expect(stickyAutoVoiceModel('', [])).toBe('');
   });
 });
 
@@ -283,51 +316,181 @@ describe('effectiveVoice', () => {
   });
 });
 
+// A saved voice belongs to the model it was chosen for (`voiceModel`). When the model that would
+// speak is another one, the voice is kept only if that model offers it -- and only once its voice
+// list is KNOWN: a list that is still loading, or that failed, decides nothing.
+describe('reconcileVoice', () => {
+  const ready = (voices: string[]): VoiceList => ({ status: 'ready', voices });
+
+  it('is no change while the voice was chosen for the model that speaks (a typed name is kept)', () => {
+    expect(
+      reconcileVoice({ voice: 'alloy', voiceModel: 'm1', effectiveModel: 'm1', voices: ready([]) }),
+    ).toBeNull();
+  });
+
+  it('keeps the voice and re-attributes it to the new model when that model offers it', () => {
+    expect(
+      reconcileVoice({
+        voice: 'alloy',
+        voiceModel: 'm1',
+        effectiveModel: 'm2',
+        voices: ready(['alloy']),
+      }),
+    ).toEqual({ voice: 'alloy', voiceModel: 'm2' });
+  });
+
+  it('clears the voice and its attribution when the new model does not offer it', () => {
+    expect(
+      reconcileVoice({
+        voice: 'alloy',
+        voiceModel: 'm1',
+        effectiveModel: 'm2',
+        voices: ready(['nova']),
+      }),
+    ).toEqual({ voice: '', voiceModel: '' });
+  });
+
+  it('defers while the new model voice list is not known: loading or failed is no change', () => {
+    const base = { voice: 'alloy', voiceModel: 'm1', effectiveModel: 'm2' };
+    expect(reconcileVoice({ ...base, voices: { status: 'loading' } })).toBeNull();
+    expect(reconcileVoice({ ...base, voices: { status: 'failed' } })).toBeNull();
+  });
+
+  it('is no change without a voice, even when the attribution is stale (nothing would be sent)', () => {
+    expect(
+      reconcileVoice({
+        voice: '',
+        voiceModel: 'm1',
+        effectiveModel: 'm2',
+        voices: ready(['nova']),
+      }),
+    ).toBeNull();
+    expect(
+      reconcileVoice({
+        voice: '   ',
+        voiceModel: 'm1',
+        effectiveModel: 'm2',
+        voices: ready(['nova']),
+      }),
+    ).toBeNull();
+  });
+
+  it('is no change without a model that would speak', () => {
+    expect(
+      reconcileVoice({
+        voice: 'alloy',
+        voiceModel: 'm1',
+        effectiveModel: '',
+        voices: ready(['nova']),
+      }),
+    ).toBeNull();
+  });
+
+  it('treats a thread saved before the attribution existed (voiceModel empty) as a differing model', () => {
+    expect(
+      reconcileVoice({
+        voice: 'alloy',
+        voiceModel: '',
+        effectiveModel: 'm2',
+        voices: ready(['alloy']),
+      }),
+    ).toEqual({ voice: 'alloy', voiceModel: 'm2' });
+    expect(
+      reconcileVoice({
+        voice: 'alloy',
+        voiceModel: '',
+        effectiveModel: 'm2',
+        voices: ready(['nova']),
+      }),
+    ).toEqual({ voice: '', voiceModel: '' });
+  });
+
+  it('compares the voice trimmed, as the saved and the spoken voice are', () => {
+    expect(
+      reconcileVoice({
+        voice: ' alloy ',
+        voiceModel: 'm1',
+        effectiveModel: 'm2',
+        voices: ready(['alloy']),
+      }),
+    ).toEqual({ voice: ' alloy ', voiceModel: 'm2' });
+  });
+});
+
 // A voice is a voice of the model that offered it: choosing another speech model must not carry it
-// there (#318) -- but choosing the model that would speak anyway changes nothing about it.
+// there (#318) -- but choosing the model that would speak anyway changes nothing about it. "The model
+// that speaks now" is passed in by the caller (the conversation's effective, sticky pick), never
+// recomputed here.
 describe('withTtsModel', () => {
   const streaming = ['tts-a', 'tts-clone'];
-  // The thread's own system prompt rides along: a speech model switch is not its business.
-  const current = { asrModel: 'asr-b', ttsModel: '', voice: 'marius', systemPrompt: 'Be terse.' };
+  // The thread's own system prompt rides along: a speech model switch is not its business. The voice
+  // was chosen for tts-a (`voiceModel`), the model that speaks while the thread is on automatic.
+  const current = {
+    asrModel: 'asr-b',
+    ttsModel: '',
+    voice: 'marius',
+    voiceModel: 'tts-a',
+    systemPrompt: 'Be terse.',
+  };
 
-  it('records the pick and clears the voice when another model would now speak', () => {
-    expect(withTtsModel(current, 'tts-clone', streaming)).toEqual({
+  it('records the pick and clears the voice and its attribution when another model would now speak', () => {
+    expect(withTtsModel(current, 'tts-clone', 'tts-a', streaming)).toEqual({
       asrModel: 'asr-b',
       ttsModel: 'tts-clone',
       voice: '',
+      voiceModel: '',
       systemPrompt: 'Be terse.',
     });
-    expect(withTtsModel({ ...current, ttsModel: 'tts-clone' }, '', streaming).voice).toBe('');
+    expect(
+      withTtsModel({ ...current, ttsModel: 'tts-clone' }, '', 'tts-clone', streaming),
+    ).toMatchObject({ ttsModel: '', voice: '', voiceModel: '' });
   });
 
-  it('keeps the voice when the model that would speak is the same one (automatic vs. the pick of it)', () => {
-    expect(withTtsModel(current, 'tts-a', streaming)).toEqual({ ...current, ttsModel: 'tts-a' });
-    expect(withTtsModel({ ...current, ttsModel: 'tts-a' }, '', streaming).voice).toBe('marius');
-    expect(withTtsModel(current, 'tts-clone', streaming).asrModel).toBe('asr-b');
+  it('keeps the voice and its attribution when the model that would speak is the same one (automatic vs. the pick of it)', () => {
+    expect(withTtsModel(current, 'tts-a', 'tts-a', streaming)).toEqual({
+      ...current,
+      ttsModel: 'tts-a',
+    });
+    expect(withTtsModel({ ...current, ttsModel: 'tts-a' }, '', 'tts-a', streaming)).toMatchObject({
+      voice: 'marius',
+      voiceModel: 'tts-a',
+    });
+    expect(withTtsModel(current, 'tts-clone', 'tts-a', streaming).asrModel).toBe('asr-b');
   });
 
   it('treats a pick that is gone as the automatic one, as the conversation does', () => {
-    expect(withTtsModel(current, 'tts-gone', streaming).voice).toBe('marius');
+    expect(withTtsModel(current, 'tts-gone', 'tts-a', streaming).voice).toBe('marius');
   });
 
-  // The model that would speak under "automatic" is the loaded one, so a voice follows that rule
-  // too: choosing the loaded model changes nothing, choosing the one that is not loaded does.
-  describe('with the catalogue to say which models are loaded', () => {
+  // The model that speaks is whatever the caller says it is -- the sticky automatic pick -- and not
+  // what a fresh automatic resolution would give now. Here the sticky pick is tts-a while tts-clone
+  // has since been loaded (so a fresh resolution would say tts-clone).
+  describe('with a speaking model that differs from a fresh automatic resolution', () => {
     const models = [catalogued('tts-a', false), catalogued('tts-clone', true)];
 
-    it('keeps the voice when the pick is the loaded model that automatic already speaks with', () => {
-      expect(withTtsModel(current, 'tts-clone', streaming, models)).toEqual({
+    it('keeps the voice when the pick is the model that speaks now, though it is not the loaded one', () => {
+      expect(withTtsModel(current, 'tts-a', 'tts-a', streaming, models)).toEqual({
         ...current,
-        ttsModel: 'tts-clone',
+        ttsModel: 'tts-a',
       });
     });
 
-    it('clears the voice when the pick is the first model that is no longer the one that speaks', () => {
-      expect(withTtsModel(current, 'tts-a', streaming, models)).toEqual({
+    it('clears the voice when the pick is the loaded model the conversation is not speaking with', () => {
+      expect(withTtsModel(current, 'tts-clone', 'tts-a', streaming, models)).toEqual({
         ...current,
-        ttsModel: 'tts-a',
+        ttsModel: 'tts-clone',
         voice: '',
+        voiceModel: '',
       });
     });
+  });
+
+  // Picking automatic ('') resolves, afresh, to the loaded model: that is another model than the
+  // sticky one that speaks now, so the voice goes with it.
+  it('clears the voice when automatic would now resolve to another model than the one speaking', () => {
+    const models = [catalogued('tts-a', false), catalogued('tts-clone', true)];
+    expect(
+      withTtsModel({ ...current, ttsModel: 'tts-a' }, '', 'tts-a', streaming, models),
+    ).toMatchObject({ ttsModel: '', voice: '', voiceModel: '' });
   });
 });
