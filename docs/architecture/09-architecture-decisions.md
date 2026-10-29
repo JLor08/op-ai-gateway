@@ -10030,8 +10030,9 @@ flag).
   the same gapless streaming player as phase 2. The **`section` tag is attribution only**, which transcript block a chunk
   belongs to; it is the section's launch index, so it can skip when a section's speech failed (the committed sections are
   compacted, (d)), and a 0 is omitted from the frame so an older client is not regressed. Because every section rides one
-  stream the drain keeps its phase-2 shape: its floor is the sum of all sections' durations from the first chunk relayed, the
-  mic stays gated across the whole queue, and `played_through` counts across all the sections. With **no usable region** the
+  stream the drain keeps its phase-2 shape: its floor is the sum of all sections' durations from the first chunk relayed (plus
+  any gap silence the relay fed between them, issue #339 below), the mic stays gated across the whole queue, and
+  `played_through` counts across all the sections. With **no usable region** the
   whole answer is spoken as one leg after the LLM ends, recorded with no section (the phase-1/2 fallback).
   *Amended by issue #337 (a bounded, retried speech leg):* the legs above no longer all synthesize at once, and a transient
   failure no longer costs a section its voice. **Concurrency is capped.** A leg used to call `/v1/audio/speech` the moment
@@ -10062,6 +10063,36 @@ flag).
   which the markers catch; a built-in-voice model's bad-voice message is not separately confirmed. They stay broad on purpose:
   a genuinely transient `500` whose message happens to contain one (`voice`, say) is treated as permanent and not retried,
   which degrades the turn as it did before, since a missed permanent failure costs extra billed requests and a delay for nothing.
+  *Amended by issue #339 (a gap in the speech is filled with keepalive silence):* a retry's backoff, and the wait for a
+  section whose synthesis has not yet produced its first chunk, used to leave the client's stream empty. The relay
+  (`relayVoiceSections`) now fills such a **quiet gap** with gateway-generated silence while the turn is still going: 200 ms
+  of zeroed mono `s16le` PCM (`voiceSilencePCM`) every 150 ms (the frame is longer than the cadence so the player never runs
+  dry between two, and both are well under the portal's 1.2 s playing-gap tolerance), for **both** kinds of gap: inside a leg
+  (queued behind the concurrency cap, waiting for its first chunk, backing off to retry) and between two legs (the next
+  section has not been launched, or has not streamed yet). The cadence timer restarts on every real chunk and every
+  hand-over to the next leg, and real audio already waiting is delivered before a timer that fired, so silence never lands
+  between chunks that arrive steadily, and the relay publishes no silence once it has observed the feed closed. **It reuses `audio_delta`:** a silence
+  frame is an ordinary frame (zeroed PCM as base64, `rate`, the one `seq`, and a `section` tag: the awaited leg's own section
+  before any audio has been relayed, the section of the audio last relayed once there is some and between legs), so there is
+  **no new wire frame and no portal change**: the client plays zeros inaudibly and its playing-gap
+  timer re-arms on any frame. **The rate** is that of the last real chunk relayed; else, before any real audio (only the first
+  section's pre-stream wait or retry), the run's output sample rate, resolved once at run start (`voiceRunOutputRate`, the
+  cached `output_byte_rate` of [ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+  returned as Hz); else **none, and no rate means no silence** (fail-open: today's behavior, the gap stays empty). The
+  between-legs wait uses the last-seen rate only, so there is **no fill of the pre-first-audio "thinking" gap** (the model
+  still writing before its first region closes stays as quiet as before). **The between-legs fill does not stop after the
+  last section:** the relay's feed of legs stays open until the LLM ends, so once audio has been relayed the wait continues,
+  silence and all, through the trailing non-spoken detail the model goes on writing; the client's queue never runs dry in
+  that window, so its `playing` state holds and the half-duplex mic gate stays shut until the turn's audio is over. **It is gated on the streaming regime:** when the
+  run's speech streaming is opted out (`audio.Stream` false, the same opt-out `speechRunStreamRate` honors, read through
+  one helper so the two cannot disagree) there is no live audio to keep alive and the relay emits no silence. **Always on, no
+  operator knob.** **Accounting is consistent and safe by construction:** because silence is a normal `audio_delta` it counts
+  toward the client's `played_through` and extends the server's drain floor by its own playout time (a 200 ms frame every 150 ms adds
+  about a third more than the gap it fills), identically on both ends, and, like any relayed chunk, clears a remembered playback-done signal;
+  and the relay is fully joined (`relayWG.Wait()`) and the run detached **before** the drain wait begins, so silence cannot
+  race the drain or end a turn early. **It is never stored and never billed:** the relay's sink and the leg's own
+  keep-and-commit sink are independent, silence is published to the run only, and a stored clip or an `audio_second`
+  quantity holds the section's real PCM and nothing else.
 - **(c) Every leg joins before the one commit.** After the LLM stream the run closes the relay's feed and joins **every** leg
   (`joinVoiceLegs`) and the relay goroutine **unconditionally**, so a cancelled or failed run never leaks a leg; only then does
   it claim the commit through the same compare-and-swap as before ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
@@ -10119,7 +10150,9 @@ flag).
   ([ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), (b)). The portal draws pause/resume and "stop speaking"
   **only while audio is actually being heard**, from the first played chunk until the answer has played out: the queue running
   dry once the gateway has sent everything, or staying dry for 1.2 s while the gateway is still `speaking` (the last section is
-  over and the model goes on writing the detail; a later section's chunk would arrive well inside that window), and not in the
+  over and the model goes on writing the detail; a later section's chunk would arrive well inside that window; *amended by
+  issue #339:* only when the gateway is not filling that wait with gap silence, since silence keeps the queue from running dry
+  and the controls stay drawn through the detail wait, (b)), and not in the
   gateway's tail, where a pause would do nothing. *Amended by issue #326:* the **output mute is not one of them any more**: it
   sits beside the microphone mute and is drawn whenever the conversation is on, in any state and before the first answer, so
   it can be set ahead of it and its state is seen between answers; the playing-only group sits inside a room of constant height
@@ -10176,19 +10209,34 @@ flag).
   client holds a pause, and the portal presents pause only while audio is heard so the ignored case does not surprise the
   user; the next turn can also meet a run still finishing its commit after a stop and degrade to the one `error` frame
   (`gateway.voice_run_start_failed`) in a window of milliseconds ([Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
-- **Speech generation is bounded and retried, not guaranteed (issue #337).** The concurrency cap and the transient
-  pre-stream retry above make a briefly busy TTS cost a section a delay instead of its voice, and stop a burst of regions from
-  swamping it. What they do **not** cover, kept as residuals rather than fixed: (1) **no empty PCM during a retry.** A retry
-  leaves a gap in that section's playback, and the stream is not kept fed with silence across it. The default budget (about
-  750 ms of backoff in all) is covered by the server's drain floor and the portal's playback-done debounce (about 1.2 s),
-  but a larger `OP_AI_GATEWAY_VOICE_TTS_RETRIES` can outlast that; streaming silence over a long gap is deferred. (2) **The permanent
-  markers are reconciled against audio.cpp's actual bad-voice `500`** (direct probing; a built-in-voice model's message is not
-  separately confirmed) but broad (above), so they may still withhold a retry that would have succeeded. (3) **Two failures are not retried:** a first-chunk-deadline timeout (it ends the attempt as the
-  run's own cutoff and is not classified transient), and a `2xx` stream that dies before any audio delta (an accepted stream
-  is never classified transient, because audio may already be relayed and billed). Both degrade the turn as before.
-  Retrying applies to the speech leg only, not to the LLM or ASR legs. Pinned by mock-backed tests (the gate's order and cap, the
-  classification table, the backoff schedule, the relayed-audio guard, a retry that keeps its slot, a cancel in the
-  backoff); **not** claimed against a live audio.cpp.
+- **Speech generation is bounded and retried, not guaranteed (issue #337); a gap in it is filled with silence (issue #339).**
+  The concurrency cap and the transient pre-stream retry above make a briefly busy TTS cost a section a delay instead of its
+  voice, and stop a burst of regions from swamping it. **Resolved by issue #339: no empty PCM during a retry.** A retry's
+  backoff (and any other quiet gap in a streamed run, the one between two sections included) used to leave playback with
+  nothing feeding the stream. The default budget (about 750 ms of backoff in all) was covered by the server's drain floor and
+  the portal's playback-done debounce (about 1.2 s), but a larger `OP_AI_GATEWAY_VOICE_TTS_RETRIES` could outlast that. The
+  relay now keeps the client fed with keepalive silence across any such gap, reusing `audio_delta` (the amendment to (b)
+  above), so a generous retry budget no longer risks ending the turn early. What is still **not** covered, kept as residuals
+  rather than fixed:
+  (1) **The permanent markers are reconciled against audio.cpp's actual bad-voice `500`** (direct probing; a built-in-voice
+  model's message is not separately confirmed) but broad (above), so they may still withhold a retry that would have
+  succeeded.
+  (2) **Two failures are not retried:** a first-chunk-deadline timeout (it ends the attempt as the run's own cutoff and is not
+  classified transient), and a `2xx` stream that dies before any audio delta (an accepted stream is never classified
+  transient, because audio may already be relayed and billed). Both degrade the turn as before.
+  (3) **The silence itself has one small cache-skew residual:** only the very first leg's pre-first-audio silence uses the
+  rate resolved once at run start, so if the routes cache changed in that narrow window it could differ from the first real
+  chunk's rate, and the client then falls back gracefully to the committed WAV (the same cache staleness
+  `speechRunStreamRate` documents). Where no rate can be resolved, or streaming is opted out, there is no silence and the gap
+  is as empty as it was before #339.
+  (4) **A long gap leaves a bounded trailing-silence backlog:** the silence frame (200 ms) is deliberately longer than the
+  cadence (150 ms), a margin that keeps the player continuously fed, so a long between-legs or trailing-detail wait queues
+  about a third of the gap as extra client-side silence, which plays out before the turn ends. Negligible for the default
+  retry budget and short detail tails, and bounded; a known trade-off of the margin.
+  Retrying applies to the speech leg only, not to the LLM or ASR legs. Pinned by mock-backed tests (the gate's order and cap,
+  the classification table, the backoff schedule, the relayed-audio guard, a retry that keeps its slot, a cancel in the
+  backoff; for #339 the relay's gap fill and its rate sources, silence that is neither stored nor billed, and a turn that
+  still ends); **not** claimed against a live audio.cpp.
 - **The automatic pick is held, and a voice is attributed to its model (issue #326).** Phase 3's loaded-aware pick had a
   drift: a voice saved for an auto-picked speech model could be sent to another model once the loaded state changed, because
   only an explicit pick was stored and the voice list is an offer, not a constraint. The pick is now made once and held while

@@ -1280,9 +1280,22 @@ func TestVoiceConcurrentEarlyPlaybackDoneClampedToFloor(t *testing.T) {
 // the remembered-signal fix itself. The client's player fires onEmpty -- and sends playback_done
 // -- on EVERY queue drain, including a gap between TTS chunks when TTS lags real time, not only at
 // the true end. A gap signal remembered mid-stream must NOT end the drain while later audio is
-// still playing. Here chunk A is relayed, a gap playback_done arrives, THEN chunk B is relayed
+// still playing. Here chunk A is relayed, a gap playback_done arrives, THEN more audio is relayed
 // (which clears the remembered signal) and the turn commits; the mic must stay gated until the
 // genuine end-of-audio signal, never re-opening on the stale gap signal (echo exposure).
+//
+// The "more audio" that clears the signal is no longer chunk B alone. Chunk B is held for half a
+// second, and the relay does not leave the player idle over a gap that long: it plays keepalive
+// silence (#339), one frame every ~150 ms, and every frame it relays -- silence included, since it is
+// audio the client still has to play -- clears the remembered gap signal exactly as a real chunk does
+// (TestVoiceRelayAudioTreatsSilenceLikeAnyChunk pins that on the machine). So the signal is cleared
+// mid-gap by the next silence frame after the gap signal (the machine holds chunk A back until the
+// continuation grace closes, so a silence frame can already have been relayed before the signal is
+// sent), well before B is released; B then adds the last audio and the turn commits. That is the
+// correct behavior and what the assertions below hold; only the mechanism that clears the signal
+// moved from B to the silence. The silence also counts toward the drain floor (relayedPlaybackDur),
+// so over this 500 ms the floor alone would keep the mic gated: this test no longer isolates the
+// clear-on-relay guard, which is why that guard is pinned directly on the machine.
 func TestVoiceConcurrentMidStreamGapSignalDoesNotEndDrainEarly(t *testing.T) {
 	child := newFakeVoiceASRChild(t)
 	child.finals = []string{concurrentSpeakFinal}
@@ -1311,19 +1324,20 @@ func TestVoiceConcurrentMidStreamGapSignalDoesNotEndDrainEarly(t *testing.T) {
 
 	// A GAP playback_done (the player's queue drained between chunks) arrives while speaking --
 	// remembered by the fix. Let the ~0.2s floor elapse so a stale signal would be able to end the
-	// drain the moment the turn commits.
+	// drain the moment the turn commits. B is still held, so the relay plays silence over these
+	// 500 ms (#339), and the next silence frame it relays after this signal clears the remembered signal.
 	sendVoiceControl(t, ctx, conn, "playback_done")
 	time.Sleep(500 * time.Millisecond)
 
-	// Release chunk B: relaying it CLEARS the remembered gap signal, then the turn commits. B is
-	// published before the run's terminal, so it is relayed -- and the signal cleared -- before the
-	// post-commit drain begins.
+	// Release chunk B: it is the last audio, and the turn then commits. B is published before the
+	// run's terminal, so it is relayed before the post-commit drain begins.
 	close(gate)
 	readVoiceUntilState(t, ctx, conn, voiceStateDraining)
 
-	// Past the mic-resume tail: with the fix the mic is still gated (the gap signal was cleared, so
-	// the drain waits for the genuine end-of-audio signal); without it the stale gap signal has
-	// already re-opened the mic. A burst now must be discarded.
+	// Past the mic-resume tail the mic must still be gated: the drain waits for the genuine
+	// end-of-audio signal, not the stale gap signal. A burst now must be discarded. (This test does
+	// not isolate the clear-on-relay guard -- the silence's floor extension keeps the mic gated here
+	// either way; that guard is pinned by TestVoiceRelayAudioTreatsSilenceLikeAnyChunk.)
 	beforeConns, beforeBytes := child.snapshot()
 	time.Sleep(150 * time.Millisecond)
 	drainBurstDiscarded(t, ctx, conn, child, beforeConns, beforeBytes,

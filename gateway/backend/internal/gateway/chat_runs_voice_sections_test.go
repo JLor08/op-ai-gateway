@@ -95,19 +95,29 @@ func waitForSpeechInput(t *testing.T, bodies <-chan []byte, want string) {
 	}
 }
 
-// assertOneMonotonicStream fails unless the relayed audio is one contiguous seq from 0 with the
-// given per-chunk section tags -- the client-visible invariant that seq never restarts mid-turn.
+// assertOneMonotonicStream fails unless the relayed audio is one contiguous seq from 0 whose REAL
+// chunks carry the given per-chunk section tags -- the client-visible invariant that seq never
+// restarts mid-turn. The relay's keepalive silence (#339) is numbered into the same seq, so it takes
+// part in the contiguity check, but it is not one of the chunks these tests are about: a run whose
+// TTS is slow for a moment (a retry's backoff, a section waiting for its synthesis slot) legitimately
+// has some. What it must never do is break the stream, and that is checked here.
 func assertOneMonotonicStream(t *testing.T, audio []runAudio, wantSections []int) {
 	t.Helper()
-	if len(audio) != len(wantSections) {
-		t.Fatalf("relayed %d audio chunks, want %d", len(audio), len(wantSections))
-	}
+	var sections []int
 	for i, a := range audio {
 		if a.Seq != i {
 			t.Fatalf("audio[%d].Seq = %d, want %d (one monotonic stream, never restarting at 0)", i, a.Seq, i)
 		}
-		if a.Section != wantSections[i] {
-			t.Fatalf("audio[%d].Section = %d, want %d", i, a.Section, wantSections[i])
+		if !isSilenceFrame(t, a) {
+			sections = append(sections, a.Section)
+		}
+	}
+	if len(sections) != len(wantSections) {
+		t.Fatalf("relayed %d real audio chunks, want %d (%d frames in all, silence included)", len(sections), len(wantSections), len(audio))
+	}
+	for i, section := range sections {
+		if section != wantSections[i] {
+			t.Fatalf("real audio chunk %d is section %d, want %d", i, section, wantSections[i])
 		}
 	}
 }
