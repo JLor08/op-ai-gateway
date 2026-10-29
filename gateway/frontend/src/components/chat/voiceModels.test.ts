@@ -10,7 +10,7 @@ import {
   stickyAutoVoiceModel,
   thoseThatStream,
   effectiveVoice,
-  voiceLegsOf,
+  stickyVoiceLegsOf,
   voiceModelChoice,
   withTtsModel,
   type VoiceList,
@@ -159,8 +159,15 @@ describe('stickyAutoVoiceModel', () => {
   });
 });
 
-describe('voiceLegsOf', () => {
+describe('stickyVoiceLegsOf', () => {
   const streaming: VoiceStreaming = { asr: ['asr-a', 'asr-b'], tts: ['tts-a', 'tts-clone'] };
+  const NOTHING_HELD = { asr: '', tts: '' };
+  // The legs alone, resolved with no automatic pick held yet: what a conversation starts with.
+  const voiceLegsOf = (
+    streams: VoiceStreaming | null,
+    picks: { asrModel: string; ttsModel: string },
+    models: readonly ModelOption[] = [],
+  ) => stickyVoiceLegsOf(streams, picks, models, NOTHING_HELD)?.legs ?? null;
 
   it('is null while the gateway has not said which models stream', () => {
     expect(voiceLegsOf(null, { asrModel: 'asr-b', ttsModel: '' })).toBeNull();
@@ -222,6 +229,91 @@ describe('voiceLegsOf', () => {
 
     it('is still null while the gateway has not said which models stream', () => {
       expect(voiceLegsOf(null, { asrModel: '', ttsModel: '' }, models)).toBeNull();
+    });
+  });
+
+  // The automatic pick held steady (#326): `held` is the model each leg's automatic pick resolved
+  // to until now, and the result says what to hold from now on.
+  describe('holding the automatic pick', () => {
+    const picks = { asrModel: '', ttsModel: '' };
+    // asr-b and tts-clone are loaded: a fresh automatic pick would be those two.
+    const models = [
+      catalogued('asr-a', false),
+      catalogued('asr-b', true),
+      catalogued('tts-a', false),
+      catalogued('tts-clone', true),
+    ];
+
+    it('seeds from a fresh automatic pick (prefer loaded) when nothing is held, and holds it', () => {
+      expect(stickyVoiceLegsOf(streaming, picks, models, NOTHING_HELD)).toEqual({
+        legs: { asr: 'asr-b', tts: 'tts-clone' },
+        held: { asr: 'asr-b', tts: 'tts-clone' },
+      });
+    });
+
+    it('keeps the held model of a leg while it streams, though another one is loaded', () => {
+      expect(stickyVoiceLegsOf(streaming, picks, models, { asr: 'asr-a', tts: 'tts-a' })).toEqual({
+        legs: { asr: 'asr-a', tts: 'tts-a' },
+        held: { asr: 'asr-a', tts: 'tts-a' },
+      });
+    });
+
+    it('moves a leg whose held model no longer streams, to a fresh pick, leg by leg', () => {
+      // tts-b comes first, tts-clone is the one that is loaded: the fresh pick prefers it.
+      const now: VoiceStreaming = { asr: ['asr-a', 'asr-b'], tts: ['tts-b', 'tts-clone'] };
+      expect(stickyVoiceLegsOf(now, picks, models, { asr: 'asr-a', tts: 'tts-a' })).toEqual({
+        legs: { asr: 'asr-a', tts: 'tts-clone' },
+        held: { asr: 'asr-a', tts: 'tts-clone' },
+      });
+    });
+
+    it("uses the user's pick of a leg and holds no automatic pick for it", () => {
+      expect(
+        stickyVoiceLegsOf(streaming, { asrModel: 'asr-a', ttsModel: 'tts-a' }, models, {
+          asr: 'asr-b',
+          tts: 'tts-clone',
+        }),
+      ).toEqual({
+        legs: { asr: 'asr-a', tts: 'tts-a' },
+        held: { asr: '', tts: '' },
+      });
+    });
+
+    it('picks afresh when the user returns a leg to automatic (nothing was held under the pick)', () => {
+      const underPick = stickyVoiceLegsOf(streaming, { asrModel: 'asr-a', ttsModel: '' }, models, {
+        asr: '',
+        tts: 'tts-a',
+      });
+      expect(underPick?.held).toEqual({ asr: '', tts: 'tts-a' });
+      expect(stickyVoiceLegsOf(streaming, picks, models, underPick!.held)?.legs).toEqual({
+        asr: 'asr-b',
+        tts: 'tts-a',
+      });
+    });
+
+    it('holds the automatic pick for a pick that is gone, which falls back to it', () => {
+      expect(
+        stickyVoiceLegsOf(streaming, { asrModel: 'asr-gone', ttsModel: '' }, models, {
+          asr: 'asr-a',
+          tts: '',
+        }),
+      ).toEqual({
+        legs: { asr: 'asr-a', tts: 'tts-clone' },
+        held: { asr: 'asr-a', tts: 'tts-clone' },
+      });
+    });
+
+    it('holds nothing for a leg of which no model streams', () => {
+      expect(
+        stickyVoiceLegsOf({ asr: [], tts: ['tts-a'] }, picks, models, { asr: 'asr-a', tts: '' }),
+      ).toEqual({
+        legs: { asr: '', tts: 'tts-a' },
+        held: { asr: '', tts: 'tts-a' },
+      });
+    });
+
+    it('is null while the gateway has not said which models stream', () => {
+      expect(stickyVoiceLegsOf(null, picks, models, { asr: 'asr-a', tts: 'tts-a' })).toBeNull();
     });
   });
 });

@@ -12,10 +12,10 @@
 //     where another has to be loaded first -- else simply the first, in the candidates' order
 //     (`autoVoiceModel`; the speech candidates are ordered plain models first, preset-clone ones
 //     after, by the store);
-//   - the automatic pick is held steady once made (`stickyAutoVoiceModel`, #326): it moves only when
-//     the model stops streaming, not as models are loaded and unloaded, so a voice chosen for it
-//     stays with it; and a saved voice is reconciled with the model that would speak
-//     (`reconcileVoice`) when that model is another one;
+//   - the automatic pick is held steady once made (`stickyAutoVoiceModel`, per leg and per chat by
+//     `stickyVoiceLegsOf`, #326): it moves only when the model stops streaming, not as models are
+//     loaded and unloaded, so a voice chosen for it stays with it; and a saved voice is reconciled
+//     with the model that would speak (`reconcileVoice`) when that model is another one;
 //   - the user's pick wins while it is one of them, and otherwise the automatic pick does -- a
 //     pick that is gone (the model left the catalogue, is unreachable, or no longer streams) is
 //     a graceful fallback, never a stuck conversation (`effectiveVoiceModel`);
@@ -171,17 +171,40 @@ export function reconcileVoice({
  * Both legs of a conversation, or null while the gateway has not yet said which models stream
  * (the switch is then closed: it must not promise a session it would refuse a ticket for).
  * `models` is the catalogue the automatic pick of each leg reads the loaded state from.
+ *
+ * A leg is the user's pick while it is one of the models that stream, else its AUTOMATIC pick, which
+ * is held steady (#326, `stickyAutoVoiceModel`): `held` is the automatic pick each leg held until
+ * now ('' for none yet), and the `held` that is returned is what to hold from now on -- the model the
+ * leg uses when it is automatic (a pick that is gone is automatic too, and holds), and '' for a leg
+ * that is under the user's own pick, which holds none: when the user returns it to automatic it is
+ * picked afresh (the loaded model, else the first), which is also what `withTtsModel` takes the
+ * automatic choice to resolve to.
  */
-export function voiceLegsOf(
+export function stickyVoiceLegsOf(
   streaming: VoiceStreaming | null,
   picks: Pick<VoiceChatSettings, 'asrModel' | 'ttsModel'>,
-  models: readonly ModelOption[] = [],
-): VoiceLegs | null {
+  models: readonly ModelOption[],
+  held: VoiceLegs,
+): { legs: VoiceLegs; held: VoiceLegs } | null {
   if (streaming === null) return null;
+  const asr = stickyLeg(picks.asrModel, streaming.asr, held.asr, models);
+  const tts = stickyLeg(picks.ttsModel, streaming.tts, held.tts, models);
   return {
-    asr: effectiveVoiceModel(picks.asrModel, streaming.asr, models),
-    tts: effectiveVoiceModel(picks.ttsModel, streaming.tts, models),
+    legs: { asr: asr.used, tts: tts.used },
+    held: { asr: asr.held, tts: tts.held },
   };
+}
+
+// One leg of stickyVoiceLegsOf: the model it uses and the automatic pick it holds.
+function stickyLeg(
+  pick: string,
+  streaming: readonly string[],
+  held: string,
+  models: readonly ModelOption[],
+): { used: string; held: string } {
+  if (pick !== '' && streaming.includes(pick)) return { used: pick, held: '' };
+  const automatic = stickyAutoVoiceModel(held, streaming, models);
+  return { used: automatic, held: automatic };
 }
 
 /**
