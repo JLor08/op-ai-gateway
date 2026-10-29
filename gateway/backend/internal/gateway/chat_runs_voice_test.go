@@ -1560,20 +1560,30 @@ func TestVoiceContentParts_RejectsMalformedSectionAudio(t *testing.T) {
 
 // recordingVoicePortal wraps the real portal.API and captures the AssistantTurn handed to
 // CommitVoiceTurn, so a test can assert fields (AudioAnswer, TTFTMs, SpokenSections) that the
-// stored chat document does not expose as keys.
+// stored chat document does not expose as keys. It also counts the commits, for a test that
+// asserts a run reached its ONE terminal commit.
 type recordingVoicePortal struct {
 	portal.API
 	mu       sync.Mutex
 	last     portal.AssistantTurn
 	captured bool
+	commits  int
 }
 
 func (p *recordingVoicePortal) CommitVoiceTurn(ctx context.Context, owner auth.Token, chatID, userText string, turn portal.AssistantTurn, status string) error {
 	p.mu.Lock()
 	p.last = turn
 	p.captured = true
+	p.commits++
 	p.mu.Unlock()
 	return p.API.CommitVoiceTurn(ctx, owner, chatID, userText, turn, status)
+}
+
+// commitCount is how many times CommitVoiceTurn was called.
+func (p *recordingVoicePortal) commitCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.commits
 }
 
 func (p *recordingVoicePortal) committed() (portal.AssistantTurn, bool) {

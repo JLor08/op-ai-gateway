@@ -5,9 +5,11 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The audio_delta frame carries the `section` index for live attribution: it is additive
@@ -55,5 +57,50 @@ func TestVoiceRelayAudioCarriesSeqAndSection(t *testing.T) {
 	}
 	if m.relayedAudioChunks != 1 {
 		t.Fatalf("relayedAudioChunks = %d, want 1", m.relayedAudioChunks)
+	}
+}
+
+// The relay's keepalive silence (#339) is, to the machine, one more audio_delta: relaying it numbers
+// it into the playout counter, adds its real-time duration to the drain floor, and clears a gap
+// playback_done remembered earlier -- exactly what a real chunk does. The counter and the floor stay
+// consistent with what the client plays and counts (it counts every audio_delta), and the clear is the
+// guard against an old client's stale gap signal ending the drain while more audio is still to play.
+// This pins the clear directly, which the WS-level gap test no longer does on its own: over its long
+// gap the silence's own floor extension keeps the mic gated whether or not the signal is cleared.
+func TestVoiceRelayAudioTreatsSilenceLikeAnyChunk(t *testing.T) {
+	const rate = 24000
+	silence := base64.StdEncoding.EncodeToString(voiceSilencePCM(rate, voiceSilenceFrameMs))
+	// A real chunk of the same 200 ms, so the two differ only in what the machine cannot tell: the bytes.
+	speech := base64.StdEncoding.EncodeToString(speechPCM(rate*speechStreamBytesPerFrame*voiceSilenceFrameMs/1000, 1))
+
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{"real chunk", speech},
+		{"silence frame", silence},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &voiceMachine{ctx: context.Background(), writer: newVoiceWriter(&fakeVoiceSocket{}, func() {})}
+			m.onPlaybackDone(nil) // an older client's gap signal, remembered while speaking
+			if !m.playbackSignaled {
+				t.Fatal("precondition: the gap signal was not remembered")
+			}
+
+			m.relayAudio(runAudio{Seq: 0, Rate: rate, Data: tc.data})
+
+			if m.playbackSignaled {
+				t.Fatal("relaying audio left the remembered gap signal set: it would end the drain while this audio is still to play")
+			}
+			if m.relayedAudioChunks != 1 {
+				t.Fatalf("relayedAudioChunks = %d, want 1: the client counts every audio_delta it receives", m.relayedAudioChunks)
+			}
+			if want := time.Duration(voiceSilenceFrameMs) * time.Millisecond; m.relayedPlaybackDur != want {
+				t.Fatalf("relayedPlaybackDur = %v, want %v: the frame's real-time duration extends the drain floor", m.relayedPlaybackDur, want)
+			}
+			if m.firstAudioAt.IsZero() {
+				t.Fatal("firstAudioAt was not stamped by the first relayed audio")
+			}
+		})
 	}
 }

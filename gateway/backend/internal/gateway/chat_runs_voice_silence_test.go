@@ -4,8 +4,14 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
+	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/usage"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -494,5 +500,360 @@ func TestSpeechStreamOptedOut(t *testing.T) {
 				t.Fatalf("speechStreamOptedOut = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- the gap silence through a whole voice run -------------------------------------------------
+//
+// The tests above drive the relay alone. These take a whole voice run through the real gateway, the
+// way the other voice-run tests do (the mock LLM, and the mock TTS behind the loopback), and pin what
+// the silence must NOT do to it: be stored, be billed, or keep the turn from ending.
+//
+// To make a gap, one section's speech request is HELD (voiceTestProvider.speechHoldByInput): the
+// relay then has no real audio for that section and fills the wait with silence. The hold is
+// released only once that silence has been seen on the run's own stream, so the gap is known to have
+// been filled -- not assumed from a sleep -- and the run is then taken to its end.
+
+// gapShapes are the two places a gap can fall in a two-section answer; the held section's wait is a
+// gap in both, filled by the relay at a different rate source each time: the run's own output rate
+// before any audio has played, the rate of the audio already playing between two sections.
+var gapShapes = []struct {
+	name string
+	// held is the synthesized text of the section whose speech request is held.
+	held string
+	// afterRealAudio is whether the silence that releases the hold must come after real audio. It
+	// does for a gap between sections: a late first chunk of section 0 is a gap too, but not the one
+	// this shape is about, and releasing the hold on it would end the very gap the test is for.
+	afterRealAudio bool
+}{
+	{name: "before the first audio", held: twoRegionSec0},
+	{name: "between two sections", held: twoRegionSec1, afterRealAudio: true},
+}
+
+// frameSummary renders frames compactly for a failure message -- seq, section, real or silence, and
+// size -- since a silence frame's base64 would otherwise fill the report.
+func frameSummary(t *testing.T, frames []runAudio) string {
+	t.Helper()
+	parts := make([]string, len(frames))
+	for i, f := range frames {
+		kind := "real"
+		if isSilenceFrame(t, f) {
+			kind = "silence"
+		}
+		parts[i] = fmt.Sprintf("#%d s%d %s %dB", f.Seq, f.Section, kind, voicePCMBytes(f.Data))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// gapRun is a two-section voice run started with one section's speech request held.
+type gapRun struct {
+	srv      *Server
+	owner    auth.Token
+	chatID   string
+	run      *ChatRun
+	events   <-chan runEvent
+	rec      *recordingVoicePortal
+	recorder *usage.Recorder
+	// release lets the held speech request answer. It is safe to call more than once.
+	release func()
+}
+
+// startGapRun starts the two-region voice run with the speech request that synthesizes the text held
+// (one of the two sections') held. The hold is also released when the test ends, so a failing test
+// cannot leave the held request blocking the test server's Close.
+func startGapRun(t *testing.T, held string) *gapRun {
+	t.Helper()
+	prov := defaultVoiceProvider()
+	prov.llmScript = twoRegionScript
+	hold := make(chan struct{})
+	prov.speechHoldByInput = map[string]chan struct{}{held: hold}
+	srv, owner, chatID, recorder, _ := newVoiceRunTestServerProv(t, prov)
+	var once sync.Once
+	release := func() { once.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	rec := &recordingVoicePortal{API: srv.Portal}
+	srv.Portal = rec
+
+	run, events := startSubscribedVoiceRun(t, srv, owner, chatID, "unused")
+	return &gapRun{srv: srv, owner: owner, chatID: chatID, run: run, events: events, rec: rec, recorder: recorder, release: release}
+}
+
+// readUntilSilence reads the run's stream until the relay has played silence over the held wait --
+// the first silence frame, or, with afterRealAudio, the first one that follows a real chunk -- and
+// returns every frame read, that silence last.
+func (g *gapRun) readUntilSilence(t *testing.T, afterRealAudio bool) []runAudio {
+	t.Helper()
+	var frames []runAudio
+	realSeen := false
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case ev, open := <-g.events:
+			if !open {
+				t.Fatalf("the run ended before the relay played any silence over the held section: %s", frameSummary(t, frames))
+			}
+			if ev.Event != "audio" || ev.Audio == nil {
+				continue
+			}
+			frames = append(frames, *ev.Audio)
+			switch {
+			case !isSilenceFrame(t, *ev.Audio):
+				realSeen = true
+			case realSeen || !afterRealAudio:
+				return frames
+			}
+		case <-timeout:
+			t.Fatalf("no silence frame was relayed over the held section within 10s: %s", frameSummary(t, frames))
+		}
+	}
+}
+
+// gapOutcome is a gap run taken to its end.
+type gapOutcome struct {
+	*gapRun
+	// audio is everything the run relayed, silence included; silence is the silence frames among it.
+	audio   []runAudio
+	silence []runAudio
+	status  string
+	errCode string
+}
+
+// finishAfterSilence is the whole scenario: wait for the relay to fill the held wait with silence,
+// release the held section, and take the run to its terminal event.
+func (g *gapRun) finishAfterSilence(t *testing.T, afterRealAudio bool) gapOutcome {
+	t.Helper()
+	audio := g.readUntilSilence(t, afterRealAudio)
+	g.release()
+	audio = append(audio, drainRunAudio(t, g.events)...)
+
+	snap, _, unsub := g.run.subscribe()
+	unsub()
+	out := gapOutcome{gapRun: g, audio: audio, status: snap.Status, errCode: snap.Err}
+	for _, a := range audio {
+		if isSilenceFrame(t, a) {
+			out.silence = append(out.silence, a)
+		}
+	}
+	// What was filled really is silence at the run's rate, and the real audio around it is the
+	// canned two chunks of each section, in one unbroken seq.
+	requireSilenceFrames(t, out.silence, speechRunTestRate)
+	assertOneMonotonicStream(t, audio, []int{0, 0, 1, 1})
+	return out
+}
+
+// runThroughSilenceGap runs the gap scenario to its end for one of the gapShapes.
+func runThroughSilenceGap(t *testing.T, held string, afterRealAudio bool) gapOutcome {
+	t.Helper()
+	return startGapRun(t, held).finishAfterSilence(t, afterRealAudio)
+}
+
+// The silence is a keepalive for the player, not part of the answer: what the turn stores is what the
+// TTS synthesized and nothing else. A turn that played silence over a gap commits exactly the audio
+// it would have without one -- one part per section, each the WAV of that section's real PCM, byte
+// for byte (a part with silence in it, or one of its own, would differ) -- and commits completed.
+func TestVoiceRunGapSilenceNotStored(t *testing.T) {
+	first, second := voiceTestPCM()
+	wantWAV := wavFromPCM16(append(append([]byte(nil), first...), second...), speechRunTestRate)
+
+	for _, shape := range gapShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			r := runThroughSilenceGap(t, shape.held, shape.afterRealAudio)
+			if len(r.silence) == 0 {
+				t.Fatal("the run relayed no silence, so this test would prove nothing")
+			}
+			if r.status != "completed" {
+				t.Fatalf("status = %q (err %q), want completed", r.status, r.errCode)
+			}
+
+			turn, ok := r.rec.committed()
+			if !ok {
+				t.Fatal("no voice commit was captured")
+			}
+			if len(turn.SpokenSections) != 2 {
+				t.Fatalf("SpokenSections = %+v, want the 2 spoken sections", turn.SpokenSections)
+			}
+			if parts := contentPartSummary(t, turn.ContentParts); len(parts) != 3 || parts[0] != "text:"+twoRegionAnswer || !strings.HasPrefix(parts[1], "audio:") || !strings.HasPrefix(parts[2], "audio:") {
+				t.Fatalf("content parts = %v, want [text, sec0 audio, sec1 audio]: no part for the silence", parts)
+			}
+
+			// The stored document: the same two audio parts, each a blob holding exactly the real WAV.
+			stored, err := r.srv.Portal.GetChat(context.Background(), r.owner, r.chatID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msgs := storedMessages(t, stored.Content)
+			if len(msgs) != 2 || msgs[1].Role != "assistant" {
+				t.Fatalf("stored %d messages, want [user, assistant]: %s", len(msgs), stored.Content)
+			}
+			var blobs int
+			for _, part := range contentPartSummary(t, msgs[1].Content) {
+				url, isAudio := strings.CutPrefix(part, "audio:")
+				if !isAudio {
+					continue
+				}
+				id, ok := strings.CutPrefix(url, chatBlobRoutePrefix)
+				if !ok {
+					t.Fatalf("stored audio url = %.80q, want a %s path", url, chatBlobRoutePrefix)
+				}
+				got, mediaType, err := r.srv.Portal.ChatBlobBytes(context.Background(), r.owner, id)
+				if err != nil {
+					t.Fatalf("ChatBlobBytes(%s): %v", id, err)
+				}
+				if mediaType != "audio/wav" || !bytes.Equal(got, wantWAV) {
+					t.Fatalf("stored audio %d is %d bytes as %s, want the %d-byte WAV of the section's real PCM and nothing more", blobs, len(got), mediaType, len(wantWAV))
+				}
+				blobs++
+			}
+			if blobs != 2 {
+				t.Fatalf("stored %d audio parts, want 2 (one per section, none for the silence): %s", blobs, stored.Content)
+			}
+		})
+	}
+}
+
+// A gap filled with silence does not keep the turn from ending: with the held section released the
+// run reaches its terminal event, and its single commit, exactly as it would have without the gap.
+// The relay goroutine is joined before the commit (executeVoiceRun waits for it right after the legs),
+// so a commit having happened is the proof it returned -- a relay that went on ticking silence, or
+// waited on a leg that had already ended, would leave the run hanging here until the drain times out.
+func TestVoiceRunGapTurnStillEnds(t *testing.T) {
+	for _, shape := range gapShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			r := runThroughSilenceGap(t, shape.held, shape.afterRealAudio)
+			if len(r.silence) == 0 {
+				t.Fatal("the run relayed no silence, so this test would prove nothing")
+			}
+			if r.status != "completed" {
+				t.Fatalf("status = %q (err %q), want completed", r.status, r.errCode)
+			}
+			if n := r.rec.commitCount(); n != 1 {
+				t.Fatalf("the run committed %d times, want its one terminal commit", n)
+			}
+			stored, err := r.srv.Portal.GetChat(context.Background(), r.owner, r.chatID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n := len(storedMessages(t, stored.Content)); n != 2 {
+				t.Fatalf("after the turn the chat has %d messages, want [user, assistant]: %s", n, stored.Content)
+			}
+		})
+	}
+}
+
+// A cancel that lands while the relay is playing silence over a gap ends the run just as promptly: no
+// hang waiting for a relay that keeps ticking, and nothing committed -- silence never makes a
+// cancelled turn look like a finished one.
+func TestVoiceRunGapCancelStillEnds(t *testing.T) {
+	g := startGapRun(t, twoRegionSec1)
+	before, err := g.srv.Portal.GetChat(context.Background(), g.owner, g.chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	g.readUntilSilence(t, true)
+	if !g.srv.ChatRuns.cancelChat(g.owner.UserID, g.chatID) {
+		t.Fatal("cancelChat found no active run to cancel")
+	}
+	drainRunAudio(t, g.events)
+
+	if got := g.run.statusValue(); got != "canceled" {
+		t.Fatalf("status = %q, want canceled", got)
+	}
+	if n := g.rec.commitCount(); n != 0 {
+		t.Fatalf("a run cancelled over a gap committed %d times, want none", n)
+	}
+	after, err := g.srv.Portal.GetChat(context.Background(), g.owner, g.chatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before.Content) != string(after.Content) {
+		t.Fatalf("a run cancelled over a gap changed the chat document:\nbefore %s\nafter  %s", before.Content, after.Content)
+	}
+}
+
+// audioBillingRows are the usage rows a run wrote for speech: the unit a speech call bills in.
+func audioBillingRows(recorder *usage.Recorder) []usage.Event {
+	var rows []usage.Event
+	for _, ev := range recorder.All() {
+		if ev.BillingUnit == usage.BillingUnitAudioSecond || ev.BillingUnit == usage.BillingUnitAudioBytes {
+			rows = append(rows, ev)
+		}
+	}
+	return rows
+}
+
+// Silence is part of the stream the client plays and counts, but it is not a synthesis: it is made
+// by the relay and never goes through the speech endpoint, so it is no usage event and adds nothing
+// to what the TTS legs are billed. Each section bills the real PCM it streamed (the canned two
+// chunks at the mapping's cached byte rate) and nothing for the silence played over the gap.
+func TestVoiceRunSilenceCountedButNoDoubleBill(t *testing.T) {
+	first, second := voiceTestPCM()
+	realBytes := len(first) + len(second)
+	byteRate := speechRunTestRate * speechStreamBytesPerFrame
+	wantSeconds := float64(realBytes) / float64(byteRate)
+
+	for _, shape := range gapShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			r := runThroughSilenceGap(t, shape.held, shape.afterRealAudio)
+			if r.status != "completed" {
+				t.Fatalf("status = %q (err %q), want completed", r.status, r.errCode)
+			}
+
+			// Counted: the silence is numbered into the one stream (assertOneMonotonicStream has just
+			// checked the seq runs unbroken over ALL frames), so the client counts it, and the relayed
+			// audio is the real PCM of both sections plus the silence on top.
+			if len(r.silence) == 0 {
+				t.Fatal("the run relayed no silence, so this test would prove nothing")
+			}
+			var relayed, silent int
+			for _, a := range r.audio {
+				raw, err := base64.StdEncoding.DecodeString(a.Data)
+				if err != nil {
+					t.Fatalf("seq %d: %v", a.Seq, err)
+				}
+				relayed += len(raw)
+				if isSilenceFrame(t, a) {
+					silent += len(raw)
+				}
+			}
+			if relayed-silent != 2*realBytes {
+				t.Fatalf("relayed %d bytes, %d of them silence: the real audio is %d, want %d (both sections' PCM)", relayed, silent, relayed-silent, 2*realBytes)
+			}
+
+			// Not billed: one audio row per section, each for the real PCM alone.
+			waitFor(t, func() bool { return len(audioBillingRows(r.recorder)) >= 2 })
+			rows := audioBillingRows(r.recorder)
+			if len(rows) != 2 {
+				t.Fatalf("%d audio usage rows, want 2 (one per section's speech call; the silence is no call): %+v", len(rows), rows)
+			}
+			for _, row := range rows {
+				if row.BillingUnit != usage.BillingUnitAudioSecond || row.BillingQuantity != wantSeconds {
+					t.Fatalf("audio row bills %v %s, want %v %s: the real PCM only, nothing for the %d silence bytes", row.BillingQuantity, row.BillingUnit, wantSeconds, usage.BillingUnitAudioSecond, silent)
+				}
+			}
+		})
+	}
+}
+
+// A run with no gap plays no silence: the legs stream promptly, so the relay never has a quiet stretch
+// to fill, and everything it relays is the real audio the TTS produced. The relay tests pin this at
+// the relay; this is the same fact for a whole run, since assertOneMonotonicStream tolerates silence
+// (a slow TTS can legitimately cause some) and so no longer notices a spurious frame on its own.
+func TestVoiceRunNoGapEmitsNoSilence(t *testing.T) {
+	prov := defaultVoiceProvider()
+	prov.llmScript = twoRegionScript
+	srv, owner, chatID, _, _ := newVoiceRunTestServerProv(t, prov)
+
+	audio := collectRunAudio(t, srv, owner, chatID, "unused")
+
+	for _, a := range audio {
+		if isSilenceFrame(t, a) {
+			t.Fatalf("a run with no gap relayed silence: %s", frameSummary(t, audio))
+		}
+	}
+	requireSeqUnbroken(t, audio)
+	assertOneMonotonicStream(t, audio, []int{0, 0, 1, 1})
+	if len(audio) != 4 {
+		t.Fatalf("relayed %d frames, want the 4 real chunks (2 per section): %s", len(audio), frameSummary(t, audio))
 	}
 }
