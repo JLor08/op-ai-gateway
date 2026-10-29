@@ -63,6 +63,15 @@ type fakeVoiceASRChild struct {
 	// long is aborted with the "live request body stalled" error event -- exactly what a muted mic
 	// starves the loopback into (#335). Zero means the child waits for data forever.
 	idleTimeout time.Duration
+
+	// silent, when set, makes the child read and record the request body without answering: no
+	// SSE frame at all, the way a model returns nothing for silence (#335). It can be flipped at
+	// any time, so a test lets the first frame be answered (which arms the gateway edge's SSE
+	// idle watchdog) and goes quiet after.
+	silent atomic.Bool
+	// eofs counts the connections whose request body ended with a CLEAN end-of-input (the
+	// terminating chunk), as opposed to an abort; read it through cleanEnds.
+	eofs int
 }
 
 // errFakeVoiceIdleStall is the read error the child's idle model reports (see idleTimeout).
@@ -133,8 +142,10 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 		n, err := next()
 		if n > 0 {
 			frame++
-			fmt.Fprintf(w, "data: {\"type\":\"transcript.text.partial\",\"text\":\"p%d\"}\n\n", frame)
-			_ = rc.Flush()
+			if !c.silent.Load() {
+				fmt.Fprintf(w, "data: {\"type\":\"transcript.text.partial\",\"text\":\"p%d\"}\n\n", frame)
+				_ = rc.Flush()
+			}
 		}
 		if err != nil {
 			readErr = err
@@ -149,6 +160,9 @@ func (c *fakeVoiceASRChild) serve(w http.ResponseWriter, r *http.Request) {
 	if readErr != io.EOF {
 		return // truncated: no clean final
 	}
+	c.mu.Lock()
+	c.eofs++
+	c.mu.Unlock()
 	fmt.Fprintf(w, "data: {\"type\":\"transcript.text.done\",\"text\":%q}\n\n", c.finalFor(idx))
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	_ = rc.Flush()
@@ -221,6 +235,13 @@ func (c *fakeVoiceASRChild) snapshot() (conns int, bytes int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conns, c.bytes
+}
+
+// cleanEnds is how many connections ended their request body with a clean end-of-input.
+func (c *fakeVoiceASRChild) cleanEnds() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.eofs
 }
 
 // bodyReads returns a copy of every request-body read the child has seen, in arrival order.

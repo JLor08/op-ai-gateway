@@ -742,6 +742,11 @@ type voiceMachine struct {
 	muteKeepC         <-chan time.Time
 	muteTeardownTimer *time.Timer
 	muteTeardownC     <-chan time.Time
+	// muteClosing is set while the mute teardown has ended the loopback's feed (a clean
+	// end-of-input) and is waiting for the child's clean end -- the relay closing (onASRClosed) or
+	// the finalize timer as the bound -- before the loopback is torn down. It implies micMuted and
+	// not finalizing; an unmute, teardownTurn or the session ending clears it.
+	muteClosing bool
 
 	// The in-flight speculative voice run and its subscription. run/runUnsub are nil when
 	// no run is open; runCh is nil whenever the run's events must not be selected (no run,
@@ -1135,6 +1140,10 @@ func (s *Server) dialTurnLoopback(turnCtx context.Context, claims liveTicketClai
 //     and is authoritative -- a failed dial closes the pipe, which fails the pump's write
 //     first -- and while finalizing, where the relay's end or the finalize timeout already
 //     finishes the chunk with its provisional text.
+//
+// While the mic is muted every one of the three failures is a QUIET end (quietTeardown): the
+// browser sent nothing and its ASR output is filtered, so an error frame would tell the user about
+// a loopback they cannot see or act on, and the next real frame after the unmute reopens one anyway.
 func (m *voiceMachine) onLoopbackEvent(ev voiceLoopbackEvent) {
 	switch ev.kind {
 	case loopbackDialed:
@@ -1147,15 +1156,28 @@ func (m *voiceMachine) onLoopbackEvent(ev voiceLoopbackEvent) {
 			voiceASRRelay(turnCtx, ev.body, asrCh)
 		}()
 	case loopbackRefused:
+		if m.micMuted {
+			m.quietTeardown("the loopback was refused while muted")
+			return
+		}
 		m.emitError(ev.code, ev.message)
 		m.teardownTurn()
 		m.setState(voiceStateIdle)
 	case loopbackDialFailed:
-		if m.ctx.Err() == nil {
-			m.failTurn("transcription.unavailable", "live transcription unavailable")
+		if m.ctx.Err() != nil {
+			return
 		}
+		if m.micMuted {
+			m.quietTeardown("the loopback dial failed while muted")
+			return
+		}
+		m.failTurn("transcription.unavailable", "live transcription unavailable")
 	case loopbackPumpFailed:
 		if m.asrCh == nil || m.finalizing {
+			return
+		}
+		if m.micMuted {
+			m.quietTeardown("the loopback body ended while muted")
 			return
 		}
 		m.failTurn("transcription.stream_error", "the transcription stream ended")
@@ -1228,8 +1250,13 @@ func (m *voiceMachine) onASREvent(ev asrEvent) {
 	// silence, so any transcript the ASR returns is invented (a model can hallucinate "Thank
 	// you." on silence) and must never reach pendingText, a chunk or the client -- nor, in the
 	// continuation window, cancel the speculative run through onVoiced's resume. An upstream
-	// error is not transcript text: it still fails the turn.
-	if m.micMuted && ev.kind != asrKindError {
+	// error is not transcript text but it is a loopback end like any other, and a muted one is
+	// quiet (quietTeardown), unless a chunk is finalizing: that is a real pre-mute turn whose
+	// failure is still worth the error frame.
+	if m.micMuted && (ev.kind != asrKindError || !m.finalizing) {
+		if ev.kind == asrKindError {
+			m.quietTeardown("the ASR reported an error while muted")
+		}
 		return
 	}
 	switch ev.kind {
@@ -1333,10 +1360,18 @@ func (m *voiceMachine) finishChunk(final string) {
 
 // onASRClosed handles the turn relay ending (the SSE body closed). If we were finalizing,
 // the clean done never came through -- finish with the provisional text so the turn is not
-// wedged. Otherwise the ASR dropped mid-chunk, which is a recoverable leg error.
+// wedged. Otherwise the ASR dropped mid-chunk, which is a recoverable leg error -- unless the
+// mic is muted, when the end is quiet (quietTeardown): it is how a mute teardown completes (the
+// child's clean end after the feed closed, muteClosing), and also how the gateway's own edge
+// stream-idle watchdog cuts a muted keepalive loopback whose ASR produced no SSE for its idle
+// window, which must not become an error frame for a mic the user has muted.
 func (m *voiceMachine) onASRClosed() {
 	if m.finalizing {
 		m.finishChunk(m.chunkText)
+		return
+	}
+	if m.micMuted {
+		m.quietTeardown("the ASR stream ended while muted")
 		return
 	}
 	if m.state == voiceStateListening && m.asrCh != nil {
@@ -1350,8 +1385,13 @@ func (m *voiceMachine) onASRClosed() {
 }
 
 // onFinalizeTimeout fires when the clean final did not arrive in time after end-of-input:
-// finalize with the provisional text rather than wedge the turn.
+// finalize with the provisional text rather than wedge the turn. The same timer bounds a mute
+// teardown's wait for the child's clean end: past it the loopback is torn down regardless.
 func (m *voiceMachine) onFinalizeTimeout() {
+	if m.muteClosing {
+		m.quietTeardown("the child did not confirm the mute teardown's end of input in time")
+		return
+	}
 	if !m.finalizing {
 		return
 	}
@@ -1993,10 +2033,15 @@ func (m *voiceMachine) onMicMute() {
 
 // onMicUnmute handles mic_unmute: the ASR output is trusted again and both mute timers stop. A
 // loopback still open simply resumes with the browser's real PCM; one the teardown already ended
-// reopens lazily on the next real frame (onPCM), as it always has after a teardown.
+// reopens lazily on the next real frame (onPCM), as it always has after a teardown. One the
+// teardown is still closing (its feed is already ended, so it cannot take the real frames) is torn
+// down at once instead, so the first real frame redials rather than being dropped.
 func (m *voiceMachine) onMicUnmute() {
 	m.micMuted = false
 	m.stopMuteTimers()
+	if m.muteClosing {
+		m.quietTeardown("unmuted while the mute teardown was closing the loopback")
+	}
 }
 
 // armMuteTimers starts the muted loopback's two timers: the keepalive ticker, and -- unless the
@@ -2029,21 +2074,39 @@ func (m *voiceMachine) onMuteKeepalive() {
 	}
 }
 
-// onMuteTeardown fires once, when the mic has stayed muted for the operator's mute teardown: the
-// loopback is torn down through the one teardownTurn -- the same graceful path every other turn end
-// takes, which frees its admission, route slot and model pin and ends its metering -- with no error
-// frame and no state change, and the mute stays latched. The chunk in progress goes with it: it can
-// no longer finalize, and its half-built text must not seed the next loopback's chunk. A loopback
-// whose chunk is already finalizing is left alone, because finishChunk is about to tear it down
-// itself with the clean final.
+// onMuteTeardown fires once, when the mic has stayed muted for the operator's mute teardown. It
+// ends the loopback CLEANLY, the way finalizeChunk ends a chunk: the feed is closed, so the pump
+// flushes what is buffered and closes the pipe, the terminating chunk reaches /v1 and the child as a
+// clean end-of-input, and /v1's relay completes and bills normally. Aborting instead (teardownTurn at
+// once) would make every sustained mute a loud-zero (ADR-041): an ERROR log and a zero-quantity row.
+// The ASR's closing transcript is filtered like any other event while muted, so there is nothing to
+// commit; the loopback is torn down when the relay closes (onASRClosed), with the finalize timer as
+// the bound (onFinalizeTimeout). No error frame and no state change; the mute stays latched. The chunk
+// in progress is dropped: it can no longer finalize, and its half-built text must not seed the next
+// loopback's chunk. A loopback whose chunk is already finalizing is left alone, because finishChunk
+// is about to tear it down itself with the clean final.
 func (m *voiceMachine) onMuteTeardown() {
 	m.stopMuteTeardown()
-	if !m.micMuted || m.turnCancel == nil || m.finalizing {
+	if !m.micMuted || m.turnCancel == nil || m.finalizing || m.muteClosing {
 		return
 	}
+	m.stopMuteKeepalive() // the feed is ending: nothing left to keep alive
+	m.resetChunk()
+	m.stopChunkTimers()
+	m.muteClosing = true
+	m.endLoopbackFeed()
+	m.armFinalize()
+}
+
+// quietTeardown ends a muted loopback without a word: the same teardownTurn every turn end takes,
+// then the half-built chunk and the finalize bound dropped with it -- but no error frame and no state
+// change, and the mute stays latched. why is the debug trace of what ended it.
+func (m *voiceMachine) quietTeardown(why string) {
+	slog.Debug("voice chat: closing the muted ASR loopback quietly", "why", why)
 	m.teardownTurn()
 	m.resetChunk()
 	m.stopChunkTimers()
+	m.stopFinalize()
 }
 
 // voiceSilenceFrame builds one keepalive frame of zeroed PCM in the ticket's fixed shape
@@ -2086,8 +2149,9 @@ func (m *voiceMachine) teardownTurn() {
 	m.drainLoopbackEvents()
 	m.pw, m.turnCtx, m.turnCancel, m.respBody, m.asrCh, m.loopCh = nil, nil, nil, nil, nil, nil
 	m.finalizing = false
-	// The mute timers serve a loopback, so they end with it (the mute itself stays latched: a
-	// loopback opened while still muted arms them again).
+	// The mute timers and the mute teardown's close serve a loopback, so they end with it (the mute
+	// itself stays latched: a loopback opened while still muted arms them again).
+	m.muteClosing = false
 	m.stopMuteTimers()
 }
 
