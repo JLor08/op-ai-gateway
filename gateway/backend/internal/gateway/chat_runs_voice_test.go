@@ -82,6 +82,11 @@ type voiceTestProvider struct {
 	// disables the count (the default).
 	speechInflight *atomic.Int32
 	speechPeak     *atomic.Int32
+	// speechAttempts, when non-nil, PROGRAMS the speech answer per ATTEMPT: the n-th speech request
+	// (counting every section's, in arrival order) takes the n-th scripted step, and a request past
+	// the script gets the normal answer. A retry test uses it to fail the first attempt(s) and let a
+	// later one succeed, and reads how many requests reached the TTS. nil answers normally.
+	speechAttempts *speechAttemptScript
 }
 
 // enterSpeech counts one speech synthesis in flight and returns the func that ends it (safe to call
@@ -176,6 +181,9 @@ func (p voiceTestProvider) speechResponse(ctx context.Context, body []byte) (*pr
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+	}
+	if step, ok := p.speechAttempts.next(); ok {
+		return step.response(ctx)
 	}
 	if p.speechFail {
 		return &provider.ProxyResponse{

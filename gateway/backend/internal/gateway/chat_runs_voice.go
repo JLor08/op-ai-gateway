@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -421,10 +423,10 @@ type voiceSpeechResult struct {
 // leg's ordered channel (drained in document order by relayVoiceSections) and sending its outcome on
 // leg.resultCh (buffered to one, so the goroutine never blocks). The leg first waits for its
 // synthesis slot (voiceSynthGate -- backpressure on the TTS, in document order), holds it for exactly
-// the synthesis and gives it back on every way out, before the relay has drained the audio. It then
-// carries its own first-chunk deadline, exactly like a standalone streaming speech run
-// (executeAudioRun), armed only once the slot is its, and derives its context from the run's so a
-// cancel ends it too.
+// the synthesis (retries included, see retryVoiceSpeech) and gives it back on every way out, before
+// the relay has drained the audio. Each attempt carries its own first-chunk deadline, exactly like a
+// standalone streaming speech run (executeAudioRun), armed only once the slot is its, and derives
+// its context from the run's so a cancel ends it too.
 func (s *Server) launchVoiceSpeech(ctx context.Context, owner auth.Token, run *ChatRun, vp *voiceRunParams, text, language string, leg *voiceSpeechLeg) {
 	go func() {
 		if !leg.synth.acquire(ctx) {
@@ -436,29 +438,108 @@ func (s *Server) launchVoiceSpeech(ctx context.Context, owner auth.Token, run *C
 			return
 		}
 		defer leg.synth.release()
-		ttsCtx, cancelTTS := context.WithCancelCause(ctx)
-		defer cancelTTS(nil)
-		liftDeadline := armRunDeadline(chatRunKindSpeech, cancelTTS)
-		defer liftDeadline()
 		prep := voiceSpeechPrep(text, vp.tts, vp.audio, language)
-		// The leg hands each audio chunk to its ordered channel rather than straight onto the run,
-		// so relayVoiceSections can serialize the sections into ONE monotonic stream. A send that
-		// cannot be taken before the leg is cancelled is dropped (the live relay is best-effort --
-		// the committed WAV is authoritative). stampTTFT=false: the LLM leg is streaming into the
-		// same run.metrics concurrently, so the speech leg must NOT also write it (a lost update on
-		// the perf metrics); the LLM leg is the sole metrics writer, keeping them deterministic.
-		sink := func(a runAudio) {
-			select {
-			case leg.audioCh <- a:
-			case <-ttsCtx.Done():
-			}
-		}
-		parts, status, errMsg, streamed := s.generateSpeechTurn(ttsCtx, owner, run, prep, liftDeadline, false, sink)
+		out := s.retryVoiceSpeech(ctx, owner, run, prep, leg)
 		// Close the audio channel first (ending the relay's drain of this leg so it advances to the
 		// next section), then report the terminal outcome.
 		close(leg.audioCh)
-		leg.resultCh <- voiceSpeechResult{parts: parts, status: status, errMsg: errMsg, streamed: streamed}
+		leg.resultCh <- voiceSpeechResult{parts: out.parts, status: out.status, errMsg: out.errMsg, streamed: out.streamed}
 	}()
+}
+
+// The backoff between a speech leg's retries: it starts at voiceTTSRetryBackoffBase, doubles with
+// each retry and is capped at voiceTTSRetryBackoffMax, so a generous retry count can never hang a
+// turn on one section. With the default of two retries a leg waits 250ms, then 500ms. The client's
+// playback-done debounce (about 1.2s) and the server's drain floor cover a gap this short, so a
+// retry does not end the turn early; a longer budget would need the stream kept fed with silence,
+// which is deliberately out of scope.
+const (
+	voiceTTSRetryBackoffBase = 250 * time.Millisecond
+	voiceTTSRetryBackoffMax  = 2 * time.Second
+)
+
+// voiceTTSRetryBackoff is how long a leg waits before retry number retry (0 is the first retry).
+func voiceTTSRetryBackoff(retry int) time.Duration {
+	d := voiceTTSRetryBackoffBase
+	for range retry {
+		if d >= voiceTTSRetryBackoffMax {
+			break
+		}
+		d *= 2
+	}
+	return min(d, voiceTTSRetryBackoffMax)
+}
+
+// retryVoiceSpeech is one section leg's synthesis, with a second chance for a briefly busy TTS: a
+// failure that is transient (speechAttemptResult.transient: the gateway or TTS busy or unavailable,
+// or the loopback dial failed) is retried, up to the run timing's ttsRetryLimit() times after a
+// growing backoff, so a hiccup does not cost the turn its voice (#337).
+//
+// The retry runs inside the slot the caller already holds. Releasing it between attempts to queue
+// again would let the NEXT section take it first (and break voiceSynthGate's document-order grant),
+// so the leg keeps it for the whole retry budget. Each attempt gets its OWN first-chunk deadline
+// (voiceSpeechAttempt): the one armed for an attempt cannot be re-armed, so sharing it would charge
+// a retry for the time the failed attempt and the backoff already spent.
+func (s *Server) retryVoiceSpeech(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, leg *voiceSpeechLeg) speechAttemptResult {
+	var relayed atomic.Bool
+	who := fmt.Sprintf("chat run %s: speech leg for section %d", run.ID, leg.section)
+	return retrySpeechAttempts(ctx, who, s.voiceTiming.ttsRetryLimit(), &relayed, func() speechAttemptResult {
+		return s.voiceSpeechAttempt(ctx, owner, run, prep, leg, &relayed)
+	})
+}
+
+// retrySpeechAttempts runs attempt until it succeeds or fails for good, retrying a TRANSIENT failure
+// up to retries more times with voiceTTSRetryBackoff between attempts.
+//
+// It retries ONLY while NO audio chunk has been handed to the leg's relay, across all attempts:
+// attempt sets relayed the moment its sink emits one. That is what makes a retry safe -- a
+// pre-stream failure produced and billed nothing, and nothing the client has heard can be repeated.
+// Once ANY chunk has gone out a failure keeps the partial audio exactly as it did before retries
+// existed and is never retried, because a second synthesis would play the section from its start
+// again and be billed on top of the partial one. (Today no attempt is both transient and
+// relayed -- a stream that was accepted is never transient -- so this guard is the invariant, held
+// here rather than left to the classification, which a later change could widen.)
+//
+// A cancel or deadline of the run ends the backoff at once and reports the run's own outcome, as a
+// leg cut off mid-request does. who prefixes the log line.
+func retrySpeechAttempts(ctx context.Context, who string, retries int, relayed *atomic.Bool, attempt func() speechAttemptResult) speechAttemptResult {
+	for n := 0; ; n++ {
+		out := attempt()
+		if !out.transient || relayed.Load() || n >= retries {
+			return out
+		}
+		backoff := voiceTTSRetryBackoff(n)
+		log.Printf("%s failed transiently (%s); retry %d of %d in %s", who, out.errMsg, n+1, retries, backoff)
+		if !sleepCtx(ctx, backoff) {
+			status, errMsg, _ := runContextOutcome(ctx)
+			return speechAttemptResult{status: status, errMsg: errMsg}
+		}
+	}
+}
+
+// voiceSpeechAttempt is ONE synthesis attempt of a section leg, under its own context and
+// first-chunk deadline derived from the run's. The leg hands each audio chunk to its ordered
+// channel rather than straight onto the run, so relayVoiceSections can serialize the sections into
+// ONE monotonic stream; the sink also records in relayed that audio went out, which is what bars a
+// retry (retryVoiceSpeech). A send that cannot be taken before the attempt is cancelled is dropped
+// (the live relay is best-effort -- the committed WAV is authoritative), but still counts as
+// relayed: the TTS did produce audio, and a retry would bill it again. stampTTFT=false: the LLM leg
+// is streaming into the same run.metrics concurrently, so the speech leg must NOT also write it (a
+// lost update on the perf metrics); the LLM leg is the sole metrics writer, keeping them
+// deterministic.
+func (s *Server) voiceSpeechAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, leg *voiceSpeechLeg, relayed *atomic.Bool) speechAttemptResult {
+	ttsCtx, cancelTTS := context.WithCancelCause(ctx)
+	defer cancelTTS(nil)
+	liftDeadline := armRunDeadline(chatRunKindSpeech, cancelTTS)
+	defer liftDeadline()
+	sink := func(a runAudio) {
+		relayed.Store(true)
+		select {
+		case leg.audioCh <- a:
+		case <-ttsCtx.Done():
+		}
+	}
+	return s.speechTurnAttempt(ttsCtx, owner, run, prep, liftDeadline, false, sink)
 }
 
 // voiceSpeechLanguage resolves the language the speech leg is asked to speak: the per-answer
