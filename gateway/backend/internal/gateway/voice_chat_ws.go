@@ -2072,14 +2072,21 @@ func (m *voiceMachine) onTailDone() {
 
 // failTurn surfaces a recoverable leg error (spec §6.6): emit the typed error, tear the
 // turn down and return to idle with the mic no longer piping -- no silent retry that could
-// spin into a loop. The client re-engages with push_start.
+// spin into a loop. The client re-engages with push_start. It ends the turn exactly as
+// degrade does (ADR-080 (h)): it cancels and detaches the speculative run, disarms the
+// grace timer and drops pendingText, so a leg failure while a run is in flight (thinking)
+// leaves no orphaned run or armed timer feeding the run loop, and the abandoned transcript
+// is never silently re-run with the next turn.
 func (m *voiceMachine) failTurn(code, message string) {
 	m.emitError(code, message)
+	m.detachRun()
 	m.teardownTurn()
 	m.resetChunk()
 	m.stopChunkTimers()
+	m.stopGrace()
 	m.stopTail()
 	m.resetPlaybackWait()
+	m.pendingText = ""
 	m.setState(voiceStateIdle)
 }
 
