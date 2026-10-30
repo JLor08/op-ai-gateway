@@ -1342,7 +1342,8 @@ through an `io.Pipe`; the loopback's SSE comes back through the shared `transcri
 `decodeTranscriptionEvent` as typed WebSocket frames. The request carries **`Expect: 100-continue`**: `/v1` may refuse
 (`409`, `429`/`402`, `503`) before it reads a byte of the open body, and the Go client would otherwise not surface that
 response until the body ended, which for a microphone is never; with it the client holds the body until `/v1` sends
-`100 Continue` (on its first body read, after every refusal) or answers a final status. A non-2xx loopback answer
+`100 Continue` (on its first body read, after every refusal) or answers a final status; the relay also writes an explicit
+`100 Continue` right before its SSE `200`, so the `200` can never overtake it and make the client abort the body (#333). A non-2xx loopback answer
 (an admission denial, `transcription.live_busy`, anything past the mint's gate) reaches the browser as one
 `{"type":"error"}` frame after the upgrade, carrying the loopback's `code` and `message` from a bounded (64 KiB)
 read of its body (a generic message only when neither parses; the status is logged, not forwarded); the composer

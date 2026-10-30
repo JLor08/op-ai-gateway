@@ -8697,7 +8697,9 @@ taking them together is what changed the shape:
   `/v1` sends `100 Continue`, which net/http does on the handler's first body read (a point the relay
   reaches only after every refusal above), or answers a final status, which the client then returns at once.
   The transport's `ExpectContinueTimeout` bounds the wait, so a `/v1` that neither reads nor refuses cannot
-  stall the dial.
+  stall the dial. The relay **also writes an explicit `100 Continue` right before the SSE `200`** on the
+  success path (#333): the first body read runs on its own goroutine and can lag the upstream accept, and a
+  `200` that overtakes the `100 Continue` makes a Go client abort the body, so the turn would read no PCM.
 - **(e) The relay is guarded by the streaming idle watchdog.** The SSE leg goes through the streamed relays'
   own copier (`nativeCopier`) with the **idle watchdog** (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`, [ADR-010](#adr-010--streaming-idle-watchdog--lifted-deadlines-no-total-cap))
   and the per-chunk write deadline: the first frame gets the cold-start budget (the larger of the target's
