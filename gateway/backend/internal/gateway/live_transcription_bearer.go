@@ -100,6 +100,9 @@ func liveParamsFromQuery(q url.Values) liveParams {
 //   - the client's PCM pumped into the upstream request body through an io.Pipe by one
 //     copy goroutine, counting the payload and latching a clean end-of-input (r.Body's EOF,
 //     the terminating chunk) versus a truncated one (any other read error);
+//   - for a client that sent Expect: 100-continue, an explicit 100 Continue written before the
+//     success response, so the SSE 200 can never reach it ahead of its 100 Continue (see
+//     sendContinue and #333);
 //   - a DEFERRED teardown that can leave no goroutine blocked: it closes the pipe reader
 //     (unblocking both the transport's read of it and the copy goroutine's pipe write),
 //     expires the request read deadline (unblocking a copy goroutine still waiting on
@@ -236,8 +239,72 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 		watchdog = time.AfterFunc(coldStartBudget(target, idle), cancel)
 		defer watchdog.Stop()
 	}
+	// ORDER 100 Continue BEFORE the final 200. A client that sent Expect: 100-continue (the
+	// voice loopback, openLiveLoopback) holds its streaming body until it sees a 100 Continue
+	// or a final response. Go's server sends that 100 Continue by itself on the FIRST
+	// r.Body.Read -- the copy goroutine's, which is scheduled independently of the dial that
+	// just succeeded and, under CPU contention, can run after it. A 200 written ahead of that
+	// read reaches the client FIRST, a Go client then takes the final response for the server
+	// refusing the body and ABORTS it, and the relay reads no PCM at all (pcm_bytes=0, no
+	// clean end): a live voice turn died with stream_error (#333). Writing the 100 Continue
+	// ourselves, right here, makes the order independent of that scheduling: it is one
+	// synchronous write ahead of the 200, and it also disables the automatic one, so a late
+	// first read adds none.
+	//
+	// Success path only: every refusal above (the busy 503, a dial failure, a non-2xx upstream)
+	// is untouched. The #331 concurrency is untouched too: the copy goroutine keeps feeding the
+	// upstream body during the dial, and the 100 Continue it triggers there is what lets the
+	// client stream that early PCM; this line only guarantees the 100 Continue is never later
+	// than the 200, and at worst repeats one (an informational response a client skips). It
+	// waits for nothing, so it cannot hold the 200 back for a client that has not yet sent PCM.
+	if requestExpectsContinue(r) {
+		sendContinue(w)
+	}
 	s.relayBearerLiveSSE(w, resp, scan, watchdog, idle)
 }
+
+// requestExpectsContinue reports whether the client sent Expect: 100-continue on an HTTP/1.1
+// (or later) request, i.e. whether Go's server would answer the request's first body read with
+// a 100 Continue. It mirrors net/http's own check: the Expect value is a comma-separated token
+// list and the token is case-insensitive. A client that did not ask is never sent one: it has
+// no 100 Continue to be ordered before the 200.
+func requestExpectsContinue(r *http.Request) bool {
+	if !r.ProtoAtLeast(1, 1) {
+		return false
+	}
+	for _, v := range r.Header.Values("Expect") {
+		for _, token := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "100-continue") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sendContinue writes a 100 Continue informational response and flushes it (net/http's
+// WriteHeader does both for a 1xx, and it disables the automatic 100 Continue the first body
+// read would otherwise send). The writer's own wrappers are bypassed deliberately:
+// accessLogResponseWriter latches the FIRST WriteHeader code as the request's final status for
+// the access log and the span, so a 100 written through it would be logged as the response
+// status of every Expect session instead of the 200.
+func sendContinue(w http.ResponseWriter) {
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		w = u.Unwrap()
+	}
+	w.WriteHeader(http.StatusContinue)
+}
+
+// liveBodyCopyStartHook is a TEST-ONLY seam: when non-nil, liveBodyCopyLoop calls it once,
+// before its first read of the request body, so a test can hold the copy goroutine back and
+// reproduce the scheduling in which the upstream accepts before that first read (#333). It
+// is nil in production, and a test that sets it must restore nil in t.Cleanup and must not
+// run in parallel (it is a package variable).
+var liveBodyCopyStartHook func()
 
 // liveBodyCopyLoop pumps the client's inbound PCM into the upstream request body through pw
 // and counts the payload. It is the SOLE writer of pw and the bearer path's twin of the
@@ -254,6 +321,9 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 //     input as truncated, no done event -- a loud zero) and cancels the one context, tearing
 //     the relay down.
 func liveBodyCopyLoop(body io.Reader, cancel context.CancelFunc, pw *io.PipeWriter, pcmBytes *int64, endReceived *atomic.Bool) {
+	if hook := liveBodyCopyStartHook; hook != nil {
+		hook()
+	}
 	buf := make([]byte, 32*1024)
 	for {
 		rn, rerr := body.Read(buf)
