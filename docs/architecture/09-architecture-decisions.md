@@ -10358,8 +10358,8 @@ frontend change and no wire change** (the ticket request and response are exactl
   (1) **A session left on a model's default voice is not primed.** The priming is gated on a non-empty chosen voice, so a
   session with no explicit voice pays the roughly 3 s graph build on its first turn. The larger cost, the roughly 8.4 s
   per-voice reference encoding, **is** covered where it exists: a preset clone has no default voice of its own, so its
-  session always names one (the portal pre-selects its first preset, and the mint's `withCloneDefaultVoice` fills it in
-  for a request that could not, [ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)).
+  session always names one (the portal pre-selects its first preset, [ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred) (f), and the mint's
+  `withCloneDefaultVoice` fills it in for a request that could not, [ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), the consequence on the voice).
   The exception is a clone whose voices cache cannot be read or lists no preset: it keeps a blank voice (logged at the
   mint) and is not primed. A graph-only warm-up for a session with no voice is a possible refinement.
   (2) **The priming text is one fixed short English phrase, whatever the voice's language.** It warms the graph and the
