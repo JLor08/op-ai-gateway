@@ -1900,7 +1900,11 @@ paths:
         a per-process key (it carries the three resolved targets, the chat, the
         attribution, the speech settings and the fixed PCM shape, none of which the
         browser can read or alter) and opens only on the gateway process that minted it.
-        It is a gate, not a relay: no admission, no usage row, no capture. Any method but
+        It is a gate, not a relay: no admission, no usage row, no capture. Once the ticket
+        is issued it also fires a detached, best-effort priming synthesis of the chosen
+        voice straight to the TTS upstream (never awaited, so it changes neither the
+        status nor the body; it writes no usage row and stores nothing; the knob
+        OP_AI_GATEWAY_VOICE_PREWARM switches it off). Any method but
         POST is 405. See api-surface.md and 06-runtime-view.md section 6.1.6.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody:

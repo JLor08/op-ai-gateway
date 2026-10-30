@@ -366,6 +366,62 @@ func TestLoadVoiceTTSKnobsFromFile(t *testing.T) {
 	}
 }
 
+// The Voice Chat session-open TTS pre-warm (#342) is on unless an operator turns it off. The knob
+// follows the repo's bool-env convention (loader.boolean): absent or empty is the default (on), and
+// a set value is on only for 1/true/yes/on (any case, trimmed) -- so "false" and "0" turn it off.
+func TestLoadVoicePrewarmDefault(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_PREWARM", "")
+	if !mustLoad(t).VoicePrewarmEnabled {
+		t.Fatal("voice prewarm (absent) = false, want the default true")
+	}
+}
+
+func TestLoadVoicePrewarmOverrides(t *testing.T) {
+	cases := []struct {
+		value string
+		want  bool
+	}{
+		{"true", true},
+		{"1", true},
+		{"yes", true},
+		{"ON", true},     // case-insensitive
+		{" true ", true}, // surrounding whitespace is trimmed
+		{"false", false},
+		{"0", false},
+		{"no", false},
+		{"off", false},
+		{" False ", false},
+		{"garbage", false}, // the repo's bool convention: anything but 1/true/yes/on is off
+	}
+	for _, tc := range cases {
+		t.Setenv("OP_AI_GATEWAY_VOICE_PREWARM", tc.value)
+		if got := mustLoad(t).VoicePrewarmEnabled; got != tc.want {
+			t.Fatalf("value %q: got %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+// A JSON config file carries the knob as a bool (or a string), and the environment still wins.
+func TestLoadVoicePrewarmFromFile(t *testing.T) {
+	t.Setenv("OP_AI_GATEWAY_VOICE_PREWARM", "")
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_VOICE_PREWARM":false}`)
+	if mustLoad(t).VoicePrewarmEnabled {
+		t.Fatal("file false: voice prewarm = true, want off")
+	}
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_VOICE_PREWARM":"0"}`)
+	if mustLoad(t).VoicePrewarmEnabled {
+		t.Fatal(`file "0": voice prewarm = true, want off`)
+	}
+	writeGatewayConfig(t, `{"OP_AI_GATEWAY_VOICE_PREWARM":true}`)
+	if !mustLoad(t).VoicePrewarmEnabled {
+		t.Fatal("file true: voice prewarm = false, want on")
+	}
+	t.Setenv("OP_AI_GATEWAY_VOICE_PREWARM", "false")
+	if mustLoad(t).VoicePrewarmEnabled {
+		t.Fatal("env false over file true: voice prewarm = true, want the environment to win")
+	}
+}
+
 func TestLoadAppHealthProbeTimeoutDefault(t *testing.T) {
 	t.Setenv("OP_AI_GATEWAY_APP_HEALTH_PROBE_TIMEOUT", "")
 	if cfg := mustLoad(t); cfg.AppHealthProbeTimeout != 3*time.Second {

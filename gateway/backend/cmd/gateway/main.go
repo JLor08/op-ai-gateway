@@ -1105,6 +1105,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		StreamIdleTimeout:               cfg.StreamIdleTimeout,
 		VoiceCoLoadTimeout:              cfg.VoiceCoLoadTimeout,
 		VoiceTiming:                     voiceTimingFromConfig(cfg),
+		VoicePrewarmEnabled:             cfg.VoicePrewarmEnabled,
 		SwapProtectWindow:               time.Duration(cfg.SwapProtectWindowSeconds) * time.Second,
 		SessionReservationWindow:        time.Duration(cfg.SessionReservationWindowSeconds) * time.Second,
 		CapacityVRAMSafetyMarginPercent: cfg.CapacityVRAMSafetyMarginPercent,

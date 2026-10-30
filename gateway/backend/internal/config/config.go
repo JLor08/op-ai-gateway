@@ -115,6 +115,14 @@ type Config struct {
 	// gateway.VoiceTTSRetriesDefault), so an absent variable stays distinguishable from a
 	// deliberate 0 -- cmd/gateway maps 0 onto gateway.VoiceTiming.TTSRetriesDisabled.
 	VoiceTTSRetries int
+	// VoicePrewarmEnabled (OP_AI_GATEWAY_VOICE_PREWARM, a bool) turns on the Voice Chat
+	// session-open TTS pre-warm (#342): once the co-load gate has confirmed the session's models
+	// resident, the gateway fires one short, unbilled, unstored priming synthesis for the
+	// session's chosen voice, so the first spoken reply is warm instead of paying the TTS's
+	// first-synthesis and per-voice setup cost. Default true; set it false to switch the
+	// pre-warm off. It follows the repo's bool-env rule (loader.boolean): absent or empty is
+	// the default, and any set value other than 1/true/yes/on (case-insensitive) is off.
+	VoicePrewarmEnabled bool
 	// CertEdgeProbeTarget is the host:port of the gateway's OWN edge (nginx)
 	// TLS listener the synthetic self-probe dials (e.g. "web:443" in compose,
 	// the Service name+port nginx's :443 server block is reachable at in
@@ -339,6 +347,8 @@ func Load() (Config, error) {
 		// integerAllowZero.
 		VoiceTTSConcurrency: l.integer("OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY", 2),
 		VoiceTTSRetries:     l.integerAllowZero("OP_AI_GATEWAY_VOICE_TTS_RETRIES", 2),
+		// Session-open TTS pre-warm (see the VoicePrewarmEnabled field doc): on by default.
+		VoicePrewarmEnabled: l.boolean("OP_AI_GATEWAY_VOICE_PREWARM", true),
 		// Retention window (hours) for persisted rich telemetry samples; the
 		// prune loop drops samples older than this. Default 168 = 7 days; junk
 		// or <= 0 falls back to the default via integer().

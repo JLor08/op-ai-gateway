@@ -497,6 +497,7 @@ sequenceDiagram
     TK->>AG: step 3, read each agent's LIVE loaded set after all ensures
     TK->>TK: every agent-managed leg resident NOW, else 409 portal.voice_chat_coload_failed (bounded by OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT)
     TK-->>B: 200 {ticket} (about 30 s, single-use, AES-256-GCM of the three targets + chat + attribution + settings + PCM shape)
+    Note over TK,AG: once the ticket is issued, a detached best-effort priming synthesis of the chosen voice goes straight to the TTS upstream (issue #342). Never awaited, knob-gated, no usage row, nothing stored
     B->>M: GET /api/portal/voice-chat, Upgrade, Sec-WebSocket-Protocol: op-voice-chat + the ticket
     M->>M: redeem BEFORE Accept (one 401 for every failure), default same-origin check
     M-->>B: 101 Switching Protocols, then {state: listening}
@@ -599,6 +600,24 @@ connection, so none of the 30 s server deadlines applies to it; the ticket POST,
 ([API Compatibility & Inference §7](cross-cutting/compatibility-and-inference.md#7-streaming-lifecycle)). The frames and codes are in the
 [HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket), the knobs in
 [Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate).
+
+**Session-open pre-warm: the chosen TTS voice is primed at ticket-mint** (issue #342, [ADR-081](09-architecture-decisions.md#adr-081--voice-chat-session-open-pre-warm-the-chosen-tts-voice-is-primed-at-ticket-mint-by-a-detached-best-effort-synthesis-that-goes-through-the-speech-benchmarks-direct-dispatch-so-it-is-neither-billed-nor-stored), knob `OP_AI_GATEWAY_VOICE_PREWARM` in [Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate)).
+The co-load gate proves the three models **resident**, which is not **warm**: the first synthesis of a TTS model still pays a
+graph build (about 3 to 3.5 s for Qwen3-TTS) and, per voice, a reference encoding (about 8.4 s for a cold preset voice),
+while the ASR's and the LLM's first inference after load is not perceptible. So, **after the gate has passed and the ticket is
+minted and size-checked**, the ticket handler fires one short synthesis for the session's chosen voice, just before it writes
+the `200`: in a **detached goroutine** on its own `context.Background()` bounded by a 30 s timeout (never the request's
+context, which ends when the response is written and carries the request's capture sink), **never awaited**, so the ticket's
+latency and success do not depend on it. It overlaps the cold start with the browser opening the WebSocket and the user
+getting ready, instead of with the first spoken reply. It goes **straight to the TTS upstream** through the speech
+benchmark's direct dispatch (`ProxyNative`), not through the loopback `/v1/audio/speech` the voice run's speech legs use, so
+it **writes no usage row, is stored nowhere** (nothing is committed) and takes no admission. It is **best-effort**: a failure
+is logged as a warning and goes no further, so the session that opens on the ticket is the same with or without it. It is
+gated by the knob (default on) and by the ticket **carrying a voice**, and it primes that one voice only: the ASR and the LLM
+are not primed. Residuals ([ADR-081](09-architecture-decisions.md#adr-081--voice-chat-session-open-pre-warm-the-chosen-tts-voice-is-primed-at-ticket-mint-by-a-detached-best-effort-synthesis-that-goes-through-the-speech-benchmarks-direct-dispatch-so-it-is-neither-billed-nor-stored) lists them): a session left on a model's
+default voice (none named) is not primed and pays the graph build on its first turn, the priming text is one fixed short
+English phrase whatever the voice's language, and there is no priming on a voice change because there is no mid-session
+voice switch (a new voice is a new ticket, which primes again at its own mint).
 
 **Phase 2: what is spoken is a short summary, and the two legs overlap** ([ADR-079](09-architecture-decisions.md#adr-079--voice-chat-phase-2-a-spoken-summary-marked-by-a-speak-tag-in-the-stream-is-spoken-concurrently-while-the-detail-streams-under-an-editable-per-thread-voice-prompt-with-a-per-answer-language), issue #314; phase 3 generalizes the one summary to several ordered sections, below). *What the model
 is told.* The voice run's LLM history opens with the **voice system prompt**: the thread's `settings.voice_chat.system_prompt`,
