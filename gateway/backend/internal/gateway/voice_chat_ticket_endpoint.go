@@ -158,9 +158,16 @@ func (s *Server) voiceCoLoadBound() time.Duration {
 //     stored one) speaks its first preset, never a blank voice (withCloneDefaultVoice). A
 //     mint that fails, or a token longer than voiceTicketMaxBytes, is 500
 //     portal.voice_chat_ticket_failed.
+//  7. Once the ticket is issued, and only then, the speech leg's voice is primed in the
+//     background (startVoicePrewarm): one short synthesis that makes the session's first
+//     spoken reply warm. It is gated by OP_AI_GATEWAY_VOICE_PREWARM and by the ticket
+//     carrying a voice, runs on its own context (never the request's), is never awaited, and
+//     a failure of it is logged and nothing else: the answer above is the same with or
+//     without it.
 //
 // Like the live ticket it is a gate, not a relay: no usage row is recorded, no capture is
-// written, and no admission is spent (each /v1 core spends its own per turn).
+// written, and no admission is spent (each /v1 core spends its own per turn). The priming
+// is no exception: it goes straight to the upstream, so it is neither billed nor stored.
 func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -228,6 +235,9 @@ func (s *Server) handlePortalVoiceChatTicket(w http.ResponseWriter, r *http.Requ
 		writeVoiceChatRefusal(w, voiceChatTicketFailed)
 		return
 	}
+	// The ticket is issued, so a session will open on this speech target and voice: warm them in
+	// the background. It returns at once and the ticket never waits for it or depends on it.
+	s.startVoicePrewarm(tts, audio.Voice)
 	writeJSON(w, http.StatusOK, voiceChatTicketResponse{Ticket: ticket})
 }
 

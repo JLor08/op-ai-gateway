@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"time"
@@ -56,6 +57,33 @@ var errVoicePrimingNoNativeProxy = errors.New("voice prewarm: provider does not 
 // Server reads as off.
 func (s *Server) voicePrewarmEnabled() bool {
 	return s != nil && s.voicePrewarm
+}
+
+// startVoicePrewarm is the ticket endpoint's one call into the pre-warm: it launches the priming of tts
+// and voice (the speech target the co-load gate resolved and the voice the ticket carries) in the
+// background and returns at once. It is gated -- nothing starts with the knob off or with no voice
+// to warm -- and best-effort in every other respect: the synthesis is never awaited, so the ticket's
+// latency and success cannot depend on it, and its failure (no native relay, a transport error, a
+// non-2xx answer, the timeout) is logged here and goes no further, so it can never fail the ticket
+// or the session that opens on it.
+//
+// The goroutine runs on its OWN context, derived from context.Background() and bounded by
+// voicePrimingTimeout, and never on the request's, for two reasons. The request's context ends the
+// moment the ticket response is written, which would cancel the synthesis before the upstream has
+// done any of the work being warmed. And it carries the request's state -- among it a
+// payload-capture sink, which would record the priming's request and response and so store them,
+// where the priming must store nothing. A clean context carries none of that.
+func (s *Server) startVoicePrewarm(tts routing.Target, voice string) {
+	if !s.voicePrewarmEnabled() || voice == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), voicePrimingTimeout)
+		defer cancel()
+		if err := s.primeSpeechVoice(ctx, tts, voice); err != nil {
+			slog.Warn("voice prewarm: priming synthesis failed", "model", tts.Model, "route", tts.RouteID, "voice", voice, "err", err)
+		}
+	}()
 }
 
 // primeSpeechVoice fires ONE short synthesis for tts and voice straight at the target's upstream, to
