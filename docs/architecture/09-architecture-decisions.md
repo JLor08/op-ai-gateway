@@ -9678,7 +9678,10 @@ streams" or `cancel` as the only control that reopens the mic, ADR-080 supersede
   arithmetic is subtle, test-pinned and direction-sensitive). It is **topology-agnostic**: an LLM on another server is
   trivially resident there while ASR and TTS must both be resident on the audio host; a non-agent (direct) leg has no
   ensure route and takes step 1 only. The mapping from a refusal to a status is `400` for the three `*_unavailable`
-  codes and `audio_settings_invalid`, `409` for `coload_failed`, `500` for `ticket_failed`.
+  codes and `audio_settings_invalid`, `409` for `coload_failed`, `500` for `ticket_failed`. *Extended by issue #342
+  (resident is not warm):* once the gate has passed and the ticket is issued, the mint also fires a best-effort priming
+  synthesis of the session's chosen TTS voice, detached, never awaited, unbilled and unstored
+  ([ADR-081](#adr-081--voice-chat-session-open-pre-warm-the-chosen-tts-voice-is-primed-at-ticket-mint-by-a-detached-best-effort-synthesis-that-goes-through-the-speech-benchmarks-direct-dispatch-so-it-is-neither-billed-nor-stored)).
 - **(g) Billing is inherited; no new metering.** Each leg bills through its own core, attributed to the loopback user
   (a token-less session principal, as a portal chat run is): ASR `audio_second` at `/v1/audio/transcriptions/live`, LLM
   tokens at `/v1/chat/completions`, TTS `audio_second` (or `audio_bytes` while the byte rate is uncached) at
@@ -10284,3 +10287,114 @@ and the planting risk of ADR-079 (a); the stored document already holds it).
 [Data Model](reference/data-model.md),
 [HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
+
+## ADR-081 — Voice Chat session-open pre-warm: the chosen TTS voice is primed at ticket-mint by a detached, best-effort synthesis that goes through the speech benchmark's direct dispatch, so it is neither billed nor stored
+**Context:** the co-load gate of [ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
+(f) proves, at ticket-mint, that the three models are resident together, but *resident is not warm*. Measured live on one
+internal host (2026-10-30, issue #342): the first inference after load of the **ASR** (about 0.1 to 0.5 s) and of the
+**LLM** (about 0.5 s; the agent's `/load` already generates a token) is not perceptible. The first synthesis of the **TTS**
+is. A TTS model pays two one-time costs on its first speech: a **compute-graph build** (about 3 to 3.5 s for Qwen3-TTS) and,
+per voice, a **reference encoding** (about 8.4 s for each cold preset voice), against tens of milliseconds once warm. So the
+first spoken reply of a session could wait up to about 11 s, on a conversation the user had only just started. Four forces
+shaped the fix:
+
+- **The earliest the work can start is the ticket-mint, not the WebSocket open.** The gate runs inside the ticket POST, so
+  when the ticket exists the models are known resident and the session's speech target and chosen voice are known. The
+  browser then opens the WebSocket and the user gets ready, which is dead time a warm-up can hide in.
+- **A priming must cost the user nothing.** The portal's speech path is a loopback to the public `/v1/audio/speech`, which
+  records a usage row and whose run stores its audio; a pre-warm that went that way would bill and store a clip nobody
+  asked for.
+- **A priming must never delay or fail a session.** It is an optimization of a turn that works without it.
+- **Only the perceptible cost is worth paying.** The ASR and the LLM have none, and a TTS voice that is never used has no
+  first turn to speed up.
+
+**Decision — four choices, taken together. No schema migration, no agent change and no `ServerAgent` version bump, no
+frontend change and no wire change** (the ticket request and response are exactly as before).
+
+- **(a) Fired at ticket-mint, after the ticket is issued, in a detached goroutine that the handler never awaits.**
+  `handlePortalVoiceChatTicket` calls `startVoicePrewarm(tts, audio.Voice)` as its last step before it writes the `200`,
+  with the speech target the co-load gate resolved and the voice the ticket carries (after `withCloneDefaultVoice` has named
+  a preset clone's first preset where none was named). It runs **after** the ticket is minted and passed its size check, so a
+  refused request (a gate refusal, or `500 portal.voice_chat_ticket_failed`) primes nothing, and the call returns at once, so
+  the ticket's latency and success cannot depend on it. The goroutine runs on **`context.Background()` bounded by `voicePrimingTimeout` (30 s),
+  never on the request's context**, for two reasons: the request's context ends the moment the ticket response is written,
+  which would cancel the synthesis before the upstream has done any of the work being warmed; and it carries the request's
+  state, among it a payload-capture sink, which would record the priming and so store it. A clean context carries none of
+  that. The 30 s covers a cold voice (seconds to about eleven) with margin and ends a hung upstream instead of holding a
+  goroutine for ever.
+- **(b) The synthesis goes through the speech benchmark's direct dispatch, not the loopback, so it neither bills nor
+  stores.** `primeSpeechVoice` sends **one** short non-stream request straight to the target's upstream through
+  `provider.NativeProxyClient.ProxyNative`, exactly as the speech benchmark does
+  ([ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+  (e): one of the reasons the benchmark went direct is that the relay would record a usage row). The body is the
+  benchmark's own (`speechBenchmarkRequest`: the application's own model id, `Input`, `Voice`), the path is the speech
+  flavor's upstream path and the credential is the target's upstream one. The answer is read to its end and **discarded**:
+  nothing is committed, so nothing is stored, and no `/v1` core is reached, so no usage row is written and **no admission
+  or per-route slot is taken**. A provider that cannot forward a raw body has no direct route, and the billing loopback is
+  deliberately **not** a fallback: the priming is refused (`errVoicePrimingNoNativeProxy`) and logged. The dispatch is
+  **mirrored, not shared** with the benchmark, whose version is entangled with its measurement (the time to first byte is
+  taken around the call and its errors are phrased as a benchmark result); the two share only the pieces that define the
+  request. The text is a fixed short phrase (`voicePrimingText`, "Hello, I'm ready."), enough to run the whole synthesis
+  path once and quick to play.
+- **(c) Scope: the chosen voice only, gated by a knob.** The priming starts only when `OP_AI_GATEWAY_VOICE_PREWARM` is on
+  ([Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate); a bool,
+  **default on**, read once at startup) **and** the ticket carries a non-empty voice. With the knob off, today's behavior
+  is unchanged. It primes the **session's one voice**, the one sealed in the ticket; the ASR and the LLM get no priming at
+  all (their first inference after load is not perceptible, and the co-load already loads them). What it warms is the
+  graph and that voice's reference encoding, which is why one synthesis of one phrase is enough.
+- **(d) Best-effort in every other respect.** A priming failure (no native relay, a transport error, a non-2xx answer, an
+  unreadable body, the timeout) is logged as a `slog.Warn` (`voice prewarm: priming synthesis failed`, with the model, route,
+  voice and error) and goes no further: it never changes the ticket, never reaches the browser, never retries and never
+  affects the session that opens on the ticket, which then simply pays the cold start as it did before.
+
+**Consequence:**
+
+- **One priming per issued ticket, outside the usage and admission accounting.** It is a gateway-initiated request that
+  never reaches a `/v1` core, so it appears in no usage row, takes no admission and holds no route slot, and a ticket whose
+  WebSocket is never opened has run it for nothing (unbilled). If the user speaks before the priming has finished, the
+  first real synthesis and the priming overlap; whether the upstream then shares the warm-up in flight or serves them
+  separately is **not measured**, and the priming is best-effort by design.
+- **Residuals, kept rather than fixed:**
+  (1) **A session left on a model's default voice is not primed.** The priming is gated on a non-empty chosen voice, so a
+  session with no explicit voice pays the roughly 3 s graph build on its first turn. The larger cost, the roughly 8.4 s
+  per-voice reference encoding, **is** covered where it exists: a preset clone has no default voice of its own, so its
+  session always names one (the portal pre-selects its first preset, and the mint's `withCloneDefaultVoice` fills it in
+  for a request that could not, [ADR-075](#adr-075--offering-a-configured-voice-clone-speech-model-the-gateway-fetches-a-clone-models-preset-voices-a-non-empty-cached-list-is-the-offer-signal-for-both-portal-pickers-a-fail-closed-and-covers-mixed-names-and-streaming-for-clone-stays-deferred)).
+  The exception is a clone whose voices cache cannot be read or lists no preset: it keeps a blank voice (logged at the
+  mint) and is not primed. A graph-only warm-up for a session with no voice is a possible refinement.
+  (2) **The priming text is one fixed short English phrase, whatever the voice's language.** It warms the graph and the
+  voice's reference encoding, both language-independent, which is the point; a localized priming text is a possible
+  refinement.
+  (3) **No priming on a voice switch.** There is no mid-session voice switch to prime for: the voice is sealed in the
+  ticket, and a change of voice is a new ticket, that is a new session, which primes again at its own mint.
+  (4) **No ASR or LLM priming**, because neither cold start is perceptible.
+  (5) **The LLM's slow load is a separate problem and is not addressed here.** A cold model load can take about 10 s with a
+  warm file cache and two minutes or more from a cold disk, and it can run into the two-minute stream-idle timeout
+  (`OP_AI_GATEWAY_STREAM_IDLE_TIMEOUT`). That is a load and co-load robustness gap for its own follow-up, not a
+  priming concern.
+- **Verification status.** Mock-backed tests pin the dispatch (direct to the upstream through the native relay, the
+  application's model id, the credential, the fixed text and the one voice, the answer read to its end), that a priming, a
+  failed one included, writes **no usage row**, the ticket's independence from the priming (a priming the upstream holds
+  open does not delay the `200`, and a failing one never fails the ticket), the knob off and the blank voice (nothing is
+  sent), a refused request (nothing is sent), the clone's default preset, and the background context (the request's
+  cancellation and its capture sink do not reach the priming, which is what keeps it from being stored; there is no commit
+  to store it either). The **measurements that
+  motivate it are live; the shipped change is not claimed as a live end-to-end run** against a real audio.cpp, so how much
+  of the cold start the priming removes in practice is for an operator to confirm.
+
+**Builds on:** [ADR-078](#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)
+(the ticket mint and the co-load gate, (a) and (f), which it follows) and
+[ADR-068](#adr-068--streaming-speech-synthesis-the-gateway-relays-the-pcm-stream-of-a-streaming-model-meters-it-from-the-bytes-it-relayed-audio_bytes-or-audio_second-over-a-benchmark-learned-byte-rate-and-the-portal-composer-plays-it-as-it-arrives)
+(the speech benchmark's direct native dispatch, which it mirrors). It changes neither.
+**Rejected:** **Priming through the loopback `/v1/audio/speech`** (the portal's own speech path: it records a usage row and
+its run stores the audio, so it would bill and store a clip nobody asked for). **Awaiting the priming before answering the
+ticket** (it would add up to about eleven seconds to every ticket and make a best-effort step part of its success).
+**Running the priming on the request's context** (the response ends it before the upstream has done the work, and its capture
+sink would store it). **Priming at WebSocket open** (later than the mint by the browser's round trip, and the mint is where
+the speech target and voice are first known with the models proven resident). **Priming every preset voice up front** (about
+8.4 s each, serially, for voices that may never be used, with one TTS loaded at a time). **Priming the ASR and the LLM** (no
+perceptible cold start to remove). **Extracting the benchmark's dispatch into a shared helper** (it is entangled with the
+measurement, and a pre-warm is not worth a change to that path).
+→ [Runtime View §6.1.6](06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts),
+[HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket),
+[Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate).
