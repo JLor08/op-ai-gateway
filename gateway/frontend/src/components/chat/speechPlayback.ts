@@ -20,15 +20,28 @@
 //     irregularity abandons live playback for the run; the committed WAV is complete.
 //   - decodeBase64 / pcm16ToFloat32 are the pure conversion, including the odd byte a chunk
 //     boundary can leave inside a sample.
-//   - StreamingPcmPlayer schedules decoded chunks back to back on an AudioContext's clock,
-//     through one gain node that is the run's mute.
-//   - createSpeechPlayback holds one session per chat on top of those, which useChatRuns
-//     drives from the run's events.
+//   - StreamingPcmPlayer resamples each decoded chunk to the AudioContext's own rate and streams
+//     it into an AudioWorklet ring buffer (playbackWorklet.ts / playbackPcm.ts), through one gain
+//     node that is the run's mute.
+//   - createSpeechPlayback holds one session per chat on top of those, which useChatRuns drives
+//     from the run's events.
 //
-// Scheduled AudioBufferSourceNodes are used rather than an AudioWorklet: the chunks arrive
-// from the network in whole pieces, and a node per chunk placed on the audio clock is
-// gapless without a second thread, a separately served worklet module, or a message channel
-// whose underruns would need their own protocol.
+// An AudioWorklet ring buffer is used rather than scheduling one AudioBufferSourceNode per chunk
+// from the main thread (#347): on a phone, with the microphone capture worklet also running, the
+// main thread jitters and the next chunk's scheduled start slips, opening an audible gap at the
+// chunk seam. A worklet drains the ring continuously on the real-time audio thread, so the main
+// thread only has to FILL the buffer -- one continuous stream, gapless under main-thread load.
+
+import { LinearResampler } from './livePcm';
+import {
+  PLAYBACK_DRAINED_MESSAGE,
+  PLAYBACK_PAUSE_MESSAGE,
+  PLAYBACK_RESUME_MESSAGE,
+  PLAYBACK_STOP_MESSAGE,
+  STREAMING_PCM_PLAYBACK_PROCESSOR_NAME,
+  type PlaybackDrainedMessage,
+} from './playbackPcm';
+import playbackWorkletUrl from './playbackWorklet.ts?worker&url';
 
 /** One chunk of a streaming speech run's audio, as the `audio` run event carries it. */
 export type AudioChunk = {
@@ -132,262 +145,300 @@ export function pcm16ToFloat32(
   return { samples, carry: whole < data.length ? data[whole] : null };
 }
 
-// The slice of the Web Audio API the player uses. The browser's AudioContext satisfies it;
-// a test passes a recording stand-in, since sound cannot be heard in jsdom.
-export type PlaybackBuffer = {
-  readonly duration: number;
-  copyToChannel(source: Float32Array<ArrayBuffer>, channelNumber: number): void;
-};
-export type PlaybackSource = {
-  buffer: PlaybackBuffer | null;
-  onended: ((event: Event) => void) | null;
-  connect(destination: unknown): unknown;
-  start(when?: number): void;
-  stop(when?: number): void;
-};
-// The one gain stage of a stream: every source reaches the destination through it, and its
-// value is the mute (0 silent, 1 as decoded).
-export type PlaybackGain = {
-  readonly gain: { value: number };
-  connect(destination: unknown): unknown;
-};
+// The slice of the Web Audio API this module needs to know the context by. The player needs only
+// the output rate (to resample to) and reads the clock state through isRunning below; the real
+// browser AudioContext also exposes audioWorklet/createGain/destination, which the worklet sink
+// reaches after narrowing -- they are kept off this structural type so a test can stand in a plain
+// object and inject its own sink.
 export type PlaybackContext = {
-  readonly currentTime: number;
-  readonly destination: unknown;
+  readonly sampleRate: number;
   readonly state?: string;
-  createBuffer(numberOfChannels: number, length: number, sampleRate: number): PlaybackBuffer;
-  createBufferSource(): PlaybackSource;
-  createGain(): PlaybackGain;
   resume?(): Promise<void>;
 };
 
-// How far ahead of "now" the first chunk of a stream (and the first after a stall) is
-// scheduled, in seconds: a cushion against the jitter between the chunks that follow, paid
-// once, as latency, at the start.
-const DEFAULT_LEAD_SECONDS = 0.12;
-
 // The margin, in ms, added to a draining tail's own remaining duration before the fallback
 // timer declares it drained (see createSpeechPlayback's `end`). The primary drain signal is the
-// last source's `onended`; this fallback only fires when that never arrives (a context frozen
-// mid-tail, a stand-in that does not call onended), and the margin keeps it from racing the real
-// end of audio by a few ms of scheduling slack.
+// worklet's drained message; this fallback only fires when that never arrives (a context frozen
+// mid-tail, a stand-in that does not report), and the margin keeps it from racing the real end of
+// audio by a few ms of scheduling slack.
 const DRAIN_FALLBACK_MARGIN_MS = 250;
 
-// One decoded chunk of PCM and the rate to play it at: what a pause holds, and what a resume
-// schedules again.
-type PcmChunk = { samples: Float32Array<ArrayBuffer>; rate: number };
-
-// A chunk placed on the audio clock: its node, and where on the clock it plays, which is what
-// a pause needs to know how much of it has been heard.
-type ScheduledChunk = PcmChunk & {
-  source: PlaybackSource;
-  startAt: number;
-  duration: number;
+/**
+ * Where the player hands its resampled audio to be heard: an AudioWorklet ring buffer on the
+ * real-time audio thread (createWorkletSink), or a stand-in in a test. `write` enqueues samples
+ * already at the context's rate; `pause`/`resume` hold and continue the playout (the ring keeps
+ * the unplayed tail); `setMuted` silences the output without stopping its clock; `onDrained` is
+ * called with the cumulative count of samples played out each time the ring drains to empty.
+ */
+export type PlaybackSink = {
+  write(samples: Float32Array): void;
+  setMuted(muted: boolean): void;
+  pause(): void;
+  resume(): void;
+  stop(): void;
+  onDrained: ((played: number) => void) | null;
 };
 
+// The playback worklet module, added to each AudioContext once: addModule is idempotent, but
+// awaiting one shared promise per context avoids a second fetch and a race to make the node.
+const playbackModuleAdded = new WeakMap<AudioContext, Promise<void>>();
+
+function ensurePlaybackModule(ctx: AudioContext): Promise<void> {
+  let added = playbackModuleAdded.get(ctx);
+  if (!added) {
+    added = ctx.audioWorklet.addModule(playbackWorkletUrl);
+    playbackModuleAdded.set(ctx, added);
+    // A failed load must not be cached for the page's whole life (the context is the long-lived
+    // shared one): drop the entry so a later player -- the next answer -- can try again. The
+    // caller of this attempt still sees the rejection and degrades for now.
+    added.catch(() => {
+      if (playbackModuleAdded.get(ctx) === added) playbackModuleAdded.delete(ctx);
+    });
+  }
+  return added;
+}
+
 /**
- * Plays the decoded chunks of ONE stream back to back on an AudioContext's own clock: each
- * chunk becomes a buffer source started exactly where the previous one ends, so there is no
- * gap however unevenly the chunks arrive, for as long as they arrive faster than they play.
- * When the queue runs dry (the stream stalled, or it is simply over) the next chunk is
- * re-anchored a lead ahead of now instead of being scheduled in the past, where it would be
- * dropped or played in a burst.
+ * The real sink: an AudioWorkletNode running playbackWorklet.ts (the ring buffer), through one
+ * gain node that is the stream's mute, to the destination. Setup is async (the module must be
+ * added first), so samples written before the node exists are held on the main thread and flushed
+ * once it does. If the browser has no AudioWorklet, or the module will not load, live playout is
+ * simply skipped -- it is an enhancement, and the committed WAV is the complete audio.
+ */
+function createWorkletSink(ctx: PlaybackContext): PlaybackSink {
+  // At runtime the context is always a real AudioContext (sharedAudioContext / the voice
+  // session's own); a test injects its own sink instead of ever reaching here.
+  const audioCtx = ctx as unknown as AudioContext;
+  let node: AudioWorkletNode | null = null;
+  let gain: GainNode | null = null;
+  // Samples written before the node exists, flushed in order once it does.
+  const queued: Float32Array[] = [];
+  let paused = false;
+  let muted = false;
+  let stopped = false;
+  // Set when the worklet could not be loaded: playout is then silent (the committed WAV is the
+  // audio), but drains are still reported so turn-taking is not stuck -- see reportSilentDrain.
+  let failed = false;
+  // The cumulative samples written, so a silent drain can report the same count a real one would.
+  let writtenCount = 0;
+  let drainScheduled = false;
+
+  const sink: PlaybackSink = {
+    onDrained: null,
+    write(samples) {
+      if (stopped) return;
+      writtenCount += samples.length;
+      if (node) node.port.postMessage(samples, [samples.buffer as ArrayBuffer]);
+      else if (failed) reportSilentDrain();
+      else queued.push(samples);
+    },
+    setMuted(next) {
+      muted = next;
+      if (gain) gain.gain.value = next ? 0 : 1;
+    },
+    pause() {
+      paused = true;
+      node?.port.postMessage(PLAYBACK_PAUSE_MESSAGE);
+    },
+    resume() {
+      paused = false;
+      node?.port.postMessage(PLAYBACK_RESUME_MESSAGE);
+    },
+    stop() {
+      stopped = true;
+      sink.onDrained = null;
+      queued.length = 0;
+      if (node) {
+        try {
+          node.port.postMessage(PLAYBACK_STOP_MESSAGE);
+        } catch {
+          // The port may already be gone.
+        }
+        node.port.onmessage = null;
+        try {
+          node.disconnect();
+        } catch {
+          // Not connected.
+        }
+        node = null;
+      }
+      if (gain) {
+        try {
+          gain.disconnect();
+        } catch {
+          // Not connected.
+        }
+        gain = null;
+      }
+    },
+  };
+
+  // If the worklet never loads, playout is silent but must still report a drain, so the session can
+  // tell the gateway the answer finished and reopen the microphone (the saved WAV is the audio).
+  // Deferred to a microtask so it never re-enters the caller's push, and debounced so a burst of
+  // writes reports one drain, as a real ring draining to empty would.
+  function reportSilentDrain(): void {
+    if (drainScheduled) return;
+    drainScheduled = true;
+    queueMicrotask(() => {
+      drainScheduled = false;
+      if (!stopped) sink.onDrained?.(writtenCount);
+    });
+  }
+
+  void setup();
+
+  async function setup(): Promise<void> {
+    try {
+      await ensurePlaybackModule(audioCtx);
+      if (stopped) return;
+      const workletNode = new AudioWorkletNode(audioCtx, STREAMING_PCM_PLAYBACK_PROCESSOR_NAME, {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      workletNode.port.onmessage = (event: MessageEvent) => {
+        if (stopped) return;
+        const data = event.data as PlaybackDrainedMessage | undefined;
+        if (data?.type === PLAYBACK_DRAINED_MESSAGE) sink.onDrained?.(data.played);
+      };
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = muted ? 0 : 1;
+      workletNode.connect(gainNode).connect(audioCtx.destination);
+      node = workletNode;
+      gain = gainNode;
+      // Apply a pause asked for before the node existed, then flush the audio that arrived first.
+      if (paused) workletNode.port.postMessage(PLAYBACK_PAUSE_MESSAGE);
+      for (const samples of queued.splice(0)) {
+        workletNode.port.postMessage(samples, [samples.buffer as ArrayBuffer]);
+      }
+    } catch {
+      // No AudioWorklet, or the module failed to load: stay silent, but report what was written as
+      // drained so turn-taking is not stuck. The saved WAV is the complete audio, so nothing is lost.
+      failed = true;
+      queued.length = 0;
+      reportSilentDrain();
+    }
+  }
+
+  return sink;
+}
+
+/**
+ * Plays the decoded chunks of ONE stream by resampling each to the AudioContext's own rate
+ * (continuously, carrying the resampler state across chunks so there is no click at the seams)
+ * and streaming the samples into an AudioWorklet ring buffer. The worklet drains the ring on the
+ * audio thread, so however unevenly the chunks arrive, and however busy the main thread is, the
+ * output is one continuous stream with no gaps -- for as long as they arrive faster than they
+ * play, which the gateway ensures by relaying ahead of real time.
  *
- * It can be paused and resumed (see `pause`). A pause halts THIS player's timeline by
- * stopping its own source nodes and holding the audio they had not played yet; the
- * AudioContext is the page's one, shared by every chat and player, and is never suspended.
+ * It can be paused and resumed (see `pause`). A pause holds THIS player's playout -- the worklet
+ * outputs silence and the ring keeps the unplayed tail -- without suspending the AudioContext,
+ * which is the page's one, shared by every chat and player.
  */
 export class StreamingPcmPlayer {
-  private nextTime = 0;
   private carry: number | null = null;
+  // The resampler from the stream's rate to the context's, made on the first chunk (the rate is
+  // not known before then) and kept for the whole stream, so cutting the audio into chunks changes
+  // nothing at the seams.
+  private resampler: LinearResampler | null = null;
   private stopped = false;
-  // The stream's mute, kept here so it holds before the gain node exists (the node is made
-  // with the first chunk) and for every chunk after.
-  private muted = false;
-  // The persistent gain stage between the sources and the destination: made once, with the
-  // first chunk, and shared by every chunk after it.
-  private gain: PlaybackGain | null = null;
-  // The chunks placed on the clock and not yet ended, in play order. Empty while paused.
-  private readonly scheduled: ScheduledChunk[] = [];
-  // Whether the timeline is halted, and the audio it holds while it is: what had not been
-  // heard when `pause` stopped the sources, then whatever is pushed, in play order. Empty
-  // unless paused.
   private paused = false;
-  private readonly held: PcmChunk[] = [];
-  // Called whenever the last scheduled source ends and the queue becomes empty. The session
-  // (createSpeechPlayback) wires this to its drain signal ONLY after the run has ended, so a
-  // queue that empties mid-stream (between chunks of a run still going) never fires it. Never
-  // fired while paused: a pause is not a drain.
+  private readonly sink: PlaybackSink;
+  // The context's output rate: what the audio is resampled to, and the unit of remainingSeconds.
+  private readonly outputRate: number;
+  // Samples (at the output rate) handed to the sink, and the cumulative count it has reported
+  // played out. Their difference is what is still to play (`pending`): 0 exactly when drained.
+  private written = 0;
+  private played = 0;
+  // Called whenever the sink reports its ring drained -- EVERY drain, including a gap between
+  // chunks when TTS lags real time. The session (createSpeechPlayback) wires this to its drain
+  // signal ONLY after the run has ended, so a queue that empties mid-stream never fires it there.
+  // Never fired while paused (a pause is not a drain) or after stop.
   onEmpty: (() => void) | null = null;
 
   constructor(
-    private readonly ctx: PlaybackContext,
-    private readonly lead: number = DEFAULT_LEAD_SECONDS,
-  ) {}
+    ctx: PlaybackContext,
+    createSink: (ctx: PlaybackContext) => PlaybackSink = createWorkletSink,
+  ) {
+    this.outputRate = ctx.sampleRate;
+    this.sink = createSink(ctx);
+    this.sink.onDrained = (played) => {
+      this.played = played;
+      if (this.stopped || this.paused) return;
+      this.onEmpty?.();
+    };
+  }
 
-  /** Queue one chunk's PCM. False when it could not be (the player is stopped, or the browser
-   * refused the buffer): the caller then stops pushing. While paused the chunk is held, not
-   * scheduled, until `resume`. */
+  /** Queue one chunk's PCM. False when it could not be (the player is stopped, or the rate is one
+   * the resampler will not accept): the caller then stops pushing. */
   push(bytes: Uint8Array, rate: number): boolean {
     if (this.stopped) return false;
+    if (!this.resampler) {
+      try {
+        this.resampler = new LinearResampler(rate, this.outputRate);
+      } catch {
+        // A rate the resampler will not accept (0, NaN, ...): nothing was queued.
+        return false;
+      }
+    }
     const { samples, carry } = pcm16ToFloat32(bytes, this.carry);
     this.carry = carry;
     if (samples.length === 0) return true;
-    if (this.paused) {
-      // Nothing is scheduled, but a rate the browser cannot make a buffer of is refused now,
-      // as it would be live, rather than silently dropped when the resume reaches it.
-      try {
-        this.ctx.createBuffer(1, samples.length, rate);
-      } catch {
-        return false;
-      }
-      this.held.push({ samples, rate });
-      return true;
-    }
-    return this.schedule({ samples, rate });
-  }
-
-  // Place one chunk on the audio clock behind the previous one (or a lead ahead of now, when
-  // the queue has caught up with the clock). False when the browser refused the buffer, with
-  // nothing scheduled.
-  private schedule(chunk: PcmChunk): boolean {
-    let source: PlaybackSource;
-    let duration: number;
-    try {
-      const buffer = this.ctx.createBuffer(1, chunk.samples.length, chunk.rate);
-      buffer.copyToChannel(chunk.samples, 0);
-      source = this.ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(this.gainStage());
-      duration = buffer.duration;
-    } catch {
-      // A rate the browser cannot make a buffer of: nothing was scheduled.
-      return false;
-    }
-    const now = this.ctx.currentTime;
-    const startAt = this.nextTime > now ? this.nextTime : now + this.lead;
-    const entry: ScheduledChunk = { ...chunk, source, startAt, duration };
-    source.onended = () => {
-      // A source this player has halted (a pause) is no longer its own: whatever the browser
-      // reports for it afterwards must neither count as a drain nor disturb the sources that
-      // replaced it.
-      const at = this.scheduled.indexOf(entry);
-      if (at < 0) return;
-      this.scheduled.splice(at, 1);
-      // The last scheduled source has ended: tell whoever is draining this player (nothing,
-      // while the run is still live).
-      if (this.scheduled.length === 0) this.onEmpty?.();
-    };
-    this.scheduled.push(entry);
-    source.start(startAt);
-    this.nextTime = startAt + duration;
+    const out = this.resampler.process(samples);
+    // The resampler is one input sample ahead of what it emits, so a tiny chunk can complete no
+    // output sample yet: nothing to write, but the chunk was accepted.
+    if (out.length === 0) return true;
+    this.written += out.length;
+    this.sink.write(out);
     return true;
   }
 
   /**
-   * Mute or unmute the stream: the gain of what is queued AND of every chunk still to come.
-   * Reversible, and local to this player's output -- nothing is stopped, dropped or
-   * rescheduled, so the stream's clock keeps running and unmuting rejoins it where it is.
+   * Mute or unmute the stream: the gain of the whole output. Reversible, and local to this
+   * player -- nothing is stopped, dropped or re-queued, so the stream's clock keeps running and
+   * unmuting rejoins it where it is.
    */
   setMuted(muted: boolean): void {
-    this.muted = muted;
-    if (this.gain) this.gain.gain.value = muted ? 0 : 1;
-  }
-
-  // The gain stage, made on first use at the current mute and wired to the destination once.
-  private gainStage(): PlaybackGain {
-    if (!this.gain) {
-      const gain = this.ctx.createGain();
-      gain.gain.value = this.muted ? 0 : 1;
-      gain.connect(this.ctx.destination);
-      this.gain = gain;
-    }
-    return this.gain;
+    this.sink.setMuted(muted);
   }
 
   /**
-   * Halt the playout where it is. Unlike a mute, the timeline stops: this player's scheduled
-   * sources are stopped and the audio not yet heard (the unplayed tail of the chunk that was
-   * playing, and every chunk after it) is held, in order, until `resume`. Chunks pushed
-   * meanwhile are held behind it. Only this player's own nodes are touched -- the shared
-   * AudioContext keeps running for every other chat -- and `onEmpty` does not fire: a pause
-   * is not a drain. A pause on a player with nothing queued still takes effect (what is
-   * pushed next waits for `resume`); one that is already paused, or stopped, does nothing.
+   * Halt the playout where it is: the worklet holds the ring and outputs silence, so the unplayed
+   * tail (and everything pushed meanwhile) waits for `resume`. Only this player's output is held;
+   * the shared AudioContext keeps running for every other chat, and `onEmpty` does not fire (a
+   * pause is not a drain). A pause on a player that is already paused, or stopped, does nothing.
    */
   pause(): void {
     if (this.stopped || this.paused) return;
     this.paused = true;
-    const now = this.ctx.currentTime;
-    for (const entry of this.scheduled) {
-      // Detach the handler first: the browser reports `ended` for a stopped source too, and
-      // that is not the queue draining.
-      entry.source.onended = null;
-      try {
-        entry.source.stop();
-      } catch {
-        // A source that has not started, or already ended, has nothing to stop.
-      }
-      // The samples the clock has already carried past: none for a chunk yet to start, all
-      // of them for one that is over (though its `ended` may not have been delivered yet).
-      const played = Math.round(Math.max(0, now - entry.startAt) * entry.rate);
-      if (played < entry.samples.length) {
-        this.held.push({
-          samples: played > 0 ? entry.samples.subarray(played) : entry.samples,
-          rate: entry.rate,
-        });
-      }
-    }
-    this.scheduled.length = 0;
-    // The timeline is gone with the sources: the held audio is placed afresh, on the live
-    // clock, when resumed.
-    this.nextTime = 0;
+    this.sink.pause();
   }
 
-  /**
-   * Continue after `pause`: place the held audio on the clock as it is NOW, a lead ahead of
-   * the present and gapless behind itself, from the point where it stopped. The queue drains
-   * (and fires `onEmpty`) at its true end as ever. A player that is not paused, or stopped,
-   * does nothing.
-   */
+  /** Continue after `pause`: the worklet drains the ring again from where it stopped. A player that
+   * is not paused, or stopped, does nothing. */
   resume(): void {
     if (this.stopped || !this.paused) return;
     this.paused = false;
-    for (const chunk of this.held.splice(0)) {
-      // A chunk this context already made a buffer of cannot be refused now; were it, the
-      // rest still plays rather than the whole queue being lost with it.
-      this.schedule(chunk);
-    }
+    this.sink.resume();
   }
 
-  /** Silence everything scheduled and ignore every later chunk. */
+  /** Silence everything queued and ignore every later chunk. */
   stop(): void {
     this.stopped = true;
     this.onEmpty = null;
-    for (const { source } of this.scheduled) {
-      try {
-        source.stop();
-      } catch {
-        // A source that has not started, or already ended, has nothing to stop.
-      }
-    }
-    this.scheduled.length = 0;
-    this.held.length = 0;
+    this.sink.stop();
   }
 
-  /** How many chunks have not yet been heard to the end: those scheduled and not ended, and
-   * those held by a pause. The length of the audio still to play out. */
+  /** How much audio has been queued but not yet played out, in samples at the output rate: it is
+   * 0 exactly when the sink has drained. */
   get pending(): number {
-    return this.scheduled.length + this.held.length;
+    return this.written - this.played;
   }
 
-  /** The seconds of audio still to play -- the queued tail's own remaining length, used to
-   * bound the drain fallback timer. Zero once the queue has caught up to the clock. While
-   * paused the clock does not drain anything: it is the held audio's length, whatever "now". */
+  /** The seconds of audio still to play, used to bound the drain fallback timer. */
   remainingSeconds(): number {
-    if (this.paused) {
-      return this.held.reduce((total, chunk) => total + chunk.samples.length / chunk.rate, 0);
-    }
-    return Math.max(0, this.nextTime - this.ctx.currentTime);
+    return this.pending / this.outputRate;
   }
 }
 
@@ -431,14 +482,14 @@ type Session = {
   // Whether the run has ended and the player is draining its tail (or has been silenced). Set by
   // `end`; a fresh run's session starts false.
   ended: boolean;
-  // The fallback timer that declares the tail drained if the last source's `onended` never fires
+  // The fallback timer that declares the tail drained if the worklet's drained message never fires
   // (a context frozen mid-tail). Cleared when the real drain lands, or the session is discarded.
   drainTimer: ReturnType<typeof setTimeout> | null;
 };
 
 // Whether the context is producing sound: it says it is running, or (a stand-in that keeps
 // no state) says nothing. A suspended or interrupted context has a frozen clock, on which
-// anything scheduled waits to be played -- stale -- whenever something later resumes it.
+// anything queued waits to be played -- stale -- whenever something later resumes it.
 function isRunning(ctx: PlaybackContext): boolean {
   return ctx.state === undefined || ctx.state === 'running';
 }
@@ -447,9 +498,13 @@ function isRunning(ctx: PlaybackContext): boolean {
  * One playback session per chat on top of the pieces above. `getContext` is asked lazily, so
  * an environment with no Web Audio (a test, an old browser) is a controller that never plays
  * and never throws: live playback is an enhancement and its absence is the buffered
- * behavior, with the finished clip rendered by AudioTurn as ever.
+ * behavior, with the finished clip rendered by AudioTurn as ever. `makePlayer` is the seam a
+ * test uses to inject a player with a recording sink (the default makes the real worklet player).
  */
-export function createSpeechPlayback(getContext: () => PlaybackContext | null): SpeechPlayback {
+export function createSpeechPlayback(
+  getContext: () => PlaybackContext | null,
+  makePlayer: (ctx: PlaybackContext) => StreamingPcmPlayer = (ctx) => new StreamingPcmPlayer(ctx),
+): SpeechPlayback {
   const sessions = new Map<string, Session>();
   let onDrainedCb: ((chatId: string) => void) | null = null;
 
@@ -500,7 +555,7 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
         session = {
           runId,
           state: { phase: 'waiting' },
-          player: new StreamingPcmPlayer(ctx),
+          player: makePlayer(ctx),
           ctx,
           ended: false,
           drainTimer: null,
@@ -510,7 +565,7 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
       // Live playback needs a context that is running NOW. A tab that re-adopts a speech run
       // before its first chunk (a reload, a second tab, during a model's cold start) was never
       // primed by a gesture, so its context is suspended -- and `resume` above only asks: it
-      // answers later, if at all. Audio scheduled on the frozen clock would play, stale and
+      // answers later, if at all. Audio queued on the frozen clock would play, stale and
       // possibly over a newer run, whenever something finally resumed it, so such a run is not
       // played live (and neither is one whose context is suspended mid-run, whose queue is
       // silenced for the same reason); its committed WAV is the reply. The resume request is
@@ -557,9 +612,9 @@ export function createSpeechPlayback(getContext: () => PlaybackContext | null): 
         drain(chatId, session);
         return;
       }
-      // Primary signal: the last scheduled source's `onended`. Fallback: a timer bounded by the
-      // tail's own remaining length, in case `onended` never arrives (a context suspended
-      // mid-tail), so the live controls can never hang on screen forever.
+      // Primary signal: the worklet's drained message (onEmpty). Fallback: a timer bounded by the
+      // tail's own remaining length, in case that never arrives (a context suspended mid-tail), so
+      // the live controls can never hang on screen forever.
       session.player.onEmpty = () => drain(chatId, session);
       session.drainTimer = setTimeout(
         () => drain(chatId, session),

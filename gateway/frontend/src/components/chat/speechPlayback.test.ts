@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   acceptChunk,
   createSpeechPlayback,
@@ -11,6 +11,7 @@ import {
   type AudioChunk,
   type LiveState,
   type PlaybackContext,
+  type PlaybackSink,
 } from './speechPlayback';
 
 // base64 of the given bytes, the way the gateway carries a chunk's PCM.
@@ -138,550 +139,243 @@ describe('acceptChunk', () => {
   });
 });
 
-// A recording stand-in for the browser's AudioContext: what the player schedules is the
-// whole observable behavior (the sound itself cannot be heard in jsdom).
-function fakeContext(initialTime = 0) {
-  const scheduled: { start: number; duration: number; rate: number; samples: Float32Array }[] = [];
-  const sources: { stopped: boolean; ended: (() => void) | null; connected: unknown[] }[] = [];
-  // The gain nodes the player made: the value is what the speakers would get multiplied by.
-  const gains: { gain: { value: number }; connected: unknown[] }[] = [];
-  const ctx = {
-    currentTime: initialTime,
-    destination: { name: 'destination' },
-    createGain: () => {
-      const node = {
-        gain: { value: 1 },
-        connected: [] as unknown[],
-        connect(destination: unknown) {
-          node.connected.push(destination);
-          return destination;
-        },
-      };
-      gains.push(node);
-      return node;
+// A recording stand-in for the AudioWorklet sink the real player feeds: jsdom has no audio
+// thread, so the player's whole observable behaviour is what it writes to the sink and how it
+// reacts to the sink reporting a drain. `drain` plays the worklet's `drained` message back.
+type RecordingSink = PlaybackSink & {
+  writes: Float32Array[];
+  muted: boolean;
+  paused: boolean;
+  stopped: boolean;
+  pauseCount: number;
+  resumeCount: number;
+  // Total samples written so far: what the player counts as pending until a drain reports it played.
+  written(): number;
+  // The worklet drained to empty after outputting `played` samples in total.
+  drain(played: number): void;
+};
+
+function fakeSink(): RecordingSink {
+  const sink: RecordingSink = {
+    writes: [],
+    muted: false,
+    paused: false,
+    stopped: false,
+    pauseCount: 0,
+    resumeCount: 0,
+    onDrained: null,
+    write(samples) {
+      sink.writes.push(samples);
     },
-    createBuffer: (_channels: number, length: number, rate: number) => {
-      let copied: Float32Array = new Float32Array(0);
-      return {
-        duration: length / rate,
-        rate,
-        copyToChannel: (source: Float32Array) => {
-          copied = source;
-        },
-        get samples() {
-          return copied;
-        },
-      };
+    setMuted(muted) {
+      sink.muted = muted;
     },
-    createBufferSource: () => {
-      const entry = {
-        stopped: false,
-        ended: null as (() => void) | null,
-        connected: [] as unknown[],
-      };
-      sources.push(entry);
-      const src = {
-        buffer: null as unknown as ReturnType<PlaybackContext['createBuffer']> | null,
-        connect: vi.fn((destination: unknown) => {
-          entry.connected.push(destination);
-          return destination;
-        }),
-        start(when: number) {
-          const b = src.buffer as unknown as {
-            duration: number;
-            rate: number;
-            samples: Float32Array;
-          };
-          scheduled.push({ start: when, duration: b.duration, rate: b.rate, samples: b.samples });
-        },
-        stop() {
-          entry.stopped = true;
-        },
-        set onended(cb: (() => void) | null) {
-          entry.ended = cb;
-        },
-        get onended() {
-          return entry.ended;
-        },
-      };
-      return src;
+    pause() {
+      sink.paused = true;
+      sink.pauseCount += 1;
+    },
+    resume() {
+      sink.paused = false;
+      sink.resumeCount += 1;
+    },
+    stop() {
+      sink.stopped = true;
+      sink.onDrained = null;
+    },
+    written() {
+      return sink.writes.reduce((total, w) => total + w.length, 0);
+    },
+    drain(played) {
+      sink.onDrained?.(played);
     },
   };
-  return {
-    ctx: ctx as unknown as PlaybackContext & { currentTime: number },
-    scheduled,
-    sources,
-    gains,
-  };
+  return sink;
 }
 
+function fakeContext(sampleRate = 48000): PlaybackContext {
+  return { sampleRate };
+}
+
+// A chunk of `count` identical samples: large enough that resampling always yields output.
+const toneBytes = (count: number, value = 1000): Uint8Array =>
+  new Uint8Array(pcm(new Array(count).fill(value)));
+
 describe('StreamingPcmPlayer', () => {
-  it('schedules the first chunk a short lead ahead of now, at the stream rate', () => {
-    const { ctx, scheduled } = fakeContext(10);
-    const player = new StreamingPcmPlayer(ctx, 0.1);
-    player.push(new Uint8Array(pcm(new Array(441).fill(100))), 44100);
-    expect(scheduled).toHaveLength(1);
-    expect(scheduled[0].start).toBeCloseTo(10.1, 6);
-    expect(scheduled[0].rate).toBe(44100);
-    expect(scheduled[0].duration).toBeCloseTo(0.01, 6);
+  function withSink(sampleRate = 48000) {
+    const sink = fakeSink();
+    const player = new StreamingPcmPlayer(fakeContext(sampleRate), () => sink);
+    return { player, sink };
+  }
+
+  it('decodes a chunk and writes its resampled audio to the sink', () => {
+    const { player, sink } = withSink();
+    expect(player.push(toneBytes(100), 44100)).toBe(true);
+    expect(sink.writes).toHaveLength(1);
+    expect(sink.writes[0].length).toBeGreaterThan(0);
   });
 
-  it('schedules each chunk exactly where the previous one ends: gapless', () => {
-    const { ctx, scheduled } = fakeContext(0);
-    const player = new StreamingPcmPlayer(ctx, 0.1);
-    for (let i = 0; i < 3; i++) player.push(new Uint8Array(pcm(new Array(4410).fill(1))), 44100);
-    expect(scheduled.map((s) => s.start)).toEqual([
-      expect.closeTo(0.1, 6),
-      expect.closeTo(0.2, 6),
-      expect.closeTo(0.3, 6),
-    ]);
+  it('writes nothing for a chunk that holds no whole sample yet (a carried byte)', () => {
+    const { player, sink } = withSink();
+    expect(player.push(new Uint8Array([7]), 44100)).toBe(true); // one byte: half a sample
+    expect(sink.writes).toHaveLength(0);
   });
 
-  it('re-anchors after an underrun instead of scheduling audio in the past', () => {
-    const { ctx, scheduled } = fakeContext(0);
-    const player = new StreamingPcmPlayer(ctx, 0.1);
-    player.push(new Uint8Array(pcm(new Array(4410).fill(1))), 44100); // 0.1 .. 0.2
-    ctx.currentTime = 5; // the stream stalled for seconds; the queue ran dry
-    player.push(new Uint8Array(pcm(new Array(4410).fill(1))), 44100);
-    expect(scheduled[1].start).toBeCloseTo(5.1, 6);
+  it('refuses a chunk at an impossible sample rate, with nothing written', () => {
+    const { player, sink } = withSink();
+    expect(player.push(toneBytes(100), 0)).toBe(false);
+    expect(sink.writes).toHaveLength(0);
   });
 
-  it('plays a sample split across two chunks as one sample', () => {
-    const { ctx, scheduled } = fakeContext(0);
-    const player = new StreamingPcmPlayer(ctx, 0);
-    const bytes = pcm([1000, -1000]);
-    player.push(new Uint8Array(bytes.slice(0, 3)), 44100); // one whole sample + half of the next
-    player.push(new Uint8Array(bytes.slice(3)), 44100);
-    expect(scheduled).toHaveLength(2);
-    expect(Array.from(scheduled[0].samples)).toEqual([1000 / 32768]);
-    expect(Array.from(scheduled[1].samples)).toEqual([-1000 / 32768]);
-  });
-
-  it('stop() silences everything scheduled and ignores later chunks', () => {
-    const { ctx, scheduled, sources } = fakeContext(0);
-    const player = new StreamingPcmPlayer(ctx, 0.1);
-    player.push(new Uint8Array(pcm([1, 2, 3, 4])), 44100);
-    player.push(new Uint8Array(pcm([1, 2, 3, 4])), 44100);
+  it('refuses every chunk once stopped, and stops the sink', () => {
+    const { player, sink } = withSink();
+    player.push(toneBytes(100), 44100);
     player.stop();
-    expect(sources.every((s) => s.stopped)).toBe(true);
-    player.push(new Uint8Array(pcm([1, 2, 3, 4])), 44100);
-    expect(scheduled).toHaveLength(2);
+    expect(sink.stopped).toBe(true);
+    expect(player.push(toneBytes(100), 44100)).toBe(false);
+    expect(sink.writes).toHaveLength(1);
   });
 
-  it('forgets a source once it has ended, so stop() does not touch a finished one', () => {
-    const { ctx, sources } = fakeContext(0);
-    const player = new StreamingPcmPlayer(ctx, 0.1);
-    player.push(new Uint8Array(pcm([1, 2])), 44100);
-    sources[0].ended?.();
+  it('counts written audio as pending until the sink reports it drained', () => {
+    const { player, sink } = withSink(48000);
+    player.push(toneBytes(100), 44100);
+    const written = sink.written();
+    expect(written).toBeGreaterThan(0);
+    expect(player.pending).toBe(written);
+    expect(player.remainingSeconds()).toBeCloseTo(written / 48000, 6);
+    sink.drain(written);
+    expect(player.pending).toBe(0);
+    expect(player.remainingSeconds()).toBe(0);
+  });
+
+  it('fires onEmpty on every drain the sink reports (a gap, then the end)', () => {
+    const { player, sink } = withSink();
+    const onEmpty = vi.fn();
+    player.onEmpty = onEmpty;
+    player.push(toneBytes(100), 44100);
+    sink.drain(sink.written());
+    expect(onEmpty).toHaveBeenCalledTimes(1);
+    player.push(toneBytes(100), 44100);
+    sink.drain(sink.written());
+    expect(onEmpty).toHaveBeenCalledTimes(2);
+    expect(player.pending).toBe(0);
+  });
+
+  it('does not fire onEmpty for a drain that lands while paused: a pause is not a drain', () => {
+    const { player, sink } = withSink();
+    const onEmpty = vi.fn();
+    player.onEmpty = onEmpty;
+    player.push(toneBytes(100), 44100);
+    player.pause();
+    sink.drain(sink.written()); // a stale drain delivered after the pause
+    expect(onEmpty).not.toHaveBeenCalled();
+  });
+
+  it('does not fire onEmpty after stop (its drain hook is detached)', () => {
+    const { player, sink } = withSink();
+    const onEmpty = vi.fn();
+    player.onEmpty = onEmpty;
+    player.push(toneBytes(100), 44100);
     player.stop();
-    expect(sources[0].stopped).toBe(false);
+    sink.drain(100);
+    expect(onEmpty).not.toHaveBeenCalled();
   });
 
-  // The mute (#281): every chunk reaches the speakers through ONE persistent gain node, so a
-  // mute is a gain of 0 on what is already queued AND on every chunk still to come -- local
-  // playback only, nothing is stopped or dropped.
-  describe('mute', () => {
-    const tone = () => new Uint8Array(pcm([1, 2, 3, 4]));
-
-    it('routes every chunk through one gain node that feeds the destination', () => {
-      const { ctx, sources, gains } = fakeContext(0);
-      const player = new StreamingPcmPlayer(ctx, 0.1);
-      player.push(tone(), 44100);
-      player.push(tone(), 44100);
-      expect(gains).toHaveLength(1);
-      expect(sources.map((s) => s.connected)).toEqual([[gains[0]], [gains[0]]]);
-      expect(gains[0].connected).toEqual([ctx.destination]);
-      expect(gains[0].gain.value).toBe(1);
-    });
-
-    it('setMuted(true) silences the queue and the chunks to come, and setMuted(false) restores it', () => {
-      const { ctx, scheduled, sources, gains } = fakeContext(0);
-      const player = new StreamingPcmPlayer(ctx, 0.1);
-      player.push(tone(), 44100);
-      player.setMuted(true);
-      expect(gains[0].gain.value).toBe(0);
-      // A chunk that arrives while muted joins the SAME gain: still silent.
-      expect(player.push(tone(), 44100)).toBe(true);
-      expect(gains).toHaveLength(1);
-      expect(sources[1].connected).toEqual([gains[0]]);
-      expect(gains[0].gain.value).toBe(0);
-      player.setMuted(false);
-      expect(gains[0].gain.value).toBe(1);
-      // Reversible, and nothing was stopped, dropped or rescheduled on the way.
-      expect(sources.every((s) => !s.stopped)).toBe(true);
-      expect(scheduled).toHaveLength(2);
-    });
-
-    it('remembers a mute asked for before the first chunk', () => {
-      const { ctx, gains } = fakeContext(0);
-      const player = new StreamingPcmPlayer(ctx, 0.1);
-      player.setMuted(true);
-      player.push(tone(), 44100);
-      expect(gains[0].gain.value).toBe(0);
-    });
+  it('mutes and unmutes through the sink, including a mute asked for before the first chunk', () => {
+    const { player, sink } = withSink();
+    player.setMuted(true);
+    expect(sink.muted).toBe(true);
+    player.push(toneBytes(100), 44100);
+    expect(sink.muted).toBe(true);
+    player.setMuted(false);
+    expect(sink.muted).toBe(false);
   });
 
-  // Pause / resume (#315): the timeline of THIS player is halted -- its scheduled sources are
-  // stopped and what has not yet been heard is held -- and resumed by scheduling the rest
-  // anew on the live clock. The page's AudioContext is shared by every chat and every other
-  // player, so it is never suspended; nothing here may touch anything but this player's nodes.
-  describe('pause and resume', () => {
-    const RATE = 44100;
-    // 0.1 s of PCM whose every sample is `value`, so a chunk can be told apart by its content.
-    const tenth = (value: number) => new Uint8Array(pcm(new Array(4410).fill(value)));
-    // What a scheduled entry holds, as one comparable value: [rate, sample count, first value].
-    const shape = (s: { samples: Float32Array; rate: number }) => [
-      s.rate,
-      s.samples.length,
-      Math.round(s.samples[0] * 32768),
-    ];
+  it('pauses and resumes the sink, and is idempotent', () => {
+    const { player, sink } = withSink();
+    player.push(toneBytes(100), 44100);
+    player.pause();
+    player.pause(); // a second pause does nothing
+    expect(sink.paused).toBe(true);
+    expect(sink.pauseCount).toBe(1);
+    player.resume();
+    player.resume(); // a resume that is not paused does nothing
+    expect(sink.paused).toBe(false);
+    expect(sink.resumeCount).toBe(1);
+  });
 
-    // Three 0.1 s chunks valued 1, 2, 3, scheduled at 0.1-0.2, 0.2-0.3 and 0.3-0.4.
-    function threeChunks(lead = 0.1) {
-      const fake = fakeContext(0);
-      const player = new StreamingPcmPlayer(fake.ctx, lead);
-      for (const v of [1, 2, 3]) player.push(tenth(v), RATE);
-      return { ...fake, player };
-    }
-
-    it('halts the playout: every scheduled source is stopped and nothing new is scheduled', () => {
-      const { ctx, scheduled, sources, player } = threeChunks();
-      ctx.currentTime = 0.25;
-      player.pause();
-      expect(sources.every((s) => s.stopped)).toBe(true);
-      ctx.currentTime = 9;
-      expect(scheduled).toHaveLength(3);
-    });
-
-    it('fires no onEmpty: a pause is not a drain, not even from a halted source ending late', () => {
-      const { ctx, sources, player } = threeChunks();
-      const onEmpty = vi.fn();
-      player.onEmpty = onEmpty;
-      // The browser dispatches `ended` for a source asked to stop; keep each source's handler
-      // as the browser would have it, and deliver it after the pause.
-      const lateEnded = sources.map((s) => s.ended);
-      ctx.currentTime = 0.25;
-      player.pause();
-      for (const ended of lateEnded) ended?.();
-      expect(onEmpty).not.toHaveBeenCalled();
-    });
-
-    it('resumes from where it paused: the finished chunk is not replayed, the playing one continues', () => {
-      const { ctx, scheduled, player } = threeChunks();
-      ctx.currentTime = 0.25; // chunk 1 (0.2-0.3) is 0.05 s in; chunk 0 is over; chunk 2 unstarted
-      player.pause();
-      ctx.currentTime = 4; // time passes while paused: the resumed audio is placed on the LIVE clock
-      player.resume();
-      // 3 original + the remainder of chunk 1 (2205 samples left) + all of chunk 2.
-      expect(scheduled).toHaveLength(5);
-      expect(scheduled.slice(3).map(shape)).toEqual([
-        [RATE, 2205, 2],
-        [RATE, 4410, 3],
-      ]);
-      expect(scheduled[3].start).toBeCloseTo(4.1, 6); // the lead ahead of "now", as after a stall
-      expect(scheduled[4].start).toBeCloseTo(4.15, 6); // gapless behind the remainder
-      // The remainder is the TAIL of the chunk, not its head.
-      expect(scheduled[3].samples.every((s) => s === 2 / 32768)).toBe(true);
-    });
-
-    it('re-anchors on resume even straight away: not behind the old timeline it halted', () => {
-      const { ctx, scheduled, player } = threeChunks(); // the old timeline runs to 0.4
-      ctx.currentTime = 0.25;
-      player.pause();
-      player.resume(); // no time has passed: "now" is still inside the halted timeline
-      expect(scheduled[3].start).toBeCloseTo(0.35, 6); // now + lead, not 0.4 (a gap of silence)
-      expect(scheduled[4].start).toBeCloseTo(0.4, 6);
-    });
-
-    it('holds a chunk that had not started yet whole, and one that has just ended not at all', () => {
-      const { ctx, scheduled, player } = threeChunks();
-      ctx.currentTime = 0.05; // nothing has started (the first chunk starts at 0.1)
-      player.pause();
-      ctx.currentTime = 1;
-      player.resume();
-      expect(scheduled.slice(3).map(shape)).toEqual([
-        [RATE, 4410, 1],
-        [RATE, 4410, 2],
-        [RATE, 4410, 3],
-      ]);
-
-      const second = threeChunks();
-      second.ctx.currentTime = 0.45; // every chunk is over, though no `ended` was delivered yet
-      second.player.pause();
-      second.ctx.currentTime = 1;
-      second.player.resume();
-      expect(second.scheduled).toHaveLength(3); // nothing replayed
-    });
-
-    it('keeps the order and drops or duplicates nothing across repeated pauses', () => {
-      const { ctx, scheduled, player } = threeChunks();
-      ctx.currentTime = 0.25;
-      player.pause();
-      ctx.currentTime = 1;
-      player.resume(); // remainder of chunk 1 at 1.1-1.15, chunk 2 at 1.15-1.25
-      ctx.currentTime = 1.12; // 0.02 s (882 samples) into the remainder
-      player.pause();
-      ctx.currentTime = 2;
-      player.resume();
-      expect(scheduled.slice(5).map(shape)).toEqual([
-        [RATE, 1323, 2], // 2205 - 882: the rest of chunk 1
-        [RATE, 4410, 3], // chunk 2, whole
-      ]);
-      expect(scheduled.slice(5).map((s) => s.start)).toEqual([
-        expect.closeTo(2.1, 6),
-        expect.closeTo(2.1 + 1323 / RATE, 6),
-      ]);
-    });
-
-    it('holds what is pushed while paused, in order, and schedules none of it until resume', () => {
-      const { ctx, scheduled, player } = threeChunks();
-      ctx.currentTime = 0.25;
-      player.pause();
-      expect(player.push(tenth(4), RATE)).toBe(true);
-      expect(player.push(tenth(5), RATE)).toBe(true);
-      expect(scheduled).toHaveLength(3);
-      ctx.currentTime = 2;
-      player.resume();
-      expect(scheduled.slice(3).map(shape)).toEqual([
-        [RATE, 2205, 2],
-        [RATE, 4410, 3],
-        [RATE, 4410, 4],
-        [RATE, 4410, 5],
-      ]);
-      // ...and a chunk pushed AFTER the resume joins the end of the same gapless timeline.
-      player.push(tenth(6), RATE);
-      expect(scheduled[7].start).toBeCloseTo(scheduled[6].start + 0.1, 6);
-    });
-
-    it('still refuses a chunk the browser cannot make a buffer of while paused', () => {
-      const { ctx, player } = threeChunks();
-      player.pause();
-      vi.spyOn(ctx, 'createBuffer').mockImplementationOnce(() => {
-        throw new Error('unsupported rate');
-      });
-      expect(player.push(tenth(4), RATE)).toBe(false);
-    });
-
-    it('counts what is held as pending and as audio still to play while paused', () => {
-      const { ctx, player } = threeChunks();
-      ctx.currentTime = 0.25;
-      player.pause();
-      expect(player.pending).toBe(2); // the rest of chunk 1 and chunk 2
-      expect(player.remainingSeconds()).toBeCloseTo(0.15, 6);
-      player.push(tenth(4), RATE);
-      expect(player.pending).toBe(3);
-      expect(player.remainingSeconds()).toBeCloseTo(0.25, 6);
-      ctx.currentTime = 100; // the clock running on does not drain a held queue
-      expect(player.remainingSeconds()).toBeCloseTo(0.25, 6);
-      player.resume();
-      expect(player.pending).toBe(3);
-      expect(player.remainingSeconds()).toBeCloseTo(0.1 + 0.25, 6); // lead + the held audio
-    });
-
-    it('is idempotent: a second pause, or a resume that is not paused, does nothing', () => {
-      const { ctx, scheduled, sources, player } = threeChunks();
-      player.resume(); // not paused
-      expect(scheduled).toHaveLength(3);
-      expect(sources.some((s) => s.stopped)).toBe(false);
-      ctx.currentTime = 0.25;
-      player.pause();
-      ctx.currentTime = 3;
-      player.pause(); // already paused: must not re-measure the offset from the later "now"
-      player.resume();
-      player.resume(); // a second resume must not schedule the remainder twice
-      expect(scheduled.slice(3).map(shape)).toEqual([
-        [RATE, 2205, 2],
-        [RATE, 4410, 3],
-      ]);
-    });
-
-    it('pause then resume on a player that has nothing is a safe no-op: no nodes, no onEmpty', () => {
-      const { ctx, sources, gains } = fakeContext(0);
-      const player = new StreamingPcmPlayer(ctx, 0.1);
-      const onEmpty = vi.fn();
-      player.onEmpty = onEmpty;
-      player.pause();
-      player.resume();
-      expect(sources).toHaveLength(0);
-      expect(gains).toHaveLength(0);
-      expect(player.pending).toBe(0);
-      expect(onEmpty).not.toHaveBeenCalled();
-    });
-
-    it('a pause made before the first chunk holds that chunk until resume', () => {
-      const fake = fakeContext(0);
-      const { ctx, scheduled } = fake;
-      const player = new StreamingPcmPlayer(ctx, 0.1);
-      const onEmpty = vi.fn();
-      player.onEmpty = onEmpty;
-      player.pause(); // nothing scheduled yet
-      player.push(tenth(1), RATE);
-      expect(scheduled).toHaveLength(0);
-      expect(player.pending).toBe(1);
-      ctx.currentTime = 1;
-      player.resume();
-      expect(scheduled.map(shape)).toEqual([[RATE, 4410, 1]]);
-      expect(scheduled[0].start).toBeCloseTo(1.1, 6);
-      expect(onEmpty).not.toHaveBeenCalled();
-    });
-
-    it('resumed with nothing held: no sources, no onEmpty', () => {
-      const { ctx, scheduled, sources, player } = threeChunks();
-      ctx.currentTime = 0.45; // all played
-      player.pause();
-      const onEmpty = vi.fn();
-      player.onEmpty = onEmpty;
-      player.resume();
-      expect(scheduled).toHaveLength(3);
-      expect(sources).toHaveLength(3);
-      expect(player.pending).toBe(0);
-      expect(onEmpty).not.toHaveBeenCalled();
-    });
-
-    it('drains after a resume and fires onEmpty once, at the true end', () => {
-      const { ctx, sources, player } = threeChunks();
-      const onEmpty = vi.fn();
-      player.onEmpty = onEmpty;
-      ctx.currentTime = 0.25;
-      player.pause();
-      ctx.currentTime = 1;
-      player.resume();
-      expect(sources).toHaveLength(5);
-      sources[3].ended?.(); // the remainder of chunk 1
-      expect(onEmpty).not.toHaveBeenCalled();
-      sources[4].ended?.(); // chunk 2: the last one
-      expect(onEmpty).toHaveBeenCalledTimes(1);
-      expect(player.pending).toBe(0);
-    });
-
-    it('ignores a halted source that reports ended after the resume, keeping the new ones', () => {
-      const { ctx, sources, player } = threeChunks();
-      const onEmpty = vi.fn();
-      player.onEmpty = onEmpty;
-      const staleEnded = sources.map((s) => s.ended);
-      ctx.currentTime = 0.25;
-      player.pause();
-      ctx.currentTime = 1;
-      player.resume();
-      for (const ended of staleEnded) ended?.();
-      expect(onEmpty).not.toHaveBeenCalled();
-      expect(player.pending).toBe(2); // the two resumed sources are still tracked
-    });
-
-    it('leaves another player on the same context, and the context itself, alone', () => {
-      const fake = fakeContext(0);
-      const suspend = vi.fn();
-      Object.assign(fake.ctx, { suspend });
-      const mine = new StreamingPcmPlayer(fake.ctx, 0.1);
-      const other = new StreamingPcmPlayer(fake.ctx, 0.1);
-      mine.push(tenth(1), RATE); // sources[0]
-      other.push(tenth(7), RATE); // sources[1]
-      other.push(tenth(8), RATE); // sources[2]
-      const otherEmpty = vi.fn();
-      other.onEmpty = otherEmpty;
-      fake.ctx.currentTime = 0.15;
-      mine.pause();
-      expect(fake.sources[0].stopped).toBe(true);
-      expect(fake.sources[1].stopped).toBe(false);
-      expect(fake.sources[2].stopped).toBe(false);
-      expect(suspend).not.toHaveBeenCalled();
-      expect(other.pending).toBe(2);
-      // The other player still plays out and drains on its own.
-      fake.sources[1].ended?.();
-      fake.sources[2].ended?.();
-      expect(otherEmpty).toHaveBeenCalledTimes(1);
-      // ...and resuming mine neither touches it nor needs the context to be resumed.
-      mine.resume();
-      expect(fake.sources[1].stopped).toBe(false);
-      expect(suspend).not.toHaveBeenCalled();
-    });
-
-    it('keeps the mute through a pause: the same gain node, still at the mute', () => {
-      const { ctx, sources, gains, player } = threeChunks();
-      player.setMuted(true);
-      ctx.currentTime = 0.25;
-      player.pause();
-      expect(gains[0].gain.value).toBe(0); // pausing is not an unmute
-      ctx.currentTime = 1;
-      player.resume();
-      expect(gains).toHaveLength(1);
-      expect(sources[3].connected).toEqual([gains[0]]);
-      expect(gains[0].gain.value).toBe(0);
-    });
-
-    it('stop() while paused discards what was held, and a resume afterwards plays nothing', () => {
-      const { ctx, scheduled, player } = threeChunks();
-      ctx.currentTime = 0.25;
-      player.pause();
-      player.stop();
-      expect(player.pending).toBe(0);
-      player.resume();
-      expect(player.push(tenth(4), RATE)).toBe(false);
-      expect(scheduled).toHaveLength(3);
-    });
-
-    it('pause after stop() is a no-op', () => {
-      const { scheduled, player } = threeChunks();
-      player.stop();
-      player.pause();
-      player.resume();
-      expect(scheduled).toHaveLength(3);
-      expect(player.pending).toBe(0);
-    });
+  it('does not touch the sink for pause/resume/push after stop', () => {
+    const { player, sink } = withSink();
+    player.stop();
+    player.pause();
+    player.resume();
+    expect(sink.pauseCount).toBe(0);
+    expect(sink.resumeCount).toBe(0);
   });
 });
 
 describe('createSpeechPlayback', () => {
-  function setup(withContext = true) {
-    const fake = fakeContext(0);
-    const playback = createSpeechPlayback(() => (withContext ? fake.ctx : null));
-    return { playback, ...fake };
+  function setup(withContext = true, sampleRate = 48000) {
+    const ctx: PlaybackContext & { state: string; resume: ReturnType<typeof vi.fn> } = {
+      sampleRate,
+      state: 'running',
+      resume: vi.fn(() => Promise.resolve()),
+    };
+    const sinks: RecordingSink[] = [];
+    const makePlayer = (c: PlaybackContext) =>
+      new StreamingPcmPlayer(c, () => {
+        const sink = fakeSink();
+        sinks.push(sink);
+        return sink;
+      });
+    const playback = createSpeechPlayback(() => (withContext ? ctx : null), makePlayer);
+    return { playback, ctx, sinks };
   }
 
   it('plays the chunks of a run as they arrive and reports the chat live', () => {
-    const { playback, scheduled } = setup();
+    const { playback, sinks } = setup();
     expect(playback.isLive('c1')).toBe(false);
     expect(playback.push('c1', 'r1', chunk(0))).toBe(true);
     expect(playback.push('c1', 'r1', chunk(1))).toBe(true);
-    expect(scheduled).toHaveLength(2);
+    expect(sinks[0].writes).toHaveLength(2);
     expect(playback.isLive('c1')).toBe(true);
     expect(playback.isLive('c2')).toBe(false);
   });
 
   it('stops pushing audio at a gap, without cutting what is already queued', () => {
-    const { playback, scheduled, sources } = setup();
+    const { playback, sinks } = setup();
     playback.push('c1', 'r1', chunk(0));
     expect(playback.push('c1', 'r1', chunk(2))).toBe(false);
     expect(playback.isLive('c1')).toBe(false);
-    expect(scheduled).toHaveLength(1);
-    expect(sources[0].stopped).toBe(false);
+    expect(sinks[0].writes).toHaveLength(1);
+    expect(sinks[0].stopped).toBe(false);
   });
 
   it('starts a fresh session for a new run of the same chat', () => {
-    const { playback, scheduled } = setup();
+    const { playback, sinks } = setup();
     playback.push('c1', 'r1', chunk(0));
     playback.push('c1', 'r1', chunk(2)); // r1 is abandoned
     expect(playback.push('c1', 'r2', chunk(0))).toBe(true); // r2 is its own stream
-    expect(scheduled).toHaveLength(2);
+    expect(sinks).toHaveLength(2);
+    expect(sinks[1].writes).toHaveLength(1);
   });
 
   it('lets a completed run play out, and silences one that did not complete', () => {
-    const { playback, sources } = setup();
+    const { playback, sinks } = setup();
     playback.push('c1', 'r1', chunk(0));
     playback.end('c1', true);
     expect(playback.isLive('c1')).toBe(false); // the run is done...
-    expect(sources[0].stopped).toBe(false); // ...but the tail of the audio is still playing
+    expect(sinks[0].stopped).toBe(false); // ...but the tail of the audio is still playing
 
     playback.push('c2', 'r2', chunk(0));
     playback.end('c2', false); // a Stop or an error: no more sound
-    expect(sources[1].stopped).toBe(true);
+    expect(sinks[1].stopped).toBe(true);
   });
 
   it('is silent, and never throws, where the browser has no audio context', () => {
-    const { playback, scheduled } = setup(false);
+    const { playback, sinks } = setup(false);
     expect(playback.push('c1', 'r1', chunk(0))).toBe(false);
     expect(playback.isLive('c1')).toBe(false);
-    expect(scheduled).toHaveLength(0);
+    expect(sinks).toHaveLength(0);
     expect(() => {
       playback.prime();
       playback.end('c1', true);
@@ -690,141 +384,152 @@ describe('createSpeechPlayback', () => {
   });
 
   it('abandons a chunk whose audio is not base64 rather than playing noise', () => {
-    const { playback, scheduled } = setup();
+    const { playback, sinks } = setup();
     expect(playback.push('c1', 'r1', chunk(0, '%%%'))).toBe(false);
-    expect(scheduled).toHaveLength(0);
+    expect(sinks[0].writes).toHaveLength(0);
     expect(playback.push('c1', 'r1', chunk(1))).toBe(false); // and stays abandoned
   });
 
   it('stopAll silences every chat', () => {
-    const { playback, sources } = setup();
+    const { playback, sinks } = setup();
     playback.push('c1', 'r1', chunk(0));
     playback.push('c2', 'r2', chunk(0));
     playback.stopAll();
-    expect(sources.every((s) => s.stopped)).toBe(true);
+    expect(sinks.every((s) => s.stopped)).toBe(true);
     expect(playback.isLive('c1')).toBe(false);
   });
 
   // A tab that re-adopts a still-running speech run before its first chunk (a reload, a second
-  // tab, during a model's cold start) has never been primed: its context is suspended, and a
-  // chunk scheduled on a suspended context sits on a frozen clock, to be played -- stale, and
-  // possibly over a newer run -- whenever something later resumes it. A run that cannot start
-  // on a running context is not played live at all; its committed WAV is the reply.
+  // tab, during a model's cold start) has never been primed: its context is suspended, and audio
+  // played on a suspended context sits on a frozen clock, to be heard -- stale, and possibly over
+  // a newer run -- whenever something later resumes it. A run that cannot start on a running
+  // context is not played live at all; its committed WAV is the reply.
   describe('on a context that is not running', () => {
     function suspendedSetup(state = 'suspended') {
-      const fake = fakeContext(0);
-      const resume = vi.fn(() => Promise.resolve());
-      const ctx = Object.assign(fake.ctx, { state, resume });
-      const playback = createSpeechPlayback(() => ctx);
-      return { playback, ctx, resume, scheduled: fake.scheduled, sources: fake.sources };
+      const ctx: PlaybackContext & { state: string; resume: ReturnType<typeof vi.fn> } = {
+        sampleRate: 48000,
+        state,
+        resume: vi.fn(() => Promise.resolve()),
+      };
+      const sinks: RecordingSink[] = [];
+      const playback = createSpeechPlayback(
+        () => ctx,
+        (c) =>
+          new StreamingPcmPlayer(c, () => {
+            const sink = fakeSink();
+            sinks.push(sink);
+            return sink;
+          }),
+      );
+      return { playback, ctx, resume: ctx.resume, sinks };
     }
 
-    it('does not schedule a run adopted on a suspended context, and a later resume plays nothing', () => {
-      const { playback, ctx, resume, scheduled } = suspendedSetup();
+    it('does not play a run adopted on a suspended context, and a later resume plays nothing', () => {
+      const { playback, ctx, resume, sinks } = suspendedSetup();
       expect(playback.push('c1', 'r1', chunk(0))).toBe(false);
       expect(resume).toHaveBeenCalled(); // it still asks, so a primed page unlocks for the NEXT run
-      expect(scheduled).toHaveLength(0);
+      expect(sinks[0].writes).toHaveLength(0);
       expect(playback.isLive('c1')).toBe(false);
 
       // The context comes up later (a gesture resumed it): the run stays abandoned, so nothing
       // that arrived before is played late and nothing from the middle of the stream starts.
-      Object.assign(ctx, { state: 'running' });
+      ctx.state = 'running';
       expect(playback.push('c1', 'r1', chunk(1))).toBe(false);
-      expect(scheduled).toHaveLength(0);
+      expect(sinks[0].writes).toHaveLength(0);
     });
 
     it('treats an interrupted context (iOS) like a suspended one', () => {
-      const { playback, scheduled } = suspendedSetup('interrupted');
+      const { playback, sinks } = suspendedSetup('interrupted');
       expect(playback.push('c1', 'r1', chunk(0))).toBe(false);
-      expect(scheduled).toHaveLength(0);
+      expect(sinks[0].writes).toHaveLength(0);
     });
 
     it('starts the NEXT run of the chat normally once the context is running', () => {
-      const { playback, ctx, scheduled } = suspendedSetup();
+      const { playback, ctx, sinks } = suspendedSetup();
       playback.push('c1', 'r1', chunk(0));
-      Object.assign(ctx, { state: 'running' });
+      ctx.state = 'running';
       expect(playback.push('c1', 'r2', chunk(0))).toBe(true);
-      expect(scheduled).toHaveLength(1);
+      expect(sinks[1].writes).toHaveLength(1);
     });
 
     it('plays on a context that says it is running', () => {
-      const { playback, scheduled } = suspendedSetup('running');
+      const { playback, sinks } = suspendedSetup('running');
       expect(playback.push('c1', 'r1', chunk(0))).toBe(true);
-      expect(scheduled).toHaveLength(1);
+      expect(sinks[0].writes).toHaveLength(1);
     });
 
     it('abandons a live run whose context is suspended mid-run and silences its queue', () => {
-      const { playback, ctx, sources, scheduled } = suspendedSetup('running');
+      const { playback, ctx, sinks } = suspendedSetup('running');
       expect(playback.push('c1', 'r1', chunk(0))).toBe(true);
-      Object.assign(ctx, { state: 'suspended' });
+      ctx.state = 'suspended';
       expect(playback.push('c1', 'r1', chunk(1))).toBe(false);
       expect(playback.isLive('c1')).toBe(false);
-      expect(scheduled).toHaveLength(1);
+      expect(sinks[0].writes).toHaveLength(1);
       // What was queued on the frozen clock must not play stale when the context resumes.
-      expect(sources[0].stopped).toBe(true);
+      expect(sinks[0].stopped).toBe(true);
     });
 
     it('silences the queue of a COMPLETED run whose context is not running', () => {
-      const { playback, ctx, sources } = suspendedSetup('running');
+      const { playback, ctx, sinks } = suspendedSetup('running');
       playback.push('c1', 'r1', chunk(0));
-      Object.assign(ctx, { state: 'suspended' });
+      ctx.state = 'suspended';
       playback.end('c1', true);
-      expect(sources[0].stopped).toBe(true);
+      expect(sinks[0].stopped).toBe(true);
     });
 
     it('still lets a completed run play out on a running context', () => {
-      const { playback, sources } = suspendedSetup('running');
+      const { playback, sinks } = suspendedSetup('running');
       playback.push('c1', 'r1', chunk(0));
       playback.end('c1', true);
-      expect(sources[0].stopped).toBe(false);
+      expect(sinks[0].stopped).toBe(false);
     });
   });
 
   // The live mute of a chat's run (#281): reversible, local to playback, and nothing the run
   // itself notices -- it stays live, keeps queueing, and finishes as ever.
   describe('setMuted', () => {
-    it('toggles the run gain to 0 and back while the run stays live', () => {
-      const { playback, gains, sources, scheduled } = setup();
+    it('toggles the run mute on and off while the run stays live', () => {
+      const { playback, sinks } = setup();
       playback.push('c1', 'r1', chunk(0));
       playback.setMuted('c1', true);
-      expect(gains[0].gain.value).toBe(0);
+      expect(sinks[0].muted).toBe(true);
       // Silenced, not stopped: the run is live and keeps queueing audio (muted).
       expect(playback.isLive('c1')).toBe(true);
       expect(playback.push('c1', 'r1', chunk(1))).toBe(true);
-      expect(scheduled).toHaveLength(2);
-      expect(sources.every((s) => !s.stopped)).toBe(true);
-      expect(gains[0].gain.value).toBe(0);
+      expect(sinks[0].writes).toHaveLength(2);
+      expect(sinks[0].stopped).toBe(false);
+      expect(sinks[0].muted).toBe(true);
 
       playback.setMuted('c1', false);
-      expect(gains[0].gain.value).toBe(1);
+      expect(sinks[0].muted).toBe(false);
       expect(playback.isLive('c1')).toBe(true);
     });
 
     it('mutes only the chat it names', () => {
-      const { playback, gains } = setup();
+      const { playback, sinks } = setup();
       playback.push('c1', 'r1', chunk(0));
       playback.push('c2', 'r2', chunk(0));
       playback.setMuted('c1', true);
-      expect(gains.map((g) => g.gain.value)).toEqual([0, 1]);
+      expect(sinks.map((s) => s.muted)).toEqual([true, false]);
     });
 
     it('keeps a completed run muted while its queue plays out', () => {
-      const { playback, gains, sources } = setup();
+      const { playback, sinks } = setup();
       playback.push('c1', 'r1', chunk(0));
       playback.setMuted('c1', true);
       playback.end('c1', true);
-      expect(sources[0].stopped).toBe(false);
-      expect(gains[0].gain.value).toBe(0);
+      expect(sinks[0].stopped).toBe(false);
+      expect(sinks[0].muted).toBe(true);
     });
 
     it('does not carry over to the next run of the chat', () => {
-      const { playback, gains } = setup();
+      const { playback, sinks } = setup();
       playback.push('c1', 'r1', chunk(0));
       playback.setMuted('c1', true);
       playback.end('c1', true);
       playback.push('c1', 'r2', chunk(0));
-      expect(gains).toHaveLength(2);
-      expect(gains[1].gain.value).toBe(1);
+      expect(sinks).toHaveLength(2);
+      expect(sinks[1].muted).toBe(false);
     });
 
     it('is a no-op, and never throws, for a chat with no run or no audio context', () => {
@@ -832,18 +537,17 @@ describe('createSpeechPlayback', () => {
       expect(() => playback.setMuted('nope', true)).not.toThrow();
       const live = setup();
       expect(() => live.playback.setMuted('nope', true)).not.toThrow();
-      expect(live.gains).toHaveLength(0);
+      expect(live.sinks).toHaveLength(0);
     });
   });
 
   // The draining tail (#281): a completed run's queued audio keeps playing after the run commits
-  // and its saved player appears. The session is KEPT alive -- reachable by Mute and a tail-stop
-  // -- in a draining state until the last scheduled source ends, and only then is the drain
-  // signalled (onDrained) and the session dropped. This is what keeps the live controls on screen
-  // until the audio has actually finished, instead of vanishing the instant the run commits.
+  // and its saved player appears. The session is KEPT alive -- reachable by Mute and a tail-stop --
+  // in a draining state until the sink reports its ring drained, and only then is the drain
+  // signalled (onDrained) and the session dropped.
   describe('the draining tail of a completed run', () => {
     it('stays reachable until the tail ends, then signals the drain', () => {
-      const { playback, sources, gains } = setup();
+      const { playback, sinks } = setup();
       const drained: string[] = [];
       playback.onDrained((chatId) => drained.push(chatId));
       playback.push('c1', 'r1', chunk(0));
@@ -853,79 +557,80 @@ describe('createSpeechPlayback', () => {
       // No longer "live" (the run is done), but the tail is still playing out: nothing stopped,
       // the drain has not fired, and the session is still reachable (Mute still silences it).
       expect(playback.isLive('c1')).toBe(false);
-      expect(sources.some((s) => s.stopped)).toBe(false);
+      expect(sinks[0].stopped).toBe(false);
       expect(drained).toEqual([]);
       playback.setMuted('c1', true);
-      expect(gains[0].gain.value).toBe(0);
+      expect(sinks[0].muted).toBe(true);
 
-      // Each scheduled source ends in turn; the last one empties the queue and drains the chat.
-      sources.forEach((s) => s.ended?.());
+      // The ring drains to empty: the chat drains.
+      sinks[0].drain(sinks[0].written());
       expect(drained).toEqual(['c1']);
+      expect(sinks[0].stopped).toBe(true);
     });
 
     it('signals the drain at once when the completed run has nothing left queued', () => {
-      const { playback, sources } = setup();
+      const { playback, sinks } = setup();
       const drained: string[] = [];
       playback.onDrained((chatId) => drained.push(chatId));
       playback.push('c1', 'r1', chunk(0));
-      sources[0].ended?.(); // the only chunk finished before the run ended
+      sinks[0].drain(sinks[0].written()); // the only chunk finished before the run ended
       playback.end('c1', true);
       expect(drained).toEqual(['c1']);
     });
 
     it('abort() stops the draining tail at once and signals the drain', () => {
-      const { playback, sources } = setup();
+      const { playback, sinks } = setup();
       const drained: string[] = [];
       playback.onDrained((chatId) => drained.push(chatId));
       playback.push('c1', 'r1', chunk(0));
       playback.end('c1', true);
-      expect(sources[0].stopped).toBe(false); // still playing out
+      expect(sinks[0].stopped).toBe(false); // still playing out
 
       playback.abort('c1');
-      expect(sources[0].stopped).toBe(true);
+      expect(sinks[0].stopped).toBe(true);
       expect(drained).toEqual(['c1']);
     });
 
-    // Finding 1: a chat-delete / a Stop of a following run routes forget -> end(chatId, false),
-    // which must still cut the tail even though the run already ended (the session is draining).
+    // A chat-delete / a Stop of a following run routes forget -> end(chatId, false), which must
+    // still cut the tail even though the run already ended (the session is draining).
     it('silences the draining tail on a non-completed end (chat-delete / cancel)', () => {
-      const { playback, sources } = setup();
+      const { playback, sinks } = setup();
       const drained: string[] = [];
       playback.onDrained((chatId) => drained.push(chatId));
       playback.push('c1', 'r1', chunk(0));
       playback.end('c1', true); // r1 draining its tail
-      expect(sources[0].stopped).toBe(false);
+      expect(sinks[0].stopped).toBe(false);
 
       playback.end('c1', false); // the chat is deleted (forget) / a following run is cancelled
-      expect(sources[0].stopped).toBe(true); // the tail is cut, not left audible
+      expect(sinks[0].stopped).toBe(true); // the tail is cut, not left audible
       expect(drained).toEqual(['c1']);
     });
 
     it('stopAll silences a chat that is draining its tail', () => {
-      const { playback, sources } = setup();
+      const { playback, sinks } = setup();
       playback.push('c1', 'r1', chunk(0));
       playback.end('c1', true); // draining
       playback.stopAll();
-      expect(sources[0].stopped).toBe(true);
+      expect(sinks[0].stopped).toBe(true);
       expect(playback.isLive('c1')).toBe(false);
     });
 
     it("a new run's push for the same chat stops the prior draining tail, with no overlap", () => {
-      const { playback, sources, scheduled } = setup();
+      const { playback, sinks } = setup();
       playback.push('c1', 'r1', chunk(0));
       playback.end('c1', true); // r1 is now draining
-      expect(sources[0].stopped).toBe(false);
+      expect(sinks[0].stopped).toBe(false);
 
       // A new run of the same chat begins while the old tail is still draining.
       expect(playback.push('c1', 'r2', chunk(0))).toBe(true);
-      expect(sources[0].stopped).toBe(true); // the old tail was cut -- no overlap
-      expect(scheduled).toHaveLength(2); // r2 scheduled its own first chunk
+      expect(sinks[0].stopped).toBe(true); // the old tail was cut -- no overlap
+      expect(sinks[1].writes).toHaveLength(1); // r2 wrote its own first chunk
       expect(playback.isLive('c1')).toBe(true);
     });
 
-    // Finding 3: a new run replacing a prior session (live OR draining) must signal the old run's
-    // drain, so its render mirror (runAudioLive, and with it the mute mark) clears before the new
-    // run goes live again -- otherwise a mute left on the old tail carries over to the new run.
+    // A new run replacing a prior session (live OR draining) must signal the old run's drain, so
+    // its render mirror (runAudioLive, and with it the mute mark) clears before the new run goes
+    // live again -- otherwise a mute left on the old tail carries over to the new run.
     it.each([
       ['a draining tail', true],
       ['a still-live run', false],
@@ -941,48 +646,182 @@ describe('createSpeechPlayback', () => {
       expect(drained).toEqual(['c1']);
     });
 
-    it('clears the tail via the fallback timer when onended never fires', () => {
+    it('clears the tail via the fallback timer when the drain is never reported', () => {
       vi.useFakeTimers();
       try {
-        const { playback, sources } = setup();
+        const { playback, sinks } = setup();
         const drained: string[] = [];
         playback.onDrained((chatId) => drained.push(chatId));
         playback.push('c1', 'r1', chunk(0));
         playback.end('c1', true);
         expect(drained).toEqual([]);
-        // onended never fires (a context suspended mid-tail, or a browser quirk): the fallback
-        // elapses so the controls can never hang on screen forever.
+        // The drain is never reported (a context suspended mid-tail, or a browser quirk): the
+        // fallback elapses so the controls can never hang on screen forever.
         vi.advanceTimersByTime(60_000);
         expect(drained).toEqual(['c1']);
-        expect(sources[0].stopped).toBe(true);
+        expect(sinks[0].stopped).toBe(true);
       } finally {
         vi.useRealTimers();
       }
     });
 
     it('resolves the drain immediately for a completed run whose context is not running', () => {
-      const fake = fakeContext(0);
-      const ctx = Object.assign(fake.ctx, {
+      const ctx: PlaybackContext & { state: string; resume: ReturnType<typeof vi.fn> } = {
+        sampleRate: 48000,
         state: 'running',
         resume: vi.fn(() => Promise.resolve()),
-      });
-      const playback = createSpeechPlayback(() => ctx);
+      };
+      const sinks: RecordingSink[] = [];
+      const playback = createSpeechPlayback(
+        () => ctx,
+        (c) =>
+          new StreamingPcmPlayer(c, () => {
+            const sink = fakeSink();
+            sinks.push(sink);
+            return sink;
+          }),
+      );
       const drained: string[] = [];
       playback.onDrained((chatId) => drained.push(chatId));
       playback.push('c1', 'r1', chunk(0));
-      Object.assign(ctx, { state: 'suspended' }); // the clock froze before the run ended
+      ctx.state = 'suspended'; // the clock froze before the run ended
       playback.end('c1', true);
       expect(drained).toEqual(['c1']);
-      expect(fake.sources[0].stopped).toBe(true);
+      expect(sinks[0].stopped).toBe(true);
     });
   });
 
   it('prime() resumes a suspended context from inside the user gesture', () => {
     const resume = vi.fn(() => Promise.resolve());
-    const fake = fakeContext(0);
-    const ctx = Object.assign(fake.ctx, { state: 'suspended', resume });
+    const ctx: PlaybackContext & { state: string; resume: typeof resume } = {
+      sampleRate: 48000,
+      state: 'suspended',
+      resume,
+    };
     const playback = createSpeechPlayback(() => ctx);
     playback.prime();
     expect(resume).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The real AudioWorklet sink, exercised through the default StreamingPcmPlayer construction (the
+// other suites inject a fake sink): the async worklet setup, the transfer, and -- the point of
+// these -- the degraded path when the worklet does not load, which must still report a drain so
+// the voice session is not left waiting on the gateway's ceiling to reopen the microphone.
+describe('createWorkletSink (the real AudioWorklet sink)', () => {
+  // A stand-in for the browser's AudioWorkletNode: records what the page posts and lets a test play
+  // the worklet's messages back. `connect` returns its argument so node.connect(gain).connect(
+  // destination) chains as in the real graph.
+  class FakeWorkletNode {
+    static last: FakeWorkletNode | undefined;
+    port = {
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+      postMessage: vi.fn(),
+    };
+    connect = vi.fn((destination: unknown) => destination);
+    disconnect = vi.fn();
+    constructor(
+      public ctx: unknown,
+      public name: string,
+      public options: unknown,
+    ) {
+      FakeWorkletNode.last = this;
+    }
+  }
+
+  function workletContext() {
+    const gain = { gain: { value: 1 }, connect: vi.fn((d: unknown) => d), disconnect: vi.fn() };
+    const addModule = vi.fn(() => Promise.resolve());
+    const destination = { name: 'destination' };
+    const ctx = {
+      sampleRate: 48000,
+      destination,
+      audioWorklet: { addModule },
+      createGain: vi.fn(() => gain),
+    };
+    return { ctx: ctx as unknown as PlaybackContext, gain, addModule, destination };
+  }
+
+  // Flush the async setup (addModule -> node) and any queued-microtask drain.
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  beforeEach(() => {
+    FakeWorkletNode.last = undefined;
+    vi.stubGlobal('AudioWorkletNode', FakeWorkletNode);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('adds the module, wires the node through a gain to the destination, and flushes queued audio', async () => {
+    const { ctx, gain, addModule, destination } = workletContext();
+    const player = new StreamingPcmPlayer(ctx);
+    player.push(toneBytes(100), 44100); // written before the node exists: held, then flushed
+    await flush();
+    const node = FakeWorkletNode.last!;
+    expect(addModule).toHaveBeenCalledTimes(1);
+    expect(node.connect).toHaveBeenCalledWith(gain);
+    expect(gain.connect).toHaveBeenCalledWith(destination);
+    const pcmPosts = node.port.postMessage.mock.calls.filter(([m]) => m instanceof Float32Array);
+    expect(pcmPosts).toHaveLength(1);
+    expect(pcmPosts[0][1]).toEqual([expect.any(ArrayBuffer)]); // transferred, not copied
+  });
+
+  it('fires onEmpty and applies the played count when the worklet reports a drain', async () => {
+    const { ctx } = workletContext();
+    const player = new StreamingPcmPlayer(ctx);
+    const onEmpty = vi.fn();
+    player.onEmpty = onEmpty;
+    player.push(toneBytes(100), 44100);
+    await flush();
+    const before = player.pending;
+    FakeWorkletNode.last!.port.onmessage!({ data: { type: 'drained', played: 48 } });
+    expect(onEmpty).toHaveBeenCalledTimes(1);
+    expect(player.pending).toBe(before - 48);
+  });
+
+  it('mutes through the gain and pauses/resumes/stops through the port', async () => {
+    const { ctx, gain } = workletContext();
+    const player = new StreamingPcmPlayer(ctx);
+    await flush();
+    const node = FakeWorkletNode.last!;
+    player.setMuted(true);
+    expect(gain.gain.value).toBe(0);
+    player.pause();
+    player.resume();
+    expect(node.port.postMessage).toHaveBeenCalledWith('pause');
+    expect(node.port.postMessage).toHaveBeenCalledWith('resume');
+    player.stop();
+    expect(node.port.postMessage).toHaveBeenCalledWith('stop');
+    expect(node.disconnect).toHaveBeenCalled();
+    expect(gain.disconnect).toHaveBeenCalled();
+  });
+
+  it('still reports a drain so turn-taking is not stuck when the worklet fails to load', async () => {
+    const { ctx, addModule } = workletContext();
+    addModule.mockImplementationOnce(() => Promise.reject(new Error('no worklet')));
+    const player = new StreamingPcmPlayer(ctx);
+    const onEmpty = vi.fn();
+    player.onEmpty = onEmpty;
+    player.push(toneBytes(100), 44100);
+    await flush();
+    // The audio is silent (the committed WAV covers it), but playout is reported drained so the
+    // session can still tell the gateway the answer finished and reopen the microphone.
+    expect(onEmpty).toHaveBeenCalled();
+    expect(player.pending).toBe(0);
+  });
+
+  it('retries the worklet load for a later player after a transient failure (no cached rejection)', async () => {
+    const { ctx, addModule } = workletContext();
+    addModule.mockImplementationOnce(() => Promise.reject(new Error('transient')));
+    const first = new StreamingPcmPlayer(ctx);
+    await flush();
+    first.stop();
+    // A second player on the SAME context tries addModule again rather than reusing the rejection.
+    const second = new StreamingPcmPlayer(ctx);
+    await flush();
+    expect(addModule).toHaveBeenCalledTimes(2);
+    expect(FakeWorkletNode.last).toBeDefined(); // the retry built a node
+    second.stop();
   });
 });
