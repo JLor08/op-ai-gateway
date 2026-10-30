@@ -307,9 +307,11 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 // session's streaming PCM may be never, so the refusal would deadlock instead of
 // reaching the browser as an error frame. With it, the client holds the body until
 // /v1 either sends 100 Continue (it does so on its first body read, when it accepts
-// the session and the relay begins) or answers a final status (the refusal, which Do
-// then returns at once). DefaultTransport's ExpectContinueTimeout bounds the wait, so
-// a /v1 that somehow neither reads nor refuses cannot stall the dial forever.
+// the session and the relay begins, and the relay also writes one explicitly right
+// before its SSE 200, so the 200 can never overtake it and make the client abort the
+// body, #333) or answers a final status (the refusal, which Do then returns at once).
+// DefaultTransport's ExpectContinueTimeout bounds the wait, so a /v1 that somehow neither
+// reads nor refuses cannot stall the dial forever.
 func (s *Server) openLiveLoopback(ctx context.Context, claims liveTicketClaims, pr io.Reader) (*http.Response, error) {
 	q := url.Values{}
 	q.Set("model", claims.Target.Model)

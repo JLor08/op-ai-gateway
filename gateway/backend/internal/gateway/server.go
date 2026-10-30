@@ -1404,7 +1404,8 @@ func isInferencePath(p string) bool {
 }
 
 // accessLogResponseWriter records the final status code and byte count for the
-// access log. It exposes the underlying writer via Unwrap so http.NewResponseController
+// access log (an interim 1xx is forwarded but never recorded as the status). It
+// exposes the underlying writer via Unwrap so http.NewResponseController
 // can still reach SetWriteDeadline on the real connection. It deliberately does NOT
 // implement http.Flusher — see flushingAccessLogResponseWriter and ServeHTTP.
 //
@@ -1425,11 +1426,25 @@ type accessLogResponseWriter struct {
 }
 
 func (w *accessLogResponseWriter) WriteHeader(code int) {
+	// An interim response (100 Continue, 102 Processing, 103 Early Hints) is not THE response:
+	// net/http lets a handler send any number of them ahead of the final one. Forward it
+	// without recording it, so the log and the span keep the real status. 101 Switching
+	// Protocols is terminal (the connection leaves HTTP), so it is recorded like a final one.
+	if isInterimStatus(code) {
+		w.ResponseWriter.WriteHeader(code)
+		return
+	}
 	if !w.wrote {
 		w.status = code
 		w.wrote = true
 	}
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// isInterimStatus reports whether code is an informational 1xx that precedes the final
+// response, i.e. every 1xx except 101 Switching Protocols (net/http's own split).
+func isInterimStatus(code int) bool {
+	return code >= 100 && code <= 199 && code != http.StatusSwitchingProtocols
 }
 
 func (w *accessLogResponseWriter) Write(b []byte) (int, error) {

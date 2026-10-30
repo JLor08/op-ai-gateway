@@ -11,10 +11,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"op-ai-gateway/internal/logbuffer"
 	"op-ai-gateway/internal/usage"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -213,44 +215,60 @@ func TestBearerLiveExpect100SendsContinueBeforeTheFinalResponse(t *testing.T) {
 	}
 }
 
-// postExpect100 opens a chunked POST to the bearer live endpoint WITH Expect: 100-continue, the
-// way the voice loopback does, on a body the caller drives through the returned pipe. Do returns
-// once the relay's final response arrives.
-func postExpect100(ctx context.Context, ts *httptest.Server) (*io.PipeWriter, <-chan expect100Result) {
-	pr, pw := io.Pipe()
-	out := make(chan expect100Result, 1)
-	go func() {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/v1/audio/transcriptions/live?"+bearerLiveQuery("asr-model"), pr)
-		if err != nil {
-			out <- expect100Result{err: err}
-			return
-		}
-		req.Header.Set("Authorization", "Bearer dev-secret")
-		req.Header.Set("Expect", "100-continue")
-		resp, err := ts.Client().Do(req)
-		out <- expect100Result{resp: resp, err: err}
-	}()
-	return pw, out
-}
-
-type expect100Result struct {
+// expect100Call is one in-flight Expect: 100-continue POST made by startExpect100.
+type expect100Call struct {
+	done chan struct{} // closed once Do has returned
 	resp *http.Response
 	err  error
+	// waited records that the client genuinely HELD its body for the handshake (httptrace's
+	// Wait100Continue), got100 that a 100 Continue then reached it. Without them an Expect
+	// header the client never honours would leave the handshake untested.
+	waited, got100 atomic.Bool
+}
+
+// startExpect100 opens a chunked POST to the bearer live endpoint WITH Expect: 100-continue, the
+// way the voice loopback does, on a body the caller drives through the returned pipe. The client
+// has a real ExpectContinueTimeout (a zero one, httptest's default Transport, sends the body at
+// once and never waits for a 100), so it holds the body until the relay sends a 100 Continue or
+// a final response. Do returns once the relay's final response arrives.
+func startExpect100(ctx context.Context, t *testing.T, ts *httptest.Server) (*io.PipeWriter, *expect100Call) {
+	t.Helper()
+	pr, pw := io.Pipe()
+	call := &expect100Call{done: make(chan struct{})}
+	tr := &http.Transport{ExpectContinueTimeout: 5 * time.Second}
+	t.Cleanup(tr.CloseIdleConnections)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		Wait100Continue: func() { call.waited.Store(true) },
+		Got100Continue:  func() { call.got100.Store(true) },
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/v1/audio/transcriptions/live?"+bearerLiveQuery("asr-model"), pr)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	req.Header.Set("Expect", "100-continue")
+	go func() {
+		defer close(call.done)
+		call.resp, call.err = (&http.Client{Transport: tr}).Do(req)
+	}()
+	return pw, call
 }
 
 // An Expect: 100-continue turn whose request body ends without a single PCM byte must still
-// complete: the handshake finishes, the upstream sees a clean end-of-input and answers done +
-// [DONE], the per-route slot is freed and one zero-quantity row is billed -- nothing hangs. The
-// copy goroutine's first read is held back, and the body is closed both at once (the transport
-// sends it as a zero-length request) and after a pause (it is sent chunked, so the relay reads
-// a terminating chunk only).
+// complete: the client holds its (empty) body for the handshake, the relay's 100 Continue
+// releases it, the upstream sees a clean end-of-input and answers done + [DONE], the per-route
+// slot is freed and one zero-quantity row is billed -- nothing hangs. The copy goroutine's first
+// read is held back, so it is the relay's own 100 Continue that has to release the client (an
+// aborted body would end the session without a done event). A POST body from an io.Pipe is
+// always sent chunked, so the relay reads only the terminating chunk; the pipe is closed either
+// as the request starts or after the client has already been waiting for the 100 Continue.
 func TestBearerLiveExpect100EmptyBodyCompletesWithoutHanging(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		closeAfter time.Duration
 	}{
-		{"closed at once", 0},
-		{"closed after the headers are sent", 350 * time.Millisecond},
+		{"body closed as the request starts", 0},
+		{"body closed while the client waits", 350 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			holdLiveBodyCopy(t, 100*time.Millisecond)
@@ -261,23 +279,26 @@ func TestBearerLiveExpect100EmptyBodyCompletesWithoutHanging(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			pw, out := postExpect100(ctx, ts)
+			pw, call := startExpect100(ctx, t, ts)
 			if tc.closeAfter > 0 {
 				time.Sleep(tc.closeAfter)
 			}
 			_ = pw.Close() // an empty body: the first read the relay issues is the EOF
 
-			res := <-out
-			if res.err != nil {
-				t.Fatalf("an empty-bodied Expect: 100-continue session never completed its handshake: %v", res.err)
+			<-call.done
+			if call.err != nil {
+				t.Fatalf("the empty Expect: 100-continue session failed before its 200: %v", call.err)
 			}
-			defer res.resp.Body.Close()
-			if res.resp.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d, want 200", res.resp.StatusCode)
+			defer call.resp.Body.Close()
+			if !call.waited.Load() || !call.got100.Load() {
+				t.Fatalf("client waited for 100 Continue = %v, received it = %v; both must hold or the handshake was not exercised", call.waited.Load(), call.got100.Load())
+			}
+			if call.resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", call.resp.StatusCode)
 			}
 			// The upstream saw a clean end-of-input with no PCM, so it ends its SSE with done +
 			// [DONE]; the stream therefore reaches EOF instead of hanging.
-			br := bufio.NewReader(res.resp.Body)
+			br := bufio.NewReader(call.resp.Body)
 			sawDone := false
 			for {
 				line, err := br.ReadString('\n')
@@ -302,6 +323,105 @@ func TestBearerLiveExpect100EmptyBodyCompletesWithoutHanging(t *testing.T) {
 					t.Fatal("the per-route live slot was never released after the empty session ended")
 				}
 				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+// requestExpectsContinue must say yes exactly where net/http's server would send its own
+// automatic 100 Continue (the relay owes the client one ahead of the 200 only then, and must not
+// invent one elsewhere). The unit cases pin the edges of that condition, the differential test
+// below checks them against the real server.
+func TestBearerLiveExpect100RequestExpectsContinue(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		expect        []string // the Expect header lines, in order
+		contentLength int64    // -1 = chunked
+		proto         string   // "" = HTTP/1.1
+		want          bool
+	}{
+		{"plain token, chunked", []string{"100-continue"}, -1, "", true},
+		{"mixed case", []string{"100-Continue"}, -1, "", true},
+		{"upper case", []string{"100-CONTINUE"}, -1, "", true},
+		{"declared length", []string{"100-continue"}, 320, "", true},
+		{"comma list, token last", []string{"foo, 100-continue"}, -1, "", true},
+		{"comma list, token first", []string{"100-continue,foo"}, -1, "", true},
+		{"space separated", []string{"100-continue foo"}, -1, "", true},
+		{"space separated, token last", []string{"foo 100-continue"}, -1, "", true},
+		{"tab separated", []string{"100-continue\tfoo"}, -1, "", true},
+		{"no Expect header", nil, -1, "", false},
+		{"other expectation", []string{"foo"}, -1, "", false},
+		{"token is a prefix of a longer word", []string{"100-continued"}, -1, "", false},
+		{"token is a suffix of a longer word", []string{"x100-continue"}, -1, "", false},
+		{"declared empty body (Content-Length: 0)", []string{"100-continue"}, 0, "", false},
+		{"HTTP/1.0", []string{"100-continue"}, 320, "HTTP/1.0", false},
+		{"HTTP/2", []string{"100-continue"}, -1, "HTTP/2.0", true},
+		{"net/http reads only the first Expect line (token first)", []string{"100-continue", "foo"}, -1, "", true},
+		{"net/http reads only the first Expect line (token second)", []string{"foo", "100-continue"}, -1, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions/live", nil)
+			r.ContentLength = tc.contentLength
+			switch tc.proto {
+			case "HTTP/1.0":
+				r.Proto, r.ProtoMajor, r.ProtoMinor = tc.proto, 1, 0
+			case "HTTP/2.0":
+				r.Proto, r.ProtoMajor, r.ProtoMinor = tc.proto, 2, 0
+			}
+			for _, v := range tc.expect {
+				r.Header.Add("Expect", v)
+			}
+			if got := requestExpectsContinue(r); got != tc.want {
+				t.Fatalf("requestExpectsContinue = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The same condition against net/http itself: a plain handler asks requestExpectsContinue and
+// then reads the body, and a raw client that has already sent the whole request (as a client does
+// once its ExpectContinueTimeout runs out) sees whether the server answered the first read with
+// its own 100 Continue. The two must agree for every shape, so the relay's explicit 100 Continue
+// is owed exactly where the server would have sent one. (Shapes net/http refuses with 417 before
+// any handler runs are not reachable here and are covered by the unit cases.)
+func TestBearerLiveExpect100RequestExpectsContinueMatchesNetHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		proto  string
+		expect string
+		body   string // the framing headers and the body, verbatim
+	}{
+		{"chunked", "HTTP/1.1", "100-continue", "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+		{"chunked, mixed case", "HTTP/1.1", "100-Continue", "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+		{"comma list", "HTTP/1.1", "foo, 100-continue", "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+		{"space separated", "HTTP/1.1", "100-continue foo", "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+		{"tab separated", "HTTP/1.1", "100-continue\tfoo", "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+		{"declared length", "HTTP/1.1", "100-continue", "Content-Length: 5\r\n\r\nhello"},
+		{"declared empty body", "HTTP/1.1", "100-continue", "Content-Length: 0\r\n\r\n"},
+		{"HTTP/1.0", "HTTP/1.0", "100-continue", "Content-Length: 5\r\n\r\nhello"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got.Store(requestExpectsContinue(r))
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			req := "POST / " + tc.proto + "\r\nHost: gateway.test\r\nExpect: " + tc.expect + "\r\n" + tc.body
+			if _, err := io.WriteString(conn, req); err != nil {
+				t.Fatalf("write request: %v", err)
+			}
+			codes := readResponseStatuses(t, bufio.NewReader(conn))
+			serverSent100 := len(codes) > 0 && codes[0] == http.StatusContinue
+			if serverSent100 != got.Load() {
+				t.Fatalf("net/http sent an automatic 100 Continue = %v (statuses %v) but requestExpectsContinue = %v", serverSent100, codes, got.Load())
 			}
 		})
 	}

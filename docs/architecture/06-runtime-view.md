@@ -398,7 +398,7 @@ sequenceDiagram
     WS-->>B: 101 Switching Protocols (subprotocol op-live-transcription)
     WS->>LV: loopback POST /v1/audio/transcriptions/live?model&sample_rate&channels&sample_format&language, chunked body from an io.Pipe, Expect: 100-continue, X-OP-Internal-Auth + X-OP-Internal-User (the ticket's user)
     LV->>LV: loopbackPrincipal, then the same gate WITH the one admission (429/402/503), streaming + fullduplex_proxy checks, then the per-route slot (busy = 503 transcription.live_busy)
-    LV-->>WS: 100 Continue on the first body read, or a final refusal status that the adapter turns into one error frame
+    LV-->>WS: 100 Continue on the first body read (and an explicit one right before the SSE 200, an ordering guarantee), or a final refusal status that the adapter turns into one error frame
     LV->>AG: POST /live/{model}?sample_rate&channels&sample_format&language, chunked body fed from an io.Pipe (ProxyNativeDuplex, no target.Timeout)
     Note over LV,AG: a direct audio_cpp target skips the agent: the gateway POSTs the child's own /v1/audio/transcriptions/live?model=...
     AG->>AG: EnableFullDuplex FIRST (so any refusal below is answered promptly), then EnsureRunning (a cold start is held), release() deferred for the whole relay

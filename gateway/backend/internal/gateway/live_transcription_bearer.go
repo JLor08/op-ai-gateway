@@ -263,39 +263,31 @@ func (s *Server) relayBearerLiveTranscription(w http.ResponseWriter, r *http.Req
 	s.relayBearerLiveSSE(w, resp, scan, watchdog, idle)
 }
 
-// requestExpectsContinue reports whether the client sent Expect: 100-continue on an HTTP/1.1
-// (or later) request, i.e. whether Go's server would answer the request's first body read with
-// a 100 Continue. It mirrors net/http's own check: the Expect value is a comma-separated token
-// list and the token is case-insensitive. A client that did not ask is never sent one: it has
-// no 100 Continue to be ordered before the 200.
+// requestExpectsContinue reports whether Go's server will answer this request's first body read
+// with an automatic 100 Continue, so the relay owes the client one ahead of the 200. It mirrors
+// net/http's own condition exactly: the FIRST Expect header value carries the 100-continue token
+// (a list separated by comma, space or tab, case-insensitive), the request is HTTP/1.1 or later,
+// and its body is not declared empty (a Content-Length of 0 is never auto-100ed; a chunked body,
+// ContentLength -1, is). A client that did not ask is never sent a 100 Continue.
 func requestExpectsContinue(r *http.Request) bool {
-	if !r.ProtoAtLeast(1, 1) {
+	if !r.ProtoAtLeast(1, 1) || r.ContentLength == 0 {
 		return false
 	}
-	for _, v := range r.Header.Values("Expect") {
-		for _, token := range strings.Split(v, ",") {
-			if strings.EqualFold(strings.TrimSpace(token), "100-continue") {
-				return true
-			}
+	for _, token := range strings.FieldsFunc(r.Header.Get("Expect"), func(c rune) bool {
+		return c == ',' || c == ' ' || c == '\t'
+	}) {
+		if strings.EqualFold(token, "100-continue") {
+			return true
 		}
 	}
 	return false
 }
 
-// sendContinue writes a 100 Continue informational response and flushes it (net/http's
-// WriteHeader does both for a 1xx, and it disables the automatic 100 Continue the first body
-// read would otherwise send). The writer's own wrappers are bypassed deliberately:
-// accessLogResponseWriter latches the FIRST WriteHeader code as the request's final status for
-// the access log and the span, so a 100 written through it would be logged as the response
-// status of every Expect session instead of the 200.
+// sendContinue writes a 100 Continue informational response and flushes it. net/http's
+// WriteHeader does both for a 1xx, and it also disables the automatic 100 Continue the first
+// body read would otherwise send. accessLogResponseWriter forwards a 1xx without recording it,
+// so the access log and the span still see the 200 as the response status.
 func sendContinue(w http.ResponseWriter) {
-	for {
-		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
-		if !ok {
-			break
-		}
-		w = u.Unwrap()
-	}
 	w.WriteHeader(http.StatusContinue)
 }
 
