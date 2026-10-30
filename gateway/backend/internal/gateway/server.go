@@ -103,6 +103,11 @@ type ServerDeps struct {
 	// (config OP_AI_GATEWAY_VOICE_*). Each zero field defaults in New to its Voice*Ms
 	// default, so a bare ServerDeps gets the built-in timing.
 	VoiceTiming VoiceTiming
+	// VoicePrewarmEnabled turns on the Voice Chat session-open TTS pre-warm (#342, config
+	// OP_AI_GATEWAY_VOICE_PREWARM, default on): the ticket endpoint fires one unbilled priming
+	// synthesis for the session's voice once the co-load gate has passed. The zero value is OFF,
+	// so a bare ServerDeps never primes; cmd/gateway carries the config's (default true) value.
+	VoicePrewarmEnabled bool
 	// SwapProtectWindow is the recency window for routing swap-protection: a
 	// server that served a request within this window is protected from eviction
 	// by a request for a different model. <= 0 defaults to 30s in New.
@@ -474,6 +479,10 @@ type Server struct {
 	// &Server{} leaves it the zero voiceTiming, which newVoiceMachine reads as the
 	// built-in defaults. A test may set it directly to drive the timers fast.
 	voiceTiming voiceTiming
+	// voicePrewarm gates the Voice Chat session-open TTS pre-warm (see
+	// ServerDeps.VoicePrewarmEnabled and voicePrewarmEnabled). A bare &Server{} leaves it
+	// off, so no test that mints a voice ticket primes the TTS unless it asks to.
+	voicePrewarm bool
 	// voiceOnPending, when non-nil, is called by the Voice Chat state machine after each
 	// chunk is appended to the session's pendingText, with the buffer's new value. It is a
 	// TEST SEAM only (pendingText is not otherwise on the wire); production leaves it nil.
@@ -1089,6 +1098,7 @@ func New(deps ServerDeps) *Server {
 		voiceTickets:                   newVoiceTicketStore(),
 		voiceCoLoadTimeout:             voiceCoLoadTimeout,
 		voiceTiming:                    voiceTiming,
+		voicePrewarm:                   deps.VoicePrewarmEnabled,
 	}
 	if s.newMailer == nil {
 		s.newMailer = func(cfg mail.Config) Mailer { return mail.New(cfg) }
