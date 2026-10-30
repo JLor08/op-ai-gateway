@@ -1296,7 +1296,9 @@ const defaultVoiceSystemPrompt = "You are in a spoken conversation. Summarize th
 	"together are a fuller but still concise summary. Keep each `<speak>` short " +
 	"enough to listen to — a sentence or two. Write the fuller detail " +
 	"(explanations, lists, code, caveats) as normal text outside the tags; that " +
-	"text is shown but not spoken. Do not put anything before the first `<speak>` " +
+	"text is shown but not spoken. If you ask the user a question — especially a " +
+	"closing one — put it in its own `<speak>` section so it is spoken, not left " +
+	"only in the unspoken detail. Do not put anything before the first `<speak>` " +
 	"tag."
 
 // voiceSystemPrompt is the system message of a voice run, read from the chat document's settings
