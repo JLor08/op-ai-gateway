@@ -71,6 +71,7 @@ import {
   type LiveErrorKind,
 } from './liveTranscription';
 import { LIVE_CAPTURE_PROCESSOR_NAME, LIVE_FLUSHED_MESSAGE, LIVE_FLUSH_MESSAGE } from './livePcm';
+import { voiceCaptureAudioConstraints } from './micConstraints';
 import {
   StreamingPcmPlayer,
   acceptChunk,
@@ -899,10 +900,10 @@ export function createVoiceSession(args: VoiceSessionArgs): VoiceSession {
     }
     const resumed = ctx.resume().catch(() => undefined);
     const [media, worklet] = await Promise.allSettled([
-      // Echo cancellation and noise suppression are a belt-and-suspenders second line under the
-      // server-authoritative half-duplex gate (spec 6.2): the gate already stops TTS-era audio
-      // from reaching the ASR, and these further damp any room echo the microphone picks up.
-      mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }),
+      // The microphone constraints and their iOS carve-out live in micConstraints.ts: on iOS,
+      // requesting voice processing crackles the TTS playout, and the server-side half-duplex gate
+      // -- not the browser -- is what keeps the answer from being heard as speech (spec 6.2).
+      mediaDevices.getUserMedia({ audio: voiceCaptureAudioConstraints() }),
       ctx.audioWorklet.addModule(workletUrl),
     ]);
     if (!(await bringUpCapture(media, worklet, ctx, resumed))) return;
