@@ -840,56 +840,54 @@ describe('createVoiceSession in a (fake) browser', () => {
     });
 
     describe('a pause that lands as the answer`s last chunk finishes playing', () => {
-      // The real player on a recording stand-in for the browser's clock: what is under test is
-      // that the drain a pause swallowed is still reported once the session resumes.
-      function playbackContext() {
-        const sources: {
-          onended: ((event: Event) => void) | null;
-        }[] = [];
-        const ctx = {
-          currentTime: 0,
-          destination: {},
-          createBuffer: (_channels: number, length: number, rate: number) => ({
-            duration: length / rate,
-            copyToChannel: () => undefined,
-          }),
-          createGain: () => ({ gain: { value: 1 }, connect: () => undefined }),
-          createBufferSource: () => {
-            const source = {
-              buffer: null,
-              onended: null as ((event: Event) => void) | null,
-              connect: () => undefined,
-              start: () => undefined,
-              stop: () => undefined,
-            };
-            sources.push(source);
-            return source;
+      // The real player on a recording sink in place of the AudioWorklet (jsdom has no audio
+      // thread): what is under test is that the drain a pause swallowed is still reported once the
+      // session resumes. `drainAll` plays the worklet's `drained` message for the whole tail.
+      function recordingSink() {
+        let written = 0;
+        const sink = {
+          onDrained: null as ((played: number) => void) | null,
+          write(samples: Float32Array) {
+            written += samples.length;
+          },
+          setMuted: () => undefined,
+          pause: () => undefined,
+          resume: () => undefined,
+          stop() {
+            sink.onDrained = null;
+          },
+          drainAll() {
+            sink.onDrained?.(written);
           },
         };
-        return { ctx: ctx as unknown as PlaybackContext & { currentTime: number }, sources };
+        return sink;
       }
 
       // 0.1 s of silence at 24 kHz: 2400 samples, 4800 bytes.
       const tenthOfASecond = new Array<number>(4800).fill(0);
 
       async function drainingOnARealPlayer() {
-        const playback = playbackContext();
-        const run = start(undefined, { createPlayer: () => new StreamingPcmPlayer(playback.ctx) });
+        const sink = recordingSink();
+        const ctx = { sampleRate: 48000 } as unknown as PlaybackContext;
+        const run = start(undefined, {
+          createPlayer: () => new StreamingPcmPlayer(ctx, () => sink),
+        });
         const socket = await connected(run);
         socket.say({ type: 'state', state: 'speaking' });
-        socket.say(audioDelta(0, tenthOfASecond)); // scheduled 0.12 s ahead: plays 0.12 - 0.22 s
+        socket.say(audioDelta(0, tenthOfASecond));
         socket.say({ type: 'audio_done' });
         socket.say({ type: 'state', state: 'draining' });
-        return { run, socket, playback };
+        return { run, socket, sink };
       }
 
       it('still sends playback_done when it resumes, so the gateway is not left to wait out its ceiling', async () => {
-        const { run, socket, playback } = await drainingOnARealPlayer();
+        const { run, socket, sink } = await drainingOnARealPlayer();
 
-        // The clock is past the end of the last chunk, but its `ended` has not been delivered when
-        // the pause arrives: the player drops it as heard, and its drain is swallowed.
-        playback.ctx.currentTime = 1;
+        // The last chunk finished playing, but its drain had not reached the main thread when the
+        // pause arrived: delivered while paused, it is swallowed (a pause is not a drain), so the
+        // session reports it on resume instead.
         run.session.pause();
+        sink.drainAll();
         expect(socket.controls()).toEqual([{ type: 'pause' }]);
         run.session.resume();
 
@@ -904,15 +902,15 @@ describe('createVoiceSession in a (fake) browser', () => {
       });
 
       it('does not report a drain on resume when audio is still left to play: that one is sent at the true end', async () => {
-        const { run, socket, playback } = await drainingOnARealPlayer();
+        const { run, socket, sink } = await drainingOnARealPlayer();
 
-        playback.ctx.currentTime = 0.15; // inside the chunk: the rest of it is held
+        // Paused mid-tail: nothing has drained, the rest is still held in the ring.
         run.session.pause();
         run.session.resume();
         expect(socket.controls()).toEqual([{ type: 'pause' }, { type: 'resume' }]);
 
         // The resumed remainder plays out, and the drain hook the session wired reports it, once.
-        playback.sources.at(-1)!.onended!(new Event('ended'));
+        sink.drainAll();
         expect(socket.controls()).toEqual([
           { type: 'pause' },
           { type: 'resume' },
