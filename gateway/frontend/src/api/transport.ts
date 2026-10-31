@@ -2,9 +2,9 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 // Shared transport primitives used by every domain module below: the Fetcher
-// type, the request/requestText helpers, the SSE reconnect scaffold, and the
-// query-string builder. Kept import-free (no cross-domain types) so every
-// domain module can depend on it without creating cycles.
+// type, the request/requestBinary/requestText helpers, the SSE reconnect
+// scaffold, and the query-string builder. Kept import-free (no cross-domain
+// types) so every domain module can depend on it without creating cycles.
 
 export type Fetcher = typeof fetch;
 
