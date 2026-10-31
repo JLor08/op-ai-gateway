@@ -29,6 +29,12 @@ import (
 // intact.
 const audiocppModelsPath = "/v1/models?include_params=true"
 
+// audiocppBareModelsPath is the same listing without the include_params query. It is
+// the fallback fetchAudioCppModels retries once when the server conclusively rejects
+// the query (audioCppParamRejected), so an audio.cpp that does not take it still
+// yields its verdicts, loaded flag and path and loses only the language fact.
+const audiocppBareModelsPath = "/v1/models"
+
 // audio.cpp task values, spelled as the server emits them in /v1/models. The
 // listing's task names what the listed model DOES: "tts" synthesises speech from
 // text and "clon" (audio.cpp's spelling of voice cloning -- NOT "clone"; the
@@ -154,7 +160,10 @@ const (
 // does not say -- no entry, no params field, a params field of the wrong shape, no
 // language param among them, an unreadable body -- because a model not observed to take a
 // language must never be sent one. It decides no verdict and no verdict decides it; an
-// odd params shape costs only this axis.
+// odd params shape costs only this axis. The same holds when the server rejected the
+// include_params query and the bare listing answered instead (fetchAudioCppModels): that
+// listing carries no params, so the axis is false/"" and the verdicts, Loaded and Path
+// are unaffected.
 type AudioCppVerdicts struct {
 	Speech                 string
 	Transcription          string
@@ -172,11 +181,12 @@ type AudioCppVerdicts struct {
 // transcription, transcription streaming, speech clone and speech streaming
 // verdicts the listing states for modelID, whether it states the model as loaded
 // right now, and whether it declares a language request param and that param's
-// default. A transport
-// failure or a non-2xx status is an error and carries no verdict, so the caller
-// writes nothing. A 2xx body that does not name the model, or cannot be read, is
-// NOT an error, only empty verdicts and Loaded false -- the caller writes
-// nothing for an empty verdict either.
+// default. A transport failure or a non-2xx status is an error and carries no
+// verdict, so the caller writes nothing -- except that a 400, 404 or 422 on the
+// include_params query is retried once against the bare GET /v1/models, whose 2xx
+// answer carries every axis but the language one (see fetchAudioCppModels). A 2xx
+// body that does not name the model, or cannot be read, is NOT an error, only empty
+// verdicts and Loaded false -- the caller writes nothing for an empty verdict either.
 //
 // It is a client method, like ProbeSdcppCapabilities, and not a free function,
 // because the request must ride the client's own *http.Client: cmd/gateway
@@ -199,40 +209,90 @@ func (c *OpenAICompatibleClient) ProbeAudioCppModels(ctx context.Context, target
 // upstream credential, and bounds the body at 1 MiB. A transport failure or a
 // non-2xx status is an ErrUnavailable; decoding is the tolerant
 // parseAudioCppModels.
+//
+// It asks for the listing WITH its params (audiocppModelsPath). When the server
+// conclusively rejects that query (audioCppParamRejected: a 400, 404 or 422), it asks
+// ONCE more for the bare listing (audiocppBareModelsPath) and reads the verdicts, the
+// loaded flag and the path from it; the language axis, which only the params carry,
+// is then left at its zero value (unknown), so an audio.cpp that does not take the
+// query costs the language fact and not the whole probe. Every other non-2xx, and a
+// failure of the retry itself, is an ErrUnavailable with no further request: only a
+// conclusive rejection of the query says the bare path may answer. Both requests ride
+// the ONE timeout context set up here, so the retry does not extend target.Timeout.
 func fetchAudioCppModels(ctx context.Context, httpClient *http.Client, target routing.Target, modelID string) (AudioCppVerdicts, error) {
 	if target.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
 		defer cancel()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(target.Endpoint, audiocppModelsPath), nil)
+	body, status, err := getAudioCppListing(ctx, httpClient, target, audiocppModelsPath)
 	if err != nil {
-		return AudioCppVerdicts{}, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
+		return AudioCppVerdicts{}, err
 	}
-	applyUpstreamAuth(ctx, req)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return AudioCppVerdicts{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return AudioCppVerdicts{}, unavailableStatus(resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return AudioCppVerdicts{}, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
+	withParams := status >= 200 && status < 300
+	if !withParams {
+		if !audioCppParamRejected(status) {
+			return AudioCppVerdicts{}, unavailableStatus(status)
+		}
+		body, status, err = getAudioCppListing(ctx, httpClient, target, audiocppBareModelsPath)
+		if err != nil {
+			return AudioCppVerdicts{}, err
+		}
+		if status < 200 || status >= 300 {
+			return AudioCppVerdicts{}, unavailableStatus(status)
+		}
 	}
 	// The verdicts, the loaded flag, the path and the language param are four reads
 	// of the one body: the verdicts are the capability rule, pinned by the table the
 	// agent's copy shares, and loaded, the path and the language param are the
 	// health, identity and request-param axes beside them (see AudioCppVerdicts).
 	// The listing is one small document per probe, so decoding it four times costs
-	// nothing worth coupling them.
+	// nothing worth coupling them. The language param is read only from the listing
+	// that was asked for it: the bare retry's body states none.
 	v := parseAudioCppModels(body, modelID)
 	v.Loaded = parseAudioCppLoaded(body, modelID)
 	v.Path = parseAudioCppPath(body, modelID)
-	v.AcceptsLanguage, v.LanguageDefault = parseAudioCppLanguageParam(body, modelID)
+	if withParams {
+		v.AcceptsLanguage, v.LanguageDefault = parseAudioCppLanguageParam(body, modelID)
+	}
 	return v, nil
+}
+
+// getAudioCppListing is the one GET of a listing path (endpointURL concatenates it
+// verbatim, query included), with the per-application upstream credential attached
+// and the body bounded at 1 MiB. A build, transport or read failure is an
+// ErrUnavailable. A non-2xx status is NOT an error here: it is returned with a nil
+// body and a nil error so the caller decides whether it retries (a rejected query) or
+// fails (anything else). A 2xx returns the body and its status.
+func getAudioCppListing(ctx context.Context, httpClient *http.Client, target routing.Target, path string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(target.Endpoint, path), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: create request: %v", ErrUnavailable, err)
+	}
+	applyUpstreamAuth(ctx, req)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, resp.StatusCode, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
+	}
+	return body, resp.StatusCode, nil
+}
+
+// audioCppParamRejected reports whether a non-2xx status is a CONCLUSIVE rejection of
+// the include_params query itself: a 400 (a strict server refusing an unknown query
+// parameter), a 404 (a route table that does not match the query form) or a 422 (a
+// validator rejecting it). Only these say the bare listing may still answer. A 401 or
+// 403 (the credential), a 429 (a rate limit) and a 5xx (a failing or starting server)
+// would fail the bare path the same way, so they are no reason to ask again.
+func audioCppParamRejected(status int) bool {
+	return status == http.StatusBadRequest || status == http.StatusNotFound || status == http.StatusUnprocessableEntity
 }
 
 // audioCppModelsDoc is the part of the listing this code reads: each entry's id,

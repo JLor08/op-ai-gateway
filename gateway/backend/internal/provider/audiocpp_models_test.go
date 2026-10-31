@@ -7,11 +7,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
 	"os"
+	"sync"
 	"testing"
+	"time"
 )
 
 // audioCppLiveListing is the shape audio.cpp v0.9.1 really answers on
@@ -503,6 +506,41 @@ func TestAudioCppModelsCasesMatchTheAgentsTable(t *testing.T) {
 	}
 }
 
+// audioCppSeenRequest is one request a test server received: its method, path and RAW
+// query, so a case can tell GET /v1/models?include_params=true from the bare GET
+// /v1/models and not merely count requests.
+type audioCppSeenRequest struct {
+	method, path, query string
+}
+
+// audioCppDeadlineRecorder is a RoundTripper that notes each request's context
+// deadline before handing it to the real transport, so a test can tell whether two
+// requests were issued under ONE timeout context.
+type audioCppDeadlineRecorder struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	log  []audioCppDeadline
+}
+
+type audioCppDeadline struct {
+	at time.Time
+	ok bool
+}
+
+func (d *audioCppDeadlineRecorder) RoundTrip(r *http.Request) (*http.Response, error) {
+	at, ok := r.Context().Deadline()
+	d.mu.Lock()
+	d.log = append(d.log, audioCppDeadline{at, ok})
+	d.mu.Unlock()
+	return d.base.RoundTrip(r)
+}
+
+func (d *audioCppDeadlineRecorder) seen() []audioCppDeadline {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]audioCppDeadline(nil), d.log...)
+}
+
 func TestProbeAudioCppModels(t *testing.T) {
 	probe := func(t *testing.T, srv *httptest.Server, ctx context.Context, modelID string) (AudioCppVerdicts, error) {
 		t.Helper()
@@ -628,6 +666,163 @@ func TestProbeAudioCppModels(t *testing.T) {
 		}
 		if got != (AudioCppVerdicts{}) {
 			t.Fatalf("got %+v, want no verdict -- a failing server's body is not its answer", got)
+		}
+	})
+
+	// listingServer answers the include_params request with paramStatus and the bare
+	// /v1/models request with bareStatus (a 200 carries the live listing), and records
+	// every request it receives, so a case can assert WHICH requests were made and not
+	// just how many. The returned func reads the recording under the handler's lock.
+	listingServer := func(t *testing.T, paramStatus, bareStatus int) (*httptest.Server, func() []audioCppSeenRequest) {
+		t.Helper()
+		var mu sync.Mutex
+		var seen []audioCppSeenRequest
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			seen = append(seen, audioCppSeenRequest{r.Method, r.URL.Path, r.URL.RawQuery})
+			mu.Unlock()
+			status, body := bareStatus, audioCppLiveListing
+			if r.URL.Query().Get("include_params") == "true" {
+				status = paramStatus
+			}
+			if status < 200 || status >= 300 {
+				body = `{"error":"rejected"}`
+			}
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return srv, func() []audioCppSeenRequest {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]audioCppSeenRequest(nil), seen...)
+		}
+	}
+
+	// A conclusive rejection of the include_params QUERY (400/404/422) is retried once
+	// against the bare listing: the verdicts, loaded and path come from it, and only
+	// the language axis is lost (it stays at its zero value, i.e. unknown), instead of
+	// the whole probe failing for an audio.cpp that does not take the query.
+	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusUnprocessableEntity} {
+		t.Run(fmt.Sprintf("a %d on include_params falls back to the bare listing and keeps the verdicts, loaded and path", status), func(t *testing.T) {
+			srv, requests := listingServer(t, status, http.StatusOK)
+			got, err := probe(t, srv, context.Background(), "pocket_tts_english_bf16")
+			if err != nil {
+				t.Fatalf("error = %v, want the bare listing's answer", err)
+			}
+			want := AudioCppVerdicts{Speech: routing.CapabilityYes, Transcription: routing.CapabilityNo, SpeechClone: routing.CapabilityNo, SpeechStreaming: routing.CapabilityNo, Loaded: true, Path: "/models/pocket_tts_english_bf16.gguf"}
+			if got != want {
+				t.Fatalf("got %+v, want %+v (the verdicts, loaded and path survive the fallback; AcceptsLanguage is false and LanguageDefault empty: the bare listing carries no params)", got, want)
+			}
+			wantRequests := []audioCppSeenRequest{
+				{http.MethodGet, "/v1/models", "include_params=true"},
+				{http.MethodGet, "/v1/models", ""},
+			}
+			if seen := requests(); fmt.Sprint(seen) != fmt.Sprint(wantRequests) {
+				t.Fatalf("requests = %+v, want %+v (the retry is the bare path with an EMPTY query)", seen, wantRequests)
+			}
+		})
+	}
+
+	// Every other non-2xx is not a verdict on the query: a credential refusal, a rate
+	// limit or a failing server would fail the bare path just the same, so it is an
+	// ErrUnavailable straight away and NO second request is made.
+	for _, tc := range []struct {
+		status int
+		want   error
+	}{
+		{http.StatusUnauthorized, ErrAuthRejected},
+		{http.StatusForbidden, ErrAuthRejected},
+		{http.StatusTooManyRequests, ErrUnavailable},
+		{http.StatusInternalServerError, ErrUnavailable},
+		{http.StatusBadGateway, ErrUnavailable},
+		{http.StatusServiceUnavailable, ErrUpstreamStarting},
+	} {
+		t.Run(fmt.Sprintf("a %d on include_params is unavailable and is not retried", tc.status), func(t *testing.T) {
+			srv, requests := listingServer(t, tc.status, http.StatusOK)
+			got, err := probe(t, srv, context.Background(), "pocket_tts_english_bf16")
+			if !errors.Is(err, ErrUnavailable) || !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want ErrUnavailable (tagged %v)", err, tc.want)
+			}
+			if got != (AudioCppVerdicts{}) {
+				t.Fatalf("got %+v, want no verdict", got)
+			}
+			wantRequests := []audioCppSeenRequest{{http.MethodGet, "/v1/models", "include_params=true"}}
+			if seen := requests(); fmt.Sprint(seen) != fmt.Sprint(wantRequests) {
+				t.Fatalf("requests = %+v, want only %+v (the bare path must never be hit for a %d)", seen, wantRequests, tc.status)
+			}
+		})
+	}
+
+	// The fallback is ONE retry: whatever the bare listing answers that is not a 2xx is
+	// an ErrUnavailable, and a second rejection is not retried again.
+	for _, tc := range []struct {
+		name       string
+		bareStatus int
+		want       error
+	}{
+		{"a 500", http.StatusInternalServerError, ErrUnavailable},
+		{"a 503", http.StatusServiceUnavailable, ErrUpstreamStarting},
+		{"another 400", http.StatusBadRequest, ErrUnavailable},
+	} {
+		t.Run(fmt.Sprintf("a 400 on include_params and %s on the bare retry is unavailable", tc.name), func(t *testing.T) {
+			srv, requests := listingServer(t, http.StatusBadRequest, tc.bareStatus)
+			got, err := probe(t, srv, context.Background(), "pocket_tts_english_bf16")
+			if !errors.Is(err, ErrUnavailable) || !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want ErrUnavailable (tagged %v)", err, tc.want)
+			}
+			if got != (AudioCppVerdicts{}) {
+				t.Fatalf("got %+v, want no verdict", got)
+			}
+			if seen := requests(); len(seen) != 2 {
+				t.Fatalf("requests = %+v, want exactly the include_params request and ONE bare retry", seen)
+			}
+		})
+	}
+
+	t.Run("a transport failure on the bare retry is unavailable", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("include_params") == "true" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// Drop the connection instead of answering the retry.
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+		}))
+		defer srv.Close()
+		got, err := probe(t, srv, context.Background(), "pocket_tts_english_bf16")
+		if !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("error = %v, want ErrUnavailable", err)
+		}
+		if got != (AudioCppVerdicts{}) {
+			t.Fatalf("got %+v, want no verdict", got)
+		}
+	})
+
+	// The include_params request and its bare retry are bounded by ONE target.Timeout:
+	// the retry does not start a fresh clock, so a probe never runs longer than the
+	// timeout the caller set. Both requests must therefore carry the same deadline.
+	t.Run("the include_params request and the bare retry share one timeout deadline", func(t *testing.T) {
+		srv, _ := listingServer(t, http.StatusBadRequest, http.StatusOK)
+		rec := &audioCppDeadlineRecorder{base: srv.Client().Transport}
+		client := NewOpenAICompatibleClient(&http.Client{Transport: rec})
+		if _, err := client.ProbeAudioCppModels(context.Background(), routing.Target{Endpoint: srv.URL, Timeout: time.Minute}, "pocket_tts_english_bf16"); err != nil {
+			t.Fatalf("error = %v", err)
+		}
+		deadlines := rec.seen()
+		if len(deadlines) != 2 {
+			t.Fatalf("recorded %d requests, want 2 (include_params, then the bare retry)", len(deadlines))
+		}
+		if !deadlines[0].ok || !deadlines[1].ok {
+			t.Fatalf("deadlines = %+v, want a deadline on both requests (target.Timeout is set)", deadlines)
+		}
+		if !deadlines[0].at.Equal(deadlines[1].at) {
+			t.Fatalf("deadlines = %v and %v, want ONE shared timeout context for both requests", deadlines[0].at, deadlines[1].at)
 		}
 	})
 
