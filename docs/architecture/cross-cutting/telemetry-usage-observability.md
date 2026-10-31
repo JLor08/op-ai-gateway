@@ -992,6 +992,15 @@ usage views and the energy tiers as ordinary transcription, chat and speech usag
 new metering model was introduced, and there is no per-conversation grouping column, so the rows of one conversation are tied
 only by user, route and time.
 
+**A section re-synthesis writes one speech row of its own, outside any conversation** ([ADR-080](../09-architecture-decisions.md#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt), issue #324).
+`POST /api/portal/voice-chat-synth` (the portal's way back to a spoken section whose stored audio was pruned) runs the speech core's own
+relay (`inferencePreflight`, then `relaySpeech`) for the caller, so the row is exactly that core's and nothing is added to it: one per call,
+`audio_second` from the upstream's `X-AudioCPP-Audio-Duration-Ms` header (the request is a one-shot, non-streamed one), with `req_path` the
+portal route the browser called (`/api/portal/voice-chat-synth`; the provider path is the upstream's `/v1/audio/speech`), attributed to the
+session user with no `TokenID`, as the Voice leg's rows are. The endpoint itself, like the ticket, writes none and introduces no unit.
+Nothing it produces is stored, so replaying the same section again writes another row; it reads in the usage views as ordinary speech
+usage of the user (§8.4.4).
+
 **The QUANTITY, unlike the unit, is response-sourced — and that is not a
 contradiction of the rule above.** The rule forbids deriving the *unit* from
 the response, because a zero `provider.Response` on a failed request would

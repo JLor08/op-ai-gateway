@@ -460,6 +460,12 @@ const de = {
   // The collapsed block of a spoken answer's summary (#314): the short part the user heard, kept
   // above the written detail and replayable from its own player. The label names what it holds.
   chatVoiceSpokenSummary: 'Gesprochene Zusammenfassung',
+  // The play control that stands in for a spoken section's player once its stored audio is
+  // gone (pruned, deleted): a click has the gateway speak that section's text again, so the label
+  // says the audio is made anew, not replayed. chatVoiceResynthError is the inline line when that
+  // fails -- the section's written text stays right there to read instead.
+  chatVoiceResynth: 'Abspielen (neu erzeugen)',
+  chatVoiceResynthError: 'Audio konnte nicht erzeugt werden.',
   // Why a conversation could not start or ended, by the gateway's portal.voice_chat_* code (the
   // gate that refuses the ticket) or by the kind of failure. A refusal is the gateway's answer to
   // the very same request, so it is repeated until the configuration changes: the operator's to
@@ -3904,6 +3910,8 @@ const en: PortalMessages = {
   chatVoiceSystemPromptReset: 'Reset to default',
   chatVoiceSystemPromptEdited: 'Edited',
   chatVoiceSpokenSummary: 'Spoken summary',
+  chatVoiceResynth: 'Play (re-synthesize)',
+  chatVoiceResynthError: 'Could not generate the audio.',
   chatVoiceErrorAsrUnavailable:
     'The transcription model cannot be used for Voice Chat (unreachable, no live streaming, or it could not be started).',
   chatVoiceErrorLlmUnavailable:

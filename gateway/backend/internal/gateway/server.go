@@ -1532,6 +1532,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/transcription-live-ticket", s.handlePortalLiveTranscriptionTicket)
 	s.mux.HandleFunc("/api/portal/transcription-live", s.handleLiveTranscription)
 	s.mux.HandleFunc("/api/portal/voice-chat-ticket", s.handlePortalVoiceChatTicket)
+	s.mux.HandleFunc("/api/portal/voice-chat-synth", s.handlePortalVoiceChatSynth)
 	s.mux.HandleFunc("/api/portal/voice-chat", s.handleVoiceChat)
 	s.mux.HandleFunc("/api/portal/model-group-servers", s.handlePortalModelGroupServers)
 	s.mux.HandleFunc("/api/portal/servers", s.handlePortalServers)

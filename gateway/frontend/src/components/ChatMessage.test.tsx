@@ -760,6 +760,24 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.queryByRole('button', { name: t.chatDownloadAudio })).toBeNull();
       });
 
+      // The per-section re-synthesis (#324) belongs to the section blocks: an answer with no
+      // sections has one answer-wide clip, whose way back is the regenerate.
+      it('offers no section re-synth on an answer without spoken sections', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[MARKER]}
+            onRegenerate={() => {}}
+            onResynthSection={vi.fn(() => Promise.resolve(new Blob()))}
+          />,
+        );
+
+        expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.chatVoiceResynth })).toBeNull();
+        expect(screen.getByRole('button', { name: t.chatRegenerate })).toBeInTheDocument();
+      });
+
       it('is not the wait of a pending run: no clock, no no-news sentence', () => {
         render(<ChatMessage t={t} role="assistant" content={[MARKER]} kind="speech" />);
 
@@ -1176,6 +1194,25 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
       });
 
+      // A turn from before sections existed has one summary and ONE answer-wide clip: the
+      // per-section re-synthesis is not offered there, whatever the row is handed.
+      it('offers no section re-synth on the summary block of a not-stored answer', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer('Sum.\n\nThe detail.', MARKER)}
+            spokenSummary="Sum."
+            onRegenerate={() => {}}
+            onResynthSection={vi.fn(() => Promise.resolve(new Blob()))}
+          />,
+        );
+
+        expect(screen.getByRole('group', { name: t.chatAudioNotStored })).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: t.chatVoiceResynth })).toBeNull();
+        expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+      });
+
       it('does not render a second player below the body', () => {
         const { container } = render(
           <ChatMessage
@@ -1560,6 +1597,84 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         // another in the action stack.
         expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
         expect(within(first).getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+      });
+
+      // The per-section re-synthesis (#324): the row hands the store's `onResynthSection` through
+      // to the blocks, where each not-stored placeholder gains a play control for ITS section.
+      it("passes onResynthSection to each block's re-synth control with that section's text", () => {
+        const onResynthSection = vi.fn(() => Promise.resolve(new Blob([new Uint8Array([1])])));
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, MARKER)}
+            spokenSections={SECTIONS}
+            onRegenerate={() => {}}
+            onResynthSection={onResynthSection}
+          />,
+        );
+
+        const [first, second] = blocks();
+        const controls = screen.getAllByRole('button', { name: t.chatVoiceResynth });
+        expect(controls).toHaveLength(2);
+        expect(first.querySelector('summary')).toContainElement(controls[0]);
+        expect(second.querySelector('summary')).toContainElement(controls[1]);
+
+        fireEvent.click(controls[1]);
+        expect(onResynthSection).toHaveBeenLastCalledWith('Sum two.');
+        fireEvent.click(controls[0]);
+        expect(onResynthSection).toHaveBeenLastCalledWith('Sum one.');
+        // The whole-answer regenerate is still the first block's alone.
+        expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+        expect(within(first).getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+      });
+
+      it('gates the re-synth controls like the regenerate while no run may start', () => {
+        const onResynthSection = vi.fn(() => Promise.resolve(new Blob([new Uint8Array([1])])));
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, MARKER)}
+            spokenSections={SECTIONS}
+            onRegenerate={() => {}}
+            onResynthSection={onResynthSection}
+            canRun={false}
+          />,
+        );
+
+        for (const control of screen.getAllByRole('button', { name: t.chatVoiceResynth })) {
+          expect(control).toBeDisabled();
+        }
+      });
+
+      it('offers no re-synth control without onResynthSection', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, MARKER)}
+            spokenSections={SECTIONS}
+            onRegenerate={() => {}}
+          />,
+        );
+
+        expect(screen.getAllByRole('group', { name: t.chatAudioNotStored })).toHaveLength(2);
+        expect(screen.queryByRole('button', { name: t.chatVoiceResynth })).toBeNull();
+      });
+
+      it('offers no re-synth control while the sections still have their audio', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={answer(TEXT, AUDIO_A, AUDIO_B)}
+            spokenSections={SECTIONS}
+            onResynthSection={vi.fn(() => Promise.resolve(new Blob()))}
+          />,
+        );
+
+        expect(screen.queryByRole('button', { name: t.chatVoiceResynth })).toBeNull();
       });
 
       it('shows text only when the sections have no audio and none is marked removed', () => {

@@ -153,7 +153,7 @@ reachable that way (§9). Every body but the two multipart ones (the image edits
 and the audio transcriptions) is read with `readRawJSONUnlimited` (§7); those two
 bodies are `multipart/form-data` and each is read by its own capped reader (§3.5,
 §3.7, §10). All eight POST endpoints call `liftInferenceDeadlines` before reading
-the body (§6); the bearer live-transcription endpoint of §3.8, a ninth POST, lifts them as well, after its own gate, and so does the portal's `POST /api/portal/voice-chat-ticket` ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)): its co-load gate cold-starts up to three models for as long as `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (default 120 s), which outlives the 30 s write deadline, so it lifts them once it has read the body and the chat and before the gate runs.
+the body (§6); the bearer live-transcription endpoint of §3.8, a ninth POST, lifts them as well, after its own gate, and so does the portal's `POST /api/portal/voice-chat-ticket` ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)): its co-load gate cold-starts up to three models for as long as `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (default 120 s), which outlives the 30 s write deadline, so it lifts them once it has read the body and the chat and before the gate runs. The portal's section re-synthesis `POST /api/portal/voice-chat-synth` (issue #324, §3.6 item 12) lifts them too, right after its auth and before it reads the body, as the speech endpoint it fronts does, because a synthesis (a cold model's first one included) can outlive them.
 
 ### 3.1 OpenAI Chat Completions
 
@@ -981,6 +981,23 @@ The portal's composer reads it through `GET /api/portal/model-speech-language` (
 `params` array states only the **default**, never the accepted values, so the gateway validates no
 language: the control is free text and an unsupported value is dropped by audio.cpp.
 
+**12. The portal has one session-cookie door onto this relay, and it commits nothing**
+([ADR-080](../09-architecture-decisions.md#adr-080--voice-chat-phase-3-several-ordered-spoken-sections-each-its-own-speech-leg-relayed-in-document-order-with-playback-and-microphone-controls-and-a-combined-system-prompt), issue #324). `POST /api/portal/voice-chat-synth`
+(`handlePortalVoiceChatSynth`, `voice_chat_synth_endpoint.go`) speaks one spoken section of a Voice Chat answer again, for the replay
+of a section whose stored audio is gone. It is not a second speech implementation: after its own auth (`requireWebScope(gateway:use)`,
+CSRF on a cookie, as the Voice Chat ticket's, [Security §1](security-auth-rbac.md#1-overview-authentication-surfaces-at-a-glance)), the
+lifted deadlines and a body read under 256 KiB, it builds the item-1 body `{model, input, voice?, language?}` itself (a blank `voice` or
+`language` is not sent, so the upstream keeps its own default), applies `validateSpeechRequest` to it (so a blank model is
+`speech.model_required` and blank text `speech.input_required`, the model first, before any gate), gates the model as the Voice Chat
+ticket gates its speech leg (`resolveVoiceTTS`: the `speech` capability, a `speech_streaming = yes` verdict, an offerable model;
+refusal `400 portal.voice_chat_tts_unavailable`, no cause in the body), and then runs the **same** `inferencePreflight` and
+`relaySpeech` as `handleOpenAISpeech`, so admission, the relay's `Content-Type`, an upstream failure's status and code (items 4 and 5)
+and the one `audio_second` usage row (item 6) are this endpoint's own. The request is a one-shot one (no `stream`, no `response_format`),
+so the answer is the upstream's WAV. What it does **not** do is the point: the body names no chat, so there is no run, no assistant turn
+and no `chat_blobs` row, the clip goes to the caller alone, and replaying a section twice is two syntheses (nothing is cached or stored).
+The portal sends the thread's current Voice Chat speech model and voice, because a stored turn records neither
+([Runtime View §6.1.6](../06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts)).
+
 ### 3.7 OpenAI audio transcriptions
 
 `POST /v1/audio/transcriptions` (`handleOpenAITranscription`,
@@ -1463,7 +1480,7 @@ ingress-nginx buffers request bodies per Ingress and not per path; a dedicated I
 the follow-up ([Deployment View §7.3](../07-deployment-view.md#73-kubernetes), [Networking & Mesh §10](networking-mesh.md#10-agentgateway-websocket-transport)). The path is verified against mock backends and a real agent proxy and router on
 both paths, **not yet against a real audio.cpp `/live`** ([ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)).
 
-**A second loopback client: Voice Chat.** The portal's hands-free spoken conversation ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Runtime View §6.1.6](../06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts)) is a further client of this endpoint, not a new relay: its WebSocket state machine opens a **fresh** loopback live relay for each chunk of the user's speech (on the first mic frame its half-duplex gate admits, closed with the end-of-input at the chunk end, so each chunk is admitted, takes the per-route slot, and bills one `audio_second` row on its own) and never holds one for the whole session. A relay does exist whenever the mic gate is open (while listening and through the continuation window, reopening about 100 ms after each chunk end), so the route's one live slot is held then and free only while the answer is spoken or the session is idle (or, since issue #335, after a sustained microphone mute has torn the relay down, unless the operator chose keepalive), and a second session on the route meets `transcription.live_busy` (one `error` frame) continuously while the first one's mic is open and live. Its ticket carries three targets instead of one and is minted by `POST /api/portal/voice-chat-ticket`, which also runs the co-load gate; everything this section says about the relay itself holds unchanged.
+**A second loopback client: Voice Chat.** The portal's hands-free spoken conversation ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Runtime View §6.1.6](../06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts)) is a further client of this endpoint, not a new relay: its WebSocket state machine opens a **fresh** loopback live relay for each chunk of the user's speech (on the first mic frame its half-duplex gate admits, closed with the end-of-input at the chunk end, so each chunk is admitted, takes the per-route slot, and bills one `audio_second` row on its own) and never holds one for the whole session. A relay does exist whenever the mic gate is open (while listening and through the continuation window, reopening about 100 ms after each chunk end), so the route's one live slot is held then and free only while the answer is spoken or the session is idle (or, since issue #335, after a sustained microphone mute has torn the relay down, unless the operator chose keepalive), and a second session on the route meets `transcription.live_busy` (one `error` frame) continuously while the first one's mic is open and live. Its ticket carries three targets instead of one and is minted by `POST /api/portal/voice-chat-ticket`, which also runs the co-load gate; everything this section says about the relay itself holds unchanged. (The portal's section re-synthesis, `POST /api/portal/voice-chat-synth`, issue #324, is not part of this loop: it touches the speech relay alone, one-shot, and no live relay, WebSocket or ticket, [§3.6](#36-openai-audio-speech) item 12.)
 
 ## 4. Session / continuity signals
 
@@ -1855,7 +1872,8 @@ long but continuously-producing stream never times out. `http.ResponseController
 deadline entirely for all eight POST inference endpoints at request start (a
 large multimodal upload can take longer than 30s to arrive; the bearer live relay of §3.8 and the portal's
 `POST /api/portal/voice-chat-ticket` call it too, the latter before its co-load gate, which can wait on a cold start for up to
-`OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT`, and a write deadline left armed would drop the connection instead of delivering the ticket or the refusal), and the streaming
+`OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT`, and a write deadline left armed would drop the connection instead of delivering the ticket or the refusal;
+the portal's `POST /api/portal/voice-chat-synth` does as well, so a long synthesis is not cut off on its way to the browser), and the streaming
 handlers then re-arm just the write deadline to `now + idle` before every SSE
 write — so a stalled real socket (as opposed to an idle *upstream*) is still
 caught, without needing a second timer. **No provider `CompleteStream`
@@ -3681,7 +3699,13 @@ the sealed chat document and the removal is a document rewrite plus a delete on 
 - **The not-stored bubble and regenerate.** A finished answer with the marker and no audio renders
   `AudioNotStoredTurn`: one line ("The audio for this answer is not stored.") and a **regenerate**
   (the existing `regenerate(id)` → `startRunWithHistory`), no player and no download; a mixed
-  text-and-audio answer keeps its text and gets the placeholder where the player was.
+  text-and-audio answer keeps its text and gets the placeholder where the player was. A **Voice Chat**
+  answer's spoken sections each render this placeholder in their own block, and since issue #324 it
+  also carries a play control (`AudioResynthControl`) that asks `POST /api/portal/voice-chat-synth`
+  for that one section's audio with the thread's current speech model and voice (§3.6 item 12,
+  [Runtime View §6.1.6](../06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts)): the clip plays from an object URL the control
+  revokes, nothing is stored, and a failure is one inline line beside the control, the section's text
+  staying in its block.
 - **Live Mute and Abort.** While a streaming answer plays, the pending bubble offers **Mute**, a
   reversible toggle that silences this tab's playback only (`StreamingPcmPlayer` has one
   persistent `GainNode`, set to 0 or 1, that every scheduled source reaches the destination

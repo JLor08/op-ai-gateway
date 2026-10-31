@@ -2053,6 +2053,77 @@ paths:
         '403':
           description: A cross-origin upgrade, refused by the same-origin check.
         '405': { description: 'Any method other than GET.' }
+  /api/portal/voice-chat-synth:
+    post:
+      tags: [portal]
+      summary: Speak one Voice Chat section again, on demand and without committing anything (scope gateway:use, CSRF on a session)
+      description: >
+        The replay's way back to a spoken section whose stored audio is gone (pruned by
+        retention or deleted, ADR-071), the endpoint ADR-080 deferred (issue #324). It speaks
+        the text of ONE section with the named speech model and answers the audio, and does
+        nothing else. It is NON-COMMITTING by construction: the body names no chat, so the
+        handler has no thread to read, extend or save, starts no run, writes no chat turn
+        and no chat_blobs row, and the audio goes to the caller alone. Auth is the ticket's
+        (POST /api/portal/voice-chat-ticket): scope `gateway:use`, a session cookie also
+        needs X-OP-CSRF (403 `auth.csrf_required`), a bearer does not, and a service token
+        is refused 401. The portal is its only client; /v1/audio/speech remains the public
+        speech API. In order: the server's 30 s read and write deadlines are lifted (a
+        synthesis can outlive them); the body is read under 256 KiB (413
+        `request.body_too_large`) and must be one JSON object of the documented shape (400
+        `request.invalid_json`); `tts_model`, `voice` and `language` are trimmed, and a
+        blank `voice` or `language` is not sent on; a blank `tts_model` is 400
+        `speech.model_required` and blank `text` 400 `speech.input_required` (the speech
+        core's own validation of the /v1/audio/speech body this handler builds, the model
+        checked first, both before the gate); the model then goes through the gate the live
+        Voice Chat applies to its speech leg (the speech capability, a
+        speech_streaming = yes verdict, an offerable model: a clone model only with a named
+        preset voice; reachable by the caller; no admission, no model started), and a
+        refusal is 400 `portal.voice_chat_tts_unavailable`, naming no internal model or
+        server. The synthesis is then the speech core's, unchanged: the one preflight
+        admits it and relaySpeech relays the upstream's audio with the upstream's own
+        Content-Type (a one-shot request, so audio/wav) and its error at its own status, so
+        an admission refusal or an upstream failure is /v1/audio/speech's own and this
+        path-level spec does not enumerate those statuses. Billing is inherited whole: one
+        `audio_second` usage row for the caller, no billing path of its own, and as nothing
+        is stored every call is a new synthesis. A stored turn records neither the model nor
+        the voice a section was spoken with, so the portal sends the thread's CURRENT Voice
+        Chat speech model and voice. Any method but POST is 405. See api-surface.md and
+        06-runtime-view.md section 6.1.6.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VoiceChatSynthRequest' }
+      responses:
+        '200':
+          description: >
+            The synthesized clip, as the upstream speech backend sends it: audio/wav for
+            the one-shot request this builds. Nothing is stored.
+          content:
+            audio/wav:
+              schema: { type: string, format: binary }
+        '400':
+          description: >
+            The Error envelope: `request.invalid_json`, `speech.model_required`,
+            `speech.input_required` or `portal.voice_chat_tts_unavailable`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: >
+            The Error envelope: `auth.csrf_required` (a session cookie without
+            X-OP-CSRF) or `auth.insufficient_scope` (no gateway:use).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '405': { description: 'Any method other than POST (Allow: POST).' }
+        '413':
+          description: The Error envelope with code `request.body_too_large`; the body is over 256 KiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/model-group-servers:
     get:
       tags: [portal]
@@ -4399,6 +4470,37 @@ components:
             `portal.voice_chat_audio_settings_invalid`). With none, a preset-clone speech
             model is minted on its first preset voice (it has no default of its own) and
             any other model speaks in its own default voice.
+    VoiceChatSynthRequest:
+      type: object
+      description: The body of POST /api/portal/voice-chat-synth. It names no chat.
+      required: [text, tts_model]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          description: >
+            The text of the one spoken section to speak again, as the stored turn holds
+            it. Blank is 400 `speech.input_required`. The whole body is capped at 256 KiB
+            (413 `request.body_too_large`).
+        tts_model:
+          type: string
+          minLength: 1
+          description: >
+            The gateway model name (trimmed) of the speech model; blank is 400
+            `speech.model_required`. It must pass the gate the live Voice Chat applies to
+            its speech leg (an offerable, streaming speech model), else 400
+            `portal.voice_chat_tts_unavailable`.
+        voice:
+          type: string
+          description: >
+            Optional, trimmed: the voice to speak in. Blank or absent is not sent on, so the
+            model speaks in its own default voice.
+        language:
+          type: string
+          description: >
+            Optional, trimmed: the language, forwarded as the speech request's top-level
+            `language` (audio.cpp applies it per model and drops it for a model that takes
+            none). Blank or absent is not sent on.
     ModelCapabilities:
       type: object
       description: >

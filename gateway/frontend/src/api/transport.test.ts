@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { describe, expect, it } from 'vitest';
-import { PortalApiError, request } from './transport';
+import { PortalApiError, request, requestBinary } from './transport';
 
 function respond(status: number, body: string, contentType: string) {
   return async () => new Response(body, { status, headers: { 'Content-Type': contentType } });
@@ -40,5 +40,44 @@ describe('request error codes', () => {
     const fetcher = respond(502, '<html><body>Bad Gateway</body></html>', 'text/html');
     const err = await request(fetcher, '/api/portal/chats', {}).catch((e: unknown) => e);
     expect(err).toMatchObject({ status: 502, code: 'request.failed' });
+  });
+});
+
+describe('requestBinary', () => {
+  it('returns the success body as a Blob without reading it as JSON', async () => {
+    const bytes = new Uint8Array([0x00, 0xff, 0x7b, 0x80, 0x52]);
+    const seen: { path: string; init: RequestInit | undefined }[] = [];
+    const fetcher = async (path: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({ path: String(path), init });
+      return new Response(bytes, { status: 200, headers: { 'Content-Type': 'audio/wav' } });
+    };
+
+    const blob = await requestBinary(fetcher, '/api/portal/clip');
+
+    expect(blob.type).toBe('audio/wav');
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(bytes);
+    // A plain GET: the session cookie, but neither the CSRF header nor a body.
+    expect(seen[0].path).toBe('/api/portal/clip');
+    expect(seen[0].init?.credentials).toBe('include');
+    expect(seen[0].init?.headers).toEqual({});
+    expect(seen[0].init?.body).toBeUndefined();
+  });
+
+  it('parses a JSON error body into a PortalApiError, like request', async () => {
+    const fetcher = respond(
+      400,
+      '{"error":{"code":"speech.input_required","message":"input is required"}}',
+      'application/json',
+    );
+    const err = await requestBinary(fetcher, '/api/portal/clip', {
+      method: 'POST',
+      body: {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PortalApiError);
+    expect(err).toMatchObject({
+      status: 400,
+      code: 'speech.input_required',
+      message: 'input is required',
+    });
   });
 });

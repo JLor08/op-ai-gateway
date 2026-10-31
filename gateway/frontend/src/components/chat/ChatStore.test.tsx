@@ -4,7 +4,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
-import { memo } from 'react';
+import { memo, useEffect } from 'react';
 import {
   ChatStoreProvider,
   ChatStoreContext,
@@ -246,14 +246,28 @@ function makeChatApi(seed: ChatRow[] = [], maxContentBytes = 4 * 1024 * 1024) {
     // The Voice Chat ticket POST. The session itself is a stand-in (see the vi.mock of
     // ./voiceSession), so nothing here calls it: the store only has to hand it over.
     createVoiceChatTicket: vi.fn(async (_body: unknown) => ({ ticket: 'tkt' })),
+    // The section re-synthesis POST (#324): the audio of one spoken section, made again on
+    // demand. Answers a clip by default; the re-synthesis tests below read the call it got.
+    synthVoiceSection: vi.fn(
+      async (_args: { text: string; ttsModel: string; voice: string; language?: string }) =>
+        new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'audio/wav' }),
+    ),
   };
   return { api: spies, rows, spies };
 }
 
 let chatApi: ReturnType<typeof makeChatApi>;
 
+// What the store's `onResynthSection` was, render after render (the Probe records it), and what
+// each call of it handed back: the re-synthesis tests read both.
+const resynthSeen: Array<ChatStore['onResynthSection']> = [];
+const resynthResults: Array<Promise<Blob>> = [];
+
 function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
   const c = useChatStore();
+  useEffect(() => {
+    resynthSeen.push(c.onResynthSection);
+  });
   const last = c.messages[c.messages.length - 1];
   const lastText = last && typeof last.content === 'string' ? last.content : '';
   return (
@@ -393,6 +407,18 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           button per voice -- the default ('') among them. */}
       <span data-testid="voice-voices">{JSON.stringify(c.voiceChatModels.voice.voices)}</span>
       <span data-testid="voice-voice">{c.voiceChatModels.voice.value}</span>
+      {/* The re-synthesis of one spoken section (#324): whether the store offers it (it does not
+          while no speech model resolves), and a button that asks it for one section. */}
+      <span data-testid="voice-resynth">{String(c.onResynthSection !== undefined)}</span>
+      <button
+        type="button"
+        onClick={() => {
+          const result = c.onResynthSection?.('A spoken section.');
+          if (result) resynthResults.push(result);
+        }}
+      >
+        voice-resynth-call
+      </button>
       {/* The voice system prompt (#314): the text the field holds (the built-in prompt until the
           thread has its own), and one button per edit -- an edit, the built-in text, and none. */}
       <span data-testid="voice-system-prompt">{c.voiceChatModels.systemPrompt.value}</span>
@@ -9421,6 +9447,120 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           click('voice-say-default');
 
           expect(Object.keys(await savedSettings())).not.toContain('voice_chat');
+        });
+      });
+
+      // The re-synthesis of a spoken section whose stored audio is gone (#324): the store hands the
+      // transcript's rows ONE callback that speaks a section's text again, with the speech model and
+      // voice the thread would speak with NOW -- not the ones the section was first spoken with.
+      describe('re-synthesizing a section', () => {
+        const resynthCall = () => chatApi.spies.synthVoiceSection;
+
+        async function renderWithResynth(rows: ChatRow[] = [voiceThread()]) {
+          resynthSeen.length = 0;
+          resynthResults.length = 0;
+          chatApi = makeChatApi(rows);
+          chatApi.spies.modelVoices.mockImplementation(
+            async (name: string) =>
+              ({ 'tts-a': ['alba', 'marius'], 'tts-clone': ['luna', 'zeta'] })[name] ?? [],
+          );
+          pickerGates();
+          const view = renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+          return view;
+        }
+
+        it('speaks the section with the resolved speech model and the model default voice', async () => {
+          await renderWithResynth();
+          await waitFor(() => expect(text('voice-resynth')).toBe('true'));
+
+          click('voice-resynth-call');
+
+          expect(resynthCall()).toHaveBeenCalledTimes(1);
+          expect(resynthCall()).toHaveBeenCalledWith({
+            text: 'A spoken section.',
+            ttsModel: 'tts-a',
+            voice: '',
+          });
+        });
+
+        it('hands back the audio the gateway made', async () => {
+          await renderWithResynth();
+          await waitFor(() => expect(text('voice-resynth')).toBe('true'));
+          const clip = new Blob([new Uint8Array([9, 9])], { type: 'audio/wav' });
+          resynthCall().mockResolvedValueOnce(clip);
+
+          click('voice-resynth-call');
+
+          await expect(resynthResults[0]).resolves.toBe(clip);
+        });
+
+        it("speaks in the thread's CURRENT voice: a voice picked after the first render counts", async () => {
+          await renderWithResynth();
+          await waitFor(() => expect(text('voice-voices')).toBe('["alba","marius"]'));
+
+          click('voice-say-marius');
+          click('voice-resynth-call');
+
+          expect(resynthCall()).toHaveBeenLastCalledWith({
+            text: 'A spoken section.',
+            ttsModel: 'tts-a',
+            voice: 'marius',
+          });
+        });
+
+        it("speaks on the thread's CURRENT speech model, with that model's voice", async () => {
+          await renderWithResynth();
+          click('voice-tts-tts-clone');
+          await waitFor(() => expect(text('voice-voice')).toBe('luna'));
+
+          click('voice-resynth-call');
+
+          expect(resynthCall()).toHaveBeenLastCalledWith({
+            text: 'A spoken section.',
+            ttsModel: 'tts-clone',
+            voice: 'luna',
+          });
+        });
+
+        it('is not offered while no speech model streams', async () => {
+          chatApi = makeChatApi([voiceThread()]);
+          chatApi.spies.modelTranscriptionStreaming.mockResolvedValue(true);
+          chatApi.spies.modelSpeechStreaming.mockResolvedValue(NO_SPEECH_STREAMING);
+          renderProvider([], { models: pickerModels });
+          await waitForReady();
+          await waitFor(() => expect(text('voice-models-ready')).toBe('true'));
+
+          expect(text('voice-tts-used')).toBe('');
+          expect(text('voice-resynth')).toBe('false');
+          click('voice-resynth-call');
+          expect(chatApi.spies.synthVoiceSection).not.toHaveBeenCalled();
+        });
+
+        it('stays the same callback across renders that change neither model nor voice', async () => {
+          const { rerenderWithLocale } = await renderWithResynth();
+          await waitFor(() => expect(text('voice-resynth')).toBe('true'));
+          const settled = resynthSeen.at(-1);
+          expect(settled).toBeDefined();
+
+          // Unrelated churn: a re-render of the provider and an edit of the composer. Every row of
+          // the transcript is memoized on its props, so a callback that changed here would
+          // re-render all of them on every token of a run.
+          rerenderWithLocale(locale === 'de' ? 'en' : 'de');
+          fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+
+          expect(resynthSeen.at(-1)).toBe(settled);
+        });
+
+        it('changes with the voice, which is what a section is then spoken in', async () => {
+          await renderWithResynth();
+          await waitFor(() => expect(text('voice-voices')).toBe('["alba","marius"]'));
+          const before = resynthSeen.at(-1);
+
+          click('voice-say-marius');
+
+          expect(resynthSeen.at(-1)).not.toBe(before);
         });
       });
 
