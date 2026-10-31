@@ -48,22 +48,25 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByRole('button')).toBeNull();
     });
 
-    it('Mute asks to mute, as a toggle that reports its state', () => {
+    it('Mute asks to mute, its state carried by the label alone', () => {
       const onMute = vi.fn();
       renderLive({ onMute });
       const mute = screen.getByRole('button', { name: t.chatAudioMute });
-      expect(mute).toHaveAttribute('aria-pressed', 'false');
+      // One signal of its state, the label: no aria-pressed beside it (matches the
+      // Voice Chat mutes' convention, #328).
+      expect(mute).not.toHaveAttribute('aria-pressed');
       fireEvent.click(mute);
       expect(onMute).toHaveBeenCalledTimes(1);
       expect(onMute).toHaveBeenCalledWith(true);
     });
 
-    it('shows Unmute while muted, and the click asks to unmute', () => {
+    it('shows Unmute while muted, its state carried by the label, and the click asks to unmute', () => {
       const onMute = vi.fn();
       renderLive({ muted: true, onMute });
       expect(screen.queryByRole('button', { name: t.chatAudioMute })).toBeNull();
       const unmute = screen.getByRole('button', { name: t.chatAudioUnmute });
-      expect(unmute).toHaveAttribute('aria-pressed', 'true');
+      // One signal of its state, the label: no aria-pressed beside it (#328).
+      expect(unmute).not.toHaveAttribute('aria-pressed');
       fireEvent.click(unmute);
       expect(onMute).toHaveBeenCalledWith(false);
     });

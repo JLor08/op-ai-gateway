@@ -37,7 +37,10 @@ export function AudioTailControls({
   return (
     <Stack direction="row" sx={{ mt: 1.25, gap: 1, flexWrap: 'wrap' }}>
       {onMute && (
-        <Button variant="outlined" size="small" aria-pressed={muted} onClick={() => onMute(!muted)}>
+        // The label (Mute/Unmute) plus the visual carry the state; no aria-pressed beside a
+        // changing label, which would announce the state twice -- the Voice Chat mutes'
+        // convention (VoiceChatControl), unified here in #328.
+        <Button variant="outlined" size="small" onClick={() => onMute(!muted)}>
           {muted ? t.chatAudioUnmute : t.chatAudioMute}
         </Button>
       )}
