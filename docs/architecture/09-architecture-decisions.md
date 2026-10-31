@@ -8880,13 +8880,19 @@ unchanged.**
   and a fact survives an unload and a restart (the persistent cache's reason to exist). A mapping that
   accepts a language and a sibling that does not make the gate open, and a request that routes to the
   sibling has its `language` dropped.
-- **The static path asks `include_params=true` unconditionally, which assumes an audio.cpp that
-  accepts the query.** The parameter only adds a field to each entry. An audio.cpp old enough to answer
-  an unknown query with a 4xx would fail the whole listing read, so no verdict (and no language fact)
-  would be written for it: the fail-safe outcome is "unknown", and **persistently** so (the query is
-  unconditional, so every tick fails the same way until the audio.cpp server is upgraded or the verdict
-  is set by hand), and a low-likelihood case. A model whose entry carries no `params`, or a malformed one, costs only the
-  language axis (`accepts:false`), never a verdict.
+- **The static path asks `include_params=true` first, which assumes an audio.cpp that accepts the
+  query; one that rejects it loses only the language fact.** The parameter only adds a field to each
+  entry. As first written the query was unconditional: an audio.cpp old enough to answer an unknown
+  query with a 4xx failed the whole listing read, so no verdict (and no language fact) was written for
+  it: the fail-safe outcome was "unknown", and **persistently** so (every tick failed the same way until
+  the audio.cpp server was upgraded or the verdict was set by hand), and a low-likelihood case.
+  **Update (issue #298):** a conclusive 400, 404 or 422 on that request is now retried once against the
+  bare `GET /v1/models` (`fetchAudioCppModels`), so such a server keeps its verdicts, `Loaded` and `Path`
+  and loses only the language fact: the bare listing carries no `params`, so the axis stays unknown and
+  reads as `accepts:false` (no composer control). Every other non-2xx (401, 403, 429, 5xx) is still an
+  unavailable probe with no retry, and both requests share the one `target.Timeout`. A model whose entry
+  carries no `params`, or a malformed one, costs only the language axis (`accepts:false`), never a
+  verdict.
 - **Whether audio.cpp reports a model's `params` while it is unloaded is not asserted.** The write is
   loaded-gated either way (an ungated write could flap `accepts` if it did not, and the gate keeps the
   static path symmetric with the agent path, which can read the fact only while the child runs), so the

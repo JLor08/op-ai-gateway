@@ -2150,8 +2150,12 @@ through the client's own transport, with the application's credential and a 1 Mi
 bound, from which the gateway's health loop derives the `speech` and `transcription`
 verdicts of an `audio_cpp` application ([Routing & Model Selection
 §2.3](routing-and-model-selection.md#23-the-capability-gate)). A transport failure or
-a non-2xx status is an error and states nothing; a 2xx body that does not name the
-model, or cannot be read, is an empty verdict, not an error. The same read also states
+a non-2xx status is an error and states nothing, with one exception: a 400, 404 or 422
+on the `include_params` query is retried once against the bare `GET /v1/models`, whose
+2xx answer keeps the verdicts, `Loaded` and `Path` and states no language fact (issue
+#298, the mitigation recorded in [§11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances));
+a 2xx body that does not name the model, or cannot be read, is an empty verdict, not an
+error. The same read also states
 whether the model is **loaded** right now (`AudioCppVerdicts.Loaded`, from the listing's
 `loaded` flag, which the verdict decode used to drop), and that gates the voices step
 below.
