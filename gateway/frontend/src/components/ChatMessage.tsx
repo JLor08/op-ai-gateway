@@ -112,6 +112,7 @@ function ChatMessageComponent({
   onRegenerate,
   onRefine,
   onDeleteAudio,
+  onResynthSection,
   canRun = true,
 }: Readonly<{
   t: Translation;
@@ -195,6 +196,13 @@ function ChatMessageComponent({
   // assistant branch has an answer's audio to delete; a user turn's audio is a transcription
   // clip and is never offered for it.
   onDeleteAudio?: () => void;
+  // Speaks ONE spoken section's text again with the thread's current speech model and voice and
+  // hands back the audio (#324): the store's single callback (not a per-message one -- it takes the
+  // section's text), threaded to the section blocks of an answer whose stored audio is gone, where
+  // each not-stored placeholder offers a play control that runs it. Supplied only where a speech
+  // model resolves for the thread. Only the section blocks use it: the summary block and an
+  // answer with no sections keep the whole-answer regenerate alone.
+  onResynthSection?: (sectionText: string) => Promise<Blob>;
   // Whether a new run may be started. False while the model is unavailable —
   // the Edit/Regenerate controls (which each start a run) are disabled to match
   // the blocked Send. Defaults true so callers that don't gate stay unchanged.
@@ -413,6 +421,7 @@ function ChatMessageComponent({
             turnId={turnId ?? ''}
             raw={showRaw}
             onRegenerate={onRegenerate}
+            onResynthSection={onResynthSection}
             canRun={canRun}
           />
         ) : (

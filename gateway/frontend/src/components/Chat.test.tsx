@@ -224,6 +224,13 @@ function makeChatApi() {
     // a real reference to this method (the conversation's session reads it) so the mock must
     // provide one.
     createVoiceChatTicket: vi.fn(async (_body: unknown) => ({ ticket: 'tkt' })),
+    // The section re-synthesis POST (#324): the store holds a real reference to this method (the
+    // transcript rows' re-synth control reads it) so the mock must provide one; the audio is a
+    // clip by default.
+    synthVoiceSection: vi.fn(
+      async (_args: { text: string; ttsModel: string; voice: string; language?: string }) =>
+        new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'audio/wav' }),
+    ),
     // The pagehide keepalive flush: no test in this file dispatches `pagehide`,
     // but the store now holds a real reference to this method so the mock must
     // provide one.
@@ -5927,6 +5934,83 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // Off: the indicator is there, muted, saying so.
       expect(within(indicator()).getByText(t.chatVoiceStateOff)).toBeInTheDocument();
       expect(within(indicator()).getByTestId('MicOffIcon')).toBeInTheDocument();
+    });
+
+    // The re-synthesis of one spoken section whose stored audio is gone (#324), end to end through
+    // the store: a stored voice answer carries `spoken_sections` and the `audio_removed` marker,
+    // each section's not-stored line gains a play control, and it speaks THAT section's text with
+    // the speech model the page's pickers resolve now. The store's rules for the callback (the
+    // current voice, its identity) are ChatStore.test.tsx's; the row's wiring is ChatMessage's.
+    describe('a spoken section whose stored audio is gone', () => {
+      const TEXT = 'Sum one.\n\nThe middle.\n\nSum two.';
+
+      function seedSections() {
+        chatApi.rows.push({
+          id: 'c_resynth',
+          title: 'Spoken sections',
+          created_at: '2026-07-22T12:00:00Z',
+          updated_at: '2026-07-22T12:00:00Z',
+          content: {
+            settings: { model: 'llm' },
+            messages: [
+              { id: 'u1', role: 'user', content: 'tell me' },
+              {
+                id: 'a1',
+                role: 'assistant',
+                status: 'complete',
+                content: [{ type: 'text', text: TEXT }, { type: 'audio_removed' }],
+                spoken_sections: [
+                  { text: 'Sum one.', start: 0, len: 8 },
+                  { text: 'Sum two.', start: 23, len: 8 },
+                ],
+              },
+            ],
+          },
+        });
+      }
+
+      const resynthButtons = () => screen.getAllByRole('button', { name: t.chatVoiceResynth });
+
+      it('speaks the clicked section with the resolved speech model and plays the audio', async () => {
+        const createObjectURL = vi.fn((_blob: Blob) => 'blob:resynth-1');
+        vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+        seedSections();
+        renderChat(tokens, audioModels);
+        await screen.findByText('Spoken sections');
+        // The control is there once the gateway has said which speech models stream.
+        await waitFor(() => expect(resynthButtons()).toHaveLength(2));
+
+        fireEvent.click(resynthButtons()[1]);
+
+        await waitFor(() =>
+          expect(chatApi.spies.synthVoiceSection).toHaveBeenCalledWith({
+            text: 'Sum two.',
+            ttsModel: 'tts',
+            voice: '',
+          }),
+        );
+        expect(chatApi.spies.synthVoiceSection).toHaveBeenCalledTimes(1);
+        const player = await screen.findByLabelText(t.chatGeneratedAudio);
+        expect(player).toHaveAttribute('src', 'blob:resynth-1');
+        // It rides the second block, and the whole-answer regenerate is still the first's alone.
+        expect(screen.getByText('Sum two.').closest('details')).toContainElement(player);
+        expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+        expect(chatApi.spies.startChatRun).not.toHaveBeenCalled();
+      });
+
+      it('offers only the whole-answer regenerate while no speech model streams', async () => {
+        chatApi.spies.modelSpeechStreaming.mockResolvedValue({ streaming: false, sampleRate: 0 });
+        seedSections();
+        renderChat(tokens, audioModels);
+        await screen.findByText('Spoken sections');
+        // The gateway has answered, and no speech model streams: the placeholders stand as before.
+        await waitFor(() => expect(chatApi.spies.modelSpeechStreaming).toHaveBeenCalled());
+        expect(await screen.findByText(t.chatVoiceUnavailableTts)).toBeInTheDocument();
+
+        expect(screen.getAllByRole('group', { name: t.chatAudioNotStored })).toHaveLength(2);
+        expect(screen.queryByRole('button', { name: t.chatVoiceResynth })).toBeNull();
+        expect(screen.getAllByRole('button', { name: t.chatRegenerate })).toHaveLength(1);
+      });
     });
 
     // The pickers of the conversation's models (#317), as the page offers them: each leg's models

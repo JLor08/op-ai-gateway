@@ -65,5 +65,52 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByText(t.chatAudioNotStored)).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: t.chatRegenerate })).toBeNull();
     });
+
+    // The per-section re-synthesis (#324): where the caller can make the section's audio again it
+    // hands an `onResynth`, and the placeholder gains a play control beside the regenerate.
+    describe('with a way to re-synthesize the section', () => {
+      const resynth = () => Promise.resolve(new Blob([new Uint8Array([1, 2])]));
+
+      it('offers the re-synth play control inside the placeholder group', () => {
+        render(<AudioNotStoredTurn t={t} onResynth={resynth} />);
+
+        const group = screen.getByRole('group', { name: t.chatAudioNotStored });
+        expect(group).toContainElement(screen.getByRole('button', { name: t.chatVoiceResynth }));
+      });
+
+      it('asks for the audio when the control is clicked', () => {
+        const onResynth = vi.fn(resynth);
+        render(<AudioNotStoredTurn t={t} onResynth={onResynth} />);
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatVoiceResynth }));
+
+        expect(onResynth).toHaveBeenCalledTimes(1);
+      });
+
+      it('keeps the regenerate beside it', () => {
+        const onRegenerate = vi.fn();
+        render(<AudioNotStoredTurn t={t} onRegenerate={onRegenerate} onResynth={resynth} />);
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatRegenerate }));
+
+        expect(onRegenerate).toHaveBeenCalledTimes(1);
+        expect(screen.getByRole('button', { name: t.chatVoiceResynth })).toBeEnabled();
+      });
+
+      it('disables the control with the same gate as the regenerate', () => {
+        const onResynth = vi.fn(resynth);
+        render(<AudioNotStoredTurn t={t} onRegenerate={() => {}} onResynth={onResynth} disabled />);
+
+        const button = screen.getByRole('button', { name: t.chatVoiceResynth });
+        expect(button).toBeDisabled();
+        fireEvent.click(button);
+        expect(onResynth).not.toHaveBeenCalled();
+      });
+
+      it('has no re-synth control without an onResynth', () => {
+        render(<AudioNotStoredTurn t={t} onRegenerate={() => {}} />);
+        expect(screen.queryByRole('button', { name: t.chatVoiceResynth })).toBeNull();
+      });
+    });
   });
 }

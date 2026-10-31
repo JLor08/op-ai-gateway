@@ -553,6 +553,14 @@ export type ChatStore = {
   // The pickers of the conversation's transcription and speech models, and the field of its
   // system prompt (see VoiceChatModels).
   voiceChatModels: VoiceChatModels;
+  // Speaks one spoken section's text again (#324), for a section whose stored audio is gone: POSTs
+  // the text to the gateway with the speech model and voice the thread would speak with NOW
+  // (voiceChatModels.tts.used and .voice.value), without a conversation and without touching the
+  // thread, and resolves with the audio. One callback for the whole transcript -- the row supplies
+  // the section's text -- and the same function until that model or voice changes, so memoized rows
+  // are not re-rendered by it. Undefined while no speech model resolves for the thread (none
+  // streams, or the gateway has not said yet): the rows then offer nothing that could only fail.
+  onResynthSection: ((sectionText: string) => Promise<Blob>) | undefined;
   // The mask of an image EDIT (inpainting): one PNG data url, or null. It exists
   // only beside a source image in edit mode (handleMaskFile refuses it otherwise,
   // and it is dropped with its source or when the mode changes) and is sent as a
@@ -669,6 +677,7 @@ export function ChatStoreProvider({
     | 'saveChatKeepalive'
     | 'serverModels'
     | 'startChatRun'
+    | 'synthVoiceSection'
   >;
   models: ModelOption[];
   tokens: PortalToken[];
@@ -2430,6 +2439,24 @@ export function ChatStoreProvider({
     voiceTtsVoices,
     presetCloneOffered(chatModels.find((option) => option.id === voiceTtsModel)),
   );
+  // The re-synthesis of one spoken section whose stored audio is gone (#324). It closes over the
+  // speech model and voice resolved HERE, this render's -- what the thread would speak with now,
+  // not what the section was first spoken with -- and is rebuilt only when either changes, so the
+  // memoized transcript rows (which take it as a prop) are not re-rendered by every token of a run.
+  // No speech model, no callback (voiceTtsModel is '' until the gateway has said which models
+  // stream, and when none does): a control for it could only fail.
+  const onResynthSection = useMemo(
+    () =>
+      voiceTtsModel === ''
+        ? undefined
+        : (sectionText: string) =>
+            apiRef.current.synthVoiceSection({
+              text: sectionText,
+              ttsModel: voiceTtsModel,
+              voice: voiceVoice,
+            }),
+    [voiceTtsModel, voiceVoice],
+  );
   const voiceChat = useVoiceChat({
     apiRef,
     activeChatId,
@@ -3105,6 +3132,7 @@ export function ChatStoreProvider({
     voiceChatCapable,
     voiceChatGap,
     voiceChatModels,
+    onResynthSection,
     mask,
     handleMaskFile,
     removeMask,

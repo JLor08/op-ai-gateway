@@ -93,7 +93,10 @@ export function audioPairsBySection(audioCount: number, sectionCount: number): b
 // stitches a clip's parts, and fetches it once). When the audio is gone (the answer carries the
 // removed marker: pruned, deleted, never stored) every block shows the not-stored placeholder
 // instead and only the first offers the regenerate: it regenerates the whole answer, and one
-// button says so. Audio that is not there and not marked removed leaves the blocks text-only.
+// button says so. Where the caller can speak a section again (`onResynthSection`, #324) EVERY
+// placeholder also carries a play control for its OWN section, which synthesizes that section's
+// text on demand without touching the answer. Audio that is not there and not marked removed
+// leaves the blocks text-only.
 // Audio that cannot be paired with the sections is not played here at all; the caller then puts
 // the answer's one stitched player below (audioPairsBySection).
 //
@@ -109,6 +112,7 @@ export function SpokenAnswer({
   turnId,
   raw,
   onRegenerate,
+  onResynthSection,
   canRun,
 }: Readonly<{
   t: Translation;
@@ -120,6 +124,10 @@ export function SpokenAnswer({
   turnId: string;
   raw: boolean;
   onRegenerate?: () => void;
+  // Speaks one section's text again with the thread's current speech model and voice and hands
+  // back the audio (ChatStore, #324). Absent when no speech model resolves; the placeholders then
+  // offer the whole-answer regenerate alone.
+  onResynthSection?: (sectionText: string) => Promise<Blob>;
   canRun: boolean;
 }>) {
   const hasBody = segments.some((segment) => segment.kind === 'body');
@@ -127,7 +135,7 @@ export function SpokenAnswer({
   const firstBlock = segments.find((segment) => segment.kind === 'section');
   const paired = audioUrls.length > 0 && audioPairsBySection(audioUrls.length, sectionCount);
 
-  const audioOf = (index: number, first: boolean): ReactNode => {
+  const audioOf = (index: number, text: string, first: boolean): ReactNode => {
     if (paired) {
       // A download is named after the turn; with several blocks the section is part of the
       // name too, or the second save would silently become "(1)".
@@ -139,6 +147,7 @@ export function SpokenAnswer({
         <AudioNotStoredTurn
           t={t}
           onRegenerate={first ? onRegenerate : undefined}
+          onResynth={onResynthSection ? () => onResynthSection(text) : undefined}
           disabled={!canRun}
         />
       );
@@ -166,7 +175,7 @@ export function SpokenAnswer({
             number={blockCount > 1 ? shown : undefined}
             open={!hasBody}
             text={segment.text}
-            audio={audioOf(segment.index, segment === firstBlock)}
+            audio={audioOf(segment.index, segment.text, segment === firstBlock)}
           />
         );
       })}

@@ -1095,6 +1095,11 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                   // The delete of a spoken answer's audio, per message like onRegenerate; the
                   // row itself offers it only where audio is still stored.
                   onDeleteAudio={message.role === 'assistant' ? handlers.onDeleteAudio : undefined}
+                  // The re-synthesis of one spoken section of a not-stored voice answer (#324):
+                  // the store's one callback (it takes the section's text, so no per-message
+                  // cache), the same function until the speech model or voice changes, so it does
+                  // not defeat ChatMessage's memo. Undefined where no speech model resolves.
+                  onResynthSection={message.role === 'assistant' ? c.onResynthSection : undefined}
                   canRun={c.modelAvailable}
                 />
               );

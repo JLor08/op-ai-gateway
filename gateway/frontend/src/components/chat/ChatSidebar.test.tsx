@@ -126,6 +126,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
       voice: { voices: [], value: '', set: vi.fn() },
       systemPrompt: { value: '', set: vi.fn() },
     },
+    onResynthSection: undefined,
     mask: null,
     handleMaskFile: vi.fn(async () => {}),
     removeMask: vi.fn(),
