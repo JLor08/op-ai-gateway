@@ -362,9 +362,10 @@ built by `server-agent/internal/client/ws.go`'s `WSSender` and served by
   so every server block sets **`large_client_header_buffers 4 16k`**, a directive that is valid only at `http` and
   `server` level, which is why it is not in the location. The ticket mint `POST /api/portal/voice-chat-ticket` blocks on the co-load gate for up to
   `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (120 s by default) and has no location of its own: it rides `location /api/` and
-  inherits the server-level 3600 s read timeout, which nginx's 60 s default would otherwise cut short. The Vite dev and
+  inherits the server-level 3600 s read timeout, which nginx's 60 s default would otherwise cut short; so does the portal's section re-synthesis
+  `POST /api/portal/voice-chat-synth` (issue #324), which can wait on a speech model's cold start. The Vite dev and
   preview proxy gets a `ws: true` context for the path, anchored (`^/api/portal/voice-chat(?:\?|$)`) so it does not also
-  catch the ticket path. The portal-side loopbacks of the orchestration stay inside the gateway process and never pass
+  catch the ticket path or the synthesis path. The portal-side loopbacks of the orchestration stay inside the gateway process and never pass
   through nginx ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Deployment View §7.3](../07-deployment-view.md#73-kubernetes)).
 
 **One registration table, two muxes.** Every agent endpoint — including the
