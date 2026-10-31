@@ -11,12 +11,6 @@ import (
 	"strings"
 )
 
-// voiceChatSynthModelRequired is the 400 for a synth request that names no speech model.
-// It is the endpoint's own code, in the dotted shape the speech core's request codes
-// (speech.input_required) have: the portal always names the model it spoke the turn with,
-// so a request without one is a client bug, not a model that "cannot be used".
-const voiceChatSynthModelRequired = "voice_chat.tts_model_required"
-
 // voiceChatSynthMaxBytes caps the body of a synth request. It carries one spoken section of
 // an answer -- a few paragraphs -- so 256 KiB is far above any real one and keeps a
 // session cookie from pushing an unbounded text at a speech model through this route.
@@ -55,9 +49,10 @@ type voiceChatSynthRequest struct {
 //  1. The body is read under voiceChatSynthMaxBytes (413 past it) and must be one JSON
 //     object of this shape (400 request.invalid_json). Model, voice and language are
 //     trimmed; a voice or language that is blank is not sent at all.
-//  2. A blank model is 400 voice_chat.tts_model_required, and blank text 400
-//     speech.input_required -- the speech core's own rule (validateSpeechRequest) applied
-//     to the body this handler builds, so the two cannot drift. Both precede the gate.
+//  2. A blank model is 400 speech.model_required, and blank text 400 speech.input_required
+//     -- the speech core's own rules (validateSpeechRequest) applied to the body this
+//     handler builds, so they cannot drift (a blank model is reported first). Both precede
+//     the gate, so the precise code wins over the gate's generic refusal.
 //  3. The model goes through the gate the live Voice Chat applies to its speech leg
 //     (resolveVoiceTTS: speech-capable, a streaming model, an offerable one, reachable by
 //     the caller): a model a session could not have spoken with is no model the replay can
@@ -103,7 +98,8 @@ func (s *Server) handlePortalVoiceChatSynth(w http.ResponseWriter, r *http.Reque
 // trimmed together with the /v1/audio/speech body the synthesis is relayed as. On any
 // refusal it writes the response and returns ok == false: a body past the cap is 413, one
 // that is not a JSON object of this shape 400 request.invalid_json, a blank model 400
-// voice_chat.tts_model_required and blank text 400 speech.input_required.
+// speech.model_required and blank text 400 speech.input_required (the last two are the
+// speech core's own validation of the body built here).
 func readVoiceChatSynthRequest(w http.ResponseWriter, r *http.Request) (voiceChatSynthRequest, []byte, bool) {
 	body, ok := readRawJSONLimit(w, r, voiceChatSynthMaxBytes)
 	if !ok {
@@ -116,10 +112,6 @@ func readVoiceChatSynthRequest(w http.ResponseWriter, r *http.Request) (voiceCha
 	}
 	req.TTSModel = strings.TrimSpace(req.TTSModel)
 	req.Voice, req.Language = strings.TrimSpace(req.Voice), strings.TrimSpace(req.Language)
-	if req.TTSModel == "" {
-		writeJSON(w, http.StatusBadRequest, apierror.Response(voiceChatSynthModelRequired, "tts_model is required", ""))
-		return voiceChatSynthRequest{}, nil, false
-	}
 	// A map of strings always encodes.
 	raw, _ := json.Marshal(speechBodyForSynth(req))
 	if verr := validateSpeechRequest(raw, req.TTSModel); verr != nil {

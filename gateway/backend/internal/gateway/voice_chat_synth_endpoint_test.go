@@ -350,10 +350,11 @@ func TestVoiceChatSynthRefusesAModelTheVoiceChatGateRefuses(t *testing.T) {
 	}
 }
 
-// Blank text is the speech core's own 400 (speech.input_required), a blank model the
-// endpoint's own (the portal names the model; a request without one is a client bug), and a
-// body that is not one JSON object of this shape (text a non-string included) is
-// request.invalid_json -- each before the gate, so nothing is resolved or spent.
+// A blank model and blank text are the speech core's own 400s (speech.model_required,
+// speech.input_required: the core validates the body the endpoint builds, the model first),
+// and a body that is not one JSON object of this shape (text a non-string included) is
+// request.invalid_json -- each before the gate, so nothing is resolved or spent and the
+// precise code is not hidden behind the gate's generic refusal.
 func TestVoiceChatSynthValidatesTheRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -364,10 +365,10 @@ func TestVoiceChatSynthValidatesTheRequest(t *testing.T) {
 		{"empty text", voiceSynthBody("", speechGatewayModel, "", ""), "speech.input_required"},
 		{"whitespace-only text", voiceSynthBody(" \n\t ", speechGatewayModel, "", ""), "speech.input_required"},
 		{"text that is no string", `{"text":["a"],"tts_model":"` + speechGatewayModel + `"}`, codeRequestInvalidJSON},
-		{"missing model", `{"text":"Hello."}`, "voice_chat.tts_model_required"},
-		{"empty model", voiceSynthBody("Hello.", "", "", ""), "voice_chat.tts_model_required"},
-		{"whitespace-only model", voiceSynthBody("Hello.", "  ", "", ""), "voice_chat.tts_model_required"},
-		{"a model that is blank and a text that is too", voiceSynthBody("", "", "", ""), "voice_chat.tts_model_required"},
+		{"missing model", `{"text":"Hello."}`, "speech.model_required"},
+		{"empty model", voiceSynthBody("Hello.", "", "", ""), "speech.model_required"},
+		{"whitespace-only model", voiceSynthBody("Hello.", "  ", "", ""), "speech.model_required"},
+		{"a model that is blank and a text that is too", voiceSynthBody("", "", "", ""), "speech.model_required"},
 		{"not JSON", `not json`, codeRequestInvalidJSON},
 		{"a JSON array", `["Hello."]`, codeRequestInvalidJSON},
 	} {
