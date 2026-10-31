@@ -125,6 +125,44 @@ export async function request<T>(
   return payload as T;
 }
 
+// Binary counterpart to request<T> for an endpoint that answers with raw bytes (a synthesized
+// audio clip) rather than JSON -- reading that body as JSON would throw on perfectly valid
+// audio. The request is set up exactly like request<T>'s (session cookie, X-OP-CSRF on a mutating
+// method, a JSON body when one is given); only the SUCCESS body differs, handed back as a Blob
+// whose type is the response's Content-Type. A failure still carries a JSON error body, parsed
+// into the same PortalApiError request<T> throws, fallback codes included.
+export async function requestBinary(
+  fetcher: Fetcher,
+  path: string,
+  options: { method?: string; body?: unknown } = {},
+): Promise<Blob> {
+  const headers: Record<string, string> = {};
+  const init: RequestInit = { headers, credentials: 'include' };
+  if (options.method) {
+    init.method = options.method;
+  }
+  const isMutating = options.method && options.method !== 'GET';
+  if (isMutating) {
+    headers['X-OP-CSRF'] = '1';
+  }
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(options.body);
+  }
+  const response = await fetcher(path, init);
+  if (!response.ok) {
+    const payload = await readJSON(response);
+    const error = isErrorPayload(payload) ? payload.error : undefined;
+    const fallbackCode = response.status === 413 ? 'request.body_too_large' : 'request.failed';
+    throw new PortalApiError(
+      response.status,
+      error?.code ?? fallbackCode,
+      error?.message ?? (response.statusText || 'request failed'),
+    );
+  }
+  return response.blob();
+}
+
 // GET-only counterpart to request<T> for an endpoint that returns plain text
 // (PEM material, a generated configuration file) rather than JSON -- reading the
 // body as JSON here would throw on perfectly valid non-JSON text. Mirrors
