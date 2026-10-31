@@ -2,7 +2,15 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { Alert, Box } from '@mui/material';
-import { createContext, useCallback, useContext, useMemo, useRef, useState } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import type { ReactNode } from 'react';
 
 type ToastSeverity = 'success' | 'error';
@@ -20,11 +28,14 @@ export function useToast(): ToastApi {
 /**
  * Fixer Stack oben rechts UNTER der 72px-AppBar. Erfolgs-Toasts blenden nach ~4000ms
  * aus (per-Item-Timer); Fehler-Toasts bleiben bis der Nutzer sie über das X schließt.
- * Jede Alert trägt per Default role="alert".
+ * Jede Alert trägt per Default role="alert". Ausstehende Auto-Dismiss-Timer werden beim
+ * Unmount gestoppt, damit ein später Tick nicht setItems nach dem Teardown des Host-Fensters
+ * aufruft (sonst crasht ein verwaister Timer fremde Test-Suiten mit "window is not defined").
  */
 export function ToastProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [items, setItems] = useState<ToastItem[]>([]);
   const nextId = useRef(0);
+  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
 
   const dismiss = useCallback((id: number) => {
     setItems((current) => current.filter((item) => item.id !== id));
@@ -34,10 +45,24 @@ export function ToastProvider({ children }: Readonly<{ children: ReactNode }>) {
     (severity: ToastSeverity, message: string) => {
       const id = nextId.current++;
       setItems((current) => [...current, { id, severity, message }]);
-      if (severity === 'success') window.setTimeout(() => dismiss(id), 4000);
+      if (severity === 'success') {
+        const handle = setTimeout(() => {
+          timers.current.delete(handle);
+          dismiss(id);
+        }, 4000);
+        timers.current.add(handle);
+      }
     },
     [dismiss],
   );
+
+  useEffect(() => {
+    const pending = timers.current;
+    return () => {
+      for (const handle of pending) clearTimeout(handle);
+      pending.clear();
+    };
+  }, []);
 
   const api = useMemo<ToastApi>(
     () => ({

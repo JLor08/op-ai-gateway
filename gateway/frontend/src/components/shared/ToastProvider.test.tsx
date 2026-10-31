@@ -51,4 +51,20 @@ describe('ToastProvider', () => {
     });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
+
+  it('clears a pending success auto-dismiss timer when it unmounts', () => {
+    const { unmount } = render(
+      <ToastProvider>
+        <Harness />
+      </ToastProvider>,
+    );
+    // A success toast schedules its 4s auto-dismiss timer.
+    fireEvent.click(screen.getByRole('button', { name: 'ok' }));
+    expect(vi.getTimerCount()).toBe(1);
+    // Unmounting before it fires must clear it: otherwise the orphan tick calls
+    // setItems after the host (jsdom window) is torn down, which crashes other
+    // suites' tests with "ReferenceError: window is not defined".
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
