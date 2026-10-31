@@ -108,8 +108,11 @@ describe('voiceChatApi synthVoiceSection', () => {
       language: 'en',
     });
 
-    expect(result).toBeInstanceOf(Blob);
+    // The body is read as a Blob (not JSON/text). Check its shape structurally rather than
+    // with `instanceof Blob`, which is unreliable across the Node/undici realms CI exercises:
+    // response.blob() can hand back a Blob from a different realm than the test's global.
     expect(result.type).toBe('audio/wav');
+    expect(result.size).toBe(wav.length);
     // The bytes round-trip untouched (the body was read as a Blob, not decoded as JSON or text).
     expect(new Uint8Array(await result.arrayBuffer())).toEqual(wav);
     const [path, init] = fetcher.mock.calls[0];
