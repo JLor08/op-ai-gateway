@@ -662,6 +662,12 @@ const de = {
   chatTranscriptionRunPending: 'Warte auf Transkript',
   chatTranscriptionNoIntermediateNews:
     'Keine Zwischenmeldungen – das Transkript erscheint, sobald das Modell Text liefert.',
+  // The speaker view of a diarized transcription turn (#295): who said what. A speaker is named by
+  // its number -- 1, 2, ... in the order the speakers first spoke in THAT transcript -- not by the
+  // id the model reported, which is an arbitrary string (it may be "0", "SPEAKER_01", or empty).
+  chatTranscriptionSpeaker: (number: number) => `Sprecher ${number}`,
+  // The name of the list of turns, for assistive technology.
+  chatTranscriptionSpeakerView: 'Transkript nach Sprechern',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -4025,6 +4031,8 @@ const en: PortalMessages = {
   chatTranscriptionRunPending: 'Waiting for transcript',
   chatTranscriptionNoIntermediateNews:
     'No intermediate updates – the transcript appears as soon as the model delivers text.',
+  chatTranscriptionSpeaker: (number: number) => `Speaker ${number}`,
+  chatTranscriptionSpeakerView: 'Transcript by speaker',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',

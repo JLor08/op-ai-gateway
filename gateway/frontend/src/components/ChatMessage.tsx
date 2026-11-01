@@ -9,7 +9,13 @@ import CodeIcon from '@mui/icons-material/Code';
 import EditIcon from '@mui/icons-material/Edit';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutlined';
 import type { ChatContent, ChatContentPart } from './shared/chatContent';
-import { audioUrlsOf, hasRemovedAudio, imageUrlsOf, isMaskPart } from './shared/chatContent';
+import {
+  audioUrlsOf,
+  hasRemovedAudio,
+  imageUrlsOf,
+  isMaskPart,
+  speakerTranscriptOf,
+} from './shared/chatContent';
 import { MASK_THUMBNAIL_BACKGROUND } from './shared/maskThumbnail';
 import type { Translation } from './shared/types';
 import { dropLeadingBlank, segmentAnswer, type SpokenSection } from './shared/spokenSections';
@@ -22,6 +28,7 @@ import { AudioTailControls } from './AudioTailControls';
 import { AudioNotStoredTurn } from './AudioNotStoredTurn';
 import { AnswerBody } from './AnswerBody';
 import { SpokenAnswer, SpokenBlock, audioPairsBySection } from './SpokenAnswer';
+import { DiarizedTranscript, diarizedTranscriptText } from './DiarizedTranscript';
 import { TranscriptionPendingTurn } from './TranscriptionPendingTurn';
 
 function contentText(content: ChatContent): string {
@@ -211,6 +218,11 @@ function ChatMessageComponent({
   const text = contentText(content);
   const images = imageUrlsOf(content);
   const audioUrls = audioUrlsOf(content);
+  // A DIARIZED transcription turn's answer (#295): one speaker_transcript part, and NO text part
+  // beside it, so `text` above is empty for it. It is an answer all the same -- the turn's whole
+  // body -- so the guards below that read an empty text as "nothing has arrived yet" must not
+  // take it for a pending run.
+  const speakerTranscript = speakerTranscriptOf(content);
   // A speech turn's reply is one audio part when short and SEVERAL ordered parts when long;
   // the ASSISTANT turn renders them all as ONE player (AudioTurn stitches them into one
   // gapless clip), and the presence of any is what tells a finished speech turn from a
@@ -284,8 +296,9 @@ function ChatMessageComponent({
     // for a run that is not reasoning and emits nothing to count. `text.length === 0` is
     // the `no answer yet` guard that keeps it from replacing an arriving transcript (a
     // streaming model's first delta, a one-shot model's whole text), as images /
-    // audio parts do for the kinds above.
-    if (streaming && kind === 'transcription' && text.length === 0) {
+    // audio parts do for the kinds above. A diarized run's answer arrives as a speaker
+    // transcript instead, which has no text -- `!speakerTranscript` is the same guard for it.
+    if (streaming && kind === 'transcription' && text.length === 0 && !speakerTranscript) {
       return <TranscriptionPendingTurn t={t} elapsedMs={elapsedMs ?? 0} roleLabel={roleLabel} />;
     }
 
@@ -341,10 +354,16 @@ function ChatMessageComponent({
       ? audioUrls.length > 0 && !audioPairsBySection(audioUrls.length, sectionCount)
       : !hasSummaryBlock;
 
-    const showReasoning = Boolean(reasoning) || (streaming && text.length === 0);
+    // A row is still waiting for its first text while it streams with none -- unless the answer is
+    // there already as a speaker transcript, which has no text to wait for.
+    const awaitingText = streaming && text.length === 0 && !speakerTranscript;
+    // What Copy hands over: the answer's text -- or, for a diarized turn, which has none, the
+    // transcript with its speakers named, as the view shows it.
+    const copyText = speakerTranscript ? diarizedTranscriptText(t, speakerTranscript) : text;
+    const showReasoning = Boolean(reasoning) || awaitingText;
     const reasoningText = reasoning ?? '';
     let summary: string;
-    if (streaming && text.length === 0) {
+    if (awaitingText) {
       summary = `${t.chatReasoningActive} · ${reasoningText.length} ${t.chatCharsUnit}`;
     } else {
       const durationSuffix = reasoningMs ? `, ${(reasoningMs / 1000).toFixed(1)}s` : '';
@@ -411,27 +430,29 @@ function ChatMessageComponent({
             </Box>
           </Box>
         )}
-        {sectionLayout ? (
-          <SpokenAnswer
-            t={t}
-            segments={sectionLayout}
-            sectionCount={sectionCount}
-            audioUrls={audioUrls}
-            audioRemoved={audioRemoved}
-            turnId={turnId ?? ''}
-            raw={showRaw}
-            onRegenerate={onRegenerate}
-            onResynthSection={onResynthSection}
-            canRun={canRun}
-          />
-        ) : (
-          <>
-            {hasSummaryBlock && (
-              <SpokenBlock t={t} open={body.trim() === ''} text={summaryText} audio={audioNode} />
-            )}
-            <AnswerBody text={body} raw={showRaw} streaming={streaming} />
-          </>
-        )}
+        {speakerTranscript && <DiarizedTranscript t={t} part={speakerTranscript} raw={showRaw} />}
+        {!speakerTranscript &&
+          (sectionLayout ? (
+            <SpokenAnswer
+              t={t}
+              segments={sectionLayout}
+              sectionCount={sectionCount}
+              audioUrls={audioUrls}
+              audioRemoved={audioRemoved}
+              turnId={turnId ?? ''}
+              raw={showRaw}
+              onRegenerate={onRegenerate}
+              onResynthSection={onResynthSection}
+              canRun={canRun}
+            />
+          ) : (
+            <>
+              {hasSummaryBlock && (
+                <SpokenBlock t={t} open={body.trim() === ''} text={summaryText} audio={audioNode} />
+              )}
+              <AnswerBody text={body} raw={showRaw} streaming={streaming} />
+            </>
+          ))}
         {images.length > 0 && (
           <ImageTurn
             t={t}
@@ -480,7 +501,7 @@ function ChatMessageComponent({
             <IconButton
               size="small"
               aria-label={t.chatCopy}
-              onClick={() => void navigator.clipboard?.writeText(text).catch(() => {})}
+              onClick={() => void navigator.clipboard?.writeText(copyText).catch(() => {})}
             >
               <ContentCopyIcon fontSize="small" />
             </IconButton>

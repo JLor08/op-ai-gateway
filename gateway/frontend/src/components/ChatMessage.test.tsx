@@ -3,6 +3,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ComponentProps } from 'react';
 import { Typography } from '@mui/material';
 import { ChatMessage } from './ChatMessage';
 import { messages, type Locale } from '../i18n';
@@ -1998,6 +1999,153 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(trash()).toBeInTheDocument();
         expect(confirmButton()).toBeNull();
         expect(screen.queryByText(t.chatAudioDeleteConfirm)).toBeNull();
+      });
+    });
+
+    // A DIARIZED transcription turn (#295) commits ONE `speaker_transcript` part and no text part
+    // beside it, so the turn has no text at all: everything that keys on an empty text (the
+    // pending wait, the reasoning block) must leave it alone, and the speaker view owns the body.
+    describe('a diarized transcription turn', () => {
+      const DIARIZED = [
+        {
+          type: 'speaker_transcript' as const,
+          text: 'Good morning. Morning, shall we begin?',
+          turns: [
+            { speaker: '0', start: 0, end: 2, text: 'Good morning.' },
+            { speaker: '1', start: 2, end: 4.5, text: 'Morning, shall we begin?' },
+          ],
+        },
+      ];
+
+      it('renders the who-said-what view: one labelled block per turn, with its text and time', () => {
+        render(<ChatMessage t={t} role="assistant" turnId="msg_d1" content={DIARIZED} />);
+
+        const blocks = within(
+          screen.getByRole('list', { name: t.chatTranscriptionSpeakerView }),
+        ).getAllByRole('listitem');
+        expect(blocks).toHaveLength(2);
+        expect(within(blocks[0]).getByText(t.chatTranscriptionSpeaker(1))).toBeInTheDocument();
+        expect(within(blocks[0]).getByText('Good morning.')).toBeInTheDocument();
+        expect(within(blocks[0]).getByText('0:00–0:02')).toBeInTheDocument();
+        expect(within(blocks[1]).getByText(t.chatTranscriptionSpeaker(2))).toBeInTheDocument();
+        expect(within(blocks[1]).getByText('Morning, shall we begin?')).toBeInTheDocument();
+      });
+
+      it('is the answer body: no reasoning block, no pending wait, no player', () => {
+        const { container } = render(<ChatMessage t={t} role="assistant" content={DIARIZED} />);
+
+        expect(container.querySelector('details')).toBeNull();
+        expect(screen.queryByText(t.chatTranscriptionRunPending)).toBeNull();
+        expect(screen.queryByLabelText(t.chatGeneratedAudio)).toBeNull();
+        expect(screen.queryByText(t.chatAudioNotStored)).toBeNull();
+        // The ordinary assistant controls are all there.
+        expect(screen.getByRole('button', { name: t.chatCopy })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: t.chatViewRaw })).toBeInTheDocument();
+      });
+
+      it('takes the speaker view, not the pending wait, even for a row that is still streaming', () => {
+        const { container } = render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={DIARIZED}
+            streaming
+            kind="transcription"
+            elapsedMs={9_000}
+          />,
+        );
+
+        expect(screen.queryByText(t.chatTranscriptionRunPending)).toBeNull();
+        expect(screen.queryByText(new RegExp(t.chatReasoningActive))).toBeNull();
+        expect(container.querySelector('details')).toBeNull();
+        expect(
+          screen.getByRole('list', { name: t.chatTranscriptionSpeakerView }),
+        ).toBeInTheDocument();
+      });
+
+      it('still shows the pending wait for a diarized run that has produced nothing yet', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content=""
+            streaming
+            kind="transcription"
+            elapsedMs={9_000}
+          />,
+        );
+
+        expect(screen.getByText(t.chatTranscriptionRunPending)).toBeInTheDocument();
+        expect(screen.queryByRole('list', { name: t.chatTranscriptionSpeakerView })).toBeNull();
+      });
+
+      it('copies the transcript with its speaker labels, not an empty string', () => {
+        const writeText = vi.fn().mockResolvedValue(undefined);
+        vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+        render(<ChatMessage t={t} role="assistant" content={DIARIZED} />);
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatCopy }));
+
+        expect(writeText).toHaveBeenCalledWith(
+          `${t.chatTranscriptionSpeaker(1)}: Good morning.\n${t.chatTranscriptionSpeaker(2)}: Morning, shall we begin?`,
+        );
+      });
+
+      it('shows the whole transcript as plain text in the raw view', () => {
+        render(<ChatMessage t={t} role="assistant" content={DIARIZED} />);
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatViewRaw }));
+
+        expect(screen.getByText('Good morning. Morning, shall we begin?')).toBeInTheDocument();
+        expect(screen.queryByRole('list', { name: t.chatTranscriptionSpeakerView })).toBeNull();
+        // ...and the rendered view is one click back.
+        fireEvent.click(screen.getByRole('button', { name: t.chatViewRendered }));
+        expect(
+          screen.getByRole('list', { name: t.chatTranscriptionSpeakerView }),
+        ).toBeInTheDocument();
+      });
+
+      it('offers Regenerate like any other answer', () => {
+        const onRegenerate = vi.fn();
+        render(
+          <ChatMessage t={t} role="assistant" content={DIARIZED} onRegenerate={onRegenerate} />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: t.chatRegenerate }));
+
+        expect(onRegenerate).toHaveBeenCalledTimes(1);
+      });
+
+      it('loads from history without a crash when the part is of an unexpected shape', () => {
+        const broken = [
+          { type: 'speaker_transcript', text: 'only the text survived', turns: 'nope' },
+        ] as unknown as ComponentProps<typeof ChatMessage>['content'];
+        render(<ChatMessage t={t} role="assistant" content={broken} />);
+
+        expect(screen.getByText('only the text survived')).toBeInTheDocument();
+        expect(screen.queryByRole('list', { name: t.chatTranscriptionSpeakerView })).toBeNull();
+      });
+
+      it('renders a turn whose speaker id is empty, with a label and no gap', () => {
+        render(
+          <ChatMessage
+            t={t}
+            role="assistant"
+            content={[
+              {
+                type: 'speaker_transcript',
+                text: 'a b',
+                turns: [
+                  { speaker: '', text: 'a' },
+                  { speaker: '1', text: 'b' },
+                ],
+              },
+            ]}
+          />,
+        );
+
+        expect(screen.getByText(t.chatTranscriptionSpeaker(1))).toBeInTheDocument();
+        expect(screen.getByText(t.chatTranscriptionSpeaker(2))).toBeInTheDocument();
       });
     });
 
