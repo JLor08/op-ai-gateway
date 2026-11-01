@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -1829,6 +1830,14 @@ func TestTranscriptionRunDiarizedCommitsASpeakerTranscript(t *testing.T) {
 				`{"speaker":"0","start":1,"end":2,"text":"C."}]}]`,
 		},
 		{
+			// A positive but denormal rate overflows a large offset to +Inf, which cannot be
+			// marshalled: the times are left out (the span's start and end both), not the transcript lost.
+			name: "a rate whose division overflows leaves the times out",
+			body: detailsDocument("A. B.", `"sample_rate":5e-324`, detailsTurn(0, 16000, "0", "A."), detailsTurn(16000, 32000, "1", "B.")),
+			want: `[{"type":"speaker_transcript","text":"A. B.","turns":[` +
+				`{"speaker":"0","text":"A."},{"speaker":"1","text":"B."}]}]`,
+		},
+		{
 			// The document's other members (segments, words, a language) are not read.
 			name: "other members of the document are ignored",
 			body: `{"text":"A. B.","language":"en","segments":[{"start":0,"end":1,"text":"A. B."}],"words":[{"word":"A.","start":0,"end":0.5}],` +
@@ -1963,8 +1972,10 @@ func TestTranscriptionRunDiarizedEmptyTranscriptIsNoTranscript(t *testing.T) {
 }
 
 // A 2xx the run cannot read as the details document is the plain run's "response
-// unreadable" -- including a document whose speaker_turns is not a list of turns, which
-// the run does not guess a transcript out of.
+// unreadable": a body with no usable PRIMARY content -- no document at all, or a text that
+// is no string. (A valid text beside a malformed speaker_turns or sample_rate is not
+// here: that transcript is kept, see
+// TestTranscriptionRunDiarizedDegradesWhenOnlyTheEnrichmentIsMalformed.)
 func TestTranscriptionRunDiarizedTreatsAnUnusable2xxAsAnError(t *testing.T) {
 	cases := []struct{ name, contentType, body string }{
 		{"an empty body", "application/json", ``},
@@ -1973,10 +1984,12 @@ func TestTranscriptionRunDiarizedTreatsAnUnusable2xxAsAnError(t *testing.T) {
 		{"a JSON array", "application/json", `["hello"]`},
 		{"a JSON null", "application/json", `null`},
 		{"a text that is no string", "application/json", `{"text":5}`},
+		{
+			// Valid speaker turns do not rescue a text that is no string: there is no transcript.
+			name: "a text that is no string, beside valid speaker turns", contentType: "application/json",
+			body: `{"text":5,"speaker_turns":[` + detailsTurn(0, 16000, "0", "a") + `,` + detailsTurn(16000, 32000, "1", "b") + `],"sample_rate":16000}`,
+		},
 		{"a truncated body", "application/json", `{"text":"hello","speaker_turns":[{"start_sample":0,`},
-		{"speaker_turns that is no list", "application/json", `{"text":"hello","speaker_turns":"nope"}`},
-		{"a turn that is no object", "application/json", `{"text":"hello","speaker_turns":["a","b"]}`},
-		{"a sample_rate that is no number", "application/json", `{"text":"hello","speaker_turns":[],"sample_rate":"16000"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1986,6 +1999,70 @@ func TestTranscriptionRunDiarizedTreatsAnUnusable2xxAsAnError(t *testing.T) {
 			}
 			if len(snap.ContentParts) != 0 {
 				t.Fatalf("an unusable response commits no transcript, got %s", snap.ContentParts)
+			}
+		})
+	}
+}
+
+// speaker_turns and sample_rate are ENRICHMENT: a transcript that is valid (a non-empty
+// text string) is never thrown away because of them. A speaker_turns that cannot be read
+// as a list of turns -- not a list, entries that are no objects, a field of the wrong type
+// -- degrades to the ordinary text part of a plain run, whatever else the document says; a
+// sample_rate that is no number is no rate, so the times are left out and the speaker
+// view stands as long as two speakers still read. Neither is an error, and neither logs
+// the transcript.
+func TestTranscriptionRunDiarizedDegradesWhenOnlyTheEnrichmentIsMalformed(t *testing.T) {
+	const marker = "zebra-drift-marker"
+	good := detailsTurn(0, 16000, "0", marker) + `,` + detailsTurn(16000, 32000, "1", "b")
+	plain := `[{"type":"text","text":"` + marker + `"}]`
+	noTimes := `[{"type":"speaker_transcript","text":"` + marker + `","turns":[` +
+		`{"speaker":"0","text":"` + marker + `"},{"speaker":"1","text":"b"}]}]`
+	cases := []struct{ name, body, want string }{
+		{"speaker_turns that is a string", `{"text":"` + marker + `","speaker_turns":"nope"}`, plain},
+		{"speaker_turns that is an object", `{"text":"` + marker + `","speaker_turns":{"a":1},"sample_rate":16000}`, plain},
+		{"speaker_turns that is a number", `{"text":"` + marker + `","speaker_turns":3}`, plain},
+		{"a turn that is no object", `{"text":"` + marker + `","speaker_turns":["a","b"]}`, plain},
+		{
+			// One bad turn among good ones drops the whole view: a speaker view with a hole in it is not the conversation.
+			name: "one turn among good ones with a speaker_id that is no string",
+			body: `{"text":"` + marker + `","speaker_turns":[` + good + `,{"start_sample":32000,"end_sample":48000,"speaker_id":2,"text":"c"}],"sample_rate":16000}`,
+			want: plain,
+		},
+		{
+			name: "a turn whose offset is no number",
+			body: `{"text":"` + marker + `","speaker_turns":[` + good + `,{"start_sample":"32000","end_sample":48000,"speaker_id":"2","text":"c"}],"sample_rate":16000}`,
+			want: plain,
+		},
+		{"a sample_rate that is a string", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":"16000"}`, noTimes},
+		{"a sample_rate that is an object", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":{"hz":16000}}`, noTimes},
+		{"a sample_rate that is null", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":null}`, noTimes},
+		{"a sample_rate past float range", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":1e999}`, noTimes},
+		{"a malformed sample_rate beside one speaker", `{"text":"` + marker + `","speaker_turns":[` + detailsTurn(0, 16000, "0", marker) + `],"sample_rate":"16000"}`, plain},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&logged)
+			restored := false
+			restore := func() {
+				if !restored {
+					restored = true
+					log.SetOutput(previous)
+				}
+			}
+			t.Cleanup(restore)
+			snap, _ := diarizedRunOutcome(t, http.StatusOK, "application/json", tc.body)
+			restore() // before logged is read: no write can reach it after this
+
+			if snap.Status != "completed" || snap.Err != "" {
+				t.Fatalf("status = %q (err %q), want completed: the transcript is valid and must be kept", snap.Status, snap.Err)
+			}
+			if string(snap.ContentParts) != tc.want {
+				t.Fatalf("content parts = %s\nwant            %s", snap.ContentParts, tc.want)
+			}
+			if strings.Contains(logged.String(), marker) {
+				t.Fatalf("the log carries the transcript: %s", logged.String())
 			}
 		})
 	}

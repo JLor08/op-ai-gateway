@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -61,7 +62,8 @@ import (
 // speakers is committed as a speaker_transcript part, and anything else -- one speaker,
 // no speaker_turns at all because the mapped model does not diarize -- is the ordinary
 // text part of a plain run, so asking for diarization of a model that cannot is never an
-// error and never a blank turn.
+// error and never a blank turn. The same holds for a speaker_turns that cannot be read as
+// a list of turns: it is enrichment, and a valid transcript is never thrown away for it.
 //
 // transcriptionTextPart is THE content part a transcription turn emits:
 //
@@ -122,22 +124,25 @@ type transcriptionResponse struct {
 // its own, decoded ONLY by a diarized run, so a plain run keeps reading the plain document
 // whatever speaker_turns it happens to carry.
 //
-// A model that does not diarize answers a document without speaker_turns, which decodes
-// to none (as does null): the fallback to the plain transcript, not a failure. A
-// speaker_turns of any other shape, like a text that is no string, is a document this run
-// cannot read.
-//
-// The sample counts and the rate are decoded as NUMBERS, not integers, so a spelling such
-// as 16000.0 is still read; they are whole samples and Hz in practice.
+// Only the text is PRIMARY: it is the transcript, and a body whose text is no string is
+// a document this run cannot read. speaker_turns and sample_rate are ENRICHMENT, so they
+// are kept as raw JSON here and read LENIENTLY afterwards (speakerTurnsOf, sampleRateOf)
+// -- a member of the wrong shape must not fail the decode of a document whose transcript
+// is good. A model that does not diarize answers a document without speaker_turns (or
+// null): the fallback to the plain transcript, not a failure; and a speaker_turns that
+// cannot be read as a list of turns is the same fallback, logged. A sample_rate that is
+// not a number is no rate, which leaves the times out (turnSeconds).
 type transcriptionDetailsResponse struct {
-	Text         string                     `json:"text"`
-	SpeakerTurns []transcriptionSpeakerTurn `json:"speaker_turns"`
-	SampleRate   float64                    `json:"sample_rate"`
+	Text         string          `json:"text"`
+	SpeakerTurns json.RawMessage `json:"speaker_turns"`
+	SampleRate   json.RawMessage `json:"sample_rate"`
 }
 
 // transcriptionSpeakerTurn is one entry of the details document's speaker_turns: the
 // turn's span in samples of the document's sample_rate, the speaker's id and the text.
-// (A confidence member rides along in the document; nothing here is made of it.)
+// (A confidence member rides along in the document; nothing here is made of it.) The
+// offsets are decoded as NUMBERS, not integers, so a spelling such as 16000.0 is still
+// read; they are whole samples in practice.
 type transcriptionSpeakerTurn struct {
 	StartSample float64 `json:"start_sample"`
 	EndSample   float64 `json:"end_sample"`
@@ -186,8 +191,7 @@ const (
 	// transcriptionRunResponseUnreadableMessage: a 2xx the run cannot treat as the
 	// transcription's answer -- the body could not be read to its end (a truncated body,
 	// a connection the upstream dropped mid-write), or it is not the {"text":...}
-	// document (an HTML error page, a proxy's own body, a JSON of another shape -- for a
-	// diarized run that includes a speaker_turns that is no list of turns), or it
+	// document (an HTML error page, a proxy's own body, a JSON of another shape), or it
 	// is an event stream that ended before its transcript.text.done frame (cut by the
 	// upstream's death or the gateway's idle timeout: what arrived is not the whole
 	// transcript, and is never committed as one). A context that ended (deadline/cancel)
@@ -562,10 +566,13 @@ func transcriptionTurnFromResponse(run *ChatRun, resp *http.Response, payload []
 
 // transcriptionTurnFromDetails is transcriptionTurnFromResponse for a diarized run's 2xx
 // answer (the non-2xx case is refused by its caller): a body that is not the details
-// document is "response unreadable", a transcript that is empty is "no transcript" -- the
-// turns beside it do not make a blank speaker view of one -- and otherwise the turn is
-// the speaker transcript when the answer names at least two distinct speakers
-// (speakerTranscriptOf) and the ordinary text part of a plain run when it does not.
+// document -- no JSON object, or a text that is no string -- is "response unreadable", a
+// transcript that is empty is "no transcript" (the turns beside it do not make a blank
+// speaker view of one), and otherwise the turn is the speaker transcript when the answer
+// names at least two distinct speakers (speakerTranscriptOf) and the ordinary text part
+// of a plain run when it does not. A transcript that is valid is KEPT whatever its
+// enrichment looks like: speaker_turns that cannot be read leave the plain part, and a
+// sample_rate that cannot be read leaves the times out.
 func transcriptionTurnFromDetails(run *ChatRun, resp *http.Response, payload []byte) (json.RawMessage, string, string) {
 	// A pointer, for the plain document's reason: a body of JSON null is not a document.
 	var decoded *transcriptionDetailsResponse
@@ -577,49 +584,99 @@ func transcriptionTurnFromDetails(run *ChatRun, resp *http.Response, payload []b
 	if strings.TrimSpace(decoded.Text) == "" {
 		return nil, "error", transcriptionRunNoTranscriptMessage
 	}
-	if part, ok := speakerTranscriptOf(*decoded); ok {
+	turns := speakerTurnsOf(run, decoded.SpeakerTurns)
+	if part, ok := speakerTranscriptOf(decoded.Text, turns, sampleRateOf(run, decoded.SampleRate)); ok {
 		return transcriptionPartOutcome(run, part)
 	}
 	return transcriptionPartOutcome(run, transcriptionTextPart{Type: "text", Text: decoded.Text})
 }
 
-// speakerTranscriptOf builds the speaker transcript of a details answer and reports
-// whether the answer is one: it is when its turns name at least
-// minSpeakersForSpeakerTranscript distinct speaker ids, counted over the ids as audio.cpp
-// wrote them (a speaker who speaks again is the same speaker, whatever the turn count).
-// With fewer -- one speaker, or no turns because the model does not diarize -- it
-// reports false and the answer is the ordinary transcript.
+// speakerTurnsOf reads the details document's speaker_turns, which the document type
+// keeps raw (transcriptionDetailsResponse), as the list of turns. Absent and null are no
+// turns, as is an empty list. A member that is not a list of turn objects -- a string, an
+// object, an entry that is no object, a speaker_id that is no string, an offset that is
+// no number -- is no turns either, as a WHOLE: a speaker view with a hole in it would not
+// be the conversation, so one unreadable turn leaves the plain transcript rather than a
+// part of the view. That is a drift in what the upstream sends and is logged, WITHOUT the
+// member (it holds the transcript, and so does the decoder's error): its size is the
+// operator's signal.
+func speakerTurnsOf(run *ChatRun, raw json.RawMessage) []transcriptionSpeakerTurn {
+	if len(raw) == 0 {
+		return nil
+	}
+	var turns []transcriptionSpeakerTurn
+	if err := json.Unmarshal(raw, &turns); err != nil {
+		log.Printf("chat run %s: transcription details response has a speaker_turns that is not a list of turns (%d bytes); keeping the plain transcript", run.ID, len(raw))
+		return nil
+	}
+	return turns
+}
+
+// sampleRateOf reads the details document's sample_rate, which the document type keeps
+// raw (transcriptionDetailsResponse), as a number. Absent and null are no rate, and so is
+// anything that is not a number (a string, an object, a value past float range): 0, which
+// turnSeconds takes as "no times". The drift is logged, WITHOUT the value, as for
+// speakerTurnsOf.
+func sampleRateOf(run *ChatRun, raw json.RawMessage) float64 {
+	if len(raw) == 0 {
+		return 0
+	}
+	var rate float64
+	if err := json.Unmarshal(raw, &rate); err != nil {
+		log.Printf("chat run %s: transcription details response has a sample_rate that is not a number (%d bytes); leaving the turn times out", run.ID, len(raw))
+		return 0
+	}
+	return rate
+}
+
+// speakerTranscriptOf builds the speaker transcript of a details answer -- the answer's
+// text, its turns and the rate their offsets count in -- and reports whether the answer is
+// one: it is when its turns name at least minSpeakersForSpeakerTranscript distinct
+// speaker ids, counted over the ids as audio.cpp wrote them (a speaker who speaks again is
+// the same speaker, whatever the turn count). With fewer -- one speaker, or no turns
+// because the model does not diarize -- it reports false and the answer is the ordinary
+// transcript.
 //
 // The turns are kept whole and in order, the speaker id verbatim and the text untouched;
 // only the offsets change, from samples to seconds (turnSeconds).
-func speakerTranscriptOf(doc transcriptionDetailsResponse) (speakerTranscriptPart, bool) {
+func speakerTranscriptOf(text string, turns []transcriptionSpeakerTurn, sampleRate float64) (speakerTranscriptPart, bool) {
 	speakers := make(map[string]struct{}, minSpeakersForSpeakerTranscript)
-	for _, turn := range doc.SpeakerTurns {
+	for _, turn := range turns {
 		speakers[turn.SpeakerID] = struct{}{}
 	}
 	if len(speakers) < minSpeakersForSpeakerTranscript {
 		return speakerTranscriptPart{}, false
 	}
-	turns := make([]speakerTurnPart, 0, len(doc.SpeakerTurns))
-	for _, turn := range doc.SpeakerTurns {
-		start, end := turnSeconds(turn.StartSample, turn.EndSample, doc.SampleRate)
-		turns = append(turns, speakerTurnPart{Speaker: turn.SpeakerID, Start: start, End: end, Text: turn.Text})
+	parts := make([]speakerTurnPart, 0, len(turns))
+	for _, turn := range turns {
+		start, end := turnSeconds(turn.StartSample, turn.EndSample, sampleRate)
+		parts = append(parts, speakerTurnPart{Speaker: turn.SpeakerID, Start: start, End: end, Text: turn.Text})
 	}
-	return speakerTranscriptPart{Type: "speaker_transcript", Text: doc.Text, Turns: turns}, true
+	return speakerTranscriptPart{Type: "speaker_transcript", Text: text, Turns: parts}, true
 }
 
 // turnSeconds converts a turn's span, stated in samples of sampleRate, to seconds. It
 // answers nil, nil -- no times, which the part omits rather than invents -- when the rate
 // is not a positive number (absent from the document, zero or negative: there is nothing
-// to divide by, and a guess would put a wrong time on every turn) or when the span is no
-// span (a negative start, or an end before its start): a time that is nonsense is worse
-// than none, and the turn's speaker and text are still good.
+// to divide by, and a guess would put a wrong time on every turn), when the span is no
+// span (a negative start, or an end before its start), or when the division does not
+// give a finite number (a denormal rate against a large offset overflows to +Inf, which
+// cannot be marshalled and would cost the whole turn its transcript). A time that is
+// nonsense is worse than none, and the turn's speaker and text are still good.
 func turnSeconds(startSample, endSample, sampleRate float64) (start, end *float64) {
 	if sampleRate <= 0 || startSample < 0 || endSample < startSample {
 		return nil, nil
 	}
 	startSeconds, endSeconds := startSample/sampleRate, endSample/sampleRate
+	if !isFinite(startSeconds) || !isFinite(endSeconds) {
+		return nil, nil
+	}
 	return &startSeconds, &endSeconds
+}
+
+// isFinite reports whether v is a number JSON can carry: neither infinite nor NaN.
+func isFinite(v float64) bool {
+	return !math.IsInf(v, 0) && !math.IsNaN(v)
 }
 
 // transcriptionInputOf reads the clip of the LAST user message in the prepared
