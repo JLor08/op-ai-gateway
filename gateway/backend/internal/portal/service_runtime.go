@@ -2643,32 +2643,19 @@ func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Applica
 // stored Args/Env/ConfigFiles is a store-data problem, not a client-input one, but still
 // surfaces as the matching domain sentinel rather than a raw JSON error.
 //
-// VRAM_LOCKED IS THE OPERATOR'S ESCAPE FROM THE MEASUREMENT RATCHET, and the
-// per-GPU choice below is what makes it one. Read that loop first, because it
-// is closed and one-way: the agent measures its own child, the write-back
-// stores it, this function prefers measured over estimate, the agent reads it
-// back AS THE SPEC'S OWN DECLARED DEMAND, and Admit's rule 3 answers a demand
-// that exceeds its GPU's budget on its own with a TERMINAL not_permitted.
+// The per-GPU VRAM demand it pushes is max(measured, estimate): the operator's
+// estimate is a FLOOR and the agent's measurement raises it when reality is
+// higher, never the other way round. That is the "never under-reserve" rule,
+// and it matters here more than anywhere else because this value is not just
+// displayed -- the agent reads it back AS THE SPEC'S OWN DECLARED DEMAND and
+// feeds it into Admit, so a number that is too low is a co-resident pair that
+// reaches an OOM.
 //
-// A 24 GB card budgeted at 20000 MB for headroom, an 18000 MB estimate that
-// served fine, and one 22000 MB measurement (llama.cpp with a large KV cache)
-// is the whole scenario: from then on every start of a model that had been
-// working is refused, with no operator action having occurred anywhere. And it
-// could not be undone -- PutRuntimeSpec deliberately copies the stored measured
-// value forward and ignores what the request sends, the write-back skips
-// values <= 0, and the spec never runs again so no newer measurement is ever
-// taken. Raising the budget past what the card physically holds is a
-// capitulation rather than a lever, and deleting and re-adding the GPU row
-// across two saves is not something an operator can be expected to find.
-//
-// So vram_locked stops the gateway SERVING the measurement, not merely the
-// agent WRITING it: locked, the operator's own estimate is authoritative in
-// both directions. That is the plain reading of "locked", it is the only
-// reading under which the flag helps someone staring at a spec that will not
-// start, and it keeps the agent the owner of the measured number -- the
-// operator chooses whether to be GOVERNED by it, never what it says. The
-// measurement itself stays on file and stays visible in the portal, because it
-// is the evidence that explains why the operator had to intervene.
+// A 0 on either side is UNKNOWN, never "needs none": a measured 0 (never
+// measured) yields the estimate, an estimate of 0 yields the measurement, and
+// both 0 stays 0 so the agent still sees an unknown demand and bootstraps it.
+// Neither stored figure is rewritten by this -- the estimate stays the
+// operator's and the measurement stays the agent's.
 func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping, gpus []routing.RuntimeSpecGPU) (AgentRuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
@@ -2690,11 +2677,11 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 	}
 	gpuDTOs := make([]AgentRuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
-		// Measured wins -- unless the operator locked the spec's VRAM, in
-		// which case their estimate does. See the doc above for why the lock
-		// has to reach this line and not only the write-back.
+		// max(measured, estimate): the estimate is the floor, a larger
+		// measurement raises it. A measured 0 is below any positive estimate
+		// so it falls through to the estimate, and both 0 stays 0 (unknown).
 		vram := g.VRAMMeasuredMB
-		if spec.VRAMLocked || vram == 0 {
+		if vram < g.VRAMEstimateMB {
 			vram = g.VRAMEstimateMB
 		}
 		gpuDTOs = append(gpuDTOs, AgentRuntimeSpecGPUDTO{Index: g.GPUIndex, VRAMMB: vram})
