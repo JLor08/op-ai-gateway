@@ -52,11 +52,17 @@ var liveTicketEncoding = base64.RawURLEncoding.Strict()
 //
 // The WebSocket handler consumes only Target.Model (the model name it loops back
 // with), the four PCM params and UserID (the trusted-loopback identity it replays
-// as). Resolution, the per-route guard, admission and billing all re-run at
+// as). These are LOAD-BEARING: dropping any of them breaks the loopback. Resolution,
+// the per-route guard, admission and billing all re-run at
 // /v1/audio/transcriptions/live, so a live row is attributed to that loopback user.
-// TokenID and the service/project fields still travel for audit and so a ticket is
-// a faithful record of the authenticated request; they are no longer read by the
-// relay's billing path.
+//
+// Everything else is AUDIT-ONLY, deliberately kept (#292): TokenID and the
+// service/project fields (ServiceID/ServiceName/ProjectID/ProjectName), plus the rest
+// of Target beyond .Model (Endpoint, the sealed APIToken, upstream headers -- /v1
+// re-resolves those from the model, so the loopback no longer reads them). They still
+// travel, encrypted, so a redeemed ticket stays a faithful record of the authenticated
+// request; TestLiveTicketClaimsAreNotReadableFromTheToken pins that none of them --
+// the sealed credential included -- can be read back out of the token.
 type liveTicketClaims struct {
 	Nonce      string
 	Exp        int64 // Unix seconds; a ticket is redeemable while now <= Exp
