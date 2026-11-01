@@ -198,6 +198,17 @@ type ManagerOptions struct {
 	// nothing, such as most tests) holds nothing back, and a negative value is
 	// treated as zero, since it would inflate the pool past what the host has.
 	HostRAMReserveMB int
+	// RAMBootstrapGuessMB is the conservative host-RAM footprint, in MB, charged to
+	// a spec of unknown RAM demand on its FIRST start so that cold start is admitted
+	// against the host-RAM pool instead of starting blind -- replaced by the real
+	// measurement once one lands. It is OPERATOR configuration from the agent's own
+	// local settings (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB) -- the gateway never supplies
+	// it. Fixed for the process lifetime, like the other options here. The agent's
+	// config defaults it to 4096 (erring high is the safe direction); zero here (the
+	// default of a caller that sets nothing, such as most tests) turns the guess off
+	// so an unknown-RAM spec starts unconstrained, and a negative value is treated
+	// as zero.
+	RAMBootstrapGuessMB int
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -300,17 +311,18 @@ func NewManager(opts ManagerOptions) *Manager {
 		logs:        NewLogStore(opts.LogBufferBytes, opts.LogBufferTotalBytes),
 	}
 	o := &owner{
-		m:                  m,
-		policy:             opts.Policy,
-		getenv:             getenv,
-		gpuVendor:          opts.GPUVendor,
-		specsFromLocalFile: opts.SpecsFromLocalFile,
-		configFilesDir:     opts.ConfigFilesDir,
-		vramHeadroomMB:     max(0, opts.VRAMHeadroomMB),
-		hostRAMReserveMB:   max(0, opts.HostRAMReserveMB),
-		specs:              make(map[string]*specState),
-		allowedPairs:       map[[2]string]bool{},
-		logs:               m.logs,
+		m:                   m,
+		policy:              opts.Policy,
+		getenv:              getenv,
+		gpuVendor:           opts.GPUVendor,
+		specsFromLocalFile:  opts.SpecsFromLocalFile,
+		configFilesDir:      opts.ConfigFilesDir,
+		vramHeadroomMB:      max(0, opts.VRAMHeadroomMB),
+		hostRAMReserveMB:    max(0, opts.HostRAMReserveMB),
+		ramBootstrapGuessMB: max(0, opts.RAMBootstrapGuessMB),
+		specs:               make(map[string]*specState),
+		allowedPairs:        map[[2]string]bool{},
+		logs:                m.logs,
 	}
 	m.wg.Add(1)
 	go func() {
@@ -1017,6 +1029,11 @@ type owner struct {
 	// Fixed for the process lifetime, so a plain field like vramHeadroomMB
 	// above; read only by buildSnapshot's host-RAM budget.
 	hostRAMReserveMB int
+	// ramBootstrapGuessMB is ManagerOptions.RAMBootstrapGuessMB, never negative.
+	// Fixed for the process lifetime, so a plain field like hostRAMReserveMB
+	// above; read only by buildSnapshot, which copies it into the snapshot's
+	// RAMBootstrapGuessMB for Admit (the one place that interprets it).
+	ramBootstrapGuessMB int
 	// ramFreedMB is the host RAM that managed processes held when they exited
 	// and that the hardware sample has not necessarily caught up with yet, valid
 	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
@@ -2115,7 +2132,10 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		// not be issued on the strength of either.
 		HostRAMCeilingMB:     hostRAMBudgetMB(hi, ramBoundMB+o.pendingRAMFreedMB(), o.hostRAMReserveMB),
 		RAMBootstrapInFlight: ramBootstrapInFlight,
-		Allowed:              o.allowedPairs,
+		// Copied verbatim; Admit is the one place that interprets it (0 = off),
+		// like every budget. It applies only to an unknown-RAM candidate.
+		RAMBootstrapGuessMB: o.ramBootstrapGuessMB,
+		Allowed:             o.allowedPairs,
 	}
 }
 

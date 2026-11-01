@@ -317,11 +317,41 @@ type Config struct {
 	// Env-only (OP_AGENT_HOST_RAM_RESERVE_MB), for the same reason as
 	// VRAMHeadroomMB: a host-tuning escape hatch the gateway can never supply.
 	HostRAMReserveMB int
+	// RAMBootstrapGuessMB is the conservative host-RAM footprint, in MB, the agent
+	// charges a spec of UNKNOWN RAM demand (ram_mb 0, no measurement yet) on its
+	// FIRST start, so that cold start is admitted against the host-RAM pool like
+	// any other instead of starting blind. It is replaced by the real measurement
+	// within a beat or two on a host that can measure RAM.
+	//
+	// It errs HIGH on purpose (DefaultRAMBootstrapGuessMB): a first start that
+	// under-estimates and then allocates more than the headroom it was admitted
+	// into is exactly how a cold start OOMs its neighbours, the one outcome the
+	// whole feature exists to prevent. The cost of erring high is only that a new
+	// spec's first start waits, or evicts an idle neighbour, on a host too tight
+	// for the guess -- never a lost or corrupted running model. A guess larger than
+	// the whole pool makes the first start wait until an operator supplies a
+	// ram_mb estimate (which is then accounted exactly) or lowers this knob, rather
+	// than ever starting blind.
+	//
+	// 0 turns the knob OFF: an unknown-RAM spec starts unconstrained, exactly as
+	// before RAM was an admission axis. Env-only
+	// (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB), for the same reason as the two above: a
+	// host-tuning escape hatch the gateway can never supply.
+	RAMBootstrapGuessMB int
 }
 
 // DefaultHostRAMReserveMB is the host-RAM reserve, in MB, an agent holds back
 // when OP_AGENT_HOST_RAM_RESERVE_MB is unset or unusable.
 const DefaultHostRAMReserveMB = 2048
+
+// DefaultRAMBootstrapGuessMB is the conservative first-start host-RAM guess, in
+// MB, an agent charges a spec of unknown RAM demand when
+// OP_AGENT_RAM_BOOTSTRAP_GUESS_MB is unset or unusable. 4 GB is deliberately on
+// the high side of a typical model-server process's resident host footprint (the
+// safe direction -- see Config.RAMBootstrapGuessMB) while staying under the
+// host-RAM pool of any host with a few GB free, so it does not make a legitimate
+// small model's first start wait on a modest host.
+const DefaultRAMBootstrapGuessMB = 4096
 
 // fileConfig mirrors the JSON config file. All fields are optional; a value set
 // by an env var or flag overrides the file. TLSInsecure is a pointer so an
@@ -485,8 +515,9 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
 		RuntimeLogBufferTotalBytes: resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES"), file.RuntimeLogBufferTotalBytes),
 
-		VRAMHeadroomMB:   resolveVRAMHeadroomMB(getenv("OP_AGENT_VRAM_HEADROOM_MB")),
-		HostRAMReserveMB: resolveHostRAMReserveMB(getenv("OP_AGENT_HOST_RAM_RESERVE_MB")),
+		VRAMHeadroomMB:      resolveVRAMHeadroomMB(getenv("OP_AGENT_VRAM_HEADROOM_MB")),
+		HostRAMReserveMB:    resolveHostRAMReserveMB(getenv("OP_AGENT_HOST_RAM_RESERVE_MB")),
+		RAMBootstrapGuessMB: resolveRAMBootstrapGuessMB(getenv("OP_AGENT_RAM_BOOTSTRAP_GUESS_MB")),
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportWebSocket
@@ -568,6 +599,25 @@ func resolveHostRAMReserveMB(envVal string) int {
 		}
 	}
 	return DefaultHostRAMReserveMB
+}
+
+// resolveRAMBootstrapGuessMB parses the env-only OP_AGENT_RAM_BOOTSTRAP_GUESS_MB:
+// a non-negative base-10 integer number of MB, default DefaultRAMBootstrapGuessMB.
+// 0 is a real value (turn the cold-start guess off, so an unknown-RAM spec starts
+// unconstrained), so it is accepted as itself rather than treated as "unset". An
+// absent, blank, malformed, fractional or negative value yields the default
+// instead of failing the whole load, for the same reason resolveHostRAMReserveMB
+// does: a mistyped tuning knob must not take the agent, and every model on the
+// host, down with it. A negative guess is not honoured -- a negative charge would
+// read as "needs less than nothing" and defeat the whole point of a conservative
+// floor.
+func resolveRAMBootstrapGuessMB(envVal string) int {
+	if v := strings.TrimSpace(envVal); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return DefaultRAMBootstrapGuessMB
 }
 
 // resolveStringList applies env(if non-empty, comma-separated) > file for a

@@ -195,6 +195,11 @@ func main() {
 		// Operator-owned (OP_AGENT_HOST_RAM_RESERVE_MB, default 2048), never
 		// gateway-supplied.
 		HostRAMReserveMB: cfg.HostRAMReserveMB,
+		// Conservative first-start host-RAM guess for a spec of unknown RAM demand,
+		// so its cold start is admitted against the pool instead of starting blind.
+		// Operator-owned (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB, default 4096), never
+		// gateway-supplied.
+		RAMBootstrapGuessMB: cfg.RAMBootstrapGuessMB,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
@@ -322,7 +327,8 @@ func main() {
 		"runtime_log_buffer_bytes", logBufferPerSpec,
 		"runtime_log_buffer_total_bytes", logBufferTotal,
 		"vram_headroom_mb", cfg.VRAMHeadroomMB,
-		"host_ram_reserve_mb", cfg.HostRAMReserveMB)
+		"host_ram_reserve_mb", cfg.HostRAMReserveMB,
+		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB)
 	// A loopback runtime_router_bind under cert_mode=proxy is the workaround
 	// operators used to repair the proxied path before the in-process wiring
 	// above existed. It is no longer needed, and it is no longer free: it

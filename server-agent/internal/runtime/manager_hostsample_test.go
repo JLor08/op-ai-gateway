@@ -625,6 +625,26 @@ func TestBuildSnapshotMarksRAMBootstrapInFlight(t *testing.T) {
 	})
 }
 
+// TestBuildSnapshotCarriesRAMBootstrapGuess: the owner's configured guess
+// (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB, plumbed to o.ramBootstrapGuessMB) reaches
+// Admit through the snapshot verbatim, so the one place that interprets it is
+// Admit (as with every other budget).
+func TestBuildSnapshotCarriesRAMBootstrapGuess(t *testing.T) {
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 40000})
+	o.ramBootstrapGuessMB = 4096
+	if got := o.buildSnapshot().RAMBootstrapGuessMB; got != 4096 {
+		t.Errorf("RAMBootstrapGuessMB = %d, want the configured 4096", got)
+	}
+
+	// The default of a caller that sets nothing (most tests) is 0: the knob off.
+	o2, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o2.m.SetHostInfo(HostInfo{MemAvailableMB: 40000})
+	if got := o2.buildSnapshot().RAMBootstrapGuessMB; got != 0 {
+		t.Errorf("RAMBootstrapGuessMB = %d with nothing configured, want 0", got)
+	}
+}
+
 // TestAdmitAndStartClearsTheRAMWaitFlagOnEveryEarlyReturn: waitingOnRAM selects a
 // spec for a sample wake, so it must never outlive the Wait it describes -- not
 // even on the returns that precede any verdict (nobody wants the spec up, or it

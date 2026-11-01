@@ -1788,12 +1788,14 @@ func TestAdmitRAMUnconstrainedWhenBudgetZero(t *testing.T) {
 	}
 }
 
-// TestAdmitRAMUnknownDemandNotGatedYet: a candidate whose own RAM demand is 0 is
-// UNKNOWN, never "needs none", and this rule does not gate it -- routing an
-// unknown demand to a first measurement is the cold-start bootstrap's job. Until
-// that exists it starts exactly as it did before RAM was an admission axis,
-// however tight the pool looks, and it evicts nobody.
-func TestAdmitRAMUnknownDemandNotGatedYet(t *testing.T) {
+// TestAdmitRAMUnknownDemandNotGatedWithoutAGuess: a candidate whose own RAM demand
+// is 0 is UNKNOWN, never "needs none". Routing an unknown demand to a first
+// measurement is the cold-start bootstrap's job, and when no bootstrap guess is
+// configured (RAMBootstrapGuessMB 0, the knob off) rule 6 charges it nothing, so it
+// starts exactly as it did before RAM was an admission axis, however tight the pool
+// looks, and it evicts nobody. (With a guess configured it is charged that guess
+// instead -- see TestRAMBootstrapStartsWithoutEvictionWhenHeadroom and friends.)
+func TestAdmitRAMUnknownDemandNotGatedWithoutAGuess(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
 			{SpecID: "resident", RAMMB: 10000, LastUsed: t0},
@@ -1802,7 +1804,7 @@ func TestAdmitRAMUnknownDemandNotGatedYet(t *testing.T) {
 		Allowed:         allowPairs("cand", "resident"),
 	}
 	got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
-	assertDecision(t, "unknown candidate demand is not gated", got, Decision{OK: true, Evict: []string{}})
+	assertDecision(t, "unknown candidate demand is not gated without a guess", got, Decision{OK: true, Evict: []string{}})
 }
 
 // TestAdmitRAMUnknownOccupantContributesNothingAndIsNotAVictim: the occupant
@@ -1986,6 +1988,169 @@ func TestRAMBootstrapBlocksConcurrentRAMAdmission(t *testing.T) {
 		snap.RAMBootstrapInFlight = false
 		got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
 		assertDecision(t, "no interlock, candidate fits", got, Decision{OK: true, Evict: []string{}})
+	})
+}
+
+// TestRAMBootstrapStartsWithoutEvictionWhenHeadroom is the common case (task
+// 4.2): an unknown-RAM candidate is charged a conservative first guess
+// (snap.RAMBootstrapGuessMB) instead of nothing, and when the host has headroom
+// for the guess it just starts and measures -- no eviction. Default-on RAM
+// accounting must not churn the host on every new spec's first start.
+func TestRAMBootstrapStartsWithoutEvictionWhenHeadroom(t *testing.T) {
+	snap := PolicySnapshot{
+		Running:             []RunningProc{{SpecID: "idle", RAMMB: 6000, LastUsed: t0}},
+		HostRAMBudgetMB:     40000,
+		RAMBootstrapGuessMB: 8000,
+		Allowed:             allowPairs("cand", "idle"),
+	}
+	// 8000 guess + 6000 resident = 14000 <= 40000: fits, and the idle neighbour
+	// that the arithmetic COULD have drained is left untouched.
+	got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
+	assertDecision(t, "unknown-RAM candidate admits on the guess, no eviction", got, Decision{OK: true, Evict: []string{}})
+
+	// The guess is charged like any demand: sized up so it just fits is still OK.
+	snap.HostRAMBudgetMB = 14000
+	got = Admit(snap, Spec{ID: "cand", RAMMB: 0})
+	assertDecision(t, "the guess summing exactly to the pool fits", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestRAMBootstrapPreEvictsUnderPressure: only when the host is genuinely too
+// tight for the guess does the bootstrap pre-evict idle processes, host-wide and
+// oldest-LastUsed first, until the guess fits -- the same machinery rule 6 uses
+// for a known demand, just with the guess standing in for the unknown one.
+func TestRAMBootstrapPreEvictsUnderPressure(t *testing.T) {
+	t.Run("one idle neighbour is drained to fit the guess", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running:             []RunningProc{{SpecID: "idle", RAMMB: 6000, LastUsed: t0}},
+			HostRAMBudgetMB:     10000,
+			RAMBootstrapGuessMB: 8000,
+			Allowed:             allowPairs("cand", "idle"),
+		}
+		// 8000 + 6000 = 14000 > 10000; draining "idle" leaves the 8000 guess alone.
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
+		assertDecision(t, "the idle neighbour is pre-evicted for the guess", got, Decision{Evict: []string{"idle"}})
+	})
+
+	t.Run("victims are drawn oldest-first, host-wide, until the guess fits", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "new", RAMMB: 5000, LastUsed: t2},
+				{SpecID: "old", RAMMB: 5000, LastUsed: t0},
+				{SpecID: "mid", RAMMB: 5000, LastUsed: t1},
+			},
+			HostRAMBudgetMB:     16000,
+			RAMBootstrapGuessMB: 8000,
+			Allowed:             allowPairs("cand", "new", "old", "mid"),
+		}
+		// 8000 + 15000 = 23000; drain old -> 18000 (over); drain mid -> 13000 (fits).
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
+		assertDecision(t, "oldest-first until the guess fits", got, Decision{Evict: []string{"old", "mid"}})
+	})
+}
+
+// TestRAMBootstrapWaitsWhenNoIdleVictimUnderPressure is the safety crux: when the
+// host is too tight for the guess AND nothing idle can be drained to make room,
+// the bootstrap WAITS (WaitOnRAM) -- it never blind-starts into RAM that is not
+// there, which is exactly how a cold start would OOM its neighbours.
+func TestRAMBootstrapWaitsWhenNoIdleVictimUnderPressure(t *testing.T) {
+	cases := []struct {
+		name    string
+		running []RunningProc
+	}{
+		{
+			name: "every neighbour is busy",
+			running: []RunningProc{
+				{SpecID: "busy-a", RAMMB: 6000, InFlight: 1, LastUsed: t0},
+				{SpecID: "busy-b", RAMMB: 4000, InFlight: 2, LastUsed: t1},
+			},
+		},
+		{
+			name: "the only roomy neighbour is pinned",
+			running: []RunningProc{
+				{SpecID: "pinned", RAMMB: 6000, Pinned: true, LastUsed: t0},
+				{SpecID: "busy", RAMMB: 4000, InFlight: 1, LastUsed: t1},
+			},
+		},
+		{
+			name: "a neighbour still loading is never a victim",
+			running: []RunningProc{
+				{SpecID: "loading", RAMMB: 6000, Starting: true, LastUsed: t0},
+				{SpecID: "busy", RAMMB: 4000, InFlight: 1, LastUsed: t1},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := PolicySnapshot{
+				Running:             tc.running,
+				HostRAMBudgetMB:     10000,
+				RAMBootstrapGuessMB: 8000,
+				Allowed:             allowPairs("cand", "busy-a", "busy-b", "pinned", "busy", "loading"),
+			}
+			// 8000 guess + 10000 resident = 18000 > 10000, and nothing drainable
+			// can bring it down: Wait, never a start, never a partial eviction.
+			got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
+			assertDecision(t, tc.name, got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+		})
+	}
+}
+
+// TestRAMBootstrapGuessNeverRefusesTerminally: the guess is an inflated stand-in,
+// not the spec's real demand, so a guess the pool cannot hold -- even with
+// everything evicted -- must still WAIT (resolvable by a fresh sample, an estimate
+// or room opening up), never the terminal own-demand refusal that a KNOWN
+// oversized demand earns. Refusing a spec terminally on a number nobody measured
+// would be wrong.
+func TestRAMBootstrapGuessNeverRefusesTerminally(t *testing.T) {
+	snap := PolicySnapshot{
+		HostRAMBudgetMB:     4000,
+		HostRAMCeilingMB:    4000,
+		RAMBootstrapGuessMB: 8000, // alone exceeds the whole pool
+		Allowed:             allowPairs("cand"),
+	}
+	got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
+	assertDecision(t, "an oversized guess waits, never refuses", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+}
+
+// TestRAMBootstrapGuessUnconfiguredStartsUnconstrained: with the knob off
+// (RAMBootstrapGuessMB 0) an unknown-RAM candidate charges nothing and starts as
+// it did before the bootstrap existed, however tight the pool -- the behaviour
+// TestAdmitRAMUnknownDemandNotGatedWithoutAGuess pins, here asserted explicitly
+// against the guess field.
+func TestRAMBootstrapGuessUnconfiguredStartsUnconstrained(t *testing.T) {
+	snap := PolicySnapshot{
+		Running:             []RunningProc{{SpecID: "resident", RAMMB: 10000, LastUsed: t0}},
+		HostRAMBudgetMB:     4000, // already overflowed by the resident alone
+		RAMBootstrapGuessMB: 0,    // the knob is off
+		Allowed:             allowPairs("cand", "resident"),
+	}
+	got := Admit(snap, Spec{ID: "cand", RAMMB: 0})
+	assertDecision(t, "no guess configured: unknown candidate is not gated", got, Decision{OK: true, Evict: []string{}})
+}
+
+// TestRAMBootstrapComposesWithOtherRules: the guess path is the ordinary rule 6
+// with the guess substituted, so it shares toEvict with the other rules -- a
+// process already queued by a VRAM budget is not charged or drained twice, and the
+// process-count limit asks only for what the guess did not already supply.
+func TestRAMBootstrapComposesWithOtherRules(t *testing.T) {
+	t.Run("a VRAM victim is not double-counted by the guess", func(t *testing.T) {
+		// "occ" is both over GPU 0's budget (rule 3 evicts it) and the only RAM
+		// holder. The guess must see it as already gone, not drain a second victim.
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "occ", GPUs: map[int]int{0: 5000}, RAMMB: 6000, LastUsed: t0},
+				{SpecID: "other", RAMMB: 3000, LastUsed: t1},
+			},
+			Budgets:             map[int]int{0: 5000},
+			HostRAMBudgetMB:     12000,
+			RAMBootstrapGuessMB: 4000,
+			Allowed:             allowPairs("cand", "occ", "other"),
+		}
+		// candidate wants GPU 0 at 3000: 3000 + occ 5000 = 8000 > 5000 budget ->
+		// rule 3 evicts occ. RAM: guess 4000 + other 3000 = 7000 (occ already gone)
+		// <= 12000, so the guess needs no further victim: Evict is just [occ].
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 0, GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}}})
+		assertDecision(t, "the VRAM victim covers the RAM too", got, Decision{Evict: []string{"occ"}})
 	})
 }
 

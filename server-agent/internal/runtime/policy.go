@@ -104,6 +104,21 @@ type PolicySnapshot struct {
 	// both cases when it exits or an operator fills its estimate in. Admit only
 	// acts on it when RAM is actually being accounted (HostRAMBudgetMB > 0).
 	RAMBootstrapInFlight bool
+	// RAMBootstrapGuessMB is the conservative host-RAM footprint Admit charges an
+	// UNKNOWN-RAM candidate (spec.RAMMB == 0) on its first start, in place of the
+	// nothing it would otherwise contribute to rule 6 (task 4.2). It is operator
+	// configuration (OP_AGENT_RAM_BOOTSTRAP_GUESS_MB, owner.ramBootstrapGuessMB)
+	// copied through verbatim; 0 is the sentinel for OFF -- the pre-bootstrap
+	// behaviour, an unknown-RAM spec starting unconstrained -- so Admit substitutes
+	// the guess only when it is > 0 (and only when HostRAMBudgetMB > 0, i.e. RAM is
+	// being accounted at all).
+	//
+	// It drives ONLY rule 6's eviction/wait arithmetic, never a terminal refusal:
+	// the guess is an inflated stand-in, not a measured demand, so a guess the pool
+	// cannot hold waits (resolvable by a sample, an estimate, or room opening up),
+	// where a KNOWN demand that large is refused (ramOwnDemandRefusal). It applies
+	// to the CANDIDATE only; an occupant's own RAM is always its RunningProc.RAMMB.
+	RAMBootstrapGuessMB int
 	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
 	// may run together. Build it with Config.AllowedPairs(), never by
 	// hand-rolling a map from Config.Coresident's raw wire-order pairs --
@@ -687,15 +702,19 @@ func sortOldestFirst(procs []RunningProc) {
 //     out. Spec's own demand is already known to fit each budget by
 //     itself: step 1 refused it otherwise.
 //  5. Host-RAM pool (rule 6), the host-scoped twin of step 4, evaluated with
-//     steps 3-4's queued evictions notionally already gone: spec's own RAM
-//     demand plus every remaining process's RAM, against the one
-//     PolicySnapshot.HostRAMBudgetMB. A budget <= 0 (no sample yet) and an
-//     unknown candidate demand (RAMMB 0, left to the cold-start bootstrap)
-//     skip it, and a demand that exceeds the whole budget by itself was
-//     already refused in step 1. Overflow evicts idle processes HOST-WIDE --
-//     any of them, not one GPU's occupants -- oldest LastUsed first, until it
-//     fits; if the idle ones cannot make it fit, step 7 answers Wait. A still-loading process is never
-//     a victim, so it reserves its RAM.
+//     steps 3-4's queued evictions notionally already gone: the candidate's RAM
+//     charge plus every remaining process's RAM, against the one
+//     PolicySnapshot.HostRAMBudgetMB. A budget <= 0 (no sample yet) skips it. The
+//     candidate's charge is its KNOWN demand, or -- when that demand is unknown
+//     (RAMMB 0) -- the conservative cold-start guess RAMBootstrapGuessMB in its
+//     place (task 4.2; 0 guess = off, skip). While another spec's RAM is
+//     mid-bootstrap (RAMBootstrapInFlight, task 4.1) EVERY RAM admission Waits
+//     here instead, evicting nothing. A known demand that exceeds the whole budget
+//     by itself was already refused in step 1; the guess never refuses. Overflow
+//     evicts idle processes HOST-WIDE -- any of them, not one GPU's occupants --
+//     oldest LastUsed first, until it fits; if the idle ones cannot make it fit,
+//     step 7 answers Wait. A still-loading process is never a victim, so it
+//     reserves its RAM.
 //  6. Process-count limit (rule 2), evaluated last so it only asks for as
 //     many ADDITIONAL evictions as steps 3-5 have not already supplied.
 //  7. Build the Decision: any non-evictable blocker anywhere makes the
@@ -997,12 +1016,17 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	//   - HostRAMBudgetMB <= 0 is unconstrained (no hardware sample yet), skipped
 	//     outright, and the check lives HERE rather than in buildSnapshot for the
 	//     reason given on PolicySnapshot.Budgets.
-	//   - spec.RAMMB == 0 is an UNKNOWN demand, never "needs none", and it is NOT
-	//     gated here: sending an unknown demand to a first measurement is the
-	//     cold-start bootstrap's job. Until it exists such a spec starts as it
-	//     always has. An occupant's unknown RAMMB is the same 0 and contributes
-	//     nothing; it is not a RAM victim either, since draining it frees
-	//     nothing this arithmetic can count.
+	//   - spec.RAMMB == 0 is an UNKNOWN demand, never "needs none". Sending an
+	//     unknown demand to a first measurement is the cold-start bootstrap's job
+	//     (task 4.2): the candidate is charged snap.RAMBootstrapGuessMB in its
+	//     place -- a conservative stand-in weighed against the pool like a known
+	//     demand, so a first start fits beside room, pre-evicts idle oldest-first
+	//     when tight, or Waits rather than blind-starting. A guess of 0 (the knob
+	//     off) charges nothing and the spec starts unconstrained, as before the
+	//     bootstrap existed. An OCCUPANT's unknown RAMMB is the same 0 and still
+	//     contributes nothing; it is not a RAM victim either, since draining it
+	//     frees nothing this arithmetic can count (the guess is the CANDIDATE's
+	//     alone, never charged to a running process).
 	//
 	// A process that is still loading is in running with its RAMMB and is never
 	// evictable (isEvictable), so it reserves what it occupies: a second
@@ -1029,8 +1053,24 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 			// Evict list), and WaitOnRAM so the next hardware sample re-asks it.
 			blocked = true
 			ramBlocked = true
-		case spec.RAMMB > 0:
-			sum := spec.RAMMB
+		default:
+			// The candidate's own charge. A KNOWN demand is itself; an UNKNOWN one
+			// (spec.RAMMB == 0, specHasUnknownRAM) is charged the conservative
+			// cold-start guess instead of nothing (task 4.2), so its first start is
+			// weighed against the pool like any other -- fitting with no eviction
+			// when there is headroom, pre-evicting idle oldest-first only when the
+			// host is genuinely too tight, and Waiting (below) rather than
+			// blind-starting when nothing idle can make room. A guess of 0 (the
+			// knob off) leaves candidateRAM 0, so this whole rule is skipped and the
+			// spec starts unconstrained, exactly as before the bootstrap existed.
+			candidateRAM := spec.RAMMB
+			if specHasUnknownRAM(spec) {
+				candidateRAM = snap.RAMBootstrapGuessMB
+			}
+			if candidateRAM <= 0 {
+				break
+			}
+			sum := candidateRAM
 			var holders []RunningProc
 			for _, r := range running {
 				if _, already := toEvict[r.SpecID]; already {
