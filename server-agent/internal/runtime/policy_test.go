@@ -1880,6 +1880,115 @@ func TestAdmitStartingProcReservesRAM(t *testing.T) {
 	})
 }
 
+// TestBootstrapConditionDetected pins the cold-start bootstrap predicates: the
+// pure RAM one (specHasUnknownRAM), the RAM-and-no-measurement combination that
+// routes a FIRST start to the bootstrap (needsRAMBootstrap), and the VRAM one it
+// is modelled on (specHasUnknownVRAM, reused unchanged).
+func TestBootstrapConditionDetected(t *testing.T) {
+	t.Run("specHasUnknownRAM is exactly RAMMB == 0", func(t *testing.T) {
+		if !specHasUnknownRAM(Spec{ID: "a", RAMMB: 0}) {
+			t.Error("RAMMB 0 is UNKNOWN demand and must read as unknown")
+		}
+		if specHasUnknownRAM(Spec{ID: "a", RAMMB: 1}) {
+			t.Error("a positive RAM demand is known, never unknown")
+		}
+		if specHasUnknownRAM(Spec{ID: "a", RAMMB: 8000}) {
+			t.Error("a positive RAM demand is known, never unknown")
+		}
+	})
+
+	t.Run("needsRAMBootstrap requires unknown demand AND no real measurement", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			spec     Spec
+			measured int
+			want     bool
+		}{
+			{"unknown demand, never measured", Spec{ID: "a", RAMMB: 0}, 0, true},
+			{"unknown demand, a non-measurement (0) is still no measurement", Spec{ID: "a", RAMMB: 0}, 0, true},
+			{"unknown demand, a non-measurement (negative) is still no measurement", Spec{ID: "a", RAMMB: 0}, -5, true},
+			{"unknown demand, already measured: not a bootstrap", Spec{ID: "a", RAMMB: 0}, 4000, false},
+			{"known demand, never measured: not a bootstrap", Spec{ID: "a", RAMMB: 8000}, 0, false},
+			{"known demand, measured: not a bootstrap", Spec{ID: "a", RAMMB: 8000}, 4000, false},
+		}
+		for _, tc := range cases {
+			if got := needsRAMBootstrap(tc.spec, tc.measured); got != tc.want {
+				t.Errorf("%s: needsRAMBootstrap(RAMMB=%d, measured=%d) = %v, want %v", tc.name, tc.spec.RAMMB, tc.measured, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("specHasUnknownVRAM, the axis this mirrors, is unchanged", func(t *testing.T) {
+		if !specHasUnknownVRAM(Spec{ID: "a", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}) {
+			t.Error("a VRAMMB 0 GPU is unknown demand")
+		}
+		if specHasUnknownVRAM(Spec{ID: "a", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}}) {
+			t.Error("a fully-declared GPU is not unknown")
+		}
+		if !specHasUnknownVRAM(Spec{ID: "a", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}, {Index: 1, VRAMMB: 0}}}) {
+			t.Error("any unknown GPU makes the spec unknown-VRAM")
+		}
+		if specHasUnknownVRAM(Spec{ID: "a"}) {
+			t.Error("a spec that declares no GPU has no unknown VRAM demand")
+		}
+	})
+}
+
+// TestRAMBootstrapBlocksConcurrentRAMAdmission is the interlock (task 4.1). While
+// one spec's RAM cold-start bootstrap is in its unaccounted window
+// (PolicySnapshot.RAMBootstrapInFlight, which buildSnapshot sets while a
+// bootstrapping process is Starting+unmeasured), its TRUE RAM cost is unknown, so
+// every OTHER RAM admission must Wait -- a second spec taking the apparently-free
+// RAM mid-window is exactly how the bootstrap causes the OOM it exists to
+// prevent. The Wait carries WaitOnRAM so the next hardware sample re-asks it, by
+// which time the bootstrap has settled or left.
+func TestRAMBootstrapBlocksConcurrentRAMAdmission(t *testing.T) {
+	// A roomy pool with one small resident: absent the interlock every candidate
+	// below fits trivially, so a Wait can only be the interlock talking.
+	base := func() PolicySnapshot {
+		return PolicySnapshot{
+			Running:              []RunningProc{{SpecID: "resident", RAMMB: 2000, LastUsed: t0}},
+			HostRAMBudgetMB:      40000,
+			RAMBootstrapInFlight: true,
+			Allowed:              allowPairs("cand", "resident"),
+		}
+	}
+
+	t.Run("a known-demand candidate that would fit still waits", func(t *testing.T) {
+		got := Admit(base(), Spec{ID: "cand", RAMMB: 8000})
+		assertDecision(t, "known demand waits behind the bootstrap", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+
+	t.Run("a second unknown-demand candidate waits too (bootstraps serialize)", func(t *testing.T) {
+		got := Admit(base(), Spec{ID: "cand", RAMMB: 0})
+		assertDecision(t, "a second bootstrap waits", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+
+	t.Run("the interlock never evicts -- it holds the host still", func(t *testing.T) {
+		snap := base()
+		// An idle neighbour the arithmetic could have drained: the interlock must
+		// not turn into an eviction, it must Wait with an empty list.
+		snap.Running = append(snap.Running, RunningProc{SpecID: "idle", RAMMB: 3000, LastUsed: t1})
+		snap.Allowed = allowPairs("cand", "resident", "idle")
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+		assertDecision(t, "no eviction during the interlock", got, Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
+	})
+
+	t.Run("no RAM accounting (no sample) means no interlock", func(t *testing.T) {
+		snap := base()
+		snap.HostRAMBudgetMB = 0 // the host has produced no MemAvailable reading yet
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+		assertDecision(t, "an unconstrained host does not interlock", got, Decision{OK: true, Evict: []string{}})
+	})
+
+	t.Run("cleared flag lets the ordinary arithmetic through", func(t *testing.T) {
+		snap := base()
+		snap.RAMBootstrapInFlight = false
+		got := Admit(snap, Spec{ID: "cand", RAMMB: 8000})
+		assertDecision(t, "no interlock, candidate fits", got, Decision{OK: true, Evict: []string{}})
+	})
+}
+
 // TestAdmitWaitOnRAMOnlyWhenTheRAMPoolBlocked pins what Decision.WaitOnRAM
 // means: rule 6 was among the causes of a Wait. It is what lets the manager
 // re-ask a waiter when the hardware sample refreshes -- and ONLY then, because a

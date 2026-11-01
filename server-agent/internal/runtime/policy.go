@@ -87,6 +87,23 @@ type PolicySnapshot struct {
 	// computed: Admit then falls back to HostRAMBudgetMB, and a ceiling BELOW the
 	// budget is ignored, so a caller that sets only the budget gets the plain rule.
 	HostRAMCeilingMB int
+	// RAMBootstrapInFlight is the cold-start RAM interlock (task 4.1): true while
+	// some managed process is still in its UNACCOUNTED bootstrap window -- unknown
+	// declared RAM and no measurement yet, so rule 6 charges it nothing and the
+	// host sample has not caught up with what it is in the middle of allocating.
+	// Its true cost being unknown, a second RAM admission that takes the
+	// apparently-free RAM mid-window is exactly how the bootstrap causes the OOM it
+	// exists to prevent, so Admit makes EVERY other RAM admission Wait (WaitOnRAM)
+	// while it is set, evicting nothing -- see rule 6 in Admit.
+	//
+	// It is computed fresh by owner.buildSnapshot from authoritative owner state
+	// (the bootstrapping spec's state, its declared demand, its measurement, and
+	// whether a RAM measurer is installed), never stored, so it cannot go stale or
+	// race, and it always clears: with a measurer when the process is measured
+	// (the brief's "healthy+measured"), otherwise when it leaves Starting, and in
+	// both cases when it exits or an operator fills its estimate in. Admit only
+	// acts on it when RAM is actually being accounted (HostRAMBudgetMB > 0).
+	RAMBootstrapInFlight bool
 	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
 	// may run together. Build it with Config.AllowedPairs(), never by
 	// hand-rolling a map from Config.Coresident's raw wire-order pairs --
@@ -275,6 +292,33 @@ func specHasUnknownVRAM(spec Spec) bool {
 		}
 	}
 	return false
+}
+
+// specHasUnknownRAM reports whether spec's host-RAM demand is unknown
+// (RAMMB == 0), the host-wide twin of specHasUnknownVRAM. Like that one it reads
+// only the spec's own declared demand, and 0 is UNKNOWN, never "needs none" (see
+// Spec.RAMMB). It is the first half of the cold-start bootstrap condition: the
+// owner pairs it with "no measurement captured yet" (needsRAMBootstrap) to decide
+// a first start, and Admit uses it to recognise the unknown-RAM candidate a
+// bootstrap guess stands in for (rule 6).
+func specHasUnknownRAM(spec Spec) bool {
+	return spec.RAMMB == 0
+}
+
+// needsRAMBootstrap reports whether a spec's NEXT start is a RAM cold-start
+// bootstrap: its declared demand is unknown (specHasUnknownRAM) AND no real
+// host-RAM measurement has been captured for its current process yet. A
+// non-positive measuredRAMMB is NOT a measurement (realRAM's rule: 0 or less is
+// "unknown", never "measured zero"), so it still counts as a first start.
+//
+// It is the predicate the owner evaluates against a RUNNING process to decide
+// whether that process is still in its unaccounted bootstrap window -- the
+// interlock in buildSnapshot. For the CANDIDATE being admitted the measurement is
+// always absent (admitAndStart runs only with no live process, which onProcExited
+// has cleared the measurement for), so there the condition reduces to
+// specHasUnknownRAM.
+func needsRAMBootstrap(spec Spec, measuredRAMMB int) bool {
+	return specHasUnknownRAM(spec) && measuredRAMMB <= 0
 }
 
 // firstUnknownGPU returns the LOWEST GPU index whose demand r reports as
@@ -963,8 +1007,11 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	// A process that is still loading is in running with its RAMMB and is never
 	// evictable (isEvictable), so it reserves what it occupies: a second
 	// admission sees the first one's headroom already spoken for and cannot
-	// double-commit it. That is the interlock for a KNOWN demand; the interlock
-	// for an unknown one belongs to the bootstrap.
+	// double-commit it. That is the interlock for a KNOWN demand. The interlock
+	// for an UNKNOWN one is snap.RAMBootstrapInFlight, checked first below: a
+	// bootstrapping process reserves nothing in the arithmetic (its RAMMB is the
+	// unknown 0), so while one is mid-window EVERY other RAM admission Waits rather
+	// than racing it for RAM whose true owner has not finished claiming it.
 	//
 	// The candidate's own demand against the whole pool is NOT decided here:
 	// it is rule 6's own-demand half, hoisted to step 1 like rule 3's (see
@@ -972,37 +1019,48 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	// and every Wait below is behind holders that cannot be evicted right now:
 	// a busy or still-loading one resolves by itself when it finishes, a pinned
 	// one is the operator's own choice.
-	if snap.HostRAMBudgetMB > 0 && spec.RAMMB > 0 {
-		sum := spec.RAMMB
-		var holders []RunningProc
-		for _, r := range running {
-			if _, already := toEvict[r.SpecID]; already {
-				continue // already guaranteed to be gone
-			}
-			if r.RAMMB <= 0 {
-				continue // unknown occupancy: nothing to charge, nothing to free
-			}
-			sum += r.RAMMB
-			holders = append(holders, r)
-		}
-		if sum > snap.HostRAMBudgetMB {
-			var idleHolders []RunningProc
-			for _, r := range holders {
-				if isEvictable(r) {
-					idleHolders = append(idleHolders, r)
+	if snap.HostRAMBudgetMB > 0 {
+		switch {
+		case snap.RAMBootstrapInFlight:
+			// The cold-start interlock (task 4.1). Another spec's RAM is mid-
+			// bootstrap and unaccounted, so no new RAM admission -- known demand or
+			// a second bootstrap alike -- may proceed until it settles or leaves.
+			// It is a Wait that evicts nothing (blocked always returns an empty
+			// Evict list), and WaitOnRAM so the next hardware sample re-asks it.
+			blocked = true
+			ramBlocked = true
+		case spec.RAMMB > 0:
+			sum := spec.RAMMB
+			var holders []RunningProc
+			for _, r := range running {
+				if _, already := toEvict[r.SpecID]; already {
+					continue // already guaranteed to be gone
 				}
-			}
-			sortOldestFirst(idleHolders)
-			for _, r := range idleHolders {
-				if sum <= snap.HostRAMBudgetMB {
-					break
+				if r.RAMMB <= 0 {
+					continue // unknown occupancy: nothing to charge, nothing to free
 				}
-				toEvict[r.SpecID] = r
-				sum -= r.RAMMB
+				sum += r.RAMMB
+				holders = append(holders, r)
 			}
 			if sum > snap.HostRAMBudgetMB {
-				blocked = true
-				ramBlocked = true
+				var idleHolders []RunningProc
+				for _, r := range holders {
+					if isEvictable(r) {
+						idleHolders = append(idleHolders, r)
+					}
+				}
+				sortOldestFirst(idleHolders)
+				for _, r := range idleHolders {
+					if sum <= snap.HostRAMBudgetMB {
+						break
+					}
+					toEvict[r.SpecID] = r
+					sum -= r.RAMMB
+				}
+				if sum > snap.HostRAMBudgetMB {
+					blocked = true
+					ramBlocked = true
+				}
 			}
 		}
 	}

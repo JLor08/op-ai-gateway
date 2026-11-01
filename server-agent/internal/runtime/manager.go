@@ -1986,12 +1986,27 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	if mp := o.m.measurer.Load(); mp != nil {
 		measured = (*mp)(pids)
 	}
+	// Whether host RAM is MEASURABLE at all decides how long the cold-start
+	// interlock below can safely hold. With a RAM measurer a bootstrapping
+	// process's first measurement will arrive, so the interlock can hold from
+	// Starting until it does (the brief's "healthy+measured"). WITHOUT one no
+	// measurement ever arrives, so holding past Starting would never clear and
+	// would hang every other RAM admission on the host; there the interlock is
+	// bounded by Starting, and once the process is healthy the conservative budget
+	// (its RAM is resident, so MemAvailable has dropped and nothing was added back)
+	// accounts for it without an interlock.
+	ramMeasurerInstalled := o.m.ramMeasurer.Load() != nil
 
 	running := make([]RunningProc, 0, len(o.specs))
 	// residentRAMMB is the host RAM the managed processes ACTUALLY hold right
 	// now -- their live measurements only, zero-guarded, never a pushed demand
 	// -- summed for the host-RAM budget below.
 	residentRAMMB := 0
+	// ramBootstrapInFlight is the cold-start RAM interlock (task 4.1), true once
+	// any managed process is still in its unaccounted bootstrap window (unknown
+	// declared RAM and no measurement -- needsRAMBootstrap), bounded as above. It
+	// is recomputed every call from owner state, so it is never a stale flag.
+	ramBootstrapInFlight := false
 	// ramBoundMB is the same sum read generously, for the ceiling the terminal
 	// RAM refusal compares against (see below): a process with no live reading
 	// is taken to hold its whole demand floor instead of nothing.
@@ -2045,6 +2060,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		} else {
 			ramBoundMB += st.spec.RAMMB
 		}
+		// The cold-start interlock (task 4.1): this process is still unaccounted
+		// if its declared RAM is unknown and nothing has measured it yet. It holds
+		// until measured when a measurer will deliver that measurement, else only
+		// while it is Starting -- see ramMeasurerInstalled above for why.
+		if needsRAMBootstrap(st.spec, st.measuredRAM) && (st.state == StateStarting || ramMeasurerInstalled) {
+			ramBootstrapInFlight = true
+		}
 		running = append(running, RunningProc{
 			SpecID:   id,
 			GPUs:     gpus,
@@ -2091,8 +2113,9 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		// host being short of anything -- a model still loading, a victim that
 		// just made room for this very candidate -- and a durable refusal must
 		// not be issued on the strength of either.
-		HostRAMCeilingMB: hostRAMBudgetMB(hi, ramBoundMB+o.pendingRAMFreedMB(), o.hostRAMReserveMB),
-		Allowed:          o.allowedPairs,
+		HostRAMCeilingMB:     hostRAMBudgetMB(hi, ramBoundMB+o.pendingRAMFreedMB(), o.hostRAMReserveMB),
+		RAMBootstrapInFlight: ramBootstrapInFlight,
+		Allowed:              o.allowedPairs,
 	}
 }
 

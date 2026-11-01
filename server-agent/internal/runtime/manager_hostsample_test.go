@@ -560,6 +560,71 @@ func TestRAMFreedCreditIsNotRecordedWithoutASample(t *testing.T) {
 	}
 }
 
+// TestBuildSnapshotMarksRAMBootstrapInFlight pins when buildSnapshot sets
+// PolicySnapshot.RAMBootstrapInFlight -- the owner-serialized interlock signal
+// Admit turns into a Wait for every other RAM admission (task 4.1). It is derived
+// fresh from authoritative owner state (st.state, st.spec.RAMMB, st.measuredRAM,
+// and whether a RAM measurer is installed) on every call, so it can never be a
+// stale flag.
+//
+// The window is "a bootstrapping process is still unaccounted": unknown declared
+// demand AND no real measurement (needsRAMBootstrap). WITH a RAM measurer it
+// holds from Starting until the first measurement lands (the brief's
+// "healthy+measured"); WITHOUT one no measurement ever arrives, so it is bounded
+// by Starting and clears when the process goes healthy -- by then its RAM is
+// resident and the conservative budget (MemAvailable has dropped, nothing was
+// added back) accounts for it, so no interlock is needed and, crucially, it can
+// never hang the host.
+func TestBuildSnapshotMarksRAMBootstrapInFlight(t *testing.T) {
+	// A RAM measurer is "installed" by its presence alone; its result does not
+	// matter here (buildSnapshot reads the stored measuredRAM, not the measurer).
+	installRAM := func(o *owner) { o.m.SetRAMMeasurer(func([]int) map[int]int { return nil }) }
+
+	cases := []struct {
+		name     string
+		state    State
+		ramMB    int // declared demand (0 = unknown)
+		measured int
+		measurer bool
+		want     bool
+	}{
+		{"starting, unknown, unmeasured: in flight", StateStarting, 0, 0, true, true},
+		{"starting, unknown, unmeasured, no measurer: still in flight", StateStarting, 0, 0, false, true},
+		{"running, unknown, unmeasured, measurer: still in flight until measured", StateRunning, 0, 0, true, true},
+		{"running, unknown, unmeasured, NO measurer: cleared at healthy (never hangs)", StateRunning, 0, 0, false, false},
+		{"running, unknown, measured: settled, not in flight", StateRunning, 0, 5000, true, false},
+		{"starting, known demand: reserved by rule 6, not a bootstrap", StateStarting, 8000, 0, true, false},
+		{"running, known demand: not a bootstrap", StateRunning, 8000, 4000, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.RAMMB = tc.ramMB
+			o, st := newSnapshotOwner(spec, 4242, nil)
+			o.m.SetHostInfo(HostInfo{MemAvailableMB: 40000})
+			st.state = tc.state
+			st.measuredRAM = tc.measured
+			if tc.measurer {
+				installRAM(o)
+			}
+			if got := o.buildSnapshot().RAMBootstrapInFlight; got != tc.want {
+				t.Errorf("RAMBootstrapInFlight = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("no bootstrapping process means the flag is clear", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.RAMMB = 6000
+		o, st := newSnapshotOwner(spec, 4242, nil)
+		o.m.SetHostInfo(HostInfo{MemAvailableMB: 40000})
+		st.measuredRAM = 6000
+		if o.buildSnapshot().RAMBootstrapInFlight {
+			t.Error("a fully-accounted host must not report a bootstrap in flight")
+		}
+	})
+}
+
 // TestAdmitAndStartClearsTheRAMWaitFlagOnEveryEarlyReturn: waitingOnRAM selects a
 // spec for a sample wake, so it must never outlive the Wait it describes -- not
 // even on the returns that precede any verdict (nobody wants the spec up, or it
