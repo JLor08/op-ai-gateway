@@ -431,8 +431,17 @@ type agentRuntimeSample struct {
 	// onto RuntimeStatusDTO.ImageOptions and lives only in the volatile
 	// runtimeStatusRegistry, so it never reaches the capability-row path.
 	ImageOptions *agentRuntimeImageOptions `json:"image_options,omitempty"`
-	GPUs         []agentRuntimeGPUSample   `json:"gpus,omitempty"`
-	LastError    *agentRuntimeError        `json:"last_error,omitempty"`
+	// RAMMeasuredMB is this child process's measured resident host RAM in MB,
+	// mirroring the agent's sample.RuntimeSample.RAMMeasuredMB (ram_measured_mb)
+	// key-for-key. A spec-level scalar beside GPUs below, not inside it: RAM has
+	// no GPU axis and one process backs one spec. 0 -- and equally an absent
+	// key, which is what an agent that predates the field, or a spec with no
+	// process measured yet, sends (the agent's field is omitempty) -- is the
+	// UNKNOWN sentinel, never "needs no RAM": writeBackRuntimeRAM drops it, so
+	// the stored measurement is neither zeroed nor rewritten by it.
+	RAMMeasuredMB int                     `json:"ram_measured_mb,omitempty"`
+	GPUs          []agentRuntimeGPUSample `json:"gpus,omitempty"`
+	LastError     *agentRuntimeError      `json:"last_error,omitempty"`
 }
 
 // agentRuntimeImageOptions mirrors the agent's sample.RuntimeImageOptions (the
@@ -666,9 +675,12 @@ const maxRuntimeSamplesPerSample = 256
 // GPU fan-out within a single one).
 const maxRuntimeGPUsPerSample = 64
 
-// resolveRuntimeSpecWritable reports whether specID's measured VRAM may be
-// written back for THIS sample, reached from server serverID. Three
-// conditions must all hold:
+// resolveRuntimeSpecOwned reports whether specID names a spec that exists and
+// belongs to serverID, and returns it. It is the AUTHORIZATION half of every
+// per-spec measurement write-back (VRAM through resolveRuntimeSpecWritable, RAM
+// directly), and deliberately knows nothing about any operator lock: a lock
+// governs one measurement axis, so each write-back layers its own on top.
+// writeBack names the axis ("vram", "ram") in the log lines only.
 //
 //  1. The spec exists (RuntimeSpecByID's ok).
 //  2. Its owning application belongs to serverID -- resolved via
@@ -680,60 +692,70 @@ const maxRuntimeGPUsPerSample = 64
 //     package resolves its target SOLELY from the token, never from a body
 //     parameter -- see handleAgentRuntimeConfig's doc). Without this check
 //     an agent authenticated for server A could name a spec_id belonging to
-//     server B and overwrite B's measured VRAM -- which is not
-//     display-only: agentRuntimeSpecDTO prefers the measured value over the
-//     operator's estimate when building the vram_mb the gateway later
-//     pushes to B's OWN agent, so a forged value would corrupt the
-//     admission arithmetic B's agent runs against a spec it never reported
-//     on.
-//  3. It is not VRAMLocked (vram_estimate_mb is operator-owned,
-//     vram_measured_mb is agent-owned, and VRAMLocked is the operator's
-//     opt-out of being governed by the measurement -- it stops the write
-//     here AND makes agentRuntimeSpecDTO serve the estimate, which together
-//     are what let an operator recover a spec a measurement has made
-//     terminally not_permitted).
+//     server B and overwrite B's measurements -- which are not display-only:
+//     agentRuntimeSpecDTO prefers the measured value over the operator's
+//     estimate when building the vram_mb the gateway later pushes to B's OWN
+//     agent, so a forged value would corrupt the admission arithmetic B's
+//     agent runs against a spec it never reported on.
 //
-// The ownership check (2) is evaluated UNCONDITIONALLY, before the
-// VRAMLocked check (3) -- deliberately, so the audit-trail Warn below fires
-// for every genuine cross-server naming attempt regardless of whether the
-// targeted spec happens to be locked. Checking VRAMLocked first would let a
-// locked spec's cross-server mismatch return false silently, leaving no
-// record of exactly the attack this method exists to catch. Still exactly
-// ONE resolution pass per call (RuntimeSpecByID + MappingByID +
-// ApplicationByID, at most) -- reordering costs nothing extra.
-//
-// Any failure to resolve (a lookup error, or a spec/mapping/application
-// that no longer exists) is treated the same as "not writable" -- logged and
-// skipped, never propagated -- matching the "a report is evidence, not a
-// transaction" best-effort discipline this whole file follows. A
-// cross-server mismatch is logged at Warn (not Debug): unlike a merely
-// stale id, it is a signal an agent is naming another server's resources.
-func (s *Server) resolveRuntimeSpecWritable(ctx context.Context, serverID, specID string) bool {
+// Exactly ONE resolution pass per call (RuntimeSpecByID + MappingByID +
+// ApplicationByID, at most). Any failure to resolve (a lookup error, or a
+// spec/mapping/application that no longer exists) is treated the same as "not
+// owned" -- logged and skipped, never propagated -- matching the "a report is
+// evidence, not a transaction" best-effort discipline this whole file follows.
+// A cross-server mismatch is logged at Warn (not Debug): unlike a merely stale
+// id, it is a signal an agent is naming another server's resources.
+func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, writeBack string) (routing.RuntimeSpec, bool) {
 	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
 	if err != nil {
-		slog.Debug("runtime vram write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
-		return false
+		slog.Debug("runtime "+writeBack+" write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+		return routing.RuntimeSpec{}, false
 	}
 	if !ok {
 		// The spec has since been deleted (or never existed); nothing to
 		// write the measurement back to. Not an error.
-		return false
+		return routing.RuntimeSpec{}, false
 	}
 	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
 	if err != nil {
-		slog.Debug("runtime vram write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
-		return false
+		slog.Debug("runtime "+writeBack+" write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
+		return routing.RuntimeSpec{}, false
 	}
 	app, err := s.Routes.ApplicationByID(ctx, mapping.ApplicationID)
 	if err != nil {
-		slog.Debug("runtime vram write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
-		return false
+		slog.Debug("runtime "+writeBack+" write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
+		return routing.RuntimeSpec{}, false
 	}
 	if app.ServerID != serverID {
-		// Checked BEFORE VRAMLocked below: this Warn must fire for a
-		// cross-server naming attempt EVEN when the targeted spec happens to
-		// be locked -- see the doc above.
-		slog.Warn("runtime vram write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		slog.Warn("runtime "+writeBack+" write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		return routing.RuntimeSpec{}, false
+	}
+	return spec, true
+}
+
+// resolveRuntimeSpecWritable reports whether specID's measured VRAM may be
+// written back for THIS sample, reached from server serverID: the spec must
+// pass resolveRuntimeSpecOwned (exists, belongs to serverID -- see its doc for
+// the authorization argument) AND must not be VRAMLocked (vram_estimate_mb is
+// operator-owned, vram_measured_mb is agent-owned, and VRAMLocked is the
+// operator's opt-out of being governed by the measurement -- it stops the write
+// here AND makes agentRuntimeSpecDTO serve the estimate, which together are
+// what let an operator recover a spec a measurement has made terminally
+// not_permitted).
+//
+// The lock is a VRAM lock ONLY: the RAM write-back (writeBackRuntimeRAM) uses
+// resolveRuntimeSpecOwned directly and is not gated by it -- there is no RAM
+// lock.
+//
+// The ownership check is evaluated UNCONDITIONALLY, before the VRAMLocked
+// check -- deliberately, so the audit-trail Warn fires for every genuine
+// cross-server naming attempt regardless of whether the targeted spec happens
+// to be locked. Checking VRAMLocked first would let a locked spec's
+// cross-server mismatch return false silently, leaving no record of exactly the
+// attack the ownership check exists to catch.
+func (s *Server) resolveRuntimeSpecWritable(ctx context.Context, serverID, specID string) bool {
+	spec, owned := s.resolveRuntimeSpecOwned(ctx, serverID, specID, "vram")
+	if !owned {
 		return false
 	}
 	if spec.VRAMLocked {
@@ -854,6 +876,87 @@ func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string
 		out[g.GPUIndex] = g.VRAMMeasuredMB
 	}
 	return out
+}
+
+// writeBackRuntimeRAM writes each sample runtime's measured resident host RAM
+// back onto its launch spec (agent_runtime_specs.ram_measured_mb), the spec-level
+// sibling of writeBackRuntimeVRAM's per-GPU write: RAM is host-scoped, so there
+// is one scalar per spec and no GPU index, and a spec with no GPU rows (CPU-only,
+// or one a sample reports no gpus array for) still lands its measurement.
+//
+// Mirrors writeBackRuntimeVRAM's discipline, deliberately:
+//
+//   - A measurement of 0 or less is UNKNOWN, never "needs no RAM", and is
+//     dropped before it reaches the store. An absent key -- an agent that
+//     predates the field, or a spec with no process measured yet -- decodes to
+//     the same 0, so it is a no-op too and never zeroes a stored value.
+//   - Ownership is checked once per DISTINCT spec_id (resolveRuntimeSpecOwned:
+//     the spec exists and belongs to serverID, with the cross-server Warn),
+//     memoized together with the stored value, and runtimes is length-capped
+//     (maxRuntimeSamplesPerSample) before any store call.
+//   - An unchanged measurement is NOT rewritten. Telemetry arrives once per
+//     second as a full snapshot, so a merely stable value would otherwise cost
+//     one UPDATE per second per spec indefinitely (the cost argument
+//     writeBackRuntimeVRAM documents at length). The comparison is against
+//     WHAT IS STORED -- read once per distinct owned spec_id, on the spec the
+//     ownership check already fetched -- not against what the agent last sent,
+//     so it converges even if the stored value changed out from under a
+//     long-running agent.
+//
+// The one deliberate difference: this is NOT gated by vram_locked. That lock
+// governs the per-GPU VRAM numbers only (resolveRuntimeSpecWritable); there is
+// no RAM lock, so a spec an operator pinned for VRAM is still measured for RAM.
+// Hence resolveRuntimeSpecOwned directly, never resolveRuntimeSpecWritable.
+//
+// Best-effort throughout, like every write-back here: nothing is returned as an
+// error and this must NEVER reject the telemetry sample it rode in on. Called
+// only AFTER every store write in ingestTelemetrySample has succeeded.
+func (s *Server) writeBackRuntimeRAM(ctx context.Context, serverID string, runtimes []agentRuntimeSample) {
+	if s.Routes == nil {
+		return
+	}
+	if len(runtimes) > maxRuntimeSamplesPerSample {
+		runtimes = runtimes[:maxRuntimeSamplesPerSample]
+	}
+	// stored[specID] is the measured RAM already on file for a spec this server
+	// owns, present only for an owned spec and read once per distinct spec_id.
+	// A spec that is not owned (or no longer exists) is memoized as absent, so a
+	// sample repeating its id never re-resolves it.
+	stored := make(map[string]int, len(runtimes))
+	owned := make(map[string]bool, len(runtimes))
+	for _, rt := range runtimes {
+		if rt.RAMMeasuredMB <= 0 {
+			continue
+		}
+		specID := strings.TrimSpace(rt.SpecID)
+		if specID == "" {
+			continue
+		}
+		ok, seen := owned[specID]
+		if !seen {
+			var spec routing.RuntimeSpec
+			spec, ok = s.resolveRuntimeSpecOwned(ctx, serverID, specID, "ram")
+			owned[specID] = ok
+			if ok {
+				stored[specID] = spec.RAMMeasuredMB
+			}
+		}
+		if !ok {
+			continue
+		}
+		if was := stored[specID]; was == rt.RAMMeasuredMB {
+			continue // already on file, byte for byte
+		}
+		if err := s.Routes.UpdateRuntimeSpecRAMMeasured(ctx, specID, rt.RAMMeasuredMB); err != nil {
+			// Tolerates ErrNotFound (the spec deleted out from under an
+			// in-flight sample) the same as any other failure: log and move on.
+			slog.Debug("runtime ram write-back failed", "server_id", serverID, "spec_id", specID, "err", err)
+			continue
+		}
+		// Keep the memo truthful for the rest of THIS sample: a malformed
+		// payload naming the same spec twice must not write twice.
+		stored[specID] = rt.RAMMeasuredMB
+	}
 }
 
 // resolveRuntimeSpecMapping reports whether specID's owning mapping may have
@@ -1943,6 +2046,12 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// launch spec (skipped for a VRAMLocked spec) -- see writeBackRuntimeVRAM.
 	// Never rejects the sample; a failure here is logged and dropped.
 	s.writeBackRuntimeVRAM(ctx, serverID, req.Runtimes)
+	// Best-effort write-back of each managed process's measured host RAM onto
+	// its launch spec -- see writeBackRuntimeRAM. NOT skipped for a VRAMLocked
+	// spec (the lock governs VRAM only), and a no-op for an agent that sends no
+	// ram_measured_mb. Never rejects the sample; a failure here is logged and
+	// dropped.
+	s.writeBackRuntimeRAM(ctx, serverID, req.Runtimes)
 	// Best-effort write-back of each managed process's probed context window
 	// onto its owning mapping (Task 12, Option B) -- see writeBackRuntimeContext.
 	// Gated on THIS sample's own parsed caps (reused from above), NOT on a

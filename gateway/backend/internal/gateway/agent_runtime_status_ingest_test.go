@@ -482,6 +482,213 @@ func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue(t *testing
 	}
 }
 
+// --- Measured host RAM write-back (spec-level, agent-owned) -----------------
+
+// countingRAMWriteStore counts the agent-owned RAM write-back's own UPDATE, so
+// a test can assert that an unchanged, non-positive or absent measurement costs
+// no write at all.
+type countingRAMWriteStore struct {
+	*routing.MemoryStore
+	updateCalls atomic.Int32
+}
+
+func (c *countingRAMWriteStore) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error {
+	c.updateCalls.Add(1)
+	return c.MemoryStore.UpdateRuntimeSpecRAMMeasured(ctx, specID, measuredMB)
+}
+
+// ramIngestBody is a one-runtime telemetry body for specID carrying the given
+// raw spec-level fragment (e.g. `"ram_measured_mb":6000,`, or "" for an agent
+// that predates the field). The fragment sits BEFORE state so it can be empty
+// without leaving a dangling comma.
+func ramIngestBody(specID, fragment string) string {
+	return `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"` + specID + `",` + fragment + `"state":"running"}]}`
+}
+
+func ingestRAMSample(t *testing.T, srv *Server, serverID, body string) {
+	t.Helper()
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), serverID, req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+}
+
+func storedRAM(t *testing.T, srv *Server, specID string) routing.RuntimeSpec {
+	t.Helper()
+	spec, ok, err := srv.Routes.RuntimeSpecByID(context.Background(), specID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByID(%s): ok=%v err=%v", specID, ok, err)
+	}
+	return spec
+}
+
+// TestIngestWritesMeasuredRAM proves a runtime sample's spec-level
+// ram_measured_mb is written back onto the spec (RAMMeasuredMB) without
+// disturbing the operator's own RAMEstimateMB. The sample carries NO gpus array
+// on purpose: RAM is host-scoped, so a CPU-only spec -- which has nothing for the
+// per-GPU VRAM write-back to do -- must still land its measurement.
+func TestIngestWritesMeasuredRAM(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram", false)
+	seeded := storedRAM(t, srv, "rspec_ram")
+	seeded.RAMEstimateMB = 4096
+	if err := srv.Routes.UpsertRuntimeSpec(context.Background(), seeded); err != nil {
+		t.Fatalf("seed ram estimate: %v", err)
+	}
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram", `"ram_measured_mb":6000,`))
+
+	got := storedRAM(t, srv, "rspec_ram")
+	if got.RAMMeasuredMB != 6000 {
+		t.Fatalf("RAMMeasuredMB = %d, want 6000", got.RAMMeasuredMB)
+	}
+	if got.RAMEstimateMB != 4096 {
+		t.Fatalf("RAMEstimateMB = %d, want the operator's 4096 untouched", got.RAMEstimateMB)
+	}
+}
+
+// TestIngestWritesMeasuredRAMForAVRAMLockedSpec is the gate-factoring guard.
+// resolveRuntimeSpecWritable refuses a VRAMLocked spec, and that lock is about
+// the per-GPU VRAM numbers ONLY -- there is no RAM lock. A RAM write-back that
+// simply reused the VRAM gate would silently never measure any spec an operator
+// had pinned for VRAM. The sample also carries a GPU measurement, so the test
+// pins both halves at once: the locked VRAM stays untouched while the RAM lands.
+func TestIngestWritesMeasuredRAMForAVRAMLockedSpec(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_locked", true)
+
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_ram_locked","state":"running",` +
+		`"ram_measured_mb":6000,"gpus":[{"index":0,"vram_measured_mb":21234}]}]}`
+	ingestRAMSample(t, srv, "mock-host-qwen", body)
+
+	if got := storedRAM(t, srv, "rspec_ram_locked"); got.RAMMeasuredMB != 6000 {
+		t.Fatalf("RAMMeasuredMB = %d, want 6000: vram_locked must not gate the RAM write-back", got.RAMMeasuredMB)
+	}
+	gpus, err := srv.Routes.RuntimeSpecGPUs(context.Background(), "rspec_ram_locked")
+	if err != nil || len(gpus) != 1 || gpus[0].VRAMMeasuredMB != 0 {
+		t.Fatalf("gpus = %#v err = %v, want the locked spec's VRAM untouched", gpus, err)
+	}
+}
+
+// TestIngestSkipsNonPositiveRAM proves a measured 0 -- or a negative number a
+// buggy agent could send -- is UNKNOWN, never "needs no RAM": it is dropped
+// before it reaches the store, so a previously stored real measurement survives.
+func TestIngestSkipsNonPositiveRAM(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_zero", false)
+	if err := srv.Routes.UpdateRuntimeSpecRAMMeasured(context.Background(), "rspec_ram_zero", 7000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	counting := &countingRAMWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	for _, fragment := range []string{`"ram_measured_mb":0,`, `"ram_measured_mb":-5,`} {
+		ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_zero", fragment))
+	}
+
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d for non-positive measurements, want 0", got)
+	}
+	if got := storedRAM(t, srv, "rspec_ram_zero"); got.RAMMeasuredMB != 7000 {
+		t.Fatalf("RAMMeasuredMB = %d, want the stored 7000 untouched by a non-positive sample", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestSkipsUnchangedRAM is the RAM twin of the VRAM change-detection
+// test: telemetry arrives once per second and every sample is a full snapshot,
+// so a stable measurement must cost one write, not one per second forever. The
+// comparison is against what is STORED, so a changed value must still land.
+func TestIngestSkipsUnchangedRAM(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_same", false)
+	counting := &countingRAMWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	for i := 0; i < 3; i++ {
+		ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_same", `"ram_measured_mb":6000,`))
+	}
+	if got := counting.updateCalls.Load(); got != 1 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d across three samples carrying the SAME measurement, want exactly 1", got)
+	}
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_same", `"ram_measured_mb":6500,`))
+	if got := counting.updateCalls.Load(); got != 2 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d after a CHANGED measurement, want 2", got)
+	}
+	if got := storedRAM(t, srv, "rspec_ram_same"); got.RAMMeasuredMB != 6500 {
+		t.Fatalf("RAMMeasuredMB = %d, want the changed 6500", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestAbsentRAMLeavesColumnAlone is the old-agent case. An agent that
+// predates the measurement sends no ram_measured_mb key at all (the agent's
+// field is omitempty, so an unmeasured spec sends none either); that must be a
+// no-op -- the stored value is neither zeroed nor rewritten.
+func TestIngestAbsentRAMLeavesColumnAlone(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_ram_absent", false)
+	if err := srv.Routes.UpdateRuntimeSpecRAMMeasured(context.Background(), "rspec_ram_absent", 7000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	counting := &countingRAMWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_absent", ""))
+
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf("UpdateRuntimeSpecRAMMeasured calls = %d for a sample with no ram_measured_mb key, want 0", got)
+	}
+	if got := storedRAM(t, srv, "rspec_ram_absent"); got.RAMMeasuredMB != 7000 {
+		t.Fatalf("RAMMeasuredMB = %d, want the stored 7000 left alone", got.RAMMeasuredMB)
+	}
+}
+
+// TestIngestRAMWriteBackRejectsCrossServerSpec is the authorization guard the
+// VRAM write-back carries, applied to RAM: spec_id is an agent-supplied body
+// field and only the token-derived server id binds a sample to a server, so an
+// agent naming ANOTHER server's spec must neither write that spec's RAM nor go
+// unrecorded -- a cross-server naming attempt is logged at Warn. The spec is
+// VRAMLocked on purpose: factoring the ownership check out of the VRAM gate must
+// not let the lock short-circuit the audit trail.
+func TestIngestRAMWriteBackRejectsCrossServerSpec(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const otherServerID = "mock-host-other-tenant-ram"
+	if err := srv.Routes.CreateAIServer(ctx, routing.AIServer{
+		ID: otherServerID, Name: otherServerID, Domain: otherServerID + ".example.test",
+		Provider: routing.ProviderMock, Endpoint: "mock://" + otherServerID,
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create other server: %v", err)
+	}
+	seedRuntimeIngestSpecForServer(t, srv, otherServerID, "rspec_ram_cross", true)
+
+	buf, restore := withCapturedSlog(t)
+	defer restore()
+
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_cross", `"ram_measured_mb":99999,`))
+
+	if got := storedRAM(t, srv, "rspec_ram_cross"); got.RAMMeasuredMB != 0 {
+		t.Fatalf("RAMMeasuredMB = %d, want untouched 0: another server's spec must not be written", got.RAMMeasuredMB)
+	}
+	if !findLogRecord(buf.Snapshot(), "WARN", "spec belongs to a different server") {
+		t.Fatal("a cross-server naming attempt on the RAM write-back must log a Warn")
+	}
+}
+
+// TestIngestRAMWriteBackToleratesUnknownSpec proves a sample naming a spec id
+// with no row never rejects the sample: the RAM write-back is best-effort.
+func TestIngestRAMWriteBackToleratesUnknownSpec(t *testing.T) {
+	srv := NewTestServer()
+	ingestRAMSample(t, srv, "mock-host-qwen", ramIngestBody("rspec_ram_ghost", `"ram_measured_mb":5000,`))
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 || snap[0].SpecID != "rspec_ram_ghost" {
+		t.Fatalf("snapshot = %#v, want the runtime status published regardless", snap)
+	}
+}
+
 // TestIngestTelemetrySampleRuntimeStatusCarriesMeasuredVRAMWatermark proves
 // the live status stream carries this sample's per-GPU measured VRAM together
 // with the GATEWAY's own arrival time for the frame that carried it. The
