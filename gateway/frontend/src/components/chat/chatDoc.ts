@@ -23,6 +23,7 @@ import {
   audioUrlsOf,
   isMaskPart,
   maskPart,
+  speakerTranscriptOf,
   type ChatContent,
   type ChatContentPart,
 } from '../shared/chatContent';
@@ -1268,10 +1269,15 @@ export function deriveTitleFromMessages(messages: ChatUiMessage[]): string {
 // The title of a transcription chat, from its transcript: the latest assistant turn's text, as
 // deriveTitle shortens it ('' when there is none). A transcription thread's first user turn is
 // audio only, so deriveTitleFromMessages (the first user message's text) finds nothing there;
-// the transcript is what names the chat, once a run has produced one.
+// the transcript is what names the chat, once a run has produced one. A diarized turn (#295)
+// has no text part -- its transcript is the whole `text` of its speaker_transcript part -- so
+// that is read when the turn has no text of its own.
 export function deriveTitleFromTranscript(messages: ChatUiMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i].role === 'assistant') return deriveTitle(textOf(messages[i].content));
+    if (messages[i].role === 'assistant') {
+      const { content } = messages[i];
+      return deriveTitle(textOf(content) || (speakerTranscriptOf(content)?.text ?? ''));
+    }
   }
   return '';
 }

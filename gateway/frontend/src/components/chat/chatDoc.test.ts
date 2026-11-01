@@ -1634,6 +1634,22 @@ describe('titling a transcription chat from its transcript', () => {
     ).toBe('Guten Morgen');
   });
 
+  // A diarized turn (#295) commits a speaker_transcript part and no text part, so the chat is
+  // named by that part's whole transcript, not left untitled.
+  it('reads the transcript from the speaker_transcript part of a diarized turn', () => {
+    const diarized = assistant([
+      {
+        type: 'speaker_transcript',
+        text: 'Guten Morgen. Morgen, los geht’s.',
+        turns: [
+          { speaker: '0', start: 0, end: 2, text: 'Guten Morgen.' },
+          { speaker: '1', start: 2, end: 4, text: 'Morgen, los geht’s.' },
+        ],
+      },
+    ]);
+    expect(deriveTitleFromTranscript([user, diarized])).toBe('Guten Morgen. Morgen, los geht’s.');
+  });
+
   it('is empty when there is no transcript to name the chat by', () => {
     expect(deriveTitleFromTranscript([])).toBe('');
     // The user turn is audio only: nothing there to read.
