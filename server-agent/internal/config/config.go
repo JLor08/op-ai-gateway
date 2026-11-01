@@ -286,6 +286,21 @@ type Config struct {
 	// (16 MiB). The agent keeps at most total/per-spec buffers, evicting the
 	// least-recently-written unwatched one.
 	RuntimeLogBufferTotalBytes int
+	// VRAMHeadroomMB is how much of each GPU's DETECTED total memory, in MB, the
+	// agent keeps out of the VRAM budget it derives for runtime admission. The
+	// agent budgets every GPU it can read at that GPU's total memory (so a model
+	// that cannot fit the card is refused up front instead of OOMing it); this is
+	// the room left over for the driver, a display, or another tenant on the
+	// same card. It applies only to that detected value: a per-GPU budget the
+	// operator configures through the gateway is used exactly as given. 0 (the
+	// default) holds nothing back; a negative value is treated as 0.
+	//
+	// Env-only (OP_AGENT_VRAM_HEADROOM_MB): no flag and, unlike the settings
+	// above, no config-file key -- it is a host-tuning escape hatch, and a file
+	// key would have to be mirrored into the generated agent config the gateway
+	// and portal hand out. Operator-owned like every runtime setting here; the
+	// gateway can never supply it.
+	VRAMHeadroomMB int
 }
 
 // fileConfig mirrors the JSON config file. All fields are optional; a value set
@@ -449,6 +464,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 
 		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
 		RuntimeLogBufferTotalBytes: resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES"), file.RuntimeLogBufferTotalBytes),
+
+		VRAMHeadroomMB: resolveVRAMHeadroomMB(getenv("OP_AGENT_VRAM_HEADROOM_MB")),
 	}
 	if cfg.Transport == "" {
 		cfg.Transport = TransportWebSocket
@@ -494,6 +511,24 @@ func resolveInt(envVal string, fileVal int) int {
 		}
 	}
 	return fileVal
+}
+
+// resolveVRAMHeadroomMB parses the env-only OP_AGENT_VRAM_HEADROOM_MB: a
+// non-negative base-10 integer number of MB, default 0. 0 is a real value (hold
+// nothing back), so it is accepted as itself rather than treated as "unset". An
+// absent, blank, malformed, fractional or negative value yields the default 0
+// instead of failing the whole load, for the same reason resolveInt falls
+// through: refusing to start an agent -- taking every model on the host down
+// with it -- over a mistyped tuning knob would be out of proportion. A negative
+// headroom is specifically not honoured because it would raise the derived VRAM
+// budget above the device's own memory.
+func resolveVRAMHeadroomMB(envVal string) int {
+	if v := strings.TrimSpace(envVal); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 // resolveStringList applies env(if non-empty, comma-separated) > file for a

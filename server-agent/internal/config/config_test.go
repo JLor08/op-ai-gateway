@@ -1500,3 +1500,50 @@ func TestGeneratedAgentConfigFixtureResolvesMeshTrustDefaults(t *testing.T) {
 		t.Errorf("CAPEM = %q, want generated inline bootstrap", cfg.CAPEM)
 	}
 }
+
+// TestVRAMHeadroomMBFromEnv covers OP_AGENT_VRAM_HEADROOM_MB, the MB held back
+// from each GPU's auto-detected VRAM budget. It is an env-only knob (no flag,
+// no config-file key), default 0 = hold nothing back. 0 is a legal, meaningful
+// value; anything that is not a non-negative base-10 integer degrades to the
+// default rather than failing the load -- a fat-fingered tuning knob must not
+// take the agent, and every model on the host, down with it. A negative value
+// is never honoured: it would inflate the budget past the device.
+func TestVRAMHeadroomMBFromEnv(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(env string, set bool) int {
+		t.Helper()
+		getenv := func(k string) string {
+			if set && k == "OP_AGENT_VRAM_HEADROOM_MB" {
+				return env
+			}
+			return ""
+		}
+		cfg, err := Load(base, getenv)
+		if err != nil {
+			t.Fatalf("Load(OP_AGENT_VRAM_HEADROOM_MB=%q): %v", env, err)
+		}
+		return cfg.VRAMHeadroomMB
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		set  bool
+		want int
+	}{
+		{"unset defaults to 0", "", false, 0},
+		{"blank defaults to 0", "   ", true, 0},
+		{"explicit 0 is allowed", "0", true, 0},
+		{"a positive value is taken", "1024", true, 1024},
+		{"surrounding space is trimmed", " 512 ", true, 512},
+		{"negative is not honoured", "-5", true, 0},
+		{"non-numeric falls back to the default", "lots", true, 0},
+		{"a fractional value falls back to the default", "1.5", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := load(tc.env, tc.set); got != tc.want {
+				t.Errorf("VRAMHeadroomMB for OP_AGENT_VRAM_HEADROOM_MB=%q = %d, want %d", tc.env, got, tc.want)
+			}
+		})
+	}
+}

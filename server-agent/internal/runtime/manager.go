@@ -171,6 +171,16 @@ type ManagerOptions struct {
 	// lifetime, like the other options here. Empty (every test that does not
 	// exercise config files) means no base directory was configured.
 	ConfigFilesDir string
+	// VRAMHeadroomMB is the amount of each GPU's DETECTED total memory, in MB,
+	// that is held back from the auto-detected VRAM budget (see
+	// owner.buildSnapshot): room for the driver, a display, other tenants. It
+	// is OPERATOR configuration from the agent's own local settings
+	// (OP_AGENT_VRAM_HEADROOM_MB) -- the gateway never supplies it. It applies
+	// only to a detected budget; an operator-configured per-GPU budget is used
+	// exactly as given. Fixed for the process lifetime, like the other options
+	// here. Zero (the default) holds nothing back; a negative value is treated
+	// as zero, since it would inflate the budget past the device.
+	VRAMHeadroomMB int
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -241,6 +251,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		gpuVendor:          opts.GPUVendor,
 		specsFromLocalFile: opts.SpecsFromLocalFile,
 		configFilesDir:     opts.ConfigFilesDir,
+		vramHeadroomMB:     max(0, opts.VRAMHeadroomMB),
 		specs:              make(map[string]*specState),
 		allowedPairs:       map[[2]string]bool{},
 		logs:               m.logs,
@@ -875,6 +886,10 @@ type owner struct {
 	// the owner writes a spec's config files under. Fixed for the process
 	// lifetime, so a plain field like gpuVendor above.
 	configFilesDir string
+	// vramHeadroomMB is ManagerOptions.VRAMHeadroomMB, never negative. Fixed
+	// for the process lifetime, so a plain field like gpuVendor above; read
+	// only by buildSnapshot's auto-detected budgets.
+	vramHeadroomMB int
 	// logs is m.logs, held here so the owner can open a generation's writer
 	// and prune the retention of specs a new config removed. Carries its own
 	// mutex; nothing about it is owner-goroutine-confined.
@@ -1797,16 +1812,64 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// rule because it is the only code that interprets a budget, whereas a
 	// snapshot can be built by any caller. A second copy of the rule here
 	// would be one more place for the two to drift apart.
+	//
+	// Budgets the operator did not set are then filled in from the detected
+	// device totals (fillDetectedBudgets), which is what makes VRAM accounting
+	// default-on. That is a different thing from filtering: it adds a value,
+	// it never removes or reinterprets a row.
 	budgets := make(map[int]int, len(o.cfg.GPUBudgets))
 	for _, b := range o.cfg.GPUBudgets {
 		budgets[b.Index] = b.BudgetMB
 	}
+	o.fillDetectedBudgets(budgets)
 
 	return PolicySnapshot{
 		Running:      running,
 		MaxProcesses: o.cfg.MaxProcesses,
 		Budgets:      budgets,
 		Allowed:      o.allowedPairs,
+	}
+}
+
+// fillDetectedBudgets makes VRAM accounting default-on: for every GPU the
+// hardware sample reported, a budget the operator did not set is filled in from
+// the detected device total, minus the optional headroom. It edits budgets in
+// place, after the operator's rows have been copied verbatim.
+//
+// Per GPU index the rule is:
+//
+//   - an operator budget > 0 WINS and is left exactly as configured (no
+//     headroom, no clamp to the hardware -- it is the operator's word);
+//   - otherwise, a detected total > 0 gives max(1, total - headroom);
+//   - otherwise the index is left as it is: absent, or a verbatim 0 row, i.e.
+//     unconstrained -- the pre-feature behaviour, which is what a host with no
+//     GPU, or one that has not produced its first sample, gets.
+//
+// A configured row of 0 (or less) is "no budget set", not an override -- the
+// portal seeds a fresh row at 0 -- so the detected value replaces it. This is
+// NOT a "skip BudgetMB == 0" filter on the operator's rows (see the caller):
+// the row is still copied verbatim whenever nothing was detected, and Admit
+// remains the only code that interprets a budget <= 0 as unconstrained.
+//
+// The floor of 1 on the detected value is not cosmetic. A headroom at or above
+// the device total would otherwise yield 0, and 0 means UNCONSTRAINED -- the
+// opposite of "keep all of it back". 1 MB is a real ceiling, so Admit refuses
+// any spec with a known VRAM demand on that GPU, which is what reserving the
+// whole device means.
+//
+// An Apple GPU is skipped entirely: it has no dedicated VRAM, and the
+// "total" its collector reports is the system memory the GPU has allocated at
+// that instant, which moves with load and is not a ceiling. Budgeting against
+// it would refuse a spec larger than whatever is allocated right now.
+func (o *owner) fillDetectedBudgets(budgets map[int]int) {
+	if o.gpuVendor == GPUVendorApple {
+		return
+	}
+	for idx, total := range o.hostInfo().GPUTotalsMB {
+		if total <= 0 || budgets[idx] > 0 {
+			continue
+		}
+		budgets[idx] = max(1, total-o.vramHeadroomMB)
 	}
 }
 

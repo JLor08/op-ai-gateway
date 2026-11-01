@@ -3697,3 +3697,194 @@ func TestSetHostInfoVisibleInSnapshot(t *testing.T) {
 		t.Errorf("hostInfo() after a second SetHostInfo = %+v, want %+v (the latest sample wins)", got, next)
 	}
 }
+
+// snapshotBudgets builds a snapshot on an owner that has been handed cfgBudgets
+// as its operator config, hi as the latest hardware sample (nil = none pushed
+// yet) and headroomMB as its VRAM headroom knob, and returns the Budgets map
+// Admit will decide on.
+func snapshotBudgets(t *testing.T, cfgBudgets []GPUBudget, hi *HostInfo, headroomMB int) map[int]int {
+	t.Helper()
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.cfg.GPUBudgets = cfgBudgets
+	o.vramHeadroomMB = headroomMB
+	if hi != nil {
+		o.m.SetHostInfo(*hi)
+	}
+	return o.buildSnapshot().Budgets
+}
+
+// TestBudgetsAutoDetectedFromGPUTotals is the default-on half of the feature:
+// with no operator budget at all, a GPU the hardware sample reported gets a
+// budget equal to its detected total -- so VRAM admission is enforced where it
+// used to be effectively off (an absent budget is "unconstrained").
+func TestBudgetsAutoDetectedFromGPUTotals(t *testing.T) {
+	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}}, 0)
+	if want := map[int]int{0: 24000, 1: 12000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (detected total, one per sampled GPU)", got, want)
+	}
+}
+
+// TestExplicitGPUBudgetOverridesDetected pins the precedence: an operator's
+// positive budget for a GPU wins over what was detected, per GPU index -- a
+// GPU the operator did not mention still gets its detected value.
+func TestExplicitGPUBudgetOverridesDetected(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 8000}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}}, 0)
+	if want := map[int]int{0: 8000, 1: 12000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (operator's 8000 wins on GPU 0, detected 12000 stands on GPU 1)", got, want)
+	}
+}
+
+// TestOperatorBudgetAboveDetectedStillWins: the override is the operator's
+// word, not a value clamped to the hardware -- a deliberate over-subscription
+// (or a detected total that is wrong for their setup) is theirs to make.
+func TestOperatorBudgetAboveDetectedStillWins(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 30000}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 0)
+	if want := map[int]int{0: 30000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v", got, want)
+	}
+}
+
+// TestNonPositiveOperatorBudgetFallsThroughToDetected: a `budget_mb: 0` row is
+// "no budget set" (the portal seeds fresh rows at 0), not an explicit override,
+// so the detected value replaces it. Without a detected value the row is still
+// copied verbatim -- buildSnapshot must not filter zeros, Admit owns that rule
+// (see TestManagerZeroGPUBudgetIsUnconstrained).
+func TestNonPositiveOperatorBudgetFallsThroughToDetected(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 0}, {Index: 1, BudgetMB: 0}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 0)
+	if want := map[int]int{0: 24000, 1: 0}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (GPU 0: 0 row replaced by the detected total; GPU 1: nothing detected, the 0 row is copied verbatim)", got, want)
+	}
+}
+
+// TestVRAMHeadroomSubtracted: the optional headroom is held back from every
+// AUTO budget, so the card keeps room for the driver, display and other
+// tenants.
+func TestVRAMHeadroomSubtracted(t *testing.T) {
+	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 1024)
+	if want := map[int]int{0: 22976}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (24000 detected - 1024 headroom)", got, want)
+	}
+}
+
+// TestVRAMHeadroomDoesNotTouchAnExplicitBudget: headroom belongs to the
+// detected value; an operator who typed a budget has already decided how much
+// to hold back.
+func TestVRAMHeadroomDoesNotTouchAnExplicitBudget(t *testing.T) {
+	got := snapshotBudgets(t,
+		[]GPUBudget{{Index: 0, BudgetMB: 8000}},
+		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 1024)
+	if want := map[int]int{0: 8000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v", got, want)
+	}
+}
+
+// TestVRAMHeadroomAtOrAboveTheDeviceReservesTheWholeGPU: a headroom that eats
+// the entire device must not become a 0 budget, because a 0 budget means
+// UNCONSTRAINED -- the exact opposite of "reserve everything". It is floored at
+// 1 MB so Admit refuses any spec with a known VRAM demand on that GPU.
+func TestVRAMHeadroomAtOrAboveTheDeviceReservesTheWholeGPU(t *testing.T) {
+	for _, headroom := range []int{8000, 9000} {
+		got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 8000}}, headroom)
+		if want := map[int]int{0: 1}; !reflect.DeepEqual(got, want) {
+			t.Errorf("headroom %d on an 8000 MB GPU: Budgets = %v, want %v (never 0: that would read as unconstrained)", headroom, got, want)
+		}
+	}
+}
+
+// TestNoGPUSampleLeavesBudgetsEmpty is the no-GPU-host case: nothing detected
+// and nothing configured must leave Budgets empty (every GPU unconstrained, the
+// pre-feature behaviour) and must not panic on the nil sample, the nil map or a
+// GPU-less sample.
+func TestNoGPUSampleLeavesBudgetsEmpty(t *testing.T) {
+	for name, hi := range map[string]*HostInfo{
+		"no sample pushed yet": nil,
+		"nil totals map":       {MemAvailableMB: 8000},
+		"empty totals map":     {GPUTotalsMB: map[int]int{}},
+		"a zero total":         {GPUTotalsMB: map[int]int{0: 0}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := snapshotBudgets(t, nil, hi, 1024); len(got) != 0 {
+				t.Errorf("Budgets = %v, want empty (nothing detected, nothing configured)", got)
+			}
+		})
+	}
+}
+
+// TestUnifiedMemoryGPUIsNotAutoBudgeted: an Apple GPU has no dedicated VRAM.
+// Its collector's "total" is the system memory the GPU has allocated at that
+// instant (ioreg "Alloc system memory") -- a figure that moves with load, not a
+// ceiling -- so turning it into a budget would refuse a spec larger than
+// whatever happens to be allocated right now. Apple hosts keep the pre-feature
+// behaviour: unconstrained unless the operator sets a budget.
+func TestUnifiedMemoryGPUIsNotAutoBudgeted(t *testing.T) {
+	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
+	o.gpuVendor = GPUVendorApple
+	o.m.SetHostInfo(HostInfo{GPUTotalsMB: map[int]int{0: 14000}})
+	if got := o.buildSnapshot().Budgets; len(got) != 0 {
+		t.Errorf("Budgets = %v on an Apple host, want empty", got)
+	}
+	o.cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 20000}}
+	if got, want := o.buildSnapshot().Budgets, map[int]int{0: 20000}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v on an Apple host with an operator budget, want %v", got, want)
+	}
+}
+
+// TestManagerEnforcesAutoDetectedBudget drives the new default through the real
+// Manager -> owner -> Admit chain: a spec whose known VRAM demand exceeds the
+// detected device total is refused, with no operator budget configured anywhere;
+// the paired case without a sample keeps starting it (the pre-feature
+// behaviour). The headroom option, which arrives via ManagerOptions, turns a
+// spec that fits the device into one that does not.
+func TestManagerEnforcesAutoDetectedBudget(t *testing.T) {
+	ensure := func(t *testing.T, opts ManagerOptions, hi *HostInfo, vramMB int) error {
+		t.Helper()
+		skipOnWindows(t)
+		shrinkTimings(t)
+		opts.Policy = allowlistPolicy()
+		opts.Getenv = func(string) string { return "" }
+		m := NewManager(opts)
+		t.Cleanup(m.Close)
+		if hi != nil {
+			m.SetHostInfo(*hi)
+		}
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: vramMB}}
+		m.Apply(Config{Specs: []Spec{spec}})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, "model-a")
+		if err == nil {
+			release()
+		}
+		return err
+	}
+	device := &HostInfo{GPUTotalsMB: map[int]int{0: 8000}}
+
+	t.Run("a spec larger than the detected device is refused", func(t *testing.T) {
+		if err := ensure(t, ManagerOptions{}, device, 12000); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("EnsureRunning(12000 MB on an 8000 MB GPU, no operator budget) = %v, want ErrNotPermitted", err)
+		}
+	})
+	t.Run("a spec that fits the detected device starts", func(t *testing.T) {
+		if err := ensure(t, ManagerOptions{}, device, 6000); err != nil {
+			t.Fatalf("EnsureRunning(6000 MB on an 8000 MB GPU) = %v, want nil", err)
+		}
+	})
+	t.Run("without a hardware sample the GPU stays unconstrained", func(t *testing.T) {
+		if err := ensure(t, ManagerOptions{}, nil, 12000); err != nil {
+			t.Fatalf("EnsureRunning before any sample = %v, want nil (unconstrained, as before this feature)", err)
+		}
+	})
+	t.Run("ManagerOptions.VRAMHeadroomMB shrinks the detected budget", func(t *testing.T) {
+		// 6000 fits 8000 on its own, but not 8000 - 4000.
+		if err := ensure(t, ManagerOptions{VRAMHeadroomMB: 4000}, device, 6000); !errors.Is(err, ErrNotPermitted) {
+			t.Fatalf("EnsureRunning(6000 MB, 4000 MB headroom on an 8000 MB GPU) = %v, want ErrNotPermitted", err)
+		}
+	})
+}
