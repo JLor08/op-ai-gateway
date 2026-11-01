@@ -137,6 +137,129 @@ func TestPutRuntimeSpecRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPutRuntimeSpecPersistsRAMEstimate pins the operator half of the per-spec
+// RAM pair: a PUT's ram_estimate_mb reaches the stored spec and the returned
+// DTO, and -- the PUT being a full-document upsert -- a later PUT that omits it
+// stores 0 ("no estimate", the unknown sentinel), not the previous value.
+func TestPutRuntimeSpecPersistsRAMEstimate(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", RAMEstimateMB: 4096,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if dto.RAMEstimateMB != 4096 || dto.RAMMeasuredMB != 0 {
+		t.Fatalf("dto ram = estimate %d measured %d, want 4096 and 0 (nothing measured yet)", dto.RAMEstimateMB, dto.RAMMeasuredMB)
+	}
+	stored, ok, err := routeStore.RuntimeSpecByMapping(ctx, mapping.ID)
+	if err != nil || !ok {
+		t.Fatalf("RuntimeSpecByMapping: ok=%v err=%v", ok, err)
+	}
+	if stored.RAMEstimateMB != 4096 {
+		t.Fatalf("stored RAMEstimateMB = %d, want 4096", stored.RAMEstimateMB)
+	}
+
+	// The agent measures; the operator then re-saves with a new estimate. The
+	// estimate moves, the agent-owned measurement survives.
+	if err := routeStore.UpdateRuntimeSpecRAMMeasured(ctx, dto.ID, 5000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	dto2, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", RAMEstimateMB: 8192,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (second): %v", err)
+	}
+	if dto2.ID != dto.ID || dto2.RAMEstimateMB != 8192 || dto2.RAMMeasuredMB != 5000 {
+		t.Fatalf("second PUT = id %q estimate %d measured %d, want the same id, 8192 and the preserved 5000", dto2.ID, dto2.RAMEstimateMB, dto2.RAMMeasuredMB)
+	}
+
+	// A full-document PUT that omits the estimate clears it; the measurement
+	// still survives.
+	dto3, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server",
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec (third): %v", err)
+	}
+	if dto3.RAMEstimateMB != 0 || dto3.RAMMeasuredMB != 5000 {
+		t.Fatalf("third PUT = estimate %d measured %d, want 0 (cleared) and the preserved 5000", dto3.RAMEstimateMB, dto3.RAMMeasuredMB)
+	}
+}
+
+// TestGetRuntimeSpecReturnsRAMFields pins the read side: GET carries the
+// operator's estimate and the agent's measurement, and an unconfigured mapping
+// reports both as 0 (unknown) rather than omitting the keys.
+func TestGetRuntimeSpecReturnsRAMFields(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "qwen", AppModelName: "qwen"})
+	if err != nil {
+		t.Fatalf("CreateMapping: %v", err)
+	}
+
+	empty, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec (unconfigured): %v", err)
+	}
+	if empty.Configured || empty.RAMEstimateMB != 0 || empty.RAMMeasuredMB != 0 {
+		t.Fatalf("unconfigured dto = %#v, want Configured:false with both RAM fields 0", empty)
+	}
+	raw, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatalf("marshal unconfigured dto: %v", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal unconfigured dto: %v", err)
+	}
+	for _, key := range []string{"ram_estimate_mb", "ram_measured_mb"} {
+		if string(keys[key]) != "0" {
+			t.Fatalf("unconfigured dto wire %s = %q, want the explicit 0 (the keys are never omitted)", key, keys[key])
+		}
+	}
+
+	put, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", RAMEstimateMB: 4096,
+	})
+	if err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	if err := routeStore.UpdateRuntimeSpecRAMMeasured(ctx, put.ID, 5000); err != nil {
+		t.Fatalf("seed measured ram: %v", err)
+	}
+	got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mapping.ID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	if got.RAMEstimateMB != 4096 || got.RAMMeasuredMB != 5000 {
+		t.Fatalf("GetRuntimeSpec ram = estimate %d measured %d, want 4096 and 5000", got.RAMEstimateMB, got.RAMMeasuredMB)
+	}
+	raw, err = json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal dto: %v", err)
+	}
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("unmarshal dto: %v", err)
+	}
+	if string(keys["ram_estimate_mb"]) != "4096" || string(keys["ram_measured_mb"]) != "5000" {
+		t.Fatalf("dto wire ram_estimate_mb = %q ram_measured_mb = %q, want 4096 and 5000", keys["ram_estimate_mb"], keys["ram_measured_mb"])
+	}
+}
+
 func TestPutRuntimeSpecValidation(t *testing.T) {
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
@@ -182,6 +305,12 @@ func TestPutRuntimeSpecValidation(t *testing.T) {
 			name:      "negative idle timeout",
 			mappingID: agentMapping.ID,
 			mutate:    func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.IdleTimeoutSeconds = -1; return r },
+			wantErr:   ErrRuntimeSpecTuningInvalid,
+		},
+		{
+			name:      "negative ram estimate",
+			mappingID: agentMapping.ID,
+			mutate:    func(r PutRuntimeSpecRequest) PutRuntimeSpecRequest { r.RAMEstimateMB = -1; return r },
 			wantErr:   ErrRuntimeSpecTuningInvalid,
 		},
 		{

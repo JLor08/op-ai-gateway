@@ -463,6 +463,15 @@ type RuntimeSpecDTO struct {
 	// PutRuntimeSpec for the two combinations this API refuses.
 	SetVisibleDevices bool                `json:"set_visible_devices"`
 	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
+	// RAMEstimateMB is the operator's estimate of this spec's resident host
+	// RAM in MB; RAMMeasuredMB is the agent's measurement of it (read-only on
+	// the wire: PutRuntimeSpecRequest has no counterpart, the store keeps the
+	// stored value across every write). RAM is host-scoped, so both are single
+	// scalars on the spec rather than per-GPU rows like the VRAM pair above. 0
+	// is the UNKNOWN sentinel -- no estimate, nothing measured yet -- never
+	// "needs no RAM", and both keys are always present on the wire.
+	RAMEstimateMB int `json:"ram_estimate_mb"`
+	RAMMeasuredMB int `json:"ram_measured_mb"`
 	// APIFlavors / ResponsesMode / MessagesMode are the per-spec snapshot of
 	// the three-state endpoint control (mirrors the same trio on
 	// ApplicationDTO), stored explicitly on this spec rather than inherited
@@ -555,6 +564,12 @@ type PutRuntimeSpecRequest struct {
 	// PutRuntimeSpec for the two combinations this API refuses.
 	SetVisibleDevices bool                `json:"set_visible_devices"`
 	GPUs              []RuntimeSpecGPUDTO `json:"gpus"`
+	// RAMEstimateMB is the operator's estimate of this spec's resident host
+	// RAM in MB (see RuntimeSpecDTO). Applied verbatim like every field of this
+	// full-document request: absent means 0, "no estimate", and clears a stored
+	// one. Negative is refused (ErrRuntimeSpecTuningInvalid). The measurement
+	// has no request field: it is agent-owned, and the store keeps it.
+	RAMEstimateMB int `json:"ram_estimate_mb"`
 	// APIFlavors / ResponsesMode / MessagesMode: see RuntimeSpecDTO's doc.
 	// Absent (empty/"") defaults to both/passthrough — see validateRuntimeSpecRequest;
 	// the backend does NOT inherit the parent server_agent application's
@@ -967,8 +982,13 @@ func validateRuntimeSpecShape(req PutRuntimeSpecRequest) (runtimeSpecFields, err
 	if !runtimeSpecBinaryIsAbsolute(binary) {
 		return runtimeSpecFields{}, ErrRuntimeSpecBinaryRequired
 	}
+	// ram_estimate_mb joins the non-negative tuning values: a negative RAM
+	// estimate has no meaning (0 is "no estimate"), and the later admission
+	// arithmetic must never be handed a negative demand. Same refusal as a
+	// negative vram_estimate_mb earns on a GPU row, in the sentinel this block
+	// already owns.
 	if req.ListenPort < 0 || req.HealthTimeoutSeconds < 0 || req.StartupTimeoutSeconds < 0 ||
-		req.IdleTimeoutSeconds < 0 || req.AdmissionWaitTimeoutSeconds < 0 {
+		req.IdleTimeoutSeconds < 0 || req.AdmissionWaitTimeoutSeconds < 0 || req.RAMEstimateMB < 0 {
 		return runtimeSpecFields{}, ErrRuntimeSpecTuningInvalid
 	}
 	adminState := strings.TrimSpace(req.AdminState)
@@ -1041,8 +1061,9 @@ func runtimeSpecEndpointModes(req PutRuntimeSpecRequest) (responses, messages ro
 }
 
 // runtimeSpecPrior is what a runtime-spec write keeps from the mapping's
-// stored spec: the row itself (ok is false when there is none) and its
-// measured VRAM per GPU index.
+// stored spec: the row itself (ok is false when there is none -- its id,
+// created_at and measured RAM carry forward) and its measured VRAM per GPU
+// index.
 type runtimeSpecPrior struct {
 	spec            routing.RuntimeSpec
 	ok              bool
@@ -1159,6 +1180,7 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		Pinned:                      req.Pinned,
 		AdminState:                  f.adminState,
 		VRAMLocked:                  req.VRAMLocked,
+		RAMEstimateMB:               req.RAMEstimateMB,
 		SetVisibleDevices:           req.SetVisibleDevices,
 		VisibleDevicesMode:          f.visibleMode,
 		APITokenMode:                mode,
@@ -1178,6 +1200,14 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 	if prior.ok {
 		spec.ID = prior.spec.ID
 		spec.CreatedAt = prior.spec.CreatedAt
+		// The agent's RAM measurement is the stored value, never the request's
+		// (the request has no such field -- the VRAM ownership rule, spec-level).
+		// The store's upsert already keeps ram_measured_mb across a conflict, so
+		// this is not what protects the column; it keeps the row this method
+		// hands back honest, because writeRuntimeSpec builds its response DTO
+		// from this row rather than re-reading the store, and a bare 0 here
+		// would report "nothing measured" for a spec that is measured.
+		spec.RAMMeasuredMB = prior.spec.RAMMeasuredMB
 	}
 	return spec, nil
 }
@@ -1684,6 +1714,8 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		VRAMLocked:                  spec.VRAMLocked,
 		SetVisibleDevices:           spec.SetVisibleDevices,
 		GPUs:                        gpuDTOs,
+		RAMEstimateMB:               spec.RAMEstimateMB,
+		RAMMeasuredMB:               spec.RAMMeasuredMB,
 		APIFlavors:                  append([]string{}, spec.APIFlavors...),
 		ResponsesMode:               string(spec.ResponsesMode),
 		MessagesMode:                string(spec.MessagesMode),
