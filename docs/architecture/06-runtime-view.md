@@ -840,7 +840,7 @@ sequenceDiagram
     GW->>RT: proxied request (app_model_name in JSON body)
     RT->>RT: buffer body, read `model` + `stream`
     RT->>MG: EnsureRunning(upstream model)
-    MG->>MG: Permit (local policy) → Admit (matrix · limit · per-GPU VRAM)
+    MG->>MG: Permit (local policy) → Admit (matrix · limit · per-GPU VRAM · host RAM)
     Note over MG: stopped → starting
     MG->>CH: exec (argv, scratch env, loopback port)
     MG->>CH: poll health until green (or startup_timeout_seconds)

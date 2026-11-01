@@ -96,8 +96,9 @@ Operators manage servers, models, users, and policies in a bilingual
   secrets never enter the gateway: a spec's environment values are
   `${AGENT_ENV:NAME}` references resolved on the AI server.
 - **Admission control before every start:** a pairwise co-residency matrix, a
-  per-server process limit, and per-GPU **VRAM budgets** with measured usage fed
-  back from the agent — so co-locating models does not become GPU OOM. Drain-first
+  per-server process limit, per-GPU **VRAM budgets** and a host-wide **RAM pool**
+  — both detected from the hardware by default, with measured usage fed back from
+  the agent — so co-locating models does not become a GPU or host OOM. Drain-first
   eviction never aborts an in-flight response.
 - Live per-model status in the portal (state, PID, port, in-flight, restarts, and
   the last load error with a stderr tail), start/stop/restart as desired-state

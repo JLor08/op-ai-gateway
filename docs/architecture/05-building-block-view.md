@@ -276,7 +276,7 @@ Three additions worth knowing when looking for code on this side:
 | Package | Responsibility |
 |---|---|
 | `agent` | The agent run loop, version, and orchestration of collection + reporting. |
-| `collector` | Host (gopsutil), GPU (nvidia-smi/rocm-smi/ioreg), power, CPU-temperature, and hardware-inventory collectors; optional inference `/metrics` scraper and loaded-model lister. |
+| `collector` | Host (gopsutil, including available memory), GPU (nvidia-smi/rocm-smi/ioreg), the per-process VRAM and host-RAM measurers (build-tag split per platform), power, CPU-temperature, and hardware-inventory collectors; optional inference `/metrics` scraper and loaded-model lister. |
 | `client` | HTTP and WebSocket senders that push telemetry to the gateway. |
 | `sample` | Telemetry sample shaping. |
 | `trust` | Gateway trust store (CA handling) for outbound TLS. |
@@ -292,7 +292,7 @@ analysable at all:
 | File | Holds |
 |---|---|
 | `types.go` | The runtime-config wire types and their parser (tolerant of unknown fields, hard-fails a duplicate spec id, silently drops a dangling co-residency pair). |
-| `policy.go` | The admission decision — matrix, per-GPU budgets, process limit, victim selection — as **pure functions over snapshots**: no clocks, no I/O, no goroutines, no logging. This is why it is the most heavily tested part, and why anything needing a clock or a syscall belongs in the manager instead. |
+| `policy.go` | The admission decision — matrix, per-GPU budgets, the host-wide RAM pool, process limit, victim selection — as **pure functions over snapshots**: no clocks, no I/O, no goroutines, no logging. This is why it is the most heavily tested part, and why anything needing a clock or a syscall belongs in the manager instead. |
 | `policy_local.go` | The agent-operator boundary: the binary allowlist, permitted directories, and placeholder expansion. |
 | `manager.go` | Child processes, reconciled against desired state by a **single serialized owner goroutine** with the proxy manager's generation discipline, so a late process exit can never clobber its successor. |
 | `router.go` | The single HTTP listener and both proxy paths. |

@@ -109,6 +109,7 @@ The ServerAgent (`op-ai-server-agent`, one process per monitored AI server) is c
 - **Telemetry sourcing**: `metrics_url` (optional inference `/metrics` scrape), `model_status_url` + `model_status_format` (poll a loaded-models endpoint in `openai`/`llama_swap`/`llama_cpp`/`litellm`/auto form), `lhm_url` (optional LibreHardwareMonitor `/data.json` URL for Windows CPU/system power).
 - **TLS trust**: `ca_file` (operator-managed PEM the agent only reads), `ca_cache_file` (agent-managed cache written atomically), `ca_pem` (inline bootstrap CA from a generated config), `tls_insecure` (skip verification — development only).
 - **Managed model runtime** (`runtime_source`, `runtime_config`, `runtime_allowed_binaries`, `runtime_allowed_dirs`, `runtime_cache`, `config_files_dir`, `runtime_router_bind`): whether launch specifications come from the gateway or a local file, and the agent-operator boundary on what may actually execute. One of these has an *empty* value that is load-bearing rather than merely unset — an empty binary allowlist starts nothing. A non-empty directory allowlist confines any spec that sets a `work_dir` to the permitted subtrees; a spec that sets none runs beside its binary and is permitted regardless. `config_files_dir` / `OP_AGENT_CONFIG_FILES_DIR` (flag `-config-files-dir`, default `server-agent-config-files` beside the binary, a relative file value resolved beside the config file) is the agent-owned base directory under which the agent writes the config files a spec asks for, one `<spec-id>/` subdirectory each — never the spec's `work_dir`, and never chosen by the gateway, which supplies only a file's name and content ([§3.5](agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child)). See [Agent-Managed Model Runtime §3 and §14](agent-runtime-manager.md).
+- **Resource accounting** (`OP_AGENT_VRAM_HEADROOM_MB`, `OP_AGENT_HOST_RAM_RESERVE_MB`, `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB`): three **env-only** integers (megabytes; no flag and no config-file key, so they resolve env > default) that tune the admission budgets the agent now derives by default: the headroom held back from each auto-detected per-GPU VRAM budget (default `0`), the host RAM held back from the host-RAM pool (default `2048`), and the conservative RAM charged to a spec of unknown RAM demand on its first start (default `4096`, `0` = off). A negative or malformed value falls back to the default rather than failing the load. They are operator-only: the gateway can never supply them ([ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides), [ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory), [ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)).
 
 See [Configuration & Environment Variables (Reference)](../reference/config-env.md) for the full `OP_AGENT_*` table with every default and floor/clamp rule.
 
@@ -117,11 +118,13 @@ variable, which makes adding the row a required part of adding a setting — in 
 same branch as the behaviour, per the repository's documentation rule. Its agent
 section additionally asserts that every row has a matching CLI flag and JSON
 config-file key with precedence flag > env > file > default, and that claim
-carries its three real exceptions:
-`OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are
-list-valued with **no flag form** (env, comma-separated, > file > default), and
-`OP_AGENT_CONFIG` has a flag (`-config`) but **no config-file key** —
-necessarily, since it names the file to read. An unqualified exhaustiveness or
+carries exceptions, which that section's own introduction enumerates (and
+`scripts/check-docs.sh` gates the flag half of) rather than a count kept here. For
+example, `OP_AGENT_RUNTIME_ALLOWED_BINARIES` and `OP_AGENT_RUNTIME_ALLOWED_DIRS` are
+list-valued with **no flag form** (env, comma-separated, > file > default),
+`OP_AGENT_CONFIG` has a flag (`-config`) but **no config-file key** — necessarily,
+since it names the file to read — and the three resource-accounting knobs are
+**env-only**, with neither. An unqualified exhaustiveness or
 parity claim silently becomes false with the next setting; stating that the claim
 is load-bearing is what keeps it true.
 
