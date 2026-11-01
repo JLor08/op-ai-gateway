@@ -179,7 +179,17 @@ type RuntimeSample struct {
 	// means "the document was read and states no options".
 	ImageOptions *RuntimeImageOptions `json:"image_options,omitempty"`
 	GPUs         []RuntimeGPUSample   `json:"gpus,omitempty"`
-	LastError    *RuntimeErrorSample  `json:"last_error,omitempty"`
+	// RAMMeasuredMB is the spec's current process's resident host RAM in MB,
+	// as the agent's own RAM measurer last observed it (RSS off Windows, the
+	// private working set on it). A spec-level scalar beside GPUs, not inside
+	// it: RAM has no per-GPU axis, and one process backs one spec. 0 means
+	// UNKNOWN -- never measured, no measurer on this host, or the process has
+	// exited -- and is never "needs no RAM", which is why it is omitempty: an
+	// unmeasured spec, and every agent that predates the field, sends no key at
+	// all and stays byte-neutral for the gateway's decoder. Declared by the
+	// runtime_ram_measurement feature; Status.MeasuredRAMMB is its source.
+	RAMMeasuredMB int                 `json:"ram_measured_mb,omitempty"`
+	LastError     *RuntimeErrorSample `json:"last_error,omitempty"`
 }
 
 // RuntimeImageOptions is one stable_diffusion_cpp child's image-generation

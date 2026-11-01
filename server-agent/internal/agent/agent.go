@@ -348,7 +348,18 @@ import (
 // an older router answers a 404 (runtime.upstream_endpoint_not_allowed) for the
 // route. The agent itself gates nothing on it. This is the ONE bump for the whole
 // branch; later commits on it do not bump again.
-const Version = "0.13.0"
+//
+// 0.13.0 -> 0.14.0 is the single bump for the RunSpec RAM-accounting branch. The
+// agent now samples the host's available RAM, auto-detects each GPU's VRAM budget
+// from the device total, and measures each managed child's resident host RAM (RSS
+// off Windows, the private working set on it), reporting it as the runtime
+// sample's spec-level ram_measured_mb. MINOR, and the rule decides it:
+// agent.Features gains "runtime_ram_measurement", the name the gateway and portal
+// read to know a connected agent reports that figure -- an older agent sends none,
+// which cannot otherwise be told apart from a spec with no process. The agent
+// itself gates nothing on it. This is the ONE bump for the whole branch; later
+// commits on it do not bump again.
+const Version = "0.14.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -2330,6 +2341,11 @@ func (a *Agent) collectOnce(ctx context.Context) {
 					sort.Slice(gpus, func(i, j int) bool { return gpus[i].Index < gpus[j].Index })
 					rs.GPUs = gpus
 				}
+				// Spec-level, so it does not ride gpus[]. 0 is the unknown
+				// sentinel (never "needs no RAM") and omitempty drops it from
+				// the wire; no clamp is needed here because the manager only
+				// ever stores a strictly positive measurement (realRAM).
+				rs.RAMMeasuredMB = st.MeasuredRAMMB
 				if st.LastError != nil {
 					rs.LastError = &sample.RuntimeErrorSample{
 						Message:    st.LastError.Message,

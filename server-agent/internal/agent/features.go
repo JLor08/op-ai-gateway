@@ -256,6 +256,24 @@ var Features = []Feature{
 	// Since is 0.13.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
 	{Name: "runtime_model_params", Since: "0.13.0"},
+	// runtime_ram_measurement: this agent measures each managed child's
+	// resident host RAM -- RSS off Windows, the private working set on it --
+	// and reports it as the runtime sample's spec-level ram_measured_mb
+	// (sample.RuntimeSample.RAMMeasuredMB), beside the per-GPU
+	// gpus[].vram_measured_mb.
+	//
+	// Like runtime_voices, runtime_model_params and fullduplex_proxy, this
+	// flag gates nothing on the agent -- it always reports what it can read --
+	// and is declared for the GATEWAY/PORTAL's benefit: an older agent sends no
+	// ram_measured_mb, which no probe of the agent can tell apart from a spec
+	// with no process, so the name is the only evidence the gateway has that a
+	// missing figure means "not reported by this agent" rather than "not
+	// running". Reporting is omitted for an unknown (0) figure, so the flag
+	// says the agent CAN report it, not that every spec carries one.
+	//
+	// Since is 0.14.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block).
+	{Name: "runtime_ram_measurement", Since: "0.14.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

@@ -481,7 +481,9 @@ type LastError struct {
 // does not put them on RuntimeSample itself -- only the PROBE RESULTS
 // (ContextSize/ActiveRequests/QueueDepth) land there. This is a second,
 // documented exception to the "mirrors sample.RuntimeSample field-for-field"
-// contract, alongside MeasuredVRAM above.
+// contract, alongside MeasuredVRAM above. MeasuredRAMMB, by contrast, IS part of
+// the mirror: it is a spec-level scalar that rides RuntimeSample.RAMMeasuredMB
+// under the same JSON key (internal/agent copies it across).
 type Status struct {
 	SpecID       string      `json:"spec_id"`
 	Model        string      `json:"model"` // upstream model name

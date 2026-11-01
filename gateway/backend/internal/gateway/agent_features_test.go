@@ -233,3 +233,28 @@ func TestRuntimeModelParamsFeatureName(t *testing.T) {
 		t.Fatalf("a server that declared %q must read as having it", RuntimeModelParamsFeature)
 	}
 }
+
+// TestRuntimeRAMMeasurementFeatureName pins the literal the agent declares for
+// its per-process host-RAM measurement (its features.go; the agent module cannot
+// import this one), and that the name stays off the gateway's own list: it
+// states a fact about the agent alone -- that it reports each managed child's
+// resident RAM as the runtime sample's spec-level ram_measured_mb -- and the
+// gateway only reads it off the agent's declared set (AgentFeatures.Has,
+// fail-closed), so a missing figure from an agent without the name reads as "not
+// reported by this agent" rather than "not running".
+func TestRuntimeRAMMeasurementFeatureName(t *testing.T) {
+	if RuntimeRAMMeasurementFeature != "runtime_ram_measurement" {
+		t.Fatalf("RuntimeRAMMeasurementFeature = %q, want the agent's literal %q", RuntimeRAMMeasurementFeature, "runtime_ram_measurement")
+	}
+	if slices.Contains(gatewayAgentFeatures, RuntimeRAMMeasurementFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeRAMMeasurementFeature)
+	}
+	srv := NewTestServer()
+	if srv.AgentFeatures.Has("ram-host", RuntimeRAMMeasurementFeature) {
+		t.Fatalf("a server that declared nothing must not read as having %q (fail-closed)", RuntimeRAMMeasurementFeature)
+	}
+	srv.AgentFeatures.Set("ram-host", []string{RuntimeRAMMeasurementFeature})
+	if !srv.AgentFeatures.Has("ram-host", RuntimeRAMMeasurementFeature) {
+		t.Fatalf("a server that declared %q must read as having it", RuntimeRAMMeasurementFeature)
+	}
+}

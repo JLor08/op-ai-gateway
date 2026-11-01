@@ -1228,6 +1228,69 @@ func TestCollectOnceRuntimePopulatesRuntimesAndOverridesLoadedModels(t *testing.
 	}
 }
 
+// TestRuntimeStatusCarriesMeasuredRAM pins the RAM half of the status -> sample
+// mirror: a spec's Status.MeasuredRAMMB lands on the wire sample as the
+// spec-level ram_measured_mb (beside, not inside, the per-GPU gpus[]), and a
+// spec whose RAM is unknown (0) sends nothing at all -- 0 is the "unknown"
+// sentinel, never "needs no RAM", and omitempty keeps an agent that measures
+// nothing byte-identical to one that predates the field.
+func TestRuntimeStatusCarriesMeasuredRAM(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	since := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	drv.setStatuses([]runtimectl.Status{
+		{
+			SpecID:        "rspec_measured",
+			Model:         "qwen-coder",
+			State:         runtimectl.StateRunning,
+			Since:         since,
+			PID:           111,
+			MeasuredVRAM:  map[int]int{0: 21234},
+			MeasuredRAMMB: 1500,
+		},
+		{
+			SpecID: "rspec_unknown",
+			Model:  "llama-small",
+			State:  runtimectl.StateRunning,
+			Since:  since,
+			PID:    222,
+		},
+	})
+
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+	a.collectOnce(context.Background())
+
+	got := poster.first()
+	if got == nil {
+		t.Fatal("no sample posted")
+	}
+	if len(got.Runtimes) != 2 {
+		t.Fatalf("Runtimes len = %d, want 2: %+v", len(got.Runtimes), got.Runtimes)
+	}
+	if got.Runtimes[0].RAMMeasuredMB != 1500 {
+		t.Errorf("Runtimes[0].RAMMeasuredMB = %d, want 1500 (Status.MeasuredRAMMB)", got.Runtimes[0].RAMMeasuredMB)
+	}
+	if len(got.Runtimes[0].GPUs) != 1 || got.Runtimes[0].GPUs[0].VRAMMeasuredMB != 21234 {
+		t.Errorf("Runtimes[0].GPUs = %+v, want the VRAM figure untouched beside the RAM one", got.Runtimes[0].GPUs)
+	}
+	if got.Runtimes[1].RAMMeasuredMB != 0 {
+		t.Errorf("Runtimes[1].RAMMeasuredMB = %d, want 0 (unknown)", got.Runtimes[1].RAMMeasuredMB)
+	}
+
+	got.Normalize()
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if n := strings.Count(string(raw), `"ram_measured_mb"`); n != 1 {
+		t.Fatalf("marshaled sample carries ram_measured_mb %d times, want exactly once (the measured spec only): %s", n, raw)
+	}
+	if !strings.Contains(string(raw), `"ram_measured_mb":1500`) {
+		t.Fatalf("marshaled sample lacks ram_measured_mb:1500: %s", raw)
+	}
+}
+
 // stubLoadedLister is a minimal collector.LoadedModelLister fake.
 type stubLoadedLister struct{ models []string }
 
