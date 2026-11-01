@@ -359,6 +359,11 @@ import (
 // which cannot otherwise be told apart from a spec with no process. The agent
 // itself gates nothing on it. This is the ONE bump for the whole branch; later
 // commits on it do not bump again.
+//
+// The same branch's later wire commit -- the runtime-config document gains a
+// spec-level ram_mb (runtime.Spec.RAMMB) carrying each spec's host-RAM demand --
+// adds "runtime_ram_accounting" to agent.Features with Since 0.14.0 and does NOT
+// bump again: a bump is per shipped change, and 0.14.0 has not shipped yet.
 const Version = "0.14.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged

@@ -274,6 +274,23 @@ var Features = []Feature{
 	// Since is 0.14.0: agent.Features gains an entry, so the rule is a MINOR
 	// bump (see agent.go's Version block).
 	{Name: "runtime_ram_measurement", Since: "0.14.0"},
+	// runtime_ram_accounting: this agent receives each spec's host-RAM demand
+	// as the runtime-config document's spec-level ram_mb (runtime.Spec.RAMMB,
+	// the gateway's max(measured, estimate); 0 = unknown) and accounts for it
+	// when admitting a spec.
+	//
+	// Like runtime_ram_measurement, this flag is declared for the
+	// GATEWAY/PORTAL's benefit: an older agent decodes the document without
+	// error and silently ignores the unknown ram_mb key, which no probe of the
+	// agent can tell apart from one that honours it, so the name is the only
+	// evidence the gateway has that a pushed RAM demand is actually enforced
+	// rather than dropped.
+	//
+	// Since is 0.14.0, not a newer version: a bump is per shipped change, and
+	// this flag rides the same RunSpec RAM-accounting branch as
+	// runtime_ram_measurement, whose single MINOR bump to 0.14.0 covers both
+	// entries (see agent.go's Version block).
+	{Name: "runtime_ram_accounting", Since: "0.14.0"},
 }
 
 // FeatureNames returns every feature name in Features, in registry order.

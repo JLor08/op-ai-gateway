@@ -1192,6 +1192,13 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Type = ""                       // reported for probes, read live
 		s.MetricsPath = ""                // "
 		s.ContextProbePath = ""           // "
+		// RAMMB is the host-RAM admission DEMAND, the spec-level twin of
+		// SpecGPU.VRAMMB below: consumed only by admission arithmetic, never
+		// baked into the child. The gateway pushes max(measured, estimate), and
+		// the measurement is written back from the agent's own reports, so
+		// leaving it in the comparison would relaunch every freshly measured
+		// healthy child.
+		s.RAMMB = 0
 		// GPUs' launch-relevant part is the ordered/deduped INDEX list
 		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy

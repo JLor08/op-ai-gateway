@@ -54,6 +54,14 @@ type ConfigFile struct {
 // everything the agent needs to exec and supervise a model process. Mirrors
 // the gateway's AgentRuntimeSpecDTO
 // (gateway/backend/internal/portal/service_runtime.go) field-for-field.
+//
+// RAMMB is the spec's effective host-RAM demand in MB, the gateway's
+// max(measured, estimate). It is spec-level because RAM is a host resource, not
+// a per-card one: it sits beside GPUs and never inside a SpecGPU row. 0 means
+// UNKNOWN demand -- the gateway holds neither a measurement nor an estimate, or
+// it is an older gateway that never sends the field -- and never "needs no RAM".
+// Like SpecGPU.VRAMMB it is an admission DEMAND, not a launch input
+// (sameLaunchShape ignores it).
 type Spec struct {
 	ID                          string            `json:"id"`
 	Model                       string            `json:"model"`
@@ -64,6 +72,7 @@ type Spec struct {
 	ConfigFiles                 []ConfigFile      `json:"config_files"` // #257; non-nil after ParseConfig, names validated there
 	WorkDir                     string            `json:"work_dir"`
 	GPUs                        []SpecGPU         `json:"gpus"`
+	RAMMB                       int               `json:"ram_mb"` // host-RAM demand (max(measured, estimate)); 0 = unknown, never "needs none"
 	ListenPort                  int               `json:"listen_port"`
 	HealthPath                  string            `json:"health_path"`
 	HealthTimeoutSeconds        int               `json:"health_timeout_seconds"`

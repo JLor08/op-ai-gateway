@@ -258,3 +258,28 @@ func TestRuntimeRAMMeasurementFeatureName(t *testing.T) {
 		t.Fatalf("a server that declared %q must read as having it", RuntimeRAMMeasurementFeature)
 	}
 }
+
+// TestRuntimeRAMAccountingFeatureName pins the literal the agent declares for its
+// host-RAM accounting (its features.go; the agent module cannot import this
+// one), and that the name stays off the gateway's own list: it states a fact
+// about the agent alone -- that it receives each spec's host-RAM demand as the
+// runtime-config wire's spec-level ram_mb and accounts for it -- and the gateway
+// only reads it off the agent's declared set (AgentFeatures.Has, fail-closed),
+// so an agent without the name reads as one that ignores the figure rather than
+// one that honours it.
+func TestRuntimeRAMAccountingFeatureName(t *testing.T) {
+	if RuntimeRAMAccountingFeature != "runtime_ram_accounting" {
+		t.Fatalf("RuntimeRAMAccountingFeature = %q, want the agent's literal %q", RuntimeRAMAccountingFeature, "runtime_ram_accounting")
+	}
+	if slices.Contains(gatewayAgentFeatures, RuntimeRAMAccountingFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeRAMAccountingFeature)
+	}
+	srv := NewTestServer()
+	if srv.AgentFeatures.Has("ram-accounting-host", RuntimeRAMAccountingFeature) {
+		t.Fatalf("a server that declared nothing must not read as having %q (fail-closed)", RuntimeRAMAccountingFeature)
+	}
+	srv.AgentFeatures.Set("ram-accounting-host", []string{RuntimeRAMAccountingFeature})
+	if !srv.AgentFeatures.Has("ram-accounting-host", RuntimeRAMAccountingFeature) {
+		t.Fatalf("a server that declared %q must read as having it", RuntimeRAMAccountingFeature)
+	}
+}

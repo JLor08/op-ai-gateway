@@ -4001,6 +4001,7 @@ func TestSameLaunchShape(t *testing.T) {
 		Args: []string{"-p", "${PORT}"}, Env: map[string]string{"A": "1"},
 		WorkDir: "/w", ListenPort: 8080,
 		GPUs:               []SpecGPU{{Index: 0, VRAMMB: 8000}},
+		RAMMB:              4096,
 		SetVisibleDevices:  true,
 		VisibleDevicesMode: "env",
 		APIToken:           "tok",
@@ -4052,6 +4053,11 @@ func TestSameLaunchShape(t *testing.T) {
 		// gateway churns it via measured-VRAM write-back, so an edit to it alone
 		// must not bounce a running child (issue #63 review finding).
 		"GPU vram_mb": func(s *Spec) { s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 9000}} },
+		// ram_mb is the host-RAM admission DEMAND, the spec-level twin of the
+		// row above: the gateway pushes max(measured, estimate), so each
+		// measured-RAM write-back moves it, and it must not bounce a healthy
+		// child either.
+		"RAMMB": func(s *Spec) { s.RAMMB = 9000 },
 	}
 	for name, mut := range meta {
 		b := base

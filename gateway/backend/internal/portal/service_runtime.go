@@ -2324,6 +2324,9 @@ type AgentRuntimeSpecGPUDTO struct {
 
 // AgentRuntimeSpecDTO is one ENABLED launch spec inside the runtime-config
 // document -- everything the agent needs to exec and supervise the process.
+// RAMMB is the spec's host-RAM demand: spec-level (RAM is a host resource, so
+// it sits beside GPUs and never on a per-GPU row) and, like each GPU's VRAMMB,
+// max(measured, estimate) -- see agentRuntimeSpecDTO. 0 is unknown demand.
 // Model/UpstreamModel fold in the owning ModelMapping's two model-name
 // fields (gateway_model_name / app_model_name), since the agent has no other
 // way to learn them. Env values legitimately carry ${AGENT_ENV:NAME}/${PORT}/
@@ -2339,6 +2342,7 @@ type AgentRuntimeSpecDTO struct {
 	Env                         map[string]string        `json:"env"`
 	WorkDir                     string                   `json:"work_dir,omitempty"`
 	GPUs                        []AgentRuntimeSpecGPUDTO `json:"gpus"`
+	RAMMB                       int                      `json:"ram_mb"` // host-RAM demand, max(measured, estimate); 0 = unknown, never "needs none"
 	ListenPort                  int                      `json:"listen_port"`
 	HealthPath                  string                   `json:"health_path"`
 	HealthTimeoutSeconds        int                      `json:"health_timeout_seconds"`
@@ -2652,6 +2656,10 @@ func (s *Service) resolvePushToken(spec routing.RuntimeSpec, app routing.Applica
 // both 0 stays 0 so the agent still sees an unknown demand and bootstraps it.
 // Neither stored figure is rewritten by this -- the estimate stays the
 // operator's and the measurement stays the agent's.
+//
+// The spec's host-RAM demand (RAMMB) follows the identical rule over the spec's
+// own two figures, RAMMeasuredMB and RAMEstimateMB: RAM is host-scoped, so it is
+// ONE number on the spec rather than one per GPU row.
 func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping, gpus []routing.RuntimeSpecGPU) (AgentRuntimeSpecDTO, error) {
 	var args []string
 	if err := json.Unmarshal([]byte(spec.Args), &args); err != nil {
@@ -2682,6 +2690,9 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		}
 		gpuDTOs = append(gpuDTOs, AgentRuntimeSpecGPUDTO{Index: g.GPUIndex, VRAMMB: vram})
 	}
+	// Host-RAM demand: the same max(measured, estimate) floor as the VRAM above,
+	// over the spec-level pair. Both 0 stays 0 (unknown).
+	ram := max(spec.RAMMeasuredMB, spec.RAMEstimateMB)
 	return AgentRuntimeSpecDTO{
 		ID:                          spec.ID,
 		Model:                       mapping.GatewayModelName,
@@ -2691,6 +2702,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		Env:                         env,
 		WorkDir:                     spec.WorkDir,
 		GPUs:                        gpuDTOs,
+		RAMMB:                       ram,
 		ListenPort:                  spec.ListenPort,
 		HealthPath:                  spec.HealthPath,
 		HealthTimeoutSeconds:        spec.HealthTimeoutSeconds,

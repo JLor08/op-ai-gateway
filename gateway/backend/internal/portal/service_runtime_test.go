@@ -2004,6 +2004,103 @@ func TestAgentRuntimeConfigPushesMaxOfMeasuredAndEstimate(t *testing.T) {
 	}
 }
 
+// TestAgentConfigCarriesRAMDemand pins the host-RAM demand the gateway pushes
+// to the agent as the spec-level ram_mb: max(ram_measured_mb, ram_estimate_mb),
+// the same "estimate is a floor, a larger measurement raises it" rule the
+// per-GPU VRAM figure follows (TestAgentRuntimeConfigPushesMaxOfMeasuredAndEstimate).
+//
+// RAM is host-scoped, not per-card, so the figure rides on the spec itself and
+// never on a gpus[] row. A 0 on either side is "unknown", never "needs none": a
+// never-measured spec yields the estimate, an estimate of 0 yields the
+// measurement, and both 0 stays 0 so the agent still sees an unknown demand.
+// Neither stored figure is rewritten by serving the larger of the two.
+func TestAgentConfigCarriesRAMDemand(t *testing.T) {
+	cases := []struct {
+		name     string
+		measured int
+		estimate int
+		want     int
+	}{
+		{name: "measured above estimate raises it", measured: 5000, estimate: 4096, want: 5000},
+		{name: "never measured yields the estimate", measured: 0, estimate: 4096, want: 4096},
+		{name: "measured below estimate is floored at the estimate", measured: 3000, estimate: 4096, want: 4096},
+		{name: "no estimate yields the measurement", measured: 5000, estimate: 0, want: 5000},
+		{name: "both unknown stays unknown", measured: 0, estimate: 0, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+			ctx := context.Background()
+			svc, routeStore := newServerTestService(t, now)
+			server := createTestServer(t, svc, "S", "s.example.test")
+			app := seedServerAgentApplication(t, routeStore, server.ID, now)
+			mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: "llama", AppModelName: "llama-3-8b"})
+			if err != nil {
+				t.Fatalf("CreateMapping: %v", err)
+			}
+			spec, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
+				Enabled:       true,
+				Binary:        "/usr/bin/llama-server",
+				GPUs:          []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 8000}},
+				RAMEstimateMB: tc.estimate,
+			})
+			if err != nil {
+				t.Fatalf("PutRuntimeSpec: %v", err)
+			}
+			if tc.measured > 0 {
+				// The agent measured its own child's resident RAM and wrote it back.
+				if err := routeStore.UpdateRuntimeSpecRAMMeasured(ctx, spec.ID, tc.measured); err != nil {
+					t.Fatalf("seed measured RAM: %v", err)
+				}
+			}
+
+			dto, err := svc.AgentRuntimeConfig(ctx, server.ID)
+			if err != nil {
+				t.Fatalf("AgentRuntimeConfig: %v", err)
+			}
+			if len(dto.Specs) != 1 {
+				t.Fatalf("dto.Specs = %#v, want exactly one spec", dto.Specs)
+			}
+			if got := dto.Specs[0].RAMMB; got != tc.want {
+				t.Fatalf("pushed ram_mb = %d for measured=%d estimate=%d, want max(measured, estimate) = %d", got, tc.measured, tc.estimate, tc.want)
+			}
+
+			// The wire key is the spec-level ram_mb, and it is not a per-GPU
+			// field: RAM is a host resource, so a gpus[] row must not carry it.
+			raw, err := json.Marshal(dto.Specs[0])
+			if err != nil {
+				t.Fatalf("marshal spec dto: %v", err)
+			}
+			var wire struct {
+				RAMMB *int             `json:"ram_mb"`
+				GPUs  []map[string]any `json:"gpus"`
+			}
+			if err := json.Unmarshal(raw, &wire); err != nil {
+				t.Fatalf("unmarshal wire spec: %v", err)
+			}
+			if wire.RAMMB == nil || *wire.RAMMB != tc.want {
+				t.Fatalf("wire ram_mb = %v, want an explicit %d on the spec (never omitted, so 0 stays 'unknown' on the wire)", wire.RAMMB, tc.want)
+			}
+			for _, g := range wire.GPUs {
+				if _, ok := g["ram_mb"]; ok {
+					t.Fatalf("a gpus[] row carries ram_mb (%v); RAM is host-scoped and belongs on the spec only", g)
+				}
+			}
+
+			// Serving the larger of the two must not rewrite either stored
+			// figure: the estimate stays the operator's and the measurement
+			// stays the agent's.
+			stored, ok, err := routeStore.RuntimeSpecByID(ctx, spec.ID)
+			if err != nil || !ok {
+				t.Fatalf("RuntimeSpecByID: ok=%v err=%v", ok, err)
+			}
+			if stored.RAMMeasuredMB != tc.measured || stored.RAMEstimateMB != tc.estimate {
+				t.Fatalf("stored (measured, estimate) = (%d, %d), want (%d, %d) untouched", stored.RAMMeasuredMB, stored.RAMEstimateMB, tc.measured, tc.estimate)
+			}
+		})
+	}
+}
+
 // --- set_visible_devices -----------------------------------------------------
 
 // seedVisibleDevicesMapping builds the server + server_agent application +
