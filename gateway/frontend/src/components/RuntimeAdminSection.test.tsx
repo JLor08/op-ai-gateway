@@ -800,6 +800,128 @@ describe('RuntimeAdminSection launch specs list', () => {
     expect(screen.getAllByText(t.runtimeSpecPinned).length).toBeGreaterThanOrEqual(2);
   });
 
+  // The per-GPU cell shows the EFFECTIVE VRAM, the number the admission
+  // arithmetic actually charges, not the operator's raw estimate. In this phase
+  // that is lock-aware: unlocked, a positive measurement REPLACES the estimate
+  // (it may be higher or lower); locked, the estimate wins and the measurement
+  // is shown nowhere but the form. A later phase retires the lock and collapses
+  // this to max(measured, estimate) -- these tests change with it.
+  describe('effective VRAM and RAM columns', () => {
+    const effectiveSpecs = {
+      // measured above the estimate, unlocked: the measurement is effective.
+      map_unlocked: makeSpec({
+        configured: true,
+        mapping_id: 'map_unlocked',
+        vram_locked: false,
+        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
+      }),
+      // the same numbers, locked: the estimate is effective.
+      map_locked: makeSpec({
+        configured: true,
+        mapping_id: 'map_locked',
+        vram_locked: true,
+        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
+      }),
+      // measured BELOW the estimate, unlocked: the measurement still replaces
+      // it (the lock-aware rule is "measured if known", not a max).
+      map_lower: makeSpec({
+        configured: true,
+        mapping_id: 'map_lower',
+        vram_locked: false,
+        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 5000 }],
+      }),
+      // two cards: 9000 (measured over estimate) + 3000 (never measured, so
+      // its estimate) = 12000.
+      map_pair_open: makeSpec({
+        configured: true,
+        mapping_id: 'map_pair_open',
+        vram_locked: false,
+        gpus: [
+          { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
+          { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+        ],
+      }),
+      // the same two cards, locked: 8000 + 3000 = 11000.
+      map_pair_lock: makeSpec({
+        configured: true,
+        mapping_id: 'map_pair_lock',
+        vram_locked: true,
+        gpus: [
+          { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
+          { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+        ],
+      }),
+      // no GPU rows at all: nothing to total.
+      map_nogpu: makeSpec({ configured: true, mapping_id: 'map_nogpu' }),
+      // RAM: measured over estimate, estimate over measured, and neither.
+      map_ram_measured: makeSpec({
+        configured: true,
+        mapping_id: 'map_ram_measured',
+        ram_estimate_mb: 4096,
+        ram_measured_mb: 6000,
+      }),
+      map_ram_estimate: makeSpec({
+        configured: true,
+        mapping_id: 'map_ram_estimate',
+        ram_estimate_mb: 4096,
+        ram_measured_mb: 2000,
+      }),
+      map_ram_unknown: makeSpec({
+        configured: true,
+        mapping_id: 'map_ram_unknown',
+        ram_estimate_mb: 0,
+        ram_measured_mb: 0,
+      }),
+    };
+
+    function renderEffective() {
+      renderSection({
+        mappings: Object.keys(effectiveSpecs).map((id) =>
+          makeMapping({ id, gateway_model_name: `gw-${id}` }),
+        ),
+        specsByMappingId: effectiveSpecs,
+      });
+    }
+
+    // A row's cells fill in only once THAT row's spec has loaded, so every
+    // assertion waits on the cell instead of reading it once.
+    async function expectCell(rowKey: string, column: string, text: string) {
+      await waitFor(() =>
+        expect(cellForColumn(`gw-${rowKey}`, column)).toHaveTextContent(new RegExp(`^${text}$`)),
+      );
+    }
+
+    it('shows the measurement as the GPU VRAM when unlocked and the estimate when locked', async () => {
+      renderEffective();
+      await expectCell('map_unlocked', t.runtimeSpecGpus, '0: 9000 MB');
+      await expectCell('map_locked', t.runtimeSpecGpus, '0: 8000 MB');
+      await expectCell('map_lower', t.runtimeSpecGpus, '0: 5000 MB');
+      // The raw estimate of the unlocked row is not what the cell says.
+      expect(cellForColumn('gw-map_unlocked', t.runtimeSpecGpus)).not.toHaveTextContent('8000');
+    });
+
+    it('totals the effective VRAM of every GPU, with the same lock rule', async () => {
+      renderEffective();
+      await expectCell('map_pair_open', t.runtimeSpecGpus, '0: 9000 MB, 1: 3000 MB');
+      await expectCell('map_pair_open', t.runtimeSpecVramTotal, '12000 MB');
+      await expectCell('map_pair_lock', t.runtimeSpecVramTotal, '11000 MB');
+      await expectCell('map_unlocked', t.runtimeSpecVramTotal, '9000 MB');
+    });
+
+    it('renders an em-dash total for a spec with no GPU rows', async () => {
+      renderEffective();
+      await expectCell('map_nogpu', t.runtimeSpecGpus, '—');
+      await expectCell('map_nogpu', t.runtimeSpecVramTotal, '—');
+    });
+
+    it('shows the larger of measured and estimated RAM, and an em-dash when both are 0', async () => {
+      renderEffective();
+      await expectCell('map_ram_measured', t.runtimeSpecRam, '6000 MB');
+      await expectCell('map_ram_estimate', t.runtimeSpecRam, '4096 MB');
+      await expectCell('map_ram_unknown', t.runtimeSpecRam, '—');
+    });
+  });
+
   it('reads the GPU-assignment column as off / arguments / environment variable per spec', async () => {
     renderSection({
       mappings: [

@@ -2396,6 +2396,8 @@ describe('agent-managed runtime i18n keys (task 19 foundation)', () => {
       'runtimeSpecWorkDir',
       'runtimeSpecGpus',
       'runtimeSpecVram',
+      'runtimeSpecVramTotal',
+      'runtimeSpecRam',
       'runtimeSpecIdleTimeout',
       'runtimeSpecStartupTimeout',
       'runtimeSpecPinned',

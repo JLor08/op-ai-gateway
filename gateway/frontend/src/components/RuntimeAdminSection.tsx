@@ -667,10 +667,46 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-function formatGpus(gpus: RuntimeSpecGPU[]): string {
-  return gpus.length === 0
-    ? '—'
-    : gpus.map((g) => `${g.index}: ${g.vram_estimate_mb} MB`).join(', ');
+// The VRAM the admission arithmetic actually charges for one GPU row of a
+// spec, which is NOT always the operator's estimate. Locked (vram_locked), the
+// estimate wins and the agent's measurement is ignored; unlocked, a positive
+// measurement REPLACES the estimate (higher or lower), and a missing one (0 =
+// UNKNOWN, never "needs none") falls back to the estimate. The table shows this
+// number so it cannot disagree with what admission does with the same spec.
+//
+// Lock-aware only for as long as the lock exists: once vram_locked is retired
+// the rule collapses to max(measured, estimate), and this is the one place to
+// change.
+function effectiveGpuVram(spec: RuntimeSpec, g: RuntimeSpecGPU): number {
+  if (spec.vram_locked) return g.vram_estimate_mb;
+  return g.vram_measured_mb > 0 ? g.vram_measured_mb : g.vram_estimate_mb;
+}
+
+// The sum of every GPU row's effective VRAM: what the spec demands across the
+// host's cards in total. A card whose demand is still unknown (0) adds nothing,
+// so the total of a partly unknown spec is a floor; 0 means every card is
+// unknown (or there is none).
+function totalGpuVram(spec: RuntimeSpec | undefined): number {
+  if (!spec) return 0;
+  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(spec, g), 0);
+}
+
+// RAM has no lock and no per-card rows: the larger of the agent's measurement
+// and the operator's estimate. `|| 0` also covers a document from a gateway
+// that predates the fields, which would otherwise surface as NaN.
+function effectiveRam(spec: RuntimeSpec | undefined): number {
+  return Math.max(spec?.ram_measured_mb || 0, spec?.ram_estimate_mb || 0);
+}
+
+function formatGpus(spec: RuntimeSpec | undefined): string {
+  if (!spec || spec.gpus.length === 0) return '—';
+  return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(spec, g)} MB`).join(', ');
+}
+
+// A megabyte quantity for the two summary columns: the em-dash when nothing is
+// known (0 is the UNKNOWN sentinel throughout this feature, never a real zero).
+function formatMb(mb: number): string {
+  return mb > 0 ? `${mb} MB` : '—';
 }
 
 function renderBoolChip(active: boolean, label: string) {
@@ -3514,7 +3550,7 @@ export function RuntimeAdminSection({
     {
       id: 'gpus',
       label: t.runtimeSpecGpus,
-      value: (m) => formatGpus(specsById[m.id]?.gpus ?? []),
+      value: (m) => formatGpus(specsById[m.id]),
       filter: 'text',
       searchable: false,
     },
@@ -3540,6 +3576,34 @@ export function RuntimeAdminSection({
           ),
           t,
         ),
+    },
+    {
+      // The two resource summaries, one per axis the admission arithmetic
+      // budgets. The cell TEXT carries the unit, but `value` is the bare
+      // number (or the em-dash) so a numeric sort and the text filter work on
+      // the magnitude, and an unknown row sorts to the bottom.
+      id: 'vram_total',
+      label: t.runtimeSpecVramTotal,
+      value: (m) => {
+        const total = totalGpuVram(specsById[m.id]);
+        return total > 0 ? String(total) : '—';
+      },
+      render: (m) => formatMb(totalGpuVram(specsById[m.id])),
+      filter: 'text',
+      searchable: false,
+      numeric: true,
+    },
+    {
+      id: 'ram',
+      label: t.runtimeSpecRam,
+      value: (m) => {
+        const ram = effectiveRam(specsById[m.id]);
+        return ram > 0 ? String(ram) : '—';
+      },
+      render: (m) => formatMb(effectiveRam(specsById[m.id])),
+      filter: 'text',
+      searchable: false,
+      numeric: true,
     },
     {
       id: 'pinned',
