@@ -390,6 +390,20 @@ var errTranscriptionUnavailable = errors.New(codeTranscriptionUnavailable)
 // errImageEditTooLarge's twin, mapped in the same three places.
 var errTranscriptionTooLarge = errors.New(codeRequestBodyTooLarge)
 
+// errTranscriptionLiveBusy refuses a buffered transcription (or /details) whose
+// resolved single-slot model currently has an active live-transcription session:
+// audio.cpp serves one session per model, so proceeding would collide at the upstream
+// and bill an honest loud zero (§11.4(4)). Refusing cleanly with the live path's own
+// transcription.live_busy (liveBearerBusyCode, a transient 503) turns that collision
+// into an explicit, retryable signal; it is mapped to its status, code and message in
+// the same one place the other transcription refusals are (completionHTTPStatus,
+// completionErrorCode, completionErrorResponse), so the response and the usage row
+// cannot disagree. INTERIM until #340 (demand-driven multi-replica autoscaling): with N
+// instances, each its own live slot plus live failover, this contention largely
+// dissolves and a buffered request can be served beside a live one -- the clean 503
+// stays the right answer only when every slot is taken.
+var errTranscriptionLiveBusy = errors.New(liveBearerBusyCode)
+
 // transcriptionInferenceShape is the shape serveTranscription hands the ONE
 // preflight gate (inferencePreflight) for the plain transcription endpoint. It is a function, not an inline literal, so
 // the exact values the handler uses are the ones its test pins:
@@ -867,6 +881,22 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
 			"route_id", target.RouteID, "feature", multipartProxyFeature)
 		s.recordTranscriptionRoutingFailure(w, r, att, errTranscriptionUnavailable)
+		return
+	}
+	// A live transcription session on this model holds audio.cpp's one slot. A buffered
+	// transcription (or /details) sent to it now would collide at the upstream and bill
+	// an honest loud zero (§11.4(4)); refuse it cleanly with the live path's own busy 503
+	// instead. Checked after the resolve and the served/multipart gates so a permanent
+	// refusal still wins, and before any upstream body is built. The check is an advisory
+	// snapshot (liveSessions.held), not a lock: a live session may start right after it,
+	// leaving the pre-existing loud zero as the fallback -- it only turns the common
+	// same-model collision into a clean refusal. INTERIM until #340 generalises this to
+	// per-instance slots + live failover.
+	if s.liveSessions.held(target.RouteID) {
+		slog.Debug("transcription refused: a live session holds this model's slot",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+			"route_id", target.RouteID)
+		s.recordTranscriptionRoutingFailure(w, r, att, errTranscriptionLiveBusy)
 		return
 	}
 	rel := nativeRelay{

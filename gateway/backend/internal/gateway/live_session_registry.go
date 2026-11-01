@@ -51,3 +51,24 @@ func (r *liveSessionRegistry) acquire(routeID string) (release func(), ok bool) 
 		})
 	}, true
 }
+
+// held reports whether routeID currently has an active live session, WITHOUT claiming
+// or changing the slot. It lets a non-live request to the same single-slot model (a
+// buffered transcription or /details) refuse cleanly instead of colliding at the
+// upstream, where audio.cpp's one-at-a-time behaviour would surface as an error and an
+// honest loud zero. A nil registry holds nothing (it admitted nothing to begin with),
+// so the check is a no-op where live transcription is not wired.
+//
+// This is an advisory snapshot, not a lock: a live session may start or end right after
+// the read. The window is small and the fallback is the pre-existing loud zero, so the
+// check only turns the common same-model collision into a clean refusal; it does not
+// try to make the two paths mutually exclusive.
+func (r *liveSessionRegistry) held(routeID string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, busy := r.active[routeID]
+	return busy
+}
