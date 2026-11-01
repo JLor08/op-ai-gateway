@@ -91,9 +91,6 @@ var (
 	// truncated (no transcript.text.done) -- which is what makes the session a loud
 	// zero rather than a billed one.
 	errLiveClientGone = errors.New("live transcription: client gone without end-of-input")
-	// liveNewline reconstructs, for the completion scanner, the newline bufio.Scanner
-	// strips from each relayed SSE line.
-	liveNewline = []byte{'\n'}
 )
 
 // liveDownMsg is the typed envelope the gateway relays down to the browser over the
@@ -224,19 +221,16 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 	go func() { defer wg.Done(); writer.run(ctx) }()
 
 	// The loopback request body is the read side of this pipe; the read loop writes
-	// inbound PCM into the write side. pcmBytes is no longer billed here (the usage
-	// row is recorded at /v1), but liveReadLoop counts it all the same; it is dropped
-	// on this side.
+	// inbound PCM into the write side. The PCM is NOT counted or billed on this side:
+	// the usage row is recorded at /v1, which counts the bytes off the loopback body it
+	// reads. This adapter owns only the browser-side lifecycle.
 	pr, pw := io.Pipe()
-	var pcmBytes int64
 	var endRequested atomic.Bool
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		liveReadLoop(conn, cancel, pw, &pcmBytes, &endRequested)
+		liveReadLoop(conn, cancel, pw, &endRequested)
 	}()
-
-	scan := s.newTranscriptionStreamScan(endpointTranscription, false)
 
 	// Teardown, DEFERRED so it is airtight even if the relay panics. Leak-free and in
 	// order:
@@ -280,7 +274,7 @@ func (s *Server) relayLiveTranscription(r *http.Request, conn *websocket.Conn, c
 		slog.Warn("live transcription: loopback non-2xx", "id", id, "status", resp.StatusCode, "model", claims.Target.Model)
 		return
 	}
-	s.liveRelaySSE(ctx, resp.Body, scan, writer)
+	s.liveRelaySSE(ctx, resp.Body, writer)
 }
 
 // openLiveLoopback opens the internal full-duplex loopback POST to the gateway's own
@@ -389,12 +383,11 @@ func liveUpstreamPath(target routing.Target, params liveParams) string {
 	return "/v1/audio/transcriptions/live?" + q.Encode() + "&model=" + target.ProviderModel
 }
 
-// liveReadLoop pumps inbound WebSocket frames into the upstream request body and
-// counts the PCM payload. It is the SOLE writer of pw.
+// liveReadLoop pumps inbound WebSocket frames into the upstream request body. It is
+// the SOLE writer of pw.
 //
-//   - A BINARY frame is PCM: its payload is written to pw (and so streamed upstream)
-//     and its length added to pcmBytes -- WS framing is never counted, only the bytes
-//     relayed. A write that fails (the pipe was torn down) ends the loop.
+//   - A BINARY frame is PCM: its payload is written to pw (and so streamed upstream).
+//     A write that fails (the pipe was torn down) ends the loop.
 //   - A TEXT frame is a control message; the only one is {"type":"end"}, the explicit
 //     end-of-input. It closes pw cleanly (io.EOF), which the transport turns into the
 //     terminating chunk audio.cpp needs to emit transcript.text.done + [DONE]. Every
@@ -409,7 +402,7 @@ func liveUpstreamPath(target routing.Target, params liveParams) string {
 //     events and wrongly loud-zero a clean session);
 //   - otherwise (a close/drop without end-of-input) → abort the upstream body (no
 //     terminating chunk) and cancel the context, tearing the whole relay down.
-func liveReadLoop(conn *websocket.Conn, cancel context.CancelFunc, pw *io.PipeWriter, pcmBytes *int64, endRequested *atomic.Bool) {
+func liveReadLoop(conn *websocket.Conn, cancel context.CancelFunc, pw *io.PipeWriter, endRequested *atomic.Bool) {
 	readCtx := context.Background()
 readLoop:
 	for {
@@ -419,11 +412,9 @@ readLoop:
 		}
 		switch typ {
 		case websocket.MessageBinary:
-			n, werr := pw.Write(data)
-			if werr != nil {
+			if _, werr := pw.Write(data); werr != nil {
 				break readLoop
 			}
-			atomic.AddInt64(pcmBytes, int64(n))
 		case websocket.MessageText:
 			if isLiveEndControl(data) {
 				endRequested.Store(true)
@@ -447,21 +438,17 @@ func isLiveEndControl(data []byte) bool {
 	return c.Type == "end"
 }
 
-// liveRelaySSE reads the upstream SSE, feeds the completion scanner, and relays each
-// event to the browser as a typed down-message through the single writer. It uses
-// the SAME audio.cpp-SSE parser the buffered streamed transcription uses
-// (transcriptionStreamScan for completion, decodeTranscriptionEvent for each event);
-// it does not fork it. It returns when the body ends (EOF, error, or a line past the
-// bound), which is the relay's end.
-func (s *Server) liveRelaySSE(ctx context.Context, body io.Reader, scan *transcriptionStreamScan, writer *liveWriter) {
+// liveRelaySSE reads the upstream SSE and relays each event to the browser as a typed
+// down-message through the single writer. It uses the SAME audio.cpp-SSE event decoder
+// the buffered streamed transcription uses (decodeTranscriptionEvent); it does not fork
+// it. It does NOT track completion -- this adapter never bills, so the usage row and its
+// completion check are owned by /v1. It returns when the body ends (EOF, error, or a
+// line past the bound), which is the relay's end.
+func (s *Server) liveRelaySSE(ctx context.Context, body io.Reader, writer *liveWriter) {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLiveSSELineBytes)
 	for sc.Scan() {
 		line := sc.Bytes()
-		// Completion tracking: feed the line and the newline the Scanner stripped, so
-		// scan.complete() latches exactly as it does on the buffered relay.
-		scan.feed(line)
-		scan.feed(liveNewline)
 		msg, ok := liveDownMsgFromSSELine(line)
 		if !ok {
 			continue
@@ -475,7 +462,6 @@ func (s *Server) liveRelaySSE(ctx context.Context, body io.Reader, scan *transcr
 			break
 		}
 	}
-	scan.finish()
 }
 
 // liveDownMsgFromSSELine maps one SSE line to a typed down-message, or reports false

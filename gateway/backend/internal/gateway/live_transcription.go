@@ -237,8 +237,9 @@ func (s *Server) handlePortalLiveTranscriptionTicket(w http.ResponseWriter, r *h
 		Language:   params.Language,
 		UserID:     token.UserID,
 		TokenID:    token.ID,
-		// The WebSocket has no principal, so the usage row's service/project
-		// attribution rides in the ticket (as the buffered path reads it off the token).
+		// Audit-only: the loopback bills as the ticket user at /v1, not from these, so
+		// the authenticated token's service/project are sealed in only so a redeemed
+		// ticket stays a faithful record of who authorized the session (liveTicketClaims).
 		ServiceID:   token.ServiceID,
 		ServiceName: token.ServiceName,
 		ProjectID:   token.ProjectID,
