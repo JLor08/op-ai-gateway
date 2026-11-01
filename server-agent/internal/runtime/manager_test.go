@@ -3654,3 +3654,46 @@ func TestApplyRelaunchesOnDemandChildOnNextRequest(t *testing.T) {
 		t.Errorf("old-args invocation count (logA) = %d, want 1: the child must not re-run with stale args", n)
 	}
 }
+
+// TestSetHostInfoVisibleInSnapshot pins the push half of the hardware plumbing:
+// whatever the agent's collect loop last handed SetHostInfo is what the owner
+// sees on its next admission, with no polling and no shelling out on that path.
+//
+// It asserts through owner.hostInfo, the single reader buildSnapshot uses, on
+// an owner built the same way the snapshot tests build theirs. Three things are
+// pinned: nothing is detected before the first sample (the pre-feature state,
+// which must read as "unknown", not as a zero-capacity host), the newest push
+// replaces the previous one wholesale, and the manager keeps its OWN copy of the
+// per-GPU map -- the collect loop is a different goroutine from the owner, so a
+// caller that went on to mutate the map it passed in would otherwise race the
+// owner's read.
+func TestSetHostInfoVisibleInSnapshot(t *testing.T) {
+	spec := baseSpec("spec-a", "model-a")
+	o, _ := newSnapshotOwner(spec, 4242, nil)
+
+	if got := o.hostInfo(); len(got.GPUTotalsMB) != 0 || got.MemAvailableMB != 0 {
+		t.Fatalf("hostInfo() before any SetHostInfo = %+v, want the zero HostInfo (no detected GPUs, MemAvailableMB 0 = unknown)", got)
+	}
+
+	pushed := HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 32000}
+	o.m.SetHostInfo(pushed)
+	if got := o.hostInfo(); !reflect.DeepEqual(got, pushed) {
+		t.Fatalf("hostInfo() after SetHostInfo(%+v) = %+v, want the pushed value", pushed, got)
+	}
+	// The snapshot path that reads it must keep working with a sample present.
+	_ = o.buildSnapshot()
+
+	// The caller mutating its own map afterwards must not reach the owner.
+	pushed.GPUTotalsMB[0] = 1
+	pushed.GPUTotalsMB[7] = 99
+	if got := o.hostInfo().GPUTotalsMB; !reflect.DeepEqual(got, map[int]int{0: 24000}) {
+		t.Errorf("hostInfo().GPUTotalsMB = %v after the caller mutated the map it pushed, want {0: 24000} -- SetHostInfo must copy, the collect loop and the owner are different goroutines", got)
+	}
+
+	// The newest push replaces the old one: both fields, wholesale.
+	next := HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}, MemAvailableMB: 1500}
+	o.m.SetHostInfo(next)
+	if got := o.hostInfo(); !reflect.DeepEqual(got, next) {
+		t.Errorf("hostInfo() after a second SetHostInfo = %+v, want %+v (the latest sample wins)", got, next)
+	}
+}

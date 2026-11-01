@@ -196,6 +196,15 @@ type Manager struct {
 	// lock-free, mirroring proxy.certHolder's atomic.Pointer pattern.
 	measurer atomic.Pointer[measurerFunc]
 
+	// hostInfo is the latest hardware figures the agent's collect loop pushed
+	// (SetHostInfo): device totals and live available RAM. Same discipline as
+	// measurer above -- the owner only reads it, the collect loop only writes
+	// it, and an atomic pointer swap needs no owner round-trip, so the
+	// admission path reads a cached value and never shells out. nil until the
+	// first sample has been pushed, which the owner reads as "nothing
+	// detected" (owner.hostInfo).
+	hostInfo atomic.Pointer[HostInfo]
+
 	// wg tracks EVERY goroutine the owner spawns (health pollers, exit
 	// waiters, the owner goroutine itself, every scheduleAfter timer
 	// callback) so Close can block until none of them can touch shared state
@@ -482,6 +491,58 @@ func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
 	}
 	fn := measurerFunc(f)
 	m.measurer.Store(&fn)
+}
+
+// HostInfo is the latest hardware sample as far as admission is concerned: the
+// figures the owner cannot get from a managed process's own measurement.
+//
+// GPUTotalsMB maps a GPU index (the same index spec.GPUs and GPUBudget use) to
+// that device's total memory in MB, as the GPU collector last reported it. An
+// index the collector did not report, or reported as 0, is simply absent --
+// there is nothing detected for it, which is never the same as "a device with
+// no memory".
+//
+// MemAvailableMB is the host RAM obtainable right now (the sample's
+// MemAvailable, not total-minus-used), in MB. 0 means "no reading": either no
+// sample has arrived yet or the read failed, and a consumer must treat it as
+// unknown rather than as an exhausted host.
+type HostInfo struct {
+	GPUTotalsMB    map[int]int
+	MemAvailableMB int
+}
+
+// SetHostInfo records the newest hardware figures for the owner's next
+// admission. The agent's collect loop calls it once per sample (about once a
+// second): it is a cheap atomic store, and PUSHING the value is the point --
+// buildSnapshot runs on the owner on the admission path and must read a cached
+// number, never poll hardware or shell out. Each call replaces the previous one
+// wholesale.
+//
+// The manager keeps its own copy of the GPUTotalsMB map. The caller is a
+// different goroutine from the owner that reads it, so retaining the caller's
+// map would let a caller that goes on to reuse or edit it race that read.
+func (m *Manager) SetHostInfo(hi HostInfo) {
+	cp := HostInfo{MemAvailableMB: hi.MemAvailableMB}
+	if len(hi.GPUTotalsMB) > 0 {
+		cp.GPUTotalsMB = make(map[int]int, len(hi.GPUTotalsMB))
+		for i, mb := range hi.GPUTotalsMB {
+			cp.GPUTotalsMB[i] = mb
+		}
+	}
+	m.hostInfo.Store(&cp)
+}
+
+// hostInfo returns the latest pushed hardware figures, or the zero HostInfo
+// when nothing has been pushed yet: no detected GPU totals and MemAvailableMB
+// 0 (unknown). It is the ONE place the "no sample yet" case is interpreted, so
+// every consumer in buildSnapshot reads the same answer. The returned maps are
+// shared and read-only -- SetHostInfo replaces the whole value, it never edits
+// one in place.
+func (o *owner) hostInfo() HostInfo {
+	if hi := o.m.hostInfo.Load(); hi != nil {
+		return *hi
+	}
+	return HostInfo{}
 }
 
 // Close drain-stops every managed process (bounded: every spec's drain runs

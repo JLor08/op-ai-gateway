@@ -446,6 +446,22 @@ type runtimeDriver interface {
 	Active() bool
 }
 
+// hostInfoSink receives the freshest hardware figures from the collect loop:
+// *runtimectl.Manager satisfies it. Admission runs on the manager's owner
+// goroutine and must decide on cached numbers (it may not poll hardware or
+// shell out), so the collect loop -- which already gathers the device totals
+// and the available RAM every cycle -- PUSHES them here once per cycle.
+//
+// It is a separate, optional hook rather than a fourth runtimeDriver method on
+// purpose: runtimeDriver is the Driver's surface and the Driver does not own
+// the Manager, and a nil sink (every test, any build that never wires the
+// runtime) simply means nothing is published. main.go assigns only a
+// proven-non-nil *runtimectl.Manager, never a possibly-nil pointer, so a nil
+// check here is a real nil check (the typed-nil-interface trap Deps documents).
+type hostInfoSink interface {
+	SetHostInfo(runtimectl.HostInfo)
+}
+
 // runtimeReportResender is the optional interface a runtimeDriver may
 // additionally implement to accept a periodic, unconditional resend of its
 // file-mode report (fix round 1, I5): design spec §10.2 requires this as a
@@ -733,6 +749,16 @@ type Agent struct {
 	// "runtimes" field on the outgoing Sample, no LoadedModels override.
 	// See the runtimeDriver interface doc above for the exact contract.
 	runtimeDriver runtimeDriver
+	// hostInfo is the optional receiver of each cycle's device totals and
+	// available RAM (see hostInfoSink); nil = nothing is published.
+	hostInfo hostInfoSink
+	// gpuTotalsMB is the last-known total memory per GPU index (MB), as read
+	// by publishHostInfo and read only from collectOnce's single goroutine --
+	// the same access pattern as runtimeCapabilityCache, so no mutex. It is
+	// carried across cycles because a device's total is static hardware: one
+	// cycle whose GPU collector failed must not erase it (see
+	// publishHostInfo). nil until the first GPU total is seen.
+	gpuTotalsMB map[int]int
 	// runtimeWake is the optional wake channel derived from the poster (see
 	// runtimeWaker); nil when the poster does not support it (the POST
 	// transport, or a test poster). A nil channel in a select case simply
@@ -848,6 +874,11 @@ type Deps struct {
 	TrustSync     trustSyncer
 	ProxyDriver   certProxyDriver
 	RuntimeDriver runtimeDriver
+	// HostInfo receives each collect cycle's device totals and available RAM
+	// for runtime admission (see hostInfoSink). Same typed-nil caveat as
+	// TrustSync: assign only a proven-non-nil value (main.go's
+	// *runtimectl.Manager always is); nil publishes nothing.
+	HostInfo hostInfoSink
 	// GatewayFeatures carries the same typed-nil caveat as TrustSync: assign
 	// only a proven-non-nil value (main.go's *runtimectl.FeaturesClient
 	// always is), never a possibly-nil concrete pointer.
@@ -912,6 +943,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		trustSync:       d.TrustSync,
 		proxy:           d.ProxyDriver,
 		runtimeDriver:   d.RuntimeDriver,
+		hostInfo:        d.HostInfo,
 		gatewayFeatures: d.GatewayFeatures,
 		now:             time.Now,
 	}
@@ -2041,6 +2073,52 @@ func capabilitiesSample(c collector.Capabilities, source string) *sample.Capabil
 	return &sample.Capabilities{Verdicts: verdicts, Source: source}
 }
 
+// publishHostInfo hands the runtime owner this cycle's device totals and
+// available RAM (see hostInfoSink), converting bytes to MB here with a plain
+// truncating division so a sub-MB remainder is never rounded into capacity that
+// is not there. It does nothing without a sink.
+//
+// The two figures are deliberately NOT treated alike when a read fails:
+//
+//   - GPU totals are last-known-good. A device's total memory is static, but
+//     the collector that reads it (nvidia-smi) is a subprocess that does time
+//     out. Pushing an empty set after one failed cycle would drop every
+//     detected VRAM budget and leave admission unconstrained until the next
+//     good read -- exactly the over-admission the budgets exist to prevent. So
+//     the totals from every earlier cycle are kept, and a GPU is updated only
+//     when this cycle reports a positive total for it (an N/A field parses to
+//     0, which is "no reading", not "a device with no memory").
+//   - Available RAM is live or nothing. It changes second to second, so a
+//     stale figure is worse than an honest 0, which the consumer reads as
+//     unknown. It is set only from this cycle's host read.
+func (a *Agent) publishHostInfo(s *sample.Sample) {
+	if a.hostInfo == nil {
+		return
+	}
+	const bytesPerMB = 1024 * 1024
+	for _, g := range s.GPUs {
+		if mb := int(g.MemTotalBytes / bytesPerMB); mb > 0 {
+			if a.gpuTotalsMB == nil {
+				a.gpuTotalsMB = make(map[int]int)
+			}
+			a.gpuTotalsMB[g.Index] = mb
+		}
+	}
+	hi := runtimectl.HostInfo{}
+	if len(a.gpuTotalsMB) > 0 {
+		// A copy, so the sink (and the owner behind it) never shares the
+		// map this loop keeps editing.
+		hi.GPUTotalsMB = make(map[int]int, len(a.gpuTotalsMB))
+		for i, mb := range a.gpuTotalsMB {
+			hi.GPUTotalsMB[i] = mb
+		}
+	}
+	if s.Host != nil {
+		hi.MemAvailableMB = int(s.Host.MemAvailableBytes / bytesPerMB)
+	}
+	a.hostInfo.SetHostInfo(hi)
+}
+
 // collectOnce builds one sample from the host, GPU, and scrape collectors and
 // pushes it. Each collector failure is logged and skipped so a partial sample
 // still ships; a push failure is logged but not returned (the loop keeps going).
@@ -2109,6 +2187,11 @@ func (a *Agent) collectOnce(ctx context.Context) {
 		}
 		s.GPUs = append(s.GPUs, gpus...)
 	}
+	// Publish the hardware half of this sample to the runtime owner NOW,
+	// before the scrape/model-status/runtime-probe steps below: those can take
+	// seconds, and admission should not wait on them for numbers already in
+	// hand.
+	a.publishHostInfo(&s)
 	if a.scraper != nil {
 		cctx, cancel := context.WithTimeout(ctx, collectTimeout)
 		active, queue, err := a.scraper.Scrape(cctx)

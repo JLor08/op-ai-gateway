@@ -5108,3 +5108,118 @@ func TestCollectOnceRuntimeLiveProgressPidChangeRearmsStableUnknown(t *testing.T
 		t.Errorf("LiveProgressSupport after restart = %q, want %q", rs.LiveProgressSupport, "")
 	}
 }
+
+// fakeHostInfoSink records every HostInfo the collect loop pushes, standing in
+// for *runtimectl.Manager.
+type fakeHostInfoSink struct{ got []runtimectl.HostInfo }
+
+func (f *fakeHostInfoSink) SetHostInfo(hi runtimectl.HostInfo) { f.got = append(f.got, hi) }
+
+func (f *fakeHostInfoSink) last(t *testing.T) runtimectl.HostInfo {
+	t.Helper()
+	if len(f.got) == 0 {
+		t.Fatal("the collect loop never pushed a HostInfo")
+	}
+	return f.got[len(f.got)-1]
+}
+
+// switchableHost and switchableGPU are collectors whose answer a test changes
+// between collect cycles, including to a failure.
+type switchableHost struct {
+	h   *sample.Host
+	err error
+}
+
+func (s *switchableHost) Collect(context.Context) (*sample.Host, error) { return s.h, s.err }
+
+type switchableGPU struct {
+	gpus []sample.GPU
+	err  error
+}
+
+func (s *switchableGPU) Name() string                                  { return "fake" }
+func (s *switchableGPU) Available() bool                               { return true }
+func (s *switchableGPU) Collect(context.Context) ([]sample.GPU, error) { return s.gpus, s.err }
+
+// TestCollectOncePushesHostInfoToTheRuntimeOwner pins the wire that gets the
+// hardware sample to the runtime owner: each collect cycle pushes the device
+// totals (bytes -> MB, keyed by the collector's GPU index) and the live
+// available RAM (bytes -> MB). A GPU the collector reports with no total (the
+// nvidia collector parses an N/A field to 0) contributes nothing -- absent, so
+// it stays unconstrained rather than becoming a zero-MB device.
+func TestCollectOncePushesHostInfoToTheRuntimeOwner(t *testing.T) {
+	const mib = 1024 * 1024
+	sink := &fakeHostInfoSink{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
+		// The sub-MB remainder is truncated, never rounded up into RAM that
+		// is not there.
+		Host: fakeHost{h: &sample.Host{MemTotalBytes: 64000 * mib, MemAvailableBytes: 32000*mib + 1234}},
+		GPUs: []collector.GPUCollector{fakeGPU{gpus: []sample.GPU{
+			{Index: 0, MemTotalBytes: 24000 * mib},
+			{Index: 1, MemTotalBytes: 0},
+			{Index: 2, MemTotalBytes: 12288 * mib},
+		}}},
+		Poster:   &capturePoster{},
+		HostInfo: sink,
+	})
+
+	a.collectOnce(context.Background())
+
+	want := runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000, 2: 12288}, MemAvailableMB: 32000}
+	if got := sink.last(t); !reflect.DeepEqual(got, want) {
+		t.Errorf("pushed HostInfo = %+v, want %+v", got, want)
+	}
+}
+
+// TestCollectOnceKeepsLastKnownGPUTotalsWhenAGPUReadFails guards the failure
+// that would silently switch VRAM enforcement off: nvidia-smi timing out for
+// one cycle. A device's total memory is static, so a cycle that could not read
+// the GPUs must not push an empty set of totals -- that would drop every
+// detected budget and leave admission unconstrained until the next good cycle.
+// The totals are carried forward; the live RAM figure is NOT (stale free RAM is
+// worse than an honest 0 = unknown), and it still updates from the host read.
+func TestCollectOnceKeepsLastKnownGPUTotalsWhenAGPUReadFails(t *testing.T) {
+	const mib = 1024 * 1024
+	sink := &fakeHostInfoSink{}
+	host := &switchableHost{h: &sample.Host{MemAvailableBytes: 8000 * mib}}
+	gpu := &switchableGPU{gpus: []sample.GPU{{Index: 0, MemTotalBytes: 24000 * mib}}}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
+		Host: host, GPUs: []collector.GPUCollector{gpu}, Poster: &capturePoster{}, HostInfo: sink,
+	})
+
+	a.collectOnce(context.Background())
+	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 8000}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("first push = %+v, want %+v", got, want)
+	}
+
+	// The GPU read fails; the host read succeeds with a new figure.
+	gpu.gpus, gpu.err = nil, errors.New("nvidia-smi timed out")
+	host.h = &sample.Host{MemAvailableBytes: 6000 * mib}
+	a.collectOnce(context.Background())
+	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 6000}); !reflect.DeepEqual(got, want) {
+		t.Errorf("push after a failed GPU read = %+v, want %+v (last-known totals kept, live RAM updated)", got, want)
+	}
+
+	// The host read fails too: RAM reads as unknown (0), never as the stale 6000.
+	host.h, host.err = nil, errors.New("read failed")
+	a.collectOnce(context.Background())
+	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 0}); !reflect.DeepEqual(got, want) {
+		t.Errorf("push after a failed host read = %+v, want %+v (available RAM unknown, not carried forward)", got, want)
+	}
+}
+
+// TestCollectOnceWithoutHostInfoSinkStillShipsTheSample pins the optional
+// contract: an Agent built without the runtime (a test, or a build that never
+// wires it) collects and posts exactly as before.
+func TestCollectOnceWithoutHostInfoSinkStillShipsTheSample(t *testing.T) {
+	poster := &capturePoster{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
+		Host:   fakeHost{h: &sample.Host{MemTotalBytes: 1024}},
+		GPUs:   []collector.GPUCollector{fakeGPU{gpus: []sample.GPU{{Index: 0, MemTotalBytes: 1 << 30}}}},
+		Poster: poster,
+	})
+	a.collectOnce(context.Background())
+	if poster.count() != 1 {
+		t.Fatalf("posted %d samples, want 1", poster.count())
+	}
+}

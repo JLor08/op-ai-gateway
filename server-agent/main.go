@@ -228,6 +228,12 @@ func main() {
 	drv := runtimectl.NewDriver(mgr, src, featuresClient, reporter, runtimeBindHost)
 	defer drv.Close()
 	deps.RuntimeDriver = drv
+	// The collect loop already reads each GPU's total memory and the host's
+	// available RAM every cycle; this hands them to the manager so admission
+	// (which runs on the manager's own goroutine and must not poll hardware)
+	// decides on the latest sample. mgr is never nil here, so this is a real
+	// non-nil interface value (see agent.Deps.HostInfo).
+	deps.HostInfo = mgr
 	// The capability probe sends the sdcpp source only if the gateway declares it.
 	deps.GatewayFeatures = featuresClient
 	// The one wire that closes the cert_mode=proxy gap: the gateway publishes
