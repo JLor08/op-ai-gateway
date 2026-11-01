@@ -2827,6 +2827,309 @@ func TestManagerWithNoMeasurerInstalledIsUnaffected(t *testing.T) {
 	}
 }
 
+// --- per-process RAM measurement ---------------------------------------------
+//
+// The RAM measurer is the host-RAM twin of the VRAM one: installed through its
+// own SetRAMMeasurer, dispatched by the same off-owner measurement beat, applied
+// through the same generation guard, and reported through Status. It has no GPU
+// axis, so its answer is one number per pid and Status carries one scalar. In
+// this phase the number flows to Status/telemetry ONLY -- admission does not
+// read it yet.
+
+// TestRAMMeasurementReachesStatus is the headline case: a running spec's own
+// child pid is handed to the RAM measurer by the recurring beat, and the answer
+// lands in Status().MeasuredRAMMB. The VRAM measurer is installed alongside, on
+// purpose: both answers ride the same cmdMeasured, and neither may disturb the
+// other.
+func TestRAMMeasurementReachesStatus(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	var ramPIDs sync.Map // pid -> struct{}
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			ramPIDs.Store(p, struct{}{})
+			out[p] = 1500
+		}
+		return out
+	})
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		out := make(map[int]map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = map[int]int{0: 4242}
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true // Apply alone starts it; no request ever arrives
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a reports measured RAM", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB > 0
+	})
+
+	st := statusFor(m, "spec-a")
+	if st.PID == 0 {
+		t.Fatalf("Status()[spec-a].PID = 0 with state %v -- the test's own premise (a live child) does not hold", st.State)
+	}
+	if _, ok := ramPIDs.Load(st.PID); !ok {
+		t.Fatalf("the RAM measurer was never asked about spec-a's own child pid %d", st.PID)
+	}
+	if st.MeasuredRAMMB != 1500 {
+		t.Fatalf("Status()[spec-a].MeasuredRAMMB = %d, want 1500 (the measurer's own answer for this child)", st.MeasuredRAMMB)
+	}
+	if got := st.MeasuredVRAM[0]; got != 4242 {
+		t.Fatalf("Status()[spec-a].MeasuredVRAM[0] = %d, want 4242 -- the RAM answer must ride beside the VRAM one, not replace it", got)
+	}
+}
+
+// TestRAMMeasuredZeroIgnored is the zero-guard (realRAM), the RAM twin of
+// realMeasurement. A measured 0 means "unknown", never "this process needs no
+// RAM": admitted as a measurement it would charge the spec nothing once
+// admission reads it. Here the measurer answers 0 for every beat, so the field
+// must stay at its unknown value.
+//
+// It waits for several full measure-and-apply cycles before asserting. At most
+// one measurement is ever outstanding, so the measurer being called a second
+// time proves the first one's result was already applied -- an assertion made
+// before that would pass for the wrong reason.
+func TestRAMMeasuredZeroIgnored(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	var calls atomic.Int64
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = 0
+		}
+		calls.Add(1)
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "the RAM measurer has run for several beats", func() bool {
+		return calls.Load() >= 3
+	})
+
+	st := statusFor(m, "spec-a")
+	if st == nil || st.State != StateRunning {
+		t.Fatalf("Status()[spec-a] = %+v, want a running spec", st)
+	}
+	if st.MeasuredRAMMB != 0 {
+		t.Fatalf("Status()[spec-a].MeasuredRAMMB = %d after the measurer answered 0, want 0 (unknown) -- a measured 0 must be dropped, not recorded", st.MeasuredRAMMB)
+	}
+}
+
+// TestRAMMeasuredZeroDoesNotOverwriteARealValue is the other half of the
+// zero-guard: a real measurement already on the spec must survive later beats
+// in which the measurer says 0 (or says nothing). Overwriting it would turn a
+// transient "unknown" into a reported 0 that the portal cannot tell apart from
+// a measured one -- the same reason applyMeasurement leaves a VRAM value alone
+// when a cycle returns zeros.
+func TestRAMMeasuredZeroDoesNotOverwriteARealValue(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	var calls atomic.Int64
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		n := calls.Add(1)
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			if n == 1 {
+				out[p] = 1500
+			} else {
+				out[p] = 0
+			}
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a reports the first (real) measurement", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB == 1500
+	})
+	waitUntil(t, 5*time.Second, "the measurer has answered 0 on several later beats", func() bool {
+		return calls.Load() >= 4
+	})
+
+	if st := statusFor(m, "spec-a"); st == nil || st.MeasuredRAMMB != 1500 {
+		t.Fatalf("Status()[spec-a] = %+v after later beats answered 0, want MeasuredRAMMB to stay 1500", st)
+	}
+}
+
+// TestRAMMeasuredClearedOnExit is the RAM twin of
+// TestManagerClearsMeasuredVRAMWhenTheProcessExits (F2): a measurement
+// describes ONE process and stops being true the instant it exits. Left in
+// place, a force-stopped spec would keep reporting a dead process's RAM in
+// every Status() and, once the gateway persists it, rewrite it forever.
+func TestRAMMeasuredClearedOnExit(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = 1500
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+
+	waitUntil(t, 5*time.Second, "spec-a carries a measurement", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB > 0
+	})
+
+	// force_stopped rather than a crash so the stop is unambiguous and nothing
+	// restarts it (applyConfig checks force_stopped ahead of the pinned restart).
+	stopped := spec
+	stopped.AdminState = "force_stopped"
+	m.Apply(Config{Specs: []Spec{stopped}, ETag: "v2"})
+
+	waitUntil(t, 5*time.Second, "spec-a's process is gone", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.PID == 0 && st.State != StateRunning && st.State != StateDraining
+	})
+
+	if st := statusFor(m, "spec-a"); st.MeasuredRAMMB != 0 {
+		t.Fatalf("Status()[spec-a].MeasuredRAMMB = %d after the process exited (state %v, pid %d), want 0 -- a dead process's RAM is still reported", st.MeasuredRAMMB, st.State, st.PID)
+	}
+}
+
+// TestRAMMeasuredForASpecWithoutGPUs pins the one place the RAM beat is
+// deliberately NOT gated like the VRAM one. dispatchMeasurement skips the
+// measurement entirely when no spec declares a GPU, because a VRAM number needs
+// a GPU index to attach to and the measurer spawns a subprocess. RAM has no such
+// axis and costs one in-process read, and a CPU-only spec is exactly the kind
+// whose host-RAM footprint matters, so it must be measured -- and measuring it
+// must not wake the VRAM measurer, which stays gated on a declared GPU.
+func TestRAMMeasuredForASpecWithoutGPUs(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = 900
+		}
+		return out
+	})
+	// admission's own buildSnapshot call has an empty pid list by design (the
+	// spec being admitted has no process yet); only a NON-empty list can be the
+	// recurring beat this test is about.
+	var vramBeats atomic.Int64
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		if len(pids) > 0 {
+			vramBeats.Add(1)
+		}
+		return nil
+	})
+
+	spec := baseSpec("spec-cpu", "model-cpu")
+	spec.Pinned = true // no GPUs declared
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "the GPU-less spec reports measured RAM", func() bool {
+		st := statusFor(m, "spec-cpu")
+		return st != nil && st.MeasuredRAMMB == 900
+	})
+	// Past several more beats, so a VRAM beat that was merely slow to arrive
+	// would still be caught.
+	time.Sleep(200 * time.Millisecond)
+	if n := vramBeats.Load(); n != 0 {
+		t.Fatalf("the VRAM measurer was called %d time(s) with a live pid although no spec declares a GPU -- the RAM beat must not lift the VRAM measurer's own gate", n)
+	}
+}
+
+// TestRAMMeasurerAloneMeasuresWithoutAVRAMMeasurer: dispatchMeasurement used to
+// return at once when no VRAM measurer was installed. A host with no NVIDIA
+// tooling (AMD, Apple, CPU-only) installs none but still has a RAM measurer, so
+// the RAM beat must run on its own.
+func TestRAMMeasurerAloneMeasuresWithoutAVRAMMeasurer(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy()) // no SetMeasurer, ever
+
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			out[p] = 2048
+		}
+		return out
+	})
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}} // a GPU spec, but no VRAM measurer
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a reports measured RAM with no VRAM measurer installed", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.MeasuredRAMMB == 2048
+	})
+	if st := statusFor(m, "spec-a"); st.MeasuredVRAM != nil {
+		t.Fatalf("Status()[spec-a].MeasuredVRAM = %v with NO VRAM measurer installed, want nil", st.MeasuredVRAM)
+	}
+}
+
+// TestManagerWithNoRAMMeasurerReportsNoRAM is the non-regression for every host
+// whose collector.NewRAMMeasurer returns nil: SetRAMMeasurer(nil) is also
+// NewManager's default, and nothing must be measured or reported.
+func TestManagerWithNoRAMMeasurerReportsNoRAM(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+	m.SetRAMMeasurer(func(pids []int) map[int]int { return map[int]int{} })
+	m.SetRAMMeasurer(nil) // installing nil must go back to "no measurer"
+
+	spec := baseSpec("spec-a", "model-a")
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{Specs: []Spec{spec}})
+
+	waitUntil(t, 5*time.Second, "spec-a is running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if st := statusFor(m, "spec-a"); st == nil || st.MeasuredRAMMB != 0 {
+			t.Fatalf("Status()[spec-a] = %+v with no RAM measurer installed, want MeasuredRAMMB 0", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestRealRAMIsAZeroGuard pins the helper itself: strictly positive MB is a
+// measurement, anything else is "unknown" and comes back as 0.
+func TestRealRAMIsAZeroGuard(t *testing.T) {
+	for _, c := range []struct{ in, want int }{{1500, 1500}, {1, 1}, {0, 0}, {-1, 0}, {-1500, 0}} {
+		if got := realRAM(c.in); got != c.want {
+			t.Errorf("realRAM(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 // --- set_visible_devices, through the real two-process path -----------------
 
 // readEnvLog reads a stubchild -env-log file, polling until it appears (the

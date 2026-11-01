@@ -207,6 +207,13 @@ func main() {
 	// operator estimate with a measured zero. Do not call a specific measurer's
 	// constructor from here; that routes around the split.
 	mgr.SetMeasurer(collector.NewVRAMMeasurer())
+	// Per-process host-RAM measurement is the same kind of hardware capability
+	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
+	// private working set on it, and returns nil on a host that cannot read
+	// process memory, where SetRAMMeasurer(nil) is NewManager's own default.
+	// Measured RAM is reported through Status/telemetry only for now; admission
+	// does not read it yet.
+	mgr.SetRAMMeasurer(collector.NewRAMMeasurer())
 
 	var src runtimectl.Source
 	if cfg.RuntimeSource == config.RuntimeSourceFile {

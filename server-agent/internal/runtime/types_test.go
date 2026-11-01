@@ -534,6 +534,26 @@ func TestStatusMarshalJSONNeverEmitsNullMeasuredVRAM(t *testing.T) {
 	}
 }
 
+// TestStatusMarshalJSONMeasuredRAM pins the scalar RAM figure's JSON shape: it
+// is absent while unknown (0 -- never "needs no RAM") and present, under the
+// key RuntimeSample carries on the wire, once measured.
+func TestStatusMarshalJSONMeasuredRAM(t *testing.T) {
+	raw, err := json.Marshal(Status{SpecID: "s1", State: StateRunning})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "ram_measured_mb") {
+		t.Errorf("raw = %s, want no ram_measured_mb while the RAM is unknown (0)", raw)
+	}
+	raw, err = json.Marshal(Status{SpecID: "s2", State: StateRunning, MeasuredRAMMB: 1500})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"ram_measured_mb":1500`) {
+		t.Errorf("raw = %s, want ram_measured_mb:1500", raw)
+	}
+}
+
 // TestStatusMarshalJSONAppliesToCollections is the receiver check B2 asked
 // for: Status.MarshalJSON has a VALUE receiver, and this pins that the
 // normalization therefore survives every placement Status can appear in --

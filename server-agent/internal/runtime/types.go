@@ -492,7 +492,14 @@ type Status struct {
 	InFlight     int         `json:"in_flight"`
 	Restarts     int         `json:"restarts"`
 	MeasuredVRAM map[int]int `json:"measured_vram"` // gpu index -> MB, when measured
-	LastError    *LastError  `json:"last_error,omitempty"`
+	// MeasuredRAMMB is the spec's current process's resident host RAM in MB, as
+	// the recurring RAM measurement last observed it; 0 means unknown (never
+	// measured, no RAM measurer, or the process has exited) and is never "needs
+	// no RAM". A spec-level scalar -- RAM has no per-GPU axis, and one process
+	// backs one spec -- carried to the wire as RuntimeSample.RAMMeasuredMB under
+	// the same JSON key.
+	MeasuredRAMMB int        `json:"ram_measured_mb,omitempty"`
+	LastError     *LastError `json:"last_error,omitempty"`
 
 	// Type, MetricsPath, and ContextProbePath are the agent's per-child
 	// probe config, resolved effective values copied from the spec by

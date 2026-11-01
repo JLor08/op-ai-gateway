@@ -121,6 +121,11 @@ var (
 // held behind an atomic.Pointer.
 type measurerFunc func(pids []int) map[int]map[int]int
 
+// ramMeasurerFunc mirrors SetRAMMeasurer's function parameter, named so it can
+// be held behind an atomic.Pointer. It is deliberately not measurerFunc: host
+// RAM has no per-GPU axis, so its answer is one MB figure per pid.
+type ramMeasurerFunc func(pids []int) map[int]int
+
 // ManagerOptions configures a new Manager.
 type ManagerOptions struct {
 	// Policy is the agent-operator boundary (binary allowlist, permitted
@@ -205,6 +210,15 @@ type Manager struct {
 	// owner round-trip and keeps the owner loop's per-admission read
 	// lock-free, mirroring proxy.certHolder's atomic.Pointer pattern.
 	measurer atomic.Pointer[measurerFunc]
+
+	// ramMeasurer is the host-RAM twin of measurer above, under the same
+	// discipline: the owner only reads it, SetRAMMeasurer's caller only writes
+	// it, and an atomic swap needs no owner round-trip. nil (the default, and
+	// every host whose collector.NewRAMMeasurer returns nil) means no RAM is
+	// measured. It is read only by the off-owner dispatchMeasurement: in this
+	// phase measured RAM flows to Status/telemetry alone, so buildSnapshot,
+	// which feeds admission, does not consult it.
+	ramMeasurer atomic.Pointer[ramMeasurerFunc]
 
 	// hostInfo is the latest hardware figures the agent's collect loop pushed
 	// (SetHostInfo): device totals and live available RAM. Same discipline as
@@ -504,6 +518,31 @@ func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
 	m.measurer.Store(&fn)
 }
 
+// SetRAMMeasurer installs f, which is called with every currently-live managed
+// PID to get its real resident host RAM in MB (main.go wires this to
+// collector.NewRAMMeasurer: RSS off Windows, the private working set on
+// Windows). f may be nil to go back to no RAM measurement, which is also
+// NewManager's default.
+//
+// It is SetMeasurer's twin and carries the same obligations, with one
+// difference in where it is called from. f is called ONLY from the recurring,
+// OFF-owner measurement (dispatchMeasurement) -- never from buildSnapshot,
+// because measured RAM is reported through Status but not yet read by
+// admission -- so it never runs on the owner goroutine. It must still be safe
+// for concurrent use (it is stateless in practice) and MUST BOUND ITS OWN
+// RUNTIME: it is tracked in the Manager's WaitGroup, so Close waits for it.
+//
+// The answer maps pid -> MB for the pids it could read; a pid it could not
+// read is simply absent. A value <= 0 is not a measurement (see realRAM).
+func (m *Manager) SetRAMMeasurer(f func(pids []int) map[int]int) {
+	if f == nil {
+		m.ramMeasurer.Store(nil)
+		return
+	}
+	fn := ramMeasurerFunc(f)
+	m.ramMeasurer.Store(&fn)
+}
+
 // HostInfo is the latest hardware sample as far as admission is concerned: the
 // figures the owner cannot get from a managed process's own measurement.
 //
@@ -719,11 +758,14 @@ type measureTarget struct {
 }
 
 // cmdMeasured carries a completed off-owner measurement back to the owner.
-// byPID is exactly what the installed measurer returned (pid -> gpu index ->
-// MB), possibly nil.
+// byPID is exactly what the installed VRAM measurer returned (pid -> gpu index
+// -> MB) and ramByPID what the installed RAM measurer returned (pid -> MB);
+// either is nil when that measurer is not installed, was not consulted this
+// cycle, or answered nothing.
 type cmdMeasured struct {
-	targets []measureTarget
-	byPID   map[int]map[int]int
+	targets  []measureTarget
+	byPID    map[int]map[int]int
+	ramByPID map[int]int
 }
 
 func (cmdMeasured) isCommand() {}
@@ -840,6 +882,19 @@ type specState struct {
 	// sample, and the gateway kept writing the same value back once per
 	// second per (spec, gpu) forever -- on a server doing nothing at all.
 	measuredVRAM map[int]int
+
+	// measuredRAM is the last real resident host-RAM measurement (MB) of THIS
+	// SPEC'S CURRENT PROCESS, from the recurring measurement beat
+	// (applyMeasurement). 0 means UNKNOWN -- never measured, no RAM measurer
+	// installed, or only non-measurements (<= 0, see realRAM) seen -- and is
+	// never "this process needs no RAM". Reported via Status.MeasuredRAMMB;
+	// not read by admission in this phase.
+	//
+	// ONE PROCESS PER SPEC, so this is a scalar: there is nothing to sum, and
+	// unlike measuredVRAM there is no per-GPU key to re-key. Cleared by
+	// onProcExited for exactly the reason measuredVRAM is (F2): it describes a
+	// process, and stops being true when that process exits.
+	measuredRAM int
 
 	// notPermittedAt is stamped to now() every time admitAndStart (re)confirms
 	// StateNotPermitted or StatePendingVRAMUnknown -- deliberately NOT the
@@ -1587,7 +1642,9 @@ func (o *owner) admitAndStart(specID string) {
 // Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
 // NewManager's default). Those hosts take the first branch,
 // spawn nothing, allocate nothing, and behave exactly as they did before this
-// function existed.
+// function existed. "No measurer" now means neither of the two: the host-RAM
+// measurer (SetRAMMeasurer) rides this same beat, and a host that has only that
+// one still measures RAM -- see the note on the two gates below.
 //
 // GATED ON A SPEC DECLARING A GPU, NOT ON BUDGETS EXISTING. Skipping the
 // measurement when no GPU budget is configured was considered and rejected:
@@ -1600,24 +1657,44 @@ func (o *owner) admitAndStart(specID string) {
 // estimate at 0 is safe. A GPU-declaring spec is the honest gate: with no
 // GPUs declared anywhere there is no index the measurement could be attached
 // to, no admission arithmetic it could inform, and no portal row it could
-// fill.
+// fill. That gate belongs to the VRAM measurer alone: the RAM measurer has no
+// GPU index to need, so it is gated only on a live process existing.
 func (o *owner) dispatchMeasurement() {
 	if o.closing || o.measuring {
 		return
 	}
 	mp := o.m.measurer.Load()
-	if mp == nil {
+	rp := o.m.ramMeasurer.Load()
+	if mp == nil && rp == nil {
 		return
 	}
-	targets := o.measurementTargets()
+	targets, declaresGPU := o.measurementTargets()
 	if len(targets) == 0 {
 		return
+	}
+	// The two measurers are gated independently, and the asymmetry is the
+	// point. The VRAM one keeps the declares-a-GPU gate described above, so a
+	// host with nvidia-smi but no GPU-declaring spec still spawns nothing. The
+	// RAM one is NOT gated on a GPU: host RAM has no GPU index to attach to,
+	// costs one in-process read per pid rather than a subprocess, and the specs
+	// whose RAM footprint matters most are exactly the CPU-only ones. Both
+	// answers return in ONE cmdMeasured, so there is still at most one
+	// measurement outstanding.
+	var vramMeasure measurerFunc
+	if mp != nil && declaresGPU {
+		vramMeasure = *mp
+	}
+	var ramMeasure ramMeasurerFunc
+	if rp != nil {
+		ramMeasure = *rp
+	}
+	if vramMeasure == nil && ramMeasure == nil {
+		return // only a VRAM measurer, and no spec declares a GPU
 	}
 	pids := make([]int, len(targets))
 	for i, t := range targets {
 		pids[i] = t.pid
 	}
-	measure := *mp
 	o.measuring = true
 	// Tracked in m.wg like every other goroutine the owner spawns, so Close
 	// cannot return while a measurer is still running (which would let a
@@ -1635,18 +1712,35 @@ func (o *owner) dispatchMeasurement() {
 		// wedge the flag. (postCmd drops the command once the owner has
 		// stopped, which only happens during Close, where the flag no longer
 		// matters.)
-		o.m.postCmd(cmdMeasured{targets: targets, byPID: measure(pids)})
+		//
+		// Both measurers run here, one after the other, and their answers
+		// travel together. Each bounds its own runtime (the RAM one is a few
+		// in-process reads and returns at once), so the pair costs no more than
+		// the VRAM measurer alone did, and one cmdMeasured keeps the
+		// one-measurement-outstanding invariant.
+		c := cmdMeasured{targets: targets}
+		if ramMeasure != nil {
+			c.ramByPID = ramMeasure(pids)
+		}
+		if vramMeasure != nil {
+			c.byPID = vramMeasure(pids)
+		}
+		o.m.postCmd(c)
 	}()
 }
 
 // measurementTargets lists the live generations worth measuring right now, or
-// nil when there is nothing to measure. Ordered by spec ID so the pid list
-// handed to an external command does not depend on Go's randomized map
-// iteration -- the measurer treats it as a set, but a stable order keeps logs
-// and test expectations reproducible.
-func (o *owner) measurementTargets() []measureTarget {
-	targets := make([]measureTarget, 0, len(o.specs))
-	declaresGPU := false
+// nil when there are none. Ordered by spec ID so the pid list handed to an
+// external command does not depend on Go's randomized map iteration -- the
+// measurer treats it as a set, but a stable order keeps logs and test
+// expectations reproducible.
+//
+// declaresGPU reports whether any live spec declares a GPU. It is NOT applied
+// here: it is the VRAM measurer's gate (see dispatchMeasurement's gating
+// paragraph), and the RAM measurer, which has no GPU axis, must still see every
+// live process on a host where no spec declares one.
+func (o *owner) measurementTargets() (targets []measureTarget, declaresGPU bool) {
+	targets = make([]measureTarget, 0, len(o.specs))
 	for id, st := range o.specs {
 		if st.proc == nil {
 			continue
@@ -1656,11 +1750,8 @@ func (o *owner) measurementTargets() []measureTarget {
 		}
 		targets = append(targets, measureTarget{specID: id, proc: st.proc, pid: st.proc.pid})
 	}
-	if !declaresGPU {
-		return nil // see dispatchMeasurement's gating paragraph
-	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].specID < targets[j].specID })
-	return targets
+	return targets, declaresGPU
 }
 
 // realMeasurement keeps only the entries of byGPU that are an actual
@@ -1709,6 +1800,22 @@ func realMeasurement(byGPU map[int]int) map[int]int {
 	return out
 }
 
+// realRAM is realMeasurement's scalar twin: a measured RAM figure is real only
+// when strictly positive, and anything else comes back as 0, "unknown".
+//
+// The meaning of 0 is the same load-bearing one: a spec's RAM demand of 0 is
+// UNKNOWN, never "needs none", so a measured 0 must not be allowed to win over
+// an operator's estimate or to be reported as a measurement. A process that has
+// not (yet) been read, a pid the measurer could not open, or a platform that
+// answered 0 all land here, and the caller treats the result exactly like "not
+// measured this cycle": the previous value stays.
+func realRAM(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	return v
+}
+
 // applyMeasurement records a completed measurement against the generations it
 // was actually taken for, and re-arms the next dispatch.
 //
@@ -1736,6 +1843,14 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		}
 		if byGPU := realMeasurement(c.byPID[t.pid]); byGPU != nil {
 			st.measuredVRAM = byGPU
+		}
+		// ONE process per spec, so the pid's figure is the spec's figure:
+		// nothing to sum and no key to re-key. The same generation guard
+		// above is what keeps a recycled pid's reading off a different
+		// process, and realRAM is the same "a non-measurement says nothing"
+		// rule, so a cycle of zeros leaves a previous real number in place.
+		if mb := realRAM(c.ramByPID[t.pid]); mb > 0 {
+			st.measuredRAM = mb
 		}
 	}
 }
@@ -2264,6 +2379,9 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// rows. Cleared for EVERY kind of exit (crash, drain, idle unload,
 	// force_stopped, shutdown): none of them leaves the number true.
 	st.measuredVRAM = nil
+	// Same reasoning, and the same F2 cost, for the host-RAM figure: it
+	// describes this generation's process and is untrue the moment it exits.
+	st.measuredRAM = 0
 
 	wasIntentional := st.intentionalStop
 	st.intentionalStop = false
@@ -2747,6 +2865,8 @@ func (o *owner) snapshotStatus() []Status {
 			}
 			s.MeasuredVRAM = cp
 		}
+		// A scalar: copied by value, so nothing aliases owner state.
+		s.MeasuredRAMMB = st.measuredRAM
 		if st.proc != nil {
 			s.PID = st.proc.pid
 			s.Port = st.proc.port
