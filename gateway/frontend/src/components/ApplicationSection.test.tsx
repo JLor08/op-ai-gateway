@@ -145,6 +145,8 @@ function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',

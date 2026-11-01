@@ -243,6 +243,8 @@ function emptySpec(mappingId: string): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -594,6 +596,11 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
   // every other field this full-document PUT carries verbatim. So does
   // config_files (#257): the PUT treats an absent list as "none", so dropping
   // it here would delete the operator's files on a Start/Stop/Clear click.
+  // ram_estimate_mb is the same kind of writable field and rides `rest` for
+  // the same reason: the PUT applies an absent estimate as 0 and clears the
+  // stored one, so an override click must restate it. ram_measured_mb is the
+  // opposite: agent-owned with no request counterpart (PutRuntimeSpecRequest
+  // excludes it), so it is dropped here rather than echoed back.
   //
   // responses_live_timings_enabled is dropped for a DIFFERENT reason: it is
   // writable, but on the request shape it is OPTIONAL, and absent means "keep
@@ -613,6 +620,7 @@ function specBodyWithAdminState(spec: RuntimeSpec, adminState: string): PutRunti
     resolved_metrics_path,
     resolved_context_probe_path,
     responses_live_timings_enabled,
+    ram_measured_mb,
     ...rest
   } = spec;
   return { ...rest, admin_state: adminState };
@@ -2413,6 +2421,12 @@ export function RuntimeAdminSection({
   const [pinned, setPinned] = useState(false);
   const [adminState, setAdminState] = useState('');
   const [vramLocked, setVramLocked] = useState(false);
+  // The spec's operator RAM estimate in MB: ONE spec-level scalar (RAM is
+  // host-scoped, so it is not a GpuRow field). It must be bound to state and
+  // emitted by buildSpecBody even where the form shows no field for it: the
+  // PUT is a full-document upsert, and an absent estimate is applied as 0,
+  // clearing one set through the API.
+  const [ramEstimateMb, setRamEstimateMb] = useState(0);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
   // Runtime-Spec API Token: mode + its per-mode write-only state.
@@ -2565,6 +2579,7 @@ export function RuntimeAdminSection({
     setPinned(false);
     setAdminState('');
     setVramLocked(false);
+    setRamEstimateMb(0);
     setSetVisibleDevices(false);
     setVisibleDevicesMode('env');
     setApiTokenMode('app');
@@ -2599,6 +2614,7 @@ export function RuntimeAdminSection({
     setPinned(spec.pinned);
     setAdminState(spec.admin_state);
     setVramLocked(spec.vram_locked);
+    setRamEstimateMb(spec.ram_estimate_mb);
     setSetVisibleDevices(spec.set_visible_devices);
     setVisibleDevicesMode(spec.visible_devices_mode);
     setApiTokenMode(spec.api_token_mode);
@@ -2997,6 +3013,7 @@ export function RuntimeAdminSection({
       pinned,
       admin_state: adminState,
       vram_locked: vramLocked,
+      ram_estimate_mb: ramEstimateMb,
       set_visible_devices: setVisibleDevices,
       visible_devices_mode: visibleDevicesMode,
       api_token_mode: apiTokenMode,

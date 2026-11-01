@@ -157,6 +157,8 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
+    ram_estimate_mb: 0,
+    ram_measured_mb: 0,
     api_token_mode: 'app',
     api_token_set: false,
     api_token_header_source: 'app',
@@ -2608,6 +2610,11 @@ function fullSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     // value from a defaulted one.
     set_visible_devices: true,
     gpus: [{ index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 }],
+    // Non-default on purpose, both of them: a body that silently dropped the
+    // estimate would clear it on an override click, and one that echoed the
+    // measurement back would hand an agent-owned number to the PUT.
+    ram_estimate_mb: 4096,
+    ram_measured_mb: 3000,
     ...overrides,
   });
 }
@@ -2636,6 +2643,10 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     api_token_header_source: spec.api_token_header_source,
     api_token_header: spec.api_token_header,
     gpus: spec.gpus,
+    // The estimate is operator-owned and replayed verbatim; ram_measured_mb is
+    // agent-owned and deliberately absent from the request shape (toEqual
+    // fails if an override click echoes it back).
+    ram_estimate_mb: spec.ram_estimate_mb,
     api_flavors: spec.api_flavors,
     responses_mode: spec.responses_mode,
     messages_mode: spec.messages_mode,
