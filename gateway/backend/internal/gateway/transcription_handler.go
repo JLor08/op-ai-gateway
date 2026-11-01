@@ -541,6 +541,21 @@ func (s *Server) transcriptionTargetServed(target routing.Target) bool {
 	return s.AgentFeatures.Has(target.ServerID, multipartProxyFeature)
 }
 
+// transcriptionAttempt bundles what travels together with one transcription request
+// through the relay's refusal sites: the caller's token, the request
+// inferencePreflight produced, the transcription endpoint the request arrived on, the
+// client's raw body (what capture records) and the moment the attempt started (what
+// the usage row's latency is measured from). token is the one resolveTarget refreshes
+// (resolveTranscriptionTarget), so the relay reads it back from here after the
+// resolve; it is not a second copy to keep in step.
+type transcriptionAttempt struct {
+	token    auth.Token
+	req      inference.Request
+	endpoint sessionEndpoint
+	raw      []byte
+	start    time.Time
+}
+
 // recordTranscriptionRoutingFailure writes the client-facing error response for a
 // terminal transcription routing failure and records its usage row, so the relay's
 // refusal sites -- an outright resolveTarget failure, the post-resolve
@@ -557,7 +572,8 @@ func (s *Server) transcriptionTargetServed(target routing.Target) bool {
 // (unit, quantity) pair exists to prevent. Endpoint is the one the request arrived on,
 // endpointTranscription or endpointTranscriptionDetails, for the row's sake, though
 // with an empty target no provider_path is derived from it.
-func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, endpoint sessionEndpoint, raw []byte, start time.Time, err error) {
+func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *http.Request, att *transcriptionAttempt, err error) {
+	token, req := att.token, att.req
 	id := nextRequestID()
 	capturing := s.capturingEnabled(token)
 	status := completionHTTPStatus(err)
@@ -572,7 +588,7 @@ func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *htt
 		slog.Debug("transcription request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
 	}
 	body := writeCompletionErrorCaptured(w, err)
-	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: endpoint}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
+	s.recordUsage(att.start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: att.endpoint}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, att.raw, w.Header(), body, status, req.APIFlavor), nil)
 }
 
 // resolveTranscriptionTarget is resolveSpeechTarget's twin: it resolves the routing
@@ -580,14 +596,16 @@ func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *htt
 // conjunct to it. On a refusal it has already written the client's response and
 // recorded the usage row, and answers ok == false.
 //
-// token is a pointer for the reason tryProxyNative's is: resolveTarget refreshes the
-// caller's last-used-model snapshot through it, and the relay that follows must carry
-// that refreshed token. endpoint is the transcription endpoint the request arrived on;
-// it only labels the refusals' usage rows (recordTranscriptionRoutingFailure).
-func (s *Server) resolveTranscriptionTarget(w http.ResponseWriter, r *http.Request, token *auth.Token, req inference.Request, endpoint sessionEndpoint, raw []byte, start time.Time) (routing.Target, bool) {
-	target, err := s.resolveTarget(r.Context(), token, req)
+// att is a pointer for the reason tryProxyNative's token is: resolveTarget refreshes the
+// caller's last-used-model snapshot through att.token, and the relay that follows must
+// carry that refreshed token. att.endpoint is the transcription endpoint the request
+// arrived on; it only labels the refusals' usage rows
+// (recordTranscriptionRoutingFailure).
+func (s *Server) resolveTranscriptionTarget(w http.ResponseWriter, r *http.Request, att *transcriptionAttempt) (routing.Target, bool) {
+	req := att.req
+	target, err := s.resolveTarget(r.Context(), &att.token, req)
 	if err != nil {
-		s.recordTranscriptionRoutingFailure(w, r, *token, req, endpoint, raw, start, err)
+		s.recordTranscriptionRoutingFailure(w, r, att, err)
 		return routing.Target{}, false
 	}
 	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors AND
@@ -604,7 +622,7 @@ func (s *Server) resolveTranscriptionTarget(w http.ResponseWriter, r *http.Reque
 		slog.Debug("transcription request rejected: resolved target's effective flavors exclude audio",
 			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.recordTranscriptionRoutingFailure(w, r, *token, req, endpoint, raw, start, routing.ErrNoModelRoute)
+		s.recordTranscriptionRoutingFailure(w, r, att, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
 	return target, true
@@ -833,8 +851,8 @@ func peekTranscriptionFileByte(part *multipart.Part) (first []byte, empty bool, 
 // transcript; any other 2xx one is buffered, metered from the timing block of its body
 // and written verbatim (relayTranscriptionResponse).
 func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, endpoint sessionEndpoint, form transcriptionForm, raw []byte) {
-	start := time.Now()
-	target, ok := s.resolveTranscriptionTarget(w, r, &token, req, endpoint, raw, start)
+	att := &transcriptionAttempt{token: token, req: req, endpoint: endpoint, raw: raw, start: time.Now()}
+	target, ok := s.resolveTranscriptionTarget(w, r, att)
 	if !ok {
 		return
 	}
@@ -848,11 +866,11 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		slog.Debug("transcription refused: the target's agent has not declared multipart_proxy",
 			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
 			"route_id", target.RouteID, "feature", multipartProxyFeature)
-		s.recordTranscriptionRoutingFailure(w, r, token, req, endpoint, raw, start, errTranscriptionUnavailable)
+		s.recordTranscriptionRoutingFailure(w, r, att, errTranscriptionUnavailable)
 		return
 	}
 	rel := nativeRelay{
-		token:       token,
+		token:       att.token,
 		target:      target,
 		path:        upstreamPath(target, req.APIFlavor, endpoint),
 		raw:         raw,
@@ -867,22 +885,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 	// stream machinery (the verdict read, the literal true, the buffered retry, the
 	// relay's stream mark) can run for it. The handler refuses a stream there before it
 	// gets this far (validateTranscriptionDetailsRequest); this does not depend on that.
-	asksStream := endpoint == endpointTranscription && form.wantsStream()
-	streaming := asksStream && s.mappingStreamsTranscription(r.Context(), target.RouteID)
-	dropStream := asksStream && !streaming
-	stream := streamKeep
-	switch {
-	case dropStream:
-		stream = streamDrop
-	case streaming && form.stream != "true":
-		// Any other spelling of the boolean is stated to the upstream as the literal.
-		stream = streamSetTrue
-	}
-	if dropStream {
-		slog.Debug("transcription asked to stream but the route is not known to: answering buffered",
-			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
-			"route_id", target.RouteID, "capability", routing.CapabilityTranscriptionStreaming)
-	}
+	stream, streaming := s.transcriptionStreamDecision(r, req, endpoint, form, target)
 	sent := len(raw)
 	rewrite := transcriptionNeedsModelRewrite(target, form.model)
 	model := ""
@@ -898,7 +901,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 			// sending the upstream a body whose model it would misread.
 			slog.Error("transcription: rebuilding the multipart body failed",
 				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
-			s.recordTranscriptionRoutingFailure(w, r, token, req, endpoint, raw, start, fmt.Errorf("rebuild multipart body: %w", err))
+			s.recordTranscriptionRoutingFailure(w, r, att, fmt.Errorf("rebuild multipart body: %w", err))
 			return
 		}
 		rel.upstreamBody, rel.contentType = body, contentType
@@ -908,7 +911,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		slog.Debug("transcription refused: the body to send is past the agent router's request limit",
 			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
 			"bytes", sent, "limit", agentRouterMaxBodyBytes)
-		s.recordTranscriptionRoutingFailure(w, r, token, req, endpoint, raw, start, errTranscriptionTooLarge)
+		s.recordTranscriptionRoutingFailure(w, r, att, errTranscriptionTooLarge)
 		return
 	}
 	if streaming {
@@ -927,6 +930,35 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		}
 	}
 	s.proxyNative(w, r, rel)
+}
+
+// transcriptionStreamDecision makes relayTranscription's stream-versus-buffered
+// decision for one request: what the rebuilt body does with the client's `stream` part
+// (stream), and whether the relay is a stream at all (streaming). Only the plain
+// transcription can ask for a stream, and it is answered as one only when the mapped
+// route is KNOWN to stream (mappingStreamsTranscription); a form that asks and is
+// refused that is answered buffered, which drops its `stream` part and is logged, so
+// the upstream is never asked for what it would refuse. A stream the route serves is
+// restated as the literal true unless the client already spelled it so; every other
+// request keeps its form as it came.
+func (s *Server) transcriptionStreamDecision(r *http.Request, req inference.Request, endpoint sessionEndpoint, form transcriptionForm, target routing.Target) (stream streamEdit, streaming bool) {
+	asksStream := endpoint == endpointTranscription && form.wantsStream()
+	streaming = asksStream && s.mappingStreamsTranscription(r.Context(), target.RouteID)
+	dropStream := asksStream && !streaming
+	stream = streamKeep
+	switch {
+	case dropStream:
+		stream = streamDrop
+	case streaming && form.stream != "true":
+		// Any other spelling of the boolean is stated to the upstream as the literal.
+		stream = streamSetTrue
+	}
+	if dropStream {
+		slog.Debug("transcription asked to stream but the route is not known to: answering buffered",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+			"route_id", target.RouteID, "capability", routing.CapabilityTranscriptionStreaming)
+	}
+	return stream, streaming
 }
 
 // bufferedTranscriptionBody builds the request that is sent INSTEAD of a streamed one

@@ -53,6 +53,20 @@ function timeSpan(turn: SpeakerTurn): string | undefined {
   return turn.end === undefined ? start : `${start}–${clockTime(turn.end)}`;
 }
 
+// The turns paired with the key each is rendered under. A turn has no id of its own, so its key
+// is its content: speaker, span and text. Turns that repeat in all of them (a "Mhm." said twice by
+// one speaker, no times given) are told apart by how many of the same came before, so the keys are
+// unique without being the turn's position.
+function keyedTurns(turns: readonly SpeakerTurn[]): { key: string; turn: SpeakerTurn }[] {
+  const seen = new Map<string, number>();
+  return turns.map((turn) => {
+    const content = JSON.stringify([turn.speaker, turn.start, turn.end, turn.text]);
+    const occurrence = (seen.get(content) ?? 0) + 1;
+    seen.set(content, occurrence);
+    return { key: occurrence === 1 ? content : `${content}#${occurrence}`, turn };
+  });
+}
+
 // The speaker view as plain text, what the Copy control hands over: one line per turn behind its
 // speaker's label, in the order spoken. A transcript with no turns to show is just its text.
 export function diarizedTranscriptText(t: Translation, part: SpeakerTranscriptPart): string {
@@ -101,14 +115,13 @@ export function DiarizedTranscript({
       aria-label={t.chatTranscriptionSpeakerView}
       sx={{ listStyle: 'none', m: 0, mt: 1.25, p: 0, display: 'grid', gap: 1 }}
     >
-      {part.turns.map((turn, index) => {
+      {keyedTurns(part.turns).map(({ key, turn }) => {
         const number = numbers.get(turn.speaker) ?? 1;
         const span = timeSpan(turn);
         return (
           <Box
             component="li"
-            // A turn has no id of its own, and the list never reorders: its place is its identity.
-            key={index}
+            key={key}
             sx={{
               p: '8px 12px',
               border: '1px solid var(--line)',
