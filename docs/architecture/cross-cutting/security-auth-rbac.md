@@ -12,13 +12,14 @@ different trust boundary:
 |---|---|---|---|
 | Portal session | The browser SPA | `op_ai_gateway_session` cookie + `X-OP-CSRF` header on unsafe methods | `internal/gateway/auth.go` (`authenticateWeb`) |
 | Bearer API token | External OpenAI/Anthropic-compatible clients, Codex, Claude Code, service integrations | `Authorization: Bearer <secret>` | `internal/auth.TokenStore`, `internal/gateway/server.go` (`authenticate`) |
-| Internal trusted loopback | The gateway's own background chat-run executor, and the portal's live-transcription WebSocket adapter, calling the gateway itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/transcriptions/live` and `/v1/audio/voices` only) |
+| Internal trusted loopback | The gateway's own background chat-run executor, and the portal's live-transcription WebSocket adapter, calling the gateway itself | `X-OP-Internal-Auth` + `X-OP-Internal-User`, guarded by a per-process secret | `internal/gateway/auth.go` (`authenticateWeb`, for `/v1/chat/completions` and every Portal/Admin/System route) and `internal/gateway/auth_internal_or_bearer.go` (`authenticateInternalOrBearer`, for `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/transcriptions/details`, `/v1/audio/transcriptions/live` and `/v1/audio/voices` only) |
 | Agent token | The `op-ai-server-agent` reporting/proxy process on each AI server | `Authorization: Bearer <agent-secret>` against a separate token universe | `internal/gateway/agent_auth.go` |
 
 `/v1/chat/completions` (and its `/openai/v1/` alias) is the one inference
 endpoint that accepts **either** a portal session (+ CSRF) **or** a bearer
 token — see [§7](#7-request-authentication-decision-flow). `/v1/images/generations`,
-`/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions`,
+`/v1/images/edits`, `/v1/audio/speech`, `/v1/audio/transcriptions` (and its one-shot `/v1/audio/transcriptions/details`
+route, the same handler and the same leg),
 `/v1/audio/transcriptions/live` and `/v1/audio/voices` (and their `/openai/v1/` aliases) accept
 **either** the internal trusted-loopback pair **or** a bearer token, but never a portal
 session cookie: they are reachable by the gateway's own background executor over
@@ -1253,7 +1254,9 @@ output-sensitive.** `POST /v1/audio/transcriptions` shares speech's `openai_audi
 flavor, and the backstop behind the `audio/*` test, `isBinarySpeechResponse`, was keyed on
 that flavor plus a 2xx status, which would have stored **every** transcript as a redacted
 metadata stub. The capture input therefore carries the **endpoint** (`captureInput.Endpoint`,
-stamped by the transcription success relay) and the backstop skips a transcription. The
+stamped by the transcription success relay) and the backstop skips a transcription (the plain route and its one-shot
+`/details` route alike, `isTranscriptionEndpoint`; the details document adds the **speaker turns**, which are the same
+spoken content and are stored under the same opt-in and cap). The
 carve-out is negative, so a speech capture built without an endpoint stays redacted: the
 way it can fail is a transcript lost to a summary, never a WAV in the envelope. The
 response is the JSON document `{"text", "timing"}`, and it is stored **like any other

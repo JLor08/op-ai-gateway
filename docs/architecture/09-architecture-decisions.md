@@ -6417,6 +6417,14 @@ stream-vs-buffered), and the ordinary-text-turn reply of (c) is unchanged. Unlik
 #262 **does** bump the ServerAgent (0.9.1 → 0.9.2, a PATCH on #258's wire) so an
 agent-launched child can report the `transcription_streaming` verdict.
 
+**Amended by [ADR-082](#adr-082--diarized-transcription-a-one-shot-v1audiotranscriptionsdetails-relay-a-result-driven-speaker-view-with-no-capability-verdict-and-a-speaker_transcript-content-part):
+a diarized run's reply is not always the ordinary text turn, and the knobs gain `diarize`.** Issue #295 adds a `Diarize`
+setting to `ChatTranscriptionSettings` ((g)'s knob list). A diarized run makes its one request to
+`/v1/audio/transcriptions/details` (one-shot, so it never takes ADR-065's streaming branch) and, when the answer names at
+least two distinct speakers, commits a new `speaker_transcript` content part **instead of** the text part of (c), so "no new
+content-part type" holds only for a run that is not diarized (or whose answer names fewer than two speakers). The part is the
+turn's only part, so the title of (i) is derived from its `text`. Nothing else here moved, and #295 bumps no agent version.
+
 **Rejected:** **Reusing `ChatAudioSettings` for the knobs** (speech's `voice`/`speed` are
 disjoint from a transcription's `language`/`prompt`/`temperature`; a shared carrier would
 hold fields neither kind uses and muddle the pin/clear). **A `response_format` control**
@@ -10430,3 +10438,146 @@ measurement, and a pre-warm is not worth a change to that path).
 → [Runtime View §6.1.6](06-runtime-view.md#616-voice-chat-browser-websocket-per-chunk-live-asr-speculative-llm-deferred-commit-streamed-tts),
 [HTTP API Surface](reference/api-surface.md#voice-chat-the-ticket-and-the-orchestration-websocket),
 [Configuration](reference/config-env.md#voice-chat-turn-detection-half-duplex-timing-and-the-co-load-gate).
+
+## ADR-082 — Diarized transcription: a one-shot `/v1/audio/transcriptions/details` relay, a result-driven speaker view with no capability verdict, and a `speaker_transcript` content part
+**Context:** a conversation transcribed through the portal chat
+([ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn),
+[ADR-065](#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript))
+comes back as one undifferentiated block of text: nothing says who spoke. audio.cpp can say, for a diarizing ASR model.
+Besides `POST /v1/audio/transcriptions` it serves **`POST /v1/audio/transcriptions/details`**, which answers the plain
+document plus the **speaker turns**. The gateway served only the plain route, and the portal's transcription run committed
+only text. Issue #295 asks for a speaker-labelled transcript. Five facts bound the design, and none of them was a choice;
+the first four were established by probing a live audio.cpp 0.9.3 server (2026-11-01):
+
+- **The details document** is `{text, segments, speaker_turns, sample_rate, timing}`, a turn being
+  `{start_sample, end_sample, speaker_id, confidence, text}`. `speaker_id` is a **string** (`"0"`, `"1"`, ...) and the offsets
+  are in **samples** of `sample_rate`, not seconds. The `timing` block is the plain document's, `audio_duration_ms` included.
+- **Diarization is a per-model capability, not a universal one.** A non-diarizing ASR model answers the same route with
+  `{text, words, ...}` and **no** `speaker_turns`. That is a valid answer, not an error.
+- **`/details` is one-shot only.** A `stream=true` is refused (HTTP 400). **Live or streaming diarization therefore does not
+  exist in audio.cpp today**, whatever the gateway does: the streamed transcription of ADR-065 and the live transcription of
+  [ADR-072](#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input) and
+  [ADR-073](#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once) cannot carry speakers.
+- **The capability is not in the model listing the gateway reads.** `GET /v1/models?include_params=true`, in every query
+  variant tried, exposes only `id`, `family`, `task`, `mode`, `loaded`, `path` and `params`, never `capabilities`. That listing
+  is what every audio.cpp capability verdict is built from (`transcription`, `speech`, and `transcription_streaming`, which is
+  read from `mode`: [ADR-062](#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint) (c), ADR-065), so a self-describing `diarization`
+  verdict cannot be built from it. The only runtime discriminator would be a maintained allowlist of model `family` names.
+- **A file transcription reaches the child through the agent's path-blind multipart proxy** (the `multipart_proxy` feature,
+  ADR-062 and
+  [ADR-057](#adr-057--image-edit-a-derived-image_edit-capability-a-multipart-passthrough-and-the-attached-image-as-the-edit-affordance)), so a
+  new path under `/v1/audio/transcriptions` is relayed to an agent-launched child unchanged and needs nothing of the agent.
+
+**Decision — five choices, taken together. No schema migration, no agent change and no `ServerAgent` version bump, no
+shared-enum change and no new capability verdict.**
+
+- **(a) `/v1/audio/transcriptions/details` is the transcription relay's second route, not a second relay.** A new
+  `sessionEndpoint`, `endpointTranscriptionDetails`, joins `endpointTranscription`; the two routes (and their `/openai/v1/...`
+  aliases) are served by **one** `serveTranscription(w, r, endpoint)`, so the method check, the auth, the body read, the form
+  parse, the run-as block, the preflight and the relay are one path and a rule added to one route cannot be missed on the
+  other. The endpoint decides only what has to differ: the **upstream path** (`upstreamPath` answers
+  `/v1/audio/transcriptions/details`, which is also the usage row's `provider_path`) and the **validation and inference shape**
+  (`transcriptionDetailsInferenceShape` is built *from* the plain shape, so the two cannot drift: the gate is
+  `RequiredCapabilities = ["transcription"]` on the `openai_audio` flavor). It takes the **same auth leg** as the plain route
+  (a bearer token or the internal loopback pair, never the session cookie), the **same body cap**
+  (`OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`), the same `multipart_proxy` gate for an agent target and the same
+  model-name rewrite. Everything on the response side that must tell a transcription from a speech request (the buffered
+  success relay, the billing quantity, the upstream-error normalisation, the capture's binary-speech carve-out) asks **one
+  predicate**, `isTranscriptionEndpoint`, instead of comparing against one endpoint. What stays exact is what only the plain
+  route does: **streaming** (`isStreamedTranscription` still matches `endpointTranscription` alone). The answer is relayed
+  **verbatim**: the gateway does not read `speaker_turns` and translates nothing, so a client (the portal's run, or a bearer
+  client) parses it.
+- **(b) The details route refuses a stream.** `validateTranscriptionDetailsRequest` is the plain validation, in its order and
+  with its codes, plus one refusal: a `stream` that reads as true is **400 `transcription.stream_unsupported`**, answered with
+  the route's other form errors, that is before the request is routed or admitted and not recorded. A `stream` that is false,
+  absent or empty is the one-shot request the route is, a non-boolean `stream` and any `stream_format` stay refused by the
+  shared check, and the relay then takes **none** of the stream decisions whatever the form says: it reads no
+  `transcription_streaming` verdict, restates no `stream` part, builds no buffered retry and is never marked a stream, so the
+  idle watchdog stays off and the application's `timeout_ms` is the one total deadline. It refuses instead of forwarding
+  because the refusal is the gateway's to name (a documented client error, answered before any admission or upstream call)
+  and there is no streaming relay to hand the request to.
+- **(c) Result-driven, with no capability verdict.** The gateway relays `/details` for **any** transcription-capable model, and
+  whether to show speakers is decided by **what the answer carries**: a document that names at least two distinct speakers is a
+  speaker transcript, and anything else (one speaker, or no `speaker_turns` because the model does not diarize) is the
+  ordinary transcript. Nothing probes whether a model can diarize and nothing new is stored, and a non-diarizing model that is
+  asked for diarization is **not an error**: it degrades to today's behavior. This is the decision's weight, and it was chosen
+  over the alternative that looks cleaner. A `diarization` verdict is not buildable (the capability is not in the listing, above),
+  and a `family` allowlist would bake into the gateway exactly the guess the audio.cpp verdict code is written to avoid: it
+  reads what the server reports and writes nothing where it does not know. Acting on the answer stays true to that.
+- **(d) The portal run: a `Diarize` thread setting, one request, and a `speaker_transcript` part decided by the answer.**
+  `ChatTranscriptionSettings.Diarize` (`diarize`, `omitempty`, declared last, so a stored chat's bytes do not move)
+  chooses the route: a diarized run makes its **one** loopback request to `/v1/audio/transcriptions/details`, states no
+  `stream` (the plain run always asks for one, ADR-065) and reads one JSON document whole. From `speaker_turns` it converts
+  the sample offsets to **seconds** with the document's `sample_rate` and counts the distinct `speaker_id`s, taken as the
+  **opaque strings** they are, never assumed to be numbers, an order or a count. With two or more it commits **one** new content
+  part, `{"type":"speaker_transcript","text":<the whole transcript>,"turns":[{"speaker","start"?,"end"?,"text"}]}`, and **no text
+  part beside it**; with fewer it commits the ordinary `{"type":"text"}` part of a plain run. An empty transcript is the
+  existing `gateway.chat_run_transcription_no_transcript` error whichever route it came from. `speaker_turns` and `sample_rate`
+  are **enrichment**: a `speaker_turns` that cannot be read as a list of turns is logged and falls back to the plain
+  transcript, and a rate that is no number only leaves the times out, so a valid transcript is never thrown away for a
+  malformed extra. The reserved passthrough keys are unchanged, `stream` included.
+- **(e) The portal renders the part as who-said-what, and because a diarized turn has no text part, three readers special-case
+  it.** The frontend's `ChatContentPart` union gains a `speaker_transcript` variant that mirrors the committed names, read by
+  `speakerTranscriptOf` (which treats persisted history as input, not as truth: a malformed turn is dropped and a malformed
+  time is absent, down to the plain `text`), and the `DiarizedTranscript` component lays it out: one block per turn with the
+  span it covers when the model said, labelled by the speaker's **number in order of first appearance in that transcript**
+  ("Speaker 1", "Speaker 2"), never by the id the model reported, which is free-form. The three readers that take "the turn's
+  text" from a text part read the part instead: **Copy** hands over the speaker view as plain lines, **view raw** shows the
+  whole `text` without the speakers, and the **title** of an untitled transcription chat is derived from the part's `text`
+  ([ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn) (i)), and the guards that read an empty text as "no answer has
+  arrived yet" count the part as an answer. A **Diarized** checkbox in the transcription settings sets the thread's `diarize`.
+  It is for a file or a recorded clip: **live transcription is never diarized** (a live recording commits its own plain-text
+  turn without these settings), and the toggle's hint says so.
+
+**Consequence:**
+
+- **One request, billed as a transcription.** A diarized run replaces the plain call, it does not add a second. The
+  quantity is the same `audio_second` read from the document's `timing.audio_duration_ms`, with zero tokens, on one usage row
+  whose `provider_path` is the details path ([Telemetry
+  §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event)); **billing is unchanged**. A model that cannot
+  diarize still transcribes the whole clip and is billed for it, so asking for diarization costs nothing extra.
+- **The diarized run is one-shot, so it does not stream.** Even against a model loaded `mode=streaming`, the run shows the
+  transcription wait of ADR-064 (i) until the one answer lands and renders no incremental deltas (ADR-065's streaming branch is
+  not taken for it). **Not probed:** how a model loaded `mode=streaming` answers `/details`. If it refuses, the run ends with
+  the upstream's own refusal, relayed like any other.
+- **A two-speaker answer is believed.** The threshold is the number of distinct ids the model reported, and nothing else is
+  read (the `confidence` member rides along in the relayed document and is not used). A diarizer that splits one voice into two
+  ids renders as a conversation, and one that merges two voices renders as the plain transcript. The gateway has no second
+  opinion.
+- **The toggle cannot be hidden for a model that cannot diarize.** With no verdict there is nothing to key the control on, so
+  it is offered for every transcription thread and its hint promises nothing: a user who switches it on for such a model gets
+  the plain transcript. **The way back is stated, not built:** if audio.cpp ever lists the capability, a verdict is a small
+  addition on the existing verdict machinery and the toggle could follow it.
+- **No live diarization, and none to build here.** The limit is upstream: audio.cpp refuses a stream on the details route. A
+  programmatic client has the same one-shot route the portal uses.
+- **A diarized turn is a structured part inside the sealed chat document**, so there is no migration and no `chat_blobs` row for
+  it. Nothing sends it upstream again: a transcription run reads only the last user message's clip (ADR-064 (b)).
+- **Verification status.** The four probed facts of the Context are live. The shipped change is covered by mock-backed tests
+  (the mock upstream answers the details path with a two-speaker document, so the dev stack has one to show) for the route,
+  its stream refusal, its gate, its billing, the run's outcomes (two speakers, one speaker, no `speaker_turns`, a malformed
+  one, an empty transcript) and the renderer. It is **not** claimed as a live end-to-end run of the portal against a diarizing
+  model, so how well a given model separates speakers is for an operator to confirm.
+
+**Amends:** [ADR-064](#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn) ((c): the reply is the ordinary text turn **unless** a
+diarized run's answer names several speakers, which commits a `speaker_transcript` part; (g): the settings gain `diarize`).
+**Extends** ADR-062 and ADR-065: the transcription endpoint family gains a one-shot member, and the plain route keeps its
+streaming; it changes neither.
+**Rejected:** **A `diarization` capability verdict** (the capability is not in the model listing the gateway reads, so a
+verdict could not be built from what the server reports). **A `family` allowlist as the gate** (a maintained guess the
+gateway would have to keep true as audio.cpp adds models, the failure mode the verdict code avoids by reading what the server
+says). **Probing a model with a synthetic clip** (it would load the model and spend a transcription to learn what the answer of the
+real request tells for free, and a clip with no speakers says little about a model that has several to find). **Gating the portal toggle on a guess** (it would hide a working model on a wrong
+guess; the result-driven fallback makes showing it harmless). **Streaming or live diarization** (audio.cpp refuses a stream on
+the details route, so there is nothing to relay). **Forwarding `stream=true` and relaying the upstream's refusal** (it
+spends an admission and an upstream call to learn what is known up front, and the answer would be the upstream's own rather
+than a documented gateway code). **Serving the details document from the plain endpoint behind a flag** (one route would then
+answer two shapes, and the plain route's streaming would have to carve itself out). **A second handler for the details route**
+(it would copy the gate, the form parse, the run-as block and the response-side relays, and a rule added to one would be
+missed on the other). **Converting the sample offsets to seconds in the gateway** (the details document is relayed verbatim,
+as the plain one is; the caller that wants seconds converts, as the portal run does). **A new agent feature
+flag or a `ServerAgent` bump** (the path-blind multipart proxy already carries the route).
+→ [API Compatibility & Inference §3.7 item 12](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions),
+[§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[Runtime View §6.1.2](06-runtime-view.md#612-transcription-relay-post-v1audiotranscriptions),
+[§6.1.4](06-runtime-view.md#614-portal-transcription-chat-turn-through-loopback-from-a-chat-blob),
+[HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints).

@@ -38,7 +38,8 @@ sequenceDiagram
 Notes: the six JSON inference endpoints read the request body with no size cap
 (large multimodal payloads); the other two, the multipart image edit
 (`POST /v1/images/edits`) and the multipart audio transcription
-(`POST /v1/audio/transcriptions`), are the capped bodies, each at a setting of its
+(`POST /v1/audio/transcriptions`, whose one-shot diarizing twin `/v1/audio/transcriptions/details`
+is the same handler under the same cap, §6.1.2), are the capped bodies, each at a setting of its
 own (`OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`,
 `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, default 32 MiB each). All eight
 lift the server read/write deadlines; SSE streams are bounded by an idle watchdog and
@@ -174,6 +175,18 @@ once** — the upload is already in memory and nothing of the stream has reached
 A cold `mode=streaming` model is given a first-byte deadline grace before the idle watchdog
 takes over ([ADR-065](09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
 [Compatibility & Inference §3.7 item 11](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions)).
+
+**Diarized variant (`POST /v1/audio/transcriptions/details`).** The same scenario with one route changed: the
+gateway serves a second, **one-shot** route that relays the upload to audio.cpp's `/v1/audio/transcriptions/details`
+and writes back its document, the plain `{text, timing}` plus `speaker_turns` and `sample_rate`, **verbatim**. Auth, body
+cap, form validation, the `transcription` gate, the `multipart_proxy` check, the model-name rewrite, the buffered success
+relay, the error normalisation and the `audio_second` billing from `timing.audio_duration_ms` are the diagram's, run by the
+same handler; only the upstream path (and so the usage row's `provider_path`) differs. It **never streams**: audio.cpp
+refuses `stream=true` on `/details`, so a request that asks for one is `400 transcription.stream_unsupported` at the
+validation step, before any admission and not recorded, and the stream decisions of the paragraph above are not taken for it. The gateway reads no
+verdict for it and adds none: a model that cannot diarize answers a document without `speaker_turns`, which the caller reads
+as the plain transcript it is ([Compatibility & Inference §3.7 item 12](cross-cutting/compatibility-and-inference.md#37-openai-audio-transcriptions),
+[ADR-082](09-architecture-decisions.md#adr-082--diarized-transcription-a-one-shot-v1audiotranscriptionsdetails-relay-a-result-driven-speaker-view-with-no-capability-verdict-and-a-speaker_transcript-content-part)).
 
 ### 6.1.3 Portal speech chat turn (through loopback to a chat blob)
 
@@ -363,6 +376,24 @@ the run is the one zero-delta call ADR-064 described
 issue #262). See [Compatibility & Inference
 §12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground) and
 [ADR-064](09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn).
+
+**Diarized variant (the thread's `diarize` setting).** With the **Diarized** toggle on, the run changes its endpoint and
+its commit, and nothing else of the diagram. It makes its **one** loopback request to
+`/v1/audio/transcriptions/details` (§6.1.2), **states no `stream`** (audio.cpp refuses a stream there, so the run is one-shot
+even against a `mode=streaming` model and renders no deltas, the pending turn showing until the one answer) and reads the
+one JSON document whole. It turns `speaker_turns` into turns of `{speaker, start?, end?, text}`, the sample offsets converted
+to **seconds** with the document's `sample_rate`, and counts the distinct `speaker_id` strings. **The answer, not the
+setting, decides what is committed:** at least two speakers commit **one** `speaker_transcript` part
+(`{type, text, turns}`) and **no text part**, and anything else (one speaker, or no `speaker_turns` because the mapped model
+cannot diarize, or a `speaker_turns` that cannot be read, which is logged and never costs the transcript) commits the
+ordinary `{"type":"text"}` part of the diagram, so asking a model that cannot diarize is never an error. An empty transcript is
+the same `gateway.chat_run_transcription_no_transcript` error. The browser renders the part with `DiarizedTranscript`
+(one block per turn, labelled "Speaker N" in order of first appearance, with its time span when known); because the turn has
+**no text part**, Copy, view-raw and the title of an untitled chat each read the part's `text` instead. Billing is the plain
+run's (`audio_second` under the run-as token, one usage row), and live transcription (§6.1.5) is never diarized
+([Compatibility & Inference
+§12](cross-cutting/compatibility-and-inference.md#12-in-portal-chat-playground),
+[ADR-082](09-architecture-decisions.md#adr-082--diarized-transcription-a-one-shot-v1audiotranscriptionsdetails-relay-a-result-driven-speaker-view-with-no-capability-verdict-and-a-speaker_transcript-content-part)).
 
 ### 6.1.5 Live transcription (browser WebSocket, gateway loopback, agent `/live`, audio.cpp)
 

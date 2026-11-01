@@ -58,7 +58,7 @@ several architectural decisions exist specifically to satisfy them.
   edge, so it is never reachable from a browser) additionally lets the
   gateway's own portal-chat run executor call `/v1/chat/completions`,
   `/v1/images/generations`, `/v1/images/edits`, `/v1/audio/speech` and
-  `/v1/audio/transcriptions` as a
+  `/v1/audio/transcriptions` (a diarized run posts to its one-shot `/v1/audio/transcriptions/details` route, the same handler) as a
   token-less session principal — the executor reaches all five inference endpoints across
   its four run kinds (text, image, speech, transcription), since the image kind covers
   both image generation and edits. No

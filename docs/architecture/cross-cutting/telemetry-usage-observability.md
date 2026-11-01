@@ -812,7 +812,9 @@ are not forwarded to the client; they reach only the payload capture's summary
 **`/v1/audio/transcriptions` is the third producer: `audio_second` again, with the
 duration read off the response BODY.** It shares speech's `openai_audio` flavor, so the
 flavor cannot tell the two apart and the quantity's source is keyed on the endpoint
-(`ex.endpoint == endpointTranscription`): `setSpeechBillingQuantity` skips a
+(`isTranscriptionEndpoint(ex.endpoint)`: the plain route and the one-shot diarizing route `/v1/audio/transcriptions/details`,
+[ADR-082](../09-architecture-decisions.md#adr-082--diarized-transcription-a-one-shot-v1audiotranscriptionsdetails-relay-a-result-driven-speaker-view-with-no-capability-verdict-and-a-speaker_transcript-content-part),
+whose document carries the same `timing` block and so bills the same way): `setSpeechBillingQuantity` skips a
 transcription, which sends no `X-AudioCPP-Audio-Duration-Ms` header and would otherwise
 log an Error on every success while leaving its quantity at 0, and
 `setTranscriptionBillingQuantity` (`internal/gateway/transcription_handler.go`) is the
@@ -820,7 +822,7 @@ transcription's setter. The unit is endpoint identity, as for speech, so **every
 transcription `recordUsage` site, a refused or failed request included, carries
 `billing_unit: "audio_second"`, with token counts and both rates at zero (`ValidateBillingXOR`,
 since the usage scanner is nil for the flavor), and its `provider_path` is
-`/v1/audio/transcriptions` (the endpoint is threaded through `usageMeta.Endpoint`, as for
+`/v1/audio/transcriptions` (`/v1/audio/transcriptions/details` for the diarizing route; the endpoint is threaded through `usageMeta.Endpoint`, as for
 an image edit, because `recordUsage` recomputes the path from the flavor and the flavor
 would say speech). The quantity is audio.cpp's own measurement of the **input** audio,
 `timing.audio_duration_ms` of the JSON response divided by 1000. The `timing` block is
