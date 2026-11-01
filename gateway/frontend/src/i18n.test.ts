@@ -2482,8 +2482,6 @@ describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
       'runtimeSpecHealthTimeout',
       'runtimeSpecAdmissionWaitTimeout',
       'runtimeSpecAdminState',
-      'runtimeSpecVramLocked',
-      'runtimeSpecVramLockedHint',
       'runtimeSpecRamEstimate',
       'runtimeSpecRamEstimateHint',
       'runtimeSpecVramMeasured',

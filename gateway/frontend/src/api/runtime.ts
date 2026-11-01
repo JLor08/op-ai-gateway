@@ -64,7 +64,6 @@ export interface RuntimeSpec {
   admission_wait_timeout_seconds: number;
   pinned: boolean;
   admin_state: string;
-  vram_locked: boolean;
   // Turns the spec's GPU list from a declaration into an enforcement: the
   // agent sets the vendor-appropriate visibility variable
   // (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on

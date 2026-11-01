@@ -239,7 +239,6 @@ function emptySpec(mappingId: string): RuntimeSpec {
     admission_wait_timeout_seconds: 0,
     pinned: false,
     admin_state: '',
-    vram_locked: false,
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
@@ -668,18 +667,14 @@ function basename(path: string): string {
 }
 
 // The VRAM the admission arithmetic actually charges for one GPU row of a
-// spec, which is NOT always the operator's estimate. Locked (vram_locked), the
-// estimate wins and the agent's measurement is ignored; unlocked, a positive
-// measurement REPLACES the estimate (higher or lower), and a missing one (0 =
-// UNKNOWN, never "needs none") falls back to the estimate. The table shows this
-// number so it cannot disagree with what admission does with the same spec.
-//
-// Lock-aware only for as long as the lock exists: once vram_locked is retired
-// the rule collapses to max(measured, estimate), and this is the one place to
-// change.
-function effectiveGpuVram(spec: RuntimeSpec, g: RuntimeSpecGPU): number {
-  if (spec.vram_locked) return g.vram_estimate_mb;
-  return g.vram_measured_mb > 0 ? g.vram_measured_mb : g.vram_estimate_mb;
+// spec, which is NOT always the operator's estimate: the larger of the agent's
+// measurement and the operator's estimate, so the estimate is a floor and a
+// higher measurement raises the charge. A missing measurement (0 = UNKNOWN,
+// never "needs none") therefore falls back to the estimate. The table shows this
+// number so it cannot disagree with what admission does with the same spec;
+// this is the one place the rule lives.
+function effectiveGpuVram(g: RuntimeSpecGPU): number {
+  return Math.max(g.vram_measured_mb, g.vram_estimate_mb);
 }
 
 // The sum of every GPU row's effective VRAM: what the spec demands across the
@@ -688,19 +683,20 @@ function effectiveGpuVram(spec: RuntimeSpec, g: RuntimeSpecGPU): number {
 // unknown (or there is none).
 function totalGpuVram(spec: RuntimeSpec | undefined): number {
   if (!spec) return 0;
-  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(spec, g), 0);
+  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(g), 0);
 }
 
-// RAM has no lock and no per-card rows: the larger of the agent's measurement
-// and the operator's estimate. `|| 0` also covers a document from a gateway
-// that predates the fields, which would otherwise surface as NaN.
+// RAM has no per-card rows: the larger of the agent's measurement and the
+// operator's estimate, the same max() rule as the VRAM above. `|| 0` also
+// covers a document from a gateway that predates the fields, which would
+// otherwise surface as NaN.
 function effectiveRam(spec: RuntimeSpec | undefined): number {
   return Math.max(spec?.ram_measured_mb || 0, spec?.ram_estimate_mb || 0);
 }
 
 function formatGpus(spec: RuntimeSpec | undefined): string {
   if (!spec || spec.gpus.length === 0) return '—';
-  return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(spec, g)} MB`).join(', ');
+  return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(g)} MB`).join(', ');
 }
 
 // A megabyte quantity for the two summary columns: the em-dash when nothing is
@@ -2456,7 +2452,6 @@ export function RuntimeAdminSection({
   const [admissionWaitTimeoutSeconds, setAdmissionWaitTimeoutSeconds] = useState(0);
   const [pinned, setPinned] = useState(false);
   const [adminState, setAdminState] = useState('');
-  const [vramLocked, setVramLocked] = useState(false);
   // The spec's operator RAM estimate in MB: ONE spec-level scalar (RAM is
   // host-scoped, so it is not a GpuRow field). It must be bound to state and
   // emitted by buildSpecBody even where the form shows no field for it: the
@@ -2614,7 +2609,6 @@ export function RuntimeAdminSection({
     setAdmissionWaitTimeoutSeconds(0);
     setPinned(false);
     setAdminState('');
-    setVramLocked(false);
     setRamEstimateMb(0);
     setSetVisibleDevices(false);
     setVisibleDevicesMode('env');
@@ -2649,7 +2643,6 @@ export function RuntimeAdminSection({
     setAdmissionWaitTimeoutSeconds(spec.admission_wait_timeout_seconds);
     setPinned(spec.pinned);
     setAdminState(spec.admin_state);
-    setVramLocked(spec.vram_locked);
     setRamEstimateMb(spec.ram_estimate_mb);
     setSetVisibleDevices(spec.set_visible_devices);
     setVisibleDevicesMode(spec.visible_devices_mode);
@@ -3048,7 +3041,6 @@ export function RuntimeAdminSection({
       admission_wait_timeout_seconds: admissionWaitTimeoutSeconds,
       pinned,
       admin_state: adminState,
-      vram_locked: vramLocked,
       ram_estimate_mb: ramEstimateMb,
       set_visible_devices: setVisibleDevices,
       visible_devices_mode: visibleDevicesMode,
@@ -4696,25 +4688,6 @@ export function RuntimeAdminSection({
               control={<Checkbox checked={pinned} onChange={(e) => setPinned(e.target.checked)} />}
               label={t.runtimeSpecPinned}
             />
-            {/* The label used to read "VRAM locked (not evictable)", which
-                described `pinned` (directly above) and not this flag at all --
-                two adjacent checkboxes both promising non-eviction, one of them
-                falsely. vram_locked decides which VRAM number the AGENT is
-                told: locked, the operator's estimate wins over the agent's
-                measurement, in the config document and in the write-back
-                alike. That is the operator's only lever when a measurement
-                above the GPU budget has made a spec terminally
-                `not_permitted`, so the hint has to say so where they are
-                looking. */}
-            <FormControlLabel
-              control={
-                <Checkbox checked={vramLocked} onChange={(e) => setVramLocked(e.target.checked)} />
-              }
-              label={t.runtimeSpecVramLocked}
-            />
-            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
-              {t.runtimeSpecVramLockedHint}
-            </Typography>
             {/* Without this, the GPU rows below are a DECLARATION: they drive
                 the admission arithmetic and the VRAM measurement mapping, and
                 nothing stops the process from landing on a different card --

@@ -153,7 +153,6 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admission_wait_timeout_seconds: 0,
     pinned: false,
     admin_state: '',
-    vram_locked: false,
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
@@ -801,51 +800,35 @@ describe('RuntimeAdminSection launch specs list', () => {
   });
 
   // The per-GPU cell shows the EFFECTIVE VRAM, the number the admission
-  // arithmetic actually charges, not the operator's raw estimate. In this phase
-  // that is lock-aware: unlocked, a positive measurement REPLACES the estimate
-  // (it may be higher or lower); locked, the estimate wins and the measurement
-  // is shown nowhere but the form. A later phase retires the lock and collapses
-  // this to max(measured, estimate) -- these tests change with it.
+  // arithmetic actually charges, not the operator's raw estimate: the larger of
+  // the agent's measurement and the operator's estimate, so the estimate is a
+  // floor and a higher measurement raises the charge. There is no lock.
   describe('effective VRAM and RAM columns', () => {
     const effectiveSpecs = {
-      // measured above the estimate, unlocked: the measurement is effective.
-      map_unlocked: makeSpec({
+      // measured above the estimate: the measurement is effective.
+      map_measured_over: makeSpec({
         configured: true,
-        mapping_id: 'map_unlocked',
-        vram_locked: false,
+        mapping_id: 'map_measured_over',
         gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
       }),
-      // the same numbers, locked: the estimate is effective.
-      map_locked: makeSpec({
+      // measured BELOW the estimate: the estimate stays as a floor (max), the
+      // lower measurement does not replace it.
+      map_estimate_floor: makeSpec({
         configured: true,
-        mapping_id: 'map_locked',
-        vram_locked: true,
-        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
-      }),
-      // measured BELOW the estimate, unlocked: the measurement still replaces
-      // it (the lock-aware rule is "measured if known", not a max).
-      map_lower: makeSpec({
-        configured: true,
-        mapping_id: 'map_lower',
-        vram_locked: false,
+        mapping_id: 'map_estimate_floor',
         gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 5000 }],
+      }),
+      // never measured (0 = unknown): the estimate.
+      map_unmeasured: makeSpec({
+        configured: true,
+        mapping_id: 'map_unmeasured',
+        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
       }),
       // two cards: 9000 (measured over estimate) + 3000 (never measured, so
       // its estimate) = 12000.
-      map_pair_open: makeSpec({
+      map_pair: makeSpec({
         configured: true,
-        mapping_id: 'map_pair_open',
-        vram_locked: false,
-        gpus: [
-          { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
-          { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
-        ],
-      }),
-      // the same two cards, locked: 8000 + 3000 = 11000.
-      map_pair_lock: makeSpec({
-        configured: true,
-        mapping_id: 'map_pair_lock',
-        vram_locked: true,
+        mapping_id: 'map_pair',
         gpus: [
           { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
           { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
@@ -891,21 +874,23 @@ describe('RuntimeAdminSection launch specs list', () => {
       );
     }
 
-    it('shows the measurement as the GPU VRAM when unlocked and the estimate when locked', async () => {
+    it('shows the larger of the measurement and the estimate as the GPU VRAM', async () => {
       renderEffective();
-      await expectCell('map_unlocked', t.runtimeSpecGpus, '0: 9000 MB');
-      await expectCell('map_locked', t.runtimeSpecGpus, '0: 8000 MB');
-      await expectCell('map_lower', t.runtimeSpecGpus, '0: 5000 MB');
-      // The raw estimate of the unlocked row is not what the cell says.
-      expect(cellForColumn('gw-map_unlocked', t.runtimeSpecGpus)).not.toHaveTextContent('8000');
+      await expectCell('map_measured_over', t.runtimeSpecGpus, '0: 9000 MB');
+      await expectCell('map_estimate_floor', t.runtimeSpecGpus, '0: 8000 MB');
+      await expectCell('map_unmeasured', t.runtimeSpecGpus, '0: 8000 MB');
+      // The raw estimate of the measured-over row is not what the cell says.
+      expect(cellForColumn('gw-map_measured_over', t.runtimeSpecGpus)).not.toHaveTextContent(
+        '8000',
+      );
     });
 
-    it('totals the effective VRAM of every GPU, with the same lock rule', async () => {
+    it('totals the effective VRAM of every GPU, with the same max rule', async () => {
       renderEffective();
-      await expectCell('map_pair_open', t.runtimeSpecGpus, '0: 9000 MB, 1: 3000 MB');
-      await expectCell('map_pair_open', t.runtimeSpecVramTotal, '12000 MB');
-      await expectCell('map_pair_lock', t.runtimeSpecVramTotal, '11000 MB');
-      await expectCell('map_unlocked', t.runtimeSpecVramTotal, '9000 MB');
+      await expectCell('map_pair', t.runtimeSpecGpus, '0: 9000 MB, 1: 3000 MB');
+      await expectCell('map_pair', t.runtimeSpecVramTotal, '12000 MB');
+      await expectCell('map_measured_over', t.runtimeSpecVramTotal, '9000 MB');
+      await expectCell('map_estimate_floor', t.runtimeSpecVramTotal, '8000 MB');
     });
 
     it('renders an em-dash total for a spec with no GPU rows', async () => {
@@ -2726,7 +2711,6 @@ function fullSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admission_wait_timeout_seconds: 45,
     pinned: true,
     admin_state: '',
-    vram_locked: true,
     // Non-default on purpose: the override actions build their PUT body by
     // spreading the LOADED spec, so a `false` here could not tell a preserved
     // value from a defaulted one.
@@ -2758,7 +2742,6 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     admission_wait_timeout_seconds: spec.admission_wait_timeout_seconds,
     pinned: spec.pinned,
     admin_state: adminState,
-    vram_locked: spec.vram_locked,
     set_visible_devices: spec.set_visible_devices,
     visible_devices_mode: spec.visible_devices_mode,
     api_token_mode: spec.api_token_mode,

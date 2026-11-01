@@ -141,7 +141,6 @@ function makeRuntimeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admission_wait_timeout_seconds: 0,
     pinned: false,
     admin_state: '',
-    vram_locked: false,
     set_visible_devices: false,
     visible_devices_mode: 'env',
     gpus: [],
