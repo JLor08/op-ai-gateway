@@ -675,6 +675,13 @@ const maxRuntimeSamplesPerSample = 256
 // single one).
 const maxRuntimeGPUsPerSample = 64
 
+// runtimeWriteBackLogPrefix is the fixed lead-in of resolveRuntimeSpecOwned's
+// log messages; the axis name ("vram", "ram") is spliced in after it, so the
+// same four audit-trail lines read "runtime vram write-back: ..." and
+// "runtime ram write-back: ..." from one source. It exists so the literal is
+// not repeated at every log site (go:S1192).
+const runtimeWriteBackLogPrefix = "runtime "
+
 // resolveRuntimeSpecOwned reports whether specID names a spec that exists and
 // belongs to serverID, and returns it. It is the AUTHORIZATION gate of every
 // per-spec measurement write-back (VRAM and RAM both call it directly): the
@@ -708,7 +715,7 @@ const maxRuntimeGPUsPerSample = 64
 func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, writeBack string) (routing.RuntimeSpec, bool) {
 	spec, ok, err := s.Routes.RuntimeSpecByID(ctx, specID)
 	if err != nil {
-		slog.Debug("runtime "+writeBack+" write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
+		slog.Debug(runtimeWriteBackLogPrefix+writeBack+" write-back: spec lookup failed", "server_id", serverID, "spec_id", specID, "err", err)
 		return routing.RuntimeSpec{}, false
 	}
 	if !ok {
@@ -718,16 +725,16 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 	}
 	mapping, err := s.Routes.MappingByID(ctx, spec.MappingID)
 	if err != nil {
-		slog.Debug("runtime "+writeBack+" write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
+		slog.Debug(runtimeWriteBackLogPrefix+writeBack+" write-back: mapping lookup failed", "server_id", serverID, "spec_id", specID, "mapping_id", spec.MappingID, "err", err)
 		return routing.RuntimeSpec{}, false
 	}
 	app, err := s.Routes.ApplicationByID(ctx, mapping.ApplicationID)
 	if err != nil {
-		slog.Debug("runtime "+writeBack+" write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
+		slog.Debug(runtimeWriteBackLogPrefix+writeBack+" write-back: application lookup failed", "server_id", serverID, "spec_id", specID, "application_id", mapping.ApplicationID, "err", err)
 		return routing.RuntimeSpec{}, false
 	}
 	if app.ServerID != serverID {
-		slog.Warn("runtime "+writeBack+" write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
+		slog.Warn(runtimeWriteBackLogPrefix+writeBack+" write-back rejected: spec belongs to a different server", "server_id", serverID, "spec_id", specID, "owner_server_id", app.ServerID)
 		return routing.RuntimeSpec{}, false
 	}
 	return spec, true
@@ -886,8 +893,8 @@ func (s *Server) writeBackRuntimeRAM(ctx context.Context, serverID string, runti
 	}
 	// stored[specID] is the measured RAM already on file for a spec this server
 	// owns, present only for an owned spec and read once per distinct spec_id.
-	// A spec that is not owned (or no longer exists) is memoized as absent, so a
-	// sample repeating its id never re-resolves it.
+	// A spec that is not owned (or no longer exists) is memoized as absent in
+	// owned, so a sample repeating its id never re-resolves it.
 	stored := make(map[string]int, len(runtimes))
 	owned := make(map[string]bool, len(runtimes))
 	for _, rt := range runtimes {
@@ -898,16 +905,7 @@ func (s *Server) writeBackRuntimeRAM(ctx context.Context, serverID string, runti
 		if specID == "" {
 			continue
 		}
-		ok, seen := owned[specID]
-		if !seen {
-			var spec routing.RuntimeSpec
-			spec, ok = s.resolveRuntimeSpecOwned(ctx, serverID, specID, "ram")
-			owned[specID] = ok
-			if ok {
-				stored[specID] = spec.RAMMeasuredMB
-			}
-		}
-		if !ok {
+		if !s.ownedRuntimeSpecRAM(ctx, serverID, specID, owned, stored) {
 			continue
 		}
 		if was := stored[specID]; was == rt.RAMMeasuredMB {
@@ -923,6 +921,28 @@ func (s *Server) writeBackRuntimeRAM(ctx context.Context, serverID string, runti
 		// payload naming the same spec twice must not write twice.
 		stored[specID] = rt.RAMMeasuredMB
 	}
+}
+
+// ownedRuntimeSpecRAM reports whether specID is a spec serverID owns, for
+// writeBackRuntimeRAM, resolving it AT MOST ONCE per distinct spec_id per
+// sample: the first call runs resolveRuntimeSpecOwned and memoizes the verdict
+// in owned -- owned or not, for whatever reason -- and every later call for the
+// same id answers from the memo without touching the store. For an owned spec
+// the first call also records the spec's currently stored measured RAM in
+// stored (the spec the ownership check already fetched, so no extra read), which
+// the caller compares against to skip an unchanged measurement; a spec that is
+// not owned never gets a stored entry. owned and stored are the caller's
+// per-sample memo maps and are mutated here.
+func (s *Server) ownedRuntimeSpecRAM(ctx context.Context, serverID, specID string, owned map[string]bool, stored map[string]int) bool {
+	if ok, seen := owned[specID]; seen {
+		return ok
+	}
+	spec, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, "ram")
+	owned[specID] = ok
+	if ok {
+		stored[specID] = spec.RAMMeasuredMB
+	}
+	return ok
 }
 
 // resolveRuntimeSpecMapping reports whether specID's owning mapping may have
