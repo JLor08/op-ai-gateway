@@ -1552,6 +1552,18 @@ func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecGPUMeasured(ctx context.Cont
 	return _d.Store.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateRuntimeSpecRAMMeasured")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateRuntimeSpecRAMMeasured(ctx, specID, measuredMB)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateServerCertificateOverride(ctx context.Context, id string, override string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateServerCertificateOverride")
 	defer span.End()

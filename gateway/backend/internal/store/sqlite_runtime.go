@@ -30,8 +30,9 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			admin_state, vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
 			visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
 			type, metrics_path, context_probe_path, responses_live_timings_enabled,
+			ram_estimate_mb, ram_measured_mb,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env,
@@ -53,6 +54,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			type = excluded.type, metrics_path = excluded.metrics_path,
 			context_probe_path = excluded.context_probe_path,
 			responses_live_timings_enabled = excluded.responses_live_timings_enabled,
+			ram_estimate_mb = excluded.ram_estimate_mb,
 			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
 		spec.ConfigFiles, spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
@@ -61,6 +63,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 		spec.VRAMLocked, spec.SetVisibleDevices, apiFlavors, string(spec.ResponsesMode), string(spec.MessagesMode),
 		string(spec.VisibleDevicesMode), spec.APITokenMode, spec.APIToken, spec.APITokenHeaderSource, spec.APITokenHeader,
 		spec.Type, spec.MetricsPath, spec.ContextProbePath, spec.ResponsesLiveTimingsEnabled,
+		spec.RAMEstimateMB, spec.RAMMeasuredMB,
 		spec.CreatedAt, spec.UpdatedAt,
 	)
 	if err != nil {
@@ -83,6 +86,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config
 	vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
 	visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
 	type, metrics_path, context_probe_path, responses_live_timings_enabled,
+	ram_estimate_mb, ram_measured_mb,
 	created_at, updated_at`
 
 // runtimeSpecColsPrefixed is runtimeSpecCols qualified with the `s` alias, for
@@ -95,6 +99,7 @@ const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s
 	s.vram_locked, s.set_visible_devices, s.api_flavors, s.responses_mode, s.messages_mode,
 	s.visible_devices_mode, s.api_token_mode, s.api_token, s.api_token_header_source, s.api_token_header,
 	s.type, s.metrics_path, s.context_probe_path, s.responses_live_timings_enabled,
+	s.ram_estimate_mb, s.ram_measured_mb,
 	s.created_at, s.updated_at`
 
 func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
@@ -220,6 +225,21 @@ func (s *SQLiteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID s
 		where spec_id = ? and gpu_index = ?`, measuredMB, specID, gpuIndex)
 	if err != nil {
 		return fmt.Errorf("update measured vram: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateRuntimeSpecRAMMeasured writes back the agent's measured host RAM for
+// the spec. Spec-level (RAM is host-scoped, so the column is on
+// agent_runtime_specs, not on a per-GPU row) and one-column on purpose: it never
+// touches ram_estimate_mb, the operator's figure. ErrNotFound when no spec has
+// that id (requireAffected).
+func (s *SQLiteStore) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error {
+	result, err := s.exec(ctx, `
+		update agent_runtime_specs set ram_measured_mb = ?
+		where id = ?`, measuredMB, specID)
+	if err != nil {
+		return fmt.Errorf("update measured ram: %w", err)
 	}
 	return requireAffected(result)
 }
@@ -365,6 +385,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 		&spec.VisibleDevicesMode,
 		&spec.APITokenMode, &spec.APIToken, &spec.APITokenHeaderSource, &spec.APITokenHeader,
 		&spec.Type, &spec.MetricsPath, &spec.ContextProbePath, &liveTimings,
+		&spec.RAMEstimateMB, &spec.RAMMeasuredMB,
 		&spec.CreatedAt, &spec.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RuntimeSpec{}, ErrNotFound

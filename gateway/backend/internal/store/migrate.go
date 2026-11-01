@@ -128,6 +128,7 @@ var migrations = []migration{
 	{version: 93, name: "runtime_spec_config_files", up: migration93Up},
 	{version: 94, name: "model_mapping_cache", up: migration94Up},
 	{version: 95, name: "model_mapping_benchmarks_audio_perf", up: migration95Up},
+	{version: 96, name: "runtime_spec_ram", up: migration96Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4267,6 +4268,41 @@ func migration95Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		"rtf double precision",
 	} {
 		if err := addColumnIfMissing(ctx, tx, dl, "model_mapping_benchmarks", col); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// migration96Up adds the per-spec RAM pair to agent_runtime_specs: the
+// operator's estimate of the spec's resident host RAM (ram_estimate_mb) and the
+// agent's measurement of it (ram_measured_mb), both in MB.
+//
+// RAM is HOST-scoped -- one process backs one spec, whatever GPUs it spans -- so
+// the pair is two scalars on the spec row itself, not rows on the per-GPU
+// agent_runtime_spec_gpus table where the vram_* pair lives. The ownership split
+// is the same one: the estimate is operator-owned (UpsertRuntimeSpec writes it),
+// the measurement is agent-owned (UpdateRuntimeSpecRAMMeasured writes it, and an
+// operator re-save of the spec does not touch it).
+//
+// Both are `integer not null default 0`, declared exactly like vram_estimate_mb
+// and vram_measured_mb (ADR-005: a megabyte count fits int4 on PostgreSQL, the
+// same reasoning as the VRAM pair). The default 0 is load-bearing and is the
+// whole of the upgrade story: 0 is the "unknown" sentinel -- no estimate yet,
+// nothing measured yet, never "needs no RAM" -- so every pre-existing row reads
+// back as unknown and no running deployment's behaviour changes. There is no
+// backfill because there is no prior column either could be derived from.
+//
+// Append-only: migration 65's create-table and the v60-frozen baseline are not
+// touched, so a fresh install gets the columns by replaying this migration.
+// addColumnIfMissing makes the step replayable on both dialects (`add column if
+// not exists` on PostgreSQL, the duplicate-column tolerance on SQLite).
+func migration96Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"ram_estimate_mb integer not null default 0",
+		"ram_measured_mb integer not null default 0",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", col); err != nil {
 			return err
 		}
 	}
