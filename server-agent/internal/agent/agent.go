@@ -752,12 +752,14 @@ type Agent struct {
 	// hostInfo is the optional receiver of each cycle's device totals and
 	// available RAM (see hostInfoSink); nil = nothing is published.
 	hostInfo hostInfoSink
-	// gpuTotalsMB is the last-known total memory per GPU index (MB), as read
-	// by publishHostInfo and read only from collectOnce's single goroutine --
-	// the same access pattern as runtimeCapabilityCache, so no mutex. It is
-	// carried across cycles because a device's total is static hardware: one
-	// cycle whose GPU collector failed must not erase it (see
-	// publishHostInfo). nil until the first GPU total is seen.
+	// gpuTotalsMB is the last-known total memory per GPU index (MB). It is
+	// seeded from the hardware inventory at the top of Run (seedHostInfo) and
+	// refreshed by publishHostInfo, and is touched only from Run's own
+	// goroutine (collectOnce runs there) -- the same access pattern as
+	// runtimeCapabilityCache, so no mutex. It is carried across cycles because
+	// a device's total is static hardware: one cycle whose GPU collector failed
+	// must not erase it (see publishHostInfo). nil until the first GPU total is
+	// seen.
 	gpuTotalsMB map[int]int
 	// runtimeWake is the optional wake channel derived from the poster (see
 	// runtimeWaker); nil when the poster does not support it (the POST
@@ -994,6 +996,10 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 func (a *Agent) Run(ctx context.Context) error {
 	hw := collectHardware(ctx, a.gpus)
 	a.hw = &hw
+	// Push the device totals BEFORE anything below triggers the runtime sync,
+	// so the pinned/force_running specs it admits at boot already see their
+	// detected VRAM budgets (see seedHostInfo).
+	a.seedHostInfo(&hw)
 	a.sendSystemReport(ctx)
 
 	// Phase 2 certificate distribution: seed the report synchronously from
@@ -2095,16 +2101,63 @@ func (a *Agent) publishHostInfo(s *sample.Sample) {
 	if a.hostInfo == nil {
 		return
 	}
-	const bytesPerMB = 1024 * 1024
 	for _, g := range s.GPUs {
-		if mb := int(g.MemTotalBytes / bytesPerMB); mb > 0 {
-			if a.gpuTotalsMB == nil {
-				a.gpuTotalsMB = make(map[int]int)
-			}
-			a.gpuTotalsMB[g.Index] = mb
-		}
+		a.noteGPUTotal(g.Index, g.MemTotalBytes)
 	}
-	hi := runtimectl.HostInfo{}
+	var availableBytes int64
+	if s.Host != nil {
+		availableBytes = s.Host.MemAvailableBytes
+	}
+	a.pushHostInfo(availableBytes)
+}
+
+// seedHostInfo is publishHostInfo's boot-time counterpart: it pushes the device
+// totals from the static hardware inventory Run has just collected, before Run
+// triggers the first runtime reconciliation.
+//
+// That ordering is the point. The first reconciliation (Driver.Sync ->
+// Manager.Apply) admits every pinned and force_running spec, and Run triggers
+// it before its first collectOnce -- the first place a live sample exists. With
+// no seed those always-on specs would be admitted against the zero HostInfo (no
+// detected budgets), silently bypassing default-on VRAM enforcement for exactly
+// the specs that start at boot, and two of them that together exceed the card
+// would both launch. The inventory already carries each GPU's index and total
+// memory, so the totals are known before the sync; the first collectOnce, about
+// a second later, refreshes them.
+//
+// No available-RAM figure is seeded: the inventory has none, so it goes out as
+// 0 = unknown (the same "no reading" a failed host read produces) and
+// collectOnce fills it in.
+func (a *Agent) seedHostInfo(hw *sample.SystemReport) {
+	if a.hostInfo == nil || hw == nil {
+		return
+	}
+	for _, g := range hw.GPUs {
+		a.noteGPUTotal(g.Index, g.MemoryTotalBytes)
+	}
+	a.pushHostInfo(0)
+}
+
+// noteGPUTotal records a GPU's total memory (bytes in, MB stored, truncating)
+// as its last-known total, ignoring a total that is not positive -- an N/A
+// field parses to 0, which is "no reading", never "a device with no memory".
+func (a *Agent) noteGPUTotal(index int, totalBytes int64) {
+	const bytesPerMB = 1024 * 1024
+	mb := int(totalBytes / bytesPerMB)
+	if mb <= 0 {
+		return
+	}
+	if a.gpuTotalsMB == nil {
+		a.gpuTotalsMB = make(map[int]int)
+	}
+	a.gpuTotalsMB[index] = mb
+}
+
+// pushHostInfo hands the sink the last-known GPU totals plus the given
+// available-RAM reading (bytes; 0 = unknown), truncated to whole MB.
+func (a *Agent) pushHostInfo(availableBytes int64) {
+	const bytesPerMB = 1024 * 1024
+	hi := runtimectl.HostInfo{MemAvailableMB: int(availableBytes / bytesPerMB)}
 	if len(a.gpuTotalsMB) > 0 {
 		// A copy, so the sink (and the owner behind it) never shares the
 		// map this loop keeps editing.
@@ -2112,9 +2165,6 @@ func (a *Agent) publishHostInfo(s *sample.Sample) {
 		for i, mb := range a.gpuTotalsMB {
 			hi.GPUTotalsMB[i] = mb
 		}
-	}
-	if s.Host != nil {
-		hi.MemAvailableMB = int(s.Host.MemAvailableBytes / bytesPerMB)
 	}
 	a.hostInfo.SetHostInfo(hi)
 }
