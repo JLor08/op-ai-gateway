@@ -2484,6 +2484,8 @@ describe('agent-managed runtime i18n keys (task 20 launch specs)', () => {
       'runtimeSpecAdminState',
       'runtimeSpecVramLocked',
       'runtimeSpecVramLockedHint',
+      'runtimeSpecRamEstimate',
+      'runtimeSpecRamEstimateHint',
       'runtimeSpecVramMeasured',
       'runtimeSpecGpuIndex',
       'runtimeSpecGpuPick',

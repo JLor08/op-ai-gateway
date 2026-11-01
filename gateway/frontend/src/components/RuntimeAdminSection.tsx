@@ -4972,6 +4972,24 @@ export function RuntimeAdminSection({
               </Box>
             )}
 
+            {/* RAM is HOST-scoped, so this is ONE spec-level field and not a
+                column of the per-GPU rows below (GpuRow stays VRAM-only). It
+                has to stay bound to the form's state and to buildSpecBody
+                regardless of how it is laid out: the PUT is a full-document
+                upsert, and a save that omitted the estimate would clear one
+                set through the API. */}
+            <Field
+              id="runtime-spec-ram-estimate"
+              type="number"
+              label={t.runtimeSpecRamEstimate}
+              value={String(ramEstimateMb)}
+              onChange={(e) => setRamEstimateMb(e.target.value === '' ? 0 : Number(e.target.value))}
+              inputProps={{ min: 0 }}
+            />
+            <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+              {t.runtimeSpecRamEstimateHint}
+            </Typography>
+
             <Box sx={{ display: 'grid', gap: 1 }}>
               <Typography variant="subtitle2" component="h3">
                 {t.runtimeSpecGpus}

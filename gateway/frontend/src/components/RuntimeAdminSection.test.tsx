@@ -9952,3 +9952,88 @@ describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, (
     });
   });
 });
+
+// The spec's host-RAM estimate: ONE spec-level field (RAM is host-scoped, so it
+// is not a per-GPU row field). The form's PUT is a full-document upsert in
+// which an absent estimate is applied as 0 and clears a stored one, so what
+// this block pins above all is the ROUND TRIP: a save that never touched the
+// field must still carry the stored value.
+describe('RuntimeAdminSection spec-level RAM estimate', () => {
+  function ramField(): HTMLInputElement {
+    return screen.getByLabelText(t.runtimeSpecRamEstimate) as HTMLInputElement;
+  }
+
+  it('round-trips the estimate: shows the stored value and PUTs the edited one', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ ram_estimate_mb: 4096 });
+
+    expect(ramField().value).toBe('4096');
+    expect(ramField()).toHaveAttribute('type', 'number');
+    expect(ramField()).toHaveAttribute('min', '0');
+
+    fireEvent.change(ramField(), { target: { value: '8192' } });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(8192);
+  });
+
+  it('a save that never touched the field restates the stored estimate', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ ram_estimate_mb: 4096 });
+
+    // An unrelated edit, then save: the estimate must ride along or this save
+    // would clear one an operator set through the API.
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecWorkDir), {
+      target: { value: '/opt/elsewhere' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(4096);
+  });
+
+  it('never sends the agent-owned measurement', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({
+      ram_estimate_mb: 4096,
+      ram_measured_mb: 6000,
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect('ram_measured_mb' in putSpecs[0].body).toBe(false);
+  });
+
+  it('is a single spec-level field, however many GPU rows the spec has', async () => {
+    await openApiTokenSpecEdit({
+      ram_estimate_mb: 2048,
+      gpus: [
+        { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 },
+        { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+      ],
+    });
+
+    expect(screen.getAllByLabelText(t.runtimeSpecVram)).toHaveLength(2);
+    expect(screen.getAllByLabelText(t.runtimeSpecRamEstimate)).toHaveLength(1);
+    expect(screen.getByText(t.runtimeSpecRamEstimateHint)).toBeInTheDocument();
+  });
+
+  it('a cleared field saves as 0 (no estimate), like every other numeric field', async () => {
+    const { putSpecs } = await openApiTokenSpecEdit({ ram_estimate_mb: 4096 });
+
+    fireEvent.change(ramField(), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(0);
+  });
+
+  it('starts a new spec at 0 and PUTs what was typed', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(ramField().value).toBe('0');
+
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    fireEvent.change(ramField(), { target: { value: '12288' } });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.ram_estimate_mb).toBe(12288);
+  });
+});
