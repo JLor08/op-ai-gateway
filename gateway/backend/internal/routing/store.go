@@ -2583,7 +2583,6 @@ type RuntimeSpec struct {
 	AdmissionWaitTimeoutSeconds int // 0 = wait until the client disconnects
 	Pinned                      bool
 	AdminState                  string // "" | "force_running" | "force_stopped"
-	VRAMLocked                  bool
 	// RAMEstimateMB is the operator's estimate of this spec's resident host
 	// RAM, in MB (agent_runtime_specs.ram_estimate_mb, migration 96). RAM is
 	// HOST-scoped -- one process backs one spec, whatever GPUs it spans -- so
@@ -2765,12 +2764,11 @@ type RuntimeStore interface {
 	RuntimeSpecByMapping(ctx context.Context, mappingID string) (RuntimeSpec, bool, error)
 	// RuntimeSpecByID returns the spec for id, keyed by its own primary key
 	// rather than its owning mapping (RuntimeSpecByMapping's key). Added for
-	// the telemetry VRAM write-back path (agent-runtime-manager Task 9): a
-	// runtime sample carries only spec_id, and resolving whether the operator
-	// has pinned vram_locked requires a point read by that id. ok is false
-	// when no spec has that id (e.g. deleted out from under an in-flight
-	// sample) -- not an error, mirroring RuntimeSpecByMapping's absent-read
-	// contract.
+	// the telemetry write-back paths (agent-runtime-manager Task 9): a runtime
+	// sample carries only spec_id, and resolving which server owns the spec
+	// requires a point read by that id. ok is false when no spec has that id
+	// (e.g. deleted out from under an in-flight sample) -- not an error,
+	// mirroring RuntimeSpecByMapping's absent-read contract.
 	RuntimeSpecByID(ctx context.Context, id string) (RuntimeSpec, bool, error)
 	// RuntimeSpecsByApplication lists every spec belonging to a mapping of
 	// appID, ordered by spec id. Always non-nil, empty when none.
@@ -2787,7 +2785,8 @@ type RuntimeStore interface {
 	// (the operator order). Always non-nil, empty when none.
 	RuntimeSpecGPUs(ctx context.Context, specID string) ([]RuntimeSpecGPU, error)
 	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement; ErrNotFound
-	// when the (spec,gpu) row does not exist. Callers skip specs with VRAMLocked.
+	// when the (spec,gpu) row does not exist. Callers pass a strictly positive
+	// measurement: a zero is "unknown" and is dropped before it reaches the store.
 	UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) error
 	// UpdateRuntimeSpecRAMMeasured writes back the agent's measured host RAM
 	// for the spec, touching only RAMMeasuredMB (RAMEstimateMB, operator-owned,

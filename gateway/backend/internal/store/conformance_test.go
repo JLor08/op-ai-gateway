@@ -8341,7 +8341,7 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			ListenPort: 0, HealthPath: "/health", HealthTimeoutSeconds: 5,
 			StartupTimeoutSeconds: 180, IdleTimeoutSeconds: 900,
 			AdmissionWaitTimeoutSeconds: 30, Pinned: true,
-			AdminState: "force_running", VRAMLocked: true,
+			AdminState:           "force_running",
 			SetVisibleDevices:    true,
 			VisibleDevicesMode:   routing.VisibleDevicesModeArgs,
 			APITokenMode:         "set",
@@ -8362,7 +8362,7 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			t.Fatalf("read back: ok=%v err=%v", ok, err)
 		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
-			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
+			!got.Enabled || !got.Pinned || !got.SetVisibleDevices ||
 			got.VisibleDevicesMode != routing.VisibleDevicesModeArgs ||
 			got.AdminState != "force_running" || got.AdmissionWaitTimeoutSeconds != 30 ||
 			got.APITokenMode != spec.APITokenMode || got.APIToken != spec.APIToken ||

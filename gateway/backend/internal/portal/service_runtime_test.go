@@ -1452,7 +1452,7 @@ func TestRuntimeWarningsIgnoresDisabledSpecs(t *testing.T) {
 // wire contract (spec §11): RouterListen is the server_agent application's
 // Port, only ENABLED specs appear, coresidency pairs are translated from
 // mapping ids to spec ids (dropping any pair touching a disabled/missing
-// spec), per-GPU VRAMMB prefers the measured value over the estimate, and a
+// spec), per-GPU VRAMMB is max(measured, estimate), and a
 // server with no server_agent application yet gets the fully empty document
 // -- never an error.
 func TestAgentRuntimeConfigAssembly(t *testing.T) {
@@ -1932,10 +1932,10 @@ func TestAgentRuntimeConfigPropagatesTransientServerReadFailure(t *testing.T) {
 // the agent feeds into Admit, so a value that is too low here is a co-resident
 // pair that reaches an OOM.
 //
-// It replaces the old "measured wins unless vram_locked" rule. Under that rule
-// a measurement BELOW the estimate silently lowered the reservation, and the
-// only way to hold it up was a separate boolean; max() makes the floor
-// unconditional and the boolean redundant.
+// It replaces the old "measured wins unless the spec's VRAM is locked" rule.
+// Under that rule a measurement BELOW the estimate silently lowered the
+// reservation, and the only way to hold it up was a separate per-spec lock
+// flag; max() makes the floor unconditional, so that flag no longer exists.
 //
 // A 0 on either side is "unknown", never "needs none": measured 0 (never
 // measured) yields the estimate, estimate 0 yields the measurement, and both 0

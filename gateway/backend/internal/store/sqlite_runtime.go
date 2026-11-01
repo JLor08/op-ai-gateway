@@ -27,12 +27,12 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			id, mapping_id, enabled, binary_path, args, env, config_files, work_dir, listen_port,
 			health_path, health_timeout_seconds, startup_timeout_seconds,
 			idle_timeout_seconds, admission_wait_timeout_seconds, pinned,
-			admin_state, vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
+			admin_state, set_visible_devices, api_flavors, responses_mode, messages_mode,
 			visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
 			type, metrics_path, context_probe_path, responses_live_timings_enabled,
 			ram_estimate_mb, ram_measured_mb,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env,
@@ -43,7 +43,6 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			idle_timeout_seconds = excluded.idle_timeout_seconds,
 			admission_wait_timeout_seconds = excluded.admission_wait_timeout_seconds,
 			pinned = excluded.pinned, admin_state = excluded.admin_state,
-			vram_locked = excluded.vram_locked,
 			set_visible_devices = excluded.set_visible_devices,
 			api_flavors = excluded.api_flavors, responses_mode = excluded.responses_mode,
 			messages_mode = excluded.messages_mode,
@@ -60,7 +59,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 		spec.ConfigFiles, spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
 		spec.StartupTimeoutSeconds, spec.IdleTimeoutSeconds,
 		spec.AdmissionWaitTimeoutSeconds, spec.Pinned, spec.AdminState,
-		spec.VRAMLocked, spec.SetVisibleDevices, apiFlavors, string(spec.ResponsesMode), string(spec.MessagesMode),
+		spec.SetVisibleDevices, apiFlavors, string(spec.ResponsesMode), string(spec.MessagesMode),
 		string(spec.VisibleDevicesMode), spec.APITokenMode, spec.APIToken, spec.APITokenHeaderSource, spec.APITokenHeader,
 		spec.Type, spec.MetricsPath, spec.ContextProbePath, spec.ResponsesLiveTimingsEnabled,
 		spec.RAMEstimateMB, spec.RAMMeasuredMB,
@@ -83,7 +82,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config_files, work_dir,
 	listen_port, health_path, health_timeout_seconds, startup_timeout_seconds,
 	idle_timeout_seconds, admission_wait_timeout_seconds, pinned, admin_state,
-	vram_locked, set_visible_devices, api_flavors, responses_mode, messages_mode,
+	set_visible_devices, api_flavors, responses_mode, messages_mode,
 	visible_devices_mode, api_token_mode, api_token, api_token_header_source, api_token_header,
 	type, metrics_path, context_probe_path, responses_live_timings_enabled,
 	ram_estimate_mb, ram_measured_mb,
@@ -96,7 +95,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config
 const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s.args, s.env, s.config_files, s.work_dir,
 	s.listen_port, s.health_path, s.health_timeout_seconds, s.startup_timeout_seconds,
 	s.idle_timeout_seconds, s.admission_wait_timeout_seconds, s.pinned, s.admin_state,
-	s.vram_locked, s.set_visible_devices, s.api_flavors, s.responses_mode, s.messages_mode,
+	s.set_visible_devices, s.api_flavors, s.responses_mode, s.messages_mode,
 	s.visible_devices_mode, s.api_token_mode, s.api_token, s.api_token_header_source, s.api_token_header,
 	s.type, s.metrics_path, s.context_probe_path, s.responses_live_timings_enabled,
 	s.ram_estimate_mb, s.ram_measured_mb,
@@ -374,13 +373,13 @@ func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]
 
 func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var spec routing.RuntimeSpec
-	var enabled, pinned, vramLocked, setVisibleDevices, liveTimings int64
+	var enabled, pinned, setVisibleDevices, liveTimings int64
 	var apiFlavors string
 	err := row.Scan(&spec.ID, &spec.MappingID, &enabled, &spec.Binary, &spec.Args,
 		&spec.Env, &spec.ConfigFiles, &spec.WorkDir, &spec.ListenPort, &spec.HealthPath,
 		&spec.HealthTimeoutSeconds, &spec.StartupTimeoutSeconds,
 		&spec.IdleTimeoutSeconds, &spec.AdmissionWaitTimeoutSeconds, &pinned,
-		&spec.AdminState, &vramLocked, &setVisibleDevices,
+		&spec.AdminState, &setVisibleDevices,
 		&apiFlavors, &spec.ResponsesMode, &spec.MessagesMode,
 		&spec.VisibleDevicesMode,
 		&spec.APITokenMode, &spec.APIToken, &spec.APITokenHeaderSource, &spec.APITokenHeader,
@@ -393,7 +392,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	if err != nil {
 		return routing.RuntimeSpec{}, fmt.Errorf("scan runtime spec: %w", err)
 	}
-	spec.Enabled, spec.Pinned, spec.VRAMLocked = enabled != 0, pinned != 0, vramLocked != 0
+	spec.Enabled, spec.Pinned = enabled != 0, pinned != 0
 	spec.SetVisibleDevices = setVisibleDevices != 0
 	spec.ResponsesLiveTimingsEnabled = liveTimings != 0
 	flavors, err := decodeAPIFlavors(apiFlavors)

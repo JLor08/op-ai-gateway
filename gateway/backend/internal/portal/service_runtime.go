@@ -457,7 +457,6 @@ type RuntimeSpecDTO struct {
 	AdmissionWaitTimeoutSeconds int               `json:"admission_wait_timeout_seconds"`
 	Pinned                      bool              `json:"pinned"`
 	AdminState                  string            `json:"admin_state"`
-	VRAMLocked                  bool              `json:"vram_locked"`
 	// SetVisibleDevices turns this spec's GPU list from a declaration into
 	// an enforcement — see routing.RuntimeSpec.SetVisibleDevices, and
 	// PutRuntimeSpec for the two combinations this API refuses.
@@ -558,7 +557,6 @@ type PutRuntimeSpecRequest struct {
 	AdmissionWaitTimeoutSeconds int               `json:"admission_wait_timeout_seconds"`
 	Pinned                      bool              `json:"pinned"`
 	AdminState                  string            `json:"admin_state"`
-	VRAMLocked                  bool              `json:"vram_locked"`
 	// SetVisibleDevices turns this spec's GPU list from a declaration into
 	// an enforcement — see routing.RuntimeSpec.SetVisibleDevices, and
 	// PutRuntimeSpec for the two combinations this API refuses.
@@ -678,10 +676,10 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 // agent-owned — only the telemetry write-back (a later task) writes it, so
 // this method PRESERVES the stored measured values verbatim for every GPU
 // index that already had a row, regardless of what the request carries, and
-// starts a brand-new index at 0. vram_locked never blocks this write: it
-// decides which of the two numbers the AGENT is told (agentRuntimeSpecDTO)
-// and whether the write-back may replace the measured one, not what the
-// operator may store.
+// starts a brand-new index at 0. Which number the AGENT is told is not decided
+// here: agentRuntimeSpecDTO pushes max(measured, estimate), so the operator may
+// store any estimate and a measurement can only ever raise the demand, never
+// lower it.
 func (s *Service) PutRuntimeSpec(ctx context.Context, principal auth.Token, mappingID string, req PutRuntimeSpecRequest) (RuntimeSpecDTO, error) {
 	mapping, app, server, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
@@ -1179,7 +1177,6 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		AdmissionWaitTimeoutSeconds: req.AdmissionWaitTimeoutSeconds,
 		Pinned:                      req.Pinned,
 		AdminState:                  f.adminState,
-		VRAMLocked:                  req.VRAMLocked,
 		RAMEstimateMB:               req.RAMEstimateMB,
 		SetVisibleDevices:           req.SetVisibleDevices,
 		VisibleDevicesMode:          f.visibleMode,
@@ -1711,7 +1708,6 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		AdmissionWaitTimeoutSeconds: spec.AdmissionWaitTimeoutSeconds,
 		Pinned:                      spec.Pinned,
 		AdminState:                  spec.AdminState,
-		VRAMLocked:                  spec.VRAMLocked,
 		SetVisibleDevices:           spec.SetVisibleDevices,
 		GPUs:                        gpuDTOs,
 		RAMEstimateMB:               spec.RAMEstimateMB,
@@ -2318,9 +2314,9 @@ func (s *Service) notifyRuntimeChangedForMapping(serverID, owningApplicationType
 
 // AgentRuntimeSpecGPUDTO is one per-GPU VRAM row inside a runtime-config spec
 // (GET /api/agent/v1/runtime-config). VRAMMB is the single number the agent
-// needs: the MEASURED value when known, else the operator's ESTIMATE -- see
-// AgentRuntimeConfig's VRAM-selection rule. 0 means unknown either way,
-// mirroring RuntimeSpecGPUDTO's two source fields.
+// needs: max(measured, estimate) of the row's two stored figures -- see
+// agentRuntimeSpecDTO. 0 means unknown (both source fields are 0), never
+// "needs no VRAM", mirroring RuntimeSpecGPUDTO's two source fields.
 type AgentRuntimeSpecGPUDTO struct {
 	Index  int `json:"index"`
 	VRAMMB int `json:"vram_mb"`
@@ -2440,8 +2436,8 @@ type AgentRuntimeConfigDTO struct {
 // disabled or missing spec is meaningless to the agent, which only ever sees
 // spec ids, never mapping ids.
 //
-// Per-GPU VRAMMB: the measured value when known (non-zero), else the
-// operator's estimate -- see agentRuntimeSpecDTO. 0 means unknown either way.
+// Per-GPU VRAMMB: max(measured, estimate) -- see agentRuntimeSpecDTO. 0 means
+// unknown (both source fields are 0).
 //
 // The empty document means exactly one thing: "this server is genuinely not
 // running anything managed" -- an empty serverID, no such AIServer row

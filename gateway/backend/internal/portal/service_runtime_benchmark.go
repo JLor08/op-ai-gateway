@@ -51,7 +51,6 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		AdmissionWaitTimeoutSeconds: dto.AdmissionWaitTimeoutSeconds,
 		Pinned:                      dto.Pinned,
 		AdminState:                  dto.AdminState,
-		VRAMLocked:                  dto.VRAMLocked,
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,

@@ -1304,7 +1304,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			ConfigFiles: `[{"name":"server.json","content":"id ${MODEL}"}]`,
 			HealthPath:  "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
 			IdleTimeoutSeconds: 900, AdmissionWaitTimeoutSeconds: 30, Pinned: true,
-			AdminState: "force_running", VRAMLocked: true, SetVisibleDevices: true,
+			AdminState: "force_running", SetVisibleDevices: true,
 			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
 			ResponsesMode: routing.EndpointModeTranslate, MessagesMode: routing.EndpointModeDisabled,
 			Type:                        string(routing.RuntimeSpecTypeOllama),
@@ -1355,7 +1355,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			t.Fatalf("config_files round-trip mismatch: got %q, want %q", got.ConfigFiles, spec.ConfigFiles)
 		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
-			!got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices ||
+			!got.Enabled || !got.Pinned || !got.SetVisibleDevices ||
 			got.AdminState != "force_running" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("round-trip mismatch: %+v", got)
 		}
@@ -1413,14 +1413,14 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		//
 		// (2) agent_runtime_specs has NO applicationParityBools-style parity
 		// fixture (application_column_parity_test.go); this round trip is the
-		// whole guard for its five integer-boolean columns. Both column-order
+		// whole guard for its four integer-boolean columns. Both column-order
 		// consts have fixed arity, so an OMITTED column errors at Scan, but
 		// two same-typed columns SWAPPED read each other's values in silence
-		// -- and the fixture above seeds enabled, pinned, vram_locked,
-		// set_visible_devices AND responses_live_timings_enabled all true, so
-		// while that holds a swap among them is invisible. One row in which
-		// this column differs from all four of its same-typed neighbours is
-		// what makes such a reorder observable.
+		// -- and the fixture above seeds enabled, pinned, set_visible_devices
+		// AND responses_live_timings_enabled all true, so while that holds a
+		// swap among them is invisible. One row in which this column differs
+		// from all three of its same-typed neighbours is what makes such a
+		// reorder observable.
 		flipped := spec
 		flipped.ResponsesLiveTimingsEnabled = false
 		flipped.UpdatedAt = now.Add(2 * time.Minute)
@@ -1431,7 +1431,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		if got.ResponsesLiveTimingsEnabled {
 			t.Fatalf("re-saving a spec with responses_live_timings_enabled cleared read back true: the upsert's do-update list writes the column on the first insert only: %+v", got)
 		}
-		if !got.Enabled || !got.Pinned || !got.VRAMLocked || !got.SetVisibleDevices {
+		if !got.Enabled || !got.Pinned || !got.SetVisibleDevices {
 			t.Fatalf("clearing responses_live_timings_enabled disturbed another integer boolean, so two same-typed columns are transposed in a column list: %+v", got)
 		}
 		// Back on, so the list read below still describes a true row.

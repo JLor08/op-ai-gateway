@@ -129,6 +129,7 @@ var migrations = []migration{
 	{version: 94, name: "model_mapping_cache", up: migration94Up},
 	{version: 95, name: "model_mapping_benchmarks_audio_perf", up: migration95Up},
 	{version: 96, name: "runtime_spec_ram", up: migration96Up},
+	{version: 97, name: "drop_vram_locked", up: migration97Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -342,7 +343,7 @@ func addColumnIfMissing(ctx context.Context, tx *sql.Tx, dl dialect, table, colD
 // rewording which started quoting the column in a refusal would not
 // silently restore it from the other direction.
 //
-// migration79Up is the first and only caller. See
+// migration79Up is the first caller and migration97Up the second. See
 // TestDropColumnIfPresentSQLite for the present, the already-absent, the
 // nonexistent-table and four BLOCKED cases (index, view, trigger, and a
 // clause-less refusal).
@@ -4307,4 +4308,27 @@ func migration96Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration97Up drops agent_runtime_specs.vram_locked, the per-spec operator
+// opt-out from being governed by an agent VRAM measurement. It is superseded by
+// the max(measured, estimate) precedence the gateway now applies wherever it
+// derives a spec's VRAM demand (the agent push in agentRuntimeSpecDTO and the
+// effective value the portal shows): the operator's estimate is a floor that a
+// larger measurement raises and a smaller one never lowers, so there is nothing
+// left for a lock to protect. The agent's measurement write-back therefore no
+// longer consults it either, and the flag has no reader or writer left anywhere
+// in the gateway.
+//
+// Forward-only and append-only, like every migration here: migration 65's
+// create-table is NOT edited, so a fresh install still creates the column there
+// and this step drops it again straight away -- an upgraded database and a fresh
+// one converge on the same schema. dropColumnIfPresent makes the step
+// replayable (`drop column if exists` on PostgreSQL, the swallowed "no such
+// column" on SQLite, and it refuses to swallow a drop BLOCKED by an index,
+// view or trigger -- vram_locked has none). The value is not preserved: a
+// locked spec simply reads as unlocked, and what the lock used to hold up now
+// holds on its own via max().
+func migration97Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return dropColumnIfPresent(ctx, tx, dl, "agent_runtime_specs", "vram_locked")
 }

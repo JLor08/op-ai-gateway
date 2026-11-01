@@ -40,7 +40,6 @@ func benchmarkSpecFixture(t *testing.T) (*Service, func() []string, string, Runt
 		IdleTimeoutSeconds:          900,
 		AdmissionWaitTimeoutSeconds: 45,
 		Pinned:                      true,
-		VRAMLocked:                  true,
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 0, VRAMEstimateMB: 18000}, {Index: 1, VRAMEstimateMB: 18000}},
 		// The operator's RAM estimate (migration 96), non-zero for the same
 		// reason as the fields below: the benchmark writers spread this loaded
@@ -165,7 +164,6 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		AdmissionWaitTimeoutSeconds: 30,
 		Pinned:                      true,
 		AdminState:                  "force_running",
-		VRAMLocked:                  true,
 		SetVisibleDevices:           true,
 		VisibleDevicesMode:          string(routing.VisibleDevicesModeArgs),
 		GPUs:                        []RuntimeSpecGPUDTO{{Index: 3, VRAMEstimateMB: 12000, VRAMMeasuredMB: 11500}},
@@ -202,7 +200,6 @@ func TestPutRequestFromDTOCoversEveryWritableField(t *testing.T) {
 		AdmissionWaitTimeoutSeconds: dto.AdmissionWaitTimeoutSeconds,
 		Pinned:                      dto.Pinned,
 		AdminState:                  dto.AdminState,
-		VRAMLocked:                  dto.VRAMLocked,
 		SetVisibleDevices:           dto.SetVisibleDevices,
 		VisibleDevicesMode:          dto.VisibleDevicesMode,
 		GPUs:                        dto.GPUs,
@@ -335,9 +332,7 @@ func TestSetBenchmarkRuntimeSpecAdminStateRefusesAnOverrideOnAMissingSpec(t *tes
 // test-plan item 11 at the layer that would actually do the damage, and it is
 // named after the rule it protects: vram_estimate_mb is operator-owned and
 // vram_measured_mb is agent-owned, so a benchmark's own write path must move
-// neither. It also covers the field that made the ratchet dangerous:
-// vram_locked survives, because it is the operator's only escape from being
-// governed by a measurement.
+// neither.
 func TestSetBenchmarkRuntimeSpecAdminStateNeverWritesTheVRAMFields(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _, spec := benchmarkSpecFixture(t)
@@ -367,13 +362,6 @@ func TestSetBenchmarkRuntimeSpecAdminStateNeverWritesTheVRAMFields(t *testing.T)
 	}
 	if !reflect.DeepEqual(gpus, want) {
 		t.Fatalf("a full VRAM run's own writes moved a VRAM number:\n got %#v\nwant %#v", gpus, want)
-	}
-	current, err := svc.GetRuntimeSpec(ctx, ownerToken(), spec.MappingID)
-	if err != nil {
-		t.Fatalf("GetRuntimeSpec: %v", err)
-	}
-	if !current.VRAMLocked {
-		t.Fatal("vram_locked was cleared by a benchmark write")
 	}
 }
 

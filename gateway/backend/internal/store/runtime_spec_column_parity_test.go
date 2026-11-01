@@ -14,27 +14,26 @@ import (
 
 // runtimeSpecParityRows is how many agent_runtime_specs rows the column-parity
 // fixture seeds, computed the same way as applicationParityRows: the readers
-// carry FIVE integer-boolean columns (enabled, pinned, vram_locked,
-// set_visible_devices, responses_live_timings_enabled), two same-typed columns
-// are only distinguishable by value if they differ in at least one seeded row,
-// so each needs its own DISTINCT pattern. With r rows there are 2^r patterns, so
-// r must satisfy 2^r >= 5 -- three rows suffice (2^3 = 8 >= 5).
+// carry FOUR integer-boolean columns (enabled, pinned, set_visible_devices,
+// responses_live_timings_enabled), two same-typed columns are only
+// distinguishable by value if they differ in at least one seeded row, so each
+// needs its own DISTINCT pattern. With r rows there are 2^r patterns, so r must
+// satisfy 2^r >= 4 -- three rows suffice (2^3 = 8 >= 4).
 const runtimeSpecParityRows = 3
 
 // runtimeSpecParityBools is the bit-pattern table, one row per integer-boolean
-// column of agent_runtime_specs in scan order (enabled, pinned, vram_locked,
+// column of agent_runtime_specs in scan order (enabled, pinned,
 // set_visible_devices, responses_live_timings_enabled) and one array slot per
 // seeded spec. Its two load-bearing properties -- every row true somewhere, and
 // every pair of rows distinct -- are pinned by
 // TestRuntimeSpecParityFixtureDistinguishesEverySameTypedPair, so the table
 // cannot degrade into an all-true fixture that catches nothing. Before this
 // fixture existed, TestRoutingStoreRuntimeSpecs flipped ONLY
-// responses_live_timings_enabled and left the other four true in every row, so a
-// swap among those four was invisible.
-var runtimeSpecParityBools = [5][runtimeSpecParityRows]bool{
+// responses_live_timings_enabled and left the others true in every row, so a
+// swap among those was invisible.
+var runtimeSpecParityBools = [4][runtimeSpecParityRows]bool{
 	{true, true, false},  // enabled
 	{false, true, true},  // pinned
-	{false, true, false}, // vram_locked
 	{false, false, true}, // set_visible_devices
 	{true, false, false}, // responses_live_timings_enabled
 }
@@ -43,12 +42,12 @@ var runtimeSpecParityBools = [5][runtimeSpecParityRows]bool{
 // order -- the ONE list of the agent_runtime_specs integer-boolean columns,
 // shared by the distinguishability guard and the schema-coverage guard.
 var runtimeSpecParityBoolNames = []string{
-	"enabled", "pinned", "vram_locked", "set_visible_devices", "responses_live_timings_enabled",
+	"enabled", "pinned", "set_visible_devices", "responses_live_timings_enabled",
 }
 
 // TestConformanceRuntimeSpecReadersAgreeOnEveryColumn is the agent_runtime_specs
 // analogue of TestConformanceApplicationReadersAgreeOnEveryColumn, and it exists
-// because #84 found agent_runtime_specs had NO column-parity fixture: its five
+// because #84 found agent_runtime_specs had NO column-parity fixture: its
 // integer-booleans were guarded only by TestRoutingStoreRuntimeSpecs, which
 // flips one of them on one of two rows -- coverage for one column, not a guard
 // for the next.
@@ -141,8 +140,7 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				AdmissionWaitTimeoutSeconds: 31 + i,
 				Pinned:                      runtimeSpecParityBools[1][i],
 				AdminState:                  adminStates[i],
-				VRAMLocked:                  runtimeSpecParityBools[2][i],
-				SetVisibleDevices:           runtimeSpecParityBools[3][i],
+				SetVisibleDevices:           runtimeSpecParityBools[2][i],
 				VisibleDevicesMode:          visibleModes[i],
 				APITokenMode:                string(routing.RuntimeAPITokenModeSet),
 				APIToken:                    "enc:token-" + idx,
@@ -156,7 +154,7 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				APIFlavors:                  apiFlavors[i],
 				ResponsesMode:               responsesModes[i],
 				MessagesMode:                messagesModes[i],
-				ResponsesLiveTimingsEnabled: runtimeSpecParityBools[4][i],
+				ResponsesLiveTimingsEnabled: runtimeSpecParityBools[3][i],
 				CreatedAt:                   now.Add(time.Duration(-10-i) * time.Minute),
 				UpdatedAt:                   now.Add(time.Duration(-i) * time.Minute),
 			})
@@ -213,7 +211,7 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 // TestRuntimeSpecParityFixtureDistinguishesEverySameTypedPair pins the two
 // properties runtimeSpecParityBools must have, exactly as its applications and
 // ai_servers siblings do: without it, a "simplification" back to an all-true
-// table would restore the very hole -- swaps among the four always-true bools
+// table would restore the very hole -- swaps among the always-true bools
 // were invisible -- that this fixture was added to close.
 func TestRuntimeSpecParityFixtureDistinguishesEverySameTypedPair(t *testing.T) {
 	names := runtimeSpecParityBoolNames
