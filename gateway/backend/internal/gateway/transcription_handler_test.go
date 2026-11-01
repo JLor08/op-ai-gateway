@@ -2788,7 +2788,7 @@ func TestTranscriptionDetailsRelayDropsAnEmptyFilePart(t *testing.T) {
 	})
 }
 
-// audio.cpp refuses stream=true on /details with a 500, so the gateway refuses it
+// audio.cpp refuses stream=true on /details with a 400, so the gateway refuses it
 // FIRST: a gateway 400 with the endpoint's own stream code, before anything is routed
 // or sent, so no admission is spent, no upstream is called and no usage is recorded.
 // Every spelling strconv.ParseBool reads as true is refused (the plain endpoint reads
