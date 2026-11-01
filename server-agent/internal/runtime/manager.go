@@ -1859,7 +1859,8 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 
 // buildSnapshot assembles the pure PolicySnapshot Admit needs from current
 // owner state, consulting the installed measurer (if any) for real per-GPU
-// VRAM instead of each spec's static estimate.
+// VRAM that can raise each spec's pushed demand (never lower it: the demand
+// is a floor, the charge is max(live, demand)).
 //
 // It measures SYNCHRONOUSLY, on the owner, and that is deliberate even though
 // dispatchMeasurement (above) now keeps st.measuredVRAM continuously fresh.
@@ -1890,20 +1891,26 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		}
 		// realMeasurement is the zero-guard: only a strictly positive value
 		// is a measurement, so an index the measurer answered with 0 (or
-		// less) is absent here and falls through to the operator's estimate
-		// below, exactly like an index it never mentioned. Without it a
-		// measured 0 WON, and "unknown" became "this model needs no VRAM" --
-		// see realMeasurement for what that costs admission.
+		// less) is absent here and charges the pushed demand below, exactly
+		// like an index it never mentioned. Without it a measured 0 WON, and
+		// "unknown" became "this model needs no VRAM" -- see realMeasurement
+		// for what that costs admission.
+		//
+		// The charge is max(live, pushed demand). The pushed demand is
+		// already max(persisted measurement, operator estimate) -- the
+		// gateway builds it that way -- so it is a FLOOR here: a fresher live
+		// reading raises it when the process has grown, but a reading below
+		// it (a transient dip between allocations) must not lower the
+		// reservation. Replacing the demand with the live value is how a
+		// co-resident start got admitted into that gap.
 		byGPU := realMeasurement(measured[st.proc.pid])
 		gpus := make(map[int]int, len(st.spec.GPUs))
 		for _, g := range st.spec.GPUs {
-			if byGPU != nil {
-				if v, ok := byGPU[g.Index]; ok {
-					gpus[g.Index] = v
-					continue
-				}
+			charge := g.VRAMMB
+			if v, ok := byGPU[g.Index]; ok && v > charge {
+				charge = v
 			}
-			gpus[g.Index] = g.VRAMMB
+			gpus[g.Index] = charge
 		}
 		if byGPU != nil {
 			st.measuredVRAM = byGPU

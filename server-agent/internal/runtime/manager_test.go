@@ -3569,6 +3569,111 @@ func TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate(t *tes
 	}
 }
 
+// TestBuildSnapshotEffectiveVRAMIsMax pins how a live measurement combines
+// with the demand the gateway pushed: the charge is max(live, pushed), so the
+// pushed demand is a FLOOR and a fresher live reading can only RAISE it.
+//
+// The pushed demand (SpecGPU.VRAMMB) already is max(persisted measurement,
+// operator estimate) -- the gateway applies the same rule when it builds the
+// document. Before this rule buildSnapshot let a present live value REPLACE
+// that number, so a transient dip (a reading taken while the child is between
+// allocations, or while a KV cache is being resized) lowered the reservation
+// below the floor for exactly as long as it lasted, and a co-resident start
+// admitted into the gap is how an OOM happens. "Never under-reserve" means the
+// live reading has no authority to lower anything.
+//
+// A reading that is not a real measurement (<= 0, dropped by realMeasurement)
+// is absent here and so lands on the pushed demand, like an index the
+// measurer never mentioned. And what is REPORTED is untouched by any of this:
+// st.measuredVRAM keeps the raw live reading (the portal's evidence), only the
+// admission charge is floored.
+func TestBuildSnapshotEffectiveVRAMIsMax(t *testing.T) {
+	const (
+		demand = 8000
+		pid    = 4242
+	)
+	cases := []struct {
+		name string
+		// measured is what the installed measurer answers for this pid; nil
+		// means the measurer has no row for the pid at all.
+		measured map[int]int
+		// wantCharged is what admission must be charged per GPU index.
+		wantCharged map[int]int
+		// wantReported is what st.measuredVRAM must hold: the raw real
+		// readings, never the floored charge. nil = nothing stored.
+		wantReported map[int]int
+	}{
+		{
+			name:         "live above the demand raises it",
+			measured:     map[int]int{0: 9000},
+			wantCharged:  map[int]int{0: 9000},
+			wantReported: map[int]int{0: 9000},
+		},
+		{
+			name:         "live below the demand is floored at the demand",
+			measured:     map[int]int{0: 7000},
+			wantCharged:  map[int]int{0: demand},
+			wantReported: map[int]int{0: 7000},
+		},
+		{
+			name:         "live equal to the demand charges the demand",
+			measured:     map[int]int{0: demand},
+			wantCharged:  map[int]int{0: demand},
+			wantReported: map[int]int{0: demand},
+		},
+		{
+			name:         "live absent charges the demand",
+			measured:     nil,
+			wantCharged:  map[int]int{0: demand},
+			wantReported: nil,
+		},
+		{
+			name:         "live zero is unknown and charges the demand",
+			measured:     map[int]int{0: 0},
+			wantCharged:  map[int]int{0: demand},
+			wantReported: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := baseSpec("spec-a", "model-a")
+			spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: demand}}
+			o, st := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
+				if tc.measured == nil {
+					return map[int]map[int]int{}
+				}
+				return map[int]map[int]int{pid: tc.measured}
+			})
+
+			snap := o.buildSnapshot()
+
+			if got := gpusChargedFor(t, snap, "spec-a"); !reflect.DeepEqual(got, tc.wantCharged) {
+				t.Errorf("admission is charged %v for the live reading %v against a pushed demand of %d MB, want %v -- the charge is max(live, pushed demand): the demand is a floor a live reading may raise but never lower", got, tc.measured, demand, tc.wantCharged)
+			}
+			if !reflect.DeepEqual(st.measuredVRAM, tc.wantReported) {
+				t.Errorf("st.measuredVRAM = %v for the live reading %v, want %v -- what is reported is the raw real reading, not the floored admission charge", st.measuredVRAM, tc.measured, tc.wantReported)
+			}
+		})
+	}
+
+	// Per GPU index, like the zero-guard: one index raised by its live reading
+	// while a sibling is floored by a lower one in the same snapshot.
+	t.Run("applied per GPU index", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: demand}, {Index: 1, VRAMMB: demand}}
+		o, _ := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
+			return map[int]map[int]int{pid: {0: 9000, 1: 7000}}
+		})
+
+		snap := o.buildSnapshot()
+
+		want := map[int]int{0: 9000, 1: demand}
+		if got := gpusChargedFor(t, snap, "spec-a"); !reflect.DeepEqual(got, want) {
+			t.Errorf("admission is charged %v, want %v -- max() is decided per GPU index, never per pid", got, want)
+		}
+	})
+}
+
 // TestApplyMeasurementNeverStoresANonPositiveMeasurement closes the second
 // door onto st.measuredVRAM. buildSnapshot is the admission path; this is the
 // recurring off-owner one (dispatchMeasurement -> cmdMeasured), and it is the
