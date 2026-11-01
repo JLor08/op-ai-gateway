@@ -3958,6 +3958,92 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(startedBody().settings.transcription).toEqual({});
       });
 
+      // The Diarized toggle (#295): a thread setting, off by default, that selects the speaker
+      // view of a one-shot file or recorded run. The live recording has no diarization upstream,
+      // so its hint says the toggle does not apply there.
+      describe('the Diarized toggle', () => {
+        const diarizeToggle = () =>
+          screen.getByRole('checkbox', { name: t.chatTranscriptionDiarize });
+
+        it('is an unchecked checkbox, described by its hint', async () => {
+          await renderTranscriptionThread();
+          openSettings();
+
+          const toggle = diarizeToggle();
+          expect(toggle).not.toBeChecked();
+          expect(toggle).toBeEnabled();
+          expect(toggle).toHaveAccessibleDescription(t.chatTranscriptionDiarizeHint);
+        });
+
+        it('writes diarize into the transcription settings of the run when it is switched on', async () => {
+          await renderTranscriptionThread();
+          openSettings();
+          fireEvent.click(diarizeToggle());
+          expect(diarizeToggle()).toBeChecked();
+          attachAudio(wavFile());
+          await waitFor(() => expect(sendButton()).toBeEnabled());
+          fireEvent.click(sendButton());
+
+          await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+          expect(startedBody().settings.kind).toBe('transcription');
+          expect(startedBody().settings.transcription).toEqual({ diarize: true });
+        });
+
+        it('sends nothing for it once it is switched off again', async () => {
+          await renderTranscriptionThread();
+          openSettings();
+          fireEvent.click(diarizeToggle());
+          fireEvent.click(diarizeToggle());
+          expect(diarizeToggle()).not.toBeChecked();
+          attachAudio(wavFile());
+          await waitFor(() => expect(sendButton()).toBeEnabled());
+          fireEvent.click(sendButton());
+
+          await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+          expect(startedBody().settings.transcription).toEqual({});
+        });
+
+        it('travels with the other knobs and does not disturb them', async () => {
+          await renderTranscriptionThread();
+          openSettings();
+          fireEvent.change(screen.getByRole('textbox', { name: t.chatTranscriptionLanguage }), {
+            target: { value: 'de' },
+          });
+          fireEvent.click(diarizeToggle());
+          expect(screen.getByRole('textbox', { name: t.chatTranscriptionLanguage })).toHaveValue(
+            'de',
+          );
+          attachAudio(wavFile());
+          await waitFor(() => expect(sendButton()).toBeEnabled());
+          fireEvent.click(sendButton());
+
+          await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+          expect(startedBody().settings.transcription).toEqual({ language: 'de', diarize: true });
+        });
+
+        it('is checked for a saved diarized thread', async () => {
+          chatApi.rows.push({
+            id: 'c_asr_diarized',
+            title: '',
+            created_at: '2026-07-22T12:00:00Z',
+            updated_at: '2026-07-22T12:00:00Z',
+            content: {
+              settings: {
+                model: 'whisper',
+                kind: 'transcription',
+                transcription: { diarize: true },
+              },
+              messages: [],
+            },
+          });
+          renderChat(tokens, asrModels);
+          await waitForChatReady();
+          openSettings();
+
+          expect(diarizeToggle()).toBeChecked();
+        });
+      });
+
       it('seeds the fields from a saved transcription thread', async () => {
         chatApi.rows.push({
           id: 'c_asr_seed',
@@ -4013,6 +4099,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           expect(screen.queryByLabelText(t.chatTranscriptionLanguage)).not.toBeInTheDocument();
           expect(screen.queryByLabelText(t.chatTranscriptionPrompt)).not.toBeInTheDocument();
           expect(screen.queryByLabelText(t.chatTranscriptionTemperature)).not.toBeInTheDocument();
+          expect(screen.queryByLabelText(t.chatTranscriptionDiarize)).not.toBeInTheDocument();
           expect(screen.queryByText(t.chatTranscriptionFormatHint)).not.toBeInTheDocument();
           openSettings();
         }

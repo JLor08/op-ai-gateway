@@ -56,6 +56,7 @@ flowchart TD
         ImgEdit["POST /v1/images/edits (multipart)\n/openai/v1/images/edits"]
         Speech["POST /v1/audio/speech\n/openai/v1/audio/speech"]
         Transcribe["POST /v1/audio/transcriptions (multipart)\n/openai/v1/audio/transcriptions"]
+        TranscribeD["POST /v1/audio/transcriptions/details (multipart, one-shot)\n/openai/v1/audio/transcriptions/details"]
     end
 
     Chat --> ParseChat["compat.ParseOpenAIChatCompletions"]
@@ -72,8 +73,9 @@ flowchart TD
     CapGateS -->|refused| Reject5["404 routing.model_not_capable"]
     CapGateS -->|target| Native5["relaySpeech -> proxyNative:\nJSON body to upstream /v1/audio/speech,\nbinary audio/wav streamed back"]
     Transcribe --> CapGateT{"Resolve with\nRequiredCapabilities=[transcription]"}
+    TranscribeD --> CapGateT
     CapGateT -->|refused| Reject6["404 routing.model_not_capable /\ntranscription.unavailable"]
-    CapGateT -->|target| Native6["relayTranscription -> proxyNative:\nmultipart body verbatim (or rebuilt once)\nto upstream /v1/audio/transcriptions,\nJSON response buffered, metered, written"]
+    CapGateT -->|target| Native6["relayTranscription -> proxyNative:\nmultipart body verbatim (or rebuilt once)\nto upstream /v1/audio/transcriptions\n(or /details for the one-shot twin),\nJSON response buffered, metered, written"]
 
     NativeGate -->|passthrough| Native["proxyNative:\nforward raw body byte-for-byte\nto upstream /v1/responses"]
     NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
@@ -140,6 +142,7 @@ extractor (§4) discriminates them by `sessionEndpoint`
 | OpenAI Images edits (multipart) | `/v1/images/edits`, `/openai/v1/images/edits` | `handleOpenAIImagesEdit` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a multipart relay, no translate path (§3.5) |
 | OpenAI audio speech | `/v1/audio/speech`, `/openai/v1/audio/speech` | `handleOpenAISpeech` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a binary-response relay, no translate path (§3.6) |
 | OpenAI audio transcriptions (multipart) | `/v1/audio/transcriptions`, `/openai/v1/audio/transcriptions` | `handleOpenAITranscription` | `requireInternalOrBearerAnyScope` (as generations) | **always** — a multipart-in, JSON-out relay, no translate path (§3.7) |
+| Diarized transcription (multipart, one-shot) | `/v1/audio/transcriptions/details`, `/openai/v1/audio/transcriptions/details` | `handleOpenAITranscriptionDetails` (the same `serveTranscription` as the row above) | `requireInternalOrBearerAnyScope` (as generations) | **always** — the transcription relay's one-shot second route, never streamed (§3.7 item 12) |
 | Anthropic token count | `/v1/messages/count_tokens`, `/anthropic/v1/messages/count_tokens` | `handleAnthropicCountTokens` | `requireAnyScope` (bearer only) | n/a — never calls an upstream |
 | OpenAI model discovery | `/v1/models`, `/openai/v1/models` | `handleOpenAIModels` | `requireAnyScope` | n/a |
 | Anthropic model discovery | `/anthropic/v1/models` | `handleAnthropicModels` | `requireScope("gateway:use")` | n/a |
@@ -152,7 +155,7 @@ methods) — `/v1/chat/completions` is deliberately the one inference endpoint
 reachable that way (§9). Every body but the two multipart ones (the image edits
 and the audio transcriptions) is read with `readRawJSONUnlimited` (§7); those two
 bodies are `multipart/form-data` and each is read by its own capped reader (§3.5,
-§3.7, §10). All eight POST endpoints call `liftInferenceDeadlines` before reading
+§3.7, §10). All eight POST handlers (the transcription one serves its plain and its `/details` route) call `liftInferenceDeadlines` before reading
 the body (§6); the bearer live-transcription endpoint of §3.8, a ninth POST, lifts them as well, after its own gate, and so does the portal's `POST /api/portal/voice-chat-ticket` ([ADR-078](../09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate)): its co-load gate cold-starts up to three models for as long as `OP_AI_GATEWAY_VOICE_COLOAD_TIMEOUT` (default 120 s), which outlives the 30 s write deadline, so it lifts them once it has read the body and the chat and before the gate runs. The portal's section re-synthesis `POST /api/portal/voice-chat-synth` (issue #324, §3.6 item 12) lifts them too, right after its auth and before it reads the body, as the speech endpoint it fronts does, because a synthesis (a cold model's first one included) can outlive them.
 
 ### 3.1 OpenAI Chat Completions
@@ -1012,14 +1015,16 @@ capability, `RequiredCapabilities = ["transcription"]`, [Routing & Model Selecti
 validates its own shape and never calls `inference.Request.Validate()`, `upstreamPath`
 answering `/v1/audio/transcriptions` directly, an empty `sessionEndpoint` case (OpenAI's
 transcription request has no session field, and its body is multipart), and **no
-affinity pin**. What follows is what transcription decides differently
+affinity pin**. A second, one-shot route, `/v1/audio/transcriptions/details`, relays audio.cpp's diarized document through
+the same handler (item 12). What follows is what transcription decides differently
 ([ADR-062](../09-architecture-decisions.md#adr-062--transcription-is-multipart-in-and-json-out-on-the-shared-openai_audio-flavor-a-distinct-transcription-capability-billing-read-from-the-response-body-and-every-divergence-from-speech-keyed-on-the-endpoint)).
 
 **1. The flavor is speech's, so every difference is keyed on the endpoint.** Both
 endpoints carry the `openai_audio` flavor string, which therefore cannot say which of
 them a request is. The upstream path (answered **before** speech's flavor branch), the
 source of the billing quantity, the upstream-error relay and the capture predicate are
-keyed on `endpoint == endpointTranscription`, and the speech-side guards
+keyed on the transcription endpoint (`endpoint == endpointTranscription`, and `isTranscriptionEndpoint`, which also
+admits the one-shot `/details` route of item 12, for the response-side checks), and the speech-side guards
 (`setSpeechBillingQuantity`, `needsSpeechErrorRelay`, `isBinarySpeechResponse`) each
 skip a transcription **and nothing else**, so a speech call site built without an
 endpoint is still speech. The flavor-keyed behavior that remains, the `audio_second`
@@ -1095,7 +1100,7 @@ fallback; audio.cpp emits its own SSE shape and the gateway translates no `strea
 `stream: false` and an absent or empty `stream` describe the buffered path and are accepted.
 This lifted ADR-062's blanket refusal
 ([ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
-issue #262).
+issue #262) for the plain route alone: the one-shot `/details` route of item 12 never streams.
 
 **6. The upload is relayed verbatim only when nothing in it must change.** The relay
 sends the **client's bytes and its own `Content-Type`**, boundary included, unless the
@@ -1240,6 +1245,41 @@ portal run's own deadline bounds that path, [Risks
 agent-launched child the `transcription_streaming` verdict is **reported by the ServerAgent**
 (0.9.2), riding the existing `capability_source_audiocpp` wire with no new feature flag
 (§6, [Agent-Managed Model Runtime §7](agent-runtime-manager.md#7-feature-negotiation)).
+
+**12. A diarized transcription is a one-shot second route, `POST /v1/audio/transcriptions/details`, relayed verbatim
+and never streamed ([ADR-082](../09-architecture-decisions.md#adr-082--diarized-transcription-a-one-shot-v1audiotranscriptionsdetails-relay-a-result-driven-speaker-view-with-no-capability-verdict-and-a-speaker_transcript-content-part),
+issue #295).** For a diarizing ASR model audio.cpp serves a second route whose answer is the plain document plus **who
+spoke when**: `{"text", "segments", "speaker_turns": [{"start_sample", "end_sample", "speaker_id", "confidence", "text"}],
+"sample_rate", "timing"}`, where `speaker_id` is a **string** and the offsets are in **samples** of `sample_rate`, not
+seconds. The gateway serves it as the transcription relay's **second route** (`handleOpenAITranscriptionDetails`, with an
+`/openai/v1/audio/transcriptions/details` alias), through the **same** `serveTranscription` as the plain one, so items 2 to
+4 and 6 to 10 hold for it unchanged: the same auth leg, the same body cap and form checks (a `model` and exactly one
+non-empty `file`, `response_format` `json` or absent; the upstream reads WAV only, which the gateway does not check), the
+same `transcription` gate, `multipart_proxy` check and model-name rewrite, the same buffered read of the response up to the cap, the same error normalisation, the same
+capture (the form, and the transcript) and the same `audio_second` billing from the document's own
+`timing.audio_duration_ms`. What differs:
+
+- **The upstream path** is `/v1/audio/transcriptions/details`, which is also the usage row's `provider_path`
+  (`upstreamPath` keys on `endpointTranscriptionDetails`).
+- **It is one-shot and refuses a stream.** audio.cpp refuses `stream=true` on this route, and so does the gateway: a
+  `stream` that reads as true is `400 transcription.stream_unsupported`, answered with the other form errors (before any
+  admission, not recorded; `validateTranscriptionDetailsRequest`). A `stream` that is false, absent or empty is accepted, and
+  a non-boolean `stream` and any `stream_format` are refused by the shared check as item 5 says. The relay takes **no**
+  stream decision for it: no `transcription_streaming` verdict is read, no `stream` part is restated, no buffered retry is
+  built and it is never marked a stream, so the idle watchdog stays off and the application's `timeout_ms` is the total
+  deadline. `isStreamedTranscription` still matches the plain endpoint alone, while the checks that only separate a
+  transcription from speech (the buffered relay, the billing quantity, the upstream-error relay, the capture's
+  binary-speech carve-out) ask `isTranscriptionEndpoint`.
+- **The document is relayed verbatim, and there is no `diarization` verdict.** The gateway does not parse `speaker_turns`,
+  converts no offsets and adds no capability. The gate is the plain `transcription` verdict, because the model listing the
+  gateway reads (`id`, `family`, `task`, `mode`, `loaded`, `path`, `params`) carries no diarization capability to build a
+  verdict from. A model that cannot diarize answers the same route with a document that has **no `speaker_turns`**, which is a
+  valid `200`, billed as any transcription, and **not an error**; the caller decides what the answer means (the portal run
+  shows speakers only for two or more, §12).
+- **Diarization is for file uploads only.** There is no live or streaming diarization, because audio.cpp has none: the
+  streamed transcription of item 11 and the live transcription of §3.8 carry no speakers.
+- **No agent change.** The agent's multipart proxy is path-blind, so the route reaches an agent-launched child unchanged and
+  no `ServerAgent` version moved.
 
 ### 3.8 Live transcription: the bearer `/v1` endpoint and the portal WebSocket
 
@@ -1631,7 +1671,8 @@ has it and no `(speech, yes)` verdict answers 404 `routing.model_not_capable`
 ([ADR-061](../09-architecture-decisions.md#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).
 **Transcription shares that flavor** rather than taking one of its own
 (`POST /v1/audio/transcriptions`, §3.7): an application that lists `openai_audio` is a
-candidate for both audio endpoints, and what tells the two apart is the **endpoint**, not
+candidate for both audio endpoints (and for the transcription's one-shot `/details` route, §3.7 item 12),
+and what tells them apart is the **endpoint**, not
 the flavor string, which is why `upstreamPath` takes the endpoint as a parameter for this
 flavor as it does for `openai_images`. The model decides which endpoint it serves, by its
 `speech` or `transcription` verdict
@@ -2131,7 +2172,9 @@ body (`{created, output_format, data:[{b64_json}]}`, a real decodable 1×1 PNG) 
 `Content-Type: application/json`, so an images request round-trips end to end
 without an upstream. It answers `/v1/audio/transcriptions` with the transcription
 document audio.cpp returns (`{"text": ..., "timing": {"audio_duration_ms": 2000}}`,
-`Content-Type: application/json`), so a transcription relay finds the duration it bills;
+`Content-Type: application/json`), so a transcription relay finds the duration it bills, and
+`/v1/audio/transcriptions/details` with the details document (the same text and timing plus a `speaker_turns` of two
+speakers and a `sample_rate`), so a diarized run has a speaker view to show without an upstream;
 every other path keeps its canned Responses-shaped SSE.
 
 The mock, Ollama and OpenAI-compatible clients also implement `Prober` (reachability probe) and, where applicable,
@@ -2787,7 +2830,7 @@ gateway sent it, is the check to run. The reasoning is recorded in [ADR-059](../
 |---|---|---|
 | The six JSON inference endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/generations`, `/v1/audio/speech`) | `readRawJSONUnlimited` | none — a large base64-encoded multimodal payload is read in full (a speech body is a short JSON object, read the same way) |
 | The image edit endpoint (`/v1/images/edits`), whose body is `multipart/form-data` | `readImageEditBody` (`internal/gateway/images_edit_handler.go`; `readRawJSONLimit` would refuse anything but one JSON value) | `OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES`, default 32 MiB: a declared `Content-Length` over it is refused without a read, an undeclared body is stopped by `http.MaxBytesReader`, both `413 request.body_too_large` |
-| The audio transcription endpoint (`/v1/audio/transcriptions`), whose body is `multipart/form-data` | `readTranscriptionBody` (`internal/gateway/transcription_handler.go`; the same reasoning) | `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, default 32 MiB, a variable of its own, independent of the image-edit one: the same two refusals, both `413 request.body_too_large`; the same value also bounds the **response** the relay buffers (§3.7) |
+| The audio transcription endpoint (`/v1/audio/transcriptions`, and its one-shot `/details` route, one handler), whose body is `multipart/form-data` | `readTranscriptionBody` (`internal/gateway/transcription_handler.go`; the same reasoning) | `OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`, default 32 MiB, a variable of its own, independent of the image-edit one: the same two refusals, both `413 request.body_too_large`; the same value also bounds the **response** the relay buffers (§3.7) |
 | The portal chat documents (`POST /api/portal/chats`, `PUT /api/portal/chats/{id}`, `POST /api/portal/chats/{id}/runs`) | `readRawJSONLimit` | `portal.MaxChatRequestBytes` = 5 MiB (the 4 MiB content cap plus the JSON envelope); the bundled nginx allows the same on `/api/portal/chats` |
 | Everything else (control plane: `/api/portal/*`, `/api/admin/*`, `/api/system/*`) | `readRawJSON` | `maxJSONBodyBytes` = 1 MiB (`http.MaxBytesReader`) |
 
@@ -2918,7 +2961,8 @@ from the browser. Instead:
    `/v1/chat/completions` — or, when the run's kind is `image` (below), to
    `/v1/images/generations`, or to `/v1/images/edits` when the turn carries a
    source image, or, when the kind is `speech` (below), to `/v1/audio/speech`, or,
-   when the kind is `transcription` (below), multipart to `/v1/audio/transcriptions` —
+   when the kind is `transcription` (below), multipart to `/v1/audio/transcriptions`
+   (or to its one-shot `/v1/audio/transcriptions/details` route when the thread is diarized) —
    authenticating via the internal trusted-loopback
    header pair (`X-OP-Internal-Auth` + `X-OP-Internal-User` — checked *first*
    by `loopbackPrincipal`, `internal/gateway/auth.go`, which both
@@ -2928,7 +2972,8 @@ from the browser. Instead:
    `X-OP-CSRF` header a direct browser call would need.
 3. `/v1/chat/completions`, `/v1/images/generations`, `/v1/images/edits`,
    `/v1/audio/speech` and `/v1/audio/transcriptions` are the five inference
-   endpoints the run executor reaches
+   endpoints the run executor reaches (a diarized transcription run posts to the transcription handler's
+   one-shot `/details` route, the same handler on the same leg)
    through a token-less, session-shaped principal — chat
    completions via `requireWebAnyScope` →
    `authenticateWeb` (session cookie, internal loopback, or bearer), the images
@@ -2967,7 +3012,8 @@ rather than inherited from the endpoint's tolerance of an absent value (§3.4).
 `speech` posts to `/v1/audio/speech`, with the last user message's text as the
 `input` ([ADR-063](../09-architecture-decisions.md#adr-063--speech-in-the-portal-chat-is-a-third-run-kind-the-model-is-the-affordance-the-run-reuses-the-speech-endpoint-over-loopback-and-the-wav-lives-in-chat_blobs), the speech paragraphs below).
 `transcription` posts the last user message's **audio clip** multipart to
-`/v1/audio/transcriptions` and commits the transcript as the ordinary text turn — the
+`/v1/audio/transcriptions` (to `/v1/audio/transcriptions/details` for a diarized thread) and commits the transcript as the
+ordinary text turn (a diarized run whose answer names several speakers commits a `speaker_transcript` part instead, below) — the
 inverse of speech, the audio being the input ([ADR-064](../09-architecture-decisions.md#adr-064--transcription-in-the-portal-chat-is-the-fourth-run-kind-the-model-is-the-affordance-the-audio-input-lives-in-chat_blobs-and-is-relayed-multipart-over-loopback-and-the-reply-is-the-ordinary-text-turn), the transcription paragraphs below).
 An image thread also carries a `ChatImageSettings` that the composer's settings
 panel edits in place of the text-chat controls (which the images endpoint uses
@@ -3728,9 +3774,10 @@ mirroring the image edit), `model`, the set `language`/`prompt`/`temperature` as
 fields and the Advanced passthrough, then POSTs over loopback and **overrides the
 `Content-Type`** with the multipart one as the edit hop does; **no `response_format`** is
 sent, because the endpoint forces JSON (§3.7). The reply is the **ordinary text turn** —
-the transcript becomes one `{"type":"text",…}` part, no new part type and no output blob,
-the inverse of speech's WAV. The run's knobs are a `ChatTranscriptionSettings` (`language`,
-`prompt`, `temperature`, `passthrough`), persisted under `settings.transcription` the way
+the transcript becomes one `{"type":"text",…}` part and no output blob, the inverse of
+speech's WAV — except for a diarized run whose answer names several speakers (the `diarize`
+knob, below). The run's knobs are a `ChatTranscriptionSettings` (`language`,
+`prompt`, `temperature`, `passthrough`, `diarize`), persisted under `settings.transcription` the way
 `settings.audio` is (`omitempty`, cleared server-side for any non-transcription kind, so a
 text, image or speech chat's stored and wire bytes are unchanged):
 
@@ -3744,6 +3791,24 @@ text, image or speech chat's stored and wire bytes are unchanged):
   `SPEECH_RESERVED_FIELDS` does. There is **no `response_format` control** — the gateway
   forces JSON, so a static caption states the reply is text, the twin of speech's "always
   WAV".
+- **`diarize` is the one knob that changes the endpoint**
+  ([ADR-082](../09-architecture-decisions.md#adr-082--diarized-transcription-a-one-shot-v1audiotranscriptionsdetails-relay-a-result-driven-speaker-view-with-no-capability-verdict-and-a-speaker_transcript-content-part),
+  issue #295). Off by default and `omitempty` (the composer sends it only when it is on, so a stored chat's bytes do not
+  move), it makes the run post its **one** request to `/v1/audio/transcriptions/details` (§3.7 item 12) with **no
+  `stream` part** (the plain run always asks for one, ADR-065), and read the one JSON document whole whatever its content
+  type: a diarized run is **one-shot even against a `mode=streaming` model** and renders no deltas, the transcription wait
+  showing until the one answer. **The answer, not the setting, decides what is committed.** A document that names **two or
+  more distinct `speaker_id`s** (counted over the ids as audio.cpp wrote them, strings never assumed to be numbers or an
+  order) commits **one** part and **no text part**, `{"type":"speaker_transcript","text":<the whole transcript>,"turns":
+  [{"speaker","start"?,"end"?,"text"}]}`: the turns in the order spoken, the speaker id verbatim and `start`/`end` in
+  **seconds** (audio.cpp's sample offsets divided by the document's `sample_rate`, each omitted when unknown, so a turn
+  that starts at 0 is told from one with no time). Anything else, one speaker, no `speaker_turns` because the model cannot
+  diarize, or a `speaker_turns` or `sample_rate` that cannot be read (logged, and never costing the transcript), commits
+  the ordinary text part of a plain run, so asking a model that cannot diarize is never an error and never a blank turn.
+  An empty transcript is `gateway.chat_run_transcription_no_transcript` either way, and `stream` stays a reserved
+  passthrough key. The composer shows it as a **Diarized** checkbox in the transcription settings, for a file or a
+  recorded clip; a live recording is never diarized (§3.8 item 9: it commits its own plain-text turn without these
+  settings), which the checkbox's hint says.
 
 Five terminal codes name the conditions: `gateway.chat_run_transcription_dispatch_failed`
 (the loopback request never completed), `gateway.chat_run_transcription_source_unreadable`
@@ -3787,13 +3852,29 @@ transcodes nothing; the conversion's accepted costs are in [Risks
 §11.4](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances). A transcription thread's first user turn is audio-only, so
 `deriveTitleFromMessages` (the first user message's text) and the backend `deriveChatTitle`
 find nothing; an untitled transcription chat is **titled from its transcript** on
-completion (`titleFromTranscript`), falling back to the localized "Untitled" placeholder.
+completion (`titleFromTranscript`; a diarized turn's, from the `text` of its `speaker_transcript` part), falling back to the localized "Untitled" placeholder.
 
 **A live input mode.** For a model the gateway says streams (`GET /api/portal/model-transcription-streaming`, §3.8
 item 2), the composer's record-mode switch has a third choice beside attaching a file and recording a clip: **live**.
 The microphone is streamed up a WebSocket while the user speaks and the transcript appears as it is said; on
 Stop it lands as **one completed turn written directly, not a chat run** (the live endpoint has already done
 and billed the work), so it bypasses the clip, the WAV conversion and the run described above (§3.8 item 9).
+
+**A diarized transcript renders as who said what.** The `speaker_transcript` part is a variant of the frontend's
+`ChatContentPart` union (`shared/chatContent.ts`), read by `speakerTranscriptOf`, which treats persisted history as input
+rather than truth: a `turns` that is no list is no turns, an entry that is no object is dropped, a `speaker` or `text` that
+is no string is empty and a time that is not a finite number is absent, which leaves a smaller transcript (down to its
+plain `text`) rather than a row that cannot render. `DiarizedTranscript` lays it out as one block per turn in the order
+spoken, with the span the turn covers when the model said (`m:ss`, or `h:mm:ss` from an hour on) and a label that is the
+speaker's **number in order of first appearance in that transcript** ("Speaker 1", "Speaker 2", in both languages),
+**never the id the model reported**, which is a free-form string that a label must assume nothing of; a stripe colour per
+speaker only decorates. Because the turn has **no text part**, the readers that take "the turn's text" from a text part read
+the part instead: **Copy** hands over the speaker view as one plain line per turn, **view raw** shows the whole `text`
+without the speakers (as it does for a part left with no turns), and the chat title is derived from the part's `text`
+(`deriveTitleFromTranscript`); the guards that read an empty text as "nothing has arrived yet" (the transcription wait, a
+streaming row's awaiting-text state) count the part as an answer, so a finished diarized turn is never mistaken for a pending
+run. Nothing but the portal's own history reads the part: the transcription run sends only the last user message's clip, so
+the part is never sent upstream again.
 
 **The turn is committed as structured content.** `portal.AssistantTurn` carries
 an optional `ContentParts`, written as the message's `content` when it is
@@ -3807,7 +3888,9 @@ as a vision input on the next turn with no extra code, and the transcript
 renderer already understood it. A speech turn's part is an `audio_url` part (one for a clip that fits the per-blob
 ceiling, several ordered ones for a longer answer, [ADR-070](../09-architecture-decisions.md#adr-070--long-speech-is-stored-as-multiple-ordered-wav-blobs-under-a-total-audio-cap-positional-order-with-no-migration-one-atomic-commit-an-honest-audio-too-large-error-that-still-bills-the-delivered-call-named-commit-failure-codes-and-a-gapless-client-side-stitch)),
 `{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,…"}}`, `image_url`'s
-twin, which no history construction ever feeds back as a vision input.
+twin, which no history construction ever feeds back as a vision input. A diarized transcription turn's part is a
+`speaker_transcript` part (`{"type":"speaker_transcript","text":…,"turns":[…]}`), the turn's only part and no text part (the
+diarized paragraph of this section).
 
 **Images live outside the transcript ([ADR-056](../09-architecture-decisions.md#adr-056--chat-binary-payloads-live-in-an-owner-scoped-sealed-chat_blobs-store-and-the-transcript-references-them-by-gateway-url)).**
 The `data:` parts above exist only until the commit: both an uploaded and a

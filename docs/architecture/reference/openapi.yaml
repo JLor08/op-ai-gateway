@@ -504,6 +504,54 @@ paths:
         '200': { $ref: '#/components/responses/Transcription' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/audio/transcriptions/details:
+    post:
+      tags: [inference]
+      summary: Diarized speech-to-text (multipart in, JSON with speaker turns out, one-shot only, no translate path)
+      description: >
+        The one-shot, diarizing twin of /v1/audio/transcriptions (ADR-082,
+        issue #295): the same handler, so auth (scope `gateway:use` or
+        `llm:invoke`, a bearer token OR the internal trusted-loopback header
+        pair, never a portal session cookie), the multipart form and its
+        refusals (a non-empty `model`, exactly one non-empty `file`,
+        `response_format` `json` or absent; the upstream reads WAV audio only,
+        and the gateway does not check it), the `transcription`
+        capability gate, the `multipart_proxy` requirement for an
+        agent-launched model, the upload cap
+        (`OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES`), the error codes
+        and the upstream-error normalisation are all /v1/audio/transcriptions's.
+        There is no separate diarization capability verdict: the model
+        listing the gateway reads carries none, so a model that cannot diarize
+        answers a valid 200 whose document has no `speaker_turns`, billed as
+        any transcription. The route NEVER streams, because audio.cpp refuses
+        a stream on it: a `stream` that reads as true is refused with 400
+        `transcription.stream_unsupported` before anything is routed, and a
+        `stream` that is false, absent or empty is accepted (a non-boolean
+        `stream` and any `stream_format` are refused as on the plain route).
+        The 200 is audio.cpp's `application/json` document written through
+        verbatim and buffered whole up to the upload cap, like the plain
+        route's, with `speaker_turns` and `sample_rate` beside the transcript:
+        the gateway parses and converts nothing. Metered in seconds of audio
+        (`billing_unit: audio_second`) from the response body's
+        `timing.audio_duration_ms`, usage `provider_path`
+        `/v1/audio/transcriptions/details`. Alias:
+        /openai/v1/audio/transcriptions/details.
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TranscriptionDetailsForm' }
+      responses:
+        '200': { $ref: '#/components/responses/TranscriptionDetails' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /openai/v1/audio/transcriptions/details:
+    post:
+      tags: [inference]
+      summary: Alias of /v1/audio/transcriptions/details
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TranscriptionDetailsForm' }
+      responses:
+        '200': { $ref: '#/components/responses/TranscriptionDetails' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /v1/audio/transcriptions/live:
     post:
       tags: [inference]
@@ -4142,6 +4190,56 @@ components:
                 description: >
                   Not supported. Any non-empty value is 400
                   `transcription.stream_unsupported`.
+    TranscriptionDetailsForm:
+      required: true
+      description: >
+        The multipart form of POST /v1/audio/transcriptions/details: the plain
+        transcription form (see TranscriptionForm), except that the route is
+        one-shot and so refuses `stream: true`. Any field the gateway does not
+        examine reaches the upstream unexamined.
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [model, file]
+            properties:
+              file:
+                type: string
+                format: binary
+                description: >
+                  The audio to transcribe. The upstream reads WAV only (the
+                  gateway does not check or convert it). Exactly one non-empty part
+                  with this name is required (400
+                  `transcription.file_required` for none, 400
+                  `transcription.invalid` for more than one).
+              model:
+                type: string
+                description: >
+                  The gateway model name. Routing input; rewritten to the
+                  mapping's own model name for the upstream.
+              language:
+                type: string
+                description: Passed to the upstream as sent.
+              prompt:
+                type: string
+                description: Passed to the upstream as sent.
+              response_format:
+                type: string
+                enum: [json]
+                description: >
+                  Only `json` (or absent) is supported, as on the plain route.
+              stream:
+                type: boolean
+                description: >
+                  The route is one-shot: `true` is 400
+                  `transcription.stream_unsupported`, `false` or absent is the
+                  request the route is, and a non-boolean value is 400
+                  `transcription.stream_unsupported`.
+              stream_format:
+                type: string
+                description: >
+                  Not supported. Any non-empty value is 400
+                  `transcription.stream_unsupported`.
   responses:
     OpaqueJSON:
       description: >
@@ -4240,6 +4338,55 @@ components:
             description: >
               The streamed case: audio.cpp's SSE frames `transcript.text.delta`
               -> `transcript.text.done` -> `[DONE]`, relayed byte for byte.
+    TranscriptionDetails:
+      description: >
+        audio.cpp's diarized transcription document, written through verbatim:
+        the plain transcription document plus `speaker_turns` and
+        `sample_rate`. `speaker_turns` is present only when the model
+        diarizes; a model that cannot answers a valid 200 without it. Each
+        turn's `speaker_id` is a STRING ("0", "1", ...) and its offsets are in
+        samples of `sample_rate`, not seconds. `timing` is the audio.cpp
+        extension the gateway keeps and reads for the usage row. The answer is
+        never an event stream.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [text]
+            properties:
+              text:
+                type: string
+                description: The whole transcript.
+              segments:
+                type: array
+                description: audio.cpp's own segments, relayed unexamined.
+                items: { type: object }
+              speaker_turns:
+                type: array
+                description: >
+                  Who said what, in the order it was said. Absent for a model
+                  that does not diarize.
+                items:
+                  type: object
+                  properties:
+                    start_sample: { type: number }
+                    end_sample: { type: number }
+                    speaker_id: { type: string }
+                    confidence: { type: number }
+                    text: { type: string }
+              sample_rate:
+                type: number
+                description: The rate the turns' sample offsets are counted in.
+              timing:
+                type: object
+                description: >
+                  audio.cpp's own timing block. `audio_duration_ms` is the input
+                  audio's duration in milliseconds, which the gateway bills as
+                  `audio_second` (divided by 1000).
+                properties:
+                  wall_ms: { type: number }
+                  audio_duration_ms: { type: number }
+                  rtf: { type: number }
     BadRequest:
       description: >
         Invalid request payload — the Error envelope carries the stable

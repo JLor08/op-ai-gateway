@@ -534,6 +534,13 @@ const de = {
     'Optionaler Text, der das Modell leitet, etwa mit der Schreibweise von Namen und Fachbegriffen aus dem Audio.',
   chatTranscriptionTemperature: 'Temperatur',
   chatTranscriptionDefault: 'Standard (Modell)',
+  // The Diarized toggle (#295): off by default, a setting of the thread. It asks for a transcript
+  // that says who spoke when. Only some models can tell speakers apart, so the hint promises
+  // nothing: no speakers found (or one) is the ordinary transcript. A live recording is never
+  // diarized (the diarizing endpoint does not stream), which the hint also says.
+  chatTranscriptionDiarize: 'Sprecher unterscheiden (Diarisierung)',
+  chatTranscriptionDiarizeHint:
+    'Zeigt bei einer Datei oder Aufnahme, wer was gesagt hat. Das können nur manche Modelle; erkennt das Modell nur einen Sprecher oder keinen, erscheint das gewöhnliche Transkript. Bei der Live-Transkription gilt das nicht.',
   chatTranscriptionFormatHint: 'Die Antwort ist immer Text (das Transkript).',
   chatTranscriptionAdvanced: 'Erweitert',
   chatTranscriptionPassthrough: 'Zusätzliche Anfragefelder (JSON)',
@@ -662,6 +669,12 @@ const de = {
   chatTranscriptionRunPending: 'Warte auf Transkript',
   chatTranscriptionNoIntermediateNews:
     'Keine Zwischenmeldungen – das Transkript erscheint, sobald das Modell Text liefert.',
+  // The speaker view of a diarized transcription turn (#295): who said what. A speaker is named by
+  // its number -- 1, 2, ... in the order the speakers first spoke in THAT transcript -- not by the
+  // id the model reported, which is an arbitrary string (it may be "0", "SPEAKER_01", or empty).
+  chatTranscriptionSpeaker: (number: number) => `Sprecher ${number}`,
+  // The name of the list of turns, for assistive technology.
+  chatTranscriptionSpeakerView: 'Transkript nach Sprechern',
   chatReasoning: 'Denkprozess',
   chatReasoningActive: 'Denkt ...',
   chatImageError: 'Bild konnte nicht angehängt werden.',
@@ -3957,6 +3970,9 @@ const en: PortalMessages = {
     'Optional text that guides the model, for example the spelling of names and terms in the audio.',
   chatTranscriptionTemperature: 'Temperature',
   chatTranscriptionDefault: 'Default (model)',
+  chatTranscriptionDiarize: 'Identify speakers (diarization)',
+  chatTranscriptionDiarizeHint:
+    'Shows who said what in a file or recording. Only some models can do this; if the model finds one speaker or none, you get the ordinary transcript. It does not apply to live transcription.',
   chatTranscriptionFormatHint: 'The reply is always text (the transcript).',
   chatTranscriptionAdvanced: 'Advanced',
   chatTranscriptionPassthrough: 'Extra request fields (JSON)',
@@ -4025,6 +4041,8 @@ const en: PortalMessages = {
   chatTranscriptionRunPending: 'Waiting for transcript',
   chatTranscriptionNoIntermediateNews:
     'No intermediate updates – the transcript appears as soon as the model delivers text.',
+  chatTranscriptionSpeaker: (number: number) => `Speaker ${number}`,
+  chatTranscriptionSpeakerView: 'Transcript by speaker',
   chatReasoning: 'Reasoning',
   chatReasoningActive: 'Thinking ...',
   chatImageError: 'Could not attach the image.',

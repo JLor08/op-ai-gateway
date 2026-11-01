@@ -663,12 +663,12 @@ type usageMeta struct {
 	// the target and the request's FLAVOR rather than taking the path the relay
 	// actually called -- and the flavor cannot tell endpoints that share it apart:
 	// openai_images covers both /v1/images/generations and /v1/images/edits, and
-	// openai_audio covers both /v1/audio/speech and /v1/audio/transcriptions. So
-	// the images call sites and the audio ones set it, and must: left at its zero
-	// value (endpointChat) a row records the generations path for an edit and the
-	// speech path for a transcription. Every other call site leaves it zero, which
-	// changes nothing for them -- upstreamPath ignores the endpoint for every
-	// flavor but those two.
+	// openai_audio covers /v1/audio/speech, /v1/audio/transcriptions and
+	// /v1/audio/transcriptions/details. So the images call sites and the audio ones
+	// set it, and must: left at its zero value (endpointChat) a row records the
+	// generations path for an edit and the speech path for a transcription. Every
+	// other call site leaves it zero, which changes nothing for them --
+	// upstreamPath ignores the endpoint for every flavor but those two.
 	Endpoint sessionEndpoint
 	// GenStart is when the first content delta of a TRANSLATE stream arrived (the
 	// requestProgress first-token stamp); the zero time means "no generation

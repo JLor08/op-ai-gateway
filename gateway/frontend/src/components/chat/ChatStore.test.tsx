@@ -567,6 +567,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
             prompt: 'Namen: Zoe',
             temperature: '0',
             passthrough: '{"beam":5}',
+            diarize: false,
           })
         }
       >
@@ -7213,6 +7214,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         prompt: '',
         temperature: '0.8',
         passthrough: '',
+        diarize: false,
       });
 
       // The transcription settings are the ONLY thing that changes here, so this also holds

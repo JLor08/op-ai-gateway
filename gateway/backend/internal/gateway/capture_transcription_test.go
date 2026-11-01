@@ -252,6 +252,9 @@ func TestIsBinarySpeechResponse(t *testing.T) {
 		{"transcription 200 is JSON", apiFlavorSpeech, endpointTranscription, http.StatusOK, false},
 		{"transcription 206", apiFlavorSpeech, endpointTranscription, http.StatusPartialContent, false},
 		{"transcription 502", apiFlavorSpeech, endpointTranscription, http.StatusBadGateway, false},
+		{"details 200 is JSON", apiFlavorSpeech, endpointTranscriptionDetails, http.StatusOK, false},
+		{"details 206", apiFlavorSpeech, endpointTranscriptionDetails, http.StatusPartialContent, false},
+		{"details 502", apiFlavorSpeech, endpointTranscriptionDetails, http.StatusBadGateway, false},
 		{"another flavor with a 200", "openai", endpointChat, http.StatusOK, false},
 		{"images with a 200", apiFlavorImages, endpointImages, http.StatusOK, false},
 	} {

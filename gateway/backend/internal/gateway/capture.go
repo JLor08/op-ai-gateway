@@ -35,11 +35,13 @@ type captureInput struct {
 	OwnerUserID string
 	Secret      bool
 	// Endpoint is the client endpoint the exchange arrived on, for the one decision
-	// the flavor cannot make: speech and transcription share the openai_audio flavor,
-	// and the first answers with one binary WAV while the second answers with JSON
-	// (isBinarySpeechResponse). The two 2xx producers that share speech's flavor
-	// stamp it: relayTranscriptionResponse for a one-shot transcript, and
-	// transcriptionStreamScan.stampCapture for a streamed one. Every other producer
+	// the flavor cannot make: speech and transcription (/v1/audio/transcriptions and
+	// its /details twin) share the openai_audio flavor, and the first answers with one
+	// binary WAV while the others answer with JSON (isBinarySpeechResponse). The two
+	// 2xx producers that share speech's flavor stamp it: relayTranscriptionResponse
+	// for a one-shot transcript (plain or details), and
+	// transcriptionStreamScan.stampCapture for a streamed one (plain only; /details
+	// never streams). Every other producer
 	// leaves it zero (endpointChat), which nothing reads. That is why the one reader carves
 	// transcription out of speech instead of requiring endpointSpeech: a speech
 	// capture built without an endpoint is still a speech capture, and the way that
@@ -226,14 +228,14 @@ func isAudioContentType(contentType string) bool {
 // is missing or wrong. It is narrow on purpose: a speech request answered with an
 // error, and every other flavor, are decided by the Content-Type alone.
 //
-// The flavor alone cannot say "speech": a transcription shares openai_audio, and
-// its 2xx answer is a JSON document -- the transcript -- that the capture exists to
-// keep. The endpoint carves it out (captureInput.Endpoint). The carve-out is
+// The flavor alone cannot say "speech": a transcription (the plain one and the details
+// one) shares openai_audio, and its 2xx answer is a JSON document -- the transcript --
+// that the capture exists to keep. The endpoint carves it out (captureInput.Endpoint). The carve-out is
 // negative, as needsSpeechErrorRelay's is, so a speech capture built without an
 // endpoint (the zero value is endpointChat) is still redacted: the failure that
 // would leave is a transcript lost to a summary, never a WAV in the envelope.
 func isBinarySpeechResponse(in *captureInput) bool {
-	return in.APIFlavor == apiFlavorSpeech && in.Endpoint != endpointTranscription && in.HTTPStatus >= 200 && in.HTTPStatus < 300
+	return in.APIFlavor == apiFlavorSpeech && !isTranscriptionEndpoint(in.Endpoint) && in.HTTPStatus >= 200 && in.HTTPStatus < 300
 }
 
 // captureResponseBody returns what the envelope stores as the response body, and

@@ -23,6 +23,7 @@ import {
   audioUrlsOf,
   isMaskPart,
   maskPart,
+  speakerTranscriptOf,
   type ChatContent,
   type ChatContentPart,
 } from '../shared/chatContent';
@@ -849,6 +850,11 @@ export type TranscriptionSettings = {
   // when it is not a non-empty object free of reserved fields; parseTranscriptionPassthrough()
   // says which, so the composer and send() can name a bad one.
   passthrough: string;
+  // Whether the run is diarized: it selects the one-shot /v1/audio/transcriptions/details
+  // relay instead of the plain transcription, so the answer carries the speaker-attributed
+  // segments. The only knob here that changes the endpoint. false = the plain transcription;
+  // transcriptionSetting() sends it only when true.
+  diarize: boolean;
 };
 
 export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
@@ -856,6 +862,7 @@ export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
   prompt: '',
   temperature: '',
   passthrough: '',
+  diarize: false,
 };
 
 // The form fields a transcription thread's passthrough may not set: the run's own (`model`
@@ -941,6 +948,7 @@ export function transcriptionSetting(
   if (temperature !== undefined) transcription.temperature = temperature;
   const passthrough = parseTranscriptionPassthrough(s.passthrough);
   if (passthrough.status === 'ok') transcription.passthrough = passthrough.value;
+  if (s.diarize) transcription.diarize = true;
   return { transcription };
 }
 
@@ -961,6 +969,7 @@ export function transcriptionSettingsFrom(
     prompt: typeof s.prompt === 'string' ? s.prompt : DEFAULT_TRANSCRIPTION_SETTINGS.prompt,
     temperature: imageNumToStr(s.temperature),
     passthrough,
+    diarize: typeof s.diarize === 'boolean' ? s.diarize : DEFAULT_TRANSCRIPTION_SETTINGS.diarize,
   };
 }
 
@@ -1260,10 +1269,15 @@ export function deriveTitleFromMessages(messages: ChatUiMessage[]): string {
 // The title of a transcription chat, from its transcript: the latest assistant turn's text, as
 // deriveTitle shortens it ('' when there is none). A transcription thread's first user turn is
 // audio only, so deriveTitleFromMessages (the first user message's text) finds nothing there;
-// the transcript is what names the chat, once a run has produced one.
+// the transcript is what names the chat, once a run has produced one. A diarized turn (#295)
+// has no text part -- its transcript is the whole `text` of its speaker_transcript part -- so
+// that is read when the turn has no text of its own.
 export function deriveTitleFromTranscript(messages: ChatUiMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i].role === 'assistant') return deriveTitle(textOf(messages[i].content));
+    if (messages[i].role === 'assistant') {
+      const { content } = messages[i];
+      return deriveTitle(textOf(content) || (speakerTranscriptOf(content)?.text ?? ''));
+    }
   }
   return '';
 }

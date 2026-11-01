@@ -579,7 +579,8 @@ func (s *Server) inferenceGate(w http.ResponseWriter, r *http.Request, token aut
 	// The offering is asked for the request's required capabilities too. The
 	// native endpoints that carry any set them from their own identity:
 	// /v1/images/generations ["image"], /v1/images/edits ["image_edit"],
-	// /v1/audio/speech ["speech"] and /v1/audio/transcriptions ["transcription"];
+	// /v1/audio/speech ["speech"] and /v1/audio/transcriptions and its /details twin
+	// ["transcription"];
 	// the translate-capable text endpoints require none. The capability gate
 	// refuses a model without them, so a candidate is taken only when it
 	// carries every one (ModelOffering.Capable): a

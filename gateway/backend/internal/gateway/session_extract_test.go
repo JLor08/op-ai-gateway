@@ -163,6 +163,20 @@ func TestExtractClientSession(t *testing.T) {
 			wantID: "", wantSource: "", wantAgent: "",
 		},
 		{
+			// The diarized transcription (/v1/audio/transcriptions/details) is the
+			// plain transcription's twin: no per-endpoint header and no body field is
+			// read, with every other endpoint's signal present at once.
+			name: "transcription details: every other endpoint's signal present -> still empty", endpoint: endpointTranscriptionDetails,
+			h:      hdr("session_id", "would-be-codex", "x-claude-code-session-id", "would-be-claude-code", "x-claude-code-agent-id", "agent_9"),
+			raw:    `{"model":"m","prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
+			wantID: "", wantSource: "", wantAgent: "",
+		},
+		{
+			name: "transcription details: explicit header still wins", endpoint: endpointTranscriptionDetails,
+			h:      hdr("X-OP-AI-Gateway-Session-ID", "sess_d"),
+			wantID: "sess_d", wantSource: "header", wantExpl: "sess_d",
+		},
+		{
 			// Only the explicit override header is honoured on transcription, like
 			// every other endpoint: the no-signal cases above are about the
 			// per-endpoint signals, not about the gateway's own session header.

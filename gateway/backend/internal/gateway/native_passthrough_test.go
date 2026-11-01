@@ -810,9 +810,10 @@ func TestUpstreamPathSpeechFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 // transcription differs from every other single-purpose flavor: it shares the
 // openai_audio flavor with speech (apiFlavorSpeech), so the flavor cannot
 // tell the two upstream paths apart and the ENDPOINT has to. The same flavor
-// string must therefore answer /v1/audio/transcriptions for endpointTranscription
-// and still /v1/audio/speech for endpointSpeech -- a transcription request must
-// never fall into the speech branch, and speech must not be disturbed. The
+// string must therefore answer /v1/audio/transcriptions for endpointTranscription,
+// /v1/audio/transcriptions/details for endpointTranscriptionDetails (the one-shot
+// diarized twin) and still /v1/audio/speech for endpointSpeech -- a transcription
+// request must never fall into the speech branch, and speech must not be disturbed. The
 // providers are ones whose OWN fallbacks would otherwise answer here
 // (ProviderOllama -> "/api/chat", ProviderVendorAnthropic -> "/v1/messages",
 // ProviderAudioCpp -> the chat-completions default), and an empty Provider
@@ -829,6 +830,10 @@ func TestUpstreamPathTranscriptionKeysOnEndpointNotFlavor(t *testing.T) {
 		{"ollama transcription", routing.ProviderOllama, apiFlavorSpeech, endpointTranscription, "/v1/audio/transcriptions"},
 		{"vendor anthropic transcription", routing.ProviderVendorAnthropic, apiFlavorSpeech, endpointTranscription, "/v1/audio/transcriptions"},
 		{"unresolved target keeps the empty answer", "", apiFlavorSpeech, endpointTranscription, ""},
+		{"audio.cpp diarized transcription", routing.ProviderAudioCpp, apiFlavorSpeech, endpointTranscriptionDetails, "/v1/audio/transcriptions/details"},
+		{"ollama diarized transcription", routing.ProviderOllama, apiFlavorSpeech, endpointTranscriptionDetails, "/v1/audio/transcriptions/details"},
+		{"vendor anthropic diarized transcription", routing.ProviderVendorAnthropic, apiFlavorSpeech, endpointTranscriptionDetails, "/v1/audio/transcriptions/details"},
+		{"unresolved target keeps the empty answer for the details endpoint too", "", apiFlavorSpeech, endpointTranscriptionDetails, ""},
 		{"speech keeps its path on the shared flavor", routing.ProviderAudioCpp, apiFlavorSpeech, endpointSpeech, "/v1/audio/speech"},
 		{"transcription does not disturb images", routing.ProviderOllama, apiFlavorImages, endpointImages, "/v1/images/generations"},
 		{"transcription does not disturb image edits", routing.ProviderOllama, apiFlavorImages, endpointImagesEdit, "/v1/images/edits"},

@@ -24,13 +24,14 @@ const maxSessionIDLen = 200
 type sessionEndpoint int
 
 const (
-	endpointChat          sessionEndpoint = iota // /v1/chat/completions (generic OpenAI)
-	endpointResponses                            // /v1/responses (Codex)
-	endpointMessages                             // /v1/messages (Claude Code / Anthropic)
-	endpointImages                               // /v1/images/generations (OpenAI images)
-	endpointImagesEdit                           // /v1/images/edits (OpenAI image edit, multipart)
-	endpointSpeech                               // /v1/audio/speech (OpenAI text-to-speech)
-	endpointTranscription                        // /v1/audio/transcriptions (OpenAI speech-to-text, multipart)
+	endpointChat                 sessionEndpoint = iota // /v1/chat/completions (generic OpenAI)
+	endpointResponses                                   // /v1/responses (Codex)
+	endpointMessages                                    // /v1/messages (Claude Code / Anthropic)
+	endpointImages                                      // /v1/images/generations (OpenAI images)
+	endpointImagesEdit                                  // /v1/images/edits (OpenAI image edit, multipart)
+	endpointSpeech                                      // /v1/audio/speech (OpenAI text-to-speech)
+	endpointTranscription                               // /v1/audio/transcriptions (OpenAI speech-to-text, multipart)
+	endpointTranscriptionDetails                        // /v1/audio/transcriptions/details (OpenAI speech-to-text with speaker turns, multipart, one-shot)
 )
 
 // sessionInfo is the extractor result. ExplicitHeader is the raw
@@ -90,9 +91,11 @@ func extractClientSession(h http.Header, raw []byte, endpoint sessionEndpoint) s
 	case endpointSpeech:
 		// /v1/audio/speech has no per-endpoint header signal either; see the
 		// fuller comment on sessionFromBody's speech case below.
-	case endpointTranscription:
-		// /v1/audio/transcriptions has no per-endpoint header signal either; see
-		// the fuller comment on sessionFromBody's transcription case below.
+	case endpointTranscription, endpointTranscriptionDetails:
+		// /v1/audio/transcriptions and its one-shot diarized twin
+		// /v1/audio/transcriptions/details have no per-endpoint header signal
+		// either; see the fuller comment on sessionFromBody's transcription case
+		// below.
 	}
 
 	// 3. Per-endpoint body fallback (only reached when headers were empty).
@@ -154,8 +157,9 @@ func sessionFromBody(raw []byte, endpoint sessionEndpoint) (id, source string) {
 		// Stated as a case rather than left to the switch's absent default, so a
 		// reader can tell "considered, and there is none" from "nobody thought
 		// about it".
-	case endpointTranscription:
-		// /v1/audio/transcriptions carries no session signal: OpenAI's
+	case endpointTranscription, endpointTranscriptionDetails:
+		// /v1/audio/transcriptions (and its /details twin, which takes the same
+		// form) carries no session signal: OpenAI's
 		// transcription request (file, model, language, prompt, response_format,
 		// temperature, ...) has no prompt_cache_key, no user and no metadata
 		// field, and a transcription is a one-shot recognition with no

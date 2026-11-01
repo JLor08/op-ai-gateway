@@ -144,7 +144,7 @@ type ServerDeps struct {
 	// in New to defaultMaxImageEditBodyBytes.
 	MaxImageEditBodyBytes int
 	// MaxAudioTranscriptionBodyBytes caps the multipart body POST
-	// /v1/audio/transcriptions reads into memory (config
+	// /v1/audio/transcriptions (and its /details twin) reads into memory (config
 	// OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES). <= 0 defaults in New to
 	// defaultMaxAudioTranscriptionBodyBytes.
 	MaxAudioTranscriptionBodyBytes int
@@ -441,8 +441,8 @@ type Server struct {
 	AppHealth                *AppHealthRegistry
 	AppImageOptions          *AppImageOptionsRegistry
 	// maxAudioTranscriptionBodyBytes is the multipart read cap of POST
-	// /v1/audio/transcriptions, defaulted in New; a bare &Server{} leaves it 0,
-	// which transcriptionBodyLimit reads as the default.
+	// /v1/audio/transcriptions and of its /details twin, defaulted in New; a bare
+	// &Server{} leaves it 0, which transcriptionBodyLimit reads as the default.
 	maxAudioTranscriptionBodyBytes int64
 	// maxChatAudioBytes is the total decoded PCM bytes (the audio itself, not its
 	// WAV headers) one chat run may store across its audio blobs, and
@@ -551,7 +551,8 @@ type Server struct {
 	// /v1/chat/completions and every Portal/Admin/System route) and
 	// authenticateInternalOrBearer (auth_internal_or_bearer.go, for
 	// /v1/images/generations, /v1/images/edits, /v1/audio/speech,
-	// /v1/audio/transcriptions and /v1/audio/voices only), which
+	// /v1/audio/transcriptions, /v1/audio/transcriptions/details and
+	// /v1/audio/voices only), which
 	// differ in what they fall back to and in nothing else. internalAuthSecret
 	// empty disables the branch entirely (fail-closed) for both, because the
 	// check is the same code.
@@ -1089,7 +1090,7 @@ func New(deps ServerDeps) *Server {
 		edgeScheme:                  edgeScheme,
 		certEdgeRequireHTTPSDisable: deps.CertEdgeRequireHTTPSDisable,
 		certMeshRequireTLSDisable:   deps.CertMeshRequireTLSDisable,
-		// multipart read cap of POST /v1/audio/transcriptions (defaulted above)
+		// multipart read cap of POST /v1/audio/transcriptions and /details (defaulted above)
 		maxAudioTranscriptionBodyBytes: maxAudioTranscriptionBodyBytes,
 		maxChatAudioBytes:              maxChatAudioBytes,
 		maxChatBlobBytes:               maxChatBlobBytes,
@@ -1482,6 +1483,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/audio/speech", s.handleOpenAISpeech)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions", s.handleOpenAITranscription)
+	s.mux.HandleFunc("/openai/v1/audio/transcriptions/details", s.handleOpenAITranscriptionDetails)
+	s.mux.HandleFunc("/v1/audio/transcriptions/details", s.handleOpenAITranscriptionDetails)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
 	s.mux.HandleFunc("/openai/v1/audio/voices", s.handleAudioVoices)

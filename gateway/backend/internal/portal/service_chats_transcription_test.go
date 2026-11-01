@@ -299,3 +299,94 @@ func TestChatTranscriptionSettingsWireShape(t *testing.T) {
 		t.Fatalf("a ChatRunSettings without transcription must carry no transcription key: %s", none)
 	}
 }
+
+// Diarize is the one transcription knob that selects the endpoint (the one-shot
+// /v1/audio/transcriptions/details relay) rather than a form field, and like
+// every other knob it is omitted when unset: an existing chat's serialized
+// settings must not gain a key. It is declared LAST, after Passthrough, so a
+// stored document's other keys keep their byte positions.
+func TestChatTranscriptionSettingsDiarizeWireShape(t *testing.T) {
+	// Set: emitted, and after passthrough (the declaration order the existing
+	// wire shape's byte-stability rests on).
+	set := transcriptionSettings()
+	set.Diarize = true
+	b, err := json.Marshal(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"language":"de","prompt":"Names: Jürgen, Kubernetes","temperature":0.2,"passthrough":{"timestamp_granularities":["word"]},"diarize":true}`; string(b) != want {
+		t.Fatalf("marshal = %s, want %s", b, want)
+	}
+	if only, _ := json.Marshal(ChatTranscriptionSettings{Diarize: true}); string(only) != `{"diarize":true}` {
+		t.Fatalf("a lone Diarize must marshal to {\"diarize\":true}, got %s", only)
+	}
+
+	// Unset / false: nothing at all, so a stored chat's bytes do not move.
+	unset := transcriptionSettings()
+	unset.Diarize = false
+	got, _ := json.Marshal(unset)
+	if want := `{"language":"de","prompt":"Names: Jürgen, Kubernetes","temperature":0.2,"passthrough":{"timestamp_granularities":["word"]}}`; string(got) != want {
+		t.Fatalf("a false Diarize must marshal to nothing, got %s", got)
+	}
+	if empty, _ := json.Marshal(ChatTranscriptionSettings{Diarize: false}); string(empty) != `{}` {
+		t.Fatalf("an unset ChatTranscriptionSettings must marshal to {}, got %s", empty)
+	}
+
+	// Round-trip: a document that carries it reads it back; one that omits it
+	// (every chat stored before the knob existed) reads false.
+	var on, off ChatTranscriptionSettings
+	if err := json.Unmarshal([]byte(`{"language":"fr","diarize":true}`), &on); err != nil {
+		t.Fatal(err)
+	}
+	if !on.Diarize || on.Language != "fr" {
+		t.Fatalf("unmarshal = %+v, want Diarize true", on)
+	}
+	if err := json.Unmarshal([]byte(`{"language":"fr"}`), &off); err != nil {
+		t.Fatal(err)
+	}
+	if off.Diarize {
+		t.Fatalf("an omitted diarize must read false, got %+v", off)
+	}
+}
+
+// The knob is persisted with the thread's settings and, like the rest of the
+// transcription settings, is per-send: a later send that does not set it
+// replaces it, so a run never inherits a stale diarize choice.
+func TestPrepareChatRunPersistsTheDiarizeSettingPerSend(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	owner := chatToken("usr_a")
+	created, _ := svc.CreateChat(ctx, owner, CreateChatRequest{
+		Content: json.RawMessage(`{"settings":{},"messages":[]}`),
+	})
+
+	_, settings, err := svc.PrepareChatRun(ctx, owner, created.ID, PrepareRunRequest{
+		UserMessage: json.RawMessage(`{"id":"u1","role":"user","content":"transcribe this"}`),
+		Settings:    ChatRunSettings{Model: "whisper", Kind: chatKindTranscription, Transcription: &ChatTranscriptionSettings{Diarize: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Transcription == nil || !settings.Transcription.Diarize {
+		t.Fatalf("diarize not returned: %+v", settings.Transcription)
+	}
+	got, _ := svc.GetChat(ctx, owner, created.ID)
+	if !strings.Contains(string(got.Content), `"transcription":{"diarize":true}`) {
+		t.Fatalf("diarize not persisted: %s", got.Content)
+	}
+
+	_, settings, err = svc.PrepareChatRun(ctx, owner, created.ID, PrepareRunRequest{
+		UserMessage: json.RawMessage(`{"id":"u2","role":"user","content":"again"}`),
+		Settings:    ChatRunSettings{Model: "whisper", Kind: chatKindTranscription, Transcription: &ChatTranscriptionSettings{Language: "en"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Transcription == nil || settings.Transcription.Diarize {
+		t.Fatalf("a later send that omits diarize must not inherit it: %+v", settings.Transcription)
+	}
+	got, _ = svc.GetChat(ctx, owner, created.ID)
+	if strings.Contains(string(got.Content), `"diarize"`) {
+		t.Fatalf("a stale diarize key survived the later send: %s", got.Content)
+	}
+}

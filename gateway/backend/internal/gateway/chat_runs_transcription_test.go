@@ -9,7 +9,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -457,6 +459,97 @@ func TestBuildTranscriptionBodyIsAcceptedByTheEndpointsOwnParser(t *testing.T) {
 	}
 	if verr := validateTranscriptionRequest(form); verr != nil {
 		t.Fatalf("validateTranscriptionRequest: %v", verr)
+	}
+}
+
+// A diarized run's form states NO stream -- the details endpoint is one-shot and
+// refuses a request to stream (validateTranscriptionDetailsRequest) -- and no diarize
+// field either: Diarize picks the endpoint, it is not a form field. Everything else is
+// the plain run's: the model, the set settings and the passthrough, with the clip.
+func TestBuildTranscriptionBodyOmitsStreamOnlyForADiarizedRun(t *testing.T) {
+	audio := speechTestWAV()
+	passthrough := map[string]json.RawMessage{"timestamp_granularity": json.RawMessage(`"word"`)}
+	cases := []struct {
+		name     string
+		settings *portal.ChatTranscriptionSettings
+		want     map[string]string
+	}{
+		{
+			name:     "diarize on and nothing else set",
+			settings: &portal.ChatTranscriptionSettings{Diarize: true},
+			want:     map[string]string{"model": transcriptionGatewayModel},
+		},
+		{
+			name:     "diarize on keeps the first-class settings",
+			settings: &portal.ChatTranscriptionSettings{Diarize: true, Language: "de", Prompt: "names", Temperature: ptr(0.2)},
+			want:     map[string]string{"model": transcriptionGatewayModel, "language": "de", "prompt": "names", "temperature": "0.2"},
+		},
+		{
+			name:     "diarize on keeps the passthrough",
+			settings: &portal.ChatTranscriptionSettings{Diarize: true, Passthrough: passthrough},
+			want:     map[string]string{"model": transcriptionGatewayModel, "timestamp_granularity": "word"},
+		},
+		{
+			name:     "an explicit diarize off still asks for a stream",
+			settings: &portal.ChatTranscriptionSettings{Diarize: false, Language: "de"},
+			want:     map[string]string{"model": transcriptionGatewayModel, "stream": "true", "language": "de"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prep := transcriptionRunPrep(t, "audio/wav", audio)
+			prep.Settings.Transcription = tc.settings
+			parts := buildTranscriptionForm(t, prep, "audio/wav", audio)
+			if fields := formFields(t, parts); !equalStringMaps(fields, tc.want) {
+				t.Fatalf("fields = %v\nwant     %v", fields, tc.want)
+			}
+			if file := onlyFile(t, parts); file.filename != "audio.wav" || !bytes.Equal(file.data, audio) {
+				t.Fatalf("file part = %q (%d bytes), want audio.wav and the clip's own %d bytes", file.filename, len(file.data), len(audio))
+			}
+		})
+	}
+}
+
+// The reserved fields stay the run's on a diarized run, stream included: the run states
+// none there, but a thread that names one is still refused rather than forwarded (the
+// details endpoint would refuse a stream of its own, and a passthrough must never
+// override what the run owns).
+func TestBuildTranscriptionBodyStillRejectsAReservedPassthroughKeyWhenDiarized(t *testing.T) {
+	audio := speechTestWAV()
+	for _, key := range []string{"model", "file", "response_format", "stream"} {
+		t.Run(key, func(t *testing.T) {
+			prep := transcriptionRunPrep(t, "audio/wav", audio)
+			prep.Settings.Transcription = &portal.ChatTranscriptionSettings{
+				Diarize:     true,
+				Passthrough: map[string]json.RawMessage{key: json.RawMessage(`"x"`)},
+			}
+			if _, _, err := buildTranscriptionBody(prep, "audio/wav", audio); !errors.Is(err, errTranscriptionPassthroughReserved) {
+				t.Fatalf("error = %v, want errTranscriptionPassthroughReserved", err)
+			}
+		})
+	}
+}
+
+// What a diarized run builds is what the DETAILS endpoint reads: the form parses, passes
+// validateTranscriptionDetailsRequest -- which refuses any stream that reads as true --
+// and carries no stream at all.
+func TestBuildTranscriptionBodyOfADiarizedRunIsAcceptedByTheDetailsParser(t *testing.T) {
+	audio := speechTestWAV()
+	prep := transcriptionRunPrep(t, "audio/wav", audio)
+	prep.Settings.Transcription = &portal.ChatTranscriptionSettings{Diarize: true, Language: "de", Prompt: "names"}
+	raw, contentType, err := buildTranscriptionBody(prep, "audio/wav", audio)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form, err := parseTranscriptionForm(contentType, raw)
+	if err != nil {
+		t.Fatalf("parseTranscriptionForm: %v", err)
+	}
+	if form.model != transcriptionGatewayModel || form.language != "de" || form.prompt != "names" || form.files != 1 || form.responseFormat != "" || form.stream != "" {
+		t.Fatalf("parsed form = %+v", form)
+	}
+	if verr := validateTranscriptionDetailsRequest(form); verr != nil {
+		t.Fatalf("validateTranscriptionDetailsRequest: %v", verr)
 	}
 }
 
@@ -1504,5 +1597,608 @@ func TestArmRunDeadlineArmsOnlyForABoundedKind(t *testing.T) {
 	waitFor(t, func() bool { return bounded.Err() != nil })
 	if !errors.Is(context.Cause(bounded), context.DeadlineExceeded) {
 		t.Fatalf("cause = %v, want context.DeadlineExceeded", context.Cause(bounded))
+	}
+}
+
+// --- a diarized transcription --------------------------------------------------
+//
+// With the thread's Diarize setting on, the run makes its one request to the gateway's
+// /v1/audio/transcriptions/details instead -- one-shot, so it states no stream and reads
+// one JSON document -- and commits what the answer holds: a speaker_transcript part when
+// at least two distinct speakers took part, the ordinary text part otherwise. The
+// stand-ins are the plain run's recording loopback; what is asserted is what the run
+// puts on the wire and what it commits from the answer.
+
+// transcriptionRunDetailsBody is the document audio.cpp's details endpoint answers a
+// diarizing model with: the transcript, its two speakers' turns (offsets in samples of the
+// stated sample_rate, speaker_id a STRING) and the timing block. It is the body the mock
+// provider answers with.
+const transcriptionRunDetailsBody = `{"text":"Mock transcription. Second speaker.","speaker_turns":[` +
+	`{"start_sample":0,"end_sample":16000,"speaker_id":"0","confidence":0,"text":"Mock transcription."},` +
+	`{"start_sample":16000,"end_sample":32000,"speaker_id":"1","confidence":0,"text":"Second speaker."}` +
+	`],"sample_rate":16000,"timing":{"audio_duration_ms":2000,"total_ms":420}}`
+
+// transcriptionRunSpeakerParts is what the run commits for transcriptionRunDetailsBody:
+// ONE speaker_transcript part -- the full text and the turns in seconds, the speaker the
+// audio.cpp id verbatim -- and no text part beside it.
+const transcriptionRunSpeakerParts = `[{"type":"speaker_transcript","text":"Mock transcription. Second speaker.","turns":[` +
+	`{"speaker":"0","start":0,"end":1,"text":"Mock transcription."},` +
+	`{"speaker":"1","start":1,"end":2,"text":"Second speaker."}]}]`
+
+// detailsTurn is one speaker turn as audio.cpp writes it.
+func detailsTurn(start, end int, speaker, text string) string {
+	return fmt.Sprintf(`{"start_sample":%d,"end_sample":%d,"speaker_id":%q,"confidence":0,"text":%q}`, start, end, speaker, text)
+}
+
+// detailsDocument is a details document of text, the given turns and (when non-empty)
+// the given sample_rate member, spelled as written -- `"sample_rate":16000` -- so a test
+// can leave it out or give it a value audio.cpp never would.
+func detailsDocument(text, sampleRate string, turns ...string) string {
+	doc := `{"text":` + fmt.Sprintf("%q", text) + `,"speaker_turns":[` + strings.Join(turns, ",") + `]`
+	if sampleRate != "" {
+		doc += `,` + sampleRate
+	}
+	return doc + `,"timing":{"audio_duration_ms":3000}}`
+}
+
+// diarizedRunPrep is the prepared transcription run with the thread's Diarize setting on
+// and the given settings (the zero value for none), which Diarize is added to.
+func diarizedRunPrep(t *testing.T, settings portal.ChatTranscriptionSettings) PrepareRunResult {
+	t.Helper()
+	prep := transcriptionRunPrep(t, "audio/wav", speechTestWAV())
+	settings.Diarize = true
+	prep.Settings.Transcription = &settings
+	return prep
+}
+
+// diarizedRunOutcome runs a diarized transcription against a loopback that answers
+// status / contentType / body, and returns the run's terminal event and the ONE request
+// it made. Every diarized run it drives is also held to the request shape that makes it
+// one: a POST to the details endpoint whose form states no stream and no diarize.
+func diarizedRunOutcome(t *testing.T, status int, contentType, body string) (runEvent, speechRunLoopbackCall) {
+	t.Helper()
+	loopback, calls := newSpeechRunLoopback(t, status, contentType, []byte(body))
+	srv, owner, chatID, _ := newSpeechRunTestServer(t, loopback.URL)
+	srv.selfBaseURL = loopback.URL
+
+	_, snap := speechRunOutcome(t, srv, owner, chatID, diarizedRunPrep(t, portal.ChatTranscriptionSettings{}))
+	got := takeSpeechRunCall(t, calls)
+	requireDetailsRequest(t, got)
+	return snap, got
+}
+
+// requireDetailsRequest fails unless call is the diarized run's request: a multipart POST
+// to /v1/audio/transcriptions/details whose form is the model and the clip and nothing that
+// asks for a stream or states the Diarize choice.
+func requireDetailsRequest(t *testing.T, call speechRunLoopbackCall) {
+	t.Helper()
+	if call.method != http.MethodPost || call.path != "/v1/audio/transcriptions/details" {
+		t.Fatalf("request = %s %s, want POST /v1/audio/transcriptions/details", call.method, call.path)
+	}
+	fields := formFields(t, decodeTranscriptionForm(t, call.contentType, call.body))
+	for _, name := range []string{"stream", "diarize"} {
+		if value, sent := fields[name]; sent {
+			t.Fatalf("the diarized run sent %s=%q; the details endpoint is one-shot and Diarize is not a form field (fields %v)", name, value, fields)
+		}
+	}
+}
+
+// A diarized run makes exactly ONE POST to the gateway's own details endpoint: a
+// multipart form of the model, the set settings and the passthrough, the clip of the LAST
+// user message byte for byte -- and NO stream and no diarize field -- under the shared
+// loopback header set. The answer's speaker turns are the turn: one speaker_transcript
+// part, committed complete as the whole turn.
+func TestTranscriptionRunDiarizedPostsOneShotToTheDetailsEndpoint(t *testing.T) {
+	loopback, calls := newSpeechRunLoopback(t, http.StatusOK, "application/json", []byte(transcriptionRunDetailsBody))
+	srv, owner, chatID, _ := newSpeechRunTestServer(t, loopback.URL)
+	srv.selfBaseURL = loopback.URL
+
+	older, clip := []byte("an older clip"), speechTestWAV()
+	prep := diarizedRunPrep(t, portal.ChatTranscriptionSettings{
+		Language: "de", Prompt: "Namen: Zoe", Temperature: ptr(0.2),
+		Passthrough: map[string]json.RawMessage{"timestamp_granularity": json.RawMessage(`"word"`)},
+	})
+	prep.History = []portal.ChatAPIMessage{
+		{Role: "user", Content: audioUserContent(t, "", audioDataURL("audio/webm", older))},
+		{Role: "assistant", Content: json.RawMessage(`"an earlier transcript"`)},
+		{Role: "user", Content: audioUserContent(t, "please transcribe", audioDataURL("audio/wav", clip))},
+	}
+
+	run, snap := speechRunOutcome(t, srv, owner, chatID, prep)
+	if snap.Status != "completed" || snap.Err != "" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+	got := takeSpeechRunCall(t, calls)
+	requireDetailsRequest(t, got)
+	if !strings.HasPrefix(got.contentType, "multipart/form-data; boundary=") {
+		t.Fatalf("Content-Type = %q, want multipart/form-data with a boundary (not the JSON the shared header set states)", got.contentType)
+	}
+	if got.header.Get(internalUserHeaderName) != owner.UserID || got.header.Get(sessionHeaderName) != chatID || got.header.Get(csrfHeaderName) != "1" || got.header.Get(internalAuthHeaderName) != "test-internal-secret" {
+		t.Fatalf("the shared loopback header set is missing: %v", got.header)
+	}
+	parts := decodeTranscriptionForm(t, got.contentType, got.body)
+	want := map[string]string{
+		"model":                 transcriptionGatewayModel,
+		"language":              "de",
+		"prompt":                "Namen: Zoe",
+		"temperature":           "0.2",
+		"timestamp_granularity": "word",
+	}
+	if fields := formFields(t, parts); !equalStringMaps(fields, want) {
+		t.Fatalf("form fields = %v\nwant          %v", fields, want)
+	}
+	if file := onlyFile(t, parts); file.filename != "audio.wav" || file.contentType != "audio/wav" || !bytes.Equal(file.data, clip) {
+		t.Fatalf("file part = %q (%s, %d bytes): want the LAST user message's audio.wav, byte for byte (%d bytes)", file.filename, file.contentType, len(file.data), len(clip))
+	}
+
+	if snap.Content != "" {
+		t.Fatalf("content = %q, want empty -- the transcript rides the structured parts", snap.Content)
+	}
+	if string(snap.ContentParts) != transcriptionRunSpeakerParts {
+		t.Fatalf("content parts = %s\nwant            %s", snap.ContentParts, transcriptionRunSpeakerParts)
+	}
+	if got := runError(t, run); got != "" {
+		t.Fatalf("error = %q, want none", got)
+	}
+
+	// Committed complete as the turn's only content, and no audio part with it.
+	stored := storedChatContent(t, srv, owner, chatID)
+	if !strings.Contains(stored, `"type":"speaker_transcript"`) || !strings.Contains(stored, `"speaker":"1"`) || !strings.Contains(stored, `"status":"complete"`) || strings.Contains(stored, `"status":"pending"`) {
+		t.Fatalf("the stored turn must be the complete speaker_transcript turn: %s", stored)
+	}
+	if strings.Contains(stored, "audio_url") {
+		t.Fatalf("a transcription turn carries no audio part: %s", stored)
+	}
+}
+
+// Two or more DISTINCT speaker ids are the speaker transcript, however many turns there
+// are and whatever the ids are called. The offsets are samples of the document's own
+// sample_rate and are committed as seconds; a rate that is absent, zero or negative (or a
+// turn whose span is no span) leaves the times OUT rather than dividing by zero or
+// committing garbage -- the part is still the speaker view, only without times.
+func TestTranscriptionRunDiarizedCommitsASpeakerTranscript(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "two speakers",
+			body: transcriptionRunDetailsBody,
+			want: transcriptionRunSpeakerParts,
+		},
+		{
+			name: "a speaker who returns, in fractions of a second",
+			body: detailsDocument("Hi. Hello. Bye.", `"sample_rate":16000`,
+				detailsTurn(0, 8000, "0", "Hi."), detailsTurn(8000, 20000, "1", "Hello."), detailsTurn(20000, 24000, "0", "Bye.")),
+			want: `[{"type":"speaker_transcript","text":"Hi. Hello. Bye.","turns":[` +
+				`{"speaker":"0","start":0,"end":0.5,"text":"Hi."},` +
+				`{"speaker":"1","start":0.5,"end":1.25,"text":"Hello."},` +
+				`{"speaker":"0","start":1.25,"end":1.5,"text":"Bye."}]}]`,
+		},
+		{
+			name: "three speakers",
+			body: detailsDocument("A. B. C.", `"sample_rate":16000`,
+				detailsTurn(0, 16000, "0", "A."), detailsTurn(16000, 32000, "1", "B."), detailsTurn(32000, 48000, "2", "C.")),
+			want: `[{"type":"speaker_transcript","text":"A. B. C.","turns":[` +
+				`{"speaker":"0","start":0,"end":1,"text":"A."},` +
+				`{"speaker":"1","start":1,"end":2,"text":"B."},` +
+				`{"speaker":"2","start":2,"end":3,"text":"C."}]}]`,
+		},
+		{
+			// An id is any string; nothing assumes integers, an order or a count.
+			name: "free-form speaker labels, verbatim",
+			body: detailsDocument("Hallo. Hi.", `"sample_rate":16000`,
+				detailsTurn(0, 16000, "anna", "Hallo."), detailsTurn(16000, 32000, "SPEAKER_01", "Hi.")),
+			want: `[{"type":"speaker_transcript","text":"Hallo. Hi.","turns":[` +
+				`{"speaker":"anna","start":0,"end":1,"text":"Hallo."},` +
+				`{"speaker":"SPEAKER_01","start":1,"end":2,"text":"Hi."}]}]`,
+		},
+		{
+			name: "another sample rate",
+			body: detailsDocument("A. B.", `"sample_rate":8000`,
+				detailsTurn(0, 4000, "0", "A."), detailsTurn(4000, 8000, "1", "B.")),
+			want: `[{"type":"speaker_transcript","text":"A. B.","turns":[` +
+				`{"speaker":"0","start":0,"end":0.5,"text":"A."},` +
+				`{"speaker":"1","start":0.5,"end":1,"text":"B."}]}]`,
+		},
+		{
+			name: "no sample rate leaves the times out",
+			body: detailsDocument("A. B.", "", detailsTurn(0, 16000, "0", "A."), detailsTurn(16000, 32000, "1", "B.")),
+			want: `[{"type":"speaker_transcript","text":"A. B.","turns":[` +
+				`{"speaker":"0","text":"A."},{"speaker":"1","text":"B."}]}]`,
+		},
+		{
+			name: "a zero sample rate leaves the times out",
+			body: detailsDocument("A. B.", `"sample_rate":0`, detailsTurn(0, 16000, "0", "A."), detailsTurn(16000, 32000, "1", "B.")),
+			want: `[{"type":"speaker_transcript","text":"A. B.","turns":[` +
+				`{"speaker":"0","text":"A."},{"speaker":"1","text":"B."}]}]`,
+		},
+		{
+			name: "a negative sample rate leaves the times out",
+			body: detailsDocument("A. B.", `"sample_rate":-16000`, detailsTurn(0, 16000, "0", "A."), detailsTurn(16000, 32000, "1", "B.")),
+			want: `[{"type":"speaker_transcript","text":"A. B.","turns":[` +
+				`{"speaker":"0","text":"A."},{"speaker":"1","text":"B."}]}]`,
+		},
+		{
+			// Only the turn whose offsets are no span loses its times; the others keep theirs.
+			name: "a turn whose span is no span has no times",
+			body: detailsDocument("A. B. C.", `"sample_rate":16000`,
+				detailsTurn(16000, 8000, "0", "A."), detailsTurn(-16000, 16000, "1", "B."), detailsTurn(16000, 32000, "0", "C.")),
+			want: `[{"type":"speaker_transcript","text":"A. B. C.","turns":[` +
+				`{"speaker":"0","text":"A."},{"speaker":"1","text":"B."},` +
+				`{"speaker":"0","start":1,"end":2,"text":"C."}]}]`,
+		},
+		{
+			// A positive but denormal rate overflows a large offset to +Inf, which cannot be
+			// marshalled: the times are left out (the span's start and end both), not the transcript lost.
+			name: "a rate whose division overflows leaves the times out",
+			body: detailsDocument("A. B.", `"sample_rate":5e-324`, detailsTurn(0, 16000, "0", "A."), detailsTurn(16000, 32000, "1", "B.")),
+			want: `[{"type":"speaker_transcript","text":"A. B.","turns":[` +
+				`{"speaker":"0","text":"A."},{"speaker":"1","text":"B."}]}]`,
+		},
+		{
+			// The document's other members (segments, words, a language) are not read.
+			name: "other members of the document are ignored",
+			body: `{"text":"A. B.","language":"en","segments":[{"start":0,"end":1,"text":"A. B."}],"words":[{"word":"A.","start":0,"end":0.5}],` +
+				`"speaker_turns":[` + detailsTurn(0, 16000, "0", "A.") + `,` + detailsTurn(16000, 32000, "1", "B.") + `],"sample_rate":16000}`,
+			want: `[{"type":"speaker_transcript","text":"A. B.","turns":[` +
+				`{"speaker":"0","start":0,"end":1,"text":"A."},` +
+				`{"speaker":"1","start":1,"end":2,"text":"B."}]}]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, _ := diarizedRunOutcome(t, http.StatusOK, "application/json", tc.body)
+			if snap.Status != "completed" || snap.Err != "" {
+				t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+			}
+			if string(snap.ContentParts) != tc.want {
+				t.Fatalf("content parts = %s\nwant            %s", snap.ContentParts, tc.want)
+			}
+		})
+	}
+}
+
+// The transcript of a speaker transcript is committed exactly as the model wrote it,
+// like the plain part's: inner line breaks, quotes and non-ASCII untouched, in the part's
+// text and in each turn's.
+func TestTranscriptionRunDiarizedKeepsTheTranscriptVerbatim(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"text": " Grüße, \"Zoe\"!\nZweite Zeile.",
+		"speaker_turns": []map[string]any{
+			{"start_sample": 0, "end_sample": 16000, "speaker_id": "0", "text": " Grüße, \"Zoe\"!"},
+			{"start_sample": 16000, "end_sample": 32000, "speaker_id": "1", "text": "\nZweite Zeile."},
+		},
+		"sample_rate": 16000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := diarizedRunOutcome(t, http.StatusOK, "application/json", string(body))
+	if snap.Status != "completed" {
+		t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+	}
+	var parts []struct {
+		Type  string `json:"type"`
+		Text  string `json:"text"`
+		Turns []struct {
+			Speaker string `json:"speaker"`
+			Text    string `json:"text"`
+		} `json:"turns"`
+	}
+	if err := json.Unmarshal(snap.ContentParts, &parts); err != nil {
+		t.Fatalf("content parts %s: %v", snap.ContentParts, err)
+	}
+	if len(parts) != 1 || parts[0].Type != "speaker_transcript" || parts[0].Text != " Grüße, \"Zoe\"!\nZweite Zeile." {
+		t.Fatalf("parts = %+v, want one speaker_transcript part holding the text verbatim", parts)
+	}
+	if len(parts[0].Turns) != 2 || parts[0].Turns[0].Text != " Grüße, \"Zoe\"!" || parts[0].Turns[1].Text != "\nZweite Zeile." {
+		t.Fatalf("turns = %+v, want both turns' text verbatim", parts[0].Turns)
+	}
+}
+
+// Fewer than two speakers is not a speaker transcript: it is the ordinary transcript, the
+// text part the plain run commits -- for a single speaker, and for a model that does not
+// diarize at all and so answers no speaker_turns (a document of words only, a null or an
+// empty list). The result decides, never an error and never a blank turn.
+func TestTranscriptionRunDiarizedFallsBackToThePlainTextPart(t *testing.T) {
+	const plain = `[{"type":"text","text":"Hello world"}]`
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "one speaker across two turns",
+			body: detailsDocument("Hello world", `"sample_rate":16000`, detailsTurn(0, 16000, "0", "Hello"), detailsTurn(16000, 32000, "0", "world")),
+		},
+		{
+			name: "a single turn",
+			body: detailsDocument("Hello world", `"sample_rate":16000`, detailsTurn(0, 32000, "0", "Hello world")),
+		},
+		{
+			name: "no speaker_turns, words only",
+			body: `{"text":"Hello world","words":[{"word":"Hello","start":0,"end":0.4},{"word":"world","start":0.5,"end":0.9}],"timing":{"audio_duration_ms":1000}}`,
+		},
+		{
+			name: "the plain document",
+			body: `{"text":"Hello world","timing":{"audio_duration_ms":1000}}`,
+		},
+		{
+			name: "speaker_turns null",
+			body: `{"text":"Hello world","speaker_turns":null,"sample_rate":16000}`,
+		},
+		{
+			name: "speaker_turns empty",
+			body: detailsDocument("Hello world", `"sample_rate":16000`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, _ := diarizedRunOutcome(t, http.StatusOK, "application/json", tc.body)
+			if snap.Status != "completed" || snap.Err != "" {
+				t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+			}
+			if string(snap.ContentParts) != plain {
+				t.Fatalf("content parts = %s\nwant            %s", snap.ContentParts, plain)
+			}
+		})
+	}
+}
+
+// A transcript that is empty is "no transcript", the plain run's error, whatever turns
+// the document carries: a speaker view of nothing would be the blank bubble that error
+// exists to refuse.
+func TestTranscriptionRunDiarizedEmptyTranscriptIsNoTranscript(t *testing.T) {
+	turns := detailsTurn(0, 16000, "0", "a") + `,` + detailsTurn(16000, 32000, "1", "b")
+	cases := []struct{ name, body string }{
+		{"empty text with two speakers", `{"text":"","speaker_turns":[` + turns + `],"sample_rate":16000}`},
+		{"whitespace-only text with two speakers", `{"text":"  \n\t ","speaker_turns":[` + turns + `],"sample_rate":16000}`},
+		{"absent text with two speakers", `{"speaker_turns":[` + turns + `],"sample_rate":16000}`},
+		{"empty text, no turns", `{"text":"","timing":{"audio_duration_ms":10}}`},
+		{"an empty object", `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, _ := diarizedRunOutcome(t, http.StatusOK, "application/json", tc.body)
+			if snap.Status != "error" || snap.Err != transcriptionRunNoTranscriptMessage {
+				t.Fatalf("status = %q, error = %q, want error %q", snap.Status, snap.Err, transcriptionRunNoTranscriptMessage)
+			}
+			if len(snap.ContentParts) != 0 {
+				t.Fatalf("no transcript commits no parts, got %s", snap.ContentParts)
+			}
+		})
+	}
+}
+
+// A 2xx the run cannot read as the details document is the plain run's "response
+// unreadable": a body with no usable PRIMARY content -- no document at all, or a text that
+// is no string. (A valid text beside a malformed speaker_turns or sample_rate is not
+// here: that transcript is kept, see
+// TestTranscriptionRunDiarizedDegradesWhenOnlyTheEnrichmentIsMalformed.)
+func TestTranscriptionRunDiarizedTreatsAnUnusable2xxAsAnError(t *testing.T) {
+	cases := []struct{ name, contentType, body string }{
+		{"an empty body", "application/json", ``},
+		{"plain text", "text/plain", `hello`},
+		{"an HTML error page", "text/html", `<html>bad gateway</html>`},
+		{"a JSON array", "application/json", `["hello"]`},
+		{"a JSON null", "application/json", `null`},
+		{"a text that is no string", "application/json", `{"text":5}`},
+		{
+			// Valid speaker turns do not rescue a text that is no string: there is no transcript.
+			name: "a text that is no string, beside valid speaker turns", contentType: "application/json",
+			body: `{"text":5,"speaker_turns":[` + detailsTurn(0, 16000, "0", "a") + `,` + detailsTurn(16000, 32000, "1", "b") + `],"sample_rate":16000}`,
+		},
+		{"a truncated body", "application/json", `{"text":"hello","speaker_turns":[{"start_sample":0,`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, _ := diarizedRunOutcome(t, http.StatusOK, tc.contentType, tc.body)
+			if snap.Status != "error" || snap.Err != transcriptionRunResponseUnreadableMessage {
+				t.Fatalf("status = %q, error = %q, want error %q", snap.Status, snap.Err, transcriptionRunResponseUnreadableMessage)
+			}
+			if len(snap.ContentParts) != 0 {
+				t.Fatalf("an unusable response commits no transcript, got %s", snap.ContentParts)
+			}
+		})
+	}
+}
+
+// speaker_turns and sample_rate are ENRICHMENT: a transcript that is valid (a non-empty
+// text string) is never thrown away because of them. A speaker_turns that cannot be read
+// as a list of turns -- not a list, entries that are no objects, a field of the wrong type
+// -- degrades to the ordinary text part of a plain run, whatever else the document says; a
+// sample_rate that is no number is no rate, so the times are left out and the speaker
+// view stands as long as two speakers still read. Neither is an error, and neither logs
+// the transcript.
+func TestTranscriptionRunDiarizedDegradesWhenOnlyTheEnrichmentIsMalformed(t *testing.T) {
+	const marker = "zebra-drift-marker"
+	good := detailsTurn(0, 16000, "0", marker) + `,` + detailsTurn(16000, 32000, "1", "b")
+	plain := `[{"type":"text","text":"` + marker + `"}]`
+	noTimes := `[{"type":"speaker_transcript","text":"` + marker + `","turns":[` +
+		`{"speaker":"0","text":"` + marker + `"},{"speaker":"1","text":"b"}]}]`
+	cases := []struct{ name, body, want string }{
+		{"speaker_turns that is a string", `{"text":"` + marker + `","speaker_turns":"nope"}`, plain},
+		{"speaker_turns that is an object", `{"text":"` + marker + `","speaker_turns":{"a":1},"sample_rate":16000}`, plain},
+		{"speaker_turns that is a number", `{"text":"` + marker + `","speaker_turns":3}`, plain},
+		{"a turn that is no object", `{"text":"` + marker + `","speaker_turns":["a","b"]}`, plain},
+		{
+			// One bad turn among good ones drops the whole view: a speaker view with a hole in it is not the conversation.
+			name: "one turn among good ones with a speaker_id that is no string",
+			body: `{"text":"` + marker + `","speaker_turns":[` + good + `,{"start_sample":32000,"end_sample":48000,"speaker_id":2,"text":"c"}],"sample_rate":16000}`,
+			want: plain,
+		},
+		{
+			name: "a turn whose offset is no number",
+			body: `{"text":"` + marker + `","speaker_turns":[` + good + `,{"start_sample":"32000","end_sample":48000,"speaker_id":"2","text":"c"}],"sample_rate":16000}`,
+			want: plain,
+		},
+		{"a sample_rate that is a string", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":"16000"}`, noTimes},
+		{"a sample_rate that is an object", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":{"hz":16000}}`, noTimes},
+		{"a sample_rate that is null", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":null}`, noTimes},
+		{"a sample_rate past float range", `{"text":"` + marker + `","speaker_turns":[` + good + `],"sample_rate":1e999}`, noTimes},
+		{"a malformed sample_rate beside one speaker", `{"text":"` + marker + `","speaker_turns":[` + detailsTurn(0, 16000, "0", marker) + `],"sample_rate":"16000"}`, plain},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&logged)
+			restored := false
+			restore := func() {
+				if !restored {
+					restored = true
+					log.SetOutput(previous)
+				}
+			}
+			t.Cleanup(restore)
+			snap, _ := diarizedRunOutcome(t, http.StatusOK, "application/json", tc.body)
+			restore() // before logged is read: no write can reach it after this
+
+			if snap.Status != "completed" || snap.Err != "" {
+				t.Fatalf("status = %q (err %q), want completed: the transcript is valid and must be kept", snap.Status, snap.Err)
+			}
+			if string(snap.ContentParts) != tc.want {
+				t.Fatalf("content parts = %s\nwant            %s", snap.ContentParts, tc.want)
+			}
+			if strings.Contains(logged.String(), marker) {
+				t.Fatalf("the log carries the transcript: %s", logged.String())
+			}
+		})
+	}
+}
+
+// An upstream failure of the details endpoint ends the run exactly as the plain one's
+// does: the gateway's own code is kept, and a body that is not that envelope -- or a
+// refusal that carries a document -- falls back to the status line.
+func TestTranscriptionRunDiarizedUpstreamErrorFinishesAnErrorTurn(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantErr     string
+	}{
+		{
+			name: "gateway envelope", status: http.StatusBadGateway, contentType: "application/json",
+			body:    `{"error":{"message":"upstream blew up","type":"upstream_error","code":"transcription.upstream_error"}}`,
+			wantErr: "transcription.upstream_error",
+		},
+		{
+			name: "a refused stream", status: http.StatusBadRequest, contentType: "application/json",
+			body:    `{"error":{"message":"stream is not supported","type":"invalid_request_error","code":"transcription.stream_unsupported"}}`,
+			wantErr: "transcription.stream_unsupported",
+		},
+		{
+			name: "not an envelope", status: http.StatusInternalServerError, contentType: "text/plain",
+			body:    "boom",
+			wantErr: "upstream status 500 Internal Server Error",
+		},
+		{
+			// The status decides, not the body: a refusal holding a two-speaker document is a refusal.
+			name: "a non-2xx with a details document", status: http.StatusServiceUnavailable, contentType: "application/json",
+			body:    transcriptionRunDetailsBody,
+			wantErr: "upstream status 503 Service Unavailable",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap, _ := diarizedRunOutcome(t, tc.status, tc.contentType, tc.body)
+			if snap.Status != "error" || snap.Err != tc.wantErr {
+				t.Fatalf("status = %q, error = %q, want error %q", snap.Status, snap.Err, tc.wantErr)
+			}
+			if len(snap.ContentParts) != 0 {
+				t.Fatalf("a failed run commits no transcript, got %s", snap.ContentParts)
+			}
+		})
+	}
+}
+
+// The diarized run never reads an event stream: the details endpoint is one-shot, so an
+// answer that is one is no document it can use -- it is read whole and found unreadable,
+// not consumed as the plain run's transcript.text.* frames, and nothing is published.
+func TestTranscriptionRunDiarizedNeverConsumesAnEventStream(t *testing.T) {
+	loopback, calls := newStreamingRunLoopback(t, func(s streamingStub) {
+		s.emit(transcriptDeltaFrame("Hello "), transcriptDeltaFrame("world"), transcriptDoneFrame("Hello world"), transcriptStreamEnd)
+	})
+	srv, owner, chatID, _ := newSpeechRunTestServer(t, loopback.URL)
+	srv.selfBaseURL = loopback.URL
+
+	_, snap := speechRunOutcome(t, srv, owner, chatID, diarizedRunPrep(t, portal.ChatTranscriptionSettings{}))
+	requireDetailsRequest(t, takeSpeechRunCall(t, calls))
+	if snap.Status != "error" || snap.Err != transcriptionRunResponseUnreadableMessage {
+		t.Fatalf("status = %q, error = %q, want error %q", snap.Status, snap.Err, transcriptionRunResponseUnreadableMessage)
+	}
+	if snap.Content != "" || len(snap.ContentParts) != 0 {
+		t.Fatalf("nothing of a stream may be published or committed, got content %q, parts %s", snap.Content, snap.ContentParts)
+	}
+}
+
+// A passthrough key the run owns fails a diarized run with the same code and sends
+// NOTHING, as it does a plain one.
+func TestTranscriptionRunDiarizedRejectsAReservedPassthroughKeyWithoutSendingAnything(t *testing.T) {
+	for _, key := range []string{"model", "file", "response_format", "stream"} {
+		t.Run(key, func(t *testing.T) {
+			loopback, calls := newSpeechRunLoopback(t, http.StatusOK, "application/json", []byte(transcriptionRunDetailsBody))
+			srv, owner, chatID, _ := newSpeechRunTestServer(t, loopback.URL)
+			srv.selfBaseURL = loopback.URL
+
+			prep := diarizedRunPrep(t, portal.ChatTranscriptionSettings{
+				Passthrough: map[string]json.RawMessage{key: json.RawMessage(`"x"`)},
+			})
+			run, snap := speechRunOutcome(t, srv, owner, chatID, prep)
+			if snap.Status != "error" {
+				t.Fatalf("status = %q, want error", snap.Status)
+			}
+			if got := runError(t, run); got != transcriptionRunReservedFieldMessage {
+				t.Fatalf("error = %q, want %q", got, transcriptionRunReservedFieldMessage)
+			}
+			requireNoSpeechRunCall(t, calls)
+		})
+	}
+}
+
+// With Diarize OFF the run is the plain one, whatever the answer holds: the ordinary
+// endpoint, a stream asked for, and the transcript as the text part -- an answer that
+// happens to carry speaker turns (or a speaker_turns that is not even a list) is read for
+// its text alone, as it always was.
+func TestTranscriptionRunWithDiarizeOffIsThePlainRun(t *testing.T) {
+	cases := []struct {
+		name     string
+		settings *portal.ChatTranscriptionSettings
+		body     string
+		want     string
+	}{
+		{"a two-speaker document", &portal.ChatTranscriptionSettings{Diarize: false, Language: "de"}, transcriptionRunDetailsBody, `[{"type":"text","text":"Mock transcription. Second speaker."}]`},
+		{"a malformed speaker_turns", &portal.ChatTranscriptionSettings{Diarize: false}, `{"text":"hello","speaker_turns":"nope","sample_rate":"x"}`, `[{"type":"text","text":"hello"}]`},
+		{"no transcription settings at all", nil, transcriptionRunDetailsBody, `[{"type":"text","text":"Mock transcription. Second speaker."}]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			loopback, calls := newSpeechRunLoopback(t, http.StatusOK, "application/json", []byte(tc.body))
+			srv, owner, chatID, _ := newSpeechRunTestServer(t, loopback.URL)
+			srv.selfBaseURL = loopback.URL
+
+			prep := transcriptionRunPrep(t, "audio/wav", speechTestWAV())
+			prep.Settings.Transcription = tc.settings
+			_, snap := speechRunOutcome(t, srv, owner, chatID, prep)
+			if snap.Status != "completed" || snap.Err != "" {
+				t.Fatalf("status = %q (err %q), want completed", snap.Status, snap.Err)
+			}
+			if string(snap.ContentParts) != tc.want {
+				t.Fatalf("content parts = %s\nwant            %s", snap.ContentParts, tc.want)
+			}
+			got := takeSpeechRunCall(t, calls)
+			if got.method != http.MethodPost || got.path != "/v1/audio/transcriptions" {
+				t.Fatalf("request = %s %s, want POST /v1/audio/transcriptions", got.method, got.path)
+			}
+			fields := formFields(t, decodeTranscriptionForm(t, got.contentType, got.body))
+			if fields["stream"] != "true" {
+				t.Fatalf("form fields = %v, want the plain run to ask for stream=true", fields)
+			}
+			if _, sent := fields["diarize"]; sent {
+				t.Fatalf("form fields = %v, Diarize is never a form field", fields)
+			}
+		})
 	}
 }

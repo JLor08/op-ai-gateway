@@ -831,8 +831,11 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                 (an ISO-639-1 code; blank = the model detects it), the prompt is free text, and
                 a blank temperature leaves the model's own (a typed 0 is a value, not blank;
                 not clamped, the model's own range applies). The reply is always text, so there
-                is no format control, just the static hint. The "Advanced" section holds a JSON
-                object of extra request fields, sent as form fields. */}
+                is no format control, just the static hint. The "Diarized" toggle (#295) asks for
+                a speaker-attributed transcript of a file or a recorded clip; it is off by
+                default, and a live recording is never diarized (the hint says so). The
+                "Advanced" section holds a JSON object of extra request fields, sent as form
+                fields. */}
               {isTranscriptionThread && (
                 <>
                   <Box
@@ -892,6 +895,33 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                       sx={{ gridColumn: '1 / -1' }}
                     />
                   </Box>
+                  <FormControlLabel
+                    sx={{ justifySelf: 'start', mr: 0 }}
+                    control={
+                      <Checkbox
+                        size="small"
+                        checked={c.transcriptionSettings.diarize}
+                        onChange={(event) =>
+                          c.setTranscriptionSettings((s) => ({
+                            ...s,
+                            diarize: event.target.checked,
+                          }))
+                        }
+                        disabled={c.streaming}
+                        slotProps={{
+                          input: { 'aria-describedby': 'chat-transcription-diarize-hint' },
+                        }}
+                      />
+                    }
+                    label={t.chatTranscriptionDiarize}
+                  />
+                  <Typography
+                    id="chat-transcription-diarize-hint"
+                    variant="caption"
+                    color="text.secondary"
+                  >
+                    {t.chatTranscriptionDiarizeHint}
+                  </Typography>
                   <Typography variant="caption" color="text.secondary">
                     {t.chatTranscriptionFormatHint}
                   </Typography>

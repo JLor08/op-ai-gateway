@@ -176,9 +176,10 @@ func targetIsAudioOnly(target routing.Target) bool {
 // exactly two flavors. openai_images covers two endpoints, generations and edits,
 // so for that flavor the endpoint -- not the flavor -- picks the upstream path
 // (endpointImagesEdit -> /v1/images/edits, anything else -> generations).
-// openai_audio covers two endpoints as well, speech and transcription, and
-// again the endpoint picks the path (endpointTranscription ->
-// /v1/audio/transcriptions, anything else -> /v1/audio/speech). For every other
+// openai_audio covers several endpoints as well, speech and the two
+// transcriptions, and again the endpoint picks the path (endpointTranscription ->
+// /v1/audio/transcriptions, endpointTranscriptionDetails ->
+// /v1/audio/transcriptions/details, anything else -> /v1/audio/speech). For every other
 // flavor it is ignored, which is why the translate handlers (which can never
 // serve images or audio, and do not know which of the three text endpoints they
 // were reached from) pass endpointChat as a placeholder that cannot change the
@@ -209,7 +210,12 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 	// (no EndpointMode to look up, no translate fallback, none of the provider
 	// fallbacks below applies), and it MUST be answered before the speech
 	// branch: it shares the openai_audio flavor with speech, so the flavor
-	// cannot tell the two upstream paths apart and the endpoint has to.
+	// cannot tell the two upstream paths apart and the endpoint has to. The
+	// one-shot diarized transcription (the details endpoint) shares that flavor
+	// too, and is told from the plain transcription by the endpoint alone.
+	if endpoint == endpointTranscriptionDetails {
+		return "/v1/audio/transcriptions/details"
+	}
 	if endpoint == endpointTranscription {
 		return "/v1/audio/transcriptions"
 	}
@@ -728,7 +734,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 
 	// The TRANSCRIPTION upstream (audio.cpp) shares the openai_audio flavor with speech,
 	// so its response-side paths are keyed on the endpoint, never the flavor
-	// (needsSpeechErrorRelay above is carved the other way for the same reason). A non-2xx is
+	// (needsSpeechErrorRelay above is carved the other way for the same reason). That
+	// covers the plain transcription and the one-shot diarized one (the details
+	// endpoint, isTranscriptionEndpoint) alike; only the plain one can stream. A non-2xx is
 	// normalised like speech's -- a transcription-specific code, see
 	// normalizeTranscriptionUpstreamError. A one-shot 2xx cannot stream: the billable
 	// duration is the TRAILING timing block of a JSON body, so the whole body is read,
@@ -742,7 +750,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		s.relayTranscriptionUpstreamError(w, r, ex, resp)
 		return
 	}
-	if rel.endpoint == endpointTranscription && !isStreamedTranscription(rel.endpoint, rel.pfReq.Stream, resp.Header) {
+	if isTranscriptionEndpoint(rel.endpoint) && !isStreamedTranscription(rel.endpoint, rel.pfReq.Stream, resp.Header) {
 		// A stream request that was answered with a plain document is no stream, and
 		// the idle watchdog armed for it above must not run on a buffered read. It is
 		// a buffered read all the same, so it gets what every buffered request has: the
@@ -821,7 +829,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// answered with one (newSpeechStreamScan reads the answer's Content-Type): a stream
 	// request answered with a plain audio/wav is no stream, and is relayed and billed like
 	// any one-shot synthesis.
-	speechRelay := rel.pfReq.APIFlavor == apiFlavorSpeech && rel.endpoint != endpointTranscription
+	speechRelay := rel.pfReq.APIFlavor == apiFlavorSpeech && !isTranscriptionEndpoint(rel.endpoint)
 	var speechScan *speechStreamScan
 	if speechRelay && rel.pfReq.Stream {
 		speechScan = newSpeechStreamScan(resp.Header)

@@ -28,11 +28,28 @@ export type ChatRole = 'system' | 'user' | 'assistant';
 // is nothing to play) and no reason (every way the audio can go renders the same placeholder).
 // The backend writes it (portal removedAudioPartType, the contract for the string); the
 // renderer shows the not-stored bubble where the player would be.
+//
+// A `speaker_transcript` part is the answer of a DIARIZED transcription turn (#295) that named
+// at least two distinct speakers: `{ type: 'speaker_transcript', text, turns: [{ speaker,
+// start?, end?, text }] }`. `text` is the whole transcript, `turns` are who said what in the
+// order it was said. It is the turn's ONLY part -- no text part beside it -- so a renderer that
+// reads the turn's text finds none and must read this part instead (speakerTranscriptOf). A
+// `speaker` is the audio.cpp speaker id, a free-form string kept verbatim ("0" and "1" today,
+// but never assumed to be a number, an order, a count, or non-empty); `start` and `end` are
+// seconds from the start of the clip and each is absent when unknown. The backend writes it
+// (gateway speakerTranscriptPart / speakerTurnPart, the contract for these names).
+export type SpeakerTurn = { speaker: string; start?: number; end?: number; text: string };
+export type SpeakerTranscriptPart = {
+  type: 'speaker_transcript';
+  text: string;
+  turns: SpeakerTurn[];
+};
 export type ChatContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string }; purpose?: 'mask' }
   | { type: 'audio_url'; audio_url: { url: string } }
-  | { type: 'audio_removed' };
+  | { type: 'audio_removed' }
+  | SpeakerTranscriptPart;
 export type ChatContent = string | ChatContentPart[];
 
 // The MASK of an image edit (inpainting) -- a PNG whose transparent pixels mark the
@@ -97,4 +114,39 @@ export function audioUrlsOf(content: ChatContent): string[] {
 export function hasRemovedAudio(content: ChatContent): boolean {
   if (typeof content === 'string') return false;
   return content.some((part) => part.type === 'audio_removed');
+}
+
+// The speaker transcript of a message, when it holds one: the `speaker_transcript` part of a
+// diarized transcription turn, or undefined. The message renderer shows the who-said-what view
+// for exactly this, and reads nothing else of such a turn (it has no text part).
+//
+// The part comes back as persisted history, so it is read, not trusted: a `turns` that is no
+// list is no turns, an entry that is no object is dropped, a `speaker` or `text` that is no
+// string is empty, and a time that is not a finite number is absent. What is left is a smaller
+// transcript (down to its plain `text`) rather than a row that cannot render.
+export function speakerTranscriptOf(content: ChatContent): SpeakerTranscriptPart | undefined {
+  if (typeof content === 'string') return undefined;
+  const part = content.find((candidate) => candidate.type === 'speaker_transcript');
+  if (part?.type !== 'speaker_transcript') return undefined;
+  return {
+    type: 'speaker_transcript',
+    text: typeof part.text === 'string' ? part.text : '',
+    turns: Array.isArray(part.turns) ? part.turns.flatMap(readSpeakerTurn) : [],
+  };
+}
+
+function readSpeakerTurn(entry: unknown): SpeakerTurn[] {
+  if (typeof entry !== 'object' || entry === null) return [];
+  const raw = entry as Record<string, unknown>;
+  const turn: SpeakerTurn = {
+    speaker: typeof raw.speaker === 'string' ? raw.speaker : '',
+    text: typeof raw.text === 'string' ? raw.text : '',
+  };
+  if (isSeconds(raw.start)) turn.start = raw.start;
+  if (isSeconds(raw.end)) turn.end = raw.end;
+  return [turn];
+}
+
+function isSeconds(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
 }

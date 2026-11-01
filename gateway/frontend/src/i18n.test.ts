@@ -4080,3 +4080,24 @@ describe('Voice Chat (#312) i18n keys', () => {
     expect(messages.en.chatVoiceSystemPromptHint).toMatch(/sections/);
   });
 });
+
+// The Diarized toggle of the transcription settings (#295): its label and the hint under it, each
+// in both languages. The hint is also where the portal says the toggle is for a file or a
+// recorded clip and not for live transcription (audio.cpp refuses streaming on the diarizing
+// endpoint), so it must name "live".
+describe('the transcription Diarized toggle keys', () => {
+  it('defines the label and the hint in de and en, in different words', () => {
+    for (const key of ['chatTranscriptionDiarize', 'chatTranscriptionDiarizeHint'] as const) {
+      for (const locale of ['de', 'en'] as readonly Locale[]) {
+        expect(messages[locale][key].length, `${locale} ${key}`).toBeGreaterThan(0);
+      }
+      expect(messages.de[key]).not.toBe(messages.en[key]);
+    }
+  });
+
+  it('says in the hint that live transcription is not diarized', () => {
+    for (const locale of ['de', 'en'] as readonly Locale[]) {
+      expect(messages[locale].chatTranscriptionDiarizeHint, locale).toMatch(/live/i);
+    }
+  });
+});

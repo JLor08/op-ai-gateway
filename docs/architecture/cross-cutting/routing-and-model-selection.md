@@ -745,7 +745,9 @@ Responses and Messages, `["image"]` for `/v1/images/generations`
 ([API Compatibility & Inference §3.4](compatibility-and-inference.md#34-openai-images-generations)),
 `["image_edit"]` for `/v1/images/edits` ([§3.5](compatibility-and-inference.md#35-openai-images-edits)),
 `["speech"]` for `/v1/audio/speech` ([§3.6](compatibility-and-inference.md#36-openai-audio-speech)),
-`["transcription"]` for `/v1/audio/transcriptions` ([§3.7](compatibility-and-inference.md#37-openai-audio-transcriptions)).
+`["transcription"]` for `/v1/audio/transcriptions` and for its one-shot diarizing twin `/v1/audio/transcriptions/details`,
+which takes the **same** verdict and adds none, because the model listing carries no diarization capability to build one from
+([§3.7](compatibility-and-inference.md#37-openai-audio-transcriptions) item 12).
 A candidate survives only if its mapping carries a `yes` verdict for **every**
 name in that list. The verdicts come from one bulk
 `Store.MappingCapabilitiesForMappings` read over the candidate list (§1), not
