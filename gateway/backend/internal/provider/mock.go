@@ -132,6 +132,24 @@ const mockTranscriptionsPath = "/v1/audio/transcriptions"
 // from (2 seconds here, so a mock transcription records a non-zero quantity).
 const mockTranscriptionBody = `{"text":"Mock transcription.","timing":{"audio_duration_ms":2000}}`
 
+// mockTranscriptionDetailsPath is the upstream diarized-transcription endpoint. The
+// plain path is matched exactly, so that case does not cover this one: without a case
+// of its own the details path would fall through to the Responses-style stream, which
+// no transcription relay can read. The mock answers it with the document below.
+const mockTranscriptionDetailsPath = "/v1/audio/transcriptions/details"
+
+// mockTranscriptionDetailsBody is the document audio.cpp's details endpoint answers a
+// diarizing model with: the text, its speaker turns (offsets in samples of the stated
+// sample_rate, speaker_id a STRING, confidence a number), and the same timing block the
+// plain document carries (2 seconds, so a mock diarized transcription records a
+// non-zero quantity). The two turns -- 1 second each at 16 kHz -- are two different
+// speakers, so a consumer that shows a speaker view only for a multi-speaker result has
+// one to show in dev and e2e.
+const mockTranscriptionDetailsBody = `{"text":"Mock transcription. Second speaker.","speaker_turns":[` +
+	`{"start_sample":0,"end_sample":16000,"speaker_id":"0","confidence":0,"text":"Mock transcription."},` +
+	`{"start_sample":16000,"end_sample":32000,"speaker_id":"1","confidence":0,"text":"Second speaker."}` +
+	`],"sample_rate":16000,"timing":{"audio_duration_ms":2000}}`
+
 // ProxyNative returns a canned answer so a native-passthrough application works in
 // dev/mock mode. contentType is accepted for the NativeProxyClient seam but not
 // inspected: the mock does not parse the request body.
@@ -141,7 +159,9 @@ const mockTranscriptionBody = `{"text":"Mock transcription.","timing":{"audio_du
 // gateway images relay counts a billable image. The transcription path
 // (/v1/audio/transcriptions) gets the JSON document audio.cpp returns,
 // {text, timing:{audio_duration_ms}}, so a gateway transcription relay finds the
-// duration it bills. Every other path gets an OpenAI-Responses-style SSE stream that
+// duration it bills, and its diarized twin (/v1/audio/transcriptions/details) the
+// details document, {text, speaker_turns, sample_rate, timing:{audio_duration_ms}},
+// with two speakers. Every other path gets an OpenAI-Responses-style SSE stream that
 // echoes the resolved upstream model and a terminal response.completed carrying
 // usage, mirroring what a real Codex-capable upstream would emit.
 func (m Mock) ProxyNative(_ context.Context, target routing.Target, path string, _ []byte, _ string) (*ProxyResponse, error) {
@@ -161,6 +181,13 @@ func (m Mock) ProxyNative(_ context.Context, target routing.Target, path string,
 			StatusCode: 200,
 			Header:     http.Header{"Content-Type": []string{jsonContentType}},
 			Body:       io.NopCloser(strings.NewReader(mockTranscriptionBody)),
+		}, nil
+	}
+	if path == mockTranscriptionDetailsPath {
+		return &ProxyResponse{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{jsonContentType}},
+			Body:       io.NopCloser(strings.NewReader(mockTranscriptionDetailsBody)),
 		}, nil
 	}
 	model := target.ProviderModel

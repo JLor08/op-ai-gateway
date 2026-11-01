@@ -295,6 +295,64 @@ func TestMockProxyNativeTranscriptionPathReturnsTranscriptionBody(t *testing.T) 
 	}
 }
 
+// The diarized transcription path (/v1/audio/transcriptions/details) answers with the
+// document audio.cpp's details endpoint returns, not the plain transcription's and
+// not a Responses stream: the transcript, its speaker turns (offsets in samples,
+// speaker_id a string, counted in sample_rate), and the same timing block the gateway
+// bills audio_second from. The mock's turns carry TWO speakers, so a consumer that
+// renders a speaker view only for a multi-speaker result has one to render in dev and
+// e2e. The path is matched EXACTLY and apart from the plain one: the plain path's
+// document has no speaker_turns, and this one is no prefix match on it.
+func TestMockProxyNativeTranscriptionDetailsPathReturnsSpeakerTurns(t *testing.T) {
+	resp, err := NewMock().ProxyNative(context.Background(), routing.Target{ProviderModel: "whisper_x"}, "/v1/audio/transcriptions/details", []byte("ignored"), "multipart/form-data; boundary=X")
+	if err != nil {
+		t.Fatalf("ProxyNative: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type = %q, want application/json (not the Responses event stream)", ct)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Text         string `json:"text"`
+		SampleRate   int    `json:"sample_rate"`
+		SpeakerTurns []struct {
+			StartSample *int   `json:"start_sample"`
+			EndSample   *int   `json:"end_sample"`
+			SpeakerID   string `json:"speaker_id"`
+			Text        string `json:"text"`
+		} `json:"speaker_turns"`
+		Timing struct {
+			AudioDurationMs *float64 `json:"audio_duration_ms"`
+		} `json:"timing"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("body %q is not JSON: %v", raw, err)
+	}
+	if out.Text == "" || out.SampleRate <= 0 {
+		t.Fatalf("body %q: text = %q, sample_rate = %d, want a transcript and the rate its turns count in", raw, out.Text, out.SampleRate)
+	}
+	speakers := map[string]bool{}
+	for i, turn := range out.SpeakerTurns {
+		if turn.StartSample == nil || turn.EndSample == nil || *turn.EndSample <= *turn.StartSample || turn.SpeakerID == "" || turn.Text == "" {
+			t.Fatalf("body %q: speaker_turns[%d] = %+v, want a non-empty span, a speaker_id string and text", raw, i, turn)
+		}
+		speakers[turn.SpeakerID] = true
+	}
+	if len(speakers) < 2 {
+		t.Fatalf("body %q: %d distinct speakers, want at least 2 so a speaker view has something to show", raw, len(speakers))
+	}
+	if out.Timing.AudioDurationMs == nil || *out.Timing.AudioDurationMs != 2000 {
+		t.Fatalf("body %q: timing.audio_duration_ms = %v, want 2000 (the duration the gateway bills from)", raw, out.Timing.AudioDurationMs)
+	}
+	if strings.Contains(string(raw), "event:") {
+		t.Fatalf("body %q looks like an SSE stream", raw)
+	}
+}
+
 func TestMockProxyNativeOtherPathsKeepResponsesStream(t *testing.T) {
 	resp, err := NewMock().ProxyNative(context.Background(), routing.Target{ProviderModel: "qwen-coder"}, "/v1/responses", []byte(`{}`), "application/json")
 	if err != nil {
@@ -319,6 +377,13 @@ func TestMockProxyNativeUnreachableFailsOnImagesPathToo(t *testing.T) {
 
 func TestMockProxyNativeUnreachableFailsOnTranscriptionPathToo(t *testing.T) {
 	_, err := NewMock().WithUnreachable(true).ProxyNative(context.Background(), routing.Target{}, "/v1/audio/transcriptions", nil, "multipart/form-data; boundary=X")
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ProxyNative error = %v, want ErrUnavailable", err)
+	}
+}
+
+func TestMockProxyNativeUnreachableFailsOnTranscriptionDetailsPathToo(t *testing.T) {
+	_, err := NewMock().WithUnreachable(true).ProxyNative(context.Background(), routing.Target{}, "/v1/audio/transcriptions/details", nil, "multipart/form-data; boundary=X")
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("ProxyNative error = %v, want ErrUnavailable", err)
 	}

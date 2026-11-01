@@ -551,7 +551,8 @@ type Server struct {
 	// /v1/chat/completions and every Portal/Admin/System route) and
 	// authenticateInternalOrBearer (auth_internal_or_bearer.go, for
 	// /v1/images/generations, /v1/images/edits, /v1/audio/speech,
-	// /v1/audio/transcriptions and /v1/audio/voices only), which
+	// /v1/audio/transcriptions, /v1/audio/transcriptions/details and
+	// /v1/audio/voices only), which
 	// differ in what they fall back to and in nothing else. internalAuthSecret
 	// empty disables the branch entirely (fail-closed) for both, because the
 	// check is the same code.
@@ -1482,6 +1483,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/audio/speech", s.handleOpenAISpeech)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions", s.handleOpenAITranscription)
+	s.mux.HandleFunc("/openai/v1/audio/transcriptions/details", s.handleOpenAITranscriptionDetails)
+	s.mux.HandleFunc("/v1/audio/transcriptions/details", s.handleOpenAITranscriptionDetails)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
 	s.mux.HandleFunc("/openai/v1/audio/voices", s.handleAudioVoices)

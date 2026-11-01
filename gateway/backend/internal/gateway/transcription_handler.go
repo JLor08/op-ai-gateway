@@ -27,7 +27,7 @@ import (
 )
 
 // defaultMaxAudioTranscriptionBodyBytes is the default bound on the multipart read
-// of POST /v1/audio/transcriptions, an operator setting
+// of POST /v1/audio/transcriptions and of its /details twin, an operator setting
 // (ServerDeps.MaxAudioTranscriptionBodyBytes, config
 // OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES; the Server's value is
 // transcriptionBodyLimit). Like the image edit, the upload is held in memory --
@@ -63,7 +63,9 @@ const (
 	transcriptionResponseFormatUnsupported = "transcription.response_format_unsupported"
 	// transcriptionStreamUnsupported is the code for a request whose streaming this
 	// relay will not honor -- a `stream` that is no boolean, or any stream_format;
-	// see validateTranscriptionRequest. (A boolean stream=true is served.)
+	// see validateTranscriptionRequest -- and, on the details endpoint alone, a
+	// stream=true: see validateTranscriptionDetailsRequest. (A boolean stream=true is
+	// served by the plain endpoint.)
 	transcriptionStreamUnsupported = "transcription.stream_unsupported"
 	// invalidTranscriptionRequest is the code for a structurally broken form: not
 	// multipart, no boundary, truncated or malformed parts, a field too large to
@@ -309,14 +311,15 @@ func readTranscriptionField(part *multipart.Part) (string, error) {
 //
 // stream decision: a boolean `stream` is accepted, true included -- the relay then
 // passes the upstream's event stream through unbuffered (relayTranscription,
-// proxyNative). A `stream` that is no boolean is refused with
-// transcriptionStreamUnsupported rather than guessed at, and so is ANY stream_format:
-// audio.cpp answers a streamed transcription in its own event shape and the gateway
-// translates it into no other, so a client asking for another shape would be handed
-// one it did not ask for. An absent or empty stream, `stream` false and an absent or
-// empty stream_format describe what the endpoint always did and are accepted (a
-// multipart form has no null: an empty value is the closest thing to one, and is
-// treated as absent, as the image edit treats an empty stream).
+// proxyNative). (The details endpoint is one-shot and refuses a true one on top of
+// this: validateTranscriptionDetailsRequest.) A `stream` that is no boolean is
+// refused with transcriptionStreamUnsupported rather than guessed at, and so is ANY
+// stream_format: audio.cpp answers a streamed transcription in its own event shape
+// and the gateway translates it into no other, so a client asking for another shape
+// would be handed one it did not ask for. An absent or empty stream, `stream` false
+// and an absent or empty stream_format describe what the endpoint always did and are
+// accepted (a multipart form has no null: an empty value is the closest thing to one,
+// and is treated as absent, as the image edit treats an empty stream).
 //
 // The result is the concrete *inference.Error, nil for a valid request. Callers
 // compare it to nil as returned and only then hand it on as an error, which avoids
@@ -341,6 +344,28 @@ func validateTranscriptionRequest(form transcriptionForm) *inference.Error {
 	}
 	if strings.TrimSpace(form.streamFormat) != "" {
 		return &inference.Error{Code: transcriptionStreamUnsupported, Message: "stream_format is not supported on this endpoint; a streamed transcription is relayed in the upstream's own event format"}
+	}
+	return nil
+}
+
+// validateTranscriptionDetailsRequest is validateTranscriptionRequest for the details
+// endpoint: every refusal of the plain endpoint's validation, in the plain endpoint's
+// order and with its codes, and ONE more -- a request to stream. audio.cpp answers a
+// stream on /details with an HTTP 500, which the relay would have to pass on as a
+// server failure for what is a client error, and the details endpoint has no streaming
+// relay to hand the request to, so a `stream` that reads as true (anything
+// strconv.ParseBool reads as such; wantsStream) is refused here with
+// transcriptionStreamUnsupported, before the request is routed or anything is sent. A
+// stream that reads as false, or is absent or empty, is the one-shot request the
+// endpoint is and is accepted. The check runs AFTER the shared validation, so a form
+// that is invalid in another way is refused for that, and a `stream` that is no boolean
+// is refused by the shared check as ever.
+func validateTranscriptionDetailsRequest(form transcriptionForm) *inference.Error {
+	if verr := validateTranscriptionRequest(form); verr != nil {
+		return verr
+	}
+	if form.wantsStream() {
+		return &inference.Error{Code: transcriptionStreamUnsupported, Message: "stream is not supported on the transcription details endpoint; it is one-shot and answers one document with the transcript and its speaker turns"}
 	}
 	return nil
 }
@@ -393,13 +418,51 @@ func transcriptionInferenceShape(model string) inferenceShape {
 	}
 }
 
+// transcriptionDetailsInferenceShape is transcriptionInferenceShape for the details
+// endpoint: the same shape in everything but the endpoint, which is
+// endpointTranscriptionDetails -- the flavor is shared with speech and the plain
+// transcription, so the endpoint alone sends the relay to
+// /v1/audio/transcriptions/details and labels the usage row with it. It is built FROM
+// the plain shape rather than beside it, so the two cannot drift: the capability list
+// (the transcription gate, which is also what keeps the request off the vendor-account
+// path) and the flavor are the plain shape's by construction, and stream stays false
+// -- the details endpoint never streams.
+func transcriptionDetailsInferenceShape(model string) inferenceShape {
+	shape := transcriptionInferenceShape(model)
+	shape.endpoint = endpointTranscriptionDetails
+	return shape
+}
+
 // handleOpenAITranscription serves POST /v1/audio/transcriptions (and its
-// /openai/v1/audio/transcriptions alias, server.go) by relaying the client's
+// /openai/v1/audio/transcriptions alias, server.go): serveTranscription for the plain
+// transcription, the one that may stream.
+func (s *Server) handleOpenAITranscription(w http.ResponseWriter, r *http.Request) {
+	s.serveTranscription(w, r, endpointTranscription)
+}
+
+// handleOpenAITranscriptionDetails serves POST /v1/audio/transcriptions/details (and
+// its /openai/v1/audio/transcriptions/details alias, server.go): serveTranscription for
+// the diarized transcription, which relays the upload to audio.cpp's details endpoint
+// and answers its document -- the transcript plus its speaker turns -- verbatim. It is
+// ONE-SHOT: audio.cpp refuses a stream there, so a request that asks for one is refused
+// here first (validateTranscriptionDetailsRequest), and the relay never marks itself a
+// stream. It adds no capability verdict: the gate is the plain transcription's, and a
+// model that cannot diarize answers a document without speaker turns, which the caller
+// reads as the plain transcript it is.
+func (s *Server) handleOpenAITranscriptionDetails(w http.ResponseWriter, r *http.Request) {
+	s.serveTranscription(w, r, endpointTranscriptionDetails)
+}
+
+// serveTranscription is what both transcription routes are, by relaying the client's
 // multipart upload to a natively OpenAI-shaped speech-to-text backend (audio.cpp). It
 // is handleOpenAISpeech's twin on the gate, the flavor and the preflight, and
 // handleOpenAIImagesEdit's on the multipart relay: there is no translate path, the
 // gateway proxies the upload and does not transcribe it, so an application that does
-// not serve openai_audio is simply not a candidate.
+// not serve openai_audio is simply not a candidate. endpoint is the route the request
+// arrived on, endpointTranscription or endpointTranscriptionDetails; it is the only
+// thing the two differ in here -- method, auth, body read, parse, gate, run-as and
+// relay are ONE path, so a rule added to one route cannot be missed on the other --
+// and picks the endpoint's own validation and inference shape.
 //
 // Auth: requireInternalOrBearerAnyScope admits a bearer token (every ordinary API
 // client) OR the internal trusted-loopback header pair, DELIBERATELY not the browser
@@ -419,7 +482,7 @@ func transcriptionInferenceShape(model string) inferenceShape {
 //
 // Run-as: the shared runAsPrincipal helper. token.ID == "" only for the loopback
 // principal, so this fires only for the run executor's own loopback calls.
-func (s *Server) handleOpenAITranscription(w http.ResponseWriter, r *http.Request) {
+func (s *Server) serveTranscription(w http.ResponseWriter, r *http.Request, endpoint sessionEndpoint) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
@@ -437,7 +500,11 @@ func (s *Server) handleOpenAITranscription(w http.ResponseWriter, r *http.Reques
 		writeRequestError(w, err)
 		return
 	}
-	if verr := validateTranscriptionRequest(form); verr != nil {
+	validate, shape := validateTranscriptionRequest, transcriptionInferenceShape
+	if endpoint == endpointTranscriptionDetails {
+		validate, shape = validateTranscriptionDetailsRequest, transcriptionDetailsInferenceShape
+	}
+	if verr := validate(form); verr != nil {
 		writeRequestError(w, verr)
 		return
 	}
@@ -445,11 +512,11 @@ func (s *Server) handleOpenAITranscription(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	pf, handled := s.inferencePreflight(w, r, token, raw, transcriptionInferenceShape(form.routingModel()))
+	pf, handled := s.inferencePreflight(w, r, token, raw, shape(form.routingModel()))
 	if handled {
 		return
 	}
-	s.relayTranscription(w, r, token, pf.Req, form, raw)
+	s.relayTranscription(w, r, token, pf.Req, endpoint, form, raw)
 }
 
 // transcriptionTargetServed reports whether target can be sent a transcription. An
@@ -486,9 +553,10 @@ func (s *Server) transcriptionTargetServed(target routing.Target) bool {
 // The row carries usage.BillingUnitAudioSecond with a zero quantity, set here
 // unconditionally: the unit is the ENDPOINT's identity, and the default "" would
 // record a refused transcription as token-metered with a zero measure, the lie the
-// (unit, quantity) pair exists to prevent. Endpoint is endpointTranscription for the
-// row's sake, though with an empty target no provider_path is derived from it.
-func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, start time.Time, err error) {
+// (unit, quantity) pair exists to prevent. Endpoint is the one the request arrived on,
+// endpointTranscription or endpointTranscriptionDetails, for the row's sake, though
+// with an empty target no provider_path is derived from it.
+func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, endpoint sessionEndpoint, raw []byte, start time.Time, err error) {
 	id := nextRequestID()
 	capturing := s.capturingEnabled(token)
 	status := completionHTTPStatus(err)
@@ -503,7 +571,7 @@ func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *htt
 		slog.Debug("transcription request rejected: routing failed", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "code", code, "status", status, "err", err)
 	}
 	body := writeCompletionErrorCaptured(w, err)
-	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: endpointTranscription}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
+	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: status, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: endpoint}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, status, req.APIFlavor), nil)
 }
 
 // resolveTranscriptionTarget is resolveSpeechTarget's twin: it resolves the routing
@@ -513,11 +581,12 @@ func (s *Server) recordTranscriptionRoutingFailure(w http.ResponseWriter, r *htt
 //
 // token is a pointer for the reason tryProxyNative's is: resolveTarget refreshes the
 // caller's last-used-model snapshot through it, and the relay that follows must carry
-// that refreshed token.
-func (s *Server) resolveTranscriptionTarget(w http.ResponseWriter, r *http.Request, token *auth.Token, req inference.Request, raw []byte, start time.Time) (routing.Target, bool) {
+// that refreshed token. endpoint is the transcription endpoint the request arrived on;
+// it only labels the refusals' usage rows (recordTranscriptionRoutingFailure).
+func (s *Server) resolveTranscriptionTarget(w http.ResponseWriter, r *http.Request, token *auth.Token, req inference.Request, endpoint sessionEndpoint, raw []byte, start time.Time) (routing.Target, bool) {
 	target, err := s.resolveTarget(r.Context(), token, req)
 	if err != nil {
-		s.recordTranscriptionRoutingFailure(w, r, *token, req, raw, start, err)
+		s.recordTranscriptionRoutingFailure(w, r, *token, req, endpoint, raw, start, err)
 		return routing.Target{}, false
 	}
 	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors AND
@@ -534,7 +603,7 @@ func (s *Server) resolveTranscriptionTarget(w http.ResponseWriter, r *http.Reque
 		slog.Debug("transcription request rejected: resolved target's effective flavors exclude audio",
 			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.recordTranscriptionRoutingFailure(w, r, *token, req, raw, start, routing.ErrNoModelRoute)
+		s.recordTranscriptionRoutingFailure(w, r, *token, req, endpoint, raw, start, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
 	return target, true
@@ -701,10 +770,14 @@ func peekTranscriptionFileByte(part *multipart.Part) (first []byte, empty bool, 
 }
 
 // relayTranscription resolves the routing target for an already-gated transcription
-// and relays it via proxyNative. The resolve and the effective-served conjunct are
-// resolveTranscriptionTarget's, so an agent child whose spec excludes audio refuses a
-// transcription exactly as it refuses speech. An agent target whose agent has not
-// declared multipart_proxy is then refused transcription.unavailable
+// and relays it via proxyNative. endpoint is the transcription endpoint the request
+// arrived on, endpointTranscription or endpointTranscriptionDetails: the resolve, the
+// multipart_proxy gate, the rebuild and the relay are ONE path for both, and the
+// endpoint is what names the upstream path, labels the usage row and decides whether
+// the request can stream at all (below). The resolve and the effective-served
+// conjunct are resolveTranscriptionTarget's, so an agent child whose spec excludes
+// audio refuses a transcription exactly as it refuses speech. An agent target whose
+// agent has not declared multipart_proxy is then refused transcription.unavailable
 // (transcriptionTargetServed) instead of being relayed. req is pf.Req from the
 // caller's inferencePreflight call, already carrying RequiredCapabilities =
 // [routing.CapabilityTranscription].
@@ -719,13 +792,21 @@ func peekTranscriptionFileByte(part *multipart.Part) (first []byte, empty bool, 
 // verbatim. The Content-Type is ALWAYS set, the client's or the rebuilt
 // one's: left empty, proxyNative would treat the body as JSON and try to rewrite a
 // model field out of a form. nativeRelay.raw stays the client's bytes either way: that
-// is what capture records. The relay names the transcriptions endpoint, so the
-// upstream path AND the usage row's provider_path are /v1/audio/transcriptions.
+// is what capture records. The relay names the endpoint the request arrived on, so the
+// upstream path AND the usage row's provider_path are /v1/audio/transcriptions for the
+// plain transcription and /v1/audio/transcriptions/details for the details one.
 //
 // The body that is finally sent to an agent-launched target must fit the agent
 // router's own request limit (agentRouterMaxBodyBytes), which the cap on what the
 // client sends does not guarantee (rebuilding can grow a body): one that does not is
 // refused here, recorded, instead of being sent.
+//
+// Only the plain transcription is ever relayed as a stream. The details endpoint is
+// one-shot (audio.cpp refuses a stream there), so its relay takes none of the stream
+// decisions below whatever its form says: it reads no verdict, restates no `stream`
+// part, builds no buffered retry and is never marked a stream, which keeps the idle
+// watchdog off it and the total timeout on. (The handler has already refused a stream
+// for it; see validateTranscriptionDetailsRequest.)
 //
 // A form that asks for a stream (form.wantsStream) is relayed as one only when the
 // mapped route is KNOWN to stream: its transcription_streaming verdict is yes
@@ -750,9 +831,9 @@ func peekTranscriptionFileByte(part *multipart.Part) (first []byte, empty bool, 
 // stream completed (setStreamedTranscriptionBillingQuantity) and captured as its
 // transcript; any other 2xx one is buffered, metered from the timing block of its body
 // and written verbatim (relayTranscriptionResponse).
-func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, form transcriptionForm, raw []byte) {
+func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, endpoint sessionEndpoint, form transcriptionForm, raw []byte) {
 	start := time.Now()
-	target, ok := s.resolveTranscriptionTarget(w, r, &token, req, raw, start)
+	target, ok := s.resolveTranscriptionTarget(w, r, &token, req, endpoint, raw, start)
 	if !ok {
 		return
 	}
@@ -766,22 +847,28 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		slog.Debug("transcription refused: the target's agent has not declared multipart_proxy",
 			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
 			"route_id", target.RouteID, "feature", multipartProxyFeature)
-		s.recordTranscriptionRoutingFailure(w, r, token, req, raw, start, errTranscriptionUnavailable)
+		s.recordTranscriptionRoutingFailure(w, r, token, req, endpoint, raw, start, errTranscriptionUnavailable)
 		return
 	}
 	rel := nativeRelay{
 		token:       token,
 		target:      target,
-		path:        upstreamPath(target, req.APIFlavor, endpointTranscription),
+		path:        upstreamPath(target, req.APIFlavor, endpoint),
 		raw:         raw,
 		pfReq:       req,
-		endpoint:    endpointTranscription,
+		endpoint:    endpoint,
 		contentType: r.Header.Get(contentTypeHeader),
 	}
 	// The stream-versus-buffered decision is made HERE, before the upstream body is
 	// built, because answering buffered means a body without the client's `stream` part.
-	streaming := form.wantsStream() && s.mappingStreamsTranscription(r.Context(), target.RouteID)
-	dropStream := form.wantsStream() && !streaming
+	// Only the plain transcription can be asked for a stream: for the details endpoint
+	// every one of the decisions below is "no" whatever the form says, so none of its
+	// stream machinery (the verdict read, the literal true, the buffered retry, the
+	// relay's stream mark) can run for it. The handler refuses a stream there before it
+	// gets this far (validateTranscriptionDetailsRequest); this does not depend on that.
+	asksStream := endpoint == endpointTranscription && form.wantsStream()
+	streaming := asksStream && s.mappingStreamsTranscription(r.Context(), target.RouteID)
+	dropStream := asksStream && !streaming
 	stream := streamKeep
 	switch {
 	case dropStream:
@@ -810,7 +897,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 			// sending the upstream a body whose model it would misread.
 			slog.Error("transcription: rebuilding the multipart body failed",
 				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
-			s.recordTranscriptionRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("rebuild multipart body: %w", err))
+			s.recordTranscriptionRoutingFailure(w, r, token, req, endpoint, raw, start, fmt.Errorf("rebuild multipart body: %w", err))
 			return
 		}
 		rel.upstreamBody, rel.contentType = body, contentType
@@ -820,7 +907,7 @@ func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, toke
 		slog.Debug("transcription refused: the body to send is past the agent router's request limit",
 			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
 			"bytes", sent, "limit", agentRouterMaxBodyBytes)
-		s.recordTranscriptionRoutingFailure(w, r, token, req, raw, start, errTranscriptionTooLarge)
+		s.recordTranscriptionRoutingFailure(w, r, token, req, endpoint, raw, start, errTranscriptionTooLarge)
 		return
 	}
 	if streaming {

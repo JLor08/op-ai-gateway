@@ -22,6 +22,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2621,4 +2622,568 @@ func TestSpeechAndTranscriptionResponseHooksDoNotCollide(t *testing.T) {
 			}
 		}
 	})
+}
+
+// --- The details endpoint ---------------------------------------------------
+//
+// POST /v1/audio/transcriptions/details is the plain transcription's one-shot
+// diarized twin: the same form, the same gates, the same buffered relay, but to
+// the upstream's /details path, and never a stream. These tests pin what differs
+// and that what does not still holds on its own path; the pieces they share with
+// the plain endpoint (form parsing, the rewrite and rebuild, the response
+// relays) are pinned above against the plain one.
+
+const (
+	transcriptionDetailsPath = "/v1/audio/transcriptions/details"
+	// transcriptionDetailsOKBody is the document audio.cpp answers a diarizing
+	// model's /details request with: the transcript, its speaker turns (offsets in
+	// samples, speaker_id a string), the rate the offsets count in, and the timing
+	// block the gateway bills audio_second from (2 seconds).
+	transcriptionDetailsOKBody = `{"text":"hello there general kenobi","speaker_turns":[` +
+		`{"start_sample":0,"end_sample":16000,"speaker_id":"0","confidence":0,"text":"hello there"},` +
+		`{"start_sample":16000,"end_sample":32000,"speaker_id":"1","confidence":0,"text":"general kenobi"}` +
+		`],"sample_rate":16000,"timing":{"audio_duration_ms":2000}}`
+)
+
+// postTranscriptionDetailsParts sends a bearer-authenticated multipart request built
+// from parts to the details endpoint through the real mux.
+func postTranscriptionDetailsParts(t *testing.T, srv *Server, parts []editPart) *httptest.ResponseRecorder {
+	t.Helper()
+	body, ct := buildEditMultipart(t, parts)
+	return postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+}
+
+// The details shape is the plain transcription's in everything but the endpoint, and
+// that is by construction (the one function that builds the plain shape builds this
+// one), so a later change to the plain shape's capability list or flavor cannot leave
+// the details endpoint behind. The endpoint is what picks the upstream path
+// (/v1/audio/transcriptions/details), the session-extraction case and the usage
+// row's provider_path; a details shape that kept endpointTranscription would send the
+// relay to the plain path.
+func TestTranscriptionDetailsInferenceShape(t *testing.T) {
+	shape := transcriptionDetailsInferenceShape("asr-model")
+
+	if shape.endpoint != endpointTranscriptionDetails {
+		t.Fatalf("endpoint = %v, want endpointTranscriptionDetails", shape.endpoint)
+	}
+	if shape.apiFlavor != "openai_audio" {
+		t.Fatalf("apiFlavor = %q, want exactly openai_audio: details shares the flavor with speech and the plain transcription", shape.apiFlavor)
+	}
+	if len(shape.requiredCapabilities) != 1 || shape.requiredCapabilities[0] != routing.CapabilityTranscription {
+		t.Fatalf("requiredCapabilities = %v, want exactly [%s]: no diarization verdict exists, the gate is the transcription one", shape.requiredCapabilities, routing.CapabilityTranscription)
+	}
+	if shape.stream {
+		t.Fatal("stream = true, want false: the details endpoint never streams")
+	}
+	want := transcriptionInferenceShape("asr-model")
+	want.endpoint = endpointTranscriptionDetails
+	if !reflect.DeepEqual(shape, want) {
+		t.Fatalf("shape = %+v, want the plain transcription's with only the endpoint changed: %+v", shape, want)
+	}
+}
+
+// A diarized transcription is relayed as the multipart request the client sent, to the
+// upstream's DETAILS endpoint, buffered, and the JSON document comes back unchanged --
+// speaker turns and all: the gateway proxies, the caller parses the turns. As on the
+// plain endpoint the model field (and only it) is rewritten to the mapped upstream name
+// in a body of its own boundary. The usage row names the details path on both path
+// columns (the endpoint reached recordUsage, else the row records the speech path),
+// bills audio seconds from the document's timing block, and is no stream.
+func TestTranscriptionDetailsRelaysMultipartToTheDetailsPathWithTheModelRewritten(t *testing.T) {
+	up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+	parts := []editPart{
+		{name: "file", filename: "clip.wav", contentType: "audio/wav", body: transcriptionTestAudio},
+		{name: "model", body: []byte(transcriptionGatewayModel)},
+		{name: "language", body: []byte("de")},
+		{name: "temperature", body: []byte("0.2")},
+	}
+	body, ct := buildEditMultipart(t, parts)
+
+	rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want the upstream's application/json", got)
+	}
+	if rec.Body.String() != transcriptionDetailsOKBody {
+		t.Fatalf("body = %s, want the upstream's document byte for byte", rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprint(len(transcriptionDetailsOKBody)) {
+		t.Fatalf("Content-Length = %q, want %d: only the buffered relay declares the body's length", got, len(transcriptionDetailsOKBody))
+	}
+
+	call := nextTranscriptionUpstreamCall(t, calls)
+	if call.method != http.MethodPost || call.path != transcriptionDetailsPath {
+		t.Fatalf("upstream call = %s %s, want POST %s", call.method, call.path, transcriptionDetailsPath)
+	}
+	mediaType, params, err := mime.ParseMediaType(call.contentType)
+	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" || call.contentType == ct {
+		t.Fatalf("upstream Content-Type = %q (%v), want multipart/form-data under the rebuilt body's own boundary, not the client's %q", call.contentType, err, ct)
+	}
+	want := append([]editPart(nil), parts...)
+	want[1].body = []byte(transcriptionUpstreamModel)
+	requireSameParts(t, readEditParts(t, call.body, call.contentType), want)
+
+	ev := lastUsageEvent(t, srv)
+	if ev.APIFlavor != apiFlavorSpeech {
+		t.Fatalf("APIFlavor = %q, want exactly %q", ev.APIFlavor, apiFlavorSpeech)
+	}
+	if ev.ReqPath != transcriptionDetailsPath || ev.ProviderPath != transcriptionDetailsPath {
+		t.Fatalf("ReqPath/ProviderPath = %q/%q, want %s for both", ev.ReqPath, ev.ProviderPath, transcriptionDetailsPath)
+	}
+	if ev.Model != transcriptionGatewayModel || ev.ProviderModel != transcriptionUpstreamModel {
+		t.Fatalf("Model/ProviderModel = %q/%q, want %q/%q", ev.Model, ev.ProviderModel, transcriptionGatewayModel, transcriptionUpstreamModel)
+	}
+	if ev.HTTPStatus != http.StatusOK || ev.Status != "success" || ev.ContentType != "application/json" || ev.Stream {
+		t.Fatalf("usage row = status %d/%q, content type %q, stream %v, want a buffered 200/success/application/json", ev.HTTPStatus, ev.Status, ev.ContentType, ev.Stream)
+	}
+	if ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 2 {
+		t.Fatalf("billing = %v %q, want 2 audio_second (timing.audio_duration_ms of the document)", ev.BillingQuantity, ev.BillingUnit)
+	}
+	requireSpeechNonTokenRow(t, ev)
+}
+
+// A form that already carries the upstream's name is relayed VERBATIM on the details
+// endpoint too: the client's bytes under its own Content-Type, boundary included.
+func TestTranscriptionDetailsRelaysVerbatimWhenTheFormCarriesTheMappedName(t *testing.T) {
+	up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+	body, ct := buildEditMultipart(t, validTranscriptionParts("asr-same"))
+
+	rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	call := nextTranscriptionUpstreamCall(t, calls)
+	if call.path != transcriptionDetailsPath || call.contentType != ct || !bytes.Equal(call.body, body) {
+		t.Fatalf("upstream call = %s with Content-Type %q and %d bytes, want the client's own body (%d bytes) and Content-Type %q verbatim on %s", call.path, call.contentType, len(call.body), len(body), ct, transcriptionDetailsPath)
+	}
+}
+
+// An empty `file` part is dropped on the details endpoint as on the plain one: the
+// rebuild is shared, and the upstream must see exactly the one file the gateway
+// validated.
+func TestTranscriptionDetailsRelayDropsAnEmptyFilePart(t *testing.T) {
+	up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+	body, ct := buildEditMultipart(t, []editPart{
+		{name: "model", body: []byte("asr-same")},
+		{name: "file", filename: "empty.wav", contentType: "audio/wav", body: nil},
+		{name: "file", filename: "clip.wav", contentType: "audio/wav", body: transcriptionTestAudio},
+	})
+
+	rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	call := nextTranscriptionUpstreamCall(t, calls)
+	requireSameParts(t, readEditParts(t, call.body, call.contentType), []editPart{
+		{name: "model", body: []byte("asr-same")},
+		{name: "file", filename: "clip.wav", contentType: "audio/wav", body: transcriptionTestAudio},
+	})
+}
+
+// audio.cpp refuses stream=true on /details with a 500, so the gateway refuses it
+// FIRST: a gateway 400 with the endpoint's own stream code, before anything is routed
+// or sent, so no admission is spent, no upstream is called and no usage is recorded.
+// Every spelling strconv.ParseBool reads as true is refused (the plain endpoint reads
+// the same ones as a request to stream), so no spelling is a way around it -- and the
+// refusal is the details endpoint's alone: the plain one serves stream=true.
+func TestTranscriptionDetailsRefusesAStreamBeforeAnyUpstreamCall(t *testing.T) {
+	for _, spelling := range []string{"true", "TRUE", "True", "t", "T", "1", " true "} {
+		t.Run(fmt.Sprintf("stream=%q", spelling), func(t *testing.T) {
+			up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionDetailsParts(t, srv, append(validTranscriptionParts(transcriptionGatewayModel),
+				editPart{name: "stream", body: []byte(spelling)}))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "transcription.stream_unsupported")
+			if !strings.Contains(rec.Body.String(), "one-shot") {
+				t.Fatalf("body = %s, want a message that says why: the details endpoint is one-shot", rec.Body.String())
+			}
+			requireNoTranscriptionUpstreamCall(t, calls)
+			if events := srv.Usage.All(); len(events) != 0 {
+				t.Fatalf("a refused request recorded usage %+v, want none", events)
+			}
+		})
+	}
+	t.Run("the plain endpoint still serves it", func(t *testing.T) {
+		up, calls := newScriptedTranscriptionUpstream(t, func(_ int, w http.ResponseWriter, _ transcriptionUpstreamCall) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, transcriptionSSEDone+transcriptionSSEEnd)
+		})
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+		rec := postTranscriptionParts(t, srv, streamingTranscriptionParts(transcriptionGatewayModel))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: the refusal is the details endpoint's alone; body = %s", rec.Code, rec.Body.String())
+		}
+		if all := drainTranscriptionUpstreamCalls(calls); len(all) != 1 || all[0].path != "/v1/audio/transcriptions" {
+			t.Fatalf("upstream calls = %+v, want exactly one, to /v1/audio/transcriptions", all)
+		}
+	})
+}
+
+// A stream that says "no" is what the endpoint always did, so it is accepted: an
+// explicit false, a zero spelling and an empty value (a multipart form has no null) are
+// served as any one-shot request is. The client's form is relayed as it came (a form
+// that needs no rewrite stays verbatim, the stream part included), and the answer is a
+// buffered one.
+func TestTranscriptionDetailsAcceptsAStreamThatIsOff(t *testing.T) {
+	for _, spelling := range []string{"false", "FALSE", "0", ""} {
+		t.Run(fmt.Sprintf("stream=%q", spelling), func(t *testing.T) {
+			up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+			body, ct := buildEditMultipart(t, append(validTranscriptionParts("asr-same"), editPart{name: "stream", body: []byte(spelling)}))
+
+			rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+			if rec.Code != http.StatusOK || rec.Body.String() != transcriptionDetailsOKBody {
+				t.Fatalf("status/body = %d/%s, want 200 and the upstream's document", rec.Code, rec.Body.String())
+			}
+			call := nextTranscriptionUpstreamCall(t, calls)
+			if call.path != transcriptionDetailsPath || !bytes.Equal(call.body, body) {
+				t.Fatalf("upstream call = %s with %d bytes, want %s and the client's form verbatim (%d bytes)", call.path, len(call.body), transcriptionDetailsPath, len(body))
+			}
+			if ev := lastUsageEvent(t, srv); ev.Stream || ev.Status != "success" {
+				t.Fatalf("usage row = %q stream=%v, want a buffered success", ev.Status, ev.Stream)
+			}
+		})
+	}
+}
+
+// The details endpoint answers an invalid request exactly as the plain one does, with
+// the plain endpoint's codes: validation is shared, so a request this relay cannot
+// honor is a gateway 400 before anything is resolved or relayed (audio.cpp would
+// answer a client error with a 500), no admission is spent and no usage is recorded.
+func TestTranscriptionDetailsRejectsAnInvalidRequestBeforeRouting(t *testing.T) {
+	valid := validTranscriptionParts(transcriptionGatewayModel)
+	with := func(extra ...editPart) []editPart { return append(append([]editPart(nil), valid...), extra...) }
+	for _, tc := range []struct {
+		name     string
+		parts    []editPart
+		wantCode string
+	}{
+		{"missing model", replaceEditPart(valid, "model", nil), "transcription.model_required"},
+		{"missing file", replaceEditPart(valid, "file", nil), "transcription.file_required"},
+		{"empty file", replaceEditPart(valid, "file", &editPart{name: "file", filename: "e.wav"}), "transcription.file_required"},
+		{"two files", with(editPart{name: "file", filename: "b.wav", body: []byte("x")}), "transcription.invalid"},
+		{"verbose_json", with(editPart{name: "response_format", body: []byte("verbose_json")}), "transcription.response_format_unsupported"},
+		{"a stream that is no boolean", with(editPart{name: "stream", body: []byte("maybe")}), "transcription.stream_unsupported"},
+		{"stream_format", with(editPart{name: "stream_format", body: []byte("sse")}), "transcription.stream_unsupported"},
+		{"a repeated model", with(editPart{name: "model", body: []byte("other")}), "transcription.invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionDetailsParts(t, srv, tc.parts)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), tc.wantCode)
+			requireNoTranscriptionUpstreamCall(t, calls)
+			if events := srv.Usage.All(); len(events) != 0 {
+				t.Fatalf("a rejected request recorded usage %+v, want none", events)
+			}
+		})
+	}
+	t.Run("not multipart", func(t *testing.T) {
+		up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+		rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, []byte(`{"model":"asr-model"}`), "application/json", map[string]string{"Authorization": "Bearer dev-secret"})
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+		}
+		requireErrorCode(t, rec.Body.String(), "transcription.invalid")
+		requireNoTranscriptionUpstreamCall(t, calls)
+	})
+}
+
+// The details endpoint is on the plain one's two routes and takes its auth: a bearer
+// token and the internal trusted-loopback pair on the path and its /openai alias alike,
+// POST only, and NO browser session cookie (a logged-in page never calls an inference
+// endpoint directly). Each way in reaches the upstream's details path; each refusal
+// reaches nothing.
+func TestTranscriptionDetailsRoutesAndAuth(t *testing.T) {
+	t.Run("a bearer and the loopback pair on both routes", func(t *testing.T) {
+		up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+		body, ct := buildEditMultipart(t, validTranscriptionParts(transcriptionGatewayModel))
+
+		for _, path := range []string{"/v1/audio/transcriptions/details", "/openai/v1/audio/transcriptions/details"} {
+			for name, hdr := range map[string]map[string]string{
+				"bearer":   {"Authorization": "Bearer dev-secret"},
+				"loopback": {internalAuthHeaderName: "s3cret", internalUserHeaderName: "usr_dev"},
+			} {
+				rec := postEditRaw(t, srv, http.MethodPost, path, body, ct, hdr)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("%s via %s: status = %d, want 200; body = %s", path, name, rec.Code, rec.Body.String())
+				}
+				if call := nextTranscriptionUpstreamCall(t, calls); call.path != transcriptionDetailsPath {
+					t.Fatalf("%s via %s: upstream path = %q, want %s", path, name, call.path, transcriptionDetailsPath)
+				}
+				if ev := lastUsageEvent(t, srv); ev.ReqPath != path {
+					t.Fatalf("%s via %s: ReqPath = %q, want the path the client used", path, name, ev.ReqPath)
+				}
+			}
+		}
+	})
+	t.Run("a request without credentials is refused", func(t *testing.T) {
+		up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+		body, ct := buildEditMultipart(t, validTranscriptionParts(transcriptionGatewayModel))
+
+		rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct, nil)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body = %s", rec.Code, rec.Body.String())
+		}
+		requireNoTranscriptionUpstreamCall(t, calls)
+	})
+	t.Run("a GET is refused", func(t *testing.T) {
+		srv, _ := newSpeechCapableTestServer(t, "http://127.0.0.1:1")
+		req := httptest.NewRequest(http.MethodGet, transcriptionDetailsPath, nil)
+		req.Header.Set("Authorization", "Bearer dev-secret")
+		rec := httptest.NewRecorder()
+
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPost {
+			t.Fatalf("status = %d, Allow = %q, want 405 with Allow: POST", rec.Code, rec.Header().Get("Allow"))
+		}
+	})
+	t.Run("a browser session cookie is refused", func(t *testing.T) {
+		srv, dir := newChatTestServer(t)
+		seedLoginUser(t, dir, "usr_transcription_details", "transcription-details@example.test", "password-1", "user")
+		cookie := loginCookie(t, srv, "transcription-details@example.test", "password-1")
+		body, ct := buildEditMultipart(t, validTranscriptionParts(transcriptionGatewayModel))
+
+		rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct,
+			map[string]string{"Cookie": cookie.Name + "=" + cookie.Value, csrfHeaderName: "1"})
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401 from a real session cookie: %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// The capability gate is the transcription one -- no diarization verdict exists, the
+// gateway acts on what the server answers -- so a model without a (transcription, yes)
+// verdict is refused on the details endpoint exactly as on the plain one, and a model
+// with one is served whether or not it can diarize. A refusal reaches no upstream and
+// records an audio_second row on the DETAILS path that claims no upstream call.
+func TestTranscriptionDetailsIsGatedOnTheTranscriptionVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		model    string
+		wantCode string
+	}{
+		{"a speech-only model", "tts-voice", "routing.model_not_capable"},
+		{"an explicit no", "asr-denied", "routing.model_not_capable"},
+		{"an unknown model", "no-such-asr", "routing.no_model_route"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionDetailsOKBody)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionDetailsParts(t, srv, validTranscriptionParts(tc.model))
+
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), tc.wantCode)
+			requireNoTranscriptionUpstreamCall(t, calls)
+			ev := onlyUsageEvent(t, srv)
+			if ev.ReqPath != transcriptionDetailsPath || ev.APIFlavor != apiFlavorSpeech || ev.ErrorCode != tc.wantCode || ev.Status != "error" {
+				t.Fatalf("row = %q/%q/%q/%q, want an error row on %s for the openai_audio flavor with code %s", ev.ReqPath, ev.APIFlavor, ev.Status, ev.ErrorCode, transcriptionDetailsPath, tc.wantCode)
+			}
+			if ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 0 {
+				t.Fatalf("row billing = %q/%v, want an audio_second row with quantity 0", ev.BillingUnit, ev.BillingQuantity)
+			}
+			if ev.Host != "" || ev.RouteID != "" || ev.ProviderPath != "" {
+				t.Fatalf("row = %+v, want Host/RouteID/ProviderPath empty: no upstream call was made", ev)
+			}
+		})
+	}
+}
+
+// The multipart_proxy gate applies to the details endpoint as to the plain one: an
+// agent-launched target is sent the upload only when its agent has DECLARED
+// multipart_proxy, and is otherwise refused transcription.unavailable instead of
+// being relayed a multipart body its router would answer 404 -- before anything is
+// sent. The positive control is the same fixture with the feature declared: the agent
+// is then relayed to on the details path, under the mapped name, with the rebuilt
+// body's own Content-Type.
+func TestTranscriptionDetailsAgentTargetNeedsMultipartProxy(t *testing.T) {
+	t.Run("an agent that has not declared it is refused", func(t *testing.T) {
+		prov := &recordingProxyProvider{respBody: transcriptionDetailsOKBody}
+		srv := newServerAgentTranscriptionTestServer(t, prov, "agent-asr", "asr-q8-gguf", []string{routing.APIFlavorOpenAIAudio})
+
+		rec := postTranscriptionDetailsParts(t, srv, validTranscriptionParts("agent-asr"))
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+		}
+		requireErrorCode(t, rec.Body.String(), "transcription.unavailable")
+		if prov.proxyCalls != 0 {
+			t.Fatalf("ProxyNative calls = %d, want 0 -- a multipart body must never be sent to an agent that did not declare multipart_proxy", prov.proxyCalls)
+		}
+		ev := onlyUsageEvent(t, srv)
+		if ev.ErrorCode != "transcription.unavailable" || ev.HTTPStatus != http.StatusNotFound || ev.ReqPath != transcriptionDetailsPath {
+			t.Fatalf("usage row = %q/%d on %q, want transcription.unavailable, 404 and the details path", ev.ErrorCode, ev.HTTPStatus, ev.ReqPath)
+		}
+		if ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 0 || ev.Host != "" || ev.RouteID != "" || ev.ProviderPath != "" {
+			t.Fatalf("usage row = %+v, want an audio_second row with quantity 0 and no upstream (Host/RouteID/ProviderPath empty)", ev)
+		}
+	})
+	t.Run("an agent that has declared it is relayed to under the mapped name", func(t *testing.T) {
+		prov := &recordingProxyProvider{respBody: transcriptionDetailsOKBody}
+		srv := newServerAgentTranscriptionTestServer(t, prov, "agent-asr", "asr-q8-gguf", []string{routing.APIFlavorOpenAIAudio})
+		declareTranscriptionMultipartProxy(srv)
+		body, ct := buildEditMultipart(t, validTranscriptionParts("agent-asr"))
+
+		rec := postEditRaw(t, srv, http.MethodPost, transcriptionDetailsPath, body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+		if rec.Code != http.StatusOK || rec.Body.String() != transcriptionDetailsOKBody {
+			t.Fatalf("status/body = %d/%s, want 200 and the agent's document", rec.Code, rec.Body.String())
+		}
+		if prov.proxyCalls != 1 || prov.gotPath != transcriptionDetailsPath || prov.gotContentType == ct {
+			t.Fatalf("ProxyNative calls/path/Content-Type = %d/%q/%q, want 1, %s and the rebuilt body's own Content-Type", prov.proxyCalls, prov.gotPath, prov.gotContentType, transcriptionDetailsPath)
+		}
+		if got := modelFieldOf(t, prov.gotBody, prov.gotContentType); got != "asr-q8-gguf" {
+			t.Fatalf("relayed model = %q, want the name the agent's router keys the child on", got)
+		}
+		if ev := lastUsageEvent(t, srv); ev.ProviderPath != transcriptionDetailsPath || ev.BillingQuantity != 2 {
+			t.Fatalf("usage ProviderPath/BillingQuantity = %q/%v, want %s and 2", ev.ProviderPath, ev.BillingQuantity, transcriptionDetailsPath)
+		}
+	})
+}
+
+// A non-2xx answer from the details upstream is normalised as the TRANSCRIPTION's
+// error, never speech's, and relayed under the upstream's own status: audio.cpp's own
+// OpenAI error object passes through byte for byte, a plain string is wrapped into one
+// under transcription.upstream_error. The row is an audio_second error row on the
+// details path with quantity 0.
+func TestTranscriptionDetailsNormalisesAnUpstreamError(t *testing.T) {
+	t.Run("an OpenAI error object passes through", func(t *testing.T) {
+		const upstreamError = `{"error":{"message":"boom","type":"server_error"}}`
+		up, calls := newTranscriptionUpstream(t, http.StatusInternalServerError, upstreamError)
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+		rec := postTranscriptionDetailsParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+		if rec.Code != http.StatusInternalServerError || rec.Body.String() != upstreamError {
+			t.Fatalf("status/body = %d/%s, want the upstream's 500 and its object untouched", rec.Code, rec.Body.String())
+		}
+		if call := nextTranscriptionUpstreamCall(t, calls); call.path != transcriptionDetailsPath {
+			t.Fatalf("upstream path = %q, want %s", call.path, transcriptionDetailsPath)
+		}
+		ev := lastUsageEvent(t, srv)
+		if ev.Status != "error" || ev.ErrorCode != "upstream.500" || ev.ProviderPath != transcriptionDetailsPath || ev.BillingQuantity != 0 {
+			t.Fatalf("usage row = %q/%q/%q/%v, want an upstream.500 error row on %s with no quantity", ev.Status, ev.ErrorCode, ev.ProviderPath, ev.BillingQuantity, transcriptionDetailsPath)
+		}
+		requireSpeechNonTokenRow(t, ev)
+	})
+	t.Run("a plain string is wrapped into the transcription's error", func(t *testing.T) {
+		up, _ := newTranscriptionUpstream(t, http.StatusBadRequest, `{"error":"model not loaded"}`)
+		srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+		rec := postTranscriptionDetailsParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want the upstream's 400; body = %s", rec.Code, rec.Body.String())
+		}
+		requireErrorCode(t, rec.Body.String(), transcriptionUpstreamErrorCode)
+	})
+}
+
+// The details relay NEVER marks itself a stream, whatever its form carries: the handler
+// refuses a stream, and the relay does not depend on that refusal alone, because a relay
+// marked a stream arms the idle watchdog with the streaming budget, takes the stream's
+// bookkeeping and would be sent a stream request audio.cpp refuses. The same form, on
+// a route that is known to stream, is a stream on the plain endpoint -- the positive
+// control, which also shows the in-flight row is where the mark is observable.
+func TestRelayTranscriptionNeverStreamsTheDetailsEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		endpoint   sessionEndpoint
+		wantPath   string
+		wantStream bool
+	}{
+		{"details", endpointTranscriptionDetails, transcriptionDetailsPath, false},
+		{"plain, as the control", endpointTranscription, "/v1/audio/transcriptions", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: transcriptionDetailsOKBody}
+			srv := newServerAgentTranscriptionTestServer(t, prov, "agent-asr", "agent-asr", []string{routing.APIFlavorOpenAIAudio})
+			declareTranscriptionMultipartProxy(srv)
+			var inFlight []ActiveRequest
+			prov.onProxy = func() { inFlight = srv.Active.Snapshot() }
+			body, ct := buildEditMultipart(t, streamingTranscriptionParts("agent-asr"))
+			form, err := parseTranscriptionForm(ct, body)
+			if err != nil || !form.wantsStream() {
+				t.Fatalf("parseTranscriptionForm: %v, wantsStream = %v, want a form that asks for a stream", err, form.wantsStream())
+			}
+			req := httptest.NewRequest(http.MethodPost, tc.wantPath, bytes.NewReader(body))
+			req.Header.Set("Content-Type", ct)
+			pfReq := inference.Request{Model: "agent-asr", RequestedModel: "agent-asr", APIFlavor: apiFlavorSpeech, RequiredCapabilities: []string{routing.CapabilityTranscription}}
+
+			srv.relayTranscription(httptest.NewRecorder(), req, auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true}, pfReq, tc.endpoint, form, body)
+
+			if prov.proxyCalls != 1 || prov.gotPath != tc.wantPath {
+				t.Fatalf("ProxyNative calls/path = %d/%q, want 1 and %s", prov.proxyCalls, prov.gotPath, tc.wantPath)
+			}
+			if len(inFlight) != 1 || inFlight[0].Stream != tc.wantStream || inFlight[0].ProviderPath != tc.wantPath {
+				t.Fatalf("in-flight rows = %+v, want one on %s with Stream = %v", inFlight, tc.wantPath, tc.wantStream)
+			}
+		})
+	}
+}
+
+// Mock mode, end to end: with the mock provider behind the gateway the details route
+// answers the mock's diarized document (two speakers, its timing block), not the
+// Responses-style stream every other mock path gets, and the row bills the 2 seconds
+// that document states.
+func TestTranscriptionDetailsAgainstTheMockProvider(t *testing.T) {
+	srv, _ := newTranscriptionCapableTestServer(t, "http://127.0.0.1:1")
+	srv.Provider = provider.NewMock()
+
+	rec := postTranscriptionDetailsParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	var doc struct {
+		SpeakerTurns []struct {
+			SpeakerID string `json:"speaker_id"`
+		} `json:"speaker_turns"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("body %q is no JSON document: %v", rec.Body.String(), err)
+	}
+	speakers := map[string]bool{}
+	for _, turn := range doc.SpeakerTurns {
+		speakers[turn.SpeakerID] = true
+	}
+	if len(speakers) < 2 {
+		t.Fatalf("body %q carries %d distinct speakers, want the mock's multi-speaker document", rec.Body.String(), len(speakers))
+	}
+	ev := lastUsageEvent(t, srv)
+	if ev.Status != "success" || ev.ProviderPath != transcriptionDetailsPath || ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 2 {
+		t.Fatalf("usage row = %q on %q billing %v %q, want a success on %s billing 2 audio_second", ev.Status, ev.ProviderPath, ev.BillingQuantity, ev.BillingUnit, transcriptionDetailsPath)
+	}
 }

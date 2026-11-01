@@ -14,13 +14,13 @@ import (
 // MINUS the session-cookie leg, and that omission is the point.
 //
 // Used by /v1/images/generations, /v1/images/edits, /v1/audio/speech,
-// /v1/audio/transcriptions and /v1/audio/voices, which the portal-chat run
-// executor reaches over the loopback pair (chat_runs.go sets
-// internalAuthHeaderName + internalUserHeaderName and no bearer; no run kind
-// calls the transcription or voices endpoint yet, but they take the same two
-// legs as their audio sibling) while no browser ever calls them directly (the
-// browser's voice list is a session-cookie portal route instead). Swapping the
-// endpoint to requireWebAnyScope would have been one
+// /v1/audio/transcriptions, /v1/audio/transcriptions/details and
+// /v1/audio/voices, which the portal-chat run executor reaches over the loopback
+// pair (chat_runs.go sets internalAuthHeaderName + internalUserHeaderName and no
+// bearer; no run kind calls the transcription or voices endpoint yet, but they
+// take the same two legs as their audio sibling) while no browser ever calls them
+// directly (the browser's voice list is a session-cookie portal route instead).
+// Swapping the endpoint to requireWebAnyScope would have been one
 // line and would ALSO have admitted the browser session cookie, making the
 // endpoint reachable from a logged-in page -- a browser leg this feature
 // never wanted and docs/architecture/02-constraints.md's auth-legs bullet
