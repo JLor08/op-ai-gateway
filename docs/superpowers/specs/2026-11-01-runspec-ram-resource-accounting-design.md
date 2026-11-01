@@ -45,11 +45,23 @@ is simply VRAM=0 / RAM>0.
 4. **Table shows the effective value.** Keep the per-GPU VRAM column but bind it
    to effective; add a **VRAM total** column (sum of effective per-GPU VRAM) and a
    new **RAM** column.
-5. **RAM feeds admission & eviction** as a single **host-wide pool**, budget based
-   on **live available RAM (`MemAvailable`) − a per-host-configurable reserve**
-   (not static `host-total − reserve`), because hosts are shared (co-located
-   docker/tig stack); live-available self-corrects for non-managed workloads.
-   Reuse the existing eviction machinery, host-scoped (any idle proc).
+5. **RAM feeds admission & eviction** as a single **host-wide pool**. The pool is
+   the capacity available to the *managed* set: **`MemAvailable` + the RAM the
+   managed procs currently hold (≈ Σ running measured-RAM) − a per-host-configurable
+   reserve** — the host-wide analogue of the per-GPU VRAM rule, whose budget is the
+   device *total* (managed-pool capacity), not device-available. The admission rule
+   then sums the candidate's RAM demand + every running proc's RAM demand against
+   that budget (the running measured/demand terms cancel in steady state, so a
+   candidate is charged against genuinely-free RAM; a demand floored at
+   `max(measured, manual)` still never under-reserves). Not static
+   `host-total − reserve`, because hosts are shared (co-located docker/tig stack):
+   folding `MemAvailable` in keeps the pool self-correcting for non-managed
+   workloads — a docker/tig spike lowers `MemAvailable`, so the budget drops and
+   admission turns more conservative. Reuse the existing eviction machinery,
+   host-scoped (any idle proc). (**A plain `MemAvailable − reserve` budget would
+   double-count the managed procs** — their RSS is already excluded from
+   `MemAvailable` — and cap the managed set at roughly half the host; corrected
+   during implementation, see the plan's ledger.)
 6. **Cold-start bootstrap** (new spec, effective `max == 0`):
    - Uses live-available RAM: with sufficient headroom, **just start and measure —
      no eviction** (so default-on does NOT churn the host on every first start);
@@ -159,11 +171,16 @@ is simply VRAM=0 / RAM>0.
   superseded by `max()`.
 
 ### Admission & eviction (RAM pool)
-- `PolicySnapshot` gains a host-RAM budget from live `MemAvailable` − per-host
-  reserve; `RunningProc` gains a RAM demand (effective RAM MB).
-- New rule parallel to VRAM rule 3: if admitting would exceed the host-RAM budget,
-  pick idle, unpinned, non-starting victims (oldest `LastUsed` first) **host-wide**;
-  else Wait. Reuse `Decision.Evict` + `beginDrain`. Self-filter (`:547`) applies.
+- `PolicySnapshot` gains a host-RAM budget = `(MemAvailable + Σ running
+  measured-RAM) − per-host reserve` (the managed-pool capacity — see goal 5 for why
+  a plain `MemAvailable − reserve` would double-count); `RunningProc` gains a RAM
+  occupancy (effective RAM MB = `max(measured, demand)`).
+- New rule parallel to VRAM rule 3: sum the candidate's RAM demand + every running
+  proc's RAM demand; if that exceeds the host-RAM budget, pick idle, unpinned,
+  non-starting victims (oldest `LastUsed` first) **host-wide**; else Wait. A
+  candidate whose own demand exceeds the whole budget is terminal `not_permitted`
+  (no eviction can make it fit — the host-wide analogue of the per-GPU own-demand
+  refusal). Reuse `Decision.Evict` + `beginDrain`. Self-filter applies.
 - **Interlock (my call):** while a RAM bootstrap is starting+measuring, block other
   RAM admissions so a second spec can't take the freed/available RAM mid-window —
   otherwise the bootstrap can cause the OOM it exists to prevent.
