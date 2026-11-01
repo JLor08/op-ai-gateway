@@ -115,6 +115,11 @@ export type ChatTranscriptionSettings = {
   // writes a string as itself and any other value as its compact JSON). The backend
   // refuses the keys the run owns (model / file / response_format / stream).
   passthrough?: Record<string, unknown>;
+  // Selects the one-shot /v1/audio/transcriptions/details relay for the run, so the answer
+  // carries the speaker-attributed segments. The only knob that changes the endpoint (the rest
+  // ride the same form); omitted = false = the plain transcription. Declared last, like the
+  // backend's field, so a stored thread's keys do not move.
+  diarize?: boolean;
 };
 
 // The Voice Chat picks of a TEXT thread (#317, #318, #314), as persisted inside

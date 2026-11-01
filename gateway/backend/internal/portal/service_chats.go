@@ -610,6 +610,12 @@ type ChatTranscriptionSettings struct {
 	// upstream with the exact type the user wrote, and they round-trip through
 	// the stored document untouched. A nil or empty map is omitted.
 	Passthrough map[string]json.RawMessage `json:"passthrough,omitempty"`
+	// Diarize selects the one-shot /v1/audio/transcriptions/details relay for the
+	// run, so the answer carries the speaker-attributed segments. It is the only
+	// transcription knob that changes the ENDPOINT; everything else rides the same
+	// form. Declared after Passthrough, last, and omitted when false, so a stored
+	// chat's serialized bytes must not move.
+	Diarize bool `json:"diarize,omitempty"`
 }
 
 // PrepareRunRequest either appends a new user message or replaces the whole

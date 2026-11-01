@@ -1182,6 +1182,7 @@ describe('the persisted transcription settings mirror the backend omitempty', ()
       prompt: '',
       temperature: '',
       passthrough: '',
+      diarize: false,
     });
     // The key is present for a transcription thread even when nothing is set, as
     // audio's is for a speech thread: `transcription: {}`.
@@ -1235,6 +1236,34 @@ describe('the persisted transcription settings mirror the backend omitempty', ()
           .transcription ?? {};
       expect('passthrough' in tr, JSON.stringify(passthrough)).toBe(false);
     }
+  });
+
+  it('emits diarize only when it is set, and only on a transcription thread', () => {
+    const wire = (diarize: boolean) =>
+      transcriptionSetting('transcription', { ...DEFAULT_TRANSCRIPTION_SETTINGS, diarize })
+        .transcription ?? {};
+    // The one knob that selects the endpoint rather than a form field: a `true` rides the
+    // wire, an unset (false) one is omitted so a stored thread's keys do not move.
+    expect(wire(true)).toEqual({ diarize: true });
+    expect('diarize' in wire(false)).toBe(false);
+    expect(transcriptionSetting('transcription', DEFAULT_TRANSCRIPTION_SETTINGS)).toEqual({
+      transcription: {},
+    });
+    // It never leaks onto another kind of thread.
+    const diarized = { ...DEFAULT_TRANSCRIPTION_SETTINGS, diarize: true };
+    for (const kind of ['', undefined, 'image', 'speech']) {
+      expect(transcriptionSetting(kind, diarized), String(kind)).toEqual({});
+    }
+    // And it rides with the other knobs without disturbing them.
+    expect(transcriptionSetting('transcription', { ...moved, diarize: true })).toEqual({
+      transcription: {
+        language: 'de',
+        prompt: 'Namen: Zoe',
+        temperature: 0.2,
+        passthrough: { beam: 5 },
+        diarize: true,
+      },
+    });
   });
 
   it('keeps each value of a passthrough in the JSON type the user wrote', () => {
@@ -1390,6 +1419,19 @@ describe('the persisted transcription settings mirror the backend omitempty', ()
     expect(transcriptionSetting('transcription', state)).toEqual({ transcription: wire });
   });
 
+  it('round-trips diarize through transcriptionSettingsFrom', () => {
+    const wire = { language: 'de', diarize: true };
+    const state = transcriptionSettingsFrom(wire);
+    expect(state.diarize).toBe(true);
+    expect(transcriptionSetting('transcription', state)).toEqual({ transcription: wire });
+    // Omitted on the wire (every thread stored before the knob existed) = off, and it stays
+    // omitted on the way back out.
+    expect(transcriptionSettingsFrom({ language: 'de' }).diarize).toBe(false);
+    expect(
+      transcriptionSetting('transcription', transcriptionSettingsFrom({ language: 'de' })),
+    ).toEqual({ transcription: { language: 'de' } });
+  });
+
   it('coerces a missing/mistyped persisted transcription back to defaults', () => {
     expect(transcriptionSettingsFrom(undefined)).toEqual(DEFAULT_TRANSCRIPTION_SETTINGS);
     expect(
@@ -1398,8 +1440,12 @@ describe('the persisted transcription settings mirror the backend omitempty', ()
         prompt: {} as unknown as string,
         temperature: 'x' as unknown as number,
         passthrough: 'oops' as unknown as Record<string, unknown>,
+        diarize: 'yes' as unknown as boolean,
       }),
     ).toEqual(DEFAULT_TRANSCRIPTION_SETTINGS);
+    // Only a real boolean counts: a truthy non-boolean is not "on".
+    expect(transcriptionSettingsFrom({ diarize: 1 as unknown as boolean }).diarize).toBe(false);
+    expect(transcriptionSettingsFrom({ diarize: false }).diarize).toBe(false);
     expect(
       transcriptionSettingsFrom({ passthrough: [1] as unknown as Record<string, unknown> }),
     ).toEqual(DEFAULT_TRANSCRIPTION_SETTINGS);
@@ -1426,6 +1472,15 @@ describe('the persisted transcription settings mirror the backend omitempty', ()
       messages: [],
     }).settings;
     expect(settings.kind).toBe('transcription');
+    expect(settings.transcription).toEqual(wire);
+  });
+
+  it('keeps diarize through the document for a transcription thread (normalizeDoc)', () => {
+    const wire = { language: 'de', diarize: true };
+    const settings = normalizeDoc({
+      settings: { model: 'whisper', kind: 'transcription', transcription: wire },
+      messages: [],
+    }).settings;
     expect(settings.transcription).toEqual(wire);
   });
 

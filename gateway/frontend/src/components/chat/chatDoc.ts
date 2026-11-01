@@ -849,6 +849,11 @@ export type TranscriptionSettings = {
   // when it is not a non-empty object free of reserved fields; parseTranscriptionPassthrough()
   // says which, so the composer and send() can name a bad one.
   passthrough: string;
+  // Whether the run is diarized: it selects the one-shot /v1/audio/transcriptions/details
+  // relay instead of the plain transcription, so the answer carries the speaker-attributed
+  // segments. The only knob here that changes the endpoint. false = the plain transcription;
+  // transcriptionSetting() sends it only when true.
+  diarize: boolean;
 };
 
 export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
@@ -856,6 +861,7 @@ export const DEFAULT_TRANSCRIPTION_SETTINGS: TranscriptionSettings = {
   prompt: '',
   temperature: '',
   passthrough: '',
+  diarize: false,
 };
 
 // The form fields a transcription thread's passthrough may not set: the run's own (`model`
@@ -941,6 +947,7 @@ export function transcriptionSetting(
   if (temperature !== undefined) transcription.temperature = temperature;
   const passthrough = parseTranscriptionPassthrough(s.passthrough);
   if (passthrough.status === 'ok') transcription.passthrough = passthrough.value;
+  if (s.diarize) transcription.diarize = true;
   return { transcription };
 }
 
@@ -961,6 +968,7 @@ export function transcriptionSettingsFrom(
     prompt: typeof s.prompt === 'string' ? s.prompt : DEFAULT_TRANSCRIPTION_SETTINGS.prompt,
     temperature: imageNumToStr(s.temperature),
     passthrough,
+    diarize: typeof s.diarize === 'boolean' ? s.diarize : DEFAULT_TRANSCRIPTION_SETTINGS.diarize,
   };
 }
 

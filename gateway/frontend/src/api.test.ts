@@ -437,6 +437,7 @@ describe('portal api', () => {
           prompt: 'Namen: Zoe',
           temperature: 0,
           passthrough: { timestamp_granularities: ['word'], beam: 5, verbose: true },
+          diarize: true,
         },
       },
     });
@@ -450,6 +451,7 @@ describe('portal api', () => {
       prompt: 'Namen: Zoe',
       temperature: 0,
       passthrough: { timestamp_granularities: ['word'], beam: 5, verbose: true },
+      diarize: true,
     });
   });
 
