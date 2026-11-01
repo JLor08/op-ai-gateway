@@ -4931,3 +4931,204 @@ func TestRAMOnlyHostWithoutASampleIsUnconstrained(t *testing.T) {
 	}
 	release()
 }
+
+// --- VRAM bootstrap: the one-shot guard lives on the owner ----------------
+//
+// The one-shot VRAM bootstrap eviction (task 4.3) is granted by the owner and
+// guarded by a single durable marker, specState.vramBootstrapDone. These tests
+// pin the owner half of the guard: who the grant is offered to, what sets the
+// marker, that the marker outlives the process it was earned under (the whole
+// point -- a marker cleared on exit would let the exception thrash), and that
+// admitAndStart burns it on the eviction and then reverts to the ADR-032 wait.
+
+// TestVRAMBootstrapEligibility pins the grant predicate: the owner offers the
+// one-shot only to an unknown-VRAM spec that has not yet resolved its bootstrap
+// (no measurement captured, shot unspent) AND only on a host where a VRAM
+// measurer is installed -- the exception exists to capture a measurement, so it
+// never fires where none can be taken (§5.3). A known-demand spec is never
+// offered it (rule 4 does not even apply to it), and neither is one already
+// marked.
+func TestVRAMBootstrapEligibility(t *testing.T) {
+	unknown := func() Spec {
+		s := baseSpec("spec-a", "model-a")
+		s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		return s
+	}
+	known := func() Spec {
+		s := baseSpec("spec-a", "model-a")
+		s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 5000}}
+		return s
+	}
+	cases := []struct {
+		name     string
+		st       *specState
+		measurer bool
+		want     bool
+	}{
+		{"unknown, unresolved, measurer installed: offered the shot", &specState{spec: unknown(), vramBootstrapDone: false}, true, true},
+		{"unknown and unresolved but NO measurer: not offered (nothing to measure)", &specState{spec: unknown(), vramBootstrapDone: false}, false, false},
+		{"unknown but already resolved: not offered", &specState{spec: unknown(), vramBootstrapDone: true}, true, false},
+		{"known demand: never offered (rule 4 does not apply)", &specState{spec: known(), vramBootstrapDone: false}, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &owner{m: &Manager{}}
+			if tc.measurer {
+				o.m.SetMeasurer(func([]int) map[int]map[int]int { return nil })
+			}
+			if got := o.vramBootstrapEligible(tc.st); got != tc.want {
+				t.Errorf("vramBootstrapEligible = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVRAMBootstrapMarkerSetWhenMeasured: a real VRAM measurement resolves the
+// bootstrap -- the spec has a number now, so it must never spend the eviction
+// shot. Both places that record a measurement (the off-owner beat via
+// applyMeasurement, and the synchronous admission-time read in buildSnapshot)
+// set the durable marker; a non-measurement (a measured 0, which realMeasurement
+// drops) does not.
+func TestVRAMBootstrapMarkerSetWhenMeasured(t *testing.T) {
+	const pid = 4242
+
+	t.Run("applyMeasurement marks a real measurement", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		o, st := newSnapshotOwner(spec, pid, nil)
+		o.applyMeasurement(cmdMeasured{
+			targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+			byPID:   map[int]map[int]int{pid: {0: 7000}},
+		})
+		if !st.vramBootstrapDone {
+			t.Error("a real VRAM measurement must resolve the bootstrap (set vramBootstrapDone)")
+		}
+	})
+
+	t.Run("applyMeasurement does not mark a measured zero", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		o, st := newSnapshotOwner(spec, pid, nil)
+		o.applyMeasurement(cmdMeasured{
+			targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
+			byPID:   map[int]map[int]int{pid: {0: 0}}, // not a measurement (realMeasurement drops it)
+		})
+		if st.vramBootstrapDone {
+			t.Error("a measured 0 is not a measurement and must not resolve the bootstrap")
+		}
+	})
+
+	t.Run("buildSnapshot marks a measured live occupant", func(t *testing.T) {
+		spec := baseSpec("spec-a", "model-a")
+		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+		measurer := func([]int) map[int]map[int]int { return map[int]map[int]int{pid: {0: 7000}} }
+		o, st := newSnapshotOwner(spec, pid, measurer)
+		_ = o.buildSnapshot()
+		if !st.vramBootstrapDone {
+			t.Error("buildSnapshot's synchronous measurement must also resolve the bootstrap")
+		}
+	})
+}
+
+// TestVRAMBootstrapMarkerSurvivesProcessExit is the backbone of the anti-thrash
+// guarantee. The marker is DURABLE: unlike the per-process measurement (which
+// onProcExited clears, F2), a spent/resolved bootstrap must outlive the process
+// it was earned under, or every restart would re-arm the one-shot and the
+// ADR-032 thrash would be back one exit at a time. onProcExited clears the
+// measurement and leaves the marker standing.
+func TestVRAMBootstrapMarkerSurvivesProcessExit(t *testing.T) {
+	spec := baseSpec("spec-a", "model-a")
+	spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
+	logs := NewLogStore(0, 0)
+	o := &owner{
+		m:     &Manager{},
+		cfg:   Config{Specs: []Spec{spec}},
+		specs: map[string]*specState{},
+	}
+	st := &specState{
+		spec:              spec,
+		state:             StateDraining,
+		intentionalStop:   true, // a clean stop, so onProcExited rests it at Stopped
+		measuredVRAM:      map[int]int{0: 7000},
+		measuredRAM:       5000,
+		vramBootstrapDone: true, // the shot was spent (or a measurement had landed)
+		proc:              &runningProc{specID: spec.ID, pid: 4242, log: logs.newProc(spec.ID), exited: make(chan struct{})},
+	}
+	o.specs[spec.ID] = st
+
+	o.onProcExited(st, nil)
+
+	if !st.vramBootstrapDone {
+		t.Error("vramBootstrapDone was cleared on exit: the one-shot would re-arm and the ADR-032 thrash would return")
+	}
+	// Sanity: the exit path really ran -- the per-process measurement IS cleared,
+	// which is exactly what the durable marker is contrasted against.
+	if st.measuredVRAM != nil || st.measuredRAM != 0 {
+		t.Errorf("the per-process measurement should be cleared on exit: measuredVRAM=%v measuredRAM=%d", st.measuredVRAM, st.measuredRAM)
+	}
+}
+
+// TestVRAMBootstrapOneShotBurnsMarkerThenWaits drives the whole guard through
+// the owner: the first admission of a never-measured unknown-VRAM spec spends
+// its one shot to evict the idle known occupant (burning the marker), and the
+// very next admission against the same host is back to the ADR-032 wait -- no
+// second eviction, ever.
+func TestVRAMBootstrapOneShotBurnsMarkerThenWaits(t *testing.T) {
+	cand := baseSpec("cand", "model-cand")
+	cand.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}} // unknown demand
+	cand.Pinned = true                           // wantUp without a queued waiter
+
+	victim := baseSpec("victim", "model-victim")
+	victim.GPUs = []SpecGPU{{Index: 0, VRAMMB: 5000}} // known demand
+
+	o := &owner{
+		m:            &Manager{},
+		policy:       allowlistPolicy(),
+		cfg:          Config{Specs: []Spec{cand, victim}},
+		allowedPairs: allowPairs("cand", "victim"), // open pair: only rule 4 can act
+		specs:        map[string]*specState{},
+	}
+	// A measurer must be installed for the bootstrap to be eligible at all: the
+	// one-shot exists to capture a measurement, so it never fires where none can
+	// be taken. Its return value is irrelevant here (no candidate pid is live).
+	o.m.SetMeasurer(func([]int) map[int]map[int]int { return nil })
+	candSt := &specState{spec: cand, state: StateStopped}
+	// The victim is already Draining, so admitAndStart's beginDrain is a no-op --
+	// the test needs no live child or SIGTERM, only a row in the running set.
+	victimSt := &specState{spec: victim, state: StateDraining, proc: &runningProc{specID: "victim", pid: 5555}}
+	o.specs["cand"] = candSt
+	o.specs["victim"] = victimSt
+
+	// First admission: the one shot fires.
+	o.admitAndStart("cand")
+	if !candSt.vramBootstrapDone {
+		t.Fatal("the one-shot eviction must burn the marker (vramBootstrapDone)")
+	}
+	if candSt.proc != nil {
+		t.Fatal("an Evict decision must not start the candidate")
+	}
+	if !contains(victimSt.drainedFor, "cand") {
+		t.Errorf("the victim must record the candidate as the beneficiary of its drain, got %v", victimSt.drainedFor)
+	}
+
+	// Second admission against the same (still-draining) host: the grant is gone,
+	// so rule 4 is back to the ADR-032 precedence wait -- the candidate records it
+	// as its last_error and does NOT evict the occupant again.
+	candSt.lastError = nil
+	o.admitAndStart("cand")
+	if candSt.proc != nil {
+		t.Fatal("the candidate must still Wait, not start, after the shot is spent")
+	}
+	if candSt.lastError == nil || !strings.Contains(candSt.lastError.Message, "waits for spec victim to leave") {
+		t.Errorf("after the shot the candidate must revert to the ADR-032 precedence wait, got lastError=%v", candSt.lastError)
+	}
+}
+
+func contains(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}

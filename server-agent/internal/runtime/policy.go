@@ -119,6 +119,33 @@ type PolicySnapshot struct {
 	// where a KNOWN demand that large is refused (ramOwnDemandRefusal). It applies
 	// to the CANDIDATE only; an occupant's own RAM is always its RunningProc.RAMMB.
 	RAMBootstrapGuessMB int
+	// VRAMBootstrapEligible grants the candidate its ONE guarded VRAM bootstrap
+	// eviction (task 4.3). ADR-032 makes rule 4 -- a candidate whose own VRAM
+	// demand is unknown -- BLOCK rather than evict a known-demand occupant, which
+	// is the total order that stops a mixed pair cold-loading each other forever.
+	// That order is correct in steady state but strands a spec that has NEVER been
+	// measured: while any known-demand occupant holds one of its cards it can
+	// never run alone, so it can never capture the first measurement that would
+	// move it out of the unknown class. When this is true, rule 4 instead evicts
+	// the idle known-demand touchers of the candidate's cards (blocking on any
+	// that cannot be evicted), exactly as rule 5 treats unknown occupants, so the
+	// candidate gets a card to itself and is measured.
+	//
+	// It is strictly a per-candidate grant the OWNER computes and sets on the
+	// snapshot before each admission (owner.vramBootstrapEligible), true only
+	// while a VRAM measurer is installed (the exception exists to capture a
+	// measurement, so it never fires where none can be taken -- §5.3), the
+	// candidate's spec has an unknown VRAM demand, AND its bootstrap is unresolved
+	// -- no measurement captured and the one shot unspent
+	// (specState.vramBootstrapDone). The owner withdraws it the instant the
+	// bootstrap resolves, and a bootstrap eviction sets Decision.VRAMBootstrap so
+	// the owner knows to burn the shot. That withdrawal is what makes the exception fire at
+	// most once per spec: it CANNOT repeat, so it cannot reintroduce the ADR-032
+	// thrash. It never affects a known-demand candidate (rule 4 does not run for
+	// one) and never touches rule 5's eviction right (the winning side of the
+	// order), so false -- the default every table test and every already-measured
+	// spec gets -- is pure ADR-032.
+	VRAMBootstrapEligible bool
 	// Allowed is the canonical (a<=b) spec-ID pair set: true = the pair
 	// may run together. Build it with Config.AllowedPairs(), never by
 	// hand-rolling a map from Config.Coresident's raw wire-order pairs --
@@ -213,6 +240,17 @@ type Decision struct {
 	// manager re-asks a WaitOnRAM spec when a sample lands, and nothing else
 	// (see owner.wakeOnHostSample).
 	WaitOnRAM bool
+	// VRAMBootstrap is set only on an Evict decision, and only when that decision
+	// spent the candidate's one-shot VRAM bootstrap -- i.e. rule 4 evicted a
+	// known-demand occupant it would otherwise only have blocked (ADR-032),
+	// because snap.VRAMBootstrapEligible granted the shot. It is the signal the
+	// owner uses to BURN the shot (set specState.vramBootstrapDone), so the
+	// exception fires at most once per spec. It is never set on an OK, a Wait or a
+	// terminal, and never for rule 5's eviction (that is the order's winning side,
+	// not a bootstrap): an eviction driven purely by the matrix, a budget, rule 5
+	// or the process limit leaves it false, so the owner burns the shot only when
+	// the bootstrap actually used it.
+	VRAMBootstrap bool
 }
 
 // PairKey canonicalizes an (a, b) spec-ID pair to lexical a<=b order, so an
@@ -685,13 +723,18 @@ func sortOldestFirst(procs []RunningProc) {
 //     any of spec's GPUs; and every process that has an unknown demand of
 //     its OWN and holds any of spec's GPUs. For rules 1 and 5 an evictable
 //     blocker is queued for eviction and a non-evictable (busy or
-//     still-loading) one marks the whole decision blocked. RULE 4 NEVER
-//     QUEUES A VICTIM: known demand beats unknown demand, so a candidate
+//     still-loading) one marks the whole decision blocked. RULE 4 NORMALLY
+//     QUEUES NO VICTIM: known demand beats unknown demand, so a candidate
 //     of unknown demand blocks on the occupants of its cards instead of
 //     evicting them -- which is also why rules 4 and 5 no longer name the
 //     same occupant when both sides are unknown. Rule 5 alone claims that
-//     one. See rule 4 in the body for the convergence defect this closes,
-//     and Decision's Wait shape for what it costs the caller.
+//     one. THE ONE EXCEPTION is the guarded bootstrap: when the owner has
+//     granted the candidate its one-shot (snap.VRAMBootstrapEligible), rule
+//     4 instead evicts idle known-demand touchers (blocking on non-evictable
+//     ones) and flags Decision.VRAMBootstrap so the owner burns the shot --
+//     fired at most once per spec, so it cannot thrash. See rule 4 in the
+//     body for the convergence defect this closes, the bootstrap that
+//     threads through it, and Decision's Wait shape for what the block costs.
 //  4. Per-GPU budget (rule 3), evaluated with step 3's already-queued
 //     evictions notionally already gone: for every GPU spec has a KNOWN
 //     demand for, sum spec's own demand plus every remaining toucher's
@@ -788,6 +831,14 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	// setting it also sets blocked, and blocked always answers Wait. See rule
 	// 4 for why that one Wait is the only one that explains itself.
 	waitMessage := ""
+	// bootstrapEvicted records that rule 4 spent the candidate's one-shot VRAM
+	// bootstrap -- it queued a known-demand toucher for eviction under the
+	// snap.VRAMBootstrapEligible grant, the one case ADR-032 otherwise only
+	// blocks. It reaches the caller as Decision.VRAMBootstrap, and ONLY on an
+	// Evict decision: a bootstrap that could not free the card (a non-evictable
+	// toucher) falls through to a plain Wait with an empty Evict list, so no shot
+	// was actually spent and the owner must not burn it.
+	bootstrapEvicted := false
 
 	// Rule 1: matrix compatibility.
 	for _, r := range running {
@@ -803,8 +854,11 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 
 	// Rule 4: unknown VRAM -- every remaining toucher of spec's GPUs. Any
 	// pinned toucher already short-circuited above, so only idle, busy and
-	// still-loading ones remain here, and NONE of them is evicted for this
-	// candidate: rule 4 only ever BLOCKS now.
+	// still-loading ones remain here. In STEADY STATE none of them is evicted
+	// for this candidate: rule 4 only BLOCKS. The ONE exception is the guarded
+	// bootstrap below (snap.VRAMBootstrapEligible), the single eviction a
+	// never-measured spec is granted to capture its first measurement -- see
+	// that branch.
 	//
 	// KNOWN DEMAND BEATS UNKNOWN DEMAND (ADR-032). Rules 4 and 5 were symmetric
 	// in outcome as well as in subject, and that was a convergence defect
@@ -871,7 +925,48 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	// StatePendingVRAMUnknown, and that state on this spec's own row already
 	// names the missing number as this spec's (§5.3). A message is added here
 	// precisely because a Wait has no state to speak for it.
-	if unknownVRAM {
+	//
+	// THE ONE-SHOT GUARDED BOOTSTRAP (task 4.3) is the sole, deliberate
+	// exception to the block above, and it is why rule 4 now has two arms.
+	// ADR-032's price is a Wait that need never resolve, and for a spec whose
+	// operator left its estimate at 0 on a host where no known-demand occupant
+	// ever becomes idle, that Wait is permanent: the spec can never run alone, so
+	// it can never be measured, so it stays unknown forever. The owner breaks
+	// that deadlock by granting the spec exactly ONE eviction -- the first time
+	// it is admitted while still never-measured and still holding its shot
+	// (snap.VRAMBootstrapEligible). Under the grant, rule 4 treats a known-demand
+	// toucher exactly as rule 5 treats an unknown one: evict it if idle, block on
+	// it otherwise, so the candidate gets its card(s) to itself and is measured.
+	// The grant is withdrawn the instant the shot is spent or a measurement lands
+	// (owner.vramBootstrapEligible / specState.vramBootstrapDone), so the
+	// exception fires AT MOST ONCE per spec and cannot reintroduce the bidirectional
+	// thrash: a host alternating requests between a mixed pair cold-loads at most
+	// one of them, once, not forever.
+	if unknownVRAM && snap.VRAMBootstrapEligible {
+		// Granted: free the candidate's cards so it can run alone and be
+		// measured. The aloneness demand is on ALL of its cards (specGPUIndexes),
+		// so every known-demand toucher must go -- idle ones are queued, a
+		// non-evictable one (busy or still loading) blocks the whole start rather
+		// than yielding a partial, unmeasured co-residency (the same "any
+		// non-evictable blocker -> Wait" invariant rules 1 and 5 keep). A toucher
+		// of UNKNOWN demand is still rule 5's subject and is left to it. The Wait
+		// this can produce carries no message: it is an ordinary wait a busy
+		// neighbour's completion resolves (the candidate is still eligible and
+		// will evict it once idle), not the ADR-032 precedence wait that need
+		// never resolve.
+		for _, r := range running {
+			if !touchesAnyGPU(r, gpuIdx) || procHasUnknownVRAM(r) {
+				continue
+			}
+			if isEvictable(r) {
+				toEvict[r.SpecID] = r
+				bootstrapEvicted = true
+			} else {
+				blocked = true
+			}
+		}
+	} else if unknownVRAM {
+		// Steady state: known demand beats unknown, so block and never evict.
 		var (
 			precedenceBlocker string
 			precedenceGPU     int
@@ -1146,5 +1241,9 @@ func Admit(snap PolicySnapshot, spec Spec) Decision {
 	for i, r := range victims {
 		evict[i] = r.SpecID
 	}
-	return Decision{Evict: evict}
+	// VRAMBootstrap is surfaced only here, on the Evict decision: if a bootstrap
+	// toucher was queued but the start ended up blocked (a non-evictable toucher
+	// elsewhere), the function returned the Wait above with an empty Evict list
+	// and no shot was spent. The owner burns the one-shot only for this return.
+	return Decision{Evict: evict, VRAMBootstrap: bootstrapEvicted}
 }

@@ -1631,6 +1631,173 @@ func TestAdmitUnknownTieStillEvictsBothWays(t *testing.T) {
 		Decision{Evict: []string{"a"}})
 }
 
+// --- VRAM bootstrap: the one-shot guarded eviction (ADR-032) --------------
+//
+// ADR-032 is a TOTAL ORDER: known VRAM demand beats unknown, so rule 4 (the
+// candidate's own demand is unknown) BLOCKS rather than evicting a
+// known-demand occupant -- which is what stops a mixed pair cold-loading each
+// other forever. That order is correct in steady state but leaves one gap: a
+// spec that has NEVER been measured and whose operator left its estimate at 0
+// can never get a card to itself while any known-demand occupant sits on it,
+// so it can never capture the first measurement that would move it out of the
+// unknown class at all.
+//
+// Task 4.3 closes that gap with ONE guarded eviction. The owner grants it
+// through PolicySnapshot.VRAMBootstrapEligible, set only while the candidate
+// has no measurement and has not yet spent the shot (see
+// specState.vramBootstrapDone). While the grant is live, rule 4 evicts idle
+// known-demand touchers to free the card -- exactly as rule 5 already treats
+// unknown occupants -- and flags Decision.VRAMBootstrap so the owner burns the
+// one-shot. The moment the shot is burned (or any measurement lands) the grant
+// is withdrawn and rule 4 is back to the pure ADR-032 block, so the exception
+// can fire at most once per spec and can never reintroduce the thrash.
+
+// TestVRAMBootstrapOneShotEvictsToMeasure: with the grant live, a never-measured
+// unknown-VRAM candidate evicts the idle known-demand occupant of its card so it
+// can start alone and be measured -- the one case rule 4 otherwise only Waits on.
+func TestVRAMBootstrapOneShotEvictsToMeasure(t *testing.T) {
+	unknownCandidate := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+
+	t.Run("one idle known occupant is evicted and the shot is flagged", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running:               []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
+			Budgets:               map[int]int{0: 20000},
+			Allowed:               allowPairs("cand", "occupant"),
+			VRAMBootstrapEligible: true,
+		}
+		got := Admit(snap, unknownCandidate)
+		assertDecision(t, "the never-measured candidate evicts the known occupant once", got, Decision{Evict: []string{"occupant"}})
+		if !got.VRAMBootstrap {
+			t.Error("the bootstrap eviction must set Decision.VRAMBootstrap so the owner can burn the one-shot")
+		}
+	})
+
+	t.Run("every idle known toucher is freed so the candidate truly runs alone", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{
+				{SpecID: "new", GPUs: map[int]int{0: 4000}, LastUsed: t2},
+				{SpecID: "old", GPUs: map[int]int{0: 4000}, LastUsed: t0},
+			},
+			Budgets:               map[int]int{0: 20000},
+			Allowed:               allowPairs("cand", "new", "old"),
+			VRAMBootstrapEligible: true,
+		}
+		// Aloneness is on ALL of the card's occupants, so both idle touchers go,
+		// oldest LastUsed first -- the eviction order the other rules use.
+		got := Admit(snap, unknownCandidate)
+		assertDecision(t, "both idle touchers are evicted oldest-first", got, Decision{Evict: []string{"old", "new"}})
+		if !got.VRAMBootstrap {
+			t.Error("VRAMBootstrap must be set when the bootstrap evicts")
+		}
+	})
+
+	t.Run("a busy known occupant is still waited for, never a partial start", func(t *testing.T) {
+		// The grant is to run ALONE; a toucher that cannot be evicted (busy or
+		// still loading) means the card cannot be freed, so the candidate Waits --
+		// an ordinary Wait that the neighbour's own completion resolves, carrying
+		// no message and NOT the ADR-032 precedence wait. The shot is not spent.
+		for _, tc := range []struct {
+			name string
+			mod  func(*RunningProc)
+		}{
+			{"busy", func(r *RunningProc) { r.InFlight = 1 }},
+			{"still loading", func(r *RunningProc) { r.Starting = true }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				r := RunningProc{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}
+				tc.mod(&r)
+				snap := PolicySnapshot{
+					Running:               []RunningProc{r},
+					Budgets:               map[int]int{0: 20000},
+					Allowed:               allowPairs("cand", "occupant"),
+					VRAMBootstrapEligible: true,
+				}
+				got := Admit(snap, unknownCandidate)
+				assertDecision(t, "a non-evictable toucher blocks the bootstrap", got, Decision{Wait: true, Evict: []string{}})
+				if got.VRAMBootstrap {
+					t.Error("a blocked bootstrap must not flag VRAMBootstrap: no eviction was issued, so the shot is not spent")
+				}
+			})
+		}
+	})
+}
+
+// TestVRAMBootstrapDoesNotRepeat: the one-shot cannot thrash. The identical
+// contested snapshot that evicts while the grant is live reverts to the ADR-032
+// Wait -- known demand beats unknown, no eviction -- the instant the grant is
+// withdrawn, which the owner does the moment the shot is burned or a measurement
+// lands. So rule 4 can evict for bootstrap at most once per spec, and after that
+// a host alternating requests between the two specs cannot cold-load either one
+// to serve the other.
+func TestVRAMBootstrapDoesNotRepeat(t *testing.T) {
+	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
+	base := PolicySnapshot{
+		Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
+		Budgets: map[int]int{0: 20000},
+		Allowed: allowPairs("cand", "occupant"),
+	}
+	const waits = "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 0 rather than evicting it"
+
+	// Grant live: the one-shot evicts the idle known occupant.
+	eligible := base
+	eligible.VRAMBootstrapEligible = true
+	first := Admit(eligible, spec)
+	assertDecision(t, "the one shot evicts the known occupant", first, Decision{Evict: []string{"occupant"}})
+	if !first.VRAMBootstrap {
+		t.Fatal("the one-shot eviction must flag VRAMBootstrap")
+	}
+
+	// Grant withdrawn (shot spent, or a measurement captured): the identical
+	// snapshot is back to the ADR-032 precedence Wait, never a second eviction.
+	spent := base // VRAMBootstrapEligible defaults to false
+	second := Admit(spent, spec)
+	assertDecision(t, "after the shot the same host reverts to the ADR-032 wait", second, Decision{Wait: true, Message: waits, Evict: []string{}})
+	if second.VRAMBootstrap {
+		t.Error("a steady-state ADR-032 wait must never flag VRAMBootstrap")
+	}
+}
+
+// TestADR032SteadyStatePreserved: with no grant (VRAMBootstrapEligible false --
+// the default, and what the owner gives every spec that already has a
+// measurement or has already spent its shot) the total order is untouched. An
+// unknown-demand candidate waits for a known occupant rather than evicting it,
+// and -- crucially -- the grant never leaks onto the winning side: a
+// known-demand candidate still evicts an unknown occupant (rule 5), with or
+// without the flag set, and never carries VRAMBootstrap.
+func TestADR032SteadyStatePreserved(t *testing.T) {
+	const waits = "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 0 rather than evicting it"
+
+	t.Run("unknown candidate still waits for an idle known occupant", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
+			Budgets: map[int]int{0: 20000},
+			Allowed: allowPairs("cand", "occupant"),
+			// VRAMBootstrapEligible defaults to false: no grant.
+		}
+		got := Admit(snap, Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}})
+		assertDecision(t, "known beats unknown: wait, never evict", got, Decision{Wait: true, Message: waits, Evict: []string{}})
+		if got.VRAMBootstrap {
+			t.Error("a steady-state wait must not flag VRAMBootstrap")
+		}
+	})
+
+	t.Run("a known candidate still evicts an idle unknown occupant even with the grant set", func(t *testing.T) {
+		snap := PolicySnapshot{
+			Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 0}, LastUsed: t0}},
+			Budgets: map[int]int{0: 20000},
+			Allowed: allowPairs("cand", "occupant"),
+			// The grant is meaningless for a KNOWN candidate (rule 4 never runs),
+			// but set it to prove the bootstrap never touches rule 5's eviction.
+			VRAMBootstrapEligible: true,
+		}
+		got := Admit(snap, Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}})
+		assertDecision(t, "rule 5 still evicts the unknown occupant", got, Decision{Evict: []string{"occupant"}})
+		if got.VRAMBootstrap {
+			t.Error("rule 5's eviction is not a bootstrap and must not flag VRAMBootstrap")
+		}
+	})
+}
+
 // --- Rule 6: the host-wide RAM pool --------------------------------------
 //
 // RAM is a host resource, not a per-card one, so unlike rule 3 (one sum per

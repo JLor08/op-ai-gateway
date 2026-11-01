@@ -967,6 +967,29 @@ type specState struct {
 	// process, and stops being true when that process exits.
 	measuredRAM int
 
+	// vramBootstrapDone is the DURABLE guard on the one-shot VRAM bootstrap
+	// eviction (task 4.3). It means the spec's unknown-VRAM bootstrap is resolved
+	// -- either a real VRAM measurement has landed for it at least once this
+	// lifetime (so it has a number now and never needs the shot), or the owner has
+	// already spent the one guarded eviction on it. While it is false AND the
+	// spec's declared VRAM demand is unknown, vramBootstrapEligible offers the
+	// shot; once it is true the spec is back to pure ADR-032 steady state (rule 4
+	// blocks, never evicts a known-demand occupant).
+	//
+	// Set in exactly two places: wherever a real measurement is recorded
+	// (applyMeasurement and buildSnapshot, beside st.measuredVRAM), and in
+	// admitAndStart when Admit returns a bootstrap eviction (Decision.VRAMBootstrap).
+	//
+	// IT IS DELIBERATELY NOT CLEARED ON EXIT, and that is the whole anti-thrash
+	// guarantee -- the opposite rule from measuredVRAM/measuredRAM above, which
+	// describe the live process and so are cleared the moment it exits (F2). This
+	// marker describes the SPEC's lifetime, not its current process: a shot once
+	// spent must stay spent across restarts, or every exit would re-arm the
+	// one-shot and the ADR-032 bidirectional thrash would return one restart at a
+	// time. It resets only when the spec itself is removed and re-added (a fresh
+	// specState); an in-place config edit keeps the same specState and the marker.
+	vramBootstrapDone bool
+
 	// waitingOnRAM is true while this spec's most recent admission verdict was a
 	// Wait the host-RAM pool contributed to (Decision.WaitOnRAM). It is the one
 	// kind of Wait a new hardware sample can end by itself, so it is what
@@ -1639,6 +1662,32 @@ func (o *owner) recordFailure(st *specState, message string, exitCode int, stder
 	}
 }
 
+// vramBootstrapEligible reports whether st may use its ONE guarded VRAM
+// bootstrap eviction on this admission (task 4.3). Three conditions, all
+// required:
+//
+//   - A VRAM measurer is installed. The exception exists only to CAPTURE a first
+//     measurement, so where none can be taken it must not fire. Measurement is
+//     NVIDIA-only (§5.3): on an AMD, Apple-silicon or GPU-less host "waiting for
+//     the measurement to arrive is waiting for something that will not happen",
+//     and there §5.3 is explicit that an unknown-demand spec simply WAITS behind
+//     a busy/pinned holder. Evicting a working known-demand model on such a host
+//     for an unknown spec that can never be measured is exactly the ADR-032
+//     regression the order exists to prevent -- so the bootstrap is gated on the
+//     measurer, the VRAM twin of P4a's ramMeasurerInstalled gate.
+//   - The declared VRAM demand is unknown. A known-demand candidate never runs
+//     rule 4 at all, so the grant would be meaningless.
+//   - The bootstrap is still unresolved: no measurement captured and the one shot
+//     unspent (specState.vramBootstrapDone). This is what keeps the exception
+//     from repeating -- the thrash guard.
+//
+// It is the per-candidate grant admitAndStart copies into
+// PolicySnapshot.VRAMBootstrapEligible, the one input that turns rule 4 from a
+// block into a single eviction.
+func (o *owner) vramBootstrapEligible(st *specState) bool {
+	return o.m.measurer.Load() != nil && !st.vramBootstrapDone && specHasUnknownVRAM(st.spec)
+}
+
 // admitAndStart is the single place that decides whether spec should move
 // toward Running right now, and if so starts it -- called for a freshly
 // queued request, after a backoff/drain/idle completion frees something up,
@@ -1675,7 +1724,13 @@ func (o *owner) admitAndStart(specID string) {
 		return
 	}
 
-	dec := Admit(o.buildSnapshot(), st.spec)
+	// The one-shot VRAM bootstrap grant is per-candidate owner state, so it is
+	// set on the snapshot here (which buildSnapshot, being candidate-agnostic,
+	// cannot know) rather than inside the builder -- the same shape every other
+	// snapshot field keeps: the owner decides, Admit interprets.
+	snap := o.buildSnapshot()
+	snap.VRAMBootstrapEligible = o.vramBootstrapEligible(st)
+	dec := Admit(snap, st.spec)
 	st.waitingOnRAM = dec.Wait && dec.WaitOnRAM
 	switch {
 	case dec.Reason == StateNotPermitted:
@@ -1692,6 +1747,14 @@ func (o *owner) admitAndStart(specID string) {
 		// noteAdmissionWait.
 		o.noteAdmissionWait(st, dec.Message)
 	case len(dec.Evict) > 0:
+		if dec.VRAMBootstrap {
+			// This Evict spent the candidate's one-shot VRAM bootstrap (rule 4
+			// evicted a known-demand occupant it would otherwise only have
+			// blocked). Burn the shot NOW, before the victim even drains, so the
+			// marker is durable against a re-entrant admission and the exception
+			// fires at most once per spec -- the ADR-032 anti-thrash guarantee.
+			st.vramBootstrapDone = true
+		}
 		for _, victimID := range dec.Evict {
 			// Record WHO this eviction is for before asking for it: the
 			// victim's exit path gives these specs their admission attempt
@@ -1957,6 +2020,10 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		}
 		if byGPU := realMeasurement(c.byPID[t.pid]); byGPU != nil {
 			st.measuredVRAM = byGPU
+			// A real measurement resolves the VRAM bootstrap durably: the spec
+			// has a number now, so it must never spend (or keep holding) the
+			// one-shot eviction. See specState.vramBootstrapDone.
+			st.vramBootstrapDone = true
 		}
 		// ONE process per spec, so the pid's figure is the spec's figure:
 		// nothing to sum and no key to re-key. The same generation guard
@@ -2057,6 +2124,11 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		}
 		if byGPU != nil {
 			st.measuredVRAM = byGPU
+			// A real measurement resolves the VRAM bootstrap durably, the same as
+			// the beat's applyMeasurement: the spec has a number now and must
+			// never spend (or keep holding) the one-shot. See
+			// specState.vramBootstrapDone.
+			st.vramBootstrapDone = true
 		}
 		// Host RAM follows the same rule as the VRAM charge above, spec-level
 		// instead of per GPU: max(live, pushed demand), the demand a FLOOR. The
