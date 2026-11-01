@@ -996,6 +996,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, errTranscriptionTooLarge) {
 		message = fmt.Sprintf("the transcription is too large for this model's server: its request limit is %d MiB, counted after the model name is prepared", agentRouterMaxBodyBytes>>20)
 	}
+	if errors.Is(err, errTranscriptionLiveBusy) {
+		message = "a live transcription session is already active for this model; retry once it ends"
+	}
 	return apierror.Response(code, message, "")
 }
 
@@ -1052,6 +1055,12 @@ func completionHTTPStatus(err error) int {
 	if errors.Is(err, errTranscriptionTooLarge) {
 		return http.StatusRequestEntityTooLarge
 	}
+	// A transcription refused because a live session holds the model's one slot
+	// (errTranscriptionLiveBusy): the same transient 503 the live bearer path's busy
+	// reject uses -- a retry, once the live session ends, is what cures it.
+	if errors.Is(err, errTranscriptionLiveBusy) {
+		return http.StatusServiceUnavailable
+	}
 	// ErrVoiceUnavailable is ErrNoHealthyHost's narrower twin (the servers that offer
 	// the requested voice are all down or busy), so it is the same 503: a retry, or
 	// the voice's servers coming back, is what cures it.
@@ -1075,6 +1084,8 @@ func completionErrorCode(err error) string {
 		return codeTranscriptionUnavailable
 	case errors.Is(err, errTranscriptionTooLarge):
 		return codeRequestBodyTooLarge
+	case errors.Is(err, errTranscriptionLiveBusy):
+		return liveBearerBusyCode
 	case errors.Is(err, routing.ErrNoHealthyHost):
 		return routing.ErrNoHealthyHost.Error()
 	case errors.Is(err, routing.ErrVoiceUnavailable):

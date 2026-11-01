@@ -1267,6 +1267,87 @@ func TestTranscriptionRefusesAModelWithoutATranscriptionVerdict(t *testing.T) {
 	}
 }
 
+// A buffered transcription (and the one-shot /details) to a single-slot model that
+// currently has an active LIVE session is refused cleanly with the live path's own
+// busy 503 (transcription.live_busy), instead of colliding at the upstream -- audio.cpp
+// serves one session per model, so the collision would surface as an upstream error and
+// bill an honest loud zero (§11.4(4), interim until #340). The guard reads the per-route
+// live slot as an advisory snapshot, so it refuses before anything is sent and the
+// upstream is never called; the refusal records the same audio_second loud-zero row the
+// other routing refusals do.
+func TestTranscriptionRefusesWhenALiveSessionHoldsTheModelSlot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{"plain transcription", "/v1/audio/transcriptions"},
+		{"details", "/v1/audio/transcriptions/details"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionOKBody)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			// asr-model resolves to route-asr; take its live slot exactly as a live
+			// session does, so the buffered request meets a held slot.
+			release, ok := srv.liveSessions.acquire("route-asr")
+			if !ok {
+				t.Fatal("could not take the live slot for route-asr")
+			}
+			defer release()
+
+			body, ct := buildEditMultipart(t, validTranscriptionParts(transcriptionGatewayModel))
+			rec := postEditRaw(t, srv, http.MethodPost, tc.path, body, ct, map[string]string{"Authorization": "Bearer dev-secret"})
+
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), liveBearerBusyCode)
+			requireNoTranscriptionUpstreamCall(t, calls)
+
+			events := srv.Usage.All()
+			if len(events) != 1 {
+				t.Fatalf("usage events = %+v, want exactly one refusal row", events)
+			}
+			ev := events[0]
+			if ev.ReqPath != tc.path || ev.HTTPStatus != http.StatusServiceUnavailable || ev.Status != "error" || ev.ErrorCode != liveBearerBusyCode {
+				t.Fatalf("row = path %q status %d/%q/%q, want %q 503/error/%s", ev.ReqPath, ev.HTTPStatus, ev.Status, ev.ErrorCode, tc.path, liveBearerBusyCode)
+			}
+			if ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 0 {
+				t.Fatalf("row billing = %q/%v, want an audio_second row with quantity 0", ev.BillingUnit, ev.BillingQuantity)
+			}
+			// No upstream call was made, so the row must not claim one (the same
+			// invariant the other transcription routing refusals keep).
+			if ev.Host != "" || ev.RouteID != "" || ev.ProviderPath != "" {
+				t.Fatalf("row = %+v, want Host/RouteID/ProviderPath empty", ev)
+			}
+		})
+	}
+}
+
+// The live-slot guard is conditional, not a blanket block: with no live session holding
+// the model's slot, a buffered transcription is relayed to the upstream as usual. The
+// slot is taken then released, so the registry holds a now-empty entry for the route --
+// the guard must read that as free, not merely as absent. Its firing twin is
+// TestTranscriptionRefusesWhenALiveSessionHoldsTheModelSlot.
+func TestTranscriptionProceedsWhenNoLiveSessionHoldsTheModelSlot(t *testing.T) {
+	up, calls := newTranscriptionUpstream(t, http.StatusOK, transcriptionOKBody)
+	srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+	release, ok := srv.liveSessions.acquire("route-asr")
+	if !ok {
+		t.Fatal("could not take the live slot for route-asr")
+	}
+	release()
+
+	rec := postTranscriptionParts(t, srv, validTranscriptionParts(transcriptionGatewayModel))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if call := nextTranscriptionUpstreamCall(t, calls); call.path != "/v1/audio/transcriptions" {
+		t.Fatalf("upstream path = %q, want /v1/audio/transcriptions", call.path)
+	}
+}
+
 // The two audio capabilities are orthogonal at the handler too: the transcription
 // model serves transcriptions and is refused speech, the speech model the other
 // way round (TestTranscriptionRefusesAModelWithoutATranscriptionVerdict has the
